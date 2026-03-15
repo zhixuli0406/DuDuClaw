@@ -9,13 +9,10 @@ use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
-use duduclaw_agent::registry::AgentRegistry;
-
-use crate::channel_reply::build_reply;
+use crate::channel_reply::{ReplyContext, build_reply};
 
 const DISCORD_API: &str = "https://discord.com/api/v10";
 
@@ -72,7 +69,7 @@ const INTENT_DIRECT_MESSAGES: u64 = 1 << 12;
 /// Returns a JoinHandle for the background task, or None if not configured.
 pub async fn start_discord_bot(
     home_dir: &Path,
-    registry: Arc<RwLock<AgentRegistry>>,
+    ctx: Arc<ReplyContext>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let token = read_discord_token(home_dir).await?;
     if token.is_empty() {
@@ -132,7 +129,7 @@ pub async fn start_discord_bot(
     info!("   ⚠ 請確認 Discord Developer Portal 已啟用 MESSAGE CONTENT Intent");
 
     let handle = tokio::spawn(async move {
-        gateway_loop(token, bot_id, gateway_url, http, registry).await;
+        gateway_loop(token, bot_id, gateway_url, http, ctx).await;
     });
 
     Some(handle)
@@ -145,7 +142,7 @@ async fn gateway_loop(
     bot_id: String,
     gateway_url: String,
     http: reqwest::Client,
-    registry: Arc<RwLock<AgentRegistry>>,
+    ctx: Arc<ReplyContext>,
 ) {
     loop {
         info!("Discord Gateway connecting...");
@@ -247,7 +244,7 @@ async fn gateway_loop(
                     if let Some(event_name) = &payload.t {
                         if event_name == "MESSAGE_CREATE" {
                             if let Some(d) = &payload.d {
-                                handle_message_create(d, &bot_id, &http, &token, &registry).await;
+                                handle_message_create(d, &bot_id, &http, &token, &ctx).await;
                             }
                         } else if event_name == "READY" {
                             info!("Discord Gateway READY");
@@ -303,7 +300,7 @@ async fn handle_message_create(
     bot_id: &str,
     http: &reqwest::Client,
     token: &str,
-    registry: &Arc<RwLock<AgentRegistry>>,
+    ctx: &Arc<ReplyContext>,
 ) {
     // Ignore messages from the bot itself
     let author_id = data
@@ -334,7 +331,7 @@ async fn handle_message_create(
 
     info!("📩 Discord [{author_name}]: {}", &content[..content.len().min(80)]);
 
-    let reply = build_reply(content, registry).await;
+    let reply = build_reply(content, ctx).await;
 
     // Send reply via REST API
     match http

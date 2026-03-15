@@ -41,10 +41,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let handler = MethodHandler::new(config.home_dir).await;
 
     // Start channel bots if configured
-    let registry = handler.registry().clone();
-    let _telegram_handle = crate::telegram::start_telegram_bot(&home_dir, registry.clone()).await;
-    let line_router = crate::line::start_line_bot(&home_dir, registry.clone()).await;
-    let _discord_handle = crate::discord::start_discord_bot(&home_dir, registry).await;
+    let reply_ctx = Arc::new(crate::channel_reply::ReplyContext::new(
+        handler.registry().clone(),
+        home_dir.clone(),
+    ));
+    let _telegram_handle = crate::telegram::start_telegram_bot(&home_dir, reply_ctx.clone()).await;
+    let line_router = crate::line::start_line_bot(&home_dir, reply_ctx.clone()).await;
+    let _discord_handle = crate::discord::start_discord_bot(&home_dir, reply_ctx).await;
 
     let state = Arc::new(AppState {
         auth: AuthManager::new(config.auth_token),

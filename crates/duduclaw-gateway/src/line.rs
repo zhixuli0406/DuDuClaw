@@ -16,12 +16,9 @@ use axum::{
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use duduclaw_agent::registry::AgentRegistry;
-
-use crate::channel_reply::build_reply;
+use crate::channel_reply::{ReplyContext, build_reply};
 
 const LINE_API: &str = "https://api.line.me/v2/bot";
 
@@ -84,7 +81,7 @@ struct LineBotInfo {
 pub struct LineState {
     token: String,
     secret: String,
-    registry: Arc<RwLock<AgentRegistry>>,
+    ctx: Arc<ReplyContext>,
     http: reqwest::Client,
 }
 
@@ -95,7 +92,7 @@ pub struct LineState {
 /// Returns `None` if LINE is not configured.
 pub async fn start_line_bot(
     home_dir: &Path,
-    registry: Arc<RwLock<AgentRegistry>>,
+    ctx: Arc<ReplyContext>,
 ) -> Option<Router> {
     let (token, secret) = read_line_config(home_dir).await?;
     if token.is_empty() {
@@ -132,7 +129,7 @@ pub async fn start_line_bot(
         }
     }
 
-    let state = LineState { token, secret, registry, http };
+    let state = LineState { token, secret, ctx, http };
 
     let router = Router::new()
         .route("/webhook/line", post(line_webhook_handler))
@@ -192,7 +189,7 @@ async fn line_webhook_handler(
 
             info!("📩 LINE [{sender}]: {}", &text[..text.len().min(80)]);
 
-            let reply = build_reply(text, &state.registry).await;
+            let reply = build_reply(text, &state.ctx).await;
             send_reply(&state.http, &state.token, reply_token, &reply).await;
         }
     }

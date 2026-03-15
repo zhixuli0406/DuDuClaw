@@ -8,12 +8,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use duduclaw_agent::registry::AgentRegistry;
-
-use crate::channel_reply::build_reply;
+use crate::channel_reply::{ReplyContext, build_reply};
 
 const TELEGRAM_API: &str = "https://api.telegram.org";
 
@@ -66,7 +63,7 @@ struct SendMessage {
 /// Returns `None` if no Telegram token is configured.
 pub async fn start_telegram_bot(
     home_dir: &Path,
-    registry: Arc<RwLock<AgentRegistry>>,
+    ctx: Arc<ReplyContext>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let token = read_telegram_token(home_dir).await?;
 
@@ -107,7 +104,7 @@ pub async fn start_telegram_bot(
     }
 
     let handle = tokio::spawn(async move {
-        poll_loop(client, api_base, registry).await;
+        poll_loop(client, api_base, ctx).await;
     });
 
     Some(handle)
@@ -131,7 +128,7 @@ async fn read_telegram_token(home_dir: &Path) -> Option<String> {
 async fn poll_loop(
     client: reqwest::Client,
     api_base: String,
-    registry: Arc<RwLock<AgentRegistry>>,
+    ctx: Arc<ReplyContext>,
 ) {
     let mut offset: i64 = 0;
     info!("Telegram polling started");
@@ -178,7 +175,7 @@ async fn poll_loop(
 
                     info!("📩 Telegram [{sender}]: {}", &text[..text.len().min(80)]);
 
-                    let reply = build_reply(text, &registry).await;
+                    let reply = build_reply(text, &ctx).await;
                     send_reply(&client, &api_base, msg.chat.id, &reply).await;
                 }
             }
