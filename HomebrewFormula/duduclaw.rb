@@ -1,7 +1,7 @@
 class Duduclaw < Formula
   desc "Multi-Agent AI Assistant Platform"
   homepage "https://github.com/zhixuli0406/DuDuClaw"
-  url "https://github.com/zhixuli0406/DuDuClaw.git", tag: "v0.1.10"
+  url "https://github.com/zhixuli0406/DuDuClaw.git", tag: "v0.1.11"
   version "0.1.10"
   license "MIT"
 
