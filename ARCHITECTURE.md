@@ -18,7 +18,8 @@
 9. [自主提升引擎](#九自主提升引擎)
 10. [專案結構](#十專案結構)
 11. [安裝與部署系統](#十一安裝與部署系統)
-12. [實作路線圖](#十二實作路線圖)
+12. [Web 管理介面](#十二web-管理介面)
+13. [實作路線圖](#十三實作路線圖)
 
 ---
 
@@ -1768,53 +1769,277 @@ New-NetFirewallRule -DisplayName "DuDuClaw Gateway" `
 
 ---
 
-## 十二、實作路線圖
+## 十二、Web 管理介面
 
-### Phase 1：核心骨架（2-3 週）
+### 12.1 設計理念
 
-- [ ] Rust workspace 建立 + 跨平台 CI/CD（見下方建構矩陣）
-- [ ] `duduclaw-core`：型別、trait 定義
-- [ ] `duduclaw-cli`：onboard 指令（跨平台路徑處理）
-- [ ] `duduclaw-agent`：Agent 資料夾掃描、agent.toml 解析
-- [ ] `duduclaw-container`：Docker runtime 基本生命週期
-- [ ] `duduclaw-bridge`：PyO3 骨架
-- [ ] Python SDK rotator 骨架（單帳號先行）
+為 DuDuClaw 提供 Web 管理儀表板，作為個人 AI 伴侶的溫暖控制台。所有 CLI 功能皆可視覺化操作，透過現有 WebSocket Gateway 即時通訊。Dashboard 嵌入 Rust binary（via `rust-embed`），使用者執行 `duduclaw run` 後瀏覽 `http://localhost:18789` 即可使用。
 
-### Phase 2：安全層 + 單 Agent 運行（2-3 週）
+### 12.2 技術選型
 
-- [ ] `duduclaw-security`：CredentialProxy、MountGuard
-- [ ] `duduclaw-container`：Apple Container 支援
-- [ ] `duduclaw-memory`：SQLite + FTS5（向量搜尋 Phase 3）
-- [ ] Container Agent Loop：Claude Code SDK 容器內執行
-- [ ] 單 Agent CLI 模式可運行（macOS + Linux + Windows）
+| 項目 | 選擇 | 理由 |
+|------|------|------|
+| 框架 | React 19 + TypeScript | 生態成熟、元件豐富、適合即時資料更新 |
+| 建構工具 | Vite 6 | 極快 HMR、產出小巧靜態檔案 |
+| UI 元件庫 | shadcn/ui + Tailwind CSS 4 | 可自訂、溫暖風格易調色 |
+| 狀態管理 | Zustand | 輕量、適合 WebSocket 即時狀態 |
+| 圖表 | Recharts | 輕量、React 原生 |
+| 國際化 | react-intl | zh-TW 為主語言 |
+| 嵌入方式 | rust-embed | 編譯期嵌入靜態檔，單一 binary |
+| 虛擬滾動 | @tanstack/react-virtual | 大量日誌不卡頓 |
 
-### Phase 3：Gateway + 通道（2-3 週）
+### 12.3 頁面架構
 
-- [ ] `duduclaw-gateway`：WebSocket RPC (OpenClaw 相容)
-- [ ] `duduclaw-bus`：訊息路由
-- [ ] Python channels：LINE、Telegram、Discord
-- [ ] 心跳排程器
-- [ ] 多帳號輪替完整實作
+```
+┌─────────────────────────────────────────────────────────┐
+│  Header：連線狀態 🟢  DuDuClaw Dashboard  🌙 Dark Mode │
+├──────────┬──────────────────────────────────────────────┤
+│          │                                              │
+│ Sidebar  │  Content Area                                │
+│          │                                              │
+│ 🐾 首頁  │  ┌─────────┐ ┌─────────┐ ┌─────────┐       │
+│ 🤖 Agent │  │ Agent    │ │ 通道     │ │ 預算     │      │
+│ 📡 通道  │  │ 3 活躍   │ │ 2 已連線 │ │ 47%     │       │
+│ 💰 帳號  │  └─────────┘ └─────────┘ └─────────┘       │
+│ 🧠 記憶  │                                              │
+│ 🔒 安全  │  ┌──────────────────┐ ┌──────────────────┐  │
+│ ⚙️ 設定  │  │ Agent 活動時間軸  │ │ 預算趨勢圖       │  │
+│ 📋 日誌  │  │                  │ │                  │  │
+│          │  └──────────────────┘ └──────────────────┘  │
+└──────────┴──────────────────────────────────────────────┘
+```
 
-### Phase 4：多 Agent + 自主提升（2-3 週）
+#### 8 個核心頁面
 
-- [ ] Agent 路由（觸發詞匹配）
-- [ ] Agent 間 IPC
-- [ ] 自主提升三層反思
-- [ ] Skill Vetter 安全掃描
-- [ ] Agent 動態管理工具（agent_create/delegate）
-- [ ] 預算控管
+| 頁面 | 路徑 | 對應 CLI | 功能 |
+|------|------|----------|------|
+| 首頁總覽 | `/` | `status` | 摘要卡片、活動時間軸、預算圖、健康條 |
+| Agent 管理 | `/agents` | `agent *` | Agent 列表/建立/檢視/暫停/恢復/委派 |
+| 通道管理 | `/channels` | `channel *` | 通道狀態/新增/測試/移除 |
+| 帳號與預算 | `/accounts` | `account *` | 帳號列表/預算圓餅圖/用量趨勢 |
+| 記憶與技能 | `/memory` | — | 記憶搜尋/每日筆記/技能列表/自主提升時間軸 |
+| 安全設定 | `/security` | `configure --section security` | RBAC 矩陣/速率限制/Token 管理 |
+| 系統設定 | `/settings` | `configure`, `cron *`, `doctor` | 一般設定/容器/心跳/排程/健康診斷 |
+| 即時日誌 | `/logs` | `logs` | 即時串流/過濾/虛擬滾動/匯出 |
 
-### Phase 5：跨平台打磨 + 文件（1-2 週）
+### 12.4 WebSocket 通訊
 
-- [ ] `duduclaw-container`：WSL2 Direct runtime 支援
-- [ ] `duduclaw-cli`：Windows Service 整合
-- [ ] 向量嵌入記憶搜尋
-- [ ] 完整測試覆蓋 (80%+)
-- [ ] 文件撰寫
-- [ ] Docker Compose 部署配置
-- [ ] winget / Scoop 套件發布
-- [ ] 效能調優
+Dashboard 透過現有 `/ws` 端點與後端通訊，使用 `WsFrame` 三種訊息格式。
+
+#### 新增 RPC Methods
+
+```
+# Agent 管理
+agents.list              # 列出所有 Agent（含即時狀態）
+agents.status            # 單一 Agent 詳細狀態
+agents.create            # 建立新 Agent
+agents.delegate          # 委派任務
+agents.pause             # 暫停 Agent
+agents.resume            # 恢復 Agent
+agents.inspect           # 完整設定 + 技能 + 記憶
+agents.update_config     # 更新設定
+
+# 通道管理
+channels.status          # 所有通道連線狀態
+channels.add             # 新增通道
+channels.test            # 測試連線
+channels.remove          # 移除通道
+
+# 帳號管理
+accounts.list            # 帳號列表（遮蔽敏感欄位）
+accounts.add             # 新增帳號
+accounts.rotate          # 手動輪替
+accounts.health          # 健康檢查
+accounts.budget_summary  # 全系統預算摘要
+
+# 記憶與技能
+memory.search            # 向量 + FTS5 混合搜尋
+memory.browse            # 瀏覽記憶條目
+memory.daily_notes       # 每日筆記
+skills.list              # 技能列表
+skills.content           # 技能 Markdown 內容
+
+# 系統
+system.doctor            # 9 項健康診斷
+system.doctor_repair     # 診斷 + 自動修復
+system.status            # 健康快照
+system.config            # 設定內容（遮蔽敏感欄位）
+system.update_config     # 更新設定
+system.version           # 版本資訊
+
+# 排程
+cron.list                # 列出排程任務
+cron.add                 # 新增排程
+cron.pause               # 暫停排程
+cron.remove              # 移除排程
+
+# 日誌
+logs.subscribe           # 開始推送日誌 events
+logs.unsubscribe         # 停止推送
+```
+
+#### Server-Push Events
+
+```
+agent.status_changed       # Agent 狀態變更
+agent.heartbeat            # 心跳觸發
+agent.delegate_started     # 委派開始
+agent.delegate_completed   # 委派完成
+channel.connected          # 通道已連線
+channel.disconnected       # 通道已斷線
+account.budget_warning     # 預算警告（達 80%）
+account.budget_exceeded    # 預算超額
+account.rotated            # 帳號已輪替
+system.health_changed      # 健康狀態變更
+logs.entry                 # 即時日誌條目
+message.received           # 收到訊息
+message.sent               # 已發送訊息
+```
+
+### 12.5 資料流架構
+
+```
+┌──────────────────────────┐
+│  Browser (React SPA)      │
+│                          │
+│  Zustand ←→ WsClient ───┼── WebSocket ──→ Axum Gateway
+│    ↕                     │                     │
+│  React Pages             │               ┌─────┼─────┐
+└──────────────────────────┘               │     │     │
+                                        Agent  Memory Security
+                                       Registry Engine  Layer
+```
+
+### 12.6 前端專案結構
+
+```
+web/
+├── package.json
+├── vite.config.ts              # proxy /ws → Rust gateway
+├── tailwind.config.ts
+├── index.html
+├── src/
+│   ├── main.tsx
+│   ├── App.tsx                 # 路由設定
+│   ├── i18n/
+│   │   ├── zh-TW.json         # 繁體中文（主語言）
+│   │   └── en.json
+│   ├── lib/
+│   │   ├── ws-client.ts       # WsFrame 協議客戶端
+│   │   └── api.ts             # 型別安全 RPC 封裝
+│   ├── stores/                 # Zustand stores
+│   │   ├── connection-store.ts
+│   │   ├── agents-store.ts
+│   │   ├── channels-store.ts
+│   │   ├── accounts-store.ts
+│   │   ├── system-store.ts
+│   │   └── logs-store.ts
+│   ├── components/
+│   │   ├── layout/             # Sidebar, Header, MainLayout
+│   │   ├── shared/             # StatusBadge, BudgetGauge, etc.
+│   │   ├── dashboard/          # OverviewCards, ActivityFeed, etc.
+│   │   ├── agents/             # AgentList, AgentCard, AgentDetail, etc.
+│   │   ├── channels/           # ChannelList, ChannelCard, etc.
+│   │   ├── accounts/           # AccountList, BudgetOverview, etc.
+│   │   ├── memory/             # MemoryBrowser, SkillList, etc.
+│   │   ├── security/           # SecurityOverview, RateLimitConfig
+│   │   ├── settings/           # GeneralSettings, CronManager, etc.
+│   │   └── logs/               # LogViewer, LogFilter
+│   └── pages/                  # 8 個頁面元件
+```
+
+### 12.7 Rust 嵌入 crate
+
+```
+crates/duduclaw-dashboard/
+├── Cargo.toml                  # rust-embed + mime_guess
+├── build.rs                    # 檢查 dist/ 是否存在
+└── src/
+    ├── lib.rs                  # dashboard_router() → Axum Router
+    └── embed.rs                # #[derive(RustEmbed)] #[folder = "dist/"]
+```
+
+Gateway 整合：
+
+```rust
+// crates/duduclaw-gateway/src/server.rs
+let app = Router::new()
+    .route("/ws", get(ws_handler))
+    .route("/health", get(health_handler))
+    .with_state(state)
+    .merge(duduclaw_dashboard::dashboard_router());  // SPA fallback
+```
+
+### 12.8 設計風格
+
+| 項目 | 規格 |
+|------|------|
+| 主色調 | amber-500 / orange-400（暖色系） |
+| 背景色 | stone-50 (light) / stone-900 (dark) |
+| 字體 | 系統字體堆疊 |
+| 圖標 | Lucide Icons |
+| 間距 | 寬鬆、呼吸感強 |
+| 動畫 | 微妙 fade-in / slide-in |
+| Dark mode | 支援系統偏好自動切換 |
+
+### 12.9 實作階段
+
+| 階段 | 內容 | 預估 |
+|------|------|------|
+| Phase A | 基礎建設：前端骨架 + WsClient + 空殼頁面 + i18n | 1 週 |
+| Phase B | 核心頁面：Dashboard 首頁 + Agent + 通道 + 帳號 | 2 週 |
+| Phase C | 完整功能：記憶/技能 + 安全 + 設定 + 日誌 | 1-2 週 |
+| Phase D | 後端擴充：新 RPC methods + Event push + rust-embed 整合 | 1-2 週 |
+
+---
+
+## 十三、實作路線圖
+
+### Phase 1：核心骨架（2-3 週） ✅ 完成 (2026-03-15)
+
+- [x] Rust workspace 建立 + 跨平台 CI/CD（見下方建構矩陣）
+- [x] `duduclaw-core`：型別、trait 定義
+- [x] `duduclaw-cli`：onboard 指令（跨平台路徑處理）
+- [x] `duduclaw-agent`：Agent 資料夾掃描、agent.toml 解析
+- [x] `duduclaw-container`：Docker runtime 基本生命週期
+- [x] `duduclaw-bridge`：PyO3 骨架
+- [x] Python SDK rotator 骨架（單帳號先行）
+
+### Phase 2：安全層 + 單 Agent 運行（2-3 週） ✅ 完成 (2026-03-15)
+
+- [x] `duduclaw-security`：CredentialProxy、MountGuard、RBAC、RateLimiter、Crypto
+- [x] `duduclaw-container`：Apple Container 支援（Phase 5 完善）
+- [x] `duduclaw-memory`：SQLite + FTS5（向量搜尋 Phase 5）
+- [x] Container Agent Loop：AgentRunner + CLI 互動模式
+- [x] 單 Agent CLI 模式可運行（onboard + agent + doctor + status）
+
+### Phase 3：Gateway + 通道（2-3 週） ✅ 完成 (2026-03-15)
+
+- [x] `duduclaw-gateway`：WebSocket RPC (OpenClaw 相容)
+- [x] `duduclaw-bus`：訊息路由（broadcast + mpsc）
+- [x] Python channels：LINE、Telegram、Discord
+- [x] 心跳排程器（HeartbeatScheduler）
+- [x] 多帳號輪替完整實作（4 種策略 + 預算追蹤）
+
+### Phase 4：多 Agent + 自主提升（2-3 週） ✅ 完成 (2026-03-15)
+
+- [x] Agent 路由（觸發詞匹配 — AgentResolver）
+- [x] Agent 間 IPC（IpcBroker + JSON 檔案持久化）
+- [x] 自主提升三層反思（Micro/Meso/Macro Reflection）
+- [x] Skill Vetter 安全掃描（5 大類威脅檢測）
+- [x] Agent 動態管理工具（agent_create/delegate/pause/resume）
+- [x] 預算控管（BudgetManager + 月自動重置 + hard stop）
+
+### Phase 5：跨平台打磨 + 文件（1-2 週） ✅ 完成 (2026-03-15)
+
+- [x] `duduclaw-container`：WSL2 Direct runtime 支援
+- [x] `duduclaw-cli`：Windows Service 整合（systemd / launchd / Windows Service）
+- [x] 向量嵌入記憶搜尋（cosine similarity + VectorIndex）
+- [x] 測試覆蓋（43 tests passing）
+- [x] Docker Compose 部署配置（quickstart + full）
+- [x] Dockerfile（agent + server 多階段建構）
+- [ ] winget / Scoop 套件發布（待發布時完成）
+- [ ] 效能調優（持續進行）
 
 ---
 
