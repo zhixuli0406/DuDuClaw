@@ -139,6 +139,7 @@ pub async fn start_line_bot(
         .with_state(state);
 
     info!("   LINE webhook endpoint: /webhook/line");
+    info!("   ⚠ 請在 LINE Developer Console 設定 Webhook URL: https://your-domain:18789/webhook/line");
     Some(router)
 }
 

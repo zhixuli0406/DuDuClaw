@@ -129,6 +129,7 @@ pub async fn start_discord_bot(
 
     let gateway_url = format!("{gateway_url}/?v=10&encoding=json");
     info!("   Discord Gateway: {gateway_url}");
+    info!("   ⚠ 請確認 Discord Developer Portal 已啟用 MESSAGE CONTENT Intent");
 
     let handle = tokio::spawn(async move {
         gateway_loop(token, bot_id, gateway_url, http, registry).await;

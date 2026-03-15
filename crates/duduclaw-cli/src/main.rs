@@ -347,6 +347,13 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
                         .unwrap_or_default();
                     if !line_token.is_empty() {
                         println!("  {} LINE 已設定", style("✓").green());
+                        println!();
+                        println!("  {} {}", style("⚠").yellow(), style("LINE 設定提醒：").bold());
+                        println!("    請到 LINE Developer Console 設定 Webhook URL：");
+                        println!("    {}", style("https://你的域名:18789/webhook/line").cyan());
+                        println!("    需要 HTTPS，可使用 {} 或 {} 暴露本地服務",
+                            style("ngrok").cyan(), style("Tailscale").cyan());
+                        println!();
                     }
                 }
                 1 => {
@@ -365,6 +372,12 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
                         .unwrap_or_default();
                     if !discord_token.is_empty() {
                         println!("  {} Discord 已設定", style("✓").green());
+                        println!();
+                        println!("  {} {}", style("⚠").yellow(), style("Discord 設定提醒：").bold());
+                        println!("    請到 Discord Developer Portal 啟用以下 Intent：");
+                        println!("    {}", style("MESSAGE CONTENT Intent").cyan());
+                        println!("    路徑：Bot → Privileged Gateway Intents → Message Content Intent");
+                        println!();
                     }
                 }
                 _ => {}
