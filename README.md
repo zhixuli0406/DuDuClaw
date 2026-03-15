@@ -173,29 +173,52 @@ duduclaw run → 瀏覽 http://localhost:18789
 
 ---
 
-## 快速開始
+## 安裝
 
-### 前置需求
+### 一行安裝（推薦）
 
-- [Rust](https://rustup.rs/) (1.82+)
-- [Python](https://www.python.org/) (3.10+)
-- [Docker](https://www.docker.com/) 或 [Apple Container](https://developer.apple.com/) (macOS 26+)
-- [Node.js](https://nodejs.org/) (20+, 僅建構 Dashboard 時需要)
+**macOS / Linux：**
 
-### 從原始碼安裝
+```bash
+curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | sh
+```
+
+**Windows (PowerShell)：**
+
+```powershell
+irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.ps1 | iex
+```
+
+### Homebrew（macOS / Linux）
+
+```bash
+brew install zhixuli0406/tap/duduclaw
+```
+
+### Cargo + pip（開發者）
+
+```bash
+cargo install duduclaw-cli
+pip install duduclaw
+```
+
+### Docker 一行部署
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... docker compose -f docker-compose.quickstart.yml up -d
+```
+
+### 從原始碼建構
 
 ```bash
 git clone https://github.com/zhixuli0406/DuDuClaw.git
 cd DuDuClaw
 
 # 建構 Dashboard
-cd web && npm ci && npm run build && cd ..
+cd web && npm ci --legacy-peer-deps && npm run build && cd ..
 
-# 建構 Rust binary
-cargo build --release --workspace --exclude duduclaw-bridge
-
-# 安裝 Python 擴充
-pip install -e .
+# 建構 Rust binary（含 Dashboard）
+cargo build --release -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard
 
 # 首次設定
 ./target/release/duduclaw onboard
@@ -204,11 +227,7 @@ pip install -e .
 ./target/release/duduclaw run
 ```
 
-### Docker 一行部署
-
-```bash
-ANTHROPIC_API_KEY=sk-ant-... docker compose -f docker-compose.quickstart.yml up -d
-```
+> **前置需求（從原始碼建構時）**：[Rust](https://rustup.rs/) 1.85+、[Python](https://www.python.org/) 3.10+、[Node.js](https://nodejs.org/) 20+、[Docker](https://www.docker.com/)
 
 ### CLI 指令
 

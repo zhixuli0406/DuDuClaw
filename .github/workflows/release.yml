@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: duduclaw-darwin-arm64
+          - target: x86_64-apple-darwin
+            os: macos-13
+            artifact: duduclaw-darwin-x64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: duduclaw-linux-x64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: duduclaw-linux-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: duduclaw-windows-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build frontend
+        run: cd web && npm ci --legacy-peer-deps && npm run build
+
+      - name: Build binary
+        run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../${{ matrix.artifact }}.tar.gz duduclaw
+          cd ../../..
+          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../${{ matrix.artifact }}.zip duduclaw.exe
+          cd ../../..
+          Get-FileHash ${{ matrix.artifact }}.zip -Algorithm SHA256 | Format-List Hash > ${{ matrix.artifact }}.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            duduclaw-*.tar.gz
+            duduclaw-*.zip
+            duduclaw-*.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            duduclaw-*.tar.gz
+            duduclaw-*.zip
+            duduclaw-*.sha256
