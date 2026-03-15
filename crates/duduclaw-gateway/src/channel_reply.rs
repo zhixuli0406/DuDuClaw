@@ -8,43 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use duduclaw_agent::registry::AgentRegistry;
-use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
-const ANTHROPIC_API: &str = "https://api.anthropic.com/v1/messages";
-
-// ── Claude API types (for direct fallback) ──────────────────
-
-#[derive(Serialize)]
-struct ClaudeRequest {
-    model: String,
-    max_tokens: u32,
-    system: String,
-    messages: Vec<ClaudeMessage>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ClaudeMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct ClaudeResponse {
-    content: Option<Vec<ClaudeContent>>,
-    error: Option<ClaudeError>,
-}
-
-#[derive(Deserialize)]
-struct ClaudeContent {
-    text: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ClaudeError {
-    message: Option<String>,
-}
 
 // ── Shared state ────────────────────────────────────────────
 
@@ -99,32 +65,29 @@ pub async fn build_reply(text: &str, ctx: &ReplyContext) -> String {
     let system_prompt = build_system_prompt(agent);
     drop(reg);
 
-    // 1. Try Python Claude Code SDK (with rotator + budget tracking)
-    match call_python_sdk_v2(text, &model, &system_prompt, &ctx.home_dir).await {
+    // 1. Try `claude` CLI directly (Claude Code SDK — has built-in tools)
+    match call_claude_cli(text, &model, &system_prompt, &ctx.home_dir).await {
         Ok(reply) => {
-            info!("🤖 Claude replied via SDK ({} chars)", reply.len());
+            info!("🤖 Claude replied via Claude Code SDK ({} chars)", reply.len());
             return reply;
         }
         Err(e) => {
-            warn!("Python SDK unavailable, falling back to direct API: {e}");
+            warn!("claude CLI unavailable: {e}");
         }
     }
 
-    // 2. Fallback: direct Anthropic API
-    let api_key = get_api_key(&ctx.home_dir).await;
-    if let Some(key) = api_key {
-        match call_claude_direct(&ctx.http, &key, &model, &system_prompt, text).await {
-            Ok(reply) => {
-                info!("🤖 Claude replied via direct API ({} chars)", reply.len());
-                return reply;
-            }
-            Err(e) => {
-                error!("Claude API error: {e}");
-            }
+    // 2. Fallback: Python wrapper (with account rotator)
+    match call_python_sdk_v2(text, &model, &system_prompt, &ctx.home_dir).await {
+        Ok(reply) => {
+            info!("🤖 Claude replied via Python SDK ({} chars)", reply.len());
+            return reply;
+        }
+        Err(e) => {
+            warn!("Python SDK unavailable: {e}");
         }
     }
 
-    // 3. Fallback: static
+    // 3. Fallback: static error
     let reg = ctx.registry.read().await;
     let name = reg
         .main_agent()
@@ -132,12 +95,108 @@ pub async fn build_reply(text: &str, ctx: &ReplyContext) -> String {
         .unwrap_or("DuDuClaw");
     format!(
         "{name} 收到你的訊息，但目前無法回覆。\n\
-        請確認 API Key 已設定：\n\
+        請安裝 Claude Code SDK：\n\
+        $ npm install -g @anthropic-ai/claude-code\n\
+        並設定 API Key：\n\
         $ export ANTHROPIC_API_KEY=sk-ant-..."
     )
 }
 
 // ── Python SDK subprocess ───────────────────────────────────
+
+// ── Claude Code SDK (claude CLI) ────────────────────────────
+
+/// Call the `claude` CLI (Claude Code SDK) directly.
+///
+/// The claude CLI has built-in tools: bash, web search, file operations, etc.
+/// This is the primary method for AI conversation.
+async fn call_claude_cli(
+    user_message: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+) -> Result<String, String> {
+    // Find claude binary
+    let claude_path = which_claude().ok_or_else(|| "claude CLI not found in PATH".to_string())?;
+
+    // Get API key
+    let api_key = get_api_key(home_dir)
+        .await
+        .ok_or_else(|| "No API key configured".to_string())?;
+
+    let mut cmd = tokio::process::Command::new(&claude_path);
+    cmd.args(["-p", user_message, "--model", model, "--output-format", "text"]);
+
+    // Pass system prompt
+    if !system_prompt.is_empty() {
+        cmd.args(["--system-prompt", system_prompt]);
+    }
+
+    cmd.env("ANTHROPIC_API_KEY", &api_key);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        cmd.output(),
+    )
+    .await
+    .map_err(|_| "claude CLI timeout (120s)".to_string())?
+    .map_err(|e| format!("claude CLI spawn error: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "claude CLI exit {}: {}",
+            output.status.code().unwrap_or(-1),
+            stderr.chars().take(200).collect::<String>()
+        ));
+    }
+
+    if stdout.is_empty() {
+        return Err("Empty response from claude CLI".to_string());
+    }
+
+    Ok(stdout)
+}
+
+/// Find the `claude` binary in PATH or common locations.
+fn which_claude() -> Option<String> {
+    // Check PATH
+    if let Ok(output) = std::process::Command::new("which")
+        .arg("claude")
+        .output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Some(path);
+        }
+    }
+
+    // Common locations
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        format!("{home}/.npm-global/bin/claude"),
+        "/usr/local/bin/claude".to_string(),
+        format!("{home}/.claude/bin/claude"),
+        format!("{home}/.local/bin/claude"),
+    ];
+
+    for path in &candidates {
+        if std::path::Path::new(path).exists() {
+            return Some(path.clone());
+        }
+    }
+
+    None
+}
+
+// ── Python SDK subprocess (fallback) ────────────────────────
 
 /// Find the Python source path for `duduclaw.sdk.chat`.
 fn find_python_path(home_dir: &Path) -> String {
@@ -238,53 +297,6 @@ async fn call_python_sdk_v2(
     }
 
     Ok(stdout)
-}
-
-// ── Direct Anthropic API (fallback) ─────────────────────────
-
-async fn call_claude_direct(
-    http: &reqwest::Client,
-    api_key: &str,
-    model: &str,
-    system: &str,
-    user_message: &str,
-) -> Result<String, String> {
-    let body = ClaudeRequest {
-        model: model.to_string(),
-        max_tokens: 2048,
-        system: system.to_string(),
-        messages: vec![ClaudeMessage {
-            role: "user".to_string(),
-            content: user_message.to_string(),
-        }],
-    };
-
-    let resp = http
-        .post(ANTHROPIC_API)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP: {e}"))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("({status}): {}", &text[..text.len().min(200)]));
-    }
-
-    let data: ClaudeResponse = resp.json().await.map_err(|e| format!("Parse: {e}"))?;
-
-    if let Some(err) = data.error {
-        return Err(err.message.unwrap_or_default());
-    }
-
-    Ok(data
-        .content
-        .and_then(|blocks| blocks.into_iter().filter_map(|b| b.text).next())
-        .unwrap_or_else(|| "（AI 沒有產生回覆）".to_string()))
 }
 
 // ── Helpers ─────────────────────────────────────────────────
