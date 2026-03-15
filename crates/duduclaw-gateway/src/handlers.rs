@@ -352,7 +352,7 @@ skill_security_scan = true
                 if ch.get(key).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
                     channels.push(json!({
                         "name": name,
-                        "connected": false,
+                        "connected": true,
                         "last_connected": null,
                         "error": null,
                     }));
