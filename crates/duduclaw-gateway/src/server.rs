@@ -41,11 +41,18 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         tx,
     });
 
-    let app = Router::new()
+    #[allow(unused_mut)]
+    let mut app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health_handler))
-        .with_state(state)
-        .merge(duduclaw_dashboard::dashboard_router());
+        .with_state(state);
+
+    #[cfg(feature = "dashboard")]
+    {
+        app = app.merge(duduclaw_dashboard::dashboard_router());
+    }
+
+    let app = app;
 
     let addr = format!("{}:{}", config.bind, config.port);
     info!("Gateway starting on {}", addr);

@@ -20,12 +20,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard
+      - name: Build core crates
+        run: cargo build --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
+      - name: Build gateway (no dashboard)
+        run: cargo build -p duduclaw-gateway --no-default-features
       - name: Test
-        run: cargo test --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard
+        run: cargo test --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
+      - name: Test gateway
+        run: cargo test -p duduclaw-gateway --no-default-features
       - name: Clippy
-        run: cargo clippy --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard -- -D warnings
+        run: cargo clippy --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway -- -D warnings
+      - name: Clippy gateway
+        run: cargo clippy -p duduclaw-gateway --no-default-features -- -D warnings
 
   dashboard:
     name: Dashboard
