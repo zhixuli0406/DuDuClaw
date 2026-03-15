@@ -78,14 +78,25 @@ impl ReplyContext {
 /// 2. Fallback to direct Anthropic API (Rust reqwest) — single key only
 /// 3. Fallback to static error message
 pub async fn build_reply(text: &str, ctx: &ReplyContext) -> String {
-    let reg = ctx.registry.read().await;
-    let main_agent = reg.main_agent();
+    // Determine which agent to use: config.toml default_agent → main_agent() → fallback
+    let default_agent_name = get_default_agent(&ctx.home_dir).await;
 
-    let model = main_agent
+    let reg = ctx.registry.read().await;
+    let agent = if let Some(name) = &default_agent_name {
+        reg.get(name).or_else(|| reg.main_agent())
+    } else {
+        reg.main_agent()
+    };
+
+    if let Some(a) = agent {
+        info!("Using agent: {} ({})", a.config.agent.display_name, a.config.agent.name);
+    }
+
+    let model = agent
         .map(|a| a.config.model.preferred.clone())
         .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
 
-    let system_prompt = build_system_prompt(main_agent);
+    let system_prompt = build_system_prompt(agent);
     drop(reg);
 
     // 1. Try Python Claude Code SDK (with rotator + budget tracking)
@@ -299,6 +310,16 @@ fn build_system_prompt(agent: Option<&duduclaw_agent::registry::LoadedAgent>) ->
     } else {
         parts.join("\n\n---\n\n")
     }
+}
+
+/// Read the default_agent from config.toml [general] section.
+async fn get_default_agent(home_dir: &Path) -> Option<String> {
+    let config_path = home_dir.join("config.toml");
+    let content = tokio::fs::read_to_string(&config_path).await.ok()?;
+    let table: toml::Table = content.parse().ok()?;
+    let general = table.get("general")?.as_table()?;
+    let name = general.get("default_agent")?.as_str()?;
+    if name.is_empty() { None } else { Some(name.to_string()) }
 }
 
 async fn get_api_key(home_dir: &Path) -> Option<String> {
