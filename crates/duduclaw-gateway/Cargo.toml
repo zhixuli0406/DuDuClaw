@@ -17,6 +17,10 @@ toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
+hmac = "0.12"
+sha2 = "0.10"
+base64 = { workspace = true }
+futures-util = { workspace = true }
 duduclaw-dashboard = { workspace = true, optional = true }
 
 [features]

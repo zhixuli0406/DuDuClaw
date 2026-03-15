@@ -1,68 +1,130 @@
-//! Lightweight LINE Messaging API integration.
+//! LINE Messaging API integration with webhook receiver.
 //!
-//! LINE uses webhooks (not polling) to receive messages, so full message
-//! receiving requires an HTTPS endpoint. For now we verify the token and
-//! expose a webhook handler that can be mounted on the Axum router.
+//! Mounts a `/webhook/line` POST endpoint on the Axum router to receive
+//! messages from LINE, validates signatures, and sends replies.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use serde::Deserialize;
+use axum::{
+    Router,
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::post,
+};
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use duduclaw_agent::registry::AgentRegistry;
 
+use crate::channel_reply::build_reply;
+
 const LINE_API: &str = "https://api.line.me/v2/bot";
+
+type HmacSha256 = Hmac<Sha256>;
+
+// ── LINE API types ──────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct LineWebhookBody {
+    events: Vec<LineEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LineEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(rename = "replyToken")]
+    reply_token: Option<String>,
+    source: Option<LineSource>,
+    message: Option<LineMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LineSource {
+    #[serde(rename = "userId")]
+    user_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LineMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+    text: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LineReplyBody {
+    #[serde(rename = "replyToken")]
+    reply_token: String,
+    messages: Vec<LineReplyMessage>,
+}
+
+#[derive(Debug, Serialize)]
+struct LineReplyMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+    text: String,
+}
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct LineBotInfo {
     #[serde(rename = "displayName")]
     display_name: Option<String>,
-    #[serde(rename = "userId")]
-    user_id: Option<String>,
 }
 
-/// Start LINE bot verification on gateway startup.
+// ── Shared state ────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct LineState {
+    token: String,
+    secret: String,
+    registry: Arc<RwLock<AgentRegistry>>,
+    http: reqwest::Client,
+}
+
+// ── Public API ──────────────────────────────────────────────
+
+/// Initialize LINE bot and return an Axum Router with the webhook endpoint.
 ///
-/// LINE message receiving requires a webhook endpoint (HTTPS).
-/// The webhook route can be added to the Axum router in a future version.
+/// Returns `None` if LINE is not configured.
 pub async fn start_line_bot(
     home_dir: &Path,
-    _registry: Arc<RwLock<AgentRegistry>>,
-) -> Option<()> {
-    let token = read_line_token(home_dir).await?;
+    registry: Arc<RwLock<AgentRegistry>>,
+) -> Option<Router> {
+    let (token, secret) = read_line_config(home_dir).await?;
     if token.is_empty() {
         return None;
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .ok()?;
 
-    // Verify token with bot info endpoint
-    match client
+    // Verify token
+    match http
         .get(format!("{LINE_API}/info"))
         .header("Authorization", format!("Bearer {token}"))
         .send()
         .await
     {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                if let Ok(info) = resp.json::<LineBotInfo>().await {
-                    let name = info.display_name.as_deref().unwrap_or("unknown");
-                    info!("💬 LINE bot connected: {name}");
-                    info!("   LINE 訊息接收需要 Webhook 端點（開發中）");
-                } else {
-                    info!("💬 LINE bot token verified");
-                    info!("   LINE 訊息接收需要 Webhook 端點（開發中）");
-                }
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(info) = resp.json::<LineBotInfo>().await {
+                let name = info.display_name.as_deref().unwrap_or("unknown");
+                info!("💬 LINE bot connected: {name}");
             } else {
-                warn!("LINE bot token invalid (HTTP {})", resp.status());
-                return None;
+                info!("💬 LINE bot token verified");
             }
+        }
+        Ok(resp) => {
+            warn!("LINE bot token invalid (HTTP {})", resp.status());
+            return None;
         }
         Err(e) => {
             warn!("LINE connection failed: {e}");
@@ -70,14 +132,124 @@ pub async fn start_line_bot(
         }
     }
 
-    Some(())
+    let state = LineState { token, secret, registry, http };
+
+    let router = Router::new()
+        .route("/webhook/line", post(line_webhook_handler))
+        .with_state(state);
+
+    info!("   LINE webhook endpoint: /webhook/line");
+    Some(router)
 }
 
-async fn read_line_token(home_dir: &Path) -> Option<String> {
+// ── Webhook handler ─────────────────────────────────────────
+
+async fn line_webhook_handler(
+    State(state): State<LineState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    // Validate signature
+    let signature = match headers.get("x-line-signature").and_then(|v| v.to_str().ok()) {
+        Some(sig) => sig.to_string(),
+        None => {
+            warn!("LINE webhook: missing X-Line-Signature");
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+
+    if !verify_signature(&state.secret, &body, &signature) {
+        warn!("LINE webhook: invalid signature");
+        return StatusCode::UNAUTHORIZED;
+    }
+
+    // Parse body
+    let webhook: LineWebhookBody = match serde_json::from_slice(&body) {
+        Ok(w) => w,
+        Err(e) => {
+            warn!("LINE webhook: parse error: {e}");
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+
+    // Process events
+    for event in webhook.events {
+        if event.event_type != "message" {
+            continue;
+        }
+
+        if let Some(msg) = &event.message
+            && msg.msg_type == "text"
+            && let Some(text) = &msg.text
+            && let Some(reply_token) = &event.reply_token
+        {
+            let sender = event
+                .source
+                .as_ref()
+                .and_then(|s| s.user_id.as_deref())
+                .unwrap_or("unknown");
+
+            info!("📩 LINE [{sender}]: {}", &text[..text.len().min(80)]);
+
+            let reply = build_reply(text, &state.registry).await;
+            send_reply(&state.http, &state.token, reply_token, &reply).await;
+        }
+    }
+
+    StatusCode::OK
+}
+
+// ── Helpers ─────────────────────────────────────────────────
+
+fn verify_signature(secret: &str, body: &[u8], signature: &str) -> bool {
+    use base64::Engine;
+
+    let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(body);
+    let expected = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    expected == signature
+}
+
+async fn send_reply(http: &reqwest::Client, token: &str, reply_token: &str, text: &str) {
+    let body = LineReplyBody {
+        reply_token: reply_token.to_string(),
+        messages: vec![LineReplyMessage {
+            msg_type: "text".to_string(),
+            text: text.to_string(),
+        }],
+    };
+
+    match http
+        .post(format!("{LINE_API}/message/reply"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if !resp.status().is_success() => {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            error!("LINE reply failed ({status}): {}", &text[..text.len().min(200)]);
+        }
+        Err(e) => error!("LINE reply error: {e}"),
+        _ => {}
+    }
+}
+
+async fn read_line_config(home_dir: &Path) -> Option<(String, String)> {
     let config_path = home_dir.join("config.toml");
     let content = tokio::fs::read_to_string(&config_path).await.ok()?;
     let table: toml::Table = content.parse().ok()?;
     let channels = table.get("channels")?.as_table()?;
-    let token = channels.get("line_channel_token")?.as_str()?;
-    if token.is_empty() { None } else { Some(token.to_string()) }
+    let token = channels.get("line_channel_token")?.as_str().unwrap_or("");
+    let secret = channels.get("line_channel_secret")?.as_str().unwrap_or("");
+    if token.is_empty() {
+        None
+    } else {
+        Some((token.to_string(), secret.to_string()))
+    }
 }

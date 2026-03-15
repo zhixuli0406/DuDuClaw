@@ -43,8 +43,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Start channel bots if configured
     let registry = handler.registry().clone();
     let _telegram_handle = crate::telegram::start_telegram_bot(&home_dir, registry.clone()).await;
-    let _line_status = crate::line::start_line_bot(&home_dir, registry.clone()).await;
-    let _discord_status = crate::discord::start_discord_bot(&home_dir, registry).await;
+    let line_router = crate::line::start_line_bot(&home_dir, registry.clone()).await;
+    let _discord_handle = crate::discord::start_discord_bot(&home_dir, registry).await;
 
     let state = Arc::new(AppState {
         auth: AuthManager::new(config.auth_token),
@@ -52,11 +52,15 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         tx,
     });
 
-    #[allow(unused_mut)]
     let mut app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health_handler))
         .with_state(state);
+
+    // Mount LINE webhook endpoint
+    if let Some(line) = line_router {
+        app = app.merge(line);
+    }
 
     #[cfg(feature = "dashboard")]
     {

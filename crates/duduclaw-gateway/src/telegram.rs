@@ -13,6 +13,8 @@ use tracing::{error, info, warn};
 
 use duduclaw_agent::registry::AgentRegistry;
 
+use crate::channel_reply::build_reply;
+
 const TELEGRAM_API: &str = "https://api.telegram.org";
 
 // ── Telegram API types ──────────────────────────────────────
@@ -182,48 +184,6 @@ async fn poll_loop(
             }
         }
     }
-}
-
-async fn build_reply(
-    text: &str,
-    registry: &Arc<RwLock<AgentRegistry>>,
-) -> String {
-    let reg = registry.read().await;
-
-    // Find main agent
-    let main_agent = reg.main_agent();
-
-    let agent_name = main_agent
-        .map(|a| a.config.agent.display_name.as_str())
-        .unwrap_or("DuDuClaw");
-
-    let agent_icon = main_agent
-        .map(|a| a.config.agent.icon.as_str())
-        .unwrap_or("🐾");
-
-    // List available skills
-    let skills: Vec<&str> = main_agent
-        .map(|a| a.skills.iter().map(|s| s.name.as_str()).collect())
-        .unwrap_or_default();
-
-    let skills_text = if skills.is_empty() {
-        String::from("（尚無技能）")
-    } else {
-        skills.join(", ")
-    };
-
-    // Build response
-    // TODO: integrate Claude API for actual AI responses
-    format!(
-        "{agent_icon} *{agent_name}* 收到你的訊息！\n\n\
-        > {text}\n\n\
-        📋 *目前狀態*\n\
-        • Agent: {agent_name}\n\
-        • 技能: {skills_text}\n\
-        • AI 回覆: _即將支援（Claude API 整合中）_\n\n\
-        💡 這是 DuDuClaw 的自動回覆，AI 對話功能開發中。",
-        text = text.chars().take(200).collect::<String>(),
-    )
 }
 
 async fn send_reply(client: &reqwest::Client, api_base: &str, chat_id: i64, text: &str) {
