@@ -488,10 +488,10 @@ health_check_interval_seconds = 60
 cooldown_after_rate_limit_seconds = 120
 
 [channels]
-line_channel_token = ""
-line_channel_secret = ""
-telegram_bot_token = ""
-discord_bot_token = ""
+line_channel_token = "{line_token}"
+line_channel_secret = "{line_secret}"
+telegram_bot_token = "{telegram_token}"
+discord_bot_token = "{discord_token}"
 "#
     );
     tokio::fs::write(&config_path, config_content).await.map_err(|e| {
