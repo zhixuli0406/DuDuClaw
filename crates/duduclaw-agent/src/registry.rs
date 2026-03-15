@@ -44,6 +44,11 @@ impl AgentRegistry {
         }
     }
 
+    /// Return the agents directory path.
+    pub fn agents_dir(&self) -> &Path {
+        &self.agents_dir
+    }
+
     /// Scan the agents directory and load all valid agent configurations.
     ///
     /// Directories whose name starts with `_` (e.g. `_defaults`) are skipped.
