@@ -1,0 +1,32 @@
+[build-system]
+requires = ["maturin>=1.7"]
+build-backend = "maturin"
+
+[project]
+name = "duduclaw"
+version = "0.1.0"
+description = "DuDuClaw - Multi-Agent AI Assistant Platform"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "anthropic>=0.40",
+]
+
+[project.optional-dependencies]
+line = ["line-bot-sdk>=3"]
+telegram = ["python-telegram-bot>=21"]
+discord = ["discord.py>=2"]
+all-channels = ["duduclaw[line,telegram,discord]"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.8"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "duduclaw._native"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests/python"]
