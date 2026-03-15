@@ -690,7 +690,7 @@ skill_security_scan = true
     // ── Cron ────────────────────────────────────────────────
 
     fn handle_cron_list(&self) -> WsFrame {
-        WsFrame::ok_response("", json!({ "jobs": [] }))
+        WsFrame::ok_response("", json!({ "tasks": [] }))
     }
 
     fn handle_cron_add(&self, params: Value) -> WsFrame {

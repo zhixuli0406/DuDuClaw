@@ -60,7 +60,7 @@ export function ChannelsPage() {
     setLoading(true);
     try {
       const result = await api.channels.status();
-      setChannels(result.channels);
+      setChannels(result?.channels ?? []);
     } catch (e) {
       showToast('error', `無法載入通道: ${e}`);
     } finally {

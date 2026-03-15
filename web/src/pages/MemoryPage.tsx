@@ -67,7 +67,7 @@ function MemoriesTab() {
     setLoading(true);
     try {
       const result = await api.memory.search('*', query);
-      setEntries(result.entries);
+      setEntries(result?.entries ?? []);
     } catch {
       // error handled silently
     } finally {

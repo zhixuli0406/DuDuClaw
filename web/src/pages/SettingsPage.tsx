@@ -142,7 +142,7 @@ function CronTab() {
   const fetchTasks = useCallback(async () => {
     try {
       const result = await api.cron.list();
-      setTasks(result.tasks);
+      setTasks(result?.tasks ?? []);
     } catch {
       // error handled silently
     }

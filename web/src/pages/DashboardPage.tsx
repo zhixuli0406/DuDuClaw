@@ -57,14 +57,16 @@ export function DashboardPage() {
   const totalBudget = budget?.total_budget_cents ?? 0;
   const totalSpent = budget?.total_spent_cents ?? 0;
 
+  const checks = doctor?.checks ?? [];
+  const summary = doctor?.summary ?? { pass: 0, warn: 0, fail: 0 };
   const healthValue = doctor
-    ? `${doctor.summary.pass}/${doctor.checks.length}`
+    ? `${summary.pass}/${checks.length}`
     : '—';
   const healthSubtitle = doctor
-    ? doctor.summary.fail > 0
-      ? `${doctor.summary.fail} 項失敗`
-      : doctor.summary.warn > 0
-        ? `${doctor.summary.warn} 項警告`
+    ? summary.fail > 0
+      ? `${summary.fail} 項失敗`
+      : summary.warn > 0
+        ? `${summary.warn} 項警告`
         : intl.formatMessage({ id: 'dashboard.health.allPassed' })
     : intl.formatMessage({ id: 'common.loading' });
 
@@ -102,18 +104,18 @@ export function DashboardPage() {
           title={intl.formatMessage({ id: 'dashboard.health.title' })}
           value={healthValue}
           subtitle={healthSubtitle}
-          color={doctor?.summary.fail ? 'bg-rose-500' : doctor?.summary.warn ? 'bg-amber-500' : 'bg-emerald-500'}
+          color={summary.fail ? 'bg-rose-500' : summary.warn ? 'bg-amber-500' : 'bg-emerald-500'}
         />
       </div>
 
       {/* Doctor Checks */}
-      {doctor && (
+      {checks.length > 0 && (
         <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
           <h3 className="mb-4 text-lg font-medium text-stone-900 dark:text-stone-50">
             {intl.formatMessage({ id: 'dashboard.health.title' })}
           </h3>
           <div className="space-y-2">
-            {doctor.checks.map((check) => (
+            {checks.map((check) => (
               <div key={check.name} className="flex items-center justify-between rounded-lg bg-stone-50 px-4 py-2.5 dark:bg-stone-800/50">
                 <span className="text-sm text-stone-700 dark:text-stone-300">{check.name}</span>
                 <div className="flex items-center gap-2">

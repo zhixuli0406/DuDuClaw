@@ -35,7 +35,7 @@ export const useAgentsStore = create<AgentsStore>((set, get) => {
       set({ loading: true, error: null });
       try {
         const result = await api.agents.list();
-        set({ agents: result.agents, loading: false });
+        set({ agents: result?.agents ?? [], loading: false });
       } catch (e) {
         set({ error: String(e), loading: false });
       }
