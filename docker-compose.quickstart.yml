@@ -1,6 +1,8 @@
 services:
   duduclaw:
-    image: ghcr.io/duduclaw/duduclaw:latest
+    build:
+      context: .
+      dockerfile: container/Dockerfile.server
     container_name: duduclaw
     restart: unless-stopped
     ports:
