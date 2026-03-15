@@ -1,0 +1,46 @@
+# DuDuClaw Server - Multi-stage build
+# Stage 1: Rust compilation
+FROM rust:1.82-slim AS rust-builder
+WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+# Build release binary (exclude bridge for now)
+RUN cargo build --release --bin duduclaw --features no-bridge || \
+    cargo build --release --bin duduclaw
+
+# Stage 2: Python extensions
+FROM python:3.12-slim AS python-builder
+WORKDIR /build
+COPY pyproject.toml ./
+COPY python/ python/
+RUN pip install --no-cache-dir --prefix=/install .
+
+# Stage 3: Production image
+FROM python:3.12-slim
+
+# Create non-root user
+RUN groupadd -r duduclaw && useradd -r -g duduclaw -u 1000 duduclaw
+
+# Copy built artifacts
+COPY --from=rust-builder /build/target/release/duduclaw /usr/local/bin/
+COPY --from=python-builder /install /usr/local
+
+# Install Docker CLI for managing agent containers
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    docker.io ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy entrypoint
+COPY container/server-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+USER duduclaw
+WORKDIR /home/duduclaw
+VOLUME /home/duduclaw/.duduclaw
+EXPOSE 18789
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["duduclaw", "run", "--yes"]

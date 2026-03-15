@@ -1,0 +1,26 @@
+# Apple Container configuration for DuDuClaw Agent
+# Requires macOS 26+ with container CLI
+
+name: duduclaw-agent
+image: duduclaw-agent:latest
+
+resources:
+  cpus: 2
+  memory: 2G
+
+network:
+  mode: bridge
+
+mounts:
+  - source: ~/.duduclaw
+    target: /home/duduclaw/.duduclaw
+    readonly: true
+  - source: ~/projects
+    target: /projects
+    readonly: false
+
+environment:
+  AGENT_NAME: dudu
+  CLAUDE_MODEL: claude-sonnet-4-6
+
+user: 1000:1000

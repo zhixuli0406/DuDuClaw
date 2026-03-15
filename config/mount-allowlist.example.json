@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "allowed_mounts": [
+    {
+      "host_path": "~/projects",
+      "container_path": "/projects",
+      "readonly": false,
+      "description": "User project files"
+    },
+    {
+      "host_path": "~/Documents",
+      "container_path": "/documents",
+      "readonly": true,
+      "description": "Read-only documents access"
+    }
+  ],
+  "blocked_patterns": [
+    ".ssh",
+    ".gnupg",
+    ".env",
+    ".aws",
+    ".config/gcloud",
+    ".docker/config.json",
+    "secret.key",
+    ".kube/config"
+  ]
+}

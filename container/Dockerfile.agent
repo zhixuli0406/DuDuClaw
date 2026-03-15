@@ -1,0 +1,25 @@
+# Agent container for DuDuClaw
+# Runs Claude Code SDK inside isolated container
+
+FROM python:3.12-slim
+
+# Create non-root user
+RUN groupadd -r duduclaw && useradd -r -g duduclaw -u 1000 duduclaw
+
+# Install minimal dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code SDK
+RUN pip install --no-cache-dir anthropic
+
+# Setup working directory
+WORKDIR /home/duduclaw
+USER duduclaw
+
+# Agent entry point
+COPY --chown=duduclaw:duduclaw container/agent-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

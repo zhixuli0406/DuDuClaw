@@ -1,0 +1,22 @@
+# DuDuClaw Configuration Example
+# Copy to ~/.duduclaw/config.toml and customize
+
+[[accounts]]
+id = "main"
+type = "api_key"
+# api_key_encrypted = "enc:aes256:..."  # Set via `duduclaw onboard`
+monthly_budget_cents = 5000
+priority = 1
+
+[rotation]
+strategy = "priority"  # round_robin | least_cost | failover | priority
+health_check_interval_seconds = 60
+cooldown_after_rate_limit_seconds = 120
+
+[gateway]
+bind = "127.0.0.1"
+port = 18789
+
+[logging]
+level = "info"  # trace | debug | info | warn | error
+format = "pretty"  # pretty | json
