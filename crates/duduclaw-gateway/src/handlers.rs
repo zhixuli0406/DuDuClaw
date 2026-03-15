@@ -45,7 +45,7 @@ impl MethodHandler {
             "agents.inspect" => self.handle_agents_inspect(params).await,
             "channels.status" => self.handle_channels_status().await,
             "channels.add" => self.handle_channels_add(params).await,
-            "channels.test" => self.handle_channels_test(params),
+            "channels.test" => self.handle_channels_test(params).await,
             "channels.remove" => self.handle_channels_remove(params).await,
             "accounts.list" => self.handle_accounts_list().await,
             "accounts.budget_summary" => self.handle_budget_summary().await,
@@ -411,10 +411,40 @@ skill_security_scan = true
         WsFrame::ok_response("", json!({ "success": true, "type": channel_type }))
     }
 
-    fn handle_channels_test(&self, params: Value) -> WsFrame {
+    async fn handle_channels_test(&self, params: Value) -> WsFrame {
         let channel_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
         info!(channel_type, "channels.test requested");
-        WsFrame::ok_response("", json!({ "success": true, "type": channel_type, "message": "Channel test placeholder" }))
+
+        let config_path = self.home_dir.join("config.toml");
+        let table = self.read_config_table(&config_path).await;
+
+        let token_key = match channel_type {
+            "line" => "line_channel_token",
+            "telegram" => "telegram_bot_token",
+            "discord" => "discord_bot_token",
+            _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
+        };
+
+        let token = table
+            .get("channels")
+            .and_then(|v| v.as_table())
+            .and_then(|ch| ch.get(token_key))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if token.is_empty() {
+            return WsFrame::ok_response("", json!({
+                "success": false,
+                "type": channel_type,
+                "message": format!("{channel_type} token 未設定"),
+            }));
+        }
+
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "type": channel_type,
+            "message": format!("{channel_type} token 已設定 ({}****)", &token[..4.min(token.len())]),
+        }))
     }
 
     async fn handle_channels_remove(&self, params: Value) -> WsFrame {
