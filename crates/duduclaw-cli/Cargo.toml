@@ -19,4 +19,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 duduclaw-gateway = { workspace = true }
 bollard = { workspace = true }
+dialoguer = { version = "0.11", features = ["password"] }
+console = "0.15"
 dirs = "6"

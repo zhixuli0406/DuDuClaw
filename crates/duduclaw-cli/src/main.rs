@@ -200,149 +200,407 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// `duduclaw onboard [--yes]`
-async fn cmd_onboard(_skip_prompts: bool) -> duduclaw_core::error::Result<()> {
+async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
+    use console::style;
+    use dialoguer::{Input, Password, Select, Confirm};
+
     let home = duduclaw_home();
 
-    println!("Initializing DuDuClaw environment at {}", home.display());
+    // ── Welcome ──────────────────────────────────────────────
+    println!();
+    println!("  {} {}", style("🐾").bold(), style("歡迎使用 DuDuClaw v0.1.0").bold());
+    println!("  {}", style("Multi-Agent AI Assistant Platform").dim());
+    println!();
+
+    // ── 1. Install mode ──────────────────────────────────────
+    let quick_mode = if skip_prompts {
+        true
+    } else {
+        let modes = &["快速啟動（推薦）— 使用預設值", "進階設定 — 完整互動式設定"];
+        let sel = Select::new()
+            .with_prompt("選擇安裝模式")
+            .items(modes)
+            .default(0)
+            .interact()
+            .unwrap_or(0);
+        sel == 0
+    };
+
+    // ── 2. API Key ───────────────────────────────────────────
+    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    let api_key = if !skip_prompts && api_key.is_empty() {
+        println!();
+        println!("  {} {}", style("▸").cyan(), style("Claude API 設定").bold());
+        let auth_methods = &["API Key", "OAuth Token", "稍後設定"];
+        let auth_sel = Select::new()
+            .with_prompt("認證方式")
+            .items(auth_methods)
+            .default(0)
+            .interact()
+            .unwrap_or(2);
+
+        match auth_sel {
+            0 => {
+                let key: String = Password::new()
+                    .with_prompt("API Key")
+                    .interact()
+                    .unwrap_or_default();
+                if !key.is_empty() {
+                    println!("  {} API Key 已設定", style("✓").green());
+                }
+                key
+            }
+            1 => {
+                let token: String = Password::new()
+                    .with_prompt("OAuth Token")
+                    .interact()
+                    .unwrap_or_default();
+                if !token.is_empty() {
+                    println!("  {} OAuth Token 已設定", style("✓").green());
+                }
+                token
+            }
+            _ => {
+                println!("  {} 稍後可透過環境變數 ANTHROPIC_API_KEY 設定", style("ℹ").blue());
+                String::new()
+            }
+        }
+    } else {
+        if !api_key.is_empty() {
+            println!("  {} 從環境變數偵測到 API Key", style("✓").green());
+        }
+        api_key
+    };
+
+    // ── 3. Agent config ──────────────────────────────────────
+    let (agent_name, agent_display, agent_trigger, agent_soul) = if !skip_prompts && !quick_mode {
+        println!();
+        println!("  {} {}", style("▸").cyan(), style("AI 助理設定").bold());
+
+        let display: String = Input::new()
+            .with_prompt("助理名稱")
+            .default("DuDu".to_string())
+            .interact_text()
+            .unwrap_or_else(|_| "DuDu".to_string());
+
+        let name = display.to_lowercase().replace(' ', "-");
+
+        let trigger: String = Input::new()
+            .with_prompt("觸發詞")
+            .default(format!("@{display}"))
+            .interact_text()
+            .unwrap_or_else(|_| format!("@{display}"));
+
+        let soul_options = &[
+            "使用預設人格（溫暖友善的助理）",
+            "自訂人格描述",
+        ];
+        let soul_sel = Select::new()
+            .with_prompt("人格設定")
+            .items(soul_options)
+            .default(0)
+            .interact()
+            .unwrap_or(0);
+
+        let soul = if soul_sel == 1 {
+            let custom: String = Input::new()
+                .with_prompt("人格描述")
+                .interact_text()
+                .unwrap_or_default();
+            custom
+        } else {
+            String::new()
+        };
+
+        (name, display, trigger, soul)
+    } else {
+        ("dudu".to_string(), "DuDu".to_string(), "@DuDu".to_string(), String::new())
+    };
+
+    // ── 4. Channels (advanced mode) ──────────────────────────
+    let mut line_token = String::new();
+    let mut line_secret = String::new();
+    let mut telegram_token = String::new();
+    let mut discord_token = String::new();
+
+    if !skip_prompts && !quick_mode {
+        println!();
+        println!("  {} {}", style("▸").cyan(), style("通訊通道設定").bold());
+
+        let channel_options = &["LINE", "Telegram", "Discord"];
+        let channels: Vec<usize> = dialoguer::MultiSelect::new()
+            .with_prompt("選擇要啟用的通道（空白鍵選取，Enter 確認）")
+            .items(channel_options)
+            .interact()
+            .unwrap_or_default();
+
+        for &ch in &channels {
+            match ch {
+                0 => {
+                    line_token = Password::new()
+                        .with_prompt("LINE Channel Access Token")
+                        .interact()
+                        .unwrap_or_default();
+                    line_secret = Password::new()
+                        .with_prompt("LINE Channel Secret")
+                        .interact()
+                        .unwrap_or_default();
+                    if !line_token.is_empty() {
+                        println!("  {} LINE 已設定", style("✓").green());
+                    }
+                }
+                1 => {
+                    telegram_token = Password::new()
+                        .with_prompt("Telegram Bot Token")
+                        .interact()
+                        .unwrap_or_default();
+                    if !telegram_token.is_empty() {
+                        println!("  {} Telegram 已設定", style("✓").green());
+                    }
+                }
+                2 => {
+                    discord_token = Password::new()
+                        .with_prompt("Discord Bot Token")
+                        .interact()
+                        .unwrap_or_default();
+                    if !discord_token.is_empty() {
+                        println!("  {} Discord 已設定", style("✓").green());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ── 5. Gateway (advanced mode) ───────────────────────────
+    let (gw_bind, gw_port) = if !skip_prompts && !quick_mode {
+        println!();
+        println!("  {} {}", style("▸").cyan(), style("Gateway 設定").bold());
+
+        let bind_options = &["localhost (127.0.0.1) — 推薦", "LAN (0.0.0.0)", "自訂"];
+        let bind_sel = Select::new()
+            .with_prompt("Gateway 綁定地址")
+            .items(bind_options)
+            .default(0)
+            .interact()
+            .unwrap_or(0);
+
+        let bind = match bind_sel {
+            0 => "127.0.0.1".to_string(),
+            1 => "0.0.0.0".to_string(),
+            _ => {
+                Input::new()
+                    .with_prompt("綁定地址")
+                    .default("127.0.0.1".to_string())
+                    .interact_text()
+                    .unwrap_or_else(|_| "127.0.0.1".to_string())
+            }
+        };
+
+        let port: u16 = Input::new()
+            .with_prompt("Gateway Port")
+            .default(18789u16)
+            .interact_text()
+            .unwrap_or(18789);
+
+        (bind, port)
+    } else {
+        ("127.0.0.1".to_string(), 18789u16)
+    };
+
+    // ── 6. Budget (advanced mode) ────────────────────────────
+    let monthly_budget_usd: u32 = if !skip_prompts && !quick_mode {
+        println!();
+        Input::new()
+            .with_prompt("每月預算上限 (USD)")
+            .default(50u32)
+            .interact_text()
+            .unwrap_or(50)
+    } else {
+        50
+    };
+
+    // ── Confirm ──────────────────────────────────────────────
+    if !skip_prompts {
+        println!();
+        println!("  {} {}", style("📋").bold(), style("設定摘要").bold());
+        println!("  ├ 助理名稱：{}", style(&agent_display).cyan());
+        println!("  ├ 觸發詞：{}", style(&agent_trigger).cyan());
+        println!("  ├ API Key：{}", if api_key.is_empty() { style("未設定").red().to_string() } else { style("已設定").green().to_string() });
+        println!("  ├ Gateway：{}:{}", style(&gw_bind).cyan(), style(gw_port).cyan());
+        println!("  ├ 月預算：${}", style(monthly_budget_usd).cyan());
+        if !line_token.is_empty() { println!("  ├ LINE：{}", style("已設定").green()); }
+        if !telegram_token.is_empty() { println!("  ├ Telegram：{}", style("已設定").green()); }
+        if !discord_token.is_empty() { println!("  ├ Discord：{}", style("已設定").green()); }
+        println!("  └ 資料目錄：{}", style(home.display()).dim());
+        println!();
+
+        let proceed = Confirm::new()
+            .with_prompt("確認並開始安裝？")
+            .default(true)
+            .interact()
+            .unwrap_or(true);
+
+        if !proceed {
+            println!("  {} 已取消", style("✗").red());
+            return Ok(());
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Write files
+    // ══════════════════════════════════════════════════════════
+
+    println!();
+    println!("  {} {}", style("⚙").bold(), style("正在建立環境...").bold());
 
     // Create directory structure
-    let dirs_to_create = [
+    let agent_dir = home.join("agents").join(&agent_name);
+    for dir in &[
         home.clone(),
         home.join("agents"),
-        home.join("agents").join("dudu"),
-        home.join("agents").join("dudu").join("SKILLS"),
-    ];
-
-    for dir in &dirs_to_create {
+        agent_dir.clone(),
+        agent_dir.join("SKILLS"),
+        home.join("logs"),
+    ] {
         tokio::fs::create_dir_all(dir).await.map_err(|e| {
-            DuDuClawError::Config(format!(
-                "Failed to create directory {}: {e}",
-                dir.display()
-            ))
+            DuDuClawError::Config(format!("Failed to create directory {}: {e}", dir.display()))
         })?;
     }
 
-    // Create config.toml if it doesn't exist
+    // config.toml
     let config_path = home.join("config.toml");
-    if !config_path.exists() {
-        let config_content = r#"# DuDuClaw configuration
+    let config_content = format!(
+        r#"# DuDuClaw configuration
 # Generated by `duduclaw onboard`
 
 [general]
-default_agent = "dudu"
+default_agent = "{agent_name}"
 log_level = "info"
 
-[api]
-# Set via ANTHROPIC_API_KEY environment variable
-anthropic_api_key = ""
+[gateway]
+bind = "{gw_bind}"
+port = {gw_port}
 
-[docker]
-enabled = true
-default_image = "duduclaw/agent:latest"
+[rotation]
+strategy = "priority"
+health_check_interval_seconds = 60
+cooldown_after_rate_limit_seconds = 120
+
+[channels]
+line_channel_token = ""
+line_channel_secret = ""
+telegram_bot_token = ""
+discord_bot_token = ""
 "#
-        .to_string();
-        tokio::fs::write(&config_path, config_content)
-            .await
-            .map_err(|e| {
-                DuDuClawError::Config(format!(
-                    "Failed to write {}: {e}",
-                    config_path.display()
-                ))
-            })?;
-        println!("  Created {}", config_path.display());
-        println!("  NOTE: Set your API key via the ANTHROPIC_API_KEY environment variable.");
-    } else {
-        println!("  Config already exists at {}", config_path.display());
-    }
+    );
+    tokio::fs::write(&config_path, config_content).await.map_err(|e| {
+        DuDuClawError::Config(format!("Failed to write {}: {e}", config_path.display()))
+    })?;
+    println!("  {} {}", style("✓").green(), config_path.display());
 
-    // Create default "dudu" agent
-    let agent_toml_path = home.join("agents").join("dudu").join("agent.toml");
-    if !agent_toml_path.exists() {
-        let agent_toml = r#"[agent]
-name = "dudu"
-display_name = "DuDu"
+    // agent.toml
+    let agent_toml_path = agent_dir.join("agent.toml");
+    let budget_cents = monthly_budget_usd as u64 * 100;
+    let agent_toml = format!(
+        r#"[agent]
+name = "{agent_name}"
+display_name = "{agent_display}"
 role = "main"
 status = "active"
-trigger = "@DuDu"
-reports_to = "human"
-icon = "paw"
+trigger = "{agent_trigger}"
+reports_to = ""
+icon = "🐾"
 
 [model]
-preferred = "claude-sonnet-4-20250514"
-fallback = "claude-haiku-4-20250514"
-account_pool = ["default"]
+preferred = "claude-sonnet-4-6"
+fallback = "claude-haiku-4-5"
+account_pool = ["main"]
 
 [container]
-timeout_ms = 300000
-max_concurrent = 1
+timeout_ms = 1800000
+max_concurrent = 3
 readonly_project = true
 additional_mounts = []
 
 [heartbeat]
-enabled = false
+enabled = true
 interval_seconds = 3600
 max_concurrent_runs = 1
 cron = ""
 
 [budget]
-monthly_limit_cents = 5000
+monthly_limit_cents = {budget_cents}
 warn_threshold_percent = 80
 hard_stop = true
 
 [permissions]
-can_create_agents = false
-can_send_cross_agent = false
-can_modify_own_skills = false
+can_create_agents = true
+can_send_cross_agent = true
+can_modify_own_skills = true
 can_modify_own_soul = false
-can_schedule_tasks = false
-allowed_channels = ["cli"]
+can_schedule_tasks = true
+allowed_channels = ["*"]
 
 [evolution]
-micro_reflection = false
-meso_reflection = false
-macro_reflection = false
-skill_auto_activate = false
+micro_reflection = true
+meso_reflection = true
+macro_reflection = true
+skill_auto_activate = true
 skill_security_scan = true
-"#;
-        tokio::fs::write(&agent_toml_path, agent_toml)
-            .await
-            .map_err(|e| {
-                DuDuClawError::Config(format!(
-                    "Failed to write {}: {e}",
-                    agent_toml_path.display()
-                ))
-            })?;
-        println!("  Created {}", agent_toml_path.display());
+"#
+    );
+    tokio::fs::write(&agent_toml_path, agent_toml).await.map_err(|e| {
+        DuDuClawError::Config(format!("Failed to write {}: {e}", agent_toml_path.display()))
+    })?;
+    println!("  {} {}", style("✓").green(), agent_toml_path.display());
+
+    // SOUL.md
+    let soul_path = agent_dir.join("SOUL.md");
+    let soul_content = if agent_soul.is_empty() {
+        format!(
+            r#"# {agent_display} — 你的 AI 助理
+
+我是 {agent_display}，一個溫暖、可靠的 AI 助理，由 DuDuClaw 驅動。
+
+## 核心價值
+
+- 用心傾聽，真誠回應
+- 撰寫乾淨、可維護的程式碼
+- 清晰解釋我的思考過程
+- 需要時主動詢問釐清
+
+## 個性特質
+
+- 專業但不冰冷
+- 高效但不急躁
+- 精準但有溫度
+"#
+        )
+    } else {
+        format!("# {agent_display}\n\n{agent_soul}\n")
+    };
+    tokio::fs::write(&soul_path, soul_content).await.map_err(|e| {
+        DuDuClawError::Config(format!("Failed to write {}: {e}", soul_path.display()))
+    })?;
+    println!("  {} {}", style("✓").green(), soul_path.display());
+
+    // ── Done ─────────────────────────────────────────────────
+    println!();
+    println!("  {} {}", style("✓").green().bold(), style("設定完成！").bold());
+    println!();
+    println!("  {}", style("下一步：").bold());
+    println!("  $ {} {}", style("duduclaw run").cyan(), style("# 啟動服務").dim());
+    println!("  $ {} {}", style("duduclaw agent").cyan(), style("# CLI 對話").dim());
+    println!("  $ {} {}", style("duduclaw status").cyan(), style("# 檢查狀態").dim());
+
+    if api_key.is_empty() {
+        println!();
+        println!("  {} 記得設定 API Key：", style("⚠").yellow());
+        println!("  $ {}", style("export ANTHROPIC_API_KEY=sk-ant-...").cyan());
     }
 
-    // Create SOUL.md for the default agent
-    let soul_path = home.join("agents").join("dudu").join("SOUL.md");
-    if !soul_path.exists() {
-        let soul_content = r#"# DuDu - Your Friendly AI Assistant
-
-You are DuDu, a helpful and friendly AI assistant powered by DuDuClaw.
-You assist users with coding, planning, and general tasks.
-
-## Core Values
-
-- Be helpful, honest, and harmless
-- Write clean, maintainable code
-- Explain your reasoning clearly
-- Ask for clarification when needed
-"#;
-        tokio::fs::write(&soul_path, soul_content)
-            .await
-            .map_err(|e| {
-                DuDuClawError::Config(format!(
-                    "Failed to write {}: {e}",
-                    soul_path.display()
-                ))
-            })?;
-        println!("  Created {}", soul_path.display());
-    }
-
-    println!("\nDuDuClaw environment initialized successfully!");
-    println!("Run `duduclaw agent` to start chatting with DuDu.");
+    println!();
     Ok(())
 }
 
