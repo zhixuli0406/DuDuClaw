@@ -485,6 +485,7 @@ dependencies = [
  "duduclaw-agent",
  "duduclaw-container",
  "duduclaw-core",
+ "duduclaw-gateway",
  "serde",
  "serde_json",
  "tokio",

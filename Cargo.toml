@@ -67,7 +67,7 @@ futures-util = "0.3"
 
 # Internal crates
 duduclaw-core = { path = "crates/duduclaw-core" }
-duduclaw-gateway = { path = "crates/duduclaw-gateway" }
+duduclaw-gateway = { path = "crates/duduclaw-gateway", default-features = false }
 duduclaw-bus = { path = "crates/duduclaw-bus" }
 duduclaw-security = { path = "crates/duduclaw-security" }
 duduclaw-memory = { path = "crates/duduclaw-memory" }

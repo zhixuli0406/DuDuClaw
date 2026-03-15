@@ -18,8 +18,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 # Copy pre-built frontend assets for dashboard embedding
 COPY --from=frontend-builder /build/crates/duduclaw-dashboard/dist/ crates/duduclaw-dashboard/dist/
-# Build release binary
-RUN cargo build --release -p duduclaw-cli
+# Build release binary with dashboard enabled
+RUN cargo build --release -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard
 
 # Stage 3: Production image
 FROM python:3.12-slim
@@ -45,6 +45,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy entrypoint
 COPY container/server-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+RUN mkdir -p /home/duduclaw/.duduclaw && chown -R duduclaw:duduclaw /home/duduclaw
 
 USER duduclaw
 WORKDIR /home/duduclaw

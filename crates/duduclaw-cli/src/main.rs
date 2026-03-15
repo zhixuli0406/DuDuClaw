@@ -23,10 +23,11 @@ enum Commands {
         yes: bool,
     },
 
-    /// Run an agent
+    /// Start DuDuClaw server (gateway + channels + heartbeat)
     Run {
-        /// Agent name or path
-        agent: String,
+        /// Skip interactive prompts
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Manage agents (or start interactive session with no subcommand)
@@ -138,7 +139,7 @@ async fn main() {
 async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
     match cli.command {
         Commands::Onboard { yes } => cmd_onboard(yes).await,
-        Commands::Run { agent } => cmd_run_agent(&agent).await,
+        Commands::Run { yes } => cmd_run_server(yes).await,
         Commands::Agent { command } => match command {
             None => cmd_agent_interactive(None).await,
             Some(AgentCommands::List) => cmd_agent_list().await,
@@ -345,9 +346,35 @@ You assist users with coding, planning, and general tasks.
     Ok(())
 }
 
-/// `duduclaw run <agent>` - Run a named agent interactively.
-async fn cmd_run_agent(agent_name: &str) -> duduclaw_core::error::Result<()> {
-    cmd_agent_interactive(Some(agent_name)).await
+/// `duduclaw run [--yes]` - Start the DuDuClaw server (gateway + dashboard).
+async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
+    let home = duduclaw_home();
+
+    // Auto-onboard if config doesn't exist
+    if !home.join("config.toml").exists() {
+        if yes {
+            cmd_onboard(true).await?;
+        } else {
+            println!("No configuration found. Run `duduclaw onboard` first.");
+            return Ok(());
+        }
+    }
+
+    println!("🐾 DuDuClaw Server Starting...");
+    println!("   Gateway: http://0.0.0.0:18789");
+    println!("   Dashboard: http://localhost:18789");
+    println!("   Press Ctrl+C to stop\n");
+
+    let config = duduclaw_gateway::GatewayConfig {
+        bind: std::env::var("DUDUCLAW_BIND").unwrap_or_else(|_| "127.0.0.1".to_string()),
+        port: std::env::var("DUDUCLAW_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(18789),
+        auth_token: None,
+    };
+
+    duduclaw_gateway::start_gateway(config).await
 }
 
 /// `duduclaw agent` or `duduclaw agent run <name>` - Interactive session.
