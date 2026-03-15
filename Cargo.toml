@@ -1,0 +1,77 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/duduclaw-core",
+    "crates/duduclaw-gateway",
+    "crates/duduclaw-bus",
+    "crates/duduclaw-security",
+    "crates/duduclaw-memory",
+    "crates/duduclaw-container",
+    "crates/duduclaw-agent",
+    "crates/duduclaw-bridge",
+    "crates/duduclaw-cli",
+    "crates/duduclaw-dashboard",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["DuDuClaw Contributors"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Web
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = "0.26"
+rust-embed = { version = "8", features = ["compression"] }
+mime_guess = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
+
+# Docker
+bollard = "0.18"
+
+# Crypto
+ring = "0.17"
+base64 = "0.22"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Streams
+futures-util = "0.3"
+
+# Internal crates
+duduclaw-core = { path = "crates/duduclaw-core" }
+duduclaw-gateway = { path = "crates/duduclaw-gateway" }
+duduclaw-bus = { path = "crates/duduclaw-bus" }
+duduclaw-security = { path = "crates/duduclaw-security" }
+duduclaw-memory = { path = "crates/duduclaw-memory" }
+duduclaw-container = { path = "crates/duduclaw-container" }
+duduclaw-agent = { path = "crates/duduclaw-agent" }
+duduclaw-bridge = { path = "crates/duduclaw-bridge" }
+duduclaw-dashboard = { path = "crates/duduclaw-dashboard" }
