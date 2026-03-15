@@ -1,12 +1,11 @@
 class Duduclaw < Formula
   desc "Multi-Agent AI Assistant Platform"
   homepage "https://github.com/zhixuli0406/DuDuClaw"
-  head "https://github.com/zhixuli0406/DuDuClaw.git", branch: "main"
+  url "https://github.com/zhixuli0406/DuDuClaw.git", tag: "v0.1.0"
   version "0.1.0"
   license "MIT"
 
-  # When v0.1.0 is released, uncomment and replace head with:
-  # url "https://github.com/zhixuli0406/DuDuClaw.git", tag: "v0.1.0"
+  head "https://github.com/zhixuli0406/DuDuClaw.git", branch: "main"
 
   depends_on "rust" => :build
   depends_on "node" => :build
