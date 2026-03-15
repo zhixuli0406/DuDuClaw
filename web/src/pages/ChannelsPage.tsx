@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type ChannelStatus } from '@/lib/api';
+import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import {
   Radio,
   Plus,
@@ -47,6 +48,7 @@ export function ChannelsPage() {
   const intl = useIntl();
   const [channels, setChannels] = useState<ReadonlyArray<ChannelStatus>>([]);
   const [loading, setLoading] = useState(false);
+  const [showAddDialog, setShowAddDialog] = useState(false);
 
   const fetchChannels = useCallback(async () => {
     setLoading(true);
@@ -88,7 +90,10 @@ export function ChannelsPage() {
         <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
           {intl.formatMessage({ id: 'channels.title' })}
         </h2>
-        <button className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600">
+        <button
+          onClick={() => setShowAddDialog(true)}
+          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600"
+        >
           <Plus className="h-4 w-4" />
           {intl.formatMessage({ id: 'channels.add' })}
         </button>
@@ -178,6 +183,86 @@ export function ChannelsPage() {
           })}
         </div>
       )}
+      {/* Add Channel Dialog */}
+      <AddChannelDialog
+        open={showAddDialog}
+        onClose={() => setShowAddDialog(false)}
+        onCreated={fetchChannels}
+      />
     </div>
+  );
+}
+
+function AddChannelDialog({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: () => void }) {
+  const [channelType, setChannelType] = useState('line');
+  const [token, setToken] = useState('');
+  const [secret, setSecret] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const handleSubmit = async () => {
+    if (!token.trim()) return;
+    setSubmitting(true);
+    try {
+      const config: Record<string, string> = { token: token.trim() };
+      if (secret.trim()) config.secret = secret.trim();
+      await api.channels.add(channelType, config);
+      onCreated();
+      onClose();
+      setToken('');
+      setSecret('');
+    } catch {
+      // error
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const tokenLabel: Record<string, string> = {
+    line: 'Channel Access Token',
+    telegram: 'Bot Token',
+    discord: 'Bot Token',
+  };
+
+  return (
+    <Dialog open={open} onClose={onClose} title="新增通道">
+      <div className="space-y-4">
+        <FormField label="通道類型">
+          <select value={channelType} onChange={(e) => setChannelType(e.target.value)} className={selectClass}>
+            <option value="line">LINE</option>
+            <option value="telegram">Telegram</option>
+            <option value="discord">Discord</option>
+          </select>
+        </FormField>
+
+        <FormField label={tokenLabel[channelType] ?? 'Token'}>
+          <input
+            type="password"
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            placeholder="貼上你的 token..."
+            className={inputClass}
+          />
+        </FormField>
+
+        {channelType === 'line' && (
+          <FormField label="Channel Secret">
+            <input
+              type="password"
+              value={secret}
+              onChange={(e) => setSecret(e.target.value)}
+              placeholder="LINE Channel Secret"
+              className={inputClass}
+            />
+          </FormField>
+        )}
+
+        <div className="flex justify-end gap-3 pt-2">
+          <button onClick={onClose} className={buttonSecondary}>取消</button>
+          <button onClick={handleSubmit} disabled={submitting || !token.trim()} className={buttonPrimary}>
+            {submitting ? '新增中...' : '新增通道'}
+          </button>
+        </div>
+      </div>
+    </Dialog>
   );
 }

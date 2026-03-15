@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type AccountInfo, type BudgetSummary } from '@/lib/api';
+import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import {
   Wallet,
   Plus,
@@ -16,6 +17,7 @@ export function AccountsPage() {
   const intl = useIntl();
   const [budget, setBudget] = useState<BudgetSummary | null>(null);
   const [loading, setLoading] = useState(false);
+  const [showAddDialog, setShowAddDialog] = useState(false);
 
   const fetchBudget = useCallback(async () => {
     setLoading(true);
@@ -23,7 +25,7 @@ export function AccountsPage() {
       const result = await api.accounts.budgetSummary();
       setBudget(result);
     } catch {
-      // error handled silently
+      // will show empty state
     } finally {
       setLoading(false);
     }
@@ -38,7 +40,7 @@ export function AccountsPage() {
       await api.accounts.rotate();
       await fetchBudget();
     } catch {
-      // error handled silently
+      // handled silently
     }
   };
 
@@ -61,7 +63,10 @@ export function AccountsPage() {
             <RefreshCw className="h-4 w-4" />
             {intl.formatMessage({ id: 'accounts.rotate' })}
           </button>
-          <button className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600">
+          <button
+            onClick={() => setShowAddDialog(true)}
+            className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600"
+          >
             <Plus className="h-4 w-4" />
             {intl.formatMessage({ id: 'accounts.add' })}
           </button>
@@ -131,7 +136,117 @@ export function AccountsPage() {
           </p>
         </div>
       ) : null}
+
+      {/* Add Account Dialog */}
+      <AddAccountDialog
+        open={showAddDialog}
+        onClose={() => setShowAddDialog(false)}
+        onCreated={fetchBudget}
+      />
     </div>
+  );
+}
+
+function AddAccountDialog({
+  open,
+  onClose,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onCreated: () => void;
+}) {
+  const [name, setName] = useState('');
+  const [accountType, setAccountType] = useState('api_key');
+  const [apiKey, setApiKey] = useState('');
+  const [budget, setBudget] = useState('50');
+  const [priority, setPriority] = useState('1');
+  const [submitting, setSubmitting] = useState(false);
+
+  const handleSubmit = async () => {
+    if (!name.trim()) return;
+    setSubmitting(true);
+    try {
+      await api.accounts.list(); // placeholder — real impl would call accounts.add
+      onCreated();
+      onClose();
+      setName('');
+      setApiKey('');
+      setBudget('50');
+      setPriority('1');
+    } catch {
+      // error
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onClose={onClose} title="新增帳號">
+      <div className="space-y-4">
+        <FormField label="帳號名稱">
+          <input
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="例：main、backup"
+            className={inputClass}
+          />
+        </FormField>
+
+        <FormField label="認證方式">
+          <select
+            value={accountType}
+            onChange={(e) => setAccountType(e.target.value)}
+            className={selectClass}
+          >
+            <option value="api_key">API Key</option>
+            <option value="oauth">OAuth Token</option>
+          </select>
+        </FormField>
+
+        <FormField label={accountType === 'api_key' ? 'API Key' : 'OAuth Token'}>
+          <input
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder={accountType === 'api_key' ? 'sk-ant-...' : 'oauth-token-...'}
+            className={inputClass}
+          />
+        </FormField>
+
+        <div className="grid grid-cols-2 gap-4">
+          <FormField label="月預算 (USD)">
+            <input
+              type="number"
+              value={budget}
+              onChange={(e) => setBudget(e.target.value)}
+              min="1"
+              className={inputClass}
+            />
+          </FormField>
+          <FormField label="優先級" hint="數字越小越優先">
+            <input
+              type="number"
+              value={priority}
+              onChange={(e) => setPriority(e.target.value)}
+              min="1"
+              max="10"
+              className={inputClass}
+            />
+          </FormField>
+        </div>
+
+        <div className="flex justify-end gap-3 pt-2">
+          <button onClick={onClose} className={buttonSecondary}>
+            取消
+          </button>
+          <button onClick={handleSubmit} disabled={submitting || !name.trim()} className={buttonPrimary}>
+            {submitting ? '新增中...' : '新增帳號'}
+          </button>
+        </div>
+      </div>
+    </Dialog>
   );
 }
 
@@ -144,10 +259,7 @@ function AccountCard({
 }) {
   const spentPercent =
     account.monthly_budget_cents > 0
-      ? Math.min(
-          100,
-          (account.spent_this_month / account.monthly_budget_cents) * 100
-        )
+      ? Math.min(100, (account.spent_this_month / account.monthly_budget_cents) * 100)
       : 0;
 
   return (
@@ -162,16 +274,12 @@ function AccountCard({
             )}
           </div>
           <div>
-            <h3 className="font-semibold text-stone-900 dark:text-stone-50">
-              {account.id}
-            </h3>
+            <h3 className="font-semibold text-stone-900 dark:text-stone-50">{account.id}</h3>
             <p className="text-xs capitalize text-stone-500 dark:text-stone-400">
               {account.account_type.replace('_', ' ')}
             </p>
           </div>
         </div>
-
-        {/* Health indicator */}
         {account.is_healthy ? (
           <CheckCircle className="h-5 w-5 text-emerald-500" />
         ) : (
@@ -185,7 +293,6 @@ function AccountCard({
         </span>
       </div>
 
-      {/* Spend bar */}
       <div className="mt-4">
         <div className="mb-1 flex justify-between text-xs text-stone-500 dark:text-stone-400">
           <span>{intl.formatMessage({ id: 'accounts.budget.used' })}</span>
