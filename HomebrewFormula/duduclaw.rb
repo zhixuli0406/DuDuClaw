@@ -1,36 +1,23 @@
 class Duduclaw < Formula
   desc "Multi-Agent AI Assistant Platform"
   homepage "https://github.com/zhixuli0406/DuDuClaw"
+  head "https://github.com/zhixuli0406/DuDuClaw.git", branch: "main"
   version "0.1.0"
   license "MIT"
 
-  # For now, build from source.
-  # When releases are available, add bottle blocks for pre-built binaries.
-
-  on_macos do
-    on_arm do
-      url "https://github.com/zhixuli0406/DuDuClaw.git", tag: "v0.1.0"
-    end
-    on_intel do
-      url "https://github.com/zhixuli0406/DuDuClaw.git", tag: "v0.1.0"
-    end
-  end
-  on_linux do
-    url "https://github.com/zhixuli0406/DuDuClaw.git", tag: "v0.1.0"
-  end
+  # When v0.1.0 is released, uncomment and replace head with:
+  # url "https://github.com/zhixuli0406/DuDuClaw.git", tag: "v0.1.0"
 
   depends_on "rust" => :build
-  depends_on "node" => :build # for dashboard
+  depends_on "node" => :build
   depends_on "python@3.12"
 
   def install
-    # Build frontend
     cd "web" do
       system "npm", "ci", "--legacy-peer-deps"
       system "npm", "run", "build"
     end
 
-    # Build Rust binary with dashboard
     system "cargo", "build", "--release", "-p", "duduclaw-cli",
            "-p", "duduclaw-gateway", "--features", "duduclaw-gateway/dashboard"
     bin.install "target/release/duduclaw"
