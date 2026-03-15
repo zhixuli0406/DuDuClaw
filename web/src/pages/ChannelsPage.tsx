@@ -49,14 +49,20 @@ export function ChannelsPage() {
   const [channels, setChannels] = useState<ReadonlyArray<ChannelStatus>>([]);
   const [loading, setLoading] = useState(false);
   const [showAddDialog, setShowAddDialog] = useState(false);
+  const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  const showToast = (type: 'success' | 'error', message: string) => {
+    setToast({ type, message });
+    setTimeout(() => setToast(null), 4000);
+  };
 
   const fetchChannels = useCallback(async () => {
     setLoading(true);
     try {
       const result = await api.channels.status();
       setChannels(result.channels);
-    } catch {
-      // error handled silently
+    } catch (e) {
+      showToast('error', `無法載入通道: ${e}`);
     } finally {
       setLoading(false);
     }
@@ -68,24 +74,39 @@ export function ChannelsPage() {
 
   const handleTest = async (type: string) => {
     try {
-      await api.channels.test(type);
+      const result = await api.channels.test(type) as { success: boolean; message: string };
+      showToast(result.success ? 'success' : 'error', result.message);
       await fetchChannels();
-    } catch {
-      // error handled silently
+    } catch (e) {
+      showToast('error', `測試失敗: ${e}`);
     }
   };
 
   const handleRemove = async (type: string) => {
+    if (!confirm(`確認移除 ${type} 通道？`)) return;
     try {
       await api.channels.remove(type);
+      showToast('success', `${type} 通道已移除`);
       await fetchChannels();
-    } catch {
-      // error handled silently
+    } catch (e) {
+      showToast('error', `移除失敗: ${e}`);
     }
   };
 
   return (
     <div className="space-y-6">
+      {/* Toast notification */}
+      {toast && (
+        <div className={cn(
+          'rounded-lg px-4 py-3 text-sm',
+          toast.type === 'success'
+            ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400'
+            : 'bg-rose-50 text-rose-700 dark:bg-rose-900/20 dark:text-rose-400'
+        )}>
+          {toast.message}
+        </div>
+      )}
+
       <div className="flex items-center justify-between">
         <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
           {intl.formatMessage({ id: 'channels.title' })}

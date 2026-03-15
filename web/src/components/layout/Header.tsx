@@ -1,6 +1,6 @@
 import { useIntl } from 'react-intl';
 import { useConnectionStore } from '@/stores/connection-store';
-import { Sun, Moon, Monitor } from 'lucide-react';
+import { Sun, Moon, Monitor, RefreshCw } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useEffect, useState } from 'react';
 
@@ -9,6 +9,8 @@ type Theme = 'light' | 'dark' | 'system';
 export function Header() {
   const intl = useIntl();
   const connectionState = useConnectionStore((s) => s.state);
+  const connectionError = useConnectionStore((s) => s.error);
+  const reconnect = useConnectionStore((s) => s.connect);
   const [theme, setTheme] = useState<Theme>('system');
 
   useEffect(() => {
@@ -31,7 +33,7 @@ export function Header() {
   }, [theme]);
 
   const stateColor: Record<string, string> = {
-    disconnected: 'bg-stone-400',
+    disconnected: 'bg-rose-400',
     connecting: 'bg-amber-400 animate-pulse',
     connected: 'bg-emerald-400',
     authenticated: 'bg-emerald-500',
@@ -49,18 +51,35 @@ export function Header() {
 
   return (
     <header className="flex h-14 items-center justify-between border-b border-stone-200 bg-white/80 px-6 backdrop-blur-sm dark:border-stone-800 dark:bg-stone-950/80">
-      <div />
+      {/* Connection error banner */}
+      {connectionState === 'disconnected' && connectionError && (
+        <div className="flex items-center gap-2 text-xs text-rose-600 dark:text-rose-400">
+          <span>連線失敗: {connectionError.slice(0, 80)}</span>
+          <button
+            onClick={() => reconnect()}
+            className="inline-flex items-center gap-1 rounded-md bg-rose-100 px-2 py-1 text-xs font-medium text-rose-700 hover:bg-rose-200 dark:bg-rose-900/30 dark:text-rose-400 dark:hover:bg-rose-900/50"
+          >
+            <RefreshCw className="h-3 w-3" />
+            重連
+          </button>
+        </div>
+      )}
+      {(connectionState !== 'disconnected' || !connectionError) && <div />}
+
       <div className="flex items-center gap-4">
         {/* Connection Status */}
-        <div className="flex items-center gap-2 text-sm text-stone-500 dark:text-stone-400">
-          <div
-            className={cn(
-              'h-2 w-2 rounded-full',
-              stateColor[connectionState] ?? 'bg-stone-400'
-            )}
-          />
+        <button
+          onClick={connectionState === 'disconnected' ? () => reconnect() : undefined}
+          className={cn(
+            'flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm transition-colors',
+            connectionState === 'disconnected'
+              ? 'text-rose-500 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-900/20 cursor-pointer'
+              : 'text-stone-500 dark:text-stone-400 cursor-default'
+          )}
+        >
+          <div className={cn('h-2 w-2 rounded-full', stateColor[connectionState] ?? 'bg-stone-400')} />
           <span>{stateLabel}</span>
-        </div>
+        </button>
 
         {/* Theme Toggle */}
         <button

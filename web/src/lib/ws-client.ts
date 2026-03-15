@@ -1,4 +1,5 @@
-// Must match crates/duduclaw-gateway/src/protocol.rs exactly
+// WebSocket client matching the Rust WsFrame protocol
+// (crates/duduclaw-gateway/src/protocol.rs)
 
 export type WsFrame =
   | { type: 'req'; id: string; method: string; params: Record<string, unknown> }
@@ -21,7 +22,7 @@ export class DuDuClawClient {
   private eventHandlers = new Map<string, Set<EventHandler>>();
   private requestId = 0;
   private reconnectAttempt = 0;
-  private maxReconnectAttempt = 10;
+  private maxReconnectAttempts = 10;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private _state: ConnectionState = 'disconnected';
   private _onStateChange: ((state: ConnectionState) => void) | null = null;
@@ -44,6 +45,7 @@ export class DuDuClawClient {
   connect(url: string, token?: string): Promise<void> {
     this.url = url;
     this.token = token;
+    this.maxReconnectAttempts = 10;
     return this.doConnect();
   }
 
@@ -54,49 +56,55 @@ export class DuDuClawClient {
       try {
         this.ws = new WebSocket(this.url);
       } catch (e) {
+        console.error('[WS] Failed to create WebSocket:', e);
         this.setState('disconnected');
         reject(e);
         return;
       }
 
-      this.ws.onopen = async () => {
-        this.reconnectAttempt = 0;
-        this.setState('connected');
-
-        // Authenticate if token provided
-        if (this.token) {
-          try {
-            await this.call('connect', { token: this.token });
-            this.setState('authenticated');
-          } catch (e) {
-            console.error('Authentication failed:', e);
-            this.ws?.close();
-            reject(e);
-            return;
-          }
-        } else {
-          this.setState('authenticated');
-        }
-        resolve();
-      };
-
+      // Set ALL handlers before the connection opens
       this.ws.onmessage = (event) => {
         try {
           const frame: WsFrame = JSON.parse(event.data);
           this.handleFrame(frame);
         } catch (e) {
-          console.error('Failed to parse WsFrame:', e);
+          console.warn('[WS] Failed to parse frame:', event.data, e);
         }
       };
 
-      this.ws.onclose = () => {
+      this.ws.onclose = (event) => {
+        console.log('[WS] Connection closed:', event.code, event.reason);
         this.setState('disconnected');
         this.rejectAllPending('Connection closed');
         this.scheduleReconnect();
       };
 
-      this.ws.onerror = () => {
+      this.ws.onerror = (event) => {
+        console.error('[WS] Connection error:', event);
         // onclose will fire after this
+      };
+
+      this.ws.onopen = async () => {
+        console.log('[WS] Connection opened');
+        this.reconnectAttempt = 0;
+        this.setState('connected');
+
+        // If token is provided, authenticate first
+        if (this.token) {
+          try {
+            await this.call('connect', { token: this.token });
+            this.setState('authenticated');
+          } catch (e) {
+            console.error('[WS] Authentication failed:', e);
+            this.ws?.close();
+            reject(e);
+            return;
+          }
+        } else {
+          // No auth required — go straight to authenticated
+          this.setState('authenticated');
+        }
+        resolve();
       };
     });
   }
@@ -117,22 +125,14 @@ export class DuDuClawClient {
       const handlers = this.eventHandlers.get(frame.event);
       if (handlers) {
         for (const handler of handlers) {
-          try {
-            handler(frame.payload);
-          } catch (e) {
-            console.error('Event handler error:', e);
-          }
+          try { handler(frame.payload); } catch (e) { console.error('[WS] Event handler error:', e); }
         }
       }
-      // Also fire wildcard handlers
+      // Wildcard handlers
       const wildcardHandlers = this.eventHandlers.get('*');
       if (wildcardHandlers) {
         for (const handler of wildcardHandlers) {
-          try {
-            handler({ ...frame, event: frame.event });
-          } catch (e) {
-            /* ignore */
-          }
+          try { handler({ ...frame, event: frame.event }); } catch { /* ignore */ }
         }
       }
     }
@@ -141,7 +141,7 @@ export class DuDuClawClient {
   call(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
     return new Promise((resolve, reject) => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-        reject(new Error('Not connected'));
+        reject(new Error(`Not connected (state: ${this._state})`));
         return;
       }
 
@@ -163,8 +163,6 @@ export class DuDuClawClient {
       this.eventHandlers.set(event, new Set());
     }
     this.eventHandlers.get(event)!.add(handler);
-
-    // Return unsubscribe function
     return () => {
       this.eventHandlers.get(event)?.delete(handler);
     };
@@ -175,23 +173,21 @@ export class DuDuClawClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    this.maxReconnectAttempt = 0; // prevent reconnect
+    this.maxReconnectAttempts = 0;
     this.ws?.close();
     this.ws = null;
     this.setState('disconnected');
   }
 
   private scheduleReconnect() {
-    if (this.reconnectAttempt >= this.maxReconnectAttempt) return;
+    if (this.reconnectAttempt >= this.maxReconnectAttempts) return;
 
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempt), 30000);
     this.reconnectAttempt++;
 
-    console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempt})`);
+    console.log(`[WS] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempt})`);
     this.reconnectTimer = setTimeout(() => {
-      this.doConnect().catch(() => {
-        /* reconnect will retry */
-      });
+      this.doConnect().catch(() => { /* reconnect will retry */ });
     }, delay);
   }
 
