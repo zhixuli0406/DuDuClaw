@@ -1,0 +1,15 @@
+[package]
+name = "duduclaw-gateway"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+duduclaw-core = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+duduclaw-dashboard = { workspace = true }
