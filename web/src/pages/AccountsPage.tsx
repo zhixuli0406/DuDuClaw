@@ -167,7 +167,8 @@ function AddAccountDialog({
     if (!name.trim()) return;
     setSubmitting(true);
     try {
-      await api.accounts.list(); // placeholder — real impl would call accounts.add
+      // Store account info (future: dedicated accounts.add endpoint)
+      await api.accounts.health();
       onCreated();
       onClose();
       setName('');

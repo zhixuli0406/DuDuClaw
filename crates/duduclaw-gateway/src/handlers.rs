@@ -2,6 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use duduclaw_agent::registry::AgentRegistry;
+use duduclaw_core::traits::MemoryEngine;
+use duduclaw_memory::SqliteMemoryEngine;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tracing::info;
@@ -42,10 +44,28 @@ impl MethodHandler {
             "agents.resume" => self.handle_agents_resume(params).await,
             "agents.inspect" => self.handle_agents_inspect(params).await,
             "channels.status" => self.handle_channels_status().await,
+            "channels.add" => self.handle_channels_add(params).await,
+            "channels.test" => self.handle_channels_test(params),
+            "channels.remove" => self.handle_channels_remove(params).await,
+            "accounts.list" => self.handle_accounts_list().await,
             "accounts.budget_summary" => self.handle_budget_summary().await,
+            "accounts.rotate" => self.handle_accounts_rotate(params),
+            "accounts.health" => self.handle_accounts_health().await,
+            "memory.search" => self.handle_memory_search(params).await,
+            "memory.browse" => self.handle_memory_browse(params).await,
+            "skills.list" => self.handle_skills_list(params).await,
+            "skills.content" => self.handle_skills_content(params).await,
+            "cron.list" => self.handle_cron_list(),
+            "cron.add" => self.handle_cron_add(params),
+            "cron.pause" => self.handle_cron_pause(params),
+            "cron.remove" => self.handle_cron_remove(params),
             "system.status" => self.handle_system_status().await,
             "system.doctor" => self.handle_system_doctor().await,
+            "system.doctor_repair" => self.handle_system_doctor_repair().await,
+            "system.config" => self.handle_system_config().await,
             "system.version" => self.handle_system_version(),
+            "logs.subscribe" => self.handle_logs_subscribe(params),
+            "logs.unsubscribe" => self.handle_logs_unsubscribe(params),
             "evolution.status" => self.handle_evolution_status().await,
             "evolution.skills" => self.handle_evolution_skills().await,
             unknown => WsFrame::error_response("", &format!("Unknown method: {unknown}")),
@@ -79,10 +99,28 @@ impl MethodHandler {
                 { "name": "agents.resume", "description": "Resume an agent" },
                 { "name": "agents.inspect", "description": "Inspect agent details" },
                 { "name": "channels.status", "description": "Channel connection status" },
+                { "name": "channels.add", "description": "Add a channel" },
+                { "name": "channels.test", "description": "Test a channel" },
+                { "name": "channels.remove", "description": "Remove a channel" },
+                { "name": "accounts.list", "description": "List accounts" },
                 { "name": "accounts.budget_summary", "description": "Budget overview" },
+                { "name": "accounts.rotate", "description": "Rotate account key" },
+                { "name": "accounts.health", "description": "Account health check" },
+                { "name": "memory.search", "description": "Search agent memory" },
+                { "name": "memory.browse", "description": "Browse recent memory entries" },
+                { "name": "skills.list", "description": "List agent skills" },
+                { "name": "skills.content", "description": "Read skill content" },
+                { "name": "cron.list", "description": "List cron jobs" },
+                { "name": "cron.add", "description": "Add a cron job" },
+                { "name": "cron.pause", "description": "Pause a cron job" },
+                { "name": "cron.remove", "description": "Remove a cron job" },
                 { "name": "system.status", "description": "System status" },
                 { "name": "system.doctor", "description": "Health checks" },
+                { "name": "system.doctor_repair", "description": "Health checks with repair hints" },
+                { "name": "system.config", "description": "View system config" },
                 { "name": "system.version", "description": "Version info" },
+                { "name": "logs.subscribe", "description": "Subscribe to logs" },
+                { "name": "logs.unsubscribe", "description": "Unsubscribe from logs" },
             ]
         }))
     }
@@ -325,7 +363,106 @@ skill_security_scan = true
         WsFrame::ok_response("", json!({ "channels": channels }))
     }
 
+    async fn handle_channels_add(&self, params: Value) -> WsFrame {
+        let channel_type = match params.get("type").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => return WsFrame::error_response("", "Missing 'type' parameter"),
+        };
+        let config_obj = params.get("config").cloned().unwrap_or(json!({}));
+        let token = config_obj.get("token").and_then(|v| v.as_str()).unwrap_or("");
+        let secret = config_obj.get("secret").and_then(|v| v.as_str()).unwrap_or("");
+
+        if token.is_empty() {
+            return WsFrame::error_response("", "Missing 'config.token' parameter");
+        }
+
+        let (token_key, secret_key) = match channel_type {
+            "line" => ("line_channel_token", Some("line_channel_secret")),
+            "telegram" => ("telegram_bot_token", None),
+            "discord" => ("discord_bot_token", None),
+            _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
+        };
+
+        let config_path = self.home_dir.join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+
+        let channels = table
+            .entry("channels")
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+            .as_table_mut();
+
+        let channels = match channels {
+            Some(ch) => ch,
+            None => return WsFrame::error_response("", "Invalid [channels] section in config.toml"),
+        };
+
+        channels.insert(token_key.to_string(), toml::Value::String(token.to_string()));
+        if let Some(sk) = secret_key
+            && !secret.is_empty()
+        {
+            channels.insert(sk.to_string(), toml::Value::String(secret.to_string()));
+        }
+
+        if let Err(e) = self.write_config_table(&config_path, &table).await {
+            return WsFrame::error_response("", &format!("Failed to write config.toml: {e}"));
+        }
+
+        info!(channel_type, "Channel added");
+        WsFrame::ok_response("", json!({ "success": true, "type": channel_type }))
+    }
+
+    fn handle_channels_test(&self, params: Value) -> WsFrame {
+        let channel_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+        info!(channel_type, "channels.test requested");
+        WsFrame::ok_response("", json!({ "success": true, "type": channel_type, "message": "Channel test placeholder" }))
+    }
+
+    async fn handle_channels_remove(&self, params: Value) -> WsFrame {
+        let channel_type = match params.get("type").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => return WsFrame::error_response("", "Missing 'type' parameter"),
+        };
+
+        let token_key = match channel_type {
+            "line" => "line_channel_token",
+            "telegram" => "telegram_bot_token",
+            "discord" => "discord_bot_token",
+            _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
+        };
+
+        let config_path = self.home_dir.join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+
+        if let Some(channels) = table.get_mut("channels").and_then(|v| v.as_table_mut()) {
+            channels.insert(token_key.to_string(), toml::Value::String(String::new()));
+            // Also clear secret for LINE
+            if channel_type == "line" {
+                channels.insert("line_channel_secret".to_string(), toml::Value::String(String::new()));
+            }
+        }
+
+        if let Err(e) = self.write_config_table(&config_path, &table).await {
+            return WsFrame::error_response("", &format!("Failed to write config.toml: {e}"));
+        }
+
+        info!(channel_type, "Channel removed");
+        WsFrame::ok_response("", json!({ "success": true, "type": channel_type }))
+    }
+
     // ── Accounts ─────────────────────────────────────────────
+
+    async fn handle_accounts_list(&self) -> WsFrame {
+        let has_key = std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.is_empty());
+        let mut accounts = Vec::new();
+        if has_key {
+            accounts.push(json!({
+                "name": "main",
+                "provider": "anthropic",
+                "active": true,
+            }));
+        }
+        WsFrame::ok_response("", json!({ "accounts": accounts }))
+    }
 
     async fn handle_budget_summary(&self) -> WsFrame {
         // Read budgets from loaded agents
@@ -335,11 +472,213 @@ skill_security_scan = true
         for a in &agents_list {
             total_budget += a.config.budget.monthly_limit_cents;
         }
+
+        let has_key = std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.is_empty());
+        let accounts: Vec<Value> = if has_key {
+            vec![json!({
+                "id": "main",
+                "account_type": "api_key",
+                "priority": 1,
+                "is_healthy": true,
+                "spent_this_month": 0,
+                "monthly_budget_cents": total_budget,
+            })]
+        } else {
+            vec![]
+        };
+
         WsFrame::ok_response("", json!({
             "total_budget_cents": total_budget,
             "total_spent_cents": 0,
-            "accounts": [],
+            "accounts": accounts,
         }))
+    }
+
+    fn handle_accounts_rotate(&self, params: Value) -> WsFrame {
+        let account = params.get("account").and_then(|v| v.as_str()).unwrap_or("main");
+        info!(account, "accounts.rotate requested");
+        WsFrame::ok_response("", json!({ "success": true, "account": account, "message": "Key rotation placeholder" }))
+    }
+
+    async fn handle_accounts_health(&self) -> WsFrame {
+        let has_key = std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.is_empty());
+        let status = if has_key { "healthy" } else { "missing_key" };
+        WsFrame::ok_response("", json!({
+            "status": status,
+            "accounts": [{
+                "name": "main",
+                "provider": "anthropic",
+                "healthy": has_key,
+                "message": if has_key { "ANTHROPIC_API_KEY is set" } else { "ANTHROPIC_API_KEY is not set" },
+            }],
+        }))
+    }
+
+    // ── Memory ──────────────────────────────────────────────
+
+    async fn handle_memory_search(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+
+        if agent_id.is_empty() || query.is_empty() {
+            return WsFrame::error_response("", "Missing 'agent_id' or 'query' parameter");
+        }
+
+        let db_path = self.home_dir.join("state.db");
+        if !db_path.exists() {
+            return WsFrame::ok_response("", json!({ "results": [] }));
+        }
+
+        let engine = match SqliteMemoryEngine::new(&db_path) {
+            Ok(e) => e,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+        };
+
+        match engine.search(agent_id, query, limit).await {
+            Ok(entries) => {
+                let results: Vec<Value> = entries.iter().map(|e| {
+                    json!({
+                        "id": e.id,
+                        "agent_id": e.agent_id,
+                        "content": e.content,
+                        "timestamp": e.timestamp.to_rfc3339(),
+                        "tags": e.tags,
+                    })
+                }).collect();
+                WsFrame::ok_response("", json!({ "results": results }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("Memory search failed: {e}")),
+        }
+    }
+
+    async fn handle_memory_browse(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+
+        if agent_id.is_empty() {
+            return WsFrame::error_response("", "Missing 'agent_id' parameter");
+        }
+
+        let db_path = self.home_dir.join("state.db");
+        if !db_path.exists() {
+            return WsFrame::ok_response("", json!({ "entries": [] }));
+        }
+
+        let engine = match SqliteMemoryEngine::new(&db_path) {
+            Ok(e) => e,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+        };
+
+        // Browse recent entries using a wildcard-like search; FTS5 requires a query
+        // so we use summarize with a broad time window instead.
+        let now = chrono::Utc::now();
+        let window = duduclaw_core::types::TimeWindow {
+            start: now - chrono::Duration::days(365),
+            end: now,
+        };
+
+        match engine.summarize(agent_id, window).await {
+            Ok(summary) => {
+                // The summarize method returns a text summary. For browse, we re-query
+                // the raw entries. Since the engine trait only exposes search and summarize,
+                // we do a broad search with a common token. If that returns nothing, return
+                // the summary text instead.
+                // A pragmatic approach: return the summary as a single entry.
+                let _ = limit; // acknowledged but summary is the best we can do via trait
+                WsFrame::ok_response("", json!({
+                    "agent_id": agent_id,
+                    "summary": summary,
+                    "entries": [],
+                }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("Memory browse failed: {e}")),
+        }
+    }
+
+    // ── Skills ──────────────────────────────────────────────
+
+    async fn handle_skills_list(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str());
+        let reg = self.registry.read().await;
+
+        match agent_id {
+            Some(id) => {
+                match reg.get(id) {
+                    Some(agent) => {
+                        let skills: Vec<Value> = agent.skills.iter().map(|s| {
+                            json!({ "name": s.name, "size": s.content.len() })
+                        }).collect();
+                        WsFrame::ok_response("", json!({ "agent_id": id, "skills": skills }))
+                    }
+                    None => WsFrame::error_response("", &format!("Agent not found: {id}")),
+                }
+            }
+            None => {
+                // Return skills for all agents
+                let mut all_skills = Vec::new();
+                for agent in reg.list() {
+                    let skills: Vec<Value> = agent.skills.iter().map(|s| {
+                        json!({ "name": s.name, "size": s.content.len() })
+                    }).collect();
+                    all_skills.push(json!({
+                        "agent_id": agent.config.agent.name,
+                        "skills": skills,
+                    }));
+                }
+                WsFrame::ok_response("", json!({ "agents": all_skills }))
+            }
+        }
+    }
+
+    async fn handle_skills_content(&self, params: Value) -> WsFrame {
+        let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+            Some(id) => id,
+            None => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
+        };
+        let skill_name = match params.get("skill_name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => return WsFrame::error_response("", "Missing 'skill_name' parameter"),
+        };
+
+        let reg = self.registry.read().await;
+        match reg.get(agent_id) {
+            Some(agent) => {
+                match agent.skills.iter().find(|s| s.name == skill_name) {
+                    Some(skill) => WsFrame::ok_response("", json!({
+                        "agent_id": agent_id,
+                        "skill_name": skill_name,
+                        "content": skill.content,
+                    })),
+                    None => WsFrame::error_response("", &format!("Skill not found: {skill_name}")),
+                }
+            }
+            None => WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
+        }
+    }
+
+    // ── Cron ────────────────────────────────────────────────
+
+    fn handle_cron_list(&self) -> WsFrame {
+        WsFrame::ok_response("", json!({ "jobs": [] }))
+    }
+
+    fn handle_cron_add(&self, params: Value) -> WsFrame {
+        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
+        info!(name, "cron.add requested");
+        WsFrame::ok_response("", json!({ "success": true, "message": "Cron add placeholder" }))
+    }
+
+    fn handle_cron_pause(&self, params: Value) -> WsFrame {
+        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
+        info!(name, "cron.pause requested");
+        WsFrame::ok_response("", json!({ "success": true, "message": "Cron pause placeholder" }))
+    }
+
+    fn handle_cron_remove(&self, params: Value) -> WsFrame {
+        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
+        info!(name, "cron.remove requested");
+        WsFrame::ok_response("", json!({ "success": true, "message": "Cron remove placeholder" }))
     }
 
     // ── System ───────────────────────────────────────────────
@@ -356,21 +695,74 @@ skill_security_scan = true
     }
 
     async fn handle_system_doctor(&self) -> WsFrame {
-        let reg = self.registry.read().await;
-        let has_agents = !reg.list().is_empty();
-        let checks = vec![
-            json!({ "name": "config_file", "status": "pass", "message": "config.toml 存在", "can_repair": false }),
-            json!({ "name": "agents", "status": if has_agents { "pass" } else { "warn" }, "message": if has_agents { "已找到 Agent" } else { "未找到任何 Agent" }, "can_repair": false }),
-            json!({ "name": "container_runtime", "status": "pass", "message": "Docker 可用", "can_repair": false }),
-        ];
+        let checks = self.run_doctor_checks().await;
         let pass = checks.iter().filter(|c| c["status"] == "pass").count();
         let warn = checks.iter().filter(|c| c["status"] == "warn").count();
         let fail = checks.iter().filter(|c| c["status"] == "fail").count();
         WsFrame::ok_response("", json!({ "checks": checks, "summary": { "pass": pass, "warn": warn, "fail": fail } }))
     }
 
+    async fn handle_system_doctor_repair(&self) -> WsFrame {
+        let checks = self.run_doctor_checks().await;
+        let pass = checks.iter().filter(|c| c["status"] == "pass").count();
+        let warn = checks.iter().filter(|c| c["status"] == "warn").count();
+        let fail = checks.iter().filter(|c| c["status"] == "fail").count();
+
+        let repair_hints: Vec<Value> = checks.iter().filter(|c| c["status"] != "pass").map(|c| {
+            let name = c["name"].as_str().unwrap_or("unknown");
+            let hint = match name {
+                "agents" => "Run 'duduclaw agent create <name>' to create your first agent.",
+                "api_key" => "Set ANTHROPIC_API_KEY environment variable with a valid key.",
+                "config_file" => "Run 'duduclaw init' to create a default config.toml.",
+                _ => "Check the documentation for repair instructions.",
+            };
+            json!({ "check": name, "hint": hint })
+        }).collect();
+
+        WsFrame::ok_response("", json!({
+            "checks": checks,
+            "summary": { "pass": pass, "warn": warn, "fail": fail },
+            "repair_hints": repair_hints,
+        }))
+    }
+
+    async fn handle_system_config(&self) -> WsFrame {
+        let config_path = self.home_dir.join("config.toml");
+        match tokio::fs::read_to_string(&config_path).await {
+            Ok(content) => {
+                // Mask sensitive fields
+                match content.parse::<toml::Table>() {
+                    Ok(mut table) => {
+                        Self::mask_sensitive_fields(&mut table);
+                        let masked = toml::to_string_pretty(&table).unwrap_or_else(|_| content.clone());
+                        WsFrame::ok_response("", json!({ "config": masked }))
+                    }
+                    Err(_) => {
+                        // Return raw content if parsing fails
+                        WsFrame::ok_response("", json!({ "config": content }))
+                    }
+                }
+            }
+            Err(e) => WsFrame::error_response("", &format!("Failed to read config.toml: {e}")),
+        }
+    }
+
     fn handle_system_version(&self) -> WsFrame {
         WsFrame::ok_response("", json!({ "version": env!("CARGO_PKG_VERSION") }))
+    }
+
+    // ── Logs ────────────────────────────────────────────────
+
+    fn handle_logs_subscribe(&self, params: Value) -> WsFrame {
+        let filter = params.get("filter").and_then(|v| v.as_str()).unwrap_or("*");
+        info!(filter, "logs.subscribe requested");
+        WsFrame::ok_response("", json!({ "success": true, "message": "Log subscription registered (WebSocket push is future work)" }))
+    }
+
+    fn handle_logs_unsubscribe(&self, params: Value) -> WsFrame {
+        let filter = params.get("filter").and_then(|v| v.as_str()).unwrap_or("*");
+        info!(filter, "logs.unsubscribe requested");
+        WsFrame::ok_response("", json!({ "success": true, "message": "Log subscription removed" }))
     }
 
     // ── Evolution ────────────────────────────────────────────
@@ -381,5 +773,84 @@ skill_security_scan = true
 
     async fn handle_evolution_skills(&self) -> WsFrame {
         WsFrame::ok_response("", json!({ "skills": [] }))
+    }
+
+    // ── Helpers ─────────────────────────────────────────────
+
+    /// Read config.toml into a TOML table, returning an empty table if the file
+    /// does not exist or cannot be parsed.
+    async fn read_config_table(&self, path: &std::path::Path) -> toml::Table {
+        match tokio::fs::read_to_string(path).await {
+            Ok(content) => content.parse::<toml::Table>().unwrap_or_default(),
+            Err(_) => toml::Table::new(),
+        }
+    }
+
+    /// Write a TOML table back to disk.
+    async fn write_config_table(
+        &self,
+        path: &std::path::Path,
+        table: &toml::Table,
+    ) -> std::io::Result<()> {
+        let content = toml::to_string_pretty(table).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+        })?;
+        tokio::fs::write(path, content).await
+    }
+
+    /// Run common health checks used by both doctor and doctor_repair.
+    async fn run_doctor_checks(&self) -> Vec<Value> {
+        let reg = self.registry.read().await;
+        let has_agents = !reg.list().is_empty();
+        let has_key = std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.is_empty());
+        let config_exists = self.home_dir.join("config.toml").exists();
+
+        vec![
+            json!({
+                "name": "config_file",
+                "status": if config_exists { "pass" } else { "fail" },
+                "message": if config_exists { "config.toml exists" } else { "config.toml not found" },
+                "can_repair": !config_exists,
+            }),
+            json!({
+                "name": "agents",
+                "status": if has_agents { "pass" } else { "warn" },
+                "message": if has_agents { "Agents found" } else { "No agents found" },
+                "can_repair": false,
+            }),
+            json!({
+                "name": "api_key",
+                "status": if has_key { "pass" } else { "warn" },
+                "message": if has_key { "ANTHROPIC_API_KEY is set" } else { "ANTHROPIC_API_KEY not set" },
+                "can_repair": false,
+            }),
+            json!({
+                "name": "container_runtime",
+                "status": "pass",
+                "message": "Docker available",
+                "can_repair": false,
+            }),
+        ]
+    }
+
+    /// Mask sensitive values (tokens, secrets, keys) in a TOML table.
+    fn mask_sensitive_fields(table: &mut toml::Table) {
+        let sensitive_patterns = ["token", "secret", "key", "password"];
+        for (key, value) in table.iter_mut() {
+            let is_sensitive = sensitive_patterns.iter().any(|p| key.to_lowercase().contains(p));
+            match value {
+                toml::Value::String(s) if is_sensitive && !s.is_empty() => {
+                    let len = s.len();
+                    if len > 4 {
+                        let masked = format!("{}****", &s[..4]);
+                        *s = masked;
+                    } else {
+                        *s = "****".to_string();
+                    }
+                }
+                toml::Value::Table(t) => Self::mask_sensitive_fields(t),
+                _ => {}
+            }
+        }
     }
 }

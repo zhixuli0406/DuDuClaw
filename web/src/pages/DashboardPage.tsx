@@ -1,7 +1,8 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useSystemStore } from '@/stores/system-store';
+import { api, type BudgetSummary, type DoctorCheck } from '@/lib/api';
 import { Bot, Radio, Wallet, HeartPulse } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -42,13 +43,30 @@ export function DashboardPage() {
   const intl = useIntl();
   const { agents, fetchAgents } = useAgentsStore();
   const { status, fetchStatus } = useSystemStore();
+  const [budget, setBudget] = useState<BudgetSummary | null>(null);
+  const [doctor, setDoctor] = useState<{ checks: DoctorCheck[]; summary: { pass: number; warn: number; fail: number } } | null>(null);
 
   useEffect(() => {
     fetchAgents();
     fetchStatus();
+    api.accounts.budgetSummary().then(setBudget).catch(() => {});
+    api.system.doctor().then(setDoctor).catch(() => {});
   }, [fetchAgents, fetchStatus]);
 
   const activeAgents = agents.filter((a) => a.status === 'active').length;
+  const totalBudget = budget?.total_budget_cents ?? 0;
+  const totalSpent = budget?.total_spent_cents ?? 0;
+
+  const healthValue = doctor
+    ? `${doctor.summary.pass}/${doctor.checks.length}`
+    : '—';
+  const healthSubtitle = doctor
+    ? doctor.summary.fail > 0
+      ? `${doctor.summary.fail} 項失敗`
+      : doctor.summary.warn > 0
+        ? `${doctor.summary.warn} 項警告`
+        : intl.formatMessage({ id: 'dashboard.health.allPassed' })
+    : intl.formatMessage({ id: 'common.loading' });
 
   return (
     <div className="space-y-6">
@@ -62,37 +80,54 @@ export function DashboardPage() {
           icon={Bot}
           title={intl.formatMessage({ id: 'dashboard.agents.title' })}
           value={agents.length}
-          subtitle={intl.formatMessage(
-            { id: 'dashboard.agents.active' },
-            { count: activeAgents }
-          )}
+          subtitle={intl.formatMessage({ id: 'dashboard.agents.active' }, { count: activeAgents })}
           color="bg-amber-500"
         />
         <StatCard
           icon={Radio}
           title={intl.formatMessage({ id: 'dashboard.channels.title' })}
           value={status?.channels_connected ?? 0}
-          subtitle={intl.formatMessage(
-            { id: 'dashboard.channels.connected' },
-            { count: status?.channels_connected ?? 0 }
-          )}
+          subtitle={intl.formatMessage({ id: 'dashboard.channels.connected' }, { count: status?.channels_connected ?? 0 })}
           color="bg-emerald-500"
         />
         <StatCard
           icon={Wallet}
           title={intl.formatMessage({ id: 'dashboard.budget.title' })}
-          value="$0.00"
-          subtitle="/ $100.00"
+          value={`$${(totalSpent / 100).toFixed(2)}`}
+          subtitle={`/ $${(totalBudget / 100).toFixed(2)}`}
           color="bg-orange-400"
         />
         <StatCard
           icon={HeartPulse}
           title={intl.formatMessage({ id: 'dashboard.health.title' })}
-          value="-"
-          subtitle={intl.formatMessage({ id: 'dashboard.health.allPassed' })}
-          color="bg-rose-500"
+          value={healthValue}
+          subtitle={healthSubtitle}
+          color={doctor?.summary.fail ? 'bg-rose-500' : doctor?.summary.warn ? 'bg-amber-500' : 'bg-emerald-500'}
         />
       </div>
+
+      {/* Doctor Checks */}
+      {doctor && (
+        <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+          <h3 className="mb-4 text-lg font-medium text-stone-900 dark:text-stone-50">
+            {intl.formatMessage({ id: 'dashboard.health.title' })}
+          </h3>
+          <div className="space-y-2">
+            {doctor.checks.map((check) => (
+              <div key={check.name} className="flex items-center justify-between rounded-lg bg-stone-50 px-4 py-2.5 dark:bg-stone-800/50">
+                <span className="text-sm text-stone-700 dark:text-stone-300">{check.name}</span>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-stone-500 dark:text-stone-400">{check.message}</span>
+                  <span className={cn(
+                    'inline-block h-2 w-2 rounded-full',
+                    check.status === 'pass' ? 'bg-emerald-500' : check.status === 'warn' ? 'bg-amber-500' : 'bg-rose-500'
+                  )} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Activity Feed */}
       <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">

@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type MemoryEntry, type SkillInfo } from '@/lib/api';
@@ -157,8 +157,20 @@ function SkillsTab() {
   const fetchSkills = useCallback(async () => {
     setLoading(true);
     try {
-      const result = await api.skills.list();
-      setSkills(result.skills);
+      const result = await api.skills.list() as Record<string, unknown>;
+      // When no agent_id, backend returns { agents: [{ agent_id, skills }] }
+      // When with agent_id, returns { skills: [...] }
+      if (Array.isArray(result.skills)) {
+        setSkills(result.skills as SkillInfo[]);
+      } else if (Array.isArray(result.agents)) {
+        const all: SkillInfo[] = [];
+        for (const ag of result.agents as Array<{ agent_id: string; skills: Array<{ name: string; size: number }> }>) {
+          for (const s of ag.skills) {
+            all.push({ name: s.name, agent_id: ag.agent_id, content: '', security_status: undefined });
+          }
+        }
+        setSkills(all);
+      }
     } catch {
       // error handled silently
     } finally {
@@ -166,10 +178,9 @@ function SkillsTab() {
     }
   }, []);
 
-  // Fetch on mount
-  useState(() => {
+  useEffect(() => {
     fetchSkills();
-  });
+  }, [fetchSkills]);
 
   const securityStyles: Record<string, string> = {
     pass: 'text-emerald-600 dark:text-emerald-400',

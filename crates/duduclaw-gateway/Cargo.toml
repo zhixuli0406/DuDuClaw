@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 duduclaw-core = { workspace = true }
 duduclaw-agent = { workspace = true }
+duduclaw-memory = { workspace = true }
+chrono = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
