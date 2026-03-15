@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use duduclaw_agent::registry::AgentRegistry;
@@ -27,6 +27,16 @@ impl MethodHandler {
             registry: Arc::new(RwLock::new(registry)),
             home_dir,
         }
+    }
+
+    /// Get a reference to the shared agent registry.
+    pub fn registry(&self) -> &Arc<RwLock<AgentRegistry>> {
+        &self.registry
+    }
+
+    /// Get the home directory path.
+    pub fn home_dir(&self) -> &Path {
+        &self.home_dir
     }
 
     /// Route `method` to the correct handler and return a [`WsFrame`] response.

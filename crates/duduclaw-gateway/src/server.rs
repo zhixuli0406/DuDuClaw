@@ -37,9 +37,19 @@ struct AppState {
 pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Result<()> {
     let (tx, _rx) = broadcast::channel::<String>(100);
 
+    let home_dir = config.home_dir.clone();
+    let handler = MethodHandler::new(config.home_dir).await;
+
+    // Start Telegram bot if configured
+    let _telegram_handle = crate::telegram::start_telegram_bot(
+        &home_dir,
+        handler.registry().clone(),
+    )
+    .await;
+
     let state = Arc::new(AppState {
         auth: AuthManager::new(config.auth_token),
-        handler: MethodHandler::new(config.home_dir).await,
+        handler,
         tx,
     });
 
