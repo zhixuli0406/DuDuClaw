@@ -630,7 +630,7 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
             .and_then(|p| p.parse().ok())
             .unwrap_or(18789),
         auth_token: None,
-        agents_dir: home.join("agents"),
+        home_dir: home,
     };
 
     duduclaw_gateway::start_gateway(config).await

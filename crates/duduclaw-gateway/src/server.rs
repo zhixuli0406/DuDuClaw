@@ -22,8 +22,8 @@ pub struct GatewayConfig {
     /// Optional authentication token.  When `None`, authentication is
     /// disabled.
     pub auth_token: Option<String>,
-    /// Path to the agents directory (e.g. `~/.duduclaw/agents`).
-    pub agents_dir: std::path::PathBuf,
+    /// Path to the DuDuClaw home directory (e.g. `~/.duduclaw`).
+    pub home_dir: std::path::PathBuf,
 }
 
 /// Internal shared state for the Axum application.
@@ -39,7 +39,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     let state = Arc::new(AppState {
         auth: AuthManager::new(config.auth_token),
-        handler: MethodHandler::new(config.agents_dir).await,
+        handler: MethodHandler::new(config.home_dir).await,
         tx,
     });
 

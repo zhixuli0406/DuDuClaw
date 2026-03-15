@@ -11,16 +11,19 @@ use crate::protocol::WsFrame;
 /// Dispatches incoming RPC methods to the appropriate handler.
 pub struct MethodHandler {
     registry: Arc<RwLock<AgentRegistry>>,
+    home_dir: PathBuf,
 }
 
 impl MethodHandler {
-    pub async fn new(agents_dir: PathBuf) -> Self {
+    pub async fn new(home_dir: PathBuf) -> Self {
+        let agents_dir = home_dir.join("agents");
         let mut registry = AgentRegistry::new(agents_dir);
         if let Err(e) = registry.scan().await {
             tracing::warn!("Failed to scan agents directory: {e}");
         }
         Self {
             registry: Arc::new(RwLock::new(registry)),
+            home_dir,
         }
     }
 
@@ -295,8 +298,31 @@ skill_security_scan = true
     // ── Channels ─────────────────────────────────────────────
 
     async fn handle_channels_status(&self) -> WsFrame {
-        // TODO: read from actual channel registry
-        WsFrame::ok_response("", json!({ "channels": [] }))
+        let config_path = self.home_dir.join("config.toml");
+        let mut channels = Vec::new();
+
+        if let Ok(content) = tokio::fs::read_to_string(&config_path).await
+            && let Ok(config) = content.parse::<toml::Table>()
+            && let Some(ch) = config.get("channels").and_then(|v| v.as_table())
+        {
+            let token_map = [
+                ("line_channel_token", "line"),
+                ("telegram_bot_token", "telegram"),
+                ("discord_bot_token", "discord"),
+            ];
+            for (key, name) in token_map {
+                if ch.get(key).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
+                    channels.push(json!({
+                        "name": name,
+                        "connected": false,
+                        "last_connected": null,
+                        "error": null,
+                    }));
+                }
+            }
+        }
+
+        WsFrame::ok_response("", json!({ "channels": channels }))
     }
 
     // ── Accounts ─────────────────────────────────────────────
