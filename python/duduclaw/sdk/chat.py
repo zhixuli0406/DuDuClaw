@@ -1,10 +1,11 @@
-"""Claude Code SDK chat interface.
+"""Claude Code SDK chat interface with tool use (web search + curl).
 
 Called by the Rust gateway as a subprocess:
     python -m duduclaw.sdk.chat --model MODEL --system-prompt-file PATH
 
 Reads user message from stdin, writes AI response to stdout.
 Uses AccountRotator for multi-account rotation and budget tracking.
+Supports tools: web_search (via DuckDuckGo) and curl (fetch URL content).
 """
 
 import argparse
@@ -12,11 +13,162 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import sys
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# ── Tool definitions for Claude API ──────────────────────────
+
+TOOLS = [
+    {
+        "name": "web_search",
+        "description": "Search the web using DuckDuckGo. Returns search results with titles, URLs, and snippets. Use this when you need current information, facts, or to look up something you don't know.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query",
+                }
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "curl",
+        "description": "Fetch the content of a URL. Returns the text content of a web page. Use this to read articles, documentation, or any web content.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to fetch",
+                },
+                "max_length": {
+                    "type": "integer",
+                    "description": "Maximum number of characters to return (default 5000)",
+                },
+            },
+            "required": ["url"],
+        },
+    },
+]
+
+
+# ── Tool implementations ─────────────────────────────────────
+
+def tool_web_search(query: str) -> str:
+    """Search using DuckDuckGo HTML and parse results."""
+    try:
+        encoded = urllib.parse.quote_plus(query)
+        url = f"https://html.duckduckgo.com/html/?q={encoded}"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "DuDuClaw/0.2 (AI Assistant)"
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+
+        # Simple HTML parsing — extract result snippets
+        results = []
+        chunks = html.split('class="result__a"')
+        for chunk in chunks[1:6]:  # top 5 results
+            # Extract title
+            title_end = chunk.find("</a>")
+            title_text = chunk[:title_end] if title_end > 0 else ""
+            title_text = _strip_html(title_text.split(">")[-1] if ">" in title_text else title_text)
+
+            # Extract URL
+            href = ""
+            if 'href="' in chunk:
+                href_start = chunk.index('href="') + 6
+                href_end = chunk.index('"', href_start)
+                href = chunk[href_start:href_end]
+                # DuckDuckGo redirects
+                if "uddg=" in href:
+                    href = urllib.parse.unquote(href.split("uddg=")[-1].split("&")[0])
+
+            # Extract snippet
+            snippet = ""
+            if 'class="result__snippet"' in chunk:
+                snip_start = chunk.index('class="result__snippet"')
+                snip_chunk = chunk[snip_start:]
+                snip_start2 = snip_chunk.find(">") + 1
+                snip_end = snip_chunk.find("</")
+                if snip_end > snip_start2:
+                    snippet = _strip_html(snip_chunk[snip_start2:snip_end])
+
+            if title_text:
+                results.append(f"**{title_text}**\n{href}\n{snippet}")
+
+        if not results:
+            return f"No results found for: {query}"
+
+        return "\n\n---\n\n".join(results)
+
+    except Exception as e:
+        return f"Search error: {e}"
+
+
+def tool_curl(url: str, max_length: int = 5000) -> str:
+    """Fetch URL content using subprocess curl."""
+    try:
+        result = subprocess.run(
+            ["curl", "-sL", "--max-time", "10", "-A", "DuDuClaw/0.2", url],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        content = result.stdout
+
+        if not content:
+            return f"Empty response from {url}"
+
+        # Strip HTML tags for readability
+        text = _strip_html(content)
+
+        # Collapse whitespace
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        text = "\n".join(lines)
+
+        if len(text) > max_length:
+            text = text[:max_length] + f"\n\n[... truncated, {len(content)} chars total]"
+
+        return text
+
+    except subprocess.TimeoutExpired:
+        return f"Timeout fetching {url}"
+    except Exception as e:
+        return f"Curl error: {e}"
+
+
+def _strip_html(html: str) -> str:
+    """Remove HTML tags from a string."""
+    import re
+    text = re.sub(r"<[^>]+>", "", html)
+    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    text = text.replace("&quot;", '"').replace("&#39;", "'").replace("&nbsp;", " ")
+    return text.strip()
+
+
+def execute_tool(name: str, input_data: dict) -> str:
+    """Execute a tool and return the result."""
+    if name == "web_search":
+        return tool_web_search(input_data.get("query", ""))
+    elif name == "curl":
+        return tool_curl(
+            input_data.get("url", ""),
+            input_data.get("max_length", 5000),
+        )
+    return f"Unknown tool: {name}"
+
+
+# ── Chat with tool use loop ──────────────────────────────────
+
+MAX_TOOL_ROUNDS = 5
 
 async def chat(
     model: str,
@@ -24,32 +176,67 @@ async def chat(
     user_message: str,
     api_key: str,
 ) -> str:
-    """Send a message to Claude via the Anthropic SDK and return the response."""
+    """Send a message to Claude with tool use support."""
     try:
         import anthropic
     except ImportError:
         return "(錯誤：anthropic 套件未安裝，請執行 pip install anthropic)"
 
     client = anthropic.Anthropic(api_key=api_key)
+    messages = [{"role": "user", "content": user_message}]
 
     try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=2048,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_message}],
-        )
+        for _round in range(MAX_TOOL_ROUNDS):
+            response = client.messages.create(
+                model=model,
+                max_tokens=4096,
+                system=system_prompt,
+                messages=messages,
+                tools=TOOLS,
+            )
 
-        # Extract text from response
-        texts = []
-        for block in response.content:
-            if hasattr(block, "text"):
-                texts.append(block.text)
+            # Check if Claude wants to use tools
+            if response.stop_reason == "tool_use":
+                # Collect all tool uses and results
+                assistant_content = []
+                tool_results = []
 
-        if not texts:
-            return "（AI 沒有產生回覆）"
+                for block in response.content:
+                    if block.type == "tool_use":
+                        logger.info("🔧 Tool call: %s(%s)", block.name, json.dumps(block.input, ensure_ascii=False)[:100])
+                        result = execute_tool(block.name, block.input)
+                        assistant_content.append({
+                            "type": "tool_use",
+                            "id": block.id,
+                            "name": block.name,
+                            "input": block.input,
+                        })
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result,
+                        })
+                    elif block.type == "text":
+                        assistant_content.append({
+                            "type": "text",
+                            "text": block.text,
+                        })
 
-        return "\n".join(texts)
+                # Add assistant message with tool uses
+                messages.append({"role": "assistant", "content": assistant_content})
+                # Add tool results
+                messages.append({"role": "user", "content": tool_results})
+                continue  # Let Claude process the tool results
+
+            # No more tool calls — extract final text
+            texts = []
+            for block in response.content:
+                if hasattr(block, "text"):
+                    texts.append(block.text)
+
+            return "\n".join(texts) if texts else "（AI 沒有產生回覆）"
+
+        return "（工具呼叫次數超過上限）"
 
     except anthropic.AuthenticationError:
         return "（錯誤：API Key 無效，請檢查設定）"
