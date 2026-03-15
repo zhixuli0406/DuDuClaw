@@ -1,0 +1,9 @@
+[package]
+name = "duduclaw-dashboard"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }

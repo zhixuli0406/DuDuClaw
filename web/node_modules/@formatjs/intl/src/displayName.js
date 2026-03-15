@@ -1,0 +1,24 @@
+import "./types.js";
+import { filterProps } from "./utils.js";
+import { ErrorCode, FormatError } from "intl-messageformat";
+import { IntlFormatError } from "./error.js";
+const DISPLAY_NAMES_OPTONS = [
+	"style",
+	"type",
+	"fallback",
+	"languageDisplay"
+];
+export function formatDisplayName({ locale, onError }, getDisplayNames, value, options) {
+	const DisplayNames = Intl.DisplayNames;
+	if (!DisplayNames) {
+		onError(new FormatError(`Intl.DisplayNames is not available in this environment.
+Try polyfilling it using "@formatjs/intl-displaynames"
+`, ErrorCode.MISSING_INTL_API));
+	}
+	const filteredOptions = filterProps(options, DISPLAY_NAMES_OPTONS);
+	try {
+		return getDisplayNames(locale, filteredOptions).of(value);
+	} catch (e) {
+		onError(new IntlFormatError("Error formatting display name.", locale, e));
+	}
+}
