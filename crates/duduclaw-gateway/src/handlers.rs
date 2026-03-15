@@ -482,7 +482,7 @@ skill_security_scan = true
     // ── Accounts ─────────────────────────────────────────────
 
     async fn handle_accounts_list(&self) -> WsFrame {
-        let has_key = std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.is_empty());
+        let has_key = self.has_api_key().await;
         let mut accounts = Vec::new();
         if has_key {
             accounts.push(json!({
@@ -503,7 +503,7 @@ skill_security_scan = true
             total_budget += a.config.budget.monthly_limit_cents;
         }
 
-        let has_key = std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.is_empty());
+        let has_key = self.has_api_key().await;
         let accounts: Vec<Value> = if has_key {
             vec![json!({
                 "id": "main",
@@ -531,7 +531,7 @@ skill_security_scan = true
     }
 
     async fn handle_accounts_health(&self) -> WsFrame {
-        let has_key = std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.is_empty());
+        let has_key = self.has_api_key().await;
         let status = if has_key { "healthy" } else { "missing_key" };
         WsFrame::ok_response("", json!({
             "status": status,
@@ -807,6 +807,28 @@ skill_security_scan = true
 
     // ── Helpers ─────────────────────────────────────────────
 
+    /// Check if an API key is available (from env var or config.toml [api] section).
+    async fn has_api_key(&self) -> bool {
+        // 1. Check environment variable
+        if std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.is_empty()) {
+            return true;
+        }
+        // 2. Check config.toml [api] section
+        let table = self.read_config_table(&self.home_dir.join("config.toml")).await;
+        if let Some(api) = table.get("api").and_then(|v| v.as_table())
+            && api.get("anthropic_api_key").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+        {
+            return true;
+        }
+        // 3. Check accounts in config.toml
+        if let Some(accounts) = table.get("accounts")
+            && let Some(arr) = accounts.as_array()
+        {
+            return !arr.is_empty();
+        }
+        false
+    }
+
     /// Read config.toml into a TOML table, returning an empty table if the file
     /// does not exist or cannot be parsed.
     async fn read_config_table(&self, path: &std::path::Path) -> toml::Table {
@@ -832,7 +854,7 @@ skill_security_scan = true
     async fn run_doctor_checks(&self) -> Vec<Value> {
         let reg = self.registry.read().await;
         let has_agents = !reg.list().is_empty();
-        let has_key = std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.is_empty());
+        let has_key = self.has_api_key().await;
         let config_exists = self.home_dir.join("config.toml").exists();
 
         vec![

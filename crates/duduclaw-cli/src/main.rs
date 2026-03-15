@@ -478,6 +478,9 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
 default_agent = "{agent_name}"
 log_level = "info"
 
+[api]
+anthropic_api_key = "{api_key}"
+
 [gateway]
 bind = "{gw_bind}"
 port = {gw_port}
