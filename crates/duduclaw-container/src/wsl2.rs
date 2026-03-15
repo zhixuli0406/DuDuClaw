@@ -3,18 +3,21 @@ use duduclaw_core::error::{DuDuClawError, Result};
 use duduclaw_core::traits::ContainerRuntime;
 use duduclaw_core::types::*;
 use std::time::Duration;
+#[cfg(target_os = "windows")]
 use tracing::info;
 
 /// WSL2 Direct runtime for Windows.
 ///
 /// Executes containers through WSL2 without Docker Desktop by
 /// forwarding docker commands via `wsl.exe -d <distro> -- docker ...`.
+#[allow(dead_code)]
 pub struct Wsl2Runtime {
     distro: String,
     wsl_binary: std::path::PathBuf,
 }
 
 impl Wsl2Runtime {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let distro =
             Self::detect_best_distro().unwrap_or_else(|| "Ubuntu-24.04".to_string());

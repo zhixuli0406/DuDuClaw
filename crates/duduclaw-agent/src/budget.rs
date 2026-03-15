@@ -120,7 +120,7 @@ impl BudgetManager {
     /// Get budget status for an agent.
     pub async fn status(&self, agent_id: &str) -> Option<BudgetStatus> {
         let trackers = self.trackers.read().await;
-        trackers.get(agent_id).map(|t| budget_status_from_tracker(t))
+        trackers.get(agent_id).map(budget_status_from_tracker)
     }
 
     /// Get all agents' budget status.
@@ -128,7 +128,7 @@ impl BudgetManager {
         let trackers = self.trackers.read().await;
         trackers
             .values()
-            .map(|t| budget_status_from_tracker(t))
+            .map(budget_status_from_tracker)
             .collect()
     }
 }

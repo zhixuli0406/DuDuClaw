@@ -42,15 +42,15 @@ impl MessageRouter {
     /// 3. Fall back to default agent
     pub fn route(&self, message: &Message) -> Vec<String> {
         // 1. Check if channel has specific routes
-        if let Some(agents) = self.routes.get(&message.channel) {
-            if !agents.is_empty() {
-                debug!(
-                    channel = %message.channel,
-                    agents = ?agents,
-                    "Routed by channel"
-                );
-                return agents.clone();
-            }
+        if let Some(agents) = self.routes.get(&message.channel)
+            && !agents.is_empty()
+        {
+            debug!(
+                channel = %message.channel,
+                agents = ?agents,
+                "Routed by channel"
+            );
+            return agents.clone();
         }
 
         // 2. Check trigger words in message text — scan all routes for

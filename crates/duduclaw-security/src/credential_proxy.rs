@@ -97,6 +97,7 @@ impl CredentialProxy {
     }
 
     /// Constant-time comparison to prevent timing attacks.
+    #[allow(dead_code)]
     fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
         if a.len() != b.len() {
             return false;

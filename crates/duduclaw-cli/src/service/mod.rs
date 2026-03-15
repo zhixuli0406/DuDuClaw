@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+
+#[allow(unused_imports)]
 use duduclaw_core::error::{DuDuClawError, Result};
 
 /// Actions that can be performed on the background service.

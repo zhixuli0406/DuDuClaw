@@ -20,12 +20,33 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build (exclude bridge)
-        run: cargo build --workspace --exclude duduclaw-bridge
-      - name: Test (exclude bridge)
-        run: cargo test --workspace --exclude duduclaw-bridge
+      - name: Build
+        run: cargo build --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard
+      - name: Test
+        run: cargo test --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard
       - name: Clippy
-        run: cargo clippy --workspace --exclude duduclaw-bridge -- -D warnings
+        run: cargo clippy --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard -- -D warnings
+
+  dashboard:
+    name: Dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install frontend dependencies
+        run: cd web && npm ci
+      - name: TypeScript check
+        run: cd web && npx tsc --noEmit
+      - name: Build frontend
+        run: cd web && npm run build
+      - name: Build dashboard crate
+        run: cargo build -p duduclaw-dashboard -p duduclaw-gateway
 
   python:
     name: Python
