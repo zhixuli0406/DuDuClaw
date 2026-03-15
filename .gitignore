@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+*.pdb
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.env
+*.key
+*.db
+*.db-shm
+*.db-wal
+.venv/
