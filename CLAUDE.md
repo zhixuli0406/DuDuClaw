@@ -1,9 +1,20 @@
 # DuDuClaw Project Guidelines
 
+## Architecture Overview (v0.4.0)
+
+DuDuClaw is a **Claude Code extension layer** — not a standalone AI platform. The AI brain is Claude Code SDK (`claude` CLI); DuDuClaw provides the plumbing: channel routing, session management, memory, evolution, and multi-account rotation.
+
+Key architectural decisions:
+- **MCP Server** (`duduclaw mcp-server`) exposes channel and memory tools to Claude Code via JSON-RPC 2.0 over stdin/stdout
+- **Agent directories** are Claude Code compatible: each contains `.claude/`, `SOUL.md`, `CLAUDE.md`, `.mcp.json`
+- **Session Manager** persists conversations in SQLite with 50k token auto-compression
+- **Python subprocess** bridge for Claude Code SDK chat and evolution engine
+- **Three channels**: Telegram (long polling), LINE (webhook), Discord (Gateway WebSocket)
+
 ## Design Context
 
 ### Users
-DuDuClaw is a **personal AI assistant platform** for individual developers and power users, primarily in Taiwan (zh-TW). Users interact through a web dashboard to manage multiple AI agents, monitor channels (LINE/Telegram/Discord), track API budgets, and observe their agents' self-evolution. They expect a tool that feels like a trusted companion — not a cold enterprise console.
+DuDuClaw is a **Claude Code extension layer** for individual developers and power users, primarily in Taiwan (zh-TW). Users interact through a web dashboard to manage AI agents, monitor channels (LINE/Telegram/Discord), track API budgets, and observe agent self-evolution. They expect a tool that feels like a trusted companion — not a cold enterprise console.
 
 ### Brand Personality
 **Professional · Efficient · Precise** — with a warm, approachable surface.

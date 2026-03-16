@@ -1,193 +1,79 @@
 # DuDuClaw 🐾
 
-> **Multi-Agent AI Assistant Platform** — 讓 AI 助理在安全容器中自主進化
+> **Claude Code Extension Layer** — 讓 Claude Code 成為你的多通道 AI 助理
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 
 ---
 
 ## 什麼是 DuDuClaw？
 
-DuDuClaw 是一個**個人 AI 助理平台**，讓你在本機或伺服器上運行多個 AI Agent，每個 Agent 都在安全隔離的容器中執行，並透過 LINE、Telegram、Discord 等通道與你互動。
+DuDuClaw **不是**一個獨立的 AI 平台。它是 **Claude Code 的擴充層 (extension layer)**——替 Claude Code 接上通訊通道、記憶、進化與帳號管理能力。
 
-核心特色：
-- **多 Agent 架構** — 同時運行多個專精 Agent（主助理、程式專家、研究員…），各有獨立人格與技能
-- **安全容器隔離** — 每個 Agent 在 Docker / Apple Container / WSL2 容器中執行，敏感資料永遠不進容器
-- **自主進化** — Agent 透過三層反思系統自動學習與改進，產出的技能經安全掃描後才啟用
-- **多帳號輪替** — 智慧管理多個 Claude API 帳號，自動切換、預算控管、故障轉移
-- **OpenClaw 相容** — WebSocket RPC 協議相容 OpenClaw 生態，可直接使用現有客戶端
-- **Web Dashboard** — 內建溫暖風格的管理介面，即時監控所有 Agent 與通道狀態
+核心概念：
+
+- **Brain = Claude Code SDK** — AI 對話由 `claude` CLI 處理，享受內建的 bash、web search、file ops 等工具
+- **Plumbing = DuDuClaw** — 負責通道路由、session 管理、記憶搜尋、帳號輪替等基礎設施
+- **橋接 = MCP Protocol** — `duduclaw mcp-server` 作為 MCP Server，將通道與記憶工具暴露給 Claude Code
+
+```
+Claude Code SDK (brain)
+  ↕ MCP Protocol (JSON-RPC 2.0, stdin/stdout)
+DuDuClaw (plumbing)
+  ├─ Channel Router — Telegram (polling) / LINE (webhook) / Discord (Gateway WebSocket)
+  ├─ Session Manager — SQLite, 50k token 自動壓縮
+  ├─ MCP Server — send_message, send_photo, web_search, memory_search, memory_store …
+  ├─ Evolution Engine — Micro / Meso / Macro 三層反思
+  ├─ Account Rotator — 多 API key 輪替、預算追蹤、健康檢查
+  └─ Web Dashboard — React SPA, 透過 rust-embed 嵌入 binary
+```
 
 ---
 
-## 系統架構
+## 核心特色
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    DuDuClaw Server                       │
-│                                                         │
-│  ┌────────────────── Rust Core ──────────────────────┐  │
-│  │                                                   │  │
-│  │  Gateway (Axum)    Message Bus    Agent Registry   │  │
-│  │  ├ WebSocket RPC   ├ broadcast    ├ 資料夾掃描     │  │
-│  │  ├ HTTP API        ├ mpsc         ├ 觸發詞路由     │  │
-│  │  └ Web Dashboard   └ 事件分發     └ 權限檢查       │  │
-│  │                                                   │  │
-│  │  ┌─────────── Security Layer ──────────────────┐  │  │
-│  │  │ Credential Proxy │ Mount Guard │ RBAC │ Rate │  │  │
-│  │  └─────────────────────────────────────────────┘  │  │
-│  │                                                   │  │
-│  │  Memory Engine     Container Manager   Heartbeat  │  │
-│  │  (SQLite+FTS5+Vec) (Docker/Apple/WSL2) Scheduler  │  │
-│  └───────────────────────────────────────────────────┘  │
-│                                                         │
-│  ┌────────────── Python Extension (PyO3) ────────────┐  │
-│  │  Channels          Evolution Engine   Claude SDK   │  │
-│  │  ├ LINE            ├ Micro Reflect    Rotator      │  │
-│  │  ├ Telegram        ├ Meso Reflect     ├ 多帳號     │  │
-│  │  └ Discord         ├ Macro Reflect    ├ 預算追蹤   │  │
-│  │                    └ Skill Vetter     └ 健康檢查   │  │
-│  └───────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Rust Crates（9 個）
-
-| Crate | 職責 |
-|-------|------|
-| `duduclaw-core` | 共用型別、traits（Channel, ContainerRuntime, MemoryEngine）、錯誤定義 |
-| `duduclaw-agent` | Agent 註冊、資料夾掃描、agent.toml 解析、IPC、心跳排程、預算控管 |
-| `duduclaw-container` | Docker (bollard)、Apple Container、WSL2 Direct 容器管理 |
-| `duduclaw-security` | AES-256-GCM 加密、Credential Proxy、Mount Guard、RBAC、滑動視窗限流 |
-| `duduclaw-memory` | SQLite + FTS5 全文搜尋 + 向量嵌入 cosine similarity |
-| `duduclaw-gateway` | Axum WebSocket RPC (OpenClaw 相容)、token 認證、HTTP API |
-| `duduclaw-bus` | tokio broadcast + mpsc 訊息路由 |
-| `duduclaw-bridge` | PyO3 Rust↔Python 橋接層 |
-| `duduclaw-cli` | clap CLI (onboard, agent, gateway, doctor, status, service) |
-| `duduclaw-dashboard` | rust-embed 嵌入 React SPA |
-
-### Python 模組
-
-| 模組 | 職責 |
+| 特色 | 說明 |
 |------|------|
-| `channels/` | LINE、Telegram、Discord 通道插件 + 自動發現 |
-| `sdk/` | Claude API 多帳號輪替（4 種策略）+ 預算追蹤 + 健康檢查 |
-| `evolution/` | 三層反思系統（Micro/Meso/Macro）+ Skill Vetter 安全掃描 |
-| `tools/` | Agent 動態管理工具（create/delegate/pause/resume） |
+| **MCP Server 架構** | `duduclaw mcp-server` 提供 10+ 工具給 Claude Code，包括 send_message、send_photo、send_sticker、web_search、send_to_agent、memory_search、memory_store 等 |
+| **三通道支援** | Telegram (long polling)、LINE (webhook)、Discord (Gateway WebSocket) |
+| **Session 管理** | SQLite 持久化對話歷程，超過 50k token 自動壓縮摘要 |
+| **自主進化引擎** | Micro（每次對話後）→ Meso（每小時心跳）→ Macro（每日排程）三層反思 |
+| **多帳號輪替** | Python SDK 管理多個 Claude API key，支援 4 種策略 + 預算追蹤 + 故障轉移 |
+| **Claude Code 原生目錄** | Agent 目錄包含 `.claude/`、`SOUL.md`、`CLAUDE.md`、`.mcp.json`，直接相容 Claude Code |
+| **Web Dashboard** | React + TypeScript + Tailwind CSS，溫暖 amber 色系，支援深淺色切換 |
 
 ---
 
-## 多 Agent 架構
+## Agent 目錄結構
 
-DuDuClaw 的每個 Agent 都是一個**資料夾**，結構清晰直覺：
+每個 Agent 是一個資料夾，結構與 Claude Code 完全相容：
 
 ```
 ~/.duduclaw/agents/
 ├── dudu/                    # 主 Agent
-│   ├── agent.toml           # 設定（模型、預算、權限、心跳）
+│   ├── .claude/             # Claude Code 設定
+│   │   └── settings.local.json
+│   ├── .mcp.json            # MCP Server 設定（指向 duduclaw mcp-server）
 │   ├── SOUL.md              # 人格定義
-│   ├── IDENTITY.md          # 身份（名稱、觸發詞）
-│   ├── MEMORY.md            # 長期記憶
-│   ├── SKILLS/              # 技能集（可自動產生）
-│   │   ├── research.md
-│   │   └── coding.md
+│   ├── CLAUDE.md            # Claude Code 指引
+│   ├── agent.toml           # DuDuClaw 特定設定（模型、預算、心跳）
+│   ├── SKILLS/              # 技能集（可由進化引擎自動產出）
 │   ├── memory/              # 每日筆記
 │   └── state/               # 運行時狀態 (SQLite)
 │
-├── coder/                   # 編碼專家 Agent
-│   ├── agent.toml
-│   ├── SOUL.md
-│   └── SKILLS/
-│       └── rust-patterns.md
-│
-└── researcher/              # 研究員 Agent
+└── coder/                   # 另一個 Agent
     └── ...
 ```
 
-### Agent 路由
-
-```
-訊息進入 → Trigger Router → "@DuDu 幫我..." → dudu agent
-                          → "@Coder 寫個..." → coder agent
-                          → "幫我研究..."    → dudu agent (預設)
-```
-
-### Agent 間通訊（IPC）
-
-Agent 之間透過 JSON 檔案佇列通訊，確保完全隔離：
-
-```
-Agent A → IPC Broker → 權限驗證 → Agent B
-          (JSON file)   ↓
-                     主機 Watcher
-```
-
----
-
-## 安全系統
-
-DuDuClaw 的安全設計遵循**零信任原則**：
-
-| 機制 | 說明 |
-|------|------|
-| **Credential Proxy** | API 金鑰永遠不進容器，透過代理存取 |
-| **Mount Guard** | 白名單掛載、自動阻擋 .ssh/.gnupg/.env、symlink 解析防穿越 |
-| **RBAC Engine** | 權限繼承上限（子 Agent 不可超越建立者）、SOUL.md 防自我修改 |
-| **Rate Limiter** | 每 Agent / 每通道獨立滑動視窗限流 |
-| **Skill Vetter** | 5 大類安全掃描（命令注入、路徑穿越、prompt injection、資源濫用、敏感資料） |
-| **Container Hardening** | 非 root (uid 1000)、唯讀掛載、一次性容器 (--rm) |
-
----
-
-## 自主進化引擎
-
-Agent 透過三層反思系統持續自我改進：
-
-```
-Layer 1: Micro Reflection    每次對話後 → 寫入每日筆記
-Layer 2: Meso Reflection     每小時心跳 → 萃取共同模式 → 更新 MEMORY.md
-Layer 3: Macro Reflection    每日排程   → 審計技能 → 產出進化報告
-
-候選技能 → Skill Vetter 安全掃描
-          ├ PASS → 自動啟用
-          ├ WARN → 啟用但標記
-          └ FAIL → 隔離至 quarantine/
-```
-
----
-
-## Web Dashboard
-
-內建的 Web 管理介面，使用 React + TypeScript + Tailwind CSS 建構，透過 rust-embed 嵌入 Rust binary。
-
-**8 個頁面**：首頁總覽 · Agent 管理 · 通道管理 · 帳號與預算 · 記憶與技能 · 安全設定 · 系統設定 · 即時日誌
-
-**設計風格**：溫暖 amber 色系、Claude.ai + Raycast 風格、支援深淺色切換
-
-```
-duduclaw run → 瀏覽 http://localhost:18789
-```
+使用 `duduclaw migrate` 可將舊版 `agent.toml` 自動轉換為 Claude Code 相容格式（產生 `.claude/`、`CLAUDE.md`、`.mcp.json`）。
 
 ---
 
 ## 安裝
-
-### 一行安裝（推薦）
-
-**macOS / Linux：**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | sh
-```
-
-**Windows (PowerShell)：**
-
-```powershell
-irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.ps1 | iex
-```
 
 ### Homebrew（macOS / Linux）
 
@@ -195,17 +81,10 @@ irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.
 brew install zhixuli0406/tap/duduclaw
 ```
 
-### Cargo + pip（開發者）
+### 一行安裝
 
 ```bash
-cargo install duduclaw-cli
-pip install duduclaw
-```
-
-### Docker 一行部署
-
-```bash
-ANTHROPIC_API_KEY=sk-ant-... docker compose -f docker-compose.quickstart.yml up -d
+curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | sh
 ```
 
 ### 從原始碼建構
@@ -227,18 +106,23 @@ cargo build --release -p duduclaw-cli -p duduclaw-gateway --features duduclaw-ga
 ./target/release/duduclaw run
 ```
 
-> **前置需求（從原始碼建構時）**：[Rust](https://rustup.rs/) 1.85+、[Python](https://www.python.org/) 3.10+、[Node.js](https://nodejs.org/) 20+、[Docker](https://www.docker.com/)
+> **前置需求**：[Rust](https://rustup.rs/) 1.85+、[Python](https://www.python.org/) 3.10+、[Node.js](https://nodejs.org/) 20+、[Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude` CLI)
 
-### CLI 指令
+---
+
+## CLI 指令
 
 ```
 duduclaw onboard         # 互動式首次設定
-duduclaw run             # 一鍵啟動（onboard + doctor + gateway）
+duduclaw run             # 一鍵啟動（onboard + doctor + gateway + channels）
+duduclaw migrate         # 將 agent.toml 轉換為 Claude Code 格式
+duduclaw mcp-server      # 啟動 MCP Server（供 Claude Code 使用）
 duduclaw agent           # CLI 互動式對話
 duduclaw agent list      # 列出所有 Agent
 duduclaw agent create    # 建立新 Agent
+duduclaw agent inspect   # 檢視 Agent 詳情
 duduclaw status          # 系統健康快照
-duduclaw doctor          # 9 項健康診斷
+duduclaw doctor          # 健康診斷
 duduclaw service install # 安裝為系統服務
 ```
 
@@ -248,36 +132,36 @@ duduclaw service install # 安裝為系統服務
 
 ```
 DuDuClaw/
-├── crates/                  # Rust crates (9 個)
-│   ├── duduclaw-core/       # 共用型別、traits
-│   ├── duduclaw-agent/      # Agent 管理 + IPC + 預算
-│   ├── duduclaw-container/  # Docker / Apple / WSL2
-│   ├── duduclaw-security/   # 加密、RBAC、限流
-│   ├── duduclaw-memory/     # SQLite + FTS5 + 向量
-│   ├── duduclaw-gateway/    # WebSocket RPC
-│   ├── duduclaw-bus/        # 訊息路由
-│   ├── duduclaw-bridge/     # PyO3 橋接
-│   ├── duduclaw-cli/        # CLI 入口
-│   └── duduclaw-dashboard/  # Web Dashboard 嵌入
+├── crates/                     # Rust crates (10 個)
+│   ├── duduclaw-core/          # 共用型別、traits (Channel, MemoryEngine)、錯誤定義
+│   ├── duduclaw-agent/         # Agent 註冊、掃描、agent.toml 解析、心跳、預算
+│   ├── duduclaw-container/     # Docker / Apple Container / WSL2 容器管理
+│   ├── duduclaw-security/      # AES-256-GCM 加密、Credential Proxy、RBAC、限流
+│   ├── duduclaw-memory/        # SQLite + FTS5 全文搜尋 + 向量嵌入
+│   ├── duduclaw-gateway/       # Axum 伺服器、通道整合、session、evolution、MCP tools
+│   ├── duduclaw-bus/           # tokio broadcast + mpsc 訊息路由
+│   ├── duduclaw-bridge/        # PyO3 Rust↔Python 橋接層
+│   ├── duduclaw-cli/           # clap CLI 入口 + MCP server + migrate
+│   └── duduclaw-dashboard/     # rust-embed 嵌入 React SPA
 │
-├── python/duduclaw/         # Python 擴充層
-│   ├── channels/            # LINE / Telegram / Discord
-│   ├── sdk/                 # 多帳號輪替
-│   ├── evolution/           # 自主進化引擎
-│   └── tools/               # Agent MCP 工具
+├── python/duduclaw/            # Python 擴充層
+│   ├── channels/               # LINE / Telegram / Discord 通道插件
+│   ├── sdk/                    # Claude Code SDK chat + 多帳號輪替
+│   ├── evolution/              # 三層反思系統 + Skill Vetter 安全掃描
+│   └── tools/                  # Agent 動態管理工具
 │
-├── web/                     # React Dashboard
+├── web/                        # React Dashboard
 │   └── src/
-│       ├── components/      # UI 元件
-│       ├── pages/           # 8 個頁面
-│       ├── stores/          # Zustand 狀態管理
-│       ├── lib/             # WsClient + API
-│       └── i18n/            # zh-TW / en
+│       ├── components/         # UI 元件 (shadcn/ui)
+│       ├── pages/              # 頁面
+│       ├── stores/             # Zustand 狀態管理
+│       ├── lib/                # API client
+│       └── i18n/               # zh-TW / en
 │
-├── container/               # Dockerfile + entrypoints
-├── config/                  # 設定範例
-├── ARCHITECTURE.md          # 完整架構設計文件
-└── CLAUDE.md                # AI 協作設計上下文
+├── container/                  # Dockerfile + entrypoints
+├── config/                     # 設定範例
+├── ARCHITECTURE.md             # 完整架構設計文件
+└── CLAUDE.md                   # AI 協作設計上下文
 ```
 
 ---
@@ -286,31 +170,20 @@ DuDuClaw/
 
 | 項目 | 選擇 | 理由 |
 |------|------|------|
-| 核心語言 | **Rust** | 安全關鍵路徑需要記憶體安全 |
-| 擴充語言 | **Python (PyO3)** | Claude Code SDK 官方支援 |
-| 容器引擎 | **Docker + Apple Container + WSL2** | 跨平台支援 |
+| AI 對話 | **Claude Code SDK (`claude` CLI)** | 內建工具鏈、MCP 相容、官方支援 |
+| 核心語言 | **Rust** | 記憶體安全、高效能、單 binary 部署 |
+| 擴充語言 | **Python (PyO3)** | Claude Code SDK 整合、通道插件彈性 |
 | 前端框架 | **React 19 + TypeScript** | 即時資料更新、生態成熟 |
 | UI 風格 | **shadcn/ui + Tailwind CSS 4** | 溫暖可自訂、效能佳 |
 | 資料庫 | **SQLite + FTS5** | 零依賴、嵌入式、全文搜尋 |
-| RPC 協議 | **WebSocket (OpenClaw 相容)** | 即時雙向通訊 |
-| 加密 | **AES-256-GCM (ring)** | 業界標準、Rust 原生 |
-
----
-
-## 支援平台
-
-| 平台 | 容器引擎 | 系統服務 |
-|------|----------|----------|
-| **macOS** | Docker Desktop / Apple Container | launchd |
-| **Linux** | Docker / Podman | systemd |
-| **Windows** | Docker Desktop / WSL2 Direct | Windows Service |
+| 工具協議 | **MCP (Model Context Protocol)** | Claude Code 原生支援、stdin/stdout JSON-RPC |
 
 ---
 
 ## 測試
 
 ```bash
-# Rust 測試 (43 tests)
+# Rust 測試
 cargo test --workspace --exclude duduclaw-bridge
 
 # Python 測試
@@ -326,7 +199,7 @@ cd web && npx tsc --noEmit
 
 ## 文件
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — 完整系統架構設計（含 13 章節）
+- [ARCHITECTURE.md](ARCHITECTURE.md) — 完整系統架構設計
 - [CLAUDE.md](CLAUDE.md) — AI 協作設計上下文與原則
 
 ---
