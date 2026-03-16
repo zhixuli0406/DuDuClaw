@@ -1,5 +1,4 @@
 """Discord Bot channel plugin"""
-import asyncio
 import logging
 from typing import List, Optional
 

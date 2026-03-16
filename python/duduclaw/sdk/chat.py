@@ -11,10 +11,8 @@ Supports multi-account rotation via AccountRotator.
 
 import argparse
 import asyncio
-import json
 import logging
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -166,7 +164,6 @@ async def chat_with_rotation(
     config_path: str,
 ) -> str:
     """Chat with multi-account rotation support."""
-    from .account import Account, AccountType
     from .rotator import AccountRotator, RequestContext, RotationStrategy
 
     # Load accounts from config
