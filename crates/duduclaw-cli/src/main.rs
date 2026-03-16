@@ -4,6 +4,8 @@ use clap::{Parser, Subcommand};
 use duduclaw_agent::AgentRunner;
 use duduclaw_core::error::DuDuClawError;
 use duduclaw_core::types::CheckStatus;
+mod mcp;
+mod migrate;
 mod service;
 
 #[derive(Parser)]
@@ -50,6 +52,12 @@ enum Commands {
         #[command(subcommand)]
         command: ServiceCommands,
     },
+
+    /// Migrate agent.toml to Claude Code format (.claude/settings.local.json)
+    Migrate,
+
+    /// Start DuDuClaw MCP server (for Claude Code integration)
+    McpServer,
 
     /// Print version information
     Version,
@@ -188,6 +196,8 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             }
             Ok(())
         }
+        Commands::Migrate => cmd_migrate().await,
+        Commands::McpServer => cmd_mcp_server().await,
         Commands::Version => {
             println!("duduclaw {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -912,4 +922,18 @@ async fn cmd_doctor() -> duduclaw_core::error::Result<()> {
     }
 
     Ok(())
+}
+
+/// `duduclaw migrate` - Migrate agent.toml to Claude Code format.
+async fn cmd_migrate() -> duduclaw_core::error::Result<()> {
+    let home = duduclaw_home();
+    println!("Migrating agents to Claude Code format...");
+    println!("Home: {}\n", home.display());
+    migrate::migrate(&home).await
+}
+
+/// `duduclaw mcp-server` - Start the MCP server for Claude Code integration.
+async fn cmd_mcp_server() -> duduclaw_core::error::Result<()> {
+    let home = duduclaw_home();
+    mcp::run_mcp_server(&home).await
 }

@@ -40,10 +40,36 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let home_dir = config.home_dir.clone();
     let handler = MethodHandler::new(config.home_dir).await;
 
+    // Initialize session manager
+    let session_db_path = home_dir.join("sessions.db");
+    let session_manager = Arc::new(
+        crate::session::SessionManager::new(&session_db_path)
+            .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(
+                format!("Failed to initialize session manager: {e}")
+            ))?,
+    );
+
+    // Start periodic session cleanup (every 6 hours, remove sessions older than 72 hours)
+    {
+        let sm = session_manager.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            loop {
+                interval.tick().await;
+                match sm.cleanup_inactive(72).await {
+                    Ok(n) if n > 0 => info!("Cleaned up {} inactive sessions", n),
+                    Ok(_) => {}
+                    Err(e) => warn!("Session cleanup error: {}", e),
+                }
+            }
+        });
+    }
+
     // Start channel bots if configured
     let reply_ctx = Arc::new(crate::channel_reply::ReplyContext::new(
         handler.registry().clone(),
         home_dir.clone(),
+        session_manager,
     ));
     let _telegram_handle = crate::telegram::start_telegram_bot(&home_dir, reply_ctx.clone()).await;
     let line_router = crate::line::start_line_bot(&home_dir, reply_ctx.clone()).await;

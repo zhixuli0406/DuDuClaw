@@ -11,6 +11,7 @@ use duduclaw_agent::registry::AgentRegistry;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use crate::session::SessionManager;
 
 // ── Shared state ────────────────────────────────────────────
 
@@ -19,10 +20,15 @@ pub struct ReplyContext {
     pub registry: Arc<RwLock<AgentRegistry>>,
     pub home_dir: PathBuf,
     pub http: reqwest::Client,
+    pub session_manager: Arc<SessionManager>,
 }
 
 impl ReplyContext {
-    pub fn new(registry: Arc<RwLock<AgentRegistry>>, home_dir: PathBuf) -> Self {
+    pub fn new(
+        registry: Arc<RwLock<AgentRegistry>>,
+        home_dir: PathBuf,
+        session_manager: Arc<SessionManager>,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()
@@ -31,6 +37,7 @@ impl ReplyContext {
             registry,
             home_dir,
             http,
+            session_manager,
         }
     }
 }
@@ -44,6 +51,11 @@ impl ReplyContext {
 /// 2. Fallback to direct Anthropic API (Rust reqwest) — single key only
 /// 3. Fallback to static error message
 pub async fn build_reply(text: &str, ctx: &ReplyContext) -> String {
+    build_reply_with_session(text, ctx, "default").await
+}
+
+/// Build a reply with session tracking.
+pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id: &str) -> String {
     // Determine which agent to use: config.toml default_agent → main_agent() → fallback
     let default_agent_name = get_default_agent(&ctx.home_dir).await;
 
@@ -71,10 +83,52 @@ pub async fn build_reply(text: &str, ctx: &ReplyContext) -> String {
     let system_prompt = build_system_prompt(agent);
     drop(reg);
 
+    // Load session and prepend history to system prompt
+    let session_mgr = &ctx.session_manager;
+    let _ = session_mgr.get_or_create(session_id, &agent_id).await;
+
+    // Append user message to session (rough token estimate: chars / 4)
+    let user_tokens = (text.len() as u32) / 4;
+    if let Err(e) = session_mgr
+        .append_message(session_id, "user", text, user_tokens)
+        .await
+    {
+        warn!("Failed to save user message to session: {e}");
+    }
+
+    // Build conversation history from session
+    let history = match session_mgr.get_messages(session_id).await {
+        Ok(msgs) => {
+            if msgs.len() > 1 {
+                let history_text = msgs
+                    .iter()
+                    .rev()
+                    .skip(1) // skip the message we just appended
+                    .rev()
+                    .map(|m| format!("{}: {}", m.role, m.content))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("\n\n## Conversation History\n{history_text}")
+            } else {
+                String::new()
+            }
+        }
+        Err(e) => {
+            warn!("Failed to load session messages: {e}");
+            String::new()
+        }
+    };
+
+    let full_system_prompt = if history.is_empty() {
+        system_prompt
+    } else {
+        format!("{system_prompt}{history}")
+    };
+
     // 1. Try `claude` CLI directly (Claude Code SDK — has built-in tools)
-    let reply = match call_claude_cli(text, &model, &system_prompt, &ctx.home_dir).await {
+    let reply = match call_claude_cli(text, &model, &full_system_prompt, &ctx.home_dir).await {
         Ok(reply) => {
-            info!("🤖 Claude replied via Claude Code SDK ({} chars)", reply.len());
+            info!("Claude replied via Claude Code SDK ({} chars)", reply.len());
             Some(reply)
         }
         Err(e) => {
@@ -86,9 +140,9 @@ pub async fn build_reply(text: &str, ctx: &ReplyContext) -> String {
     // 2. Fallback: Python wrapper (with account rotator)
     let reply = match reply {
         Some(r) => Some(r),
-        None => match call_python_sdk_v2(text, &model, &system_prompt, &ctx.home_dir).await {
+        None => match call_python_sdk_v2(text, &model, &full_system_prompt, &ctx.home_dir).await {
             Ok(reply) => {
-                info!("🤖 Claude replied via Python SDK ({} chars)", reply.len());
+                info!("Claude replied via Python SDK ({} chars)", reply.len());
                 Some(reply)
             }
             Err(e) => {
@@ -99,6 +153,27 @@ pub async fn build_reply(text: &str, ctx: &ReplyContext) -> String {
     };
 
     if let Some(reply) = reply {
+        // Save assistant reply to session
+        let reply_tokens = (reply.len() as u32) / 4;
+        if let Err(e) = session_mgr
+            .append_message(session_id, "assistant", &reply, reply_tokens)
+            .await
+        {
+            warn!("Failed to save assistant message to session: {e}");
+        }
+
+        // Check if compression needed, compress in background
+        let sm = ctx.session_manager.clone();
+        let sid = session_id.to_string();
+        tokio::spawn(async move {
+            if sm.should_compress(&sid).await {
+                let summary = "[Session compressed — previous conversation summary omitted for brevity]".to_string();
+                if let Err(e) = sm.compress(&sid, &summary).await {
+                    warn!("Session compression failed: {e}");
+                }
+            }
+        });
+
         // Trigger micro reflection in background (non-blocking)
         if evolution_enabled
             && let Some(dir) = agent_dir

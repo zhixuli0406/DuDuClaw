@@ -527,6 +527,7 @@ name = "duduclaw-cli"
 version = "0.1.0"
 dependencies = [
  "bollard",
+ "chrono",
  "clap",
  "console",
  "dialoguer",
@@ -535,11 +536,16 @@ dependencies = [
  "duduclaw-container",
  "duduclaw-core",
  "duduclaw-gateway",
+ "duduclaw-memory",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
+ "urlencoding",
+ "uuid",
 ]
 
 [[package]]
@@ -595,6 +601,7 @@ dependencies = [
  "futures-util",
  "hmac",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
@@ -2813,6 +2820,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "urlencoding"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "utf-8"

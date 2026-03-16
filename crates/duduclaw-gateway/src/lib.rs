@@ -6,6 +6,7 @@ pub mod handlers;
 pub mod line;
 pub mod protocol;
 pub mod server;
+pub mod session;
 pub mod telegram;
 
 pub use server::{start_gateway, GatewayConfig};
