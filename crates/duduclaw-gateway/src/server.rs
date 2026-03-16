@@ -49,6 +49,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let line_router = crate::line::start_line_bot(&home_dir, reply_ctx.clone()).await;
     let _discord_handle = crate::discord::start_discord_bot(&home_dir, reply_ctx).await;
 
+    // Start evolution engine timers (meso: hourly, macro: daily)
+    let _evolution_handles = crate::evolution::start_evolution_timers(
+        home_dir.clone(),
+        handler.registry().clone(),
+    );
+    info!("Evolution engine timers started (meso: hourly, macro: daily)");
+
     let state = Arc::new(AppState {
         auth: AuthManager::new(config.auth_token),
         handler,

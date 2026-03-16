@@ -808,11 +808,47 @@ skill_security_scan = true
     // ── Evolution ────────────────────────────────────────────
 
     async fn handle_evolution_status(&self) -> WsFrame {
-        WsFrame::ok_response("", json!({ "enabled": false, "message": "Evolution subsystem not yet active" }))
+        let reg = self.registry.read().await;
+        let agents: Vec<Value> = reg.list().iter().map(|a| {
+            let cfg = &a.config;
+            json!({
+                "agent_id": cfg.agent.name,
+                "micro_reflection": cfg.evolution.micro_reflection,
+                "meso_reflection": cfg.evolution.meso_reflection,
+                "macro_reflection": cfg.evolution.macro_reflection,
+                "skill_auto_activate": cfg.evolution.skill_auto_activate,
+                "skill_security_scan": cfg.evolution.skill_security_scan,
+            })
+        }).collect();
+
+        let any_enabled = reg.list().iter().any(|a| {
+            let e = &a.config.evolution;
+            e.micro_reflection || e.meso_reflection || e.macro_reflection
+        });
+
+        WsFrame::ok_response("", json!({
+            "enabled": any_enabled,
+            "agents": agents,
+            "timers": {
+                "meso_interval_seconds": 3600,
+                "macro_interval_seconds": 86400,
+            },
+        }))
     }
 
     async fn handle_evolution_skills(&self) -> WsFrame {
-        WsFrame::ok_response("", json!({ "skills": [] }))
+        let reg = self.registry.read().await;
+        let mut all_skills = Vec::new();
+        for agent in reg.list() {
+            for skill in &agent.skills {
+                all_skills.push(json!({
+                    "agent_id": agent.config.agent.name,
+                    "name": skill.name,
+                    "size": skill.content.len(),
+                }));
+            }
+        }
+        WsFrame::ok_response("", json!({ "skills": all_skills }))
     }
 
     // ── Helpers ─────────────────────────────────────────────

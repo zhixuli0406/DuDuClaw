@@ -62,29 +62,55 @@ pub async fn build_reply(text: &str, ctx: &ReplyContext) -> String {
         .map(|a| a.config.model.preferred.clone())
         .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
 
+    let agent_id = agent.map(|a| a.config.agent.name.clone()).unwrap_or_default();
+    let agent_dir = agent.map(|a| a.dir.clone());
+    let evolution_enabled = agent
+        .map(|a| a.config.evolution.micro_reflection)
+        .unwrap_or(false);
+
     let system_prompt = build_system_prompt(agent);
     drop(reg);
 
     // 1. Try `claude` CLI directly (Claude Code SDK — has built-in tools)
-    match call_claude_cli(text, &model, &system_prompt, &ctx.home_dir).await {
+    let reply = match call_claude_cli(text, &model, &system_prompt, &ctx.home_dir).await {
         Ok(reply) => {
             info!("🤖 Claude replied via Claude Code SDK ({} chars)", reply.len());
-            return reply;
+            Some(reply)
         }
         Err(e) => {
             warn!("claude CLI unavailable: {e}");
+            None
         }
-    }
+    };
 
     // 2. Fallback: Python wrapper (with account rotator)
-    match call_python_sdk_v2(text, &model, &system_prompt, &ctx.home_dir).await {
-        Ok(reply) => {
-            info!("🤖 Claude replied via Python SDK ({} chars)", reply.len());
-            return reply;
+    let reply = match reply {
+        Some(r) => Some(r),
+        None => match call_python_sdk_v2(text, &model, &system_prompt, &ctx.home_dir).await {
+            Ok(reply) => {
+                info!("🤖 Claude replied via Python SDK ({} chars)", reply.len());
+                Some(reply)
+            }
+            Err(e) => {
+                warn!("Python SDK unavailable: {e}");
+                None
+            }
+        },
+    };
+
+    if let Some(reply) = reply {
+        // Trigger micro reflection in background (non-blocking)
+        if evolution_enabled
+            && let Some(dir) = agent_dir
+        {
+                let home = ctx.home_dir.clone();
+                let aid = agent_id.clone();
+                let summary = format!("User: {}\nAgent: {}", &text[..text.len().min(200)], &reply[..reply.len().min(200)]);
+                tokio::spawn(async move {
+                    crate::evolution::run_micro(&home, &aid, &dir, &summary).await;
+                });
         }
-        Err(e) => {
-            warn!("Python SDK unavailable: {e}");
-        }
+        return reply;
     }
 
     // 3. Fallback: static error

@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod channel_reply;
 pub mod discord;
+pub mod evolution;
 pub mod handlers;
 pub mod line;
 pub mod protocol;
