@@ -338,5 +338,5 @@ MIT License
 ---
 
 <p align="center">
-  🐾 Built with love for AI companions
+  🐾 Built with louis.li
 </p>
