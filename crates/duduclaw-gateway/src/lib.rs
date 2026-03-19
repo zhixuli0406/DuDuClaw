@@ -4,6 +4,7 @@ pub mod discord;
 pub mod evolution;
 pub mod handlers;
 pub mod line;
+pub mod log;
 pub mod protocol;
 pub mod server;
 pub mod session;

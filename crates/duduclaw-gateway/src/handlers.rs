@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use duduclaw_agent::registry::AgentRegistry;
 use duduclaw_core::traits::MemoryEngine;
@@ -14,6 +15,16 @@ use crate::protocol::WsFrame;
 pub struct MethodHandler {
     registry: Arc<RwLock<AgentRegistry>>,
     home_dir: PathBuf,
+    start_time: Instant,
+    channel_status: Arc<RwLock<std::collections::HashMap<String, ChannelState>>>,
+}
+
+/// Runtime state for a connected channel.
+#[derive(Clone)]
+pub struct ChannelState {
+    pub connected: bool,
+    pub last_event: Option<chrono::DateTime<chrono::Utc>>,
+    pub error: Option<String>,
 }
 
 impl MethodHandler {
@@ -26,7 +37,24 @@ impl MethodHandler {
         Self {
             registry: Arc::new(RwLock::new(registry)),
             home_dir,
+            start_time: Instant::now(),
+            channel_status: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Update a channel's runtime connection state (called by channel bots).
+    pub async fn set_channel_state(&self, name: &str, connected: bool, error: Option<String>) {
+        let mut map = self.channel_status.write().await;
+        map.insert(name.to_string(), ChannelState {
+            connected,
+            last_event: Some(chrono::Utc::now()),
+            error,
+        });
+    }
+
+    /// Get the shared channel status map for use by channel bots.
+    pub fn channel_status(&self) -> &Arc<RwLock<std::collections::HashMap<String, ChannelState>>> {
+        &self.channel_status
     }
 
     /// Get a reference to the shared agent registry.
@@ -59,7 +87,7 @@ impl MethodHandler {
             "channels.remove" => self.handle_channels_remove(params).await,
             "accounts.list" => self.handle_accounts_list().await,
             "accounts.budget_summary" => self.handle_budget_summary().await,
-            "accounts.rotate" => self.handle_accounts_rotate(params),
+            "accounts.rotate" => self.handle_accounts_rotate(params).await,
             "accounts.health" => self.handle_accounts_health().await,
             "memory.search" => self.handle_memory_search(params).await,
             "memory.browse" => self.handle_memory_browse(params).await,
@@ -291,22 +319,119 @@ skill_security_scan = true
     async fn handle_agents_delegate(&self, params: Value) -> WsFrame {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
         let prompt = params.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+        let wait = params.get("wait_for_response").and_then(|v| v.as_bool()).unwrap_or(false);
         info!(agent_id, "agents.delegate requested");
+
+        // Verify target agent exists
+        let reg = self.registry.read().await;
+        let agent = match reg.get(agent_id) {
+            Some(a) => a.clone(),
+            None => return WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
+        };
+        let agent_dir = agent.dir.clone();
+        let model = agent.config.model.preferred.clone();
+        drop(reg);
+
         let message_id = uuid::Uuid::new_v4().to_string();
-        WsFrame::ok_response("", json!({ "success": true, "message_id": message_id, "target_agent": agent_id, "prompt": prompt }))
+
+        if wait {
+            // Synchronous delegation: spawn Python subprocess and wait
+            let home = self.home_dir.clone();
+            let system_prompt = agent.soul.as_deref().unwrap_or("You are a helpful AI agent.").to_string();
+            match crate::channel_reply::call_python_sdk_delegate(prompt, &model, &system_prompt, &home).await {
+                Ok(response) => WsFrame::ok_response("", json!({
+                    "success": true,
+                    "message_id": message_id,
+                    "target_agent": agent_id,
+                    "response": response,
+                    "status": "completed",
+                })),
+                Err(e) => WsFrame::error_response("", &format!("Delegate execution failed: {e}")),
+            }
+        } else {
+            // Async delegation: write to bus queue for background processing
+            let queue_path = self.home_dir.join("bus_queue.jsonl");
+            let task = serde_json::json!({
+                "type": "delegate_task",
+                "message_id": &message_id,
+                "agent_id": agent_id,
+                "agent_dir": agent_dir.to_string_lossy(),
+                "prompt": prompt,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            });
+            let _ = tokio::task::spawn_blocking({
+                let queue_path = queue_path.clone();
+                let task_str = task.to_string();
+                move || {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true).append(true).open(&queue_path)
+                    {
+                        let _ = writeln!(f, "{task_str}");
+                    }
+                }
+            }).await;
+
+            WsFrame::ok_response("", json!({
+                "success": true,
+                "message_id": message_id,
+                "target_agent": agent_id,
+                "status": "queued",
+            }))
+        }
     }
 
     async fn handle_agents_pause(&self, params: Value) -> WsFrame {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
         info!(agent_id, "agents.pause requested");
-        // TODO: actually modify agent.toml status field
+
+        if let Err(e) = self.update_agent_status(agent_id, "paused").await {
+            return WsFrame::error_response("", &format!("Failed to pause agent: {e}"));
+        }
+
         WsFrame::ok_response("", json!({ "success": true, "name": agent_id, "status": "paused" }))
     }
 
     async fn handle_agents_resume(&self, params: Value) -> WsFrame {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
         info!(agent_id, "agents.resume requested");
+
+        if let Err(e) = self.update_agent_status(agent_id, "active").await {
+            return WsFrame::error_response("", &format!("Failed to resume agent: {e}"));
+        }
+
         WsFrame::ok_response("", json!({ "success": true, "name": agent_id, "status": "active" }))
+    }
+
+    /// Modify the `status` field in an agent's `agent.toml` and persist it to disk.
+    async fn update_agent_status(&self, agent_id: &str, status: &str) -> Result<(), String> {
+        let reg = self.registry.read().await;
+        let agent = reg.get(agent_id)
+            .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
+        let agent_toml_path = agent.dir.join("agent.toml");
+        drop(reg);
+
+        let content = tokio::fs::read_to_string(&agent_toml_path).await
+            .map_err(|e| format!("Failed to read agent.toml: {e}"))?;
+
+        // Parse and update the status field
+        let mut table: toml::Table = content.parse()
+            .map_err(|e| format!("Failed to parse agent.toml: {e}"))?;
+
+        if let Some(agent_section) = table.get_mut("agent").and_then(|v| v.as_table_mut()) {
+            agent_section.insert("status".to_string(), toml::Value::String(status.to_string()));
+        } else {
+            return Err("agent.toml missing [agent] section".to_string());
+        }
+
+        let new_content = toml::to_string_pretty(&table)
+            .map_err(|e| format!("Failed to serialise agent.toml: {e}"))?;
+
+        tokio::fs::write(&agent_toml_path, new_content).await
+            .map_err(|e| format!("Failed to write agent.toml: {e}"))?;
+
+        info!(agent_id, status, "Agent status updated in agent.toml");
+        Ok(())
     }
 
     async fn handle_agents_inspect(&self, params: Value) -> WsFrame {
@@ -347,6 +472,7 @@ skill_security_scan = true
 
     async fn handle_channels_status(&self) -> WsFrame {
         let config_path = self.home_dir.join("config.toml");
+        let runtime_status = self.channel_status.read().await;
         let mut channels = Vec::new();
 
         if let Ok(content) = tokio::fs::read_to_string(&config_path).await
@@ -359,12 +485,22 @@ skill_security_scan = true
                 ("discord_bot_token", "discord"),
             ];
             for (key, name) in token_map {
-                if ch.get(key).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
+                let configured = ch.get(key).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
+                if configured {
+                    // Use runtime state if available; otherwise use "connecting" status
+                    let (connected, last_ts, error) = match runtime_status.get(name) {
+                        Some(state) => (
+                            state.connected,
+                            state.last_event.as_ref().map(|t| t.to_rfc3339()),
+                            state.error.clone(),
+                        ),
+                        None => (false, None, Some("connecting".to_string())),
+                    };
                     channels.push(json!({
                         "name": name,
-                        "connected": true,
-                        "last_connected": null,
-                        "error": null,
+                        "connected": connected,
+                        "last_connected": last_ts,
+                        "error": error,
                     }));
                 }
             }
@@ -534,10 +670,59 @@ skill_security_scan = true
         }))
     }
 
-    fn handle_accounts_rotate(&self, params: Value) -> WsFrame {
+    async fn handle_accounts_rotate(&self, params: Value) -> WsFrame {
         let account = params.get("account").and_then(|v| v.as_str()).unwrap_or("main");
         info!(account, "accounts.rotate requested");
-        WsFrame::ok_response("", json!({ "success": true, "account": account, "message": "Key rotation placeholder" }))
+
+        // Invoke Python SDK's AccountRotator to perform actual rotation
+        let config_path = self.home_dir.join("config.toml");
+        let python_script = format!(
+            r#"
+import asyncio, sys, json
+sys.path.insert(0, '{python_path}')
+from duduclaw.sdk.chat import load_accounts
+from duduclaw.sdk.rotator import AccountRotator, RequestContext, RotationStrategy
+
+accounts = load_accounts('{config}')
+if not accounts:
+    print(json.dumps({{"success": False, "error": "No accounts configured"}}))
+    sys.exit(0)
+
+rotator = AccountRotator(accounts, RotationStrategy.ROUND_ROBIN)
+ctx = RequestContext(model="claude-haiku-4-5")
+
+async def main():
+    try:
+        selected = await rotator.select_account(ctx)
+        print(json.dumps({{"success": True, "account": selected.id, "rotated": True}}))
+    except Exception as e:
+        print(json.dumps({{"success": False, "error": str(e)}}))
+
+asyncio.run(main())
+"#,
+            python_path = crate::channel_reply::find_python_path_static(&self.home_dir),
+            config = config_path.display(),
+        );
+
+        match tokio::process::Command::new("python3")
+            .arg("-c")
+            .arg(&python_script)
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                match serde_json::from_str::<Value>(&stdout) {
+                    Ok(result) => WsFrame::ok_response("", result),
+                    Err(_) => WsFrame::ok_response("", json!({ "success": true, "account": account, "message": stdout })),
+                }
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                WsFrame::error_response("", &format!("Rotation failed: {}", stderr.chars().take(200).collect::<String>()))
+            }
+            Err(e) => WsFrame::error_response("", &format!("Failed to invoke Python: {e}")),
+        }
     }
 
     async fn handle_accounts_health(&self) -> WsFrame {
@@ -586,7 +771,7 @@ skill_security_scan = true
                         "tags": e.tags,
                     })
                 }).collect();
-                WsFrame::ok_response("", json!({ "results": results }))
+                WsFrame::ok_response("", json!({ "entries": results }))
             }
             Err(e) => WsFrame::error_response("", &format!("Memory search failed: {e}")),
         }
@@ -610,27 +795,18 @@ skill_security_scan = true
             Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
         };
 
-        // Browse recent entries using a wildcard-like search; FTS5 requires a query
-        // so we use summarize with a broad time window instead.
-        let now = chrono::Utc::now();
-        let window = duduclaw_core::types::TimeWindow {
-            start: now - chrono::Duration::days(365),
-            end: now,
-        };
-
-        match engine.summarize(agent_id, window).await {
-            Ok(summary) => {
-                // The summarize method returns a text summary. For browse, we re-query
-                // the raw entries. Since the engine trait only exposes search and summarize,
-                // we do a broad search with a common token. If that returns nothing, return
-                // the summary text instead.
-                // A pragmatic approach: return the summary as a single entry.
-                let _ = limit; // acknowledged but summary is the best we can do via trait
-                WsFrame::ok_response("", json!({
-                    "agent_id": agent_id,
-                    "summary": summary,
-                    "entries": [],
-                }))
+        match engine.list_recent(agent_id, limit).await {
+            Ok(entries) => {
+                let rows: Vec<Value> = entries.iter().map(|e| {
+                    json!({
+                        "id": e.id,
+                        "agent_id": e.agent_id,
+                        "content": e.content,
+                        "timestamp": e.timestamp.to_rfc3339(),
+                        "tags": e.tags,
+                    })
+                }).collect();
+                WsFrame::ok_response("", json!({ "entries": rows }))
             }
             Err(e) => WsFrame::error_response("", &format!("Memory browse failed: {e}")),
         }
@@ -699,37 +875,117 @@ skill_security_scan = true
 
     // ── Cron ────────────────────────────────────────────────
 
+    fn cron_tasks_path(&self) -> std::path::PathBuf {
+        self.home_dir.join("cron_tasks.jsonl")
+    }
+
+    fn read_cron_tasks(&self) -> Vec<Value> {
+        let path = self.cron_tasks_path();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect()
+    }
+
+    fn write_cron_tasks(&self, tasks: &[Value]) {
+        let path = self.cron_tasks_path();
+        let content = tasks
+            .iter()
+            .filter_map(|t| serde_json::to_string(t).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = std::fs::write(&path, content);
+    }
+
     fn handle_cron_list(&self) -> WsFrame {
-        WsFrame::ok_response("", json!({ "tasks": [] }))
+        let tasks = self.read_cron_tasks();
+        WsFrame::ok_response("", json!({ "tasks": tasks }))
     }
 
     fn handle_cron_add(&self, params: Value) -> WsFrame {
-        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
-        info!(name, "cron.add requested");
-        WsFrame::ok_response("", json!({ "success": true, "message": "Cron add placeholder" }))
+        let name = match params.get("name").and_then(|v| v.as_str()) {
+            Some(n) if !n.is_empty() => n,
+            _ => return WsFrame::error_response("", "Missing 'name' parameter"),
+        };
+        let schedule = params.get("schedule").and_then(|v| v.as_str()).unwrap_or("*/60 * * * *");
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("heartbeat");
+
+        let mut tasks = self.read_cron_tasks();
+        if tasks.iter().any(|t| t.get("name").and_then(|v| v.as_str()) == Some(name)) {
+            return WsFrame::error_response("", &format!("Cron task '{name}' already exists"));
+        }
+
+        let task = json!({
+            "name": name,
+            "schedule": schedule,
+            "agent_id": agent_id,
+            "action": action,
+            "enabled": true,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "last_run": null,
+        });
+        tasks.push(task.clone());
+        self.write_cron_tasks(&tasks);
+
+        info!(name, schedule, agent_id, "Cron task added");
+        WsFrame::ok_response("", json!({ "success": true, "task": task }))
     }
 
     fn handle_cron_pause(&self, params: Value) -> WsFrame {
-        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
-        info!(name, "cron.pause requested");
-        WsFrame::ok_response("", json!({ "success": true, "message": "Cron pause placeholder" }))
+        let name = match params.get("name").and_then(|v| v.as_str()) {
+            Some(n) if !n.is_empty() => n,
+            _ => return WsFrame::error_response("", "Missing 'name' parameter"),
+        };
+
+        let mut tasks = self.read_cron_tasks();
+        let found = tasks.iter_mut().find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name));
+        match found {
+            Some(task) => {
+                task["enabled"] = json!(false);
+                self.write_cron_tasks(&tasks);
+                info!(name, "Cron task paused");
+                WsFrame::ok_response("", json!({ "success": true, "name": name, "enabled": false }))
+            }
+            None => WsFrame::error_response("", &format!("Cron task '{name}' not found")),
+        }
     }
 
     fn handle_cron_remove(&self, params: Value) -> WsFrame {
-        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
-        info!(name, "cron.remove requested");
-        WsFrame::ok_response("", json!({ "success": true, "message": "Cron remove placeholder" }))
+        let name = match params.get("name").and_then(|v| v.as_str()) {
+            Some(n) if !n.is_empty() => n,
+            _ => return WsFrame::error_response("", "Missing 'name' parameter"),
+        };
+
+        let tasks = self.read_cron_tasks();
+        let before = tasks.len();
+        let filtered: Vec<Value> = tasks.into_iter()
+            .filter(|t| t.get("name").and_then(|v| v.as_str()) != Some(name))
+            .collect();
+
+        if filtered.len() == before {
+            return WsFrame::error_response("", &format!("Cron task '{name}' not found"));
+        }
+        self.write_cron_tasks(&filtered);
+        info!(name, "Cron task removed");
+        WsFrame::ok_response("", json!({ "success": true, "name": name }))
     }
 
     // ── System ───────────────────────────────────────────────
 
     async fn handle_system_status(&self) -> WsFrame {
         let reg = self.registry.read().await;
+        let uptime = self.start_time.elapsed().as_secs();
+        let channel_map = self.channel_status.read().await;
+        let channels_connected = channel_map.values().filter(|s| s.connected).count();
+        drop(channel_map);
         WsFrame::ok_response("", json!({
             "version": env!("CARGO_PKG_VERSION"),
-            "uptime_seconds": 0,
+            "uptime_seconds": uptime,
             "agents_count": reg.list().len(),
-            "channels_connected": 0,
+            "channels_connected": channels_connected,
             "gateway_address": "localhost:18789",
         }))
     }
@@ -795,14 +1051,23 @@ skill_security_scan = true
 
     fn handle_logs_subscribe(&self, params: Value) -> WsFrame {
         let filter = params.get("filter").and_then(|v| v.as_str()).unwrap_or("*");
-        info!(filter, "logs.subscribe requested");
-        WsFrame::ok_response("", json!({ "success": true, "message": "Log subscription registered (WebSocket push is future work)" }))
+        info!(filter, "logs.subscribe activated — WebSocket push enabled for this connection");
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "subscribed": true,
+            "filter": filter,
+            "message": "Log push active — events will stream on this WebSocket connection",
+        }))
     }
 
     fn handle_logs_unsubscribe(&self, params: Value) -> WsFrame {
         let filter = params.get("filter").and_then(|v| v.as_str()).unwrap_or("*");
-        info!(filter, "logs.unsubscribe requested");
-        WsFrame::ok_response("", json!({ "success": true, "message": "Log subscription removed" }))
+        info!(filter, "logs.unsubscribe — WebSocket push disabled for this connection");
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "subscribed": false,
+            "filter": filter,
+        }))
     }
 
     // ── Evolution ────────────────────────────────────────────
@@ -922,12 +1187,15 @@ skill_security_scan = true
                 "message": if has_key { "ANTHROPIC_API_KEY is set" } else { "ANTHROPIC_API_KEY not set" },
                 "can_repair": false,
             }),
-            json!({
-                "name": "container_runtime",
-                "status": "pass",
-                "message": "Docker available",
-                "can_repair": false,
-            }),
+            {
+                let (docker_status, docker_msg) = check_docker().await;
+                json!({
+                    "name": "container_runtime",
+                    "status": docker_status,
+                    "message": docker_msg,
+                    "can_repair": false,
+                })
+            },
         ]
     }
 
@@ -951,4 +1219,32 @@ skill_security_scan = true
             }
         }
     }
+}
+
+// ── Standalone helpers ────────────────────────────────────────
+
+/// Check if Docker (or Podman) is available by running `docker info`.
+/// Returns `("pass"/"warn", message)`.
+async fn check_docker() -> (&'static str, String) {
+    // Try `docker info` first, then `podman info`
+    for cmd_name in &["docker", "podman"] {
+        let result = tokio::process::Command::new(cmd_name)
+            .arg("info")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await;
+
+        match result {
+            Ok(out) if out.status.success() => {
+                return ("pass", format!("{cmd_name} daemon is running"));
+            }
+            Ok(_) => {
+                return ("warn", format!("{cmd_name} found but daemon is not running"));
+            }
+            Err(_) => {} // try next
+        }
+    }
+
+    ("warn", "No container runtime (docker/podman) found in PATH".to_string())
 }

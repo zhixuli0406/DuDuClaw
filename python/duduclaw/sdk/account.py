@@ -16,6 +16,7 @@ class Account:
     priority: int = 1
     monthly_budget_cents: int = 5000
     tags: List[str] = field(default_factory=list)
+    api_key: str = ""  # Actual API key value (not persisted to disk)
 
     # Runtime state (not persisted)
     is_healthy: bool = True

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +22,8 @@ pub struct HeartbeatTask {
 pub struct HeartbeatScheduler {
     tasks: Arc<RwLock<HashMap<String, HeartbeatTask>>>,
     running: Arc<AtomicBool>,
+    /// Home directory used to locate the Python SDK for evolution calls.
+    home_dir: PathBuf,
 }
 
 impl HeartbeatScheduler {
@@ -29,6 +32,16 @@ impl HeartbeatScheduler {
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(AtomicBool::new(false)),
+            home_dir: PathBuf::new(),
+        }
+    }
+
+    /// Create a new scheduler with a home directory for evolution calls.
+    pub fn with_home(home_dir: PathBuf) -> Self {
+        Self {
+            tasks: Arc::new(RwLock::new(HashMap::new())),
+            running: Arc::new(AtomicBool::new(false)),
+            home_dir,
         }
     }
 
@@ -81,7 +94,14 @@ impl HeartbeatScheduler {
                 if should_run {
                     info!(agent_id = %agent_id, "Heartbeat firing for agent");
                     task.last_run = Some(now);
-                    // TODO: trigger agent heartbeat action (Phase 4)
+
+                    // Trigger meso reflection for this agent in background
+                    let aid = agent_id.clone();
+                    let home = self.home_dir.clone();
+                    let agent_dir = home.join("agents").join(&aid);
+                    tokio::spawn(async move {
+                        trigger_meso_reflection(&home, &aid, &agent_dir).await;
+                    });
                 }
             }
             drop(tasks);
@@ -110,4 +130,40 @@ impl Default for HeartbeatScheduler {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ── Evolution helper ─────────────────────────────────────────
+
+async fn trigger_meso_reflection(home_dir: &Path, agent_id: &str, agent_dir: &Path) {
+    let python_path = find_python_path(home_dir);
+    let mut cmd = tokio::process::Command::new("python3");
+    cmd.args([
+        "-m", "duduclaw.evolution.run",
+        "meso",
+        "--agent-id", agent_id,
+        "--agent-dir", &agent_dir.to_string_lossy(),
+    ]);
+    cmd.env("PYTHONPATH", &python_path);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    match tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await {
+        Ok(Ok(out)) if out.status.success() => {
+            info!(agent_id, "Heartbeat meso reflection completed");
+        }
+        Ok(Ok(out)) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            warn!(agent_id, "Heartbeat meso reflection failed: {}", &stderr[..stderr.len().min(200)]);
+        }
+        Ok(Err(e)) => warn!(agent_id, "Heartbeat spawn error: {e}"),
+        Err(_) => warn!(agent_id, "Heartbeat meso reflection timed out (60s)"),
+    }
+}
+
+fn find_python_path(home_dir: &Path) -> String {
+    let candidate = home_dir.parent().unwrap_or(home_dir).join("python");
+    if candidate.join("duduclaw").exists() {
+        return candidate.to_string_lossy().to_string();
+    }
+    std::env::var("PYTHONPATH").unwrap_or_default()
 }

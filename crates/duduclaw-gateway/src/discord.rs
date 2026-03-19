@@ -166,118 +166,111 @@ async fn gateway_loop(
 
         let heartbeat_write = Arc::new(tokio::sync::Mutex::new(None::<tokio::task::JoinHandle<()>>));
 
-        while let Some(msg_result) = read.next().await {
-            let msg = match msg_result {
-                Ok(Message::Text(text)) => text,
-                Ok(Message::Close(_)) => {
-                    warn!("Discord Gateway closed");
-                    break;
-                }
-                Err(e) => {
-                    warn!("Discord Gateway error: {e}");
-                    break;
-                }
-                _ => continue,
-            };
+        loop {
+            tokio::select! {
+                // ── Incoming Gateway events ─────────────────
+                msg_opt = read.next() => {
+                    let msg = match msg_opt {
+                        Some(Ok(Message::Text(text))) => text,
+                        Some(Ok(Message::Close(_))) => { warn!("Discord Gateway closed"); break; }
+                        Some(Err(e)) => { warn!("Discord Gateway error: {e}"); break; }
+                        None => break,
+                        _ => continue,
+                    };
 
-            let payload: GatewayPayload = match serde_json::from_str(&msg) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
+                    let payload: GatewayPayload = match serde_json::from_str(&msg) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
 
-            if let Some(s) = payload.s {
-                sequence = Some(s);
-            }
-
-            match payload.op {
-                // Hello — start heartbeating
-                10 => {
-                    if let Some(d) = &payload.d {
-                        heartbeat_interval_ms = d
-                            .get("heartbeat_interval")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(41250);
+                    if let Some(s) = payload.s {
+                        sequence = Some(s);
                     }
 
-                    // Start heartbeat task
-                    let interval = std::time::Duration::from_millis(heartbeat_interval_ms);
-                    let tx = heartbeat_tx.clone();
-                    let seq = sequence;
-                    let hb_handle = tokio::spawn(async move {
-                        loop {
-                            tokio::time::sleep(interval).await;
-                            if tx.send(seq).await.is_err() {
+                    match payload.op {
+                        // Hello — start heartbeating
+                        10 => {
+                            if let Some(d) = &payload.d {
+                                heartbeat_interval_ms = d
+                                    .get("heartbeat_interval")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(41250);
+                            }
+
+                            // Start heartbeat timer task (fires on its own interval)
+                            let interval = std::time::Duration::from_millis(heartbeat_interval_ms);
+                            let tx = heartbeat_tx.clone();
+                            let seq = sequence;
+                            let hb_handle = tokio::spawn(async move {
+                                loop {
+                                    tokio::time::sleep(interval).await;
+                                    if tx.send(seq).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            });
+
+                            let mut guard = heartbeat_write.lock().await;
+                            *guard = Some(hb_handle);
+
+                            // Send Identify
+                            let identify = GatewayIdentify {
+                                op: 2,
+                                d: IdentifyData {
+                                    token: token.clone(),
+                                    intents: INTENT_GUILD_MESSAGES | INTENT_MESSAGE_CONTENT | INTENT_DIRECT_MESSAGES,
+                                    properties: IdentifyProperties {
+                                        os: "linux".to_string(),
+                                        browser: "duduclaw".to_string(),
+                                        device: "duduclaw".to_string(),
+                                    },
+                                },
+                            };
+                            let json = serde_json::to_string(&identify).unwrap_or_default();
+                            if write.send(Message::Text(json.into())).await.is_err() {
                                 break;
                             }
+                            identified = true;
+                            info!("Discord Gateway identified (heartbeat: {heartbeat_interval_ms}ms)");
                         }
-                    });
 
-                    let mut guard = heartbeat_write.lock().await;
-                    *guard = Some(hb_handle);
+                        // Heartbeat ACK
+                        11 => {}
 
-                    // Send Identify
-                    let identify = GatewayIdentify {
-                        op: 2,
-                        d: IdentifyData {
-                            token: token.clone(),
-                            intents: INTENT_GUILD_MESSAGES | INTENT_MESSAGE_CONTENT | INTENT_DIRECT_MESSAGES,
-                            properties: IdentifyProperties {
-                                os: "linux".to_string(),
-                                browser: "duduclaw".to_string(),
-                                device: "duduclaw".to_string(),
-                            },
-                        },
-                    };
-                    let json = serde_json::to_string(&identify).unwrap_or_default();
-                    if write.send(Message::Text(json.into())).await.is_err() {
+                        // Dispatch (events)
+                        0 => {
+                            if let Some(event_name) = &payload.t {
+                                if event_name == "MESSAGE_CREATE" {
+                                    if let Some(d) = &payload.d {
+                                        handle_message_create(d, &bot_id, &http, &token, &ctx).await;
+                                    }
+                                } else if event_name == "READY" {
+                                    info!("Discord Gateway READY");
+                                }
+                            }
+                        }
+
+                        // Reconnect
+                        7 => { info!("Discord Gateway requested reconnect"); break; }
+
+                        // Invalid Session
+                        9 => {
+                            warn!("Discord Gateway invalid session");
+                            identified = false;
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            break;
+                        }
+
+                        _ => {}
+                    }
+                }
+
+                // ── Heartbeat — fired independently of incoming events ──
+                Some(seq) = heartbeat_rx.recv() => {
+                    let hb = json!({ "op": 1, "d": seq });
+                    if write.send(Message::Text(hb.to_string().into())).await.is_err() {
                         break;
                     }
-                    identified = true;
-                    info!("Discord Gateway identified (heartbeat: {heartbeat_interval_ms}ms)");
-                }
-
-                // Heartbeat ACK
-                11 => {}
-
-                // Dispatch (events)
-                0 => {
-                    if let Some(event_name) = &payload.t {
-                        if event_name == "MESSAGE_CREATE" {
-                            if let Some(d) = &payload.d {
-                                handle_message_create(d, &bot_id, &http, &token, &ctx).await;
-                            }
-                        } else if event_name == "READY" {
-                            info!("Discord Gateway READY");
-                        }
-                    }
-                }
-
-                // Reconnect
-                7 => {
-                    info!("Discord Gateway requested reconnect");
-                    break;
-                }
-
-                // Invalid Session
-                9 => {
-                    warn!("Discord Gateway invalid session");
-                    identified = false;
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    break;
-                }
-
-                _ => {}
-            }
-
-            // Check for heartbeat sends
-            if let Ok(seq) = heartbeat_rx.try_recv() {
-                let hb = json!({ "op": 1, "d": seq });
-                if write
-                    .send(Message::Text(hb.to_string().into()))
-                    .await
-                    .is_err()
-                {
-                    break;
                 }
             }
         }

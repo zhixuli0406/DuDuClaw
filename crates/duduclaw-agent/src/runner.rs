@@ -44,11 +44,16 @@ impl AgentRunner {
 
         // Build the system prompt from agent files
         let system_prompt = self.build_system_prompt(agent);
+        let model_id = agent.config.model.preferred.clone();
+        let api_key = get_api_key(&self.agents_dir).await;
 
         println!(
             "DuDuClaw: {} is ready! Type your message (Ctrl+D to exit)",
             agent.config.agent.display_name
         );
+        if api_key.is_empty() {
+            println!("  [warn] No API key found — set ANTHROPIC_API_KEY or run `duduclaw onboard`");
+        }
         println!("---");
 
         // Simple stdin read loop
@@ -58,18 +63,19 @@ impl AgentRunner {
         let mut lines = reader.lines();
 
         while let Ok(Some(line)) = lines.next_line().await {
-            if line.trim().is_empty() {
+            let input = line.trim();
+            if input.is_empty() {
                 continue;
             }
 
-            // For Phase 2, echo what the agent would do.
-            // Real Claude Code SDK integration will come in Phase 3.
-            println!(
-                "\n[{}]: Received: \"{}\"\n(Claude Code SDK integration pending - Phase 3)",
-                agent.config.agent.display_name,
-                line.trim()
-            );
-            println!("System prompt length: {} chars", system_prompt.len());
+            print!("\n[{}]: ", agent.config.agent.display_name);
+            // Flush before blocking on subprocess
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+
+            // Call Claude Code SDK (claude CLI)
+            let response = call_claude(input, &model_id, &system_prompt, &api_key).await;
+            println!("{response}");
             println!("---");
         }
 
@@ -109,4 +115,94 @@ impl AgentRunner {
     pub fn agents_dir(&self) -> &PathBuf {
         &self.agents_dir
     }
+}
+
+// ── Standalone helpers ───────────────────────────────────────
+
+/// Get the API key from env var or config.toml.
+async fn get_api_key(agents_dir: &PathBuf) -> String {
+    // 1. Environment variable
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        if !key.is_empty() {
+            return key;
+        }
+    }
+    // 2. config.toml in home dir (agents_dir parent is home/agents, parent of that is home)
+    if let Some(home) = agents_dir.parent().and_then(|p| p.parent()) {
+        let config_path = home.join("config.toml");
+        if let Ok(content) = tokio::fs::read_to_string(&config_path).await {
+            if let Ok(table) = content.parse::<toml::Value>() {
+                if let Some(key) = table.get("api")
+                    .and_then(|v| v.get("anthropic_api_key"))
+                    .and_then(|v| v.as_str())
+                {
+                    if !key.is_empty() {
+                        return key.to_string();
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// Call the claude CLI (Claude Code SDK) with a prompt and return the response.
+async fn call_claude(prompt: &str, model: &str, system_prompt: &str, api_key: &str) -> String {
+    // Find claude binary
+    let claude = match which_claude() {
+        Some(p) => p,
+        None => return "(Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code)".to_string(),
+    };
+
+    if api_key.is_empty() {
+        return "(No API key configured. Run: export ANTHROPIC_API_KEY=sk-ant-...)".to_string();
+    }
+
+    let mut cmd = tokio::process::Command::new(&claude);
+    cmd.args(["-p", prompt, "--model", model, "--output-format", "text"]);
+    if !system_prompt.is_empty() {
+        cmd.args(["--system-prompt", system_prompt]);
+    }
+    cmd.env("ANTHROPIC_API_KEY", api_key);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        cmd.output(),
+    ).await {
+        Ok(Ok(out)) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if text.is_empty() { "(empty response)".to_string() } else { text }
+        }
+        Ok(Ok(out)) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            format!("(claude error: {})", stderr.chars().take(200).collect::<String>())
+        }
+        Ok(Err(e)) => format!("(spawn error: {e})"),
+        Err(_) => "(timeout after 120s)".to_string(),
+    }
+}
+
+/// Find the `claude` CLI binary.
+fn which_claude() -> Option<String> {
+    if let Ok(out) = std::process::Command::new("which").arg("claude").output()
+        && out.status.success()
+    {
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !path.is_empty() { return Some(path); }
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        format!("{home}/.npm-global/bin/claude"),
+        "/usr/local/bin/claude".to_string(),
+        format!("{home}/.claude/bin/claude"),
+        format!("{home}/.local/bin/claude"),
+    ];
+    for p in &candidates {
+        if std::path::Path::new(p).exists() { return Some(p.clone()); }
+    }
+    None
 }

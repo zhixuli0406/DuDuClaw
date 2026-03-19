@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use duduclaw_agent::AgentRunner;
 use duduclaw_core::error::DuDuClawError;
@@ -7,6 +8,66 @@ use duduclaw_core::types::CheckStatus;
 mod mcp;
 mod migrate;
 mod service;
+
+// ── Credential helpers (M-4) ────────────────────────────────
+
+/// Load or generate the per-machine AES-256 key stored in `~/.duduclaw/.keyfile`.
+fn load_or_create_keyfile(home: &PathBuf) -> [u8; 32] {
+    let keyfile = home.join(".keyfile");
+    if let Ok(bytes) = std::fs::read(&keyfile) {
+        if bytes.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            return key;
+        }
+    }
+    // Generate fresh key
+    let key = duduclaw_security::crypto::CryptoEngine::generate_key()
+        .unwrap_or([0u8; 32]);
+    let _ = std::fs::write(&keyfile, &key);
+    // Restrict permissions on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&keyfile, std::fs::Permissions::from_mode(0o600));
+    }
+    key
+}
+
+/// Encrypt an API key and return the base64-encoded ciphertext.
+fn encrypt_api_key(api_key: &str, home: &PathBuf) -> Option<String> {
+    if api_key.is_empty() {
+        return None;
+    }
+    let key = load_or_create_keyfile(home);
+    let engine = duduclaw_security::crypto::CryptoEngine::new(&key).ok()?;
+    engine.encrypt_string(api_key).ok()
+}
+
+/// Decrypt a base64-encoded API key from config.toml.
+pub fn decrypt_api_key_from_config(home: &PathBuf) -> Option<String> {
+    let config_path = home.join("config.toml");
+    let content = std::fs::read_to_string(&config_path).ok()?;
+    let table: toml::Table = content.parse().ok()?;
+    let api = table.get("api")?.as_table()?;
+
+    // Check encrypted first
+    if let Some(enc) = api.get("anthropic_api_key_enc").and_then(|v| v.as_str()) {
+        if !enc.is_empty() {
+            let key = load_or_create_keyfile(home);
+            if let Ok(engine) = duduclaw_security::crypto::CryptoEngine::new(&key) {
+                if let Ok(plain) = engine.decrypt_string(enc) {
+                    if !plain.is_empty() {
+                        return Some(plain);
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: plaintext (backwards compat)
+    let plain = api.get("anthropic_api_key")?.as_str()?;
+    if plain.is_empty() { None } else { Some(plain.to_string()) }
+}
 
 #[derive(Parser)]
 #[command(name = "duduclaw", about = "DuDuClaw - Multi-Agent Orchestration CLI")]
@@ -151,50 +212,24 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Agent { command } => match command {
             None => cmd_agent_interactive(None).await,
             Some(AgentCommands::List) => cmd_agent_list().await,
-            Some(AgentCommands::Create { name }) => {
-                println!("TODO: implement agent create '{name}'");
-                Ok(())
-            }
+            Some(AgentCommands::Create { name }) => cmd_agent_create(&name).await,
             Some(AgentCommands::Inspect { agent }) => cmd_agent_inspect(&agent).await,
-            Some(AgentCommands::Pause { agent }) => {
-                println!("TODO: implement agent pause '{agent}'");
-                Ok(())
-            }
-            Some(AgentCommands::Resume { agent }) => {
-                println!("TODO: implement agent resume '{agent}'");
-                Ok(())
-            }
+            Some(AgentCommands::Pause { agent }) => cmd_agent_set_status(&agent, "paused").await,
+            Some(AgentCommands::Resume { agent }) => cmd_agent_set_status(&agent, "active").await,
             Some(AgentCommands::Run { name }) => cmd_agent_interactive(Some(&name)).await,
         },
-        Commands::Gateway => {
-            println!("TODO: implement gateway");
-            Ok(())
-        }
+        Commands::Gateway => cmd_run_server(true).await,
         Commands::Status => cmd_status().await,
         Commands::Doctor => cmd_doctor().await,
         Commands::Service { command } => {
             match command {
-                ServiceCommands::Install => {
-                    println!("TODO: implement service install");
-                    service::detect_platform();
-                }
-                ServiceCommands::Start => {
-                    println!("TODO: implement service start");
-                }
-                ServiceCommands::Stop => {
-                    println!("TODO: implement service stop");
-                }
-                ServiceCommands::Status => {
-                    println!("TODO: implement service status");
-                }
-                ServiceCommands::Logs { lines } => {
-                    println!("TODO: implement service logs (lines: {lines})");
-                }
-                ServiceCommands::Uninstall => {
-                    println!("TODO: implement service uninstall");
-                }
+                ServiceCommands::Install => service::handle_service(service::ServiceAction::Install).await,
+                ServiceCommands::Start => service::handle_service(service::ServiceAction::Start).await,
+                ServiceCommands::Stop => service::handle_service(service::ServiceAction::Stop).await,
+                ServiceCommands::Status => service::handle_service(service::ServiceAction::Status).await,
+                ServiceCommands::Logs { lines: _ } => service::handle_service(service::ServiceAction::Logs).await,
+                ServiceCommands::Uninstall => service::handle_service(service::ServiceAction::Uninstall).await,
             }
-            Ok(())
         }
         Commands::Migrate => cmd_migrate().await,
         Commands::McpServer => cmd_mcp_server().await,
@@ -491,8 +526,17 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
         })?;
     }
 
-    // config.toml
+    // config.toml — encrypt API key with AES-256-GCM (M-4)
     let config_path = home.join("config.toml");
+    let api_key_enc = encrypt_api_key(&api_key, &home).unwrap_or_default();
+    let api_key_line = if !api_key_enc.is_empty() {
+        // Store encrypted; keep plaintext field empty for safety
+        format!(
+            "anthropic_api_key = \"\"\nanthropic_api_key_enc = \"{api_key_enc}\""
+        )
+    } else {
+        format!("anthropic_api_key = \"{api_key}\"")
+    };
     let config_content = format!(
         r#"# DuDuClaw configuration
 # Generated by `duduclaw onboard`
@@ -502,7 +546,7 @@ default_agent = "{agent_name}"
 log_level = "info"
 
 [api]
-anthropic_api_key = "{api_key}"
+{api_key_line}
 
 [gateway]
 bind = "{gw_bind}"
@@ -921,6 +965,136 @@ async fn cmd_doctor() -> duduclaw_core::error::Result<()> {
         println!("All checks passed!");
     }
 
+    Ok(())
+}
+
+/// `duduclaw agent create <name>` - Create a new agent from template.
+async fn cmd_agent_create(name: &str) -> duduclaw_core::error::Result<()> {
+    use console::style;
+
+    let home = duduclaw_home();
+    let agent_name = name.to_lowercase().replace(' ', "-");
+    let display_name = name.to_string();
+    let agent_dir = home.join("agents").join(&agent_name);
+
+    if agent_dir.exists() {
+        println!("  {} Agent '{}' already exists at {}", style("✗").red(), agent_name, agent_dir.display());
+        return Ok(());
+    }
+
+    // Create directory structure
+    for dir in &[
+        agent_dir.clone(),
+        agent_dir.join("SKILLS"),
+        agent_dir.join("memory"),
+    ] {
+        tokio::fs::create_dir_all(dir).await.map_err(|e| {
+            DuDuClawError::Agent(format!("Failed to create {}: {e}", dir.display()))
+        })?;
+    }
+
+    // agent.toml
+    let agent_toml = format!(r#"[agent]
+name = "{agent_name}"
+display_name = "{display_name}"
+role = "specialist"
+status = "active"
+trigger = "@{display_name}"
+reports_to = ""
+icon = "🤖"
+
+[model]
+preferred = "claude-sonnet-4-6"
+fallback = "claude-haiku-4-5"
+account_pool = ["main"]
+
+[container]
+timeout_ms = 1800000
+max_concurrent = 1
+readonly_project = true
+additional_mounts = []
+
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 5000
+warn_threshold_percent = 80
+hard_stop = true
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = true
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = ["*"]
+
+[evolution]
+micro_reflection = true
+meso_reflection = true
+macro_reflection = true
+skill_auto_activate = false
+skill_security_scan = true
+"#);
+    tokio::fs::write(agent_dir.join("agent.toml"), &agent_toml).await.map_err(|e| {
+        DuDuClawError::Agent(format!("Failed to write agent.toml: {e}"))
+    })?;
+
+    // SOUL.md
+    let soul = format!("# {display_name}\n\nI am {display_name}, a specialist AI agent powered by DuDuClaw.\n\n## Core Values\n\n- Helpful and precise\n- Clear in communication\n- Focused on the task at hand\n");
+    tokio::fs::write(agent_dir.join("SOUL.md"), &soul).await.map_err(|e| {
+        DuDuClawError::Agent(format!("Failed to write SOUL.md: {e}"))
+    })?;
+
+    // .claude/ and CLAUDE.md for Claude Code compatibility
+    tokio::fs::create_dir_all(agent_dir.join(".claude")).await.ok();
+    let claude_md = format!("# {display_name}\n\nAgent managed by DuDuClaw v{}.\n", env!("CARGO_PKG_VERSION"));
+    tokio::fs::write(agent_dir.join("CLAUDE.md"), &claude_md).await.ok();
+
+    println!("  {} Created agent '{}' at {}", style("✓").green().bold(), agent_name, agent_dir.display());
+    println!("  {} {}", style("→").cyan(), style("Run `duduclaw agent run {agent_name}` to start a session").dim());
+    Ok(())
+}
+
+/// `duduclaw agent pause/resume <agent>` - Modify agent.toml status.
+async fn cmd_agent_set_status(agent: &str, status: &str) -> duduclaw_core::error::Result<()> {
+    use console::style;
+
+    let home = duduclaw_home();
+    let agent_toml_path = home.join("agents").join(agent).join("agent.toml");
+
+    if !agent_toml_path.exists() {
+        return Err(DuDuClawError::Agent(format!("Agent '{}' not found", agent)));
+    }
+
+    let content = tokio::fs::read_to_string(&agent_toml_path).await.map_err(|e| {
+        DuDuClawError::Agent(format!("Failed to read agent.toml: {e}"))
+    })?;
+
+    let mut table: toml::Table = content.parse().map_err(|e| {
+        DuDuClawError::Agent(format!("Failed to parse agent.toml: {e}"))
+    })?;
+
+    if let Some(agent_section) = table.get_mut("agent").and_then(|v| v.as_table_mut()) {
+        agent_section.insert("status".to_string(), toml::Value::String(status.to_string()));
+    } else {
+        return Err(DuDuClawError::Agent("agent.toml missing [agent] section".to_string()));
+    }
+
+    let new_content = toml::to_string_pretty(&table).map_err(|e| {
+        DuDuClawError::Agent(format!("Failed to serialise agent.toml: {e}"))
+    })?;
+
+    tokio::fs::write(&agent_toml_path, new_content).await.map_err(|e| {
+        DuDuClawError::Agent(format!("Failed to write agent.toml: {e}"))
+    })?;
+
+    let icon = if status == "paused" { style("⏸").yellow() } else { style("▶").green() };
+    println!("  {} Agent '{}' is now {}", icon, agent, style(status).bold());
     Ok(())
 }
 

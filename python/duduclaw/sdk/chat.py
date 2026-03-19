@@ -218,62 +218,122 @@ async def chat_with_rotation(
     return last_error or "（錯誤：所有帳號均不可用）"
 
 
+def _load_config_toml(config_path: str) -> dict:
+    """Parse config.toml and return a dict. Returns {} on error."""
+    try:
+        raw = Path(config_path).read_bytes()
+    except Exception:
+        return {}
+    # Python 3.11+ has tomllib in stdlib; older versions need tomli
+    try:
+        import tomllib  # type: ignore
+        return tomllib.loads(raw.decode("utf-8", errors="replace"))
+    except ImportError:
+        pass
+    try:
+        import tomli  # type: ignore
+        return tomli.loads(raw.decode("utf-8", errors="replace"))
+    except ImportError:
+        pass
+    # Fallback: minimal line-based parser for simple key=value pairs
+    result: dict = {}
+    current_section: str = ""
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and not line.startswith("[["):
+            current_section = line.strip("[]").strip()
+            result.setdefault(current_section, {})
+        elif "=" in line:
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if current_section:
+                result.setdefault(current_section, {})[key] = val
+            else:
+                result[key] = val
+    return result
+
+
 def load_accounts(config_path: str) -> list:
-    """Load accounts from config.toml."""
+    """Load all accounts from config.toml.
+
+    Supports two config formats:
+    1. New multi-account format:
+       [[accounts]]
+       id = "account1"
+       anthropic_api_key = "sk-ant-..."
+       priority = 1
+
+    2. Legacy single-account format:
+       [api]
+       anthropic_api_key = "sk-ant-..."
+    """
     from .account import Account, AccountType
 
+    config = _load_config_toml(config_path)
     accounts = []
 
-    # Try reading config
-    try:
-        content = Path(config_path).read_text()
-    except Exception:
-        # Fallback to env var
-        env_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if env_key:
-            return [Account(id="env", account_type=AccountType.API_KEY, priority=1)]
-        return []
+    # Format 1: [[accounts]] array
+    if "accounts" in config and isinstance(config["accounts"], list):
+        for idx, acc_data in enumerate(config["accounts"]):
+            if not isinstance(acc_data, dict):
+                continue
+            api_key = acc_data.get("anthropic_api_key", "").strip()
+            if not api_key:
+                continue
+            accounts.append(Account(
+                id=acc_data.get("id", f"account_{idx}"),
+                account_type=AccountType.API_KEY,
+                priority=int(acc_data.get("priority", idx + 1)),
+                monthly_budget_cents=int(acc_data.get("monthly_budget_cents", 5000)),
+                tags=acc_data.get("tags", []),
+                api_key=api_key,
+            ))
 
-    # Parse for API key
-    for line in content.splitlines():
-        if "anthropic_api_key" in line and "=" in line:
-            val = line.split("=", 1)[1].strip().strip('"').strip("'")
-            if val:
-                accounts.append(
-                    Account(id="main", account_type=AccountType.API_KEY, priority=1)
-                )
-                break
-
-    # Also check env var
+    # Format 2: [api] section
     if not accounts:
-        env_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        api_section = config.get("api", {})
+        if isinstance(api_section, dict):
+            key = api_section.get("anthropic_api_key", "").strip()
+            if key:
+                accounts.append(Account(
+                    id="main",
+                    account_type=AccountType.API_KEY,
+                    priority=1,
+                    api_key=key,
+                ))
+
+    # Fallback: environment variable
+    if not accounts:
+        env_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
         if env_key:
-            accounts.append(
-                Account(id="env", account_type=AccountType.API_KEY, priority=1)
-            )
+            accounts.append(Account(
+                id="env",
+                account_type=AccountType.API_KEY,
+                priority=1,
+                api_key=env_key,
+            ))
 
     return accounts
 
 
 def get_account_key(account_id: str, config_path: str) -> str:
-    """Get the actual API key for an account."""
-    # Check env var first
-    env_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if env_key:
-        return env_key
+    """Get the actual API key for an account by its ID."""
+    accounts = load_accounts(config_path)
 
-    # Read from config.toml
-    try:
-        content = Path(config_path).read_text()
-        for line in content.splitlines():
-            if "anthropic_api_key" in line and "=" in line:
-                val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                if val:
-                    return val
-    except Exception:
-        pass
+    # Find by ID
+    for account in accounts:
+        if account.id == account_id:
+            return account.api_key
 
-    return ""
+    # Fallback: return the first available key
+    if accounts:
+        return accounts[0].api_key
+
+    # Last resort: environment variable
+    return os.environ.get("ANTHROPIC_API_KEY", "")
 
 
 def main() -> None:

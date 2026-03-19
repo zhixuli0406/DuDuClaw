@@ -87,8 +87,8 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
     let session_mgr = &ctx.session_manager;
     let _ = session_mgr.get_or_create(session_id, &agent_id).await;
 
-    // Append user message to session (rough token estimate: chars / 4)
-    let user_tokens = (text.len() as u32) / 4;
+    // Append user message to session using improved CJK-aware token estimate
+    let user_tokens = estimate_tokens(text);
     if let Err(e) = session_mgr
         .append_message(session_id, "user", text, user_tokens)
         .await
@@ -154,7 +154,7 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
 
     if let Some(reply) = reply {
         // Save assistant reply to session
-        let reply_tokens = (reply.len() as u32) / 4;
+        let reply_tokens = estimate_tokens(&reply);
         if let Err(e) = session_mgr
             .append_message(session_id, "assistant", &reply, reply_tokens)
             .await
@@ -162,12 +162,26 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
             warn!("Failed to save assistant message to session: {e}");
         }
 
-        // Check if compression needed, compress in background
+        // Check if compression needed; generate Claude summary then compress in background
         let sm = ctx.session_manager.clone();
         let sid = session_id.to_string();
+        let home_for_compress = ctx.home_dir.clone();
         tokio::spawn(async move {
             if sm.should_compress(&sid).await {
-                let summary = "[Session compressed — previous conversation summary omitted for brevity]".to_string();
+                // Gather last messages to summarise
+                let msgs = sm.get_messages(&sid).await.unwrap_or_default();
+                let transcript: String = msgs.iter()
+                    .map(|m| format!("[{}] {}", m.role, &m.content[..m.content.len().min(300)]))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let prompt = format!(
+                    "Summarize the following conversation history concisely for use as context \
+                     in future turns. Include key facts, decisions, and outcomes. Max 400 words.\n\n{transcript}"
+                );
+                let summary = match call_claude_cli(&prompt, "claude-haiku-4-5", "", &home_for_compress).await {
+                    Ok(s) => s,
+                    Err(_) => "[Session compressed — previous conversation summary omitted for brevity]".to_string(),
+                };
                 if let Err(e) = sm.compress(&sid, &summary).await {
                     warn!("Session compression failed: {e}");
                 }
@@ -301,6 +315,11 @@ fn which_claude() -> Option<String> {
 
 /// Find the Python source path for `duduclaw.sdk.chat`.
 fn find_python_path(home_dir: &Path) -> String {
+    find_python_path_static(home_dir)
+}
+
+/// Public version usable from other modules (e.g. handlers).
+pub fn find_python_path_static(home_dir: &Path) -> String {
     // Try common locations
     let candidates = [
         // Installed via pip
@@ -324,6 +343,16 @@ fn find_python_path(home_dir: &Path) -> String {
 
     // Fallback: return existing PYTHONPATH
     std::env::var("PYTHONPATH").unwrap_or_default()
+}
+
+/// Delegate execution — spawn Python subprocess with a given prompt and return the response.
+pub async fn call_python_sdk_delegate(
+    prompt: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+) -> Result<String, String> {
+    call_python_sdk_v2(prompt, model, system_prompt, home_dir).await
 }
 
 /// Call the Python Claude Code SDK via subprocess.
@@ -433,6 +462,38 @@ async fn get_default_agent(home_dir: &Path) -> Option<String> {
     let general = table.get("general")?.as_table()?;
     let name = general.get("default_agent")?.as_str()?;
     if name.is_empty() { None } else { Some(name.to_string()) }
+}
+
+/// Estimate the token count for a piece of text.
+///
+/// Uses a CJK-aware heuristic:
+/// - CJK characters (U+3000–U+9FFF and supplementary ranges): ~1.5 chars/token
+/// - ASCII words: ~4 chars/token
+/// - Mixed: weighted average
+///
+/// This is significantly more accurate than the naive `len / 4` for Chinese,
+/// Japanese, and Korean text, which is the primary language of this application.
+fn estimate_tokens(text: &str) -> u32 {
+    let mut cjk_chars: u32 = 0;
+    let mut other_chars: u32 = 0;
+
+    for ch in text.chars() {
+        let cp = ch as u32;
+        if (0x3000..=0x9FFF).contains(&cp)
+            || (0xF900..=0xFAFF).contains(&cp)
+            || (0x20000..=0x2A6DF).contains(&cp)
+            || (0x2A700..=0x2CEAF).contains(&cp)
+        {
+            cjk_chars += 1;
+        } else {
+            other_chars += 1;
+        }
+    }
+
+    // CJK: ~1.5 chars per token; other: ~4 chars per token
+    let cjk_tokens = (cjk_chars as f32 / 1.5).ceil() as u32;
+    let other_tokens = (other_chars as f32 / 4.0).ceil() as u32;
+    cjk_tokens + other_tokens + 1 // +1 minimum
 }
 
 async fn get_api_key(home_dir: &Path) -> Option<String> {

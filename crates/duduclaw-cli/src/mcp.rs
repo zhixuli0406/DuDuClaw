@@ -430,9 +430,202 @@ async fn handle_memory_store(
     }
 }
 
-fn placeholder_response(tool_name: &str) -> Value {
+/// Send a message to another agent via the bus queue.
+async fn handle_send_to_agent(params: &Value, home_dir: &Path) -> Value {
+    let target = params.get("agent_id").or_else(|| params.get("agent")).and_then(|v| v.as_str()).unwrap_or("");
+    let prompt = params.get("prompt").or_else(|| params.get("message")).and_then(|v| v.as_str()).unwrap_or("");
+
+    if target.is_empty() || prompt.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: agent_id and prompt are required"}],
+            "isError": true
+        });
+    }
+
+    let msg_id = uuid::Uuid::new_v4().to_string();
+    let queue_path = home_dir.join("bus_queue.jsonl");
+    let task = serde_json::json!({
+        "type": "agent_message",
+        "message_id": &msg_id,
+        "agent_id": target,
+        "payload": prompt,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+
+    let queued = tokio::task::spawn_blocking({
+        let path = queue_path.clone();
+        let task_str = task.to_string();
+        move || -> bool {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                writeln!(f, "{task_str}").is_ok()
+            } else { false }
+        }
+    }).await.unwrap_or(false);
+
     serde_json::json!({
-        "content": [{"type": "text", "text": format!("Tool '{}' received. (Not yet implemented — placeholder response.)", tool_name)}]
+        "content": [{"type": "text", "text": if queued {
+            format!("Message queued for agent '{target}' (id: {msg_id})")
+        } else {
+            format!("Failed to queue message for agent '{target}'")
+        }}]
+    })
+}
+
+/// Send a photo or sticker via a channel.
+async fn handle_send_media(
+    params: &Value,
+    home_dir: &Path,
+    http: &reqwest::Client,
+    media_type: &str,
+) -> Value {
+    let channel = params.get("channel").and_then(|v| v.as_str()).unwrap_or("telegram");
+    let chat_id = params.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
+    let url_or_id = params.get("url")
+        .or_else(|| params.get("sticker_id"))
+        .or_else(|| params.get("file_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if chat_id.is_empty() || url_or_id.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: chat_id and url/sticker_id are required for {media_type}")}],
+            "isError": true
+        });
+    }
+
+    let config = read_config(home_dir).await;
+    let result = match channel {
+        "telegram" => {
+            let token = config.as_ref()
+                .and_then(|c| c.get("channels"))
+                .and_then(|c| c.get("telegram_bot_token"))
+                .and_then(|v| v.as_str()).unwrap_or("");
+            if token.is_empty() {
+                "Error: telegram_bot_token not configured".to_string()
+            } else {
+                let (method, key) = match media_type {
+                    "photo" => ("sendPhoto", "photo"),
+                    _ => ("sendSticker", "sticker"),
+                };
+                let api_url = format!("https://api.telegram.org/bot{token}/{method}");
+                match http.post(&api_url)
+                    .json(&serde_json::json!({ "chat_id": chat_id, key: url_or_id }))
+                    .send().await
+                {
+                    Ok(r) => format!("{media_type} sent. Status: {}", r.status()),
+                    Err(e) => format!("Error: {e}"),
+                }
+            }
+        }
+        "discord" => {
+            let token = config.as_ref()
+                .and_then(|c| c.get("channels"))
+                .and_then(|c| c.get("discord_bot_token"))
+                .and_then(|v| v.as_str()).unwrap_or("");
+            if token.is_empty() {
+                "Error: discord_bot_token not configured".to_string()
+            } else {
+                let api_url = format!("https://discord.com/api/v10/channels/{chat_id}/messages");
+                match http.post(&api_url)
+                    .header("Authorization", format!("Bot {token}"))
+                    .json(&serde_json::json!({ "content": url_or_id }))
+                    .send().await
+                {
+                    Ok(r) => format!("{media_type} sent. Status: {}", r.status()),
+                    Err(e) => format!("Error: {e}"),
+                }
+            }
+        }
+        _ => format!("Channel '{channel}' does not support {media_type} yet"),
+    };
+
+    serde_json::json!({ "content": [{"type": "text", "text": result}] })
+}
+
+/// Log a mood/emotion entry to agent memory.
+async fn handle_log_mood(
+    params: &Value,
+    _home_dir: &Path,
+    memory: &duduclaw_memory::SqliteMemoryEngine,
+    default_agent: &str,
+) -> Value {
+    use duduclaw_core::traits::MemoryEngine;
+    use duduclaw_core::types::MemoryEntry;
+
+    let mood = params.get("mood").and_then(|v| v.as_str()).unwrap_or("neutral");
+    let note = params.get("note").and_then(|v| v.as_str()).unwrap_or("");
+    let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
+
+    let content = if note.is_empty() {
+        format!("[mood] {mood}")
+    } else {
+        format!("[mood] {mood}: {note}")
+    };
+
+    let entry = MemoryEntry {
+        id: uuid::Uuid::new_v4().to_string(),
+        agent_id: agent_id.to_string(),
+        content,
+        timestamp: chrono::Utc::now(),
+        tags: vec!["mood".to_string(), mood.to_string()],
+        embedding: None,
+    };
+
+    match memory.store(agent_id, entry).await {
+        Ok(()) => serde_json::json!({
+            "content": [{"type": "text", "text": format!("Mood '{mood}' logged for agent '{agent_id}'")}]
+        }),
+        Err(e) => serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error logging mood: {e}")}],
+            "isError": true
+        }),
+    }
+}
+
+/// Schedule a recurring or one-shot task.
+async fn handle_schedule_task(params: &Value, home_dir: &Path) -> Value {
+    let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("default");
+    let cron = params.get("cron").and_then(|v| v.as_str()).unwrap_or("");
+    let task = params.get("task").or_else(|| params.get("prompt")).and_then(|v| v.as_str()).unwrap_or("");
+    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
+
+    if cron.is_empty() || task.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: cron and task are required"}],
+            "isError": true
+        });
+    }
+
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let cron_path = home_dir.join("cron_tasks.jsonl");
+    let entry = serde_json::json!({
+        "id": &task_id,
+        "name": name,
+        "agent_id": agent_id,
+        "cron": cron,
+        "task": task,
+        "enabled": true,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+    });
+
+    let queued = tokio::task::spawn_blocking({
+        let path = cron_path;
+        let entry_str = entry.to_string();
+        move || -> bool {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                writeln!(f, "{entry_str}").is_ok()
+            } else { false }
+        }
+    }).await.unwrap_or(false);
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": if queued {
+            format!("Task '{name}' scheduled (id: {task_id}, cron: {cron})")
+        } else {
+            "Error: Failed to persist task".to_string()
+        }}]
     })
 }
 
@@ -595,9 +788,11 @@ async fn handle_tools_call(
         "web_search" => handle_web_search(&arguments, http).await,
         "memory_search" => handle_memory_search(&arguments, memory, default_agent).await,
         "memory_store" => handle_memory_store(&arguments, memory, default_agent).await,
-        "send_photo" | "send_sticker" | "send_to_agent" | "log_mood" | "schedule_task" => {
-            placeholder_response(tool_name)
-        }
+        "send_to_agent" => handle_send_to_agent(&arguments, home_dir).await,
+        "send_photo" => handle_send_media(&arguments, home_dir, http, "photo").await,
+        "send_sticker" => handle_send_media(&arguments, home_dir, http, "sticker").await,
+        "log_mood" => handle_log_mood(&arguments, home_dir, memory, default_agent).await,
+        "schedule_task" => handle_schedule_task(&arguments, home_dir).await,
         _ => {
             return jsonrpc_error(
                 id,

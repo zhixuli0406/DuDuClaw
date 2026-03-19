@@ -1,9 +1,40 @@
 """Macro Reflection - triggered daily (e.g., 3 AM)"""
+import asyncio
 import logging
+import os
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _call_claude(prompt: str, model: str = "claude-haiku-4-5") -> str:
+    """Call the claude CLI subprocess."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return ""
+    import shutil
+    claude = shutil.which("claude") or ""
+    if not claude:
+        home = os.environ.get("HOME", "")
+        for c in [f"{home}/.npm-global/bin/claude", "/usr/local/bin/claude",
+                  f"{home}/.claude/bin/claude", f"{home}/.local/bin/claude"]:
+            if os.path.exists(c):
+                claude = c
+                break
+    if not claude:
+        return ""
+    try:
+        result = subprocess.run(
+            [claude, "-p", prompt, "--model", model, "--output-format", "text"],
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, "ANTHROPIC_API_KEY": api_key},
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception as e:
+        logger.debug("claude CLI call failed: %s", e)
+        return ""
 
 
 class MacroReflection:
@@ -28,10 +59,32 @@ class MacroReflection:
             "report": "",
         }
 
-        # Analyze skill usage and effectiveness
-        for skill_name, skill_content in skills.items():
-            # TODO: Use Claude to evaluate skill quality
-            pass
+        # Use Claude to evaluate each skill's quality and relevance
+        if skills:
+            skills_text = "\n\n".join(
+                f"### {name}\n{content[:500]}" for name, content in skills.items()
+            )
+            evaluation = await asyncio.get_event_loop().run_in_executor(
+                None,
+                _call_claude,
+                (
+                    f"You are a senior AI agent performing a daily self-audit.\n\n"
+                    f"Review these skills and evaluate each one:\n{skills_text[:5000]}\n\n"
+                    f"Respond in JSON with keys:\n"
+                    f"- skills_to_improve: list of skill names that need updating\n"
+                    f"- skills_to_archive: list of skill names that are outdated or unused\n"
+                    f"- soul_alignment_score: float 0-1 representing overall mission alignment"
+                ),
+            )
+            if evaluation:
+                try:
+                    import json
+                    parsed = json.loads(evaluation)
+                    result["skills_to_improve"] = parsed.get("skills_to_improve", [])
+                    result["skills_to_archive"] = parsed.get("skills_to_archive", [])
+                    result["soul_alignment_score"] = parsed.get("soul_alignment_score")
+                except (json.JSONDecodeError, ValueError):
+                    pass
 
         # Generate daily evolution report
         result["report"] = self._generate_report(result)

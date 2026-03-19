@@ -1,9 +1,54 @@
 """Micro Reflection - triggered after each conversation"""
+import asyncio
 import logging
+import os
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _call_claude(prompt: str, model: str = "claude-haiku-4-5") -> str:
+    """Call the claude CLI subprocess for a quick reflection prompt."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return ""
+
+    claude = _find_claude()
+    if not claude:
+        return ""
+
+    try:
+        result = subprocess.run(
+            [claude, "-p", prompt, "--model", model, "--output-format", "text"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "ANTHROPIC_API_KEY": api_key},
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception as e:
+        logger.debug("claude CLI call failed: %s", e)
+        return ""
+
+
+def _find_claude() -> str:
+    """Find the claude CLI binary."""
+    import shutil
+    path = shutil.which("claude")
+    if path:
+        return path
+    home = os.environ.get("HOME", "")
+    for candidate in [
+        f"{home}/.npm-global/bin/claude",
+        "/usr/local/bin/claude",
+        f"{home}/.claude/bin/claude",
+        f"{home}/.local/bin/claude",
+    ]:
+        if os.path.exists(candidate):
+            return candidate
+    return ""
 
 
 class MicroReflection:
@@ -36,9 +81,31 @@ class MicroReflection:
             "candidate_skills": [],
         }
 
-        # TODO: Use Claude to generate actual reflection
-        # For now, create a structured daily note
-        daily_entry = self._format_daily_entry(now, conversation_summary)
+        # Use Claude to generate structured reflection insights
+        claude_insights = await asyncio.get_event_loop().run_in_executor(
+            None,
+            _call_claude,
+            (
+                f"You are a reflective AI agent. A conversation just ended.\n\n"
+                f"Conversation summary:\n{conversation_summary}\n\n"
+                f"Briefly answer in JSON with keys: what_went_well (list), "
+                f"what_could_improve (list), patterns_noticed (list), "
+                f"candidate_skills (list of skill names worth creating).\n"
+                f"Respond ONLY with the JSON object, no other text."
+            ),
+        )
+        if claude_insights:
+            try:
+                import json
+                parsed = json.loads(claude_insights)
+                reflection["what_went_well"] = parsed.get("what_went_well", [])
+                reflection["what_could_improve"] = parsed.get("what_could_improve", [])
+                reflection["patterns_noticed"] = parsed.get("patterns_noticed", [])
+                reflection["candidate_skills"] = parsed.get("candidate_skills", [])
+            except (json.JSONDecodeError, ValueError):
+                pass  # Ignore malformed JSON; fall back to empty lists
+
+        daily_entry = self._format_daily_entry(now, conversation_summary, reflection)
 
         # Append to daily note
         with open(daily_note_path, "a", encoding="utf-8") as f:
@@ -49,5 +116,14 @@ class MicroReflection:
         )
         return reflection
 
-    def _format_daily_entry(self, timestamp: datetime, summary: str) -> str:
-        return f"\n## {timestamp.strftime('%H:%M:%S')}\n\n{summary}\n\n---\n"
+    def _format_daily_entry(self, timestamp: datetime, summary: str, reflection: dict | None = None) -> str:
+        entry = f"\n## {timestamp.strftime('%H:%M:%S')}\n\n{summary}\n"
+        if reflection:
+            if reflection.get("what_went_well"):
+                entry += "\n**Went well:** " + "; ".join(reflection["what_went_well"]) + "\n"
+            if reflection.get("what_could_improve"):
+                entry += "**Improve:** " + "; ".join(reflection["what_could_improve"]) + "\n"
+            if reflection.get("candidate_skills"):
+                entry += "**Candidate skills:** " + ", ".join(reflection["candidate_skills"]) + "\n"
+        entry += "\n---\n"
+        return entry
