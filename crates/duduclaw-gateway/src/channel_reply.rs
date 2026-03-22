@@ -11,7 +11,11 @@ use duduclaw_agent::registry::AgentRegistry;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use crate::handlers::ChannelState;
 use crate::session::SessionManager;
+
+/// Shared channel status map, accessible by both channel bots and the RPC handler.
+pub type ChannelStatusMap = Arc<RwLock<std::collections::HashMap<String, ChannelState>>>;
 
 // ── Shared state ────────────────────────────────────────────
 
@@ -21,6 +25,7 @@ pub struct ReplyContext {
     pub home_dir: PathBuf,
     pub http: reqwest::Client,
     pub session_manager: Arc<SessionManager>,
+    pub channel_status: ChannelStatusMap,
 }
 
 impl ReplyContext {
@@ -28,6 +33,7 @@ impl ReplyContext {
         registry: Arc<RwLock<AgentRegistry>>,
         home_dir: PathBuf,
         session_manager: Arc<SessionManager>,
+        channel_status: ChannelStatusMap,
     ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
@@ -38,8 +44,19 @@ impl ReplyContext {
             home_dir,
             http,
             session_manager,
+            channel_status,
         }
     }
+}
+
+/// Helper to update a channel's connection state.
+pub async fn set_channel_connected(status: &ChannelStatusMap, name: &str, connected: bool, error: Option<String>) {
+    let mut map = status.write().await;
+    map.insert(name.to_string(), ChannelState {
+        connected,
+        last_event: Some(chrono::Utc::now()),
+        error,
+    });
 }
 
 // ── Public API ──────────────────────────────────────────────

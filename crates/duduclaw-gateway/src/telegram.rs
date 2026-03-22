@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use crate::channel_reply::{ReplyContext, build_reply};
+use crate::channel_reply::{ReplyContext, build_reply, set_channel_connected};
 
 const TELEGRAM_API: &str = "https://api.telegram.org";
 
@@ -91,14 +91,18 @@ pub async fn start_telegram_bot(
                         let name = user.username.as_deref().unwrap_or("unknown");
                         info!("🤖 Telegram bot connected: @{name}");
                     }
+                    set_channel_connected(&ctx.channel_status, "telegram", true, None).await;
                 } else {
-                    warn!("Telegram getMe failed: {}", data.description.unwrap_or_default());
+                    let desc = data.description.unwrap_or_default();
+                    warn!("Telegram getMe failed: {desc}");
+                    set_channel_connected(&ctx.channel_status, "telegram", false, Some(desc)).await;
                     return None;
                 }
             }
         }
         Err(e) => {
             warn!("Telegram connection failed: {e}");
+            set_channel_connected(&ctx.channel_status, "telegram", false, Some(e.to_string())).await;
             return None;
         }
     }
@@ -131,6 +135,7 @@ async fn poll_loop(
     ctx: Arc<ReplyContext>,
 ) {
     let mut offset: i64 = 0;
+    let mut consecutive_errors: u32 = 0;
     info!("Telegram polling started");
 
     loop {
@@ -139,7 +144,9 @@ async fn poll_loop(
         let resp = match client.get(&url).send().await {
             Ok(r) => r,
             Err(e) => {
+                consecutive_errors += 1;
                 warn!("Telegram poll error: {e}");
+                set_channel_connected(&ctx.channel_status, "telegram", false, Some(e.to_string())).await;
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 continue;
             }
@@ -148,17 +155,29 @@ async fn poll_loop(
         let data: TgResponse<Vec<TgUpdate>> = match resp.json().await {
             Ok(d) => d,
             Err(e) => {
+                consecutive_errors += 1;
                 warn!("Telegram parse error: {e}");
+                set_channel_connected(&ctx.channel_status, "telegram", false, Some(e.to_string())).await;
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 continue;
             }
         };
 
         if !data.ok {
-            warn!("Telegram API error: {}", data.description.unwrap_or_default());
+            consecutive_errors += 1;
+            let desc = data.description.unwrap_or_default();
+            warn!("Telegram API error: {desc}");
+            set_channel_connected(&ctx.channel_status, "telegram", false, Some(desc)).await;
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             continue;
         }
+
+        // Poll succeeded — mark connected (only log recovery once)
+        if consecutive_errors > 0 {
+            info!("Telegram polling recovered after {consecutive_errors} errors");
+        }
+        consecutive_errors = 0;
+        set_channel_connected(&ctx.channel_status, "telegram", true, None).await;
 
         if let Some(updates) = data.result {
             for update in updates {

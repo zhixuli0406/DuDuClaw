@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tracing::{error, info, warn};
 
-use crate::channel_reply::{ReplyContext, build_reply};
+use crate::channel_reply::{ChannelStatusMap, ReplyContext, build_reply, set_channel_connected};
 
 const LINE_API: &str = "https://api.line.me/v2/bot";
 
@@ -83,6 +83,7 @@ pub struct LineState {
     secret: String,
     ctx: Arc<ReplyContext>,
     http: reqwest::Client,
+    channel_status: ChannelStatusMap,
 }
 
 // ── Public API ──────────────────────────────────────────────
@@ -104,6 +105,8 @@ pub async fn start_line_bot(
         .build()
         .ok()?;
 
+    let channel_status = ctx.channel_status.clone();
+
     // Verify token
     match http
         .get(format!("{LINE_API}/info"))
@@ -118,18 +121,22 @@ pub async fn start_line_bot(
             } else {
                 info!("💬 LINE bot token verified");
             }
+            set_channel_connected(&channel_status, "line", true, None).await;
         }
         Ok(resp) => {
-            warn!("LINE bot token invalid (HTTP {})", resp.status());
+            let msg = format!("token invalid (HTTP {})", resp.status());
+            warn!("LINE bot {msg}");
+            set_channel_connected(&channel_status, "line", false, Some(msg)).await;
             return None;
         }
         Err(e) => {
             warn!("LINE connection failed: {e}");
+            set_channel_connected(&channel_status, "line", false, Some(e.to_string())).await;
             return None;
         }
     }
 
-    let state = LineState { token, secret, ctx, http };
+    let state = LineState { token, secret, ctx, http, channel_status };
 
     let router = Router::new()
         .route("/webhook/line", post(line_webhook_handler))
@@ -169,6 +176,9 @@ async fn line_webhook_handler(
             return StatusCode::BAD_REQUEST;
         }
     };
+
+    // Update last_event timestamp on each webhook call
+    set_channel_connected(&state.channel_status, "line", true, None).await;
 
     // Process events
     for event in webhook.events {

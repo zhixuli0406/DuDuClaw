@@ -5,6 +5,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -12,7 +13,7 @@ use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
-use crate::channel_reply::{ReplyContext, build_reply};
+use crate::channel_reply::{ReplyContext, build_reply, set_channel_connected};
 
 const DISCORD_API: &str = "https://discord.com/api/v10";
 
@@ -81,6 +82,8 @@ pub async fn start_discord_bot(
         .build()
         .ok()?;
 
+    let channel_status = ctx.channel_status.clone();
+
     // Verify token + get bot info
     let bot_id = match http
         .get(format!("{DISCORD_API}/users/@me"))
@@ -99,11 +102,14 @@ pub async fn start_discord_bot(
             }
         }
         Ok(resp) => {
-            warn!("Discord bot token invalid (HTTP {})", resp.status());
+            let msg = format!("token invalid (HTTP {})", resp.status());
+            warn!("Discord bot {msg}");
+            set_channel_connected(&channel_status, "discord", false, Some(msg)).await;
             return None;
         }
         Err(e) => {
             warn!("Discord connection failed: {e}");
+            set_channel_connected(&channel_status, "discord", false, Some(e.to_string())).await;
             return None;
         }
     };
@@ -144,6 +150,8 @@ async fn gateway_loop(
     http: reqwest::Client,
     ctx: Arc<ReplyContext>,
 ) {
+    let channel_status = ctx.channel_status.clone();
+
     loop {
         info!("Discord Gateway connecting...");
 
@@ -151,20 +159,23 @@ async fn gateway_loop(
             Ok((ws, _)) => ws,
             Err(e) => {
                 warn!("Discord Gateway connection failed: {e}");
+                set_channel_connected(&channel_status, "discord", false, Some(e.to_string())).await;
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
         };
 
         let (mut write, mut read) = ws.split();
-        let mut sequence: Option<u64> = None;
+        // Use AtomicU64 so the heartbeat task always reads the latest sequence number.
+        // Encode None as u64::MAX since Discord sequence numbers start at 0.
+        let sequence = Arc::new(AtomicU64::new(u64::MAX));
         let mut heartbeat_interval_ms: u64 = 41250;
         let mut identified = false;
 
-        // Spawn heartbeat task
-        let (heartbeat_tx, mut heartbeat_rx) = tokio::sync::mpsc::channel::<Option<u64>>(1);
-
-        let heartbeat_write = Arc::new(tokio::sync::Mutex::new(None::<tokio::task::JoinHandle<()>>));
+        // Channel for heartbeat timer to signal "time to send heartbeat"
+        let (heartbeat_tx, mut heartbeat_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let heartbeat_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
 
         loop {
             tokio::select! {
@@ -184,7 +195,7 @@ async fn gateway_loop(
                     };
 
                     if let Some(s) = payload.s {
-                        sequence = Some(s);
+                        sequence.store(s, Ordering::Relaxed);
                     }
 
                     match payload.op {
@@ -197,20 +208,19 @@ async fn gateway_loop(
                                     .unwrap_or(41250);
                             }
 
-                            // Start heartbeat timer task (fires on its own interval)
+                            // Start heartbeat timer task (only signals when to send)
                             let interval = std::time::Duration::from_millis(heartbeat_interval_ms);
                             let tx = heartbeat_tx.clone();
-                            let seq = sequence;
                             let hb_handle = tokio::spawn(async move {
                                 loop {
                                     tokio::time::sleep(interval).await;
-                                    if tx.send(seq).await.is_err() {
+                                    if tx.send(()).await.is_err() {
                                         break;
                                     }
                                 }
                             });
 
-                            let mut guard = heartbeat_write.lock().await;
+                            let mut guard = heartbeat_handle.lock().await;
                             *guard = Some(hb_handle);
 
                             // Send Identify
@@ -246,6 +256,7 @@ async fn gateway_loop(
                                     }
                                 } else if event_name == "READY" {
                                     info!("Discord Gateway READY");
+                                    set_channel_connected(&channel_status, "discord", true, None).await;
                                 }
                             }
                         }
@@ -256,6 +267,7 @@ async fn gateway_loop(
                         // Invalid Session
                         9 => {
                             warn!("Discord Gateway invalid session");
+                            set_channel_connected(&channel_status, "discord", false, Some("invalid session".to_string())).await;
                             identified = false;
                             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                             break;
@@ -265,9 +277,15 @@ async fn gateway_loop(
                     }
                 }
 
-                // ── Heartbeat — fired independently of incoming events ──
-                Some(seq) = heartbeat_rx.recv() => {
-                    let hb = json!({ "op": 1, "d": seq });
+                // ── Heartbeat — read the latest sequence from the shared atomic ──
+                Some(()) = heartbeat_rx.recv() => {
+                    let seq_val = sequence.load(Ordering::Relaxed);
+                    let seq_json: Value = if seq_val == u64::MAX {
+                        Value::Null
+                    } else {
+                        Value::Number(seq_val.into())
+                    };
+                    let hb = json!({ "op": 1, "d": seq_json });
                     if write.send(Message::Text(hb.to_string().into())).await.is_err() {
                         break;
                     }
@@ -276,13 +294,14 @@ async fn gateway_loop(
         }
 
         // Cleanup heartbeat
-        let mut guard = heartbeat_write.lock().await;
+        let mut guard = heartbeat_handle.lock().await;
         if let Some(h) = guard.take() {
             h.abort();
         }
         drop(guard);
 
         let _ = identified;
+        set_channel_connected(&channel_status, "discord", false, Some("reconnecting".to_string())).await;
         warn!("Discord Gateway disconnected, reconnecting in 5s...");
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }

@@ -73,6 +73,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         handler.registry().clone(),
         home_dir.clone(),
         session_manager,
+        handler.channel_status().clone(),
     ));
     let _telegram_handle = crate::telegram::start_telegram_bot(&home_dir, reply_ctx.clone()).await;
     let line_router = crate::line::start_line_bot(&home_dir, reply_ctx.clone()).await;

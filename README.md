@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.4.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-0.5.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 
 ---
 
@@ -135,7 +135,6 @@ DuDuClaw/
 ├── crates/                     # Rust crates (10 個)
 │   ├── duduclaw-core/          # 共用型別、traits (Channel, MemoryEngine)、錯誤定義
 │   ├── duduclaw-agent/         # Agent 註冊、掃描、agent.toml 解析、心跳、預算
-│   ├── duduclaw-container/     # Docker / Apple Container / WSL2 容器管理
 │   ├── duduclaw-security/      # AES-256-GCM 加密、Credential Proxy、RBAC、限流
 │   ├── duduclaw-memory/        # SQLite + FTS5 全文搜尋 + 向量嵌入
 │   ├── duduclaw-gateway/       # Axum 伺服器、通道整合、session、evolution、MCP tools
@@ -158,7 +157,6 @@ DuDuClaw/
 │       ├── lib/                # API client
 │       └── i18n/               # zh-TW / en
 │
-├── container/                  # Dockerfile + entrypoints
 ├── config/                     # 設定範例
 ├── ARCHITECTURE.md             # 完整架構設計文件
 └── CLAUDE.md                   # AI 協作設計上下文
