@@ -13,48 +13,118 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 /// Run micro reflection after a conversation.
+/// Includes external factors if configured.
 pub async fn run_micro(
     home_dir: &Path,
     agent_id: &str,
     agent_dir: &Path,
     summary: &str,
 ) {
-    info!("🔄 Micro reflection for {agent_id}");
-    match call_evolution("micro", home_dir, agent_id, agent_dir, Some(summary)).await {
+    info!("Micro reflection for {agent_id}");
+
+    // Collect external context (lightweight for micro — only user feedback)
+    let external = collect_micro_context(home_dir, agent_id, agent_dir).await;
+    let enriched_summary = if external.is_empty() {
+        summary.to_string()
+    } else {
+        format!("{summary}\n{external}")
+    };
+
+    match call_evolution("micro", home_dir, agent_id, agent_dir, Some(&enriched_summary)).await {
         Ok(result) => {
-            info!("✅ Micro reflection done: {}", result.get("status").and_then(|v| v.as_str()).unwrap_or("?"));
+            info!("Micro reflection done: {}", result.get("status").and_then(|v| v.as_str()).unwrap_or("?"));
         }
         Err(e) => warn!("Micro reflection failed: {e}"),
     }
 }
 
-/// Run meso reflection (heartbeat).
+/// Run meso reflection (heartbeat) with full external factors.
 pub async fn run_meso(home_dir: &Path, agent_id: &str, agent_dir: &Path) {
-    info!("🔄 Meso reflection for {agent_id}");
-    match call_evolution("meso", home_dir, agent_id, agent_dir, None).await {
+    info!("Meso reflection for {agent_id}");
+
+    let external = collect_full_context(home_dir, agent_id, agent_dir).await;
+    let context = if external.is_empty() { None } else { Some(external.as_str()) };
+
+    match call_evolution("meso", home_dir, agent_id, agent_dir, context).await {
         Ok(result) => {
             let notes = result.get("notes_reviewed").and_then(|v| v.as_u64()).unwrap_or(0);
-            info!("✅ Meso reflection done: reviewed {notes} notes");
+            info!("Meso reflection done: reviewed {notes} notes");
         }
         Err(e) => warn!("Meso reflection failed: {e}"),
     }
 }
 
-/// Run macro reflection (daily).
+/// Run macro reflection (daily) with full external factors + business context.
 pub async fn run_macro(home_dir: &Path, agent_id: &str, agent_dir: &Path) {
-    info!("🔄 Macro reflection for {agent_id}");
-    match call_evolution("macro", home_dir, agent_id, agent_dir, None).await {
+    info!("Macro reflection for {agent_id}");
+
+    let external = collect_full_context(home_dir, agent_id, agent_dir).await;
+    let context = if external.is_empty() { None } else { Some(external.as_str()) };
+
+    match call_evolution("macro", home_dir, agent_id, agent_dir, context).await {
         Ok(result) => {
             let skills = result.get("skills_reviewed").and_then(|v| v.as_u64()).unwrap_or(0);
-            info!("✅ Macro reflection done: reviewed {skills} skills");
-            // Log the report if present
+            info!("Macro reflection done: reviewed {skills} skills");
             if let Some(report) = result.get("report").and_then(|v| v.as_str())
                 && !report.is_empty()
             {
-                info!("📊 Evolution report:\n{report}");
+                info!("Evolution report:\n{report}");
             }
         }
         Err(e) => warn!("Macro reflection failed: {e}"),
+    }
+}
+
+/// Collect lightweight external context for micro reflections (only user feedback).
+async fn collect_micro_context(home_dir: &Path, agent_id: &str, agent_dir: &Path) -> String {
+    let config = load_evolution_config(agent_dir).await;
+    if !config.external_factors.user_feedback {
+        return String::new();
+    }
+
+    let ctx = crate::external_factors::collect_external_factors(
+        home_dir,
+        agent_id,
+        &duduclaw_core::types::ExternalFactorsConfig {
+            user_feedback: true,
+            ..Default::default()
+        },
+    ).await;
+
+    ctx.to_prompt()
+}
+
+/// Collect full external context for meso/macro reflections.
+async fn collect_full_context(home_dir: &Path, agent_id: &str, agent_dir: &Path) -> String {
+    let config = load_evolution_config(agent_dir).await;
+    let ctx = crate::external_factors::collect_external_factors(
+        home_dir,
+        agent_id,
+        &config.external_factors,
+    ).await;
+
+    ctx.to_prompt()
+}
+
+/// Load EvolutionConfig from agent.toml.
+async fn load_evolution_config(agent_dir: &Path) -> duduclaw_core::types::EvolutionConfig {
+    let toml_path = agent_dir.join("agent.toml");
+    match tokio::fs::read_to_string(&toml_path).await {
+        Ok(content) => {
+            if let Ok(config) = toml::from_str::<duduclaw_core::types::AgentConfig>(&content) {
+                return config.evolution;
+            }
+        }
+        Err(_) => {}
+    }
+    // Default: all external factors disabled
+    duduclaw_core::types::EvolutionConfig {
+        micro_reflection: true,
+        meso_reflection: true,
+        macro_reflection: true,
+        skill_auto_activate: false,
+        skill_security_scan: true,
+        external_factors: Default::default(),
     }
 }
 
