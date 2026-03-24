@@ -100,16 +100,22 @@ pub struct SkillRegistry {
 }
 
 impl SkillRegistry {
-    /// Load the registry from disk (or create an empty one).
+    /// Load the registry from disk. Seeds built-in skills if empty.
     pub fn load(home_dir: &Path) -> Self {
         let index_path = home_dir.join("skill_index.json");
-        let index = match std::fs::read_to_string(&index_path) {
+        let mut index = match std::fs::read_to_string(&index_path) {
             Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
                 warn!("Failed to parse skill index: {e}");
                 SkillIndex::empty()
             }),
             Err(_) => SkillIndex::empty(),
         };
+
+        // Seed built-in skills if the index is empty
+        if index.skills.is_empty() {
+            index.skills = builtin_skills();
+            index.updated_at = Utc::now().to_rfc3339();
+        }
 
         info!(
             count = index.skills.len(),
@@ -171,4 +177,30 @@ impl SkillRegistry {
     pub fn index(&self) -> &SkillIndex {
         &self.index
     }
+}
+
+/// Built-in skill catalog — seeded when the index is empty.
+fn builtin_skills() -> Vec<SkillIndexEntry> {
+    vec![
+        SkillIndexEntry { name: "code-review".into(), description: "Automated code review with severity ratings, security checks, and actionable suggestions".into(), tags: vec!["code".into(), "review".into(), "quality".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into(), "openclaw".into()] },
+        SkillIndexEntry { name: "git-commit".into(), description: "Generate conventional commit messages from staged changes".into(), tags: vec!["git".into(), "automation".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into(), "openclaw".into()] },
+        SkillIndexEntry { name: "test-generator".into(), description: "Generate unit tests for functions and modules with TDD methodology".into(), tags: vec!["testing".into(), "tdd".into(), "code".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into()] },
+        SkillIndexEntry { name: "api-designer".into(), description: "Design REST API endpoints with OpenAPI spec generation".into(), tags: vec!["api".into(), "design".into(), "openapi".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into(), "openclaw".into()] },
+        SkillIndexEntry { name: "sql-optimizer".into(), description: "Analyze and optimize SQL queries for PostgreSQL and MySQL".into(), tags: vec!["database".into(), "sql".into(), "performance".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into()] },
+        SkillIndexEntry { name: "security-scanner".into(), description: "Scan code for OWASP Top 10 vulnerabilities, secrets, and injection risks".into(), tags: vec!["security".into(), "owasp".into(), "scanning".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into(), "openclaw".into()] },
+        SkillIndexEntry { name: "dockerfile-builder".into(), description: "Generate optimized Dockerfiles with multi-stage builds and security best practices".into(), tags: vec!["docker".into(), "devops".into(), "container".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into()] },
+        SkillIndexEntry { name: "i18n-translator".into(), description: "Extract and translate UI strings for internationalization (zh-TW, en, ja)".into(), tags: vec!["i18n".into(), "translation".into(), "ui".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into(), "openclaw".into()] },
+        SkillIndexEntry { name: "changelog-writer".into(), description: "Generate changelogs from git history with semantic grouping".into(), tags: vec!["git".into(), "documentation".into(), "release".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into()] },
+        SkillIndexEntry { name: "data-visualizer".into(), description: "Create charts and dashboards from CSV/JSON data using D3.js or Recharts".into(), tags: vec!["data".into(), "visualization".into(), "charts".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into()] },
+        SkillIndexEntry { name: "email-composer".into(), description: "Draft professional emails with tone adjustment and multilingual support".into(), tags: vec!["communication".into(), "email".into(), "writing".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into(), "openclaw".into()] },
+        SkillIndexEntry { name: "meeting-summarizer".into(), description: "Summarize meeting notes into action items, decisions, and follow-ups".into(), tags: vec!["communication".into(), "meetings".into(), "productivity".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into()] },
+        SkillIndexEntry { name: "odoo-assistant".into(), description: "Query and manage Odoo ERP data — CRM leads, sales orders, inventory, invoices".into(), tags: vec!["erp".into(), "odoo".into(), "business".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into()] },
+        SkillIndexEntry { name: "prompt-engineer".into(), description: "Optimize and refine AI prompts for better outputs with evaluation metrics".into(), tags: vec!["ai".into(), "prompts".into(), "optimization".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into(), "openclaw".into()] },
+        SkillIndexEntry { name: "regex-builder".into(), description: "Build and test regular expressions with explanations and test cases".into(), tags: vec!["utility".into(), "regex".into(), "text".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into()] },
+        SkillIndexEntry { name: "dependency-auditor".into(), description: "Audit npm/cargo/pip dependencies for vulnerabilities and license issues".into(), tags: vec!["security".into(), "dependencies".into(), "audit".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into(), "openclaw".into()] },
+        SkillIndexEntry { name: "performance-profiler".into(), description: "Profile application performance and suggest optimizations for web and API".into(), tags: vec!["performance".into(), "optimization".into(), "profiling".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into()] },
+        SkillIndexEntry { name: "markdown-formatter".into(), description: "Format and beautify Markdown documents with table alignment and TOC generation".into(), tags: vec!["documentation".into(), "markdown".into(), "formatting".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into(), "openclaw".into()] },
+        SkillIndexEntry { name: "crm-pipeline".into(), description: "Manage CRM pipeline — create leads, update stages, send follow-up notifications".into(), tags: vec!["crm".into(), "sales".into(), "business".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into()] },
+        SkillIndexEntry { name: "image-describer".into(), description: "Describe images for accessibility, generate alt text, and extract visual content".into(), tags: vec!["media".into(), "accessibility".into(), "ai".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into(), "openclaw".into()] },
+    ]
 }
