@@ -866,11 +866,16 @@ skill_security_scan = true
             }
         }
 
-        // Also search the local skill registry if available
-        let registry = duduclaw_agent::skill_registry::SkillRegistry::load(&self.home_dir);
+        // Search the skill market registry (remote-backed, cached locally)
+        let mut registry = duduclaw_agent::skill_registry::SkillRegistry::load(&self.home_dir);
+
+        // Auto-refresh from remote if cache is stale or empty
+        if registry.needs_refresh() {
+            let _ = registry.refresh().await;
+        }
+
         let index_results = registry.search(query, 20);
         for entry in index_results {
-            // Avoid duplicates
             if !results.iter().any(|r| r["name"].as_str() == Some(&entry.name)) {
                 results.push(json!({
                     "name": entry.name,
@@ -883,7 +888,11 @@ skill_security_scan = true
             }
         }
 
-        WsFrame::ok_response("", json!({ "skills": results }))
+        WsFrame::ok_response("", json!({
+            "skills": results,
+            "source": registry.source(),
+            "total_indexed": registry.count(),
+        }))
     }
 
     async fn handle_skills_content(&self, params: Value) -> WsFrame {

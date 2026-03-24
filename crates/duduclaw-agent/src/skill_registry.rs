@@ -1,7 +1,8 @@
-//! Local skill registry — cached index for searching and installing skills.
+//! Skill registry — fetches from remote skill markets and caches locally.
 //!
-//! [B-2a] Maintains a local JSON index at `~/.duduclaw/skill_index.json`
-//! supporting search by name, tag, and description.
+//! [B-2a] Fetches skill index from GitHub (awesome-openclaw-skills or similar),
+//! caches to `~/.duduclaw/skill_index.json`, and supports search.
+//! Falls back to built-in seeds only when offline and no cache exists.
 
 use std::path::{Path, PathBuf};
 
@@ -29,19 +30,20 @@ pub struct SkillIndexEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillIndex {
     pub updated_at: String,
+    #[serde(default)]
+    pub source: String,
     pub skills: Vec<SkillIndexEntry>,
 }
 
 impl SkillIndex {
-    /// Create an empty index.
     pub fn empty() -> Self {
         Self {
             updated_at: Utc::now().to_rfc3339(),
+            source: String::new(),
             skills: Vec::new(),
         }
     }
 
-    /// Search skills by query (matches name, description, and tags).
     pub fn search(&self, query: &str, limit: usize) -> Vec<&SkillIndexEntry> {
         let lower = query.to_lowercase();
         let terms: Vec<&str> = lower.split_whitespace().collect();
@@ -55,23 +57,19 @@ impl SkillIndex {
             })
             .collect();
 
-        // Sort by score descending
         results.sort_by(|a, b| b.1.cmp(&a.1));
         results.into_iter().take(limit).map(|(s, _)| s).collect()
     }
 
-    /// Get total skill count.
     pub fn len(&self) -> usize {
         self.skills.len()
     }
 
-    /// Check if index is empty.
     pub fn is_empty(&self) -> bool {
         self.skills.is_empty()
     }
 }
 
-/// Score how well a skill matches the search terms.
 fn score_match(skill: &SkillIndexEntry, terms: &[&str]) -> usize {
     let mut score = 0;
     let name_lower = skill.name.to_lowercase();
@@ -79,7 +77,7 @@ fn score_match(skill: &SkillIndexEntry, terms: &[&str]) -> usize {
 
     for term in terms {
         if name_lower.contains(term) {
-            score += 10; // Name match is highest weight
+            score += 10;
         }
         if desc_lower.contains(term) {
             score += 5;
@@ -93,17 +91,36 @@ fn score_match(skill: &SkillIndexEntry, terms: &[&str]) -> usize {
     score
 }
 
-/// Local skill registry manager.
+// ── Remote sources ──────────────────────────────────────────
+
+/// Known remote skill index sources.
+const REMOTE_SOURCES: &[(&str, &str)] = &[
+    (
+        "awesome-openclaw-skills",
+        "https://raw.githubusercontent.com/VoltAgent/awesome-openclaw-skills/main/index.json",
+    ),
+    (
+        "duduclaw-skills",
+        "https://raw.githubusercontent.com/zhixuli0406/duduclaw-skills/main/index.json",
+    ),
+];
+
+/// Maximum age of cached index before re-fetching (24 hours).
+const CACHE_MAX_AGE_SECS: i64 = 86400;
+
+// ── SkillRegistry ───────────────────────────────────────────
+
+/// Local skill registry manager with remote fetching.
 pub struct SkillRegistry {
     index_path: PathBuf,
     index: SkillIndex,
 }
 
 impl SkillRegistry {
-    /// Load the registry from disk. Seeds built-in skills if empty.
+    /// Load from disk cache. Does NOT fetch remotely (use `refresh()` for that).
     pub fn load(home_dir: &Path) -> Self {
         let index_path = home_dir.join("skill_index.json");
-        let mut index = match std::fs::read_to_string(&index_path) {
+        let index = match std::fs::read_to_string(&index_path) {
             Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
                 warn!("Failed to parse skill index: {e}");
                 SkillIndex::empty()
@@ -111,19 +128,97 @@ impl SkillRegistry {
             Err(_) => SkillIndex::empty(),
         };
 
-        // Seed built-in skills if the index is empty
-        if index.skills.is_empty() {
-            index.skills = builtin_skills();
-            index.updated_at = Utc::now().to_rfc3339();
-        }
-
         info!(
             count = index.skills.len(),
-            updated = %index.updated_at,
-            "Skill registry loaded"
+            source = %index.source,
+            "Skill registry loaded from cache"
         );
 
         Self { index_path, index }
+    }
+
+    /// Check if the cache is stale (older than 24 hours) or empty.
+    pub fn needs_refresh(&self) -> bool {
+        if self.index.skills.is_empty() {
+            return true;
+        }
+        let updated = chrono::DateTime::parse_from_rfc3339(&self.index.updated_at)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now() - chrono::Duration::days(2));
+        let age = Utc::now().signed_duration_since(updated);
+        age.num_seconds() > CACHE_MAX_AGE_SECS
+    }
+
+    /// Fetch skill index from remote sources and update local cache.
+    /// Falls back to built-in seeds if all remotes fail.
+    pub async fn refresh(&mut self) -> Result<usize, String> {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| format!("HTTP client: {e}"))?;
+
+        for (source_name, url) in REMOTE_SOURCES {
+            info!(source = source_name, url, "Fetching skill index");
+
+            match http.get(*url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<RemoteIndex>().await {
+                        Ok(remote) => {
+                            let skills: Vec<SkillIndexEntry> = remote.skills
+                                .into_iter()
+                                .map(|s| SkillIndexEntry {
+                                    name: s.name,
+                                    description: s.description.unwrap_or_default(),
+                                    tags: s.tags.unwrap_or_default(),
+                                    author: s.author.unwrap_or_default(),
+                                    url: s.url.unwrap_or_default(),
+                                    compatible: s.compatible.unwrap_or_default(),
+                                })
+                                .collect();
+
+                            let count = skills.len();
+                            self.index = SkillIndex {
+                                updated_at: Utc::now().to_rfc3339(),
+                                source: source_name.to_string(),
+                                skills,
+                            };
+
+                            if let Err(e) = self.save() {
+                                warn!("Failed to cache skill index: {e}");
+                            }
+
+                            info!(source = source_name, count, "Skill index fetched from remote");
+                            return Ok(count);
+                        }
+                        Err(e) => {
+                            warn!(source = source_name, "Failed to parse remote index: {e}");
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    warn!(source = source_name, status = %resp.status(), "Remote index returned error");
+                }
+                Err(e) => {
+                    warn!(source = source_name, "Failed to fetch remote index: {e}");
+                }
+            }
+        }
+
+        // All remotes failed — seed built-in if empty
+        if self.index.skills.is_empty() {
+            info!("All remote sources failed, seeding built-in skills");
+            self.index = SkillIndex {
+                updated_at: Utc::now().to_rfc3339(),
+                source: "built-in".to_string(),
+                skills: builtin_skills(),
+            };
+            let _ = self.save();
+            Ok(self.index.skills.len())
+        } else {
+            // Keep existing cache, just log
+            warn!("All remote sources failed, using stale cache ({} skills)", self.index.skills.len());
+            Ok(self.index.skills.len())
+        }
     }
 
     /// Save the current index to disk.
@@ -177,9 +272,33 @@ impl SkillRegistry {
     pub fn index(&self) -> &SkillIndex {
         &self.index
     }
+
+    /// Get the source name of the current index.
+    pub fn source(&self) -> &str {
+        &self.index.source
+    }
 }
 
-/// Built-in skill catalog — seeded when the index is empty.
+// ── Remote index format (flexible parsing) ──────────────────
+
+#[derive(Deserialize)]
+struct RemoteIndex {
+    #[serde(default)]
+    skills: Vec<RemoteSkill>,
+}
+
+#[derive(Deserialize)]
+struct RemoteSkill {
+    name: String,
+    description: Option<String>,
+    tags: Option<Vec<String>>,
+    author: Option<String>,
+    url: Option<String>,
+    compatible: Option<Vec<String>>,
+}
+
+// ── Built-in fallback ───────────────────────────────────────
+
 fn builtin_skills() -> Vec<SkillIndexEntry> {
     vec![
         SkillIndexEntry { name: "code-review".into(), description: "Automated code review with severity ratings, security checks, and actionable suggestions".into(), tags: vec!["code".into(), "review".into(), "quality".into()], author: "duduclaw".into(), url: String::new(), compatible: vec!["duduclaw".into(), "openclaw".into()] },
