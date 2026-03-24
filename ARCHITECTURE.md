@@ -1,7 +1,7 @@
 # DuDuClaw 系統架構設計
 
-> 版本：0.5.1
-> 日期：2026-03-19
+> 版本：0.6.0
+> 日期：2026-03-23
 
 ---
 
@@ -596,3 +596,99 @@ ed25519_pubkey = "<base64 public key>"
 ```json
 {"id": "uuid", "name": "daily-macro", "schedule": "0 0 * * *", "agent_id": "dudu", "action": "macro_reflect", "enabled": true}
 ```
+
+### 12.5 `CONTRACT.toml`（行為契約）
+
+```toml
+[boundaries]
+must_not = ["reveal api keys", "execute rm -rf", "modify SOUL.md"]
+must_always = ["respond in zh-TW", "refuse harmful requests"]
+max_tool_calls_per_turn = 10
+```
+
+### 12.6 `security_audit.jsonl`
+
+```json
+{"timestamp": "2026-03-23T12:00:00Z", "event_type": "soul_drift", "agent_id": "dudu", "severity": "critical", "details": {"expected_hash": "abc...", "actual_hash": "def..."}}
+```
+
+---
+
+## 十三、Phase 2 新增模組（v0.6.0）
+
+### 13.1 容器沙箱（Container Sandbox）
+
+```
+Agent Task
+  ↓ dispatch_to_agent()
+  ├─ sandbox_enabled = false → call_claude_for_agent() [直接呼叫]
+  └─ sandbox_enabled = true  → run_sandboxed() [Docker 容器]
+                                 ├─ Agent dir: /agent (read-only mount)
+                                 ├─ Workspace: /workspace (tmpfs 256MB)
+                                 ├─ Network: none (預設離線)
+                                 ├─ Root FS: read-only
+                                 ├─ Memory: 512MB limit
+                                 └─ Timeout: auto-kill
+```
+
+**Runtime 偵測優先級**：Apple Container (macOS 15+) > WSL2 (Windows) > Docker
+
+### 13.2 安全防護層（Security Layer）
+
+| 模組 | 檔案 | 功能 |
+|------|------|------|
+| Soul Guard | `soul_guard.rs` | SHA-256 指紋 + `.soul_hash` 持久化 + `.soul_history/` 10 版備份 |
+| Input Guard | `input_guard.rs` | 6 類 prompt injection 規則（風險評分 0-100） |
+| Audit Log | `audit.rs` | JSONL append-only 安全事件日誌 |
+| Key Vault | `key_vault.rs` | Per-agent 通道權限 + API key 隔離 |
+
+**Injection 規則類別**：instruction_override (40), role_hijack (35), system_prompt_extraction (30), tool_abuse (30), encoding_bypass (25), data_exfiltration (25), unicode_injection (20)
+
+### 13.3 Skill 生態系統
+
+```
+skill_loader.rs     ← 解析 SKILL.md YAML frontmatter
+skill_registry.rs   ← 本地 JSON 索引 + 加權搜尋
+MCP: skill_search   ← Agent 自主搜尋 skill
+MCP: skill_list     ← 列出 agent 已安裝 skill
+```
+
+**搜尋權重**：name x10 > tag x7 > description x5
+
+### 13.4 紅隊測試（Red Team）
+
+`duduclaw test <agent>` 內建 9 項測試：
+
+1. SOUL.md 完整性
+2. 行為契約存在性
+3. Instruction override 偵測
+4. Role hijack 偵測
+5. System prompt extraction 偵測
+6. Tool abuse 偵測
+7. Data exfiltration 偵測
+8. Encoding bypass 偵測
+9. Contract enforcement 驗證
+
+輸出：彩色終端機摘要 + `~/.duduclaw/test-report-<agent>.json`
+
+### 13.5 Sub-Agent 編排
+
+```
+Main Agent (Claude Code)
+  ├─ create_agent(name, role, soul, reports_to)  → 建立持久化 agent 目錄
+  ├─ spawn_agent(agent_id, task)                 → 寫入 bus_queue.jsonl
+  │     → AgentDispatcher 消費 → spawn claude CLI → 結果回寫
+  ├─ list_agents()                               → 掃描 agents/ 目錄
+  └─ agent_status(agent_id)                      → 配置 + 待處理任務數
+```
+
+### 13.6 統一 Heartbeat Scheduler
+
+取代舊版 `start_evolution_timers`（全局硬編碼），改為 per-agent 排程：
+
+- 每個 agent 獨立的 cron/interval 設定
+- `max_concurrent_runs` Semaphore 並行控制
+- 每 30 秒 tick，每 5 分鐘從 registry 重新同步
+- Meso reflection：每次 heartbeat 觸發
+- Macro reflection：每 24 小時觸發
+- RPC 方法：`heartbeat.status` + `heartbeat.trigger`

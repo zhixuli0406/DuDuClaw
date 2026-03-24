@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.5.1-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-0.6.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 
 ---
 
@@ -38,13 +38,18 @@ DuDuClaw (plumbing)
 
 | 特色 | 說明 |
 |------|------|
-| **MCP Server 架構** | `duduclaw mcp-server` 提供 10+ 工具給 Claude Code，包括 send_message、send_photo、send_sticker、web_search、send_to_agent、memory_search、memory_store 等 |
+| **MCP Server 架構** | `duduclaw mcp-server` 提供 15+ 工具給 Claude Code，包括 send_message、send_photo、send_sticker、web_search、send_to_agent、memory_search、memory_store、create_agent、spawn_agent、list_agents、agent_status、skill_search、skill_list、schedule_task 等 |
+| **Sub-Agent 編排** | `create_agent` 建立持久化 sub-agent + `spawn_agent` 背景派發 + `reports_to` 組織層級 + D3.js 組織架構圖 |
 | **三通道支援** | Telegram (long polling)、LINE (webhook)、Discord (Gateway WebSocket) |
+| **容器沙箱** | Docker / Apple Container 隔離執行（`--network=none`、tmpfs workspace、read-only rootfs、512MB limit） |
 | **Session 管理** | SQLite 持久化對話歷程，超過 50k token 自動壓縮摘要 |
-| **自主進化引擎** | Micro（每次對話後）→ Meso（每小時心跳）→ Macro（每日排程）三層反思 |
+| **自主進化引擎** | Micro（每次對話後）→ Meso（per-agent 心跳）→ Macro（每日排程）三層反思，統一由 heartbeat scheduler 驅動 |
+| **安全防護** | SOUL.md 漂移檢測（SHA-256）+ prompt injection 掃描（6 類規則）+ JSONL 審計日誌 + per-agent 密鑰隔離 |
+| **行為契約** | `CONTRACT.toml` 定義 `must_not` / `must_always` 邊界 + `duduclaw test` 紅隊測試（9 項內建場景） |
+| **Skill 市場** | OpenClaw 相容的 skill 格式解析 + 本地 registry 索引 + MCP 工具自主安裝 + Dashboard 市場頁面 |
 | **多帳號輪替** | Python SDK 管理多個 Claude API key，支援 4 種策略 + 預算追蹤 + 故障轉移 |
 | **Claude Code 原生目錄** | Agent 目錄包含 `.claude/`、`SOUL.md`、`CLAUDE.md`、`.mcp.json`，直接相容 Claude Code |
-| **Web Dashboard** | React + TypeScript + Tailwind CSS，溫暖 amber 色系，支援深淺色切換 |
+| **Web Dashboard** | React + TypeScript + Tailwind CSS，溫暖 amber 色系，支援深淺色切換，含組織架構圖、Skill 市場、安全審計頁 |
 
 ---
 
@@ -114,13 +119,14 @@ cargo build --release -p duduclaw-cli -p duduclaw-gateway --features duduclaw-ga
 
 ```
 duduclaw onboard         # 互動式首次設定
-duduclaw run             # 一鍵啟動（onboard + doctor + gateway + channels）
+duduclaw run             # 一鍵啟動（gateway + channels + heartbeat + cron + dispatcher）
 duduclaw migrate         # 將 agent.toml 轉換為 Claude Code 格式
 duduclaw mcp-server      # 啟動 MCP Server（供 Claude Code 使用）
 duduclaw agent           # CLI 互動式對話
 duduclaw agent list      # 列出所有 Agent
 duduclaw agent create    # 建立新 Agent
 duduclaw agent inspect   # 檢視 Agent 詳情
+duduclaw test <agent>    # 紅隊安全測試（9 項內建場景 + JSON 報告）
 duduclaw status          # 系統健康快照
 duduclaw doctor          # 健康診斷
 duduclaw service install # 安裝為系統服務
@@ -134,13 +140,14 @@ duduclaw service install # 安裝為系統服務
 DuDuClaw/
 ├── crates/                     # Rust crates (10 個)
 │   ├── duduclaw-core/          # 共用型別、traits (Channel, MemoryEngine)、錯誤定義
-│   ├── duduclaw-agent/         # Agent 註冊、掃描、agent.toml 解析、心跳、預算
-│   ├── duduclaw-security/      # AES-256-GCM 加密、Credential Proxy、RBAC、限流
+│   ├── duduclaw-agent/         # Agent 註冊、心跳、預算、契約、skill loader/registry
+│   ├── duduclaw-security/      # AES-256-GCM、SOUL guard、input guard、audit、key vault
+│   ├── duduclaw-container/     # Docker / Apple Container / WSL2 沙箱執行
 │   ├── duduclaw-memory/        # SQLite + FTS5 全文搜尋 + 向量嵌入
-│   ├── duduclaw-gateway/       # Axum 伺服器、通道整合、session、evolution、MCP tools
+│   ├── duduclaw-gateway/       # Axum 伺服器、通道、session、evolution、cron、dispatcher
 │   ├── duduclaw-bus/           # tokio broadcast + mpsc 訊息路由
 │   ├── duduclaw-bridge/        # PyO3 Rust↔Python 橋接層
-│   ├── duduclaw-cli/           # clap CLI 入口 + MCP server + migrate
+│   ├── duduclaw-cli/           # clap CLI 入口 + MCP server + migrate + test
 │   └── duduclaw-dashboard/     # rust-embed 嵌入 React SPA
 │
 ├── python/duduclaw/            # Python 擴充層
@@ -151,14 +158,16 @@ DuDuClaw/
 │
 ├── web/                        # React Dashboard
 │   └── src/
-│       ├── components/         # UI 元件 (shadcn/ui)
-│       ├── pages/              # 頁面
+│       ├── components/         # UI 元件 (OrgChart, Dialog, Layout)
+│       ├── pages/              # 10 個頁面（Dashboard, Agents, OrgChart, SkillMarket, ...）
 │       ├── stores/             # Zustand 狀態管理
-│       ├── lib/                # API client
+│       ├── lib/                # API client (WebSocket JSON-RPC)
 │       └── i18n/               # zh-TW / en
 │
-├── config/                     # 設定範例
+├── docs/                       # 研究文件
+│   └── claw-ecosystem-report.md
 ├── ARCHITECTURE.md             # 完整架構設計文件
+├── Phase2-TODO.md              # Phase 2 任務追蹤（21/21 完成）
 └── CLAUDE.md                   # AI 協作設計上下文
 ```
 
