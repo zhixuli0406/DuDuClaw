@@ -110,9 +110,9 @@ const ROLE_COLORS: Record<string, string> = {
 
 // ── Node dimensions ───────────────────────────────────────────
 
-const NODE_W = 200;
-const NODE_H = 80;
-const NODE_RX = 12;
+const NODE_W = 180;
+const NODE_H = 64;
+const NODE_RX = 10;
 
 // ── Component ─────────────────────────────────────────────────
 
@@ -137,11 +137,11 @@ export function OrgChart({ agents, onNodeClick }: OrgChartProps) {
     const containerWidth = containerRef.current.clientWidth;
     const containerHeight = containerRef.current.clientHeight;
 
-    // Tree layout
+    // Tree layout — compact spacing
     const treeLayout = d3
       .tree<OrgNode>()
-      .nodeSize([NODE_W + 40, NODE_H + 60])
-      .separation((a, b) => (a.parent === b.parent ? 1 : 1.2));
+      .nodeSize([NODE_W + 24, NODE_H + 40])
+      .separation((a, b) => (a.parent === b.parent ? 1 : 1.1));
 
     treeLayout(root);
 
@@ -157,35 +157,33 @@ export function OrgChart({ agents, onNodeClick }: OrgChartProps) {
       if (d.y! > maxY) maxY = d.y!;
     });
 
-    const treeWidth = maxX - minX + NODE_W + 80;
-    const treeHeight = maxY - minY + NODE_H + 80;
-    const offsetX = -minX + NODE_W / 2 + 40;
-    const offsetY = -minY + 40;
+    const treeWidth = maxX - minX + NODE_W + 40;
+    const treeHeight = maxY - minY + NODE_H + 40;
+    const offsetX = -minX + NODE_W / 2 + 20;
+    const offsetY = -minY + 20;
 
-    svg.attr('width', treeWidth).attr('height', treeHeight);
+    // SVG fills the container — zoom handles the fit
+    svg.attr('width', containerWidth).attr('height', containerHeight);
 
     // Zoom & pan
     const g = svg.append('g');
 
     const zoom = d3
       .zoom<SVGSVGElement, unknown>()
-      .scaleExtent([0.3, 2])
+      .scaleExtent([0.2, 3])
       .on('zoom', (event: d3.D3ZoomEvent<SVGSVGElement, unknown>) => {
         g.attr('transform', event.transform.toString());
       });
 
     svg.call(zoom);
 
-    // Initial transform: center the tree
-    const initialScale = Math.min(
-      containerWidth / treeWidth,
-      containerHeight / treeHeight,
-      1,
-    );
-    const initialX =
-      (containerWidth - treeWidth * initialScale) / 2;
-    const initialY =
-      (containerHeight - treeHeight * initialScale) / 2;
+    // Auto-fit: scale to fit entire tree within the container with padding
+    const pad = 32;
+    const scaleX = (containerWidth - pad * 2) / treeWidth;
+    const scaleY = (containerHeight - pad * 2) / treeHeight;
+    const initialScale = Math.min(scaleX, scaleY, 1.2);
+    const initialX = (containerWidth - treeWidth * initialScale) / 2;
+    const initialY = (containerHeight - treeHeight * initialScale) / 2;
 
     svg.call(
       zoom.transform,
@@ -257,20 +255,20 @@ export function OrgChart({ agents, onNodeClick }: OrgChartProps) {
     // Icon
     nodeGroups
       .append('text')
-      .attr('x', 20)
-      .attr('y', NODE_H / 2 + 2)
+      .attr('x', 16)
+      .attr('y', NODE_H / 2 + 1)
       .attr('text-anchor', 'start')
       .attr('dominant-baseline', 'middle')
-      .attr('font-size', '24px')
+      .attr('font-size', '20px')
       .text((d) => d.data.icon);
 
     // Display name
     nodeGroups
       .append('text')
-      .attr('x', 52)
-      .attr('y', 28)
+      .attr('x', 44)
+      .attr('y', 22)
       .attr('fill', textColor)
-      .attr('font-size', '14px')
+      .attr('font-size', '13px')
       .attr('font-weight', '600')
       .text((d) => {
         const name = d.data.displayName;
@@ -280,8 +278,8 @@ export function OrgChart({ agents, onNodeClick }: OrgChartProps) {
     // Role + status line
     nodeGroups
       .append('text')
-      .attr('x', 52)
-      .attr('y', 48)
+      .attr('x', 44)
+      .attr('y', 38)
       .attr('fill', subtextColor)
       .attr('font-size', '11px')
       .text((d) => {
@@ -292,8 +290,8 @@ export function OrgChart({ agents, onNodeClick }: OrgChartProps) {
     // Model badge
     nodeGroups
       .append('text')
-      .attr('x', 52)
-      .attr('y', 64)
+      .attr('x', 44)
+      .attr('y', 52)
       .attr('fill', subtextColor)
       .attr('font-size', '10px')
       .attr('opacity', 0.7)
