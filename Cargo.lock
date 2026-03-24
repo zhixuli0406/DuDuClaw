@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-agent"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "chrono",
  "cron",
@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-bridge"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "chrono",
  "duduclaw-core",
@@ -526,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-bus"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "duduclaw-core",
  "serde",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-cli"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "base64",
  "bollard",
@@ -552,6 +552,7 @@ dependencies = [
  "duduclaw-core",
  "duduclaw-gateway",
  "duduclaw-memory",
+ "duduclaw-odoo",
  "duduclaw-security",
  "reqwest",
  "serde",
@@ -566,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-container"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "async-trait",
  "bollard",
@@ -581,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-core"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -596,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-dashboard"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "axum",
  "mime_guess",
@@ -605,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-gateway"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "axum",
  "base64",
@@ -616,6 +617,7 @@ dependencies = [
  "duduclaw-core",
  "duduclaw-dashboard",
  "duduclaw-memory",
+ "duduclaw-odoo",
  "duduclaw-security",
  "futures-util",
  "hmac",
@@ -635,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-memory"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -649,8 +651,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "duduclaw-odoo"
+version = "0.6.2"
+dependencies = [
+ "chrono",
+ "duduclaw-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "duduclaw-security"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "base64",
  "chrono",

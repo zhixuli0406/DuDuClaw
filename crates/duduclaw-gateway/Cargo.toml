@@ -9,6 +9,7 @@ duduclaw-agent = { workspace = true }
 duduclaw-memory = { workspace = true }
 duduclaw-security = { workspace = true }
 duduclaw-container = { workspace = true }
+duduclaw-odoo = { workspace = true }
 chrono = { workspace = true }
 cron = { workspace = true }
 axum = { workspace = true }

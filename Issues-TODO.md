@@ -213,6 +213,21 @@
 
 ---
 
+## Phase 3（v0.7.0）— Odoo ERP 整合
+
+> 詳細規劃：[docs/odoo-integration-plan.md](docs/odoo-integration-plan.md)
+> 架構：中間層 `duduclaw-odoo-bridge`（獨立 crate）
+
+| 階段 | 任務數 | 核心價值 |
+|------|--------|---------|
+| 3A. 基礎連線 | 4 | XML-RPC/JSON-RPC 雙協議 + CE/EE 偵測 |
+| 3B. CRM + 銷售 | 5 | 5 個 MCP 工具 + Agent 權限控制 |
+| 3C. 庫存 + 會計 | 4 | 4 個 MCP 工具 |
+| 3D. 事件橋接 + Dashboard | 5 | Polling + Webhook + 6 種事件 |
+| 3E. 通用工具 + 報表 | 3 | 進階 search/execute + PDF |
+
+---
+
 ## 進度總覽
 
 | Phase | 任務數 | 完成 | 剩餘 |
@@ -225,4 +240,5 @@
 | Phase 6 — 品質精確度 | 3 | 3 | 0 |
 | **v0.1–v0.5.1 小計** | **46** | **46** | **0** |
 | Phase 2 (v0.6.0) — 競爭力強化 | 21 | 21 | 0 |
-| **總計** | **67** | **67** | **0** |
+| Phase 3 (v0.7.0) — Odoo ERP 整合 | 21 | 21 | 0 |
+| **總計** | **88** | **88** | **0** |

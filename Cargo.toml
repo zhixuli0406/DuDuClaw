@@ -11,10 +11,11 @@ members = [
     "crates/duduclaw-bridge",
     "crates/duduclaw-cli",
     "crates/duduclaw-dashboard",
+    "crates/duduclaw-odoo",
 ]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 license = "MIT"
 authors = ["DuDuClaw Contributors"]
@@ -76,3 +77,4 @@ duduclaw-container = { path = "crates/duduclaw-container" }
 duduclaw-agent = { path = "crates/duduclaw-agent" }
 duduclaw-bridge = { path = "crates/duduclaw-bridge" }
 duduclaw-dashboard = { path = "crates/duduclaw-dashboard" }
+duduclaw-odoo = { path = "crates/duduclaw-odoo" }
