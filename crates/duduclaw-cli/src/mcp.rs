@@ -151,6 +151,125 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
         ],
     },
+    // ── Odoo ERP tools (Phase 3) ────────────────────────────────
+    ToolDef {
+        name: "odoo_connect",
+        description: "Connect to Odoo ERP and authenticate. Must be called before using other odoo_* tools.",
+        params: &[],
+    },
+    ToolDef {
+        name: "odoo_status",
+        description: "Show Odoo connection status, version, edition (CE/EE), and installed modules",
+        params: &[],
+    },
+    ToolDef {
+        name: "odoo_crm_leads",
+        description: "Search CRM leads/opportunities in Odoo",
+        params: &[
+            ParamDef { name: "stage", description: "Filter by stage name (optional)", required: false },
+            ParamDef { name: "limit", description: "Max results (default 20)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "odoo_crm_create_lead",
+        description: "Create a new CRM lead in Odoo",
+        params: &[
+            ParamDef { name: "name", description: "Lead name / subject", required: true },
+            ParamDef { name: "contact_name", description: "Contact person name", required: false },
+            ParamDef { name: "email", description: "Contact email", required: false },
+            ParamDef { name: "phone", description: "Contact phone", required: false },
+            ParamDef { name: "expected_revenue", description: "Expected revenue", required: false },
+        ],
+    },
+    ToolDef {
+        name: "odoo_crm_update_stage",
+        description: "Move a CRM lead to a different stage",
+        params: &[
+            ParamDef { name: "lead_id", description: "Lead ID", required: true },
+            ParamDef { name: "stage_name", description: "Target stage name", required: true },
+        ],
+    },
+    ToolDef {
+        name: "odoo_sale_orders",
+        description: "Search sale orders in Odoo",
+        params: &[
+            ParamDef { name: "status", description: "Filter by status (draft/sale/done)", required: false },
+            ParamDef { name: "limit", description: "Max results (default 20)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "odoo_sale_create_quotation",
+        description: "Create a new quotation (draft sale order) in Odoo",
+        params: &[
+            ParamDef { name: "partner_id", description: "Customer partner ID", required: true },
+            ParamDef { name: "product_id", description: "Product ID", required: true },
+            ParamDef { name: "quantity", description: "Quantity (default 1)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "odoo_sale_confirm",
+        description: "Confirm a quotation into a sale order",
+        params: &[
+            ParamDef { name: "order_id", description: "Sale order ID to confirm", required: true },
+        ],
+    },
+    ToolDef {
+        name: "odoo_inventory_products",
+        description: "Search products with stock levels in Odoo",
+        params: &[
+            ParamDef { name: "query", description: "Product name search", required: false },
+            ParamDef { name: "limit", description: "Max results (default 20)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "odoo_inventory_check",
+        description: "Check real-time stock level for a specific product",
+        params: &[
+            ParamDef { name: "product_id", description: "Product ID", required: true },
+        ],
+    },
+    ToolDef {
+        name: "odoo_invoice_list",
+        description: "List invoices from Odoo (draft/posted/paid)",
+        params: &[
+            ParamDef { name: "status", description: "Filter: draft/posted/paid", required: false },
+            ParamDef { name: "limit", description: "Max results (default 20)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "odoo_payment_status",
+        description: "Check payment status for an invoice",
+        params: &[
+            ParamDef { name: "invoice_id", description: "Invoice ID", required: true },
+        ],
+    },
+    ToolDef {
+        name: "odoo_search",
+        description: "Generic Odoo model search (advanced). Blocked models: ir.config_parameter, res.users, ir.cron, etc.",
+        params: &[
+            ParamDef { name: "model", description: "Odoo model name (e.g. res.partner)", required: true },
+            ParamDef { name: "domain", description: "Search domain as JSON array", required: false },
+            ParamDef { name: "fields", description: "Comma-separated field names", required: false },
+            ParamDef { name: "limit", description: "Max results (default 20)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "odoo_execute",
+        description: "Call a method on an Odoo model (advanced). Example: action_confirm on sale.order.",
+        params: &[
+            ParamDef { name: "model", description: "Odoo model name", required: true },
+            ParamDef { name: "method", description: "Method name to call", required: true },
+            ParamDef { name: "ids", description: "Record IDs as JSON array", required: true },
+        ],
+    },
+    ToolDef {
+        name: "odoo_report",
+        description: "Generate a PDF report from Odoo (e.g. invoice, quotation)",
+        params: &[
+            ParamDef { name: "report_name", description: "Report template name (e.g. account.report_invoice)", required: true },
+            ParamDef { name: "record_id", description: "Record ID", required: true },
+        ],
+    },
 ];
 
 // ── JSON-RPC helpers ─────────────────────────────────────────
@@ -1117,6 +1236,302 @@ async fn count_pending_tasks(home_dir: &Path, agent_id: &str) -> usize {
         .count()
 }
 
+// ── Odoo ERP handlers ───────────────────────────────────────
+
+async fn handle_odoo_tool(tool: &str, params: &Value, home_dir: &Path, odoo: &OdooState) -> Value {
+    use duduclaw_odoo::connector::OdooConnector;
+    use duduclaw_odoo::models::{crm, sale, inventory, accounting};
+
+    // odoo_connect doesn't require an existing connection
+    if tool == "odoo_connect" {
+        return handle_odoo_connect(home_dir, odoo).await;
+    }
+
+    if tool == "odoo_status" {
+        let guard = odoo.read().await;
+        return match guard.as_ref() {
+            Some(conn) => {
+                let s = conn.status();
+                serde_json::json!({ "content": [{"type": "text", "text": format!(
+                    "Odoo connected: {} ({})\nEdition: {}\nVersion: {}\nUser ID: {}\nEE modules: {}",
+                    s.url, s.db, s.edition, s.version,
+                    s.uid.map(|u| u.to_string()).unwrap_or("-".into()),
+                    if s.ee_modules.is_empty() { "none".to_string() } else { s.ee_modules.join(", ") },
+                )}]})
+            }
+            None => serde_json::json!({
+                "content": [{"type": "text", "text": "Odoo not connected. Call odoo_connect first."}],
+                "isError": true
+            }),
+        };
+    }
+
+    // All other tools require an active connection
+    let guard = odoo.read().await;
+    let conn = match guard.as_ref() {
+        Some(c) => c,
+        None => {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": "Odoo not connected. Call odoo_connect first."}],
+                "isError": true
+            });
+        }
+    };
+
+    let result: std::result::Result<String, String> = match tool {
+        "odoo_crm_leads" => {
+            let stage = params.get("stage").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = params.get("limit").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(20usize);
+            let mut domain = vec![];
+            if !stage.is_empty() {
+                domain.push(serde_json::json!(["stage_id.name", "ilike", stage]));
+            }
+            match conn.search_read("crm.lead", domain, crm::CRM_LEAD_FIELDS, limit).await {
+                Ok(data) => {
+                    let leads: Vec<crm::CrmLead> = data.as_array().unwrap_or(&vec![]).iter().map(crm::map_crm_lead).collect();
+                    Ok(serde_json::to_string_pretty(&leads).unwrap_or_default())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "odoo_crm_create_lead" => {
+            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() { return mcp_error("name is required"); }
+            let mut vals = serde_json::json!({"name": name, "type": "lead"});
+            if let Some(v) = params.get("contact_name").and_then(|v| v.as_str()) { vals["contact_name"] = serde_json::json!(v); }
+            if let Some(v) = params.get("email").and_then(|v| v.as_str()) { vals["email_from"] = serde_json::json!(v); }
+            if let Some(v) = params.get("phone").and_then(|v| v.as_str()) { vals["phone"] = serde_json::json!(v); }
+            if let Some(v) = params.get("expected_revenue").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()) { vals["expected_revenue"] = serde_json::json!(v); }
+            match conn.create("crm.lead", vals).await {
+                Ok(id) => Ok(format!("CRM lead created (ID: {id})")),
+                Err(e) => Err(e),
+            }
+        }
+        "odoo_crm_update_stage" => {
+            let lead_id = params.get("lead_id").and_then(|v| v.as_str()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+            let stage_name = params.get("stage_name").and_then(|v| v.as_str()).unwrap_or("");
+            if lead_id == 0 || stage_name.is_empty() { return mcp_error("lead_id and stage_name are required"); }
+            // Find stage ID by name
+            match conn.search_read("crm.stage", vec![serde_json::json!(["name", "ilike", stage_name])], &["id", "name"], 1).await {
+                Ok(stages) => {
+                    let stage_id = stages.as_array().and_then(|a| a.first()).and_then(|s| s["id"].as_i64()).unwrap_or(0);
+                    if stage_id == 0 { return mcp_error(&format!("Stage '{stage_name}' not found")); }
+                    match conn.write("crm.lead", &[lead_id], serde_json::json!({"stage_id": stage_id})).await {
+                        Ok(_) => Ok(format!("Lead {lead_id} moved to stage '{stage_name}'")),
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "odoo_sale_orders" => {
+            let status = params.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = params.get("limit").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(20usize);
+            let mut domain = vec![];
+            if !status.is_empty() { domain.push(serde_json::json!(["state", "=", status])); }
+            match conn.search_read("sale.order", domain, sale::SALE_ORDER_FIELDS, limit).await {
+                Ok(data) => {
+                    let orders: Vec<sale::SaleOrder> = data.as_array().unwrap_or(&vec![]).iter().map(sale::map_sale_order).collect();
+                    Ok(serde_json::to_string_pretty(&orders).unwrap_or_default())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "odoo_sale_create_quotation" => {
+            let partner_id = params.get("partner_id").and_then(|v| v.as_str()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+            let product_id = params.get("product_id").and_then(|v| v.as_str()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+            let qty = params.get("quantity").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(1.0);
+            if partner_id == 0 || product_id == 0 { return mcp_error("partner_id and product_id are required"); }
+            let vals = serde_json::json!({
+                "partner_id": partner_id,
+                "order_line": [[0, 0, {"product_id": product_id, "product_uom_qty": qty}]],
+            });
+            match conn.create("sale.order", vals).await {
+                Ok(id) => Ok(format!("Quotation created (ID: {id})")),
+                Err(e) => Err(e),
+            }
+        }
+        "odoo_sale_confirm" => {
+            let order_id = params.get("order_id").and_then(|v| v.as_str()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+            if order_id == 0 { return mcp_error("order_id is required"); }
+            match conn.execute_kw("sale.order", "action_confirm", vec![serde_json::json!([order_id])], serde_json::json!({})).await {
+                Ok(_) => Ok(format!("Order {order_id} confirmed")),
+                Err(e) => Err(e),
+            }
+        }
+        "odoo_inventory_products" => {
+            let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = params.get("limit").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(20usize);
+            let mut domain = vec![serde_json::json!(["detailed_type", "=", "product"])];
+            if !query.is_empty() { domain.push(serde_json::json!(["name", "ilike", query])); }
+            match conn.search_read("product.product", domain, inventory::PRODUCT_FIELDS, limit).await {
+                Ok(data) => {
+                    let products: Vec<inventory::Product> = data.as_array().unwrap_or(&vec![]).iter().map(inventory::map_product).collect();
+                    Ok(serde_json::to_string_pretty(&products).unwrap_or_default())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "odoo_inventory_check" => {
+            let product_id = params.get("product_id").and_then(|v| v.as_str()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+            if product_id == 0 { return mcp_error("product_id is required"); }
+            let domain = vec![serde_json::json!(["product_id", "=", product_id])];
+            match conn.search_read("stock.quant", domain, inventory::STOCK_QUANT_FIELDS, 10).await {
+                Ok(data) => {
+                    let quants: Vec<inventory::StockQuant> = data.as_array().unwrap_or(&vec![]).iter().map(inventory::map_stock_quant).collect();
+                    Ok(serde_json::to_string_pretty(&quants).unwrap_or_default())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "odoo_invoice_list" => {
+            let status = params.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = params.get("limit").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(20usize);
+            let mut domain = vec![serde_json::json!(["move_type", "in", ["out_invoice", "in_invoice"]])];
+            if !status.is_empty() {
+                match status {
+                    "paid" => domain.push(serde_json::json!(["payment_state", "=", "paid"])),
+                    "draft" => domain.push(serde_json::json!(["state", "=", "draft"])),
+                    "posted" => domain.push(serde_json::json!(["state", "=", "posted"])),
+                    _ => {}
+                }
+            }
+            match conn.search_read("account.move", domain, accounting::INVOICE_FIELDS, limit).await {
+                Ok(data) => {
+                    let invoices: Vec<accounting::Invoice> = data.as_array().unwrap_or(&vec![]).iter().map(accounting::map_invoice).collect();
+                    Ok(serde_json::to_string_pretty(&invoices).unwrap_or_default())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "odoo_payment_status" => {
+            let invoice_id = params.get("invoice_id").and_then(|v| v.as_str()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+            if invoice_id == 0 { return mcp_error("invoice_id is required"); }
+            match conn.search_read("account.move", vec![serde_json::json!(["id", "=", invoice_id])], accounting::INVOICE_FIELDS, 1).await {
+                Ok(data) => {
+                    let inv = data.as_array().and_then(|a| a.first()).map(accounting::map_invoice);
+                    match inv {
+                        Some(i) => Ok(serde_json::to_string_pretty(&i).unwrap_or_default()),
+                        None => Err(format!("Invoice {invoice_id} not found")),
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "odoo_search" => {
+            let model = params.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            if model.is_empty() { return mcp_error("model is required"); }
+            if OdooConnector::is_model_blocked(model) { return mcp_error(&format!("Model '{model}' is blocked for security reasons")); }
+            let domain_str = params.get("domain").and_then(|v| v.as_str()).unwrap_or("[]");
+            let domain: Vec<Value> = serde_json::from_str(domain_str).unwrap_or_default();
+            let fields_str = params.get("fields").and_then(|v| v.as_str()).unwrap_or("id,name");
+            let fields: Vec<&str> = fields_str.split(',').map(|s| s.trim()).collect();
+            let limit = params.get("limit").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(20usize);
+            match conn.search_read(model, domain, &fields, limit).await {
+                Ok(data) => Ok(serde_json::to_string_pretty(&data).unwrap_or_default()),
+                Err(e) => Err(e),
+            }
+        }
+        "odoo_execute" => {
+            let model = params.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            let method = params.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            let ids_str = params.get("ids").and_then(|v| v.as_str()).unwrap_or("[]");
+            if model.is_empty() || method.is_empty() { return mcp_error("model and method are required"); }
+            if OdooConnector::is_model_blocked(model) { return mcp_error(&format!("Model '{model}' is blocked")); }
+            let ids: Vec<Value> = serde_json::from_str(ids_str).unwrap_or_default();
+            match conn.execute_kw(model, method, vec![serde_json::json!(ids)], serde_json::json!({})).await {
+                Ok(data) => Ok(serde_json::to_string_pretty(&data).unwrap_or_default()),
+                Err(e) => Err(e),
+            }
+        }
+        "odoo_report" => {
+            let report_name = params.get("report_name").and_then(|v| v.as_str()).unwrap_or("");
+            let record_id = params.get("record_id").and_then(|v| v.as_str()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+            if report_name.is_empty() || record_id == 0 { return mcp_error("report_name and record_id are required"); }
+            // Reports use a special render method
+            match conn.execute_kw("ir.actions.report", "render_qweb_pdf", vec![serde_json::json!(report_name), serde_json::json!([record_id])], serde_json::json!({})).await {
+                Ok(_) => Ok(format!("Report '{report_name}' generated for record {record_id}. Download from Odoo.")),
+                Err(e) => Err(format!("Report generation failed: {e}")),
+            }
+        }
+        _ => Err(format!("Unknown Odoo tool: {tool}")),
+    };
+
+    match result {
+        Ok(text) => serde_json::json!({ "content": [{"type": "text", "text": text}] }),
+        Err(e) => serde_json::json!({ "content": [{"type": "text", "text": format!("Odoo error: {e}")}], "isError": true }),
+    }
+}
+
+/// Connect to Odoo using config.toml [odoo] settings.
+async fn handle_odoo_connect(home_dir: &Path, odoo: &OdooState) -> Value {
+    let config_path = home_dir.join("config.toml");
+    let content = match tokio::fs::read_to_string(&config_path).await {
+        Ok(c) => c,
+        Err(e) => return mcp_error(&format!("Cannot read config.toml: {e}")),
+    };
+    let table: toml::Table = match content.parse() {
+        Ok(t) => t,
+        Err(e) => return mcp_error(&format!("Invalid config.toml: {e}")),
+    };
+    let odoo_config = duduclaw_odoo::OdooConfig::from_toml(&table);
+    if !odoo_config.is_configured() {
+        return mcp_error("Odoo not configured. Add [odoo] section to config.toml with url and db.");
+    }
+
+    // Resolve credential (try api_key_enc first, then password_enc)
+    let credential = if !odoo_config.api_key_enc.is_empty() {
+        // Try to decrypt
+        let keyfile = home_dir.join(".keyfile");
+        if let Ok(bytes) = std::fs::read(&keyfile) {
+            if bytes.len() == 32 {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&bytes);
+                duduclaw_security::crypto::CryptoEngine::new(&key)
+                    .ok()
+                    .and_then(|e| e.decrypt_string(&odoo_config.api_key_enc).ok())
+                    .unwrap_or_default()
+            } else { String::new() }
+        } else { String::new() }
+    } else if !odoo_config.password_enc.is_empty() {
+        let keyfile = home_dir.join(".keyfile");
+        if let Ok(bytes) = std::fs::read(&keyfile) {
+            if bytes.len() == 32 {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&bytes);
+                duduclaw_security::crypto::CryptoEngine::new(&key)
+                    .ok()
+                    .and_then(|e| e.decrypt_string(&odoo_config.password_enc).ok())
+                    .unwrap_or_default()
+            } else { String::new() }
+        } else { String::new() }
+    } else {
+        String::new()
+    };
+
+    if credential.is_empty() {
+        return mcp_error("Odoo credential not found. Set api_key_enc or password_enc in [odoo] config.");
+    }
+
+    match duduclaw_odoo::OdooConnector::connect(&odoo_config, &credential).await {
+        Ok(conn) => {
+            let status = conn.status();
+            *odoo.write().await = Some(conn);
+            serde_json::json!({
+                "content": [{"type": "text", "text": format!(
+                    "Connected to Odoo {} ({}) — {} v{}",
+                    status.url, status.db, status.edition, status.version,
+                )}]
+            })
+        }
+        Err(e) => mcp_error(&format!("Odoo connection failed: {e}")),
+    }
+}
+
+fn mcp_error(msg: &str) -> Value {
+    serde_json::json!({ "content": [{"type": "text", "text": format!("Error: {msg}")}], "isError": true })
+}
+
 // ── Skill management handlers ───────────────────────────────
 
 /// Search the local skill registry.
@@ -1274,6 +1689,10 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
 
     let default_agent = get_default_agent(home_dir).await;
 
+    // Odoo connector (lazy — connected on first odoo_connect call)
+    let odoo: std::sync::Arc<tokio::sync::RwLock<Option<duduclaw_odoo::OdooConnector>>> =
+        std::sync::Arc::new(tokio::sync::RwLock::new(None));
+
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
@@ -1317,7 +1736,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
             "tools/list" => handle_tools_list(&id),
             "tools/call" => {
                 let params = request.get("params").cloned().unwrap_or(Value::Null);
-                handle_tools_call(&id, &params, home_dir, &http, &memory, &default_agent).await
+                handle_tools_call(&id, &params, home_dir, &http, &memory, &default_agent, &odoo).await
             }
             "notifications/initialized" => {
                 // This is a notification (no id expected in response), skip
@@ -1371,6 +1790,8 @@ fn handle_tools_list(id: &Value) -> Value {
     jsonrpc_response(id, serde_json::json!({ "tools": tools }))
 }
 
+type OdooState = std::sync::Arc<tokio::sync::RwLock<Option<duduclaw_odoo::OdooConnector>>>;
+
 async fn handle_tools_call(
     id: &Value,
     params: &Value,
@@ -1378,6 +1799,7 @@ async fn handle_tools_call(
     http: &reqwest::Client,
     memory: &SqliteMemoryEngine,
     default_agent: &str,
+    odoo: &OdooState,
 ) -> Value {
     let tool_name = params
         .get("name")
@@ -1406,6 +1828,8 @@ async fn handle_tools_call(
         "spawn_agent" => handle_spawn_agent(&arguments, home_dir).await,
         "skill_search" => handle_skill_search(&arguments, home_dir).await,
         "skill_list" => handle_skill_list(&arguments, home_dir).await,
+        // Odoo ERP tools
+        t if t.starts_with("odoo_") => handle_odoo_tool(t, &arguments, home_dir, odoo).await,
         _ => {
             return jsonrpc_error(
                 id,
