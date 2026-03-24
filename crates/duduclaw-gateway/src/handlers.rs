@@ -99,6 +99,7 @@ impl MethodHandler {
             "memory.search" => self.handle_memory_search(params).await,
             "memory.browse" => self.handle_memory_browse(params).await,
             "skills.list" => self.handle_skills_list(params).await,
+            "skills.search" => self.handle_skills_search(params).await,
             "skills.content" => self.handle_skills_content(params).await,
             "cron.list" => self.handle_cron_list(),
             "cron.add" => self.handle_cron_add(params),
@@ -111,6 +112,7 @@ impl MethodHandler {
             "system.version" => self.handle_system_version(),
             "logs.subscribe" => self.handle_logs_subscribe(params),
             "logs.unsubscribe" => self.handle_logs_unsubscribe(params),
+            "security.audit_log" => self.handle_security_audit_log(params).await,
             "heartbeat.status" => self.handle_heartbeat_status().await,
             "heartbeat.trigger" => self.handle_heartbeat_trigger(params).await,
             "evolution.status" => self.handle_evolution_status().await,
@@ -836,6 +838,54 @@ skill_security_scan = true
         }
     }
 
+    async fn handle_skills_search(&self, params: Value) -> WsFrame {
+        let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        if query.is_empty() {
+            return WsFrame::error_response("", "Missing 'query' parameter");
+        }
+
+        let lower = query.to_lowercase();
+        let reg = self.registry.read().await;
+        let mut results = Vec::new();
+
+        // Search across all agents' installed skills
+        for agent in reg.list() {
+            for skill in &agent.skills {
+                let name_match = skill.name.to_lowercase().contains(&lower);
+                let content_match = skill.content.to_lowercase().contains(&lower);
+                if name_match || content_match {
+                    results.push(json!({
+                        "name": skill.name,
+                        "description": skill.content.lines().take(3).collect::<Vec<_>>().join(" ").chars().take(200).collect::<String>(),
+                        "tags": [],
+                        "author": agent.config.agent.name,
+                        "url": "",
+                        "compatible": ["duduclaw"],
+                    }));
+                }
+            }
+        }
+
+        // Also search the local skill registry if available
+        let registry = duduclaw_agent::skill_registry::SkillRegistry::load(&self.home_dir);
+        let index_results = registry.search(query, 20);
+        for entry in index_results {
+            // Avoid duplicates
+            if !results.iter().any(|r| r["name"].as_str() == Some(&entry.name)) {
+                results.push(json!({
+                    "name": entry.name,
+                    "description": entry.description,
+                    "tags": entry.tags,
+                    "author": entry.author,
+                    "url": entry.url,
+                    "compatible": entry.compatible,
+                }));
+            }
+        }
+
+        WsFrame::ok_response("", json!({ "skills": results }))
+    }
+
     async fn handle_skills_content(&self, params: Value) -> WsFrame {
         let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
             Some(id) => id,
@@ -1034,6 +1084,23 @@ skill_security_scan = true
 
     fn handle_system_version(&self) -> WsFrame {
         WsFrame::ok_response("", json!({ "version": env!("CARGO_PKG_VERSION") }))
+    }
+
+    // ── Security ────────────────────────────────────────────
+
+    async fn handle_security_audit_log(&self, params: Value) -> WsFrame {
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let events = duduclaw_security::audit::read_recent_events(&self.home_dir, limit);
+        let events_json: Vec<Value> = events.iter().map(|e| {
+            json!({
+                "timestamp": e.timestamp,
+                "event_type": e.event_type,
+                "agent_id": e.agent_id,
+                "severity": e.severity,
+                "details": e.details,
+            })
+        }).collect();
+        WsFrame::ok_response("", json!({ "events": events_json }))
     }
 
     // ── Heartbeat ────────────────────────────────────────────
