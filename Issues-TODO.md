@@ -1,7 +1,7 @@
 # DuDuClaw — 任務清單
 
-> 最後更新：2026-03-18
-> 來源：[ISSUES.md](ISSUES.md)
+> 最後更新：2026-03-23
+> 來源：[ISSUES.md](ISSUES.md)（已歸檔）
 > 格式：`- [ ]` 待辦 ／ `- [x]` 完成
 
 ---
@@ -197,6 +197,22 @@
 
 ---
 
+---
+
+## Phase 2（v0.6.0）— 競爭力強化
+
+> 詳細規劃：[Phase2-TODO.md](Phase2-TODO.md)
+> 參考：[docs/claw-ecosystem-report.md](docs/claw-ecosystem-report.md)
+
+| 模組 | 任務數 | 核心價值 |
+|------|--------|---------|
+| A. 容器隔離 | 6 | NanoClaw/NemoClaw 安全沙箱 |
+| B. Skill 市場相容 | 5 | 借用 5,400+ OpenClaw skills |
+| C. 安全防護 | 6 | SOUL.md 漂移 + prompt injection 防禦 |
+| D. 紅隊測試 | 4 | 部署前安全驗證 |
+
+---
+
 ## 進度總覽
 
 | Phase | 任務數 | 完成 | 剩餘 |
@@ -207,4 +223,6 @@
 | Phase 4 — Evolution & 記憶 | 7 | 7 | 0 |
 | Phase 5 — Dashboard & 維運 | 12 | 12 | 0 |
 | Phase 6 — 品質精確度 | 3 | 3 | 0 |
-| **合計** | **46** | **46** | **0** |
+| **v0.1–v0.5.1 小計** | **46** | **46** | **0** |
+| Phase 2 (v0.6.0) — 競爭力強化 | 21 | 21 | 0 |
+| **總計** | **67** | **67** | **0** |

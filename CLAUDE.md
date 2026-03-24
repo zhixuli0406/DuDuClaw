@@ -1,20 +1,26 @@
 # DuDuClaw Project Guidelines
 
-## Architecture Overview (v0.5.1)
+## Architecture Overview (v0.6.0)
 
 DuDuClaw is a **Claude Code extension layer** — not a standalone AI platform. The AI brain is Claude Code SDK (`claude` CLI); DuDuClaw provides the plumbing: channel routing, session management, memory, evolution, and multi-account rotation.
 
 Key architectural decisions:
-- **MCP Server** (`duduclaw mcp-server`) exposes channel and memory tools to Claude Code via JSON-RPC 2.0 over stdin/stdout
+- **MCP Server** (`duduclaw mcp-server`) exposes channel, memory, agent, and skill tools to Claude Code via JSON-RPC 2.0 over stdin/stdout
 - **Agent directories** are Claude Code compatible: each contains `.claude/`, `SOUL.md`, `CLAUDE.md`, `.mcp.json`
+- **Sub-agent orchestration** via `create_agent` / `spawn_agent` / `list_agents` MCP tools with `reports_to` hierarchy
 - **Session Manager** persists conversations in SQLite with 50k token auto-compression (CJK-aware token estimation)
-- **File-based IPC** (`bus_queue.jsonl`) for inter-agent delegation; no container layer
+- **File-based IPC** (`bus_queue.jsonl`) for inter-agent delegation; **AgentDispatcher** consumes and spawns Claude CLI subprocesses
+- **Container sandbox** (Docker / Apple Container) for agent task isolation with `--network=none`, tmpfs, read-only rootfs
 - **Python subprocess** bridge for Claude Code SDK chat and evolution engine
 - **Three channels**: Telegram (long polling), LINE (webhook), Discord (Gateway WebSocket with tokio::select! heartbeat)
 - **BroadcastLayer** tracing layer streams real-time logs to WebSocket subscribers
 - **Ed25519 challenge-response** auth for secure WebSocket connections
-- **Three-layer evolution** with real Claude subprocess calls: Micro (post-conversation) → Meso (hourly heartbeat) → Macro (daily cron)
-- **Cron persistence** via `cron_tasks.jsonl` JSONL flat file
+- **Unified heartbeat scheduler** — per-agent cron/interval with meso/macro evolution, `max_concurrent_runs` semaphore
+- **CronScheduler** reads `cron_tasks.jsonl`, evaluates cron expressions, fires tasks on schedule
+- **Three-layer evolution** with real Claude subprocess calls: Micro (post-conversation) → Meso (per-agent heartbeat) → Macro (daily)
+- **Security layer**: SOUL.md drift detection (SHA-256), prompt injection scanner (6 rule categories), JSONL audit log, per-agent key isolation
+- **Behavioral contracts** (`CONTRACT.toml`) with `must_not` / `must_always` boundaries + `duduclaw test` red-team CLI
+- **Skill ecosystem**: OpenClaw-compatible skill parser (YAML frontmatter), local skill registry with weighted search, MCP `skill_search` / `skill_list` tools
 - **API key encryption**: AES-256-GCM stored as base64 in config
 
 ## Design Context
