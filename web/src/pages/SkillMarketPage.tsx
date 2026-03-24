@@ -10,12 +10,12 @@ export function SkillMarketPage() {
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
 
-  const handleSearch = async () => {
-    if (!query.trim()) return;
+  const handleSearchQuery = async (q: string) => {
+    if (!q.trim()) return;
     setLoading(true);
     setSearched(true);
     try {
-      const res = await api.skillMarket.search(query);
+      const res = await api.skillMarket.search(q);
       setResults(res?.skills ?? []);
     } catch {
       setResults([]);
@@ -23,6 +23,8 @@ export function SkillMarketPage() {
       setLoading(false);
     }
   };
+
+  const handleSearch = () => handleSearchQuery(query);
 
   return (
     <div className="space-y-6">
@@ -95,7 +97,7 @@ export function SkillMarketPage() {
                   key={cat}
                   onClick={() => {
                     setQuery(cat);
-                    handleSearch();
+                    handleSearchQuery(cat);
                   }}
                   className="flex items-center gap-2 rounded-lg border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700 transition-colors hover:border-amber-300 hover:bg-amber-50 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-300 dark:hover:border-amber-600 dark:hover:bg-amber-900/20"
                 >
@@ -118,7 +120,7 @@ function SkillCard({ skill }: { skill: SkillIndexEntry }) {
         <h3 className="font-semibold text-stone-900 dark:text-stone-50">
           {skill.name}
         </h3>
-        {skill.url && (
+        {skill.url && /^https?:\/\//i.test(skill.url) && (
           <a
             href={skill.url}
             target="_blank"

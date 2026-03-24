@@ -600,7 +600,7 @@ skill_security_scan = true
         WsFrame::ok_response("", json!({
             "success": true,
             "type": channel_type,
-            "message": format!("{channel_type} token 已設定 ({}****)", &token[..4.min(token.len())]),
+            "message": format!("{channel_type} token is configured"),
         }))
     }
 
@@ -687,37 +687,15 @@ skill_security_scan = true
 
         // Invoke Python SDK's AccountRotator to perform actual rotation
         let config_path = self.home_dir.join("config.toml");
-        let python_script = format!(
-            r#"
-import asyncio, sys, json
-sys.path.insert(0, '{python_path}')
-from duduclaw.sdk.chat import load_accounts
-from duduclaw.sdk.rotator import AccountRotator, RequestContext, RotationStrategy
+        let python_path = crate::channel_reply::find_python_path_static(&self.home_dir);
 
-accounts = load_accounts('{config}')
-if not accounts:
-    print(json.dumps({{"success": False, "error": "No accounts configured"}}))
-    sys.exit(0)
-
-rotator = AccountRotator(accounts, RotationStrategy.ROUND_ROBIN)
-ctx = RequestContext(model="claude-haiku-4-5")
-
-async def main():
-    try:
-        selected = await rotator.select_account(ctx)
-        print(json.dumps({{"success": True, "account": selected.id, "rotated": True}}))
-    except Exception as e:
-        print(json.dumps({{"success": False, "error": str(e)}}))
-
-asyncio.run(main())
-"#,
-            python_path = crate::channel_reply::find_python_path_static(&self.home_dir),
-            config = config_path.display(),
-        );
-
+        // Use -m module invocation + env vars instead of -c to prevent script injection
         match tokio::process::Command::new("python3")
-            .arg("-c")
-            .arg(&python_script)
+            .args(["-m", "duduclaw.sdk.rotate", "--config"])
+            .arg(&config_path)
+            .env("PYTHONPATH", &python_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .output()
             .await
         {

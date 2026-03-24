@@ -156,31 +156,31 @@ impl HeartbeatScheduler {
     }
 
     /// Sync internal state with the registry (picks up new/removed/changed agents).
+    /// Avoids nested locks by collecting data from registry first, then updating agents.
     async fn sync_from_registry(&self) {
-        let reg = self.registry.read().await;
-        let loaded: Vec<&LoadedAgent> = reg.list();
+        // Step 1: Read registry and collect all data (release reg lock immediately)
+        let snapshot: Vec<LoadedAgent> = {
+            let reg = self.registry.read().await;
+            reg.list().iter().map(|a| (*a).clone()).collect()
+        }; // reg lock released here
 
+        // Step 2: Now take agents write lock (no nested locks)
         let mut agents = self.agents.write().await;
 
-        // Remove agents that no longer exist in registry
-        let current_names: Vec<String> = loaded.iter().map(|a| a.config.agent.name.clone()).collect();
+        let current_names: Vec<String> = snapshot.iter().map(|a| a.config.agent.name.clone()).collect();
         agents.retain(|name, _| current_names.contains(name));
 
-        // Add/update agents
-        for la in loaded {
-            // Skip terminated agents
+        for la in &snapshot {
             if la.config.agent.status == AgentStatus::Terminated {
                 agents.remove(&la.config.agent.name);
                 continue;
             }
 
             if let Some(existing) = agents.get_mut(&la.config.agent.name) {
-                // Update config in-place (preserve last_run, total_runs)
                 existing.config = la.config.heartbeat.clone();
                 existing.evolution = la.config.evolution.clone();
                 existing.schedule = parse_cron(&la.config.heartbeat.cron);
             } else {
-                // New agent
                 agents.insert(la.config.agent.name.clone(), LiveAgent::from_loaded(la));
             }
         }
@@ -251,38 +251,42 @@ impl HeartbeatScheduler {
             }
 
             let now = Utc::now();
-            let mut agents = self.agents.write().await;
 
-            for agent in agents.values_mut() {
-                if !agent.should_fire(now) {
-                    continue;
+            // Collect tasks to spawn while holding the lock, then release before spawning
+            let mut to_spawn: Vec<(PathBuf, String, PathBuf, EvolutionConfig, Arc<tokio::sync::Semaphore>, bool)> = Vec::new();
+            {
+                let mut agents = self.agents.write().await;
+                for agent in agents.values_mut() {
+                    if !agent.should_fire(now) {
+                        continue;
+                    }
+                    if agent.active_runs.available_permits() == 0 {
+                        debug!(agent = %agent.agent_id, "Heartbeat skipped: max concurrent runs reached");
+                        continue;
+                    }
+
+                    info!(agent = %agent.agent_id, run = agent.total_runs + 1, "Heartbeat firing");
+                    agent.last_run = Some(now);
+                    agent.total_runs += 1;
+
+                    let run_macro = agent.should_macro(now);
+                    if run_macro {
+                        agent.last_macro = Some(now);
+                    }
+
+                    to_spawn.push((
+                        self.home_dir.clone(),
+                        agent.agent_id.clone(),
+                        agent.agent_dir.clone(),
+                        agent.evolution.clone(),
+                        agent.active_runs.clone(),
+                        run_macro,
+                    ));
                 }
+            } // write lock released here
 
-                // Check concurrency limit
-                if agent.active_runs.available_permits() == 0 {
-                    debug!(
-                        agent = %agent.agent_id,
-                        "Heartbeat skipped: max concurrent runs reached"
-                    );
-                    continue;
-                }
-
-                info!(agent = %agent.agent_id, run = agent.total_runs + 1, "Heartbeat firing");
-                agent.last_run = Some(now);
-                agent.total_runs += 1;
-
-                // Check if macro is also due
-                let run_macro = agent.should_macro(now);
-                if run_macro {
-                    agent.last_macro = Some(now);
-                }
-
-                let home = self.home_dir.clone();
-                let aid = agent.agent_id.clone();
-                let dir = agent.agent_dir.clone();
-                let evo = agent.evolution.clone();
-                let sem = agent.active_runs.clone();
-
+            // Now spawn tasks without holding any lock
+            for (home, aid, dir, evo, sem, run_macro) in to_spawn {
                 tokio::spawn(async move {
                     execute_heartbeat(&home, &aid, &dir, &evo, &sem).await;
                     if run_macro {

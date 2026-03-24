@@ -73,7 +73,7 @@ const TOOLS: &[ToolDef] = &[
         name: "log_mood",
         description: "Log user mood",
         params: &[
-            ParamDef { name: "score", description: "Mood score (1-10)", required: true },
+            ParamDef { name: "mood", description: "Mood label (e.g. happy, tired, neutral)", required: true },
             ParamDef { name: "note", description: "Optional note", required: false },
         ],
     },
@@ -161,6 +161,33 @@ fn jsonrpc_response(id: &Value, result: Value) -> Value {
         "id": id,
         "result": result
     })
+}
+
+/// Validate agent ID is safe for filesystem paths (no traversal).
+fn is_valid_agent_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Maximum JSONL queue file size (10 MB).
+const MAX_QUEUE_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Append a line to a JSONL file with size limit check.
+fn append_to_jsonl_sync(path: &std::path::Path, line: &str) -> bool {
+    // Check size limit
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_QUEUE_FILE_SIZE {
+            tracing::warn!("Queue file {} exceeds size limit", path.display());
+            return false;
+        }
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        writeln!(f, "{line}").is_ok()
+    } else {
+        false
+    }
 }
 
 fn jsonrpc_error(id: &Value, code: i64, message: &str) -> Value {
@@ -255,7 +282,7 @@ async fn handle_send_message(
                     .send()
                     .await
                 {
-                    Ok(resp) => format!("Message sent. Status: {}", resp.status()),
+                    Ok(resp) => if resp.status().is_success() { "Message sent successfully.".to_string() } else { format!("Error: API returned {}", resp.status()) },
                     Err(e) => format!("Error sending Telegram message: {e}"),
                 }
             }
@@ -280,7 +307,7 @@ async fn handle_send_message(
                     .send()
                     .await
                 {
-                    Ok(resp) => format!("Message sent. Status: {}", resp.status()),
+                    Ok(resp) => if resp.status().is_success() { "Message sent successfully.".to_string() } else { format!("Error: API returned {}", resp.status()) },
                     Err(e) => format!("Error sending LINE message: {e}"),
                 }
             }
@@ -307,7 +334,7 @@ async fn handle_send_message(
                     .send()
                     .await
                 {
-                    Ok(resp) => format!("Message sent. Status: {}", resp.status()),
+                    Ok(resp) => if resp.status().is_success() { "Message sent successfully.".to_string() } else { format!("Error: API returned {}", resp.status()) },
                     Err(e) => format!("Error sending Discord message: {e}"),
                 }
             }
@@ -493,6 +520,14 @@ async fn handle_send_to_agent(params: &Value, home_dir: &Path) -> Value {
         });
     }
 
+    // Validate agent_id format
+    if !is_valid_agent_id(target) {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: agent_id must be lowercase alphanumeric with hyphens"}],
+            "isError": true
+        });
+    }
+
     let msg_id = uuid::Uuid::new_v4().to_string();
     let queue_path = home_dir.join("bus_queue.jsonl");
     let task = serde_json::json!({
@@ -506,12 +541,7 @@ async fn handle_send_to_agent(params: &Value, home_dir: &Path) -> Value {
     let queued = tokio::task::spawn_blocking({
         let path = queue_path.clone();
         let task_str = task.to_string();
-        move || -> bool {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                writeln!(f, "{task_str}").is_ok()
-            } else { false }
-        }
+        move || append_to_jsonl_sync(&path, &task_str)
     }).await.unwrap_or(false);
 
     serde_json::json!({
@@ -530,9 +560,10 @@ async fn handle_send_media(
     http: &reqwest::Client,
     media_type: &str,
 ) -> Value {
-    let channel = params.get("channel").and_then(|v| v.as_str()).unwrap_or("telegram");
+    let channel = params.get("channel").and_then(|v| v.as_str()).unwrap_or("");
     let chat_id = params.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
-    let url_or_id = params.get("url")
+    let url_or_id = params.get("url_or_path")
+        .or_else(|| params.get("url"))
         .or_else(|| params.get("sticker_id"))
         .or_else(|| params.get("file_id"))
         .and_then(|v| v.as_str())
@@ -638,12 +669,25 @@ async fn handle_log_mood(
 async fn handle_schedule_task(params: &Value, home_dir: &Path) -> Value {
     let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("default");
     let cron = params.get("cron").and_then(|v| v.as_str()).unwrap_or("");
-    let task = params.get("task").or_else(|| params.get("prompt")).and_then(|v| v.as_str()).unwrap_or("");
+    let task = params.get("task").or_else(|| params.get("prompt")).or_else(|| params.get("description")).and_then(|v| v.as_str()).unwrap_or("");
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
 
     if cron.is_empty() || task.is_empty() {
         return serde_json::json!({
             "content": [{"type": "text", "text": "Error: cron and task are required"}],
+            "isError": true
+        });
+    }
+
+    // Validate cron expression before persisting
+    let normalised_cron = if cron.split_whitespace().count() == 5 {
+        format!("0 {cron}")
+    } else {
+        cron.to_string()
+    };
+    if normalised_cron.parse::<cron::Schedule>().is_err() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: invalid cron expression: {cron}")}],
             "isError": true
         });
     }
@@ -663,19 +707,14 @@ async fn handle_schedule_task(params: &Value, home_dir: &Path) -> Value {
     let queued = tokio::task::spawn_blocking({
         let path = cron_path;
         let entry_str = entry.to_string();
-        move || -> bool {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                writeln!(f, "{entry_str}").is_ok()
-            } else { false }
-        }
+        move || append_to_jsonl_sync(&path, &entry_str)
     }).await.unwrap_or(false);
 
     serde_json::json!({
         "content": [{"type": "text", "text": if queued {
             format!("Task '{name}' scheduled (id: {task_id}, cron: {cron})")
         } else {
-            "Error: Failed to persist task".to_string()
+            "Error: Failed to persist task (queue full or write error)".to_string()
         }}]
     })
 }

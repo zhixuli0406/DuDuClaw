@@ -47,10 +47,19 @@ export function DashboardPage() {
   const [doctor, setDoctor] = useState<{ checks: DoctorCheck[]; summary: { pass: number; warn: number; fail: number } } | null>(null);
 
   useEffect(() => {
+    // Initial fetch
     fetchAgents();
     fetchStatus();
     api.accounts.budgetSummary().then(setBudget).catch(() => {});
     api.system.doctor().then(setDoctor).catch(() => {});
+
+    // Poll every 30s to keep stats fresh
+    const interval = setInterval(() => {
+      fetchAgents();
+      fetchStatus();
+      api.accounts.budgetSummary().then(setBudget).catch(() => {});
+    }, 30_000);
+    return () => clearInterval(interval);
   }, [fetchAgents, fetchStatus]);
 
   const activeAgents = agents.filter((a) => a.status === 'active').length;

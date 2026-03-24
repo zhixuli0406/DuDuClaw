@@ -319,11 +319,15 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             log_line = log_rx.recv(), if logs_subscribed => {
                 match log_line {
                     Ok(line) => {
-                        let push = serde_json::json!({
-                            "type": "log",
-                            "data": serde_json::from_str::<serde_json::Value>(&line)
-                                .unwrap_or(serde_json::Value::String(line)),
-                        });
+                        // Send as WsFrame::Event so the frontend can parse it uniformly
+                        let data = serde_json::from_str::<serde_json::Value>(&line)
+                            .unwrap_or(serde_json::Value::String(line));
+                        let push = WsFrame::Event {
+                            event: "logs.entry".to_string(),
+                            payload: data,
+                            seq: None,
+                            state_version: None,
+                        };
                         let text = serde_json::to_string(&push).unwrap_or_default();
                         if sink.send(Message::Text(text.into())).await.is_err() { break; }
                     }

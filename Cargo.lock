@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-agent"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "chrono",
  "cron",
@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-bridge"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "chrono",
  "duduclaw-core",
@@ -526,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-bus"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "duduclaw-core",
  "serde",
@@ -537,13 +537,14 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-cli"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "base64",
  "bollard",
  "chrono",
  "clap",
  "console",
+ "cron",
  "dialoguer",
  "dirs",
  "duduclaw-agent",
@@ -565,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-container"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "async-trait",
  "bollard",
@@ -580,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-core"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -595,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-dashboard"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "axum",
  "mime_guess",
@@ -604,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-gateway"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "axum",
  "base64",
@@ -634,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-memory"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -649,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-security"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "base64",
  "chrono",

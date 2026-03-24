@@ -21,6 +21,8 @@ pub struct InputScanResult {
 struct Rule {
     name: &'static str,
     weight: u32,
+    /// If true, matching this rule alone is enough to block.
+    instant_block: bool,
     patterns: &'static [&'static str],
 }
 
@@ -28,6 +30,7 @@ const RULES: &[Rule] = &[
     Rule {
         name: "instruction_override",
         weight: 40,
+        instant_block: true,
         patterns: &[
             "ignore previous instructions",
             "ignore all previous",
@@ -42,6 +45,7 @@ const RULES: &[Rule] = &[
     Rule {
         name: "system_prompt_extraction",
         weight: 30,
+        instant_block: false,
         patterns: &[
             "repeat your system prompt",
             "show me your instructions",
@@ -56,6 +60,7 @@ const RULES: &[Rule] = &[
     Rule {
         name: "role_hijack",
         weight: 35,
+        instant_block: true,
         patterns: &[
             "you are now",
             "pretend you are",
@@ -70,6 +75,7 @@ const RULES: &[Rule] = &[
     Rule {
         name: "encoding_bypass",
         weight: 25,
+        instant_block: false,
         patterns: &[
             "base64:",
             "decode the following",
@@ -81,6 +87,7 @@ const RULES: &[Rule] = &[
     Rule {
         name: "tool_abuse",
         weight: 30,
+        instant_block: true,
         patterns: &[
             "rm -rf",
             "sudo rm",
@@ -95,6 +102,7 @@ const RULES: &[Rule] = &[
     Rule {
         name: "data_exfiltration",
         weight: 25,
+        instant_block: true,
         patterns: &[
             "send to my email",
             "upload to",
@@ -114,6 +122,7 @@ pub fn scan_input(text: &str, block_threshold: u32) -> InputScanResult {
     let lower = text.to_lowercase();
     let mut total_score: u32 = 0;
     let mut matched = Vec::new();
+    let mut force_block = false;
 
     for rule in RULES {
         for pattern in rule.patterns {
@@ -121,6 +130,9 @@ pub fn scan_input(text: &str, block_threshold: u32) -> InputScanResult {
                 if !matched.contains(&rule.name.to_string()) {
                     matched.push(rule.name.to_string());
                     total_score = total_score.saturating_add(rule.weight);
+                    if rule.instant_block {
+                        force_block = true;
+                    }
                 }
                 break; // One match per rule is enough
             }
@@ -145,7 +157,7 @@ pub fn scan_input(text: &str, block_threshold: u32) -> InputScanResult {
     }
 
     let score = total_score.min(100);
-    let blocked = score >= block_threshold;
+    let blocked = force_block || score >= block_threshold;
 
     let summary = if matched.is_empty() {
         "No suspicious patterns detected".to_string()

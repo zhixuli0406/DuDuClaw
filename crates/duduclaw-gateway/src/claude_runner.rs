@@ -106,13 +106,14 @@ async fn get_api_key(home_dir: &Path) -> String {
                 }
             }
 
-            // Fallback: plaintext key
+            // Fallback: plaintext key (legacy configs only — warn about insecure storage)
             if let Some(key) = table
                 .get("api")
                 .and_then(|v| v.get("anthropic_api_key"))
                 .and_then(|v| v.as_str())
             {
                 if !key.is_empty() {
+                    tracing::warn!("API key loaded from plaintext config — run `duduclaw onboard` to encrypt");
                     return key.to_string();
                 }
             }

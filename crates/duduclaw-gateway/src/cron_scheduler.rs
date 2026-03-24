@@ -48,10 +48,14 @@ struct LiveTask {
 }
 
 /// Cron scheduler that loads tasks from `cron_tasks.jsonl` and fires them on time.
+/// Maximum concurrent cron task executions.
+const MAX_CONCURRENT_CRON: usize = 4;
+
 pub struct CronScheduler {
     home_dir: PathBuf,
     registry: Arc<RwLock<AgentRegistry>>,
     tasks: Arc<RwLock<Vec<LiveTask>>>,
+    semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl CronScheduler {
@@ -60,6 +64,7 @@ impl CronScheduler {
             home_dir,
             registry,
             tasks: Arc::new(RwLock::new(Vec::new())),
+            semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CRON)),
         }
     }
 
@@ -168,7 +173,9 @@ impl CronScheduler {
                     let home = self.home_dir.clone();
                     let registry = self.registry.clone();
                     let task = lt.task.clone();
+                    let sem = self.semaphore.clone();
                     tokio::spawn(async move {
+                        let _permit = sem.acquire().await;
                         execute_cron_task(&home, &registry, &task).await;
                     });
                 }
