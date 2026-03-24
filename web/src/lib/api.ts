@@ -98,6 +98,35 @@ export interface SkillInfo {
   security_status?: 'pass' | 'warn' | 'fail';
 }
 
+export interface HeartbeatInfo {
+  agent_id: string;
+  enabled: boolean;
+  interval_seconds: number;
+  cron: string;
+  last_run?: string;
+  next_run?: string;
+  total_runs: number;
+  active_runs: number;
+  max_concurrent: number;
+}
+
+export interface AuditEvent {
+  timestamp: string;
+  event_type: string;
+  agent_id: string;
+  severity: 'info' | 'warning' | 'critical';
+  details: Record<string, unknown>;
+}
+
+export interface SkillIndexEntry {
+  name: string;
+  description: string;
+  tags: string[];
+  author: string;
+  url: string;
+  compatible: string[];
+}
+
 // API namespace
 export const api = {
   agents: {
@@ -190,6 +219,20 @@ export const api = {
       client.call('cron.pause', { id }),
     remove: (id: string) =>
       client.call('cron.remove', { id }),
+  },
+  heartbeat: {
+    status: () =>
+      client.call('heartbeat.status') as Promise<{ heartbeats: HeartbeatInfo[] }>,
+    trigger: (agentId: string) =>
+      client.call('heartbeat.trigger', { agent_id: agentId }) as Promise<{ success: boolean }>,
+  },
+  security: {
+    auditLog: (limit = 50) =>
+      client.call('security.audit_log', { limit }) as Promise<{ events: AuditEvent[] }>,
+  },
+  skillMarket: {
+    search: (query: string) =>
+      client.call('skills.search', { query }) as Promise<{ skills: SkillIndexEntry[] }>,
   },
   logs: {
     subscribe: () =>

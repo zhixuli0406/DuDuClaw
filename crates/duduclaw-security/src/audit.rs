@@ -1,0 +1,184 @@
+//! Security audit event log — append-only JSONL file.
+//!
+//! [C-2b] All security events (drift, injection, quarantine) are persisted
+//! to `~/.duduclaw/security_audit.jsonl` for forensic review.
+
+use std::path::Path;
+
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use tracing::warn;
+
+/// Severity level of a security event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Info,
+    Warning,
+    Critical,
+}
+
+/// A single security audit event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub timestamp: String,
+    pub event_type: String,
+    pub agent_id: String,
+    pub severity: Severity,
+    pub details: serde_json::Value,
+}
+
+impl AuditEvent {
+    /// Create a new audit event with the current timestamp.
+    pub fn new(
+        event_type: impl Into<String>,
+        agent_id: impl Into<String>,
+        severity: Severity,
+        details: serde_json::Value,
+    ) -> Self {
+        Self {
+            timestamp: Utc::now().to_rfc3339(),
+            event_type: event_type.into(),
+            agent_id: agent_id.into(),
+            severity,
+            details,
+        }
+    }
+}
+
+/// Append an audit event to the security log file.
+///
+/// The log is stored at `<home_dir>/security_audit.jsonl`.
+/// This function is synchronous (blocking I/O) and suitable for
+/// calling from both sync and async contexts via `spawn_blocking`.
+pub fn append_audit_event(home_dir: &Path, event: &AuditEvent) {
+    let path = home_dir.join("security_audit.jsonl");
+    let json = match serde_json::to_string(event) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!("Failed to serialize audit event: {e}");
+            return;
+        }
+    };
+
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{json}") {
+                warn!("Failed to write audit event: {e}");
+            }
+        }
+        Err(e) => {
+            warn!("Failed to open audit log {}: {e}", path.display());
+        }
+    }
+}
+
+/// Read recent audit events (last N entries).
+pub fn read_recent_events(home_dir: &Path, limit: usize) -> Vec<AuditEvent> {
+    let path = home_dir.join("security_audit.jsonl");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let all: Vec<AuditEvent> = content
+        .lines()
+        .rev()
+        .take(limit)
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+
+    // Reverse back to chronological order
+    all.into_iter().rev().collect()
+}
+
+/// Count events by severity since a given timestamp.
+pub fn count_events_since(
+    home_dir: &Path,
+    since: &str,
+) -> (usize, usize, usize) {
+    let path = home_dir.join("security_audit.jsonl");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return (0, 0, 0),
+    };
+
+    let mut info = 0usize;
+    let mut warning = 0usize;
+    let mut critical = 0usize;
+
+    for line in content.lines() {
+        if let Ok(event) = serde_json::from_str::<AuditEvent>(line) {
+            if event.timestamp.as_str() >= since {
+                match event.severity {
+                    Severity::Info => info += 1,
+                    Severity::Warning => warning += 1,
+                    Severity::Critical => critical += 1,
+                }
+            }
+        }
+    }
+
+    (info, warning, critical)
+}
+
+// ── Convenience constructors for common events ──────────────
+
+/// Log a SOUL.md drift detection event.
+pub fn log_soul_drift(home_dir: &Path, agent_id: &str, expected: &str, actual: &str) {
+    let event = AuditEvent::new(
+        "soul_drift",
+        agent_id,
+        Severity::Critical,
+        serde_json::json!({
+            "expected_hash": expected,
+            "actual_hash": actual,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
+/// Log a prompt injection detection event.
+pub fn log_injection_detected(
+    home_dir: &Path,
+    agent_id: &str,
+    risk_score: u32,
+    matched_rules: &[String],
+    blocked: bool,
+) {
+    let severity = if blocked {
+        Severity::Critical
+    } else {
+        Severity::Warning
+    };
+    let event = AuditEvent::new(
+        "prompt_injection",
+        agent_id,
+        severity,
+        serde_json::json!({
+            "risk_score": risk_score,
+            "matched_rules": matched_rules,
+            "blocked": blocked,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
+/// Log a skill quarantine event.
+pub fn log_skill_quarantined(home_dir: &Path, agent_id: &str, skill_name: &str, reason: &str) {
+    let event = AuditEvent::new(
+        "skill_quarantined",
+        agent_id,
+        Severity::Warning,
+        serde_json::json!({
+            "skill_name": skill_name,
+            "reason": reason,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}

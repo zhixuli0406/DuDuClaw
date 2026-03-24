@@ -14,8 +14,10 @@
   "type": "module",
   "dependencies": {
     "@tanstack/react-virtual": "^3.13.22",
+    "@types/d3": "^7.4.3",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "d3": "^7.9.0",
     "lucide-react": "^0.577.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",

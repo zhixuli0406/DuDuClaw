@@ -100,6 +100,57 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "tags", description: "Comma-separated tags", required: false },
         ],
     },
+    // ── Sub-agent management tools ──────────────────────────────
+    ToolDef {
+        name: "create_agent",
+        description: "Create a persistent sub-agent with its own identity, skills, and configuration. The agent is registered and available for delegation immediately.",
+        params: &[
+            ParamDef { name: "name", description: "Agent name (lowercase, no spaces, e.g. 'researcher')", required: true },
+            ParamDef { name: "display_name", description: "Human-readable display name (e.g. 'Research Assistant')", required: true },
+            ParamDef { name: "role", description: "Agent role: 'specialist' or 'worker' (default: specialist)", required: false },
+            ParamDef { name: "reports_to", description: "Parent agent name this agent reports to (default: main agent)", required: false },
+            ParamDef { name: "soul", description: "Personality/system prompt for this agent (written to SOUL.md)", required: false },
+            ParamDef { name: "model", description: "Preferred model (default: claude-sonnet-4-6)", required: false },
+            ParamDef { name: "trigger", description: "Trigger keyword (default: @display_name)", required: false },
+            ParamDef { name: "icon", description: "Emoji icon for this agent (default: 🤖)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "list_agents",
+        description: "List all registered agents with their role, status, and reports_to hierarchy",
+        params: &[],
+    },
+    ToolDef {
+        name: "agent_status",
+        description: "Get detailed status and configuration of a specific agent",
+        params: &[
+            ParamDef { name: "agent_id", description: "Agent name to inspect", required: true },
+        ],
+    },
+    ToolDef {
+        name: "spawn_agent",
+        description: "Spawn a persistent sub-agent task. The agent runs in the background with its own session, executing the given prompt. Use agent_status to check progress.",
+        params: &[
+            ParamDef { name: "agent_id", description: "Target agent name", required: true },
+            ParamDef { name: "task", description: "Task prompt for the agent to execute", required: true },
+            ParamDef { name: "session_key", description: "Optional session key to resume a previous conversation context", required: false },
+        ],
+    },
+    // ── Skill management tools ──────────────────────────────────
+    ToolDef {
+        name: "skill_search",
+        description: "Search the local skill registry for available skills to install",
+        params: &[
+            ParamDef { name: "query", description: "Search query (name, tag, or description)", required: true },
+        ],
+    },
+    ToolDef {
+        name: "skill_list",
+        description: "List all skills installed for a specific agent",
+        params: &[
+            ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
+        ],
+    },
 ];
 
 // ── JSON-RPC helpers ─────────────────────────────────────────
@@ -629,6 +680,523 @@ async fn handle_schedule_task(params: &Value, home_dir: &Path) -> Value {
     })
 }
 
+// ── Sub-agent management handlers ───────────────────────────
+
+/// Create a persistent sub-agent directory with agent.toml, SOUL.md, etc.
+async fn handle_create_agent(params: &Value, home_dir: &Path) -> Value {
+    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let display_name = params.get("display_name").and_then(|v| v.as_str()).unwrap_or("");
+
+    if name.is_empty() || display_name.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: name and display_name are required"}],
+            "isError": true
+        });
+    }
+
+    // Validate name: lowercase, alphanumeric + hyphens only
+    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: name must be lowercase alphanumeric with hyphens only"}],
+            "isError": true
+        });
+    }
+
+    let agent_dir = home_dir.join("agents").join(name);
+    if agent_dir.exists() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: agent '{name}' already exists at {}", agent_dir.display())}],
+            "isError": true
+        });
+    }
+
+    let role = params.get("role").and_then(|v| v.as_str()).unwrap_or("specialist");
+    let reports_to = params.get("reports_to").and_then(|v| v.as_str()).unwrap_or("");
+    let soul = params.get("soul").and_then(|v| v.as_str()).unwrap_or("");
+    let model = params.get("model").and_then(|v| v.as_str()).unwrap_or("claude-sonnet-4-6");
+    let trigger = params.get("trigger").and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("@{display_name}"));
+    let icon = params.get("icon").and_then(|v| v.as_str()).unwrap_or("\u{1F916}");
+
+    // Resolve reports_to: default to the main agent if not specified
+    let reports_to = if reports_to.is_empty() {
+        resolve_main_agent_name(home_dir).await
+    } else {
+        reports_to.to_string()
+    };
+
+    // Create directory structure
+    if let Err(e) = tokio::fs::create_dir_all(&agent_dir).await {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error creating agent directory: {e}")}],
+            "isError": true
+        });
+    }
+    let _ = tokio::fs::create_dir_all(agent_dir.join("SKILLS")).await;
+
+    // Write agent.toml
+    let agent_toml = format!(
+r#"[agent]
+name = "{name}"
+display_name = "{display_name}"
+role = "{role}"
+status = "active"
+trigger = "{trigger}"
+reports_to = "{reports_to}"
+icon = "{icon}"
+
+[model]
+preferred = "{model}"
+fallback = "claude-haiku-4-5"
+account_pool = ["main"]
+
+[container]
+timeout_ms = 1800000
+max_concurrent = 2
+readonly_project = true
+additional_mounts = []
+
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 2000
+warn_threshold_percent = 80
+hard_stop = true
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = true
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = []
+
+[evolution]
+micro_reflection = true
+meso_reflection = false
+macro_reflection = false
+skill_auto_activate = false
+skill_security_scan = true
+"#);
+
+    if let Err(e) = tokio::fs::write(agent_dir.join("agent.toml"), &agent_toml).await {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error writing agent.toml: {e}")}],
+            "isError": true
+        });
+    }
+
+    // Write SOUL.md if provided
+    if !soul.is_empty() {
+        let _ = tokio::fs::write(agent_dir.join("SOUL.md"), soul).await;
+    }
+
+    // Write empty MEMORY.md
+    let _ = tokio::fs::write(agent_dir.join("MEMORY.md"), "").await;
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": format!(
+            "Agent '{display_name}' ({name}) created successfully.\n\
+             Role: {role}\n\
+             Reports to: {reports_to}\n\
+             Model: {model}\n\
+             Directory: {}\n\n\
+             The agent is now available for delegation via send_to_agent or spawn_agent.",
+            agent_dir.display()
+        )}]
+    })
+}
+
+/// List all registered agents with role, status, and hierarchy.
+async fn handle_list_agents(home_dir: &Path) -> Value {
+    let agents_dir = home_dir.join("agents");
+    let mut entries = match tokio::fs::read_dir(&agents_dir).await {
+        Ok(e) => e,
+        Err(e) => {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error reading agents directory: {e}")}],
+                "isError": true
+            });
+        }
+    };
+
+    let mut agents = Vec::new();
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        if dir_name.starts_with('_') {
+            continue;
+        }
+
+        let toml_path = path.join("agent.toml");
+        if let Ok(content) = tokio::fs::read_to_string(&toml_path).await {
+            if let Ok(config) = toml::from_str::<duduclaw_core::types::AgentConfig>(&content) {
+                agents.push(serde_json::json!({
+                    "name": config.agent.name,
+                    "display_name": config.agent.display_name,
+                    "role": format!("{:?}", config.agent.role).to_lowercase(),
+                    "status": format!("{:?}", config.agent.status).to_lowercase(),
+                    "reports_to": config.agent.reports_to,
+                    "icon": config.agent.icon,
+                    "model": config.model.preferred,
+                    "can_create_agents": config.permissions.can_create_agents,
+                    "can_schedule_tasks": config.permissions.can_schedule_tasks,
+                }));
+            }
+        }
+    }
+
+    if agents.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "No agents found."}]
+        });
+    }
+
+    // Build a readable text table
+    let mut lines = vec![format!("Found {} agent(s):\n", agents.len())];
+    for a in &agents {
+        let name = a["name"].as_str().unwrap_or("?");
+        let display = a["display_name"].as_str().unwrap_or("?");
+        let role = a["role"].as_str().unwrap_or("?");
+        let status = a["status"].as_str().unwrap_or("?");
+        let reports_to = a["reports_to"].as_str().unwrap_or("");
+        let icon = a["icon"].as_str().unwrap_or("");
+        let hierarchy = if reports_to.is_empty() {
+            "(root)".to_string()
+        } else {
+            format!("-> {reports_to}")
+        };
+        lines.push(format!("{icon} {display} ({name}) [{role}/{status}] {hierarchy}"));
+    }
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": lines.join("\n")}]
+    })
+}
+
+/// Get detailed status of a specific agent.
+async fn handle_agent_status(params: &Value, home_dir: &Path) -> Value {
+    let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+    if agent_id.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: agent_id is required"}],
+            "isError": true
+        });
+    }
+
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    let toml_path = agent_dir.join("agent.toml");
+
+    let content = match tokio::fs::read_to_string(&toml_path).await {
+        Ok(c) => c,
+        Err(_) => {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: agent '{agent_id}' not found")}],
+                "isError": true
+            });
+        }
+    };
+
+    let config: duduclaw_core::types::AgentConfig = match toml::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error parsing agent.toml: {e}")}],
+                "isError": true
+            });
+        }
+    };
+
+    // Check for SOUL.md, skills, memory
+    let has_soul = agent_dir.join("SOUL.md").exists();
+    let has_identity = agent_dir.join("IDENTITY.md").exists();
+    let skill_count = match tokio::fs::read_dir(agent_dir.join("SKILLS")).await {
+        Ok(mut entries) => {
+            let mut count = 0u32;
+            while let Ok(Some(_)) = entries.next_entry().await {
+                count += 1;
+            }
+            count
+        }
+        Err(_) => 0,
+    };
+
+    // Check pending bus_queue messages for this agent
+    let pending_tasks = count_pending_tasks(home_dir, agent_id).await;
+
+    let info = format!(
+        "Agent: {} ({})\n\
+         Role: {:?} | Status: {:?}\n\
+         Reports to: {}\n\
+         Model: {} (fallback: {})\n\
+         Icon: {}\n\
+         Trigger: {}\n\
+         \n\
+         Files:\n\
+         - SOUL.md: {}\n\
+         - IDENTITY.md: {}\n\
+         - Skills: {} file(s)\n\
+         - Directory: {}\n\
+         \n\
+         Permissions:\n\
+         - Create agents: {}\n\
+         - Cross-agent messaging: {}\n\
+         - Schedule tasks: {}\n\
+         - Modify own skills: {}\n\
+         - Allowed channels: {:?}\n\
+         \n\
+         Budget: {} cents/month (warn: {}%, hard stop: {})\n\
+         Heartbeat: {} (interval: {}s)\n\
+         Pending tasks in queue: {}",
+        config.agent.display_name,
+        config.agent.name,
+        config.agent.role,
+        config.agent.status,
+        if config.agent.reports_to.is_empty() { "(root)" } else { &config.agent.reports_to },
+        config.model.preferred,
+        config.model.fallback,
+        config.agent.icon,
+        config.agent.trigger,
+        if has_soul { "yes" } else { "no" },
+        if has_identity { "yes" } else { "no" },
+        skill_count,
+        agent_dir.display(),
+        config.permissions.can_create_agents,
+        config.permissions.can_send_cross_agent,
+        config.permissions.can_schedule_tasks,
+        config.permissions.can_modify_own_skills,
+        config.permissions.allowed_channels,
+        config.budget.monthly_limit_cents,
+        config.budget.warn_threshold_percent,
+        config.budget.hard_stop,
+        if config.heartbeat.enabled { "enabled" } else { "disabled" },
+        config.heartbeat.interval_seconds,
+        pending_tasks,
+    );
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": info}]
+    })
+}
+
+/// Spawn a persistent sub-agent task in the background.
+async fn handle_spawn_agent(params: &Value, home_dir: &Path) -> Value {
+    let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+    let task = params.get("task").and_then(|v| v.as_str()).unwrap_or("");
+    let session_key = params.get("session_key").and_then(|v| v.as_str()).unwrap_or("");
+
+    if agent_id.is_empty() || task.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: agent_id and task are required"}],
+            "isError": true
+        });
+    }
+
+    // Verify agent exists
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    if !agent_dir.join("agent.toml").exists() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: agent '{agent_id}' not found")}],
+            "isError": true
+        });
+    }
+
+    let task_id = uuid::Uuid::new_v4().to_string();
+
+    // Write a structured task entry to bus_queue.jsonl with spawn metadata
+    let queue_path = home_dir.join("bus_queue.jsonl");
+    let entry = serde_json::json!({
+        "type": "agent_message",
+        "message_id": &task_id,
+        "agent_id": agent_id,
+        "payload": task,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "session_key": if session_key.is_empty() { &task_id } else { session_key },
+        "persistent": true,
+    });
+
+    let queued = tokio::task::spawn_blocking({
+        let path = queue_path;
+        let entry_str = entry.to_string();
+        move || -> bool {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                writeln!(f, "{entry_str}").is_ok()
+            } else {
+                false
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    if queued {
+        serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "Sub-agent '{agent_id}' task spawned successfully.\n\
+                 Task ID: {task_id}\n\
+                 Session key: {}\n\
+                 \n\
+                 The task is queued and will be picked up by the dispatcher.\n\
+                 Use agent_status to check progress, or check bus_queue.jsonl for the response.",
+                if session_key.is_empty() { &task_id } else { session_key }
+            )}]
+        })
+    } else {
+        serde_json::json!({
+            "content": [{"type": "text", "text": "Error: Failed to queue agent task"}],
+            "isError": true
+        })
+    }
+}
+
+/// Count pending agent_message entries in bus_queue.jsonl for a given agent.
+async fn count_pending_tasks(home_dir: &Path, agent_id: &str) -> usize {
+    let queue_path = home_dir.join("bus_queue.jsonl");
+    let content = match tokio::fs::read_to_string(&queue_path).await {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| {
+            v.get("type").and_then(|t| t.as_str()) == Some("agent_message")
+                && v.get("agent_id").and_then(|a| a.as_str()) == Some(agent_id)
+        })
+        .count()
+}
+
+// ── Skill management handlers ───────────────────────────────
+
+/// Search the local skill registry.
+async fn handle_skill_search(params: &Value, home_dir: &Path) -> Value {
+    let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    if query.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: query is required"}],
+            "isError": true
+        });
+    }
+
+    let registry = duduclaw_agent::skill_registry::SkillRegistry::load(home_dir);
+    let results = registry.search(query, 20);
+
+    if results.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "No skills found for '{query}'. Registry has {} skills indexed.",
+                registry.count()
+            )}]
+        });
+    }
+
+    let mut lines = vec![format!("Found {} skill(s) for '{query}':\n", results.len())];
+    for s in &results {
+        let tags = if s.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", s.tags.join(", "))
+        };
+        lines.push(format!("- **{}**: {}{}", s.name, s.description, tags));
+    }
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": lines.join("\n")}]
+    })
+}
+
+/// List all skills installed for a specific agent.
+async fn handle_skill_list(params: &Value, home_dir: &Path) -> Value {
+    let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+
+    let agent_name = if agent_id.is_empty() {
+        resolve_main_agent_name(home_dir).await
+    } else {
+        agent_id.to_string()
+    };
+
+    let skills_dir = home_dir.join("agents").join(&agent_name).join("SKILLS");
+    let mut skills = Vec::new();
+
+    if let Ok(mut entries) = tokio::fs::read_dir(&skills_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+
+                // Try to parse metadata
+                let meta = duduclaw_agent::skill_loader::parse_skill_file(&path).ok();
+                let desc = meta
+                    .as_ref()
+                    .map(|m| m.meta.description.clone())
+                    .unwrap_or_default();
+
+                skills.push(format!("- {name}: {desc}"));
+            }
+        }
+    }
+
+    if skills.is_empty() {
+        serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "No skills installed for agent '{agent_name}'."
+            )}]
+        })
+    } else {
+        let text = format!(
+            "Agent '{}' has {} skill(s):\n\n{}",
+            agent_name,
+            skills.len(),
+            skills.join("\n")
+        );
+        serde_json::json!({
+            "content": [{"type": "text", "text": text}]
+        })
+    }
+}
+
+/// Resolve the main agent name from the agents directory.
+async fn resolve_main_agent_name(home_dir: &Path) -> String {
+    let agents_dir = home_dir.join("agents");
+    let mut entries = match tokio::fs::read_dir(&agents_dir).await {
+        Ok(e) => e,
+        Err(_) => return String::new(),
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let toml_path = path.join("agent.toml");
+        if let Ok(content) = tokio::fs::read_to_string(&toml_path).await {
+            if let Ok(config) = toml::from_str::<duduclaw_core::types::AgentConfig>(&content) {
+                if config.agent.role == duduclaw_core::types::AgentRole::Main {
+                    return config.agent.name;
+                }
+            }
+        }
+    }
+
+    String::new()
+}
+
 // ── Config reader ────────────────────────────────────────────
 
 async fn read_config(home_dir: &Path) -> Option<toml::Table> {
@@ -793,6 +1361,12 @@ async fn handle_tools_call(
         "send_sticker" => handle_send_media(&arguments, home_dir, http, "sticker").await,
         "log_mood" => handle_log_mood(&arguments, home_dir, memory, default_agent).await,
         "schedule_task" => handle_schedule_task(&arguments, home_dir).await,
+        "create_agent" => handle_create_agent(&arguments, home_dir).await,
+        "list_agents" => handle_list_agents(home_dir).await,
+        "agent_status" => handle_agent_status(&arguments, home_dir).await,
+        "spawn_agent" => handle_spawn_agent(&arguments, home_dir).await,
+        "skill_search" => handle_skill_search(&arguments, home_dir).await,
+        "skill_list" => handle_skill_list(&arguments, home_dir).await,
         _ => {
             return jsonrpc_error(
                 id,

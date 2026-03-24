@@ -4,6 +4,8 @@ import { cn } from '@/lib/utils';
 import {
   LayoutDashboard,
   Bot,
+  Network,
+  Puzzle,
   Radio,
   Wallet,
   Brain,
@@ -15,6 +17,8 @@ import {
 const navItems = [
   { to: '/', icon: LayoutDashboard, label: 'nav.dashboard' },
   { to: '/agents', icon: Bot, label: 'nav.agents' },
+  { to: '/org', icon: Network, label: 'nav.org' },
+  { to: '/skills', icon: Puzzle, label: 'nav.skills' },
   { to: '/channels', icon: Radio, label: 'nav.channels' },
   { to: '/accounts', icon: Wallet, label: 'nav.accounts' },
   { to: '/memory', icon: Brain, label: 'nav.memory' },

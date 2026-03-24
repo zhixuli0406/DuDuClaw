@@ -4,7 +4,7 @@ import { useAgentsStore } from '@/stores/agents-store';
 import { cn } from '@/lib/utils';
 import { api, type AgentDetail } from '@/lib/api';
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
-import { Bot, Pause, Play, Send, Eye, Plus, X } from 'lucide-react';
+import { Bot, Pause, Play, Send, Eye, Plus, X, ShieldCheck } from 'lucide-react';
 
 function StatusBadge({ status }: { status: string }) {
   const intl = useIntl();
@@ -83,6 +83,12 @@ export function AgentsPage() {
 
               <div className="mt-3 flex items-center gap-2">
                 <RoleBadge role={agent.role} />
+                {(agent as unknown as { sandbox_enabled?: boolean }).sandbox_enabled && (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
+                    <ShieldCheck className="h-3 w-3" />
+                    {intl.formatMessage({ id: 'agents.sandboxed' })}
+                  </span>
+                )}
               </div>
 
               {agent.budget && (

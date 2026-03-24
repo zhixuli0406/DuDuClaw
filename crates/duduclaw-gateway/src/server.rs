@@ -79,12 +79,29 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let line_router = crate::line::start_line_bot(&home_dir, reply_ctx.clone()).await;
     let _discord_handle = crate::discord::start_discord_bot(&home_dir, reply_ctx).await;
 
-    // Start evolution engine timers (meso: hourly, macro: daily)
-    let _evolution_handles = crate::evolution::start_evolution_timers(
+    // Start unified heartbeat scheduler (per-agent: evolution + cron + monitoring)
+    // Replaces the old start_evolution_timers — each agent's HeartbeatConfig
+    // now drives meso/macro reflections at its own interval or cron schedule.
+    let heartbeat = duduclaw_agent::heartbeat::start_heartbeat_scheduler(
         home_dir.clone(),
         handler.registry().clone(),
     );
-    info!("Evolution engine timers started (meso: hourly, macro: daily)");
+    handler.set_heartbeat(heartbeat).await;
+    info!("Heartbeat scheduler started (per-agent evolution + monitoring)");
+
+    // Start cron scheduler (reads cron_tasks.jsonl, fires on schedule)
+    let _cron_handle = crate::cron_scheduler::start_cron_scheduler(
+        home_dir.clone(),
+        handler.registry().clone(),
+    );
+    info!("Cron scheduler started");
+
+    // Start agent dispatcher (consumes bus_queue.jsonl, spawns sub-agents)
+    let _dispatcher_handle = crate::dispatcher::start_agent_dispatcher(
+        home_dir.clone(),
+        handler.registry().clone(),
+    );
+    info!("Agent dispatcher started");
 
     let state = Arc::new(AppState {
         auth: AuthManager::new(config.auth_token),

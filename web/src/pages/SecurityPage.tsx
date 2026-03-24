@@ -1,14 +1,30 @@
+import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
+import { api, type AuditEvent } from '@/lib/api';
 import {
   Shield,
   Lock,
   ShieldCheck,
   Users,
   Timer,
+  AlertTriangle,
+  FileWarning,
+  History,
 } from 'lucide-react';
 
 export function SecurityPage() {
   const intl = useIntl();
+  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+  const [auditLoading, setAuditLoading] = useState(false);
+
+  useEffect(() => {
+    setAuditLoading(true);
+    api.security
+      .auditLog(30)
+      .then((res) => setAuditEvents(res?.events ?? []))
+      .catch(() => setAuditEvents([]))
+      .finally(() => setAuditLoading(false));
+  }, []);
 
   return (
     <div className="space-y-6">
@@ -17,6 +33,29 @@ export function SecurityPage() {
       </h2>
 
       <div className="grid gap-6 lg:grid-cols-2">
+        {/* Audit Log */}
+        <SecurityCard
+          icon={History}
+          title={intl.formatMessage({ id: 'security.audit.title' })}
+          description={intl.formatMessage({ id: 'security.audit.desc' })}
+        >
+          {auditLoading ? (
+            <p className="py-4 text-center text-sm text-stone-400">
+              {intl.formatMessage({ id: 'common.loading' })}
+            </p>
+          ) : auditEvents.length === 0 ? (
+            <p className="py-4 text-center text-sm text-stone-400">
+              {intl.formatMessage({ id: 'security.audit.empty' })}
+            </p>
+          ) : (
+            <div className="max-h-64 space-y-2 overflow-y-auto">
+              {auditEvents.map((evt, i) => (
+                <AuditRow key={`${evt.timestamp}-${i}`} event={evt} />
+              ))}
+            </div>
+          )}
+        </SecurityCard>
+
         {/* Credential Proxy */}
         <SecurityCard
           icon={Lock}
@@ -92,6 +131,37 @@ export function SecurityPage() {
             <LimitRow label="Burst allowance" value="10" />
           </div>
         </SecurityCard>
+      </div>
+    </div>
+  );
+}
+
+function AuditRow({ event }: { event: AuditEvent }) {
+  const severityStyles: Record<string, string> = {
+    info: 'text-blue-500',
+    warning: 'text-amber-500',
+    critical: 'text-rose-500',
+  };
+
+  const SevIcon = event.severity === 'critical' ? AlertTriangle
+    : event.severity === 'warning' ? FileWarning
+    : Shield;
+
+  const time = new Date(event.timestamp).toLocaleString();
+
+  return (
+    <div className="flex items-start gap-2 rounded-lg bg-stone-50 p-2.5 dark:bg-stone-800/50">
+      <SevIcon className={`mt-0.5 h-4 w-4 shrink-0 ${severityStyles[event.severity] ?? 'text-stone-400'}`} />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium text-stone-900 dark:text-stone-100">
+            {event.event_type}
+          </span>
+          <span className="text-xs text-stone-400">{event.agent_id}</span>
+        </div>
+        <p className="truncate text-xs text-stone-500 dark:text-stone-400">
+          {time}
+        </p>
       </div>
     </div>
   );

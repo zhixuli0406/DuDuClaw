@@ -49,6 +49,12 @@ pub struct ContainerConfig {
     pub max_concurrent: u32,
     pub readonly_project: bool,
     pub additional_mounts: Vec<MountConfig>,
+    /// Run agent tasks inside a sandboxed container (Docker / Apple Container).
+    #[serde(default)]
+    pub sandbox_enabled: bool,
+    /// Allow network access inside the sandbox (default: false = offline).
+    #[serde(default)]
+    pub network_access: bool,
 }
 
 /// Heartbeat / scheduled-task configuration.

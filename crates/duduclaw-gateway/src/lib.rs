@@ -1,6 +1,9 @@
 pub mod auth;
 pub mod channel_reply;
+pub mod claude_runner;
+pub mod cron_scheduler;
 pub mod discord;
+pub mod dispatcher;
 pub mod evolution;
 pub mod handlers;
 pub mod line;

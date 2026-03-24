@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 license = "MIT"
 authors = ["DuDuClaw Contributors"]
@@ -58,6 +58,7 @@ base64 = "0.22"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+cron = "0.15"
 
 # UUID
 uuid = { version = "1", features = ["v4", "serde"] }

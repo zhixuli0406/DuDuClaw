@@ -400,6 +400,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cron"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5877d3fbf742507b66bc2a1945106bd30dd8504019d596901ddd012a4dd01740"
+dependencies = [
+ "chrono",
+ "once_cell",
+ "winnow 0.6.26",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -489,9 +500,10 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-agent"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "chrono",
+ "cron",
  "duduclaw-core",
  "serde",
  "serde_json",
@@ -503,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-bridge"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "duduclaw-core",
@@ -514,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-bus"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "duduclaw-core",
  "serde",
@@ -525,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-cli"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "base64",
  "bollard",
@@ -553,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-container"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "bollard",
@@ -568,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-core"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -583,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-dashboard"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "axum",
  "mime_guess",
@@ -592,15 +604,18 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-gateway"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "axum",
  "base64",
  "chrono",
+ "cron",
  "duduclaw-agent",
+ "duduclaw-container",
  "duduclaw-core",
  "duduclaw-dashboard",
  "duduclaw-memory",
+ "duduclaw-security",
  "futures-util",
  "hmac",
  "reqwest",
@@ -619,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-memory"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -634,14 +649,16 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-security"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "base64",
+ "chrono",
  "duduclaw-core",
  "ring",
  "serde",
  "serde_json",
  "tokio",
+ "toml",
  "tracing",
 ]
 
@@ -2586,7 +2603,7 @@ dependencies = [
  "serde_spanned",
  "toml_datetime",
  "toml_write",
- "winnow",
+ "winnow 0.7.15",
 ]
 
 [[package]]
@@ -3201,6 +3218,15 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "winnow"
+version = "0.6.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e90edd2ac1aa278a5c4599b1d89cf03074b610800f866d4026dc199d7929a28"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "winnow"

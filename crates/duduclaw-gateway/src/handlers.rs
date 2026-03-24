@@ -17,6 +17,7 @@ pub struct MethodHandler {
     home_dir: PathBuf,
     start_time: Instant,
     channel_status: Arc<RwLock<std::collections::HashMap<String, ChannelState>>>,
+    heartbeat: RwLock<Option<Arc<duduclaw_agent::HeartbeatScheduler>>>,
 }
 
 /// Runtime state for a connected channel.
@@ -39,6 +40,7 @@ impl MethodHandler {
             home_dir,
             start_time: Instant::now(),
             channel_status: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            heartbeat: RwLock::new(None),
         }
     }
 
@@ -65,6 +67,11 @@ impl MethodHandler {
     /// Get the home directory path.
     pub fn home_dir(&self) -> &Path {
         &self.home_dir
+    }
+
+    /// Set the heartbeat scheduler reference (called after gateway start).
+    pub async fn set_heartbeat(&self, scheduler: Arc<duduclaw_agent::HeartbeatScheduler>) {
+        *self.heartbeat.write().await = Some(scheduler);
     }
 
     /// Route `method` to the correct handler and return a [`WsFrame`] response.
@@ -104,6 +111,8 @@ impl MethodHandler {
             "system.version" => self.handle_system_version(),
             "logs.subscribe" => self.handle_logs_subscribe(params),
             "logs.unsubscribe" => self.handle_logs_unsubscribe(params),
+            "heartbeat.status" => self.handle_heartbeat_status().await,
+            "heartbeat.trigger" => self.handle_heartbeat_trigger(params).await,
             "evolution.status" => self.handle_evolution_status().await,
             "evolution.skills" => self.handle_evolution_skills().await,
             unknown => WsFrame::error_response("", &format!("Unknown method: {unknown}")),
@@ -157,6 +166,8 @@ impl MethodHandler {
                 { "name": "system.doctor_repair", "description": "Health checks with repair hints" },
                 { "name": "system.config", "description": "View system config" },
                 { "name": "system.version", "description": "Version info" },
+                { "name": "heartbeat.status", "description": "Per-agent heartbeat status" },
+                { "name": "heartbeat.trigger", "description": "Manually trigger heartbeat for an agent" },
                 { "name": "logs.subscribe", "description": "Subscribe to logs" },
                 { "name": "logs.unsubscribe", "description": "Unsubscribe from logs" },
             ]
@@ -1045,6 +1056,49 @@ asyncio.run(main())
 
     fn handle_system_version(&self) -> WsFrame {
         WsFrame::ok_response("", json!({ "version": env!("CARGO_PKG_VERSION") }))
+    }
+
+    // ── Heartbeat ────────────────────────────────────────────
+
+    async fn handle_heartbeat_status(&self) -> WsFrame {
+        let hb = self.heartbeat.read().await;
+        match hb.as_ref() {
+            Some(scheduler) => {
+                let statuses = scheduler.status().await;
+                WsFrame::ok_response("", json!({
+                    "heartbeats": statuses,
+                    "count": statuses.len(),
+                }))
+            }
+            None => WsFrame::ok_response("", json!({
+                "heartbeats": [],
+                "count": 0,
+                "message": "Heartbeat scheduler not started",
+            })),
+        }
+    }
+
+    async fn handle_heartbeat_trigger(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if agent_id.is_empty() {
+            return WsFrame::error_response("", "agent_id is required");
+        }
+
+        let hb = self.heartbeat.read().await;
+        match hb.as_ref() {
+            Some(scheduler) => {
+                let triggered = scheduler.trigger(agent_id).await;
+                if triggered {
+                    WsFrame::ok_response("", json!({
+                        "success": true,
+                        "message": format!("Heartbeat triggered for agent '{agent_id}'"),
+                    }))
+                } else {
+                    WsFrame::error_response("", &format!("Agent '{agent_id}' not found in heartbeat scheduler"))
+                }
+            }
+            None => WsFrame::error_response("", "Heartbeat scheduler not started"),
+        }
     }
 
     // ── Logs ────────────────────────────────────────────────

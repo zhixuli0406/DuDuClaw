@@ -1,5 +1,9 @@
+pub mod audit;
 pub mod credential_proxy;
 pub mod crypto;
+pub mod input_guard;
+pub mod key_vault;
 pub mod mount_guard;
 pub mod rate_limiter;
 pub mod rbac;
+pub mod soul_guard;
