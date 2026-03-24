@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.6.4-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-0.6.5-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 
 ---
 
@@ -47,7 +47,7 @@ DuDuClaw (plumbing)
 | **安全防護** | SOUL.md 漂移檢測（SHA-256）+ prompt injection 掃描（6 類規則）+ JSONL 審計日誌 + per-agent 密鑰隔離 |
 | **行為契約** | `CONTRACT.toml` 定義 `must_not` / `must_always` 邊界 + `duduclaw test` 紅隊測試（9 項內建場景） |
 | **Odoo ERP 整合** | 中間層 `duduclaw-odoo` 支援 CE/EE — 15 個 MCP 工具（CRM/銷售/庫存/會計/通用搜尋報表）+ 事件橋接 |
-| **Skill 市場** | OpenClaw 相容的 skill 格式解析 + 本地 registry 索引 + MCP 工具自主安裝 + Dashboard 市場頁面 |
+| **Skill 市場** | GitHub Search API 即時索引真實 skill repo + 24h 本地快取 + Dashboard 市場頁面 |
 | **多帳號輪替** | Python SDK 管理多個 Claude API key，支援 4 種策略 + 預算追蹤 + 故障轉移 |
 | **Claude Code 原生目錄** | Agent 目錄包含 `.claude/`、`SOUL.md`、`CLAUDE.md`、`.mcp.json`，直接相容 Claude Code |
 | **Web Dashboard** | React + TypeScript + Tailwind CSS，溫暖 amber 色系，支援深淺色切換，含組織架構圖、Skill 市場、安全審計頁 |

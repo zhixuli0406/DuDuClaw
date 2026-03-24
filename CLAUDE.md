@@ -1,6 +1,6 @@
 # DuDuClaw Project Guidelines
 
-## Architecture Overview (v0.6.2)
+## Architecture Overview (v0.6.5)
 
 DuDuClaw is a **Claude Code extension layer** — not a standalone AI platform. The AI brain is Claude Code SDK (`claude` CLI); DuDuClaw provides the plumbing: channel routing, session management, memory, evolution, and multi-account rotation.
 
@@ -20,7 +20,7 @@ Key architectural decisions:
 - **Three-layer evolution** with real Claude subprocess calls: Micro (post-conversation) → Meso (per-agent heartbeat) → Macro (daily)
 - **Security layer**: SOUL.md drift detection (SHA-256), prompt injection scanner (6 rule categories), JSONL audit log, per-agent key isolation
 - **Behavioral contracts** (`CONTRACT.toml`) with `must_not` / `must_always` boundaries + `duduclaw test` red-team CLI
-- **Skill ecosystem**: OpenClaw-compatible skill parser (YAML frontmatter), local skill registry with weighted search, MCP `skill_search` / `skill_list` tools
+- **Skill ecosystem**: GitHub Search API live indexing of real skill repos, 24h local cache, weighted search, MCP `skill_search` / `skill_list` tools
 - **Odoo ERP bridge** (`duduclaw-odoo` crate): JSON-RPC middleware supporting CE/EE, 15 MCP tools (CRM/Sales/Inventory/Accounting), EditionGate auto-detection, event polling + webhook
 - **API key encryption**: AES-256-GCM stored as base64 in config (all tokens including channel tokens)
 
