@@ -641,93 +641,93 @@ skill_security_scan = true
     // ── Accounts ─────────────────────────────────────────────
 
     async fn handle_accounts_list(&self) -> WsFrame {
-        let has_key = self.has_api_key().await;
-        let mut accounts = Vec::new();
-        if has_key {
-            accounts.push(json!({
-                "name": "main",
-                "provider": "anthropic",
-                "active": true,
-            }));
-        }
-        WsFrame::ok_response("", json!({ "accounts": accounts }))
+        let rotator = self.create_rotator().await;
+        let accounts = rotator.status().await;
+        let accounts_json: Vec<Value> = accounts.iter().map(|a| json!({
+            "id": a.id,
+            "account_type": a.account_type,
+            "priority": a.priority,
+            "is_healthy": a.is_healthy,
+            "spent_this_month": a.spent_this_month,
+            "monthly_budget_cents": a.monthly_budget_cents,
+            "total_requests": a.total_requests,
+            "is_available": a.is_available,
+        })).collect();
+        WsFrame::ok_response("", json!({ "accounts": accounts_json }))
     }
 
     async fn handle_budget_summary(&self) -> WsFrame {
-        // Read budgets from loaded agents
-        let reg = self.registry.read().await;
-        let mut total_budget: u64 = 0;
-        let agents_list = reg.list();
-        for a in &agents_list {
-            total_budget += a.config.budget.monthly_limit_cents;
-        }
+        let rotator = self.create_rotator().await;
+        let accounts = rotator.status().await;
+        let total_budget: u64 = accounts.iter().map(|a| a.monthly_budget_cents).sum();
+        let total_spent: u64 = accounts.iter().map(|a| a.spent_this_month).sum();
 
-        let has_key = self.has_api_key().await;
-        let accounts: Vec<Value> = if has_key {
-            vec![json!({
-                "id": "main",
-                "account_type": "api_key",
-                "priority": 1,
-                "is_healthy": true,
-                "spent_this_month": 0,
-                "monthly_budget_cents": total_budget,
-            })]
-        } else {
-            vec![]
-        };
+        let accounts_json: Vec<Value> = accounts.iter().map(|a| json!({
+            "id": a.id,
+            "account_type": a.account_type,
+            "priority": a.priority,
+            "is_healthy": a.is_healthy,
+            "spent_this_month": a.spent_this_month,
+            "monthly_budget_cents": a.monthly_budget_cents,
+        })).collect();
 
         WsFrame::ok_response("", json!({
             "total_budget_cents": total_budget,
-            "total_spent_cents": 0,
-            "accounts": accounts,
+            "total_spent_cents": total_spent,
+            "accounts": accounts_json,
         }))
     }
 
-    async fn handle_accounts_rotate(&self, params: Value) -> WsFrame {
-        let account = params.get("account").and_then(|v| v.as_str()).unwrap_or("main");
-        info!(account, "accounts.rotate requested");
-
-        // Invoke Python SDK's AccountRotator to perform actual rotation
-        let config_path = self.home_dir.join("config.toml");
-        let python_path = crate::channel_reply::find_python_path_static(&self.home_dir);
-
-        // Use -m module invocation + env vars instead of -c to prevent script injection
-        match tokio::process::Command::new("python3")
-            .args(["-m", "duduclaw.sdk.rotate", "--config"])
-            .arg(&config_path)
-            .env("PYTHONPATH", &python_path)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .await
-        {
-            Ok(out) if out.status.success() => {
-                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                match serde_json::from_str::<Value>(&stdout) {
-                    Ok(result) => WsFrame::ok_response("", result),
-                    Err(_) => WsFrame::ok_response("", json!({ "success": true, "account": account, "message": stdout })),
-                }
+    async fn handle_accounts_rotate(&self, _params: Value) -> WsFrame {
+        let rotator = self.create_rotator().await;
+        match rotator.select().await {
+            Some(selected) => {
+                WsFrame::ok_response("", json!({
+                    "success": true,
+                    "selected_account": selected.id,
+                    "strategy": "configured",
+                    "message": format!("Rotated to account '{}'", selected.id),
+                }))
             }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                WsFrame::error_response("", &format!("Rotation failed: {}", stderr.chars().take(200).collect::<String>()))
-            }
-            Err(e) => WsFrame::error_response("", &format!("Failed to invoke Python: {e}")),
+            None => WsFrame::error_response("", "No available accounts for rotation"),
         }
     }
 
     async fn handle_accounts_health(&self) -> WsFrame {
-        let has_key = self.has_api_key().await;
-        let status = if has_key { "healthy" } else { "missing_key" };
+        let rotator = self.create_rotator().await;
+        let accounts = rotator.status().await;
+        let healthy_count = accounts.iter().filter(|a| a.is_healthy).count();
+        let status = if accounts.is_empty() { "no_accounts" }
+            else if healthy_count == accounts.len() { "healthy" }
+            else if healthy_count > 0 { "degraded" }
+            else { "unhealthy" };
+
+        let accounts_json: Vec<Value> = accounts.iter().map(|a| json!({
+            "id": a.id,
+            "healthy": a.is_healthy,
+            "available": a.is_available,
+            "spent": a.spent_this_month,
+            "budget": a.monthly_budget_cents,
+            "requests": a.total_requests,
+        })).collect();
+
         WsFrame::ok_response("", json!({
             "status": status,
-            "accounts": [{
-                "name": "main",
-                "provider": "anthropic",
-                "healthy": has_key,
-                "message": if has_key { "ANTHROPIC_API_KEY is set" } else { "ANTHROPIC_API_KEY is not set" },
-            }],
+            "healthy_count": healthy_count,
+            "total_count": accounts.len(),
+            "accounts": accounts_json,
         }))
+    }
+
+    /// Create a rotator instance loaded from config.
+    async fn create_rotator(&self) -> duduclaw_agent::account_rotator::AccountRotator {
+        let config_content = tokio::fs::read_to_string(self.home_dir.join("config.toml"))
+            .await
+            .unwrap_or_default();
+        let config_table: toml::Table = config_content.parse().unwrap_or_default();
+        let rotator = duduclaw_agent::account_rotator::create_from_config(&config_table);
+        let _ = rotator.load_from_config(&self.home_dir).await;
+        rotator
     }
 
     // ── Memory ──────────────────────────────────────────────
