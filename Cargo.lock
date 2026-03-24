@@ -505,6 +505,7 @@ dependencies = [
  "chrono",
  "cron",
  "duduclaw-core",
+ "duduclaw-security",
  "reqwest",
  "serde",
  "serde_json",

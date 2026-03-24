@@ -1,3 +1,4 @@
+pub mod account_rotator;
 pub mod budget;
 pub mod contract;
 pub mod heartbeat;

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use duduclaw_agent::registry::AgentRegistry;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Build a system prompt from an agent's loaded markdown files.
 fn build_system_prompt(agent: &duduclaw_agent::LoadedAgent) -> String {
@@ -56,12 +56,63 @@ pub async fn call_claude_for_agent(
 
     info!(agent = %model_id, prompt_len = prompt.len(), "Calling Claude CLI");
 
-    let api_key = get_api_key(home_dir).await;
-    if api_key.is_empty() {
-        return Err("No API key configured".to_string());
+    // Use account rotator for key selection (with retry on failure)
+    call_with_rotation(home_dir, prompt, &model, &system_prompt).await
+}
+
+/// Call Claude CLI with account rotation — tries next account on failure.
+async fn call_with_rotation(
+    home_dir: &Path,
+    prompt: &str,
+    model: &str,
+    system_prompt: &str,
+) -> Result<String, String> {
+    let config_content = tokio::fs::read_to_string(home_dir.join("config.toml"))
+        .await
+        .unwrap_or_default();
+    let config_table: toml::Table = config_content.parse().unwrap_or_default();
+
+    let rotator = duduclaw_agent::account_rotator::create_from_config(&config_table);
+    rotator.load_from_config(home_dir).await?;
+
+    let max_attempts = rotator.count().await.max(1);
+    let mut last_error = String::new();
+
+    for attempt in 0..max_attempts {
+        let selected = match rotator.select().await {
+            Some(s) => s,
+            None => break,
+        };
+
+        info!(account = %selected.id, attempt, "Trying account");
+
+        match call_claude(prompt, model, system_prompt, &selected.api_key).await {
+            Ok(response) => {
+                // Estimate cost: ~1 cent per 1000 chars (rough heuristic)
+                let cost = ((prompt.len() + response.len()) / 1000).max(1) as u64;
+                rotator.on_success(&selected.id, cost).await;
+                return Ok(response);
+            }
+            Err(e) => {
+                last_error = e.clone();
+                if e.contains("rate") || e.contains("429") {
+                    rotator.on_rate_limited(&selected.id).await;
+                } else {
+                    rotator.on_error(&selected.id).await;
+                }
+                warn!(account = %selected.id, error = %e, "Account failed, trying next");
+            }
+        }
     }
 
-    call_claude(prompt, &model, &system_prompt, &api_key).await
+    // All accounts failed — fall back to direct key
+    let api_key = get_api_key(home_dir).await;
+    if !api_key.is_empty() {
+        warn!("All rotated accounts failed, using fallback key");
+        return call_claude(prompt, model, system_prompt, &api_key).await;
+    }
+
+    Err(format!("All accounts exhausted. Last error: {last_error}"))
 }
 
 /// Public API key getter for use by other modules (e.g., sandbox dispatcher).
