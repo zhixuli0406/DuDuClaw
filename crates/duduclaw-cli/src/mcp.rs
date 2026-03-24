@@ -151,6 +151,16 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
         ],
     },
+    // ── Feedback tool ────────────────────────────────────────────
+    ToolDef {
+        name: "submit_feedback",
+        description: "Submit user feedback signal (positive/negative/correction) to influence agent evolution",
+        params: &[
+            ParamDef { name: "signal_type", description: "Feedback type: positive, negative, or correction", required: true },
+            ParamDef { name: "detail", description: "What the feedback is about", required: true },
+            ParamDef { name: "agent_id", description: "Target agent (default: main agent)", required: false },
+        ],
+    },
     // ── Odoo ERP tools (Phase 3) ────────────────────────────────
     ToolDef {
         name: "odoo_connect",
@@ -1236,6 +1246,42 @@ async fn count_pending_tasks(home_dir: &Path, agent_id: &str) -> usize {
         .count()
 }
 
+// ── Feedback handler ────────────────────────────────────────
+
+async fn handle_submit_feedback(params: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let signal_type = params.get("signal_type").and_then(|v| v.as_str()).unwrap_or("");
+    let detail = params.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+    let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
+
+    if signal_type.is_empty() || detail.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: signal_type and detail are required"}],
+            "isError": true
+        });
+    }
+
+    if !["positive", "negative", "correction"].contains(&signal_type) {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: signal_type must be positive, negative, or correction"}],
+            "isError": true
+        });
+    }
+
+    match duduclaw_gateway::external_factors::submit_feedback(
+        home_dir, agent_id, signal_type, "mcp", detail,
+    ).await {
+        Ok(()) => serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "Feedback recorded: [{signal_type}] for agent '{agent_id}'. This will be included in the next evolution reflection."
+            )}]
+        }),
+        Err(e) => serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error submitting feedback: {e}")}],
+            "isError": true
+        }),
+    }
+}
+
 // ── Odoo ERP handlers ───────────────────────────────────────
 
 async fn handle_odoo_tool(tool: &str, params: &Value, home_dir: &Path, odoo: &OdooState) -> Value {
@@ -1828,6 +1874,7 @@ async fn handle_tools_call(
         "spawn_agent" => handle_spawn_agent(&arguments, home_dir).await,
         "skill_search" => handle_skill_search(&arguments, home_dir).await,
         "skill_list" => handle_skill_list(&arguments, home_dir).await,
+        "submit_feedback" => handle_submit_feedback(&arguments, home_dir, default_agent).await,
         // Odoo ERP tools
         t if t.starts_with("odoo_") => handle_odoo_tool(t, &arguments, home_dir, odoo).await,
         _ => {

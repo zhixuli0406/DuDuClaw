@@ -97,6 +97,30 @@ pub struct EvolutionConfig {
     pub macro_reflection: bool,
     pub skill_auto_activate: bool,
     pub skill_security_scan: bool,
+    /// External factors to include in reflections.
+    #[serde(default)]
+    pub external_factors: ExternalFactorsConfig,
+}
+
+/// Configuration for external factors that feed into the evolution engine.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ExternalFactorsConfig {
+    /// Include user feedback signals (thumbs up/down, corrections).
+    #[serde(default)]
+    pub user_feedback: bool,
+    /// Include security events (injection attempts, SOUL drift) in reflection.
+    #[serde(default)]
+    pub security_events: bool,
+    /// Include channel activity metrics (response times, error rates).
+    #[serde(default)]
+    pub channel_metrics: bool,
+    /// Include Odoo business context (pipeline changes, KPIs) in reflection.
+    #[serde(default)]
+    pub business_context: bool,
+    /// Include peer agent performance signals (cross-agent learning).
+    #[serde(default)]
+    pub peer_signals: bool,
 }
 
 /// Top-level agent identity (the `[agent]` table in agent.toml).
