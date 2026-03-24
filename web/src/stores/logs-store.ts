@@ -24,6 +24,8 @@ export const useLogsStore = create<LogsStore>((set, get) => {
     paused: false,
     filter: { level: null, agentId: null, keyword: '' },
     subscribe: () => {
+      // Guard against double subscription (e.g. React Strict Mode)
+      unsubscribeFn?.();
       api.logs.subscribe().catch(() => {});
       unsubscribeFn = client.subscribe('logs.entry', (payload) => {
         if (get().paused) return;

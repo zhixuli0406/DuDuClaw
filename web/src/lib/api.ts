@@ -27,6 +27,8 @@ export interface AgentModel {
 export interface AgentDetail extends AgentInfo {
   budget: AgentBudget;
   model: AgentModel;
+  sandbox_enabled?: boolean;
+  network_access?: boolean;
   heartbeat: {
     enabled: boolean;
     interval_seconds: number;

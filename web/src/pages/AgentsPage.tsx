@@ -83,7 +83,7 @@ export function AgentsPage() {
 
               <div className="mt-3 flex items-center gap-2">
                 <RoleBadge role={agent.role} />
-                {(agent as unknown as { sandbox_enabled?: boolean }).sandbox_enabled && (
+                {agent.sandbox_enabled && (
                   <span className="inline-flex items-center gap-1 rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
                     <ShieldCheck className="h-3 w-3" />
                     {intl.formatMessage({ id: 'agents.sandboxed' })}

@@ -22,29 +22,62 @@ interface OrgChartProps {
 // ── Helpers ───────────────────────────────────────────────────
 
 function buildTree(agents: ReadonlyArray<AgentDetail>): OrgNode {
-  const byName = new Map<string, AgentDetail>();
-  for (const a of agents) byName.set(a.name, a);
+  if (agents.length === 0) {
+    return { name: '__root__', displayName: 'DuDuClaw', role: 'system', status: 'active', icon: '\u{1F43E}', model: '', children: [] };
+  }
 
-  // Find root: agent with role=main or no reports_to
-  const root = agents.find(
-    (a) => a.role === 'main' || !a.reports_to || a.reports_to === '',
-  );
+  // Find the root: prefer role=main, then first agent with no reports_to
+  const root = agents.find((a) => a.role === 'main')
+    ?? agents.find((a) => !a.reports_to || a.reports_to === '');
 
-  const toNode = (agent: AgentDetail): OrgNode => ({
-    name: agent.name,
-    displayName: agent.display_name,
-    role: agent.role,
-    status: agent.status,
-    icon: agent.icon || '\u{1F916}',
-    model: agent.model?.preferred ?? '',
-    children: agents
-      .filter((a) => a.reports_to === agent.name && a.name !== agent.name)
-      .map(toNode),
-  });
+  const toNode = (agent: AgentDetail, visited = new Set<string>()): OrgNode => {
+    // Prevent infinite recursion from circular reports_to
+    if (visited.has(agent.name)) {
+      return { name: agent.name, displayName: agent.display_name, role: agent.role, status: agent.status, icon: agent.icon || '\u{1F916}', model: agent.model?.preferred ?? '', children: [] };
+    }
+    const next = new Set(visited);
+    next.add(agent.name);
+    return {
+      name: agent.name,
+      displayName: agent.display_name,
+      role: agent.role,
+      status: agent.status,
+      icon: agent.icon || '\u{1F916}',
+      model: agent.model?.preferred ?? '',
+      children: agents
+        .filter((a) => a.reports_to === agent.name && a.name !== agent.name)
+        .map((a) => toNode(a, new Set(next))),
+    };
+  };
 
-  if (root) return toNode(root);
+  if (root) {
+    const rootNode = toNode(root);
 
-  // Fallback: synthetic root grouping all agents
+    // Find orphans: agents that are NOT the root and whose reports_to
+    // is empty OR points to a non-existent agent (and not already a child)
+    const childNames = new Set<string>();
+    const collectChildNames = (node: OrgNode) => {
+      childNames.add(node.name);
+      node.children?.forEach(collectChildNames);
+    };
+    collectChildNames(rootNode);
+
+    const orphans = agents.filter(
+      (a) => !childNames.has(a.name) && a.name !== root.name,
+    );
+
+    // Attach orphans directly under root
+    if (orphans.length > 0) {
+      rootNode.children = [
+        ...(rootNode.children ?? []),
+        ...orphans.map((a) => toNode(a)),
+      ];
+    }
+
+    return rootNode;
+  }
+
+  // No root found — synthetic root grouping all agents
   return {
     name: '__root__',
     displayName: 'DuDuClaw',
@@ -52,7 +85,7 @@ function buildTree(agents: ReadonlyArray<AgentDetail>): OrgNode {
     status: 'active',
     icon: '\u{1F43E}',
     model: '',
-    children: agents.map(toNode),
+    children: agents.map((a) => toNode(a)),
   };
 }
 

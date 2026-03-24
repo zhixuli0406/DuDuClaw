@@ -5,7 +5,7 @@
 //! - Workspace as tmpfs
 //! - Network disabled by default (configurable)
 //! - Timeout-based auto-kill
-//! - API key injected via stdin (never in env vars)
+//! - API key passed via container env var (isolated per container, not visible to host)
 
 use std::path::Path;
 use std::time::Duration;

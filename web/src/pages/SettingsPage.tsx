@@ -113,6 +113,33 @@ function ContainerTab() {
 
 function HeartbeatTab() {
   const intl = useIntl();
+  const [heartbeats, setHeartbeats] = useState<
+    ReadonlyArray<{
+      agent_id: string;
+      enabled: boolean;
+      interval_seconds: number;
+      cron: string;
+      last_run?: string;
+      next_run?: string;
+      total_runs: number;
+      active_runs: number;
+      max_concurrent: number;
+    }>
+  >([]);
+
+  useEffect(() => {
+    api.heartbeat
+      .status()
+      .then((r) => setHeartbeats(r?.heartbeats ?? []))
+      .catch(() => {});
+    const interval = setInterval(() => {
+      api.heartbeat
+        .status()
+        .then((r) => setHeartbeats(r?.heartbeats ?? []))
+        .catch(() => {});
+    }, 15_000);
+    return () => clearInterval(interval);
+  }, []);
 
   return (
     <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
@@ -123,12 +150,44 @@ function HeartbeatTab() {
         </h3>
       </div>
 
-      <div className="space-y-4">
-        <SettingRow label="Interval" value="30s" />
-        <SettingRow label="Timeout" value="10s" />
-        <SettingRow label="Max Retries" value="3" />
-        <SettingRow label="Status" value="Enabled" badge="emerald" />
-      </div>
+      {heartbeats.length === 0 ? (
+        <p className="py-8 text-center text-sm text-stone-400">
+          {intl.formatMessage({ id: 'common.noData' })}
+        </p>
+      ) : (
+        <div className="space-y-3">
+          {heartbeats.map((hb) => (
+            <div
+              key={hb.agent_id}
+              className="flex items-center justify-between rounded-lg bg-stone-50 p-3 dark:bg-stone-800/50"
+            >
+              <div>
+                <span className="text-sm font-medium text-stone-900 dark:text-stone-100">
+                  {hb.agent_id}
+                </span>
+                <div className="flex gap-3 text-xs text-stone-400 mt-0.5">
+                  <span>{hb.cron || `${hb.interval_seconds}s`}</span>
+                  <span>Runs: {hb.total_runs}</span>
+                  {hb.last_run && (
+                    <span>Last: {new Date(hb.last_run).toLocaleTimeString()}</span>
+                  )}
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-stone-400">
+                  {hb.active_runs}/{hb.max_concurrent}
+                </span>
+                <span
+                  className={cn(
+                    'inline-block h-2.5 w-2.5 rounded-full',
+                    hb.enabled ? 'bg-emerald-500' : 'bg-stone-300 dark:bg-stone-600'
+                  )}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

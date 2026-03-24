@@ -63,6 +63,14 @@ impl IpcBroker {
         uuid::Uuid::parse_str(s).is_ok()
     }
 
+    /// Validate that an agent ID is safe for filesystem use (no path traversal).
+    fn is_valid_agent_id(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= 64
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }
+
     /// Send an IPC message from one agent to another.
     ///
     /// The message is persisted as a JSON file under
@@ -74,6 +82,20 @@ impl IpcBroker {
             return Err(DuDuClawError::Agent(format!(
                 "invalid IPC message id (must be UUID): {}",
                 message.id
+            )));
+        }
+
+        // Validate agent IDs to prevent path traversal
+        if !Self::is_valid_agent_id(&message.target_agent) {
+            return Err(DuDuClawError::Agent(format!(
+                "invalid target agent id: {}",
+                message.target_agent
+            )));
+        }
+        if !Self::is_valid_agent_id(&message.source_agent) {
+            return Err(DuDuClawError::Agent(format!(
+                "invalid source agent id: {}",
+                message.source_agent
             )));
         }
 

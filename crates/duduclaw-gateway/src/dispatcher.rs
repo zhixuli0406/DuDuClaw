@@ -43,10 +43,13 @@ pub fn start_agent_dispatcher(
     home_dir: PathBuf,
     registry: Arc<RwLock<AgentRegistry>>,
 ) -> tokio::task::JoinHandle<()> {
+    // Mutex protects the read-modify-write cycle on bus_queue.jsonl
+    let dispatch_lock = Arc::new(tokio::sync::Mutex::new(()));
     tokio::spawn(async move {
         info!("Agent dispatcher started");
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let _guard = dispatch_lock.lock().await;
             if let Err(e) = poll_and_dispatch(&home_dir, &registry).await {
                 warn!("Dispatcher poll error: {e}");
             }
@@ -156,7 +159,9 @@ async fn poll_and_dispatch(
 
     // Wait for all dispatches to complete
     for handle in handles {
-        let _ = handle.await;
+        if let Err(e) = handle.await {
+            warn!("Dispatch task panicked: {e}");
+        }
     }
 
     Ok(())

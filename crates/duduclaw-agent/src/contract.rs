@@ -138,11 +138,22 @@ fn regex_lite_match(pattern: &str, text: &str) -> Result<bool, ()> {
     Ok(true)
 }
 
-/// Extract a ~60-char context window around a match.
+/// Extract a ~60-char context window around a match (UTF-8 safe).
 fn extract_context(text: &str, needle: &str) -> String {
     if let Some(idx) = text.find(needle) {
-        let start = idx.saturating_sub(20);
-        let end = (idx + needle.len() + 20).min(text.len());
+        // Find char-boundary-safe start and end positions
+        let start = text[..idx]
+            .char_indices()
+            .rev()
+            .nth(20)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let end_offset = idx + needle.len();
+        let end = text[end_offset..]
+            .char_indices()
+            .nth(20)
+            .map(|(i, _)| end_offset + i)
+            .unwrap_or(text.len());
         let snippet = &text[start..end];
         if start > 0 || end < text.len() {
             format!("...{snippet}...")

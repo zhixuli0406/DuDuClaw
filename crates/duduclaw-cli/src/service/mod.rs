@@ -54,7 +54,7 @@ mod systemd {
             r#"[Unit]
 Description=DuDuClaw AI Assistant
 After=network.target docker.service
-Requires=docker.service
+Wants=docker.service
 
 [Service]
 Type=simple

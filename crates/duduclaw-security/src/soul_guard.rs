@@ -150,7 +150,7 @@ fn save_soul_version(agent_dir: &Path) -> std::io::Result<()> {
     let history_dir = agent_dir.join(".soul_history");
     std::fs::create_dir_all(&history_dir)?;
 
-    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
     let backup_name = format!("SOUL_{timestamp}.md");
     std::fs::write(history_dir.join(&backup_name), &content)?;
 
