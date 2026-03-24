@@ -38,7 +38,7 @@ DuDuClaw (plumbing)
 
 | 特色 | 說明 |
 |------|------|
-| **MCP Server 架構** | `duduclaw mcp-server` 提供 15+ 工具給 Claude Code，包括 send_message、send_photo、send_sticker、web_search、send_to_agent、memory_search、memory_store、create_agent、spawn_agent、list_agents、agent_status、skill_search、skill_list、schedule_task 等 |
+| **MCP Server 架構** | `duduclaw mcp-server` 提供 30+ 工具給 Claude Code，涵蓋通訊、記憶、Agent 管理、Skill 市場、Odoo ERP（CRM/銷售/庫存/會計）|
 | **Sub-Agent 編排** | `create_agent` 建立持久化 sub-agent + `spawn_agent` 背景派發 + `reports_to` 組織層級 + D3.js 組織架構圖 |
 | **三通道支援** | Telegram (long polling)、LINE (webhook)、Discord (Gateway WebSocket) |
 | **容器沙箱** | Docker / Apple Container 隔離執行（`--network=none`、tmpfs workspace、read-only rootfs、512MB limit） |
@@ -46,6 +46,7 @@ DuDuClaw (plumbing)
 | **自主進化引擎** | Micro（每次對話後）→ Meso（per-agent 心跳）→ Macro（每日排程）三層反思，統一由 heartbeat scheduler 驅動 |
 | **安全防護** | SOUL.md 漂移檢測（SHA-256）+ prompt injection 掃描（6 類規則）+ JSONL 審計日誌 + per-agent 密鑰隔離 |
 | **行為契約** | `CONTRACT.toml` 定義 `must_not` / `must_always` 邊界 + `duduclaw test` 紅隊測試（9 項內建場景） |
+| **Odoo ERP 整合** | 中間層 `duduclaw-odoo` 支援 CE/EE — 15 個 MCP 工具（CRM/銷售/庫存/會計/通用搜尋報表）+ 事件橋接 |
 | **Skill 市場** | OpenClaw 相容的 skill 格式解析 + 本地 registry 索引 + MCP 工具自主安裝 + Dashboard 市場頁面 |
 | **多帳號輪替** | Python SDK 管理多個 Claude API key，支援 4 種策略 + 預算追蹤 + 故障轉移 |
 | **Claude Code 原生目錄** | Agent 目錄包含 `.claude/`、`SOUL.md`、`CLAUDE.md`、`.mcp.json`，直接相容 Claude Code |
@@ -147,6 +148,7 @@ DuDuClaw/
 │   ├── duduclaw-gateway/       # Axum 伺服器、通道、session、evolution、cron、dispatcher
 │   ├── duduclaw-bus/           # tokio broadcast + mpsc 訊息路由
 │   ├── duduclaw-bridge/        # PyO3 Rust↔Python 橋接層
+│   ├── duduclaw-odoo/           # Odoo ERP 中間層 (JSON-RPC, CE/EE)
 │   ├── duduclaw-cli/           # clap CLI 入口 + MCP server + migrate + test
 │   └── duduclaw-dashboard/     # rust-embed 嵌入 React SPA
 │
