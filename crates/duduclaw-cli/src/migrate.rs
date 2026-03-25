@@ -34,12 +34,23 @@ pub async fn migrate(home_dir: &Path) -> Result<()> {
     }
 
     let mut migrated = 0u32;
-    let skipped = 0u32;
+    let mut skipped = 0u32;
 
     for agent in &agents {
         let agent_dir = &agent.dir;
         let agent_name = &agent.config.agent.name;
         let display_name = &agent.config.agent.display_name;
+
+        // Skip already-migrated agents (CLI-H6)
+        let claude_dir = agent_dir.join(".claude");
+        if claude_dir.join("settings.local.json").exists()
+            && agent_dir.join("CLAUDE.md").exists()
+            && agent_dir.join(".mcp.json").exists()
+        {
+            info!(agent = %agent_name, "already migrated, skipping");
+            skipped += 1;
+            continue;
+        }
 
         info!(agent = %agent_name, "migrating agent");
 
@@ -53,10 +64,12 @@ pub async fn migrate(home_dir: &Path) -> Result<()> {
         })?;
 
         // Generate .claude/settings.local.json
+        // Read allow_bash from agent permissions instead of hardcoding (CLI-L5)
+        let allow_bash = agent.config.permissions.can_modify_own_skills;
         let settings = serde_json::json!({
             "model": agent.config.model.preferred,
             "permissions": {
-                "allow_bash": true,
+                "allow_bash": allow_bash,
                 "allow_mcp": true
             }
         });
@@ -127,7 +140,5 @@ pub async fn migrate(home_dir: &Path) -> Result<()> {
         "Migration complete: {} migrated, {} skipped.",
         migrated, skipped
     );
-    // Suppress unused variable warning — skipped is intentionally tracked for future use
-    let _ = skipped;
     Ok(())
 }

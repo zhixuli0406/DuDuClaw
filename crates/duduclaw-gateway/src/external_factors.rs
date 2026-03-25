@@ -200,9 +200,31 @@ pub async fn collect_external_factors(
 
 // ── Individual collectors ───────────────────────────────────
 
+/// Maximum feedback.jsonl file size before truncation (5 MB).
+const MAX_FEEDBACK_SIZE: u64 = 5 * 1024 * 1024;
+
 /// Collect user feedback from bus_queue (thumbs up/down, corrections).
 async fn collect_user_feedback(home_dir: &Path, agent_id: &str) -> Vec<FeedbackSignal> {
     let feedback_path = home_dir.join("feedback.jsonl");
+
+    // Truncate if file exceeds size limit (BE-M3)
+    if let Ok(meta) = tokio::fs::metadata(&feedback_path).await {
+        if meta.len() > MAX_FEEDBACK_SIZE {
+            tracing::warn!(
+                size = meta.len(),
+                "feedback.jsonl exceeds {}MB — truncating old entries",
+                MAX_FEEDBACK_SIZE / 1024 / 1024
+            );
+            if let Ok(content) = tokio::fs::read_to_string(&feedback_path).await {
+                let lines: Vec<&str> = content.lines().collect();
+                // Keep only the last 1000 lines
+                let keep = lines.len().saturating_sub(1000);
+                let truncated = lines[keep..].join("\n");
+                let _ = tokio::fs::write(&feedback_path, truncated).await;
+            }
+        }
+    }
+
     let content = match tokio::fs::read_to_string(&feedback_path).await {
         Ok(c) => c,
         Err(_) => return Vec::new(),

@@ -77,6 +77,13 @@ impl RateLimiter {
     /// Returns `true` when the request was accepted.
     pub async fn check_and_record(&self, key: &str) -> bool {
         let mut windows = self.windows.write().await;
+
+        // Evict stale keys to prevent unbounded memory growth (MW-H3)
+        if windows.len() > 10_000 {
+            let cutoff = Instant::now() - self.window_duration;
+            windows.retain(|_, w| w.timestamps.iter().any(|t| *t > cutoff));
+        }
+
         let window = windows
             .entry(key.to_string())
             .or_insert_with(|| SlidingWindow::new(self.default_limit));

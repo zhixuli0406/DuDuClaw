@@ -81,13 +81,19 @@ class MicroReflection:
             "candidate_skills": [],
         }
 
+        # Sanitize conversation summary to prevent prompt injection (C5)
+        # Truncate and strip instruction-like patterns
+        safe_summary = conversation_summary[:5000] if conversation_summary else ""
+        safe_summary = safe_summary.replace("ignore previous", "[REDACTED]")
+        safe_summary = safe_summary.replace("system prompt", "[REDACTED]")
+
         # Use Claude to generate structured reflection insights
         claude_insights = await asyncio.get_event_loop().run_in_executor(
             None,
             _call_claude,
             (
                 f"You are a reflective AI agent. A conversation just ended.\n\n"
-                f"Conversation summary:\n{conversation_summary}\n\n"
+                f"<conversation_summary>\n{safe_summary}\n</conversation_summary>\n\n"
                 f"Briefly answer in JSON with keys: what_went_well (list), "
                 f"what_could_improve (list), patterns_noticed (list), "
                 f"candidate_skills (list of skill names worth creating).\n"

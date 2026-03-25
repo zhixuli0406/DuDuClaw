@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-agent"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "chrono",
  "cron",
@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-bridge"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "chrono",
  "duduclaw-core",
@@ -585,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-bus"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "duduclaw-core",
  "serde",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-cli"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "base64",
  "bollard",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-container"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "bollard",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-core"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -657,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-dashboard"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "axum",
  "mime_guess",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-gateway"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "axum",
  "base64",
@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-memory"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -714,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-odoo"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "chrono",
  "duduclaw-core",
@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-security"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "base64",
  "chrono",
@@ -1433,9 +1433,9 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
 name = "iri-string"
-version = "0.7.10"
+version = "0.7.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c91338f0783edbd6195decb37bae672fd3b165faffb89bf7b9e6942f8b1a731a"
+checksum = "d8e7418f59cc01c88316161279a7f665217ae316b388e58a0d10e29f54f1e5eb"
 dependencies = [
  "memchr",
  "serde",
@@ -1517,9 +1517,9 @@ dependencies = [
 
 [[package]]
 name = "libredox"
-version = "0.1.14"
+version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1744e39d1d6a9948f4f388969627434e31128196de472883b39f148769bfe30a"
+checksum = "7ddbf48fd451246b1f8c2610bd3b4ac0cc6e149d89832867093ab69a17194f08"
 dependencies = [
  "libc",
 ]
@@ -1684,9 +1684,9 @@ dependencies = [
 
 [[package]]
 name = "num-conv"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf97ec579c3c42f953ef76dbf8d55ac91fb219dde70e49aa4a6b7d74e9919050"
+checksum = "c6673768db2d862beb9b39a78fdcb1a69439615d5794a1be50caa9bc92c81967"
 
 [[package]]
 name = "num-traits"

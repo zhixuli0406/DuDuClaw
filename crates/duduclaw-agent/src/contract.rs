@@ -121,20 +121,48 @@ pub fn validate_response(contract: &Contract, response: &str) -> ValidationResul
     ValidationResult { passed, violations }
 }
 
-/// Simple regex-like matching without pulling in the `regex` crate.
+/// Glob-style pattern matching for behavioral contracts (BE-L3).
+///
+/// Supports:
+/// - `.*` — match any sequence of characters (like regex `.*`)
+/// - `^` prefix — anchor to start of text
+/// - `$` suffix — anchor to end of text
+/// - Literal substring matching (case-insensitive)
 fn regex_lite_match(pattern: &str, text: &str) -> Result<bool, ()> {
-    // Very basic glob-to-contains: split on .* and check all parts exist in order
-    let parts: Vec<&str> = pattern.split(".*").collect();
+    let text_lower = text.to_lowercase();
+    let pattern_lower = pattern.to_lowercase();
+
+    let anchor_start = pattern_lower.starts_with('^');
+    let anchor_end = pattern_lower.ends_with('$');
+
+    let trimmed = pattern_lower
+        .trim_start_matches('^')
+        .trim_end_matches('$');
+
+    let parts: Vec<&str> = trimmed.split(".*").collect();
     let mut pos = 0;
-    for part in &parts {
+
+    for (i, part) in parts.iter().enumerate() {
         if part.is_empty() {
             continue;
         }
-        match text[pos..].find(part) {
-            Some(idx) => pos += idx + part.len(),
+        match text_lower[pos..].find(part) {
+            Some(idx) => {
+                // If anchored to start, first part must match at position 0
+                if i == 0 && anchor_start && idx != 0 {
+                    return Ok(false);
+                }
+                pos += idx + part.len();
+            }
             None => return Ok(false),
         }
     }
+
+    // If anchored to end, last match must reach end of text
+    if anchor_end && pos != text_lower.len() {
+        return Ok(false);
+    }
+
     Ok(true)
 }
 

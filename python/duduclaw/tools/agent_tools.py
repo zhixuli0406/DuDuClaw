@@ -1,9 +1,18 @@
 """Agent management MCP tools"""
 import logging
 import os
+import re
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Valid agent name: lowercase alphanumeric + hyphens, 1-64 chars
+_VALID_AGENT_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]?$")
+
+
+def _is_valid_agent_id(name: str) -> bool:
+    """Validate agent name is safe for filesystem paths (no traversal)."""
+    return bool(name) and bool(_VALID_AGENT_NAME.match(name)) and ".." not in name
 
 
 def _get_agents_dir() -> Path:
@@ -61,6 +70,11 @@ class AgentTools:
         logger.info("Creating agent: %s (%s)", name, display_name)
 
         agent_name = name.lower().replace(" ", "-")
+
+        # Validate agent name to prevent path traversal (C3)
+        if not _is_valid_agent_id(agent_name):
+            return {"success": False, "error": f"Invalid agent name: must be lowercase alphanumeric with hyphens, 1-64 chars"}
+
         agents_dir = _get_agents_dir()
         agent_dir = agents_dir / agent_name
 
@@ -72,47 +86,77 @@ class AgentTools:
         (agent_dir / "memory").mkdir(parents=True, exist_ok=True)
         (agent_dir / ".claude").mkdir(parents=True, exist_ok=True)
 
-        # Write agent.toml
-        agent_toml = f"""[agent]
-name = "{agent_name}"
-display_name = "{display_name}"
-role = "{role}"
-status = "active"
-trigger = "{trigger or f'@{display_name}'}"
-reports_to = ""
-icon = "🤖"
+        # Build agent.toml using dict → toml serialization to prevent injection (C4)
+        try:
+            import tomli_w
+        except ImportError:
+            tomli_w = None
 
-[model]
-preferred = "{model}"
-fallback = "claude-haiku-4-5"
-account_pool = ["main"]
+        agent_config = {
+            "agent": {
+                "name": agent_name,
+                "display_name": display_name,
+                "role": role,
+                "status": "active",
+                "trigger": trigger or f"@{display_name}",
+                "reports_to": "",
+                "icon": "\U0001f916",
+            },
+            "model": {
+                "preferred": model,
+                "fallback": "claude-haiku-4-5",
+                "account_pool": ["main"],
+            },
+            "heartbeat": {
+                "enabled": False,
+                "interval_seconds": 3600,
+                "max_concurrent_runs": 1,
+                "cron": "",
+            },
+            "budget": {
+                "monthly_limit_cents": 5000,
+                "warn_threshold_percent": 80,
+                "hard_stop": True,
+            },
+            "permissions": {
+                "can_create_agents": False,
+                "can_send_cross_agent": True,
+                "can_modify_own_skills": True,
+                "can_modify_own_soul": False,
+                "can_schedule_tasks": False,
+                "allowed_channels": ["*"],
+            },
+            "evolution": {
+                "micro_reflection": True,
+                "meso_reflection": True,
+                "macro_reflection": True,
+                "skill_auto_activate": False,
+                "skill_security_scan": True,
+            },
+        }
 
-[heartbeat]
-enabled = false
-interval_seconds = 3600
-max_concurrent_runs = 1
-cron = ""
+        if tomli_w:
+            agent_toml = tomli_w.dumps(agent_config)
+        else:
+            # Fallback: manual safe serialization (values properly quoted)
+            import json
+            lines = []
+            for section, values in agent_config.items():
+                lines.append(f"[{section}]")
+                for k, v in values.items():
+                    if isinstance(v, bool):
+                        lines.append(f"{k} = {'true' if v else 'false'}")
+                    elif isinstance(v, int):
+                        lines.append(f"{k} = {v}")
+                    elif isinstance(v, list):
+                        lines.append(f"{k} = {json.dumps(v)}")
+                    else:
+                        # Escape strings properly
+                        escaped = str(v).replace("\\", "\\\\").replace('"', '\\"')
+                        lines.append(f'{k} = "{escaped}"')
+                lines.append("")
+            agent_toml = "\n".join(lines)
 
-[budget]
-monthly_limit_cents = 5000
-warn_threshold_percent = 80
-hard_stop = true
-
-[permissions]
-can_create_agents = false
-can_send_cross_agent = true
-can_modify_own_skills = true
-can_modify_own_soul = false
-can_schedule_tasks = false
-allowed_channels = ["*"]
-
-[evolution]
-micro_reflection = true
-meso_reflection = true
-macro_reflection = true
-skill_auto_activate = false
-skill_security_scan = true
-"""
         (agent_dir / "agent.toml").write_text(agent_toml)
 
         # Write SOUL.md

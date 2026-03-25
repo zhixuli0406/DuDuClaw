@@ -42,20 +42,28 @@ export const useAgentsStore = create<AgentsStore>((set, get) => {
     },
     selectAgent: (id) => set({ selectedAgentId: id }),
     pauseAgent: async (id) => {
-      await api.agents.pause(id);
-      set({
-        agents: get().agents.map((a) =>
-          a.name === id ? { ...a, status: 'paused' } : a
-        ),
-      });
+      try {
+        await api.agents.pause(id);
+        set({
+          agents: get().agents.map((a) =>
+            a.name === id ? { ...a, status: 'paused' } : a
+          ),
+        });
+      } catch {
+        set({ error: `無法暫停 agent: ${id}` });
+      }
     },
     resumeAgent: async (id) => {
-      await api.agents.resume(id);
-      set({
-        agents: get().agents.map((a) =>
-          a.name === id ? { ...a, status: 'active' } : a
-        ),
-      });
+      try {
+        await api.agents.resume(id);
+        set({
+          agents: get().agents.map((a) =>
+            a.name === id ? { ...a, status: 'active' } : a
+          ),
+        });
+      } catch {
+        set({ error: `無法恢復 agent: ${id}` });
+      }
     },
   };
 });

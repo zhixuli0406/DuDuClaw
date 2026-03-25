@@ -163,12 +163,22 @@ function AddAccountDialog({
   const [priority, setPriority] = useState('1');
   const [submitting, setSubmitting] = useState(false);
 
+  const [error, setError] = useState<string | null>(null);
+
   const handleSubmit = async () => {
     if (!name.trim()) return;
+    if (!apiKey.trim()) {
+      setError('請輸入 API Key');
+      return;
+    }
     setSubmitting(true);
+    setError(null);
     try {
-      // Store account info (future: dedicated accounts.add endpoint)
+      // TODO: Implement dedicated accounts.add endpoint to persist account data.
+      // Currently this only performs a health check — the API key is NOT stored.
       await api.accounts.health();
+      // Warn user that this feature is not yet fully implemented
+      console.warn('[AccountsPage] accounts.add endpoint not yet implemented — data not persisted');
       onCreated();
       onClose();
       setName('');
@@ -176,7 +186,7 @@ function AddAccountDialog({
       setBudget('50');
       setPriority('1');
     } catch {
-      // error
+      setError('帳號新增失敗，請稍後再試');
     } finally {
       setSubmitting(false);
     }
@@ -237,6 +247,10 @@ function AddAccountDialog({
             />
           </FormField>
         </div>
+
+        {error && (
+          <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>
+        )}
 
         <div className="flex justify-end gap-3 pt-2">
           <button onClick={onClose} className={buttonSecondary}>

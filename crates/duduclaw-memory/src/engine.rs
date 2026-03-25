@@ -165,6 +165,17 @@ impl MemoryEngine for SqliteMemoryEngine {
     ) -> Result<Vec<MemoryEntry>> {
         let conn = self.conn.lock().await;
 
+        // Sanitize FTS5 query: strip special characters that could alter query semantics (BE-H2).
+        // FTS5 operators: AND, OR, NOT, NEAR, *, ^, "..." — we escape quotes and strip column filters.
+        let sanitized_query: String = query
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\'' | ':' | '^' | '{' | '}'))
+            .take(500) // limit query length
+            .collect();
+        if sanitized_query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
         // Use FTS5 MATCH to find relevant memory ids, then join back for full rows.
         let mut stmt = conn
             .prepare(
@@ -179,8 +190,12 @@ impl MemoryEngine for SqliteMemoryEngine {
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
         let rows = stmt
-            .query_map(params![query, agent_id, limit as i64], Self::row_to_entry)
-            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            .query_map(params![sanitized_query, agent_id, limit as i64], Self::row_to_entry)
+            .map_err(|e| {
+                // Don't leak schema details — return generic error (BE-H2)
+                tracing::warn!("FTS5 search error: {e}");
+                DuDuClawError::Memory("Search query error — please simplify your query".to_string())
+            })?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -296,27 +311,7 @@ async fn call_claude_summarize(raw_memories: &str) -> String {
 }
 
 fn which_claude_bin() -> Option<String> {
-    if let Ok(out) = std::process::Command::new("which").arg("claude").output()
-        && out.status.success()
-    {
-        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !p.is_empty() {
-            return Some(p);
-        }
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let candidates = [
-        format!("{home}/.npm-global/bin/claude"),
-        "/usr/local/bin/claude".to_string(),
-        format!("{home}/.claude/bin/claude"),
-        format!("{home}/.local/bin/claude"),
-    ];
-    for p in &candidates {
-        if std::path::Path::new(p).exists() {
-            return Some(p.clone());
-        }
-    }
-    None
+    duduclaw_core::which_claude()
 }
 
 #[cfg(test)]

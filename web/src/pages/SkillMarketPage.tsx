@@ -156,7 +156,10 @@ function SkillCard({ skill }: { skill: SkillIndexEntry }) {
             {skill.author}
           </span>
         )}
-        <button className="inline-flex items-center gap-1 rounded-md bg-amber-100 px-2.5 py-1.5 text-xs font-medium text-amber-700 transition-colors hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50">
+        <button
+          onClick={() => alert('Skill 安裝功能尚未實作，敬請期待！')}
+          className="inline-flex items-center gap-1 rounded-md bg-amber-100 px-2.5 py-1.5 text-xs font-medium text-amber-700 transition-colors hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50"
+        >
           <Download className="h-3.5 w-3.5" />
           Install
         </button>

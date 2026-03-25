@@ -117,16 +117,7 @@ pub async fn start_telegram_bot(
 // ── Internal ────────────────────────────────────────────────
 
 async fn read_telegram_token(home_dir: &Path) -> Option<String> {
-    let config_path = home_dir.join("config.toml");
-    let content = tokio::fs::read_to_string(&config_path).await.ok()?;
-    let table: toml::Table = content.parse().ok()?;
-    let channels = table.get("channels")?.as_table()?;
-    let token = channels.get("telegram_bot_token")?.as_str()?;
-    if token.is_empty() {
-        None
-    } else {
-        Some(token.to_string())
-    }
+    crate::config_crypto::read_encrypted_config_field(home_dir, "channels", "telegram_bot_token").await
 }
 
 async fn poll_loop(

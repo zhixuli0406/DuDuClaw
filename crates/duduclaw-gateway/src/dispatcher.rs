@@ -82,7 +82,13 @@ async fn poll_and_dispatch(
     for line in &lines {
         match serde_json::from_str::<BusMessage>(line) {
             Ok(msg) if msg.msg_type == "agent_message" => {
-                to_dispatch.push(msg);
+                // Enforce payload size limit (BE-H6)
+                if msg.payload.len() > 100_000 {
+                    warn!(id = %msg.message_id, len = msg.payload.len(), "Dropping oversized message");
+                    remaining_lines.push(line.to_string()); // keep but don't dispatch
+                } else {
+                    to_dispatch.push(msg);
+                }
             }
             _ => {
                 // Keep non-message lines (responses, unknown types)
@@ -98,7 +104,7 @@ async fn poll_and_dispatch(
     info!(count = to_dispatch.len(), "Dispatching agent messages");
 
     // Rewrite the queue without the messages we're about to process.
-    // This prevents double-processing on next poll.
+    // Uses write→rename for atomicity — prevents data loss if process crashes mid-write.
     let new_content = if remaining_lines.is_empty() {
         String::new()
     } else {
@@ -106,9 +112,13 @@ async fn poll_and_dispatch(
         s.push('\n');
         s
     };
-    tokio::fs::write(&queue_path, &new_content)
+    let tmp_path = queue_path.with_extension("jsonl.tmp");
+    tokio::fs::write(&tmp_path, &new_content)
         .await
-        .map_err(|e| format!("Failed to rewrite bus_queue: {e}"))?;
+        .map_err(|e| format!("Failed to write temp bus_queue: {e}"))?;
+    tokio::fs::rename(&tmp_path, &queue_path)
+        .await
+        .map_err(|e| format!("Failed to rename temp bus_queue: {e}"))?;
 
     // Process each message concurrently (up to 4 at a time)
     let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
@@ -262,22 +272,37 @@ async fn dispatch_sandboxed(
     }
 }
 
-/// Append a single line to a file (atomic-ish via OpenOptions::append).
+/// Append a single line to a file with advisory file lock (MCP-M4).
+///
+/// Uses `spawn_blocking` + `flock(LOCK_EX)` on Unix for safe concurrent writes.
 async fn append_line(path: &Path, line: &str) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt;
+    let path = path.to_path_buf();
+    let line = line.to_string();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
 
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await
-        .map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc != 0 {
+                return Err(format!(
+                    "flock failed on {}: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
 
-    let mut buf = line.to_string();
-    buf.push('\n');
-    file.write_all(buf.as_bytes())
-        .await
-        .map_err(|e| format!("Failed to write to {}: {e}", path.display()))?;
-
-    Ok(())
+        writeln!(file, "{line}")
+            .map_err(|e| format!("Failed to write to {}: {e}", path.display()))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {e}"))?
 }

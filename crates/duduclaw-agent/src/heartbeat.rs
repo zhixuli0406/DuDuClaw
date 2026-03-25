@@ -138,11 +138,16 @@ impl LiveAgent {
 
 /// Unified heartbeat scheduler: reads agent configs from the registry,
 /// fires per-agent heartbeats, and drives evolution reflections.
+/// Maximum total concurrent evolution subprocesses across all agents (BE-H5).
+const MAX_GLOBAL_CONCURRENT: usize = 8;
+
 pub struct HeartbeatScheduler {
     home_dir: PathBuf,
     registry: Arc<RwLock<AgentRegistry>>,
     agents: Arc<RwLock<HashMap<String, LiveAgent>>>,
     running: Arc<AtomicBool>,
+    /// Global concurrency limiter for evolution subprocesses.
+    global_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl HeartbeatScheduler {
@@ -152,6 +157,7 @@ impl HeartbeatScheduler {
             registry,
             agents: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(AtomicBool::new(false)),
+            global_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_GLOBAL_CONCURRENT)),
         }
     }
 
@@ -206,7 +212,7 @@ impl HeartbeatScheduler {
                 next_run: a.next_fire().map(|t| t.to_rfc3339()),
                 total_runs: a.total_runs,
                 active_runs: a.config.max_concurrent_runs.max(1)
-                    - a.active_runs.available_permits() as u32,
+                    .saturating_sub(a.active_runs.available_permits().min(u32::MAX as usize) as u32),
                 max_concurrent: a.config.max_concurrent_runs.max(1),
             })
             .collect()
@@ -287,7 +293,13 @@ impl HeartbeatScheduler {
 
             // Now spawn tasks without holding any lock
             for (home, aid, dir, evo, sem, run_macro) in to_spawn {
+                let global_sem = self.global_semaphore.clone();
                 tokio::spawn(async move {
+                    // Acquire global permit to limit total concurrent subprocesses (BE-H5)
+                    let _global_permit = match global_sem.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
                     execute_heartbeat(&home, &aid, &dir, &evo, &sem).await;
                     if run_macro {
                         execute_evolution("macro", &home, &aid, &dir).await;

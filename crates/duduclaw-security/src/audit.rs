@@ -68,9 +68,18 @@ pub fn append_audit_event(home_dir: &Path, event: &AuditEvent) {
         .open(&path)
     {
         Ok(mut f) => {
+            // Use advisory file lock to prevent multi-process write corruption (MW-H2)
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                    warn!("flock failed on audit log: {}", std::io::Error::last_os_error());
+                }
+            }
             if let Err(e) = writeln!(f, "{json}") {
                 warn!("Failed to write audit event: {e}");
             }
+            // Lock automatically released when file is dropped
         }
         Err(e) => {
             warn!("Failed to open audit log {}: {e}", path.display());
@@ -79,6 +88,9 @@ pub fn append_audit_event(home_dir: &Path, event: &AuditEvent) {
 }
 
 /// Read recent audit events (last N entries).
+///
+/// Simplified: collect all lines, then slice the tail (MW-L2).
+/// For very large files, consider using a reverse-line reader crate.
 pub fn read_recent_events(home_dir: &Path, limit: usize) -> Vec<AuditEvent> {
     let path = home_dir.join("security_audit.jsonl");
     let content = match std::fs::read_to_string(&path) {
@@ -86,18 +98,19 @@ pub fn read_recent_events(home_dir: &Path, limit: usize) -> Vec<AuditEvent> {
         Err(_) => return Vec::new(),
     };
 
-    let all: Vec<AuditEvent> = content
-        .lines()
-        .rev()
-        .take(limit)
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(limit);
 
-    // Reverse back to chronological order
-    all.into_iter().rev().collect()
+    lines[start..]
+        .iter()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
 }
 
 /// Count events by severity since a given timestamp.
+///
+/// Uses proper ISO 8601 DateTime parsing instead of string prefix
+/// comparison to avoid incorrect ordering (MW-M3).
 pub fn count_events_since(
     home_dir: &Path,
     since: &str,
@@ -108,13 +121,20 @@ pub fn count_events_since(
         Err(_) => return (0, 0, 0),
     };
 
+    let since_dt = chrono::DateTime::parse_from_rfc3339(since)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now() - chrono::Duration::hours(24));
+
     let mut info = 0usize;
     let mut warning = 0usize;
     let mut critical = 0usize;
 
     for line in content.lines() {
         if let Ok(event) = serde_json::from_str::<AuditEvent>(line) {
-            if event.timestamp.as_str() >= since {
+            let event_time = chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .ok();
+            if event_time.is_some_and(|t| t >= since_dt) {
                 match event.severity {
                     Severity::Info => info += 1,
                     Severity::Warning => warning += 1,

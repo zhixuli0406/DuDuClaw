@@ -104,6 +104,21 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
     let session_mgr = &ctx.session_manager;
     let _ = session_mgr.get_or_create(session_id, &agent_id).await;
 
+    // Scan user input for prompt injection before processing
+    let scan = duduclaw_security::input_guard::scan_input(
+        text,
+        duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
+    );
+    if scan.blocked {
+        warn!(
+            agent = %agent_id,
+            score = scan.risk_score,
+            rules = ?scan.matched_rules,
+            "Prompt injection detected — blocking message"
+        );
+        return format!("⚠️ {}", scan.summary);
+    }
+
     // Append user message to session using improved CJK-aware token estimate
     let user_tokens = estimate_tokens(text);
     if let Err(e) = session_mgr
@@ -259,10 +274,25 @@ async fn call_claude_cli(
     let mut cmd = tokio::process::Command::new(&claude_path);
     cmd.args(["-p", user_message, "--model", model, "--output-format", "text"]);
 
-    // Pass system prompt
-    if !system_prompt.is_empty() {
-        cmd.args(["--system-prompt", system_prompt]);
-    }
+    // Pass system prompt via temp file to avoid exposure in /proc/PID/cmdline (BE-C1)
+    let _prompt_guard: Option<tempfile::TempPath> = if !system_prompt.is_empty() {
+        match tempfile::NamedTempFile::new() {
+            Ok(mut f) => {
+                use std::io::Write;
+                let _ = f.write_all(system_prompt.as_bytes());
+                let path = f.into_temp_path();
+                cmd.args(["--system-prompt-file", &path.to_string_lossy()]);
+                Some(path)
+            }
+            Err(_) => {
+                // Fallback to arg if temp file creation fails
+                cmd.args(["--system-prompt", system_prompt]);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     cmd.env("ANTHROPIC_API_KEY", &api_key);
     cmd.stdin(std::process::Stdio::null());
@@ -296,36 +326,9 @@ async fn call_claude_cli(
     Ok(stdout)
 }
 
-/// Find the `claude` binary in PATH or common locations.
+/// Find the `claude` binary — delegates to shared impl in duduclaw-core (BE-L1).
 fn which_claude() -> Option<String> {
-    // Check PATH
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("claude")
-        .output()
-        && output.status.success()
-    {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !path.is_empty() {
-            return Some(path);
-        }
-    }
-
-    // Common locations
-    let home = std::env::var("HOME").unwrap_or_default();
-    let candidates = [
-        format!("{home}/.npm-global/bin/claude"),
-        "/usr/local/bin/claude".to_string(),
-        format!("{home}/.claude/bin/claude"),
-        format!("{home}/.local/bin/claude"),
-    ];
-
-    for path in &candidates {
-        if std::path::Path::new(path).exists() {
-            return Some(path.clone());
-        }
-    }
-
-    None
+    duduclaw_core::which_claude()
 }
 
 // ── Python SDK subprocess (fallback) ────────────────────────
@@ -385,7 +388,7 @@ async fn call_python_sdk_v2(
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
 
-    let prompt_file = home_dir.join(".tmp_system_prompt.md");
+    let prompt_file = home_dir.join(format!(".tmp_system_prompt_{}.md", uuid::Uuid::new_v4()));
     tokio::fs::write(&prompt_file, system_prompt)
         .await
         .map_err(|e| format!("Write prompt: {e}"))?;
@@ -514,19 +517,12 @@ fn estimate_tokens(text: &str) -> u32 {
 }
 
 async fn get_api_key(home_dir: &Path) -> Option<String> {
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
-        && !key.is_empty()
-    {
-        return Some(key);
+    // Environment variable takes precedence
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        if !key.is_empty() {
+            return Some(key);
+        }
     }
-    let config_path = home_dir.join("config.toml");
-    let content = tokio::fs::read_to_string(&config_path).await.ok()?;
-    let table: toml::Table = content.parse().ok()?;
-    let api = table.get("api")?.as_table()?;
-    let key = api.get("anthropic_api_key")?.as_str()?;
-    if key.is_empty() {
-        None
-    } else {
-        Some(key.to_string())
-    }
+    // Try encrypted config field, fallback to plaintext
+    crate::config_crypto::read_encrypted_config_field(home_dir, "api", "anthropic_api_key").await
 }

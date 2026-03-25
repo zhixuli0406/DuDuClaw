@@ -71,7 +71,7 @@ export function Sidebar() {
 
       {/* Footer */}
       <div className="border-t border-stone-200 px-5 py-3 dark:border-stone-800">
-        <p className="text-xs text-stone-400 dark:text-stone-500">v0.1.0</p>
+        <p className="text-xs text-stone-400 dark:text-stone-500">v0.6.5</p>
       </div>
     </aside>
   );

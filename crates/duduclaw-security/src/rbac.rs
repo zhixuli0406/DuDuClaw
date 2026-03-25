@@ -72,7 +72,9 @@ impl RbacEngine {
                 }
             }
             AgentAction::SendToChannel(channel) => {
-                if !perms.allowed_channels.contains(channel) {
+                // Support wildcard "*" to allow all channels (MW-H1)
+                let allowed = perms.allowed_channels.iter().any(|c| c == "*" || c == channel);
+                if !allowed {
                     return Err(Self::denied(
                         &agent.agent.name,
                         &format!("send to channel '{channel}'"),
@@ -174,6 +176,8 @@ mod tests {
                 max_concurrent: 1,
                 readonly_project: true,
                 additional_mounts: vec![],
+                sandbox_enabled: false,
+                network_access: false,
             },
             heartbeat: HeartbeatConfig {
                 enabled: false,
@@ -193,6 +197,7 @@ mod tests {
                 macro_reflection: false,
                 skill_auto_activate: false,
                 skill_security_scan: false,
+                external_factors: Default::default(),
             },
         }
     }

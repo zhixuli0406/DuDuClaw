@@ -110,64 +110,44 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<(SkillMeta, String), 
     Ok((meta, body))
 }
 
-/// Simple YAML-like parser for frontmatter (avoids adding a full YAML dependency).
+/// Parse skill frontmatter YAML using serde_yaml (MCP-M6 — replaces custom parser).
 fn parse_simple_yaml(yaml: &str, path: &Path) -> Result<SkillMeta, String> {
-    let mut name = String::new();
-    let mut description = String::new();
-    let mut trigger = String::new();
-    let mut tools = Vec::new();
-    let mut tags = Vec::new();
-    let mut author = String::new();
-    let mut version = String::new();
-
-    for line in yaml.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once(':') {
-            let key = key.trim();
-            let value = value.trim().trim_matches('"').trim_matches('\'');
-            match key {
-                "name" => name = value.to_string(),
-                "description" => description = value.to_string(),
-                "trigger" => trigger = value.to_string(),
-                "author" => author = value.to_string(),
-                "version" => version = value.to_string(),
-                "tools" => tools = parse_list_value(value),
-                "tags" => tags = parse_list_value(value),
-                _ => {} // ignore unknown keys
-            }
-        }
+    /// Intermediate struct for serde deserialization.
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct RawMeta {
+        name: String,
+        description: String,
+        trigger: String,
+        tools: Vec<String>,
+        tags: Vec<String>,
+        author: String,
+        version: String,
     }
 
-    if name.is_empty() {
-        name = path
-            .file_stem()
+    let raw: RawMeta = serde_yaml::from_str(yaml).unwrap_or_else(|e| {
+        tracing::warn!("YAML parse error in {}: {e} — falling back to defaults", path.display());
+        RawMeta::default()
+    });
+
+    let name = if raw.name.is_empty() {
+        path.file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown")
-            .to_string();
-    }
+            .to_string()
+    } else {
+        raw.name
+    };
 
     Ok(SkillMeta {
         name,
-        description,
-        trigger,
-        tools,
-        tags,
-        author,
-        version,
+        description: raw.description,
+        trigger: raw.trigger,
+        tools: raw.tools,
+        tags: raw.tags,
+        author: raw.author,
+        version: raw.version,
     })
-}
-
-/// Parse `[a, b, c]` or `a, b, c` into a Vec<String>.
-fn parse_list_value(value: &str) -> Vec<String> {
-    let inner = value.trim_start_matches('[').trim_end_matches(']');
-    inner
-        .split(',')
-        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
 }
 
 /// Scan a directory for tool scripts (.js, .ts, .py).

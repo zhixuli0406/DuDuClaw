@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use duduclaw_agent::AgentRunner;
 use duduclaw_core::error::DuDuClawError;
@@ -31,8 +30,9 @@ fn load_or_create_keyfile(home: &PathBuf) -> [u8; 32] {
         }
     };
     if let Err(e) = std::fs::write(&keyfile, &key) {
-        eprintln!("WARNING: Failed to write keyfile {}: {e}", keyfile.display());
-        eprintln!("Encryption key will not persist across restarts.");
+        eprintln!("FATAL: Failed to write keyfile {}: {e}", keyfile.display());
+        eprintln!("Cannot proceed — encrypted data would be permanently unrecoverable.");
+        std::process::exit(1);
     }
     // Restrict permissions on Unix
     #[cfg(unix)]
@@ -201,9 +201,15 @@ enum ServiceCommands {
 }
 
 /// Resolve the DuDuClaw home directory (~/.duduclaw).
+///
+/// Panics if the home directory cannot be determined — running from "."
+/// would silently create data in unpredictable locations (CLI-L4).
 fn duduclaw_home() -> PathBuf {
+    if let Ok(custom) = std::env::var("DUDUCLAW_HOME") {
+        return PathBuf::from(custom);
+    }
     dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
+        .expect("Cannot determine home directory. Set DUDUCLAW_HOME env var.")
         .join(".duduclaw")
 }
 
@@ -242,7 +248,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
                 ServiceCommands::Start => service::handle_service(service::ServiceAction::Start).await,
                 ServiceCommands::Stop => service::handle_service(service::ServiceAction::Stop).await,
                 ServiceCommands::Status => service::handle_service(service::ServiceAction::Status).await,
-                ServiceCommands::Logs { lines: _ } => service::handle_service(service::ServiceAction::Logs).await,
+                ServiceCommands::Logs { lines } => service::handle_service(service::ServiceAction::Logs { lines }).await,
                 ServiceCommands::Uninstall => service::handle_service(service::ServiceAction::Uninstall).await,
             }
         }
@@ -471,11 +477,17 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
             }
         };
 
-        let port: u16 = Input::new()
-            .with_prompt("Gateway Port")
-            .default(18789u16)
-            .interact_text()
-            .unwrap_or(18789);
+        let port: u16 = loop {
+            let p: u16 = Input::new()
+                .with_prompt("Gateway Port (1024-65535)")
+                .default(18789u16)
+                .interact_text()
+                .unwrap_or(18789);
+            if p >= 1024 {
+                break p;
+            }
+            eprintln!("Port must be >= 1024 (non-privileged). Please try again.");
+        };
 
         (bind, port)
     } else {
@@ -710,18 +722,35 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
         }
     }
 
+    let bind = std::env::var("DUDUCLAW_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port: u16 = std::env::var("DUDUCLAW_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(18789);
+
     println!("🐾 DuDuClaw Server Starting...");
-    println!("   Gateway: http://0.0.0.0:18789");
-    println!("   Dashboard: http://localhost:18789");
+    println!("   Gateway: http://{bind}:{port}");
+    println!("   Dashboard: http://localhost:{port}");
     println!("   Press Ctrl+C to stop\n");
 
+    // Read auth token from env, config.toml, or leave None for local-only mode
+    let auth_token = std::env::var("DUDUCLAW_AUTH_TOKEN").ok().filter(|t| !t.is_empty()).or_else(|| {
+        let config_path = home.join("config.toml");
+        let content = std::fs::read_to_string(&config_path).ok()?;
+        let table: toml::Table = content.parse().ok()?;
+        table.get("gateway")?.as_table()?.get("auth_token")?.as_str()
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_string())
+    });
+    if auth_token.is_none() {
+        println!("   ⚠ No auth token configured — dashboard is accessible without authentication");
+        println!("     Set DUDUCLAW_AUTH_TOKEN env var or [gateway].auth_token in config.toml\n");
+    }
+
     let config = duduclaw_gateway::GatewayConfig {
-        bind: std::env::var("DUDUCLAW_BIND").unwrap_or_else(|_| "127.0.0.1".to_string()),
-        port: std::env::var("DUDUCLAW_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(18789),
-        auth_token: None,
+        bind,
+        port,
+        auth_token,
         home_dir: home,
     };
 
@@ -1082,9 +1111,23 @@ skill_security_scan = true
     Ok(())
 }
 
+/// Validate agent ID is safe for filesystem paths (no traversal).
+fn is_valid_agent_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !id.starts_with('-')
+        && !id.ends_with('-')
+        && !id.contains("..")
+}
+
 /// `duduclaw agent pause/resume <agent>` - Modify agent.toml status.
 async fn cmd_agent_set_status(agent: &str, status: &str) -> duduclaw_core::error::Result<()> {
     use console::style;
+
+    if !is_valid_agent_id(agent) {
+        return Err(DuDuClawError::Agent("Agent name must be lowercase alphanumeric with hyphens".to_string()));
+    }
 
     let home = duduclaw_home();
     let agent_toml_path = home.join("agents").join(agent).join("agent.toml");
@@ -1129,7 +1172,16 @@ async fn cmd_migrate() -> duduclaw_core::error::Result<()> {
 }
 
 /// `duduclaw mcp-server` - Start the MCP server for Claude Code integration.
+///
+/// Tracing is redirected to stderr so that stdout remains clean for
+/// JSON-RPC 2.0 protocol messages (CLI-H7).
 async fn cmd_mcp_server() -> duduclaw_core::error::Result<()> {
+    // Re-initialize tracing to stderr (MCP uses stdout for JSON-RPC)
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
     let home = duduclaw_home();
     mcp::run_mcp_server(&home).await
 }

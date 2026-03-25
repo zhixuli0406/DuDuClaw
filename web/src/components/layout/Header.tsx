@@ -20,16 +20,25 @@ export function Header() {
 
   useEffect(() => {
     const root = document.documentElement;
-    if (theme === 'system') {
-      root.classList.toggle(
-        'dark',
-        window.matchMedia('(prefers-color-scheme: dark)').matches
-      );
-      localStorage.removeItem('duduclaw-theme');
-    } else {
-      root.classList.toggle('dark', theme === 'dark');
-      localStorage.setItem('duduclaw-theme', theme);
-    }
+    const applyTheme = () => {
+      if (theme === 'system') {
+        root.classList.toggle(
+          'dark',
+          window.matchMedia('(prefers-color-scheme: dark)').matches
+        );
+        localStorage.removeItem('duduclaw-theme');
+      } else {
+        root.classList.toggle('dark', theme === 'dark');
+        localStorage.setItem('duduclaw-theme', theme);
+      }
+    };
+    applyTheme();
+
+    // Listen for OS theme changes when in system mode (FE-M5)
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const listener = () => { if (theme === 'system') applyTheme(); };
+    mq.addEventListener('change', listener);
+    return () => mq.removeEventListener('change', listener);
   }, [theme]);
 
   const stateColor: Record<string, string> = {
