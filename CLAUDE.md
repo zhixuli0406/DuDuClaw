@@ -22,6 +22,8 @@ Key architectural decisions:
 - **Behavioral contracts** (`CONTRACT.toml`) with `must_not` / `must_always` boundaries + `duduclaw test` red-team CLI
 - **Skill ecosystem**: GitHub Search API live indexing of real skill repos, 24h local cache, weighted search, MCP `skill_search` / `skill_list` tools
 - **Odoo ERP bridge** (`duduclaw-odoo` crate): JSON-RPC middleware supporting CE/EE, 15 MCP tools (CRM/Sales/Inventory/Accounting), EditionGate auto-detection, event polling + webhook
+- **Dual-mode account rotation**: OAuth sessions (Claude Pro/Team/Max via `~/.claude/.credentials.json`) + API keys, with 4 strategies (Priority/LeastCost/Failover/RoundRobin), health tracking, rate-limit cooldown, budget enforcement
+- **Three-layer evolution with external factors**: User feedback, security events, channel metrics, Odoo business context, peer agent signals feed into Micro/Meso/Macro reflections
 - **API key encryption**: AES-256-GCM stored as base64 in config (all tokens including channel tokens)
 
 ## Design Context
