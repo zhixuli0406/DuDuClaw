@@ -1,4 +1,9 @@
-#![allow(dead_code)]
+//! Service management helpers — generates systemd/launchd configuration.
+//!
+//! **NOTE**: These functions intentionally only *print* commands and config
+//! snippets for the user to run manually. They do NOT execute system-level
+//! service commands, because that requires elevated privileges and varies
+//! by OS/distribution. This is by design (CLI-H1).
 
 #[allow(unused_imports)]
 use duduclaw_core::error::{DuDuClawError, Result};
@@ -9,7 +14,7 @@ pub enum ServiceAction {
     Start,
     Stop,
     Status,
-    Logs,
+    Logs { lines: usize },
     Uninstall,
 }
 
@@ -20,12 +25,13 @@ pub async fn handle_service(action: ServiceAction) -> Result<()> {
         ServiceAction::Start => start_service().await,
         ServiceAction::Stop => stop_service().await,
         ServiceAction::Status => service_status().await,
-        ServiceAction::Logs => service_logs().await,
+        ServiceAction::Logs { lines } => service_logs(lines).await,
         ServiceAction::Uninstall => uninstall_service().await,
     }
 }
 
 /// Detect the current platform and print service manager info.
+#[allow(dead_code)] // Public API — will be called from future `service install` command
 pub fn detect_platform() {
     #[cfg(target_os = "macos")]
     println!("Platform: macOS — will use launchd");
@@ -121,6 +127,7 @@ mod launchd {
     /// Generate and print the launchd plist.
     pub async fn install() -> Result<()> {
         let exe = std::env::current_exe().unwrap_or_default();
+        let home = dirs::home_dir().unwrap_or_default();
         let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -139,15 +146,14 @@ mod launchd {
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/duduclaw.stdout.log</string>
+    <string>{home}/Library/Logs/duduclaw.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/duduclaw.stderr.log</string>
+    <string>{home}/Library/Logs/duduclaw.stderr.log</string>
 </dict>
 </plist>"#,
-            exe = exe.display()
+            exe = exe.display(),
+            home = home.display(),
         );
-
-        let home = dirs::home_dir().unwrap_or_default();
         let plist_path = home.join("Library/LaunchAgents/dev.duduclaw.plist");
         println!("LaunchAgent plist for: {}\n", plist_path.display());
         println!("{}", plist);
@@ -295,7 +301,8 @@ async fn service_status() -> Result<()> {
     ));
 }
 
-async fn service_logs() -> Result<()> {
+async fn service_logs(lines: usize) -> Result<()> {
+    let _ = lines; // TODO: pass to platform-specific impl
     #[cfg(target_os = "linux")]
     return systemd::logs().await;
     #[cfg(target_os = "macos")]

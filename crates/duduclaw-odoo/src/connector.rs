@@ -58,9 +58,20 @@ impl OdooConnector {
             .build()
             .map_err(|e| format!("HTTP client: {e}"))?;
 
-        // Authenticate
-        let uid = rpc::authenticate(&http, &config.url, &config.db, &config.username, credential)
-            .await?;
+        // Authenticate with exponential backoff retry (MW-H5)
+        let mut uid = None;
+        let retries = [100, 500, 1000]; // ms
+        for (attempt, delay_ms) in retries.iter().enumerate() {
+            match rpc::authenticate(&http, &config.url, &config.db, &config.username, credential).await {
+                Ok(u) => { uid = Some(u); break; }
+                Err(e) if attempt < retries.len() - 1 => {
+                    warn!(attempt = attempt + 1, "Odoo auth failed, retrying: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+                }
+                Err(e) => return Err(format!("Odoo authentication failed after {} attempts: {e}", retries.len())),
+            }
+        }
+        let uid = uid.unwrap();
 
         info!(url = %config.url, db = %config.db, uid, "Odoo connected");
 

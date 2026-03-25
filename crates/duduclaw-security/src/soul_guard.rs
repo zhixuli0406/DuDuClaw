@@ -39,19 +39,50 @@ pub fn fingerprint_soul(agent_dir: &Path) -> Option<String> {
     Some(sha256_hex(&content))
 }
 
-/// Read the stored fingerprint from `.soul_hash`.
+/// Resolve the path for storing soul hashes.
+///
+/// Hashes are stored in `~/.duduclaw/soul_hashes/<agent_name>.hash` so that
+/// an attacker who compromises an agent directory cannot tamper with both
+/// SOUL.md and its hash simultaneously (MW-H4).
+fn hash_path(agent_dir: &Path) -> std::path::PathBuf {
+    // Extract agent name from the directory path
+    let agent_name = agent_dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+
+    // Try to resolve ~/.duduclaw/soul_hashes/
+    let soul_hashes_dir = agent_dir
+        .parent() // agents/
+        .and_then(|p| p.parent()) // ~/.duduclaw/
+        .map(|home| home.join("soul_hashes"))
+        .unwrap_or_else(|| agent_dir.join(".soul_hashes"));
+
+    let _ = std::fs::create_dir_all(&soul_hashes_dir);
+    soul_hashes_dir.join(format!("{agent_name}.hash"))
+}
+
+/// Read the stored fingerprint from the soul_hashes directory.
 pub fn read_stored_hash(agent_dir: &Path) -> Option<String> {
-    let hash_path = agent_dir.join(".soul_hash");
-    std::fs::read_to_string(&hash_path)
+    let path = hash_path(agent_dir);
+    // Fallback: also check legacy location for migration
+    std::fs::read_to_string(&path)
+        .or_else(|_| std::fs::read_to_string(agent_dir.join(".soul_hash")))
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
-/// Persist the fingerprint to `.soul_hash`.
+/// Persist the fingerprint to the soul_hashes directory.
 pub fn store_hash(agent_dir: &Path, hash: &str) -> std::io::Result<()> {
-    let hash_path = agent_dir.join(".soul_hash");
-    std::fs::write(&hash_path, hash)
+    let path = hash_path(agent_dir);
+    std::fs::write(&path, hash)?;
+    // Clean up legacy location if it exists
+    let legacy = agent_dir.join(".soul_hash");
+    if legacy.exists() {
+        let _ = std::fs::remove_file(&legacy);
+    }
+    Ok(())
 }
 
 /// Check SOUL.md integrity for a single agent.
@@ -187,6 +218,8 @@ fn prune_history(history_dir: &Path) -> std::io::Result<()> {
 }
 
 /// List all SOUL.md version history files for an agent.
+///
+/// Reuses the same directory read as prune_history to avoid duplicate I/O (MW-L4).
 pub fn list_soul_history(agent_dir: &Path) -> Vec<String> {
     let history_dir = agent_dir.join(".soul_history");
     let mut entries: Vec<String> = std::fs::read_dir(&history_dir)

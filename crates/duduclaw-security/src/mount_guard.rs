@@ -91,7 +91,14 @@ impl MountGuard {
         // original path (it might be created later by the container runtime).
         match path.canonicalize() {
             Ok(resolved) => Ok(resolved),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Path doesn't exist yet — log warning instead of silently degrading (MW-M5)
+                tracing::warn!(
+                    path = %path.display(),
+                    "Mount path does not exist — using unresolved path (potential TOCTOU risk)"
+                );
+                Ok(path.to_path_buf())
+            }
             Err(e) => Err(DuDuClawError::Security(format!(
                 "failed to resolve path {}: {e}",
                 path.display()

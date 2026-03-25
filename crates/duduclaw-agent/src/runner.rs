@@ -186,23 +186,7 @@ async fn call_claude(prompt: &str, model: &str, system_prompt: &str, api_key: &s
     }
 }
 
-/// Find the `claude` CLI binary.
+/// Find the `claude` CLI binary — delegates to shared impl in duduclaw-core (BE-L1).
 fn which_claude() -> Option<String> {
-    if let Ok(out) = std::process::Command::new("which").arg("claude").output()
-        && out.status.success()
-    {
-        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !path.is_empty() { return Some(path); }
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let candidates = [
-        format!("{home}/.npm-global/bin/claude"),
-        "/usr/local/bin/claude".to_string(),
-        format!("{home}/.claude/bin/claude"),
-        format!("{home}/.local/bin/claude"),
-    ];
-    for p in &candidates {
-        if std::path::Path::new(p).exists() { return Some(p.clone()); }
-    }
-    None
+    duduclaw_core::which_claude()
 }

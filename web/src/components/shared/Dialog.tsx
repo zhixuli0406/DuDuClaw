@@ -34,13 +34,15 @@ export function Dialog({ open, onClose, title, children, className }: DialogProp
   return (
     <dialog
       ref={dialogRef}
+      aria-labelledby="dialog-title"
+      aria-modal="true"
       className={cn(
         'w-full max-w-lg rounded-xl border border-stone-200 bg-white p-0 shadow-xl backdrop:bg-black/40 backdrop:backdrop-blur-sm dark:border-stone-700 dark:bg-stone-900',
         className
       )}
     >
       <div className="flex items-center justify-between border-b border-stone-200 px-6 py-4 dark:border-stone-700">
-        <h3 className="text-lg font-semibold text-stone-900 dark:text-stone-50">{title}</h3>
+        <h3 id="dialog-title" className="text-lg font-semibold text-stone-900 dark:text-stone-50">{title}</h3>
         <button
           onClick={onClose}
           className="rounded-lg p-1.5 text-stone-400 hover:bg-stone-100 hover:text-stone-600 dark:hover:bg-stone-800 dark:hover:text-stone-300"

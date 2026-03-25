@@ -53,12 +53,11 @@ export function DashboardPage() {
     api.accounts.budgetSummary().then(setBudget).catch(() => {});
     api.system.doctor().then(setDoctor).catch(() => {});
 
-    // Poll every 30s to keep stats fresh
+    // Rely on WebSocket events for real-time updates (FE-H7).
+    // Only do a lightweight budget refresh every 60s instead of full polling.
     const interval = setInterval(() => {
-      fetchAgents();
-      fetchStatus();
       api.accounts.budgetSummary().then(setBudget).catch(() => {});
-    }, 30_000);
+    }, 60_000);
     return () => clearInterval(interval);
   }, [fetchAgents, fetchStatus]);
 
@@ -73,9 +72,9 @@ export function DashboardPage() {
     : '—';
   const healthSubtitle = doctor
     ? summary.fail > 0
-      ? `${summary.fail} 項失敗`
+      ? intl.formatMessage({ id: 'dashboard.health.failCount' }, { count: summary.fail })
       : summary.warn > 0
-        ? `${summary.warn} 項警告`
+        ? intl.formatMessage({ id: 'dashboard.health.warnCount' }, { count: summary.warn })
         : intl.formatMessage({ id: 'dashboard.health.allPassed' })
     : intl.formatMessage({ id: 'common.loading' });
 

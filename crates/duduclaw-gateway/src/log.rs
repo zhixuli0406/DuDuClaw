@@ -66,8 +66,43 @@ impl<S: Subscriber> Layer<S> for BroadcastLayer {
             return; // Skip events with no message
         }
 
-        push_log(level, event.metadata().target(), &visitor.message);
+        // Scrub messages that might contain sensitive data before broadcasting (BE-M5)
+        let msg = scrub_sensitive(&visitor.message);
+        push_log(level, event.metadata().target(), &msg);
     }
+}
+
+/// Redact values that look like secrets from log messages before broadcast.
+///
+/// Handles multiple occurrences of the same prefix and end-of-string values.
+fn scrub_sensitive(msg: &str) -> String {
+    let sensitive_prefixes = [
+        "api_key=", "token=", "secret=", "password=", "credential=",
+        "Bearer ", "Bot ", "ANTHROPIC_API_KEY=",
+    ];
+    let mut result = msg.to_string();
+    for prefix in &sensitive_prefixes {
+        // Loop to handle multiple occurrences of the same prefix
+        let mut search_from = 0;
+        while let Some(rel_pos) = result[search_from..].find(prefix) {
+            let pos = search_from + rel_pos;
+            let value_start = pos + prefix.len();
+            if value_start >= result.len() {
+                break; // prefix at very end, nothing to redact
+            }
+            let value_end = result[value_start..]
+                .find(|c: char| c.is_whitespace() || c == ',' || c == '"' || c == '\'' || c == '}' || c == ']')
+                .map(|i| value_start + i)
+                .unwrap_or(result.len());
+            if value_end > value_start {
+                result.replace_range(value_start..value_end, "****");
+                search_from = value_start + 4; // skip past "****"
+            } else {
+                break;
+            }
+        }
+    }
+    result
 }
 
 /// Minimal visitor that extracts the `message` field from a tracing event.

@@ -218,7 +218,20 @@ fn verify_signature(secret: &str, body: &[u8], signature: &str) -> bool {
     };
     mac.update(body);
     let expected = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
-    expected == signature
+    // Use constant-time comparison to prevent timing attacks (BE-M8)
+    constant_time_eq(expected.as_bytes(), signature.as_bytes())
+}
+
+/// Constant-time byte-slice equality check.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
 }
 
 async fn send_reply(http: &reqwest::Client, token: &str, reply_token: &str, text: &str) {
@@ -249,15 +262,9 @@ async fn send_reply(http: &reqwest::Client, token: &str, reply_token: &str, text
 }
 
 async fn read_line_config(home_dir: &Path) -> Option<(String, String)> {
-    let config_path = home_dir.join("config.toml");
-    let content = tokio::fs::read_to_string(&config_path).await.ok()?;
-    let table: toml::Table = content.parse().ok()?;
-    let channels = table.get("channels")?.as_table()?;
-    let token = channels.get("line_channel_token")?.as_str().unwrap_or("");
-    let secret = channels.get("line_channel_secret")?.as_str().unwrap_or("");
-    if token.is_empty() {
-        None
-    } else {
-        Some((token.to_string(), secret.to_string()))
-    }
+    let token = crate::config_crypto::read_encrypted_config_field(home_dir, "channels", "line_channel_token").await?;
+    let secret = crate::config_crypto::read_encrypted_config_field(home_dir, "channels", "line_channel_secret")
+        .await
+        .unwrap_or_default();
+    Some((token, secret))
 }

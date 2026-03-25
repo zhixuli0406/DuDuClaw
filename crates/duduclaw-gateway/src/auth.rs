@@ -13,9 +13,12 @@ pub struct AuthManager {
     token: Option<String>,
     /// Raw 32-byte Ed25519 public key (if configured).
     ed25519_pubkey: Option<Vec<u8>>,
-    /// Active challenge (set by `issue_challenge`, consumed by `verify_ed25519`).
-    challenge: std::sync::Mutex<Option<[u8; 32]>>,
+    /// Active challenge with creation timestamp (set by `issue_challenge`, consumed by `verify_ed25519`).
+    challenge: std::sync::Mutex<Option<(std::time::Instant, [u8; 32])>>,
 }
+
+/// Maximum age of a challenge before it expires (30 seconds).
+const CHALLENGE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl AuthManager {
     /// Create a new [`AuthManager`] with optional token auth.
@@ -57,7 +60,7 @@ impl AuthManager {
         rng.fill(&mut bytes).expect("RNG should not fail");
 
         if let Ok(mut guard) = self.challenge.lock() {
-            *guard = Some(bytes);
+            *guard = Some((std::time::Instant::now(), bytes));
         }
 
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
@@ -74,12 +77,17 @@ impl AuthManager {
             DuDuClawError::Security("Ed25519 not configured".to_owned())
         })?;
 
-        let challenge = self
+        let (created_at, challenge) = self
             .challenge
             .lock()
             .map_err(|_| DuDuClawError::Security("challenge lock poisoned".to_owned()))?
             .take()
             .ok_or_else(|| DuDuClawError::Security("no active challenge".to_owned()))?;
+
+        // Reject expired challenges
+        if created_at.elapsed() > CHALLENGE_TTL {
+            return Err(DuDuClawError::Security("challenge expired".to_owned()));
+        }
 
         let sig_bytes = base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,

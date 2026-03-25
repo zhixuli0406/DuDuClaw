@@ -139,46 +139,50 @@ impl CronScheduler {
             }
 
             let now = Utc::now();
-            let mut tasks = self.tasks.write().await;
 
-            for lt in tasks.iter_mut() {
-                let should_fire = match lt.last_run {
-                    Some(last) => {
-                        // Find next scheduled time after last_run
-                        lt.schedule
-                            .after(&last)
-                            .next()
-                            .map(|next| next <= now)
-                            .unwrap_or(false)
+            // Collect tasks to spawn while holding write lock, then release before spawning (BE-M2)
+            let mut to_spawn = Vec::new();
+            {
+                let mut tasks = self.tasks.write().await;
+                for lt in tasks.iter_mut() {
+                    let should_fire = match lt.last_run {
+                        Some(last) => {
+                            lt.schedule
+                                .after(&last)
+                                .next()
+                                .map(|next| next <= now)
+                                .unwrap_or(false)
+                        }
+                        None => {
+                            lt.schedule
+                                .after(&(now - chrono::Duration::hours(1)))
+                                .next()
+                                .map(|next| next <= now)
+                                .unwrap_or(false)
+                        }
+                    };
+
+                    if should_fire {
+                        info!(
+                            id = %lt.task.id,
+                            name = %lt.task.name,
+                            agent = %lt.task.agent_id,
+                            "Cron task firing"
+                        );
+                        lt.last_run = Some(now);
+                        to_spawn.push(lt.task.clone());
                     }
-                    None => {
-                        // Never run — check if there was a scheduled time before now
-                        lt.schedule
-                            .after(&(now - chrono::Duration::hours(1)))
-                            .next()
-                            .map(|next| next <= now)
-                            .unwrap_or(false)
-                    }
-                };
-
-                if should_fire {
-                    info!(
-                        id = %lt.task.id,
-                        name = %lt.task.name,
-                        agent = %lt.task.agent_id,
-                        "Cron task firing"
-                    );
-                    lt.last_run = Some(now);
-
-                    let home = self.home_dir.clone();
-                    let registry = self.registry.clone();
-                    let task = lt.task.clone();
-                    let sem = self.semaphore.clone();
-                    tokio::spawn(async move {
-                        let _permit = sem.acquire().await;
-                        execute_cron_task(&home, &registry, &task).await;
-                    });
                 }
+            } // write lock released
+
+            for task in to_spawn {
+                let home = self.home_dir.clone();
+                let registry = self.registry.clone();
+                let sem = self.semaphore.clone();
+                tokio::spawn(async move {
+                    let _permit = sem.acquire().await;
+                    execute_cron_task(&home, &registry, &task).await;
+                });
             }
         }
     }

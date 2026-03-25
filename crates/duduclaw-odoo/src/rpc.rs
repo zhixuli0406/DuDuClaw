@@ -2,8 +2,13 @@
 //!
 //! [O-1a] Supports both protocols; JSON-RPC is preferred for performance.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde_json::{json, Value};
 use tracing::debug;
+
+/// Monotonically increasing JSON-RPC request ID for correct response pairing (MW-M7).
+static RPC_ID: AtomicU64 = AtomicU64::new(1);
 
 /// RPC protocol to use for communicating with Odoo.
 #[derive(Debug, Clone, PartialEq)]
@@ -37,7 +42,7 @@ pub async fn jsonrpc_call(
             "method": method,
             "args": args,
         },
-        "id": 1,
+        "id": RPC_ID.fetch_add(1, Ordering::Relaxed),
     });
 
     debug!(url, service, method, "Odoo JSON-RPC call");

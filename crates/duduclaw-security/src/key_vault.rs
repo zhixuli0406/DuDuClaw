@@ -30,36 +30,51 @@ pub fn resolve_agent_keys(
 
     let allow_all = allowed_channels.iter().any(|c| c == "*");
 
-    let channel_key_mapping = [
-        ("telegram", "telegram_bot_token"),
-        ("line", "line_channel_token"),
-        ("discord", "discord_bot_token"),
+    // Encrypted field mappings: (channel, enc_field, plaintext_fallback_field)
+    let channel_key_mapping_enc = [
+        ("telegram", "telegram_bot_token_enc", "telegram_bot_token"),
+        ("line", "line_channel_token_enc", "line_channel_token"),
+        ("discord", "discord_bot_token_enc", "discord_bot_token"),
     ];
 
-    for (channel, config_key) in &channel_key_mapping {
+    for (channel, enc_key, plain_key) in &channel_key_mapping_enc {
         if !allow_all && !allowed_channels.iter().any(|c| c == *channel) {
             continue;
         }
 
-        if let Some(value) = channels
-            .and_then(|c| c.get(*config_key))
+        // Try encrypted field first, fallback to plaintext for backwards compat
+        let value = channels
+            .and_then(|c| c.get(*enc_key))
             .and_then(|v| v.as_str())
-        {
-            if !value.is_empty() {
-                keys.insert(channel.to_string(), value.to_string());
-            }
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                channels
+                    .and_then(|c| c.get(*plain_key))
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty())
+            });
+
+        if let Some(value) = value {
+            keys.insert(channel.to_string(), value.to_string());
         }
     }
 
-    // API key (Anthropic) — always allowed if the agent can send messages
-    if let Some(api_key) = config
+    // API key (Anthropic) — try encrypted field first
+    let api_key = config
         .get("api")
-        .and_then(|a| a.get("anthropic_api_key"))
+        .and_then(|a| a.get("anthropic_api_key_enc"))
         .and_then(|v| v.as_str())
-    {
-        if !api_key.is_empty() {
-            keys.insert("anthropic".to_string(), api_key.to_string());
-        }
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            config
+                .get("api")
+                .and_then(|a| a.get("anthropic_api_key"))
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+        });
+
+    if let Some(api_key) = api_key {
+        keys.insert("anthropic".to_string(), api_key.to_string());
     }
 
     info!(

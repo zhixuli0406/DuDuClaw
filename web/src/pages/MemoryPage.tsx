@@ -201,7 +201,7 @@ function SkillsTab() {
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {skills.map((skill) => (
             <div
-              key={skill.name}
+              key={`${(skill as unknown as Record<string, unknown>).agent_id ?? 'global'}:${skill.name}`}
               className="rounded-xl border border-stone-200 bg-white p-5 transition-shadow hover:shadow-md dark:border-stone-800 dark:bg-stone-900"
             >
               <div className="flex items-start justify-between">

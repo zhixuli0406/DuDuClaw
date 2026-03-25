@@ -183,8 +183,6 @@ export const api = {
         query,
         limit,
       }) as Promise<{ entries: MemoryEntry[] }>,
-    browse: (agentId: string) =>
-      client.call('memory.browse', { agent_id: agentId }) as Promise<{ entries: MemoryEntry[] }>,
   },
   skills: {
     list: (agentId?: string) =>

@@ -28,6 +28,10 @@ sha2 = "0.10"
 base64 = { workspace = true }
 ring = { workspace = true }
 futures-util = { workspace = true }
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 duduclaw-dashboard = { workspace = true, optional = true }
 
 [features]

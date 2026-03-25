@@ -303,6 +303,11 @@ fn is_valid_agent_id(id: &str) -> bool {
 const MAX_QUEUE_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Append a line to a JSONL file with size limit check.
+///
+/// **Concurrency note (MCP-M4)**: Uses `O_APPEND` which is atomic on POSIX
+/// for writes ≤ PIPE_BUF (typically 4096 bytes). JSONL lines are typically
+/// < 1KB so concurrent appends from MCP server and gateway are safe.
+/// The dispatcher uses its own Mutex for read-modify-write operations.
 fn append_to_jsonl_sync(path: &std::path::Path, line: &str) -> bool {
     // Check size limit
     if let Ok(meta) = std::fs::metadata(path) {
@@ -390,11 +395,7 @@ async fn handle_send_message(
 
     let result = match channel {
         "telegram" => {
-            let token = config
-                .get("channels")
-                .and_then(|c| c.get("telegram_bot_token"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let token = decrypt_channel_token(&config, "telegram_bot_token_enc", "telegram_bot_token", home_dir);
             if token.is_empty() {
                 "Error: telegram_bot_token not configured".to_string()
             } else {
@@ -417,11 +418,7 @@ async fn handle_send_message(
             }
         }
         "line" => {
-            let token = config
-                .get("channels")
-                .and_then(|c| c.get("line_channel_token"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let token = decrypt_channel_token(&config, "line_channel_token_enc", "line_channel_token", home_dir);
             if token.is_empty() {
                 "Error: line_channel_token not configured".to_string()
             } else {
@@ -442,11 +439,7 @@ async fn handle_send_message(
             }
         }
         "discord" => {
-            let token = config
-                .get("channels")
-                .and_then(|c| c.get("discord_bot_token"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let token = decrypt_channel_token(&config, "discord_bot_token_enc", "discord_bot_token", home_dir);
             if token.is_empty() {
                 "Error: discord_bot_token not configured".to_string()
             } else {
@@ -490,17 +483,20 @@ async fn handle_web_search(params: &Value, http: &reqwest::Client) -> Value {
         urlencoding::encode(query)
     );
 
-    let result = match http
-        .get(&url)
-        .header("User-Agent", "DuDuClaw/0.1")
-        .send()
-        .await
-    {
-        Ok(resp) => match resp.text().await {
-            Ok(body) => extract_search_results(&body),
-            Err(e) => format!("Error reading response: {e}"),
-        },
-        Err(e) => format!("Error performing search: {e}"),
+    // Enforce 10s timeout so web_search doesn't block the MCP server (CLI-H5)
+    let search_future = async {
+        let resp = http
+            .get(&url)
+            .header("User-Agent", "DuDuClaw/0.6")
+            .send()
+            .await?;
+        resp.text().await
+    };
+
+    let result = match tokio::time::timeout(std::time::Duration::from_secs(10), search_future).await {
+        Ok(Ok(body)) => extract_search_results(&body),
+        Ok(Err(e)) => format!("Error performing search: {e}"),
+        Err(_) => "Error: web search timed out after 10 seconds".to_string(),
     };
 
     serde_json::json!({
@@ -508,29 +504,32 @@ async fn handle_web_search(params: &Value, http: &reqwest::Client) -> Value {
     })
 }
 
-/// Extract text results from DuckDuckGo HTML response.
+/// Extract text results from DuckDuckGo HTML response using `scraper` (CLI-M5).
 fn extract_search_results(html: &str) -> String {
-    // Simple extraction: find result snippets between common markers
-    let mut results = Vec::new();
-    let mut remaining = html;
+    use scraper::{Html, Selector};
 
-    // Look for result__snippet class
-    while let Some(start) = remaining.find("class=\"result__snippet") {
-        remaining = &remaining[start..];
-        if let Some(tag_end) = remaining.find('>') {
-            remaining = &remaining[tag_end + 1..];
-            if let Some(end) = remaining.find("</") {
-                let snippet = &remaining[..end];
-                let clean = strip_html_tags(snippet).trim().to_string();
-                if !clean.is_empty() {
+    let document = Html::parse_document(html);
+    let mut results = Vec::new();
+
+    // Try selectors in priority order
+    let selectors = [
+        ".result__snippet",
+        ".result__a",
+        ".links_main a",
+    ];
+
+    for sel_str in selectors {
+        if let Ok(selector) = Selector::parse(sel_str) {
+            for element in document.select(&selector) {
+                let text: String = element.text().collect::<Vec<_>>().join(" ");
+                let clean = text.trim().to_string();
+                if !clean.is_empty() && clean.len() > 10 {
                     results.push(clean);
                 }
-                remaining = &remaining[end..];
+                if results.len() >= 5 { break; }
             }
         }
-        if results.len() >= 5 {
-            break;
-        }
+        if !results.is_empty() { break; }
     }
 
     if results.is_empty() {
@@ -543,21 +542,6 @@ fn extract_search_results(html: &str) -> String {
             .collect::<Vec<_>>()
             .join("\n\n")
     }
-}
-
-/// Strip HTML tags from a string.
-fn strip_html_tags(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut in_tag = false;
-    for ch in input.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => output.push(ch),
-            _ => {}
-        }
-    }
-    output
 }
 
 async fn handle_memory_search(
@@ -706,12 +690,12 @@ async fn handle_send_media(
     }
 
     let config = read_config(home_dir).await;
+    let config_ref = config.as_ref();
     let result = match channel {
         "telegram" => {
-            let token = config.as_ref()
-                .and_then(|c| c.get("channels"))
-                .and_then(|c| c.get("telegram_bot_token"))
-                .and_then(|v| v.as_str()).unwrap_or("");
+            let token = config_ref
+                .map(|c| decrypt_channel_token(c, "telegram_bot_token_enc", "telegram_bot_token", home_dir))
+                .unwrap_or_default();
             if token.is_empty() {
                 "Error: telegram_bot_token not configured".to_string()
             } else {
@@ -730,10 +714,9 @@ async fn handle_send_media(
             }
         }
         "discord" => {
-            let token = config.as_ref()
-                .and_then(|c| c.get("channels"))
-                .and_then(|c| c.get("discord_bot_token"))
-                .and_then(|v| v.as_str()).unwrap_or("");
+            let token = config_ref
+                .map(|c| decrypt_channel_token(c, "discord_bot_token_enc", "discord_bot_token", home_dir))
+                .unwrap_or_default();
             if token.is_empty() {
                 "Error: discord_bot_token not configured".to_string()
             } else {
@@ -862,10 +845,10 @@ async fn handle_create_agent(params: &Value, home_dir: &Path) -> Value {
         });
     }
 
-    // Validate name: lowercase, alphanumeric + hyphens only
-    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+    // Validate name: safe for filesystem paths (no traversal)
+    if !is_valid_agent_id(name) {
         return serde_json::json!({
-            "content": [{"type": "text", "text": "Error: name must be lowercase alphanumeric with hyphens only"}],
+            "content": [{"type": "text", "text": "Error: name must be lowercase alphanumeric with hyphens, max 64 chars"}],
             "isError": true
         });
     }
@@ -903,54 +886,57 @@ async fn handle_create_agent(params: &Value, home_dir: &Path) -> Value {
     }
     let _ = tokio::fs::create_dir_all(agent_dir.join("SKILLS")).await;
 
-    // Write agent.toml
-    let agent_toml = format!(
-r#"[agent]
-name = "{name}"
-display_name = "{display_name}"
-role = "{role}"
-status = "active"
-trigger = "{trigger}"
-reports_to = "{reports_to}"
-icon = "{icon}"
+    // Write agent.toml — use toml crate to prevent injection via display_name/trigger/icon
+    // Clone values that will be consumed by the toml! macro
+    let reports_to_display = reports_to.clone();
+    let agent_config = toml::toml! {
+        [agent]
+        name = name
+        display_name = display_name
+        role = role
+        status = "active"
+        trigger = trigger
+        reports_to = reports_to
+        icon = icon
 
-[model]
-preferred = "{model}"
-fallback = "claude-haiku-4-5"
-account_pool = ["main"]
+        [model]
+        preferred = model
+        fallback = "claude-haiku-4-5"
+        account_pool = ["main"]
 
-[container]
-timeout_ms = 1800000
-max_concurrent = 2
-readonly_project = true
-additional_mounts = []
+        [container]
+        timeout_ms = 1800000
+        max_concurrent = 2
+        readonly_project = true
+        additional_mounts = []
 
-[heartbeat]
-enabled = false
-interval_seconds = 3600
-max_concurrent_runs = 1
-cron = ""
+        [heartbeat]
+        enabled = false
+        interval_seconds = 3600
+        max_concurrent_runs = 1
+        cron = ""
 
-[budget]
-monthly_limit_cents = 2000
-warn_threshold_percent = 80
-hard_stop = true
+        [budget]
+        monthly_limit_cents = 2000
+        warn_threshold_percent = 80
+        hard_stop = true
 
-[permissions]
-can_create_agents = false
-can_send_cross_agent = true
-can_modify_own_skills = true
-can_modify_own_soul = false
-can_schedule_tasks = false
-allowed_channels = []
+        [permissions]
+        can_create_agents = false
+        can_send_cross_agent = true
+        can_modify_own_skills = true
+        can_modify_own_soul = false
+        can_schedule_tasks = false
+        allowed_channels = []
 
-[evolution]
-micro_reflection = true
-meso_reflection = false
-macro_reflection = false
-skill_auto_activate = false
-skill_security_scan = true
-"#);
+        [evolution]
+        micro_reflection = true
+        meso_reflection = false
+        macro_reflection = false
+        skill_auto_activate = false
+        skill_security_scan = true
+    };
+    let agent_toml = toml::to_string_pretty(&agent_config).unwrap_or_default();
 
     if let Err(e) = tokio::fs::write(agent_dir.join("agent.toml"), &agent_toml).await {
         return serde_json::json!({
@@ -971,7 +957,7 @@ skill_security_scan = true
         "content": [{"type": "text", "text": format!(
             "Agent '{display_name}' ({name}) created successfully.\n\
              Role: {role}\n\
-             Reports to: {reports_to}\n\
+             Reports to: {reports_to_display}\n\
              Model: {model}\n\
              Directory: {}\n\n\
              The agent is now available for delegation via send_to_agent or spawn_agent.",
@@ -1057,6 +1043,12 @@ async fn handle_agent_status(params: &Value, home_dir: &Path) -> Value {
     if agent_id.is_empty() {
         return serde_json::json!({
             "content": [{"type": "text", "text": "Error: agent_id is required"}],
+            "isError": true
+        });
+    }
+    if !is_valid_agent_id(agent_id) {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: agent_id must be lowercase alphanumeric with hyphens"}],
             "isError": true
         });
     }
@@ -1168,6 +1160,12 @@ async fn handle_spawn_agent(params: &Value, home_dir: &Path) -> Value {
             "isError": true
         });
     }
+    if !is_valid_agent_id(agent_id) {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: agent_id must be lowercase alphanumeric with hyphens"}],
+            "isError": true
+        });
+    }
 
     // Verify agent exists
     let agent_dir = home_dir.join("agents").join(agent_id);
@@ -1197,6 +1195,13 @@ async fn handle_spawn_agent(params: &Value, home_dir: &Path) -> Value {
         let entry_str = entry.to_string();
         move || -> bool {
             use std::io::Write;
+            // Enforce bus_queue.jsonl size limit (CLI-H4)
+            const MAX_QUEUE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.len() > MAX_QUEUE_SIZE {
+                    return false;
+                }
+            }
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
                 writeln!(f, "{entry_str}").is_ok()
             } else {
@@ -1228,22 +1233,33 @@ async fn handle_spawn_agent(params: &Value, home_dir: &Path) -> Value {
 }
 
 /// Count pending agent_message entries in bus_queue.jsonl for a given agent.
+///
+/// Reads line-by-line with a size cap to avoid OOM on large queues (CLI-M2).
 async fn count_pending_tasks(home_dir: &Path, agent_id: &str) -> usize {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
     let queue_path = home_dir.join("bus_queue.jsonl");
-    let content = match tokio::fs::read_to_string(&queue_path).await {
-        Ok(c) => c,
+    let file = match tokio::fs::File::open(&queue_path).await {
+        Ok(f) => f,
         Err(_) => return 0,
     };
 
-    content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|v| {
-            v.get("type").and_then(|t| t.as_str()) == Some("agent_message")
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+    let mut count = 0usize;
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.trim().is_empty() { continue; }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            if v.get("type").and_then(|t| t.as_str()) == Some("agent_message")
                 && v.get("agent_id").and_then(|a| a.as_str()) == Some(agent_id)
-        })
-        .count()
+            {
+                count += 1;
+            }
+        }
+    }
+
+    count
 }
 
 // ── Feedback handler ────────────────────────────────────────
@@ -1484,6 +1500,16 @@ async fn handle_odoo_tool(tool: &str, params: &Value, home_dir: &Path, odoo: &Od
             let ids_str = params.get("ids").and_then(|v| v.as_str()).unwrap_or("[]");
             if model.is_empty() || method.is_empty() { return mcp_error("model and method are required"); }
             if OdooConnector::is_model_blocked(model) { return mcp_error(&format!("Model '{model}' is blocked")); }
+
+            // Whitelist safe Odoo methods — block dangerous ones like unlink, write on sensitive models (MCP-H6)
+            const BLOCKED_METHODS: &[&str] = &[
+                "unlink", "uninstall", "uninstall_hook",
+                "init", "_auto_init", "_register_hook",
+                "signal_workflow", "execute_import",
+            ];
+            if BLOCKED_METHODS.contains(&method) {
+                return mcp_error(&format!("Method '{method}' is blocked for security reasons"));
+            }
             let ids: Vec<Value> = serde_json::from_str(ids_str).unwrap_or_default();
             match conn.execute_kw(model, method, vec![serde_json::json!(ids)], serde_json::json!({})).await {
                 Ok(data) => Ok(serde_json::to_string_pretty(&data).unwrap_or_default()),
@@ -1526,34 +1552,9 @@ async fn handle_odoo_connect(home_dir: &Path, odoo: &OdooState) -> Value {
     }
 
     // Resolve credential (try api_key_enc first, then password_enc)
-    let credential = if !odoo_config.api_key_enc.is_empty() {
-        // Try to decrypt
-        let keyfile = home_dir.join(".keyfile");
-        if let Ok(bytes) = std::fs::read(&keyfile) {
-            if bytes.len() == 32 {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&bytes);
-                duduclaw_security::crypto::CryptoEngine::new(&key)
-                    .ok()
-                    .and_then(|e| e.decrypt_string(&odoo_config.api_key_enc).ok())
-                    .unwrap_or_default()
-            } else { String::new() }
-        } else { String::new() }
-    } else if !odoo_config.password_enc.is_empty() {
-        let keyfile = home_dir.join(".keyfile");
-        if let Ok(bytes) = std::fs::read(&keyfile) {
-            if bytes.len() == 32 {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&bytes);
-                duduclaw_security::crypto::CryptoEngine::new(&key)
-                    .ok()
-                    .and_then(|e| e.decrypt_string(&odoo_config.password_enc).ok())
-                    .unwrap_or_default()
-            } else { String::new() }
-        } else { String::new() }
-    } else {
-        String::new()
-    };
+    let credential = decrypt_encrypted_value(&odoo_config.api_key_enc, home_dir)
+        .or_else(|| decrypt_encrypted_value(&odoo_config.password_enc, home_dir))
+        .unwrap_or_default();
 
     if credential.is_empty() {
         return mcp_error("Odoo credential not found. Set api_key_enc or password_enc in [odoo] config.");
@@ -1703,6 +1704,49 @@ async fn read_config(home_dir: &Path) -> Option<toml::Table> {
     let config_path = home_dir.join("config.toml");
     let content = tokio::fs::read_to_string(&config_path).await.ok()?;
     content.parse().ok()
+}
+
+/// Load the AES-256 keyfile and create a CryptoEngine.
+fn load_crypto_engine(home_dir: &Path) -> Option<duduclaw_security::crypto::CryptoEngine> {
+    let keyfile = home_dir.join(".keyfile");
+    let bytes = std::fs::read(&keyfile).ok()?;
+    if bytes.len() == 32 {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        duduclaw_security::crypto::CryptoEngine::new(&key).ok()
+    } else {
+        None
+    }
+}
+
+/// Decrypt an encrypted base64 value using the per-machine keyfile.
+fn decrypt_encrypted_value(encrypted: &str, home_dir: &Path) -> Option<String> {
+    if encrypted.is_empty() { return None; }
+    let engine = load_crypto_engine(home_dir)?;
+    let plain = engine.decrypt_string(encrypted).ok()?;
+    if plain.is_empty() { None } else { Some(plain) }
+}
+
+/// Decrypt a channel token from config.toml.
+///
+/// Tries the encrypted field (`_enc` suffix) first, then falls back to the
+/// plaintext field for backwards compatibility.
+fn decrypt_channel_token(config: &toml::Table, enc_key: &str, plain_key: &str, home_dir: &Path) -> String {
+    let channels = config.get("channels").and_then(|c| c.as_table());
+
+    // Try encrypted field first
+    if let Some(enc_val) = channels.and_then(|c| c.get(enc_key)).and_then(|v| v.as_str()) {
+        if let Some(decrypted) = decrypt_encrypted_value(enc_val, home_dir) {
+            return decrypted;
+        }
+    }
+
+    // Fallback: plaintext field (backwards compat)
+    channels
+        .and_then(|c| c.get(plain_key))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Read the default agent name from config.toml.

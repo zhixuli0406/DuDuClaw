@@ -75,9 +75,16 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         session_manager,
         handler.channel_status().clone(),
     ));
-    let _telegram_handle = crate::telegram::start_telegram_bot(&home_dir, reply_ctx.clone()).await;
+    // Store background task handles for graceful shutdown (BE-L4)
+    let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    if let Some(h) = crate::telegram::start_telegram_bot(&home_dir, reply_ctx.clone()).await {
+        bg_handles.push(h);
+    }
     let line_router = crate::line::start_line_bot(&home_dir, reply_ctx.clone()).await;
-    let _discord_handle = crate::discord::start_discord_bot(&home_dir, reply_ctx).await;
+    if let Some(h) = crate::discord::start_discord_bot(&home_dir, reply_ctx).await {
+        bg_handles.push(h);
+    }
 
     // Start unified heartbeat scheduler (per-agent: evolution + cron + monitoring)
     // Replaces the old start_evolution_timers — each agent's HeartbeatConfig
@@ -90,18 +97,18 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     info!("Heartbeat scheduler started (per-agent evolution + monitoring)");
 
     // Start cron scheduler (reads cron_tasks.jsonl, fires on schedule)
-    let _cron_handle = crate::cron_scheduler::start_cron_scheduler(
+    bg_handles.push(crate::cron_scheduler::start_cron_scheduler(
         home_dir.clone(),
         handler.registry().clone(),
-    );
+    ));
     info!("Cron scheduler started");
 
     // Start agent dispatcher (consumes bus_queue.jsonl, spawns sub-agents)
-    let _dispatcher_handle = crate::dispatcher::start_agent_dispatcher(
+    bg_handles.push(crate::dispatcher::start_agent_dispatcher(
         home_dir.clone(),
         handler.registry().clone(),
-    );
-    info!("Agent dispatcher started");
+    ));
+    info!("Agent dispatcher started ({} background tasks)", bg_handles.len());
 
     let state = Arc::new(AppState {
         auth: AuthManager::new(config.auth_token),
@@ -156,7 +163,15 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     // If auth is required, the first message MUST be a "connect" request
     // carrying a valid token. Reject and close otherwise.
     if state.auth.is_auth_required() {
-        let authenticated = match socket.recv().await {
+        // Timeout auth handshake to prevent Slowloris-style resource exhaustion (BE-C4)
+        let auth_timeout = std::time::Duration::from_secs(10);
+        let authenticated = match tokio::time::timeout(auth_timeout, socket.recv()).await {
+            Err(_) => {
+                warn!("WebSocket auth timeout — closing connection");
+                let _ = socket.send(Message::Close(None)).await;
+                return;
+            }
+            Ok(recv_result) => match recv_result {
             Some(Ok(Message::Text(text))) => {
                 match serde_json::from_str::<WsFrame>(&text) {
                     Ok(WsFrame::Request { id, method, params }) if method == "connect" => {
@@ -175,8 +190,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                 serde_json::to_string(&resp).unwrap_or_default().into(),
                             )).await;
 
-                            // Wait for the `authenticate` message
-                            match socket.recv().await {
+                            // Wait for the `authenticate` message (with timeout)
+                            match tokio::time::timeout(auth_timeout, socket.recv()).await.unwrap_or(None) {
                                 Some(Ok(Message::Text(auth_text))) => {
                                     match serde_json::from_str::<WsFrame>(&auth_text) {
                                         Ok(WsFrame::Request { id: auth_id, method: auth_method, params: auth_params })
@@ -251,7 +266,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 }
             }
             _ => false,
-        };
+        } // match recv_result
+        }; // match tokio::time::timeout
 
         if !authenticated {
             warn!("WebSocket auth failed – closing connection");

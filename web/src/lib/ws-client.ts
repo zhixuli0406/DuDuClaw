@@ -101,8 +101,15 @@ export class DuDuClawClient {
             return;
           }
         } else {
-          // No auth required — go straight to authenticated
-          this.setState('authenticated');
+          // No token configured — still verify connection with server handshake
+          try {
+            await this.call('connect', { version: '0.6.5' });
+            this.setState('authenticated');
+          } catch {
+            // Server may not require auth — allow connection for local-only dashboard
+            console.warn('[WS] No auth configured — operating in local-only mode');
+            this.setState('authenticated');
+          }
         }
         resolve();
       };

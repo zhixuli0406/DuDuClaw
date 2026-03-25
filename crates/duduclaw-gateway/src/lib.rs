@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod channel_reply;
+pub mod config_crypto;
 pub mod claude_runner;
 pub mod cron_scheduler;
 pub mod discord;

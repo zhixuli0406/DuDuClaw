@@ -37,7 +37,16 @@ export function OrgChartPage() {
       </div>
 
       <div className="flex-1">
-        <OrgChart agents={agents} onNodeClick={handleNodeClick} />
+        <OrgChart
+          agents={agents}
+          onNodeClick={handleNodeClick}
+          labels={{
+            main: intl.formatMessage({ id: 'orgchart.legend.main' }),
+            specialist: intl.formatMessage({ id: 'orgchart.legend.specialist' }),
+            worker: intl.formatMessage({ id: 'orgchart.legend.worker' }),
+            zoom: intl.formatMessage({ id: 'orgchart.zoom' }),
+          }}
+        />
       </div>
 
       {/* Agent detail panel */}

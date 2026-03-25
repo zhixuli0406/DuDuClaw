@@ -14,9 +14,17 @@ interface OrgNode {
   children?: OrgNode[];
 }
 
+interface OrgChartLabels {
+  main?: string;
+  specialist?: string;
+  worker?: string;
+  zoom?: string;
+}
+
 interface OrgChartProps {
   agents: ReadonlyArray<AgentDetail>;
   onNodeClick?: (agentName: string) => void;
+  labels?: OrgChartLabels;
 }
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -116,7 +124,7 @@ const NODE_RX = 10;
 
 // ── Component ─────────────────────────────────────────────────
 
-export function OrgChart({ agents, onNodeClick }: OrgChartProps) {
+export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -342,33 +350,33 @@ export function OrgChart({ agents, onNodeClick }: OrgChartProps) {
         className="h-full w-full"
         style={{ minHeight: '500px' }}
       />
-      {/* Legend */}
+      {/* Legend — labels passed via props or default (FE-L4) */}
       <div className="absolute bottom-4 left-4 flex gap-4 rounded-lg border border-stone-200 bg-white/90 px-4 py-2 text-xs backdrop-blur-sm dark:border-stone-700 dark:bg-stone-900/90">
         <span className="flex items-center gap-1.5">
           <span
             className="inline-block h-2.5 w-2.5 rounded-full"
             style={{ background: ROLE_COLORS.main }}
           />
-          Main
+          {labels?.main ?? 'Main'}
         </span>
         <span className="flex items-center gap-1.5">
           <span
             className="inline-block h-2.5 w-2.5 rounded-full"
             style={{ background: ROLE_COLORS.specialist }}
           />
-          Specialist
+          {labels?.specialist ?? 'Specialist'}
         </span>
         <span className="flex items-center gap-1.5">
           <span
             className="inline-block h-2.5 w-2.5 rounded-full"
             style={{ background: ROLE_COLORS.worker }}
           />
-          Worker
+          {labels?.worker ?? 'Worker'}
         </span>
       </div>
       {/* Zoom hint */}
       <div className="absolute bottom-4 right-4 rounded-lg border border-stone-200 bg-white/90 px-3 py-1.5 text-xs text-stone-400 backdrop-blur-sm dark:border-stone-700 dark:bg-stone-900/90">
-        Scroll to zoom · Drag to pan
+        {labels?.zoom ?? 'Scroll to zoom · Drag to pan'}
       </div>
     </div>
   );

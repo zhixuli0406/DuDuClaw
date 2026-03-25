@@ -16,6 +16,8 @@ export function SecurityPage() {
   const intl = useIntl();
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
+  // FE-H1: Security panels below show static placeholder data, not live system state.
+  const isStaticData = true;
 
   useEffect(() => {
     setAuditLoading(true);
@@ -31,6 +33,13 @@ export function SecurityPage() {
       <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
         {intl.formatMessage({ id: 'security.title' })}
       </h2>
+
+      {isStaticData && (
+        <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900/50 dark:bg-amber-900/20 dark:text-amber-300">
+          <AlertTriangle className="h-4 w-4 shrink-0" />
+          <span>部分安全面板顯示的是預設靜態數值，尚未連接實際系統狀態。審計日誌為即時資料。</span>
+        </div>
+      )}
 
       <div className="grid gap-6 lg:grid-cols-2">
         {/* Audit Log */}

@@ -170,14 +170,17 @@ export function AgentsPage() {
 }
 
 function CreateAgentDialog({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: () => void }) {
+  const intl = useIntl();
   const [name, setName] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [role, setRole] = useState('specialist');
   const [trigger, setTrigger] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleSubmit = async () => {
     if (!name.trim() || !displayName.trim()) return;
+    setError(null);
     setSubmitting(true);
     try {
       await api.agents.create({ name: name.trim(), display_name: displayName.trim(), role, trigger: trigger || `@${displayName.trim()}` });
@@ -188,34 +191,37 @@ function CreateAgentDialog({ open, onClose, onCreated }: { open: boolean; onClos
       setRole('specialist');
       setTrigger('');
     } catch {
-      // error
+      setError('Agent 建立失敗，請確認名稱格式正確');
     } finally {
       setSubmitting(false);
     }
   };
 
   return (
-    <Dialog open={open} onClose={onClose} title="建立 Agent">
+    <Dialog open={open} onClose={onClose} title={intl.formatMessage({ id: 'agents.create' })}>
       <div className="space-y-4">
-        <FormField label="Agent ID" hint="小寫英文、數字、連字號">
-          <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="例：coder" className={inputClass} />
+        <FormField label="Agent ID" hint={intl.formatMessage({ id: 'agents.create.idHint' })}>
+          <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="coder" className={inputClass} />
         </FormField>
-        <FormField label="顯示名稱">
-          <input type="text" value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder="例：Coder" className={inputClass} />
+        <FormField label={intl.formatMessage({ id: 'agents.create.displayName' })}>
+          <input type="text" value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder="Coder" className={inputClass} />
         </FormField>
-        <FormField label="角色">
+        <FormField label={intl.formatMessage({ id: 'orgchart.detail.role' })}>
           <select value={role} onChange={(e) => setRole(e.target.value)} className={selectClass}>
-            <option value="specialist">專家 (Specialist)</option>
-            <option value="worker">工作者 (Worker)</option>
+            <option value="specialist">{intl.formatMessage({ id: 'agents.role.specialist' })}</option>
+            <option value="worker">{intl.formatMessage({ id: 'agents.role.worker' })}</option>
           </select>
         </FormField>
-        <FormField label="觸發詞" hint="留空則自動產生">
+        <FormField label={intl.formatMessage({ id: 'orgchart.detail.trigger' })} hint={intl.formatMessage({ id: 'agents.create.triggerHint' })}>
           <input type="text" value={trigger} onChange={(e) => setTrigger(e.target.value)} placeholder="@Coder" className={inputClass} />
         </FormField>
+        {error && (
+          <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>
+        )}
         <div className="flex justify-end gap-3 pt-2">
-          <button onClick={onClose} className={buttonSecondary}>取消</button>
+          <button onClick={onClose} className={buttonSecondary}>{intl.formatMessage({ id: 'common.cancel' })}</button>
           <button onClick={handleSubmit} disabled={submitting || !name.trim() || !displayName.trim()} className={buttonPrimary}>
-            {submitting ? '建立中...' : '建立 Agent'}
+            {submitting ? intl.formatMessage({ id: 'common.loading' }) : intl.formatMessage({ id: 'agents.create' })}
           </button>
         </div>
       </div>

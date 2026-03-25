@@ -37,13 +37,18 @@ pub const EVENT_TYPES: &[&str] = &[
 /// Polling state tracker — stores last poll timestamp per model.
 pub struct PollTracker {
     last_poll: HashMap<String, String>,
+    /// Maximum records to fetch per poll. Default: 500.
+    pub poll_limit: Option<usize>,
 }
 
 impl PollTracker {
     pub fn new() -> Self {
-        Self {
-            last_poll: HashMap::new(),
-        }
+        Self { last_poll: HashMap::new(), poll_limit: None }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_limit(limit: usize) -> Self {
+        Self { last_poll: HashMap::new(), poll_limit: Some(limit) }
     }
 
     /// Poll a model for records modified since last poll.
@@ -63,7 +68,9 @@ impl PollTracker {
             });
 
         let domain = vec![json!(["write_date", ">", since])];
-        let result = conn.search_read(model, domain, fields, 100).await?;
+        // Use configurable limit; default 500 to reduce missed events (MW-M1)
+        let poll_limit = self.poll_limit.unwrap_or(500);
+        let result = conn.search_read(model, domain, fields, poll_limit).await?;
 
         // Update last poll timestamp
         self.last_poll.insert(
@@ -86,10 +93,21 @@ pub fn classify_event(model: &str, record: &Value, _previous: Option<&Value>) ->
 
     match model {
         "crm.lead" => {
-            // If create_date == write_date (approximately), it's a new lead
+            // If create_date ≈ write_date (within 2 seconds), it's a new lead (MW-M2)
             let create = record["create_date"].as_str().unwrap_or("");
             let write = record["write_date"].as_str().unwrap_or("");
-            let event_type = if create == write {
+            let is_new = if create.is_empty() || write.is_empty() {
+                false
+            } else {
+                // Parse timestamps; treat as "new" if difference < 2 seconds
+                chrono::NaiveDateTime::parse_from_str(create, "%Y-%m-%d %H:%M:%S")
+                    .and_then(|c| {
+                        chrono::NaiveDateTime::parse_from_str(write, "%Y-%m-%d %H:%M:%S")
+                            .map(|w| (w - c).num_seconds().abs() < 2)
+                    })
+                    .unwrap_or(create == write)
+            };
+            let event_type = if is_new {
                 "odoo.crm.lead_created"
             } else {
                 "odoo.crm.stage_changed"
@@ -166,14 +184,27 @@ pub struct WebhookPayload {
     pub secret: Option<String>,
 }
 
+/// Constant-time byte-slice equality check to prevent timing attacks.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
 /// Validate and convert a webhook payload into an OdooEvent.
 pub fn parse_webhook(payload: &WebhookPayload, expected_secret: &str) -> Result<OdooEvent, String> {
-    // Verify secret if configured
-    if !expected_secret.is_empty() {
-        let provided = payload.secret.as_deref().unwrap_or("");
-        if provided != expected_secret {
-            return Err("Invalid webhook secret".to_string());
-        }
+    // Always verify webhook secret — reject all requests if no secret configured
+    if expected_secret.is_empty() {
+        return Err("Webhook secret not configured — rejecting request".to_string());
+    }
+    let provided = payload.secret.as_deref().unwrap_or("");
+    if !constant_time_eq(provided.as_bytes(), expected_secret.as_bytes()) {
+        return Err("Invalid webhook secret".to_string());
     }
 
     Ok(OdooEvent {
@@ -183,4 +214,67 @@ pub fn parse_webhook(payload: &WebhookPayload, expected_secret: &str) -> Result<
         data: payload.data.clone().unwrap_or(Value::Null),
         timestamp: Utc::now().to_rfc3339(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_webhook_rejects_empty_secret() {
+        let payload = WebhookPayload {
+            event: "test".to_string(),
+            model: None,
+            record_id: None,
+            data: None,
+            secret: None,
+        };
+        assert!(parse_webhook(&payload, "").is_err());
+    }
+
+    #[test]
+    fn parse_webhook_rejects_wrong_secret() {
+        let payload = WebhookPayload {
+            event: "test".to_string(),
+            model: None,
+            record_id: None,
+            data: None,
+            secret: Some("wrong".to_string()),
+        };
+        assert!(parse_webhook(&payload, "correct").is_err());
+    }
+
+    #[test]
+    fn parse_webhook_accepts_correct_secret() {
+        let payload = WebhookPayload {
+            event: "lead_created".to_string(),
+            model: Some("crm.lead".to_string()),
+            record_id: Some(42),
+            data: None,
+            secret: Some("my-secret".to_string()),
+        };
+        let event = parse_webhook(&payload, "my-secret").unwrap();
+        assert_eq!(event.event_type, "lead_created");
+        assert_eq!(event.model, "crm.lead");
+        assert_eq!(event.record_id, 42);
+    }
+
+    #[test]
+    fn constant_time_eq_works() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn poll_tracker_new() {
+        let tracker = PollTracker::new();
+        assert!(tracker.poll_limit.is_none());
+    }
+
+    #[test]
+    fn poll_tracker_with_limit() {
+        let tracker = PollTracker::with_limit(200);
+        assert_eq!(tracker.poll_limit, Some(200));
+    }
 }

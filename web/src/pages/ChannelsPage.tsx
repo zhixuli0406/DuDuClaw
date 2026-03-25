@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type ChannelStatus } from '@/lib/api';
@@ -51,18 +51,23 @@ export function ChannelsPage() {
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout>>(null);
   const showToast = (type: 'success' | 'error', message: string) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     setToast({ type, message });
-    setTimeout(() => setToast(null), 4000);
+    toastTimerRef.current = setTimeout(() => setToast(null), 4000);
   };
+  useEffect(() => {
+    return () => { if (toastTimerRef.current) clearTimeout(toastTimerRef.current); };
+  }, []);
 
   const fetchChannels = useCallback(async () => {
     setLoading(true);
     try {
       const result = await api.channels.status();
       setChannels(result?.channels ?? []);
-    } catch (e) {
-      showToast('error', `無法載入通道: ${e}`);
+    } catch {
+      showToast('error', '無法載入通道，請稍後再試');
     } finally {
       setLoading(false);
     }
@@ -77,8 +82,8 @@ export function ChannelsPage() {
       const result = await api.channels.test(type) as { success: boolean; message: string };
       showToast(result.success ? 'success' : 'error', result.message);
       await fetchChannels();
-    } catch (e) {
-      showToast('error', `測試失敗: ${e}`);
+    } catch {
+      showToast('error', '通道測試失敗，請確認設定');
     }
   };
 

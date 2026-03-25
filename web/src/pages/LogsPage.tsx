@@ -1,7 +1,7 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
-import { useLogsStore } from '@/stores/logs-store';
+import { useLogsStore, selectFilteredEntries } from '@/stores/logs-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import {
   Pause,
@@ -29,7 +29,7 @@ const levelBg: Record<string, string> = {
 export function LogsPage() {
   const intl = useIntl();
   const {
-    filteredEntries,
+    entries,
     paused,
     filter,
     subscribe,
@@ -38,6 +38,7 @@ export function LogsPage() {
     setFilter,
     clear,
   } = useLogsStore();
+  const filteredEntries = useMemo(() => selectFilteredEntries({ entries, filter }), [entries, filter]);
   const { agents, fetchAgents } = useAgentsStore();
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -155,7 +156,7 @@ export function LogsPage() {
           <div className="space-y-px">
             {filteredEntries.map((entry, i) => (
               <div
-                key={`${entry.timestamp}-${i}`}
+                key={(entry as unknown as Record<string, unknown>)._id as number ?? `${entry.timestamp}-${i}`}
                 className={cn(
                   'flex items-start gap-3 rounded px-3 py-1.5 font-mono text-xs',
                   levelBg[entry.level] ?? 'bg-transparent'
