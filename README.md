@@ -43,12 +43,12 @@ DuDuClaw (plumbing)
 | **三通道支援** | Telegram (long polling)、LINE (webhook)、Discord (Gateway WebSocket) |
 | **容器沙箱** | Docker / Apple Container 隔離執行（`--network=none`、tmpfs workspace、read-only rootfs、512MB limit） |
 | **Session 管理** | SQLite 持久化對話歷程，超過 50k token 自動壓縮摘要 |
-| **自主進化引擎** | Micro（每次對話後）→ Meso（per-agent 心跳）→ Macro（每日排程）三層反思，統一由 heartbeat scheduler 驅動 |
+| **自主進化引擎** | Micro → Meso → Macro 三層反思 + 5 種外部因素介入（使用者反饋、安全事件、通道指標、業務數據、Peer 信號） |
 | **安全防護** | SOUL.md 漂移檢測（SHA-256）+ prompt injection 掃描（6 類規則）+ JSONL 審計日誌 + per-agent 密鑰隔離 |
 | **行為契約** | `CONTRACT.toml` 定義 `must_not` / `must_always` 邊界 + `duduclaw test` 紅隊測試（9 項內建場景） |
 | **Odoo ERP 整合** | 中間層 `duduclaw-odoo` 支援 CE/EE — 15 個 MCP 工具（CRM/銷售/庫存/會計/通用搜尋報表）+ 事件橋接 |
 | **Skill 市場** | GitHub Search API 即時索引真實 skill repo + 24h 本地快取 + Dashboard 市場頁面 |
-| **多帳號輪替** | Python SDK 管理多個 Claude API key，支援 4 種策略 + 預算追蹤 + 故障轉移 |
+| **雙模式帳號輪替** | OAuth 訂閱帳號 + API Key 混合輪替 — 4 種策略（LeastCost 優先 OAuth 零成本）、健康追蹤、Rate limit 冷卻、預算強制 |
 | **Claude Code 原生目錄** | Agent 目錄包含 `.claude/`、`SOUL.md`、`CLAUDE.md`、`.mcp.json`，直接相容 Claude Code |
 | **Web Dashboard** | React + TypeScript + Tailwind CSS，溫暖 amber 色系，支援深淺色切換，含組織架構圖、Skill 市場、安全審計頁 |
 
@@ -210,6 +210,9 @@ cd web && npx tsc --noEmit
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — 完整系統架構設計
 - [CLAUDE.md](CLAUDE.md) — AI 協作設計上下文與原則
+- [docs/account-rotation-guide.md](docs/account-rotation-guide.md) — 帳號輪替使用教學（OAuth + API Key）
+- [docs/odoo-integration-plan.md](docs/odoo-integration-plan.md) — Odoo ERP 整合規劃
+- [docs/claw-ecosystem-report.md](docs/claw-ecosystem-report.md) — Claw 生態系統研究報告
 
 ---
 
