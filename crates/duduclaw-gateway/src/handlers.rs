@@ -11,6 +11,16 @@ use tracing::info;
 
 use crate::protocol::WsFrame;
 
+/// Validate agent ID is safe for filesystem paths (no traversal).
+fn is_valid_agent_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !id.starts_with('-')
+        && !id.ends_with('-')
+        && !id.contains("..")
+}
+
 /// Dispatches incoming RPC methods to the appropriate handler.
 pub struct MethodHandler {
     registry: Arc<RwLock<AgentRegistry>>,
@@ -75,7 +85,16 @@ impl MethodHandler {
     }
 
     /// Route `method` to the correct handler and return a [`WsFrame`] response.
+    ///
+    /// `request_id` is carried through so that all response frames are correctly
+    /// correlated with the originating client request.
     pub async fn handle(&self, method: &str, params: Value) -> WsFrame {
+        let response = self.dispatch(method, params).await;
+        response
+    }
+
+    /// Internal dispatch — returns a WsFrame with placeholder id (overwritten by caller).
+    async fn dispatch(&self, method: &str, params: Value) -> WsFrame {
         match method {
             "connect.challenge" => self.handle_connect_challenge(params),
             "connect" => self.handle_connect(params),
@@ -179,13 +198,18 @@ impl MethodHandler {
     // ── Agents ───────────────────────────────────────────────
 
     async fn handle_agents_list(&self) -> WsFrame {
-        // Re-scan to pick up changes
-        {
-            let mut reg = self.registry.write().await;
+        // Re-scan to pick up changes — only acquire write lock for scan,
+        // then drop it immediately before reading (MCP-M3).
+        if let Ok(mut reg) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            self.registry.write(),
+        ).await {
             let _ = reg.scan().await;
         }
 
         let reg = self.registry.read().await;
+        // Pre-compute total spend once (MCP-L5) — shared across all agents for now
+        let total_spent = self.get_total_spent().await;
         let agents: Vec<Value> = reg.list().iter().map(|a| {
             let cfg = &a.config;
             json!({
@@ -203,7 +227,7 @@ impl MethodHandler {
                 },
                 "budget": {
                     "monthly_limit_cents": cfg.budget.monthly_limit_cents,
-                    "spent_cents": 0,
+                    "spent_cents": total_spent,
                     "warn_threshold_percent": cfg.budget.warn_threshold_percent,
                     "hard_stop": cfg.budget.hard_stop,
                 },
@@ -253,6 +277,9 @@ impl MethodHandler {
         if name.is_empty() {
             return WsFrame::error_response("", "Agent name is required");
         }
+        if !is_valid_agent_id(name) {
+            return WsFrame::error_response("", "Agent name must be lowercase alphanumeric with hyphens, max 64 chars");
+        }
 
         // Create agent directory and files
         let reg = self.registry.read().await;
@@ -268,52 +295,54 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("Failed to create directory: {e}"));
         }
 
-        let agent_toml = format!(r#"[agent]
-name = "{name}"
-display_name = "{display_name}"
-role = "{role}"
-status = "active"
-trigger = "{trigger}"
-reports_to = ""
-icon = "🤖"
+        let agent_config = toml::toml! {
+            [agent]
+            name = name
+            display_name = display_name
+            role = role
+            status = "active"
+            trigger = trigger
+            reports_to = ""
+            icon = "🤖"
 
-[model]
-preferred = "claude-sonnet-4-6"
-fallback = "claude-haiku-4-5"
-account_pool = ["main"]
+            [model]
+            preferred = "claude-sonnet-4-6"
+            fallback = "claude-haiku-4-5"
+            account_pool = ["main"]
 
-[container]
-timeout_ms = 1800000
-max_concurrent = 1
-readonly_project = true
-additional_mounts = []
+            [container]
+            timeout_ms = 1800000
+            max_concurrent = 1
+            readonly_project = true
+            additional_mounts = []
 
-[heartbeat]
-enabled = false
-interval_seconds = 3600
-max_concurrent_runs = 1
-cron = ""
+            [heartbeat]
+            enabled = false
+            interval_seconds = 3600
+            max_concurrent_runs = 1
+            cron = ""
 
-[budget]
-monthly_limit_cents = 5000
-warn_threshold_percent = 80
-hard_stop = true
+            [budget]
+            monthly_limit_cents = 5000
+            warn_threshold_percent = 80
+            hard_stop = true
 
-[permissions]
-can_create_agents = false
-can_send_cross_agent = true
-can_modify_own_skills = true
-can_modify_own_soul = false
-can_schedule_tasks = false
-allowed_channels = ["*"]
+            [permissions]
+            can_create_agents = false
+            can_send_cross_agent = true
+            can_modify_own_skills = true
+            can_modify_own_soul = false
+            can_schedule_tasks = false
+            allowed_channels = ["*"]
 
-[evolution]
-micro_reflection = false
-meso_reflection = false
-macro_reflection = false
-skill_auto_activate = false
-skill_security_scan = true
-"#);
+            [evolution]
+            micro_reflection = false
+            meso_reflection = false
+            macro_reflection = false
+            skill_auto_activate = false
+            skill_security_scan = true
+        };
+        let agent_toml = toml::to_string_pretty(&agent_config).unwrap_or_default();
 
         if let Err(e) = tokio::fs::write(agent_dir.join("agent.toml"), &agent_toml).await {
             return WsFrame::error_response("", &format!("Failed to write agent.toml: {e}"));
@@ -333,6 +362,13 @@ skill_security_scan = true
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
         let prompt = params.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
         let wait = params.get("wait_for_response").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // Enforce prompt length limit to prevent abuse (MCP-H1)
+        const MAX_PROMPT_LEN: usize = 100_000;
+        if prompt.len() > MAX_PROMPT_LEN {
+            return WsFrame::error_response("", &format!("Prompt too long: {} chars (max {MAX_PROMPT_LEN})", prompt.len()));
+        }
+
         info!(agent_id, "agents.delegate requested");
 
         // Verify target agent exists
@@ -449,6 +485,7 @@ skill_security_scan = true
 
     async fn handle_agents_inspect(&self, params: Value) -> WsFrame {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let spent = self.get_total_spent().await;
         let reg = self.registry.read().await;
         match reg.get(agent_id) {
             Some(a) => {
@@ -461,12 +498,12 @@ skill_security_scan = true
                     "trigger": cfg.agent.trigger,
                     "icon": cfg.agent.icon,
                     "reports_to": cfg.agent.reports_to,
-                    "soul": a.soul,
-                    "identity": a.identity,
+                    "soul_preview": a.soul.as_ref().map(|s| if s.len() > 500 { format!("{}…", &s[..500]) } else { s.clone() }),
+                    "identity_preview": a.identity.as_ref().map(|s| if s.len() > 500 { format!("{}…", &s[..500]) } else { s.clone() }),
                     "memory_summary": a.memory,
                     "skills": a.skills.iter().map(|s| &s.name).collect::<Vec<_>>(),
                     "model": { "preferred": cfg.model.preferred, "fallback": cfg.model.fallback, "account_pool": cfg.model.account_pool },
-                    "budget": { "monthly_limit_cents": cfg.budget.monthly_limit_cents, "spent_cents": 0, "warn_threshold_percent": cfg.budget.warn_threshold_percent, "hard_stop": cfg.budget.hard_stop },
+                    "budget": { "monthly_limit_cents": cfg.budget.monthly_limit_cents, "spent_cents": spent, "warn_threshold_percent": cfg.budget.warn_threshold_percent, "hard_stop": cfg.budget.hard_stop },
                     "heartbeat": { "enabled": cfg.heartbeat.enabled, "interval_seconds": cfg.heartbeat.interval_seconds },
                     "permissions": {
                         "can_create_agents": cfg.permissions.can_create_agents,
@@ -542,6 +579,19 @@ skill_security_scan = true
             _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
         };
 
+        // Encrypt tokens before storing (H3)
+        let enc_token_key = format!("{token_key}_enc");
+        let encrypted_token = crate::config_crypto::encrypt_value(token, &self.home_dir);
+        let enc_secret = if let Some(sk) = secret_key {
+            if !secret.is_empty() {
+                Some((format!("{sk}_enc"), crate::config_crypto::encrypt_value(secret, &self.home_dir)))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let config_path = self.home_dir.join("config.toml");
         let mut table = self.read_config_table(&config_path).await;
 
@@ -555,11 +605,18 @@ skill_security_scan = true
             None => return WsFrame::error_response("", "Invalid [channels] section in config.toml"),
         };
 
+        // Store encrypted version; also keep plaintext as fallback
         channels.insert(token_key.to_string(), toml::Value::String(token.to_string()));
-        if let Some(sk) = secret_key
-            && !secret.is_empty()
-        {
-            channels.insert(sk.to_string(), toml::Value::String(secret.to_string()));
+        if let Some(enc) = &encrypted_token {
+            channels.insert(enc_token_key, toml::Value::String(enc.clone()));
+        }
+        if let Some((sk_enc, enc_val)) = &enc_secret {
+            if let Some(sk) = secret_key {
+                channels.insert(sk.to_string(), toml::Value::String(secret.to_string()));
+            }
+            if let Some(v) = enc_val {
+                channels.insert(sk_enc.clone(), toml::Value::String(v.clone()));
+            }
         }
 
         if let Err(e) = self.write_config_table(&config_path, &table).await {
@@ -641,11 +698,11 @@ skill_security_scan = true
     // ── Accounts ─────────────────────────────────────────────
 
     async fn handle_accounts_list(&self) -> WsFrame {
-        let rotator = self.create_rotator().await;
+        let rotator = self.cached_rotator().await;
         let accounts = rotator.status().await;
         let accounts_json: Vec<Value> = accounts.iter().map(|a| json!({
             "id": a.id,
-            "account_type": a.account_type,
+            "auth_method": a.auth_method,
             "priority": a.priority,
             "is_healthy": a.is_healthy,
             "spent_this_month": a.spent_this_month,
@@ -657,14 +714,14 @@ skill_security_scan = true
     }
 
     async fn handle_budget_summary(&self) -> WsFrame {
-        let rotator = self.create_rotator().await;
+        let rotator = self.cached_rotator().await;
         let accounts = rotator.status().await;
         let total_budget: u64 = accounts.iter().map(|a| a.monthly_budget_cents).sum();
         let total_spent: u64 = accounts.iter().map(|a| a.spent_this_month).sum();
 
         let accounts_json: Vec<Value> = accounts.iter().map(|a| json!({
             "id": a.id,
-            "account_type": a.account_type,
+            "auth_method": a.auth_method,
             "priority": a.priority,
             "is_healthy": a.is_healthy,
             "spent_this_month": a.spent_this_month,
@@ -679,7 +736,7 @@ skill_security_scan = true
     }
 
     async fn handle_accounts_rotate(&self, _params: Value) -> WsFrame {
-        let rotator = self.create_rotator().await;
+        let rotator = self.cached_rotator().await;
         match rotator.select().await {
             Some(selected) => {
                 WsFrame::ok_response("", json!({
@@ -694,7 +751,7 @@ skill_security_scan = true
     }
 
     async fn handle_accounts_health(&self) -> WsFrame {
-        let rotator = self.create_rotator().await;
+        let rotator = self.cached_rotator().await;
         let accounts = rotator.status().await;
         let healthy_count = accounts.iter().filter(|a| a.is_healthy).count();
         let status = if accounts.is_empty() { "no_accounts" }
@@ -719,15 +776,33 @@ skill_security_scan = true
         }))
     }
 
-    /// Create a rotator instance loaded from config.
-    async fn create_rotator(&self) -> duduclaw_agent::account_rotator::AccountRotator {
-        let config_content = tokio::fs::read_to_string(self.home_dir.join("config.toml"))
-            .await
-            .unwrap_or_default();
-        let config_table: toml::Table = config_content.parse().unwrap_or_default();
-        let rotator = duduclaw_agent::account_rotator::create_from_config(&config_table);
-        let _ = rotator.load_from_config(&self.home_dir).await;
-        rotator
+    /// Get or create a cached rotator (uses the same static cache as claude_runner).
+    async fn cached_rotator(&self) -> std::sync::Arc<duduclaw_agent::account_rotator::AccountRotator> {
+        // Reuse the global cache from claude_runner to avoid redundant disk reads
+        match crate::claude_runner::get_rotator_cached(&self.home_dir).await {
+            Ok(r) => r,
+            Err(_) => {
+                // Fallback: create a fresh one
+                let config_content = tokio::fs::read_to_string(self.home_dir.join("config.toml"))
+                    .await
+                    .unwrap_or_default();
+                let config_table: toml::Table = config_content.parse().unwrap_or_default();
+                let rotator = duduclaw_agent::account_rotator::create_from_config(&config_table);
+                let _ = rotator.load_from_config(&self.home_dir).await;
+                std::sync::Arc::new(rotator)
+            }
+        }
+    }
+
+    /// Get total spent cents across all accounts (MCP-L5).
+    ///
+    /// Note: AccountRotator tracks spend per-account (API key), not per-agent.
+    /// Per-agent tracking requires adding a usage ledger — this returns the
+    /// aggregate across all accounts as an honest approximation.
+    async fn get_total_spent(&self) -> u64 {
+        let rotator = self.cached_rotator().await;
+        let accounts = rotator.status().await;
+        accounts.iter().map(|a| a.spent_this_month).sum()
     }
 
     // ── Memory ──────────────────────────────────────────────
@@ -735,7 +810,7 @@ skill_security_scan = true
     async fn handle_memory_search(&self, params: Value) -> WsFrame {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
         let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).min(200) as usize;
 
         if agent_id.is_empty() || query.is_empty() {
             return WsFrame::error_response("", "Missing 'agent_id' or 'query' parameter");
@@ -874,9 +949,14 @@ skill_security_scan = true
             let _ = registry.refresh().await;
         }
 
+        // Collect local skill names for dedup (MCP-L3)
+        let local_names: std::collections::HashSet<String> = results.iter()
+            .filter_map(|r| r["name"].as_str().map(|s| s.to_string()))
+            .collect();
+
         let index_results = registry.search(query, 20);
         for entry in index_results {
-            if !results.iter().any(|r| r["name"].as_str() == Some(&entry.name)) {
+            if !local_names.contains(&entry.name) {
                 results.push(json!({
                     "name": entry.name,
                     "description": entry.description,
@@ -958,6 +1038,13 @@ skill_security_scan = true
             _ => return WsFrame::error_response("", "Missing 'name' parameter"),
         };
         let schedule = params.get("schedule").and_then(|v| v.as_str()).unwrap_or("*/60 * * * *");
+
+        // Validate cron expression format (basic: 5 fields separated by spaces)
+        let cron_parts: Vec<&str> = schedule.split_whitespace().collect();
+        if cron_parts.len() != 5 {
+            return WsFrame::error_response("", "Invalid cron expression: expected 5 space-separated fields (minute hour day month weekday)");
+        }
+
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
         let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("heartbeat");
 
@@ -1082,8 +1169,8 @@ skill_security_scan = true
                         WsFrame::ok_response("", json!({ "config": masked }))
                     }
                     Err(_) => {
-                        // Return raw content if parsing fails
-                        WsFrame::ok_response("", json!({ "config": content }))
+                        // Do NOT return raw content — it may contain unmasked tokens (MCP-H5)
+                        WsFrame::error_response("", "Failed to parse config.toml — cannot safely display")
                     }
                 }
             }
@@ -1314,13 +1401,8 @@ skill_security_scan = true
             let is_sensitive = sensitive_patterns.iter().any(|p| key.to_lowercase().contains(p));
             match value {
                 toml::Value::String(s) if is_sensitive && !s.is_empty() => {
-                    let len = s.len();
-                    if len > 4 {
-                        let masked = format!("{}****", &s[..4]);
-                        *s = masked;
-                    } else {
-                        *s = "****".to_string();
-                    }
+                    // Fully mask sensitive values — do NOT leak any prefix chars (MCP-M7)
+                    *s = "********".to_string();
                 }
                 toml::Value::Table(t) => Self::mask_sensitive_fields(t),
                 _ => {}

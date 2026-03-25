@@ -60,6 +60,41 @@ pub async fn call_claude_for_agent(
     call_with_rotation(home_dir, prompt, &model, &system_prompt).await
 }
 
+/// Cached AccountRotator — avoids rebuilding on every call (BE-H4).
+static ROTATOR_CACHE: std::sync::OnceLock<tokio::sync::RwLock<Option<(std::time::Instant, std::sync::Arc<duduclaw_agent::account_rotator::AccountRotator>)>>> = std::sync::OnceLock::new();
+
+/// Get or create a cached AccountRotator (refreshes every 5 minutes).
+/// Public accessor for the cached rotator — used by handlers.rs too.
+pub async fn get_rotator_cached(home_dir: &Path) -> Result<std::sync::Arc<duduclaw_agent::account_rotator::AccountRotator>, String> {
+    get_rotator(home_dir).await
+}
+
+async fn get_rotator(home_dir: &Path) -> Result<std::sync::Arc<duduclaw_agent::account_rotator::AccountRotator>, String> {
+    let cache = ROTATOR_CACHE.get_or_init(|| tokio::sync::RwLock::new(None));
+    let ttl = std::time::Duration::from_secs(300); // 5 min cache
+
+    // Check if cached version is still valid
+    {
+        let guard = cache.read().await;
+        if let Some((created, rotator)) = guard.as_ref() {
+            if created.elapsed() < ttl {
+                return Ok(rotator.clone());
+            }
+        }
+    }
+
+    // Rebuild
+    let config_content = tokio::fs::read_to_string(home_dir.join("config.toml"))
+        .await
+        .unwrap_or_default();
+    let config_table: toml::Table = config_content.parse().unwrap_or_default();
+    let rotator = duduclaw_agent::account_rotator::create_from_config(&config_table);
+    rotator.load_from_config(home_dir).await?;
+    let arc = std::sync::Arc::new(rotator);
+    *cache.write().await = Some((std::time::Instant::now(), arc.clone()));
+    Ok(arc)
+}
+
 /// Call Claude CLI with account rotation — tries next account on failure.
 async fn call_with_rotation(
     home_dir: &Path,
@@ -67,13 +102,7 @@ async fn call_with_rotation(
     model: &str,
     system_prompt: &str,
 ) -> Result<String, String> {
-    let config_content = tokio::fs::read_to_string(home_dir.join("config.toml"))
-        .await
-        .unwrap_or_default();
-    let config_table: toml::Table = config_content.parse().unwrap_or_default();
-
-    let rotator = duduclaw_agent::account_rotator::create_from_config(&config_table);
-    rotator.load_from_config(home_dir).await?;
+    let rotator = get_rotator(home_dir).await?;
 
     let max_attempts = rotator.count().await.max(1);
     let mut last_error = String::new();
@@ -84,12 +113,16 @@ async fn call_with_rotation(
             None => break,
         };
 
-        info!(account = %selected.id, attempt, "Trying account");
+        info!(account = %selected.id, method = ?selected.auth_method, attempt, "Trying account");
 
-        match call_claude(prompt, model, system_prompt, &selected.api_key).await {
+        match call_claude_with_env(prompt, model, system_prompt, &selected.env_vars).await {
             Ok(response) => {
-                // Estimate cost: ~1 cent per 1000 chars (rough heuristic)
-                let cost = ((prompt.len() + response.len()) / 1000).max(1) as u64;
+                // OAuth accounts: no per-token cost. API key: rough estimate
+                let cost = if selected.auth_method == duduclaw_agent::account_rotator::AuthMethod::OAuth {
+                    0
+                } else {
+                    ((prompt.len() + response.len()) / 1000).max(1) as u64
+                };
                 rotator.on_success(&selected.id, cost).await;
                 return Ok(response);
             }
@@ -122,56 +155,70 @@ pub async fn get_api_key_from_home(home_dir: &Path) -> String {
 
 /// Get the API key from env var or config.toml.
 async fn get_api_key(home_dir: &Path) -> String {
+    // Environment variable takes precedence
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         if !key.is_empty() {
             return key;
         }
     }
+    // Use shared encrypted config reader (tries _enc first, falls back to plaintext)
+    crate::config_crypto::read_encrypted_config_field(home_dir, "api", "anthropic_api_key")
+        .await
+        .unwrap_or_default()
+}
 
-    let config_path = home_dir.join("config.toml");
-    if let Ok(content) = tokio::fs::read_to_string(&config_path).await {
-        if let Ok(table) = content.parse::<toml::Value>() {
-            // Try encrypted key first
-            if let Some(enc) = table
-                .get("api")
-                .and_then(|v| v.get("anthropic_api_key_enc"))
-                .and_then(|v| v.as_str())
-            {
-                if !enc.is_empty() {
-                    // Attempt decryption via keyfile
-                    let keyfile = home_dir.join(".keyfile");
-                    if let Ok(bytes) = std::fs::read(&keyfile) {
-                        if bytes.len() == 32 {
-                            let mut key = [0u8; 32];
-                            key.copy_from_slice(&bytes);
-                            if let Ok(engine) = duduclaw_security::crypto::CryptoEngine::new(&key)
-                            {
-                                if let Ok(plain) = engine.decrypt_string(enc) {
-                                    if !plain.is_empty() {
-                                        return plain;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+/// Call claude CLI with custom env vars (supports both OAuth and API key).
+async fn call_claude_with_env(
+    prompt: &str,
+    model: &str,
+    system_prompt: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Result<String, String> {
+    let claude = which_claude().ok_or("Claude CLI not found")?;
+    let mut cmd = tokio::process::Command::new(&claude);
+    cmd.args(["-p", prompt, "--model", model, "--output-format", "text"]);
+
+    if !system_prompt.is_empty() {
+        match tempfile::NamedTempFile::new() {
+            Ok(mut f) => {
+                use std::io::Write;
+                let _ = f.write_all(system_prompt.as_bytes());
+                let path = f.into_temp_path();
+                cmd.args(["--system-prompt-file", &path.to_string_lossy()]);
+                // path kept alive until cmd completes
             }
-
-            // Fallback: plaintext key (legacy configs only — warn about insecure storage)
-            if let Some(key) = table
-                .get("api")
-                .and_then(|v| v.get("anthropic_api_key"))
-                .and_then(|v| v.as_str())
-            {
-                if !key.is_empty() {
-                    tracing::warn!("API key loaded from plaintext config — run `duduclaw onboard` to encrypt");
-                    return key.to_string();
-                }
+            Err(_) => {
+                cmd.args(["--system-prompt", system_prompt]);
             }
         }
     }
 
-    String::new()
+    // Set env vars from the selected account
+    for (key, value) in env_vars {
+        if value.is_empty() {
+            cmd.env_remove(key);
+        } else {
+            cmd.env(key, value);
+        }
+    }
+
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    match tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output()).await {
+        Ok(Ok(out)) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if text.is_empty() { Ok("(empty response)".to_string()) } else { Ok(text) }
+        }
+        Ok(Ok(out)) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            Err(format!("claude error: {}", stderr.chars().take(200).collect::<String>()))
+        }
+        Ok(Err(e)) => Err(format!("spawn error: {e}")),
+        Err(_) => Err("timeout after 120s".to_string()),
+    }
 }
 
 /// Call the `claude` CLI binary with a prompt and return the response text.
@@ -185,9 +232,26 @@ async fn call_claude(
 
     let mut cmd = tokio::process::Command::new(&claude);
     cmd.args(["-p", prompt, "--model", model, "--output-format", "text"]);
-    if !system_prompt.is_empty() {
-        cmd.args(["--system-prompt", system_prompt]);
-    }
+
+    // Pass system prompt via temp file to avoid /proc exposure (BE-C1)
+    let _prompt_guard: Option<tempfile::TempPath> = if !system_prompt.is_empty() {
+        match tempfile::NamedTempFile::new() {
+            Ok(mut f) => {
+                use std::io::Write;
+                let _ = f.write_all(system_prompt.as_bytes());
+                let path = f.into_temp_path();
+                cmd.args(["--system-prompt-file", &path.to_string_lossy()]);
+                Some(path)
+            }
+            Err(_) => {
+                cmd.args(["--system-prompt", system_prompt]);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     cmd.env("ANTHROPIC_API_KEY", api_key);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
@@ -215,27 +279,7 @@ async fn call_claude(
     }
 }
 
-/// Find the `claude` CLI binary on the system.
+/// Find the `claude` CLI binary — delegates to shared impl in duduclaw-core (BE-L1).
 fn which_claude() -> Option<String> {
-    if let Ok(out) = std::process::Command::new("which").arg("claude").output() {
-        if out.status.success() {
-            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(path);
-            }
-        }
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let candidates = [
-        format!("{home}/.npm-global/bin/claude"),
-        "/usr/local/bin/claude".to_string(),
-        format!("{home}/.claude/bin/claude"),
-        format!("{home}/.local/bin/claude"),
-    ];
-    for p in &candidates {
-        if std::path::Path::new(p).exists() {
-            return Some(p.clone());
-        }
-    }
-    None
+    duduclaw_core::which_claude()
 }

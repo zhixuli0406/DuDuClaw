@@ -15,3 +15,5 @@ chrono = { workspace = true }
 cron = { workspace = true }
 uuid = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
+dirs = "6"
+serde_yaml = "0.9"
