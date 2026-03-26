@@ -164,6 +164,11 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
             Some(reply)
         }
         Err(e) => {
+            let log_line = format!("[{}] claude CLI error: {e}\n", chrono::Utc::now());
+            let _ = tokio::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open(ctx.home_dir.join("debug.log")).await
+                .map(|mut f| { use tokio::io::AsyncWriteExt; tokio::spawn(async move { let _ = f.write_all(log_line.as_bytes()).await; }); });
             warn!("claude CLI unavailable: {e}");
             None
         }
@@ -178,6 +183,11 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
                 Some(reply)
             }
             Err(e) => {
+                let log_line = format!("[{}] python SDK error: {e}\n", chrono::Utc::now());
+                let _ = tokio::fs::OpenOptions::new()
+                    .create(true).append(true)
+                    .open(ctx.home_dir.join("debug.log")).await
+                    .map(|mut f| { use tokio::io::AsyncWriteExt; tokio::spawn(async move { let _ = f.write_all(log_line.as_bytes()).await; }); });
                 warn!("Python SDK unavailable: {e}");
                 None
             }
