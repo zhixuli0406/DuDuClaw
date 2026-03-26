@@ -312,12 +312,13 @@ async fn call_claude_cli(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
+    let timeout_secs = get_cli_timeout_secs(home_dir).await;
     let output = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
+        std::time::Duration::from_secs(timeout_secs),
         cmd.output(),
     )
     .await
-    .map_err(|_| "claude CLI timeout (120s)".to_string())?
+    .map_err(|_| format!("claude CLI timeout ({timeout_secs}s)"))?
     .map_err(|e| format!("claude CLI spawn error: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -488,6 +489,26 @@ fn build_system_prompt(agent: Option<&duduclaw_agent::registry::LoadedAgent>) ->
     } else {
         parts.join("\n\n---\n\n")
     }
+}
+
+/// Read the CLI timeout from config.toml [gateway].cli_timeout_secs, default 300.
+async fn get_cli_timeout_secs(home_dir: &Path) -> u64 {
+    let config_path = home_dir.join("config.toml");
+    let content = match tokio::fs::read_to_string(&config_path).await {
+        Ok(c) => c,
+        Err(_) => return 300,
+    };
+    let table: toml::Table = match content.parse() {
+        Ok(t) => t,
+        Err(_) => return 300,
+    };
+    table
+        .get("gateway")
+        .and_then(|g| g.as_table())
+        .and_then(|g| g.get("cli_timeout_secs"))
+        .and_then(|v| v.as_integer())
+        .map(|v| v.max(30) as u64)
+        .unwrap_or(300)
 }
 
 /// Read the default_agent from config.toml [general] section.
