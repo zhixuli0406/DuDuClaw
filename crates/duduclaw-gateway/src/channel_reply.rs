@@ -295,6 +295,8 @@ async fn call_claude_cli(
     };
 
     cmd.env("ANTHROPIC_API_KEY", &api_key);
+    // Prevent "nested session" error when gateway was launched from a Claude Code session
+    cmd.env_remove("CLAUDECODE");
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -312,14 +314,18 @@ async fn call_claude_cli(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
+        let detail = format!(
             "claude CLI exit {}: {}",
             output.status.code().unwrap_or(-1),
-            stderr.chars().take(200).collect::<String>()
-        ));
+            stderr.chars().take(500).collect::<String>()
+        );
+        warn!("{detail}");
+        return Err(detail);
     }
 
     if stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!("Empty stdout from claude CLI, stderr: {}", stderr.chars().take(500).collect::<String>());
         return Err("Empty response from claude CLI".to_string());
     }
 

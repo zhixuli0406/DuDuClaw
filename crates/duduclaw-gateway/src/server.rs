@@ -82,6 +82,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         bg_handles.push(h);
     }
     let line_router = crate::line::start_line_bot(&home_dir, reply_ctx.clone()).await;
+    let reply_ctx_for_debug = reply_ctx.clone();
     if let Some(h) = crate::discord::start_discord_bot(&home_dir, reply_ctx).await {
         bg_handles.push(h);
     }
@@ -116,9 +117,21 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         tx,
     });
 
+    // Debug chat endpoint — test AI reply pipeline directly via HTTP
+    let debug_ctx = reply_ctx_for_debug;
+    let debug_chat = axum::routing::post(move |body: String| {
+        let ctx = debug_ctx.clone();
+        async move {
+            let msg = if body.is_empty() { "hello".to_string() } else { body };
+            let reply = crate::channel_reply::build_reply(&msg, &ctx).await;
+            reply
+        }
+    });
+
     let mut app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health_handler))
+        .route("/debug/chat", debug_chat)
         .with_state(state);
 
     // Mount LINE webhook endpoint

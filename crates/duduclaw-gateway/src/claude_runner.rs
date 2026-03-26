@@ -193,6 +193,9 @@ async fn call_claude_with_env(
         }
     }
 
+    // Prevent "nested session" error when gateway was launched from a Claude Code session
+    cmd.env_remove("CLAUDECODE");
+
     // Set env vars from the selected account
     for (key, value) in env_vars {
         if value.is_empty() {
@@ -253,6 +256,8 @@ async fn call_claude(
     };
 
     cmd.env("ANTHROPIC_API_KEY", api_key);
+    // Prevent "nested session" error when gateway was launched from a Claude Code session
+    cmd.env_remove("CLAUDECODE");
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
