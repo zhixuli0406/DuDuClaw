@@ -167,6 +167,9 @@ async fn get_api_key(home_dir: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Default CLI timeout in seconds (5 minutes).
+const DEFAULT_CLI_TIMEOUT_SECS: u64 = 300;
+
 /// Call claude CLI with custom env vars (supports both OAuth and API key).
 async fn call_claude_with_env(
     prompt: &str,
@@ -210,7 +213,7 @@ async fn call_claude_with_env(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
-    match tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output()).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(DEFAULT_CLI_TIMEOUT_SECS), cmd.output()).await {
         Ok(Ok(out)) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if text.is_empty() { Ok("(empty response)".to_string()) } else { Ok(text) }
@@ -263,7 +266,7 @@ async fn call_claude(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
-    match tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output()).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(DEFAULT_CLI_TIMEOUT_SECS), cmd.output()).await {
         Ok(Ok(out)) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if text.is_empty() {
