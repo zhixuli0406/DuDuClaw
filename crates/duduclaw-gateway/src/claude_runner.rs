@@ -167,80 +167,102 @@ async fn get_api_key(home_dir: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Default CLI timeout in seconds (5 minutes).
-const DEFAULT_CLI_TIMEOUT_SECS: u64 = 300;
+/// Default idle timeout in seconds — resets every time new data arrives.
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 
-/// Call claude CLI with custom env vars (supports both OAuth and API key).
-async fn call_claude_with_env(
-    prompt: &str,
-    model: &str,
-    system_prompt: &str,
-    env_vars: &std::collections::HashMap<String, String>,
+/// Spawn a `claude` CLI process with streaming output and read the result.
+///
+/// Uses `--output-format stream-json --verbose` and an idle timeout that resets
+/// on every received line. This means long-running responses (tool use, multi-turn)
+/// will never be killed as long as the CLI keeps producing events.
+async fn call_claude_streaming(
+    cmd: &mut tokio::process::Command,
 ) -> Result<String, String> {
-    let claude = which_claude().ok_or("Claude CLI not found")?;
-    let mut cmd = tokio::process::Command::new(&claude);
-    cmd.args(["-p", prompt, "--model", model, "--output-format", "text"]);
-
-    if !system_prompt.is_empty() {
-        match tempfile::NamedTempFile::new() {
-            Ok(mut f) => {
-                use std::io::Write;
-                let _ = f.write_all(system_prompt.as_bytes());
-                let path = f.into_temp_path();
-                cmd.args(["--system-prompt-file", &path.to_string_lossy()]);
-                // path kept alive until cmd completes
-            }
-            Err(_) => {
-                cmd.args(["--system-prompt", system_prompt]);
-            }
-        }
-    }
-
-    // Prevent "nested session" error when gateway was launched from a Claude Code session
-    cmd.env_remove("CLAUDECODE");
-
-    // Set env vars from the selected account
-    for (key, value) in env_vars {
-        if value.is_empty() {
-            cmd.env_remove(key);
-        } else {
-            cmd.env(key, value);
-        }
-    }
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
-    match tokio::time::timeout(std::time::Duration::from_secs(DEFAULT_CLI_TIMEOUT_SECS), cmd.output()).await {
-        Ok(Ok(out)) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if text.is_empty() { Ok("(empty response)".to_string()) } else { Ok(text) }
+    let mut child = cmd.spawn().map_err(|e| format!("claude CLI spawn error: {e}"))?;
+    let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
+    let mut reader = BufReader::new(stdout).lines();
+
+    let idle_timeout = std::time::Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS);
+    let mut result_text = String::new();
+
+    loop {
+        match tokio::time::timeout(idle_timeout, reader.next_line()).await {
+            Err(_) => {
+                let _ = child.kill().await;
+                if result_text.is_empty() {
+                    return Err(format!("claude CLI idle timeout ({DEFAULT_IDLE_TIMEOUT_SECS}s, no output)"));
+                }
+                warn!("claude CLI idle timeout — returning partial result ({} chars)", result_text.len());
+                break;
+            }
+            Ok(Ok(None)) => break, // stream ended
+            Ok(Err(e)) => {
+                let _ = child.kill().await;
+                return Err(format!("claude CLI read error: {e}"));
+            }
+            Ok(Ok(Some(line))) => {
+                if line.trim().is_empty() { continue; }
+                if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+                    match event.get("type").and_then(|t| t.as_str()) {
+                        Some("result") => {
+                            if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
+                                result_text = text.to_string();
+                            }
+                        }
+                        Some("assistant") => {
+                            if let Some(content) = event.pointer("/message/content").and_then(|c| c.as_array()) {
+                                for block in content {
+                                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                            result_text = text.to_string();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
-        Ok(Ok(out)) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            Err(format!("claude error: {}", stderr.chars().take(200).collect::<String>()))
-        }
-        Ok(Err(e)) => Err(format!("spawn error: {e}")),
-        Err(_) => Err("timeout after 120s".to_string()),
     }
+
+    let status = child.wait().await.map_err(|e| format!("wait error: {e}"))?;
+    if !status.success() && result_text.is_empty() {
+        return Err(format!("claude CLI exit {}", status.code().unwrap_or(-1)));
+    }
+
+    let result_text = result_text.trim().to_string();
+    if result_text.is_empty() {
+        return Err("Empty response from claude CLI".to_string());
+    }
+
+    Ok(result_text)
 }
 
-/// Call the `claude` CLI binary with a prompt and return the response text.
-async fn call_claude(
+/// Prepare a `claude` CLI command with common args and env vars.
+fn prepare_claude_cmd(
+    claude_path: &str,
     prompt: &str,
     model: &str,
     system_prompt: &str,
-    api_key: &str,
-) -> Result<String, String> {
-    let claude = which_claude().ok_or("Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code")?;
+) -> (tokio::process::Command, Option<tempfile::TempPath>) {
+    let mut cmd = tokio::process::Command::new(claude_path);
+    cmd.args([
+        "-p", prompt,
+        "--model", model,
+        "--output-format", "stream-json",
+        "--verbose",
+    ]);
 
-    let mut cmd = tokio::process::Command::new(&claude);
-    cmd.args(["-p", prompt, "--model", model, "--output-format", "text"]);
-
-    // Pass system prompt via temp file to avoid /proc exposure (BE-C1)
-    let _prompt_guard: Option<tempfile::TempPath> = if !system_prompt.is_empty() {
+    let prompt_guard = if !system_prompt.is_empty() {
         match tempfile::NamedTempFile::new() {
             Ok(mut f) => {
                 use std::io::Write;
@@ -258,33 +280,45 @@ async fn call_claude(
         None
     };
 
-    cmd.env("ANTHROPIC_API_KEY", api_key);
     // Prevent "nested session" error when gateway was launched from a Claude Code session
     cmd.env_remove("CLAUDECODE");
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
 
-    match tokio::time::timeout(std::time::Duration::from_secs(DEFAULT_CLI_TIMEOUT_SECS), cmd.output()).await {
-        Ok(Ok(out)) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if text.is_empty() {
-                Ok("(empty response)".to_string())
-            } else {
-                Ok(text)
-            }
+    (cmd, prompt_guard)
+}
+
+/// Call claude CLI with custom env vars (supports both OAuth and API key).
+async fn call_claude_with_env(
+    prompt: &str,
+    model: &str,
+    system_prompt: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Result<String, String> {
+    let claude = which_claude().ok_or("Claude CLI not found")?;
+    let (mut cmd, _prompt_guard) = prepare_claude_cmd(&claude, prompt, model, system_prompt);
+
+    for (key, value) in env_vars {
+        if value.is_empty() {
+            cmd.env_remove(key);
+        } else {
+            cmd.env(key, value);
         }
-        Ok(Ok(out)) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            Err(format!(
-                "claude error: {}",
-                stderr.chars().take(200).collect::<String>()
-            ))
-        }
-        Ok(Err(e)) => Err(format!("spawn error: {e}")),
-        Err(_) => Err("timeout after 120s".to_string()),
     }
+
+    call_claude_streaming(&mut cmd).await
+}
+
+/// Call the `claude` CLI binary with a prompt and return the response text.
+async fn call_claude(
+    prompt: &str,
+    model: &str,
+    system_prompt: &str,
+    api_key: &str,
+) -> Result<String, String> {
+    let claude = which_claude().ok_or("Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code")?;
+    let (mut cmd, _prompt_guard) = prepare_claude_cmd(&claude, prompt, model, system_prompt);
+    cmd.env("ANTHROPIC_API_KEY", api_key);
+
+    call_claude_streaming(&mut cmd).await
 }
 
 /// Find the `claude` CLI binary — delegates to shared impl in duduclaw-core (BE-L1).

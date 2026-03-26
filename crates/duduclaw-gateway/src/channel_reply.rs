@@ -263,16 +263,20 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
 
 // ── Claude Code SDK (claude CLI) ────────────────────────────
 
-/// Call the `claude` CLI (Claude Code SDK) directly.
+/// Call the `claude` CLI (Claude Code SDK) with streaming output.
 ///
-/// The claude CLI has built-in tools: bash, web search, file operations, etc.
-/// This is the primary method for AI conversation.
+/// Uses `--output-format stream-json --verbose` to read incremental events.
+/// Instead of a hard total timeout, uses an **idle timeout** (default 120s):
+/// the timer resets every time new data arrives, so long-running responses
+/// that keep producing output will never be killed.
 async fn call_claude_cli(
     user_message: &str,
     model: &str,
     system_prompt: &str,
     home_dir: &Path,
 ) -> Result<String, String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
     // Find claude binary
     let claude_path = which_claude().ok_or_else(|| "claude CLI not found in PATH".to_string())?;
 
@@ -282,7 +286,12 @@ async fn call_claude_cli(
         .ok_or_else(|| "No API key configured".to_string())?;
 
     let mut cmd = tokio::process::Command::new(&claude_path);
-    cmd.args(["-p", user_message, "--model", model, "--output-format", "text"]);
+    cmd.args([
+        "-p", user_message,
+        "--model", model,
+        "--output-format", "stream-json",
+        "--verbose",
+    ]);
 
     // Pass system prompt via temp file to avoid exposure in /proc/PID/cmdline (BE-C1)
     let _prompt_guard: Option<tempfile::TempPath> = if !system_prompt.is_empty() {
@@ -295,7 +304,6 @@ async fn call_claude_cli(
                 Some(path)
             }
             Err(_) => {
-                // Fallback to arg if temp file creation fails
                 cmd.args(["--system-prompt", system_prompt]);
                 None
             }
@@ -312,35 +320,81 @@ async fn call_claude_cli(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let timeout_secs = get_cli_timeout_secs(home_dir).await;
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        cmd.output(),
-    )
-    .await
-    .map_err(|_| format!("claude CLI timeout ({timeout_secs}s)"))?
-    .map_err(|e| format!("claude CLI spawn error: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("claude CLI spawn error: {e}"))?;
+    let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
+    let mut reader = BufReader::new(stdout).lines();
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // Idle timeout: reset every time a line arrives
+    let idle_timeout = std::time::Duration::from_secs(120);
+    let mut result_text = String::new();
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = format!(
-            "claude CLI exit {}: {}",
-            output.status.code().unwrap_or(-1),
-            stderr.chars().take(500).collect::<String>()
-        );
-        warn!("{detail}");
-        return Err(detail);
+    loop {
+        match tokio::time::timeout(idle_timeout, reader.next_line()).await {
+            // Timeout — no data for 120s
+            Err(_) => {
+                let _ = child.kill().await;
+                if result_text.is_empty() {
+                    return Err(format!("claude CLI idle timeout ({idle_timeout:?}, no output)"));
+                }
+                // Return whatever we have so far
+                warn!("claude CLI idle timeout — returning partial result ({} chars)", result_text.len());
+                break;
+            }
+            // Stream ended
+            Ok(Ok(None)) => break,
+            // Read error
+            Ok(Err(e)) => {
+                let _ = child.kill().await;
+                return Err(format!("claude CLI read error: {e}"));
+            }
+            // Got a line — parse stream-json event
+            Ok(Ok(Some(line))) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                // Parse the JSON event and extract the result text
+                if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+                    match event.get("type").and_then(|t| t.as_str()) {
+                        // Final result event — contains the complete response
+                        Some("result") => {
+                            if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
+                                result_text = text.to_string();
+                            }
+                        }
+                        // Assistant message with text content (incremental)
+                        Some("assistant") => {
+                            if let Some(content) = event
+                                .pointer("/message/content")
+                                .and_then(|c| c.as_array())
+                            {
+                                for block in content {
+                                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                            result_text = text.to_string();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {} // system, rate_limit_event, etc. — ignore
+                    }
+                }
+            }
+        }
     }
 
-    if stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("Empty stdout from claude CLI, stderr: {}", stderr.chars().take(500).collect::<String>());
+    // Wait for process to exit
+    let status = child.wait().await.map_err(|e| format!("wait error: {e}"))?;
+    if !status.success() && result_text.is_empty() {
+        return Err(format!("claude CLI exit {}", status.code().unwrap_or(-1)));
+    }
+
+    let result_text = result_text.trim().to_string();
+    if result_text.is_empty() {
         return Err("Empty response from claude CLI".to_string());
     }
 
-    Ok(stdout)
+    Ok(result_text)
 }
 
 /// Find the `claude` binary — delegates to shared impl in duduclaw-core (BE-L1).
@@ -489,26 +543,6 @@ fn build_system_prompt(agent: Option<&duduclaw_agent::registry::LoadedAgent>) ->
     } else {
         parts.join("\n\n---\n\n")
     }
-}
-
-/// Read the CLI timeout from config.toml [gateway].cli_timeout_secs, default 300.
-async fn get_cli_timeout_secs(home_dir: &Path) -> u64 {
-    let config_path = home_dir.join("config.toml");
-    let content = match tokio::fs::read_to_string(&config_path).await {
-        Ok(c) => c,
-        Err(_) => return 300,
-    };
-    let table: toml::Table = match content.parse() {
-        Ok(t) => t,
-        Err(_) => return 300,
-    };
-    table
-        .get("gateway")
-        .and_then(|g| g.as_table())
-        .and_then(|g| g.get("cli_timeout_secs"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v.max(30) as u64)
-        .unwrap_or(300)
 }
 
 /// Read the default_agent from config.toml [general] section.
