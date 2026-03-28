@@ -1242,10 +1242,11 @@ max_active_skills = 5
     println!("  $ {} {}", style("duduclaw agent").cyan(), style("# CLI 對話").dim());
     println!("  $ {} {}", style("duduclaw status").cyan(), style("# 檢查狀態").dim());
 
-    if api_key.is_empty() {
+    if api_key.is_empty() && !has_oauth {
         println!();
-        println!("  {} 記得設定 API Key：", style("⚠").yellow());
-        println!("  $ {}", style("export ANTHROPIC_API_KEY=sk-ant-...").cyan());
+        println!("  {} 記得設定認證（二擇一）：", style("⚠").yellow());
+        println!("  $ {}  {}", style("claude").cyan(), style("# OAuth 登入（推薦）").dim());
+        println!("  $ {}  {}", style("export ANTHROPIC_API_KEY=sk-ant-...").cyan(), style("# 或 API Key").dim());
     }
 
     println!();
