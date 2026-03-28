@@ -509,7 +509,39 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
         String::new()
     };
 
-    // ── 3. Agent config ──────────────────────────────────────
+    // ── 3a. API Mode (if claude or hybrid) ───────────────────
+    //  Controls how DuDuClaw calls the Anthropic API:
+    //  "cli" = via claude binary (default, supports tools)
+    //  "direct" = HTTP API call (95%+ cache hit, pure chat only)
+    //  "auto" = try direct first, fallback to CLI
+    let api_mode: String = if use_claude && !skip_prompts && !quick_mode {
+        println!();
+        println!("  {} {}", style("▸").cyan(), style("API 呼叫模式").bold());
+        println!("  控制 DuDuClaw 如何呼叫 Claude API（影響 token 成本與 cache 效率）：");
+        println!();
+        let api_mode_options = &[
+            "CLI 模式（預設）— 透過 claude 指令，支援完整工具使用",
+            "Direct API — 直接呼叫 HTTP API，cache 命中率 95%+，僅支援純對話",
+            "Auto 模式（推薦）— 優先 Direct API，需要工具時自動切換 CLI",
+        ];
+        let sel = Select::new()
+            .with_prompt("API 呼叫模式")
+            .items(api_mode_options)
+            .default(2)
+            .interact()
+            .unwrap_or(0);
+        match sel {
+            0 => "cli".to_string(),
+            1 => "direct".to_string(),
+            _ => "auto".to_string(),
+        }
+    } else if use_claude && (skip_prompts || quick_mode) {
+        "auto".to_string() // quick mode defaults to auto (best cost savings)
+    } else {
+        "cli".to_string() // local-only doesn't need api_mode
+    };
+
+    // ── 3b. Agent config ──────────────────────────────────────
     let (agent_name, agent_display, agent_trigger, agent_soul) = if !skip_prompts && !quick_mode {
         println!();
         println!("  {} {}", style("▸").cyan(), style("AI 助理設定").bold());
@@ -729,6 +761,12 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
         }
         if use_claude {
             println!("  ├ API Key：{}", if api_key.is_empty() { style("未設定").red().to_string() } else { style("已設定").green().to_string() });
+            let api_mode_label = match api_mode.as_str() {
+                "direct" => "Direct API（高 cache 效率）",
+                "auto" => "Auto（推薦，自動切換）",
+                _ => "CLI（完整功能）",
+            };
+            println!("  ├ API 模式：{}", style(api_mode_label).cyan());
         }
         println!("  ├ Gateway：{}:{}", style(&gw_bind).cyan(), style(gw_port).cyan());
         println!("  ├ 月預算：${}", style(monthly_budget_usd).cyan());
@@ -947,6 +985,7 @@ icon = "🐾"
 preferred = "claude-sonnet-4-6"
 fallback = "claude-haiku-4-5"
 account_pool = ["main"]
+api_mode = "{api_mode}"
 {model_local_section}
 [container]
 timeout_ms = 1800000
@@ -1396,6 +1435,7 @@ icon = "🤖"
 preferred = "claude-sonnet-4-6"
 fallback = "claude-haiku-4-5"
 account_pool = ["main"]
+api_mode = "auto"
 
 [container]
 timeout_ms = 1800000

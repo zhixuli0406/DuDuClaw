@@ -43,6 +43,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let home_dir = config.home_dir.clone();
     let handler = MethodHandler::new(config.home_dir).await;
 
+    // Initialize cost telemetry (must happen before any Claude CLI calls)
+    if let Err(e) = crate::cost_telemetry::init_telemetry(&home_dir) {
+        tracing::warn!(error = %e, "Failed to initialize cost telemetry — continuing without it");
+    }
+
     // Initialize session manager
     let session_db_path = home_dir.join("sessions.db");
     let session_manager = Arc::new(
@@ -64,6 +69,20 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                     Ok(_) => {}
                     Err(e) => warn!("Session cleanup error: {}", e),
                 }
+            }
+        });
+    }
+
+    // ── Cost telemetry: periodic cleanup + adaptive routing ────
+    {
+        let hd = home_dir.clone();
+        tokio::spawn(async move {
+            // Wait 10 minutes before first check
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                crate::cost_telemetry::adaptive_routing_check(&hd).await;
             }
         });
     }

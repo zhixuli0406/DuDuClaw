@@ -1,41 +1,14 @@
 """Meso Reflection - triggered by heartbeat scheduler"""
 import asyncio
+import functools
 import logging
-import os
-import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List
 
+from .llm_call import call_llm
+
 logger = logging.getLogger(__name__)
-
-
-def _call_claude(prompt: str, model: str = "claude-haiku-4-5") -> str:
-    """Call the claude CLI subprocess."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        return ""
-    import shutil
-    claude = shutil.which("claude") or ""
-    if not claude:
-        home = os.environ.get("HOME", "")
-        for c in [f"{home}/.npm-global/bin/claude", "/usr/local/bin/claude",
-                  f"{home}/.claude/bin/claude", f"{home}/.local/bin/claude"]:
-            if os.path.exists(c):
-                claude = c
-                break
-    if not claude:
-        return ""
-    try:
-        result = subprocess.run(
-            [claude, "-p", prompt, "--model", model, "--output-format", "text"],
-            capture_output=True, text=True, timeout=90,
-            env={**os.environ, "ANTHROPIC_API_KEY": api_key},
-        )
-        return result.stdout.strip() if result.returncode == 0 else ""
-    except Exception as e:
-        logger.debug("claude CLI call failed: %s", e)
-        return ""
 
 
 class MesoReflection:
@@ -66,18 +39,18 @@ class MesoReflection:
             )
             return result
 
-        # Use Claude to analyze patterns across the recent daily notes
+        # Use local LLM or Claude to analyze patterns across the recent daily notes
         combined = "\n\n---\n\n".join(recent_notes)
-        analysis = await asyncio.get_event_loop().run_in_executor(
-            None,
-            _call_claude,
-            (
-                f"You are a reflective AI agent reviewing your own daily logs.\n\n"
-                f"Recent daily notes (last 3 days):\n{combined[:4000]}\n\n"
-                f"Identify common patterns, frequent topics, and candidate skills to formalise.\n"
-                f"Respond in JSON with keys: common_patterns (list of strings), "
-                f"memory_updates (list of strings), candidate_skills (list of strings)."
-            ),
+        safe_combined = combined[:4000].replace("<", "&lt;").replace(">", "&gt;")
+        prompt = (
+            f"You are a reflective AI agent reviewing your own daily logs.\n\n"
+            f"Recent daily notes (last 3 days):\n{safe_combined}\n\n"
+            f"Identify common patterns, frequent topics, and candidate skills to formalise.\n"
+            f"Respond in JSON with keys: common_patterns (list of strings), "
+            f"memory_updates (list of strings), candidate_skills (list of strings)."
+        )
+        analysis = await asyncio.get_running_loop().run_in_executor(
+            None, functools.partial(call_llm, prompt, timeout=90),
         )
         if analysis:
             try:

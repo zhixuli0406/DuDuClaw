@@ -33,6 +33,14 @@ pub struct ModelConfig {
     /// Local model configuration (optional — enables local inference for this agent)
     #[serde(default)]
     pub local: Option<LocalModelConfig>,
+    /// API mode for cloud calls: "cli" (default, via claude binary), "direct" (HTTP API),
+    /// or "auto" (telemetry-driven: use direct for pure chat, CLI when tools are needed).
+    #[serde(default = "default_api_mode")]
+    pub api_mode: String,
+}
+
+fn default_api_mode() -> String {
+    "cli".to_string()
 }
 
 /// Configuration for a local LLM model (per-agent).

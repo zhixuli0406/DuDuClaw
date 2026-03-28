@@ -199,12 +199,27 @@ async fn run_reflections_for_all_agents(
     reflection_type: &str,
 ) {
     let reg = registry.read().await;
-    let agents: Vec<(String, PathBuf)> = reg.list().iter().map(|a| {
-        (a.config.agent.name.clone(), a.dir.clone())
+    let agents: Vec<(String, PathBuf, bool)> = reg.list().iter().map(|a| {
+        (
+            a.config.agent.name.clone(),
+            a.dir.clone(),
+            a.config.evolution.prediction_driven,
+        )
     }).collect();
     drop(reg);
 
-    for (agent_id, agent_dir) in agents {
+    for (agent_id, agent_dir, prediction_driven) in agents {
+        // Skip agents using the new prediction-driven / GVU evolution system —
+        // they handle reflections via the Rust-native pipeline, not Python timers.
+        if prediction_driven {
+            info!(
+                agent = %agent_id,
+                reflection_type,
+                "Skipping legacy Python reflection (agent uses prediction-driven evolution)"
+            );
+            continue;
+        }
+
         match reflection_type {
             "meso" => run_meso(home_dir, &agent_id, &agent_dir).await,
             "macro" => run_macro(home_dir, &agent_id, &agent_dir).await,

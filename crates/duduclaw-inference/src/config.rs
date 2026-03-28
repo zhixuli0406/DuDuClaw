@@ -193,21 +193,22 @@ impl Default for RouterConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            fast_threshold: 0.8,
-            strong_threshold: 0.5,
+            fast_threshold: 0.7,
+            strong_threshold: 0.35,
             fast_model: None,
             strong_model: None,
-            max_fast_prompt_tokens: 500,
+            max_fast_prompt_tokens: 1000,
+            // Only keywords that truly require Cloud API reasoning.
+            // Removed "review", "complex" — LocalStrong can handle these.
             cloud_keywords: vec![
-                "analyze".to_string(),
                 "refactor".to_string(),
                 "architect".to_string(),
-                "security".to_string(),
-                "review".to_string(),
-                "complex".to_string(),
+                "security audit".to_string(),
                 "multi-step".to_string(),
             ],
+            // Expanded: more query types that local models handle well.
             fast_keywords: vec![
+                // English
                 "translate".to_string(),
                 "summarize".to_string(),
                 "classify".to_string(),
@@ -215,6 +216,23 @@ impl Default for RouterConfig {
                 "explain".to_string(),
                 "hello".to_string(),
                 "hi".to_string(),
+                "define".to_string(),
+                "list".to_string(),
+                "convert".to_string(),
+                "count".to_string(),
+                "extract".to_string(),
+                "rewrite".to_string(),
+                // CJK / zh-TW common patterns
+                "翻譯".to_string(),
+                "摘要".to_string(),
+                "分類".to_string(),
+                "格式".to_string(),
+                "解釋".to_string(),
+                "你好".to_string(),
+                "定義".to_string(),
+                "列出".to_string(),
+                "轉換".to_string(),
+                "改寫".to_string(),
             ],
         }
     }

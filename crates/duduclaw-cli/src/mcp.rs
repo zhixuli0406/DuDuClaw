@@ -391,6 +391,29 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "record_id", description: "Record ID", required: true },
         ],
     },
+    // ── Cost telemetry tools ─────────────────────────────────────
+    ToolDef {
+        name: "cost_summary",
+        description: "Get token usage and cost summary (global or per-agent). Shows cache efficiency, total tokens, estimated cost. Use to monitor API spending and detect cache degradation.",
+        params: &[
+            ParamDef { name: "agent_id", description: "Agent ID to filter (optional, omit for global summary)", required: false },
+            ParamDef { name: "hours", description: "Time window in hours (default 24)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "cost_agents",
+        description: "List all agents ranked by cost. Shows per-agent cache efficiency and health status (healthy/normal/degraded).",
+        params: &[
+            ParamDef { name: "hours", description: "Time window in hours (default 24)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "cost_recent",
+        description: "Show recent individual API call records with detailed token breakdown (input, cache_read, cache_write, output).",
+        params: &[
+            ParamDef { name: "limit", description: "Number of recent records (default 20)", required: false },
+        ],
+    },
 ];
 
 // ── JSON-RPC helpers ─────────────────────────────────────────
@@ -1980,6 +2003,107 @@ async fn handle_decompress_text(params: &Value) -> Value {
     })
 }
 
+// ── Cost telemetry handlers ─────────────────────────────────
+
+async fn handle_cost_summary(params: &Value, home_dir: &Path) -> Value {
+    // Ensure telemetry is initialized (idempotent on second call)
+    let _ = duduclaw_gateway::cost_telemetry::init_telemetry(home_dir);
+
+    let telemetry = match duduclaw_gateway::cost_telemetry::get_telemetry() {
+        Some(t) => t,
+        None => return serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "Cost telemetry not initialized"}]
+        }),
+    };
+
+    let hours = params.get("hours").and_then(|v| v.as_u64()).unwrap_or(24);
+
+    if let Some(agent_id) = params.get("agent_id").and_then(|v| v.as_str()) {
+        match telemetry.summary_by_agent(agent_id, hours).await {
+            Ok(summary) => serde_json::json!({
+                "content": [{"type": "text", "text": serde_json::to_string_pretty(&summary).unwrap_or_default()}]
+            }),
+            Err(e) => serde_json::json!({
+                "isError": true,
+                "content": [{"type": "text", "text": format!("Error: {e}")}]
+            }),
+        }
+    } else {
+        match telemetry.summary_global(hours).await {
+            Ok(summary) => serde_json::json!({
+                "content": [{"type": "text", "text": serde_json::to_string_pretty(&summary).unwrap_or_default()}]
+            }),
+            Err(e) => serde_json::json!({
+                "isError": true,
+                "content": [{"type": "text", "text": format!("Error: {e}")}]
+            }),
+        }
+    }
+}
+
+async fn handle_cost_agents(params: &Value, home_dir: &Path) -> Value {
+    let _ = duduclaw_gateway::cost_telemetry::init_telemetry(home_dir);
+
+    let telemetry = match duduclaw_gateway::cost_telemetry::get_telemetry() {
+        Some(t) => t,
+        None => return serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "Cost telemetry not initialized"}]
+        }),
+    };
+
+    let hours = params.get("hours").and_then(|v| v.as_u64()).unwrap_or(24);
+
+    match telemetry.all_agents_summary(hours).await {
+        Ok(agents) => {
+            if agents.is_empty() {
+                return serde_json::json!({
+                    "content": [{"type": "text", "text": "No cost data in the selected time window."}]
+                });
+            }
+            let text = serde_json::to_string_pretty(&agents).unwrap_or_default();
+            serde_json::json!({
+                "content": [{"type": "text", "text": text}]
+            })
+        }
+        Err(e) => serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": format!("Error: {e}")}]
+        }),
+    }
+}
+
+async fn handle_cost_recent(params: &Value) -> Value {
+    let telemetry = match duduclaw_gateway::cost_telemetry::get_telemetry() {
+        Some(t) => t,
+        None => return serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "Cost telemetry not initialized"}]
+        }),
+    };
+
+    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
+
+    match telemetry.recent_records(limit).await {
+        Ok(records) => {
+            if records.is_empty() {
+                return serde_json::json!({
+                    "content": [{"type": "text", "text": "No cost records yet."}]
+                });
+            }
+            let text = serde_json::to_string_pretty(&records).unwrap_or_default();
+            serde_json::json!({
+                "content": [{"type": "text", "text": text}]
+            })
+        }
+        Err(e) => serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": format!("Error: {e}")}]
+        }),
+    }
+}
+
 // ── Odoo ERP handlers ───────────────────────────────────────
 
 async fn handle_odoo_tool(tool: &str, params: &Value, home_dir: &Path, odoo: &OdooState) -> Value {
@@ -2621,6 +2745,10 @@ async fn handle_tools_call(
         "model_recommend" => handle_model_recommend(home_dir).await,
         "compress_text" => handle_compress_text(&arguments).await,
         "decompress_text" => handle_decompress_text(&arguments).await,
+        // Cost telemetry tools
+        "cost_summary" => handle_cost_summary(&arguments, home_dir).await,
+        "cost_agents" => handle_cost_agents(&arguments, home_dir).await,
+        "cost_recent" => handle_cost_recent(&arguments).await,
         // Odoo ERP tools
         t if t.starts_with("odoo_") => handle_odoo_tool(t, &arguments, home_dir, odoo).await,
         _ => {

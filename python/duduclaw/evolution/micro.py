@@ -1,54 +1,14 @@
 """Micro Reflection - triggered after each conversation"""
 import asyncio
+import functools
 import logging
-import os
-import subprocess
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .llm_call import call_llm
+
 logger = logging.getLogger(__name__)
-
-
-def _call_claude(prompt: str, model: str = "claude-haiku-4-5") -> str:
-    """Call the claude CLI subprocess for a quick reflection prompt."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        return ""
-
-    claude = _find_claude()
-    if not claude:
-        return ""
-
-    try:
-        result = subprocess.run(
-            [claude, "-p", prompt, "--model", model, "--output-format", "text"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            env={**os.environ, "ANTHROPIC_API_KEY": api_key},
-        )
-        return result.stdout.strip() if result.returncode == 0 else ""
-    except Exception as e:
-        logger.debug("claude CLI call failed: %s", e)
-        return ""
-
-
-def _find_claude() -> str:
-    """Find the claude CLI binary."""
-    import shutil
-    path = shutil.which("claude")
-    if path:
-        return path
-    home = os.environ.get("HOME", "")
-    for candidate in [
-        f"{home}/.npm-global/bin/claude",
-        "/usr/local/bin/claude",
-        f"{home}/.claude/bin/claude",
-        f"{home}/.local/bin/claude",
-    ]:
-        if os.path.exists(candidate):
-            return candidate
-    return ""
 
 
 class MicroReflection:
@@ -82,23 +42,23 @@ class MicroReflection:
         }
 
         # Sanitize conversation summary to prevent prompt injection (C5)
-        # Truncate and strip instruction-like patterns
+        # Truncate, escape XML-like tags, strip instruction-like patterns
         safe_summary = conversation_summary[:5000] if conversation_summary else ""
-        safe_summary = safe_summary.replace("ignore previous", "[REDACTED]")
-        safe_summary = safe_summary.replace("system prompt", "[REDACTED]")
+        safe_summary = safe_summary.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        safe_summary = re.sub(r"(?i)ignore\s+previous", "[REDACTED]", safe_summary)
+        safe_summary = re.sub(r"(?i)system\s+prompt", "[REDACTED]", safe_summary)
 
-        # Use Claude to generate structured reflection insights
-        claude_insights = await asyncio.get_event_loop().run_in_executor(
-            None,
-            _call_claude,
-            (
-                f"You are a reflective AI agent. A conversation just ended.\n\n"
-                f"<conversation_summary>\n{safe_summary}\n</conversation_summary>\n\n"
-                f"Briefly answer in JSON with keys: what_went_well (list), "
-                f"what_could_improve (list), patterns_noticed (list), "
-                f"candidate_skills (list of skill names worth creating).\n"
-                f"Respond ONLY with the JSON object, no other text."
-            ),
+        # Use local LLM (preferred) or Claude to generate reflection insights
+        prompt = (
+            f"You are a reflective AI agent. A conversation just ended.\n\n"
+            f"<conversation_summary>\n{safe_summary}\n</conversation_summary>\n\n"
+            f"Briefly answer in JSON with keys: what_went_well (list), "
+            f"what_could_improve (list), patterns_noticed (list), "
+            f"candidate_skills (list of skill names worth creating).\n"
+            f"Respond ONLY with the JSON object, no other text."
+        )
+        claude_insights = await asyncio.get_running_loop().run_in_executor(
+            None, functools.partial(call_llm, prompt, timeout=60),
         )
         if claude_insights:
             try:
