@@ -12,10 +12,11 @@ members = [
     "crates/duduclaw-cli",
     "crates/duduclaw-dashboard",
     "crates/duduclaw-odoo",
+    "crates/duduclaw-inference",
 ]
 
 [workspace.package]
-version = "0.6.6"
+version = "0.7.0"
 edition = "2024"
 license = "MIT"
 authors = ["DuDuClaw Contributors"]
@@ -67,8 +68,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Streams
 futures-util = "0.3"
 
+# HTTP client (shared)
+reqwest = { version = "0.12", features = ["json"] }
+
 # Internal crates
 duduclaw-core = { path = "crates/duduclaw-core" }
+duduclaw-inference = { path = "crates/duduclaw-inference", default-features = false }
 duduclaw-gateway = { path = "crates/duduclaw-gateway", default-features = false }
 duduclaw-bus = { path = "crates/duduclaw-bus" }
 duduclaw-security = { path = "crates/duduclaw-security" }

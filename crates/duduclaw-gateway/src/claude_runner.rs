@@ -29,9 +29,14 @@ fn build_system_prompt(agent: &duduclaw_agent::LoadedAgent) -> String {
     parts.join("\n\n---\n\n")
 }
 
-/// Look up an agent from the registry and call the Claude CLI with a prompt.
+/// Look up an agent from the registry and route to the best model.
 ///
-/// Returns the response text on success, or an error message.
+/// Routing logic per agent:
+/// 1. If agent has `model.local` with `prefer_local = true` and local engine is available
+///    → try local inference first
+/// 2. If local fails or is not configured → fall back to Claude Code SDK via AccountRotator
+///
+/// Local inference and account rotation are completely separate paths.
 pub async fn call_claude_for_agent(
     home_dir: &Path,
     registry: &Arc<RwLock<AgentRegistry>>,
@@ -40,7 +45,6 @@ pub async fn call_claude_for_agent(
 ) -> Result<String, String> {
     let reg = registry.read().await;
 
-    // Look up agent; fall back to main agent if "default"
     let agent = if agent_id == "default" {
         reg.main_agent()
     } else {
@@ -50,18 +54,127 @@ pub async fn call_claude_for_agent(
     let agent = agent.ok_or_else(|| format!("Agent '{agent_id}' not found in registry"))?;
 
     let system_prompt = build_system_prompt(agent);
-    let model_id = agent.config.agent.name.clone();
-    let model = agent.config.model.preferred.clone();
+    let agent_name = agent.config.agent.name.clone();
+    let claude_model = agent.config.model.preferred.clone();
+    let local_config = agent.config.model.local.clone();
     drop(reg);
 
-    info!(agent = %model_id, prompt_len = prompt.len(), "Calling Claude CLI");
+    // Step 1: Try local inference if agent prefers it
+    if let Some(ref local) = local_config {
+        if local.prefer_local {
+            info!(agent = %agent_name, local_model = %local.model, "Trying local inference for agent");
+            match call_local_inference(home_dir, prompt, &system_prompt, Some(&local.model)).await {
+                Ok(response) => {
+                    info!(agent = %agent_name, "Agent served by local model");
+                    return Ok(response);
+                }
+                Err(e) if e == "ROUTER_ESCALATE_TO_CLOUD" => {
+                    info!(agent = %agent_name, "Router escalated to Claude API");
+                }
+                Err(e) => {
+                    warn!(agent = %agent_name, error = %e, "Local inference failed, falling back to Claude API");
+                }
+            }
+        }
+    }
 
-    // Use account rotator for key selection (with retry on failure)
-    call_with_rotation(home_dir, prompt, &model, &system_prompt).await
+    // Step 2: Fall back to Claude Code SDK via account rotation
+    info!(agent = %agent_name, model = %claude_model, prompt_len = prompt.len(), "Calling Claude CLI");
+    call_with_rotation(home_dir, prompt, &claude_model, &system_prompt).await
 }
 
 /// Cached AccountRotator — avoids rebuilding on every call (BE-H4).
 static ROTATOR_CACHE: std::sync::OnceLock<tokio::sync::RwLock<Option<(std::time::Instant, std::sync::Arc<duduclaw_agent::account_rotator::AccountRotator>)>>> = std::sync::OnceLock::new();
+
+/// Cached InferenceEngine — singleton for local LLM inference.
+static INFERENCE_ENGINE: std::sync::OnceLock<tokio::sync::RwLock<Option<std::sync::Arc<duduclaw_inference::InferenceEngine>>>> = std::sync::OnceLock::new();
+
+/// Get or create the inference engine singleton.
+async fn get_inference_engine(home_dir: &std::path::Path) -> Option<std::sync::Arc<duduclaw_inference::InferenceEngine>> {
+    let cache = INFERENCE_ENGINE.get_or_init(|| tokio::sync::RwLock::new(None));
+
+    {
+        let guard = cache.read().await;
+        if let Some(engine) = guard.as_ref() {
+            return Some(engine.clone());
+        }
+    }
+
+    // Initialize engine
+    let engine = duduclaw_inference::InferenceEngine::new(home_dir).await;
+    if let Err(e) = engine.init().await {
+        warn!("Failed to initialize inference engine: {e}");
+        return None;
+    }
+    if !engine.is_available().await {
+        return None;
+    }
+    let arc = std::sync::Arc::new(engine);
+    *cache.write().await = Some(arc.clone());
+    Some(arc)
+}
+
+/// Call local inference engine instead of Claude CLI.
+///
+/// If the confidence router is enabled, it may decide to escalate to Cloud API
+/// (returns `Err` with a special marker so the caller knows to try Cloud).
+async fn call_local_inference(
+    home_dir: &std::path::Path,
+    prompt: &str,
+    system_prompt: &str,
+    model_id: Option<&str>,
+) -> Result<String, String> {
+    let engine = get_inference_engine(home_dir)
+        .await
+        .ok_or_else(|| "Local inference engine not available".to_string())?;
+
+    let request = duduclaw_inference::InferenceRequest {
+        system_prompt: system_prompt.to_string(),
+        user_prompt: prompt.to_string(),
+        params: engine.config().generation.clone(),
+        model_id: model_id.map(|s| s.to_string()),
+    };
+
+    // Use router if enabled — may escalate to Cloud API
+    if engine.router_enabled() {
+        match engine.route_and_generate(&request).await {
+            Ok(Some(response)) => {
+                info!(
+                    model = %response.model_id,
+                    tokens = response.tokens_generated,
+                    tps = format!("{:.1}", response.tokens_per_second),
+                    ms = response.generation_time_ms,
+                    "Local inference completed (routed)"
+                );
+                return Ok(response.text);
+            }
+            Ok(None) => {
+                // Router decided Cloud API is needed
+                return Err("ROUTER_ESCALATE_TO_CLOUD".to_string());
+            }
+            Err(e) => {
+                warn!(error = %e, "Routed local inference failed");
+                return Err(format!("Local inference error: {e}"));
+            }
+        }
+    }
+
+    // No router — direct generation
+    let response = engine
+        .generate(&request)
+        .await
+        .map_err(|e| format!("Local inference error: {e}"))?;
+
+    info!(
+        model = %response.model_id,
+        tokens = response.tokens_generated,
+        tps = format!("{:.1}", response.tokens_per_second),
+        ms = response.generation_time_ms,
+        "Local inference completed"
+    );
+
+    Ok(response.text)
+}
 
 /// Get or create a cached AccountRotator (refreshes every 5 minutes).
 /// Public accessor for the cached rotator — used by handlers.rs too.
