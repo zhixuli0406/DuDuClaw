@@ -293,50 +293,134 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
         sel == 0
     };
 
-    // ── 2. API Key ───────────────────────────────────────────
-    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-    let api_key = if !skip_prompts && api_key.is_empty() {
+    // ── 1.5. Inference mode ──────────────────────────────────
+    //  0 = local_only, 1 = claude_only, 2 = hybrid
+    let inference_mode: usize = if skip_prompts {
+        1 // quick mode defaults to Claude SDK
+    } else {
         println!();
-        println!("  {} {}", style("▸").cyan(), style("Claude API 設定").bold());
-        let auth_methods = &["API Key", "OAuth Token", "稍後設定"];
-        let auth_sel = Select::new()
-            .with_prompt("認證方式")
-            .items(auth_methods)
-            .default(0)
+        println!("  {} {}", style("▸").cyan(), style("推理模式").bold());
+        println!("  選擇 AI 推理引擎的運作方式：");
+        println!();
+        let mode_options = &[
+            "純本地模型 — 所有 Agent 走 Local LLM（不需 Claude API Key）",
+            "純 Claude Code SDK — 所有 Agent 走 Claude API（不需設定本地模型）",
+            "混合模式 — Agent 可自由選擇本地或 Claude（兩者都要設定）",
+        ];
+        Select::new()
+            .with_prompt("推理模式")
+            .items(mode_options)
+            .default(1)
             .interact()
-            .unwrap_or(2);
+            .unwrap_or(1)
+    };
 
-        match auth_sel {
-            0 => {
-                let key: String = Password::new()
-                    .with_prompt("API Key")
-                    .interact()
-                    .unwrap_or_default();
-                if !key.is_empty() {
-                    println!("  {} API Key 已設定", style("✓").green());
+    let use_local = inference_mode == 0 || inference_mode == 2;
+    let use_claude = inference_mode == 1 || inference_mode == 2;
+
+    // ── 2. Local LLM setup (if local or hybrid) ────────────
+    let local_model_id: String = if use_local && !skip_prompts {
+        println!();
+        println!("  {} {}", style("▸").cyan(), style("本地模型設定").bold());
+        println!("  將 GGUF 模型檔案放入 ~/.duduclaw/models/ 即可使用。");
+        println!("  推薦模型：Qwen3-8B-Q4_K_M、Gemma-3-4B-Q4_K_M");
+        println!();
+
+        // Scan existing models
+        let models_dir = home.join("models");
+        let _ = tokio::fs::create_dir_all(&models_dir).await;
+        let mut available_models: Vec<String> = Vec::new();
+        if let Ok(mut entries) = tokio::fs::read_dir(&models_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".gguf") {
+                    available_models.push(name.trim_end_matches(".gguf").to_string());
                 }
-                key
             }
-            1 => {
-                let token: String = Password::new()
-                    .with_prompt("OAuth Token")
-                    .interact()
-                    .unwrap_or_default();
-                if !token.is_empty() {
-                    println!("  {} OAuth Token 已設定", style("✓").green());
+        }
+
+        if available_models.is_empty() {
+            println!("  {} ~/.duduclaw/models/ 目前沒有模型", style("ℹ").blue());
+            println!("  請下載 GGUF 模型後再啟動，或輸入預期的模型 ID");
+            println!();
+            Input::new()
+                .with_prompt("本地模型 ID（檔名不含 .gguf）")
+                .default("qwen3-8b-q4_k_m".to_string())
+                .interact_text()
+                .unwrap_or_else(|_| "qwen3-8b-q4_k_m".to_string())
+        } else {
+            available_models.push("手動輸入...".to_string());
+            let sel = Select::new()
+                .with_prompt("選擇本地模型")
+                .items(&available_models)
+                .default(0)
+                .interact()
+                .unwrap_or(0);
+
+            if sel == available_models.len() - 1 {
+                Input::new()
+                    .with_prompt("模型 ID")
+                    .interact_text()
+                    .unwrap_or_else(|_| "qwen3-8b-q4_k_m".to_string())
+            } else {
+                available_models[sel].clone()
+            }
+        }
+    } else if use_local {
+        "qwen3-8b-q4_k_m".to_string()
+    } else {
+        String::new()
+    };
+
+    // ── 3. Claude API Key (if claude or hybrid) ─────────────
+    let api_key = if use_claude {
+        let env_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+        if !skip_prompts && env_key.is_empty() {
+            println!();
+            println!("  {} {}", style("▸").cyan(), style("Claude API 設定").bold());
+            let auth_methods = &["API Key", "OAuth Token", "稍後設定"];
+            let auth_sel = Select::new()
+                .with_prompt("認證方式")
+                .items(auth_methods)
+                .default(0)
+                .interact()
+                .unwrap_or(2);
+
+            match auth_sel {
+                0 => {
+                    let key: String = Password::new()
+                        .with_prompt("API Key")
+                        .interact()
+                        .unwrap_or_default();
+                    if !key.is_empty() {
+                        println!("  {} API Key 已設定", style("✓").green());
+                    }
+                    key
                 }
-                token
+                1 => {
+                    let token: String = Password::new()
+                        .with_prompt("OAuth Token")
+                        .interact()
+                        .unwrap_or_default();
+                    if !token.is_empty() {
+                        println!("  {} OAuth Token 已設定", style("✓").green());
+                    }
+                    token
+                }
+                _ => {
+                    println!("  {} 稍後可透過環境變數 ANTHROPIC_API_KEY 設定", style("ℹ").blue());
+                    String::new()
+                }
             }
-            _ => {
-                println!("  {} 稍後可透過環境變數 ANTHROPIC_API_KEY 設定", style("ℹ").blue());
-                String::new()
+        } else {
+            if !env_key.is_empty() {
+                println!("  {} 從環境變數偵測到 API Key", style("✓").green());
             }
+            env_key
         }
     } else {
-        if !api_key.is_empty() {
-            println!("  {} 從環境變數偵測到 API Key", style("✓").green());
-        }
-        api_key
+        println!("  {} 純本地模式 — 不需要 Claude API Key", style("ℹ").blue());
+        String::new()
     };
 
     // ── 3. Agent config ──────────────────────────────────────
@@ -545,10 +629,21 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
     // ── Confirm ──────────────────────────────────────────────
     if !skip_prompts {
         println!();
+        let mode_label = match inference_mode {
+            0 => "純本地模型",
+            1 => "純 Claude SDK",
+            _ => "混合模式",
+        };
         println!("  {} {}", style("📋").bold(), style("設定摘要").bold());
+        println!("  ├ 推理模式：{}", style(mode_label).cyan().bold());
         println!("  ├ 助理名稱：{}", style(&agent_display).cyan());
         println!("  ├ 觸發詞：{}", style(&agent_trigger).cyan());
-        println!("  ├ API Key：{}", if api_key.is_empty() { style("未設定").red().to_string() } else { style("已設定").green().to_string() });
+        if use_local {
+            println!("  ├ 本地模型：{}", style(&local_model_id).cyan());
+        }
+        if use_claude {
+            println!("  ├ API Key：{}", if api_key.is_empty() { style("未設定").red().to_string() } else { style("已設定").green().to_string() });
+        }
         println!("  ├ Gateway：{}:{}", style(&gw_bind).cyan(), style(gw_port).cyan());
         println!("  ├ 月預算：${}", style(monthly_budget_usd).cyan());
         if enable_prediction_driven {
@@ -614,6 +709,11 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
     let telegram_token_enc = encrypt_api_key(&telegram_token, &home).unwrap_or_default();
     let discord_token_enc = encrypt_api_key(&discord_token, &home).unwrap_or_default();
 
+    let inference_mode_str = match inference_mode {
+        0 => "local",
+        1 => "claude",
+        _ => "hybrid",
+    };
     let config_content = format!(
         r#"# DuDuClaw configuration
 # Generated by `duduclaw onboard`
@@ -621,6 +721,8 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
 [general]
 default_agent = "{agent_name}"
 log_level = "info"
+# Inference mode: "local" | "claude" | "hybrid"
+inference_mode = "{inference_mode_str}"
 
 [api]
 {api_key_line}
@@ -646,9 +748,56 @@ discord_bot_token_enc = "{discord_token_enc}"
     })?;
     println!("  {} {}", style("✓").green(), config_path.display());
 
+    // inference.toml (only for local / hybrid modes)
+    if use_local {
+        let inference_toml_path = home.join("inference.toml");
+        let inference_content = format!(
+            r#"# DuDuClaw Local Inference Configuration
+# Generated by `duduclaw onboard` (mode: {inference_mode_str})
+
+enabled = true
+models_dir = "~/.duduclaw/models"
+default_model = "{local_model_id}"
+auto_load = true
+
+[generation]
+max_tokens = 2048
+temperature = 0.7
+top_p = 0.9
+gpu_layers = -1
+context_size = 4096
+"#
+        );
+        tokio::fs::write(&inference_toml_path, inference_content).await.map_err(|e| {
+            DuDuClawError::Config(format!("Failed to write {}: {e}", inference_toml_path.display()))
+        })?;
+        // Create models directory
+        let models_dir = home.join("models");
+        let _ = tokio::fs::create_dir_all(&models_dir).await;
+        println!("  {} {}", style("✓").green(), inference_toml_path.display());
+    }
+
     // agent.toml
     let agent_toml_path = agent_dir.join("agent.toml");
     let budget_cents = monthly_budget_usd as u64 * 100;
+    let model_local_section = if use_local {
+        format!(
+            r#"
+[model.local]
+model = "{local_model_id}"
+backend = "llama_cpp"
+context_length = 4096
+gpu_layers = -1
+prefer_local = {prefer}
+use_router = {router}
+"#,
+            prefer = if inference_mode == 0 { "true" } else { "true" }, // hybrid also prefers local
+            router = if inference_mode == 2 { "true" } else { "false" }, // only hybrid uses router
+        )
+    } else {
+        String::new()
+    };
+
     let agent_toml = format!(
         r#"[agent]
 name = "{agent_name}"
@@ -663,7 +812,7 @@ icon = "🐾"
 preferred = "claude-sonnet-4-6"
 fallback = "claude-haiku-4-5"
 account_pool = ["main"]
-
+{model_local_section}
 [container]
 timeout_ms = 1800000
 max_concurrent = 3

@@ -79,8 +79,29 @@ pub async fn call_claude_for_agent(
     }
 
     // Step 2: Fall back to Claude Code SDK via account rotation
+    // Read inference_mode from config — if "local", don't attempt Claude API
+    let inference_mode = read_inference_mode(home_dir).await;
+    if inference_mode == "local" {
+        return Err(format!(
+            "Agent '{agent_name}' is in local-only mode but local inference failed. \
+             Switch to 'hybrid' or 'claude' mode in config.toml, or fix the local model setup."
+        ));
+    }
+
     info!(agent = %agent_name, model = %claude_model, prompt_len = prompt.len(), "Calling Claude CLI");
     call_with_rotation(home_dir, prompt, &claude_model, &system_prompt).await
+}
+
+/// Read inference_mode from config.toml [general] section.
+async fn read_inference_mode(home_dir: &Path) -> String {
+    let config_path = home_dir.join("config.toml");
+    let content = tokio::fs::read_to_string(&config_path).await.unwrap_or_default();
+    let table: toml::Table = content.parse().unwrap_or_default();
+    table.get("general")
+        .and_then(|g| g.get("inference_mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("claude")
+        .to_string()
 }
 
 /// Cached AccountRotator — avoids rebuilding on every call (BE-H4).
