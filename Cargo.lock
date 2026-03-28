@@ -1623,6 +1623,7 @@ dependencies = [
  "chrono",
  "duduclaw-core",
  "either",
+ "futures-util",
  "indexmap 2.13.0",
  "llama-cpp-2",
  "mistralrs-core",
@@ -1633,6 +1634,7 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
+ "urlencoding",
  "uuid 1.22.0",
 ]
 

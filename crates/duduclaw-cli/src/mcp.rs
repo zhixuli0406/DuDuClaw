@@ -251,6 +251,27 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "text", description: "Compressed text to decompress", required: true },
         ],
     },
+    // ── Model registry tools ────────────────────────────────────────
+    ToolDef {
+        name: "model_search",
+        description: "Search for GGUF models from curated recommendations and HuggingFace. Results are filtered by available RAM. Trusted repos are marked [推薦].",
+        params: &[
+            ParamDef { name: "query", description: "Search query (e.g., 'qwen 8b', 'code llama', 'gemma')", required: true },
+        ],
+    },
+    ToolDef {
+        name: "model_download",
+        description: "Download a GGUF model from HuggingFace to ~/.duduclaw/models/. Supports resume and mirror fallback.",
+        params: &[
+            ParamDef { name: "repo", description: "HuggingFace repo (e.g., 'Qwen/Qwen3-8B-GGUF')", required: true },
+            ParamDef { name: "filename", description: "GGUF filename (e.g., 'qwen3-8b-q4_k_m.gguf')", required: true },
+        ],
+    },
+    ToolDef {
+        name: "model_recommend",
+        description: "Get hardware-aware model recommendations based on detected GPU and available RAM.",
+        params: &[],
+    },
     // ── Odoo ERP tools ────────────────────────────────────────────
     ToolDef {
         name: "odoo_connect",
@@ -1801,6 +1822,109 @@ async fn handle_llamafile_list(home_dir: &Path) -> Value {
     })
 }
 
+// ── Model registry handlers ─────────────────────────────────
+
+async fn handle_model_search(params: &Value, home_dir: &Path) -> Value {
+    let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("chat gguf");
+
+    let hw = duduclaw_inference::hardware::detect_hardware().await;
+    let results = duduclaw_inference::model_registry::hf_api::search_models(
+        query, hw.ram_available_mb, home_dir,
+    ).await;
+
+    // Also include curated
+    let curated = duduclaw_inference::model_registry::curated::builtin_registry();
+    let curated_filtered = duduclaw_inference::model_registry::curated::filter_by_hardware(&curated, hw.ram_available_mb);
+
+    let mut all = curated_filtered;
+    for r in &results {
+        if !all.iter().any(|a| a.repo == r.repo && a.filename == r.filename) {
+            all.push(r.clone());
+        }
+    }
+
+    if all.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("No models found for query: '{query}' (RAM: {} MB)", hw.ram_available_mb)}]
+        });
+    }
+
+    let mut text = format!("Models for '{}' (RAM: {} MB):\n", query, hw.ram_available_mb);
+    for (i, e) in all.iter().enumerate().take(15) {
+        let tier = match e.tier {
+            duduclaw_inference::model_registry::ModelTier::Recommended => "[推薦]",
+            duduclaw_inference::model_registry::ModelTier::Community => "[社群]",
+        };
+        text.push_str(&format!(
+            "\n  {}. {} {} ({}, {}) — {}\n     repo: {} file: {}",
+            i + 1, tier, e.name, e.params, e.size_display(),
+            e.description, e.repo, e.filename
+        ));
+    }
+
+    serde_json::json!({"content": [{"type": "text", "text": text}]})
+}
+
+async fn handle_model_download(params: &Value, home_dir: &Path) -> Value {
+    let repo = params.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+    let filename = params.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+
+    if repo.is_empty() || filename.is_empty() {
+        return serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "repo and filename are required"}]
+        });
+    }
+
+    // Validate filename
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "Invalid filename"}]
+        });
+    }
+
+    let models_dir = home_dir.join("models");
+    let url = format!("https://huggingface.co/{}/resolve/main/{}", repo, filename);
+    let mirror = format!("https://hf-mirror.com/{}/resolve/main/{}", repo, filename);
+
+    match duduclaw_inference::model_registry::downloader::download_model(
+        &url, &mirror, &models_dir, filename, None,
+    ).await {
+        Ok(path) => serde_json::json!({
+            "content": [{"type": "text", "text": format!("Downloaded to: {}", path.display())}]
+        }),
+        Err(e) => serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": format!("Download failed: {e}\nManual URL: {url}")}]
+        }),
+    }
+}
+
+async fn handle_model_recommend(_home_dir: &Path) -> Value {
+    let hw = duduclaw_inference::hardware::detect_hardware().await;
+    let curated = duduclaw_inference::model_registry::curated::builtin_registry();
+    let filtered = duduclaw_inference::model_registry::curated::filter_by_hardware(&curated, hw.ram_available_mb);
+
+    let mut text = format!(
+        "Hardware: {} ({:?})\nRAM: {} MB available / {} MB total\nRecommended max model: {:.1} GB\n\nRecommended models:\n",
+        hw.gpu_name, hw.gpu_type, hw.ram_available_mb, hw.ram_total_mb, hw.recommended_max_model_gb
+    );
+
+    if filtered.is_empty() {
+        text.push_str("\n  No models fit in available RAM.");
+    } else {
+        for (i, e) in filtered.iter().enumerate() {
+            text.push_str(&format!(
+                "\n  {}. {} ({}, {}) — {}\n     repo: {} file: {}",
+                i + 1, e.name, e.params, e.size_display(), e.description, e.repo, e.filename
+            ));
+        }
+    }
+
+    serde_json::json!({"content": [{"type": "text", "text": text}]})
+}
+
 // ── Compression handlers ────────────────────────────────────
 
 async fn handle_compress_text(params: &Value) -> Value {
@@ -2487,6 +2611,10 @@ async fn handle_tools_call(
         "llamafile_stop" => handle_llamafile_stop(home_dir).await,
         "llamafile_list" => handle_llamafile_list(home_dir).await,
         // Compression tools
+        // Model registry tools
+        "model_search" => handle_model_search(&arguments, home_dir).await,
+        "model_download" => handle_model_download(&arguments, home_dir).await,
+        "model_recommend" => handle_model_recommend(home_dir).await,
         "compress_text" => handle_compress_text(&arguments).await,
         "decompress_text" => handle_decompress_text(&arguments).await,
         // Odoo ERP tools

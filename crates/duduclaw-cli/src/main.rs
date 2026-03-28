@@ -319,57 +319,143 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
     let use_claude = inference_mode == 1 || inference_mode == 2;
 
     // ── 2. Local LLM setup (if local or hybrid) ────────────
-    let local_model_id: String = if use_local && !skip_prompts {
+    //  Uses model registry: curated recommendations + HF search + auto-download
+    let local_model_id: String;
+    let mut download_entry: Option<duduclaw_inference::model_registry::RegistryEntry> = None;
+
+    if use_local && !skip_prompts {
         println!();
         println!("  {} {}", style("▸").cyan(), style("本地模型設定").bold());
-        println!("  將 GGUF 模型檔案放入 ~/.duduclaw/models/ 即可使用。");
-        println!("  推薦模型：Qwen3-8B-Q4_K_M、Gemma-3-4B-Q4_K_M");
+        println!("  正在偵測硬體並準備推薦模型...");
+
+        // Detect hardware for RAM-aware filtering
+        let hw = duduclaw_inference::hardware::detect_hardware().await;
+        let ram_mb = hw.ram_available_mb;
+        println!("  {} 可用記憶體：{} MB（{}）",
+            style("ℹ").blue(), ram_mb, hw.gpu_name);
         println!();
 
-        // Scan existing models
+        // 1. Get curated recommendations filtered by hardware
+        let curated = duduclaw_inference::model_registry::curated::builtin_registry();
+        let mut recommended = duduclaw_inference::model_registry::curated::filter_by_hardware(&curated, ram_mb);
+
+        // 2. Try HF search for more options (non-blocking, fall back to curated)
+        let hf_results = duduclaw_inference::model_registry::hf_api::search_models(
+            "chat gguf", ram_mb, &home,
+        ).await;
+        // Merge: curated first, then HF results not already in curated
+        for hf in &hf_results {
+            if !recommended.iter().any(|r| r.repo == hf.repo && r.filename == hf.filename) {
+                recommended.push(hf.clone());
+            }
+        }
+
+        // 3. Also check for existing local models
         let models_dir = home.join("models");
         let _ = tokio::fs::create_dir_all(&models_dir).await;
-        let mut available_models: Vec<String> = Vec::new();
+        let mut local_existing: Vec<String> = Vec::new();
         if let Ok(mut entries) = tokio::fs::read_dir(&models_dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name.ends_with(".gguf") {
-                    available_models.push(name.trim_end_matches(".gguf").to_string());
+                    local_existing.push(name.trim_end_matches(".gguf").to_string());
                 }
             }
         }
 
-        if available_models.is_empty() {
-            println!("  {} ~/.duduclaw/models/ 目前沒有模型", style("ℹ").blue());
-            println!("  請下載 GGUF 模型後再啟動，或輸入預期的模型 ID");
-            println!();
-            Input::new()
-                .with_prompt("本地模型 ID（檔名不含 .gguf）")
-                .default("qwen3-8b-q4_k_m".to_string())
-                .interact_text()
-                .unwrap_or_else(|_| "qwen3-8b-q4_k_m".to_string())
-        } else {
-            available_models.push("手動輸入...".to_string());
-            let sel = Select::new()
-                .with_prompt("選擇本地模型")
-                .items(&available_models)
-                .default(0)
-                .interact()
-                .unwrap_or(0);
+        // 4. Build selection menu
+        let mut menu_items: Vec<String> = Vec::new();
+        let mut menu_entries: Vec<Option<duduclaw_inference::model_registry::RegistryEntry>> = Vec::new();
 
-            if sel == available_models.len() - 1 {
-                Input::new()
-                    .with_prompt("模型 ID")
-                    .interact_text()
-                    .unwrap_or_else(|_| "qwen3-8b-q4_k_m".to_string())
+        // Recommended models (top 5)
+        for entry in recommended.iter().take(5) {
+            let tier_label = match entry.tier {
+                duduclaw_inference::model_registry::ModelTier::Recommended => style("[推薦]").green().bold().to_string(),
+                duduclaw_inference::model_registry::ModelTier::Community => style("[社群]").yellow().to_string(),
+            };
+            menu_items.push(format!(
+                "{} {} ({}, {}) — {}",
+                tier_label, entry.name, entry.params, entry.size_display(), entry.description
+            ));
+            menu_entries.push(Some(entry.clone()));
+        }
+
+        // Existing local models
+        for name in &local_existing {
+            menu_items.push(format!("{} {} (已下載)", style("[本地]").cyan(), name));
+            menu_entries.push(None);
+        }
+
+        // Extra options
+        menu_items.push("搜尋更多模型...".to_string());
+        menu_entries.push(None);
+        menu_items.push("稍後手動設定".to_string());
+        menu_entries.push(None);
+
+        let sel = Select::new()
+            .with_prompt("選擇模型")
+            .items(&menu_items)
+            .default(0)
+            .interact()
+            .unwrap_or(menu_items.len() - 1);
+
+        let search_idx = menu_items.len() - 2;
+        let skip_idx = menu_items.len() - 1;
+        let local_start = recommended.len().min(5);
+        let local_end = local_start + local_existing.len();
+
+        if sel == skip_idx {
+            // Skip
+            local_model_id = "qwen3-8b-q4_k_m".to_string();
+        } else if sel == search_idx {
+            // HF search
+            let query: String = Input::new()
+                .with_prompt("搜尋模型（例如 'qwen 8b' 或 'code llama'）")
+                .interact_text()
+                .unwrap_or_else(|_| "qwen 8b gguf".to_string());
+
+            println!("  正在搜尋 HuggingFace...");
+            let results = duduclaw_inference::model_registry::hf_api::search_models(
+                &query, ram_mb, &home,
+            ).await;
+
+            if results.is_empty() {
+                println!("  {} 沒有找到符合的模型，使用預設", style("⚠").yellow());
+                local_model_id = "qwen3-8b-q4_k_m".to_string();
             } else {
-                available_models[sel].clone()
+                let search_items: Vec<String> = results.iter().take(10).map(|e| {
+                    let tier_label = match e.tier {
+                        duduclaw_inference::model_registry::ModelTier::Recommended => "[推薦]".to_string(),
+                        duduclaw_inference::model_registry::ModelTier::Community => "[社群]".to_string(),
+                    };
+                    format!("{} {} ({}, {})", tier_label, e.name, e.params, e.size_display())
+                }).collect();
+
+                let search_sel = Select::new()
+                    .with_prompt("選擇搜尋結果")
+                    .items(&search_items)
+                    .default(0)
+                    .interact()
+                    .unwrap_or(0);
+
+                let entry = &results[search_sel.min(results.len() - 1)];
+                local_model_id = entry.model_id();
+                download_entry = Some(entry.clone());
             }
+        } else if sel >= local_start && sel < local_end {
+            // Existing local model
+            local_model_id = local_existing[sel - local_start].clone();
+        } else if let Some(Some(entry)) = menu_entries.get(sel) {
+            // Curated/HF model — needs download
+            local_model_id = entry.model_id();
+            download_entry = Some(entry.clone());
+        } else {
+            local_model_id = "qwen3-8b-q4_k_m".to_string();
         }
     } else if use_local {
-        "qwen3-8b-q4_k_m".to_string()
+        local_model_id = "qwen3-8b-q4_k_m".to_string();
     } else {
-        String::new()
+        local_model_id = String::new();
     };
 
     // ── 3. Claude API Key (if claude or hybrid) ─────────────
@@ -775,6 +861,55 @@ context_size = 4096
         let models_dir = home.join("models");
         let _ = tokio::fs::create_dir_all(&models_dir).await;
         println!("  {} {}", style("✓").green(), inference_toml_path.display());
+
+        // Download model if selected from registry
+        if let Some(ref entry) = download_entry {
+            let dest = models_dir.join(&entry.filename);
+            if !dest.exists() {
+                println!();
+                println!("  {} {} ({})",
+                    style("⬇").cyan().bold(),
+                    style(format!("正在下載 {}", entry.name)).bold(),
+                    entry.size_display());
+                println!("  來源：{}", style(&entry.repo).dim());
+                println!();
+
+                let _progress_style = style("").clone();
+                let result = duduclaw_inference::model_registry::downloader::download_model(
+                    &entry.download_url(),
+                    &entry.mirror_url(),
+                    &models_dir,
+                    &entry.filename,
+                    Some(Box::new(move |p| {
+                        let bar_width = 40;
+                        let filled = (p.percent() / 100.0 * bar_width as f64) as usize;
+                        let empty = bar_width - filled;
+                        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
+                        eprint!("\r  {bar} {:.1}% ({}/{} MB) {} ETA {}    ",
+                            p.percent(),
+                            p.downloaded_bytes / (1024 * 1024),
+                            p.total_bytes / (1024 * 1024),
+                            p.display_speed(),
+                            p.display_eta(),
+                        );
+                    })),
+                ).await;
+
+                eprintln!(); // newline after progress bar
+                match result {
+                    Ok(_) => {
+                        println!("  {} 模型下載完成！", style("✓").green());
+                    }
+                    Err(e) => {
+                        println!("  {} 下載失敗：{e}", style("✗").red());
+                        println!("  手動下載：{}", style(entry.download_url()).cyan());
+                        println!("  放置路徑：{}", style(models_dir.display()).cyan());
+                    }
+                }
+            } else {
+                println!("  {} 模型已存在：{}", style("✓").green(), dest.display());
+            }
+        }
     }
 
     // agent.toml
