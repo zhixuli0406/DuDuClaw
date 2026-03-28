@@ -58,6 +58,9 @@ pub async fn download_model(
     filename: &str,
     on_progress: Option<ProgressCallback>,
 ) -> Result<PathBuf> {
+    // C-1: validate filename — must be safe basename, no path traversal
+    validate_filename(filename)?;
+
     let dest = dest_dir.join(filename);
     if dest.exists() {
         info!(path = %dest.display(), "Model already exists, skipping download");
@@ -66,8 +69,8 @@ pub async fn download_model(
 
     tokio::fs::create_dir_all(dest_dir).await?;
 
-    // Try primary URL first, then mirror
-    let result = download_with_resume(url, dest_dir, filename, &on_progress).await;
+    // Try primary URL first (with auth), then mirror (without auth)
+    let result = download_with_resume(url, dest_dir, filename, &on_progress, true).await;
     match result {
         Ok(path) => Ok(path),
         Err(e) => {
@@ -75,10 +78,46 @@ pub async fn download_model(
                 return Err(e);
             }
             warn!(error = %e, "Primary download failed, trying mirror");
-            download_with_resume(mirror_url, dest_dir, filename, &on_progress).await
+            // H-S1: do NOT send HF token to third-party mirror
+            download_with_resume(mirror_url, dest_dir, filename, &on_progress, false).await
         }
     }
 }
+
+/// Validate filename is a safe basename (no path traversal).
+fn validate_filename(filename: &str) -> Result<()> {
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+        || filename.starts_with('.')
+        || !filename.ends_with(".gguf")
+    {
+        return Err(InferenceError::Config(format!("Invalid model filename: {filename}")));
+    }
+    // Only allow alphanumeric, dash, underscore, dot
+    if !filename.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return Err(InferenceError::Config(format!("Filename contains invalid characters: {filename}")));
+    }
+    Ok(())
+}
+
+/// Validate repo is a valid HuggingFace owner/name format.
+pub fn validate_repo(repo: &str) -> Result<()> {
+    let parts: Vec<&str> = repo.split('/').collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(InferenceError::Config(format!("Invalid repo format: {repo} (expected owner/name)")));
+    }
+    for part in &parts {
+        if !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            return Err(InferenceError::Config(format!("Repo contains invalid characters: {repo}")));
+        }
+    }
+    Ok(())
+}
+
+/// Maximum download size (100 GB).
+const MAX_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 
 /// Download with resume support.
 async fn download_with_resume(
@@ -86,27 +125,29 @@ async fn download_with_resume(
     dest_dir: &Path,
     filename: &str,
     on_progress: &Option<ProgressCallback>,
+    send_auth: bool,
 ) -> Result<PathBuf> {
     let dest = dest_dir.join(filename);
     let partial = dest_dir.join(format!("{filename}.partial"));
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3600)) // 1 hour max
+        .timeout(std::time::Duration::from_secs(3600))
         .build()
         .map_err(|e| InferenceError::Http(format!("Failed to create HTTP client: {e}")))?;
 
-    // Check existing partial download
     let existing_size = if partial.exists() {
         tokio::fs::metadata(&partial).await.map(|m| m.len()).unwrap_or(0)
     } else {
         0
     };
 
-    // Build request with Range header for resume
     let mut req = client.get(url);
-    let hf_token = std::env::var("HF_TOKEN").unwrap_or_default();
-    if !hf_token.is_empty() {
-        req = req.bearer_auth(&hf_token);
+    // H-S1: only send auth token to primary HF URL, not mirrors
+    if send_auth {
+        let hf_token = std::env::var("HF_TOKEN").unwrap_or_default();
+        if !hf_token.is_empty() {
+            req = req.bearer_auth(&hf_token);
+        }
     }
     if existing_size > 0 {
         req = req.header("Range", format!("bytes={existing_size}-"));
@@ -154,6 +195,12 @@ async fn download_with_resume(
         let chunk = chunk.map_err(|e| InferenceError::Http(format!("Download stream error: {e}")))?;
         file.write_all(&chunk).await?;
         downloaded += chunk.len() as u64;
+
+        // L-3: guard against infinite download
+        if downloaded > MAX_DOWNLOAD_BYTES {
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Err(InferenceError::Http("Download size exceeds 100 GB limit".to_string()));
+        }
 
         if let Some(cb) = on_progress {
             let elapsed = start.elapsed().as_secs_f64();

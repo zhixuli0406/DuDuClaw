@@ -59,7 +59,30 @@ pub async fn call_claude_for_agent(
     let local_config = agent.config.model.local.clone();
     drop(reg);
 
-    // Step 1: Try local inference if agent prefers it
+    // P0 fix: global mode gate BEFORE per-agent routing
+    let inference_mode = get_inference_mode(home_dir).await;
+    match inference_mode.as_str() {
+        "local" => {
+            // Force local inference regardless of per-agent prefer_local
+            let model_id = local_config.as_ref().map(|c| c.model.as_str());
+            return call_local_inference(home_dir, prompt, &system_prompt, model_id)
+                .await
+                .map_err(|e| format!(
+                    "Agent '{agent_name}' is in local-only mode but inference failed: {e}. \
+                     Fix local model setup or switch to 'hybrid' mode in config.toml."
+                ));
+        }
+        "claude" => {
+            // Skip local entirely, go straight to Claude API
+            info!(agent = %agent_name, model = %claude_model, "Claude-only mode");
+            return call_with_rotation(home_dir, prompt, &claude_model, &system_prompt).await;
+        }
+        _ => {
+            // "hybrid" — use per-agent prefer_local
+        }
+    }
+
+    // Hybrid mode: try local inference if agent prefers it
     if let Some(ref local) = local_config {
         if local.prefer_local {
             info!(agent = %agent_name, local_model = %local.model, "Trying local inference for agent");
@@ -78,30 +101,38 @@ pub async fn call_claude_for_agent(
         }
     }
 
-    // Step 2: Fall back to Claude Code SDK via account rotation
-    // Read inference_mode from config — if "local", don't attempt Claude API
-    let inference_mode = read_inference_mode(home_dir).await;
-    if inference_mode == "local" {
-        return Err(format!(
-            "Agent '{agent_name}' is in local-only mode but local inference failed. \
-             Switch to 'hybrid' or 'claude' mode in config.toml, or fix the local model setup."
-        ));
-    }
-
+    // Fall back to Claude Code SDK via account rotation
     info!(agent = %agent_name, model = %claude_model, prompt_len = prompt.len(), "Calling Claude CLI");
     call_with_rotation(home_dir, prompt, &claude_model, &system_prompt).await
 }
 
-/// Read inference_mode from config.toml [general] section.
-async fn read_inference_mode(home_dir: &Path) -> String {
+/// Cached inference_mode — avoids reading config.toml on every call (P1-3).
+static INFERENCE_MODE_CACHE: std::sync::OnceLock<tokio::sync::RwLock<Option<(std::time::Instant, String)>>> = std::sync::OnceLock::new();
+
+async fn get_inference_mode(home_dir: &Path) -> String {
+    let cache = INFERENCE_MODE_CACHE.get_or_init(|| tokio::sync::RwLock::new(None));
+    let ttl = std::time::Duration::from_secs(300); // 5 min
+
+    {
+        let guard = cache.read().await;
+        if let Some((created, mode)) = guard.as_ref() {
+            if created.elapsed() < ttl {
+                return mode.clone();
+            }
+        }
+    }
+
     let config_path = home_dir.join("config.toml");
     let content = tokio::fs::read_to_string(&config_path).await.unwrap_or_default();
     let table: toml::Table = content.parse().unwrap_or_default();
-    table.get("general")
+    let mode = table.get("general")
         .and_then(|g| g.get("inference_mode"))
         .and_then(|v| v.as_str())
         .unwrap_or("claude")
-        .to_string()
+        .to_string();
+
+    *cache.write().await = Some((std::time::Instant::now(), mode.clone()));
+    mode
 }
 
 /// Cached AccountRotator — avoids rebuilding on every call (BE-H4).
