@@ -16,8 +16,10 @@ async-trait = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 
-# HTTP client for OpenAI-compat backend
-reqwest = { workspace = true }
+# HTTP client for OpenAI-compat backend + model download
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = { workspace = true }
+urlencoding = "2"
 
 # LLM inference — llama.cpp
 llama-cpp-2 = { version = "0.1", optional = true, features = ["sampler"] }

@@ -31,6 +31,7 @@ pub mod manager;
 pub mod mistral_rs;
 pub mod mlx_bridge;
 pub mod model_manager;
+pub mod model_registry;
 pub mod openai_compat;
 pub mod router;
 pub mod types;
