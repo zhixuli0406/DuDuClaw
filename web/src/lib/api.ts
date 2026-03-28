@@ -48,11 +48,19 @@ export interface ChannelStatus {
 
 export interface AccountInfo {
   id: string;
-  account_type: 'api_key' | 'oauth';
+  auth_method: 'apikey' | 'oauth';
+  account_type?: string; // legacy alias
   priority: number;
   is_healthy: boolean;
+  is_available: boolean;
   spent_this_month: number;
   monthly_budget_cents: number;
+  total_requests: number;
+  label: string;
+  email: string;
+  subscription: string;
+  expires_at: string | null;
+  days_until_expiry: number | null;
 }
 
 export interface BudgetSummary {
