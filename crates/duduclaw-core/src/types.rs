@@ -141,35 +141,27 @@ pub struct PermissionsConfig {
 }
 
 /// Evolution / self-improvement configuration.
+///
+/// Evolution is driven exclusively by the prediction engine (error-based triggering)
+/// and the GVU self-play loop (Generator → Verifier → Updater).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct EvolutionConfig {
-    pub micro_reflection: bool,
-    pub meso_reflection: bool,
-    pub macro_reflection: bool,
     pub skill_auto_activate: bool,
     pub skill_security_scan: bool,
     /// External factors to include in reflections.
     #[serde(default)]
     pub external_factors: ExternalFactorsConfig,
 
-    // ── Prediction-driven evolution (Phase 1) ──
-
-    /// When true, evolution is driven by prediction errors instead of fixed timers.
-    /// Heartbeat scheduler still runs for bus polling and silence checking.
-    #[serde(default)]
-    pub prediction_driven: bool,
-
-    /// Enable GVU (Generator-Verifier-Updater) loop for evolution proposals (Phase 2).
-    #[serde(default)]
+    /// Enable GVU (Generator-Verifier-Updater) loop for evolution proposals.
+    #[serde(default = "default_true")]
     pub gvu_enabled: bool,
 
-    /// Enable cognitive memory layer with episodic/semantic separation (Phase 3).
+    /// Enable cognitive memory layer with episodic/semantic separation.
     #[serde(default)]
     pub cognitive_memory: bool,
 
-    /// Maximum hours of silence before a forced Meso reflection is triggered.
-    /// Only applies when `prediction_driven` is true.
+    /// Maximum hours of silence before the heartbeat silence-breaker fires.
     #[serde(default = "default_max_silence_hours")]
     pub max_silence_hours: f64,
 
@@ -195,14 +187,10 @@ pub struct EvolutionConfig {
 impl Default for EvolutionConfig {
     fn default() -> Self {
         Self {
-            micro_reflection: true,
-            meso_reflection: true,
-            macro_reflection: true,
             skill_auto_activate: false,
             skill_security_scan: true,
             external_factors: Default::default(),
-            prediction_driven: false,
-            gvu_enabled: false,
+            gvu_enabled: true,
             cognitive_memory: false,
             max_silence_hours: 12.0,
             max_gvu_generations: 3,
@@ -211,6 +199,10 @@ impl Default for EvolutionConfig {
             max_active_skills: 5,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_max_silence_hours() -> f64 {

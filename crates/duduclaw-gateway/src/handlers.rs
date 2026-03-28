@@ -790,6 +790,11 @@ impl MethodHandler {
             "monthly_budget_cents": a.monthly_budget_cents,
             "total_requests": a.total_requests,
             "is_available": a.is_available,
+            "label": a.label,
+            "email": a.email,
+            "subscription": a.subscription,
+            "expires_at": a.expires_at,
+            "days_until_expiry": a.days_until_expiry,
         })).collect();
         WsFrame::ok_response("", json!({ "accounts": accounts_json }))
     }
@@ -1354,26 +1359,20 @@ impl MethodHandler {
             let cfg = &a.config;
             json!({
                 "agent_id": cfg.agent.name,
-                "micro_reflection": cfg.evolution.micro_reflection,
-                "meso_reflection": cfg.evolution.meso_reflection,
-                "macro_reflection": cfg.evolution.macro_reflection,
+                "gvu_enabled": cfg.evolution.gvu_enabled,
+                "cognitive_memory": cfg.evolution.cognitive_memory,
                 "skill_auto_activate": cfg.evolution.skill_auto_activate,
                 "skill_security_scan": cfg.evolution.skill_security_scan,
+                "max_silence_hours": cfg.evolution.max_silence_hours,
+                "max_gvu_generations": cfg.evolution.max_gvu_generations,
+                "observation_period_hours": cfg.evolution.observation_period_hours,
             })
         }).collect();
 
-        let any_enabled = reg.list().iter().any(|a| {
-            let e = &a.config.evolution;
-            e.micro_reflection || e.meso_reflection || e.macro_reflection
-        });
-
         WsFrame::ok_response("", json!({
-            "enabled": any_enabled,
+            "enabled": true,
+            "mode": "prediction_driven",
             "agents": agents,
-            "timers": {
-                "meso_interval_seconds": 3600,
-                "macro_interval_seconds": 86400,
-            },
         }))
     }
 

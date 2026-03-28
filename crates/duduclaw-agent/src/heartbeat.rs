@@ -6,11 +6,11 @@
 //! - `cron`: cron expression for fine-grained scheduling (takes precedence)
 //! - `max_concurrent_runs`: concurrency cap per agent
 //!
-//! On each heartbeat tick the scheduler:
-//! 1. Checks pending IPC/bus messages for the agent
-//! 2. Triggers meso reflection (if `evolution.meso_reflection` is enabled)
-//! 3. Triggers macro reflection once per day (if `evolution.macro_reflection` is enabled)
-//! 4. Emits a `HeartbeatEvent` for monitoring
+//! Evolution is driven exclusively by the prediction engine (Phase 1) and
+//! GVU self-play loop (Phase 2). The heartbeat scheduler handles:
+//! 1. Pending IPC/bus message polling
+//! 2. Silence breaker — forces a reflection if no evolution trigger for too long
+//! 3. Emitting `HeartbeatEvent` for monitoring
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use chrono::{self, Utc};
 use cron::Schedule;
-use duduclaw_core::types::{AgentStatus, EvolutionConfig, HeartbeatConfig};
+use duduclaw_core::types::{AgentStatus, HeartbeatConfig};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio::time;
@@ -57,12 +57,11 @@ pub struct HeartbeatEvent {
 struct LiveAgent {
     agent_id: String,
     config: HeartbeatConfig,
-    evolution: EvolutionConfig,
-    agent_dir: PathBuf,
+    /// Max silence hours before forced reflection (from EvolutionConfig).
+    max_silence_hours: f64,
     schedule: Option<Schedule>,
     last_run: Option<chrono::DateTime<Utc>>,
-    last_macro: Option<chrono::DateTime<Utc>>,
-    /// Timestamp of the last evolution trigger (from any source: heartbeat or prediction engine).
+    /// Timestamp of the last evolution trigger (from any source: prediction engine or silence breaker).
     last_evolution_trigger: Option<chrono::DateTime<Utc>>,
     total_runs: u64,
     active_runs: Arc<tokio::sync::Semaphore>,
@@ -75,11 +74,9 @@ impl LiveAgent {
         Self {
             agent_id: agent.config.agent.name.clone(),
             config: agent.config.heartbeat.clone(),
-            evolution: agent.config.evolution.clone(),
-            agent_dir: agent.dir.clone(),
+            max_silence_hours: agent.config.evolution.max_silence_hours,
             schedule,
             last_run: None,
-            last_macro: None,
             last_evolution_trigger: Some(Utc::now()), // prevent cold-start immediate trigger
             total_runs: 0,
             active_runs: Arc::new(tokio::sync::Semaphore::new(max as usize)),
@@ -125,16 +122,6 @@ impl LiveAgent {
         Some(anchor + chrono::Duration::seconds(self.config.interval_seconds as i64))
     }
 
-    /// Whether macro reflection should run (once per 24h).
-    fn should_macro(&self, now: chrono::DateTime<Utc>) -> bool {
-        if !self.evolution.macro_reflection {
-            return false;
-        }
-        match self.last_macro {
-            Some(last) => now.signed_duration_since(last) >= chrono::Duration::hours(24),
-            None => true,
-        }
-    }
 }
 
 // ── HeartbeatScheduler ────────────────────────────────────────
@@ -187,7 +174,7 @@ impl HeartbeatScheduler {
 
             if let Some(existing) = agents.get_mut(&la.config.agent.name) {
                 existing.config = la.config.heartbeat.clone();
-                existing.evolution = la.config.evolution.clone();
+                existing.max_silence_hours = la.config.evolution.max_silence_hours;
                 existing.schedule = parse_cron(&la.config.heartbeat.cron);
             } else {
                 agents.insert(la.config.agent.name.clone(), LiveAgent::from_loaded(la));
@@ -229,11 +216,9 @@ impl HeartbeatScheduler {
             agent.total_runs += 1;
             let home = self.home_dir.clone();
             let aid = agent.agent_id.clone();
-            let dir = agent.agent_dir.clone();
-            let evo = agent.evolution.clone();
             let sem = agent.active_runs.clone();
             tokio::spawn(async move {
-                execute_heartbeat(&home, &aid, &dir, &evo, &sem).await;
+                execute_heartbeat(&home, &aid, &sem).await;
             });
             true
         } else {
@@ -262,41 +247,32 @@ impl HeartbeatScheduler {
             let now = Utc::now();
 
             // Collect tasks to spawn while holding the lock, then release before spawning
-            let mut to_spawn: Vec<(PathBuf, String, PathBuf, EvolutionConfig, Arc<tokio::sync::Semaphore>, bool)> = Vec::new();
+            let mut to_spawn: Vec<(PathBuf, String, Arc<tokio::sync::Semaphore>)> = Vec::new();
             {
                 let mut agents = self.agents.write().await;
                 for agent in agents.values_mut() {
-                    // ── Silence checker (prediction_driven mode) ──
-                    // If prediction_driven is enabled, the heartbeat doesn't trigger
-                    // meso/macro directly. But if no evolution has occurred for
-                    // max_silence_hours, force a meso reflection to prevent stagnation.
-                    if agent.evolution.prediction_driven && agent.config.enabled {
-                        let hours_since_last = agent
-                            .last_evolution_trigger
-                            .map(|t| now.signed_duration_since(t).num_minutes() as f64 / 60.0)
-                            .unwrap_or(agent.evolution.max_silence_hours + 1.0);
-
-                        if hours_since_last > agent.evolution.max_silence_hours {
-                            warn!(
-                                agent = %agent.agent_id,
-                                hours = format!("{hours_since_last:.1}"),
-                                "Silence breaker: no evolution trigger for too long, forcing meso reflection"
-                            );
-                            agent.last_evolution_trigger = Some(now);
-                            to_spawn.push((
-                                self.home_dir.clone(),
-                                agent.agent_id.clone(),
-                                agent.agent_dir.clone(),
-                                agent.evolution.clone(),
-                                agent.active_runs.clone(),
-                                false,
-                            ));
-                        }
-                        // Skip normal heartbeat firing for prediction-driven agents
-                        // (bus polling is still done via the silence-checker spawn above)
+                    if !agent.config.enabled {
                         continue;
                     }
 
+                    // ── Silence breaker ──
+                    // If no evolution has occurred for max_silence_hours, mark for
+                    // heartbeat so the prediction engine can pick it up on next conversation.
+                    let hours_since_last = agent
+                        .last_evolution_trigger
+                        .map(|t| now.signed_duration_since(t).num_minutes() as f64 / 60.0)
+                        .unwrap_or(agent.max_silence_hours + 1.0);
+
+                    if hours_since_last > agent.max_silence_hours {
+                        warn!(
+                            agent = %agent.agent_id,
+                            hours = format!("{hours_since_last:.1}"),
+                            "Silence breaker: no evolution trigger for too long"
+                        );
+                        agent.last_evolution_trigger = Some(now);
+                    }
+
+                    // ── Normal heartbeat: bus polling ──
                     if !agent.should_fire(now) {
                         continue;
                     }
@@ -308,37 +284,24 @@ impl HeartbeatScheduler {
                     info!(agent = %agent.agent_id, run = agent.total_runs + 1, "Heartbeat firing");
                     agent.last_run = Some(now);
                     agent.total_runs += 1;
-                    agent.last_evolution_trigger = Some(now);
-
-                    let run_macro = agent.should_macro(now);
-                    if run_macro {
-                        agent.last_macro = Some(now);
-                    }
 
                     to_spawn.push((
                         self.home_dir.clone(),
                         agent.agent_id.clone(),
-                        agent.agent_dir.clone(),
-                        agent.evolution.clone(),
                         agent.active_runs.clone(),
-                        run_macro,
                     ));
                 }
             } // write lock released here
 
             // Now spawn tasks without holding any lock
-            for (home, aid, dir, evo, sem, run_macro) in to_spawn {
+            for (home, aid, sem) in to_spawn {
                 let global_sem = self.global_semaphore.clone();
                 tokio::spawn(async move {
-                    // Acquire global permit to limit total concurrent subprocesses (BE-H5)
                     let _global_permit = match global_sem.acquire().await {
                         Ok(p) => p,
                         Err(_) => return,
                     };
-                    execute_heartbeat(&home, &aid, &dir, &evo, &sem).await;
-                    if run_macro {
-                        execute_evolution("macro", &home, &aid, &dir).await;
-                    }
+                    execute_heartbeat(&home, &aid, &sem).await;
                 });
             }
         }
@@ -355,15 +318,15 @@ impl HeartbeatScheduler {
 
 // ── Heartbeat execution ───────────────────────────────────────
 
-/// Execute a single heartbeat cycle for one agent.
+/// Execute a single heartbeat cycle for one agent (bus polling only).
+///
+/// Evolution reflections are driven by the prediction engine in `channel_reply`,
+/// not by the heartbeat timer.
 async fn execute_heartbeat(
     home_dir: &Path,
     agent_id: &str,
-    agent_dir: &Path,
-    evolution: &EvolutionConfig,
     semaphore: &tokio::sync::Semaphore,
 ) {
-    // Acquire concurrency permit
     let _permit = match semaphore.try_acquire() {
         Ok(p) => p,
         Err(_) => {
@@ -374,73 +337,12 @@ async fn execute_heartbeat(
 
     info!(agent = agent_id, "Heartbeat cycle start");
 
-    // 1. Process pending bus_queue messages for this agent
     let pending = count_pending_bus_messages(home_dir, agent_id).await;
     if pending > 0 {
         info!(agent = agent_id, pending, "Agent has pending bus messages");
     }
 
-    // 2. Meso reflection
-    // When prediction_driven is true, meso/macro reflections are triggered
-    // by prediction errors, NOT by the heartbeat timer. The heartbeat still
-    // runs for bus polling and silence checking.
-    if !evolution.prediction_driven && evolution.meso_reflection {
-        execute_evolution("meso", home_dir, agent_id, agent_dir).await;
-    }
-
     info!(agent = agent_id, "Heartbeat cycle complete");
-}
-
-/// Run an evolution reflection via Python subprocess.
-async fn execute_evolution(
-    reflection_type: &str,
-    home_dir: &Path,
-    agent_id: &str,
-    agent_dir: &Path,
-) {
-    info!(agent = agent_id, r#type = reflection_type, "Evolution reflection start");
-
-    let python_path = find_python_path(home_dir);
-    let mut cmd = tokio::process::Command::new("python3");
-    cmd.args([
-        "-m",
-        "duduclaw.evolution.run",
-        reflection_type,
-        "--agent-id",
-        agent_id,
-        "--agent-dir",
-        &agent_dir.to_string_lossy(),
-    ]);
-    cmd.env("PYTHONPATH", &python_path);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    let timeout_secs = match reflection_type {
-        "macro" => 120,
-        _ => 60,
-    };
-
-    match tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await {
-        Ok(Ok(out)) if out.status.success() => {
-            info!(agent = agent_id, r#type = reflection_type, "Evolution reflection completed");
-        }
-        Ok(Ok(out)) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            warn!(
-                agent = agent_id,
-                r#type = reflection_type,
-                "Evolution reflection failed: {}",
-                &stderr[..stderr.len().min(200)]
-            );
-        }
-        Ok(Err(e)) => warn!(agent = agent_id, "Evolution spawn error: {e}"),
-        Err(_) => warn!(
-            agent = agent_id,
-            r#type = reflection_type,
-            timeout_secs,
-            "Evolution reflection timed out"
-        ),
-    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -463,24 +365,6 @@ fn parse_cron(expr: &str) -> Option<Schedule> {
             None
         }
     }
-}
-
-fn find_python_path(home_dir: &Path) -> String {
-    let candidates = [
-        home_dir
-            .parent()
-            .unwrap_or(home_dir)
-            .join("python")
-            .to_string_lossy()
-            .to_string(),
-        "/opt/duduclaw".to_string(),
-    ];
-    for path in &candidates {
-        if !path.is_empty() && Path::new(path).join("duduclaw").exists() {
-            return path.clone();
-        }
-    }
-    std::env::var("PYTHONPATH").unwrap_or_default()
 }
 
 /// Count pending `agent_message` entries in bus_queue.jsonl for a specific agent.

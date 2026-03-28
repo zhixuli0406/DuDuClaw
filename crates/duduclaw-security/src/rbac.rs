@@ -170,6 +170,8 @@ mod tests {
                 preferred: "gpt-4".to_string(),
                 fallback: "gpt-3.5".to_string(),
                 account_pool: vec![],
+                local: None,
+                api_mode: "cli".to_string(),
             },
             container: ContainerConfig {
                 timeout_ms: 30000,
@@ -192,12 +194,9 @@ mod tests {
             },
             permissions: perms,
             evolution: EvolutionConfig {
-                micro_reflection: false,
-                meso_reflection: false,
-                macro_reflection: false,
                 skill_auto_activate: false,
                 skill_security_scan: false,
-                external_factors: Default::default(),
+                ..Default::default()
             },
         }
     }

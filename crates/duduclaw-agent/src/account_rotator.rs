@@ -47,9 +47,20 @@ pub struct Account {
     /// For OAuth: subscription type (pro, team, max)
     #[serde(default)]
     pub subscription: String,
+    /// For OAuth: user-visible label (e.g., "工作帳號")
+    #[serde(default)]
+    pub label: String,
+    /// OAuth token expiry (ISO 8601). Accounts past expiry are marked unhealthy.
+    #[serde(default)]
+    pub expires_at: Option<String>,
     // Runtime state (not persisted in config)
     #[serde(skip)]
     pub api_key: String,
+    /// OAuth token from `setup-token` (decrypted at runtime from oauth_token_enc).
+    /// When set, injected as CLAUDE_CODE_OAUTH_TOKEN env var.
+    /// When empty (default account), CLI uses OS keychain auth.
+    #[serde(skip)]
+    pub oauth_token: Option<String>,
     #[serde(skip)]
     pub credentials_dir: Option<PathBuf>,
     #[serde(skip)]
@@ -81,10 +92,26 @@ impl Account {
         if self.cooldown_until.is_some_and(|cd| Utc::now() < cd) {
             return false;
         }
+        // Check token expiry for OAuth accounts
+        if let Some(ref exp) = self.expires_at {
+            if let Ok(expiry) = exp.parse::<DateTime<Utc>>() {
+                if Utc::now() > expiry {
+                    return false;
+                }
+            }
+        }
         match self.auth_method {
             AuthMethod::ApiKey => !self.api_key.is_empty(),
-            AuthMethod::OAuth => self.credentials_dir.is_some(),
+            // OAuth: either has explicit token (setup-token) or credentials_dir (OS keychain)
+            AuthMethod::OAuth => self.oauth_token.is_some() || self.credentials_dir.is_some(),
         }
+    }
+
+    /// Days until token expires. Returns None if no expiry set.
+    pub fn days_until_expiry(&self) -> Option<i64> {
+        let exp = self.expires_at.as_ref()?;
+        let expiry = exp.parse::<DateTime<Utc>>().ok()?;
+        Some((expiry - Utc::now()).num_days())
     }
 }
 
@@ -131,6 +158,9 @@ pub struct AccountStatus {
     pub is_available: bool,
     pub email: String,
     pub subscription: String,
+    pub label: String,
+    pub expires_at: Option<String>,
+    pub days_until_expiry: Option<i64>,
 }
 
 // ── AccountRotator ──────────────────────────────────────────
@@ -181,7 +211,10 @@ impl AccountRotator {
                             profile: String::new(),
                             email: String::new(),
                             subscription: String::new(),
+                            label: acc_table.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            expires_at: None,
                             api_key,
+                            oauth_token: None,
                             credentials_dir: None,
                             is_healthy: true,
                             consecutive_errors: 0,
@@ -194,20 +227,34 @@ impl AccountRotator {
                         let profile = acc_table.get("profile").and_then(|v| v.as_str()).unwrap_or("default");
                         let email = acc_table.get("email").and_then(|v| v.as_str()).unwrap_or("");
                         let sub = acc_table.get("subscription").and_then(|v| v.as_str()).unwrap_or("");
+                        let label = acc_table.get("label").and_then(|v| v.as_str()).unwrap_or("");
+                        let expires_at = acc_table.get("expires_at").and_then(|v| v.as_str()).map(|s| s.to_string());
                         let creds_dir = resolve_oauth_credentials(profile);
+
+                        // Decrypt oauth_token_enc if present
+                        let oauth_token = acc_table
+                            .get("oauth_token_enc")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .and_then(|enc| decrypt_with_keyfile(home_dir, enc));
+
+                        let has_auth = oauth_token.is_some() || creds_dir.is_some();
 
                         loaded.push(Account {
                             id: id.to_string(),
                             auth_method: AuthMethod::OAuth,
                             priority: acc_table.get("priority").and_then(|v| v.as_integer()).unwrap_or(5) as u32,
-                            monthly_budget_cents: 0, // OAuth = subscription, no per-token budget
+                            monthly_budget_cents: 0,
                             tags: Vec::new(),
                             profile: profile.to_string(),
                             email: email.to_string(),
                             subscription: sub.to_string(),
+                            label: label.to_string(),
+                            expires_at,
                             api_key: String::new(),
-                            credentials_dir: creds_dir.clone(),
-                            is_healthy: creds_dir.is_some(),
+                            oauth_token,
+                            credentials_dir: creds_dir,
+                            is_healthy: has_auth,
                             consecutive_errors: 0,
                             spent_this_month: 0,
                             cooldown_until: None,
@@ -240,7 +287,10 @@ impl AccountRotator {
                         profile: String::new(),
                         email: String::new(),
                         subscription: String::new(),
+                        label: String::new(),
+                        expires_at: None,
                         api_key,
+                        oauth_token: None,
                         credentials_dir: None,
                         is_healthy: true,
                         consecutive_errors: 0,
@@ -265,7 +315,10 @@ impl AccountRotator {
                         profile: String::new(),
                         email: String::new(),
                         subscription: String::new(),
+                        label: "環境變數".to_string(),
+                        expires_at: None,
                         api_key: key,
+                        oauth_token: None,
                         credentials_dir: None,
                         is_healthy: true,
                         consecutive_errors: 0,
@@ -281,6 +334,33 @@ impl AccountRotator {
         let oauth_count = loaded.iter().filter(|a| a.auth_method == AuthMethod::OAuth).count();
         let apikey_count = loaded.iter().filter(|a| a.auth_method == AuthMethod::ApiKey).count();
         let count = loaded.len();
+
+        // Check token expiry warnings
+        for acc in &loaded {
+            if let Some(days) = acc.days_until_expiry() {
+                if days <= 0 {
+                    warn!(
+                        account = %acc.id,
+                        label = %acc.label,
+                        "OAuth token EXPIRED — run `claude setup-token` to renew"
+                    );
+                } else if days <= 7 {
+                    warn!(
+                        account = %acc.id,
+                        label = %acc.label,
+                        days_remaining = days,
+                        "OAuth token expiring soon — run `claude setup-token` to renew"
+                    );
+                } else if days <= 30 {
+                    info!(
+                        account = %acc.id,
+                        label = %acc.label,
+                        days_remaining = days,
+                        "OAuth token will expire in {days} days"
+                    );
+                }
+            }
+        }
 
         info!(total = count, oauth = oauth_count, api_key = apikey_count, strategy = ?self.strategy, "Accounts loaded");
         *self.accounts.write().await = loaded;
@@ -326,9 +406,14 @@ impl AccountRotator {
                     env_vars.insert("ANTHROPIC_API_KEY".to_string(), a.api_key.clone());
                 }
                 AuthMethod::OAuth => {
-                    if let Some(dir) = &a.credentials_dir {
+                    if let Some(ref token) = a.oauth_token {
+                        // setup-token account: inject token via env var
+                        env_vars.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone());
+                    } else if let Some(dir) = &a.credentials_dir {
+                        // OS keychain account: point to config dir
                         env_vars.insert("CLAUDE_CONFIG_DIR".to_string(), dir.to_string_lossy().to_string());
                     }
+                    // Ensure API key doesn't override OAuth
                     env_vars.insert("ANTHROPIC_API_KEY".to_string(), String::new());
                 }
             }
@@ -416,6 +501,9 @@ impl AccountRotator {
             is_available: a.is_available(),
             email: a.email.clone(),
             subscription: a.subscription.clone(),
+            label: a.label.clone(),
+            expires_at: a.expires_at.clone(),
+            days_until_expiry: a.days_until_expiry(),
         }).collect()
     }
 
@@ -474,7 +562,10 @@ fn detect_default_oauth_session() -> Option<Account> {
         profile: "default".to_string(),
         email: email.to_string(),
         subscription: subscription.to_string(),
+        label: "本機登入".to_string(),
+        expires_at: None, // OS keychain manages token lifecycle
         api_key: String::new(),
+        oauth_token: None, // Uses OS keychain, not explicit token
         credentials_dir: Some(claude_dir),
         is_healthy: true,
         consecutive_errors: 0,

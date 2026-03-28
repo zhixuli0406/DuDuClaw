@@ -164,10 +164,10 @@ const TOOLS: &[ToolDef] = &[
     // ── Evolution controls ──────────────────────────────────────
     ToolDef {
         name: "evolution_toggle",
-        description: "Toggle evolution engine flags for an agent (prediction_driven, gvu_enabled, cognitive_memory, etc.). Changes take effect within seconds.",
+        description: "Toggle evolution engine flags for an agent (gvu_enabled, cognitive_memory, etc.). Changes take effect within seconds.",
         params: &[
             ParamDef { name: "agent_id", description: "Target agent name", required: true },
-            ParamDef { name: "field", description: "Config field to toggle: prediction_driven, gvu_enabled, cognitive_memory, micro_reflection, meso_reflection, macro_reflection, skill_auto_activate, skill_security_scan", required: true },
+            ParamDef { name: "field", description: "Config field to toggle: gvu_enabled, cognitive_memory, skill_auto_activate, skill_security_scan", required: true },
             ParamDef { name: "value", description: "New value: true/false (for booleans), or a number (for max_silence_hours, skill_token_budget, etc.)", required: true },
         ],
     },
@@ -1076,12 +1076,9 @@ async fn handle_create_agent(params: &Value, home_dir: &Path) -> Value {
         allowed_channels = []
 
         [evolution]
-        micro_reflection = true
-        meso_reflection = false
-        macro_reflection = false
         skill_auto_activate = false
         skill_security_scan = true
-        prediction_driven = false
+        gvu_enabled = true
         gvu_enabled = false
         cognitive_memory = false
         max_silence_hours = 12.0
@@ -1505,8 +1502,7 @@ async fn handle_evolution_toggle(params: &Value, home_dir: &Path) -> Value {
 
     // Validate field name
     let boolean_fields = [
-        "prediction_driven", "gvu_enabled", "cognitive_memory",
-        "micro_reflection", "meso_reflection", "macro_reflection",
+        "gvu_enabled", "cognitive_memory",
         "skill_auto_activate", "skill_security_scan",
     ];
     let numeric_fields = [
@@ -1589,13 +1585,8 @@ async fn handle_evolution_status_tool(params: &Value, home_dir: &Path, default_a
     let status = format!(
         "Evolution status for agent '{agent_id}':\n\
          \n\
-         Prediction-driven: {}\n\
          GVU self-play:     {}\n\
          Cognitive memory:  {}\n\
-         \n\
-         Micro reflection:  {}\n\
-         Meso reflection:   {}\n\
-         Macro reflection:  {}\n\
          \n\
          Skill auto-activate:  {}\n\
          Skill security scan:  {}\n\
@@ -1605,8 +1596,7 @@ async fn handle_evolution_status_tool(params: &Value, home_dir: &Path, default_a
          Max silence hours:         {:.1}\n\
          Max GVU generations:       {}\n\
          Observation period hours:  {:.1}",
-        evo.prediction_driven, evo.gvu_enabled, evo.cognitive_memory,
-        evo.micro_reflection, evo.meso_reflection, evo.macro_reflection,
+        evo.gvu_enabled, evo.cognitive_memory,
         evo.skill_auto_activate, evo.skill_security_scan,
         evo.skill_token_budget, evo.max_active_skills,
         evo.max_silence_hours, evo.max_gvu_generations, evo.observation_period_hours,
