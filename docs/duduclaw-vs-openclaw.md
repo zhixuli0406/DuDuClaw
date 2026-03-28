@@ -1,7 +1,7 @@
 # DuDuClaw vs OpenClaw 深度比較
 
 > 更新日期：2026-03-29
-> OpenClaw 版本：v2026.3.24 | DuDuClaw 版本：v0.8.11
+> OpenClaw 版本：v2026.3.24 | DuDuClaw 版本：v0.8.12
 
 ---
 
