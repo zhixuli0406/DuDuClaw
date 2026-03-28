@@ -1876,27 +1876,31 @@ async fn handle_model_download(params: &Value, home_dir: &Path) -> Value {
         });
     }
 
-    // Validate filename
-    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+    // C-2: validate repo format (owner/name, safe characters only)
+    if let Err(e) = duduclaw_inference::model_registry::downloader::validate_repo(repo) {
         return serde_json::json!({
             "isError": true,
-            "content": [{"type": "text", "text": "Invalid filename"}]
+            "content": [{"type": "text", "text": format!("{e}")}]
         });
     }
 
     let models_dir = home_dir.join("models");
-    let url = format!("https://huggingface.co/{}/resolve/main/{}", repo, filename);
-    let mirror = format!("https://hf-mirror.com/{}/resolve/main/{}", repo, filename);
+    let entry = duduclaw_inference::model_registry::RegistryEntry {
+        name: String::new(), repo: repo.to_string(), filename: filename.to_string(),
+        size_bytes: 0, quantization: String::new(), params: String::new(),
+        languages: vec![], tags: vec![], min_ram_mb: 0, description: String::new(),
+        tier: duduclaw_inference::model_registry::ModelTier::Community, downloads: 0,
+    };
 
     match duduclaw_inference::model_registry::downloader::download_model(
-        &url, &mirror, &models_dir, filename, None,
+        &entry.download_url(), &entry.mirror_url(), &models_dir, filename, None,
     ).await {
         Ok(path) => serde_json::json!({
             "content": [{"type": "text", "text": format!("Downloaded to: {}", path.display())}]
         }),
-        Err(e) => serde_json::json!({
+        Err(_e) => serde_json::json!({
             "isError": true,
-            "content": [{"type": "text", "text": format!("Download failed: {e}\nManual URL: {url}")}]
+            "content": [{"type": "text", "text": format!("Download failed. Check logs for details.\nManual URL: {}", entry.download_url())}]
         }),
     }
 }

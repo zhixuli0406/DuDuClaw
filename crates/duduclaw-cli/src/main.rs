@@ -926,8 +926,8 @@ gpu_layers = -1
 prefer_local = {prefer}
 use_router = {router}
 "#,
-            prefer = if inference_mode == 0 { "true" } else { "true" }, // hybrid also prefers local
-            router = if inference_mode == 2 { "true" } else { "false" }, // only hybrid uses router
+            prefer = if inference_mode == 0 { "true" } else { "false" }, // hybrid: respect router decision
+            router = if inference_mode == 2 { "true" } else { "false" },
         )
     } else {
         String::new()

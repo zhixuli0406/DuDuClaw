@@ -47,25 +47,29 @@ pub async fn search_models(
     available_ram_mb: u64,
     home_dir: &Path,
 ) -> Vec<RegistryEntry> {
-    // Check cache first
-    if let Some(cached) = load_cache(query, home_dir).await {
-        info!(query, count = cached.len(), "Using cached HF search results");
+    // M-1: limit query length
+    let query: String = query.chars().take(200).collect();
+
+    // Build the actual search query (append gguf if not present)
+    let search_query = if query.to_lowercase().contains("gguf") {
+        query.to_string()
+    } else {
+        format!("{query} gguf")
+    };
+
+    // H-Q2: use search_query (not raw query) as cache key
+    if let Some(cached) = load_cache(&search_query, home_dir).await {
+        info!(query = %search_query, count = cached.len(), "Using cached HF search results");
         return filter_and_sort(cached, available_ram_mb);
     }
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
+        .map_err(|e| { warn!(error = %e, "Failed to build HTTP client"); })
         .unwrap_or_default();
 
     let hf_token = std::env::var("HF_TOKEN").unwrap_or_default();
-
-    // Search for GGUF models
-    let search_query = if query.to_lowercase().contains("gguf") {
-        query.to_string()
-    } else {
-        format!("{query} gguf")
-    };
 
     let url = format!(
         "{HF_API_BASE}/models?search={}&filter=gguf&sort=downloads&direction=-1&limit=20",
@@ -97,12 +101,12 @@ pub async fn search_models(
         }
     };
 
-    // Cache results
+    // Cache results (use search_query as key, matching load_cache)
     if !results.is_empty() {
-        save_cache(query, &results, home_dir).await;
+        save_cache(&search_query, &results, home_dir).await;
     }
 
-    info!(query, count = results.len(), "HF search completed");
+    info!(query = %search_query, count = results.len(), "HF search completed");
     filter_and_sort(results, available_ram_mb)
 }
 
@@ -112,9 +116,16 @@ fn convert_hf_models(models: Vec<HfModel>) -> Vec<RegistryEntry> {
 
     for model in models {
         let siblings = model.siblings.unwrap_or_default();
+        // C-1: filter filenames — must be safe basename, no path traversal
         let gguf_files: Vec<&HfSibling> = siblings
             .iter()
-            .filter(|s| s.filename.ends_with(".gguf"))
+            .filter(|s| {
+                s.filename.ends_with(".gguf")
+                    && !s.filename.contains('/')
+                    && !s.filename.contains('\\')
+                    && !s.filename.contains("..")
+                    && !s.filename.starts_with('.')
+            })
             .collect();
 
         if gguf_files.is_empty() {
@@ -164,14 +175,13 @@ fn convert_hf_models(models: Vec<HfModel>) -> Vec<RegistryEntry> {
 ///
 /// Preference order: Q4_K_M > Q4_K_S > Q5_K_M > Q4_0 > Q8_0 > others
 fn pick_best_quantization<'a>(files: &[&'a HfSibling]) -> Option<&'a HfSibling> {
-    let preference = ["Q4_K_M", "q4_k_m", "Q4_K_S", "q4_k_s", "Q5_K_M", "q5_k_m", "Q4_0", "q4_0", "Q8_0", "q8_0"];
-
+    // M-9: case-insensitive matching via uppercase
+    let preference = ["Q4_K_M", "Q4_K_S", "Q5_K_M", "Q4_0", "Q8_0"];
     for pref in preference {
-        if let Some(f) = files.iter().find(|f| f.filename.contains(pref)) {
+        if let Some(f) = files.iter().find(|f| f.filename.to_uppercase().contains(pref)) {
             return Some(f);
         }
     }
-    // Fallback to first GGUF
     files.first().copied()
 }
 
@@ -224,21 +234,27 @@ fn guess_languages(tags: &[String]) -> Vec<String> {
     langs
 }
 
-/// Estimate minimum RAM from file size (file size + ~20% overhead).
+/// Estimate minimum RAM from file size (file size + ~50% for KV cache + context).
 fn estimate_min_ram(size_bytes: u64) -> u64 {
-    (size_bytes / (1024 * 1024)) * 12 / 10
+    (size_bytes / (1024 * 1024)) * 15 / 10
 }
 
 /// Filter by RAM and sort: recommended first, then by downloads.
+/// H-Q4: explicit tier ordering (not relying on enum discriminant)
+fn tier_order(t: &super::ModelTier) -> u8 {
+    match t {
+        super::ModelTier::Recommended => 0,
+        super::ModelTier::Community => 1,
+    }
+}
+
 fn filter_and_sort(mut entries: Vec<RegistryEntry>, available_ram_mb: u64) -> Vec<RegistryEntry> {
     entries.retain(|e| e.min_ram_mb <= available_ram_mb || available_ram_mb == 0);
     entries.sort_by(|a, b| {
-        // Recommended before Community
-        let tier_cmp = (a.tier as u8).cmp(&(b.tier as u8));
+        let tier_cmp = tier_order(&a.tier).cmp(&tier_order(&b.tier));
         if tier_cmp != std::cmp::Ordering::Equal {
             return tier_cmp;
         }
-        // Then by downloads descending
         b.downloads.cmp(&a.downloads)
     });
     entries
@@ -259,7 +275,7 @@ async fn load_cache(query: &str, home_dir: &Path) -> Option<Vec<RegistryEntry>> 
         .unwrap_or_default()
         .as_secs();
 
-    if now - cache.timestamp > CACHE_TTL_HOURS * 3600 {
+    if now.saturating_sub(cache.timestamp) > CACHE_TTL_HOURS * 3600 {
         return None;
     }
 

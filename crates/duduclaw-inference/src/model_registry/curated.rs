@@ -25,7 +25,8 @@ pub const TRUSTED_UPLOADERS: &[&str] = &[
 /// Check if a HF repo belongs to a trusted uploader.
 pub fn is_trusted(repo: &str) -> bool {
     let owner = repo.split('/').next().unwrap_or("");
-    TRUSTED_UPLOADERS.iter().any(|t| t.eq_ignore_ascii_case(owner))
+    // H-S2: exact case-sensitive match (HF org names are case-sensitive)
+    TRUSTED_UPLOADERS.iter().any(|t| *t == owner)
 }
 
 /// Built-in curated model list — fallback when network is unavailable.
