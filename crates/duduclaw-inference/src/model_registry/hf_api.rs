@@ -125,6 +125,8 @@ fn convert_hf_models(models: Vec<HfModel>) -> Vec<RegistryEntry> {
                     && !s.filename.contains('\\')
                     && !s.filename.contains("..")
                     && !s.filename.starts_with('.')
+                    // Match validate_filename allowlist: ASCII alphanumeric + [-_.]
+                    && s.filename.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
             })
             .collect();
 
