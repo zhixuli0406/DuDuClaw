@@ -1,0 +1,41 @@
+[package]
+name = "duduclaw-inference"
+version.workspace = true
+edition.workspace = true
+description = "Local LLM inference engine for DuDuClaw — multi-backend support"
+
+[dependencies]
+duduclaw-core = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# HTTP client for OpenAI-compat backend
+reqwest = { workspace = true }
+
+# LLM inference — llama.cpp
+llama-cpp-2 = { version = "0.1", optional = true, features = ["sampler"] }
+
+# LLM inference — mistral.rs (Rust-native)
+mistralrs-core = { version = "0.7", optional = true }
+# Required by mistralrs-core RequestMessage types
+indexmap = { version = "2", optional = true }
+either = { version = "1", optional = true }
+
+[features]
+default = ["cpu"]
+cpu = []
+metal = ["llama-cpp-2/metal"]
+cuda = ["llama-cpp-2/cuda"]
+vulkan = ["llama-cpp-2/vulkan"]
+# mistral.rs backends
+mistralrs = ["dep:mistralrs-core", "dep:indexmap", "dep:either"]
+mistralrs-metal = ["mistralrs", "mistralrs-core/metal"]
+mistralrs-cuda = ["mistralrs", "mistralrs-core/cuda"]
+mistralrs-flash-attn = ["mistralrs-cuda", "mistralrs-core/flash-attn"]
