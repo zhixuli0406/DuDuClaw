@@ -121,16 +121,19 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .with_prediction_engine(prediction_engine.clone())
         .with_gvu_loop(gvu_loop.clone())
     );
+    // Inject reply context into handler for channel hot-start/stop
+    handler.set_reply_ctx(reply_ctx.clone()).await;
+
     // Store background task handles for graceful shutdown (BE-L4)
     let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     if let Some(h) = crate::telegram::start_telegram_bot(&home_dir, reply_ctx.clone()).await {
-        bg_handles.push(h);
+        handler.register_channel_handle("telegram", h).await;
     }
     let line_router = crate::line::start_line_bot(&home_dir, reply_ctx.clone()).await;
     let reply_ctx_for_debug = reply_ctx.clone();
     if let Some(h) = crate::discord::start_discord_bot(&home_dir, reply_ctx).await {
-        bg_handles.push(h);
+        handler.register_channel_handle("discord", h).await;
     }
 
     // Start unified heartbeat scheduler (per-agent: evolution + cron + monitoring)
