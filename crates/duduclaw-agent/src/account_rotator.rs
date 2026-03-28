@@ -426,28 +426,44 @@ impl AccountRotator {
 
 // ── OAuth helpers ───────────────────────────────────────────
 
-/// Detect the default OAuth session from ~/.claude/.credentials.json
+/// Detect the default OAuth session via `claude auth status`.
+///
+/// Works with all Claude Code versions — does not depend on `.credentials.json`
+/// which no longer exists in recent versions. The `claude` CLI manages its own
+/// auth state (OS keychain / internal storage).
 fn detect_default_oauth_session() -> Option<Account> {
+    let claude = duduclaw_core::which_claude()?;
     let claude_dir = dirs::home_dir()?.join(".claude");
-    let creds_path = claude_dir.join(".credentials.json");
-    let content = std::fs::read_to_string(&creds_path).ok()?;
-    let creds: serde_json::Value = serde_json::from_str(&content).ok()?;
 
-    let oauth = creds.get("claudeAiOauth")?;
-    let access_token = oauth.get("accessToken").and_then(|v| v.as_str())?;
-    if access_token.is_empty() { return None; }
+    let output = std::process::Command::new(&claude)
+        .args(["auth", "status"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .ok()?;
 
-    // Check expiry
-    let expires_at = oauth.get("expiresAt").and_then(|v| v.as_i64()).unwrap_or(0);
-    let now_ms = Utc::now().timestamp_millis();
-    if expires_at > 0 && now_ms > expires_at {
-        warn!("Default OAuth session expired");
+    if !output.status.success() {
         return None;
     }
 
-    let subscription = oauth.get("subscriptionType").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).ok()?;
 
-    info!(subscription, "Default OAuth session detected");
+    let logged_in = json.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !logged_in {
+        return None;
+    }
+
+    let subscription = json
+        .get("subscriptionType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let email = json
+        .get("email")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    info!(subscription, email, "OAuth session detected via `claude auth status`");
 
     Some(Account {
         id: "oauth-default".to_string(),
@@ -456,7 +472,7 @@ fn detect_default_oauth_session() -> Option<Account> {
         monthly_budget_cents: 0,
         tags: Vec::new(),
         profile: "default".to_string(),
-        email: String::new(),
+        email: email.to_string(),
         subscription: subscription.to_string(),
         api_key: String::new(),
         credentials_dir: Some(claude_dir),
