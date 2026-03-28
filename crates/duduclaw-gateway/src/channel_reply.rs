@@ -31,8 +31,7 @@ pub struct ReplyContext {
     pub http: reqwest::Client,
     pub session_manager: Arc<SessionManager>,
     pub channel_status: ChannelStatusMap,
-    /// Prediction engine for event-driven evolution (Phase 1).
-    /// `None` when `prediction_driven` is not enabled for any agent.
+    /// Prediction engine for event-driven evolution.
     pub prediction_engine: Option<Arc<PredictionEngine>>,
     /// GVU evolution loop (Phase 2).
     pub gvu_loop: Option<Arc<GvuLoop>>,
@@ -130,9 +129,6 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
 
     let agent_id = agent.map(|a| a.config.agent.name.clone()).unwrap_or_default();
     let agent_dir = agent.map(|a| a.dir.clone());
-    let evolution_enabled = agent
-        .map(|a| a.config.evolution.micro_reflection)
-        .unwrap_or(false);
     let skill_token_budget = agent
         .map(|a| a.config.evolution.skill_token_budget)
         .unwrap_or(2500);
@@ -278,16 +274,8 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
             warn!("Failed to save assistant message to session: {e}");
         }
 
-        // ── Prediction-driven evolution (Phase 1) ──────────────────
-        // Only activate when the agent has prediction_driven=true in its config.
-        let agent_prediction_driven = {
-            let reg = ctx.registry.read().await;
-            reg.get(&agent_id)
-                .map(|a| a.config.evolution.prediction_driven)
-                .unwrap_or(false)
-        };
-
-        if agent_prediction_driven && ctx.prediction_engine.is_some() {
+        // ── Prediction-driven evolution ──────────────────────────────
+        if ctx.prediction_engine.is_some() {
             let pe = ctx.prediction_engine.as_ref().unwrap().clone();
             let gvu = ctx.gvu_loop.clone();
             let user_id_for_pred = user_id.to_string();
@@ -429,7 +417,7 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
                             info!(agent = %agent_id_for_pred, error = format!("{:.3}", error.composite_error), "Prediction error → triggering reflection");
                         }
 
-                        // Try GVU loop if available, fallback to legacy reflection
+                        // Run GVU loop if available
                         if let (Some(gvu), Some(dir)) = (&gvu, &agent_dir_for_pred) {
                             let contract = duduclaw_agent::contract::load_contract(dir);
                             let pre_metrics = crate::gvu::version_store::VersionMetrics::default();
@@ -477,21 +465,17 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
                                 }
                                 crate::gvu::loop_::GvuOutcome::Skipped { ref reason } => {
                                     debug!(agent = %agent_id_for_pred, reason, "GVU skipped");
-                                    // Concurrency-lock skips count as unresolved triggers;
-                                    // observation-period skips are expected and don't count.
                                     if !reason.contains("observation") {
                                         let mut meta = pe.metacognition.lock().await;
                                         meta.record_outcome(error.category, false);
                                     }
                                 }
                             }
-                        } else if let Some(ref dir) = agent_dir_for_pred {
-                            // Fallback: legacy reflection
-                            if is_emergency {
-                                crate::evolution::run_macro(&home_for_pred, &agent_id_for_pred, dir).await;
-                            } else {
-                                crate::evolution::run_meso(&home_for_pred, &agent_id_for_pred, dir).await;
-                            }
+                        } else {
+                            warn!(
+                                agent = %agent_id_for_pred,
+                                "Evolution triggered but GVU loop not available — skipping"
+                            );
                         }
                     }
                 }
@@ -524,20 +508,6 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
             }
         });
 
-        // Trigger micro reflection in background (non-blocking)
-        // When prediction_driven is enabled, micro reflection is handled by the prediction engine above.
-        // Only run legacy micro reflection when prediction engine is NOT active.
-        if !agent_prediction_driven
-            && evolution_enabled
-            && let Some(dir) = agent_dir
-        {
-                let home = ctx.home_dir.clone();
-                let aid = agent_id.clone();
-                let summary = format!("User: {}\nAgent: {}", &text[..text.len().min(200)], &reply[..reply.len().min(200)]);
-                tokio::spawn(async move {
-                    crate::evolution::run_micro(&home, &aid, &dir, &summary).await;
-                });
-        }
         return reply;
     }
 

@@ -15,10 +15,11 @@ Key architectural decisions:
 - **Three channels**: Telegram (long polling), LINE (webhook), Discord (Gateway WebSocket with tokio::select! heartbeat)
 - **BroadcastLayer** tracing layer streams real-time logs to WebSocket subscribers
 - **Ed25519 challenge-response** auth for secure WebSocket connections
-- **Unified heartbeat scheduler** — per-agent cron/interval with meso/macro evolution, `max_concurrent_runs` semaphore
+- **Unified heartbeat scheduler** — per-agent cron/interval for bus polling + silence breaker, `max_concurrent_runs` semaphore
 - **CronScheduler** reads `cron_tasks.jsonl`, evaluates cron expressions, fires tasks on schedule
-- **Three-layer evolution** with real Claude subprocess calls: Micro (post-conversation) → Meso (per-agent heartbeat) → Macro (daily)
-- **Evolution Engine v2** (optional, `prediction_driven=true`): Prediction-error-driven evolution (Active Inference / Dual Process Theory), GVU self-play loop (Generator→Verifier→Updater with TextGrad feedback, max 3 rounds), cognitive memory (episodic/semantic separation with Generative Agents 3D-weighted retrieval), SOUL.md versioning with observation period + auto-rollback
+- **Prediction-driven evolution engine**: Prediction-error-driven evolution (Active Inference / Dual Process Theory) — zero LLM cost for ~90% of conversations. Dual Process Router: Negligible/Moderate errors → zero cost, Significant → GVU reflection, Critical → emergency GVU loop. MetaCognition self-calibrates error thresholds every 100 predictions.
+- **GVU self-play loop** (Generator→Verifier→Updater): TextGrad feedback, max 3 rounds, 4-layer verification (L1-L2-L4 deterministic zero-cost + L3 LLM judge). SOUL.md versioning with 24h observation period + auto-rollback. Atomic write (temp + rename) with SHA-256 fingerprint.
+- **Cognitive memory** (optional): episodic/semantic separation with Generative Agents 3D-weighted retrieval
 - **Security layer**: SOUL.md drift detection (SHA-256), prompt injection scanner (6 rule categories), JSONL audit log, per-agent key isolation
 - **Claude Code security hooks** (`.claude/hooks/`): 3-phase progressive defense — Layer 1 deterministic blacklist, Layer 2 obfuscation/exfiltration detection (YELLOW+), Layer 3 Haiku AI judgment (RED only). Threat level state machine (GREEN→YELLOW→RED) with auto-escalation/degradation. Protects Write/Edit/Read of sensitive files, scans for secret leaks, audits all tool calls (async JSONL compatible with Rust `audit.rs`), validates `.env.claude`, detects config tampering. All prompts use XML delimiters for injection resistance. See `docs/TODO-security-hooks.md` and `docs/code-review-security-hooks.md`.
 - **Behavioral contracts** (`CONTRACT.toml`) with `must_not` / `must_always` boundaries + `duduclaw test` red-team CLI
@@ -31,10 +32,10 @@ Key architectural decisions:
 - **InferenceManager**: Multi-mode auto-switching state machine with priority: Exo P2P cluster → llamafile → Direct backend → OpenAI-compat → Cloud API. Periodic health checks with automatic failover between modes.
 - **Exo P2P cluster** client (`exo_cluster.rs`): HTTP client for Exo distributed inference, cluster discovery, health monitoring, automatic endpoint failover. Enables 235B+ models across multiple machines.
 - **llamafile manager** (`llamafile.rs`): Subprocess lifecycle management for Mozilla's single-binary LLM inference — auto-start/stop, health monitoring, ready-wait polling, OpenAI-compatible API on localhost. Zero-install portable inference across 6 OS.
-- **MLX bridge** (`mlx_bridge.rs`): Python subprocess calling `mlx_lm` on Apple Silicon for local evolution reflections (Micro/Meso), LoRA adapter support for agent personality. Saves API tokens by running reflections locally.
+- **MLX bridge** (`mlx_bridge.rs`): Python subprocess calling `mlx_lm` on Apple Silicon for local GVU reflections, LoRA adapter support for agent personality. Saves API tokens by running reflections locally.
 - **Token/prompt compression** (`compression/`): Three strategies — (1) **Meta-Token (LTSC)**: Rust-native lossless BPE-like compression replacing repeated subsequences with meta-tokens, 27-47% reduction on structured input (JSON, code, templates); (2) **LLMLingua-2**: Python subprocess bridge to Microsoft's token-importance pruning, 2-5x lossy compression for session history; (3) **StreamingLLM**: attention sink + sliding window KV-cache management for infinite-length conversation.
 - **MCP tools (inference)**: `model_list`, `model_load`, `model_unload`, `inference_status`, `hardware_info`, `route_query`, `inference_mode`, `llamafile_start`, `llamafile_stop`, `llamafile_list`, `compress_text`, `decompress_text`.
-- **Three-layer evolution with external factors**: User feedback, security events, channel metrics, Odoo business context, peer agent signals feed into Micro/Meso/Macro reflections
+- **Evolution external factors**: User feedback, security events, channel metrics, Odoo business context, peer agent signals feed into prediction engine and GVU reflections
 - **API key encryption**: AES-256-GCM stored as base64 in config (all tokens including channel tokens)
 
 ## Design Context

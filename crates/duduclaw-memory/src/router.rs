@@ -21,14 +21,14 @@ pub struct Classification {
 /// Zero LLM cost — pure rule-based.
 pub fn classify(content: &str, source: &str) -> Classification {
     let (layer, base_importance) = match source {
-        // Micro reflection outputs — recent, specific observations
-        "micro_reflection" | "conversation_summary" => (MemoryLayer::Episodic, 5.0),
+        // Prediction engine outputs — per-conversation observations
+        "prediction_observation" | "conversation_summary" => (MemoryLayer::Episodic, 5.0),
 
-        // Meso reflection outputs — pattern consolidation
-        "meso_reflection" => (MemoryLayer::Episodic, 7.0),
+        // GVU reflection outputs — pattern consolidation from evolution
+        "gvu_reflection" => (MemoryLayer::Episodic, 7.0),
 
-        // Macro reflection outputs — high-level conclusions → semantic
-        "macro_reflection" | "evolution_report" => (MemoryLayer::Semantic, 8.0),
+        // Evolution report outputs — high-level conclusions → semantic
+        "evolution_report" | "gvu_outcome" => (MemoryLayer::Semantic, 8.0),
 
         // User feedback — episodic, importance varies by type
         "user_feedback_positive" => (MemoryLayer::Episodic, 4.0),
@@ -107,15 +107,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn micro_reflection_is_episodic() {
-        let c = classify("The user asked about Rust", "micro_reflection");
+    fn prediction_observation_is_episodic() {
+        let c = classify("The user asked about Rust", "prediction_observation");
         assert_eq!(c.layer, MemoryLayer::Episodic);
         assert!((c.importance - 5.0).abs() < 1.0);
     }
 
     #[test]
-    fn macro_reflection_is_semantic() {
-        let c = classify("Agent performance improved", "macro_reflection");
+    fn evolution_report_is_semantic() {
+        let c = classify("Agent performance improved", "evolution_report");
         assert_eq!(c.layer, MemoryLayer::Semantic);
         assert!(c.importance >= 8.0);
     }
@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn content_with_always_becomes_semantic() {
-        let c = classify("The user always prefers concise answers", "micro_reflection");
+        let c = classify("The user always prefers concise answers", "prediction_observation");
         assert_eq!(c.layer, MemoryLayer::Semantic);
     }
 
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn chinese_rule_indicator_becomes_semantic() {
         // 原則：使用者偏好簡潔回覆
-        let c = classify("\u{539f}\u{5247}\u{ff1a}\u{4f7f}\u{7528}\u{8005}\u{504f}\u{597d}\u{7c21}\u{6f54}\u{56de}\u{8986}", "meso_reflection");
+        let c = classify("\u{539f}\u{5247}\u{ff1a}\u{4f7f}\u{7528}\u{8005}\u{504f}\u{597d}\u{7c21}\u{6f54}\u{56de}\u{8986}", "gvu_reflection");
         assert_eq!(c.layer, MemoryLayer::Semantic);
     }
 

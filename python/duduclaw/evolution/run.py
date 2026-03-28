@@ -1,14 +1,13 @@
 """Evolution Engine CLI — called by Rust gateway as subprocess.
 
 Usage:
-    python -m duduclaw.evolution.run micro --agent-dir DIR --summary "..."
-    python -m duduclaw.evolution.run meso --agent-dir DIR
-    python -m duduclaw.evolution.run macro --agent-dir DIR
-    python -m duduclaw.evolution.run vet --skill-name NAME --content "..."
+    python -m duduclaw.evolution.run vet --skill-name NAME [--skills-dir DIR] [--quarantine-dir DIR]
+
+Note: Legacy micro/meso/macro reflection commands have been removed.
+Evolution is now driven by the Rust-native prediction engine + GVU loop.
 """
 
 import argparse
-import asyncio
 import json
 import sys
 from pathlib import Path
@@ -18,22 +17,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="DuDuClaw Evolution Engine")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # Micro reflection
-    micro_p = subparsers.add_parser("micro", help="Run micro reflection")
-    micro_p.add_argument("--agent-id", required=True)
-    micro_p.add_argument("--agent-dir", required=True)
-    micro_p.add_argument("--summary", default="")
-
-    # Meso reflection
-    meso_p = subparsers.add_parser("meso", help="Run meso reflection")
-    meso_p.add_argument("--agent-id", required=True)
-    meso_p.add_argument("--agent-dir", required=True)
-
-    # Macro reflection
-    macro_p = subparsers.add_parser("macro", help="Run macro reflection")
-    macro_p.add_argument("--agent-id", required=True)
-    macro_p.add_argument("--agent-dir", required=True)
-
     # Skill vetting
     vet_p = subparsers.add_parser("vet", help="Vet a skill file")
     vet_p.add_argument("--skill-name", required=True)
@@ -41,58 +24,8 @@ def main() -> None:
     vet_p.add_argument("--quarantine-dir", default="")
 
     args = parser.parse_args()
-    result = asyncio.run(dispatch(args))
+    result = run_vet(args)
     print(json.dumps(result, ensure_ascii=False, indent=2))
-
-
-async def dispatch(args: argparse.Namespace) -> dict:
-    if args.command == "micro":
-        return await run_micro(args)
-    elif args.command == "meso":
-        return await run_meso(args)
-    elif args.command == "macro":
-        return await run_macro(args)
-    elif args.command == "vet":
-        return run_vet(args)
-    return {"error": f"Unknown command: {args.command}"}
-
-
-async def run_micro(args: argparse.Namespace) -> dict:
-    from .micro import MicroReflection
-
-    agent_dir = Path(args.agent_dir)
-    memory_dir = agent_dir / "memory"
-
-    summary = args.summary
-    if not summary:
-        summary = sys.stdin.read().strip()
-    if not summary:
-        return {"status": "skipped", "reason": "no summary provided"}
-
-    reflection = MicroReflection(args.agent_id, memory_dir)
-    result = await reflection.reflect(summary)
-    result["status"] = "ok"
-    return result
-
-
-async def run_meso(args: argparse.Namespace) -> dict:
-    from .meso import MesoReflection
-
-    agent_dir = Path(args.agent_dir)
-    reflection = MesoReflection(args.agent_id, agent_dir)
-    result = await reflection.reflect()
-    result["status"] = "ok"
-    return result
-
-
-async def run_macro(args: argparse.Namespace) -> dict:
-    from .macro_ import MacroReflection
-
-    agent_dir = Path(args.agent_dir)
-    reflection = MacroReflection(args.agent_id, agent_dir)
-    result = await reflection.reflect()
-    result["status"] = "ok"
-    return result
 
 
 def run_vet(args: argparse.Namespace) -> dict:

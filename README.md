@@ -27,7 +27,7 @@ DuDuClaw (plumbing)
   ├─ Channel Router — Telegram (polling) / LINE (webhook) / Discord (Gateway WebSocket)
   ├─ Session Manager — SQLite, 50k token 自動壓縮
   ├─ MCP Server — send_message, send_photo, web_search, memory_search, memory_store …
-  ├─ Evolution Engine — Micro / Meso / Macro 三層反思
+  ├─ Evolution Engine — 預測驅動進化 + GVU 自我博弈迴圈
   ├─ Account Rotator — 多 API key 輪替、預算追蹤、健康檢查
   └─ Web Dashboard — React SPA, 透過 rust-embed 嵌入 binary
 ```
@@ -43,7 +43,7 @@ DuDuClaw (plumbing)
 | **三通道支援** | Telegram (long polling)、LINE (webhook)、Discord (Gateway WebSocket) |
 | **容器沙箱** | Docker / Apple Container 隔離執行（`--network=none`、tmpfs workspace、read-only rootfs、512MB limit） |
 | **Session 管理** | SQLite 持久化對話歷程，超過 50k token 自動壓縮摘要 |
-| **自主進化引擎** | Micro → Meso → Macro 三層反思 + 5 種外部因素介入（使用者反饋、安全事件、通道指標、業務數據、Peer 信號） |
+| **自主進化引擎** | 預測驅動進化（~90% 對話零 LLM 成本）+ GVU 自我博弈迴圈（Generator→Verifier→Updater, 4 層驗證）+ SOUL.md 版本控制（24h 觀察期 + 自動回滾）+ 5 種外部因素介入 |
 | **安全防護** | SOUL.md 漂移檢測（SHA-256）+ prompt injection 掃描（6 類規則）+ JSONL 審計日誌 + per-agent 密鑰隔離 + **Claude Code Security Hooks（三層漸進式防禦）** |
 | **行為契約** | `CONTRACT.toml` 定義 `must_not` / `must_always` 邊界 + `duduclaw test` 紅隊測試（9 項內建場景） |
 | **Odoo ERP 整合** | 中間層 `duduclaw-odoo` 支援 CE/EE — 15 個 MCP 工具（CRM/銷售/庫存/會計/通用搜尋報表）+ 事件橋接 |
@@ -210,7 +210,7 @@ DuDuClaw/
 ├── python/duduclaw/            # Python 擴充層
 │   ├── channels/               # LINE / Telegram / Discord 通道插件
 │   ├── sdk/                    # Claude Code SDK chat + 多帳號輪替
-│   ├── evolution/              # 三層反思系統 + Skill Vetter 安全掃描
+│   ├── evolution/              # Skill Vetter 安全掃描
 │   └── tools/                  # Agent 動態管理工具
 │
 ├── web/                        # React Dashboard

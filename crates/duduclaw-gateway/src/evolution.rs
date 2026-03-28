@@ -1,125 +1,14 @@
-//! Evolution Engine integration — calls Python subprocess for reflections.
+//! Evolution Engine — skill vetting utility.
 //!
-//! - Micro: triggered after each channel message
-//! - Meso: triggered by heartbeat timer (hourly)
-//! - Macro: triggered by daily timer
+//! Legacy three-layer reflection (micro/meso/macro via Python subprocess)
+//! has been removed. All evolution is now driven by the prediction engine
+//! (Phase 1) and GVU self-play loop (Phase 2) in the Rust-native pipeline.
+//! See `prediction/` and `gvu/` modules.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 
-use duduclaw_agent::registry::AgentRegistry;
 use serde_json::Value;
-use tokio::sync::RwLock;
-use tracing::{info, warn};
-
-/// Run micro reflection after a conversation.
-/// Includes external factors if configured.
-pub async fn run_micro(
-    home_dir: &Path,
-    agent_id: &str,
-    agent_dir: &Path,
-    summary: &str,
-) {
-    info!("Micro reflection for {agent_id}");
-
-    // Collect external context (lightweight for micro — only user feedback)
-    let external = collect_micro_context(home_dir, agent_id, agent_dir).await;
-    let enriched_summary = if external.is_empty() {
-        summary.to_string()
-    } else {
-        format!("{summary}\n{external}")
-    };
-
-    match call_evolution("micro", home_dir, agent_id, agent_dir, Some(&enriched_summary)).await {
-        Ok(result) => {
-            info!("Micro reflection done: {}", result.get("status").and_then(|v| v.as_str()).unwrap_or("?"));
-        }
-        Err(e) => warn!("Micro reflection failed: {e}"),
-    }
-}
-
-/// Run meso reflection (heartbeat) with full external factors.
-pub async fn run_meso(home_dir: &Path, agent_id: &str, agent_dir: &Path) {
-    info!("Meso reflection for {agent_id}");
-
-    let external = collect_full_context(home_dir, agent_id, agent_dir).await;
-    let context = if external.is_empty() { None } else { Some(external.as_str()) };
-
-    match call_evolution("meso", home_dir, agent_id, agent_dir, context).await {
-        Ok(result) => {
-            let notes = result.get("notes_reviewed").and_then(|v| v.as_u64()).unwrap_or(0);
-            info!("Meso reflection done: reviewed {notes} notes");
-        }
-        Err(e) => warn!("Meso reflection failed: {e}"),
-    }
-}
-
-/// Run macro reflection (daily) with full external factors + business context.
-pub async fn run_macro(home_dir: &Path, agent_id: &str, agent_dir: &Path) {
-    info!("Macro reflection for {agent_id}");
-
-    let external = collect_full_context(home_dir, agent_id, agent_dir).await;
-    let context = if external.is_empty() { None } else { Some(external.as_str()) };
-
-    match call_evolution("macro", home_dir, agent_id, agent_dir, context).await {
-        Ok(result) => {
-            let skills = result.get("skills_reviewed").and_then(|v| v.as_u64()).unwrap_or(0);
-            info!("Macro reflection done: reviewed {skills} skills");
-            if let Some(report) = result.get("report").and_then(|v| v.as_str())
-                && !report.is_empty()
-            {
-                info!("Evolution report:\n{report}");
-            }
-        }
-        Err(e) => warn!("Macro reflection failed: {e}"),
-    }
-}
-
-/// Collect lightweight external context for micro reflections (only user feedback).
-async fn collect_micro_context(home_dir: &Path, agent_id: &str, agent_dir: &Path) -> String {
-    let config = load_evolution_config(agent_dir).await;
-    if !config.external_factors.user_feedback {
-        return String::new();
-    }
-
-    let ctx = crate::external_factors::collect_external_factors(
-        home_dir,
-        agent_id,
-        &duduclaw_core::types::ExternalFactorsConfig {
-            user_feedback: true,
-            ..Default::default()
-        },
-    ).await;
-
-    ctx.to_prompt()
-}
-
-/// Collect full external context for meso/macro reflections.
-async fn collect_full_context(home_dir: &Path, agent_id: &str, agent_dir: &Path) -> String {
-    let config = load_evolution_config(agent_dir).await;
-    let ctx = crate::external_factors::collect_external_factors(
-        home_dir,
-        agent_id,
-        &config.external_factors,
-    ).await;
-
-    ctx.to_prompt()
-}
-
-/// Load EvolutionConfig from agent.toml.
-async fn load_evolution_config(agent_dir: &Path) -> duduclaw_core::types::EvolutionConfig {
-    let toml_path = agent_dir.join("agent.toml");
-    match tokio::fs::read_to_string(&toml_path).await {
-        Ok(content) => {
-            if let Ok(config) = toml::from_str::<duduclaw_core::types::AgentConfig>(&content) {
-                return config.evolution;
-            }
-        }
-        Err(_) => {}
-    }
-    // Default: legacy mode with all external factors disabled
-    Default::default()
-}
+use tracing::info;
 
 /// Vet a skill file for security issues.
 pub async fn vet_skill(
@@ -156,121 +45,11 @@ pub async fn vet_skill(
 
     let output = child.wait_with_output().await.map_err(|e| format!("Wait: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
+    info!("Skill vet for '{skill_name}' completed");
     serde_json::from_str(&stdout).map_err(|e| format!("Parse: {e}"))
 }
 
-/// Start the evolution heartbeat background tasks.
-pub fn start_evolution_timers(
-    home_dir: PathBuf,
-    registry: Arc<RwLock<AgentRegistry>>,
-) -> Vec<tokio::task::JoinHandle<()>> {
-    let mut handles = Vec::new();
-
-    // Meso: every hour
-    let h = home_dir.clone();
-    let r = registry.clone();
-    handles.push(tokio::spawn(async move {
-        // Wait 5 minutes before first meso reflection
-        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-        loop {
-            run_reflections_for_all_agents(&h, &r, "meso").await;
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-        }
-    }));
-
-    // Macro: every 24 hours
-    let h = home_dir;
-    let r = registry;
-    handles.push(tokio::spawn(async move {
-        // Wait 1 hour before first macro reflection
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-        loop {
-            run_reflections_for_all_agents(&h, &r, "macro").await;
-            tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
-        }
-    }));
-
-    handles
-}
-
-async fn run_reflections_for_all_agents(
-    home_dir: &Path,
-    registry: &Arc<RwLock<AgentRegistry>>,
-    reflection_type: &str,
-) {
-    let reg = registry.read().await;
-    let agents: Vec<(String, PathBuf, bool)> = reg.list().iter().map(|a| {
-        (
-            a.config.agent.name.clone(),
-            a.dir.clone(),
-            a.config.evolution.prediction_driven,
-        )
-    }).collect();
-    drop(reg);
-
-    for (agent_id, agent_dir, prediction_driven) in agents {
-        // Skip agents using the new prediction-driven / GVU evolution system —
-        // they handle reflections via the Rust-native pipeline, not Python timers.
-        if prediction_driven {
-            info!(
-                agent = %agent_id,
-                reflection_type,
-                "Skipping legacy Python reflection (agent uses prediction-driven evolution)"
-            );
-            continue;
-        }
-
-        match reflection_type {
-            "meso" => run_meso(home_dir, &agent_id, &agent_dir).await,
-            "macro" => run_macro(home_dir, &agent_id, &agent_dir).await,
-            _ => {}
-        }
-    }
-}
-
 // ── Internal ────────────────────────────────────────────────
-
-async fn call_evolution(
-    command: &str,
-    home_dir: &Path,
-    agent_id: &str,
-    agent_dir: &Path,
-    summary: Option<&str>,
-) -> Result<Value, String> {
-    let python_path = find_python_path(home_dir);
-
-    let mut cmd = tokio::process::Command::new("python3");
-    cmd.args([
-        "-m", "duduclaw.evolution.run",
-        command,
-        "--agent-id", agent_id,
-        "--agent-dir", &agent_dir.to_string_lossy(),
-    ]);
-
-    if let Some(s) = summary {
-        cmd.args(["--summary", s]);
-    }
-
-    cmd.env("PYTHONPATH", &python_path);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        cmd.output(),
-    )
-    .await
-    .map_err(|_| "Evolution timeout (30s)".to_string())?
-    .map_err(|e| format!("Spawn: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("exit {}: {}", output.status.code().unwrap_or(-1), &stderr[..stderr.len().min(200)]));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(&stdout).map_err(|e| format!("Parse: {e}, stdout: {}", &stdout[..stdout.len().min(100)]))
-}
 
 fn find_python_path(home_dir: &Path) -> String {
     let candidates = [

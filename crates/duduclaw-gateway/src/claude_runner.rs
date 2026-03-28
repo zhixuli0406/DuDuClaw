@@ -112,13 +112,13 @@ pub async fn call_claude_for_agent_with_type(
     // Hybrid mode routing — SDK is the brain, local is cost-saving offload
     //
     // Design principle: "Claude Code SDK = brain, DuDuClaw = plumbing"
+    // OAuth subscription is the primary fuel, API Key is the reserve tank.
     //
-    //  ① Confidence Router pre-check: if query is clearly simple AND
-    //     local model is available → offload to local (zero API cost)
-    //  ② Direct API: for medium/complex queries, use HTTP API with
-    //     cache_control for 95%+ cache hit rate (if api_mode allows)
-    //  ③ CLI (claude -p): full Claude Code SDK with tool support —
-    //     the primary brain, always available as final path
+    //  ① Local offload: Router-confirmed simple queries → zero cost
+    //  ② CLI (claude -p): primary brain, uses OAuth subscription
+    //     - Multiple OAuth accounts rotated via CLAUDE_CODE_OAUTH_TOKEN
+    //  ③ Direct API (API Key): fallback when all OAuth accounts rate-limited
+    //     - cache_control for 95%+ cache hit rate
     // ══════════════════════════════════════════════════════════════
 
     // Validate api_mode
@@ -131,25 +131,13 @@ pub async fn call_claude_for_agent_with_type(
     }
 
     // ── ① Local offload: only for clearly simple queries ─────────
-    // The Confidence Router decides; we don't blindly try local first.
-    // Local is used ONLY when the router says the query is simple enough
-    // (use_router=true) or when adaptive telemetry forces local (cache degraded).
     let adaptive_prefer = crate::cost_telemetry::should_prefer_local(agent_id).await;
     if let Some(ref local) = local_config {
-        let should_try_local = if adaptive_prefer {
-            // Adaptive override: cache is degraded, force local to stop bleeding
-            true
-        } else if local.use_router {
-            // Router-driven: let Confidence Router decide per-query
-            true
-        } else {
-            // No router, no adaptive — only if explicitly prefer_local AND no Cloud available
-            // In hybrid mode this is false by default (SDK-first)
-            local.prefer_local
-        };
-
+        let should_try_local = adaptive_prefer || local.use_router || local.prefer_local;
         if should_try_local {
-            let reason = if adaptive_prefer { "adaptive-override" } else { "router-driven" };
+            let reason = if adaptive_prefer { "adaptive-override" }
+                else if local.use_router { "router-driven" }
+                else { "prefer-local" };
             info!(agent = %agent_name, local_model = %local.model, reason, "Trying local offload");
             match call_local_inference(home_dir, prompt, &system_prompt, Some(&local.model)).await {
                 Ok(response) => {
@@ -157,7 +145,7 @@ pub async fn call_claude_for_agent_with_type(
                     return Ok(response);
                 }
                 Err(e) if e == "ROUTER_ESCALATE_TO_CLOUD" => {
-                    info!(agent = %agent_name, "Router: query too complex for local → escalating to SDK");
+                    info!(agent = %agent_name, "Router: query too complex → escalating to SDK");
                 }
                 Err(e) => {
                     warn!(agent = %agent_name, error = %e, "Local offload failed → escalating to SDK");
@@ -166,31 +154,37 @@ pub async fn call_claude_for_agent_with_type(
         }
     }
 
-    // ── ② Direct API: cache-optimized cloud path ─────────────────
-    let use_direct = matches!(api_mode.as_str(), "direct" | "auto");
-    if use_direct {
-        info!(agent = %agent_name, model = %claude_model, api_mode = %api_mode, "Trying Direct API (cache-optimized)");
-        match try_direct_api(home_dir, agent_id, prompt, &claude_model, &system_prompt, request_type).await {
+    // ── ② CLI: primary brain (OAuth subscription) ────────────────
+    // In "auto" mode: try CLI first. Only fall through to Direct API
+    // if CLI fails with rate limit (all OAuth accounts exhausted).
+    // In "cli" mode: CLI is the only cloud path.
+    // In "direct" mode: skip CLI, go straight to Direct API.
+    if api_mode != "direct" {
+        info!(agent = %agent_name, model = %claude_model, "Calling Claude CLI (SDK primary)");
+        match call_with_rotation(
+            home_dir, agent_id, prompt, &claude_model, &system_prompt, request_type,
+        ).await {
             Ok(text) => return Ok(text),
             Err(e) => {
-                if api_mode == "direct" {
-                    return Err(e); // strict mode: no fallback
-                }
-                // "auto" mode: billing/auth errors should not retry via CLI with same key
-                if is_billing_error(&e) {
+                let is_rate = is_rate_limit_error(&e);
+                if api_mode == "auto" && is_rate {
+                    // All OAuth accounts rate-limited → fall through to Direct API
+                    warn!(agent = %agent_name, "All CLI accounts rate-limited → trying Direct API fallback");
+                } else {
+                    // "cli" mode or non-rate error → report error
                     return Err(e);
                 }
-                warn!(agent = %agent_name, error = %e, "Direct API failed → falling back to CLI");
             }
         }
     }
 
-    // ── ③ CLI: full Claude Code SDK (primary brain) ──────────────
-    info!(agent = %agent_name, model = %claude_model, prompt_len = prompt.len(), "Calling Claude CLI (full SDK)");
-    call_with_rotation(
-        home_dir, agent_id, prompt, &claude_model, &system_prompt,
-        request_type,
-    ).await
+    // ── ③ Direct API: fallback with API Key (cache-optimized) ────
+    // Only reached when: api_mode="direct", or api_mode="auto" + all OAuth rate-limited
+    info!(agent = %agent_name, model = %claude_model, "Trying Direct API (API Key fallback)");
+    match try_direct_api(home_dir, agent_id, prompt, &claude_model, &system_prompt, request_type).await {
+        Ok(text) => Ok(text),
+        Err(e) => Err(e),
+    }
 }
 
 /// Check whether an error string indicates a billing/credit exhaustion issue.
@@ -205,6 +199,13 @@ fn is_billing_error(error: &str) -> bool {
         || lower.contains("payment")
         || lower.contains("402")
         || lower.contains("insufficient_quota")
+}
+
+/// Check whether an error indicates rate limiting (usage limit exhausted).
+fn is_rate_limit_error(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("rate") || lower.contains("429") || lower.contains("usage limit")
+        || lower.contains("overloaded") || lower.contains("capacity")
 }
 
 /// Try calling the Anthropic Messages API directly (bypassing Claude CLI).

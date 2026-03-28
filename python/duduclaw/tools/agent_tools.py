@@ -127,11 +127,9 @@ class AgentTools:
                 "allowed_channels": ["*"],
             },
             "evolution": {
-                "micro_reflection": True,
-                "meso_reflection": True,
-                "macro_reflection": True,
                 "skill_auto_activate": False,
                 "skill_security_scan": True,
+                "gvu_enabled": True,
             },
         }
 
