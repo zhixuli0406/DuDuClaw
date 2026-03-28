@@ -37,7 +37,7 @@ pub fn builtin_registry() -> Vec<RegistryEntry> {
         RegistryEntry {
             name: "Qwen3-8B".to_string(),
             repo: "Qwen/Qwen3-8B-GGUF".to_string(),
-            filename: "qwen3-8b-q4_k_m.gguf".to_string(),
+            filename: "Qwen3-8B-Q4_K_M.gguf".to_string(),
             size_bytes: 5_400_000_000,
             quantization: "Q4_K_M".to_string(),
             params: "8B".to_string(),
@@ -65,9 +65,9 @@ pub fn builtin_registry() -> Vec<RegistryEntry> {
         RegistryEntry {
             name: "Qwen3-1.7B".to_string(),
             repo: "Qwen/Qwen3-1.7B-GGUF".to_string(),
-            filename: "qwen3-1.7b-q4_k_m.gguf".to_string(),
-            size_bytes: 1_200_000_000,
-            quantization: "Q4_K_M".to_string(),
+            filename: "Qwen3-1.7B-Q8_0.gguf".to_string(),
+            size_bytes: 1_900_000_000,
+            quantization: "Q8_0".to_string(),
             params: "1.7B".to_string(),
             languages: vec!["en".into(), "zh".into()],
             tags: vec!["chat".into(), "fast".into(), "low-ram".into()],
@@ -79,7 +79,7 @@ pub fn builtin_registry() -> Vec<RegistryEntry> {
         RegistryEntry {
             name: "Qwen3-14B".to_string(),
             repo: "Qwen/Qwen3-14B-GGUF".to_string(),
-            filename: "qwen3-14b-q4_k_m.gguf".to_string(),
+            filename: "Qwen3-14B-Q4_K_M.gguf".to_string(),
             size_bytes: 9_000_000_000,
             quantization: "Q4_K_M".to_string(),
             params: "14B".to_string(),
@@ -93,7 +93,7 @@ pub fn builtin_registry() -> Vec<RegistryEntry> {
         RegistryEntry {
             name: "Qwen3-32B".to_string(),
             repo: "Qwen/Qwen3-32B-GGUF".to_string(),
-            filename: "qwen3-32b-q4_k_m.gguf".to_string(),
+            filename: "Qwen3-32B-Q4_K_M.gguf".to_string(),
             size_bytes: 20_000_000_000,
             quantization: "Q4_K_M".to_string(),
             params: "32B".to_string(),
