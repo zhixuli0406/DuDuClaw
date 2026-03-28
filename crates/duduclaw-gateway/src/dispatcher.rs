@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::claude_runner::call_claude_for_agent;
+use crate::claude_runner::{call_claude_for_agent_with_type};
 use duduclaw_agent::registry::AgentRegistry;
 use duduclaw_container::sandbox;
 
@@ -82,10 +82,9 @@ async fn poll_and_dispatch(
     for line in &lines {
         match serde_json::from_str::<BusMessage>(line) {
             Ok(msg) if msg.msg_type == "agent_message" => {
-                // Enforce payload size limit (BE-H6)
+                // Enforce payload size limit (BE-H6) — drop, do NOT keep in queue
                 if msg.payload.len() > 100_000 {
-                    warn!(id = %msg.message_id, len = msg.payload.len(), "Dropping oversized message");
-                    remaining_lines.push(line.to_string()); // keep but don't dispatch
+                    warn!(id = %msg.message_id, len = msg.payload.len(), "Dropping oversized message (removed from queue)");
                 } else {
                     to_dispatch.push(msg);
                 }
@@ -101,7 +100,14 @@ async fn poll_and_dispatch(
         return Ok(());
     }
 
-    info!(count = to_dispatch.len(), "Dispatching agent messages");
+    // ── Request Coalescing ──────────────────────────────────────
+    // Merge consecutive messages for the same agent into a single prompt.
+    // This reduces API calls and amortizes the system prompt overhead.
+    // Max: 5 messages per coalesced group, 2-second window is implicit
+    // (we batch within a single poll cycle which is 5 seconds).
+    let to_dispatch = coalesce_messages(to_dispatch);
+
+    info!(count = to_dispatch.len(), "Dispatching agent messages (after coalescing)");
 
     // Rewrite the queue without the messages we're about to process.
     // Uses write→rename for atomicity — prevents data loss if process crashes mid-write.
@@ -199,7 +205,10 @@ async fn dispatch_to_agent(
         info!(agent = agent_id, "Dispatching via sandbox");
         dispatch_sandboxed(home_dir, registry, agent_id, prompt).await
     } else {
-        call_claude_for_agent(home_dir, registry, agent_id, prompt).await
+        call_claude_for_agent_with_type(
+            home_dir, registry, agent_id, prompt,
+            crate::cost_telemetry::RequestType::Dispatch,
+        ).await
     }
 }
 
@@ -270,6 +279,75 @@ async fn dispatch_sandboxed(
     } else {
         Ok(text)
     }
+}
+
+/// Maximum number of messages to coalesce into a single prompt per agent.
+const MAX_COALESCE: usize = 5;
+
+/// Merge consecutive bus messages for the same agent into a single message.
+///
+/// This amortizes the system prompt overhead across multiple user messages,
+/// reducing total API calls. Messages are grouped by `agent_id`; within each
+/// group, payloads are joined with a separator. The first message's
+/// `message_id` is reused as the coalesced message's ID.
+fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
+    use std::collections::HashMap;
+
+    // Group by agent_id, preserving insertion order via Vec
+    let mut groups: HashMap<String, Vec<BusMessage>> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+
+    for msg in messages {
+        let key = msg.agent_id.clone();
+        let entry = groups.entry(key.clone()).or_default();
+        if entry.is_empty() {
+            order.push(key);
+        }
+        entry.push(msg);
+    }
+
+    let mut result = Vec::new();
+    for agent_id in order {
+        let group = groups.remove(&agent_id).unwrap_or_default();
+        if group.len() <= 1 {
+            result.extend(group);
+            continue;
+        }
+
+        // Split into chunks of MAX_COALESCE
+        for chunk in group.chunks(MAX_COALESCE) {
+            if chunk.len() == 1 {
+                result.push(chunk[0].clone());
+                continue;
+            }
+
+            let coalesced_payload = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, m)| format!("[Message {}] {}", i + 1, m.payload))
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n");
+
+            let first = &chunk[0];
+            info!(
+                agent = %first.agent_id,
+                merged = chunk.len(),
+                "Coalesced messages into single prompt"
+            );
+
+            result.push(BusMessage {
+                msg_type: "agent_message".to_string(),
+                message_id: first.message_id.clone(),
+                agent_id: first.agent_id.clone(),
+                payload: coalesced_payload,
+                timestamp: first.timestamp.clone(),
+                response: None,
+                in_reply_to: None,
+            });
+        }
+    }
+
+    result
 }
 
 /// Append a single line to a file with advisory file lock (MCP-M4).

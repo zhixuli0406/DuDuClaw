@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::claude_runner::call_claude_for_agent;
+use crate::claude_runner::call_claude_for_agent_with_type;
 use duduclaw_agent::registry::AgentRegistry;
 
 /// A single persisted cron task entry from `cron_tasks.jsonl`.
@@ -199,7 +199,10 @@ async fn execute_cron_task(
         task.name, task.task
     );
 
-    match call_claude_for_agent(home_dir, registry, &task.agent_id, &prompt).await {
+    match call_claude_for_agent_with_type(
+        home_dir, registry, &task.agent_id, &prompt,
+        crate::cost_telemetry::RequestType::Cron,
+    ).await {
         Ok(response) => {
             info!(
                 id = %task.id,

@@ -10,20 +10,28 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 /// Build a system prompt from an agent's loaded markdown files.
+///
+/// Skills are sorted alphabetically by name to ensure deterministic byte
+/// sequences across calls — this maximizes prompt cache hit rates.
 fn build_system_prompt(agent: &duduclaw_agent::LoadedAgent) -> String {
     let mut parts = Vec::new();
 
     if let Some(soul) = &agent.soul {
-        parts.push(format!("# Soul\n{soul}"));
+        parts.push(format!("# Soul\n{}", soul.trim_end()));
     }
     if let Some(identity) = &agent.identity {
-        parts.push(format!("# Identity\n{identity}"));
+        parts.push(format!("# Identity\n{}", identity.trim_end()));
     }
-    for skill in &agent.skills {
-        parts.push(format!("# Skill: {}\n{}", skill.name, skill.content));
+
+    // Sort skills by name for deterministic ordering (cache-friendly)
+    let mut skills: Vec<_> = agent.skills.iter().collect();
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    for skill in skills {
+        parts.push(format!("# Skill: {}\n{}", skill.name, skill.content.trim_end()));
     }
+
     if let Some(memory) = &agent.memory {
-        parts.push(format!("# Memory\n{memory}"));
+        parts.push(format!("# Memory\n{}", memory.trim_end()));
     }
 
     parts.join("\n\n---\n\n")
@@ -43,6 +51,20 @@ pub async fn call_claude_for_agent(
     agent_id: &str,
     prompt: &str,
 ) -> Result<String, String> {
+    call_claude_for_agent_with_type(
+        home_dir, registry, agent_id, prompt,
+        crate::cost_telemetry::RequestType::Chat,
+    ).await
+}
+
+/// Like [`call_claude_for_agent`] but allows specifying the request type for telemetry.
+pub async fn call_claude_for_agent_with_type(
+    home_dir: &Path,
+    registry: &Arc<RwLock<AgentRegistry>>,
+    agent_id: &str,
+    prompt: &str,
+    request_type: crate::cost_telemetry::RequestType,
+) -> Result<String, String> {
     let reg = registry.read().await;
 
     let agent = if agent_id == "default" {
@@ -57,6 +79,7 @@ pub async fn call_claude_for_agent(
     let agent_name = agent.config.agent.name.clone();
     let claude_model = agent.config.model.preferred.clone();
     let local_config = agent.config.model.local.clone();
+    let api_mode = agent.config.model.api_mode.clone();
     drop(reg);
 
     // P0 fix: global mode gate BEFORE per-agent routing
@@ -75,17 +98,22 @@ pub async fn call_claude_for_agent(
         "claude" => {
             // Skip local entirely, go straight to Claude API
             info!(agent = %agent_name, model = %claude_model, "Claude-only mode");
-            return call_with_rotation(home_dir, prompt, &claude_model, &system_prompt).await;
+            return call_with_rotation(
+                home_dir, agent_id, prompt, &claude_model, &system_prompt,
+                request_type,
+            ).await;
         }
         _ => {
             // "hybrid" — use per-agent prefer_local
         }
     }
 
-    // Hybrid mode: try local inference if agent prefers it
+    // Hybrid mode: try local inference if agent prefers it OR if adaptive routing says so
+    let adaptive_prefer = crate::cost_telemetry::should_prefer_local(agent_id).await;
     if let Some(ref local) = local_config {
-        if local.prefer_local {
-            info!(agent = %agent_name, local_model = %local.model, "Trying local inference for agent");
+        if local.prefer_local || adaptive_prefer {
+            let reason = if adaptive_prefer && !local.prefer_local { "adaptive-override" } else { "agent-config" };
+            info!(agent = %agent_name, local_model = %local.model, reason, "Trying local inference for agent");
             match call_local_inference(home_dir, prompt, &system_prompt, Some(&local.model)).await {
                 Ok(response) => {
                     info!(agent = %agent_name, "Agent served by local model");
@@ -101,9 +129,64 @@ pub async fn call_claude_for_agent(
         }
     }
 
+    // ── Direct API path (bypasses CLI for pure chat) ──────────
+    // Validate api_mode — warn on unrecognized values
+    if !matches!(api_mode.as_str(), "cli" | "direct" | "auto") {
+        warn!(
+            agent = %agent_name,
+            api_mode = %api_mode,
+            "Unrecognized api_mode in agent.toml — expected cli/direct/auto, defaulting to cli"
+        );
+    }
+    let use_direct = matches!(api_mode.as_str(), "direct" | "auto");
+    if use_direct {
+        info!(agent = %agent_name, model = %claude_model, api_mode = %api_mode, "Trying Direct API");
+        match try_direct_api(home_dir, agent_id, prompt, &claude_model, &system_prompt, request_type).await {
+            Ok(text) => return Ok(text),
+            Err(e) => {
+                if api_mode == "direct" {
+                    return Err(e); // no fallback
+                }
+                warn!(agent = %agent_name, error = %e, "Direct API failed, falling back to CLI");
+            }
+        }
+    }
+
     // Fall back to Claude Code SDK via account rotation
     info!(agent = %agent_name, model = %claude_model, prompt_len = prompt.len(), "Calling Claude CLI");
-    call_with_rotation(home_dir, prompt, &claude_model, &system_prompt).await
+    call_with_rotation(
+        home_dir, agent_id, prompt, &claude_model, &system_prompt,
+        request_type,
+    ).await
+}
+
+/// Try calling the Anthropic Messages API directly (bypassing Claude CLI).
+///
+/// Only works with API key accounts (not OAuth). If no API key is available,
+/// returns an error so the caller can fall back to CLI.
+async fn try_direct_api(
+    home_dir: &Path,
+    agent_id: &str,
+    prompt: &str,
+    model: &str,
+    system_prompt: &str,
+    request_type: crate::cost_telemetry::RequestType,
+) -> Result<String, String> {
+    let api_key = get_api_key(home_dir).await;
+    if api_key.is_empty() {
+        return Err("No API key available for Direct API (OAuth accounts require CLI path)".to_string());
+    }
+
+    let response = crate::direct_api::call_direct_api(&api_key, model, system_prompt, prompt).await?;
+
+    // Record telemetry
+    if let Some(ref usage) = response.usage {
+        if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
+            telemetry.record(agent_id, request_type, model, usage).await;
+        }
+    }
+
+    Ok(response.text)
 }
 
 /// Cached inference_mode — avoids reading config.toml on every call (P1-3).
@@ -141,10 +224,27 @@ static ROTATOR_CACHE: std::sync::OnceLock<tokio::sync::RwLock<Option<(std::time:
 /// Cached InferenceEngine — singleton for local LLM inference.
 static INFERENCE_ENGINE: std::sync::OnceLock<tokio::sync::RwLock<Option<std::sync::Arc<duduclaw_inference::InferenceEngine>>>> = std::sync::OnceLock::new();
 
+/// Mutex protecting the one-time initialization of the inference engine.
+/// Prevents concurrent tasks from each loading a full GGUF model (OOM risk).
+static INFERENCE_INIT_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
 /// Get or create the inference engine singleton.
 async fn get_inference_engine(home_dir: &std::path::Path) -> Option<std::sync::Arc<duduclaw_inference::InferenceEngine>> {
     let cache = INFERENCE_ENGINE.get_or_init(|| tokio::sync::RwLock::new(None));
 
+    // Fast path: engine already initialized
+    {
+        let guard = cache.read().await;
+        if let Some(engine) = guard.as_ref() {
+            return Some(engine.clone());
+        }
+    }
+
+    // Slow path: serialize initialization to prevent concurrent model loading
+    let init_lock = INFERENCE_INIT_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
+    let _init_guard = init_lock.lock().await;
+
+    // Double-check after acquiring lock (another task may have initialized)
     {
         let guard = cache.read().await;
         if let Some(engine) = guard.as_ref() {
@@ -261,12 +361,25 @@ async fn get_rotator(home_dir: &Path) -> Result<std::sync::Arc<duduclaw_agent::a
 }
 
 /// Call Claude CLI with account rotation — tries next account on failure.
+///
+/// Records token usage telemetry when available.
 async fn call_with_rotation(
     home_dir: &Path,
+    agent_id: &str,
     prompt: &str,
     model: &str,
     system_prompt: &str,
+    request_type: crate::cost_telemetry::RequestType,
 ) -> Result<String, String> {
+    // Pre-flight: check 200K price cliff
+    if let Some(estimated) = crate::cost_telemetry::check_price_cliff(system_prompt, prompt) {
+        warn!(
+            agent_id,
+            estimated_tokens = estimated,
+            "WARNING: Estimated input tokens near 200K price cliff — pricing will double"
+        );
+    }
+
     let rotator = get_rotator(home_dir).await?;
 
     let max_attempts = rotator.count().await.max(1);
@@ -282,14 +395,28 @@ async fn call_with_rotation(
 
         match call_claude_with_env(prompt, model, system_prompt, &selected.env_vars).await {
             Ok(response) => {
-                // OAuth accounts: no per-token cost. API key: rough estimate
-                let cost = if selected.auth_method == duduclaw_agent::account_rotator::AuthMethod::OAuth {
+                // Use telemetry-based cost if usage available, else rough estimate
+                let cost = if let Some(ref usage) = response.usage {
+                    if selected.auth_method == duduclaw_agent::account_rotator::AuthMethod::OAuth {
+                        0
+                    } else {
+                        usage.estimated_cost_millicents() / 10 // convert millicents to ~cents
+                    }
+                } else if selected.auth_method == duduclaw_agent::account_rotator::AuthMethod::OAuth {
                     0
                 } else {
-                    ((prompt.len() + response.len()) / 1000).max(1) as u64
+                    ((prompt.len() + response.text.len()) / 1000).max(1) as u64
                 };
                 rotator.on_success(&selected.id, cost).await;
-                return Ok(response);
+
+                // Record telemetry
+                if let Some(ref usage) = response.usage {
+                    if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
+                        telemetry.record(agent_id, request_type, model, usage).await;
+                    }
+                }
+
+                return Ok(response.text);
             }
             Err(e) => {
                 last_error = e.clone();
@@ -307,7 +434,16 @@ async fn call_with_rotation(
     let api_key = get_api_key(home_dir).await;
     if !api_key.is_empty() {
         warn!("All rotated accounts failed, using fallback key");
-        return call_claude(prompt, model, system_prompt, &api_key).await;
+        let response = call_claude(prompt, model, system_prompt, &api_key).await?;
+
+        // Record telemetry for fallback path too
+        if let Some(ref usage) = response.usage {
+            if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
+                telemetry.record(agent_id, request_type, model, usage).await;
+            }
+        }
+
+        return Ok(response.text);
     }
 
     Err(format!("All accounts exhausted. Last error: {last_error}"))
@@ -335,14 +471,22 @@ async fn get_api_key(home_dir: &Path) -> String {
 /// Default idle timeout in seconds — resets every time new data arrives.
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 
+/// Response from a Claude CLI call, including optional token usage telemetry.
+struct ClaudeResponse {
+    text: String,
+    usage: Option<crate::cost_telemetry::TokenUsage>,
+}
+
 /// Spawn a `claude` CLI process with streaming output and read the result.
 ///
 /// Uses `--output-format stream-json --verbose` and an idle timeout that resets
 /// on every received line. This means long-running responses (tool use, multi-turn)
 /// will never be killed as long as the CLI keeps producing events.
+///
+/// Extracts `TokenUsage` from the `result` event's `usage` field when available.
 async fn call_claude_streaming(
     cmd: &mut tokio::process::Command,
-) -> Result<String, String> {
+) -> Result<ClaudeResponse, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     cmd.stdin(std::process::Stdio::null());
@@ -356,6 +500,7 @@ async fn call_claude_streaming(
 
     let idle_timeout = std::time::Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS);
     let mut result_text = String::new();
+    let mut token_usage: Option<crate::cost_telemetry::TokenUsage> = None;
 
     loop {
         match tokio::time::timeout(idle_timeout, reader.next_line()).await {
@@ -380,6 +525,10 @@ async fn call_claude_streaming(
                             if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
                                 result_text = text.to_string();
                             }
+                            // Extract token usage from result event
+                            if let Some(usage_val) = event.get("usage") {
+                                token_usage = crate::cost_telemetry::TokenUsage::from_json(usage_val);
+                            }
                         }
                         Some("assistant") => {
                             if let Some(content) = event.pointer("/message/content").and_then(|c| c.as_array()) {
@@ -389,6 +538,12 @@ async fn call_claude_streaming(
                                             result_text = text.to_string();
                                         }
                                     }
+                                }
+                            }
+                            // Also check usage in assistant message events
+                            if token_usage.is_none() {
+                                if let Some(usage_val) = event.pointer("/message/usage") {
+                                    token_usage = crate::cost_telemetry::TokenUsage::from_json(usage_val);
                                 }
                             }
                         }
@@ -409,7 +564,7 @@ async fn call_claude_streaming(
         return Err("Empty response from claude CLI".to_string());
     }
 
-    Ok(result_text)
+    Ok(ClaudeResponse { text: result_text, usage: token_usage })
 }
 
 /// Prepare a `claude` CLI command with common args and env vars.
@@ -457,7 +612,7 @@ async fn call_claude_with_env(
     model: &str,
     system_prompt: &str,
     env_vars: &std::collections::HashMap<String, String>,
-) -> Result<String, String> {
+) -> Result<ClaudeResponse, String> {
     let claude = which_claude().ok_or("Claude CLI not found")?;
     let (mut cmd, _prompt_guard) = prepare_claude_cmd(&claude, prompt, model, system_prompt);
 
@@ -478,7 +633,7 @@ async fn call_claude(
     model: &str,
     system_prompt: &str,
     api_key: &str,
-) -> Result<String, String> {
+) -> Result<ClaudeResponse, String> {
     let claude = which_claude().ok_or("Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code")?;
     let (mut cmd, _prompt_guard) = prepare_claude_cmd(&claude, prompt, model, system_prompt);
     cmd.env("ANTHROPIC_API_KEY", api_key);

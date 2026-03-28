@@ -195,12 +195,12 @@ mod tests {
         RouterConfig {
             enabled: true,
             fast_threshold: 0.7,
-            strong_threshold: 0.4,
+            strong_threshold: 0.35,
             fast_model: Some("small-model".to_string()),
             strong_model: Some("large-model".to_string()),
-            max_fast_prompt_tokens: 500,
+            max_fast_prompt_tokens: 1000,
             cloud_keywords: vec!["refactor".to_string(), "architect".to_string()],
-            fast_keywords: vec!["hello".to_string(), "translate".to_string()],
+            fast_keywords: vec!["hello".to_string(), "translate".to_string(), "翻譯".to_string()],
         }
     }
 
@@ -242,6 +242,13 @@ mod tests {
         let router = ConfidenceRouter::new(config);
         let decision = router.route("", "anything");
         assert_eq!(decision.tier, RoutingTier::LocalStrong);
+    }
+
+    #[test]
+    fn cjk_fast_keyword_routes_locally() {
+        let router = ConfidenceRouter::new(test_config());
+        let decision = router.route("", "請幫我翻譯這段文字");
+        assert_ne!(decision.tier, RoutingTier::CloudApi, "CJK fast keyword should route locally");
     }
 
     #[test]
