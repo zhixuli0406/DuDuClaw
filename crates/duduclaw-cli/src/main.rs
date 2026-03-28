@@ -10,6 +10,27 @@ mod service;
 
 // ── Credential helpers (M-4) ────────────────────────────────
 
+/// Recursively copy a directory (for config backup).
+async fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
+    if let Err(e) = tokio::fs::create_dir_all(dst).await {
+        eprintln!("Failed to create {}: {e}", dst.display());
+        return;
+    }
+    let mut entries = match tokio::fs::read_dir(src).await {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            Box::pin(copy_dir_recursive(&src_path, &dst_path)).await;
+        } else if let Err(e) = tokio::fs::copy(&src_path, &dst_path).await {
+            eprintln!("Failed to copy {}: {e}", src_path.display());
+        }
+    }
+}
+
 /// Load or generate the per-machine AES-256 key stored in `~/.duduclaw/.keyfile`.
 fn load_or_create_keyfile(home: &PathBuf) -> [u8; 32] {
     let keyfile = home.join(".keyfile");
@@ -272,6 +293,78 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
     use dialoguer::{Input, Password, Select, Confirm};
 
     let home = duduclaw_home();
+
+    // ── Pre-check: detect existing configuration ─────────────
+    let config_exists = home.join("config.toml").exists();
+    if config_exists {
+        println!();
+        println!("  {} {}", style("⚠").yellow().bold(), style("偵測到現有設定").yellow().bold());
+        println!("  資料目錄：{}", style(home.display()).dim());
+        println!();
+
+        if skip_prompts {
+            // --yes mode: refuse to silently overwrite existing config
+            return Err(DuDuClawError::Config(
+                "已存在設定檔，拒絕自動覆蓋。請手動執行 `duduclaw onboard` 進行互動式重設。".to_string()
+            ));
+        }
+
+        let reset_options = &[
+            "重新設定（備份現有設定後重來）",
+            "取消（保留現有設定）",
+        ];
+        let sel = Select::new()
+            .with_prompt("已有設定，要如何處理？")
+            .items(reset_options)
+            .default(1) // default: cancel (safe)
+            .interact()
+            .unwrap_or(1);
+
+        if sel == 1 {
+            println!("  {} 已取消，現有設定不變", style("ℹ").blue());
+            return Ok(());
+        }
+
+        // Back up existing config to timestamped directory
+        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let backup_dir = home.join(format!("backup_{ts}"));
+        tokio::fs::create_dir_all(&backup_dir).await.map_err(|e| {
+            DuDuClawError::Config(format!("Failed to create backup dir: {e}"))
+        })?;
+
+        // Back up key files (non-recursive, only top-level config + agents)
+        for name in &["config.toml", "inference.toml", ".keyfile"] {
+            let src = home.join(name);
+            if src.exists() {
+                let dst = backup_dir.join(name);
+                if let Err(e) = tokio::fs::copy(&src, &dst).await {
+                    eprintln!("  {} 備份 {} 失敗：{e}", style("⚠").yellow(), name);
+                }
+            }
+        }
+
+        // Back up agents directory
+        let agents_src = home.join("agents");
+        if agents_src.exists() {
+            let agents_dst = backup_dir.join("agents");
+            copy_dir_recursive(&agents_src, &agents_dst).await;
+        }
+
+        // Remove old config files (keep logs, models, backups)
+        for name in &["config.toml", "inference.toml"] {
+            let p = home.join(name);
+            if p.exists() {
+                let _ = tokio::fs::remove_file(&p).await;
+            }
+        }
+        // Remove old agents (will be recreated)
+        if agents_src.exists() {
+            let _ = tokio::fs::remove_dir_all(&agents_src).await;
+        }
+
+        println!("  {} 現有設定已備份至 {}", style("✓").green(), style(backup_dir.display()).cyan());
+        println!();
+    }
 
     // ── Welcome ──────────────────────────────────────────────
     println!();
