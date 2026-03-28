@@ -406,9 +406,9 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
         println!("  選擇 AI 推理引擎的運作方式：");
         println!();
         let mode_options = &[
-            "純本地模型 — 所有 Agent 走 Local LLM（不需 Claude API Key）",
-            "純 Claude Code SDK — 所有 Agent 走 Claude API（不需設定本地模型）",
-            "混合模式 — Agent 可自由選擇本地或 Claude（兩者都要設定）",
+            "純本地模型 — 所有 Agent 走 Local LLM（離線可用，不需任何帳號）",
+            "純 Claude Code SDK — 所有 Agent 走 claude CLI（自動偵測 OAuth 登入）",
+            "混合模式（推薦）— 簡單查詢走本地省錢，複雜任務走 Claude SDK",
         ];
         Select::new()
             .with_prompt("推理模式")
@@ -578,7 +578,7 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
 
         // Report what we detected
         println!();
-        println!("  {} {}", style("▸").cyan(), style("Claude API 認證").bold());
+        println!("  {} {}", style("▸").cyan(), style("Claude 認證").bold());
 
         if has_oauth {
             // Read subscription type for display
