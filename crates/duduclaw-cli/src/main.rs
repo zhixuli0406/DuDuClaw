@@ -10,6 +10,16 @@ mod service;
 
 // ── Credential helpers (M-4) ────────────────────────────────
 
+/// Read the OAuth subscription type from ~/.claude/.credentials.json.
+fn detect_oauth_subscription() -> Option<String> {
+    let creds_path = dirs::home_dir()?.join(".claude/.credentials.json");
+    let content = std::fs::read_to_string(creds_path).ok()?;
+    let creds: serde_json::Value = serde_json::from_str(&content).ok()?;
+    creds.pointer("/claudeAiOauth/subscriptionType")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Recursively copy a directory (for config backup).
 async fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
     if let Err(e) = tokio::fs::create_dir_all(dst).await {
@@ -551,21 +561,54 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
         local_model_id = String::new();
     };
 
-    // ── 3. Claude API Key (if claude or hybrid) ─────────────
+    // ── 3. Claude API authentication (if claude or hybrid) ───
+    //
+    // Detection priority:
+    //  1. ~/.claude/.credentials.json (OAuth — Claude Pro/Team/Max subscription)
+    //  2. ANTHROPIC_API_KEY env var
+    //  3. Interactive prompt (API Key input)
+    //
+    // OAuth sessions are auto-detected by AccountRotator at runtime — no manual
+    // input needed. We only store API key in config.toml as fallback.
+    let has_oauth = dirs::home_dir()
+        .map(|h| h.join(".claude/.credentials.json").exists())
+        .unwrap_or(false);
     let api_key = if use_claude {
         let env_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-        if !skip_prompts && env_key.is_empty() {
-            println!();
-            println!("  {} {}", style("▸").cyan(), style("Claude API 設定").bold());
-            let auth_methods = &["API Key", "OAuth Token", "稍後設定"];
-            let auth_sel = Select::new()
-                .with_prompt("認證方式")
-                .items(auth_methods)
+
+        // Report what we detected
+        println!();
+        println!("  {} {}", style("▸").cyan(), style("Claude API 認證").bold());
+
+        if has_oauth {
+            // Read subscription type for display
+            let sub_type = detect_oauth_subscription().unwrap_or_else(|| "unknown".to_string());
+            println!("  {} 偵測到 OAuth 登入（Claude {}）— 自動使用，無需額外設定",
+                style("✓").green(), style(&sub_type).cyan().bold());
+            if !env_key.is_empty() {
+                println!("  {} 同時偵測到 API Key 環境變數（作為備援）", style("✓").green());
+            }
+        }
+
+        if !env_key.is_empty() && !has_oauth {
+            println!("  {} 從環境變數偵測到 API Key", style("✓").green());
+        }
+
+        // Only prompt for API key if no OAuth AND no env var
+        if !has_oauth && env_key.is_empty() && !skip_prompts {
+            let auth_options = &[
+                "輸入 API Key",
+                "使用 OAuth 登入（先執行 `claude` 登入後再回來）",
+                "稍後設定",
+            ];
+            let sel = Select::new()
+                .with_prompt("未偵測到認證，請選擇")
+                .items(auth_options)
                 .default(0)
                 .interact()
                 .unwrap_or(2);
 
-            match auth_sel {
+            match sel {
                 0 => {
                     let key: String = Password::new()
                         .with_prompt("API Key")
@@ -577,28 +620,26 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
                     key
                 }
                 1 => {
-                    let token: String = Password::new()
-                        .with_prompt("OAuth Token")
-                        .interact()
-                        .unwrap_or_default();
-                    if !token.is_empty() {
-                        println!("  {} OAuth Token 已設定", style("✓").green());
-                    }
-                    token
+                    println!();
+                    println!("  {} 請在另一個終端執行：", style("ℹ").blue());
+                    println!("    {}", style("claude").cyan().bold());
+                    println!("  登入完成後，重新執行 {} 即可自動偵測", style("duduclaw onboard").cyan());
+                    println!();
+                    return Ok(());
                 }
                 _ => {
-                    println!("  {} 稍後可透過環境變數 ANTHROPIC_API_KEY 設定", style("ℹ").blue());
+                    println!("  {} 稍後可透過 {} 或 {} 設定",
+                        style("ℹ").blue(),
+                        style("claude 登入 (OAuth)").cyan(),
+                        style("ANTHROPIC_API_KEY 環境變數").cyan());
                     String::new()
                 }
             }
         } else {
-            if !env_key.is_empty() {
-                println!("  {} 從環境變數偵測到 API Key", style("✓").green());
-            }
             env_key
         }
     } else {
-        println!("  {} 純本地模式 — 不需要 Claude API Key", style("ℹ").blue());
+        println!("  {} 純本地模式 — 不需要 Claude API 認證", style("ℹ").blue());
         String::new()
     };
 
@@ -853,7 +894,16 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
             println!("  ├ 本地模型：{}", style(&local_model_id).cyan());
         }
         if use_claude {
-            println!("  ├ API Key：{}", if api_key.is_empty() { style("未設定").red().to_string() } else { style("已設定").green().to_string() });
+            let auth_status = if has_oauth && !api_key.is_empty() {
+                format!("{} + {}", style("OAuth").green(), style("API Key").green())
+            } else if has_oauth {
+                style("OAuth（自動偵測）").green().to_string()
+            } else if !api_key.is_empty() {
+                style("API Key").green().to_string()
+            } else {
+                style("未設定").red().to_string()
+            };
+            println!("  ├ 認證：{}", auth_status);
             let api_mode_label = match api_mode.as_str() {
                 "direct" => "Direct API（高 cache 效率）",
                 "auto" => "Auto（推薦，自動切換）",
