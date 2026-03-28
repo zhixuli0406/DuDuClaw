@@ -7,7 +7,7 @@ use duduclaw_core::traits::MemoryEngine;
 use duduclaw_memory::SqliteMemoryEngine;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::protocol::WsFrame;
 
@@ -28,6 +28,10 @@ pub struct MethodHandler {
     start_time: Instant,
     channel_status: Arc<RwLock<std::collections::HashMap<String, ChannelState>>>,
     heartbeat: RwLock<Option<Arc<duduclaw_agent::HeartbeatScheduler>>>,
+    /// Reply context for hot-starting channels after config changes.
+    reply_ctx: RwLock<Option<Arc<crate::channel_reply::ReplyContext>>>,
+    /// Handles for running channel bot tasks (for hot-stop on remove).
+    channel_handles: tokio::sync::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 /// Runtime state for a connected channel.
@@ -51,7 +55,20 @@ impl MethodHandler {
             start_time: Instant::now(),
             channel_status: Arc::new(RwLock::new(std::collections::HashMap::new())),
             heartbeat: RwLock::new(None),
+            reply_ctx: RwLock::new(None),
+            channel_handles: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Inject the reply context for hot-starting channels. Called once after
+    /// ReplyContext is constructed in server.rs.
+    pub async fn set_reply_ctx(&self, ctx: Arc<crate::channel_reply::ReplyContext>) {
+        *self.reply_ctx.write().await = Some(ctx);
+    }
+
+    /// Register a running channel handle (for hot-stop on remove).
+    pub async fn register_channel_handle(&self, name: &str, handle: tokio::task::JoinHandle<()>) {
+        self.channel_handles.lock().await.insert(name.to_string(), handle);
     }
 
     /// Update a channel's runtime connection state (called by channel bots).
@@ -623,8 +640,16 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("Failed to write config.toml: {e}"));
         }
 
-        info!(channel_type, "Channel added");
-        WsFrame::ok_response("", json!({ "success": true, "type": channel_type }))
+        info!(channel_type, "Channel config saved");
+
+        // Hot-start: launch the channel bot immediately without gateway restart
+        let hot_started = self.hot_start_channel(channel_type).await;
+
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "type": channel_type,
+            "hot_started": hot_started,
+        }))
     }
 
     async fn handle_channels_test(&self, params: Value) -> WsFrame {
@@ -691,8 +716,64 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("Failed to write config.toml: {e}"));
         }
 
-        info!(channel_type, "Channel removed");
+        // Hot-stop: abort the running channel bot task
+        self.hot_stop_channel(channel_type).await;
+
+        info!(channel_type, "Channel removed and stopped");
         WsFrame::ok_response("", json!({ "success": true, "type": channel_type }))
+    }
+
+    // ── Channel hot-start/stop ────────────────────────────────
+
+    /// Launch a channel bot immediately after config is saved.
+    async fn hot_start_channel(&self, channel_type: &str) -> bool {
+        let ctx = match self.reply_ctx.read().await.clone() {
+            Some(ctx) => ctx,
+            None => {
+                warn!(channel_type, "Cannot hot-start channel: ReplyContext not available");
+                return false;
+            }
+        };
+
+        // Stop existing instance first (if any)
+        self.hot_stop_channel(channel_type).await;
+
+        let home = self.home_dir.clone();
+        let handle = match channel_type {
+            "telegram" => crate::telegram::start_telegram_bot(&home, ctx).await,
+            "discord" => crate::discord::start_discord_bot(&home, ctx).await,
+            "line" => {
+                // LINE uses webhook (axum router), not a background task.
+                // Updating config is enough; the webhook handler reads token on each request.
+                info!("LINE channel updated (webhook-based, no background task needed)");
+                return true;
+            }
+            _ => None,
+        };
+
+        match handle {
+            Some(h) => {
+                info!(channel_type, "Channel hot-started successfully");
+                self.channel_handles.lock().await.insert(channel_type.to_string(), h);
+                true
+            }
+            None => {
+                warn!(channel_type, "Channel hot-start failed (check token validity)");
+                false
+            }
+        }
+    }
+
+    /// Stop a running channel bot task.
+    async fn hot_stop_channel(&self, channel_type: &str) {
+        let mut handles = self.channel_handles.lock().await;
+        if let Some(handle) = handles.remove(channel_type) {
+            handle.abort();
+            info!(channel_type, "Channel bot stopped");
+            // Update runtime status
+            let mut status = self.channel_status.write().await;
+            status.remove(channel_type);
+        }
     }
 
     // ── Accounts ─────────────────────────────────────────────
