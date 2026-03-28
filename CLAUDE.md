@@ -1,8 +1,8 @@
 # DuDuClaw Project Guidelines
 
-## Architecture Overview (v0.6.6)
+## Architecture Overview (v0.7.0)
 
-DuDuClaw is a **Claude Code extension layer** — not a standalone AI platform. The AI brain is Claude Code SDK (`claude` CLI); DuDuClaw provides the plumbing: channel routing, session management, memory, evolution, and multi-account rotation.
+DuDuClaw is a **Claude Code extension layer** — not a standalone AI platform. The AI brain is Claude Code SDK (`claude` CLI); DuDuClaw provides the plumbing: channel routing, session management, memory, evolution, multi-account rotation, and **local LLM inference**.
 
 Key architectural decisions:
 - **MCP Server** (`duduclaw mcp-server`) exposes channel, memory, agent, and skill tools to Claude Code via JSON-RPC 2.0 over stdin/stdout
@@ -18,11 +18,22 @@ Key architectural decisions:
 - **Unified heartbeat scheduler** — per-agent cron/interval with meso/macro evolution, `max_concurrent_runs` semaphore
 - **CronScheduler** reads `cron_tasks.jsonl`, evaluates cron expressions, fires tasks on schedule
 - **Three-layer evolution** with real Claude subprocess calls: Micro (post-conversation) → Meso (per-agent heartbeat) → Macro (daily)
+- **Evolution Engine v2** (optional, `prediction_driven=true`): Prediction-error-driven evolution (Active Inference / Dual Process Theory), GVU self-play loop (Generator→Verifier→Updater with TextGrad feedback, max 3 rounds), cognitive memory (episodic/semantic separation with Generative Agents 3D-weighted retrieval), SOUL.md versioning with observation period + auto-rollback
 - **Security layer**: SOUL.md drift detection (SHA-256), prompt injection scanner (6 rule categories), JSONL audit log, per-agent key isolation
+- **Claude Code security hooks** (`.claude/hooks/`): 3-phase progressive defense — Layer 1 deterministic blacklist, Layer 2 obfuscation/exfiltration detection (YELLOW+), Layer 3 Haiku AI judgment (RED only). Threat level state machine (GREEN→YELLOW→RED) with auto-escalation/degradation. Protects Write/Edit/Read of sensitive files, scans for secret leaks, audits all tool calls (async JSONL compatible with Rust `audit.rs`), validates `.env.claude`, detects config tampering. All prompts use XML delimiters for injection resistance. See `docs/TODO-security-hooks.md` and `docs/code-review-security-hooks.md`.
 - **Behavioral contracts** (`CONTRACT.toml`) with `must_not` / `must_always` boundaries + `duduclaw test` red-team CLI
 - **Skill ecosystem**: GitHub Search API live indexing of real skill repos, 24h local cache, weighted search, MCP `skill_search` / `skill_list` tools
 - **Odoo ERP bridge** (`duduclaw-odoo` crate): JSON-RPC middleware supporting CE/EE, 15 MCP tools (CRM/Sales/Inventory/Accounting), EditionGate auto-detection, event polling + webhook
-- **Dual-mode account rotation**: OAuth sessions (Claude Pro/Team/Max via `~/.claude/.credentials.json`) + API keys, with 4 strategies (Priority/LeastCost/Failover/RoundRobin), health tracking, rate-limit cooldown, budget enforcement
+- **Per-agent model routing**: Each agent independently configures its model via `agent.toml [model]` — `preferred` (Claude SDK model), `local.model` (local GGUF), `local.prefer_local` (try local first), `local.use_router` (confidence router). Routing: if `prefer_local` → try local inference → fallback to Claude SDK. Local inference and account rotation are completely separate paths.
+- **Dual-mode account rotation** (Claude SDK only): OAuth sessions (Claude Pro/Team/Max via `~/.claude/.credentials.json`) + API keys, with 4 strategies (Priority/LeastCost/Failover/RoundRobin), health tracking, rate-limit cooldown, budget enforcement. `LeastCost` prefers OAuth → API. Local LLM is NOT part of rotation — it's a separate per-agent routing decision.
+- **Local inference engine** (`duduclaw-inference` crate): Unified `InferenceBackend` trait with pluggable backends — llama.cpp (Metal/CUDA/Vulkan/CPU via `llama-cpp-2`), mistral.rs (Rust-native via `mistralrs-core` with ISQ on-the-fly quantization, PagedAttention, Speculative Decoding), OpenAI-compatible HTTP (Exo/llamafile/vLLM/SGLang). Hardware auto-detection, GGUF model management (`~/.duduclaw/models/`), configured via `inference.toml`. MCP tools: `model_list`, `model_load`, `model_unload`, `inference_status`, `hardware_info`, `route_query`.
+- **Confidence Router**: Three-tier query routing (LocalFast → LocalStrong → CloudAPI) based on heuristic confidence scoring — token count, keyword complexity detection, CJK-aware token estimation. Configurable thresholds and keyword lists in `inference.toml [router]`. Router escalation: when confidence is low, automatically falls back to Claude API through the AccountRotator.
+- **InferenceManager**: Multi-mode auto-switching state machine with priority: Exo P2P cluster → llamafile → Direct backend → OpenAI-compat → Cloud API. Periodic health checks with automatic failover between modes.
+- **Exo P2P cluster** client (`exo_cluster.rs`): HTTP client for Exo distributed inference, cluster discovery, health monitoring, automatic endpoint failover. Enables 235B+ models across multiple machines.
+- **llamafile manager** (`llamafile.rs`): Subprocess lifecycle management for Mozilla's single-binary LLM inference — auto-start/stop, health monitoring, ready-wait polling, OpenAI-compatible API on localhost. Zero-install portable inference across 6 OS.
+- **MLX bridge** (`mlx_bridge.rs`): Python subprocess calling `mlx_lm` on Apple Silicon for local evolution reflections (Micro/Meso), LoRA adapter support for agent personality. Saves API tokens by running reflections locally.
+- **Token/prompt compression** (`compression/`): Three strategies — (1) **Meta-Token (LTSC)**: Rust-native lossless BPE-like compression replacing repeated subsequences with meta-tokens, 27-47% reduction on structured input (JSON, code, templates); (2) **LLMLingua-2**: Python subprocess bridge to Microsoft's token-importance pruning, 2-5x lossy compression for session history; (3) **StreamingLLM**: attention sink + sliding window KV-cache management for infinite-length conversation.
+- **MCP tools (inference)**: `model_list`, `model_load`, `model_unload`, `inference_status`, `hardware_info`, `route_query`, `inference_mode`, `llamafile_start`, `llamafile_stop`, `llamafile_list`, `compress_text`, `decompress_text`.
 - **Three-layer evolution with external factors**: User feedback, security events, channel metrics, Odoo business context, peer agent signals feed into Micro/Meso/Macro reflections
 - **API key encryption**: AES-256-GCM stored as base64 in config (all tokens including channel tokens)
 
