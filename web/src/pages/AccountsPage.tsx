@@ -282,7 +282,7 @@ function AccountCard({
       <div className="flex items-start justify-between">
         <div className="flex items-center gap-3">
           <div className="rounded-lg bg-stone-100 p-2 dark:bg-stone-800">
-            {account.account_type === 'api_key' ? (
+            {(account.auth_method ?? 'unknown') === 'apikey' ? (
               <Key className="h-4 w-4 text-stone-600 dark:text-stone-400" />
             ) : (
               <KeyRound className="h-4 w-4 text-stone-600 dark:text-stone-400" />
@@ -291,7 +291,7 @@ function AccountCard({
           <div>
             <h3 className="font-semibold text-stone-900 dark:text-stone-50">{account.id}</h3>
             <p className="text-xs capitalize text-stone-500 dark:text-stone-400">
-              {account.account_type.replace('_', ' ')}
+              {(account.auth_method ?? account.account_type ?? 'unknown').replace('_', ' ')}
             </p>
           </div>
         </div>
