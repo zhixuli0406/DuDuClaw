@@ -10,14 +10,41 @@ mod service;
 
 // ── Credential helpers (M-4) ────────────────────────────────
 
-/// Read the OAuth subscription type from ~/.claude/.credentials.json.
-fn detect_oauth_subscription() -> Option<String> {
-    let creds_path = dirs::home_dir()?.join(".claude/.credentials.json");
-    let content = std::fs::read_to_string(creds_path).ok()?;
-    let creds: serde_json::Value = serde_json::from_str(&content).ok()?;
-    creds.pointer("/claudeAiOauth/subscriptionType")
+/// Detect Claude CLI OAuth login via `claude auth status`.
+///
+/// Returns (logged_in, subscription_type) — e.g., (true, Some("max")).
+/// Works with all Claude Code versions (doesn't depend on credentials.json).
+fn detect_claude_auth() -> (bool, Option<String>) {
+    let claude = duduclaw_core::which_claude();
+    let claude = match claude {
+        Some(c) => c,
+        None => return (false, None),
+    };
+
+    let output = std::process::Command::new(&claude)
+        .args(["auth", "status"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return (false, None),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = match serde_json::from_str(&stdout) {
+        Ok(v) => v,
+        Err(_) => return (false, None),
+    };
+
+    let logged_in = json.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
+    let sub_type = json
+        .get("subscriptionType")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .map(|s| s.to_string());
+
+    (logged_in, sub_type)
 }
 
 /// Recursively copy a directory (for config backup).
@@ -570,9 +597,7 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
     //
     // OAuth sessions are auto-detected by AccountRotator at runtime — no manual
     // input needed. We only store API key in config.toml as fallback.
-    let has_oauth = dirs::home_dir()
-        .map(|h| h.join(".claude/.credentials.json").exists())
-        .unwrap_or(false);
+    let (has_oauth, oauth_sub) = detect_claude_auth();
     let api_key = if use_claude {
         let env_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
 
@@ -581,10 +606,9 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
         println!("  {} {}", style("▸").cyan(), style("Claude 認證").bold());
 
         if has_oauth {
-            // Read subscription type for display
-            let sub_type = detect_oauth_subscription().unwrap_or_else(|| "unknown".to_string());
-            println!("  {} 偵測到 OAuth 登入（Claude {}）— 自動使用，無需額外設定",
-                style("✓").green(), style(&sub_type).cyan().bold());
+            let sub_label = oauth_sub.as_deref().unwrap_or("unknown");
+            println!("  {} 偵測到 Claude {} 登入 — 自動使用，無需額外設定",
+                style("✓").green(), style(sub_label).cyan().bold());
             if !env_key.is_empty() {
                 println!("  {} 同時偵測到 API Key 環境變數（作為備援）", style("✓").green());
             }
