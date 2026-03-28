@@ -146,12 +146,33 @@ export class DuDuClawClient {
   }
 
   call(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
-    return new Promise((resolve, reject) => {
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-        reject(new Error(`Not connected (state: ${this._state})`));
-        return;
+    // If WebSocket isn't ready yet, wait for it (up to 10s).
+    // This prevents race conditions on page refresh where components
+    // call API methods before the WebSocket handshake completes.
+    const waitForReady = (): Promise<void> => {
+      if (this.ws?.readyState === WebSocket.OPEN) return Promise.resolve();
+      if (this._state === 'disconnected' && !this.reconnectTimer) {
+        return Promise.reject(new Error('Not connected'));
       }
+      return new Promise((resolve, reject) => {
+        const maxWait = setTimeout(() => {
+          reject(new Error(`WebSocket not ready after 10s (state: ${this._state})`));
+        }, 10000);
+        const check = setInterval(() => {
+          if (this.ws?.readyState === WebSocket.OPEN) {
+            clearInterval(check);
+            clearTimeout(maxWait);
+            resolve();
+          } else if (this._state === 'disconnected' && !this.reconnectTimer) {
+            clearInterval(check);
+            clearTimeout(maxWait);
+            reject(new Error('Connection lost'));
+          }
+        }, 100);
+      });
+    };
 
+    return waitForReady().then(() => new Promise((resolve, reject) => {
       const id = String(++this.requestId);
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(id);
@@ -161,8 +182,8 @@ export class DuDuClawClient {
       this.pendingRequests.set(id, { resolve, reject, timeout });
 
       const frame: WsFrame = { type: 'req', id, method, params };
-      this.ws.send(JSON.stringify(frame));
-    });
+      this.ws!.send(JSON.stringify(frame));
+    }));
   }
 
   subscribe(event: string, handler: EventHandler): () => void {
