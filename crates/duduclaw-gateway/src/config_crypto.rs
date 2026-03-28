@@ -7,6 +7,11 @@
 use std::path::Path;
 
 /// Load the AES-256 keyfile from `~/.duduclaw/.keyfile`.
+/// Public variant for GVU encryption and other internal consumers.
+pub(crate) fn load_keyfile_public(home_dir: &Path) -> Option<[u8; 32]> {
+    load_keyfile(home_dir)
+}
+
 fn load_keyfile(home_dir: &Path) -> Option<[u8; 32]> {
     let keyfile = home_dir.join(".keyfile");
     let bytes = std::fs::read(&keyfile).ok()?;
@@ -15,6 +20,11 @@ fn load_keyfile(home_dir: &Path) -> Option<[u8; 32]> {
         key.copy_from_slice(&bytes);
         Some(key)
     } else {
+        tracing::warn!(
+            path = %keyfile.display(),
+            actual_len = bytes.len(),
+            "Keyfile has incorrect length (expected 32 bytes) — encryption disabled"
+        );
         None
     }
 }

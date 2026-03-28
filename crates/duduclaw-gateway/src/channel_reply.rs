@@ -9,10 +9,15 @@ use std::sync::Arc;
 
 use duduclaw_agent::registry::AgentRegistry;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::handlers::ChannelState;
+use crate::gvu::loop_::GvuLoop;
+use crate::prediction::engine::PredictionEngine;
 use crate::session::SessionManager;
+use crate::skill_lifecycle::activation::SkillActivationController;
+use crate::skill_lifecycle::compression::CompressedSkillCache;
+use crate::skill_lifecycle::lift::LiftTrackerStore;
 
 /// Shared channel status map, accessible by both channel bots and the RPC handler.
 pub type ChannelStatusMap = Arc<RwLock<std::collections::HashMap<String, ChannelState>>>;
@@ -26,6 +31,17 @@ pub struct ReplyContext {
     pub http: reqwest::Client,
     pub session_manager: Arc<SessionManager>,
     pub channel_status: ChannelStatusMap,
+    /// Prediction engine for event-driven evolution (Phase 1).
+    /// `None` when `prediction_driven` is not enabled for any agent.
+    pub prediction_engine: Option<Arc<PredictionEngine>>,
+    /// GVU evolution loop (Phase 2).
+    pub gvu_loop: Option<Arc<GvuLoop>>,
+    /// Skill lifecycle: compressed skill cache.
+    pub skill_cache: Arc<tokio::sync::Mutex<CompressedSkillCache>>,
+    /// Skill lifecycle: activation controller.
+    pub skill_activation: Arc<tokio::sync::Mutex<SkillActivationController>>,
+    /// Skill lifecycle: lift tracker store.
+    pub skill_lift: Arc<tokio::sync::Mutex<LiftTrackerStore>>,
 }
 
 impl ReplyContext {
@@ -45,7 +61,24 @@ impl ReplyContext {
             http,
             session_manager,
             channel_status,
+            prediction_engine: None,
+            gvu_loop: None,
+            skill_cache: Arc::new(tokio::sync::Mutex::new(CompressedSkillCache::new())),
+            skill_activation: Arc::new(tokio::sync::Mutex::new(SkillActivationController::new(5))),
+            skill_lift: Arc::new(tokio::sync::Mutex::new(LiftTrackerStore::new())),
         }
+    }
+
+    /// Create with prediction engine enabled.
+    pub fn with_prediction_engine(mut self, engine: Arc<PredictionEngine>) -> Self {
+        self.prediction_engine = Some(engine);
+        self
+    }
+
+    /// Create with GVU evolution loop enabled.
+    pub fn with_gvu_loop(mut self, gvu: Arc<GvuLoop>) -> Self {
+        self.gvu_loop = Some(gvu);
+        self
     }
 }
 
@@ -61,18 +94,22 @@ pub async fn set_channel_connected(status: &ChannelStatusMap, name: &str, connec
 
 // ── Public API ──────────────────────────────────────────────
 
-/// Build a reply for an incoming user message.
+/// Build a reply for an incoming user message (no user tracking).
 ///
 /// Strategy:
 /// 1. Try Python Claude Code SDK (subprocess) — uses rotator + budget tracking
 /// 2. Fallback to direct Anthropic API (Rust reqwest) — single key only
 /// 3. Fallback to static error message
 pub async fn build_reply(text: &str, ctx: &ReplyContext) -> String {
-    build_reply_with_session(text, ctx, "default").await
+    build_reply_with_session(text, ctx, "default", "anonymous").await
 }
 
 /// Build a reply with session tracking.
-pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id: &str) -> String {
+///
+/// `user_id` should be the stable per-user identifier from the channel
+/// (e.g., Telegram chat_id, LINE sender ID, Discord user ID).
+/// This feeds the prediction engine's per-user statistical models.
+pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id: &str, user_id: &str) -> String {
     // Determine which agent to use: config.toml default_agent → main_agent() → fallback
     let default_agent_name = get_default_agent(&ctx.home_dir).await;
 
@@ -96,8 +133,45 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
     let evolution_enabled = agent
         .map(|a| a.config.evolution.micro_reflection)
         .unwrap_or(false);
+    let skill_token_budget = agent
+        .map(|a| a.config.evolution.skill_token_budget)
+        .unwrap_or(2500);
 
-    let system_prompt = build_system_prompt(agent);
+    // Refresh compressed skill cache from agent's loaded skills
+    {
+        let skills_data: Vec<(String, String, Option<String>)> = agent
+            .map(|a| {
+                a.skills.iter().map(|s| {
+                    (s.name.clone(), s.content.clone(), None)
+                }).collect()
+            })
+            .unwrap_or_default();
+        let mut cache = ctx.skill_cache.lock().await;
+        cache.refresh(&skills_data);
+    }
+
+    // Get active skills for progressive injection
+    let active_skills = {
+        let ctrl = ctx.skill_activation.lock().await;
+        ctrl.get_active(&agent_id)
+    };
+
+    // Build progressive system prompt
+    let system_prompt = {
+        let cache = ctx.skill_cache.lock().await;
+        let compressed: Vec<_> = cache.all().into_iter().cloned().collect();
+        if compressed.is_empty() {
+            build_system_prompt(agent, None, None, None, skill_token_budget)
+        } else {
+            build_system_prompt(
+                agent,
+                Some(text),
+                Some(&compressed),
+                Some(&active_skills),
+                skill_token_budget,
+            )
+        }
+    };
     drop(reg);
 
     // Load session and prepend history to system prompt
@@ -204,6 +278,226 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
             warn!("Failed to save assistant message to session: {e}");
         }
 
+        // ── Prediction-driven evolution (Phase 1) ──────────────────
+        // Only activate when the agent has prediction_driven=true in its config.
+        let agent_prediction_driven = {
+            let reg = ctx.registry.read().await;
+            reg.get(&agent_id)
+                .map(|a| a.config.evolution.prediction_driven)
+                .unwrap_or(false)
+        };
+
+        if agent_prediction_driven && ctx.prediction_engine.is_some() {
+            let pe = ctx.prediction_engine.as_ref().unwrap().clone();
+            let gvu = ctx.gvu_loop.clone();
+            let user_id_for_pred = user_id.to_string();
+            let agent_id_for_pred = agent_id.clone();
+            let session_id_for_pred = session_id.to_string();
+            let text_clone = text.to_string();
+            let home_for_pred = ctx.home_dir.clone();
+            let agent_dir_for_pred = agent_dir.clone();
+            let sm_for_pred = ctx.session_manager.clone();
+            let skill_cache_for_pred = ctx.skill_cache.clone();
+            let skill_activation_for_pred = ctx.skill_activation.clone();
+            let skill_lift_for_pred = ctx.skill_lift.clone();
+
+            tokio::spawn(async move {
+                // 1. Generate prediction (< 1ms, zero LLM)
+                let prediction = pe.predict(&user_id_for_pred, &agent_id_for_pred, &text_clone).await;
+                debug!(
+                    agent = %agent_id_for_pred,
+                    satisfaction = format!("{:.2}", prediction.expected_satisfaction),
+                    confidence = format!("{:.2}", prediction.confidence),
+                    "Prediction generated"
+                );
+
+                // 2. Extract conversation metrics
+                let messages = sm_for_pred.get_messages(&session_id_for_pred).await.unwrap_or_default();
+                let metrics = crate::prediction::metrics::ConversationMetrics::extract(
+                    &session_id_for_pred,
+                    &agent_id_for_pred,
+                    &user_id_for_pred,
+                    &messages,
+                    0,
+                );
+
+                // 3. Calculate prediction error (< 1ms, zero LLM)
+                let error = pe.calculate_error(&prediction, &metrics).await;
+
+                // 4. Update user model (< 1ms)
+                pe.update_model(&metrics).await;
+
+                // 5. Skill lifecycle: diagnose + activate + track lift
+                {
+                    let compressed: Vec<_> = {
+                        let cache = skill_cache_for_pred.lock().await;
+                        cache.all().into_iter().cloned().collect()
+                    };
+
+                    // Diagnose error and suggest skills
+                    if let Some(diagnosis) = crate::skill_lifecycle::diagnostician::diagnose(&error, &compressed) {
+                        // Activate suggested skills
+                        if !diagnosis.suggested_skills.is_empty() {
+                            let mut ctrl = skill_activation_for_pred.lock().await;
+                            for skill_name in &diagnosis.suggested_skills {
+                                ctrl.activate(&agent_id_for_pred, skill_name, error.composite_error);
+                            }
+                        }
+                        // Report skill gap to evolution engine
+                        if let Some(ref gap) = diagnosis.skill_gap {
+                            crate::skill_lifecycle::gap::inject_skill_gap(gap, &home_for_pred, &agent_id_for_pred);
+                        }
+                    }
+
+                    // Record conversation for activation effectiveness tracking
+                    {
+                        let mut ctrl = skill_activation_for_pred.lock().await;
+                        ctrl.record_conversation(&agent_id_for_pred, error.composite_error);
+                    }
+
+                    // Track lift for each skill (active vs inactive)
+                    {
+                        let active = {
+                            let ctrl = skill_activation_for_pred.lock().await;
+                            ctrl.get_active(&agent_id_for_pred)
+                        };
+                        let mut lift_store = skill_lift_for_pred.lock().await;
+                        for skill in &compressed {
+                            let tracker = lift_store.get_or_create(&agent_id_for_pred, &skill.name);
+                            if active.contains(&skill.name) {
+                                tracker.record_with(error.composite_error);
+                            } else {
+                                tracker.record_without(error.composite_error);
+                            }
+                        }
+                    }
+                }
+
+                // 6. Periodic: evaluate activations + scan distillation (every ~20 conversations)
+                {
+                    // Use prediction count as conversation counter (low overhead)
+                    let should_evaluate = pe.metacognition.lock().await.total_predictions % 20 == 0;
+                    if should_evaluate {
+                        // Evaluate and prune ineffective skills
+                        let deactivated = {
+                            let mut ctrl = skill_activation_for_pred.lock().await;
+                            ctrl.evaluate_all(&agent_id_for_pred)
+                        };
+                        for name in &deactivated {
+                            info!(agent = %agent_id_for_pred, skill = %name, "Skill deactivated by effectiveness evaluation");
+                        }
+
+                        // Scan for distillation candidates
+                        let candidates = {
+                            let lift_store = skill_lift_for_pred.lock().await;
+                            let trackers = lift_store.get_all(&agent_id_for_pred);
+                            crate::skill_lifecycle::distillation::scan_for_distillation(&agent_id_for_pred, &trackers)
+                        };
+                        for candidate in &candidates {
+                            info!(
+                                agent = %agent_id_for_pred,
+                                skill = %candidate.skill_name,
+                                readiness = format!("{:.2}", candidate.readiness),
+                                lift = format!("{:.3}", candidate.lift),
+                                "Skill ready for distillation into SOUL.md"
+                            );
+                            // Distillation via GVU would be triggered here in production
+                            // (requires async GVU call — deferred to dedicated distillation task)
+                        }
+                    }
+                }
+
+                // 7. Route to evolution action
+                let consecutive = pe.consecutive_significant_count(&agent_id_for_pred).await;
+                let action = crate::prediction::router::route(&error, consecutive);
+
+                match action {
+                    crate::prediction::router::EvolutionAction::None => {}
+                    crate::prediction::router::EvolutionAction::StoreEpisodic { content, importance: _ } => {
+                        let preview: String = content.chars().take(80).collect();
+                        debug!(agent = %agent_id_for_pred, "Storing episodic observation: {preview}");
+                    }
+                    crate::prediction::router::EvolutionAction::TriggerReflection { ref context }
+                    | crate::prediction::router::EvolutionAction::TriggerEmergencyEvolution { ref context } => {
+                        let is_emergency = matches!(
+                            action,
+                            crate::prediction::router::EvolutionAction::TriggerEmergencyEvolution { .. }
+                        );
+                        if is_emergency {
+                            warn!(agent = %agent_id_for_pred, error = format!("{:.3}", error.composite_error), "Critical prediction error → emergency evolution");
+                        } else {
+                            info!(agent = %agent_id_for_pred, error = format!("{:.3}", error.composite_error), "Prediction error → triggering reflection");
+                        }
+
+                        // Try GVU loop if available, fallback to legacy reflection
+                        if let (Some(gvu), Some(dir)) = (&gvu, &agent_dir_for_pred) {
+                            let contract = duduclaw_agent::contract::load_contract(dir);
+                            let pre_metrics = crate::gvu::version_store::VersionMetrics::default();
+                            let home = home_for_pred.clone();
+
+                            // LLM caller: uses claude CLI
+                            let call_llm = |prompt: String| {
+                                let h = home.clone();
+                                async move {
+                                    crate::channel_reply::call_claude_cli_public(
+                                        &prompt, "claude-haiku-4-5", "", &h,
+                                    ).await
+                                }
+                            };
+
+                            let outcome = gvu.run(
+                                &agent_id_for_pred,
+                                dir,
+                                &context,
+                                pre_metrics,
+                                &contract.boundaries.must_not,
+                                &contract.boundaries.must_always,
+                                call_llm,
+                            ).await;
+
+                            // Log outcome and feed back to metacognition
+                            match outcome {
+                                crate::gvu::loop_::GvuOutcome::Applied(ref version) => {
+                                    info!(
+                                        agent = %agent_id_for_pred,
+                                        version = %version.version_id,
+                                        "GVU applied SOUL.md change"
+                                    );
+                                    let mut meta = pe.metacognition.lock().await;
+                                    meta.record_outcome(error.category, true);
+                                }
+                                crate::gvu::loop_::GvuOutcome::Abandoned { ref last_gradient } => {
+                                    warn!(
+                                        agent = %agent_id_for_pred,
+                                        critique = %last_gradient.critique,
+                                        "GVU abandoned all attempts"
+                                    );
+                                    let mut meta = pe.metacognition.lock().await;
+                                    meta.record_outcome(error.category, false);
+                                }
+                                crate::gvu::loop_::GvuOutcome::Skipped { ref reason } => {
+                                    debug!(agent = %agent_id_for_pred, reason, "GVU skipped");
+                                    // Concurrency-lock skips count as unresolved triggers;
+                                    // observation-period skips are expected and don't count.
+                                    if !reason.contains("observation") {
+                                        let mut meta = pe.metacognition.lock().await;
+                                        meta.record_outcome(error.category, false);
+                                    }
+                                }
+                            }
+                        } else if let Some(ref dir) = agent_dir_for_pred {
+                            // Fallback: legacy reflection
+                            if is_emergency {
+                                crate::evolution::run_macro(&home_for_pred, &agent_id_for_pred, dir).await;
+                            } else {
+                                crate::evolution::run_meso(&home_for_pred, &agent_id_for_pred, dir).await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         // Check if compression needed; generate Claude summary then compress in background
         let sm = ctx.session_manager.clone();
         let sid = session_id.to_string();
@@ -231,7 +525,10 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
         });
 
         // Trigger micro reflection in background (non-blocking)
-        if evolution_enabled
+        // When prediction_driven is enabled, micro reflection is handled by the prediction engine above.
+        // Only run legacy micro reflection when prediction engine is NOT active.
+        if !agent_prediction_driven
+            && evolution_enabled
             && let Some(dir) = agent_dir
         {
                 let home = ctx.home_dir.clone();
@@ -267,6 +564,22 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
 ///
 /// Uses `--output-format stream-json --verbose` to read incremental events.
 /// Instead of a hard total timeout, uses an **idle timeout** (default 120s):
+/// Internal wrapper for GVU loop LLM calls.
+/// Restricted to crate-internal use with model allowlist.
+const ALLOWED_EVOLUTION_MODELS: &[&str] = &["claude-haiku-4-5", "claude-haiku-4-5-20250307"];
+
+pub(crate) async fn call_claude_cli_public(
+    user_message: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+) -> Result<String, String> {
+    if !ALLOWED_EVOLUTION_MODELS.contains(&model) {
+        return Err(format!("Model '{model}' not allowed for evolution calls"));
+    }
+    call_claude_cli(user_message, model, system_prompt, home_dir).await
+}
+
 /// the timer resets every time new data arrives, so long-running responses
 /// that keep producing output will never be killed.
 async fn call_claude_cli(
@@ -522,7 +835,18 @@ async fn call_python_sdk_v2(
 
 // ── Helpers ─────────────────────────────────────────────────
 
-fn build_system_prompt(agent: Option<&duduclaw_agent::registry::LoadedAgent>) -> String {
+/// Build system prompt with progressive skill injection.
+///
+/// When `compressed_skills` and `active_skills` are available, uses three-layer
+/// progressive loading instead of full injection. Otherwise falls back to legacy
+/// full injection.
+fn build_system_prompt(
+    agent: Option<&duduclaw_agent::registry::LoadedAgent>,
+    user_message: Option<&str>,
+    compressed_skills: Option<&[crate::skill_lifecycle::compression::CompressedSkill]>,
+    active_skills: Option<&std::collections::HashSet<String>>,
+    skill_token_budget: u32,
+) -> String {
     let mut parts = Vec::new();
 
     if let Some(a) = agent {
@@ -532,8 +856,48 @@ fn build_system_prompt(agent: Option<&duduclaw_agent::registry::LoadedAgent>) ->
         if let Some(identity) = &a.identity {
             parts.push(identity.clone());
         }
-        for skill in &a.skills {
-            parts.push(format!("## Skill: {}\n{}", skill.name, skill.content));
+
+        // Progressive skill injection (when available)
+        if let (Some(skills), Some(msg)) = (compressed_skills, user_message) {
+            if !skills.is_empty() {
+                let active = active_skills.cloned().unwrap_or_default();
+
+                // Layer 0: all skill names
+                let index: Vec<&str> = skills.iter().map(|s| s.tag.as_str()).collect();
+                parts.push(format!("Available skills: {}", index.join(", ")));
+
+                // Rank and select layers
+                let ranked = crate::skill_lifecycle::relevance::rank_skills(msg, skills);
+                let config = crate::skill_lifecycle::relevance::RelevanceConfig::default();
+                let selection = crate::skill_lifecycle::relevance::select_layers(
+                    &ranked, &active, skills, &config,
+                );
+
+                let mut remaining_budget = skill_token_budget;
+
+                // Layer 2: active + highly relevant — full content
+                for &idx in &selection.layer2 {
+                    let skill = &skills[idx];
+                    if remaining_budget >= skill.tokens_layer2 {
+                        parts.push(format!("## Skill: {}\n{}", skill.name, skill.full_content));
+                        remaining_budget = remaining_budget.saturating_sub(skill.tokens_layer2);
+                    }
+                }
+
+                // Layer 1: relevant — summary only
+                for &idx in &selection.layer1 {
+                    let skill = &skills[idx];
+                    if remaining_budget >= skill.tokens_layer1 {
+                        parts.push(format!("## {}: {}", skill.name, skill.summary));
+                        remaining_budget = remaining_budget.saturating_sub(skill.tokens_layer1);
+                    }
+                }
+            }
+        } else {
+            // Legacy: inject all skills fully (backward compat when progressive not enabled)
+            for skill in &a.skills {
+                parts.push(format!("## Skill: {}\n{}", skill.name, skill.content));
+            }
         }
     }
 

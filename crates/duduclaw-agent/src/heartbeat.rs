@@ -62,6 +62,8 @@ struct LiveAgent {
     schedule: Option<Schedule>,
     last_run: Option<chrono::DateTime<Utc>>,
     last_macro: Option<chrono::DateTime<Utc>>,
+    /// Timestamp of the last evolution trigger (from any source: heartbeat or prediction engine).
+    last_evolution_trigger: Option<chrono::DateTime<Utc>>,
     total_runs: u64,
     active_runs: Arc<tokio::sync::Semaphore>,
 }
@@ -78,6 +80,7 @@ impl LiveAgent {
             schedule,
             last_run: None,
             last_macro: None,
+            last_evolution_trigger: Some(Utc::now()), // prevent cold-start immediate trigger
             total_runs: 0,
             active_runs: Arc::new(tokio::sync::Semaphore::new(max as usize)),
         }
@@ -263,6 +266,37 @@ impl HeartbeatScheduler {
             {
                 let mut agents = self.agents.write().await;
                 for agent in agents.values_mut() {
+                    // ── Silence checker (prediction_driven mode) ──
+                    // If prediction_driven is enabled, the heartbeat doesn't trigger
+                    // meso/macro directly. But if no evolution has occurred for
+                    // max_silence_hours, force a meso reflection to prevent stagnation.
+                    if agent.evolution.prediction_driven && agent.config.enabled {
+                        let hours_since_last = agent
+                            .last_evolution_trigger
+                            .map(|t| now.signed_duration_since(t).num_minutes() as f64 / 60.0)
+                            .unwrap_or(agent.evolution.max_silence_hours + 1.0);
+
+                        if hours_since_last > agent.evolution.max_silence_hours {
+                            warn!(
+                                agent = %agent.agent_id,
+                                hours = format!("{hours_since_last:.1}"),
+                                "Silence breaker: no evolution trigger for too long, forcing meso reflection"
+                            );
+                            agent.last_evolution_trigger = Some(now);
+                            to_spawn.push((
+                                self.home_dir.clone(),
+                                agent.agent_id.clone(),
+                                agent.agent_dir.clone(),
+                                agent.evolution.clone(),
+                                agent.active_runs.clone(),
+                                false,
+                            ));
+                        }
+                        // Skip normal heartbeat firing for prediction-driven agents
+                        // (bus polling is still done via the silence-checker spawn above)
+                        continue;
+                    }
+
                     if !agent.should_fire(now) {
                         continue;
                     }
@@ -274,6 +308,7 @@ impl HeartbeatScheduler {
                     info!(agent = %agent.agent_id, run = agent.total_runs + 1, "Heartbeat firing");
                     agent.last_run = Some(now);
                     agent.total_runs += 1;
+                    agent.last_evolution_trigger = Some(now);
 
                     let run_macro = agent.should_macro(now);
                     if run_macro {
@@ -345,8 +380,11 @@ async fn execute_heartbeat(
         info!(agent = agent_id, pending, "Agent has pending bus messages");
     }
 
-    // 2. Meso reflection (if enabled)
-    if evolution.meso_reflection {
+    // 2. Meso reflection
+    // When prediction_driven is true, meso/macro reflections are triggered
+    // by prediction errors, NOT by the heartbeat timer. The heartbeat still
+    // runs for bus polling and silence checking.
+    if !evolution.prediction_driven && evolution.meso_reflection {
         execute_evolution("meso", home_dir, agent_id, agent_dir).await;
     }
 

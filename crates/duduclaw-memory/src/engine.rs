@@ -10,12 +10,41 @@ use duduclaw_core::error::{DuDuClawError, Result};
 use duduclaw_core::traits::MemoryEngine;
 use duduclaw_core::types::{MemoryEntry, TimeWindow};
 
+/// Configurable weights for the Generative Agents 3D retrieval re-ranking.
+///
+/// Adjustable per-engine instance. Defaults tuned for agents with daily conversations.
+#[derive(Debug, Clone)]
+pub struct RetrievalWeights {
+    /// Recency decay base (default 0.995). Higher = slower decay.
+    /// 0.99 → 7-day half-life; 0.995 → 14-day half-life; 0.999 → 69-day half-life.
+    pub recency_decay: f64,
+    /// Weight for recency dimension (default 0.25).
+    pub w_recency: f64,
+    /// Weight for importance dimension (default 0.35).
+    pub w_importance: f64,
+    /// Weight for FTS relevance dimension (default 0.40).
+    pub w_fts: f64,
+}
+
+impl Default for RetrievalWeights {
+    fn default() -> Self {
+        Self {
+            recency_decay: 0.995,  // ~14-day half-life (better differentiation in 0-48h window)
+            w_recency: 0.25,
+            w_importance: 0.35,
+            w_fts: 0.40,
+        }
+    }
+}
+
 /// SQLite-backed memory engine with FTS5 full-text search.
 ///
 /// Note: `list_recent()` is an inherent method (not on the `MemoryEngine` trait)
 /// that returns entries ordered by recency without requiring an FTS query.
 pub struct SqliteMemoryEngine {
     conn: Mutex<Connection>,
+    /// Configurable retrieval weights for search re-ranking.
+    pub retrieval_weights: RetrievalWeights,
 }
 
 impl SqliteMemoryEngine {
@@ -27,6 +56,7 @@ impl SqliteMemoryEngine {
         info!(?db_path, "SQLite memory engine initialised");
         Ok(Self {
             conn: Mutex::new(conn),
+            retrieval_weights: RetrievalWeights::default(),
         })
     }
 
@@ -38,20 +68,23 @@ impl SqliteMemoryEngine {
         info!("SQLite in-memory memory engine initialised");
         Ok(Self {
             conn: Mutex::new(conn),
+            retrieval_weights: RetrievalWeights::default(),
         })
     }
+
+    /// Select clause for all memory columns (qualified with table alias `m.`).
+    const SELECT_COLS: &str = "m.id, m.agent_id, m.content, m.timestamp, m.tags, m.layer, m.importance, m.access_count, m.last_accessed, m.source_event";
+
 
     /// Return up to `limit` most-recent memory entries for `agent_id`, newest first.
     pub async fn list_recent(&self, agent_id: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
         let conn = self.conn.lock().await;
+        let sql = format!(
+            "SELECT {} FROM memories AS m WHERE m.agent_id = ?1 ORDER BY m.timestamp DESC LIMIT ?2",
+            Self::SELECT_COLS
+        );
         let mut stmt = conn
-            .prepare(
-                "SELECT id, agent_id, content, timestamp, tags
-                 FROM memories
-                 WHERE agent_id = ?1
-                 ORDER BY timestamp DESC
-                 LIMIT ?2",
-            )
+            .prepare(&sql)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
         let rows = stmt
@@ -65,6 +98,112 @@ impl SqliteMemoryEngine {
         Ok(entries)
     }
 
+    /// Search memories filtered by cognitive layer.
+    ///
+    /// Same as `search()` but restricted to a specific layer (episodic/semantic).
+    pub async fn search_layer(
+        &self,
+        agent_id: &str,
+        query: &str,
+        layer: &duduclaw_core::types::MemoryLayer,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        let conn = self.conn.lock().await;
+
+        let cleaned: String = query
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\'' | ':' | '^' | '{' | '}' | '*' | '(' | ')'))
+            .take(500)
+            .collect();
+        if cleaned.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let sanitized_query = format!("\"{}\"", cleaned.replace('"', ""));
+
+        let sql = format!(
+            "SELECT {cols}
+             FROM memories_fts AS f
+             JOIN memories AS m ON m.id = f.memory_id
+             WHERE f.memories_fts MATCH ?1
+               AND f.agent_id = ?2
+               AND m.layer = ?3
+             ORDER BY rank
+             LIMIT ?4",
+            cols = Self::SELECT_COLS
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![sanitized_query, agent_id, layer.as_str(), limit as i64], Self::row_to_entry)
+            .map_err(|e| {
+                tracing::warn!("FTS5 layer search error: {e}");
+                DuDuClawError::Memory("Search query error".to_string())
+            })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
+    /// Calculate episodic memory pressure for an agent.
+    ///
+    /// Returns the sum of importance scores of episodic memories created
+    /// since `since` timestamp, divided by 10. A value > 10.0 suggests
+    /// the agent has accumulated enough observations to warrant a Meso reflection.
+    pub async fn episodic_pressure(&self, agent_id: &str, since: DateTime<Utc>) -> f64 {
+        let conn = self.conn.lock().await;
+        let since_str = since.to_rfc3339();
+
+        conn.query_row(
+            "SELECT COALESCE(SUM(importance), 0.0) FROM memories
+             WHERE agent_id = ?1 AND layer = 'episodic' AND timestamp >= ?2",
+            params![agent_id, since_str],
+            |row| row.get::<_, f64>(0),
+        )
+        .unwrap_or(0.0)
+            / 10.0
+    }
+
+    /// Count high-importance episodic memories that have no corresponding semantic memory.
+    ///
+    /// Heuristic: counts episodic memories (importance >= 7, last 7 days) where
+    /// the semantic memory layer has zero entries for the same agent.
+    /// This indicates accumulated observations that haven't been consolidated
+    /// into generalised knowledge yet.
+    pub async fn semantic_conflict_count(&self, agent_id: &str) -> u32 {
+        let conn = self.conn.lock().await;
+
+        let semantic_count: u32 = conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE agent_id = ?1 AND layer = 'semantic'",
+            params![agent_id],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        let high_episodic: u32 = conn.query_row(
+            "SELECT COUNT(*) FROM memories
+             WHERE agent_id = ?1 AND layer = 'episodic' AND importance >= 7.0
+             AND timestamp >= datetime('now', '-7 days')",
+            params![agent_id],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        // If there are high-importance episodic memories but few semantic memories,
+        // this indicates unconsolidated knowledge (potential "conflicts")
+        if semantic_count == 0 && high_episodic > 0 {
+            high_episodic
+        } else if semantic_count > 0 {
+            // Ratio: how many high episodic per semantic
+            // More than 3:1 suggests consolidation is needed
+            high_episodic.saturating_sub(semantic_count * 3)
+        } else {
+            0
+        }
+    }
+
     fn init_tables(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "
@@ -74,7 +213,12 @@ impl SqliteMemoryEngine {
                 content TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 tags TEXT NOT NULL DEFAULT '[]',
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                layer TEXT NOT NULL DEFAULT 'episodic',
+                importance REAL NOT NULL DEFAULT 5.0,
+                access_count INTEGER NOT NULL DEFAULT 0,
+                last_accessed TEXT,
+                source_event TEXT DEFAULT ''
             );
 
             CREATE INDEX IF NOT EXISTS idx_memories_agent
@@ -82,6 +226,12 @@ impl SqliteMemoryEngine {
 
             CREATE INDEX IF NOT EXISTS idx_memories_timestamp
                 ON memories(timestamp);
+
+            CREATE INDEX IF NOT EXISTS idx_memories_layer
+                ON memories(layer);
+
+            CREATE INDEX IF NOT EXISTS idx_memories_importance
+                ON memories(importance DESC);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 content,
@@ -92,10 +242,36 @@ impl SqliteMemoryEngine {
             ",
         )
         .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        // Migration: add cognitive memory columns to existing databases (idempotent).
+        // Each ALTER is run individually so that "duplicate column" errors on one
+        // do not prevent subsequent columns from being added.
+        let migrations = [
+            "ALTER TABLE memories ADD COLUMN layer TEXT NOT NULL DEFAULT 'episodic'",
+            "ALTER TABLE memories ADD COLUMN importance REAL NOT NULL DEFAULT 5.0",
+            "ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE memories ADD COLUMN last_accessed TEXT",
+            "ALTER TABLE memories ADD COLUMN source_event TEXT DEFAULT ''",
+        ];
+        for sql in &migrations {
+            match conn.execute_batch(sql) {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("duplicate column name") => {}
+                Err(e) => {
+                    tracing::warn!("Memory schema migration failed: {e} — SQL: {sql}");
+                    return Err(DuDuClawError::Memory(format!("Migration failed: {e}")));
+                }
+            }
+        }
+
         Ok(())
     }
 
     /// Parse a row from the `memories` table into a [`MemoryEntry`].
+    ///
+    /// Expects columns: id, agent_id, content, timestamp, tags, layer, importance,
+    /// access_count, last_accessed, source_event.
+    /// Gracefully handles missing cognitive columns (backward compat with old DBs).
     fn row_to_entry(row: &rusqlite::Row<'_>) -> std::result::Result<MemoryEntry, rusqlite::Error> {
         let id: String = row.get(0)?;
         let agent_id: String = row.get(1)?;
@@ -121,6 +297,16 @@ impl SqliteMemoryEngine {
             Vec::new()
         });
 
+        // Cognitive fields — gracefully default if columns missing (old DB)
+        let layer_str: String = row.get(5).unwrap_or_else(|_| "episodic".to_string());
+        let importance: f64 = row.get(6).unwrap_or(5.0);
+        let access_count: u32 = row.get(7).unwrap_or(0);
+        let last_accessed: Option<DateTime<Utc>> = row
+            .get::<_, Option<String>>(8)
+            .unwrap_or(None)
+            .and_then(|s| s.parse().ok());
+        let source_event: String = row.get(9).unwrap_or_default();
+
         Ok(MemoryEntry {
             id,
             agent_id,
@@ -128,6 +314,11 @@ impl SqliteMemoryEngine {
             timestamp,
             tags,
             embedding: None,
+            layer: duduclaw_core::types::MemoryLayer::from_str(&layer_str),
+            importance,
+            access_count,
+            last_accessed,
+            source_event,
         })
     }
 }
@@ -140,10 +331,16 @@ impl MemoryEngine for SqliteMemoryEngine {
         let tags_json =
             serde_json::to_string(&entry.tags).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         let timestamp_str = entry.timestamp.to_rfc3339();
+        let last_accessed_str = entry.last_accessed.map(|t| t.to_rfc3339());
 
         conn.execute(
-            "INSERT INTO memories (id, agent_id, content, timestamp, tags) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![entry.id, agent_id, entry.content, timestamp_str, tags_json],
+            "INSERT INTO memories (id, agent_id, content, timestamp, tags, layer, importance, access_count, last_accessed, source_event)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                entry.id, agent_id, entry.content, timestamp_str, tags_json,
+                entry.layer.as_str(), entry.importance, entry.access_count,
+                last_accessed_str, entry.source_event
+            ],
         )
         .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
@@ -165,42 +362,84 @@ impl MemoryEngine for SqliteMemoryEngine {
     ) -> Result<Vec<MemoryEntry>> {
         let conn = self.conn.lock().await;
 
-        // Sanitize FTS5 query: strip special characters that could alter query semantics (BE-H2).
-        // FTS5 operators: AND, OR, NOT, NEAR, *, ^, "..." — we escape quotes and strip column filters.
-        let sanitized_query: String = query
+        // Sanitize FTS5 query: strip ALL special characters and operators (BE-H2).
+        // Then wrap as a phrase query to prevent boolean operators (AND/OR/NOT/NEAR).
+        let cleaned: String = query
             .chars()
-            .filter(|c| !matches!(c, '"' | '\'' | ':' | '^' | '{' | '}'))
-            .take(500) // limit query length
+            .filter(|c| !matches!(c, '"' | '\'' | ':' | '^' | '{' | '}' | '*' | '(' | ')'))
+            .take(500)
             .collect();
-        if sanitized_query.trim().is_empty() {
+        let sanitized_query = format!("\"{}\"", cleaned.replace('"', ""));
+        if cleaned.trim().is_empty() {
             return Ok(Vec::new());
         }
 
         // Use FTS5 MATCH to find relevant memory ids, then join back for full rows.
+        // Retrieve more candidates than needed for post-retrieval re-ranking by importance.
+        let fetch_limit = (limit * 4).max(20);
+        let sql = format!(
+            "SELECT {cols}
+             FROM memories_fts AS f
+             JOIN memories AS m ON m.id = f.memory_id
+             WHERE f.memories_fts MATCH ?1
+               AND f.agent_id = ?2
+             ORDER BY rank
+             LIMIT ?3",
+            cols = Self::SELECT_COLS
+        );
         let mut stmt = conn
-            .prepare(
-                "SELECT m.id, m.agent_id, m.content, m.timestamp, m.tags
-                 FROM memories_fts AS f
-                 JOIN memories AS m ON m.id = f.memory_id
-                 WHERE f.memories_fts MATCH ?1
-                   AND f.agent_id = ?2
-                 ORDER BY rank
-                 LIMIT ?3",
-            )
+            .prepare(&sql)
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
         let rows = stmt
-            .query_map(params![sanitized_query, agent_id, limit as i64], Self::row_to_entry)
+            .query_map(params![sanitized_query, agent_id, fetch_limit as i64], Self::row_to_entry)
             .map_err(|e| {
                 // Don't leak schema details — return generic error (BE-H2)
                 tracing::warn!("FTS5 search error: {e}");
                 DuDuClawError::Memory("Search query error — please simplify your query".to_string())
             })?;
 
-        let mut results = Vec::new();
+        let mut candidates = Vec::new();
         for row in rows {
             let entry = row.map_err(|e| DuDuClawError::Memory(e.to_string()))?;
-            results.push(entry);
+            candidates.push(entry);
+        }
+
+        // Post-retrieval re-ranking by recency + importance + FTS position.
+        // Generative Agents (arXiv 2304.03442) three-dimensional weighting.
+        let now = Utc::now();
+        let w = &self.retrieval_weights;
+        let mut scored: Vec<(f64, MemoryEntry)> = candidates
+            .into_iter()
+            .enumerate()
+            .map(|(rank_pos, entry)| {
+                let hours_ago = now
+                    .signed_duration_since(
+                        entry.last_accessed.unwrap_or(entry.timestamp)
+                    )
+                    .num_hours()
+                    .max(0) as f64;
+                let recency = w.recency_decay.powf(hours_ago);
+                let importance = entry.importance / 10.0;
+                let fts_rank = 1.0 / (1.0 + rank_pos as f64);
+
+                let score = w.w_recency * recency + w.w_importance * importance + w.w_fts * fts_rank;
+                (score, entry)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let results: Vec<MemoryEntry> = scored.into_iter().take(limit).map(|(_, e)| e).collect();
+
+        // Update access_count for returned results (within same lock, but after stmt is dropped)
+        let result_ids: Vec<String> = results.iter().map(|e| e.id.clone()).collect();
+        let now_str = now.to_rfc3339();
+        // stmt is already dropped here (it went out of scope after query_map)
+        for id in &result_ids {
+            let _ = conn.execute(
+                "UPDATE memories SET access_count = access_count + 1, last_accessed = ?1 WHERE id = ?2",
+                params![now_str, id],
+            );
         }
 
         Ok(results)
@@ -214,15 +453,12 @@ impl MemoryEngine for SqliteMemoryEngine {
             let start_str = window.start.to_rfc3339();
             let end_str = window.end.to_rfc3339();
 
+            let sql = format!(
+                "SELECT {} FROM memories AS m WHERE m.agent_id = ?1 AND m.timestamp >= ?2 AND m.timestamp <= ?3 ORDER BY m.timestamp ASC",
+                Self::SELECT_COLS
+            );
             let mut stmt = conn
-                .prepare(
-                    "SELECT m.id, m.agent_id, m.content, m.timestamp, m.tags
-                     FROM memories AS m
-                     WHERE m.agent_id = ?1
-                       AND m.timestamp >= ?2
-                       AND m.timestamp <= ?3
-                     ORDER BY m.timestamp ASC",
-                )
+                .prepare(&sql)
                 .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
             let rows = stmt
@@ -328,6 +564,11 @@ mod tests {
             timestamp: Utc::now(),
             tags,
             embedding: None,
+            layer: Default::default(),
+            importance: 5.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: String::new(),
         }
     }
 
