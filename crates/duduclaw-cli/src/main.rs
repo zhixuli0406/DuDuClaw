@@ -506,6 +506,42 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
         50
     };
 
+    // ── 7. Evolution Engine (advanced mode) ──────────────────
+    let enable_prediction_driven: bool = if !skip_prompts && !quick_mode {
+        println!();
+        println!("  {} {}", style("🧬").bold(), style("自主進化引擎").bold());
+        println!("  啟用後，AI 會根據對話預測誤差自動進化自己的人格和技能。");
+        println!("  （可隨時用 evolution_toggle 工具開關，不需重新編譯）");
+        println!();
+        Confirm::new()
+            .with_prompt("啟用預測驅動進化？（推薦）")
+            .default(true)
+            .interact()
+            .unwrap_or(true)
+    } else {
+        false // skip_prompts 或 quick_mode 下預設關閉
+    };
+
+    let enable_gvu: bool = if enable_prediction_driven && !skip_prompts && !quick_mode {
+        Confirm::new()
+            .with_prompt("啟用 GVU 自我博弈迴路？（AI 自動審查修改）")
+            .default(true)
+            .interact()
+            .unwrap_or(true)
+    } else {
+        false
+    };
+
+    let enable_cognitive_memory: bool = if enable_prediction_driven && !skip_prompts && !quick_mode {
+        Confirm::new()
+            .with_prompt("啟用認知記憶分層？（情節 vs 語意記憶）")
+            .default(true)
+            .interact()
+            .unwrap_or(true)
+    } else {
+        false
+    };
+
     // ── Confirm ──────────────────────────────────────────────
     if !skip_prompts {
         println!();
@@ -515,6 +551,13 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
         println!("  ├ API Key：{}", if api_key.is_empty() { style("未設定").red().to_string() } else { style("已設定").green().to_string() });
         println!("  ├ Gateway：{}:{}", style(&gw_bind).cyan(), style(gw_port).cyan());
         println!("  ├ 月預算：${}", style(monthly_budget_usd).cyan());
+        if enable_prediction_driven {
+            println!("  ├ 自主進化：{}", style("已啟用").green());
+            if enable_gvu { println!("  │  ├ GVU 博弈：{}", style("已啟用").green()); }
+            if enable_cognitive_memory { println!("  │  └ 認知記憶：{}", style("已啟用").green()); }
+        } else {
+            println!("  ├ 自主進化：{}", style("未啟用").dim());
+        }
         if !line_token.is_empty() { println!("  ├ LINE：{}", style("已設定").green()); }
         if !telegram_token.is_empty() { println!("  ├ Telegram：{}", style("已設定").green()); }
         if !discord_token.is_empty() { println!("  ├ Discord：{}", style("已設定").green()); }
@@ -652,7 +695,18 @@ meso_reflection = true
 macro_reflection = true
 skill_auto_activate = true
 skill_security_scan = true
-"#
+prediction_driven = {prediction_driven}
+gvu_enabled = {gvu_enabled}
+cognitive_memory = {cognitive_memory}
+max_silence_hours = 12.0
+max_gvu_generations = 3
+observation_period_hours = 24.0
+skill_token_budget = 2500
+max_active_skills = 5
+"#,
+        prediction_driven = enable_prediction_driven,
+        gvu_enabled = enable_gvu,
+        cognitive_memory = enable_cognitive_memory,
     );
     tokio::fs::write(&agent_toml_path, agent_toml).await.map_err(|e| {
         DuDuClawError::Config(format!("Failed to write {}: {e}", agent_toml_path.display()))

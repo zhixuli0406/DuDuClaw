@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.6.5-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-0.6.7-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 
 ---
 
@@ -44,12 +44,13 @@ DuDuClaw (plumbing)
 | **容器沙箱** | Docker / Apple Container 隔離執行（`--network=none`、tmpfs workspace、read-only rootfs、512MB limit） |
 | **Session 管理** | SQLite 持久化對話歷程，超過 50k token 自動壓縮摘要 |
 | **自主進化引擎** | Micro → Meso → Macro 三層反思 + 5 種外部因素介入（使用者反饋、安全事件、通道指標、業務數據、Peer 信號） |
-| **安全防護** | SOUL.md 漂移檢測（SHA-256）+ prompt injection 掃描（6 類規則）+ JSONL 審計日誌 + per-agent 密鑰隔離 |
+| **安全防護** | SOUL.md 漂移檢測（SHA-256）+ prompt injection 掃描（6 類規則）+ JSONL 審計日誌 + per-agent 密鑰隔離 + **Claude Code Security Hooks（三層漸進式防禦）** |
 | **行為契約** | `CONTRACT.toml` 定義 `must_not` / `must_always` 邊界 + `duduclaw test` 紅隊測試（9 項內建場景） |
 | **Odoo ERP 整合** | 中間層 `duduclaw-odoo` 支援 CE/EE — 15 個 MCP 工具（CRM/銷售/庫存/會計/通用搜尋報表）+ 事件橋接 |
 | **Skill 市場** | GitHub Search API 即時索引真實 skill repo + 24h 本地快取 + Dashboard 市場頁面 |
 | **雙模式帳號輪替** | OAuth 訂閱帳號 + API Key 混合輪替 — 4 種策略（LeastCost 優先 OAuth 零成本）、健康追蹤、Rate limit 冷卻、預算強制 |
 | **Claude Code 原生目錄** | Agent 目錄包含 `.claude/`、`SOUL.md`、`CLAUDE.md`、`.mcp.json`，直接相容 Claude Code |
+| **Claude Code Security Hooks** | 三層漸進式防禦 — Layer 1 黑名單（<50ms）→ Layer 2 混淆偵測（YELLOW+）→ Layer 3 Haiku AI 研判（RED only）；威脅等級自動升降級；敏感檔案 R/W 保護；Secret 洩漏掃描（20+ 模式）；async 審計日誌（相容 Rust AuditEvent） |
 | **Web Dashboard** | React + TypeScript + Tailwind CSS，溫暖 amber 色系，支援深淺色切換，含組織架構圖、Skill 市場、安全審計頁 |
 
 ---
@@ -76,6 +77,60 @@ DuDuClaw (plumbing)
 ```
 
 使用 `duduclaw migrate` 可將舊版 `agent.toml` 自動轉換為 Claude Code 相容格式（產生 `.claude/`、`CLAUDE.md`、`.mcp.json`）。
+
+---
+
+## Security Hooks 安全防禦系統
+
+DuDuClaw 在 Claude Code 的 Hook 系統上建構了三層漸進式防禦，保護開發環境免受惡意命令、秘密洩漏和配置篡改：
+
+```
+                    ┌─────────────────────────────────────┐
+  SessionStart ──→  │ session-init.sh                     │  密鑰權限驗證 + 環境初始化
+                    └─────────────────────────────────────┘
+                    ┌─────────────────────────────────────┐
+  UserPrompt   ──→  │ inject-contract.sh                  │  CONTRACT.toml 規則注入
+                    └─────────────────────────────────────┘
+                    ┌─────────────────────────────────────┐
+  PreToolUse   ──→  │ bash-gate.sh (Bash)                 │  Layer 1: 黑名單 (<50ms)
+     (Bash)         │   ├─ Layer 2: 混淆偵測 (YELLOW+)    │  Layer 2: base64/eval/外滲
+                    │   └─ Layer 3: Haiku AI (RED only)   │  Layer 3: AI 安全研判
+                    └─────────────────────────────────────┘
+                    ┌─────────────────────────────────────┐
+  PreToolUse   ──→  │ file-protect.sh → ai-review.sh     │  敏感檔案保護 + AI 審查
+  (Write|Edit|Read) └─────────────────────────────────────┘
+                    ┌─────────────────────────────────────┐
+  PostToolUse  ──→  │ secret-scanner.sh → audit-logger.sh │  Secret 掃描 → async 審計
+                    └─────────────────────────────────────┘
+                    ┌─────────────────────────────────────┐
+  Stop         ──→  │ threat-eval.sh                      │  威脅等級重新評估
+                    └─────────────────────────────────────┘
+                    ┌─────────────────────────────────────┐
+  ConfigChange ──→  │ config-guard.sh                     │  配置篡改偵測
+                    └─────────────────────────────────────┘
+```
+
+### 威脅等級狀態機
+
+| 等級 | 觸發條件 | 防禦行為 |
+|------|---------|---------|
+| **GREEN** (預設) | 正常操作 | Layer 1 黑名單 + 檔案保護 + Secret 掃描 |
+| **YELLOW** | 1 小時內 ≥ 2 次攔截 | +Layer 2 混淆偵測 + 外部網路限制 |
+| **RED** | 偵測到注入/eval 攻擊 | +Layer 3 Haiku AI 研判所有命令 + AI 檔案審查 |
+
+降級：24 小時無事件自動降一級（RED→YELLOW→GREEN）。
+
+### 保護範圍
+
+- **30+ 危險命令模式**：rm -rf、fork bomb、curl pipe sh、DROP TABLE、chmod 777 等
+- **20+ Secret 洩漏模式**：Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/Vault/DB URL 等
+- **敏感檔案保護**：`secret.key`、`.env*`、`.credentials.json`、`SOUL.md`、`CONTRACT.toml`、`threat_level`
+- **Read tool 保護**：防止讀取敏感檔案洩漏至 context
+- **AI 提示注入防護**：所有 Haiku 提示使用 XML 分隔標籤標記不受信任輸入
+- **審計日誌**：每次工具呼叫 async 寫入 JSONL，格式相容 Rust `audit.rs` 的 `AuditEvent` schema
+
+> 詳細設計見 [docs/TODO-security-hooks.md](docs/TODO-security-hooks.md)，
+> Code Review 報告見 [docs/code-review-security-hooks.md](docs/code-review-security-hooks.md)。
 
 ---
 
@@ -166,8 +221,25 @@ DuDuClaw/
 │       ├── lib/                # API client (WebSocket JSON-RPC)
 │       └── i18n/               # zh-TW / en
 │
+├── .claude/                    # Claude Code Hook 安全系統
+│   ├── settings.local.json     # Hook 設定（6 事件 × 10 腳本）
+│   └── hooks/
+│       ├── lib/threat-level.sh # 共享函式庫（狀態機、timeout、TOML 解析）
+│       ├── bash-gate.sh        # PreToolUse Bash — 三層防禦
+│       ├── file-protect.sh     # PreToolUse Write|Edit|Read — 敏感檔案保護
+│       ├── secret-scanner.sh   # PostToolUse — Secret 洩漏掃描（20+ 模式）
+│       ├── inject-contract.sh  # UserPromptSubmit — CONTRACT.toml 注入
+│       ├── session-init.sh     # SessionStart — 環境初始化 + 密鑰驗證
+│       ├── audit-logger.sh     # PostToolUse — async JSONL 審計
+│       ├── config-guard.sh     # ConfigChange — 配置篡改偵測
+│       ├── threat-eval.sh      # Stop — 威脅等級重新評估
+│       └── security-file-ai-review.sh  # PreToolUse — RED 模式 AI 審查
+│
 ├── docs/                       # 研究文件
-│   └── claw-ecosystem-report.md
+│   ├── TODO-security-hooks.md  # Security Hooks 設計 + 實作追蹤
+│   ├── code-review-security-hooks.md # Security Hooks 深度 Code Review
+│   ├── claw-ecosystem-report.md
+│   └── ...
 ├── ARCHITECTURE.md             # 完整架構設計文件
 ├── Phase2-TODO.md              # Phase 2 任務追蹤（21/21 完成）
 └── CLAUDE.md                   # AI 協作設計上下文
@@ -210,6 +282,8 @@ cd web && npx tsc --noEmit
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — 完整系統架構設計
 - [CLAUDE.md](CLAUDE.md) — AI 協作設計上下文與原則
+- [docs/TODO-security-hooks.md](docs/TODO-security-hooks.md) — Security Hooks 設計文件與實作追蹤（Phase 1~4）
+- [docs/code-review-security-hooks.md](docs/code-review-security-hooks.md) — Security Hooks 深度 Code Review（6 CRITICAL + 14 HIGH 全部修復）
 - [docs/account-rotation-guide.md](docs/account-rotation-guide.md) — 帳號輪替使用教學（OAuth + API Key）
 - [docs/odoo-integration-plan.md](docs/odoo-integration-plan.md) — Odoo ERP 整合規劃
 - [docs/claw-ecosystem-report.md](docs/claw-ecosystem-report.md) — Claw 生態系統研究報告

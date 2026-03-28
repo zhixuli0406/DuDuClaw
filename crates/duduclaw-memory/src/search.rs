@@ -55,6 +55,11 @@ mod tests {
             timestamp: Utc::now(),
             tags: tags.into_iter().map(String::from).collect(),
             embedding: None,
+            layer: Default::default(),
+            importance: 5.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: String::new(),
         }
     }
 

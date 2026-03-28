@@ -68,13 +68,40 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         });
     }
 
-    // Start channel bots if configured
-    let reply_ctx = Arc::new(crate::channel_reply::ReplyContext::new(
-        handler.registry().clone(),
-        home_dir.clone(),
-        session_manager,
-        handler.channel_status().clone(),
+    // ── Initialize prediction engine (Phase 1) ────────────────
+    let prediction_db_path = home_dir.join("prediction.db");
+    let metacognition_path = home_dir.join("metacognition.json");
+    let prediction_engine = Arc::new(
+        crate::prediction::engine::PredictionEngine::new(
+            prediction_db_path,
+            Some(metacognition_path.clone()),
+        )
+    );
+    info!("Prediction engine initialized");
+
+    // ── Initialize GVU loop (Phase 2) ────────────────────────
+    let gvu_db_path = home_dir.join("evolution.db");
+    // Load encryption key for rollback_diff at rest (reuses existing keyfile)
+    let gvu_encryption_key = crate::config_crypto::load_keyfile_public(&home_dir);
+    let gvu_loop = Arc::new(crate::gvu::loop_::GvuLoop::with_encryption(
+        &gvu_db_path,
+        None, // observation_hours — will be set per-agent from config
+        None, // max_generations — will be set per-agent from config
+        gvu_encryption_key.as_ref(),
     ));
+    info!("GVU evolution loop initialized (encryption: {})", if gvu_encryption_key.is_some() { "enabled" } else { "disabled" });
+
+    // Start channel bots if configured
+    let reply_ctx = Arc::new(
+        crate::channel_reply::ReplyContext::new(
+            handler.registry().clone(),
+            home_dir.clone(),
+            session_manager,
+            handler.channel_status().clone(),
+        )
+        .with_prediction_engine(prediction_engine.clone())
+        .with_gvu_loop(gvu_loop.clone())
+    );
     // Store background task handles for graceful shutdown (BE-L4)
     let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
@@ -153,7 +180,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .await
         .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(e.to_string()))?;
 
+    // Serve with graceful shutdown on Ctrl+C
+    let pe_for_shutdown = prediction_engine.clone();
+    let meta_path_for_shutdown = metacognition_path.clone();
     axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Shutdown signal received, flushing state...");
+            pe_for_shutdown.flush_all().await;
+            pe_for_shutdown.persist_metacognition(&meta_path_for_shutdown).await;
+            info!("Prediction engine state flushed");
+        })
         .await
         .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(e.to_string()))?;
 

@@ -117,15 +117,8 @@ async fn load_evolution_config(agent_dir: &Path) -> duduclaw_core::types::Evolut
         }
         Err(_) => {}
     }
-    // Default: all external factors disabled
-    duduclaw_core::types::EvolutionConfig {
-        micro_reflection: true,
-        meso_reflection: true,
-        macro_reflection: true,
-        skill_auto_activate: false,
-        skill_security_scan: true,
-        external_factors: Default::default(),
-    }
+    // Default: legacy mode with all external factors disabled
+    Default::default()
 }
 
 /// Vet a skill file for security issues.
