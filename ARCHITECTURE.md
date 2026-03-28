@@ -1,7 +1,7 @@
 # DuDuClaw 系統架構設計
 
-> 版本：0.6.5
-> 日期：2026-03-23
+> 版本：0.8.11
+> 日期：2026-03-29
 
 ---
 
@@ -13,7 +13,7 @@
 4. [Rust 核心層](#四rust-核心層)
 5. [Python 擴充層](#五python-擴充層)
 6. [安全系統](#六安全系統)
-7. [Evolution 三層反思引擎](#七evolution-三層反思引擎)
+7. [自主進化引擎（Prediction-Driven + GVU）](#七自主進化引擎prediction-driven--gvu)
 8. [記憶系統](#八記憶系統)
 9. [通訊通道](#九通訊通道)
 10. [Web 管理介面](#十web-管理介面)
@@ -35,7 +35,7 @@
 | 安全認證 | **Ed25519 challenge-response** | 非對稱簽章，無密碼傳輸 |
 | API key 儲存 | **AES-256-GCM** | 對稱加密，base64 存於 config.toml |
 | 日誌推送 | **BroadcastLayer** tracing | 即時推播 log 到 WebSocket，零侵入 |
-| Evolution | **Claude subprocess 呼叫** | 三層反思均使用真實 LLM 推理，非模板產出 |
+| Evolution | **預測驅動 + GVU 自我博弈** | 90% 零 LLM 成本，Significant/Critical 才觸發 GVU 迴圈 |
 | Token 計算 | **CJK-aware heuristic** | CJK 字元 ~1.5 chars/token，ASCII ~4 chars/token |
 
 ---
@@ -228,17 +228,17 @@ loop {
 
 ### 4.6 HeartbeatScheduler
 
-`duduclaw-agent/src/heartbeat.rs` 定期觸發 Meso 反思：
+`duduclaw-agent/src/heartbeat.rs` 負責 bus polling 和靜默破壞器：
 
 ```
-HeartbeatScheduler::run()
+HeartbeatScheduler::run()  （每 30 秒 tick）
     │
-    ├─ 每次心跳 →  trigger_meso_reflection()
-    │                   │
-    │                   └─ spawn: python3 -m duduclaw.evolution.run meso
+    ├─ 每次心跳 → count_pending_bus_messages()
     │
-    └─ budget 檢查（token 用量 vs 上限）
+    └─ 靜默破壞器 → 超過 max_silence_hours 未進化 → 重置時間戳
 ```
+
+進化反思由預測引擎在 `channel_reply.rs` 中事件驅動觸發，不由 heartbeat 觸發。
 
 ---
 
@@ -260,11 +260,9 @@ python/duduclaw/
 │   ├── rotator.py      # AccountRotator：4 種輪替策略
 │   └── health.py       # check_account_health()：呼叫 GET /v1/models 驗證
 │
-├── evolution/          # 三層反思系統
-│   ├── micro.py        # 每次對話後的即時反思
-│   ├── meso.py         # 每小時心跳，分析最近 3 天 daily notes
-│   ├── macro_.py       # 每日排程，評估技能品質
-│   └── run.py          # CLI 入口：python3 -m duduclaw.evolution.run <level>
+├── evolution/          # Skill Vetter 安全掃描
+│   ├── vetter.py       # 技能安全審查（6 類規則）
+│   └── run.py          # CLI 入口：python3 -m duduclaw.evolution.run vet
 │
 └── tools/              # Agent 動態管理工具
     └── agent_tools.py  # agent_list / agent_create / agent_delegate / agent_status
@@ -324,52 +322,58 @@ GET https://api.anthropic.com/v1/models
 
 ---
 
-## 七、Evolution 三層反思引擎
+## 七、自主進化引擎（Prediction-Driven + GVU）
 
-每層均呼叫真實 `claude` CLI subprocess，輸出結構化 JSON。
+> 完整技術文件：[docs/evolution-engine.md](docs/evolution-engine.md)
 
-### 7.1 Micro 反思（每次對話後）
+進化引擎以**預測誤差**驅動，取代固定計時器反思，約 90% 的對話零 LLM 成本。
 
-觸發時機：對話結束後立即執行
+### 7.1 預測引擎（Phase 1）
 
-Claude 提示產出：
-```json
-{
-  "what_went_well": ["...", "..."],
-  "what_could_improve": ["...", "..."],
-  "patterns_noticed": ["...", "..."],
-  "candidate_skills": [{"name": "...", "description": "..."}]
-}
+每次對話後自動執行（< 1ms, 零 LLM）：
+
+```
+predict() → calculate_error() → route()
+    │               │                │
+    ▼               ▼                ▼
+ UserModel     PredictionError    EvolutionAction
+ 統計預測       加權組合誤差        None / StoreEpisodic / TriggerGVU
 ```
 
-結果寫入當日 `memory/YYYYMM/YYYYMMDD.md`。
+**誤差分級**（Dual Process Theory）：
 
-### 7.2 Meso 反思（每小時心跳）
+| 等級 | 閾值 | 動作 | LLM 成本 |
+|------|------|------|---------|
+| Negligible | < 0.2 | 無 | 0 |
+| Moderate | 0.2-0.5 | 存情節記憶 | 0 |
+| Significant | 0.5-0.8 | GVU 反思 | 2-6 次 |
+| Critical | ≥ 0.8 | 緊急 GVU | 2-6 次 |
 
-觸發時機：`HeartbeatScheduler` 定時觸發 → `python3 -m duduclaw.evolution.run meso`
+**MetaCognition**：每 100 次預測自適應調整閾值邊界（效果好放寬、效果差收緊）。
 
-Claude 分析最近 3 天的 daily notes，產出：
-```json
-{
-  "common_patterns": ["...", "..."],
-  "candidate_skills": [{"name": "...", "description": "..."}],
-  "period": "2026-03-17 to 2026-03-19"
-}
+### 7.2 GVU 自我博弈迴圈（Phase 2）
+
+Generator → Verifier → Updater，最多 3 輪：
+
+```
+GENERATE (Claude Haiku + OPRO 歷史 + TextGrad 反饋)
+    ↓
+VERIFY (4 層)
+  L1: 合約邊界 + 安全性          [零 LLM]
+  L2: 回滾重複 + 搖擺偵測       [零 LLM]
+  L3: LLM 法官 (score ≥ 0.7)   [1 API]
+  L4: 趨勢一致性                [零 LLM]
+    ↓
+APPLY → 原子寫入 SOUL.md → 24h 觀察期 → Confirm / Rollback
 ```
 
-### 7.3 Macro 反思（每日排程）
+### 7.3 安全機制
 
-觸發時機：Cron 任務排程（`0 0 * * *`）
-
-Claude 評估 `SKILLS/` 下每個技能的品質：
-```json
-{
-  "skills_to_improve": ["skill-name"],
-  "skills_to_archive": ["old-skill"],
-  "soul_alignment_score": 0.87,
-  "recommendations": ["...", "..."]
-}
-```
+- **XML 隔離**：所有不受信任內容用 XML tag 包裹
+- **合約強制**：`CONTRACT.toml` 的 `must_not` / `must_always` 在 L1 硬性檢查
+- **原子寫入**：temp 檔 → rename，失敗不會損壞 SOUL.md
+- **SHA-256 指紋**：soul_guard 偵測非法修改
+- **AES-256-GCM**：回滾差異加密儲存
 
 ---
 
@@ -514,7 +518,7 @@ DuDuClaw/
 ├── python/duduclaw/            # Python 擴充層
 │   ├── channels/               # 通道插件
 │   ├── sdk/                    # Claude Code SDK 整合
-│   ├── evolution/              # 三層反思系統
+│   ├── evolution/              # Skill Vetter 安全掃描
 │   └── tools/                  # Agent 動態管理工具
 │
 ├── web/                        # React Dashboard
@@ -563,9 +567,9 @@ allow_network = true
 allow_shell = false
 
 [evolution]
-micro_enabled = true
-meso_enabled = true
-macro_enabled = true
+gvu_enabled = true
+max_silence_hours = 12.0
+observation_period_hours = 24.0
 ```
 
 ### 12.2 `config.toml`（全域）
@@ -684,11 +688,11 @@ Main Agent (Claude Code)
 
 ### 13.6 統一 Heartbeat Scheduler
 
-取代舊版 `start_evolution_timers`（全局硬編碼），改為 per-agent 排程：
+Per-agent 排程系統，負責 bus polling 和靜默破壞器：
 
 - 每個 agent 獨立的 cron/interval 設定
 - `max_concurrent_runs` Semaphore 並行控制
 - 每 30 秒 tick，每 5 分鐘從 registry 重新同步
-- Meso reflection：每次 heartbeat 觸發
-- Macro reflection：每 24 小時觸發
+- 靜默破壞器：超過 `max_silence_hours`（預設 12h）無進化觸發 → 記錄警告
+- 進化反思由預測引擎在對話後事件驅動觸發（見 [第七節](#七自主進化引擎prediction-driven--gvu)）
 - RPC 方法：`heartbeat.status` + `heartbeat.trigger`
