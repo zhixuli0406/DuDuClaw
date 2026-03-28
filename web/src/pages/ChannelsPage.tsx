@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type ChannelStatus } from '@/lib/api';
+import { useConnectionStore } from '@/stores/connection-store';
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import {
   Radio,
@@ -46,6 +47,7 @@ function getChannelStyle(name: string) {
 
 export function ChannelsPage() {
   const intl = useIntl();
+  const connState = useConnectionStore((s) => s.state);
   const [channels, setChannels] = useState<ReadonlyArray<ChannelStatus>>([]);
   const [loading, setLoading] = useState(false);
   const [showAddDialog, setShowAddDialog] = useState(false);
@@ -73,9 +75,12 @@ export function ChannelsPage() {
     }
   }, []);
 
+  // Wait for WebSocket to be authenticated before fetching
   useEffect(() => {
-    fetchChannels();
-  }, [fetchChannels]);
+    if (connState === 'authenticated') {
+      fetchChannels();
+    }
+  }, [connState, fetchChannels]);
 
   const handleTest = async (type: string) => {
     try {
