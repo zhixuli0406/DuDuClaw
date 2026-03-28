@@ -42,23 +42,26 @@ anthropic_api_key_enc = "..."  # duduclaw onboard 會自動加密
 ```toml
 # ── 帳號設定 ────────────────────────────────
 
-# 帳號 1：Claude Max 訂閱（優先使用，零額外費用）
-[[accounts]]
-id = "my-subscription"
-type = "oauth"
-profile = "default"           # 使用 ~/.claude/.credentials.json
-email = "me@example.com"
-subscription = "max"
-priority = 1                  # 數字越小越優先
+# 帳號 1：本機 Claude 登入（自動偵測，優先使用）
+# 不需要在此宣告 — DuDuClaw 會自動透過 `claude auth status` 偵測
 
-# 帳號 2：團隊的 Claude Team 帳號
+# 帳號 2：setup-token 產生的 OAuth token（第二順位）
 [[accounts]]
-id = "team-account"
+id = "work-team"
 type = "oauth"
-profile = "work"              # 使用 ~/.claude/profiles/work/.credentials.json
-email = "me@company.com"
-subscription = "team"
+label = "工作帳號"
+oauth_token_enc = "AES256GCM加密後的token..."  # 由 Dashboard 自動加密儲存
+expires_at = "2027-03-28T00:00:00Z"
 priority = 2
+
+# 帳號 3：另一組 setup-token（第三順位）
+[[accounts]]
+id = "personal-max"
+type = "oauth"
+label = "個人 Max"
+oauth_token_enc = "..."
+expires_at = "2027-06-15T00:00:00Z"
+priority = 3
 
 # 帳號 3：API Key 備用（訂閱額度用完時自動切換）
 [[accounts]]

@@ -1,7 +1,7 @@
 # DuDuClaw vs OpenClaw 深度比較
 
-> 更新日期：2026-03-28
-> OpenClaw 版本：v2026.3.24 | DuDuClaw 版本：v0.7.0
+> 更新日期：2026-03-29
+> OpenClaw 版本：v2026.3.24 | DuDuClaw 版本：v0.8.11
 
 ---
 
@@ -93,13 +93,13 @@
 | **Agent 間通訊** | 無原生 IPC | ✅ bus_queue.jsonl 檔案 IPC + AgentDispatcher |
 | **組織架構** | 扁平 | ✅ `reports_to` 階層 + D3.js 組織圖 |
 | **MCP 編排** | Gateway 內部 | `create_agent` / `spawn_agent` / `list_agents` MCP 工具 |
-| **自我演化** | ❌ 靜態配置 | ✅ 三層演化 (Micro/Meso/Macro) |
-| **演化 v2** | ❌ | ✅ 預測驅動（Active Inference）、GVU 自我對弈、認知記憶 |
+| **自我演化** | ❌ 靜態配置 | ✅ 預測驅動演化（Active Inference + GVU 自我對弈） |
+| **認知記憶** | ❌ | ✅ episodic/semantic 分離 + Generative Agents 3D 加權檢索 |
 | **人格定義** | Agent 設定檔 | SOUL.md（可版本化 + 漂移偵測） |
 | **行為契約** | ❌ | ✅ CONTRACT.toml（must_not / must_always） |
 | **紅隊測試** | ❌ | ✅ `duduclaw test <agent>`（9 種內建場景） |
 
-**分析**：OpenClaw 的 Agent 是「路由到不同工作區的 AI 實例」；DuDuClaw 的 Agent 是「具有人格、會自我演化、有行為邊界的 AI 實體」。三層演化引擎是 DuDuClaw 獨有的能力，讓 Agent 能從對話中學習、定期反思、每日策略調整。
+**分析**：OpenClaw 的 Agent 是「路由到不同工作區的 AI 實例」；DuDuClaw 的 Agent 是「具有人格、會自我演化、有行為邊界的 AI 實體」。預測驅動演化引擎 + GVU 自我對弈是 DuDuClaw 獨有的能力 — ~90% 的對話零 LLM 成本，只有真正的預測誤差才觸發 SOUL.md 演化。
 
 ---
 
@@ -246,7 +246,7 @@
 
 - 是 **Claude Code 重度用戶**，想延伸而非替換 Claude Code
 - 需要 **本地 LLM 推理**（llama.cpp / mistral.rs / P2P 叢集）
-- 需要 **Agent 自我演化**（三層演化 + 預測驅動 + GVU 自我對弈）
+- 需要 **Agent 自我演化**（預測驅動 + GVU 自我對弈 + 認知記憶）
 - 需要 **精密安全防護**（三層 Hooks、行為契約、紅隊測試、Prompt 注入偵測）
 - 需要 **ERP 整合**（Odoo CRM/銷售/庫存/會計）
 - 需要 **帳號成本最佳化**（OAuth 輪替 + 信心路由 + 本地推理降本）
