@@ -104,33 +104,24 @@ pub async fn call_claude_for_agent_with_type(
             ).await;
         }
         _ => {
-            // "hybrid" — use per-agent prefer_local
+            // "hybrid" — SDK-first design (see routing logic below)
         }
     }
 
-    // Hybrid mode: try local inference if agent prefers it OR if adaptive routing says so
-    let adaptive_prefer = crate::cost_telemetry::should_prefer_local(agent_id).await;
-    if let Some(ref local) = local_config {
-        if local.prefer_local || adaptive_prefer {
-            let reason = if adaptive_prefer && !local.prefer_local { "adaptive-override" } else { "agent-config" };
-            info!(agent = %agent_name, local_model = %local.model, reason, "Trying local inference for agent");
-            match call_local_inference(home_dir, prompt, &system_prompt, Some(&local.model)).await {
-                Ok(response) => {
-                    info!(agent = %agent_name, "Agent served by local model");
-                    return Ok(response);
-                }
-                Err(e) if e == "ROUTER_ESCALATE_TO_CLOUD" => {
-                    info!(agent = %agent_name, "Router escalated to Claude API");
-                }
-                Err(e) => {
-                    warn!(agent = %agent_name, error = %e, "Local inference failed, falling back to Claude API");
-                }
-            }
-        }
-    }
+    // ══════════════════════════════════════════════════════════════
+    // Hybrid mode routing — SDK is the brain, local is cost-saving offload
+    //
+    // Design principle: "Claude Code SDK = brain, DuDuClaw = plumbing"
+    //
+    //  ① Confidence Router pre-check: if query is clearly simple AND
+    //     local model is available → offload to local (zero API cost)
+    //  ② Direct API: for medium/complex queries, use HTTP API with
+    //     cache_control for 95%+ cache hit rate (if api_mode allows)
+    //  ③ CLI (claude -p): full Claude Code SDK with tool support —
+    //     the primary brain, always available as final path
+    // ══════════════════════════════════════════════════════════════
 
-    // ── Direct API path (bypasses CLI for pure chat) ──────────
-    // Validate api_mode — warn on unrecognized values
+    // Validate api_mode
     if !matches!(api_mode.as_str(), "cli" | "direct" | "auto") {
         warn!(
             agent = %agent_name,
@@ -138,26 +129,82 @@ pub async fn call_claude_for_agent_with_type(
             "Unrecognized api_mode in agent.toml — expected cli/direct/auto, defaulting to cli"
         );
     }
-    let use_direct = matches!(api_mode.as_str(), "direct" | "auto");
-    if use_direct {
-        info!(agent = %agent_name, model = %claude_model, api_mode = %api_mode, "Trying Direct API");
-        match try_direct_api(home_dir, agent_id, prompt, &claude_model, &system_prompt, request_type).await {
-            Ok(text) => return Ok(text),
-            Err(e) => {
-                if api_mode == "direct" {
-                    return Err(e); // no fallback
+
+    // ── ① Local offload: only for clearly simple queries ─────────
+    // The Confidence Router decides; we don't blindly try local first.
+    // Local is used ONLY when the router says the query is simple enough
+    // (use_router=true) or when adaptive telemetry forces local (cache degraded).
+    let adaptive_prefer = crate::cost_telemetry::should_prefer_local(agent_id).await;
+    if let Some(ref local) = local_config {
+        let should_try_local = if adaptive_prefer {
+            // Adaptive override: cache is degraded, force local to stop bleeding
+            true
+        } else if local.use_router {
+            // Router-driven: let Confidence Router decide per-query
+            true
+        } else {
+            // No router, no adaptive — only if explicitly prefer_local AND no Cloud available
+            // In hybrid mode this is false by default (SDK-first)
+            local.prefer_local
+        };
+
+        if should_try_local {
+            let reason = if adaptive_prefer { "adaptive-override" } else { "router-driven" };
+            info!(agent = %agent_name, local_model = %local.model, reason, "Trying local offload");
+            match call_local_inference(home_dir, prompt, &system_prompt, Some(&local.model)).await {
+                Ok(response) => {
+                    info!(agent = %agent_name, "Query served by local model (cost saved)");
+                    return Ok(response);
                 }
-                warn!(agent = %agent_name, error = %e, "Direct API failed, falling back to CLI");
+                Err(e) if e == "ROUTER_ESCALATE_TO_CLOUD" => {
+                    info!(agent = %agent_name, "Router: query too complex for local → escalating to SDK");
+                }
+                Err(e) => {
+                    warn!(agent = %agent_name, error = %e, "Local offload failed → escalating to SDK");
+                }
             }
         }
     }
 
-    // Fall back to Claude Code SDK via account rotation
-    info!(agent = %agent_name, model = %claude_model, prompt_len = prompt.len(), "Calling Claude CLI");
+    // ── ② Direct API: cache-optimized cloud path ─────────────────
+    let use_direct = matches!(api_mode.as_str(), "direct" | "auto");
+    if use_direct {
+        info!(agent = %agent_name, model = %claude_model, api_mode = %api_mode, "Trying Direct API (cache-optimized)");
+        match try_direct_api(home_dir, agent_id, prompt, &claude_model, &system_prompt, request_type).await {
+            Ok(text) => return Ok(text),
+            Err(e) => {
+                if api_mode == "direct" {
+                    return Err(e); // strict mode: no fallback
+                }
+                // "auto" mode: billing/auth errors should not retry via CLI with same key
+                if is_billing_error(&e) {
+                    return Err(e);
+                }
+                warn!(agent = %agent_name, error = %e, "Direct API failed → falling back to CLI");
+            }
+        }
+    }
+
+    // ── ③ CLI: full Claude Code SDK (primary brain) ──────────────
+    info!(agent = %agent_name, model = %claude_model, prompt_len = prompt.len(), "Calling Claude CLI (full SDK)");
     call_with_rotation(
         home_dir, agent_id, prompt, &claude_model, &system_prompt,
         request_type,
     ).await
+}
+
+/// Check whether an error string indicates a billing/credit exhaustion issue.
+///
+/// These errors should NOT be retried with the same account — the account
+/// needs a long cooldown (topped up manually).
+fn is_billing_error(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("credit")
+        || lower.contains("balance")
+        || lower.contains("billing")
+        || lower.contains("payment")
+        || lower.contains("402")
+        || lower.contains("insufficient_quota")
 }
 
 /// Try calling the Anthropic Messages API directly (bypassing Claude CLI).
@@ -420,7 +467,11 @@ async fn call_with_rotation(
             }
             Err(e) => {
                 last_error = e.clone();
-                if e.contains("rate") || e.contains("429") {
+                if is_billing_error(&e) {
+                    // Billing/credit exhaustion: long cooldown (24h), mark unhealthy immediately
+                    warn!(account = %selected.id, error = %e, "Account billing exhausted — 24h cooldown");
+                    rotator.on_billing_exhausted(&selected.id).await;
+                } else if e.contains("rate") || e.contains("429") {
                     rotator.on_rate_limited(&selected.id).await;
                 } else {
                     rotator.on_error(&selected.id).await;

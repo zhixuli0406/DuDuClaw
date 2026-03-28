@@ -380,6 +380,22 @@ impl AccountRotator {
         }
     }
 
+    /// Billing/credit exhaustion — mark account unhealthy with 24-hour cooldown.
+    ///
+    /// Unlike rate limiting (minutes), billing exhaustion requires manual top-up
+    /// or a new billing cycle, so we use a much longer cooldown.
+    pub async fn on_billing_exhausted(&self, account_id: &str) {
+        let mut accounts = self.accounts.write().await;
+        if let Some(acc) = accounts.iter_mut().find(|a| a.id == account_id) {
+            acc.is_healthy = false;
+            acc.cooldown_until = Some(Utc::now() + chrono::Duration::hours(24));
+            warn!(
+                account = account_id,
+                "Account billing exhausted — marked unhealthy with 24h cooldown"
+            );
+        }
+    }
+
     pub async fn reset_monthly(&self) {
         let mut accounts = self.accounts.write().await;
         for acc in accounts.iter_mut() {
