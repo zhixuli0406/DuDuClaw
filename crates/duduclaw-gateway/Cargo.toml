@@ -34,6 +34,13 @@ tempfile = "3"
 libc = "0.2"
 duduclaw-dashboard = { workspace = true, optional = true }
 
+duduclaw-inference = { workspace = true }
+
 [features]
 default = ["dashboard"]
 dashboard = ["dep:duduclaw-dashboard"]
+metal = ["duduclaw-inference/metal"]
+cuda = ["duduclaw-inference/cuda"]
+vulkan = ["duduclaw-inference/vulkan"]
+mistralrs-metal = ["duduclaw-inference/mistralrs-metal"]
+mistralrs-cuda = ["duduclaw-inference/mistralrs-cuda"]

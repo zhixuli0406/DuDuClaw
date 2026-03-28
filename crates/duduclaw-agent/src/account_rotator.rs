@@ -19,7 +19,7 @@ use tracing::{info, warn};
 
 // ── Types ───────────────────────────────────────────────────
 
-/// Authentication method for an account.
+/// Authentication method for a Claude Code SDK account.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
@@ -81,7 +81,6 @@ impl Account {
         if self.cooldown_until.is_some_and(|cd| Utc::now() < cd) {
             return false;
         }
-        // Must have credentials
         match self.auth_method {
             AuthMethod::ApiKey => !self.api_key.is_empty(),
             AuthMethod::OAuth => self.credentials_dir.is_some(),
@@ -303,7 +302,7 @@ impl AccountRotator {
                 available.iter().min_by_key(|a| a.priority).copied()
             }
             RotationStrategy::LeastCost => {
-                // Prefer OAuth (no per-token cost), then least spent API key
+                // Prefer OAuth (subscription, no per-token cost), then least spent API key
                 let oauth: Vec<&&Account> = available.iter().filter(|a| a.auth_method == AuthMethod::OAuth).collect();
                 if !oauth.is_empty() {
                     Some(*oauth[0])
@@ -327,11 +326,9 @@ impl AccountRotator {
                     env_vars.insert("ANTHROPIC_API_KEY".to_string(), a.api_key.clone());
                 }
                 AuthMethod::OAuth => {
-                    // Point claude CLI to the profile's credential directory
                     if let Some(dir) = &a.credentials_dir {
                         env_vars.insert("CLAUDE_CONFIG_DIR".to_string(), dir.to_string_lossy().to_string());
                     }
-                    // Remove API key to ensure OAuth is used
                     env_vars.insert("ANTHROPIC_API_KEY".to_string(), String::new());
                 }
             }

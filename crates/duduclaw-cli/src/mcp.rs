@@ -161,7 +161,97 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "agent_id", description: "Target agent (default: main agent)", required: false },
         ],
     },
-    // ── Odoo ERP tools (Phase 3) ────────────────────────────────
+    // ── Evolution controls ──────────────────────────────────────
+    ToolDef {
+        name: "evolution_toggle",
+        description: "Toggle evolution engine flags for an agent (prediction_driven, gvu_enabled, cognitive_memory, etc.). Changes take effect within seconds.",
+        params: &[
+            ParamDef { name: "agent_id", description: "Target agent name", required: true },
+            ParamDef { name: "field", description: "Config field to toggle: prediction_driven, gvu_enabled, cognitive_memory, micro_reflection, meso_reflection, macro_reflection, skill_auto_activate, skill_security_scan", required: true },
+            ParamDef { name: "value", description: "New value: true/false (for booleans), or a number (for max_silence_hours, skill_token_budget, etc.)", required: true },
+        ],
+    },
+    ToolDef {
+        name: "evolution_status",
+        description: "Get the current evolution engine configuration and status for an agent",
+        params: &[
+            ParamDef { name: "agent_id", description: "Target agent name (default: main agent)", required: false },
+        ],
+    },
+    // ── Local inference tools ─────────────────────────────────────
+    ToolDef {
+        name: "inference_status",
+        description: "Get local inference engine status: loaded model, hardware info, memory usage, backend type",
+        params: &[],
+    },
+    ToolDef {
+        name: "model_list",
+        description: "List available local GGUF models in ~/.duduclaw/models/",
+        params: &[],
+    },
+    ToolDef {
+        name: "model_load",
+        description: "Load a local GGUF model into memory for inference",
+        params: &[
+            ParamDef { name: "model_id", description: "Model ID or filename (e.g., 'qwen3-8b-q4_k_m')", required: true },
+        ],
+    },
+    ToolDef {
+        name: "model_unload",
+        description: "Unload the currently loaded model to free memory",
+        params: &[],
+    },
+    ToolDef {
+        name: "hardware_info",
+        description: "Detect and display hardware capabilities: GPU type, VRAM, RAM, recommended backend and model size",
+        params: &[],
+    },
+    ToolDef {
+        name: "route_query",
+        description: "Preview how the confidence router would route a query (LocalFast / LocalStrong / CloudAPI) without actually generating. Shows confidence score and reasoning.",
+        params: &[
+            ParamDef { name: "prompt", description: "The user prompt to test routing for", required: true },
+            ParamDef { name: "system_prompt", description: "Optional system prompt context", required: false },
+        ],
+    },
+    ToolDef {
+        name: "inference_mode",
+        description: "Show the current inference mode (exo-cluster / llamafile / direct / cloud-only) and multi-mode manager status",
+        params: &[],
+    },
+    ToolDef {
+        name: "llamafile_start",
+        description: "Start a llamafile server for local inference",
+        params: &[
+            ParamDef { name: "file", description: "llamafile filename (optional, uses default)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "llamafile_stop",
+        description: "Stop the running llamafile server",
+        params: &[],
+    },
+    ToolDef {
+        name: "llamafile_list",
+        description: "List available llamafile executables in ~/.duduclaw/llamafiles/",
+        params: &[],
+    },
+    // ── Compression tools ──────────────────────────────────────────
+    ToolDef {
+        name: "compress_text",
+        description: "Compress text using Meta-Token (lossless) compression. Returns compressed text and compression ratio. Best for JSON, code, and repetitive templates.",
+        params: &[
+            ParamDef { name: "text", description: "Text to compress", required: true },
+        ],
+    },
+    ToolDef {
+        name: "decompress_text",
+        description: "Decompress a Meta-Token compressed string back to the original text (lossless).",
+        params: &[
+            ParamDef { name: "text", description: "Compressed text to decompress", required: true },
+        ],
+    },
+    // ── Odoo ERP tools ────────────────────────────────────────────
     ToolDef {
         name: "odoo_connect",
         description: "Connect to Odoo ERP and authenticate. Must be called before using other odoo_* tools.",
@@ -601,6 +691,7 @@ async fn handle_memory_store(
         tags_str.split(',').map(|s| s.trim().to_string()).collect()
     };
 
+    let classification = duduclaw_memory::classify(content, "user_input");
     let entry = MemoryEntry {
         id: uuid::Uuid::new_v4().to_string(),
         agent_id: agent_id.to_string(),
@@ -608,6 +699,11 @@ async fn handle_memory_store(
         timestamp: chrono::Utc::now(),
         tags,
         embedding: None,
+        layer: classification.layer,
+        importance: classification.importance,
+        access_count: 0,
+        last_accessed: None,
+        source_event: "mcp_memory_store".to_string(),
     };
 
     match memory.store(agent_id, entry).await {
@@ -757,6 +853,7 @@ async fn handle_log_mood(
         format!("[mood] {mood}: {note}")
     };
 
+    let classification = duduclaw_memory::classify(&content, "agent_mood");
     let entry = MemoryEntry {
         id: uuid::Uuid::new_v4().to_string(),
         agent_id: agent_id.to_string(),
@@ -764,6 +861,11 @@ async fn handle_log_mood(
         timestamp: chrono::Utc::now(),
         tags: vec!["mood".to_string(), mood.to_string()],
         embedding: None,
+        layer: classification.layer,
+        importance: classification.importance,
+        access_count: 0,
+        last_accessed: None,
+        source_event: "agent_mood".to_string(),
     };
 
     match memory.store(agent_id, entry).await {
@@ -935,6 +1037,12 @@ async fn handle_create_agent(params: &Value, home_dir: &Path) -> Value {
         macro_reflection = false
         skill_auto_activate = false
         skill_security_scan = true
+        prediction_driven = false
+        gvu_enabled = false
+        cognitive_memory = false
+        max_silence_hours = 12.0
+        max_gvu_generations = 3
+        observation_period_hours = 24.0
     };
     let agent_toml = toml::to_string_pretty(&agent_config).unwrap_or_default();
 
@@ -1296,6 +1404,452 @@ async fn handle_submit_feedback(params: &Value, home_dir: &Path, default_agent: 
             "isError": true
         }),
     }
+}
+
+// ── Evolution control handlers ──────────────────────────────
+
+async fn handle_evolution_toggle(params: &Value, home_dir: &Path) -> Value {
+    let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+        Some(id) if !id.is_empty() => id,
+        _ => return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: agent_id is required"}],
+            "isError": true
+        }),
+    };
+    let field = match params.get("field").and_then(|v| v.as_str()) {
+        Some(f) if !f.is_empty() => f,
+        _ => return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: field is required"}],
+            "isError": true
+        }),
+    };
+    let value_str = match params.get("value").and_then(|v| v.as_str()) {
+        Some(v) => v,
+        None => match params.get("value") {
+            Some(v) => &v.to_string(),
+            None => return serde_json::json!({
+                "content": [{"type": "text", "text": "Error: value is required"}],
+                "isError": true
+            }),
+        },
+    };
+
+    // Read current agent.toml
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    let toml_path = agent_dir.join("agent.toml");
+    let content = match tokio::fs::read_to_string(&toml_path).await {
+        Ok(c) => c,
+        Err(e) => return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: agent '{agent_id}' not found: {e}")}],
+            "isError": true
+        }),
+    };
+
+    let mut doc: toml::Table = match content.parse() {
+        Ok(t) => t,
+        Err(e) => return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error parsing agent.toml: {e}")}],
+            "isError": true
+        }),
+    };
+
+    // Ensure [evolution] section exists
+    if !doc.contains_key("evolution") {
+        doc.insert("evolution".to_string(), toml::Value::Table(toml::Table::new()));
+    }
+    let evo = doc.get_mut("evolution").unwrap().as_table_mut().unwrap();
+
+    // Validate field name
+    let boolean_fields = [
+        "prediction_driven", "gvu_enabled", "cognitive_memory",
+        "micro_reflection", "meso_reflection", "macro_reflection",
+        "skill_auto_activate", "skill_security_scan",
+    ];
+    let numeric_fields = [
+        "max_silence_hours", "max_gvu_generations", "observation_period_hours",
+        "skill_token_budget", "max_active_skills",
+    ];
+
+    if boolean_fields.contains(&field) {
+        let bool_val = match value_str {
+            "true" | "1" | "yes" | "on" => true,
+            "false" | "0" | "no" | "off" => false,
+            _ => return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: invalid boolean value '{value_str}' — use true/false")}],
+                "isError": true
+            }),
+        };
+        evo.insert(field.to_string(), toml::Value::Boolean(bool_val));
+    } else if numeric_fields.contains(&field) {
+        if let Ok(int_val) = value_str.parse::<i64>() {
+            evo.insert(field.to_string(), toml::Value::Integer(int_val));
+        } else if let Ok(float_val) = value_str.parse::<f64>() {
+            evo.insert(field.to_string(), toml::Value::Float(float_val));
+        } else {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: invalid numeric value '{value_str}'")}],
+                "isError": true
+            });
+        }
+    } else {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "Error: unknown field '{field}'. Valid fields: {}",
+                boolean_fields.iter().chain(numeric_fields.iter()).cloned().collect::<Vec<_>>().join(", ")
+            )}],
+            "isError": true
+        });
+    }
+
+    // Write back
+    let new_content = toml::to_string_pretty(&doc).unwrap_or_default();
+    if let Err(e) = tokio::fs::write(&toml_path, &new_content).await {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error writing agent.toml: {e}")}],
+            "isError": true
+        });
+    }
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": format!(
+            "Evolution config updated: {agent_id}.evolution.{field} = {value_str}\n\
+             Changes take effect within 5 minutes (next heartbeat sync) or immediately on restart."
+        )}]
+    })
+}
+
+async fn handle_evolution_status_tool(params: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let agent_id = params.get("agent_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_agent);
+
+    let toml_path = home_dir.join("agents").join(agent_id).join("agent.toml");
+    let content = match tokio::fs::read_to_string(&toml_path).await {
+        Ok(c) => c,
+        Err(e) => return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: agent '{agent_id}' not found: {e}")}],
+            "isError": true
+        }),
+    };
+
+    let config: duduclaw_core::types::AgentConfig = match toml::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error parsing agent.toml: {e}")}],
+            "isError": true
+        }),
+    };
+
+    let evo = &config.evolution;
+    let status = format!(
+        "Evolution status for agent '{agent_id}':\n\
+         \n\
+         Prediction-driven: {}\n\
+         GVU self-play:     {}\n\
+         Cognitive memory:  {}\n\
+         \n\
+         Micro reflection:  {}\n\
+         Meso reflection:   {}\n\
+         Macro reflection:  {}\n\
+         \n\
+         Skill auto-activate:  {}\n\
+         Skill security scan:  {}\n\
+         Skill token budget:   {}\n\
+         Max active skills:    {}\n\
+         \n\
+         Max silence hours:         {:.1}\n\
+         Max GVU generations:       {}\n\
+         Observation period hours:  {:.1}",
+        evo.prediction_driven, evo.gvu_enabled, evo.cognitive_memory,
+        evo.micro_reflection, evo.meso_reflection, evo.macro_reflection,
+        evo.skill_auto_activate, evo.skill_security_scan,
+        evo.skill_token_budget, evo.max_active_skills,
+        evo.max_silence_hours, evo.max_gvu_generations, evo.observation_period_hours,
+    );
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": status}]
+    })
+}
+
+// ── Local inference handlers ────────────────────────────────
+
+async fn handle_inference_status(home_dir: &Path) -> Value {
+    let engine = duduclaw_inference::InferenceEngine::new(home_dir).await;
+    let available = engine.is_available().await;
+    let hw = engine.hardware_info().await;
+    let models = engine.list_models().await;
+    let loaded_count = models.iter().filter(|m| m.is_loaded).count();
+
+    let mut status = format!(
+        "Inference Engine Status:\n  Enabled: {}\n  Available: {}\n  Models: {} available, {} loaded",
+        engine.config().enabled, available, models.len(), loaded_count
+    );
+
+    if let Some(ref hw) = hw {
+        status.push_str(&format!(
+            "\n  GPU: {} ({})\n  RAM: {}MB / {}MB\n  Recommended backend: {}",
+            hw.gpu_name,
+            format!("{:?}", hw.gpu_type),
+            hw.ram_available_mb,
+            hw.ram_total_mb,
+            hw.recommended_backend
+        ));
+    }
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": status}]
+    })
+}
+
+async fn handle_model_list(home_dir: &Path) -> Value {
+    let engine = duduclaw_inference::InferenceEngine::new(home_dir).await;
+    let models = engine.list_models().await;
+
+    if models.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "No models found in ~/.duduclaw/models/\n\nTo get started:\n1. Download a GGUF model (e.g., from huggingface.co)\n2. Place it in ~/.duduclaw/models/\n3. Run model_list again"}]
+        });
+    }
+
+    let mut text = format!("Available models ({}):\n", models.len());
+    for m in &models {
+        let loaded = if m.is_loaded { " [LOADED]" } else { "" };
+        let size_mb = m.file_size_bytes / (1024 * 1024);
+        text.push_str(&format!(
+            "\n  {} ({} {} {}) — {}MB est. {}MB RAM{}",
+            m.id, m.architecture, m.parameter_count, m.quantization,
+            size_mb, m.estimated_memory_mb, loaded
+        ));
+    }
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": text}]
+    })
+}
+
+async fn handle_model_load(params: &Value, home_dir: &Path) -> Value {
+    let model_id = params.get("model_id").and_then(|v| v.as_str()).unwrap_or("");
+    if model_id.is_empty() {
+        return serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "model_id is required"}]
+        });
+    }
+
+    let engine = duduclaw_inference::InferenceEngine::new(home_dir).await;
+    if let Err(e) = engine.init().await {
+        return serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": format!("Failed to init inference engine: {e}")}]
+        });
+    }
+
+    match engine.load_model(model_id).await {
+        Ok(info) => serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "Model loaded: {} ({} {} {})\nEstimated memory: {}MB\nContext length: {}",
+                info.id, info.architecture, info.parameter_count, info.quantization,
+                info.estimated_memory_mb, info.context_length
+            )}]
+        }),
+        Err(e) => serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": format!("Failed to load model: {e}")}]
+        }),
+    }
+}
+
+async fn handle_model_unload(home_dir: &Path) -> Value {
+    let engine = duduclaw_inference::InferenceEngine::new(home_dir).await;
+    if let Err(e) = engine.init().await {
+        return serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": format!("Failed to init inference engine: {e}")}]
+        });
+    }
+
+    match engine.unload_model().await {
+        Ok(()) => serde_json::json!({
+            "content": [{"type": "text", "text": "Model unloaded successfully. Memory freed."}]
+        }),
+        Err(e) => serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": format!("Failed to unload: {e}")}]
+        }),
+    }
+}
+
+async fn handle_hardware_info() -> Value {
+    let hw = duduclaw_inference::hardware::detect_hardware().await;
+    let text = format!(
+        "Hardware Detection Results:\n\
+         \n  GPU: {} ({:?})\
+         \n  VRAM: {}MB total, {}MB available\
+         \n  RAM: {}MB total, {}MB available\
+         \n  CPU cores: {}\
+         \n  Recommended backend: {}\
+         \n  Recommended max model: {:.1}GB",
+        hw.gpu_name, hw.gpu_type,
+        hw.vram_total_mb, hw.vram_available_mb,
+        hw.ram_total_mb, hw.ram_available_mb,
+        hw.cpu_cores,
+        hw.recommended_backend,
+        hw.recommended_max_model_gb,
+    );
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": text}]
+    })
+}
+
+async fn handle_route_query(params: &Value, home_dir: &Path) -> Value {
+    let prompt = params.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+    let system_prompt = params.get("system_prompt").and_then(|v| v.as_str()).unwrap_or("");
+
+    if prompt.is_empty() {
+        return serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "prompt is required"}]
+        });
+    }
+
+    let engine = duduclaw_inference::InferenceEngine::new(home_dir).await;
+    let decision = engine.route(system_prompt, prompt);
+
+    let text = format!(
+        "Routing Decision:\n\
+         \n  Tier: {}\
+         \n  Confidence: {:.2}\
+         \n  Model: {}\
+         \n  Reason: {}\
+         \n  Router enabled: {}",
+        decision.tier,
+        decision.confidence,
+        decision.model_id.as_deref().unwrap_or("(cloud api)"),
+        decision.reason,
+        engine.router_enabled(),
+    );
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": text}]
+    })
+}
+
+async fn handle_inference_mode(home_dir: &Path) -> Value {
+    let engine = duduclaw_inference::InferenceEngine::new(home_dir).await;
+    let mode = engine.current_mode().await;
+    let status = engine.manager().status().await;
+    let mlx = engine.mlx_available().await;
+
+    let text = format!(
+        "Inference Manager Status:\n\
+         \n  Current mode: {}\
+         \n  Exo cluster: {}\
+         \n  llamafile: {}\
+         \n  MLX bridge: {}",
+        mode,
+        if status.exo_available { "available" } else { "unavailable" },
+        if status.llamafile_available { "running" } else { "stopped" },
+        if mlx { "available (Apple Silicon)" } else { "unavailable" },
+    );
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": text}]
+    })
+}
+
+async fn handle_llamafile_start(params: &Value, home_dir: &Path) -> Value {
+    let _file = params.get("file").and_then(|v| v.as_str());
+    let engine = duduclaw_inference::InferenceEngine::new(home_dir).await;
+
+    match engine.manager().start_llamafile().await {
+        Ok(()) => serde_json::json!({
+            "content": [{"type": "text", "text": "llamafile server started successfully"}]
+        }),
+        Err(e) => serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": format!("Failed to start llamafile: {e}")}]
+        }),
+    }
+}
+
+async fn handle_llamafile_stop(home_dir: &Path) -> Value {
+    let engine = duduclaw_inference::InferenceEngine::new(home_dir).await;
+    engine.manager().stop_llamafile().await;
+    serde_json::json!({
+        "content": [{"type": "text", "text": "llamafile server stopped"}]
+    })
+}
+
+async fn handle_llamafile_list(home_dir: &Path) -> Value {
+    let engine = duduclaw_inference::InferenceEngine::new(home_dir).await;
+    let files = engine.manager().list_llamafiles().await;
+
+    if files.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "No llamafiles found in ~/.duduclaw/llamafiles/\n\nTo get started:\n1. Download a .llamafile from huggingface.co or github.com/Mozilla-Ocho/llamafile\n2. Place it in ~/.duduclaw/llamafiles/\n3. Run llamafile_list again"}]
+        });
+    }
+
+    let text = format!("Available llamafiles ({}):\n{}", files.len(),
+        files.iter().map(|f| format!("  - {f}")).collect::<Vec<_>>().join("\n"));
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": text}]
+    })
+}
+
+// ── Compression handlers ────────────────────────────────────
+
+async fn handle_compress_text(params: &Value) -> Value {
+    let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    if text.is_empty() {
+        return serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "text is required"}]
+        });
+    }
+
+    let (compressed, stats) = duduclaw_inference::compression::meta_token::compress(text);
+
+    let result = format!(
+        "Compression Result (Meta-Token, lossless):\n\
+         \n  Original: {} chars\
+         \n  Compressed: {} chars\
+         \n  Ratio: {:.2}x\
+         \n  Savings: {:.1}%\n\n{}",
+        stats.original_len,
+        stats.compressed_len,
+        stats.ratio,
+        (1.0 - 1.0 / stats.ratio) * 100.0,
+        if stats.ratio > 1.05 {
+            format!("Compressed text:\n{compressed}")
+        } else {
+            "No significant compression achieved (text has little repetition).".to_string()
+        }
+    );
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": result}]
+    })
+}
+
+async fn handle_decompress_text(params: &Value) -> Value {
+    let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    if text.is_empty() {
+        return serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "text is required"}]
+        });
+    }
+
+    let decompressed = duduclaw_inference::compression::meta_token::decompress(text);
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": decompressed}]
+    })
 }
 
 // ── Odoo ERP handlers ───────────────────────────────────────
@@ -1919,6 +2473,22 @@ async fn handle_tools_call(
         "skill_search" => handle_skill_search(&arguments, home_dir).await,
         "skill_list" => handle_skill_list(&arguments, home_dir).await,
         "submit_feedback" => handle_submit_feedback(&arguments, home_dir, default_agent).await,
+        "evolution_toggle" => handle_evolution_toggle(&arguments, home_dir).await,
+        "evolution_status" => handle_evolution_status_tool(&arguments, home_dir, default_agent).await,
+        // Local inference tools
+        "inference_status" => handle_inference_status(home_dir).await,
+        "model_list" => handle_model_list(home_dir).await,
+        "model_load" => handle_model_load(&arguments, home_dir).await,
+        "model_unload" => handle_model_unload(home_dir).await,
+        "hardware_info" => handle_hardware_info().await,
+        "route_query" => handle_route_query(&arguments, home_dir).await,
+        "inference_mode" => handle_inference_mode(home_dir).await,
+        "llamafile_start" => handle_llamafile_start(&arguments, home_dir).await,
+        "llamafile_stop" => handle_llamafile_stop(home_dir).await,
+        "llamafile_list" => handle_llamafile_list(home_dir).await,
+        // Compression tools
+        "compress_text" => handle_compress_text(&arguments).await,
+        "decompress_text" => handle_decompress_text(&arguments).await,
         // Odoo ERP tools
         t if t.starts_with("odoo_") => handle_odoo_tool(t, &arguments, home_dir, odoo).await,
         _ => {

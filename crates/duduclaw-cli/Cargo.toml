@@ -13,6 +13,7 @@ duduclaw-agent = { workspace = true }
 duduclaw-container = { workspace = true }
 duduclaw-security = { workspace = true }
 duduclaw-odoo = { workspace = true }
+duduclaw-inference = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
