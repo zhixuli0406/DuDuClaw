@@ -16,9 +16,9 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.15"
+version = "0.9.0"
 edition = "2024"
-license = "MIT"
+license = "Elastic-2.0"
 authors = ["DuDuClaw Contributors"]
 
 [workspace.dependencies]

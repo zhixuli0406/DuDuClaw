@@ -15,3 +15,9 @@ build/
 .venv/
 node_modules/
 crates/duduclaw-dashboard/dist/
+
+# Commercial closed-source modules (not pushed to public repo)
+commercial/duduclaw-license/
+commercial/templates-premium/
+commercial/evolution-params/
+commercial/dashboard-enterprise/

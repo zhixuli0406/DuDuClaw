@@ -5,8 +5,8 @@
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.8.12-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![License: Elastic-2.0](https://img.shields.io/badge/License-Elastic--2.0-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.9.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 
 ---
 
@@ -292,7 +292,7 @@ cd web && npx tsc --noEmit
 
 ## 授權
 
-MIT License
+[Elastic License 2.0 (ELv2)](LICENSE) — 個人、教育、企業內部使用免費。詳見 [LICENSING.md](LICENSING.md)。
 
 ---
 
