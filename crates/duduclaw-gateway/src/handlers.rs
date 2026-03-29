@@ -123,6 +123,8 @@ impl MethodHandler {
             "agents.delegate" => self.handle_agents_delegate(params).await,
             "agents.pause" => self.handle_agents_pause(params).await,
             "agents.resume" => self.handle_agents_resume(params).await,
+            "agents.update" => self.handle_agents_update(params).await,
+            "agents.remove" => self.handle_agents_remove(params).await,
             "agents.inspect" => self.handle_agents_inspect(params).await,
             "channels.status" => self.handle_channels_status().await,
             "channels.add" => self.handle_channels_add(params).await,
@@ -145,6 +147,8 @@ impl MethodHandler {
             "system.doctor" => self.handle_system_doctor().await,
             "system.doctor_repair" => self.handle_system_doctor_repair().await,
             "system.config" => self.handle_system_config().await,
+            "system.update_config" => self.handle_system_update_config(params).await,
+            "accounts.update_budget" => self.handle_accounts_update_budget(params).await,
             "system.version" => self.handle_system_version(),
             "logs.subscribe" => self.handle_logs_subscribe(params),
             "logs.unsubscribe" => self.handle_logs_unsubscribe(params),
@@ -182,6 +186,8 @@ impl MethodHandler {
                 { "name": "agents.delegate", "description": "Delegate a task" },
                 { "name": "agents.pause", "description": "Pause an agent" },
                 { "name": "agents.resume", "description": "Resume an agent" },
+                { "name": "agents.update", "description": "Update agent config fields" },
+                { "name": "agents.remove", "description": "Remove an agent (to trash)" },
                 { "name": "agents.inspect", "description": "Inspect agent details" },
                 { "name": "channels.status", "description": "Channel connection status" },
                 { "name": "channels.add", "description": "Add a channel" },
@@ -203,6 +209,8 @@ impl MethodHandler {
                 { "name": "system.doctor", "description": "Health checks" },
                 { "name": "system.doctor_repair", "description": "Health checks with repair hints" },
                 { "name": "system.config", "description": "View system config" },
+                { "name": "system.update_config", "description": "Update system config (log_level, rotation)" },
+                { "name": "accounts.update_budget", "description": "Update account monthly budget" },
                 { "name": "system.version", "description": "Version info" },
                 { "name": "heartbeat.status", "description": "Per-agent heartbeat status" },
                 { "name": "heartbeat.trigger", "description": "Manually trigger heartbeat for an agent" },
@@ -469,8 +477,18 @@ impl MethodHandler {
         WsFrame::ok_response("", json!({ "success": true, "name": agent_id, "status": "active" }))
     }
 
-    /// Modify the `status` field in an agent's `agent.toml` and persist it to disk.
-    async fn update_agent_status(&self, agent_id: &str, status: &str) -> Result<(), String> {
+    /// Read-modify-write an agent's `agent.toml` using the provided mutation closure.
+    ///
+    /// Uses atomic write (temp + rename) to prevent corruption on concurrent access.
+    /// After a successful write, triggers a registry re-scan for hot-reload.
+    async fn update_agent_toml<F>(&self, agent_id: &str, mutate: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut toml::Table) -> Result<(), String>,
+    {
+        if !is_valid_agent_id(agent_id) {
+            return Err(format!("Invalid agent_id: {agent_id}"));
+        }
+
         let reg = self.registry.read().await;
         let agent = reg.get(agent_id)
             .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
@@ -480,24 +498,278 @@ impl MethodHandler {
         let content = tokio::fs::read_to_string(&agent_toml_path).await
             .map_err(|e| format!("Failed to read agent.toml: {e}"))?;
 
-        // Parse and update the status field
         let mut table: toml::Table = content.parse()
             .map_err(|e| format!("Failed to parse agent.toml: {e}"))?;
 
-        if let Some(agent_section) = table.get_mut("agent").and_then(|v| v.as_table_mut()) {
-            agent_section.insert("status".to_string(), toml::Value::String(status.to_string()));
-        } else {
-            return Err("agent.toml missing [agent] section".to_string());
-        }
+        mutate(&mut table)?;
 
         let new_content = toml::to_string_pretty(&table)
             .map_err(|e| format!("Failed to serialise agent.toml: {e}"))?;
 
-        tokio::fs::write(&agent_toml_path, new_content).await
-            .map_err(|e| format!("Failed to write agent.toml: {e}"))?;
+        // Atomic write: temp file + rename
+        let tmp_path = agent_toml_path.with_extension("toml.tmp");
+        tokio::fs::write(&tmp_path, &new_content).await
+            .map_err(|e| format!("Failed to write agent.toml.tmp: {e}"))?;
+        tokio::fs::rename(&tmp_path, &agent_toml_path).await
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&tmp_path);
+                format!("Failed to commit agent.toml: {e}")
+            })?;
 
-        info!(agent_id, status, "Agent status updated in agent.toml");
+        // Trigger registry re-scan for hot-reload
+        if let Ok(mut reg) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            self.registry.write(),
+        ).await {
+            let _ = reg.scan().await;
+        }
+
         Ok(())
+    }
+
+    /// Convenience: update only the `status` field in an agent's `agent.toml`.
+    async fn update_agent_status(&self, agent_id: &str, status: &str) -> Result<(), String> {
+        let status = status.to_string();
+        self.update_agent_toml(agent_id, move |table| {
+            let agent_section = table.get_mut("agent")
+                .and_then(|v| v.as_table_mut())
+                .ok_or_else(|| "agent.toml missing [agent] section".to_string())?;
+            agent_section.insert("status".to_string(), toml::Value::String(status.clone()));
+            info!("Agent status updated to {status}");
+            Ok(())
+        }).await?;
+        Ok(())
+    }
+
+    /// Update one or more fields of an agent's `agent.toml`.
+    ///
+    /// Supports identity, model, budget, heartbeat, permissions, and evolution fields.
+    /// Only sends changed fields — unchanged fields are omitted from the request.
+    async fn handle_agents_update(&self, params: Value) -> WsFrame {
+        let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
+        };
+
+        let params_clone = params.clone();
+        let mut changes: Vec<String> = Vec::new();
+
+        let result = self.update_agent_toml(&agent_id, move |table| {
+            // ── Identity fields ([agent] section) ──
+            if let Some(agent_section) = table.get_mut("agent").and_then(|v| v.as_table_mut()) {
+                if let Some(v) = params_clone.get("display_name").and_then(|v| v.as_str()) {
+                    agent_section.insert("display_name".into(), toml::Value::String(v.into()));
+                    changes.push(format!("display_name = \"{v}\""));
+                }
+                if let Some(v) = params_clone.get("role").and_then(|v| v.as_str()) {
+                    match v {
+                        "main" | "specialist" | "worker" | "developer" | "qa" | "planner" => {
+                            agent_section.insert("role".into(), toml::Value::String(v.into()));
+                            changes.push(format!("role = \"{v}\""));
+                        }
+                        _ => return Err(format!("Invalid role '{v}'. Valid: main, specialist, worker, developer, qa, planner")),
+                    }
+                }
+                if let Some(v) = params_clone.get("status").and_then(|v| v.as_str()) {
+                    match v {
+                        "active" | "paused" | "terminated" => {
+                            agent_section.insert("status".into(), toml::Value::String(v.into()));
+                            changes.push(format!("status = \"{v}\""));
+                        }
+                        _ => return Err(format!("Invalid status '{v}'. Valid: active, paused, terminated")),
+                    }
+                }
+                if let Some(v) = params_clone.get("trigger").and_then(|v| v.as_str()) {
+                    agent_section.insert("trigger".into(), toml::Value::String(v.into()));
+                    changes.push(format!("trigger = \"{v}\""));
+                }
+                if let Some(v) = params_clone.get("icon").and_then(|v| v.as_str()) {
+                    agent_section.insert("icon".into(), toml::Value::String(v.into()));
+                    changes.push(format!("icon = \"{v}\""));
+                }
+                if let Some(v) = params_clone.get("reports_to").and_then(|v| v.as_str()) {
+                    agent_section.insert("reports_to".into(), toml::Value::String(v.into()));
+                    changes.push(format!("reports_to = \"{v}\""));
+                }
+            }
+
+            // ── Model fields ([model] section) ──
+            let model = table.entry("model")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut();
+            if let Some(model) = model {
+                if let Some(v) = params_clone.get("preferred").and_then(|v| v.as_str()) {
+                    model.insert("preferred".into(), toml::Value::String(v.into()));
+                    changes.push(format!("model.preferred = \"{v}\""));
+                }
+                if let Some(v) = params_clone.get("fallback").and_then(|v| v.as_str()) {
+                    model.insert("fallback".into(), toml::Value::String(v.into()));
+                    changes.push(format!("model.fallback = \"{v}\""));
+                }
+                if let Some(v) = params_clone.get("api_mode").and_then(|v| v.as_str()) {
+                    match v {
+                        "cli" | "direct" | "auto" => {
+                            model.insert("api_mode".into(), toml::Value::String(v.into()));
+                            changes.push(format!("model.api_mode = \"{v}\""));
+                        }
+                        _ => return Err(format!("Invalid api_mode '{v}'. Valid: cli, direct, auto")),
+                    }
+                }
+            }
+
+            // ── Budget fields ([budget] section) ──
+            let budget = table.entry("budget")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut();
+            if let Some(budget) = budget {
+                if let Some(v) = params_clone.get("monthly_limit_cents").and_then(|v| v.as_u64()) {
+                    budget.insert("monthly_limit_cents".into(), toml::Value::Integer(v as i64));
+                    changes.push(format!("budget.monthly_limit_cents = {v}"));
+                }
+                if let Some(v) = params_clone.get("warn_threshold_percent").and_then(|v| v.as_u64()) {
+                    if v > 100 {
+                        return Err("warn_threshold_percent must be 0-100".into());
+                    }
+                    budget.insert("warn_threshold_percent".into(), toml::Value::Integer(v as i64));
+                    changes.push(format!("budget.warn_threshold_percent = {v}"));
+                }
+                if let Some(v) = params_clone.get("hard_stop").and_then(|v| v.as_bool()) {
+                    budget.insert("hard_stop".into(), toml::Value::Boolean(v));
+                    changes.push(format!("budget.hard_stop = {v}"));
+                }
+            }
+
+            // ── Heartbeat fields ([heartbeat] section) ──
+            let heartbeat = table.entry("heartbeat")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut();
+            if let Some(hb) = heartbeat {
+                if let Some(v) = params_clone.get("heartbeat_enabled").and_then(|v| v.as_bool()) {
+                    hb.insert("enabled".into(), toml::Value::Boolean(v));
+                    changes.push(format!("heartbeat.enabled = {v}"));
+                }
+                if let Some(v) = params_clone.get("heartbeat_interval").and_then(|v| v.as_u64()) {
+                    hb.insert("interval_seconds".into(), toml::Value::Integer(v as i64));
+                    changes.push(format!("heartbeat.interval_seconds = {v}"));
+                }
+                if let Some(v) = params_clone.get("heartbeat_cron").and_then(|v| v.as_str()) {
+                    hb.insert("cron".into(), toml::Value::String(v.into()));
+                    changes.push(format!("heartbeat.cron = \"{v}\""));
+                }
+            }
+
+            // ── Permissions fields ([permissions] section) ──
+            let perms = table.entry("permissions")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut();
+            if let Some(perms) = perms {
+                for key in &[
+                    "can_create_agents",
+                    "can_send_cross_agent",
+                    "can_modify_own_skills",
+                    "can_modify_own_soul",
+                    "can_schedule_tasks",
+                ] {
+                    if let Some(v) = params_clone.get(*key).and_then(|v| v.as_bool()) {
+                        perms.insert((*key).into(), toml::Value::Boolean(v));
+                        changes.push(format!("permissions.{key} = {v}"));
+                    }
+                }
+            }
+
+            // ── Evolution fields ([evolution] section) ──
+            let evo = table.entry("evolution")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut();
+            if let Some(evo) = evo {
+                for key in &["skill_auto_activate", "skill_security_scan", "gvu_enabled", "cognitive_memory"] {
+                    if let Some(v) = params_clone.get(*key).and_then(|v| v.as_bool()) {
+                        evo.insert((*key).into(), toml::Value::Boolean(v));
+                        changes.push(format!("evolution.{key} = {v}"));
+                    }
+                }
+                if let Some(v) = params_clone.get("max_active_skills").and_then(|v| v.as_u64()) {
+                    evo.insert("max_active_skills".into(), toml::Value::Integer(v as i64));
+                    changes.push(format!("evolution.max_active_skills = {v}"));
+                }
+                if let Some(v) = params_clone.get("max_silence_hours").and_then(|v| v.as_f64()) {
+                    evo.insert("max_silence_hours".into(), toml::Value::Float(v));
+                    changes.push(format!("evolution.max_silence_hours = {v}"));
+                }
+            }
+
+            if changes.is_empty() {
+                return Err("No valid fields to update".into());
+            }
+
+            Ok(())
+        }).await;
+
+        match result {
+            Ok(()) => {
+                info!(agent_id = agent_id.as_str(), "agents.update completed");
+                WsFrame::ok_response("", json!({
+                    "success": true,
+                    "agent_id": agent_id,
+                    "message": "Agent updated successfully",
+                }))
+            }
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// Remove an agent by moving its directory to `_trash/`.
+    ///
+    /// Refuses to remove the main agent. Recovery is possible from `_trash/`.
+    async fn handle_agents_remove(&self, params: Value) -> WsFrame {
+        let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id,
+            _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
+        };
+
+        if !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+
+        // Refuse to remove the main agent
+        let reg = self.registry.read().await;
+        if let Some(agent) = reg.get(agent_id) {
+            if matches!(agent.config.agent.role, duduclaw_core::types::AgentRole::Main) {
+                return WsFrame::error_response("", "Cannot remove the main agent");
+            }
+        } else {
+            return WsFrame::error_response("", &format!("Agent not found: {agent_id}"));
+        }
+        let agents_dir = reg.agents_dir().to_path_buf();
+        drop(reg);
+
+        let agent_dir = agents_dir.join(agent_id);
+        let trash_dir = agents_dir.join("_trash");
+        if let Err(e) = tokio::fs::create_dir_all(&trash_dir).await {
+            return WsFrame::error_response("", &format!("Failed to create _trash/: {e}"));
+        }
+
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let trash_dest = trash_dir.join(format!("{agent_id}_{timestamp}"));
+
+        if let Err(e) = tokio::fs::rename(&agent_dir, &trash_dest).await {
+            return WsFrame::error_response("", &format!("Failed to move agent to trash: {e}"));
+        }
+
+        // Re-scan registry
+        if let Ok(mut reg) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            self.registry.write(),
+        ).await {
+            let _ = reg.scan().await;
+        }
+
+        info!(agent_id, "Agent removed (moved to _trash/)");
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "agent_id": agent_id,
+            "trash_path": trash_dest.to_string_lossy(),
+        }))
     }
 
     async fn handle_agents_inspect(&self, params: Value) -> WsFrame {
@@ -1389,6 +1661,127 @@ impl MethodHandler {
             }
         }
         WsFrame::ok_response("", json!({ "skills": all_skills }))
+    }
+
+    // ── System Config Update ─────────────────────────────────
+
+    /// Update system-level config.toml fields (whitelist only).
+    ///
+    /// Only allows safe, non-sensitive fields: `log_level`, `rotation_strategy`.
+    /// Uses atomic write (temp + rename) and never touches token/key fields.
+    async fn handle_system_update_config(&self, params: Value) -> WsFrame {
+        let config_path = self.home_dir.join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+        let mut changes: Vec<String> = Vec::new();
+
+        // ── log_level ──
+        if let Some(v) = params.get("log_level").and_then(|v| v.as_str()) {
+            match v {
+                "trace" | "debug" | "info" | "warn" | "error" => {
+                    let logging = table.entry("logging")
+                        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                        .as_table_mut();
+                    if let Some(logging) = logging {
+                        logging.insert("level".into(), toml::Value::String(v.into()));
+                        changes.push(format!("logging.level = \"{v}\""));
+                    }
+                }
+                _ => return WsFrame::error_response("", &format!(
+                    "Invalid log_level '{v}'. Valid: trace, debug, info, warn, error"
+                )),
+            }
+        }
+
+        // ── rotation_strategy ──
+        if let Some(v) = params.get("rotation_strategy").and_then(|v| v.as_str()) {
+            match v {
+                "priority" | "round_robin" | "least_cost" | "failover" => {
+                    let rotation = table.entry("rotation")
+                        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                        .as_table_mut();
+                    if let Some(rotation) = rotation {
+                        rotation.insert("strategy".into(), toml::Value::String(v.into()));
+                        changes.push(format!("rotation.strategy = \"{v}\""));
+                    }
+                }
+                _ => return WsFrame::error_response("", &format!(
+                    "Invalid rotation_strategy '{v}'. Valid: priority, round_robin, least_cost, failover"
+                )),
+            }
+        }
+
+        if changes.is_empty() {
+            return WsFrame::error_response("", "No valid fields to update. Supported: log_level, rotation_strategy");
+        }
+
+        // Atomic write: temp + rename
+        let tmp_path = config_path.with_extension("toml.tmp");
+        if let Err(e) = self.write_config_table(&tmp_path, &table).await {
+            return WsFrame::error_response("", &format!("Failed to write config: {e}"));
+        }
+        if let Err(e) = tokio::fs::rename(&tmp_path, &config_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return WsFrame::error_response("", &format!("Failed to commit config: {e}"));
+        }
+
+        info!(?changes, "system.update_config completed");
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "changes": changes,
+        }))
+    }
+
+    /// Update the monthly budget for a specific account in config.toml.
+    async fn handle_accounts_update_budget(&self, params: Value) -> WsFrame {
+        let account_id = match params.get("account_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id,
+            _ => return WsFrame::error_response("", "Missing 'account_id' parameter"),
+        };
+        let budget_cents = match params.get("monthly_budget_cents").and_then(|v| v.as_u64()) {
+            Some(v) => v,
+            None => return WsFrame::error_response("", "Missing 'monthly_budget_cents' parameter (integer)"),
+        };
+
+        let config_path = self.home_dir.join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+
+        // Find the target account in [[accounts]] array
+        let accounts = match table.get_mut("accounts").and_then(|v| v.as_array_mut()) {
+            Some(arr) => arr,
+            None => return WsFrame::error_response("", "No [[accounts]] section in config.toml"),
+        };
+
+        let target = accounts.iter_mut().find(|a| {
+            a.as_table()
+                .and_then(|t| t.get("id").and_then(|v| v.as_str()))
+                == Some(account_id)
+        });
+
+        match target {
+            Some(account) => {
+                if let Some(t) = account.as_table_mut() {
+                    t.insert("monthly_budget_cents".into(), toml::Value::Integer(budget_cents as i64));
+                }
+            }
+            None => return WsFrame::error_response("", &format!("Account not found: {account_id}")),
+        }
+
+        // Atomic write
+        let tmp_path = config_path.with_extension("toml.tmp");
+        if let Err(e) = self.write_config_table(&tmp_path, &table).await {
+            return WsFrame::error_response("", &format!("Failed to write config: {e}"));
+        }
+        if let Err(e) = tokio::fs::rename(&tmp_path, &config_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return WsFrame::error_response("", &format!("Failed to commit config: {e}"));
+        }
+
+        info!(account_id, budget_cents, "accounts.update_budget completed");
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "account_id": account_id,
+            "monthly_budget_cents": budget_cents,
+        }))
     }
 
     // ── Helpers ─────────────────────────────────────────────

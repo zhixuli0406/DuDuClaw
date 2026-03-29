@@ -1,10 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
 import { useAgentsStore } from '@/stores/agents-store';
 import { cn } from '@/lib/utils';
-import { api, type AgentDetail } from '@/lib/api';
+import { api, type AgentDetail, type AgentUpdateParams } from '@/lib/api';
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
-import { Bot, Pause, Play, Send, Eye, Plus, X, ShieldCheck } from 'lucide-react';
+import { Bot, Pause, Play, Send, Eye, Plus, X, ShieldCheck, Pencil, Trash2 } from 'lucide-react';
 
 function StatusBadge({ status }: { status: string }) {
   const intl = useIntl();
@@ -32,10 +32,12 @@ function RoleBadge({ role }: { role: string }) {
 
 export function AgentsPage() {
   const intl = useIntl();
-  const { agents, fetchAgents, pauseAgent, resumeAgent, loading } = useAgentsStore();
+  const { agents, fetchAgents, pauseAgent, resumeAgent, removeAgent, loading } = useAgentsStore();
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [delegateTarget, setDelegateTarget] = useState<string | null>(null);
   const [inspectTarget, setInspectTarget] = useState<AgentDetail | null>(null);
+  const [editTarget, setEditTarget] = useState<AgentDetail | null>(null);
+  const [removeTarget, setRemoveTarget] = useState<string | null>(null);
 
   useEffect(() => {
     fetchAgents();
@@ -140,6 +142,21 @@ export function AgentsPage() {
                   <Eye className="h-3.5 w-3.5" />
                   {intl.formatMessage({ id: 'agents.inspect' })}
                 </button>
+                <button
+                  onClick={() => setEditTarget(agent)}
+                  className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-stone-600 hover:bg-stone-100 dark:text-stone-400 dark:hover:bg-stone-800"
+                >
+                  <Pencil className="h-3.5 w-3.5" />
+                  {intl.formatMessage({ id: 'agents.edit' })}
+                </button>
+                {agent.role !== 'main' && (
+                  <button
+                    onClick={() => setRemoveTarget(agent.name)}
+                    className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-900/20"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                )}
               </div>
             </div>
           ))}
@@ -164,6 +181,26 @@ export function AgentsPage() {
       <InspectDialog
         agent={inspectTarget}
         onClose={() => setInspectTarget(null)}
+        onEdit={(agent) => { setInspectTarget(null); setEditTarget(agent); }}
+      />
+
+      {/* Edit Agent Dialog */}
+      <EditAgentDialog
+        agent={editTarget}
+        onClose={() => setEditTarget(null)}
+        onSaved={() => { setEditTarget(null); fetchAgents(); }}
+      />
+
+      {/* Remove Confirm Dialog */}
+      <RemoveConfirmDialog
+        agentName={removeTarget}
+        onClose={() => setRemoveTarget(null)}
+        onConfirm={async () => {
+          if (removeTarget) {
+            await removeAgent(removeTarget);
+            setRemoveTarget(null);
+          }
+        }}
       />
     </div>
   );
@@ -282,7 +319,8 @@ function DelegateDialog({ open, agentName, onClose }: { open: boolean; agentName
   );
 }
 
-function InspectDialog({ agent, onClose }: { agent: AgentDetail | null; onClose: () => void }) {
+function InspectDialog({ agent, onClose, onEdit }: { agent: AgentDetail | null; onClose: () => void; onEdit?: (agent: AgentDetail) => void }) {
+  const intl = useIntl();
   if (!agent) return null;
 
   return (
@@ -323,9 +361,275 @@ function InspectDialog({ agent, onClose }: { agent: AgentDetail | null; onClose:
           </Section>
         )}
 
-        <div className="flex justify-end pt-2">
+        <div className="flex justify-end gap-3 pt-2">
+          {onEdit && (
+            <button onClick={() => onEdit(agent)} className={buttonPrimary}>
+              <Pencil className="h-4 w-4" /> {intl.formatMessage({ id: 'agents.edit' })}
+            </button>
+          )}
           <button onClick={onClose} className={buttonSecondary}>
-            <X className="h-4 w-4" /> 關閉
+            <X className="h-4 w-4" /> {intl.formatMessage({ id: 'common.cancel' })}
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+// ── Toggle component ──
+
+function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label: string }) {
+  return (
+    <label className="flex items-center justify-between py-1.5">
+      <span className="text-sm text-stone-700 dark:text-stone-300">{label}</span>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        onClick={() => onChange(!checked)}
+        className={cn(
+          'relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full transition-colors',
+          checked ? 'bg-amber-500' : 'bg-stone-300 dark:bg-stone-600'
+        )}
+      >
+        <span
+          className={cn(
+            'pointer-events-none inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform mt-0.5',
+            checked ? 'translate-x-4 ml-0.5' : 'translate-x-0.5'
+          )}
+        />
+      </button>
+    </label>
+  );
+}
+
+// ── Edit Agent Dialog ──
+
+type EditTab = 'identity' | 'model' | 'heartbeat' | 'permissions';
+
+function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | null; onClose: () => void; onSaved: () => void }) {
+  const intl = useIntl();
+  const { updateAgent } = useAgentsStore();
+  const [tab, setTab] = useState<EditTab>('identity');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Local form state — initialized from agent when dialog opens
+  const [form, setForm] = useState<AgentUpdateParams>({});
+
+  useEffect(() => {
+    if (agent) {
+      setForm({
+        display_name: agent.display_name,
+        role: agent.role,
+        trigger: agent.trigger,
+        icon: agent.icon,
+        reports_to: agent.reports_to,
+        preferred: agent.model?.preferred ?? '',
+        fallback: agent.model?.fallback ?? '',
+        monthly_limit_cents: agent.budget?.monthly_limit_cents ?? 5000,
+        warn_threshold_percent: agent.budget?.warn_threshold_percent ?? 80,
+        hard_stop: agent.budget?.hard_stop ?? true,
+        heartbeat_enabled: agent.heartbeat?.enabled ?? false,
+        heartbeat_interval: agent.heartbeat?.interval_seconds ?? 3600,
+        heartbeat_cron: '',
+        can_create_agents: agent.permissions?.can_create_agents ?? false,
+        can_send_cross_agent: agent.permissions?.can_send_cross_agent ?? true,
+        can_modify_own_skills: agent.permissions?.can_modify_own_skills ?? true,
+        can_modify_own_soul: agent.permissions?.can_modify_own_soul ?? false,
+        can_schedule_tasks: agent.permissions?.can_schedule_tasks ?? false,
+        skill_auto_activate: false,
+        skill_security_scan: true,
+        gvu_enabled: true,
+        cognitive_memory: false,
+      });
+      setTab('identity');
+      setError(null);
+    }
+  }, [agent]);
+
+  const updateField = useCallback(<K extends keyof AgentUpdateParams>(key: K, value: AgentUpdateParams[K]) => {
+    setForm((prev) => ({ ...prev, [key]: value }));
+  }, []);
+
+  const handleSave = async () => {
+    if (!agent) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await updateAgent(agent.name, form);
+      onSaved();
+    } catch {
+      setError('儲存失敗');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!agent) return null;
+
+  const tabs: ReadonlyArray<{ id: EditTab; label: string }> = [
+    { id: 'identity', label: intl.formatMessage({ id: 'agents.edit.identity' }) },
+    { id: 'model', label: intl.formatMessage({ id: 'agents.edit.model' }) },
+    { id: 'heartbeat', label: intl.formatMessage({ id: 'agents.edit.heartbeat' }) },
+    { id: 'permissions', label: intl.formatMessage({ id: 'agents.edit.permissions' }) },
+  ];
+
+  return (
+    <Dialog open={agent !== null} onClose={onClose} title={`${agent.icon || '🤖'} ${intl.formatMessage({ id: 'agents.edit' })}`} className="max-w-2xl">
+      <div className="space-y-4">
+        {/* Tab bar */}
+        <div className="flex gap-1 rounded-lg bg-stone-100 p-1 dark:bg-stone-800">
+          {tabs.map((t) => (
+            <button
+              key={t.id}
+              onClick={() => setTab(t.id)}
+              className={cn(
+                'flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
+                tab === t.id
+                  ? 'bg-white text-stone-900 shadow-sm dark:bg-stone-700 dark:text-stone-50'
+                  : 'text-stone-500 hover:text-stone-700 dark:text-stone-400'
+              )}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Tab content */}
+        <div className="max-h-[50vh] overflow-y-auto space-y-4 pr-1">
+          {tab === 'identity' && (
+            <>
+              <FormField label={intl.formatMessage({ id: 'agents.edit.displayName' })}>
+                <input type="text" value={form.display_name ?? ''} onChange={(e) => updateField('display_name', e.target.value)} className={inputClass} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'agents.edit.role' })}>
+                <select value={form.role ?? 'specialist'} onChange={(e) => updateField('role', e.target.value)} className={selectClass}>
+                  {['main', 'specialist', 'worker', 'developer', 'qa', 'planner'].map((r) => (
+                    <option key={r} value={r}>{intl.formatMessage({ id: `agents.role.${r}` })}</option>
+                  ))}
+                </select>
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'agents.edit.trigger' })}>
+                <input type="text" value={form.trigger ?? ''} onChange={(e) => updateField('trigger', e.target.value)} className={inputClass} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'agents.edit.icon' })}>
+                <input type="text" value={form.icon ?? ''} onChange={(e) => updateField('icon', e.target.value)} className={inputClass} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'agents.edit.reportsTo' })}>
+                <input type="text" value={form.reports_to ?? ''} onChange={(e) => updateField('reports_to', e.target.value)} className={inputClass} />
+              </FormField>
+            </>
+          )}
+
+          {tab === 'model' && (
+            <>
+              <FormField label={intl.formatMessage({ id: 'agents.edit.preferredModel' })}>
+                <select value={form.preferred ?? ''} onChange={(e) => updateField('preferred', e.target.value)} className={selectClass}>
+                  <option value="claude-opus-4-6">Claude Opus 4.6</option>
+                  <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+                  <option value="claude-haiku-4-5">Claude Haiku 4.5</option>
+                </select>
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'agents.edit.fallbackModel' })}>
+                <select value={form.fallback ?? ''} onChange={(e) => updateField('fallback', e.target.value)} className={selectClass}>
+                  <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+                  <option value="claude-haiku-4-5">Claude Haiku 4.5</option>
+                  <option value="claude-opus-4-6">Claude Opus 4.6</option>
+                </select>
+              </FormField>
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700">
+                <FormField label={intl.formatMessage({ id: 'agents.edit.budgetLimit' })}>
+                  <input type="number" min={0} value={form.monthly_limit_cents ?? 5000} onChange={(e) => updateField('monthly_limit_cents', Number(e.target.value))} className={inputClass} />
+                </FormField>
+              </div>
+              <FormField label={intl.formatMessage({ id: 'agents.edit.warnThreshold' })}>
+                <input type="number" min={0} max={100} value={form.warn_threshold_percent ?? 80} onChange={(e) => updateField('warn_threshold_percent', Number(e.target.value))} className={inputClass} />
+              </FormField>
+              <Toggle checked={form.hard_stop ?? true} onChange={(v) => updateField('hard_stop', v)} label={intl.formatMessage({ id: 'agents.edit.hardStop' })} />
+            </>
+          )}
+
+          {tab === 'heartbeat' && (
+            <>
+              <Toggle checked={form.heartbeat_enabled ?? false} onChange={(v) => updateField('heartbeat_enabled', v)} label={intl.formatMessage({ id: 'agents.edit.heartbeatEnabled' })} />
+              <FormField label={intl.formatMessage({ id: 'agents.edit.heartbeatInterval' })}>
+                <input type="number" min={60} value={form.heartbeat_interval ?? 3600} onChange={(e) => updateField('heartbeat_interval', Number(e.target.value))} className={inputClass} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'agents.edit.heartbeatCron' })} hint="e.g. 0 * * * * (every hour)">
+                <input type="text" value={form.heartbeat_cron ?? ''} onChange={(e) => updateField('heartbeat_cron', e.target.value)} placeholder="0 * * * *" className={inputClass} />
+              </FormField>
+            </>
+          )}
+
+          {tab === 'permissions' && (
+            <>
+              <div className="space-y-1">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400 mb-2">
+                  {intl.formatMessage({ id: 'agents.edit.permissions' }).split('&')[0]?.trim() ?? 'Permissions'}
+                </h4>
+                <Toggle checked={form.can_create_agents ?? false} onChange={(v) => updateField('can_create_agents', v)} label={intl.formatMessage({ id: 'agents.edit.canCreateAgents' })} />
+                <Toggle checked={form.can_send_cross_agent ?? true} onChange={(v) => updateField('can_send_cross_agent', v)} label={intl.formatMessage({ id: 'agents.edit.canSendCrossAgent' })} />
+                <Toggle checked={form.can_modify_own_skills ?? true} onChange={(v) => updateField('can_modify_own_skills', v)} label={intl.formatMessage({ id: 'agents.edit.canModifySkills' })} />
+                <Toggle checked={form.can_modify_own_soul ?? false} onChange={(v) => updateField('can_modify_own_soul', v)} label={intl.formatMessage({ id: 'agents.edit.canModifySoul' })} />
+                <Toggle checked={form.can_schedule_tasks ?? false} onChange={(v) => updateField('can_schedule_tasks', v)} label={intl.formatMessage({ id: 'agents.edit.canScheduleTasks' })} />
+              </div>
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-1">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400 mb-2">Evolution</h4>
+                <Toggle checked={form.skill_auto_activate ?? false} onChange={(v) => updateField('skill_auto_activate', v)} label={intl.formatMessage({ id: 'agents.edit.skillAutoActivate' })} />
+                <Toggle checked={form.skill_security_scan ?? true} onChange={(v) => updateField('skill_security_scan', v)} label={intl.formatMessage({ id: 'agents.edit.skillSecurityScan' })} />
+                <Toggle checked={form.gvu_enabled ?? true} onChange={(v) => updateField('gvu_enabled', v)} label={intl.formatMessage({ id: 'agents.edit.gvuEnabled' })} />
+                <Toggle checked={form.cognitive_memory ?? false} onChange={(v) => updateField('cognitive_memory', v)} label={intl.formatMessage({ id: 'agents.edit.cognitiveMemory' })} />
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Error + Actions */}
+        {error && <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>}
+        <div className="flex justify-end gap-3 border-t border-stone-200 pt-4 dark:border-stone-700">
+          <button onClick={onClose} className={buttonSecondary}>{intl.formatMessage({ id: 'common.cancel' })}</button>
+          <button onClick={handleSave} disabled={saving} className={buttonPrimary}>
+            {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+// ── Remove Confirm Dialog ──
+
+function RemoveConfirmDialog({ agentName, onClose, onConfirm }: { agentName: string | null; onClose: () => void; onConfirm: () => void }) {
+  const intl = useIntl();
+  const [confirming, setConfirming] = useState(false);
+
+  const handleConfirm = async () => {
+    setConfirming(true);
+    try {
+      await onConfirm();
+    } finally {
+      setConfirming(false);
+    }
+  };
+
+  if (!agentName) return null;
+
+  return (
+    <Dialog open={agentName !== null} onClose={onClose} title={intl.formatMessage({ id: 'agents.remove' })}>
+      <div className="space-y-4">
+        <p className="text-sm text-stone-600 dark:text-stone-400">
+          {intl.formatMessage({ id: 'agents.remove.confirm' })}
+        </p>
+        <p className="text-sm font-medium text-stone-900 dark:text-stone-50">Agent: {agentName}</p>
+        <div className="flex justify-end gap-3 pt-2">
+          <button onClick={onClose} className={buttonSecondary}>{intl.formatMessage({ id: 'common.cancel' })}</button>
+          <button
+            onClick={handleConfirm}
+            disabled={confirming}
+            className="inline-flex items-center justify-center gap-2 rounded-lg bg-rose-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-rose-600 disabled:opacity-50"
+          >
+            {confirming ? intl.formatMessage({ id: 'common.loading' }) : intl.formatMessage({ id: 'common.delete' })}
           </button>
         </div>
       </div>

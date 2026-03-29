@@ -115,6 +115,30 @@ for pattern in "${DANGEROUS_PATTERNS[@]}"; do
 done
 
 # ===========================================================================
+# Layer 1.5: Browser automation allowlist
+#   When browser_via_bash is enabled (env flag), allow playwright/puppeteer
+#   commands through even in elevated threat modes. These tools are sandboxed
+#   by their own --headless mode and DuDuClaw's CapabilitiesConfig.
+# ===========================================================================
+if [[ "${DUDUCLAW_BROWSER_VIA_BASH:-}" == "1" ]]; then
+  # Allow specific browser automation commands (headless only)
+  BROWSER_ALLOW_PATTERNS=(
+    '^npx[[:space:]]+(@anthropic-ai/mcp-server-)?playwright'
+    '^npx[[:space:]]+puppeteer'
+    '^playwright[[:space:]]+(test|install|codegen)'
+    '^node[[:space:]]+.*playwright'
+  )
+  for allow_pat in "${BROWSER_ALLOW_PATTERNS[@]}"; do
+    if printf '%s' "$COMMAND" | grep -iqE -- "$allow_pat"; then
+      # Ensure no pipe-to-shell or chained destructive commands
+      if ! printf '%s' "$COMMAND" | grep -qE -- '[;&|]{2,}|`|\$\('; then
+        exit 0  # Allow — trusted browser automation command
+      fi
+    fi
+  done
+fi
+
+# ===========================================================================
 # Layer 2: Extended inspection (YELLOW and RED only)
 #   All \s replaced with [[:space:]] for macOS compatibility [H-1]
 # ===========================================================================

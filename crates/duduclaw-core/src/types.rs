@@ -143,6 +143,66 @@ pub struct PermissionsConfig {
     pub allowed_channels: Vec<String>,
 }
 
+/// Capabilities controlling access to high-risk Claude Code native tools.
+///
+/// Each capability defaults to `false` (deny-by-default). Enabling a capability
+/// removes it from the `--disallowedTools` list passed to the Claude CLI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CapabilitiesConfig {
+    /// Allow Claude Code's `computer_use` tool (screenshot + mouse + keyboard).
+    /// WARNING: operates on the host display — only enable for attended local use.
+    #[serde(default)]
+    pub computer_use: bool,
+
+    /// Allow running browser automation commands (playwright, puppeteer) via Bash.
+    #[serde(default)]
+    pub browser_via_bash: bool,
+
+    /// Explicit tool allowlist. If non-empty, ONLY these tools are permitted.
+    /// Takes precedence over individual capability flags.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+
+    /// Explicit tool denylist. Tools listed here are always blocked,
+    /// even if allowed by other flags. Evaluated after `allowed_tools`.
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
+}
+
+impl Default for CapabilitiesConfig {
+    fn default() -> Self {
+        Self {
+            computer_use: false,
+            browser_via_bash: false,
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+        }
+    }
+}
+
+impl CapabilitiesConfig {
+    /// Compute the list of tools that should be disallowed for Claude CLI.
+    ///
+    /// Logic:
+    /// 1. If `denied_tools` is non-empty, those are always blocked.
+    /// 2. Individual capability flags control built-in high-risk tools.
+    /// 3. Returns a deduplicated, sorted Vec suitable for `--disallowedTools`.
+    pub fn disallowed_tools(&self) -> Vec<String> {
+        let mut denied: Vec<String> = self.denied_tools.clone();
+
+        // Deny-by-default high-risk tools unless explicitly enabled
+        if !self.computer_use {
+            denied.push("computer".to_string());
+        }
+
+        // Deduplicate and sort for deterministic CLI args
+        denied.sort();
+        denied.dedup();
+        denied
+    }
+}
+
 /// Evolution / self-improvement configuration.
 ///
 /// Evolution is driven exclusively by the prediction engine (error-based triggering)
@@ -273,6 +333,10 @@ pub struct AgentConfig {
     pub budget: BudgetConfig,
     pub permissions: PermissionsConfig,
     pub evolution: EvolutionConfig,
+    /// High-risk tool capabilities (computer_use, browser, etc.)
+    /// Defaults to all-denied if omitted from agent.toml.
+    #[serde(default)]
+    pub capabilities: CapabilitiesConfig,
 }
 
 // ---------------------------------------------------------------------------

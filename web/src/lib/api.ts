@@ -137,6 +137,42 @@ export interface SkillIndexEntry {
   compatible: string[];
 }
 
+/** Fields that can be updated on an agent via `agents.update`. All optional. */
+export interface AgentUpdateParams {
+  // Identity
+  display_name?: string;
+  role?: string;
+  status?: string;
+  trigger?: string;
+  icon?: string;
+  reports_to?: string;
+  // Model
+  preferred?: string;
+  fallback?: string;
+  api_mode?: 'cli' | 'direct' | 'auto';
+  // Budget
+  monthly_limit_cents?: number;
+  warn_threshold_percent?: number;
+  hard_stop?: boolean;
+  // Heartbeat
+  heartbeat_enabled?: boolean;
+  heartbeat_interval?: number;
+  heartbeat_cron?: string;
+  // Permissions
+  can_create_agents?: boolean;
+  can_send_cross_agent?: boolean;
+  can_modify_own_skills?: boolean;
+  can_modify_own_soul?: boolean;
+  can_schedule_tasks?: boolean;
+  // Evolution
+  skill_auto_activate?: boolean;
+  skill_security_scan?: boolean;
+  gvu_enabled?: boolean;
+  cognitive_memory?: boolean;
+  max_active_skills?: number;
+  max_silence_hours?: number;
+}
+
 // API namespace
 export const api = {
   agents: {
@@ -163,6 +199,10 @@ export const api = {
       client.call('agents.resume', { agent_id: agentId }) as Promise<{ success: boolean }>,
     inspect: (agentId: string) =>
       client.call('agents.inspect', { agent_id: agentId }) as Promise<AgentDetail>,
+    update: (agentId: string, fields: AgentUpdateParams) =>
+      client.call('agents.update', { agent_id: agentId, ...fields }) as Promise<{ success: boolean }>,
+    remove: (agentId: string) =>
+      client.call('agents.remove', { agent_id: agentId }) as Promise<{ success: boolean }>,
   },
   channels: {
     status: () =>
@@ -183,6 +223,11 @@ export const api = {
       client.call('accounts.rotate') as Promise<{ success: boolean }>,
     health: () =>
       client.call('accounts.health') as Promise<Record<string, unknown>>,
+    updateBudget: (accountId: string, monthlyBudgetCents: number) =>
+      client.call('accounts.update_budget', {
+        account_id: accountId,
+        monthly_budget_cents: monthlyBudgetCents,
+      }) as Promise<{ success: boolean }>,
   },
   memory: {
     search: (agentId: string, query: string, limit = 20) =>
@@ -215,6 +260,8 @@ export const api = {
       client.call('system.version') as Promise<{ version: string }>,
     config: () =>
       client.call('system.config') as Promise<Record<string, unknown>>,
+    updateConfig: (fields: { log_level?: string; rotation_strategy?: string }) =>
+      client.call('system.update_config', fields) as Promise<{ success: boolean; changes: string[] }>,
   },
   cron: {
     list: () =>
