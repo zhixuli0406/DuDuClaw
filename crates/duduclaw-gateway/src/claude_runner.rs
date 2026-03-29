@@ -80,6 +80,7 @@ pub async fn call_claude_for_agent_with_type(
     let claude_model = agent.config.model.preferred.clone();
     let local_config = agent.config.model.local.clone();
     let api_mode = agent.config.model.api_mode.clone();
+    let capabilities = agent.config.capabilities.clone();
     drop(reg);
 
     // P0 fix: global mode gate BEFORE per-agent routing
@@ -100,7 +101,7 @@ pub async fn call_claude_for_agent_with_type(
             info!(agent = %agent_name, model = %claude_model, "Claude-only mode");
             return call_with_rotation(
                 home_dir, agent_id, prompt, &claude_model, &system_prompt,
-                request_type,
+                request_type, Some(&capabilities),
             ).await;
         }
         _ => {
@@ -163,6 +164,7 @@ pub async fn call_claude_for_agent_with_type(
         info!(agent = %agent_name, model = %claude_model, "Calling Claude CLI (SDK primary)");
         match call_with_rotation(
             home_dir, agent_id, prompt, &claude_model, &system_prompt, request_type,
+            Some(&capabilities),
         ).await {
             Ok(text) => return Ok(text),
             Err(e) => {
@@ -418,6 +420,7 @@ async fn call_with_rotation(
     model: &str,
     system_prompt: &str,
     request_type: crate::cost_telemetry::RequestType,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
     // Pre-flight: check 200K price cliff
     if let Some(estimated) = crate::cost_telemetry::check_price_cliff(system_prompt, prompt) {
@@ -441,7 +444,7 @@ async fn call_with_rotation(
 
         info!(account = %selected.id, method = ?selected.auth_method, attempt, "Trying account");
 
-        match call_claude_with_env(prompt, model, system_prompt, &selected.env_vars).await {
+        match call_claude_with_env(prompt, model, system_prompt, &selected.env_vars, capabilities).await {
             Ok(response) => {
                 // Use telemetry-based cost if usage available, else rough estimate
                 let cost = if let Some(ref usage) = response.usage {
@@ -486,7 +489,7 @@ async fn call_with_rotation(
     let api_key = get_api_key(home_dir).await;
     if !api_key.is_empty() {
         warn!("All rotated accounts failed, using fallback key");
-        let response = call_claude(prompt, model, system_prompt, &api_key).await?;
+        let response = call_claude(prompt, model, system_prompt, &api_key, capabilities).await?;
 
         // Record telemetry for fallback path too
         if let Some(ref usage) = response.usage {
@@ -669,11 +672,15 @@ async fn call_claude_streaming(
 }
 
 /// Prepare a `claude` CLI command with common args and env vars.
+///
+/// When `capabilities` is provided, high-risk tools not explicitly enabled
+/// are added to `--disallowedTools` (deny-by-default security posture).
 fn prepare_claude_cmd(
     claude_path: &str,
     prompt: &str,
     model: &str,
     system_prompt: &str,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> (tokio::process::Command, Option<tempfile::TempPath>) {
     let mut cmd = tokio::process::Command::new(claude_path);
     cmd.args([
@@ -687,6 +694,19 @@ fn prepare_claude_cmd(
         // Allow enough agentic turns for complex tasks (read → think → write).
         "--max-turns", "50",
     ]);
+
+    // Apply tool restrictions based on agent capabilities (deny-by-default)
+    let caps = capabilities.cloned().unwrap_or_default();
+    let denied = caps.disallowed_tools();
+    if !denied.is_empty() {
+        let denied_csv = denied.join(",");
+        cmd.args(["--disallowedTools", &denied_csv]);
+    }
+
+    // Signal bash-gate.sh to allow browser automation commands
+    if caps.browser_via_bash {
+        cmd.env("DUDUCLAW_BROWSER_VIA_BASH", "1");
+    }
 
     let prompt_guard = if !system_prompt.is_empty() {
         match tempfile::NamedTempFile::new() {
@@ -718,9 +738,10 @@ async fn call_claude_with_env(
     model: &str,
     system_prompt: &str,
     env_vars: &std::collections::HashMap<String, String>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<ClaudeResponse, String> {
     let claude = which_claude().ok_or("Claude CLI not found")?;
-    let (mut cmd, _prompt_guard) = prepare_claude_cmd(&claude, prompt, model, system_prompt);
+    let (mut cmd, _prompt_guard) = prepare_claude_cmd(&claude, prompt, model, system_prompt, capabilities);
 
     for (key, value) in env_vars {
         if value.is_empty() {
@@ -739,9 +760,10 @@ async fn call_claude(
     model: &str,
     system_prompt: &str,
     api_key: &str,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<ClaudeResponse, String> {
     let claude = which_claude().ok_or("Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code")?;
-    let (mut cmd, _prompt_guard) = prepare_claude_cmd(&claude, prompt, model, system_prompt);
+    let (mut cmd, _prompt_guard) = prepare_claude_cmd(&claude, prompt, model, system_prompt, capabilities);
     cmd.env("ANTHROPIC_API_KEY", api_key);
 
     call_claude_streaming(&mut cmd, None).await

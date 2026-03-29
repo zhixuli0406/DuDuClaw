@@ -13,6 +13,7 @@ import {
   AlertTriangle,
   XCircle,
   Play,
+  Plus,
   Wrench,
 } from 'lucide-react';
 
@@ -70,6 +71,40 @@ export function SettingsPage() {
 function GeneralTab() {
   const intl = useIntl();
   const { status } = useSystemStore();
+  const [logLevel, setLogLevel] = useState('info');
+  const [rotationStrategy, setRotationStrategy] = useState('priority');
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  // Load current config on mount
+  useEffect(() => {
+    api.system.config().then((res) => {
+      const raw = (res as Record<string, unknown>)?.config;
+      if (typeof raw === 'string') {
+        // Parse TOML string for current values
+        const logMatch = raw.match(/level\s*=\s*"(\w+)"/);
+        if (logMatch) setLogLevel(logMatch[1]);
+        const rotMatch = raw.match(/strategy\s*=\s*"(\w+)"/);
+        if (rotMatch) setRotationStrategy(rotMatch[1]);
+      }
+    }).catch(() => {});
+  }, []);
+
+  const handleSave = async () => {
+    setSaving(true);
+    setSaved(false);
+    try {
+      await api.system.updateConfig({ log_level: logLevel, rotation_strategy: rotationStrategy });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch {
+      // error handled silently
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const selectStyle = 'rounded-lg border border-stone-300 bg-white px-3 py-1.5 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50';
 
   return (
     <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
@@ -84,7 +119,43 @@ function GeneralTab() {
           label="Uptime"
           value={status?.uptime_seconds ? formatUptime(status.uptime_seconds) : '-'}
         />
-        <SettingRow label="Log Level" value="info" />
+
+        {/* Editable: Log Level */}
+        <div className="flex items-center justify-between border-b border-stone-100 pb-3 dark:border-stone-800">
+          <span className="text-sm text-stone-600 dark:text-stone-400">
+            {intl.formatMessage({ id: 'settings.general.logLevel' })}
+          </span>
+          <select value={logLevel} onChange={(e) => setLogLevel(e.target.value)} className={selectStyle}>
+            {['trace', 'debug', 'info', 'warn', 'error'].map((l) => (
+              <option key={l} value={l}>{l}</option>
+            ))}
+          </select>
+        </div>
+
+        {/* Editable: Rotation Strategy */}
+        <div className="flex items-center justify-between border-b border-stone-100 pb-3 last:border-0 dark:border-stone-800">
+          <span className="text-sm text-stone-600 dark:text-stone-400">
+            {intl.formatMessage({ id: 'settings.general.rotationStrategy' })}
+          </span>
+          <select value={rotationStrategy} onChange={(e) => setRotationStrategy(e.target.value)} className={selectStyle}>
+            <option value="priority">Priority</option>
+            <option value="round_robin">Round Robin</option>
+            <option value="least_cost">Least Cost</option>
+            <option value="failover">Failover</option>
+          </select>
+        </div>
+
+        {/* Save button */}
+        <div className="flex justify-end gap-2 pt-2">
+          {saved && (
+            <span className="self-center text-xs text-emerald-600 dark:text-emerald-400">
+              {intl.formatMessage({ id: 'settings.general.saved' })}
+            </span>
+          )}
+          <button onClick={handleSave} disabled={saving} className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50">
+            {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -177,12 +248,26 @@ function HeartbeatTab() {
                 <span className="text-xs text-stone-400">
                   {hb.active_runs}/{hb.max_concurrent}
                 </span>
-                <span
+                <button
+                  onClick={() => {
+                    api.agents.update(hb.agent_id, { heartbeat_enabled: !hb.enabled }).then(() => {
+                      setHeartbeats((prev) =>
+                        prev.map((h) => h.agent_id === hb.agent_id ? { ...h, enabled: !h.enabled } : h)
+                      );
+                    }).catch(() => {});
+                  }}
+                  title={intl.formatMessage({ id: 'settings.heartbeat.toggle' })}
                   className={cn(
-                    'inline-block h-2.5 w-2.5 rounded-full',
+                    'inline-block h-2.5 w-2.5 rounded-full cursor-pointer ring-2 ring-offset-1 ring-transparent hover:ring-amber-400 transition-all',
                     hb.enabled ? 'bg-emerald-500' : 'bg-stone-300 dark:bg-stone-600'
                   )}
                 />
+                <button
+                  onClick={() => api.heartbeat.trigger(hb.agent_id).catch(() => {})}
+                  className="rounded px-1.5 py-0.5 text-xs text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-amber-900/20"
+                >
+                  <Play className="h-3 w-3" />
+                </button>
               </div>
             </div>
           ))}
@@ -195,8 +280,13 @@ function HeartbeatTab() {
 function CronTab() {
   const intl = useIntl();
   const [tasks, setTasks] = useState<
-    ReadonlyArray<{ id: string; agent_id: string; cron: string; enabled: boolean }>
+    ReadonlyArray<{ id?: string; name?: string; agent_id: string; cron?: string; schedule?: string; enabled: boolean }>
   >([]);
+  const [showAdd, setShowAdd] = useState(false);
+  const [newName, setNewName] = useState('');
+  const [newSchedule, setNewSchedule] = useState('0 * * * *');
+  const [newAgent, setNewAgent] = useState('');
+  const [adding, setAdding] = useState(false);
 
   const fetchTasks = useCallback(async () => {
     try {
@@ -211,6 +301,39 @@ function CronTab() {
     fetchTasks();
   }, [fetchTasks]);
 
+  const handleAdd = async () => {
+    if (!newName.trim()) return;
+    setAdding(true);
+    try {
+      await api.cron.add(newAgent, newSchedule, newName.trim());
+      setShowAdd(false);
+      setNewName('');
+      setNewSchedule('0 * * * *');
+      setNewAgent('');
+      await fetchTasks();
+    } catch {
+      // error
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const handlePause = async (name: string) => {
+    try {
+      await api.cron.pause(name);
+      await fetchTasks();
+    } catch { /* ignore */ }
+  };
+
+  const handleRemove = async (name: string) => {
+    try {
+      await api.cron.remove(name);
+      await fetchTasks();
+    } catch { /* ignore */ }
+  };
+
+  const inputStyle = 'rounded-lg border border-stone-300 bg-white px-3 py-1.5 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50';
+
   return (
     <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
       <div className="flex items-center justify-between mb-4">
@@ -220,7 +343,33 @@ function CronTab() {
             {intl.formatMessage({ id: 'settings.cron' })}
           </h3>
         </div>
+        <button
+          onClick={() => setShowAdd(!showAdd)}
+          className="inline-flex items-center gap-1 rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-600"
+        >
+          <Plus className="h-3.5 w-3.5" />
+          {intl.formatMessage({ id: 'settings.cron.add' })}
+        </button>
       </div>
+
+      {/* Add task form */}
+      {showAdd && (
+        <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50/50 p-4 dark:border-amber-800 dark:bg-amber-900/10">
+          <div className="grid gap-3 sm:grid-cols-3">
+            <input type="text" placeholder={intl.formatMessage({ id: 'settings.cron.name' })} value={newName} onChange={(e) => setNewName(e.target.value)} className={inputStyle} />
+            <input type="text" placeholder="0 * * * *" value={newSchedule} onChange={(e) => setNewSchedule(e.target.value)} className={inputStyle} />
+            <input type="text" placeholder={intl.formatMessage({ id: 'settings.cron.agent' })} value={newAgent} onChange={(e) => setNewAgent(e.target.value)} className={inputStyle} />
+          </div>
+          <div className="mt-3 flex justify-end gap-2">
+            <button onClick={() => setShowAdd(false)} className="rounded-lg border border-stone-300 px-3 py-1.5 text-xs text-stone-600 dark:border-stone-600 dark:text-stone-400">
+              {intl.formatMessage({ id: 'common.cancel' })}
+            </button>
+            <button onClick={handleAdd} disabled={adding || !newName.trim()} className="rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-600 disabled:opacity-50">
+              {adding ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+            </button>
+          </div>
+        </div>
+      )}
 
       {tasks.length === 0 ? (
         <div className="flex items-center justify-center py-12 text-stone-400 dark:text-stone-500">
@@ -232,49 +381,72 @@ function CronTab() {
             <thead>
               <tr className="border-b border-stone-200 dark:border-stone-700">
                 <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">
-                  ID
+                  {intl.formatMessage({ id: 'settings.cron.name' })}
                 </th>
                 <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">
-                  Agent
+                  {intl.formatMessage({ id: 'settings.cron.agent' })}
                 </th>
                 <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">
-                  Schedule
+                  {intl.formatMessage({ id: 'settings.cron.schedule' })}
                 </th>
                 <th className="py-2 text-center font-medium text-stone-500 dark:text-stone-400">
-                  Status
+                  {intl.formatMessage({ id: 'settings.cron.enabled' })}
                 </th>
+                <th className="py-2 text-right font-medium text-stone-500 dark:text-stone-400" />
               </tr>
             </thead>
             <tbody>
-              {tasks.map((task) => (
-                <tr
-                  key={task.id}
-                  className="border-b border-stone-100 dark:border-stone-800"
-                >
-                  <td className="py-2 font-mono text-xs text-stone-700 dark:text-stone-300">
-                    {task.id}
-                  </td>
-                  <td className="py-2 text-stone-700 dark:text-stone-300">
-                    {task.agent_id}
-                  </td>
-                  <td className="py-2">
-                    <code className="rounded bg-stone-100 px-2 py-0.5 font-mono text-xs text-stone-600 dark:bg-stone-800 dark:text-stone-400">
-                      {task.cron}
-                    </code>
-                  </td>
-                  <td className="py-2 text-center">
-                    {task.enabled ? (
-                      <span className="inline-flex items-center rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400">
-                        Enabled
-                      </span>
-                    ) : (
-                      <span className="inline-flex items-center rounded-full bg-stone-100 px-2 py-0.5 text-xs font-medium text-stone-600 dark:bg-stone-800 dark:text-stone-400">
-                        Disabled
-                      </span>
-                    )}
-                  </td>
-                </tr>
-              ))}
+              {tasks.map((task) => {
+                const taskName = task.name ?? task.id ?? '';
+                const taskCron = task.schedule ?? task.cron ?? '';
+                return (
+                  <tr
+                    key={taskName}
+                    className="border-b border-stone-100 dark:border-stone-800"
+                  >
+                    <td className="py-2 font-mono text-xs text-stone-700 dark:text-stone-300">
+                      {taskName}
+                    </td>
+                    <td className="py-2 text-stone-700 dark:text-stone-300">
+                      {task.agent_id}
+                    </td>
+                    <td className="py-2">
+                      <code className="rounded bg-stone-100 px-2 py-0.5 font-mono text-xs text-stone-600 dark:bg-stone-800 dark:text-stone-400">
+                        {taskCron}
+                      </code>
+                    </td>
+                    <td className="py-2 text-center">
+                      {task.enabled ? (
+                        <span className="inline-flex items-center rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400">
+                          {intl.formatMessage({ id: 'settings.cron.enabled' })}
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center rounded-full bg-stone-100 px-2 py-0.5 text-xs font-medium text-stone-600 dark:bg-stone-800 dark:text-stone-400">
+                          Disabled
+                        </span>
+                      )}
+                    </td>
+                    <td className="py-2 text-right">
+                      <div className="flex justify-end gap-1">
+                        {task.enabled && (
+                          <button
+                            onClick={() => handlePause(taskName)}
+                            className="rounded px-2 py-1 text-xs text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-amber-900/20"
+                          >
+                            {intl.formatMessage({ id: 'settings.cron.pause' })}
+                          </button>
+                        )}
+                        <button
+                          onClick={() => handleRemove(taskName)}
+                          className="rounded px-2 py-1 text-xs text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-900/20"
+                        >
+                          {intl.formatMessage({ id: 'settings.cron.remove' })}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

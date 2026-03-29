@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { api, type AgentDetail } from '@/lib/api';
+import { api, type AgentDetail, type AgentUpdateParams } from '@/lib/api';
 import { client } from '@/lib/ws-client';
 
 interface AgentsStore {
@@ -11,6 +11,8 @@ interface AgentsStore {
   selectAgent: (id: string | null) => void;
   pauseAgent: (id: string) => Promise<void>;
   resumeAgent: (id: string) => Promise<void>;
+  updateAgent: (id: string, fields: AgentUpdateParams) => Promise<void>;
+  removeAgent: (id: string) => Promise<void>;
 }
 
 export const useAgentsStore = create<AgentsStore>((set, get) => {
@@ -63,6 +65,23 @@ export const useAgentsStore = create<AgentsStore>((set, get) => {
         });
       } catch {
         set({ error: `無法恢復 agent: ${id}` });
+      }
+    },
+    updateAgent: async (id, fields) => {
+      try {
+        await api.agents.update(id, fields);
+        // Re-fetch to get the authoritative state after update
+        await get().fetchAgents();
+      } catch {
+        set({ error: `無法更新 agent: ${id}` });
+      }
+    },
+    removeAgent: async (id) => {
+      try {
+        await api.agents.remove(id);
+        set({ agents: get().agents.filter((a) => a.name !== id) });
+      } catch {
+        set({ error: `無法刪除 agent: ${id}` });
       }
     },
   };

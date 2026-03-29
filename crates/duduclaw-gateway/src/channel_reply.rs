@@ -147,6 +147,7 @@ pub async fn build_reply_with_session(
 
     let agent_id = agent.map(|a| a.config.agent.name.clone()).unwrap_or_default();
     let agent_dir = agent.map(|a| a.dir.clone());
+    let capabilities = agent.map(|a| a.config.capabilities.clone());
     let skill_token_budget = agent
         .map(|a| a.config.evolution.skill_token_budget)
         .unwrap_or(2500);
@@ -246,7 +247,7 @@ pub async fn build_reply_with_session(
     };
 
     // 1. Try `claude` CLI directly (Claude Code SDK — has built-in tools)
-    let reply = match call_claude_cli(text, &model, &full_system_prompt, &ctx.home_dir, agent_dir.as_deref(), on_progress.as_ref()).await {
+    let reply = match call_claude_cli(text, &model, &full_system_prompt, &ctx.home_dir, agent_dir.as_deref(), on_progress.as_ref(), capabilities.as_ref()).await {
         Ok(reply) => {
             info!("Claude replied via Claude Code SDK ({} chars)", reply.len());
             Some(reply)
@@ -516,7 +517,7 @@ pub async fn build_reply_with_session(
                     "Summarize the following conversation history concisely for use as context \
                      in future turns. Include key facts, decisions, and outcomes. Max 400 words.\n\n{transcript}"
                 );
-                let summary = match call_claude_cli(&prompt, "claude-haiku-4-5", "", &home_for_compress, None, None).await {
+                let summary = match call_claude_cli(&prompt, "claude-haiku-4-5", "", &home_for_compress, None, None, None).await {
                     Ok(s) => s,
                     Err(_) => "[Session compressed — previous conversation summary omitted for brevity]".to_string(),
                 };
@@ -613,7 +614,7 @@ pub(crate) async fn call_claude_cli_public(
     if !ALLOWED_EVOLUTION_MODELS.contains(&model) {
         return Err(format!("Model '{model}' not allowed for evolution calls"));
     }
-    call_claude_cli(user_message, model, system_prompt, home_dir, None, None).await
+    call_claude_cli(user_message, model, system_prompt, home_dir, None, None, None).await
 }
 
 /// Call the `claude` CLI (Claude Code SDK) with streaming output.
@@ -628,6 +629,7 @@ async fn call_claude_cli(
     home_dir: &Path,
     work_dir: Option<&Path>,
     on_progress: Option<&ProgressCallback>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -653,6 +655,20 @@ async fn call_claude_cli(
         // and return a text summary instead of completing the work.
         "--max-turns", "50",
     ]);
+
+    // Apply tool restrictions based on agent capabilities (deny-by-default)
+    {
+        let caps = capabilities.cloned().unwrap_or_default();
+        let denied = caps.disallowed_tools();
+        if !denied.is_empty() {
+            let denied_csv = denied.join(",");
+            cmd.args(["--disallowedTools", &denied_csv]);
+        }
+        // Signal bash-gate.sh to allow browser automation commands
+        if caps.browser_via_bash {
+            cmd.env("DUDUCLAW_BROWSER_VIA_BASH", "1");
+        }
+    }
     // Set working directory to agent dir so Claude can access agent config
     // (.claude/, CLAUDE.md, .mcp.json) and project files (docs/, etc.)
     if let Some(dir) = work_dir {
