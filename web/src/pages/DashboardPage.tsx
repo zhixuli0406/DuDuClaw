@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useSystemStore } from '@/stores/system-store';
+import { useConnectionStore } from '@/stores/connection-store';
 import { api, type BudgetSummary, type DoctorCheck } from '@/lib/api';
 import { Bot, Radio, Wallet, HeartPulse } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -43,23 +44,26 @@ export function DashboardPage() {
   const intl = useIntl();
   const { agents, fetchAgents } = useAgentsStore();
   const { status, fetchStatus } = useSystemStore();
+  const connectionState = useConnectionStore((s) => s.state);
   const [budget, setBudget] = useState<BudgetSummary | null>(null);
   const [doctor, setDoctor] = useState<{ checks: DoctorCheck[]; summary: { pass: number; warn: number; fail: number } } | null>(null);
 
+  // Fetch data only after WebSocket is authenticated.
+  // Re-fetches on reconnect (connectionState goes back to 'authenticated').
   useEffect(() => {
-    // Initial fetch
+    if (connectionState !== 'authenticated') return;
+
     fetchAgents();
     fetchStatus();
     api.accounts.budgetSummary().then(setBudget).catch(() => {});
     api.system.doctor().then(setDoctor).catch(() => {});
 
-    // Rely on WebSocket events for real-time updates (FE-H7).
-    // Only do a lightweight budget refresh every 60s instead of full polling.
+    // Lightweight budget refresh every 60s
     const interval = setInterval(() => {
       api.accounts.budgetSummary().then(setBudget).catch(() => {});
     }, 60_000);
     return () => clearInterval(interval);
-  }, [fetchAgents, fetchStatus]);
+  }, [connectionState, fetchAgents, fetchStatus]);
 
   const activeAgents = agents.filter((a) => a.status === 'active').length;
   const totalBudget = budget?.total_budget_cents ?? 0;

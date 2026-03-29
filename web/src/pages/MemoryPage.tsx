@@ -61,24 +61,59 @@ function MemoriesTab() {
   const [query, setQuery] = useState('');
   const [entries, setEntries] = useState<ReadonlyArray<MemoryEntry>>([]);
   const [loading, setLoading] = useState(false);
+  const [agents, setAgents] = useState<ReadonlyArray<{ name: string; display_name: string }>>([]);
+  const [selectedAgent, setSelectedAgent] = useState('');
+
+  // Load agent list on mount
+  useEffect(() => {
+    api.agents.list().then((res) => {
+      const list = res?.agents ?? [];
+      setAgents(list);
+      if (list.length > 0 && !selectedAgent) {
+        setSelectedAgent(list[0].name);
+      }
+    }).catch(() => {});
+  }, []);
+
+  // Auto-browse when agent changes
+  useEffect(() => {
+    if (!selectedAgent) return;
+    setLoading(true);
+    api.memory.browse(selectedAgent, 50).then((res) => {
+      setEntries(res?.entries ?? []);
+    }).catch(() => {
+      setEntries([]);
+    }).finally(() => setLoading(false));
+  }, [selectedAgent]);
 
   const handleSearch = useCallback(async () => {
-    if (!query.trim()) return;
+    if (!query.trim() || !selectedAgent) return;
     setLoading(true);
     try {
-      const result = await api.memory.search('*', query);
+      const result = await api.memory.search(selectedAgent, query);
       setEntries(result?.entries ?? []);
     } catch {
-      // error handled silently
+      setEntries([]);
     } finally {
       setLoading(false);
     }
-  }, [query]);
+  }, [query, selectedAgent]);
+
+  const selectStyle = 'rounded-lg border border-stone-200 bg-white px-3 py-2.5 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-700 dark:bg-stone-800 dark:text-stone-50';
 
   return (
     <div className="space-y-4">
-      {/* Search bar */}
+      {/* Agent selector + Search bar */}
       <div className="flex gap-2">
+        <select
+          value={selectedAgent}
+          onChange={(e) => { setSelectedAgent(e.target.value); setQuery(''); }}
+          className={selectStyle}
+        >
+          {agents.map((a) => (
+            <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
+          ))}
+        </select>
         <div className="relative flex-1">
           <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-stone-400" />
           <input
@@ -94,7 +129,7 @@ function MemoriesTab() {
         </div>
         <button
           onClick={handleSearch}
-          disabled={loading}
+          disabled={loading || !selectedAgent}
           className="rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
         >
           <Search className="h-4 w-4" />
