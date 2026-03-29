@@ -519,10 +519,8 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
         .unwrap_or("DuDuClaw");
     format!(
         "{name} 收到你的訊息，但目前無法回覆。\n\
-        請安裝 Claude Code SDK：\n\
-        $ npm install -g @anthropic-ai/claude-code\n\
-        並設定 API Key：\n\
-        $ export ANTHROPIC_API_KEY=sk-ant-..."
+        請確認 Claude Code 已安裝並登入：\n\
+        $ claude auth status"
     )
 }
 
@@ -563,10 +561,9 @@ async fn call_claude_cli(
     // Find claude binary
     let claude_path = which_claude().ok_or_else(|| "claude CLI not found in PATH".to_string())?;
 
-    // Get API key
-    let api_key = get_api_key(home_dir)
-        .await
-        .ok_or_else(|| "No API key configured".to_string())?;
+    // API key is optional — OAuth users authenticate via OS keychain.
+    // Only set ANTHROPIC_API_KEY env var if we have one (as backup/override).
+    let api_key = get_api_key(home_dir).await;
 
     let mut cmd = tokio::process::Command::new(&claude_path);
     cmd.args([
@@ -575,6 +572,9 @@ async fn call_claude_cli(
         "--output-format", "stream-json",
         "--verbose",
     ]);
+    if let Some(ref key) = api_key {
+        cmd.env("ANTHROPIC_API_KEY", key);
+    }
 
     // Pass system prompt via temp file to avoid exposure in /proc/PID/cmdline (BE-C1)
     let _prompt_guard: Option<tempfile::TempPath> = if !system_prompt.is_empty() {
@@ -595,7 +595,6 @@ async fn call_claude_cli(
         None
     };
 
-    cmd.env("ANTHROPIC_API_KEY", &api_key);
     // Prevent "nested session" error when gateway was launched from a Claude Code session
     cmd.env_remove("CLAUDECODE");
     cmd.stdin(std::process::Stdio::null());
