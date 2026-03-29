@@ -632,6 +632,9 @@ fn prepare_claude_cmd(
         "--model", model,
         "--output-format", "stream-json",
         "--verbose",
+        // Subprocess has no TTY — auto-accept tool permissions.
+        // Security is enforced by DuDuClaw's CONTRACT.toml + container sandbox.
+        "--permission-mode", "auto",
     ]);
 
     let prompt_guard = if !system_prompt.is_empty() {
