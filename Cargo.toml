@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 license = "Elastic-2.0"
 authors = ["DuDuClaw Contributors"]
@@ -74,7 +74,7 @@ reqwest = { version = "0.12", features = ["json"] }
 # Internal crates
 duduclaw-core = { path = "crates/duduclaw-core" }
 duduclaw-inference = { path = "crates/duduclaw-inference", default-features = false }
-duduclaw-gateway = { path = "crates/duduclaw-gateway", default-features = false }
+duduclaw-gateway = { path = "crates/duduclaw-gateway" }
 duduclaw-bus = { path = "crates/duduclaw-bus" }
 duduclaw-security = { path = "crates/duduclaw-security" }
 duduclaw-memory = { path = "crates/duduclaw-memory" }

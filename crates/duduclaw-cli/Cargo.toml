@@ -34,3 +34,4 @@ console = "0.15"
 dirs = "6"
 base64 = { workspace = true }
 scraper = "0.22"
+sha2 = "0.10"

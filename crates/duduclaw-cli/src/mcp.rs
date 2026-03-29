@@ -136,6 +136,41 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "session_key", description: "Optional session key to resume a previous conversation context", required: false },
         ],
     },
+    ToolDef {
+        name: "agent_update",
+        description: "Update one or more fields of an existing agent's configuration (agent.toml). Supports identity, model, budget, heartbeat, and container fields. Uses atomic write for safety.",
+        params: &[
+            ParamDef { name: "agent_id", description: "Agent name to update", required: true },
+            ParamDef { name: "display_name", description: "New display name", required: false },
+            ParamDef { name: "role", description: "New role: main, specialist, worker, developer, qa, planner", required: false },
+            ParamDef { name: "status", description: "New status: active, paused, terminated", required: false },
+            ParamDef { name: "trigger", description: "New trigger keyword", required: false },
+            ParamDef { name: "icon", description: "New emoji icon", required: false },
+            ParamDef { name: "reports_to", description: "New parent agent name", required: false },
+            ParamDef { name: "model", description: "New preferred model", required: false },
+            ParamDef { name: "fallback_model", description: "New fallback model", required: false },
+            ParamDef { name: "api_mode", description: "API mode: cli, direct, auto", required: false },
+            ParamDef { name: "budget_cents", description: "Monthly budget limit in cents", required: false },
+            ParamDef { name: "max_concurrent", description: "Max concurrent container tasks", required: false },
+            ParamDef { name: "heartbeat_enabled", description: "Enable/disable heartbeat (true/false)", required: false },
+            ParamDef { name: "heartbeat_cron", description: "Heartbeat cron expression", required: false },
+        ],
+    },
+    ToolDef {
+        name: "agent_remove",
+        description: "Remove an agent (moves to _trash/ for recovery). Refuses to remove the main agent.",
+        params: &[
+            ParamDef { name: "agent_id", description: "Agent name to remove", required: true },
+        ],
+    },
+    ToolDef {
+        name: "agent_update_soul",
+        description: "Update an agent's SOUL.md personality file via the trusted MCP channel. Bypasses file-protect hooks. Uses atomic write with SHA-256 fingerprinting.",
+        params: &[
+            ParamDef { name: "agent_id", description: "Agent name", required: true },
+            ParamDef { name: "content", description: "New SOUL.md content (full replacement)", required: true },
+        ],
+    },
     // ── Skill management tools ──────────────────────────────────
     ToolDef {
         name: "skill_search",
@@ -1078,7 +1113,6 @@ async fn handle_create_agent(params: &Value, home_dir: &Path) -> Value {
         [evolution]
         skill_auto_activate = false
         skill_security_scan = true
-        gvu_enabled = true
         gvu_enabled = false
         cognitive_memory = false
         max_silence_hours = 12.0
@@ -1379,6 +1413,304 @@ async fn handle_spawn_agent(params: &Value, home_dir: &Path) -> Value {
             "isError": true
         })
     }
+}
+
+/// Update one or more fields in an existing agent's agent.toml.
+///
+/// Reads the current config, applies the requested changes, and writes back.
+/// Uses `toml::to_string_pretty` for consistent formatting.
+async fn handle_agent_update(params: &Value, home_dir: &Path) -> Value {
+    let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+    if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: valid agent_id is required (lowercase alphanumeric with hyphens, max 64 chars)"}],
+            "isError": true
+        });
+    }
+
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    let toml_path = agent_dir.join("agent.toml");
+
+    let content = match tokio::fs::read_to_string(&toml_path).await {
+        Ok(c) => c,
+        Err(_) => return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: agent '{agent_id}' not found")}],
+            "isError": true
+        }),
+    };
+
+    let mut config: duduclaw_core::types::AgentConfig = match toml::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error parsing agent.toml: {e}")}],
+            "isError": true
+        }),
+    };
+
+    let mut changes = Vec::new();
+
+    // -- Agent identity fields --
+    if let Some(v) = params.get("display_name").and_then(|v| v.as_str()) {
+        config.agent.display_name = v.to_string();
+        changes.push(format!("display_name = \"{v}\""));
+    }
+    if let Some(v) = params.get("role").and_then(|v| v.as_str()) {
+        let role = match v.to_lowercase().as_str() {
+            "main" => duduclaw_core::types::AgentRole::Main,
+            "specialist" => duduclaw_core::types::AgentRole::Specialist,
+            "worker" => duduclaw_core::types::AgentRole::Worker,
+            "developer" => duduclaw_core::types::AgentRole::Developer,
+            "qa" => duduclaw_core::types::AgentRole::Qa,
+            "planner" => duduclaw_core::types::AgentRole::Planner,
+            _ => return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: invalid role '{v}'. Valid: main, specialist, worker, developer, qa, planner")}],
+                "isError": true
+            }),
+        };
+        config.agent.role = role;
+        changes.push(format!("role = \"{v}\""));
+    }
+    if let Some(v) = params.get("status").and_then(|v| v.as_str()) {
+        let status = match v.to_lowercase().as_str() {
+            "active" => duduclaw_core::types::AgentStatus::Active,
+            "paused" => duduclaw_core::types::AgentStatus::Paused,
+            "terminated" => duduclaw_core::types::AgentStatus::Terminated,
+            _ => return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: invalid status '{v}'. Valid: active, paused, terminated")}],
+                "isError": true
+            }),
+        };
+        config.agent.status = status;
+        changes.push(format!("status = \"{v}\""));
+    }
+    if let Some(v) = params.get("trigger").and_then(|v| v.as_str()) {
+        config.agent.trigger = v.to_string();
+        changes.push(format!("trigger = \"{v}\""));
+    }
+    if let Some(v) = params.get("icon").and_then(|v| v.as_str()) {
+        config.agent.icon = v.to_string();
+        changes.push(format!("icon = \"{v}\""));
+    }
+    if let Some(v) = params.get("reports_to").and_then(|v| v.as_str()) {
+        config.agent.reports_to = v.to_string();
+        changes.push(format!("reports_to = \"{v}\""));
+    }
+
+    // -- Model fields --
+    if let Some(v) = params.get("model").and_then(|v| v.as_str()) {
+        config.model.preferred = v.to_string();
+        changes.push(format!("model.preferred = \"{v}\""));
+    }
+    if let Some(v) = params.get("fallback_model").and_then(|v| v.as_str()) {
+        config.model.fallback = v.to_string();
+        changes.push(format!("model.fallback = \"{v}\""));
+    }
+    if let Some(v) = params.get("api_mode").and_then(|v| v.as_str()) {
+        match v {
+            "cli" | "direct" | "auto" => {
+                config.model.api_mode = v.to_string();
+                changes.push(format!("model.api_mode = \"{v}\""));
+            }
+            _ => return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: invalid api_mode '{v}'. Valid: cli, direct, auto")}],
+                "isError": true
+            }),
+        }
+    }
+
+    // -- Budget fields --
+    if let Some(v) = params.get("budget_cents").and_then(|v| v.as_u64()) {
+        config.budget.monthly_limit_cents = v;
+        changes.push(format!("budget.monthly_limit_cents = {v}"));
+    }
+
+    // -- Container fields --
+    if let Some(v) = params.get("max_concurrent").and_then(|v| v.as_u64()) {
+        config.container.max_concurrent = v as u32;
+        changes.push(format!("container.max_concurrent = {v}"));
+    }
+
+    // -- Heartbeat fields --
+    if let Some(v) = params.get("heartbeat_enabled") {
+        if let Some(b) = v.as_bool() {
+            config.heartbeat.enabled = b;
+            changes.push(format!("heartbeat.enabled = {b}"));
+        }
+    }
+    if let Some(v) = params.get("heartbeat_cron").and_then(|v| v.as_str()) {
+        config.heartbeat.cron = v.to_string();
+        changes.push(format!("heartbeat.cron = \"{v}\""));
+    }
+
+    if changes.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: no valid fields to update. Supported fields: display_name, role, status, trigger, icon, reports_to, model, fallback_model, api_mode, budget_cents, max_concurrent, heartbeat_enabled, heartbeat_cron"}],
+            "isError": true
+        });
+    }
+
+    // Serialize and write atomically (temp + rename)
+    let updated_toml = match toml::to_string_pretty(&config) {
+        Ok(s) => s,
+        Err(e) => return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error serializing agent.toml: {e}")}],
+            "isError": true
+        }),
+    };
+
+    let tmp_path = toml_path.with_extension("toml.tmp");
+    if let Err(e) = tokio::fs::write(&tmp_path, &updated_toml).await {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error writing agent.toml: {e}")}],
+            "isError": true
+        });
+    }
+    if let Err(e) = tokio::fs::rename(&tmp_path, &toml_path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error committing agent.toml: {e}")}],
+            "isError": true
+        });
+    }
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": format!(
+            "Agent '{agent_id}' updated successfully.\n\nChanges:\n{}",
+            changes.iter().map(|c| format!("  • {c}")).collect::<Vec<_>>().join("\n")
+        )}]
+    })
+}
+
+/// Remove an agent directory after safety checks.
+///
+/// Refuses to remove the main agent. Moves to `_trash/{name}_{timestamp}` instead
+/// of hard-deleting, so recovery is possible.
+async fn handle_agent_remove(params: &Value, home_dir: &Path) -> Value {
+    let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+    if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: valid agent_id is required"}],
+            "isError": true
+        });
+    }
+
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    let toml_path = agent_dir.join("agent.toml");
+
+    // Verify agent exists
+    let content = match tokio::fs::read_to_string(&toml_path).await {
+        Ok(c) => c,
+        Err(_) => return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: agent '{agent_id}' not found")}],
+            "isError": true
+        }),
+    };
+
+    // Refuse to remove main agent
+    if let Ok(config) = toml::from_str::<duduclaw_core::types::AgentConfig>(&content) {
+        if config.agent.role == duduclaw_core::types::AgentRole::Main {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: cannot remove main agent '{agent_id}'. Change its role first if you really mean to.")}],
+                "isError": true
+            });
+        }
+    }
+
+    // Move to trash instead of hard delete
+    let trash_dir = home_dir.join("agents").join("_trash");
+    let _ = tokio::fs::create_dir_all(&trash_dir).await;
+    let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+    let trash_name = format!("{agent_id}_{timestamp}");
+    let trash_path = trash_dir.join(&trash_name);
+
+    if let Err(e) = tokio::fs::rename(&agent_dir, &trash_path).await {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error moving agent to trash: {e}")}],
+            "isError": true
+        });
+    }
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": format!(
+            "Agent '{agent_id}' removed (moved to trash).\n\
+             Recovery path: {}\n\n\
+             To permanently delete: rm -rf {}",
+            trash_path.display(),
+            trash_path.display()
+        )}]
+    })
+}
+
+/// Update SOUL.md for an agent via the trusted MCP channel.
+///
+/// This bypasses file-protect.sh (which blocks Write/Edit on SOUL.md)
+/// because MCP tools are a trusted code path in the DuDuClaw architecture.
+async fn handle_agent_update_soul(params: &Value, home_dir: &Path) -> Value {
+    let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+    if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: valid agent_id is required"}],
+            "isError": true
+        });
+    }
+
+    let soul_content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    if soul_content.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: content is required (the new SOUL.md text)"}],
+            "isError": true
+        });
+    }
+
+    let agent_dir = home_dir.join("agents").join(agent_id);
+
+    // Verify agent exists
+    if !agent_dir.join("agent.toml").exists() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: agent '{agent_id}' not found")}],
+            "isError": true
+        });
+    }
+
+    let soul_path = agent_dir.join("SOUL.md");
+
+    // Read old content for SHA-256 fingerprint comparison
+    let old_content = tokio::fs::read_to_string(&soul_path).await.unwrap_or_default();
+    let old_hash = {
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(old_content.as_bytes());
+        format!("{:x}", digest)
+    };
+
+    // Atomic write: temp file + rename
+    let tmp_path = soul_path.with_extension("md.tmp");
+    if let Err(e) = tokio::fs::write(&tmp_path, soul_content).await {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error writing SOUL.md: {e}")}],
+            "isError": true
+        });
+    }
+    if let Err(e) = tokio::fs::rename(&tmp_path, &soul_path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error committing SOUL.md: {e}")}],
+            "isError": true
+        });
+    }
+
+    let new_hash = {
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(soul_content.as_bytes());
+        format!("{:x}", digest)
+    };
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": format!(
+            "SOUL.md updated for agent '{agent_id}'.\n\
+             Old SHA-256: {old_hash}\n\
+             New SHA-256: {new_hash}\n\
+             Size: {} bytes",
+            soul_content.len()
+        )}]
+    })
 }
 
 /// Count pending agent_message entries in bus_queue.jsonl for a given agent.
@@ -2712,6 +3044,9 @@ async fn handle_tools_call(
         "list_agents" => handle_list_agents(home_dir).await,
         "agent_status" => handle_agent_status(&arguments, home_dir).await,
         "spawn_agent" => handle_spawn_agent(&arguments, home_dir).await,
+        "agent_update" => handle_agent_update(&arguments, home_dir).await,
+        "agent_remove" => handle_agent_remove(&arguments, home_dir).await,
+        "agent_update_soul" => handle_agent_update_soul(&arguments, home_dir).await,
         "skill_search" => handle_skill_search(&arguments, home_dir).await,
         "skill_list" => handle_skill_list(&arguments, home_dir).await,
         "submit_feedback" => handle_submit_feedback(&arguments, home_dir, default_agent).await,
