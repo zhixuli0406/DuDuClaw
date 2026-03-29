@@ -12,6 +12,9 @@ pub enum AgentRole {
     Main,
     Specialist,
     Worker,
+    Developer,
+    Qa,
+    Planner,
 }
 
 /// Current lifecycle status of an agent.
