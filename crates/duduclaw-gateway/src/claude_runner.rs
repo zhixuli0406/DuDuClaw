@@ -520,8 +520,8 @@ async fn get_api_key(home_dir: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Default idle timeout in seconds — resets every time new data arrives.
-const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
+/// Hard max timeout — absolute safety net to kill truly hung processes.
+const HARD_MAX_TIMEOUT_SECS: u64 = 30 * 60; // 30 minutes
 
 /// Response from a Claude CLI call, including optional token usage telemetry.
 struct ClaudeResponse {
@@ -531,13 +531,15 @@ struct ClaudeResponse {
 
 /// Spawn a `claude` CLI process with streaming output and read the result.
 ///
-/// Uses `--output-format stream-json --verbose` and an idle timeout that resets
-/// on every received line. This means long-running responses (tool use, multi-turn)
-/// will never be killed as long as the CLI keeps producing events.
+/// Uses `--output-format stream-json --verbose`. No idle timeout — the process
+/// runs until it completes or hits the hard max timeout (30 min safety net).
+/// An optional `on_progress` callback receives `ProgressEvent`s for keepalive
+/// and tool-use progress (used by channel reply; cron/dispatch pass `None`).
 ///
 /// Extracts `TokenUsage` from the `result` event's `usage` field when available.
 async fn call_claude_streaming(
     cmd: &mut tokio::process::Command,
+    on_progress: Option<&crate::channel_reply::ProgressCallback>,
 ) -> Result<ClaudeResponse, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -550,58 +552,105 @@ async fn call_claude_streaming(
     let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 
-    let idle_timeout = std::time::Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS);
     let mut result_text = String::new();
     let mut token_usage: Option<crate::cost_telemetry::TokenUsage> = None;
+    let mut last_tool_reported: Option<String> = None;
+
+    // Keepalive timer (90s) — only meaningful when on_progress is Some
+    let mut keepalive = tokio::time::interval(
+        std::time::Duration::from_secs(crate::channel_reply::KEEPALIVE_INTERVAL_SECS),
+    );
+    keepalive.reset();
+
+    // Hard max timeout — absolute safety net
+    let hard_deadline = tokio::time::sleep(
+        std::time::Duration::from_secs(HARD_MAX_TIMEOUT_SECS),
+    );
+    tokio::pin!(hard_deadline);
 
     loop {
-        match tokio::time::timeout(idle_timeout, reader.next_line()).await {
-            Err(_) => {
-                let _ = child.kill().await;
-                if result_text.is_empty() {
-                    return Err(format!("claude CLI idle timeout ({DEFAULT_IDLE_TIMEOUT_SECS}s, no output)"));
-                }
-                warn!("claude CLI idle timeout — returning partial result ({} chars)", result_text.len());
-                break;
-            }
-            Ok(Ok(None)) => break, // stream ended
-            Ok(Err(e)) => {
-                let _ = child.kill().await;
-                return Err(format!("claude CLI read error: {e}"));
-            }
-            Ok(Ok(Some(line))) => {
-                if line.trim().is_empty() { continue; }
-                if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
-                    match event.get("type").and_then(|t| t.as_str()) {
-                        Some("result") => {
-                            if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
-                                result_text = text.to_string();
-                            }
-                            // Extract token usage from result event
-                            if let Some(usage_val) = event.get("usage") {
-                                token_usage = crate::cost_telemetry::TokenUsage::from_json(usage_val);
-                            }
-                        }
-                        Some("assistant") => {
-                            if let Some(content) = event.pointer("/message/content").and_then(|c| c.as_array()) {
-                                for block in content {
-                                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                            result_text = text.to_string();
+        tokio::select! {
+            line_result = reader.next_line() => {
+                match line_result {
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = child.kill().await;
+                        return Err(format!("claude CLI read error: {e}"));
+                    }
+                    Ok(Some(line)) => {
+                        keepalive.reset();
+                        if line.trim().is_empty() { continue; }
+
+                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+                            match event.get("type").and_then(|t| t.as_str()) {
+                                Some("result") => {
+                                    if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
+                                        result_text = text.to_string();
+                                    }
+                                    if let Some(usage_val) = event.get("usage") {
+                                        token_usage = crate::cost_telemetry::TokenUsage::from_json(usage_val);
+                                    }
+                                }
+                                Some("assistant") => {
+                                    if let Some(content) = event.pointer("/message/content").and_then(|c| c.as_array()) {
+                                        for block in content {
+                                            let block_type = block.get("type").and_then(|t| t.as_str());
+                                            match block_type {
+                                                Some("text") => {
+                                                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                                        result_text = text.to_string();
+                                                    }
+                                                }
+                                                Some("tool_use") => {
+                                                    if let Some(cb) = on_progress {
+                                                        let tool = block.get("name")
+                                                            .and_then(|n| n.as_str())
+                                                            .unwrap_or("unknown")
+                                                            .to_string();
+                                                        let detail = crate::channel_reply::extract_tool_detail(block);
+                                                        let dominated = last_tool_reported
+                                                            .as_ref()
+                                                            .is_some_and(|prev| *prev == tool && detail.is_none());
+                                                        if !dominated {
+                                                            cb(crate::channel_reply::ProgressEvent::ToolUse {
+                                                                tool: tool.clone(),
+                                                                detail,
+                                                            });
+                                                            last_tool_reported = Some(tool);
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    if token_usage.is_none() {
+                                        if let Some(usage_val) = event.pointer("/message/usage") {
+                                            token_usage = crate::cost_telemetry::TokenUsage::from_json(usage_val);
                                         }
                                     }
                                 }
-                            }
-                            // Also check usage in assistant message events
-                            if token_usage.is_none() {
-                                if let Some(usage_val) = event.pointer("/message/usage") {
-                                    token_usage = crate::cost_telemetry::TokenUsage::from_json(usage_val);
-                                }
+                                _ => {}
                             }
                         }
-                        _ => {}
                     }
                 }
+            }
+
+            _ = keepalive.tick() => {
+                if let Some(cb) = on_progress {
+                    cb(crate::channel_reply::ProgressEvent::Keepalive);
+                }
+            }
+
+            _ = &mut hard_deadline => {
+                warn!("claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s) — killing process");
+                let _ = child.kill().await;
+                if result_text.is_empty() {
+                    return Err(format!("claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s, no output)"));
+                }
+                warn!("claude CLI hard timeout — returning partial result ({} chars)", result_text.len());
+                break;
             }
         }
     }
@@ -635,6 +684,8 @@ fn prepare_claude_cmd(
         // Subprocess has no TTY — auto-accept tool permissions.
         // Security is enforced by DuDuClaw's CONTRACT.toml + container sandbox.
         "--permission-mode", "auto",
+        // Allow enough agentic turns for complex tasks (read → think → write).
+        "--max-turns", "50",
     ]);
 
     let prompt_guard = if !system_prompt.is_empty() {
@@ -679,7 +730,7 @@ async fn call_claude_with_env(
         }
     }
 
-    call_claude_streaming(&mut cmd).await
+    call_claude_streaming(&mut cmd, None).await
 }
 
 /// Call the `claude` CLI binary with a prompt and return the response text.
@@ -693,7 +744,7 @@ async fn call_claude(
     let (mut cmd, _prompt_guard) = prepare_claude_cmd(&claude, prompt, model, system_prompt);
     cmd.env("ANTHROPIC_API_KEY", api_key);
 
-    call_claude_streaming(&mut cmd).await
+    call_claude_streaming(&mut cmd, None).await
 }
 
 /// Find the `claude` CLI binary — delegates to shared impl in duduclaw-core (BE-L1).
