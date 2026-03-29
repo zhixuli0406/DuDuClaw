@@ -2,6 +2,7 @@
 
 > 對應 [business-plan.md](./business-plan.md) 的技術實作項目
 > Priority: P0 = 立即（M1-2）、P1 = 短期（M3-6）、P2 = 中期（M6-12）、P3 = 長期（Y2+）
+> Last updated: 2026-03-29 | Project version: v0.9.0
 
 ---
 
@@ -9,75 +10,46 @@
 
 > 這些行動優先於任何產品開發，應立即啟動
 
-### 0.0 授權模式變更：MIT → BSL 1.1 [P0-NOW — 最高優先]
+### 0.0 授權與智財保護 [P0-NOW]
 
-> 必須在任何推廣行動之前完成，否則推廣出去後再改授權會引發社群反彈
+- [x] ~~**授權模式變更**~~ ✅ 已完成
+  - [x] `LICENSE` — 已採用 **Elastic License 2.0 (ELv2)**（比原計畫 BSL 1.1 更嚴格，禁止託管服務）
+  - [x] `LICENSING.md` — 已完成中英文 FAQ（個人/企業內部免費、託管服務需商業授權）
+  - [x] `Cargo.toml` license = "Elastic-2.0"
+  - [x] README.md License badge 已更新
 
-- [ ] **BSL 1.1 授權文件**
-  - [ ] 撰寫 `LICENSE` 文件（BSL 1.1 格式）
-    - [ ] Licensor: DuDuClaw Contributors
-    - [ ] Licensed Work: DuDuClaw v0.9.0+（從下個版本起生效）
-    - [ ] Additional Use Grant: 個人/教育/非商業/企業內部使用免費
-    - [ ] Change License: MIT
-    - [ ] Change Date: 發布日 + 36 個月
-  - [ ] 撰寫 `LICENSING.md` 說明文件（常見問題 FAQ 格式）
-    - [ ] 「我是個人開發者，需要付費嗎？」→ 不用
-    - [ ] 「我在公司內部用，需要付費嗎？」→ 不用（內部使用免費）
-    - [ ] 「我用 DuDuClaw 幫客戶做 AI 客服收費，需要付費嗎？」→ 需要
-    - [ ] 「我 Fork 後改名字賣，可以嗎？」→ 不行（BSL 限制 + 商標保護）
-    - [ ] 「36 個月後真的會變 MIT 嗎？」→ 是的，寫在 LICENSE 裡，法律保證
-  - [ ] 更新 `Cargo.toml` workspace package license 欄位
-  - [ ] 更新 README.md License 段落 + badge
-  - [ ] 在 GitHub Release Notes 說明授權變更理由
+- [x] ~~**Open Core 邊界定義**~~ ✅ 部分完成
+  - [x] `commercial/` 目錄已建立（含 `.gitkeep`）
+  - [ ] 填充商業閉源子目錄：
+    - [ ] `commercial/duduclaw-license/` — 授權驗證 crate
+    - [ ] `commercial/templates-premium/` — 產業 SOUL.md 調校版
+    - [ ] `commercial/evolution-params/` — Evolution 最佳參數集
+    - [ ] `commercial/dashboard-enterprise/` — ROI 報表、稽核匯出
+  - [ ] 安全補丁發布 SOP 文件：商業版即時 → 開源版延遲 30 天
 
 - [ ] **商標註冊啟動**
   - [ ] 確認「DuDuClaw」+ 爪印 Logo 在智慧財產局無衝突
   - [ ] 提交商標申請（類別 9: 電腦軟體、類別 42: 軟體即服務）
   - [ ] 預算：NT$6,000-10,000（政府規費 + 代辦）
 
-- [ ] **Open Core 邊界定義**
-  - [ ] 建立 `commercial/` 目錄（.gitignore 排除，不推至公開 repo）
-  - [ ] 定義哪些模組為商業閉源（見 business-plan.md §2.0.2）：
-    - [ ] `commercial/duduclaw-license/` — 授權驗證
-    - [ ] `commercial/templates-premium/` — 產業 SOUL.md 調校版
-    - [ ] `commercial/evolution-params/` — Evolution 最佳參數集
-    - [ ] `commercial/dashboard-enterprise/` — ROI 報表、稽核匯出
-  - [ ] 安全補丁發布 SOP：商業版即時 → 開源版延遲 30 天
+### 0.0.1 內容分層策略 [P0-NOW]
 
-### 0.0.1 內容分層策略建立 [P0-NOW]
+- [x] ~~**內容分類規則文件**~~ ✅ 已完成
+  - [x] `docs/content-policy.md` — 三層分類已定義（公開/半公開/付費專屬）
 
-- [ ] **制定內容分類規則文件** `docs/content-policy.md`
-  - [ ] 公開內容規範（What + Why）：
-    - [ ] 安裝教學：完整 `brew install` + `duduclaw onboard` 流程 ✅ 公開
-    - [ ] 單 Agent + 單頻道 Demo ✅ 公開
-    - [ ] 架構原理、設計理念 ✅ 公開
-    - [ ] Community 版全部功能操作 ✅ 公開
-  - [ ] 半公開內容規範（How，付費教育）：
-    - [ ] 多頻道整合實戰 → 體驗營 / 實戰班限定
-    - [ ] Odoo ERP 整合 step-by-step → 實戰班限定
-    - [ ] Evolution Engine 參數調校 → 實戰班限定
-    - [ ] 踩坑經驗 + 排錯 SOP → 實戰班限定
-  - [ ] 付費專屬內容規範（How Well，導入服務）：
-    - [ ] 客製化 SOUL.md 人格設計 → 導入專案
-    - [ ] CONTRACT.toml 行為邊界顧問 → 導入專案
-    - [ ] 持續調校 + 月度優化報告 → 維護合約
-    - [ ] SLA + 緊急支援 → 維護合約
-
-- [ ] **YouTube 內容規則**
+- [ ] **YouTube 內容規則**（待開始產出內容時執行）
   - [ ] 每支影片結尾固定 CTA：LINE OA QR Code + 官網連結
   - [ ] Pro/Enterprise 功能：只展示效果畫面，不教完整設定步驟
   - [ ] Evolution 演化：展示 SOUL.md 自動改善的前後對比，不教參數
   - [ ] Odoo 整合：展示「詢價 → 自動查價目表 → 回覆」流程，不教設定
 
-- [ ] **客戶黏著機制設計**
+- [ ] **客戶黏著機制實作**
   - [ ] 自動更新：付費版 `duduclaw update` 即時取得最新版 + 安全補丁
   - [ ] 模型庫訂閱概念：持續更新產業專用 GGUF 模型（含在維護合約中）
   - [ ] SOUL.md 模板市集：經實戰驗證的 Agent 人格，持續新增
   - [ ] 數據飛輪提醒：Dashboard 顯示「您的 Agent 已累積 N 筆記憶，演化 M 次」
 
 ---
-
-### 0.1 用自己的產品推廣自己（Dog-fooding）[P0-NOW]
 
 ### 0.1 用自己的產品推廣自己（Dog-fooding）[P0-NOW]
 
@@ -103,15 +75,15 @@
 
 ### 0.2 GitHub 病毒式引爆 [P0-NOW]
 
-- [ ] **README.md 重寫**
+- [ ] **README.md 強化**（現有基礎已佳，需補強以下項目）
+  - [x] ~~Badge 牆：License / Version / CI / Rust / Python~~ ✅ 已有
+  - [x] ~~安裝指令（Homebrew / one-liner / source build）~~ ✅ 已有
+  - [x] ~~核心特色表格~~ ✅ 已有完整 feature table
+  - [x] ~~架構圖 + Agent 目錄結構~~ ✅ 已有
   - [ ] 首屏：30 秒 GIF Demo（LINE 對話 → Agent 回覆 → Evolution 演化 → 零成本）
-  - [ ] 一行安裝指令：`brew install zhixuli0406/tap/duduclaw` 置頂
-  - [ ] Badge 牆：License / Version / Stars / CI / Discord 在線人數
-  - [ ] 「Why DuDuClaw?」3 點快速價值主張
   - [ ] Star History 動態圖表（star-history.com embed）
-  - [ ] 截圖展示：Dashboard / Agent 對話 / Evolution 演化 / 本地推論
   - [ ] 對比表：DuDuClaw vs OpenClaw vs NanoClaw vs MicroClaw
-  - [ ] 中英雙語（zh-TW 為主、en 次之）
+  - [ ] Discord 在線人數 badge（待 Discord 建立後加入）
 
 - [ ] **Awesome Lists 收錄**
   - [ ] 提交 PR 至 `awesome-rust`
@@ -157,7 +129,7 @@
 ### 1.1 授權系統 `duduclaw-license` [P0]
 
 > 此 crate 為商業閉源模組，放在 `commercial/duduclaw-license/`，不推至公開 repo。
-> BSL 1.1 授權變更（§0.0）必須先於此 crate 實作完成。
+> ELv2 授權（§0.0）已完成，此 crate 可直接開始實作。
 
 #### 1.1.1 新增 Crate
 
@@ -169,7 +141,7 @@
   - [ ] `src/tier.rs` — `LicenseTier` enum: `Community | Pro | Enterprise | OEM`
   - [ ] `src/gate.rs` — `FeatureGate` trait：依授權等級啟用/停用功能
   - [ ] `src/fingerprint.rs` — 機器指紋（MAC + hostname hash）
-  - [ ] `src/bsl.rs` — BSL 1.1 合規檢查（商業使用偵測 + Change Date 自動解鎖）
+  - [ ] `src/elv2.rs` — ELv2 合規檢查（託管服務偵測 + license key 保護）
   - [ ] `src/error.rs` — 授權相關錯誤類型
 
 #### 1.1.2 功能閘門定義
@@ -177,16 +149,16 @@
 - [ ] 定義功能矩陣（`features.toml` 或 embedded constant）：
 
   ```
-  Community (BSL 1.1 — 非商業免費):
+  Community (ELv2 — 非託管服務免費):
     max_channels: 1
     max_agents: 1
-    evolution_enabled: true (full features, non-commercial only)
-    odoo_enabled: true (non-commercial only)
+    evolution_enabled: true (full features, non-hosted-service only)
+    odoo_enabled: true (non-hosted-service only)
     container_sandbox: true
     local_inference: true (all backends)
     compression: all
     security_hooks: all layers
-    commercial_use: false (BSL 1.1 restriction)
+    hosted_service: false (ELv2 restriction)
     security_patch_delay: 30 days
 
   Pro (商業授權 — 單機):
@@ -717,11 +689,12 @@
 
 ### 3.7 多語系支援強化 [P2]
 
-- [ ] `web/src/i18n/`
-  - [ ] 完善 zh-TW 翻譯覆蓋率至 100%
-  - [ ] 新增 en-US（國際客戶 + 經銷商）
-  - [ ] 新增 ja-JP（日本市場，LINE 普及）
-  - [ ] SOUL.md 模板多語版本
+- [x] ~~`web/src/i18n/` 基礎框架~~ ✅ 已有 Zustand i18n store
+  - [x] zh-TW 翻譯 ✅ 已有
+  - [x] en 翻譯 ✅ 已有
+- [ ] 完善 zh-TW / en 翻譯覆蓋率至 100%（檢查是否有遺漏的 key）
+- [ ] 新增 ja-JP（日本市場，LINE 普及）
+- [ ] SOUL.md 模板多語版本
 
 ### 3.8 SaaS 基礎設施準備 [P2]
 
@@ -781,11 +754,11 @@
 
 ### 法律與行政
 
-- [ ] BSL 1.1 授權文件 — 已移至 §0.0（最高優先）
-- [ ] 商標註冊 — 已移至 §0.0（與授權同步）
+- [x] ~~授權文件~~ ✅ ELv2 已完成（見 §0.0）
+- [ ] 商標註冊 — 見 §0.0（待執行）
 - [ ] 公司設立（有限公司，資本額 NT$500,000）
 - [ ] 統一編號申請
-- [ ] EULA 商業授權合約撰寫（委託律師，需涵蓋 BSL 1.1 商業使用條款）
+- [ ] EULA 商業授權合約撰寫（委託律師，需涵蓋 ELv2 商業託管服務條款）
 - [ ] 服務條款 + 隱私權政策（官網 + SaaS）
 - [ ] 專業責任保險投保
 - [ ] 記帳事務所委託
@@ -848,17 +821,17 @@
 
 ```
 DuDuClaw/
-├── LICENSE                    # [MODIFY] P0-NOW — MIT → BSL 1.1
-├── LICENSING.md               # [NEW] P0-NOW — 授權 FAQ（常見問題）
+├── LICENSE                    # [✅ DONE] ELv2 授權
+├── LICENSING.md               # [✅ DONE] 授權 FAQ（中英文）
 ├── crates/
-│   ├── duduclaw-billing/      # [NEW] P3 — 計費引擎（開源）
-│   ├── duduclaw-marketplace/  # [NEW] P3 — MCP 市集（開源）
-│   └── (existing 12 crates — 維持 BSL 1.1 開源)
-├── commercial/                # [NEW] P0 — 商業閉源模組（.gitignore 排除）
-│   ├── duduclaw-license/      # 授權驗證 + 功能閘門 + BSL 合規檢查
-│   ├── templates-premium/     # 產業 SOUL.md 調校版（實戰驗證）
-│   ├── evolution-params/      # Evolution 最佳參數集
-│   └── dashboard-enterprise/  # ROI 報表、稽核匯出、經銷商入口
+│   ├── duduclaw-billing/      # [NEW] P3 — 計費引擎
+│   ├── duduclaw-marketplace/  # [NEW] P3 — MCP 市集
+│   └── (existing 12 crates — ELv2 授權)
+├── commercial/                # [✅ EXISTS] 商業閉源模組（目前僅 .gitkeep）
+│   ├── duduclaw-license/      # [NEW] P0 — 授權驗證 + 功能閘門
+│   ├── templates-premium/     # [NEW] P1 — 產業 SOUL.md 調校版
+│   ├── evolution-params/      # [NEW] P1 — Evolution 最佳參數集
+│   └── dashboard-enterprise/  # [NEW] P2 — ROI 報表、稽核匯出
 ├── templates/                 # [NEW] P0-P1 — 產業模板（基礎版，公開）
 │   ├── restaurant/
 │   ├── manufacturing/
@@ -873,9 +846,9 @@ DuDuClaw/
 │   ├── press-kit/             # 媒體素材包（Logo/截圖/簡介）
 │   └── slide-decks/           # 簡報模板（體驗營/研討會/說明會）
 ├── docs/
-│   ├── business-plan.md       # [UPDATED] v1.1 — 含授權策略 + 護城河
-│   ├── content-policy.md      # [NEW] P0-NOW — 內容分層規範
-│   ├── TODO-commercialization.md  # [UPDATED] 本文件
+│   ├── business-plan.md       # [✅ DONE] v1.1 — 含授權策略 + 護城河
+│   ├── content-policy.md      # [✅ DONE] 內容分層規範（三層策略）
+│   ├── TODO-commercialization.md  # [✅ DONE] 本文件
 │   └── implementation-methodology/  # [NEW] P1 — 導入方法論
 ├── web/src/pages/
 │   ├── LicensePage.tsx        # [NEW] P0
