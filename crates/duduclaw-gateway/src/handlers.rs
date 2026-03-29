@@ -1174,7 +1174,7 @@ impl MethodHandler {
             return WsFrame::error_response("", "Missing 'agent_id' or 'query' parameter");
         }
 
-        let db_path = self.home_dir.join("state.db");
+        let db_path = self.home_dir.join("memory.db");
         if !db_path.exists() {
             return WsFrame::ok_response("", json!({ "results": [] }));
         }
@@ -1209,7 +1209,7 @@ impl MethodHandler {
             return WsFrame::error_response("", "Missing 'agent_id' parameter");
         }
 
-        let db_path = self.home_dir.join("state.db");
+        let db_path = self.home_dir.join("memory.db");
         if !db_path.exists() {
             return WsFrame::ok_response("", json!({ "entries": [] }));
         }

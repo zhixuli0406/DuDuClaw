@@ -92,7 +92,7 @@ export class DuDuClawClient {
         // If token is provided, authenticate first
         if (this.token) {
           try {
-            await this.call('connect', { token: this.token });
+            await this.call('connect', { token: this.token }, true);
             this.setState('authenticated');
           } catch (e) {
             console.error('[WS] Authentication failed:', e);
@@ -103,7 +103,7 @@ export class DuDuClawClient {
         } else {
           // No token configured — still verify connection with server handshake
           try {
-            await this.call('connect', { version: '0.6.5' });
+            await this.call('connect', { version: '0.6.5' }, true);
             this.setState('authenticated');
           } catch {
             // Server may not require auth — allow connection for local-only dashboard
@@ -145,12 +145,22 @@ export class DuDuClawClient {
     }
   }
 
-  call(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
-    // If WebSocket isn't ready yet, wait for it (up to 10s).
-    // This prevents race conditions on page refresh where components
-    // call API methods before the WebSocket handshake completes.
+  /**
+   * Send an RPC request over the WebSocket.
+   *
+   * If `skipAuthWait` is true, only waits for `WebSocket.OPEN` (used for
+   * the handshake `connect` call itself). Otherwise waits until state
+   * reaches `authenticated` to prevent race conditions where API calls
+   * fire before the handshake completes.
+   */
+  call(method: string, params: Record<string, unknown> = {}, skipAuthWait = false): Promise<unknown> {
     const waitForReady = (): Promise<void> => {
-      if (this.ws?.readyState === WebSocket.OPEN) return Promise.resolve();
+      // For handshake calls, only need WS to be open
+      const isReady = skipAuthWait
+        ? this.ws?.readyState === WebSocket.OPEN
+        : this._state === 'authenticated';
+
+      if (isReady) return Promise.resolve();
       if (this._state === 'disconnected' && !this.reconnectTimer) {
         return Promise.reject(new Error('Not connected'));
       }
@@ -159,7 +169,10 @@ export class DuDuClawClient {
           reject(new Error(`WebSocket not ready after 10s (state: ${this._state})`));
         }, 10000);
         const check = setInterval(() => {
-          if (this.ws?.readyState === WebSocket.OPEN) {
+          const ready = skipAuthWait
+            ? this.ws?.readyState === WebSocket.OPEN
+            : this._state === 'authenticated';
+          if (ready) {
             clearInterval(check);
             clearTimeout(maxWait);
             resolve();
