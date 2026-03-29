@@ -571,6 +571,10 @@ async fn call_claude_cli(
         "--model", model,
         "--output-format", "stream-json",
         "--verbose",
+        // Channel subprocess has no TTY — auto-accept tool permissions.
+        // Agent-level security is enforced by CONTRACT.toml + container sandbox,
+        // not by Claude Code's interactive permission prompts.
+        "--permission-mode", "auto",
     ]);
     if let Some(ref key) = api_key {
         cmd.env("ANTHROPIC_API_KEY", key);
