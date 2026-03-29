@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use crate::channel_reply::{ReplyContext, build_reply, set_channel_connected};
+use crate::channel_reply::{ReplyContext, build_reply_with_progress, set_channel_connected};
 
 const TELEGRAM_API: &str = "https://api.telegram.org";
 
@@ -185,7 +185,32 @@ async fn poll_loop(
 
                     info!("📩 Telegram [{sender}]: {}", &text[..text.len().min(80)]);
 
-                    let reply = build_reply(text, &ctx).await;
+                    // Progress callback: sends keepalive/tool-use messages to the chat.
+                    // Uses debounce (min 30s between sends) to respect Telegram rate limits.
+                    let progress_client = client.clone();
+                    let progress_api = api_base.clone();
+                    let progress_chat_id = msg.chat.id;
+                    let last_progress = Arc::new(std::sync::Mutex::new(std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_secs(60))
+                        .unwrap_or_else(std::time::Instant::now)));
+                    let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
+                        // Debounce: skip if last progress was < 30s ago
+                        let mut last = last_progress.lock().unwrap();
+                        if last.elapsed().as_secs() < 30 {
+                            return;
+                        }
+                        *last = std::time::Instant::now();
+                        drop(last);
+
+                        let msg_text = event.to_display();
+                        let c = progress_client.clone();
+                        let api = progress_api.clone();
+                        tokio::spawn(async move {
+                            send_reply(&c, &api, progress_chat_id, &msg_text).await;
+                        });
+                    });
+
+                    let reply = build_reply_with_progress(text, &ctx, Some(on_progress)).await;
                     send_reply(&client, &api_base, msg.chat.id, &reply).await;
                 }
             }

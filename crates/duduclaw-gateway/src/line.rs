@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tracing::{error, info, warn};
 
-use crate::channel_reply::{ChannelStatusMap, ReplyContext, build_reply, set_channel_connected};
+use crate::channel_reply::{ChannelStatusMap, ReplyContext, build_reply_with_progress, set_channel_connected};
 
 const LINE_API: &str = "https://api.line.me/v2/bot";
 
@@ -199,7 +199,39 @@ async fn line_webhook_handler(
 
             info!("📩 LINE [{sender}]: {}", &text[..text.len().min(80)]);
 
-            let reply = build_reply(text, &state.ctx).await;
+            // Progress callback via Push API (requires userId).
+            // LINE Push API has monthly message quotas — debounce at 60s
+            // (more conservative than Telegram's 30s).
+            let user_id_for_push = event.source
+                .as_ref()
+                .and_then(|s| s.user_id.clone());
+            let on_progress: Option<crate::channel_reply::ProgressCallback> = if let Some(uid) = user_id_for_push {
+                let push_http = state.http.clone();
+                let push_token = state.token.clone();
+                let last_progress = Arc::new(std::sync::Mutex::new(std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(120))
+                    .unwrap_or_else(std::time::Instant::now)));
+                Some(Box::new(move |event: crate::channel_reply::ProgressEvent| {
+                    let mut last = last_progress.lock().unwrap();
+                    if last.elapsed().as_secs() < 60 {
+                        return;
+                    }
+                    *last = std::time::Instant::now();
+                    drop(last);
+
+                    let msg_text = event.to_display();
+                    let c = push_http.clone();
+                    let t = push_token.clone();
+                    let u = uid.clone();
+                    tokio::spawn(async move {
+                        push_message(&c, &t, &u, &msg_text).await;
+                    });
+                }))
+            } else {
+                None
+            };
+
+            let reply = build_reply_with_progress(text, &state.ctx, on_progress).await;
             send_reply(&state.http, &state.token, reply_token, &reply).await;
         }
     }
@@ -257,6 +289,33 @@ async fn send_reply(http: &reqwest::Client, token: &str, reply_token: &str, text
             error!("LINE reply failed ({status}): {}", &text[..text.len().min(200)]);
         }
         Err(e) => error!("LINE reply error: {e}"),
+        _ => {}
+    }
+}
+
+/// Send a push message to a specific LINE user (for progress updates).
+///
+/// Uses the LINE Push API which counts against the monthly message quota.
+async fn push_message(http: &reqwest::Client, token: &str, user_id: &str, text: &str) {
+    let body = serde_json::json!({
+        "to": user_id,
+        "messages": [{ "type": "text", "text": text }]
+    });
+
+    match http
+        .post(format!("{LINE_API}/message/push"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if !resp.status().is_success() => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warn!("LINE push failed ({status}): {}", &body[..body.len().min(200)]);
+        }
+        Err(e) => warn!("LINE push error: {e}"),
         _ => {}
     }
 }

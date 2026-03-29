@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
-use crate::channel_reply::{ReplyContext, build_reply, set_channel_connected};
+use crate::channel_reply::{ReplyContext, build_reply_with_progress, set_channel_connected};
 
 const DISCORD_API: &str = "https://discord.com/api/v10";
 
@@ -343,9 +343,39 @@ async fn handle_message_create(
 
     info!("📩 Discord [{author_name}]: {}", &content[..content.len().min(80)]);
 
-    let reply = build_reply(content, ctx).await;
+    // Progress callback: send keepalive/tool-use messages to the same channel.
+    // Debounce at 30s to avoid flooding.
+    let progress_http = http.clone();
+    let progress_token = token.to_string();
+    let progress_channel = channel_id.to_string();
+    let last_progress = Arc::new(std::sync::Mutex::new(std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(60))
+        .unwrap_or_else(std::time::Instant::now)));
+    let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
+        let mut last = last_progress.lock().unwrap();
+        if last.elapsed().as_secs() < 30 {
+            return;
+        }
+        *last = std::time::Instant::now();
+        drop(last);
 
-    // Send reply via REST API
+        let msg_text = event.to_display();
+        let c = progress_http.clone();
+        let t = progress_token.clone();
+        let ch = progress_channel.clone();
+        tokio::spawn(async move {
+            let _ = c
+                .post(format!("{DISCORD_API}/channels/{ch}/messages"))
+                .header("Authorization", format!("Bot {t}"))
+                .json(&json!({ "content": msg_text }))
+                .send()
+                .await;
+        });
+    });
+
+    let reply = build_reply_with_progress(content, ctx, Some(on_progress)).await;
+
+    // Send final reply via REST API
     match http
         .post(format!("{DISCORD_API}/channels/{channel_id}/messages"))
         .header("Authorization", format!("Bot {token}"))

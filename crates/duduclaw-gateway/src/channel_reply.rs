@@ -100,15 +100,33 @@ pub async fn set_channel_connected(status: &ChannelStatusMap, name: &str, connec
 /// 2. Fallback to direct Anthropic API (Rust reqwest) — single key only
 /// 3. Fallback to static error message
 pub async fn build_reply(text: &str, ctx: &ReplyContext) -> String {
-    build_reply_with_session(text, ctx, "default", "anonymous").await
+    build_reply_with_session(text, ctx, "default", "anonymous", None).await
 }
 
-/// Build a reply with session tracking.
+/// Build a reply with progress streaming.
+///
+/// `on_progress` callback receives real-time progress events (keepalive,
+/// tool-use details) that the channel handler can forward to the user.
+pub async fn build_reply_with_progress(
+    text: &str,
+    ctx: &ReplyContext,
+    on_progress: Option<ProgressCallback>,
+) -> String {
+    build_reply_with_session(text, ctx, "default", "anonymous", on_progress).await
+}
+
+/// Build a reply with session tracking and optional progress streaming.
 ///
 /// `user_id` should be the stable per-user identifier from the channel
 /// (e.g., Telegram chat_id, LINE sender ID, Discord user ID).
 /// This feeds the prediction engine's per-user statistical models.
-pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id: &str, user_id: &str) -> String {
+pub async fn build_reply_with_session(
+    text: &str,
+    ctx: &ReplyContext,
+    session_id: &str,
+    user_id: &str,
+    on_progress: Option<ProgressCallback>,
+) -> String {
     // Determine which agent to use: config.toml default_agent → main_agent() → fallback
     let default_agent_name = get_default_agent(&ctx.home_dir).await;
 
@@ -228,7 +246,7 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
     };
 
     // 1. Try `claude` CLI directly (Claude Code SDK — has built-in tools)
-    let reply = match call_claude_cli(text, &model, &full_system_prompt, &ctx.home_dir).await {
+    let reply = match call_claude_cli(text, &model, &full_system_prompt, &ctx.home_dir, agent_dir.as_deref(), on_progress.as_ref()).await {
         Ok(reply) => {
             info!("Claude replied via Claude Code SDK ({} chars)", reply.len());
             Some(reply)
@@ -498,7 +516,7 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
                     "Summarize the following conversation history concisely for use as context \
                      in future turns. Include key facts, decisions, and outcomes. Max 400 words.\n\n{transcript}"
                 );
-                let summary = match call_claude_cli(&prompt, "claude-haiku-4-5", "", &home_for_compress).await {
+                let summary = match call_claude_cli(&prompt, "claude-haiku-4-5", "", &home_for_compress, None, None).await {
                     Ok(s) => s,
                     Err(_) => "[Session compressed — previous conversation summary omitted for brevity]".to_string(),
                 };
@@ -528,10 +546,60 @@ pub async fn build_reply_with_session(text: &str, ctx: &ReplyContext, session_id
 
 // ── Claude Code SDK (claude CLI) ────────────────────────────
 
-/// Call the `claude` CLI (Claude Code SDK) with streaming output.
+// ── Streaming progress types ───────────────────────────────
+
+/// Progress events emitted during Claude CLI streaming.
 ///
-/// Uses `--output-format stream-json --verbose` to read incremental events.
-/// Instead of a hard total timeout, uses an **idle timeout** (default 120s):
+/// Sent to the channel via callback so users see real-time progress
+/// instead of silence during long-running agentic tasks.
+#[derive(Debug, Clone)]
+pub enum ProgressEvent {
+    /// Periodic keepalive — no new stream-json events for `keepalive_interval`.
+    Keepalive,
+    /// Claude is using a tool (parsed from stream-json `tool_use` content block).
+    ToolUse {
+        tool: String,
+        /// Optional file path or search pattern extracted from tool input.
+        detail: Option<String>,
+    },
+}
+
+impl ProgressEvent {
+    /// Format as a user-facing progress message.
+    pub fn to_display(&self) -> String {
+        match self {
+            Self::Keepalive => "⏳ 仍在處理中…".to_string(),
+            Self::ToolUse { tool, detail } => {
+                let action = match tool.as_str() {
+                    "Read" | "read" => "正在讀取",
+                    "Write" | "write" => "正在撰寫",
+                    "Edit" | "edit" => "正在編輯",
+                    "Grep" | "grep" | "search" => "正在搜尋",
+                    "Glob" | "glob" => "正在搜尋檔案",
+                    "Bash" | "bash" => "正在執行指令",
+                    _ => "正在使用工具",
+                };
+                match detail {
+                    Some(d) => format!("⏳ {action} {d}…"),
+                    None => format!("⏳ {action}…"),
+                }
+            }
+        }
+    }
+}
+
+/// Callback type for sending progress events to the channel.
+///
+/// The callback is `Send + Sync` so it can be invoked from the streaming loop.
+/// Implementations should be lightweight (just enqueue a message send).
+pub type ProgressCallback = Box<dyn Fn(ProgressEvent) + Send + Sync>;
+
+/// Keepalive interval — send progress if no stream-json events for this long.
+pub(crate) const KEEPALIVE_INTERVAL_SECS: u64 = 90;
+
+/// Hard max timeout — absolute safety net to kill truly hung processes.
+const HARD_MAX_TIMEOUT_SECS: u64 = 30 * 60; // 30 minutes
+
 /// Internal wrapper for GVU loop LLM calls.
 /// Restricted to crate-internal use with model allowlist.
 const ALLOWED_EVOLUTION_MODELS: &[&str] = &["claude-haiku-4-5", "claude-haiku-4-5-20250307"];
@@ -545,16 +613,21 @@ pub(crate) async fn call_claude_cli_public(
     if !ALLOWED_EVOLUTION_MODELS.contains(&model) {
         return Err(format!("Model '{model}' not allowed for evolution calls"));
     }
-    call_claude_cli(user_message, model, system_prompt, home_dir).await
+    call_claude_cli(user_message, model, system_prompt, home_dir, None, None).await
 }
 
-/// the timer resets every time new data arrives, so long-running responses
-/// that keep producing output will never be killed.
+/// Call the `claude` CLI (Claude Code SDK) with streaming output.
+///
+/// Uses `--output-format stream-json --verbose` to read incremental events.
+/// Instead of killing on idle, sends keepalive progress to the channel via
+/// `on_progress` callback. A hard max timeout (30 min) acts as safety net.
 async fn call_claude_cli(
     user_message: &str,
     model: &str,
     system_prompt: &str,
     home_dir: &Path,
+    work_dir: Option<&Path>,
+    on_progress: Option<&ProgressCallback>,
 ) -> Result<String, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -575,7 +648,16 @@ async fn call_claude_cli(
         // Agent-level security is enforced by CONTRACT.toml + container sandbox,
         // not by Claude Code's interactive permission prompts.
         "--permission-mode", "auto",
+        // Allow enough agentic turns for complex tasks (read files → think → write).
+        // Default -p max-turns can be too low, causing Claude to stop mid-task
+        // and return a text summary instead of completing the work.
+        "--max-turns", "50",
     ]);
+    // Set working directory to agent dir so Claude can access agent config
+    // (.claude/, CLAUDE.md, .mcp.json) and project files (docs/, etc.)
+    if let Some(dir) = work_dir {
+        cmd.current_dir(dir);
+    }
     if let Some(ref key) = api_key {
         cmd.env("ANTHROPIC_API_KEY", key);
     }
@@ -610,61 +692,122 @@ async fn call_claude_cli(
     let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 
-    // Idle timeout: reset every time a line arrives
-    let idle_timeout = std::time::Duration::from_secs(120);
     let mut result_text = String::new();
+    // Track last tool type to suppress duplicate progress messages
+    let mut last_tool_reported: Option<String> = None;
+
+    // Keepalive timer — fires periodically when no stream events arrive
+    let mut keepalive = tokio::time::interval(
+        std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
+    );
+    keepalive.reset(); // don't fire immediately
+
+    // Hard max timeout — absolute safety net
+    let hard_deadline = tokio::time::sleep(
+        std::time::Duration::from_secs(HARD_MAX_TIMEOUT_SECS),
+    );
+    tokio::pin!(hard_deadline);
 
     loop {
-        match tokio::time::timeout(idle_timeout, reader.next_line()).await {
-            // Timeout — no data for 120s
-            Err(_) => {
-                let _ = child.kill().await;
-                if result_text.is_empty() {
-                    return Err(format!("claude CLI idle timeout ({idle_timeout:?}, no output)"));
-                }
-                // Return whatever we have so far
-                warn!("claude CLI idle timeout — returning partial result ({} chars)", result_text.len());
-                break;
-            }
-            // Stream ended
-            Ok(Ok(None)) => break,
-            // Read error
-            Ok(Err(e)) => {
-                let _ = child.kill().await;
-                return Err(format!("claude CLI read error: {e}"));
-            }
-            // Got a line — parse stream-json event
-            Ok(Ok(Some(line))) => {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                // Parse the JSON event and extract the result text
-                if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
-                    match event.get("type").and_then(|t| t.as_str()) {
-                        // Final result event — contains the complete response
-                        Some("result") => {
-                            if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
-                                result_text = text.to_string();
-                            }
+        tokio::select! {
+            // Priority 1: read stream-json events from CLI stdout
+            line_result = reader.next_line() => {
+                match line_result {
+                    // Stream ended normally
+                    Ok(None) => break,
+                    // Read error
+                    Err(e) => {
+                        let _ = child.kill().await;
+                        return Err(format!("claude CLI read error: {e}"));
+                    }
+                    // Got a line — parse stream-json event
+                    Ok(Some(line)) => {
+                        // Reset keepalive timer on every received line
+                        keepalive.reset();
+
+                        if line.trim().is_empty() {
+                            continue;
                         }
-                        // Assistant message with text content (incremental)
-                        Some("assistant") => {
-                            if let Some(content) = event
-                                .pointer("/message/content")
-                                .and_then(|c| c.as_array())
-                            {
-                                for block in content {
-                                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                            result_text = text.to_string();
+
+                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+                            match event.get("type").and_then(|t| t.as_str()) {
+                                // Final result event — contains the complete response
+                                Some("result") => {
+                                    if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
+                                        result_text = text.to_string();
+                                    }
+                                }
+                                // Assistant message with content blocks
+                                Some("assistant") => {
+                                    if let Some(content) = event
+                                        .pointer("/message/content")
+                                        .and_then(|c| c.as_array())
+                                    {
+                                        for block in content {
+                                            let block_type = block.get("type").and_then(|t| t.as_str());
+                                            match block_type {
+                                                Some("text") => {
+                                                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                                        result_text = text.to_string();
+                                                    }
+                                                }
+                                                Some("tool_use") => {
+                                                    // Extract tool name and detail for progress
+                                                    if let Some(cb) = on_progress {
+                                                        let tool = block.get("name")
+                                                            .and_then(|n| n.as_str())
+                                                            .unwrap_or("unknown")
+                                                            .to_string();
+                                                        let detail = extract_tool_detail(block);
+
+                                                        // Suppress duplicate: same tool consecutively
+                                                        let dominated = last_tool_reported
+                                                            .as_ref()
+                                                            .is_some_and(|prev| *prev == tool && detail.is_none());
+                                                        if !dominated {
+                                                            cb(ProgressEvent::ToolUse {
+                                                                tool: tool.clone(),
+                                                                detail,
+                                                            });
+                                                            last_tool_reported = Some(tool);
+                                                        }
+                                                    }
+                                                }
+                                                _ => {} // thinking, tool_result, etc.
+                                            }
                                         }
                                     }
                                 }
+                                _ => {} // system, rate_limit_event, etc.
                             }
                         }
-                        _ => {} // system, rate_limit_event, etc. — ignore
                     }
                 }
+            }
+
+            // Priority 2: keepalive timer — send progress if silent too long
+            _ = keepalive.tick() => {
+                if let Some(cb) = on_progress {
+                    cb(ProgressEvent::Keepalive);
+                }
+            }
+
+            // Priority 3: hard max timeout — kill truly hung processes
+            _ = &mut hard_deadline => {
+                warn!(
+                    "claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s) — killing process"
+                );
+                let _ = child.kill().await;
+                if result_text.is_empty() {
+                    return Err(format!(
+                        "claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s, no output)"
+                    ));
+                }
+                warn!(
+                    "claude CLI hard timeout — returning partial result ({} chars)",
+                    result_text.len()
+                );
+                break;
             }
         }
     }
@@ -686,6 +829,21 @@ async fn call_claude_cli(
 /// Find the `claude` binary — delegates to shared impl in duduclaw-core (BE-L1).
 fn which_claude() -> Option<String> {
     duduclaw_core::which_claude()
+}
+
+/// Extract a human-readable detail from a `tool_use` content block's `input`.
+///
+/// Tries common field names: `file_path`, `path`, `command`, `pattern`, `query`.
+/// Returns the first match (truncated to 60 chars for display).
+pub(crate) fn extract_tool_detail(block: &serde_json::Value) -> Option<String> {
+    let input = block.get("input")?;
+    for key in &["file_path", "path", "command", "pattern", "query"] {
+        if let Some(val) = input.get(key).and_then(|v| v.as_str()) {
+            let truncated: String = val.chars().take(60).collect();
+            return Some(truncated);
+        }
+    }
+    None
 }
 
 // ── Python SDK subprocess (fallback) ────────────────────────
