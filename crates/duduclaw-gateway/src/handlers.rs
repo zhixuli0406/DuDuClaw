@@ -251,6 +251,15 @@ impl MethodHandler {
                     "preferred": cfg.model.preferred,
                     "fallback": cfg.model.fallback,
                     "account_pool": cfg.model.account_pool,
+                    "api_mode": cfg.model.api_mode,
+                    "local": cfg.model.local.as_ref().map(|l| json!({
+                        "model": l.model,
+                        "backend": l.backend,
+                        "context_length": l.context_length,
+                        "gpu_layers": l.gpu_layers,
+                        "prefer_local": l.prefer_local,
+                        "use_router": l.use_router,
+                    })),
                 },
                 "budget": {
                     "monthly_limit_cents": cfg.budget.monthly_limit_cents,
@@ -619,6 +628,50 @@ impl MethodHandler {
                 }
             }
 
+            // ── Local model fields ([model.local] section) ──
+            if let Some(model) = table.get_mut("model").and_then(|v| v.as_table_mut()) {
+                // Check if any local model param is provided
+                let has_local_params = ["local_model", "local_backend", "local_context_length", "local_gpu_layers", "prefer_local", "use_router"]
+                    .iter().any(|k| params_clone.get(*k).is_some());
+
+                if has_local_params {
+                    let local = model.entry("local")
+                        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                        .as_table_mut();
+                    if let Some(local) = local {
+                        if let Some(v) = params_clone.get("local_model").and_then(|v| v.as_str()) {
+                            local.insert("model".into(), toml::Value::String(v.into()));
+                            changes.push(format!("model.local.model = \"{v}\""));
+                        }
+                        if let Some(v) = params_clone.get("local_backend").and_then(|v| v.as_str()) {
+                            match v {
+                                "llama_cpp" | "openai_compat" | "mistral_rs" => {
+                                    local.insert("backend".into(), toml::Value::String(v.into()));
+                                    changes.push(format!("model.local.backend = \"{v}\""));
+                                }
+                                _ => return Err(format!("Invalid local_backend '{v}'. Valid: llama_cpp, openai_compat, mistral_rs")),
+                            }
+                        }
+                        if let Some(v) = params_clone.get("local_context_length").and_then(|v| v.as_u64()) {
+                            local.insert("context_length".into(), toml::Value::Integer(v as i64));
+                            changes.push(format!("model.local.context_length = {v}"));
+                        }
+                        if let Some(v) = params_clone.get("local_gpu_layers").and_then(|v| v.as_i64()) {
+                            local.insert("gpu_layers".into(), toml::Value::Integer(v));
+                            changes.push(format!("model.local.gpu_layers = {v}"));
+                        }
+                        if let Some(v) = params_clone.get("prefer_local").and_then(|v| v.as_bool()) {
+                            local.insert("prefer_local".into(), toml::Value::Boolean(v));
+                            changes.push(format!("model.local.prefer_local = {v}"));
+                        }
+                        if let Some(v) = params_clone.get("use_router").and_then(|v| v.as_bool()) {
+                            local.insert("use_router".into(), toml::Value::Boolean(v));
+                            changes.push(format!("model.local.use_router = {v}"));
+                        }
+                    }
+                }
+            }
+
             // ── Budget fields ([budget] section) ──
             let budget = table.entry("budget")
                 .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
@@ -818,7 +871,20 @@ impl MethodHandler {
                     "identity_preview": a.identity.as_ref().map(|s| if s.len() > 500 { format!("{}…", &s[..500]) } else { s.clone() }),
                     "memory_summary": a.memory,
                     "skills": a.skills.iter().map(|s| &s.name).collect::<Vec<_>>(),
-                    "model": { "preferred": cfg.model.preferred, "fallback": cfg.model.fallback, "account_pool": cfg.model.account_pool },
+                    "model": {
+                        "preferred": cfg.model.preferred,
+                        "fallback": cfg.model.fallback,
+                        "account_pool": cfg.model.account_pool,
+                        "api_mode": cfg.model.api_mode,
+                        "local": cfg.model.local.as_ref().map(|l| json!({
+                            "model": l.model,
+                            "backend": l.backend,
+                            "context_length": l.context_length,
+                            "gpu_layers": l.gpu_layers,
+                            "prefer_local": l.prefer_local,
+                            "use_router": l.use_router,
+                        })),
+                    },
                     "budget": { "monthly_limit_cents": cfg.budget.monthly_limit_cents, "spent_cents": spent, "warn_threshold_percent": cfg.budget.warn_threshold_percent, "hard_stop": cfg.budget.hard_stop },
                     "heartbeat": { "enabled": cfg.heartbeat.enabled, "interval_seconds": cfg.heartbeat.interval_seconds },
                     "permissions": {

@@ -18,10 +18,21 @@ export interface AgentBudget {
   hard_stop: boolean;
 }
 
+export interface AgentLocalModel {
+  model: string;
+  backend: string;
+  context_length: number;
+  gpu_layers: number;
+  prefer_local: boolean;
+  use_router: boolean;
+}
+
 export interface AgentModel {
   preferred: string;
   fallback: string;
   account_pool: string[];
+  api_mode?: string;
+  local?: AgentLocalModel | null;
 }
 
 export interface AgentDetail extends AgentInfo {
@@ -164,6 +175,13 @@ export interface AgentUpdateParams {
   can_modify_own_skills?: boolean;
   can_modify_own_soul?: boolean;
   can_schedule_tasks?: boolean;
+  // Local model
+  local_model?: string;
+  local_backend?: string;
+  local_context_length?: number;
+  local_gpu_layers?: number;
+  prefer_local?: boolean;
+  use_router?: boolean;
   // Container
   timeout_ms?: number;
   max_concurrent?: number;

@@ -427,6 +427,13 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
         reports_to: agent.reports_to,
         preferred: agent.model?.preferred ?? '',
         fallback: agent.model?.fallback ?? '',
+        api_mode: (agent.model?.api_mode ?? 'cli') as 'cli' | 'direct' | 'auto',
+        local_model: agent.model?.local?.model ?? '',
+        local_backend: agent.model?.local?.backend ?? 'llama_cpp',
+        local_context_length: agent.model?.local?.context_length ?? 4096,
+        local_gpu_layers: agent.model?.local?.gpu_layers ?? -1,
+        prefer_local: agent.model?.local?.prefer_local ?? false,
+        use_router: agent.model?.local?.use_router ?? false,
         monthly_limit_cents: agent.budget?.monthly_limit_cents ?? 5000,
         warn_threshold_percent: agent.budget?.warn_threshold_percent ?? 80,
         hard_stop: agent.budget?.hard_stop ?? true,
@@ -555,6 +562,31 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
                 <input type="number" min={0} max={100} value={form.warn_threshold_percent ?? 80} onChange={(e) => updateField('warn_threshold_percent', Number(e.target.value))} className={inputClass} />
               </FormField>
               <Toggle checked={form.hard_stop ?? true} onChange={(v) => updateField('hard_stop', v)} label={intl.formatMessage({ id: 'agents.edit.hardStop' })} />
+
+              {/* Local Model */}
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700">
+                <h4 className="mb-3 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">本地模型 (Local LLM)</h4>
+                <Toggle checked={form.prefer_local ?? false} onChange={(v) => updateField('prefer_local', v)} label="優先使用本地模型" />
+                <Toggle checked={form.use_router ?? false} onChange={(v) => updateField('use_router', v)} label="信心路由（自動判斷本地/雲端）" />
+                <FormField label="模型名稱 / GGUF 檔案" hint="e.g. qwen3-8b-q4_k_m">
+                  <input type="text" value={form.local_model ?? ''} onChange={(e) => updateField('local_model', e.target.value)} placeholder="qwen3-1.7b-q4_k_m" className={inputClass} />
+                </FormField>
+                <FormField label="推理後端">
+                  <select value={form.local_backend ?? 'llama_cpp'} onChange={(e) => updateField('local_backend', e.target.value)} className={selectClass}>
+                    <option value="llama_cpp">llama.cpp (Metal/CUDA)</option>
+                    <option value="mistral_rs">mistral.rs (Rust-native)</option>
+                    <option value="openai_compat">OpenAI-compatible (Exo/vLLM/SGLang)</option>
+                  </select>
+                </FormField>
+                <div className="grid grid-cols-2 gap-3">
+                  <FormField label="Context 長度">
+                    <input type="number" min={512} value={form.local_context_length ?? 4096} onChange={(e) => updateField('local_context_length', Number(e.target.value))} className={inputClass} />
+                  </FormField>
+                  <FormField label="GPU Layers (-1=全部)">
+                    <input type="number" min={-1} value={form.local_gpu_layers ?? -1} onChange={(e) => updateField('local_gpu_layers', Number(e.target.value))} className={inputClass} />
+                  </FormField>
+                </div>
+              </div>
             </>
           )}
 
