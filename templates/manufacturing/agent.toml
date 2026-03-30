@@ -1,0 +1,75 @@
+# DuDuClaw Manufacturing Agent Template
+# Usage: cp -r templates/manufacturing/ ~/.duduclaw/agents/<your-agent-name>/
+
+[agent]
+name = "factory-assistant"
+display_name = "Factory Assistant"
+role = "main"
+status = "active"
+trigger = "factory"
+reports_to = "none"
+icon = "factory"
+
+[model]
+preferred = "claude-sonnet-4-6"
+fallback = "claude-haiku-4-5"
+account_pool = ["main"]
+api_mode = "cli"
+
+[model.local]
+model = ""
+backend = "llama_cpp"
+context_length = 4096
+gpu_layers = -1
+prefer_local = true
+use_router = true
+
+[container]
+timeout_ms = 30000
+max_concurrent = 2
+readonly_project = true
+sandbox_enabled = false
+network_access = false
+
+[heartbeat]
+enabled = true
+interval_seconds = 300
+max_concurrent_runs = 1
+cron = "*/5 * * * *"
+
+[budget]
+monthly_limit_cents = 3000
+warn_threshold_percent = 80
+hard_stop = false
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = false
+can_modify_own_soul = false
+can_schedule_tasks = true
+allowed_channels = ["telegram", "line"]
+
+[evolution]
+skill_auto_activate = true
+skill_security_scan = true
+gvu_enabled = true
+cognitive_memory = false
+max_silence_hours = 4.0
+max_gvu_generations = 3
+observation_period_hours = 24.0
+skill_token_budget = 2500
+max_active_skills = 5
+
+[evolution.external_factors]
+user_feedback = true
+security_events = true
+channel_metrics = true
+business_context = true
+peer_signals = false
+
+[capabilities]
+computer_use = false
+browser_via_bash = false
+allowed_tools = []
+denied_tools = []

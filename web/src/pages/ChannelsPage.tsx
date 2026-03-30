@@ -11,6 +11,7 @@ import {
   Trash2,
   CheckCircle,
   XCircle,
+  Pencil,
 } from 'lucide-react';
 
 const channelMeta: Record<
@@ -51,6 +52,7 @@ export function ChannelsPage() {
   const [channels, setChannels] = useState<ReadonlyArray<ChannelStatus>>([]);
   const [loading, setLoading] = useState(false);
   const [showAddDialog, setShowAddDialog] = useState(false);
+  const [editChannel, setEditChannel] = useState<string | null>(null);
   const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
   const toastTimerRef = useRef<ReturnType<typeof setTimeout>>(null);
@@ -202,6 +204,13 @@ export function ChannelsPage() {
                     {intl.formatMessage({ id: 'channels.test' })}
                   </button>
                   <button
+                    onClick={() => setEditChannel(channel.name)}
+                    className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-stone-600 hover:bg-stone-100 dark:text-stone-400 dark:hover:bg-stone-800"
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                    編輯
+                  </button>
+                  <button
                     onClick={() => handleRemove(channel.name)}
                     className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-900/20"
                   >
@@ -220,12 +229,24 @@ export function ChannelsPage() {
         onClose={() => setShowAddDialog(false)}
         onCreated={fetchChannels}
       />
+
+      {/* Edit Channel Dialog (re-uses add flow to replace token) */}
+      <AddChannelDialog
+        open={editChannel !== null}
+        onClose={() => setEditChannel(null)}
+        onCreated={() => { setEditChannel(null); fetchChannels(); }}
+        fixedType={editChannel ?? undefined}
+      />
     </div>
   );
 }
 
-function AddChannelDialog({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: () => void }) {
-  const [channelType, setChannelType] = useState('line');
+function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boolean; onClose: () => void; onCreated: () => void; fixedType?: string }) {
+  const [channelType, setChannelType] = useState(fixedType ?? 'line');
+
+  useEffect(() => {
+    if (fixedType) setChannelType(fixedType);
+  }, [fixedType]);
   const [token, setToken] = useState('');
   const [secret, setSecret] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -255,10 +276,10 @@ function AddChannelDialog({ open, onClose, onCreated }: { open: boolean; onClose
   };
 
   return (
-    <Dialog open={open} onClose={onClose} title="新增通道">
+    <Dialog open={open} onClose={onClose} title={fixedType ? `編輯 ${fixedType} 通道` : '新增通道'}>
       <div className="space-y-4">
         <FormField label="通道類型">
-          <select value={channelType} onChange={(e) => setChannelType(e.target.value)} className={selectClass}>
+          <select value={channelType} onChange={(e) => setChannelType(e.target.value)} disabled={!!fixedType} className={selectClass}>
             <option value="line">LINE</option>
             <option value="telegram">Telegram</option>
             <option value="discord">Discord</option>

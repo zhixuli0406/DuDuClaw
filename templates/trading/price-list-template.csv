@@ -1,0 +1,4 @@
+product_code,product_name_zh,product_name_en,unit,unit_price_usd,moq,lead_time_days,origin,hs_code,notes
+P001,不鏽鋼螺絲 M8x20,Stainless Steel Screw M8x20,kg,3.50,100,14,Taiwan,7318.15,SUS304
+P002,碳鋼法蘭 DN50,Carbon Steel Flange DN50,pc,12.00,50,21,Taiwan,7307.91,ANSI B16.5
+P003,銅管 15mm,Copper Tube 15mm,m,8.20,200,28,Taiwan,7411.10,C1100 紫銅

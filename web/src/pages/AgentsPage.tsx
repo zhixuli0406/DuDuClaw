@@ -405,7 +405,7 @@ function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: 
 
 // ── Edit Agent Dialog ──
 
-type EditTab = 'identity' | 'model' | 'heartbeat' | 'permissions';
+type EditTab = 'identity' | 'model' | 'heartbeat' | 'container' | 'permissions';
 
 function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | null; onClose: () => void; onSaved: () => void }) {
   const intl = useIntl();
@@ -472,6 +472,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
     { id: 'identity', label: intl.formatMessage({ id: 'agents.edit.identity' }) },
     { id: 'model', label: intl.formatMessage({ id: 'agents.edit.model' }) },
     { id: 'heartbeat', label: intl.formatMessage({ id: 'agents.edit.heartbeat' }) },
+    { id: 'container', label: intl.formatMessage({ id: 'settings.container' }) },
     { id: 'permissions', label: intl.formatMessage({ id: 'agents.edit.permissions' }) },
   ];
 
@@ -538,6 +539,13 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
                   <option value="claude-opus-4-6">Claude Opus 4.6</option>
                 </select>
               </FormField>
+              <FormField label={intl.formatMessage({ id: 'agents.edit.apiMode' })}>
+                <select value={form.api_mode ?? 'cli'} onChange={(e) => updateField('api_mode', e.target.value as 'cli' | 'direct' | 'auto')} className={selectClass}>
+                  <option value="cli">CLI (OAuth)</option>
+                  <option value="direct">Direct API</option>
+                  <option value="auto">Auto</option>
+                </select>
+              </FormField>
               <div className="border-t border-stone-200 pt-4 dark:border-stone-700">
                 <FormField label={intl.formatMessage({ id: 'agents.edit.budgetLimit' })}>
                   <input type="number" min={0} value={form.monthly_limit_cents ?? 5000} onChange={(e) => updateField('monthly_limit_cents', Number(e.target.value))} className={inputClass} />
@@ -562,6 +570,20 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
             </>
           )}
 
+          {tab === 'container' && (
+            <>
+              <Toggle checked={form.sandbox_enabled ?? false} onChange={(v) => updateField('sandbox_enabled', v)} label="Sandbox 隔離" />
+              <Toggle checked={form.network_access ?? false} onChange={(v) => updateField('network_access', v)} label="容器網路存取" />
+              <Toggle checked={form.readonly_project ?? true} onChange={(v) => updateField('readonly_project', v)} label="唯讀專案掛載" />
+              <FormField label="任務逾時 (ms)">
+                <input type="number" min={0} value={form.timeout_ms ?? 1800000} onChange={(e) => updateField('timeout_ms', Number(e.target.value))} className={inputClass} />
+              </FormField>
+              <FormField label="最大並行數">
+                <input type="number" min={1} max={10} value={form.max_concurrent ?? 1} onChange={(e) => updateField('max_concurrent', Number(e.target.value))} className={inputClass} />
+              </FormField>
+            </>
+          )}
+
           {tab === 'permissions' && (
             <>
               <div className="space-y-1">
@@ -580,6 +602,12 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
                 <Toggle checked={form.skill_security_scan ?? true} onChange={(v) => updateField('skill_security_scan', v)} label={intl.formatMessage({ id: 'agents.edit.skillSecurityScan' })} />
                 <Toggle checked={form.gvu_enabled ?? true} onChange={(v) => updateField('gvu_enabled', v)} label={intl.formatMessage({ id: 'agents.edit.gvuEnabled' })} />
                 <Toggle checked={form.cognitive_memory ?? false} onChange={(v) => updateField('cognitive_memory', v)} label={intl.formatMessage({ id: 'agents.edit.cognitiveMemory' })} />
+                <FormField label={intl.formatMessage({ id: 'agents.edit.maxActiveSkills' })}>
+                  <input type="number" min={1} max={20} value={form.max_active_skills ?? 5} onChange={(e) => updateField('max_active_skills', Number(e.target.value))} className={inputClass} />
+                </FormField>
+                <FormField label={intl.formatMessage({ id: 'agents.edit.maxSilenceHours' })}>
+                  <input type="number" min={1} step={0.5} value={form.max_silence_hours ?? 12} onChange={(e) => updateField('max_silence_hours', Number(e.target.value))} className={inputClass} />
+                </FormField>
               </div>
             </>
           )}
