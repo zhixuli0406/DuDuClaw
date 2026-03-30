@@ -414,25 +414,39 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Available models (cloud + local)
+  const [availableModels, setAvailableModels] = useState<ReadonlyArray<{ id: string; label: string; type: 'cloud' | 'local'; file?: string }>>([]);
+
   // Local form state — initialized from agent when dialog opens
   const [form, setForm] = useState<AgentUpdateParams>({});
 
   useEffect(() => {
     if (agent) {
+      // Fetch available models
+      api.models.list().then((res) => setAvailableModels(res?.models ?? [])).catch(() => {});
+
+      // Determine current preferred/fallback as unified IDs
+      const localModel = agent.model?.local?.model ?? '';
+      const preferLocal = agent.model?.local?.prefer_local ?? false;
+      const currentPreferred = preferLocal && localModel
+        ? `local:${localModel}`
+        : agent.model?.preferred ?? 'claude-sonnet-4-6';
+      const currentFallback = agent.model?.fallback ?? 'claude-haiku-4-5';
+
       setForm({
         display_name: agent.display_name,
         role: agent.role,
         trigger: agent.trigger,
         icon: agent.icon,
         reports_to: agent.reports_to,
-        preferred: agent.model?.preferred ?? '',
-        fallback: agent.model?.fallback ?? '',
+        preferred: currentPreferred,
+        fallback: currentFallback,
         api_mode: (agent.model?.api_mode ?? 'cli') as 'cli' | 'direct' | 'auto',
-        local_model: agent.model?.local?.model ?? '',
+        local_model: localModel,
         local_backend: agent.model?.local?.backend ?? 'llama_cpp',
         local_context_length: agent.model?.local?.context_length ?? 4096,
         local_gpu_layers: agent.model?.local?.gpu_layers ?? -1,
-        prefer_local: agent.model?.local?.prefer_local ?? false,
+        prefer_local: preferLocal,
         use_router: agent.model?.local?.use_router ?? false,
         monthly_limit_cents: agent.budget?.monthly_limit_cents ?? 5000,
         warn_threshold_percent: agent.budget?.warn_threshold_percent ?? 80,
@@ -464,7 +478,27 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
     setSaving(true);
     setError(null);
     try {
-      await updateAgent(agent.name, form);
+      // Decompose unified model IDs into cloud preferred + local config
+      const submitForm = { ...form };
+      const pref = submitForm.preferred ?? '';
+      const fb = submitForm.fallback ?? '';
+
+      if (pref.startsWith('local:')) {
+        // Local model as preferred: set prefer_local + local_model, keep a cloud fallback
+        submitForm.local_model = pref.replace('local:', '');
+        submitForm.prefer_local = true;
+        submitForm.preferred = fb.startsWith('local:') ? 'claude-sonnet-4-6' : (fb || 'claude-sonnet-4-6');
+      } else {
+        // Cloud model as preferred
+        submitForm.prefer_local = false;
+      }
+
+      if (fb.startsWith('local:')) {
+        submitForm.local_model = submitForm.local_model || fb.replace('local:', '');
+        submitForm.fallback = 'claude-haiku-4-5';
+      }
+
+      await updateAgent(agent.name, submitForm);
       onSaved();
     } catch {
       setError('儲存失敗');
@@ -530,65 +564,85 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
             </>
           )}
 
-          {tab === 'model' && (
-            <>
-              <FormField label={intl.formatMessage({ id: 'agents.edit.preferredModel' })}>
-                <select value={form.preferred ?? ''} onChange={(e) => updateField('preferred', e.target.value)} className={selectClass}>
-                  <option value="claude-opus-4-6">Claude Opus 4.6</option>
-                  <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
-                  <option value="claude-haiku-4-5">Claude Haiku 4.5</option>
-                </select>
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'agents.edit.fallbackModel' })}>
-                <select value={form.fallback ?? ''} onChange={(e) => updateField('fallback', e.target.value)} className={selectClass}>
-                  <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
-                  <option value="claude-haiku-4-5">Claude Haiku 4.5</option>
-                  <option value="claude-opus-4-6">Claude Opus 4.6</option>
-                </select>
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'agents.edit.apiMode' })}>
-                <select value={form.api_mode ?? 'cli'} onChange={(e) => updateField('api_mode', e.target.value as 'cli' | 'direct' | 'auto')} className={selectClass}>
-                  <option value="cli">CLI (OAuth)</option>
-                  <option value="direct">Direct API</option>
-                  <option value="auto">Auto</option>
-                </select>
-              </FormField>
-              <div className="border-t border-stone-200 pt-4 dark:border-stone-700">
-                <FormField label={intl.formatMessage({ id: 'agents.edit.budgetLimit' })}>
-                  <input type="number" min={0} value={form.monthly_limit_cents ?? 5000} onChange={(e) => updateField('monthly_limit_cents', Number(e.target.value))} className={inputClass} />
-                </FormField>
-              </div>
-              <FormField label={intl.formatMessage({ id: 'agents.edit.warnThreshold' })}>
-                <input type="number" min={0} max={100} value={form.warn_threshold_percent ?? 80} onChange={(e) => updateField('warn_threshold_percent', Number(e.target.value))} className={inputClass} />
-              </FormField>
-              <Toggle checked={form.hard_stop ?? true} onChange={(v) => updateField('hard_stop', v)} label={intl.formatMessage({ id: 'agents.edit.hardStop' })} />
+          {tab === 'model' && (() => {
+            const cloudModels = availableModels.filter((m) => m.type === 'cloud');
+            const localModels = availableModels.filter((m) => m.type === 'local');
+            const prefIsLocal = (form.preferred ?? '').startsWith('local:');
+            const fbIsLocal = (form.fallback ?? '').startsWith('local:');
+            const hasLocalSelected = prefIsLocal || fbIsLocal;
 
-              {/* Local Model */}
-              <div className="border-t border-stone-200 pt-4 dark:border-stone-700">
-                <h4 className="mb-3 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">本地模型 (Local LLM)</h4>
-                <Toggle checked={form.prefer_local ?? false} onChange={(v) => updateField('prefer_local', v)} label="優先使用本地模型" />
-                <Toggle checked={form.use_router ?? false} onChange={(v) => updateField('use_router', v)} label="信心路由（自動判斷本地/雲端）" />
-                <FormField label="模型名稱 / GGUF 檔案" hint="e.g. qwen3-8b-q4_k_m">
-                  <input type="text" value={form.local_model ?? ''} onChange={(e) => updateField('local_model', e.target.value)} placeholder="qwen3-1.7b-q4_k_m" className={inputClass} />
-                </FormField>
-                <FormField label="推理後端">
-                  <select value={form.local_backend ?? 'llama_cpp'} onChange={(e) => updateField('local_backend', e.target.value)} className={selectClass}>
-                    <option value="llama_cpp">llama.cpp (Metal/CUDA)</option>
-                    <option value="mistral_rs">mistral.rs (Rust-native)</option>
-                    <option value="openai_compat">OpenAI-compatible (Exo/vLLM/SGLang)</option>
+            return (
+              <>
+                <FormField label={intl.formatMessage({ id: 'agents.edit.preferredModel' })}>
+                  <select value={form.preferred ?? ''} onChange={(e) => updateField('preferred', e.target.value)} className={selectClass}>
+                    <optgroup label="Cloud">
+                      {cloudModels.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
+                    </optgroup>
+                    {localModels.length > 0 && (
+                      <optgroup label="Local">
+                        {localModels.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
+                      </optgroup>
+                    )}
                   </select>
                 </FormField>
-                <div className="grid grid-cols-2 gap-3">
-                  <FormField label="Context 長度">
-                    <input type="number" min={512} value={form.local_context_length ?? 4096} onChange={(e) => updateField('local_context_length', Number(e.target.value))} className={inputClass} />
+                <FormField label={intl.formatMessage({ id: 'agents.edit.fallbackModel' })}>
+                  <select value={form.fallback ?? ''} onChange={(e) => updateField('fallback', e.target.value)} className={selectClass}>
+                    <optgroup label="Cloud">
+                      {cloudModels.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
+                    </optgroup>
+                    {localModels.length > 0 && (
+                      <optgroup label="Local">
+                        {localModels.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
+                      </optgroup>
+                    )}
+                  </select>
+                </FormField>
+
+                <FormField label={intl.formatMessage({ id: 'agents.edit.apiMode' })}>
+                  <select value={form.api_mode ?? 'cli'} onChange={(e) => updateField('api_mode', e.target.value as 'cli' | 'direct' | 'auto')} className={selectClass}>
+                    <option value="cli">CLI (OAuth)</option>
+                    <option value="direct">Direct API</option>
+                    <option value="auto">Auto</option>
+                  </select>
+                </FormField>
+
+                <Toggle checked={form.use_router ?? false} onChange={(v) => updateField('use_router', v)} label="信心路由（自動判斷本地/雲端）" />
+
+                {/* Local model advanced config — shown when a local model is selected */}
+                {hasLocalSelected && (
+                  <div className="rounded-lg border border-amber-200 bg-amber-50/50 p-4 dark:border-amber-800 dark:bg-amber-900/10">
+                    <h4 className="mb-3 text-xs font-semibold uppercase text-amber-700 dark:text-amber-400">本地推理設定</h4>
+                    <FormField label="推理後端">
+                      <select value={form.local_backend ?? 'llama_cpp'} onChange={(e) => updateField('local_backend', e.target.value)} className={selectClass}>
+                        <option value="llama_cpp">llama.cpp (Metal/CUDA)</option>
+                        <option value="mistral_rs">mistral.rs (Rust-native)</option>
+                        <option value="openai_compat">OpenAI-compatible (Exo/vLLM)</option>
+                      </select>
+                    </FormField>
+                    <div className="grid grid-cols-2 gap-3">
+                      <FormField label="Context 長度">
+                        <input type="number" min={512} value={form.local_context_length ?? 4096} onChange={(e) => updateField('local_context_length', Number(e.target.value))} className={inputClass} />
+                      </FormField>
+                      <FormField label="GPU Layers (-1=全部)">
+                        <input type="number" min={-1} value={form.local_gpu_layers ?? -1} onChange={(e) => updateField('local_gpu_layers', Number(e.target.value))} className={inputClass} />
+                      </FormField>
+                    </div>
+                  </div>
+                )}
+
+                <div className="border-t border-stone-200 pt-4 dark:border-stone-700">
+                  <h4 className="mb-3 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'dashboard.budget.title' })}</h4>
+                  <FormField label={intl.formatMessage({ id: 'agents.edit.budgetLimit' })}>
+                    <input type="number" min={0} value={form.monthly_limit_cents ?? 5000} onChange={(e) => updateField('monthly_limit_cents', Number(e.target.value))} className={inputClass} />
                   </FormField>
-                  <FormField label="GPU Layers (-1=全部)">
-                    <input type="number" min={-1} value={form.local_gpu_layers ?? -1} onChange={(e) => updateField('local_gpu_layers', Number(e.target.value))} className={inputClass} />
+                  <FormField label={intl.formatMessage({ id: 'agents.edit.warnThreshold' })}>
+                    <input type="number" min={0} max={100} value={form.warn_threshold_percent ?? 80} onChange={(e) => updateField('warn_threshold_percent', Number(e.target.value))} className={inputClass} />
                   </FormField>
+                  <Toggle checked={form.hard_stop ?? true} onChange={(v) => updateField('hard_stop', v)} label={intl.formatMessage({ id: 'agents.edit.hardStop' })} />
                 </div>
-              </div>
-            </>
-          )}
+              </>
+            );
+          })()}
 
           {tab === 'heartbeat' && (
             <>
