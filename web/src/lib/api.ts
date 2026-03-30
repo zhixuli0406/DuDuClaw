@@ -323,6 +323,13 @@ export const api = {
     search: (query: string) =>
       client.call('skills.search', { query }) as Promise<{ skills: SkillIndexEntry[] }>,
   },
+  models: {
+    list: () =>
+      client.call('models.list') as Promise<{
+        models: Array<{ id: string; label: string; type: 'cloud' | 'local'; file?: string; size_bytes?: number }>;
+        default_local: string | null;
+      }>,
+  },
   logs: {
     subscribe: () =>
       client.call('logs.subscribe'),

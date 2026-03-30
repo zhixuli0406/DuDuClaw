@@ -146,6 +146,7 @@ impl MethodHandler {
             "system.status" => self.handle_system_status().await,
             "system.doctor" => self.handle_system_doctor().await,
             "system.doctor_repair" => self.handle_system_doctor_repair().await,
+            "models.list" => self.handle_models_list().await,
             "system.config" => self.handle_system_config().await,
             "system.update_config" => self.handle_system_update_config(params).await,
             "accounts.add" => self.handle_accounts_add(params).await,
@@ -209,6 +210,7 @@ impl MethodHandler {
                 { "name": "system.status", "description": "System status" },
                 { "name": "system.doctor", "description": "Health checks" },
                 { "name": "system.doctor_repair", "description": "Health checks with repair hints" },
+                { "name": "models.list", "description": "List available cloud and local models" },
                 { "name": "system.config", "description": "View system config" },
                 { "name": "system.update_config", "description": "Update system config (log_level, rotation)" },
                 { "name": "accounts.add", "description": "Add a new account" },
@@ -1754,6 +1756,64 @@ impl MethodHandler {
             }
         }
         WsFrame::ok_response("", json!({ "skills": all_skills }))
+    }
+
+    // ── Models ──────────────────────────────────────────────
+
+    /// List all available models (cloud + local GGUF files).
+    async fn handle_models_list(&self) -> WsFrame {
+        let mut models = Vec::new();
+
+        // Cloud models (always available)
+        for (id, label) in [
+            ("claude-opus-4-6", "Claude Opus 4.6"),
+            ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+            ("claude-haiku-4-5", "Claude Haiku 4.5"),
+        ] {
+            models.push(json!({
+                "id": id,
+                "label": label,
+                "type": "cloud",
+            }));
+        }
+
+        // Local models: scan ~/.duduclaw/models/ for GGUF files
+        let models_dir = self.home_dir.join("models");
+        if let Ok(mut entries) = tokio::fs::read_dir(&models_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
+                    continue;
+                }
+                let name = path.file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+                let size_gb = size as f64 / (1024.0 * 1024.0 * 1024.0);
+                models.push(json!({
+                    "id": format!("local:{name}"),
+                    "label": format!("{name} ({size_gb:.1}GB)"),
+                    "type": "local",
+                    "file": name,
+                    "size_bytes": size,
+                }));
+            }
+        }
+
+        // Also read default_model from inference.toml if it exists
+        let inf_path = self.home_dir.join("inference.toml");
+        let default_model = if let Ok(content) = tokio::fs::read_to_string(&inf_path).await {
+            content.parse::<toml::Table>().ok()
+                .and_then(|t| t.get("default_model")?.as_str().map(|s| s.to_string()))
+        } else {
+            None
+        };
+
+        WsFrame::ok_response("", json!({
+            "models": models,
+            "default_local": default_model,
+        }))
     }
 
     // ── System Config Update ─────────────────────────────────
