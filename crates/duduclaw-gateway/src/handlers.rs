@@ -148,6 +148,7 @@ impl MethodHandler {
             "system.doctor_repair" => self.handle_system_doctor_repair().await,
             "system.config" => self.handle_system_config().await,
             "system.update_config" => self.handle_system_update_config(params).await,
+            "accounts.add" => self.handle_accounts_add(params).await,
             "accounts.update_budget" => self.handle_accounts_update_budget(params).await,
             "system.version" => self.handle_system_version(),
             "logs.subscribe" => self.handle_logs_subscribe(params),
@@ -210,6 +211,7 @@ impl MethodHandler {
                 { "name": "system.doctor_repair", "description": "Health checks with repair hints" },
                 { "name": "system.config", "description": "View system config" },
                 { "name": "system.update_config", "description": "Update system config (log_level, rotation)" },
+                { "name": "accounts.add", "description": "Add a new account" },
                 { "name": "accounts.update_budget", "description": "Update account monthly budget" },
                 { "name": "system.version", "description": "Version info" },
                 { "name": "heartbeat.status", "description": "Per-agent heartbeat status" },
@@ -677,6 +679,27 @@ impl MethodHandler {
                 }
             }
 
+            // ── Container fields ([container] section) ──
+            let container = table.entry("container")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut();
+            if let Some(ct) = container {
+                if let Some(v) = params_clone.get("timeout_ms").and_then(|v| v.as_u64()) {
+                    ct.insert("timeout_ms".into(), toml::Value::Integer(v as i64));
+                    changes.push(format!("container.timeout_ms = {v}"));
+                }
+                if let Some(v) = params_clone.get("max_concurrent").and_then(|v| v.as_u64()) {
+                    ct.insert("max_concurrent".into(), toml::Value::Integer(v as i64));
+                    changes.push(format!("container.max_concurrent = {v}"));
+                }
+                for key in &["sandbox_enabled", "network_access", "readonly_project"] {
+                    if let Some(v) = params_clone.get(*key).and_then(|v| v.as_bool()) {
+                        ct.insert((*key).into(), toml::Value::Boolean(v));
+                        changes.push(format!("container.{key} = {v}"));
+                    }
+                }
+            }
+
             // ── Evolution fields ([evolution] section) ──
             let evo = table.entry("evolution")
                 .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
@@ -688,13 +711,17 @@ impl MethodHandler {
                         changes.push(format!("evolution.{key} = {v}"));
                     }
                 }
-                if let Some(v) = params_clone.get("max_active_skills").and_then(|v| v.as_u64()) {
-                    evo.insert("max_active_skills".into(), toml::Value::Integer(v as i64));
-                    changes.push(format!("evolution.max_active_skills = {v}"));
+                for key in &["max_active_skills", "max_gvu_generations", "skill_token_budget"] {
+                    if let Some(v) = params_clone.get(*key).and_then(|v| v.as_u64()) {
+                        evo.insert((*key).into(), toml::Value::Integer(v as i64));
+                        changes.push(format!("evolution.{key} = {v}"));
+                    }
                 }
-                if let Some(v) = params_clone.get("max_silence_hours").and_then(|v| v.as_f64()) {
-                    evo.insert("max_silence_hours".into(), toml::Value::Float(v));
-                    changes.push(format!("evolution.max_silence_hours = {v}"));
+                for key in &["max_silence_hours", "observation_period_hours"] {
+                    if let Some(v) = params_clone.get(*key).and_then(|v| v.as_f64()) {
+                        evo.insert((*key).into(), toml::Value::Float(v));
+                        changes.push(format!("evolution.{key} = {v}"));
+                    }
                 }
             }
 
@@ -1728,6 +1755,72 @@ impl MethodHandler {
         WsFrame::ok_response("", json!({
             "success": true,
             "changes": changes,
+        }))
+    }
+
+    /// Add a new account to config.toml [[accounts]] array.
+    ///
+    /// Encrypts the API key before storing. Supports `api_key` and `oauth` types.
+    async fn handle_accounts_add(&self, params: Value) -> WsFrame {
+        let id = match params.get("id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id,
+            _ => return WsFrame::error_response("", "Missing 'id' parameter"),
+        };
+        let auth_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("api_key");
+        let key = match params.get("key").and_then(|v| v.as_str()) {
+            Some(k) if !k.is_empty() => k,
+            _ => return WsFrame::error_response("", "Missing 'key' parameter"),
+        };
+        let budget_cents = params.get("monthly_budget_cents").and_then(|v| v.as_u64()).unwrap_or(5000);
+        let priority = params.get("priority").and_then(|v| v.as_u64()).unwrap_or(1);
+
+        let config_path = self.home_dir.join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+
+        // Ensure [[accounts]] array exists
+        let accounts = table.entry("accounts")
+            .or_insert_with(|| toml::Value::Array(Vec::new()));
+        let arr = match accounts.as_array_mut() {
+            Some(a) => a,
+            None => return WsFrame::error_response("", "Invalid 'accounts' section in config.toml"),
+        };
+
+        // Check for duplicate id
+        if arr.iter().any(|a| a.as_table().and_then(|t| t.get("id").and_then(|v| v.as_str())) == Some(id)) {
+            return WsFrame::error_response("", &format!("Account '{id}' already exists"));
+        }
+
+        // Encrypt the key
+        let encrypted = crate::config_crypto::encrypt_value(key, &self.home_dir);
+
+        let mut account = toml::map::Map::new();
+        account.insert("id".into(), toml::Value::String(id.into()));
+        account.insert("type".into(), toml::Value::String(auth_type.into()));
+        account.insert("monthly_budget_cents".into(), toml::Value::Integer(budget_cents as i64));
+        account.insert("priority".into(), toml::Value::Integer(priority as i64));
+        // Store plaintext key for runtime use + encrypted version for security
+        let key_field = if auth_type == "oauth" { "oauth_token" } else { "anthropic_api_key" };
+        account.insert(key_field.into(), toml::Value::String(key.into()));
+        if let Some(enc) = &encrypted {
+            account.insert(format!("{key_field}_enc"), toml::Value::String(enc.clone()));
+        }
+        arr.push(toml::Value::Table(account));
+
+        // Atomic write
+        let tmp_path = config_path.with_extension("toml.tmp");
+        if let Err(e) = self.write_config_table(&tmp_path, &table).await {
+            return WsFrame::error_response("", &format!("Failed to write config: {e}"));
+        }
+        if let Err(e) = tokio::fs::rename(&tmp_path, &config_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return WsFrame::error_response("", &format!("Failed to commit config: {e}"));
+        }
+
+        info!(id, auth_type, "accounts.add completed");
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "id": id,
+            "type": auth_type,
         }))
     }
 

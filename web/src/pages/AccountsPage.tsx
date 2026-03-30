@@ -11,6 +11,7 @@ import {
   AlertTriangle,
   Key,
   KeyRound,
+  Pencil,
 } from 'lucide-react';
 
 export function AccountsPage() {
@@ -125,7 +126,7 @@ export function AccountsPage() {
       {!loading && budget?.accounts && budget.accounts.length > 0 ? (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {budget.accounts.map((account) => (
-            <AccountCard key={account.id} account={account} intl={intl} />
+            <AccountCard key={account.id} account={account} intl={intl} onBudgetUpdated={fetchBudget} />
           ))}
         </div>
       ) : !loading ? (
@@ -174,11 +175,13 @@ function AddAccountDialog({
     setSubmitting(true);
     setError(null);
     try {
-      // TODO: Implement dedicated accounts.add endpoint to persist account data.
-      // Currently this only performs a health check — the API key is NOT stored.
-      await api.accounts.health();
-      // Warn user that this feature is not yet fully implemented
-      console.warn('[AccountsPage] accounts.add endpoint not yet implemented — data not persisted');
+      await api.accounts.add({
+        id: name.trim(),
+        type: accountType,
+        key: apiKey.trim(),
+        monthly_budget_cents: Math.round(Number(budget) * 100),
+        priority: Number(priority),
+      });
       onCreated();
       onClose();
       setName('');
@@ -268,14 +271,33 @@ function AddAccountDialog({
 function AccountCard({
   account,
   intl,
+  onBudgetUpdated,
 }: {
   account: AccountInfo;
   intl: ReturnType<typeof useIntl>;
+  onBudgetUpdated: () => void;
 }) {
+  const [editing, setEditing] = useState(false);
+  const [budgetInput, setBudgetInput] = useState(String(account.monthly_budget_cents / 100));
+  const [saving, setSaving] = useState(false);
+
   const spentPercent =
     account.monthly_budget_cents > 0
       ? Math.min(100, (account.spent_this_month / account.monthly_budget_cents) * 100)
       : 0;
+
+  const handleSaveBudget = async () => {
+    setSaving(true);
+    try {
+      await api.accounts.updateBudget(account.id, Math.round(Number(budgetInput) * 100));
+      setEditing(false);
+      onBudgetUpdated();
+    } catch {
+      // error
+    } finally {
+      setSaving(false);
+    }
+  };
 
   return (
     <div className="rounded-xl border border-stone-200 bg-white p-5 transition-shadow hover:shadow-md dark:border-stone-800 dark:bg-stone-900">
@@ -309,12 +331,38 @@ function AccountCard({
       </div>
 
       <div className="mt-4">
-        <div className="mb-1 flex justify-between text-xs text-stone-500 dark:text-stone-400">
+        <div className="mb-1 flex items-center justify-between text-xs text-stone-500 dark:text-stone-400">
           <span>{intl.formatMessage({ id: 'accounts.budget.used' })}</span>
-          <span>
-            ${(account.spent_this_month / 100).toFixed(2)} / $
-            {(account.monthly_budget_cents / 100).toFixed(2)}
-          </span>
+          {editing ? (
+            <div className="flex items-center gap-1">
+              <span>${(account.spent_this_month / 100).toFixed(2)} / $</span>
+              <input
+                type="number"
+                min="1"
+                value={budgetInput}
+                onChange={(e) => setBudgetInput(e.target.value)}
+                className="w-20 rounded border border-amber-400 bg-white px-1.5 py-0.5 text-xs text-stone-900 focus:outline-none dark:border-amber-600 dark:bg-stone-800 dark:text-stone-50"
+                autoFocus
+              />
+              <button onClick={handleSaveBudget} disabled={saving} className="rounded bg-amber-500 px-1.5 py-0.5 text-xs text-white hover:bg-amber-600 disabled:opacity-50">
+                {intl.formatMessage({ id: 'common.save' })}
+              </button>
+              <button onClick={() => setEditing(false)} className="text-xs text-stone-400 hover:text-stone-600">
+                {intl.formatMessage({ id: 'common.cancel' })}
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={() => { setBudgetInput(String(account.monthly_budget_cents / 100)); setEditing(true); }}
+              className="flex items-center gap-1 hover:text-amber-600 dark:hover:text-amber-400"
+            >
+              <span>
+                ${(account.spent_this_month / 100).toFixed(2)} / $
+                {(account.monthly_budget_cents / 100).toFixed(2)}
+              </span>
+              <Pencil className="h-3 w-3" />
+            </button>
+          )}
         </div>
         <div className="h-1.5 overflow-hidden rounded-full bg-stone-200 dark:bg-stone-700">
           <div

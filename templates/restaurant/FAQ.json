@@ -1,0 +1,64 @@
+{
+  "_comment": "Restaurant FAQ template — replace placeholder values with actual data",
+  "business_info": {
+    "name": "YOUR_RESTAURANT_NAME",
+    "address": "台北市XX區XX路XX號",
+    "phone": "02-XXXX-XXXX",
+    "parking": "門口有路邊停車格，附近有XX停車場",
+    "hours": {
+      "monday": "11:00-14:00, 17:00-21:00",
+      "tuesday": "11:00-14:00, 17:00-21:00",
+      "wednesday": "11:00-14:00, 17:00-21:00",
+      "thursday": "11:00-14:00, 17:00-21:00",
+      "friday": "11:00-14:00, 17:00-22:00",
+      "saturday": "11:00-22:00",
+      "sunday": "11:00-21:00"
+    },
+    "last_order_before_close_minutes": 30,
+    "holidays": "每月第一個週一公休"
+  },
+  "reservation": {
+    "max_party_size_online": 10,
+    "advance_days_max": 30,
+    "advance_days_min": 0,
+    "cancellation_policy": "請於用餐前 2 小時來電取消，逾時可能收取訂金",
+    "deposit_required_above": 6,
+    "deposit_amount": 500
+  },
+  "menu_categories": [
+    {
+      "category": "招牌料理",
+      "items": [
+        { "name": "招牌牛肉麵", "price": 220, "description": "紅燒湯頭，手工拉麵，半筋半肉", "allergens": ["gluten", "soy"] },
+        { "name": "麻辣乾拌麵", "price": 180, "description": "自製花椒辣油，配溫泉蛋", "allergens": ["gluten", "egg", "soy"], "spicy": true }
+      ]
+    },
+    {
+      "category": "小菜",
+      "items": [
+        { "name": "涼拌小黃瓜", "price": 60, "description": "蒜味清爽", "allergens": [] },
+        { "name": "滷味拼盤", "price": 120, "description": "豆干、海帶、滷蛋", "allergens": ["soy", "egg"] }
+      ]
+    },
+    {
+      "category": "飲料",
+      "items": [
+        { "name": "酸梅湯", "price": 40, "description": "自製冰鎮酸梅湯", "allergens": [] },
+        { "name": "紅茶", "price": 30, "description": "古早味紅茶", "allergens": [] }
+      ]
+    }
+  ],
+  "promotions": [
+    {
+      "name": "平日午間優惠",
+      "description": "週一至週五午餐，點主餐送小菜一份",
+      "valid_until": "2026-06-30"
+    }
+  ],
+  "payment_methods": ["cash", "credit_card", "line_pay", "jko_pay"],
+  "wifi": {
+    "available": true,
+    "ssid": "YOUR_RESTAURANT_WIFI",
+    "password": "請向店員索取"
+  }
+}

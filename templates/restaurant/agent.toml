@@ -1,0 +1,75 @@
+# DuDuClaw Restaurant Agent Template
+# Usage: cp -r templates/restaurant/ ~/.duduclaw/agents/<your-agent-name>/
+
+[agent]
+name = "restaurant-assistant"
+display_name = "Restaurant Assistant"
+role = "main"
+status = "active"
+trigger = "restaurant"
+reports_to = "none"
+icon = "fork-knife"
+
+[model]
+preferred = "claude-sonnet-4-6"
+fallback = "claude-haiku-4-5"
+account_pool = ["main"]
+api_mode = "cli"
+
+[model.local]
+model = ""
+backend = "llama_cpp"
+context_length = 4096
+gpu_layers = -1
+prefer_local = true
+use_router = true
+
+[container]
+timeout_ms = 30000
+max_concurrent = 2
+readonly_project = true
+sandbox_enabled = false
+network_access = false
+
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 2000
+warn_threshold_percent = 80
+hard_stop = false
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = false
+can_modify_own_skills = false
+can_modify_own_soul = false
+can_schedule_tasks = true
+allowed_channels = ["line", "telegram"]
+
+[evolution]
+skill_auto_activate = true
+skill_security_scan = true
+gvu_enabled = true
+cognitive_memory = false
+max_silence_hours = 12.0
+max_gvu_generations = 3
+observation_period_hours = 24.0
+skill_token_budget = 2500
+max_active_skills = 5
+
+[evolution.external_factors]
+user_feedback = true
+security_events = false
+channel_metrics = true
+business_context = false
+peer_signals = false
+
+[capabilities]
+computer_use = false
+browser_via_bash = false
+allowed_tools = []
+denied_tools = []

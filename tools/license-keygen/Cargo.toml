@@ -1,0 +1,19 @@
+[package]
+name = "duduclaw-license-keygen"
+version = "0.1.0"
+edition = "2021"
+description = "Internal tool for generating DuDuClaw license keys"
+publish = false
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+sha2 = "0.10"
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+hostname = "0.4"
+hex = "0.4"

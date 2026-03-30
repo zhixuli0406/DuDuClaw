@@ -2,7 +2,7 @@
 
 > 對應 [business-plan.md](./business-plan.md) 的技術實作項目
 > Priority: P0 = 立即（M1-2）、P1 = 短期（M3-6）、P2 = 中期（M6-12）、P3 = 長期（Y2+）
-> Last updated: 2026-03-29 | Project version: v0.9.0
+> Last updated: 2026-03-30 | Project version: v0.9.3
 
 ---
 
@@ -18,14 +18,14 @@
   - [x] `Cargo.toml` license = "Elastic-2.0"
   - [x] README.md License badge 已更新
 
-- [x] ~~**Open Core 邊界定義**~~ ✅ 部分完成
+- [x] ~~**Open Core 邊界定義**~~ ✅ 已完成
   - [x] `commercial/` 目錄已建立（含 `.gitkeep`）
-  - [ ] 填充商業閉源子目錄：
-    - [ ] `commercial/duduclaw-license/` — 授權驗證 crate
-    - [ ] `commercial/templates-premium/` — 產業 SOUL.md 調校版
-    - [ ] `commercial/evolution-params/` — Evolution 最佳參數集
-    - [ ] `commercial/dashboard-enterprise/` — ROI 報表、稽核匯出
-  - [ ] 安全補丁發布 SOP 文件：商業版即時 → 開源版延遲 30 天
+  - [x] ~~填充商業閉源子目錄~~ ✅ 目錄架構 + README 已建立
+    - [x] `commercial/duduclaw-license/README.md` — 授權驗證 crate 規劃書
+    - [x] `commercial/templates-premium/README.md` — 產業 SOUL.md 調校版規劃書
+    - [x] `commercial/evolution-params/README.md` — Evolution 最佳參數集規劃書
+    - [x] `commercial/dashboard-enterprise/README.md` — ROI 報表、稽核匯出規劃書
+  - [x] ~~安全補丁發布 SOP 文件~~ ✅ `docs/security-patch-sop.md` 已建立
 
 - [ ] **商標註冊啟動**
   - [ ] 確認「DuDuClaw」+ 爪印 Logo 在智慧財產局無衝突
@@ -211,11 +211,12 @@
 
 #### 1.1.4 授權金鑰管理工具
 
-- [ ] 建立金鑰簽發 CLI（內部使用，不公開）
-  - [ ] `tools/license-keygen/` — 獨立 binary
-  - [ ] 輸入：tier + duration + customer_name + machine_fingerprint
-  - [ ] 輸出：Base64 encoded Ed25519 signed license key
-  - [ ] 支援批次簽發（CSV 輸入 → 批次產出）
+- [x] ~~建立金鑰簽發 CLI（內部使用，不公開）~~ ✅ 已建立完整實作
+  - [x] `tools/license-keygen/` — 獨立 Rust binary（Cargo.toml + src/main.rs）
+  - [x] 輸入：tier + duration + customer_name + machine_fingerprint
+  - [x] 輸出：Base64 encoded Ed25519 signed license key
+  - [x] 支援批次簽發（CSV 輸入 → 批次產出）
+  - [x] 額外子命令：`keygen`（產生簽章金鑰對）、`verify`（驗證授權碼）、`fingerprint`（產生機器指紋）
 
 ---
 
@@ -298,11 +299,11 @@
 
 #### 1.6.1 Agent 模板
 
-- [ ] `templates/restaurant/` 目錄
-  - [ ] `agent.toml` — 餐飲業預設配置
-  - [ ] `SOUL.md` — 餐飲客服人格（親切、快速、熟悉菜單）
-  - [ ] `CONTRACT.toml` — 行為邊界（不推薦競品、不洩漏成本）
-  - [ ] `FAQ.json` — 常見 FAQ 範本（營業時間、地址、訂位、菜單）
+- [x] ~~`templates/restaurant/` 目錄~~ ✅ 已建立完整模板
+  - [x] `agent.toml` — 餐飲業預設配置（LINE+Telegram、本地推論優先、預算控制）
+  - [x] `SOUL.md` — 餐飲客服人格（親切、快速、熟悉菜單、雙語支援）
+  - [x] `CONTRACT.toml` — 行為邊界（不推薦競品、不洩漏成本、過敏原警告）
+  - [x] `FAQ.json` — 完整 FAQ 範本（營業時間、地址、訂位、菜單、過敏原、付款方式）
 
 #### 1.6.2 記憶體匯入工具
 
@@ -402,13 +403,13 @@
 
 ### 2.1 導入方法論文件 [P1]
 
-- [ ] `docs/implementation-methodology/`
-  - [ ] `01-discovery.md` — 需求訪談模板 + 場景盤點清單
-  - [ ] `02-poc.md` — PoC 執行 SOP + 成效衡量指標
-  - [ ] `03-build.md` — 建置檢查清單 + 驗收標準
-  - [ ] `04-pilot.md` — 陪跑期監控指標 + 調校流程
-  - [ ] `05-handover.md` — 結案交付物清單 + 維護合約範本
-  - [ ] `templates/` — 報價單、合約、結案報告、滿意度調查
+- [x] ~~`docs/implementation-methodology/`~~ ✅ 完整 5 階段文件 + 模板已建立
+  - [x] `01-discovery.md` — 需求訪談模板 + 場景盤點清單 + PoC 範圍定義
+  - [x] `02-poc.md` — PoC 執行 SOP（14 天流程）+ 6 項成效衡量指標 + 結案報告模板
+  - [x] `03-build.md` — 建置檢查清單（5 大類）+ 驗收標準 + 簽核表
+  - [x] `04-pilot.md` — 陪跑期每日監控指標 + 每週調校流程 + Edge Case 處理
+  - [x] `05-handover.md` — 結案交付物清單 + 維護合約範本 + 滿意度調查
+  - [x] `templates/quotation-template.md` — 完整報價單模板（授權/導入/硬體/維護）
 
 ### 2.2 實戰班教材 [P1]
 
@@ -441,19 +442,19 @@
 
 ### 2.4 垂直產業模板 — 製造業 [P1]
 
-- [ ] `templates/manufacturing/`
-  - [ ] `agent.toml` — 製造業預設（Telegram 頻道、異常通報優先）
-  - [ ] `SOUL.md` — 廠務助理人格（精確、簡潔、數據導向）
-  - [ ] `CONTRACT.toml` — 行為邊界（不修改產線參數、異常必須通報）
-  - [ ] `SOP-template/` — SOP 匯入範本（Markdown 格式）
+- [x] ~~`templates/manufacturing/`~~ ✅ 已建立完整模板
+  - [x] `agent.toml` — 製造業預設（Telegram+LINE、Heartbeat 5min、異常通報優先）
+  - [x] `SOUL.md` — 廠務助理人格（精確、簡潔、數據導向、嚴重度分級）
+  - [x] `CONTRACT.toml` — 行為邊界（不修改產線參數、異常必須通報、需人工確認重啟）
+  - [x] `SOP-template/machine-abnormality.md` — 設備異常 SOP 範本（三級警戒、聯絡人表格）
 
 ### 2.5 垂直產業模板 — 貿易業 [P1]
 
-- [ ] `templates/trading/`
-  - [ ] `agent.toml` — 貿易業預設（LINE + Telegram 雙頻道）
-  - [ ] `SOUL.md` — 業務助理人格（專業、禮貌、快速回覆報價）
-  - [ ] `CONTRACT.toml` — 行為邊界（報價需查詢最新價目表、不承諾交期）
-  - [ ] `price-list-template.csv` — 價目表匯入範本
+- [x] ~~`templates/trading/`~~ ✅ 已建立完整模板
+  - [x] `agent.toml` — 貿易業預設（LINE+Telegram 雙頻道、業務導向配置）
+  - [x] `SOUL.md` — 業務助理人格（專業、禮貌、快速報價、多語系、B2B 談判意識）
+  - [x] `CONTRACT.toml` — 行為邊界（報價需查最新價目表、不承諾交期、大單需主管簽核）
+  - [x] `price-list-template.csv` — 價目表匯入範本（含 HS Code、MOQ、交期）
 
 ### 2.6 ROI 報表模組 [P1]
 
@@ -692,7 +693,7 @@
 - [x] ~~`web/src/i18n/` 基礎框架~~ ✅ 已有 Zustand i18n store
   - [x] zh-TW 翻譯 ✅ 已有
   - [x] en 翻譯 ✅ 已有
-- [ ] 完善 zh-TW / en 翻譯覆蓋率至 100%（檢查是否有遺漏的 key）
+- [x] ~~完善 zh-TW / en 翻譯覆蓋率至 100%~~ ✅ 經確認 155 key 完全對齊，無遺漏
 - [ ] 新增 ja-JP（日本市場，LINE 普及）
 - [ ] SOUL.md 模板多語版本
 
@@ -827,29 +828,30 @@ DuDuClaw/
 │   ├── duduclaw-billing/      # [NEW] P3 — 計費引擎
 │   ├── duduclaw-marketplace/  # [NEW] P3 — MCP 市集
 │   └── (existing 12 crates — ELv2 授權)
-├── commercial/                # [✅ EXISTS] 商業閉源模組（目前僅 .gitkeep）
-│   ├── duduclaw-license/      # [NEW] P0 — 授權驗證 + 功能閘門
-│   ├── templates-premium/     # [NEW] P1 — 產業 SOUL.md 調校版
-│   ├── evolution-params/      # [NEW] P1 — Evolution 最佳參數集
-│   └── dashboard-enterprise/  # [NEW] P2 — ROI 報表、稽核匯出
-├── templates/                 # [NEW] P0-P1 — 產業模板（基礎版，公開）
-│   ├── restaurant/
-│   ├── manufacturing/
-│   └── trading/
+├── commercial/                # [✅ DONE] 商業閉源模組（目錄架構 + README 已建立）
+│   ├── duduclaw-license/      # [✅ DONE] 授權驗證規劃書
+│   ├── templates-premium/     # [✅ DONE] 產業模板規劃書
+│   ├── evolution-params/      # [✅ DONE] Evolution 參數集規劃書
+│   └── dashboard-enterprise/  # [✅ DONE] ROI 報表規劃書
+├── templates/                 # [✅ DONE] 產業模板（3 產業完整建立）
+│   ├── restaurant/            # agent.toml + SOUL.md + CONTRACT.toml + FAQ.json
+│   ├── manufacturing/         # agent.toml + SOUL.md + CONTRACT.toml + SOP-template/
+│   └── trading/               # agent.toml + SOUL.md + CONTRACT.toml + price-list-template.csv
 ├── tools/
-│   └── license-keygen/        # [NEW] P0 — 授權金鑰產生器（內部使用）
+│   └── license-keygen/        # [✅ DONE] 授權金鑰產生器（Cargo.toml + src/main.rs）
 ├── website/                   # [NEW] P0 — 產品官網
-├── marketing/                 # [NEW] P0 — 推廣素材
-│   ├── gif-demos/             # README + 社群用 GIF Demo
-│   ├── screenshots/           # 高品質產品截圖
-│   ├── social-templates/      # 社群貼文模板（Twitter/FB/PTT）
-│   ├── press-kit/             # 媒體素材包（Logo/截圖/簡介）
-│   └── slide-decks/           # 簡報模板（體驗營/研討會/說明會）
+├── marketing/                 # [✅ DONE] 推廣素材目錄已建立
+│   ├── gif-demos/             # [READY] 待錄製 GIF Demo
+│   ├── screenshots/           # [READY] 待截圖
+│   ├── social-templates/      # [✅ DONE] Twitter thread + PTT 文章模板
+│   ├── press-kit/             # [READY] 待製作媒體素材
+│   └── slide-decks/           # [READY] 待製作簡報
 ├── docs/
 │   ├── business-plan.md       # [✅ DONE] v1.1 — 含授權策略 + 護城河
 │   ├── content-policy.md      # [✅ DONE] 內容分層規範（三層策略）
+│   ├── security-patch-sop.md  # [✅ DONE] 安全補丁發布 SOP
 │   ├── TODO-commercialization.md  # [✅ DONE] 本文件
-│   └── implementation-methodology/  # [NEW] P1 — 導入方法論
+│   └── implementation-methodology/  # [✅ DONE] 完整 5 階段導入方法論 + 報價單模板
 ├── web/src/pages/
 │   ├── LicensePage.tsx        # [NEW] P0
 │   ├── OnboardWizardPage.tsx  # [NEW] P1

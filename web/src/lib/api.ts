@@ -164,6 +164,12 @@ export interface AgentUpdateParams {
   can_modify_own_skills?: boolean;
   can_modify_own_soul?: boolean;
   can_schedule_tasks?: boolean;
+  // Container
+  timeout_ms?: number;
+  max_concurrent?: number;
+  sandbox_enabled?: boolean;
+  network_access?: boolean;
+  readonly_project?: boolean;
   // Evolution
   skill_auto_activate?: boolean;
   skill_security_scan?: boolean;
@@ -171,6 +177,9 @@ export interface AgentUpdateParams {
   cognitive_memory?: boolean;
   max_active_skills?: number;
   max_silence_hours?: number;
+  max_gvu_generations?: number;
+  observation_period_hours?: number;
+  skill_token_budget?: number;
 }
 
 // API namespace
@@ -228,6 +237,8 @@ export const api = {
         account_id: accountId,
         monthly_budget_cents: monthlyBudgetCents,
       }) as Promise<{ success: boolean }>,
+    add: (params: { id: string; type: string; key: string; monthly_budget_cents: number; priority: number }) =>
+      client.call('accounts.add', params) as Promise<{ success: boolean }>,
   },
   memory: {
     search: (agentId: string, query: string, limit = 20) =>

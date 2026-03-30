@@ -36,10 +36,31 @@
 - [x] 5.1 zh-TW.json 新增翻譯 key
 - [x] 5.2 en.json 新增翻譯 key
 
+## Phase 6: 深度補全（第二輪）
+
+- [x] 6.1 Backend: `accounts.add` handler（持久化帳號到 config.toml）
+- [x] 6.2 Backend: `agents.update` 補 container 欄位（sandbox, network, timeout, max_concurrent）
+- [x] 6.3 Backend: `agents.update` 補進階演化欄位（max_gvu_generations, observation_period_hours, skill_token_budget）
+- [x] 6.4 Frontend: AccountsPage 帳號預算 inline 編輯（Pencil icon → 數字輸入 → Save）
+- [x] 6.5 Frontend: AddAccountDialog 改接 `accounts.add`（原本是空操作）
+- [x] 6.6 Frontend: EditAgentDialog 新增 Container tab（sandbox, network, readonly, timeout, max_concurrent）
+- [x] 6.7 Frontend: EditAgentDialog 補 api_mode 下拉（cli/direct/auto）
+- [x] 6.8 Frontend: EditAgentDialog 補進階演化欄位（max_active_skills, max_silence_hours）
+- [x] 6.9 Frontend: ChannelsPage 加入編輯按鈕（re-add 替換 token）
+- [x] 6.10 Frontend: `api.accounts.add()` 方法
+- [x] 6.11 Frontend: `AgentUpdateParams` 補 container + 進階演化欄位
+
+## Bug 修復
+
+- [x] Memory 頁面 DB 路徑不一致（state.db → memory.db）
+- [x] Memory 頁面沒有 auto-load（加 agent 選擇器 + browse）
+- [x] Memory 頁面 `memory.browse` API 未暴露
+- [x] Dashboard 首頁載入 race condition（ws-client 等 authenticated 狀態）
+
 ## Build 驗證
 
-- [x] Rust `cargo check` 通過
-- [x] TypeScript `tsc --noEmit` 通過
+- [x] Rust `cargo check` 通過（兩輪）
+- [x] TypeScript `tsc --noEmit` 通過（兩輪）
 
 ## 風險控制
 
