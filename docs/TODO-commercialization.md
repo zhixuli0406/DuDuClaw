@@ -2,7 +2,7 @@
 
 > 對應 [business-plan.md](./business-plan.md) 的技術實作項目
 > Priority: P0 = 立即（M1-2）、P1 = 短期（M3-6）、P2 = 中期（M6-12）、P3 = 長期（Y2+）
-> Last updated: 2026-03-30 | Project version: v0.9.5
+> Last updated: 2026-03-30 | Project version: v0.9.6
 
 ---
 
