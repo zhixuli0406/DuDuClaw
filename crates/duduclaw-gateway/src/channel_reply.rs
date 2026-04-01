@@ -208,10 +208,17 @@ pub async fn build_reply_with_session(
         return format!("⚠️ {}", scan.summary);
     }
 
+    // Sanitize role-prefix injection: strip any attempt to impersonate assistant/system role
+    let sanitized_text = if text.starts_with("assistant:") || text.starts_with("system:") {
+        format!("[user input] {text}")
+    } else {
+        text.to_string()
+    };
+
     // Append user message to session using improved CJK-aware token estimate
-    let user_tokens = estimate_tokens(text);
+    let user_tokens = estimate_tokens(&sanitized_text);
     if let Err(e) = session_mgr
-        .append_message(session_id, "user", text, user_tokens)
+        .append_message(session_id, "user", &sanitized_text, user_tokens)
         .await
     {
         warn!("Failed to save user message to session: {e}");
@@ -247,7 +254,7 @@ pub async fn build_reply_with_session(
     };
 
     // 1. Try `claude` CLI directly (Claude Code SDK — has built-in tools)
-    let reply = match call_claude_cli(text, &model, &full_system_prompt, &ctx.home_dir, agent_dir.as_deref(), on_progress.as_ref(), capabilities.as_ref()).await {
+    let reply = match call_claude_cli(&sanitized_text, &model, &full_system_prompt, &ctx.home_dir, agent_dir.as_deref(), on_progress.as_ref(), capabilities.as_ref()).await {
         Ok(reply) => {
             info!("Claude replied via Claude Code SDK ({} chars)", reply.len());
             Some(reply)
@@ -266,7 +273,7 @@ pub async fn build_reply_with_session(
     // 2. Fallback: Python wrapper (with account rotator)
     let reply = match reply {
         Some(r) => Some(r),
-        None => match call_python_sdk_v2(text, &model, &full_system_prompt, &ctx.home_dir).await {
+        None => match call_python_sdk_v2(&sanitized_text, &model, &full_system_prompt, &ctx.home_dir).await {
             Ok(reply) => {
                 info!("Claude replied via Python SDK ({} chars)", reply.len());
                 Some(reply)

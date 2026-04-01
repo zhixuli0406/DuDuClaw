@@ -5,11 +5,14 @@
 //! which were rolled back).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+
+static VERSION_STORE_NO_CRYPTO_WARNED: AtomicBool = AtomicBool::new(false);
 
 use duduclaw_security::crypto::CryptoEngine;
 
@@ -83,6 +86,9 @@ pub struct SoulVersion {
     pub proposal_id: String,
     /// Reverse diff to undo this change.
     pub rollback_diff: String,
+    /// SHA-256 hex digest of the plaintext rollback_diff for integrity verification.
+    #[serde(default)]
+    pub rollback_diff_hash: Option<String>,
 }
 
 /// Persistent store for SOUL.md version history.
@@ -99,6 +105,13 @@ impl VersionStore {
     ///
     /// If `key_bytes` is provided, rollback_diff will be encrypted at rest.
     pub fn new(db_path: &Path) -> Self {
+        if !VERSION_STORE_NO_CRYPTO_WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "VersionStore initialized without encryption — \
+                 rollback_diff stored as plaintext. \
+                 Use VersionStore::with_crypto() for production."
+            );
+        }
         Self::with_crypto(db_path, None)
     }
 
@@ -327,6 +340,8 @@ impl VersionStore {
             post_metrics: post_json.and_then(|j| serde_json::from_str(&j).ok()),
             proposal_id: row.get("proposal_id")?,
             rollback_diff: row.get("rollback_diff")?,
+            // Hash not stored in legacy DB rows — integrity check skipped for old records
+            rollback_diff_hash: None,
         })
     }
 }

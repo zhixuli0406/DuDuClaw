@@ -525,9 +525,16 @@ async fn call_claude_summarize(raw_memories: &str) -> String {
         None => return String::new(),
     };
 
+    // Escape XML closing tags in memory content to prevent prompt injection
+    // via crafted memory entries that could break out of the XML delimiters.
+    let escaped_memories = raw_memories
+        .replace("</memory_entries>", "&lt;/memory_entries&gt;")
+        .replace("<memory_entries>", "&lt;memory_entries&gt;");
+
     let prompt = format!(
         "Summarize the following agent memory entries into a concise narrative (max 300 words). \
-         Focus on patterns, key decisions, and recurring themes.\n\n{raw_memories}"
+         Focus on patterns, key decisions, and recurring themes.\n\n\
+         <memory_entries>\n{escaped_memories}\n</memory_entries>"
     );
 
     let mut cmd = tokio::process::Command::new(&claude);

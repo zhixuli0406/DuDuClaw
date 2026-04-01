@@ -2,13 +2,36 @@ use axum::{
     Router,
     extract::State,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    extract::ConnectInfo,
     response::IntoResponse,
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
+
+static WS_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<IpAddr, (Instant, u32)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn check_ws_rate_limit(ip: IpAddr) -> bool {
+    let mut map = WS_RATE_LIMITER.lock().unwrap();
+    let now = Instant::now();
+    // Cleanup stale entries every time the map grows large
+    if map.len() > 1000 {
+        map.retain(|_, (t, _)| now.duration_since(*t).as_secs() < 120);
+    }
+    let entry = map.entry(ip).or_insert((now, 0));
+    if now.duration_since(entry.0).as_secs() > 60 {
+        *entry = (now, 1);
+        return true;
+    }
+    entry.1 += 1;
+    entry.1 <= 30 // max 30 WS connections per minute per IP
+}
 
 use crate::auth::AuthManager;
 use crate::handlers::MethodHandler;
@@ -131,7 +154,6 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         handler.register_channel_handle("telegram", h).await;
     }
     let line_router = crate::line::start_line_bot(&home_dir, reply_ctx.clone()).await;
-    let reply_ctx_for_debug = reply_ctx.clone();
     if let Some(h) = crate::discord::start_discord_bot(&home_dir, reply_ctx).await {
         handler.register_channel_handle("discord", h).await;
     }
@@ -166,21 +188,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         tx,
     });
 
-    // Debug chat endpoint — test AI reply pipeline directly via HTTP
-    let debug_ctx = reply_ctx_for_debug;
-    let debug_chat = axum::routing::post(move |body: String| {
-        let ctx = debug_ctx.clone();
-        async move {
-            let msg = if body.is_empty() { "hello".to_string() } else { body };
-            let reply = crate::channel_reply::build_reply(&msg, &ctx).await;
-            reply
-        }
-    });
-
     let mut app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health_handler))
-        .route("/debug/chat", debug_chat)
         .with_state(state);
 
     // Mount LINE webhook endpoint
@@ -205,7 +215,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Serve with graceful shutdown on Ctrl+C
     let pe_for_shutdown = prediction_engine.clone();
     let meta_path_for_shutdown = metacognition_path.clone();
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
             info!("Shutdown signal received, flushing state...");
@@ -223,8 +233,29 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    // Rate limit: max 30 WS connections per minute per IP.
+    if !check_ws_rate_limit(addr.ip()) {
+        warn!(ip = %addr.ip(), "WebSocket connection rejected: rate limit exceeded");
+        return axum::http::StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+
+    // Validate Origin header to prevent cross-site WebSocket hijacking.
+    // Non-browser clients (curl, SDK) don't send Origin, so absent is OK.
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        let is_safe = origin.starts_with("http://127.0.0.1")
+            || origin.starts_with("http://localhost")
+            || origin.starts_with("https://127.0.0.1")
+            || origin.starts_with("https://localhost");
+        if !is_safe {
+            warn!(origin, "WebSocket connection rejected: invalid origin");
+            return axum::http::StatusCode::FORBIDDEN.into_response();
+        }
+    }
+    ws.max_message_size(1024 * 1024) // 1MB max WebSocket message
+      .on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 /// Process a single WebSocket connection.

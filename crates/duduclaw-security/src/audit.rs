@@ -72,6 +72,8 @@ pub fn append_audit_event(home_dir: &Path, event: &AuditEvent) {
             #[cfg(unix)]
             {
                 use std::os::unix::io::AsRawFd;
+                // SAFETY: fd comes from a valid, open File handle obtained above.
+                // flock is async-signal-safe and the fd remains valid for the duration of this call.
                 if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
                     warn!("flock failed on audit log: {}", std::io::Error::last_os_error());
                 }

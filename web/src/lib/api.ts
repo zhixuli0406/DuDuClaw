@@ -148,6 +148,83 @@ export interface SkillIndexEntry {
   compatible: string[];
 }
 
+export interface BrowserAuditEntry {
+  id: string;
+  timestamp: string;
+  agent_id: string;
+  action: string;
+  url?: string;
+  screenshot?: string;
+  screenshot_path?: string;
+  tier?: string;
+  domain?: string;
+  risk_level: 'low' | 'medium' | 'high';
+  details: Record<string, unknown>;
+}
+
+export interface BrowserbaseSession {
+  session_id: string;
+  agent_id: string;
+  status: 'active' | 'closed' | 'error' | 'running' | 'completed';
+  created_at: string;
+  url?: string;
+  replay_url?: string;
+}
+
+export interface BrowserbaseCostSummary {
+  total_sessions: number;
+  active_sessions: number;
+  estimated_cost_cents: number;
+  total_cost_usd?: number;
+  total_duration_seconds?: number;
+  hours: number;
+}
+
+export interface ToolApproval {
+  tool_name: string;
+  agent_id: string;
+  approved_at: string;
+  expires_at?: string;
+  session_scoped: boolean;
+  duration_minutes?: number;
+}
+
+export interface BillingUsageMeter {
+  used: number;
+  limit: number;
+}
+
+export interface BillingUsage {
+  plan: string;
+  tier: string;
+  conversations: BillingUsageMeter;
+  agents: BillingUsageMeter;
+  channels: BillingUsageMeter;
+  inference_hours: BillingUsageMeter;
+  reset_at: string;
+}
+
+export interface BillingInvoice {
+  id: string;
+  date: string;
+  amount_cents: number;
+  status: 'paid' | 'pending' | 'failed';
+  description: string;
+  pdf_url?: string;
+}
+
+export interface LicenseInfo {
+  tier: string;
+  license_key?: string;
+  activated: boolean;
+  expires_at?: string;
+  days_remaining?: number;
+  features: string[];
+  fingerprint?: string;
+  machine_fingerprint?: string;
+  customer_name?: string;
+}
+
 /** Fields that can be updated on an agent via `agents.update`. All optional. */
 export interface AgentUpdateParams {
   // Identity
@@ -335,5 +412,71 @@ export const api = {
       client.call('logs.subscribe'),
     unsubscribe: () =>
       client.call('logs.unsubscribe'),
+  },
+  browser: {
+    auditLog: (limit = 20, agentId?: string) =>
+      client.call('browser.audit_log', { limit, agent_id: agentId }) as Promise<{ entries: BrowserAuditEntry[] }>,
+    emergencyStop: (action: 'status' | 'stop' | 'resume') =>
+      client.call('browser.emergency_stop', { action }) as Promise<{ status: 'normal' | 'stopped' | 'unknown' }>,
+    toolApprove: (
+      action: 'list' | 'approve' | 'revoke',
+      params?: {
+        agent_id?: string;
+        tool_name?: string;
+        duration_minutes?: number;
+        session_scoped?: boolean;
+      }
+    ) =>
+      client.call('browser.tool_approve', { action, ...params }) as Promise<{ approvals: ToolApproval[] }>,
+    browserbaseSessions: (
+      action: 'list' | 'create' | 'close',
+      params?: { limit?: number; session_id?: string }
+    ) =>
+      client.call('browser.browserbase_sessions', { action, ...params }) as Promise<{ sessions: BrowserbaseSession[] }>,
+    browserbaseCost: (hours = 24) =>
+      client.call('browser.browserbase_cost', { hours }) as Promise<BrowserbaseCostSummary>,
+  },
+  analytics: {
+    summary: (period: 'day' | 'week' | 'month') =>
+      client.call('analytics.summary', { period }) as Promise<{
+        total_conversations: number;
+        total_messages: number;
+        auto_reply_rate: number;
+        avg_response_ms: number;
+        p95_response_ms: number;
+        zero_cost_ratio: number;
+        estimated_savings_cents: number;
+        period: string;
+      }>,
+    conversations: () =>
+      client.call('analytics.conversations') as Promise<{
+        daily: Array<{ date: string; count: number; auto_count: number }>;
+      }>,
+    costSavings: () =>
+      client.call('analytics.cost_savings') as Promise<{
+        monthly: Array<{ month: string; human_cost: number; agent_cost: number; savings: number }>;
+      }>,
+  },
+  billing: {
+    usage: () =>
+      client.call('billing.usage') as Promise<BillingUsage>,
+    history: () =>
+      client.call('billing.history') as Promise<{ invoices: BillingInvoice[] }>,
+  },
+  license: {
+    status: () =>
+      client.call('license.status') as Promise<LicenseInfo>,
+    activate: (key: string) =>
+      client.call('license.activate', { key }) as Promise<{ success: boolean }>,
+    deactivate: () =>
+      client.call('license.deactivate') as Promise<{ success: boolean }>,
+  },
+  marketplace: {
+    install: (serverId: string) =>
+      client.call('marketplace.install', { server_id: serverId }) as Promise<{ success: boolean }>,
+  },
+  partner: {
+    generateLicense: (params: { tier: string; customer: string; months: number }) =>
+      client.call('partner.generate_license', params) as Promise<{ key: string }>,
   },
 };

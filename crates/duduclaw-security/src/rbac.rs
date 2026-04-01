@@ -198,6 +198,7 @@ mod tests {
                 skill_security_scan: false,
                 ..Default::default()
             },
+            capabilities: CapabilitiesConfig::default(),
         }
     }
 

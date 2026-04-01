@@ -29,6 +29,8 @@ base64 = { workspace = true }
 ring = { workspace = true }
 futures-util = { workspace = true }
 tempfile = "3"
+zeroize = "1"
+unicode-normalization = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -44,3 +46,6 @@ cuda = ["duduclaw-inference/cuda"]
 vulkan = ["duduclaw-inference/vulkan"]
 mistralrs-metal = ["duduclaw-inference/mistralrs-metal"]
 mistralrs-cuda = ["duduclaw-inference/mistralrs-cuda"]
+
+[dev-dependencies]
+hex = "0.4.3"

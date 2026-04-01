@@ -64,17 +64,23 @@ impl SessionManager {
     /// Acquire a connection from the pool.
     ///
     /// Tries non-blocking acquisition across all connections first. If all busy,
-    /// yields and retries — distributes contention evenly instead of thundering
-    /// herd on pool[0].
+    /// sleeps 1ms before retrying to avoid CPU spin (R4-M2). Logs a warning
+    /// after 1000 consecutive misses to surface pool exhaustion.
     async fn acquire(&self) -> tokio::sync::MutexGuard<'_, Connection> {
+        let mut attempts = 0u32;
         loop {
             for conn in &self.pool {
                 if let Ok(guard) = conn.try_lock() {
                     return guard;
                 }
             }
-            // All busy — yield to let other tasks release their connections
-            tokio::task::yield_now().await;
+            attempts += 1;
+            if attempts >= 1000 {
+                tracing::error!("Session pool exhausted after 1000 attempts — possible deadlock");
+                attempts = 0;
+            }
+            // Short sleep instead of yield_now to avoid CPU spin-loop (R4-M2)
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
 
@@ -111,10 +117,24 @@ impl SessionManager {
     }
 
     /// Get an existing session or create a new one.
+    ///
+    /// Uses INSERT OR IGNORE + SELECT to avoid the TOCTOU race where two
+    /// concurrent callers both see "not found" and both attempt INSERT,
+    /// causing one to fail with a UNIQUE constraint error.
     pub async fn get_or_create(&self, session_id: &str, agent_id: &str) -> Result<Session> {
         let conn = self.acquire().await;
+        let now = chrono::Utc::now().to_rfc3339();
 
-        let existing: Option<Session> = conn
+        // Atomic upsert: INSERT OR IGNORE is a no-op if the row already exists.
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, agent_id, summary, total_tokens, last_active, model, created_at)
+             VALUES (?1, ?2, '', 0, ?3, 'claude-sonnet-4-6', ?3)",
+            params![session_id, agent_id, now],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+
+        // Authoritative SELECT — reads whichever row won the race.
+        let session = conn
             .query_row(
                 "SELECT id, agent_id, summary, total_tokens, last_active, model
                  FROM sessions WHERE id = ?1",
@@ -130,30 +150,18 @@ impl SessionManager {
                     })
                 },
             )
-            .ok();
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
-        if let Some(session) = existing {
-            return Ok(session);
+        // Verify the session belongs to the expected agent to prevent session
+        // hijacking across agents (e.g. two agents racing with the same session_id).
+        if session.agent_id != agent_id {
+            return Err(DuDuClawError::Gateway(format!(
+                "Session '{session_id}' belongs to agent '{}', not '{agent_id}'",
+                session.agent_id
+            )));
         }
 
-        let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO sessions (id, agent_id, summary, total_tokens, last_active, model, created_at)
-             VALUES (?1, ?2, '', 0, ?3, 'claude-sonnet-4-6', ?3)",
-            params![session_id, agent_id, now],
-        )
-        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
-
-        info!(session_id, agent_id, "Created new session");
-
-        Ok(Session {
-            id: session_id.to_string(),
-            agent_id: agent_id.to_string(),
-            summary: String::new(),
-            total_tokens: 0,
-            last_active: now,
-            model: "claude-sonnet-4-6".to_string(),
-        })
+        Ok(session)
     }
 
     /// Append a message to the session and update token count.
@@ -263,6 +271,45 @@ impl SessionManager {
 
         info!(session_id, "Session compressed");
         Ok(())
+    }
+
+    /// Force-compress a session immediately, truncating message history and resetting
+    /// the token counter. Returns the number of tokens freed.
+    ///
+    /// Uses a 10-second timeout to prevent long-running compression from starving the
+    /// connection pool (SEC2-M25).
+    pub async fn force_compress(&self, session_id: &str) -> Result<u32> {
+        let compress_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            async {
+                let tokens: u32 = {
+                    let conn = self.acquire().await;
+                    conn.query_row(
+                        "SELECT total_tokens FROM sessions WHERE id = ?1",
+                        params![session_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0)
+                };
+
+                let summary = "[Session force-compressed — history cleared to free token budget]";
+                self.compress(session_id, summary).await?;
+                Ok::<u32, DuDuClawError>(tokens)
+            },
+        )
+        .await;
+
+        match compress_result {
+            Ok(Ok(tokens)) => Ok(tokens),
+            Ok(Err(e)) => {
+                tracing::warn!(session_id, error = %e, "Session force_compress failed");
+                Err(e)
+            }
+            Err(_) => {
+                tracing::warn!(session_id, "Session force_compress timed out after 10s");
+                Err(DuDuClawError::Gateway("compression timed out".to_string()))
+            }
+        }
     }
 
     /// Remove sessions that have been inactive for longer than `max_age_hours`.

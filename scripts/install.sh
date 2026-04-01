@@ -7,7 +7,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DUDUCLAW_VERSION="0.1.0"
+DUDUCLAW_VERSION="0.12.0"
 GITHUB_REPO="zhixuli0406/DuDuClaw"
 INSTALL_DIR="${DUDUCLAW_HOME:-$HOME/.duduclaw}/bin"
 BINARY_NAME="duduclaw"

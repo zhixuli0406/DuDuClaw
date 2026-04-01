@@ -27,7 +27,7 @@ services:
       retries: 3
 
   watchtower:
-    image: containrrr/watchtower
+    image: containrrr/watchtower:1.7.1  # Pin to specific version
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
@@ -38,6 +38,8 @@ services:
       - "com.centurylinklabs.watchtower.scope=duduclaw"
 
   tailscale:
+    # TODO: Pin to digest for production deployments
+    # Example: image: tailscale/tailscale:v1.78.3@sha256:abc123...
     image: tailscale/tailscale:latest
     hostname: duduclaw
     environment:
