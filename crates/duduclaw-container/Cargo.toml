@@ -13,3 +13,4 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
 futures-util = { workspace = true }
+tempfile = "3"

@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use zeroize::Zeroize;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -75,6 +76,15 @@ pub struct Account {
     pub last_used: Option<DateTime<Utc>>,
     #[serde(skip)]
     pub total_requests: u64,
+}
+
+impl Drop for Account {
+    fn drop(&mut self) {
+        self.api_key.zeroize();
+        if let Some(ref mut token) = self.oauth_token {
+            token.zeroize();
+        }
+    }
 }
 
 impl Account {
@@ -499,7 +509,17 @@ impl AccountRotator {
             monthly_budget_cents: a.monthly_budget_cents,
             total_requests: a.total_requests,
             is_available: a.is_available(),
-            email: a.email.clone(),
+            email: {
+                if a.email.contains('@') {
+                    let parts: Vec<&str> = a.email.splitn(2, '@').collect();
+                    let prefix = &parts[0][..parts[0].len().min(2)];
+                    format!("{}***@{}", prefix, parts.get(1).unwrap_or(&""))
+                } else if a.email.is_empty() {
+                    String::new()
+                } else {
+                    "***".to_string()
+                }
+            },
             subscription: a.subscription.clone(),
             label: a.label.clone(),
             expires_at: a.expires_at.clone(),

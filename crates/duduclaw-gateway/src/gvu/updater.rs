@@ -15,6 +15,7 @@ use std::path::Path;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+use unicode_normalization::UnicodeNormalization;
 
 use super::proposal::EvolutionProposal;
 use super::version_store::{SoulVersion, VersionMetrics, VersionStatus, VersionStore};
@@ -63,6 +64,39 @@ impl Updater {
     ) -> Result<SoulVersion, String> {
         let soul_path = agent_dir.join("SOUL.md");
 
+        // Scan proposal content for prompt injection before applying to SOUL.md.
+        let scan = duduclaw_security::input_guard::scan_input(
+            &proposal.content,
+            duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
+        );
+        if scan.blocked {
+            warn!(
+                agent = %proposal.agent_id,
+                score = scan.risk_score,
+                rules = ?scan.matched_rules,
+                "GVU proposal blocked by content safety scan"
+            );
+            return Err(format!(
+                "GVU proposal contains unsafe content (score {}): {:?}",
+                scan.risk_score, scan.matched_rules
+            ));
+        }
+
+        // Verify the proposal does not attempt to override behavioral contracts.
+        // NFKC-normalize and strip invisible characters before checking to prevent
+        // Unicode fullwidth/homoglyph bypass attacks (R4-H2).
+        let normalized: String = proposal.content.nfkc().collect();
+        let clean: String = normalized
+            .chars()
+            .filter(|c| !matches!(*c,
+                '\u{00AD}' | '\u{200B}'..='\u{200F}' | '\u{FEFF}' | '\u{00A0}'
+            ))
+            .collect();
+        let lower = clean.to_lowercase();
+        if lower.contains("must_not") || lower.contains("must_always") || lower.contains("contract.toml") {
+            return Err("GVU proposal cannot modify behavioral contracts".to_string());
+        }
+
         // Read current SOUL.md (for rollback)
         let current_content = std::fs::read_to_string(&soul_path)
             .map_err(|e| format!("Failed to read SOUL.md: {e}"))?;
@@ -106,6 +140,13 @@ impl Updater {
         let now = Utc::now();
         let observation_end = now + chrono::Duration::seconds((self.observation_hours * 3600.0) as i64);
 
+        // Compute SHA-256 hash of rollback content for integrity verification on rollback
+        let rollback_diff_hash = {
+            use ring::digest;
+            let d = digest::digest(&digest::SHA256, current_content.as_bytes());
+            d.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+
         let version = SoulVersion {
             version_id: uuid::Uuid::new_v4().to_string(),
             agent_id: proposal.agent_id.clone(),
@@ -118,6 +159,7 @@ impl Updater {
             post_metrics: None,
             proposal_id: proposal.id.clone(),
             rollback_diff: current_content,
+            rollback_diff_hash: Some(rollback_diff_hash),
         };
 
         // Step 1: Record version to SQLite (if this fails, SOUL.md is untouched)
@@ -210,6 +252,18 @@ impl Updater {
         agent_dir: &Path,
     ) -> Result<(), String> {
         let soul_path = agent_dir.join("SOUL.md");
+
+        // Verify rollback_diff integrity before writing
+        if let Some(ref expected_hash) = version.rollback_diff_hash {
+            use ring::digest;
+            let actual = {
+                let d = digest::digest(&digest::SHA256, version.rollback_diff.as_bytes());
+                d.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>()
+            };
+            if actual != *expected_hash {
+                return Err("Rollback diff integrity check failed: hash mismatch".to_string());
+            }
+        }
 
         // Atomic rollback: write to temp file, then rename (same pattern as apply)
         let tmp_path = soul_path.with_extension("md.rollback_tmp");

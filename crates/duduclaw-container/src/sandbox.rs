@@ -10,6 +10,8 @@
 use std::path::Path;
 use std::time::Duration;
 
+use tempfile::NamedTempFile;
+
 use bollard::container::{
     Config, CreateContainerOptions, LogsOptions, RemoveContainerOptions,
     StartContainerOptions, WaitContainerOptions,
@@ -52,11 +54,44 @@ pub async fn run_sandboxed(
 
     let container_name = format!("duduclaw-sandbox-{}", uuid::Uuid::new_v4());
 
-    // Build mount: agent dir as read-only
+    // Write API key to a secure temp file (O_EXCL creation).
+    // Convert to TempPath so we control exactly when deletion happens — this
+    // prevents async cancellation from dropping the file while the container
+    // still needs to read it (R4-M3).
+    let key_file = NamedTempFile::new()
+        .map_err(|e| format!("Failed to create temp key file: {e}"))?;
+    let key_path = key_file.into_temp_path();
+    std::fs::write(&key_path, api_key)
+        .map_err(|e| format!("Failed to write API key to temp file: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            &key_path,
+            std::fs::Permissions::from_mode(0o600),
+        );
+    }
+    let key_path_str = key_path.to_string_lossy().to_string();
+
+    // Build mount: agent dir as read-only, key file as read-only bind mount
     let agent_dir_str = agent_dir.to_string_lossy().to_string();
-    let binds = vec![format!("{agent_dir_str}:/agent:ro")];
+    let binds = vec![
+        format!("{agent_dir_str}:/agent:ro"),
+        format!("{key_path_str}:/run/secrets/api_key:ro"),
+    ];
+
+    // Sanitize system_prompt: remove newlines and prevent CLI flag injection (R3-H5)
+    let safe_prompt = system_prompt
+        .replace('\n', " ")
+        .replace('\r', " ");
+    let safe_prompt = if safe_prompt.starts_with('-') {
+        format!(" {safe_prompt}")
+    } else {
+        safe_prompt
+    };
 
     // Build command: call claude CLI with the prompt
+    // TODO: Add --allowedTools restriction based on agent CONTRACT.toml capabilities
     let cmd = vec![
         "claude".to_string(),
         "-p".to_string(),
@@ -66,11 +101,11 @@ pub async fn run_sandboxed(
         "--output-format".to_string(),
         "text".to_string(),
         "--system-prompt".to_string(),
-        system_prompt.to_string(),
+        safe_prompt,
     ];
 
-    // Environment variables (only API key)
-    let env = vec![format!("ANTHROPIC_API_KEY={api_key}")];
+    // Environment variables: point to the secret file instead of embedding key in env string
+    let env = vec!["ANTHROPIC_API_KEY_FILE=/run/secrets/api_key".to_string()];
 
     let network_mode = if network_access {
         None // Use default bridge network
@@ -201,6 +236,10 @@ pub async fn run_sandboxed(
     } else {
         info!(id = %container_id, "Sandbox container cleaned up");
     }
+
+    // Explicitly drop key_path AFTER container removal so the API key file
+    // is never deleted while the container is still running (R4-M3).
+    drop(key_path);
 
     Ok(SandboxResult {
         stdout,

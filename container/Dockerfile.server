@@ -35,7 +35,7 @@ COPY python/ /opt/duduclaw/python/
 ENV PYTHONPATH=/opt/duduclaw
 
 # Install Python dependencies
-RUN pip install --no-cache-dir anthropic
+RUN pip install --no-cache-dir anthropic==0.50.0
 
 # Install Docker CLI and curl for healthcheck
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -121,6 +121,12 @@ impl IpcBroker {
         let file_path = target_dir.join(&filename);
 
         let json = serde_json::to_string_pretty(&message)?;
+        if json.len() > 100_000 {
+            return Err(DuDuClawError::Agent(format!(
+                "IPC message payload too large: {} bytes (max 100KB)",
+                json.len()
+            )));
+        }
         tokio::fs::write(&file_path, json).await.map_err(|e| {
             DuDuClawError::Agent(format!(
                 "failed to write IPC message {}: {e}",

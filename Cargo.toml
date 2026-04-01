@@ -16,10 +16,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.7"
+version = "0.12.0"
 edition = "2024"
 license = "Elastic-2.0"
 authors = ["DuDuClaw Contributors"]
+
+[workspace.lints.rust]
+unsafe_code = "warn"
 
 [workspace.dependencies]
 # Async runtime

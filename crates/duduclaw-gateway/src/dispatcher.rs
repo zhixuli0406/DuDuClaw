@@ -82,6 +82,10 @@ async fn poll_and_dispatch(
     for line in &lines {
         match serde_json::from_str::<BusMessage>(line) {
             Ok(msg) if msg.msg_type == "agent_message" => {
+                if !duduclaw_core::is_valid_agent_id(&msg.agent_id) {
+                    warn!("Invalid agent_id in bus queue, skipping");
+                    continue;
+                }
                 // Enforce payload size limit (BE-H6) — drop, do NOT keep in queue
                 if msg.payload.len() > 100_000 {
                     warn!(id = %msg.message_id, len = msg.payload.len(), "Dropping oversized message (removed from queue)");
@@ -328,6 +332,12 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
                 .collect::<Vec<_>>()
                 .join("\n\n---\n\n");
 
+            let mut coalesced_payload = coalesced_payload;
+            if coalesced_payload.len() > 200_000 {
+                warn!(size = coalesced_payload.len(), "Coalesced payload too large, truncating");
+                coalesced_payload.truncate(200_000);
+            }
+
             let first = &chunk[0];
             info!(
                 agent = %first.agent_id,
@@ -353,7 +363,7 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
 /// Append a single line to a file with advisory file lock (MCP-M4).
 ///
 /// Uses `spawn_blocking` + `flock(LOCK_EX)` on Unix for safe concurrent writes.
-async fn append_line(path: &Path, line: &str) -> Result<(), String> {
+pub async fn append_line(path: &Path, line: &str) -> Result<(), String> {
     let path = path.to_path_buf();
     let line = line.to_string();
     tokio::task::spawn_blocking(move || {
@@ -367,6 +377,8 @@ async fn append_line(path: &Path, line: &str) -> Result<(), String> {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
+            // SAFETY: fd comes from a valid, open File handle obtained above.
+            // flock is async-signal-safe and the fd remains valid for the duration of this call.
             let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
             if rc != 0 {
                 return Err(format!(

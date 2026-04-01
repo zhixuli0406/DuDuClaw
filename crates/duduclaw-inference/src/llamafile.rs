@@ -184,6 +184,10 @@ impl LlamafileManager {
                 warn!(arg = %arg, "Blocked extra_arg that overrides security-critical setting");
                 continue;
             }
+            if !Self::is_safe_arg_value(arg) {
+                warn!(arg = %arg, "Blocked extra_arg with unsafe value characters");
+                continue;
+            }
             cmd.arg(arg);
         }
 
@@ -243,6 +247,20 @@ impl LlamafileManager {
     /// Check if llamafile is enabled.
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
+    }
+
+    /// Validate that an extra CLI arg's value portion contains only safe characters.
+    ///
+    /// Accepts flags of the form `--key=value` or bare flags `--flag`.
+    /// Values may only contain alphanumerics, `.`, `-`, and `_` to prevent
+    /// shell injection via config-file-supplied extra arguments.
+    fn is_safe_arg_value(arg: &str) -> bool {
+        if let Some((_key, val)) = arg.split_once('=') {
+            val.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        } else {
+            true // bare flag, no value portion
+        }
     }
 
     /// Wait for the server to become ready.

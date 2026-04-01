@@ -1,0 +1,2324 @@
+openapi: 3.1.0
+info:
+  title: DuDuClaw WebSocket RPC API
+  version: 0.12.0
+  description: |
+    JSON-RPC 2.0 API over WebSocket for DuDuClaw multi-agent orchestration.
+
+    ## Connection
+
+    Connect to `ws://<host>:<port>/ws` and exchange JSON-RPC 2.0 frames:
+
+    ```json
+    { "jsonrpc": "2.0", "method": "<method>", "params": { ... }, "id": "1" }
+    ```
+
+    Responses follow the standard JSON-RPC 2.0 envelope with `result` or `error`.
+
+    ## Authentication
+
+    1. Send `connect.challenge` to receive a challenge string.
+    2. Sign the challenge with your Ed25519 private key.
+    3. Send `connect` with the signed response and your client version.
+
+    ## Method Categories
+
+    | Prefix | Description |
+    |--------|-------------|
+    | `agents.*` | Agent lifecycle and management |
+    | `channels.*` | Channel (Telegram/LINE/Discord) management |
+    | `accounts.*` | OAuth/API account rotation and budgets |
+    | `memory.*` | Cognitive memory search and browsing |
+    | `skills.*` | Skill ecosystem discovery |
+    | `cron.*` | Scheduled task management |
+    | `system.*` | System status, config, diagnostics |
+    | `license.*` | License activation and status |
+    | `analytics.*` | Usage analytics and cost savings |
+    | `referral.*` | Referral code system |
+    | `security.*` | Audit logs, credentials, browser approval |
+    | `models.*` | Model listing (cloud + local) |
+    | `logs.*` | Real-time log streaming |
+    | `heartbeat.*` | Agent heartbeat scheduling |
+    | `evolution.*` | Evolution engine status |
+    | `browser.*` | Browser automation approval |
+    | `billing.*` | Usage and billing history |
+    | `marketplace.*` | Skill marketplace |
+    | `partner.*` | Partner/reseller management |
+  contact:
+    name: DuDuClaw
+  license:
+    name: Proprietary
+
+paths:
+  /ws:
+    get:
+      summary: WebSocket JSON-RPC 2.0 endpoint
+      description: |
+        Upgrade to WebSocket for bidirectional JSON-RPC 2.0 communication.
+        All methods listed below are invoked via this single endpoint.
+      responses:
+        "101":
+          description: WebSocket upgrade successful
+
+  # ── Connection ───────────────────────────────────────────────
+
+  /rpc/connect.challenge:
+    post:
+      tags: [connection]
+      summary: Request authentication challenge
+      description: Returns a UUID challenge string for Ed25519 signing.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Challenge issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  challenge:
+                    type: string
+                    format: uuid
+
+  /rpc/connect:
+    post:
+      tags: [connection]
+      summary: Authenticate with signed challenge
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                signature:
+                  type: string
+                  format: base64
+                  description: Ed25519 signature of the challenge, base64-encoded
+                public_key:
+                  type: string
+                  format: hex
+                  description: Ed25519 public key, hex-encoded (64 chars)
+                version:
+                  type: string
+                  description: Client version string
+      responses:
+        "200":
+          description: Connection established
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: string
+                  client_version:
+                    type: string
+                  status:
+                    type: string
+                    enum: [connected]
+
+  /rpc/tools.catalog:
+    post:
+      tags: [connection]
+      summary: List all available RPC methods
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Method catalog
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tools:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                        description:
+                          type: string
+
+  # ── Agents ───────────────────────────────────────────────────
+
+  /rpc/agents.list:
+    post:
+      tags: [agents]
+      summary: List all registered agents
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Agent list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agents:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AgentSummary"
+
+  /rpc/agents.status:
+    post:
+      tags: [agents]
+      summary: Get agent status
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id]
+              properties:
+                agent_id:
+                  type: string
+      responses:
+        "200":
+          description: Agent status details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentStatus"
+
+  /rpc/agents.create:
+    post:
+      tags: [agents]
+      summary: Create a new agent
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  description: Agent name (lowercase alphanumeric + hyphens)
+                display_name:
+                  type: string
+                role:
+                  type: string
+                  description: Agent role description
+      responses:
+        "200":
+          description: Agent created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  agent:
+                    $ref: "#/components/schemas/AgentSummary"
+
+  /rpc/agents.delegate:
+    post:
+      tags: [agents]
+      summary: Delegate a task to an agent
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id, message]
+              properties:
+                agent_id:
+                  type: string
+                message:
+                  type: string
+                  description: Task description to delegate
+      responses:
+        "200":
+          description: Delegation result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message_id:
+                    type: string
+                  status:
+                    type: string
+
+  /rpc/agents.pause:
+    post:
+      tags: [agents]
+      summary: Pause an agent
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id]
+              properties:
+                agent_id:
+                  type: string
+      responses:
+        "200":
+          description: Agent paused
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  /rpc/agents.resume:
+    post:
+      tags: [agents]
+      summary: Resume a paused agent
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id]
+              properties:
+                agent_id:
+                  type: string
+      responses:
+        "200":
+          description: Agent resumed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  /rpc/agents.update:
+    post:
+      tags: [agents]
+      summary: Update agent configuration fields
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id]
+              properties:
+                agent_id:
+                  type: string
+                display_name:
+                  type: string
+                role:
+                  type: string
+                system_prompt:
+                  type: string
+                model:
+                  type: string
+      responses:
+        "200":
+          description: Agent updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  /rpc/agents.remove:
+    post:
+      tags: [agents]
+      summary: Remove an agent (moved to trash)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id]
+              properties:
+                agent_id:
+                  type: string
+      responses:
+        "200":
+          description: Agent removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  agent_id:
+                    type: string
+                  trash_path:
+                    type: string
+
+  /rpc/agents.inspect:
+    post:
+      tags: [agents]
+      summary: Inspect agent details (config, SOUL.md, files)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id]
+              properties:
+                agent_id:
+                  type: string
+      responses:
+        "200":
+          description: Agent inspection details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agent_id:
+                    type: string
+                  config:
+                    type: object
+                  soul_md:
+                    type: string
+                  files:
+                    type: array
+                    items:
+                      type: string
+
+  /rpc/agents.access_control:
+    post:
+      tags: [agents]
+      summary: Get agent access control settings
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id]
+              properties:
+                agent_id:
+                  type: string
+      responses:
+        "200":
+          description: Access control settings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agent_id:
+                    type: string
+                  mode:
+                    type: string
+                    enum: [open, paired, locked]
+                  allowed_users:
+                    type: array
+                    items:
+                      type: string
+
+  /rpc/agents.update_access:
+    post:
+      tags: [agents]
+      summary: Update agent access control
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id]
+              properties:
+                agent_id:
+                  type: string
+                mode:
+                  type: string
+                  enum: [open, paired, locked]
+                allowed_users:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "200":
+          description: Access control updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  /rpc/agents.pairing_requests:
+    post:
+      tags: [agents]
+      summary: List pairing requests for an agent
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id]
+              properties:
+                agent_id:
+                  type: string
+      responses:
+        "200":
+          description: Pairing request list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  requests:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        user_id:
+                          type: string
+                        channel:
+                          type: string
+                        requested_at:
+                          type: string
+                          format: date-time
+
+  /rpc/agents.approve_pairing:
+    post:
+      tags: [agents]
+      summary: Approve or reject a pairing request
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id, user_id, approved]
+              properties:
+                agent_id:
+                  type: string
+                user_id:
+                  type: string
+                approved:
+                  type: boolean
+      responses:
+        "200":
+          description: Pairing decision applied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  /rpc/agents.webhook_url:
+    post:
+      tags: [agents]
+      summary: Get agent webhook URL
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id]
+              properties:
+                agent_id:
+                  type: string
+      responses:
+        "200":
+          description: Webhook URL details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url:
+                    type: string
+                  method:
+                    type: string
+                    enum: [POST]
+                  content_type:
+                    type: string
+
+  # ── Channels ─────────────────────────────────────────────────
+
+  /rpc/channels.status:
+    post:
+      tags: [channels]
+      summary: Get channel connection status
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Channel status for all configured channels
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  channels:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        type:
+                          type: string
+                          enum: [telegram, line, discord]
+                        status:
+                          type: string
+                          enum: [connected, disconnected, error]
+
+  /rpc/channels.add:
+    post:
+      tags: [channels]
+      summary: Add a channel (hot-start, no restart needed)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, token]
+              properties:
+                type:
+                  type: string
+                  enum: [telegram, line, discord]
+                token:
+                  type: string
+                  description: Bot token for the channel
+                secret:
+                  type: string
+                  description: Channel secret (required for LINE)
+      responses:
+        "200":
+          description: Channel added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  type:
+                    type: string
+                  hot_started:
+                    type: boolean
+
+  /rpc/channels.test:
+    post:
+      tags: [channels]
+      summary: Test a channel token
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type]
+              properties:
+                type:
+                  type: string
+                  enum: [telegram, line, discord]
+      responses:
+        "200":
+          description: Channel test result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  type:
+                    type: string
+                  message:
+                    type: string
+
+  /rpc/channels.remove:
+    post:
+      tags: [channels]
+      summary: Remove a channel (hot-stop)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type]
+              properties:
+                type:
+                  type: string
+                  enum: [telegram, line, discord]
+      responses:
+        "200":
+          description: Channel removed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  /rpc/channels.webchat_status:
+    post:
+      tags: [channels]
+      summary: Get webchat channel status
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Webchat status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                  url:
+                    type: string
+
+  # ── Accounts ─────────────────────────────────────────────────
+
+  /rpc/accounts.list:
+    post:
+      tags: [accounts]
+      summary: List all OAuth/API accounts
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Account list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accounts:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Account"
+
+  /rpc/accounts.budget_summary:
+    post:
+      tags: [accounts]
+      summary: Budget overview across all accounts
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Budget summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_budget_cents:
+                    type: integer
+                  total_spent_cents:
+                    type: integer
+                  accounts:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Account"
+
+  /rpc/accounts.rotate:
+    post:
+      tags: [accounts]
+      summary: Rotate an account key
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [account_id]
+              properties:
+                account_id:
+                  type: string
+      responses:
+        "200":
+          description: Account rotated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  /rpc/accounts.health:
+    post:
+      tags: [accounts]
+      summary: Account health check
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Account health status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  healthy_count:
+                    type: integer
+                  total_count:
+                    type: integer
+                  accounts:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        healthy:
+                          type: boolean
+                        available:
+                          type: boolean
+                        spent:
+                          type: number
+                        budget:
+                          type: integer
+                        requests:
+                          type: integer
+
+  /rpc/accounts.add:
+    post:
+      tags: [accounts]
+      summary: Add a new account
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type]
+              properties:
+                type:
+                  type: string
+                  enum: [oauth, api_key, setup_token]
+                token:
+                  type: string
+                label:
+                  type: string
+                priority:
+                  type: integer
+                monthly_budget_cents:
+                  type: integer
+      responses:
+        "200":
+          description: Account added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  id:
+                    type: string
+                  type:
+                    type: string
+
+  /rpc/accounts.update_budget:
+    post:
+      tags: [accounts]
+      summary: Update account monthly budget
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [account_id, monthly_budget_cents]
+              properties:
+                account_id:
+                  type: string
+                monthly_budget_cents:
+                  type: integer
+      responses:
+        "200":
+          description: Budget updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  account_id:
+                    type: string
+                  monthly_budget_cents:
+                    type: integer
+
+  # ── Memory ───────────────────────────────────────────────────
+
+  /rpc/memory.search:
+    post:
+      tags: [memory]
+      summary: Search agent memory (semantic + keyword)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query:
+                  type: string
+                  description: Search query
+                agent_id:
+                  type: string
+                  description: Filter by agent
+                limit:
+                  type: integer
+                  default: 10
+      responses:
+        "200":
+          description: Memory search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MemoryEntry"
+
+  /rpc/memory.browse:
+    post:
+      tags: [memory]
+      summary: Browse recent memory entries
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                agent_id:
+                  type: string
+                limit:
+                  type: integer
+                  default: 20
+                offset:
+                  type: integer
+                  default: 0
+      responses:
+        "200":
+          description: Memory entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MemoryEntry"
+
+  # ── Skills ───────────────────────────────────────────────────
+
+  /rpc/skills.list:
+    post:
+      tags: [skills]
+      summary: List agent skills
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                agent_id:
+                  type: string
+      responses:
+        "200":
+          description: Skill list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  skills:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Skill"
+                  source:
+                    type: string
+                  total_indexed:
+                    type: integer
+
+  /rpc/skills.search:
+    post:
+      tags: [skills]
+      summary: Search skills by keyword
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query:
+                  type: string
+      responses:
+        "200":
+          description: Skill search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  skills:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Skill"
+
+  /rpc/skills.content:
+    post:
+      tags: [skills]
+      summary: Read skill content
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [skill_id]
+              properties:
+                skill_id:
+                  type: string
+      responses:
+        "200":
+          description: Skill content
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  skill_id:
+                    type: string
+                  content:
+                    type: string
+
+  # ── Cron ─────────────────────────────────────────────────────
+
+  /rpc/cron.list:
+    post:
+      tags: [cron]
+      summary: List cron jobs
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Cron job list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tasks:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/CronTask"
+
+  /rpc/cron.add:
+    post:
+      tags: [cron]
+      summary: Add a cron job
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, schedule, agent_id, action]
+              properties:
+                name:
+                  type: string
+                schedule:
+                  type: string
+                  description: Cron expression (e.g. "0 9 * * *")
+                agent_id:
+                  type: string
+                action:
+                  type: string
+                  description: Task action or message
+      responses:
+        "200":
+          description: Cron job added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  task:
+                    $ref: "#/components/schemas/CronTask"
+
+  /rpc/cron.pause:
+    post:
+      tags: [cron]
+      summary: Pause a cron job
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+      responses:
+        "200":
+          description: Cron job paused
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  /rpc/cron.remove:
+    post:
+      tags: [cron]
+      summary: Remove a cron job
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+      responses:
+        "200":
+          description: Cron job removed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  # ── System ───────────────────────────────────────────────────
+
+  /rpc/system.status:
+    post:
+      tags: [system]
+      summary: System status overview
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: System status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: string
+                  uptime_seconds:
+                    type: integer
+                  agents_count:
+                    type: integer
+                  channels_connected:
+                    type: integer
+                  gateway_address:
+                    type: string
+
+  /rpc/system.stats:
+    post:
+      tags: [system]
+      summary: Aggregate stats (memories, evolutions) for data flywheel
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Aggregate statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_memories:
+                    type: integer
+                  total_evolutions:
+                    type: integer
+                  agents:
+                    type: object
+                    additionalProperties:
+                      type: object
+
+  /rpc/system.doctor:
+    post:
+      tags: [system]
+      summary: Run health checks
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Health check results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  checks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                        status:
+                          type: string
+                          enum: [pass, warn, fail]
+                        message:
+                          type: string
+                  summary:
+                    type: object
+                    properties:
+                      pass:
+                        type: integer
+                      warn:
+                        type: integer
+                      fail:
+                        type: integer
+
+  /rpc/system.doctor_repair:
+    post:
+      tags: [system]
+      summary: Health checks with repair hints
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Health checks with repair suggestions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  checks:
+                    type: array
+                    items:
+                      type: object
+                  summary:
+                    type: object
+                  repair_hints:
+                    type: array
+                    items:
+                      type: string
+
+  /rpc/system.config:
+    post:
+      tags: [system]
+      summary: View system configuration
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Current system config
+          content:
+            application/json:
+              schema:
+                type: object
+                description: Full config.toml as JSON
+
+  /rpc/system.update_config:
+    post:
+      tags: [system]
+      summary: Update system configuration (log_level, rotation, etc.)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                log_level:
+                  type: string
+                  enum: [trace, debug, info, warn, error]
+                rotation_strategy:
+                  type: string
+      responses:
+        "200":
+          description: Config updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  changes:
+                    type: array
+                    items:
+                      type: string
+
+  /rpc/system.version:
+    post:
+      tags: [system]
+      summary: Get version information
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Version info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: string
+
+  /rpc/system.runtimes:
+    post:
+      tags: [system]
+      summary: List available CLI runtimes
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Runtime list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  runtimes:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                        path:
+                          type: string
+                        version:
+                          type: string
+
+  # ── License ──────────────────────────────────────────────────
+
+  /rpc/license.status:
+    post:
+      tags: [license]
+      summary: License tier and expiry status
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: License information
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tier:
+                    type: string
+                    enum: [community, pro, enterprise, oem]
+                  customer_name:
+                    type: string
+                    nullable: true
+                  expires_at:
+                    type: string
+                    format: date-time
+                    nullable: true
+                  machine_fingerprint:
+                    type: string
+                  days_remaining:
+                    type: integer
+                    nullable: true
+                  features:
+                    type: object
+
+  /rpc/license.activate:
+    post:
+      tags: [license]
+      summary: Activate a license key
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key]
+              properties:
+                key:
+                  type: string
+                  description: Base64-encoded license key
+      responses:
+        "200":
+          description: Activation result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  /rpc/license.deactivate:
+    post:
+      tags: [license]
+      summary: Deactivate (remove) current license
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: License deactivated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  # ── Analytics ────────────────────────────────────────────────
+
+  /rpc/analytics.summary:
+    post:
+      tags: [analytics]
+      summary: Usage analytics summary
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                period:
+                  type: string
+                  enum: [day, week, month]
+                  default: month
+      responses:
+        "200":
+          description: Analytics summary
+          content:
+            application/json:
+              schema:
+                type: object
+                description: Period-based analytics summary
+
+  /rpc/analytics.conversations:
+    post:
+      tags: [analytics]
+      summary: Daily conversation counts
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Conversation analytics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  daily:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        date:
+                          type: string
+                          format: date
+                        count:
+                          type: integer
+
+  /rpc/analytics.cost_savings:
+    post:
+      tags: [analytics]
+      summary: Monthly cost savings analytics
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Cost savings data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  monthly:
+                    type: array
+                    items:
+                      type: object
+
+  # ── Referral ─────────────────────────────────────────────────
+
+  /rpc/referral.generate:
+    post:
+      tags: [referral]
+      summary: Generate a unique referral code
+      description: |
+        Creates a random 8-char alphanumeric referral code (DDCL-XXXXXXXX).
+        If a code already exists, returns the existing one.
+        Stored in `~/.duduclaw/referral.json`.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Referral code generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: string
+                    example: "DDCL-A1B2C3D4"
+                  already_existed:
+                    type: boolean
+                    description: True if returning an existing code
+
+  /rpc/referral.status:
+    post:
+      tags: [referral]
+      summary: Check referral status and rewards
+      description: |
+        Returns referral count, earned rewards, and progress toward next tier.
+        Reward tiers: 1 referral = +500 conversations, 3 = 1 month Pro, 10 = permanent Pro.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Referral status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: string
+                    nullable: true
+                  referral_count:
+                    type: integer
+                  next_reward_at:
+                    type: integer
+                    description: Number of referrals needed for next reward (0 = all earned)
+                  next_reward_description:
+                    type: string
+                  rewards_earned:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        description:
+                          type: string
+                        earned_at:
+                          type: string
+                          format: date-time
+                  tiers:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        count:
+                          type: integer
+                        reward:
+                          type: string
+
+  /rpc/referral.redeem:
+    post:
+      tags: [referral]
+      summary: Redeem a referral code (as the referred person)
+      description: |
+        Stores the referral in `~/.duduclaw/referred_by.json`.
+        Each installation can only redeem one referral code.
+        Cannot redeem your own code.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  description: Referral code to redeem (DDCL-XXXXXXXX)
+                  example: "DDCL-A1B2C3D4"
+      responses:
+        "200":
+          description: Redemption result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  bonus:
+                    type: string
+                    example: "Community+ for 30 days"
+
+  # ── Security ─────────────────────────────────────────────────
+
+  /rpc/security.audit_log:
+    post:
+      tags: [security]
+      summary: Query audit log entries
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                agent_id:
+                  type: string
+                limit:
+                  type: integer
+                  default: 50
+                level:
+                  type: string
+                  enum: [info, warn, critical]
+      responses:
+        "200":
+          description: Audit log entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        timestamp:
+                          type: string
+                          format: date-time
+                        level:
+                          type: string
+                        agent_id:
+                          type: string
+                        event:
+                          type: string
+                        details:
+                          type: object
+
+  # ── Models ───────────────────────────────────────────────────
+
+  /rpc/models.list:
+    post:
+      tags: [models]
+      summary: List available cloud and local models
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Model list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  models:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        name:
+                          type: string
+                        provider:
+                          type: string
+                        type:
+                          type: string
+                          enum: [cloud, local]
+                  default_local:
+                    type: string
+                    nullable: true
+
+  # ── Logs ─────────────────────────────────────────────────────
+
+  /rpc/logs.subscribe:
+    post:
+      tags: [logs]
+      summary: Subscribe to real-time log streaming
+      description: Enables log push on the current WebSocket connection.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                filter:
+                  type: string
+                  description: Log level filter (e.g. "info", "warn")
+      responses:
+        "200":
+          description: Subscription active
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  subscribed:
+                    type: boolean
+                  filter:
+                    type: string
+                  message:
+                    type: string
+
+  /rpc/logs.unsubscribe:
+    post:
+      tags: [logs]
+      summary: Unsubscribe from log streaming
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                filter:
+                  type: string
+      responses:
+        "200":
+          description: Unsubscribed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  subscribed:
+                    type: boolean
+
+  # ── Heartbeat ────────────────────────────────────────────────
+
+  /rpc/heartbeat.status:
+    post:
+      tags: [heartbeat]
+      summary: Per-agent heartbeat status
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Heartbeat status for all agents
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agents:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        agent_id:
+                          type: string
+                        last_beat:
+                          type: string
+                          format: date-time
+                        interval_secs:
+                          type: integer
+                        healthy:
+                          type: boolean
+
+  /rpc/heartbeat.trigger:
+    post:
+      tags: [heartbeat]
+      summary: Manually trigger heartbeat for an agent
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id]
+              properties:
+                agent_id:
+                  type: string
+      responses:
+        "200":
+          description: Heartbeat triggered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  # ── Evolution ────────────────────────────────────────────────
+
+  /rpc/evolution.status:
+    post:
+      tags: [evolution]
+      summary: Evolution engine status
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Evolution engine status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                  mode:
+                    type: string
+                  agents:
+                    type: array
+                    items:
+                      type: object
+
+  /rpc/evolution.skills:
+    post:
+      tags: [evolution]
+      summary: Evolution skills status
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Evolution skills
+          content:
+            application/json:
+              schema:
+                type: object
+
+  # ── Browser ──────────────────────────────────────────────────
+
+  /rpc/browser.request_approval:
+    post:
+      tags: [browser]
+      summary: Request human approval for browser automation action
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id, action, url]
+              properties:
+                agent_id:
+                  type: string
+                action:
+                  type: string
+                url:
+                  type: string
+                details:
+                  type: string
+      responses:
+        "200":
+          description: Approval request submitted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_id:
+                    type: string
+                  status:
+                    type: string
+                    enum: [pending]
+
+  /rpc/browser.respond_approval:
+    post:
+      tags: [browser]
+      summary: Respond to a browser automation approval request
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [request_id, approved]
+              properties:
+                request_id:
+                  type: string
+                approved:
+                  type: boolean
+      responses:
+        "200":
+          description: Approval response recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_id:
+                    type: string
+                  approved:
+                    type: boolean
+                  decided_at:
+                    type: string
+                    format: date-time
+
+  # ── Billing ──────────────────────────────────────────────────
+
+  /rpc/billing.usage:
+    post:
+      tags: [billing]
+      summary: Current billing period usage
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                period:
+                  type: string
+                  enum: [day, week, month]
+                  default: month
+      responses:
+        "200":
+          description: Usage data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  period:
+                    type: string
+                  total_tokens:
+                    type: integer
+                  total_cost_cents:
+                    type: integer
+                  breakdown:
+                    type: array
+                    items:
+                      type: object
+
+  /rpc/billing.history:
+    post:
+      tags: [billing]
+      summary: Billing history
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                months:
+                  type: integer
+                  default: 6
+      responses:
+        "200":
+          description: Historical billing data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  history:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        month:
+                          type: string
+                        total_cost_cents:
+                          type: integer
+                        total_tokens:
+                          type: integer
+
+  # ── Marketplace ──────────────────────────────────────────────
+
+  /rpc/marketplace.list:
+    post:
+      tags: [marketplace]
+      summary: List available marketplace skills/plugins
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                category:
+                  type: string
+                query:
+                  type: string
+      responses:
+        "200":
+          description: Marketplace listings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        name:
+                          type: string
+                        description:
+                          type: string
+                        category:
+                          type: string
+                        version:
+                          type: string
+
+  /rpc/marketplace.install:
+    post:
+      tags: [marketplace]
+      summary: Install a marketplace skill/plugin
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [item_id]
+              properties:
+                item_id:
+                  type: string
+                agent_id:
+                  type: string
+                  description: Target agent for installation
+      responses:
+        "200":
+          description: Installation result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  # ── Partner ──────────────────────────────────────────────────
+
+  /rpc/partner.status:
+    post:
+      tags: [partner]
+      summary: Partner/reseller account status
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Partner status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  is_partner:
+                    type: boolean
+                  tier:
+                    type: string
+                  commission_rate:
+                    type: number
+                  customers_count:
+                    type: integer
+
+  /rpc/partner.customers:
+    post:
+      tags: [partner]
+      summary: List partner customers
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                limit:
+                  type: integer
+                  default: 50
+                offset:
+                  type: integer
+                  default: 0
+      responses:
+        "200":
+          description: Customer list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  customers:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        name:
+                          type: string
+                        tier:
+                          type: string
+                        created_at:
+                          type: string
+                          format: date-time
+
+  /rpc/partner.generate_license:
+    post:
+      tags: [partner]
+      summary: Generate a license key for a customer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [customer_name, tier]
+              properties:
+                customer_name:
+                  type: string
+                tier:
+                  type: string
+                  enum: [pro, enterprise]
+                duration_months:
+                  type: integer
+                  default: 12
+                machine_fingerprint:
+                  type: string
+      responses:
+        "200":
+          description: License generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  license_key:
+                    type: string
+                    description: Base64-encoded license key
+
+  /rpc/partner.sales:
+    post:
+      tags: [partner]
+      summary: Partner sales summary
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                period:
+                  type: string
+                  enum: [month, quarter, year]
+                  default: month
+      responses:
+        "200":
+          description: Sales summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  period:
+                    type: string
+                  total_sales:
+                    type: integer
+                  total_revenue_cents:
+                    type: integer
+                  commission_cents:
+                    type: integer
+
+components:
+  schemas:
+    EmptyParams:
+      type: object
+      description: No parameters required
+
+    SuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+
+    AgentSummary:
+      type: object
+      properties:
+        name:
+          type: string
+        display_name:
+          type: string
+        role:
+          type: string
+        status:
+          type: string
+          enum: [active, paused, error]
+
+    AgentStatus:
+      type: object
+      properties:
+        name:
+          type: string
+        status:
+          type: string
+        display_name:
+          type: string
+        role:
+          type: string
+        model:
+          type: string
+        channels:
+          type: array
+          items:
+            type: string
+
+    Account:
+      type: object
+      properties:
+        id:
+          type: string
+        auth_method:
+          type: string
+        priority:
+          type: integer
+        is_healthy:
+          type: boolean
+        spent_this_month:
+          type: number
+        monthly_budget_cents:
+          type: integer
+        total_requests:
+          type: integer
+        is_available:
+          type: boolean
+        label:
+          type: string
+        email:
+          type: string
+        subscription:
+          type: string
+        expires_at:
+          type: string
+          nullable: true
+        days_until_expiry:
+          type: integer
+          nullable: true
+
+    MemoryEntry:
+      type: object
+      properties:
+        id:
+          type: string
+        agent_id:
+          type: string
+        content:
+          type: string
+        type:
+          type: string
+          enum: [episodic, semantic]
+        created_at:
+          type: string
+          format: date-time
+        relevance:
+          type: number
+          description: Relevance score (0.0-1.0), present in search results
+
+    Skill:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        source:
+          type: string
+
+    CronTask:
+      type: object
+      properties:
+        name:
+          type: string
+        schedule:
+          type: string
+        agent_id:
+          type: string
+        action:
+          type: string
+        enabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        last_run:
+          type: string
+          format: date-time
+          nullable: true
+
+tags:
+  - name: connection
+    description: WebSocket connection and authentication
+  - name: agents
+    description: Agent lifecycle and management
+  - name: channels
+    description: Channel (Telegram/LINE/Discord) management
+  - name: accounts
+    description: OAuth/API account rotation and budgets
+  - name: memory
+    description: Cognitive memory search and browsing
+  - name: skills
+    description: Skill ecosystem discovery
+  - name: cron
+    description: Scheduled task management
+  - name: system
+    description: System status, configuration, and diagnostics
+  - name: license
+    description: License activation and status
+  - name: analytics
+    description: Usage analytics and cost savings
+  - name: referral
+    description: Referral code system and rewards
+  - name: security
+    description: Audit logs, credentials, and browser approval
+  - name: models
+    description: Model listing (cloud + local)
+  - name: logs
+    description: Real-time log streaming
+  - name: heartbeat
+    description: Agent heartbeat scheduling
+  - name: evolution
+    description: Evolution engine status and skills
+  - name: browser
+    description: Browser automation approval (human-in-the-loop)
+  - name: billing
+    description: Usage and billing history
+  - name: marketplace
+    description: Skill marketplace
+  - name: partner
+    description: Partner/reseller management

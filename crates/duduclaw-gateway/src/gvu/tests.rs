@@ -195,6 +195,7 @@ mod version_store_tests {
             post_metrics: None,
             proposal_id: "prop1".to_string(),
             rollback_diff: "old content".to_string(),
+            rollback_diff_hash: None,
         }
     }
 
@@ -282,6 +283,7 @@ mod updater_tests {
             post_metrics: None,
             proposal_id: "p1".to_string(),
             rollback_diff: "old".to_string(),
+            rollback_diff_hash: None,
         }
     }
 

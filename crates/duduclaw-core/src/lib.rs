@@ -6,6 +6,17 @@ pub use error::{DuDuClawError, Result};
 pub use traits::{Channel, ContainerRuntime, MemoryEngine};
 pub use types::*;
 
+/// Validate that an agent ID is safe for filesystem and log use.
+///
+/// A valid agent ID contains only lowercase alphanumerics, hyphens, and
+/// underscores; is non-empty; and is at most 64 characters long.
+pub fn is_valid_agent_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// Find the `claude` binary in PATH or common locations (BE-L1, BE-M1).
 ///
 /// Uses async-safe `tokio::process::Command` when called from an async context.

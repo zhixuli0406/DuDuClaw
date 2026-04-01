@@ -47,6 +47,11 @@ impl MlxBridge {
         }
     }
 
+    /// Validate model/adapter path to prevent path traversal attacks.
+    fn is_safe_model_path(path: &str) -> bool {
+        !path.contains("..") && !path.starts_with('/') && !path.contains('\0')
+    }
+
     /// Validate the python executable path (must be python/python3 basename).
     fn validate_python(python: &str) -> bool {
         matches!(python, "python3" | "python") || {
@@ -89,6 +94,15 @@ impl MlxBridge {
                 "Invalid python path: {}. Must be 'python3', 'python', or absolute path ending in python/python3",
                 self.config.python
             )));
+        }
+
+        if !Self::is_safe_model_path(&self.config.model) {
+            return Err(InferenceError::GenerationFailed("Invalid model path".to_string()));
+        }
+        if let Some(ref adapter) = self.config.adapter_path {
+            if !Self::is_safe_model_path(adapter) {
+                return Err(InferenceError::GenerationFailed("Invalid adapter path".to_string()));
+            }
         }
 
         let payload = serde_json::json!({

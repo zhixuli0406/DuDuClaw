@@ -100,11 +100,9 @@ pub fn validate_response(contract: &Contract, response: &str) -> ValidationResul
             continue;
         }
 
-        // Second: try as regex (if it looks like a pattern)
+        // Second: try as glob pattern (if it looks like one)
         if rule.contains('*') || rule.contains('?') || rule.contains('[') {
-            let pattern = rule_lower
-                .replace('*', ".*")
-                .replace('?', ".");
+            let pattern = glob_to_regex_pattern(&rule_lower);
             if let Ok(re) = regex_lite_match(&pattern, &lower) {
                 if re {
                     violations.push(ContractViolation {
@@ -119,6 +117,26 @@ pub fn validate_response(contract: &Contract, response: &str) -> ValidationResul
 
     let passed = violations.is_empty();
     ValidationResult { passed, violations }
+}
+
+/// Convert a glob pattern to a regex-compatible pattern used by `regex_lite_match`.
+///
+/// Escapes regex special characters (`.`, `+`, `(`, `)`, etc.) except `*` and `?`,
+/// which are converted to their regex equivalents (`.*` and `.`).
+fn glob_to_regex_pattern(glob: &str) -> String {
+    let mut out = String::with_capacity(glob.len() * 2);
+    for c in glob.chars() {
+        match c {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            '.' | '+' | '(' | ')' | '{' | '}' | '[' | ']' | '|' | '^' | '$' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Glob-style pattern matching for behavioral contracts (BE-L3).

@@ -88,6 +88,14 @@ impl ExoCluster {
             node_count: None,
         };
 
+        if !config.endpoint.is_empty() && !config.endpoint.starts_with("https://") {
+            warn!(
+                endpoint = %config.endpoint,
+                "Exo cluster endpoint uses unencrypted HTTP — \
+                 consider using HTTPS for production"
+            );
+        }
+
         Self {
             config,
             client,

@@ -17,9 +17,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        # NOTE: dtolnay/rust-toolchain is maintained by a trusted Rust community
+        # member and does not follow SHA-pinning conventions upstream. Pinning
+        # by tag is accepted here as a documented trust decision.
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd3b9a  # v2.7.8
       - name: Build core crates
         run: cargo build --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
       - name: Build gateway (no dashboard)
@@ -37,14 +40,17 @@ jobs:
     name: Dashboard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af  # v4.1.0
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: web/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        # NOTE: dtolnay/rust-toolchain is maintained by a trusted Rust community
+        # member and does not follow SHA-pinning conventions upstream. Pinning
+        # by tag is accepted here as a documented trust decision.
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd3b9a  # v2.7.8
       - name: Install frontend dependencies
         run: cd web && npm ci --legacy-peer-deps
       - name: TypeScript check
@@ -58,12 +64,12 @@ jobs:
     name: Python
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
         with:
           python-version: "3.12"
       - name: Install dev dependencies
-        run: pip install pytest pytest-asyncio ruff
+        run: pip install pytest==8.3.4 pytest-asyncio==0.24.0 ruff==0.8.6
       - name: Lint
         run: ruff check python/
       - name: Test
@@ -73,3 +79,13 @@ jobs:
           else
             echo "No Python tests found, skipping"
           fi
+
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run cargo audit
+        run: cargo audit --deny warnings
