@@ -87,7 +87,6 @@ pub fn build_memory_entry(
         access_count: 0,
         last_accessed: None,
         source_event: "import".to_string(),
-        shareable: false,
     }
 }
 

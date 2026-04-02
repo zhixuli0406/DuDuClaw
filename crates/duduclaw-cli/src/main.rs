@@ -1903,7 +1903,6 @@ async fn cmd_license_verify(key: &str) -> duduclaw_core::error::Result<()> {
     let customer = json.get("customer_name").and_then(|v| v.as_str()).unwrap_or("unknown");
     let expires = json.get("expires_at").and_then(|v| v.as_str()).unwrap_or("perpetual");
     let fp = json.get("machine_fingerprint").and_then(|v| v.as_str()).unwrap_or("");
-    let has_sig = json.get("signature").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
 
     println!("\n  {} License Key Details\n", style("🔍").bold());
     println!("  Tier:        {tier}");

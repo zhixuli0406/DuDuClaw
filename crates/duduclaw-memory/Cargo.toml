@@ -13,3 +13,4 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+csv = "1"
