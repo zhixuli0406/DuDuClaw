@@ -33,6 +33,21 @@ const channelMeta: Record<
     bg: 'bg-purple-100',
     darkBg: 'dark:bg-purple-900/30',
   },
+  slack: {
+    color: 'text-rose-600 dark:text-rose-400',
+    bg: 'bg-rose-100',
+    darkBg: 'dark:bg-rose-900/30',
+  },
+  whatsapp: {
+    color: 'text-emerald-600 dark:text-emerald-400',
+    bg: 'bg-emerald-100',
+    darkBg: 'dark:bg-emerald-900/30',
+  },
+  feishu: {
+    color: 'text-sky-600 dark:text-sky-400',
+    bg: 'bg-sky-100',
+    darkBg: 'dark:bg-sky-900/30',
+  },
 };
 
 function getChannelStyle(name: string) {
@@ -269,49 +284,131 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
     }
   };
 
-  const tokenLabel: Record<string, string> = {
-    line: 'Channel Access Token',
-    telegram: 'Bot Token',
-    discord: 'Bot Token',
+  const channelGuide: Record<string, { tokenLabel: string; secretLabel?: string; steps: string[] }> = {
+    telegram: {
+      tokenLabel: 'Bot Token',
+      steps: [
+        '1. 在 Telegram 搜尋 @BotFather 並開始對話',
+        '2. 輸入 /newbot，依提示設定名稱與 username',
+        '3. BotFather 會回傳 Bot Token，複製貼到下方',
+        'Long Polling 模式，無需設定 Webhook',
+      ],
+    },
+    line: {
+      tokenLabel: 'Channel Access Token',
+      secretLabel: 'Channel Secret',
+      steps: [
+        '1. 前往 developers.line.biz/console',
+        '2. 建立 Provider → Messaging API Channel',
+        '3. Basic settings → 複製 Channel Secret',
+        '4. Messaging API → Issue Channel Access Token',
+        '5. Webhook settings → 設定 URL + 開啟 Use webhook',
+        '需要 HTTPS（ngrok / Tailscale Funnel）',
+      ],
+    },
+    discord: {
+      tokenLabel: 'Bot Token',
+      steps: [
+        '1. 前往 discord.com/developers/applications',
+        '2. New Application → 左側 Bot → Reset Token',
+        '⚠️ 必須啟用 MESSAGE CONTENT INTENT',
+        '  路徑：Bot → Privileged Gateway Intents',
+        '3. OAuth2 → URL Generator → bot scope',
+        '4. 勾選 Send Messages + Read History 權限',
+        '5. 用產生的 URL 邀請 Bot 加入伺服器',
+      ],
+    },
+    slack: {
+      tokenLabel: 'Bot User OAuth Token (xoxb-...)',
+      secretLabel: 'App-Level Token (xapp-...)',
+      steps: [
+        '1. 前往 api.slack.com/apps → Create New App',
+        '2. OAuth & Permissions → Install to Workspace',
+        '3. 複製 Bot User OAuth Token (xoxb-...)',
+        '4. Socket Mode → 啟用 → 取得 App-Level Token (xapp-...)',
+        '5. OAuth Scopes: chat:write, channels:read, app_mentions:read',
+        'Socket Mode 模式，無需公開 URL',
+      ],
+    },
+    whatsapp: {
+      tokenLabel: 'Access Token',
+      secretLabel: 'Phone Number ID',
+      steps: [
+        '1. 前往 developers.facebook.com/apps',
+        '2. 建立 Business App → 加入 WhatsApp 產品',
+        '3. WhatsApp → API Setup → 取得 Access Token',
+        '4. 記下 Phone Number ID',
+        '5. Configuration → 設定 Webhook URL + Verify Token',
+        '6. 訂閱 messages 事件',
+        '需要 Meta Business 驗證才能正式上線',
+      ],
+    },
+    feishu: {
+      tokenLabel: 'App ID',
+      secretLabel: 'App Secret',
+      steps: [
+        '1. 前往 open.feishu.cn/app',
+        '2. 建立企業自建應用',
+        '3. 憑證與基礎資訊 → 取得 App ID + App Secret',
+        '4. 事件與回調 → 設定 Request URL',
+        '5. 權限: im:message:send_as_bot, im:message',
+        '6. 提交審核 → 發布上線',
+      ],
+    },
   };
 
+  const guide = channelGuide[channelType] ?? { tokenLabel: 'Token', steps: [] };
+
   return (
-    <Dialog open={open} onClose={onClose} title={fixedType ? `編輯 ${fixedType} 通道` : '新增通道'}>
+    <Dialog open={open} onClose={onClose} title={fixedType ? `Edit ${fixedType}` : 'Add Channel'}>
       <div className="space-y-4">
-        <FormField label="通道類型">
+        <FormField label="Channel Type">
           <select value={channelType} onChange={(e) => setChannelType(e.target.value)} disabled={!!fixedType} className={selectClass}>
-            <option value="line">LINE</option>
             <option value="telegram">Telegram</option>
+            <option value="line">LINE</option>
             <option value="discord">Discord</option>
+            <option value="slack">Slack</option>
+            <option value="whatsapp">WhatsApp</option>
+            <option value="feishu">Feishu</option>
           </select>
         </FormField>
 
-        <FormField label={tokenLabel[channelType] ?? 'Token'}>
+        {/* Setup guide */}
+        <div className="rounded-lg bg-amber-50 p-3 text-xs text-amber-800 dark:bg-amber-900/20 dark:text-amber-300">
+          <p className="mb-1 font-medium">Setup Guide:</p>
+          {guide.steps.map((step, i) => (
+            <p key={i} className={step.startsWith('⚠') ? 'font-semibold text-rose-600 dark:text-rose-400' : ''}>
+              {step}
+            </p>
+          ))}
+        </div>
+
+        <FormField label={guide.tokenLabel}>
           <input
             type="password"
             value={token}
             onChange={(e) => setToken(e.target.value)}
-            placeholder="貼上你的 token..."
+            placeholder={`Paste your ${guide.tokenLabel.toLowerCase()}...`}
             className={inputClass}
           />
         </FormField>
 
-        {channelType === 'line' && (
-          <FormField label="Channel Secret">
+        {guide.secretLabel && (
+          <FormField label={guide.secretLabel}>
             <input
               type="password"
               value={secret}
               onChange={(e) => setSecret(e.target.value)}
-              placeholder="LINE Channel Secret"
+              placeholder={guide.secretLabel}
               className={inputClass}
             />
           </FormField>
         )}
 
         <div className="flex justify-end gap-3 pt-2">
-          <button onClick={onClose} className={buttonSecondary}>取消</button>
+          <button onClick={onClose} className={buttonSecondary}>Cancel</button>
           <button onClick={handleSubmit} disabled={submitting || !token.trim()} className={buttonPrimary}>
-            {submitting ? '新增中...' : '新增通道'}
+            {submitting ? 'Adding...' : 'Add Channel'}
           </button>
         </div>
       </div>

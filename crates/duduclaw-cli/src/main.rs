@@ -807,17 +807,58 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
     if !skip_prompts && !quick_mode {
         println!();
         println!("  {} {}", style("▸").cyan(), style("通訊通道設定").bold());
+        println!("  選擇要啟用的通道（可隨時在 Dashboard 新增更多）");
+        println!();
 
-        let channel_options = &["LINE", "Telegram", "Discord"];
+        let channel_options = &[
+            "Telegram",
+            "LINE",
+            "Discord",
+            "Slack",
+            "WhatsApp",
+            "Feishu（飛書）",
+        ];
         let channels: Vec<usize> = dialoguer::MultiSelect::new()
-            .with_prompt("選擇要啟用的通道（空白鍵選取，Enter 確認）")
+            .with_prompt("選擇通道（空白鍵選取，Enter 確認）")
             .items(channel_options)
             .interact()
             .unwrap_or_default();
 
         for &ch in &channels {
             match ch {
+                // ── Telegram ──
                 0 => {
+                    println!();
+                    println!("  {} {}", style("📱").bold(), style("Telegram 設定指南").bold());
+                    println!("    1. 在 Telegram 搜尋 {} 並開始對話", style("@BotFather").cyan());
+                    println!("    2. 輸入 {} 建立新 Bot", style("/newbot").cyan());
+                    println!("    3. 依提示設定 Bot 名稱與 username");
+                    println!("    4. BotFather 會回傳 Bot Token（格式：{}）", style("123456:ABC-DEF...").dim());
+                    println!("    5. 複製 Token 貼到下方");
+                    println!();
+                    telegram_token = Password::new()
+                        .with_prompt("Telegram Bot Token")
+                        .interact()
+                        .unwrap_or_default();
+                    if !telegram_token.is_empty() {
+                        println!("  {} Telegram 已設定（Long Polling 模式，無需設定 Webhook）", style("✓").green());
+                    }
+                }
+                // ── LINE ──
+                1 => {
+                    println!();
+                    println!("  {} {}", style("💬").bold(), style("LINE 設定指南").bold());
+                    println!("    1. 前往 {}", style("https://developers.line.biz/console/").cyan());
+                    println!("    2. 建立 Provider → 建立 Messaging API Channel");
+                    println!("    3. 在 Channel 頁面取得：");
+                    println!("       - {} → Basic settings → Channel secret", style("Channel Secret").yellow());
+                    println!("       - {} → Messaging API → Issue Channel access token", style("Channel Access Token").yellow());
+                    println!("    4. 在 Messaging API → Webhook settings：");
+                    println!("       - 設定 Webhook URL：{}", style("https://你的域名/webhook/line").cyan());
+                    println!("       - 開啟 {}", style("Use webhook").yellow());
+                    println!("       - 關閉 {}", style("Auto-reply messages").yellow());
+                    println!("    5. 需要 HTTPS，可使用 {} 或 {}", style("ngrok").cyan(), style("Tailscale Funnel").cyan());
+                    println!();
                     line_token = Password::new()
                         .with_prompt("LINE Channel Access Token")
                         .interact()
@@ -828,38 +869,78 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
                         .unwrap_or_default();
                     if !line_token.is_empty() {
                         println!("  {} LINE 已設定", style("✓").green());
-                        println!();
-                        println!("  {} {}", style("⚠").yellow(), style("LINE 設定提醒：").bold());
-                        println!("    請到 LINE Developer Console 設定 Webhook URL：");
-                        println!("    {}", style("https://你的域名:18789/webhook/line").cyan());
-                        println!("    需要 HTTPS，可使用 {} 或 {} 暴露本地服務",
-                            style("ngrok").cyan(), style("Tailscale").cyan());
-                        println!();
                     }
                 }
-                1 => {
-                    telegram_token = Password::new()
-                        .with_prompt("Telegram Bot Token")
-                        .interact()
-                        .unwrap_or_default();
-                    if !telegram_token.is_empty() {
-                        println!("  {} Telegram 已設定", style("✓").green());
-                    }
-                }
+                // ── Discord ──
                 2 => {
+                    println!();
+                    println!("  {} {}", style("🎮").bold(), style("Discord 設定指南").bold());
+                    println!("    1. 前往 {}", style("https://discord.com/developers/applications").cyan());
+                    println!("    2. 點選 {} 建立 Application", style("New Application").yellow());
+                    println!("    3. 左側選單 → {} → Reset Token → 複製 Token", style("Bot").yellow());
+                    println!("    4. {} 啟用以下 Privileged Gateway Intents：", style("重要！").red().bold());
+                    println!("       - {} ✅ 必須開啟", style("MESSAGE CONTENT INTENT").yellow().bold());
+                    println!("       - {} ✅ 建議開啟", style("SERVER MEMBERS INTENT").yellow());
+                    println!("    5. 左側 → OAuth2 → URL Generator：");
+                    println!("       - Scopes：勾選 {}", style("bot").yellow());
+                    println!("       - Bot Permissions：勾選 {} + {} + {}",
+                        style("Send Messages").yellow(), style("Read Message History").yellow(), style("View Channels").yellow());
+                    println!("    6. 複製產生的 URL，在瀏覽器開啟，邀請 Bot 加入你的伺服器");
+                    println!();
                     discord_token = Password::new()
                         .with_prompt("Discord Bot Token")
                         .interact()
                         .unwrap_or_default();
                     if !discord_token.is_empty() {
                         println!("  {} Discord 已設定", style("✓").green());
-                        println!();
-                        println!("  {} {}", style("⚠").yellow(), style("Discord 設定提醒：").bold());
-                        println!("    請到 Discord Developer Portal 啟用以下 Intent：");
-                        println!("    {}", style("MESSAGE CONTENT Intent").cyan());
-                        println!("    路徑：Bot → Privileged Gateway Intents → Message Content Intent");
-                        println!();
                     }
+                }
+                // ── Slack ──
+                3 => {
+                    println!();
+                    println!("  {} {}", style("📋").bold(), style("Slack 設定指南").bold());
+                    println!("    1. 前往 {}", style("https://api.slack.com/apps").cyan());
+                    println!("    2. {} → 選擇 From an app manifest", style("Create New App").yellow());
+                    println!("    3. 左側 → {} → Install to Workspace", style("OAuth & Permissions").yellow());
+                    println!("    4. 取得 {} (xoxb-...)", style("Bot User OAuth Token").yellow());
+                    println!("    5. 左側 → {} → 開啟 Enable Events", style("Socket Mode").yellow());
+                    println!("       取得 {} (xapp-...)", style("App-Level Token").yellow());
+                    println!("    6. 在 OAuth Scopes 加入：{}, {}, {}",
+                        style("chat:write").yellow(), style("channels:read").yellow(), style("app_mentions:read").yellow());
+                    println!("    ℹ Slack 使用 Socket Mode，無需公開 URL");
+                    println!();
+                    println!("  {} Slack 通道設定請在 Dashboard → Channels 頁面完成", style("ℹ").blue());
+                }
+                // ── WhatsApp ──
+                4 => {
+                    println!();
+                    println!("  {} {}", style("📲").bold(), style("WhatsApp 設定指南").bold());
+                    println!("    1. 前往 {}", style("https://developers.facebook.com/apps/").cyan());
+                    println!("    2. 建立 Business App → 加入 {} 產品", style("WhatsApp").yellow());
+                    println!("    3. WhatsApp → API Setup：");
+                    println!("       - 取得 {} (永久 token 需到 System Users 產生)", style("Access Token").yellow());
+                    println!("       - 記下 {}", style("Phone Number ID").yellow());
+                    println!("    4. WhatsApp → Configuration：");
+                    println!("       - 設定 Webhook URL：{}", style("https://你的域名/webhook/whatsapp").cyan());
+                    println!("       - 設定 Verify Token（自訂字串）");
+                    println!("       - 訂閱 {} 事件", style("messages").yellow());
+                    println!("    ℹ 需要 Meta Business 驗證才能正式上線");
+                    println!();
+                    println!("  {} WhatsApp 通道設定請在 Dashboard → Channels 頁面完成", style("ℹ").blue());
+                }
+                // ── Feishu ──
+                5 => {
+                    println!();
+                    println!("  {} {}", style("🪶").bold(), style("飛書（Feishu）設定指南").bold());
+                    println!("    1. 前往 {}", style("https://open.feishu.cn/app/").cyan());
+                    println!("    2. 建立企業自建應用");
+                    println!("    3. 憑證與基礎資訊 → 取得 {} 和 {}", style("App ID").yellow(), style("App Secret").yellow());
+                    println!("    4. 事件與回調 → 設定 Request URL：{}", style("https://你的域名/webhook/feishu").cyan());
+                    println!("    5. 權限管理 → 加入 {} + {}",
+                        style("im:message:send_as_bot").yellow(), style("im:message").yellow());
+                    println!("    6. 版本管理與發布 → 提交審核");
+                    println!();
+                    println!("  {} Feishu 通道設定請在 Dashboard → Channels 頁面完成", style("ℹ").blue());
                 }
                 _ => {}
             }
