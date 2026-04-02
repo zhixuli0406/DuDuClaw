@@ -1427,12 +1427,17 @@ impl MethodHandler {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str());
         let reg = self.registry.read().await;
 
+        // Collect global skill names for scope tagging
+        let global_names: std::collections::HashSet<&str> =
+            reg.global_skills().iter().map(|s| s.name.as_str()).collect();
+
         match agent_id {
             Some(id) => {
                 match reg.get(id) {
                     Some(agent) => {
                         let skills: Vec<Value> = agent.skills.iter().map(|s| {
-                            json!({ "name": s.name, "size": s.content.len() })
+                            let scope = if global_names.contains(s.name.as_str()) { "global" } else { "agent" };
+                            json!({ "name": s.name, "size": s.content.len(), "scope": scope })
                         }).collect();
                         WsFrame::ok_response("", json!({ "agent_id": id, "skills": skills }))
                     }
@@ -1440,18 +1445,27 @@ impl MethodHandler {
                 }
             }
             None => {
-                // Return skills for all agents
+                // Global skills
+                let global: Vec<Value> = reg.global_skills().iter().map(|s| {
+                    json!({ "name": s.name, "size": s.content.len() })
+                }).collect();
+
+                // Per-agent skills
                 let mut all_skills = Vec::new();
                 for agent in reg.list() {
                     let skills: Vec<Value> = agent.skills.iter().map(|s| {
-                        json!({ "name": s.name, "size": s.content.len() })
+                        let scope = if global_names.contains(s.name.as_str()) { "global" } else { "agent" };
+                        json!({ "name": s.name, "size": s.content.len(), "scope": scope })
                     }).collect();
                     all_skills.push(json!({
                         "agent_id": agent.config.agent.name,
                         "skills": skills,
                     }));
                 }
-                WsFrame::ok_response("", json!({ "agents": all_skills }))
+                WsFrame::ok_response("", json!({
+                    "global_skills": global,
+                    "agents": all_skills,
+                }))
             }
         }
     }

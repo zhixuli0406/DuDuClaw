@@ -114,9 +114,10 @@ pub async fn start_discord_bot(
         }
     };
 
-    // Get Gateway URL
+    // Get Gateway URL (use /gateway/bot for proper bot auth)
     let gateway_url = match http
-        .get(format!("{DISCORD_API}/gateway"))
+        .get(format!("{DISCORD_API}/gateway/bot"))
+        .header("Authorization", format!("Bot {token}"))
         .send()
         .await
     {
@@ -154,12 +155,25 @@ async fn gateway_loop(
 
     loop {
         info!("Discord Gateway connecting...");
+        set_channel_connected(&channel_status, "discord", false, Some("connecting".into())).await;
 
-        let ws = match tokio_tungstenite::connect_async(&gateway_url).await {
-            Ok((ws, _)) => ws,
-            Err(e) => {
+        let ws = match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            tokio_tungstenite::connect_async(&gateway_url),
+        ).await {
+            Ok(Ok((ws, resp))) => {
+                info!("Discord Gateway WebSocket connected (HTTP {})", resp.status());
+                ws
+            }
+            Ok(Err(e)) => {
                 warn!("Discord Gateway connection failed: {e}");
                 set_channel_connected(&channel_status, "discord", false, Some(e.to_string())).await;
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                continue;
+            }
+            Err(_) => {
+                warn!("Discord Gateway connection timeout (15s)");
+                set_channel_connected(&channel_status, "discord", false, Some("Connection timeout".into())).await;
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }

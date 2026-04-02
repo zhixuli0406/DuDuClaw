@@ -203,3 +203,16 @@ pub async fn install_skill(
 
     Ok(parsed)
 }
+
+/// Install a skill into the global `~/.duduclaw/skills/` directory.
+///
+/// Global skills are automatically shared with all agents.
+/// Agent-local skills with the same name take precedence (override).
+pub async fn install_skill_global(
+    skill_path: &Path,
+    home_dir: &Path,
+    quarantine_dir: &Path,
+) -> Result<ParsedSkill, String> {
+    let global_skills_dir = home_dir.join("skills");
+    install_skill(skill_path, &global_skills_dir, quarantine_dir).await
+}

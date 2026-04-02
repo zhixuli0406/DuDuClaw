@@ -2763,7 +2763,7 @@ async fn handle_skill_search(params: &Value, home_dir: &Path) -> Value {
     })
 }
 
-/// List all skills installed for a specific agent.
+/// List all skills installed for a specific agent, including global skills.
 async fn handle_skill_list(params: &Value, home_dir: &Path) -> Value {
     let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -2773,8 +2773,36 @@ async fn handle_skill_list(params: &Value, home_dir: &Path) -> Value {
         agent_id.to_string()
     };
 
+    // Collect global skills from ~/.duduclaw/skills/
+    let global_skills_dir = home_dir.join("skills");
+    let mut global_skills = Vec::new();
+    let mut global_names = std::collections::HashSet::new();
+
+    if let Ok(mut entries) = tokio::fs::read_dir(&global_skills_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+
+                let meta = duduclaw_agent::skill_loader::parse_skill_file(&path).ok();
+                let desc = meta
+                    .as_ref()
+                    .map(|m| m.meta.description.clone())
+                    .unwrap_or_default();
+
+                global_names.insert(name.clone());
+                global_skills.push(format!("- {name}: {desc} (global)"));
+            }
+        }
+    }
+
+    // Collect agent-local skills from ~/.duduclaw/agents/<agent>/SKILLS/
     let skills_dir = home_dir.join("agents").join(&agent_name).join("SKILLS");
-    let mut skills = Vec::new();
+    let mut agent_skills = Vec::new();
 
     if let Ok(mut entries) = tokio::fs::read_dir(&skills_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
@@ -2786,31 +2814,46 @@ async fn handle_skill_list(params: &Value, home_dir: &Path) -> Value {
                     .unwrap_or("?")
                     .to_string();
 
-                // Try to parse metadata
                 let meta = duduclaw_agent::skill_loader::parse_skill_file(&path).ok();
                 let desc = meta
                     .as_ref()
                     .map(|m| m.meta.description.clone())
                     .unwrap_or_default();
 
-                skills.push(format!("- {name}: {desc}"));
+                // If agent-local overrides a global skill, mark it
+                let suffix = if global_names.contains(&name) { " (override)" } else { "" };
+                agent_skills.push(format!("- {name}: {desc}{suffix}"));
             }
         }
     }
 
-    if skills.is_empty() {
+    // Remove global skills that are overridden by agent-local
+    let agent_local_names: std::collections::HashSet<String> = agent_skills.iter()
+        .filter_map(|s| s.strip_prefix("- ").and_then(|s| s.split(':').next()).map(String::from))
+        .collect();
+    global_skills.retain(|s| {
+        let name = s.strip_prefix("- ")
+            .and_then(|s| s.split(':').next())
+            .unwrap_or("");
+        !agent_local_names.contains(name)
+    });
+
+    let total = global_skills.len() + agent_skills.len();
+    if total == 0 {
         serde_json::json!({
             "content": [{"type": "text", "text": format!(
                 "No skills installed for agent '{agent_name}'."
             )}]
         })
     } else {
-        let text = format!(
-            "Agent '{}' has {} skill(s):\n\n{}",
-            agent_name,
-            skills.len(),
-            skills.join("\n")
-        );
+        let mut parts = Vec::new();
+        if !global_skills.is_empty() {
+            parts.push(format!("**Global skills** ({}):\n{}", global_skills.len(), global_skills.join("\n")));
+        }
+        if !agent_skills.is_empty() {
+            parts.push(format!("**Agent '{}' skills** ({}):\n{}", agent_name, agent_skills.len(), agent_skills.join("\n")));
+        }
+        let text = format!("Total {} skill(s):\n\n{}", total, parts.join("\n\n"));
         serde_json::json!({
             "content": [{"type": "text", "text": text}]
         })

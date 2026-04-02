@@ -33,6 +33,8 @@ pub struct LoadedAgent {
 pub struct AgentRegistry {
     agents_dir: PathBuf,
     agents: HashMap<String, LoadedAgent>,
+    /// Global skills loaded from `~/.duduclaw/skills/` — shared by all agents.
+    global_skills: Vec<SkillFile>,
 }
 
 impl AgentRegistry {
@@ -41,6 +43,7 @@ impl AgentRegistry {
         Self {
             agents_dir,
             agents: HashMap::new(),
+            global_skills: Vec::new(),
         }
     }
 
@@ -51,8 +54,20 @@ impl AgentRegistry {
 
     /// Scan the agents directory and load all valid agent configurations.
     ///
+    /// Also loads global skills from `~/.duduclaw/skills/` and merges them
+    /// into each agent (global skills appear before agent-local skills).
+    ///
     /// Directories whose name starts with `_` (e.g. `_defaults`) are skipped.
     pub async fn scan(&mut self) -> Result<()> {
+        // Load global skills from sibling `skills/` directory
+        let global_skills_dir = self.agents_dir.parent()
+            .map(|home| home.join("skills"))
+            .unwrap_or_else(|| self.agents_dir.join("../skills"));
+        self.global_skills = Self::load_skills(&global_skills_dir).await;
+        if !self.global_skills.is_empty() {
+            info!(count = self.global_skills.len(), dir = %global_skills_dir.display(), "loaded global skills");
+        }
+
         let mut entries = fs::read_dir(&self.agents_dir).await.map_err(|e| {
             DuDuClawError::Agent(format!(
                 "failed to read agents directory {}: {e}",
@@ -82,7 +97,17 @@ impl AgentRegistry {
 
             // Attempt to load the agent
             match Self::load_agent(&path).await {
-                Ok(agent) => {
+                Ok(mut agent) => {
+                    // Prepend global skills (agent-local skills override globals with same name)
+                    let local_names: std::collections::HashSet<&str> =
+                        agent.skills.iter().map(|s| s.name.as_str()).collect();
+                    let mut merged: Vec<SkillFile> = self.global_skills.iter()
+                        .filter(|gs| !local_names.contains(gs.name.as_str()))
+                        .cloned()
+                        .collect();
+                    merged.append(&mut agent.skills);
+                    agent.skills = merged;
+
                     let name = agent.config.agent.name.clone();
                     info!(agent = %name, dir = %dir_name, "loaded agent");
                     loaded.insert(name, agent);
@@ -138,6 +163,11 @@ impl AgentRegistry {
     /// Return all loaded agents as a list.
     pub fn list(&self) -> Vec<&LoadedAgent> {
         self.agents.values().collect()
+    }
+
+    /// Return the global skills (loaded from `~/.duduclaw/skills/`).
+    pub fn global_skills(&self) -> &[SkillFile] {
+        &self.global_skills
     }
 
     /// Find the agent whose role is `Main`, if any.
