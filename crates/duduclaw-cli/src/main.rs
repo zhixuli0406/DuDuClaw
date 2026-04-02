@@ -314,6 +314,10 @@ fn duduclaw_home() -> PathBuf {
 
 #[tokio::main]
 async fn main() {
+    // Install ring as the default rustls CryptoProvider (required for TLS WebSocket connections).
+    // Must be called before any TLS connection is attempted (Discord, edge-tts, etc.).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();

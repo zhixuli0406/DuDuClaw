@@ -20,7 +20,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.6"
+version = "1.0.7"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["DuDuClaw Contributors"]
@@ -49,6 +49,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Web
 axum = { version = "0.8", features = ["ws"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rust-embed = { version = "8", features = ["compression"] }
 mime_guess = "2"
 
