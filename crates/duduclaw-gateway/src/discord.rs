@@ -196,7 +196,26 @@ async fn gateway_loop(
                 // ── Incoming Gateway events ─────────────────
                 msg_opt = read.next() => {
                     let msg = match msg_opt {
-                        Some(Ok(Message::Text(text))) => text,
+                        Some(Ok(Message::Text(text))) => text.to_string(),
+                        Some(Ok(Message::Binary(bin))) => {
+                            // Discord may send Binary frames (e.g., zlib compressed)
+                            // Try to decode as UTF-8 text
+                            match String::from_utf8(bin.to_vec()) {
+                                Ok(text) => text,
+                                Err(_) => {
+                                    warn!("Discord Gateway: received non-UTF8 binary frame ({} bytes)", bin.len());
+                                    continue;
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Ping(data))) => {
+                            // Respond to ping with pong (keep-alive)
+                            if let Err(e) = write.send(Message::Pong(data)).await {
+                                warn!("Discord Gateway: failed to send pong: {e}");
+                                break;
+                            }
+                            continue;
+                        }
                         Some(Ok(Message::Close(_))) => { warn!("Discord Gateway closed"); break; }
                         Some(Err(e)) => { warn!("Discord Gateway error: {e}"); break; }
                         None => break,
@@ -205,7 +224,10 @@ async fn gateway_loop(
 
                     let payload: GatewayPayload = match serde_json::from_str(&msg) {
                         Ok(p) => p,
-                        Err(_) => continue,
+                        Err(e) => {
+                            warn!("Discord Gateway: failed to parse payload: {e} (first 200 chars: {})", &msg[..msg.len().min(200)]);
+                            continue;
+                        }
                     };
 
                     if let Some(s) = payload.s {
