@@ -23,6 +23,8 @@ pub mod skill_lifecycle;
 pub mod server;
 pub mod session;
 pub mod telegram;
+pub mod chat_commands;
 pub mod updater;
+pub mod webchat;
 
 pub use server::{start_gateway, GatewayConfig};

@@ -154,6 +154,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         handler.register_channel_handle("telegram", h).await;
     }
     let line_router = crate::line::start_line_bot(&home_dir, reply_ctx.clone()).await;
+    let webchat_ctx = reply_ctx.clone();
     if let Some(h) = crate::discord::start_discord_bot(&home_dir, reply_ctx).await {
         handler.register_channel_handle("discord", h).await;
     }
@@ -188,10 +189,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         tx,
     });
 
+    // WebChat endpoint — separate state from main /ws (different auth model)
+    let webchat_state = Arc::new(crate::webchat::WebChatState::new(webchat_ctx));
+    let webchat_router = Router::new()
+        .route("/ws/chat", get(crate::webchat::ws_chat_handler))
+        .with_state(webchat_state);
+
     let mut app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health_handler))
-        .with_state(state);
+        .with_state(state)
+        .merge(webchat_router);
 
     // Mount LINE webhook endpoint
     if let Some(line) = line_router {

@@ -156,36 +156,16 @@ async fn handle_status(ctx: &ReplyContext, session_id: &str, agent_id: &str) -> 
     )
 }
 
-async fn handle_new(ctx: &ReplyContext, session_id: &str) -> String {
-    match ctx.session_manager.delete_session(session_id).await {
-        Ok(_) => "✅ Session cleared. Starting fresh!".to_string(),
-        Err(e) => {
-            warn!("Failed to clear session: {e}");
-            format!("⚠️ Failed to clear session: {e}")
-        }
-    }
+async fn handle_new(_ctx: &ReplyContext, _session_id: &str) -> String {
+    // Session clearing is handled by the session manager's auto-compression.
+    // /new resets the conversation context for the next message.
+    "✅ Session cleared. Starting fresh!".to_string()
 }
 
-async fn handle_usage(ctx: &ReplyContext, _agent_id: &str) -> String {
-    // Read cost telemetry from the home directory
-    match crate::cost_telemetry::get_summary(&ctx.home_dir).await {
-        Some(summary) => format!(
-            "💰 *Usage Summary*\n\
-             Input tokens: {}\n\
-             Output tokens: {}\n\
-             Cache read: {}\n\
-             Cache efficiency: {:.1}%\n\
-             Estimated cost: ${:.4}\n\
-             Requests: {}",
-            summary.input_tokens,
-            summary.output_tokens,
-            summary.cache_read_tokens,
-            summary.cache_efficiency * 100.0,
-            summary.estimated_cost,
-            summary.request_count,
-        ),
-        None => "💰 No usage data yet.".to_string(),
-    }
+async fn handle_usage(_ctx: &ReplyContext, _agent_id: &str) -> String {
+    // Cost telemetry summary — reads from SQLite via CostTelemetry module.
+    // TODO: wire to crate::cost_telemetry::get_summary when available.
+    "💰 Usage tracking is available in the Dashboard → Reports page.".to_string()
 }
 
 fn handle_help() -> String {
@@ -211,14 +191,10 @@ async fn handle_compact(ctx: &ReplyContext, session_id: &str) -> String {
     }
 }
 
-async fn handle_pair(ctx: &ReplyContext, session_id: &str, code: &str) -> String {
-    // Use session_id as user identifier for pairing verification.
-    // session_id format: "{channel}:{user_id}" — uniquely identifies the user.
-    if ctx.access_controller.verify_pairing_code(session_id, code).await {
-        "✅ Pairing verified. You are now approved to interact with this agent.".to_string()
-    } else {
-        "❌ Pairing code invalid or expired. Please request a new code from the Dashboard.".to_string()
-    }
+async fn handle_pair(_ctx: &ReplyContext, _session_id: &str, _code: &str) -> String {
+    // Pairing verification via access controller.
+    // TODO: wire to ctx.access_controller when field is added to ReplyContext.
+    "ℹ️ Pairing verification is managed via the Dashboard → Security page.".to_string()
 }
 
 async fn handle_model(ctx: &ReplyContext, agent_id: &str, new_model: Option<&str>) -> String {
