@@ -72,7 +72,7 @@ export class DuDuClawClient {
         }
       };
 
-      this.ws.onclose = (event) => {
+      this.ws.onclose = (_event) => {
         // console.log('[WS] Connection closed:', event.code, event.reason);
         this.setState('disconnected');
         this.rejectAllPending('Connection closed');

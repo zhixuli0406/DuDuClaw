@@ -371,7 +371,7 @@ export const api = {
       client.call('system.version') as Promise<{ version: string }>,
     config: () =>
       client.call('system.config') as Promise<Record<string, unknown>>,
-    updateConfig: (fields: { log_level?: string; rotation_strategy?: string }) =>
+    updateConfig: (fields: Record<string, unknown>) =>
       client.call('system.update_config', fields) as Promise<{ success: boolean; changes: string[] }>,
     checkUpdate: () =>
       client.call('system.check_update') as Promise<{

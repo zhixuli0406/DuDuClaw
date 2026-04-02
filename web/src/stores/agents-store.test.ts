@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { mockWsClient } from '@/test/mocks';
+import '@/test/mocks';
 import { useAgentsStore } from './agents-store';
 
 vi.mock('@/lib/api', async (importOriginal) => {
