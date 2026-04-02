@@ -1,0 +1,678 @@
+# Instincts generated from https://github.com/zhixuli0406/DuDuClaw
+# Generated: 2026-04-02T10:40:00.376Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: DuDuClaw-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: feat, fix, chore, docs
+
+## Evidence
+
+- 137 commits analyzed
+- Detected conventional commit pattern
+- Examples: fix: add missing web source files for homebrew build, chore: bump v0.12.0, update homebrew formula
+
+---
+id: DuDuClaw-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Commit Length
+
+## Action
+
+Write moderate-length commit messages (~56 characters)
+
+## Evidence
+
+- Average commit message length: 56 chars
+- Based on 137 commits
+
+---
+id: DuDuClaw-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: DuDuClaw-import-alias
+trigger: "when importing modules"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Import Alias
+
+## Action
+
+Use path aliases (@/, ~/) instead of relative imports
+
+## Evidence
+
+- Import analysis shows alias pattern
+- Example: import { x } from '@/lib/x'
+
+---
+id: DuDuClaw-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: DuDuClaw-arch-type-based
+trigger: "when adding new code"
+confidence: 0.8
+domain: architecture
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Arch Type Based
+
+## Action
+
+Place code in the appropriate type folder (components/, services/, utils/, etc.)
+
+## Evidence
+
+- Type-based module organization detected
+- Folders: 
+
+---
+id: DuDuClaw-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: DuDuClaw-workflow-feature-development
+trigger: "when implementing a new feature"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Workflow Feature Development
+
+## Action
+
+Follow the feature-development workflow:
+1. Add feature implementation
+2. Add tests for feature
+3. Update documentation
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~15x per month
+- Files: web/src/components/*, web/src/components/layout/*, web/src/components/shared/*
+
+---
+id: DuDuClaw-workflow-refactoring
+trigger: "when refactoring code"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Workflow Refactoring
+
+## Action
+
+Follow the refactoring workflow:
+1. Ensure tests pass before refactor
+2. Refactor code structure
+3. Verify tests still pass
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: src/**/*
+
+---
+id: DuDuClaw-workflow-release-version-bump-and-homebrew-formula-update
+trigger: "when doing release version bump and homebrew formula update"
+confidence: 0.8
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Workflow Release Version Bump And Homebrew Formula Update
+
+## Action
+
+Follow the release-version-bump-and-homebrew-formula-update workflow:
+1. Update version in Cargo.toml and Cargo.lock
+2. Update version in HomebrewFormula/duduclaw.rb
+3. Update version references in README.md (and sometimes other docs)
+4. Commit with a message indicating version bump
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~6x per month
+- Files: Cargo.toml, Cargo.lock, HomebrewFormula/duduclaw.rb
+
+---
+id: DuDuClaw-workflow-add-or-update-api-endpoint-or-dashboard-feature
+trigger: "when doing add or update api endpoint or dashboard feature"
+confidence: 0.75
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Workflow Add Or Update Api Endpoint Or Dashboard Feature
+
+## Action
+
+Follow the add-or-update-api-endpoint-or-dashboard-feature workflow:
+1. Update or add backend handler (e.g., src/handlers.rs)
+2. Update core types if needed (e.g., src/types.rs)
+3. Update frontend API client (web/src/lib/api.ts)
+4. Update or add relevant frontend page/component (web/src/pages/ or web/src/components/)
+5. Update tests or documentation if necessary
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~5x per month
+- Files: crates/duduclaw-gateway/src/handlers.rs, crates/duduclaw-core/src/types.rs, web/src/lib/api.ts
+
+---
+id: DuDuClaw-workflow-fix-websocket-auth-or-dashboard-race-condition
+trigger: "when doing fix websocket auth or dashboard race condition"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Workflow Fix Websocket Auth Or Dashboard Race Condition
+
+## Action
+
+Follow the fix-websocket-auth-or-dashboard-race-condition workflow:
+1. Update web/src/lib/ws-client.ts to improve connection/auth handling
+2. Update affected dashboard pages (web/src/pages/*.tsx) to wait for proper auth state
+3. Update backend if handshake logic needs adjustment
+4. Test dashboard for race condition resolution
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: web/src/lib/ws-client.ts, web/src/pages/*.tsx, crates/duduclaw-gateway/src/handlers.rs
+
+---
+id: DuDuClaw-workflow-add-or-update-local-model-inference-support
+trigger: "when doing add or update local model inference support"
+confidence: 0.65
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Workflow Add Or Update Local Model Inference Support
+
+## Action
+
+Follow the add-or-update-local-model-inference-support workflow:
+1. Add or update crates/duduclaw-inference (new modules, registry, backends)
+2. Update gateway runner/handlers for routing and config
+3. Update agent.toml/config.toml schema and types
+4. Update dashboard frontend for model selection/config
+5. Update or add onboarding flow for inference mode selection
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~3x per month
+- Files: crates/duduclaw-inference/**, crates/duduclaw-gateway/src/claude_runner.rs, crates/duduclaw-gateway/src/handlers.rs
+
+---
+id: DuDuClaw-workflow-add-or-update-account-rotation-or-auth-method
+trigger: "when doing add or update account rotation or auth method"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Workflow Add Or Update Account Rotation Or Auth Method
+
+## Action
+
+Follow the add-or-update-account-rotation-or-auth-method workflow:
+1. Update or add account_rotator.rs in duduclaw-agent
+2. Update claude_runner.rs for rotation logic
+3. Update handlers.rs for account list/status endpoints
+4. Update dashboard frontend for account management
+5. Update docs for new auth/rotation logic
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: crates/duduclaw-agent/src/account_rotator.rs, crates/duduclaw-gateway/src/claude_runner.rs, crates/duduclaw-gateway/src/handlers.rs
+
+---
+id: DuDuClaw-workflow-add-or-update-dashboard-i18n
+trigger: "when doing add or update dashboard i18n"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Workflow Add Or Update Dashboard I18n
+
+## Action
+
+Follow the add-or-update-dashboard-i18n workflow:
+1. Update or add web/src/i18n/*.json files
+2. Update i18n index or loader (web/src/i18n/index.ts)
+3. Update affected UI components/pages to use new i18n keys
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: web/src/i18n/*.json, web/src/i18n/index.ts, web/src/pages/*.tsx
+
+---
+id: duduclaw-camelcase-files
+trigger: "When creating or renaming a source file"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Camelcase Files
+
+## Action
+
+Name the file using camelCase (e.g., myFile.tsx)
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.files: camelCase
+
+---
+id: duduclaw-camelcase-functions
+trigger: "When defining a function"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Camelcase Functions
+
+## Action
+
+Name the function using camelCase (e.g., handleEvent)
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.functions: camelCase
+
+---
+id: duduclaw-pascalcase-classes
+trigger: "When defining a class"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Pascalcase Classes
+
+## Action
+
+Name the class using PascalCase (e.g., UserManager)
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.classes: PascalCase
+
+---
+id: duduclaw-screaming-snake-constants
+trigger: "When defining a constant"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Screaming Snake Constants
+
+## Action
+
+Name the constant using SCREAMING_SNAKE_CASE (e.g., MAX_RETRIES)
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.constants: SCREAMING_SNAKE_CASE
+
+---
+id: duduclaw-alias-imports
+trigger: "When importing modules"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Alias Imports
+
+## Action
+
+Use alias import style
+
+## Evidence
+
+- Pattern in codeStyle.importStyle: alias
+
+---
+id: duduclaw-named-exports
+trigger: "When exporting modules or functions"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Named Exports
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in codeStyle.exportStyle: named
+
+---
+id: duduclaw-try-catch-errors
+trigger: "When handling errors in code"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Try Catch Errors
+
+## Action
+
+Use try-catch blocks for error handling
+
+## Evidence
+
+- Pattern in errorHandling.style: try-catch
+
+---
+id: duduclaw-test-location-separate
+trigger: "When writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Test Location Separate
+
+## Action
+
+Place test files in a separate location from source files
+
+## Evidence
+
+- Pattern in architecture.folderStructure.testLocation: separate
+
+---
+id: duduclaw-feature-test-doc-sequence
+trigger: "When developing a new feature"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Feature Test Doc Sequence
+
+## Action
+
+First implement the feature, then add tests, then update documentation
+
+## Evidence
+
+- feature-development workflow commitSequence
+- Files: web/src/components/*, **/*.test.*
+
+---
+id: duduclaw-conventional-commits
+trigger: "When making a git commit"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Conventional Commits
+
+## Action
+
+Format the commit message using conventional commit prefixes (feat, fix, chore, docs, refactor)
+
+## Evidence
+
+- Pattern in commits.type: conventional
+- Examples: 'fix: add missing web source files...'
+
+---
+id: duduclaw-commit-length
+trigger: "When writing a commit message"
+confidence: 0.7
+domain: git
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Commit Length
+
+## Action
+
+Keep the commit message concise, around 56 characters on average
+
+## Evidence
+
+- Pattern in commits.averageLength: 56
+
+---
+id: duduclaw-release-bump
+trigger: "When releasing a new version of the software"
+confidence: 0.98
+domain: workflow
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Release Bump
+
+## Action
+
+Synchronize version numbers in Cargo.toml, Cargo.lock, HomebrewFormula/duduclaw.rb, and README.md, then commit with a version bump message
+
+## Evidence
+
+- release-version-bump-and-homebrew-formula-update workflow
+- Seen in multiple version bump commits
+
+---
+id: duduclaw-add-api-endpoint
+trigger: "When adding a new API endpoint or dashboard feature"
+confidence: 0.93
+domain: workflow
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Add Api Endpoint
+
+## Action
+
+Update backend handler, core types, frontend API client, and relevant frontend page/component; update tests or docs if needed
+
+## Evidence
+
+- add-or-update-api-endpoint-or-dashboard-feature workflow
+- Example commit sequences
+
+---
+id: duduclaw-fix-ws-auth
+trigger: "When encountering dashboard bugs due to WebSocket auth or race conditions"
+confidence: 0.88
+domain: workflow
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Fix Ws Auth
+
+## Action
+
+Update ws-client.ts, affected dashboard pages, and backend handshake logic as needed; test for resolution
+
+## Evidence
+
+- fix-websocket-auth-or-dashboard-race-condition workflow
+- Example commit sequences
+
+---
+id: duduclaw-add-local-model
+trigger: "When adding new local model support or improving inference capabilities"
+confidence: 0.92
+domain: workflow
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Add Local Model
+
+## Action
+
+Update inference modules, gateway runner/handlers, config schemas/types, dashboard frontend, and onboarding flow
+
+## Evidence
+
+- add-or-update-local-model-inference-support workflow
+- Example commit sequences
+
+---
+id: duduclaw-update-account-rotation
+trigger: "When supporting new authentication methods or improving account rotation"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Update Account Rotation
+
+## Action
+
+Update account_rotator.rs, claude_runner.rs, handlers.rs, dashboard frontend, and documentation
+
+## Evidence
+
+- add-or-update-account-rotation-or-auth-method workflow
+- Example commit sequences
+
+---
+id: duduclaw-update-i18n
+trigger: "When adding UI features or new languages requiring translation"
+confidence: 0.85
+domain: workflow
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Update I18n
+
+## Action
+
+Update or add i18n JSON files, update i18n index/loader, and update affected UI components/pages to use new i18n keys
+
+## Evidence
+
+- add-or-update-dashboard-i18n workflow
+- Example commit sequences
+
