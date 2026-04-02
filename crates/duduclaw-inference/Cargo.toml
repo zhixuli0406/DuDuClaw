@@ -17,9 +17,25 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 
 # HTTP client for OpenAI-compat backend + model download
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 futures-util = { workspace = true }
 urlencoding = "2"
+zeroize = "1"
+tokio-tungstenite = { workspace = true }
+
+# Audio decoding (OGG Opus, MP3, AAC, WAV, FLAC → PCM)
+symphonia = { version = "0.5", features = ["ogg", "mp3", "isomp4", "aac", "wav", "flac", "pcm"] }
+
+# ONNX Runtime for local ASR (SenseVoice), VAD (Silero), TTS (Piper)
+ort = { version = "2.0.0-rc.12", optional = true }
+ndarray = { version = "0.16", optional = true }
+
+# Local Whisper ASR (whisper.cpp binding)
+whisper-rs = { version = "0.13", optional = true }
+
+# LiveKit WebRTC voice rooms
+livekit = { version = "0.7", optional = true, features = ["rustls-tls-native-roots"] }
+livekit-api = { version = "0.4", optional = true, features = ["rustls-tls-native-roots"] }
 
 # LLM inference — llama.cpp
 llama-cpp-2 = { version = "0.1", optional = true, features = ["sampler"] }
@@ -33,6 +49,9 @@ either = { version = "1", optional = true }
 [features]
 default = ["cpu"]
 cpu = []
+onnx = ["dep:ort", "dep:ndarray"]
+whisper = ["dep:whisper-rs"]
+livekit-voice = ["dep:livekit", "dep:livekit-api"]
 metal = ["llama-cpp-2/metal"]
 cuda = ["llama-cpp-2/cuda"]
 vulkan = ["llama-cpp-2/vulkan"]

@@ -16,8 +16,12 @@ build/
 node_modules/
 crates/duduclaw-dashboard/dist/
 
+# Build artifacts from standalone tools
+tools/license-keygen/target/
+tools/license-keygen/Cargo.lock
+
+# Claude Code worktrees
+.claude/worktrees/
+
 # Commercial closed-source modules (not pushed to public repo)
-commercial/duduclaw-license/
-commercial/templates-premium/
-commercial/evolution-params/
-commercial/dashboard-enterprise/
+commercial/

@@ -7,6 +7,7 @@ use duduclaw_core::types::CheckStatus;
 mod mcp;
 mod migrate;
 mod service;
+mod wizard;
 
 // ── Credential helpers (M-4) ────────────────────────────────
 
@@ -187,10 +188,26 @@ enum Commands {
     /// Start DuDuClaw MCP server (for Claude Code integration)
     McpServer,
 
+    /// Interactive industry-specific agent setup wizard
+    Wizard,
+
+    /// Manage license activation and status
+    License {
+        #[command(subcommand)]
+        command: LicenseCommands,
+    },
+
     /// Red-team test an agent against its behavioral contract
     Test {
         /// Agent name to test
         name: String,
+    },
+
+    /// Check for updates and optionally install the latest version
+    Update {
+        /// Apply the update without confirmation
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Print version information
@@ -258,6 +275,30 @@ enum ServiceCommands {
     Uninstall,
 }
 
+#[derive(Subcommand)]
+enum LicenseCommands {
+    /// Activate a license key
+    Activate {
+        /// License key (base64-encoded JSON)
+        key: String,
+    },
+
+    /// Deactivate the current license
+    Deactivate,
+
+    /// Show current license status
+    Status,
+
+    /// Verify a license key without activating it
+    Verify {
+        /// License key to verify
+        key: String,
+    },
+
+    /// Print this machine's fingerprint (for license binding)
+    Fingerprint,
+}
+
 /// Resolve the DuDuClaw home directory (~/.duduclaw).
 ///
 /// Panics if the home directory cannot be determined — running from "."
@@ -312,7 +353,16 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         }
         Commands::Migrate => cmd_migrate().await,
         Commands::McpServer => cmd_mcp_server().await,
+        Commands::Wizard => wizard::cmd_wizard(&duduclaw_home()).await,
+        Commands::License { command } => match command {
+            LicenseCommands::Activate { key } => cmd_license_activate(&key).await,
+            LicenseCommands::Deactivate => cmd_license_deactivate().await,
+            LicenseCommands::Status => cmd_license_status().await,
+            LicenseCommands::Verify { key } => cmd_license_verify(&key).await,
+            LicenseCommands::Fingerprint => cmd_license_fingerprint(),
+        },
         Commands::Test { name } => cmd_test_agent(&name).await,
+        Commands::Update { yes } => cmd_update(yes).await,
         Commands::Version => {
             println!("duduclaw {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -1024,6 +1074,9 @@ discord_bot_token_enc = "{discord_token_enc}"
     })?;
     println!("  {} {}", style("✓").green(), config_path.display());
 
+    // License public key is embedded at compile time via DUDUCLAW_LICENSE_PUBKEY_HEX.
+    // No runtime file deployment needed — see feature_gate.rs load_public_key().
+
     // inference.toml (only for local / hybrid modes)
     if use_local {
         let inference_toml_path = home.join("inference.toml");
@@ -1712,6 +1765,220 @@ async fn cmd_mcp_server() -> duduclaw_core::error::Result<()> {
     mcp::run_mcp_server(&home).await
 }
 
+// ── License management ──────────────────────────────────────
+
+/// `duduclaw license status` — Show current license tier, expiry, and machine fingerprint.
+async fn cmd_license_status() -> duduclaw_core::error::Result<()> {
+    use console::style;
+    let home = duduclaw_home();
+    let gate = duduclaw_gateway::feature_gate::FeatureGate::load();
+    let tier = gate.tier();
+    let license_path = home.join("license.key");
+
+    println!("\n  {} License Status\n", style("🔑").bold());
+
+    let tier_display = match tier {
+        duduclaw_gateway::feature_gate::Tier::Community => style("Community (Open Source)").green(),
+        duduclaw_gateway::feature_gate::Tier::Pro => style("Pro").yellow(),
+        duduclaw_gateway::feature_gate::Tier::Enterprise => style("Enterprise").magenta(),
+        duduclaw_gateway::feature_gate::Tier::Oem => style("OEM").cyan(),
+    };
+    println!("  Tier:        {tier_display}");
+
+    if license_path.exists() {
+        if let Ok(content) = tokio::fs::read_to_string(&license_path).await {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(customer) = json.get("customer_name").and_then(|v| v.as_str()) {
+                    println!("  Customer:    {customer}");
+                }
+                if let Some(expires) = json.get("expires_at").and_then(|v| v.as_str()) {
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(expires) {
+                        let now = chrono::Utc::now();
+                        let days = (dt.signed_duration_since(now)).num_days();
+                        if days < 0 {
+                            println!("  Expires:     {} ({})", expires, style("EXPIRED").red().bold());
+                        } else if days < 30 {
+                            println!("  Expires:     {} ({} days remaining)", expires, style(days).yellow());
+                        } else {
+                            println!("  Expires:     {} ({days} days remaining)", expires);
+                        }
+                    } else {
+                        println!("  Expires:     {expires}");
+                    }
+                }
+                if let Some(fp) = json.get("machine_fingerprint").and_then(|v| v.as_str()) {
+                    println!("  Fingerprint: {fp}");
+                }
+            }
+        }
+    } else {
+        println!("  License:     {}", style("Not activated").dim());
+    }
+
+    // Show machine fingerprint
+    let fingerprint = build_machine_fingerprint();
+    println!("  Machine ID:  {fingerprint}");
+
+    println!();
+    Ok(())
+}
+
+/// `duduclaw license activate <key>` — Write a license key to ~/.duduclaw/license.key.
+async fn cmd_license_activate(key: &str) -> duduclaw_core::error::Result<()> {
+    use console::style;
+    let home = duduclaw_home();
+
+    // Validate JSON
+    let json: serde_json::Value = serde_json::from_str(key).map_err(|e| {
+        DuDuClawError::Config(format!("Invalid license key format: {e}"))
+    })?;
+
+    // Verify Ed25519 signature before writing
+    let pubkey = duduclaw_gateway::feature_gate::FeatureGate::load_public_key()
+        .ok_or_else(|| DuDuClawError::Config("License public key not configured".into()))?;
+    let canonical = duduclaw_gateway::feature_gate::build_canonical_payload(&json)
+        .ok_or_else(|| DuDuClawError::Config("License missing required fields".into()))?;
+    let sig_b64 = json.get("signature").and_then(|v| v.as_str())
+        .ok_or_else(|| DuDuClawError::Config("License missing signature".into()))?;
+    let sig_bytes = duduclaw_gateway::feature_gate::base64_decode(sig_b64)
+        .ok_or_else(|| DuDuClawError::Config("Invalid signature encoding".into()))?;
+    if !duduclaw_gateway::feature_gate::verify_ed25519_signature(&pubkey, &canonical, &sig_bytes) {
+        return Err(DuDuClawError::Config("License signature verification failed".into()));
+    }
+
+    // Atomic write with restrictive permissions
+    let license_path = home.join("license.key");
+    let rand_suffix = uuid::Uuid::new_v4().as_simple().to_string();
+    let tmp_path = license_path.with_extension(format!("key.{rand_suffix}.tmp"));
+    tokio::fs::write(&tmp_path, key).await.map_err(|e| {
+        DuDuClawError::Config(format!("Failed to write license: {e}"))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tokio::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).await;
+    }
+    if let Err(e) = tokio::fs::rename(&tmp_path, &license_path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(DuDuClawError::Config(format!("Failed to commit license: {e}")));
+    }
+
+    // Reload and verify
+    let gate = duduclaw_gateway::feature_gate::FeatureGate::load();
+    let tier = gate.tier().as_str();
+    println!("\n  {} License activated — tier: {}\n", style("✓").green().bold(), style(tier).yellow());
+    Ok(())
+}
+
+/// `duduclaw license deactivate` — Remove license.key.
+async fn cmd_license_deactivate() -> duduclaw_core::error::Result<()> {
+    use console::style;
+    let home = duduclaw_home();
+    let license_path = home.join("license.key");
+
+    if license_path.exists() {
+        tokio::fs::remove_file(&license_path).await.map_err(|e| {
+            DuDuClawError::Config(format!("Failed to remove license: {e}"))
+        })?;
+        println!("\n  {} License deactivated — reverted to Community tier\n", style("✓").green().bold());
+    } else {
+        println!("\n  {} No license is currently active\n", style("ℹ").blue());
+    }
+    Ok(())
+}
+
+/// `duduclaw license verify <key>` — Validate a license key without writing it.
+async fn cmd_license_verify(key: &str) -> duduclaw_core::error::Result<()> {
+    use console::style;
+
+    let json: serde_json::Value = match serde_json::from_str(key) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("\n  {} Invalid JSON: {e}\n", style("✗").red().bold());
+            return Ok(());
+        }
+    };
+
+    let tier = json.get("tier").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let customer = json.get("customer_name").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let expires = json.get("expires_at").and_then(|v| v.as_str()).unwrap_or("perpetual");
+    let fp = json.get("machine_fingerprint").and_then(|v| v.as_str()).unwrap_or("");
+    let has_sig = json.get("signature").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
+
+    println!("\n  {} License Key Details\n", style("🔍").bold());
+    println!("  Tier:        {tier}");
+    println!("  Customer:    {customer}");
+    println!("  Expires:     {expires}");
+    println!("  Fingerprint: {}", if fp.is_empty() { "(none)" } else { fp });
+
+    // Actual Ed25519 signature verification
+    match duduclaw_gateway::feature_gate::FeatureGate::load_public_key() {
+        None => {
+            println!("  Signature:   {}", style("UNVERIFIED (no public key)").yellow());
+        }
+        Some(pubkey) => {
+            let canonical = duduclaw_gateway::feature_gate::build_canonical_payload(&json);
+            let sig_b64 = json.get("signature").and_then(|v| v.as_str()).unwrap_or("");
+            let sig_bytes = duduclaw_gateway::feature_gate::base64_decode(sig_b64);
+            match (canonical, sig_bytes) {
+                (Some(c), Some(s)) if duduclaw_gateway::feature_gate::verify_ed25519_signature(&pubkey, &c, &s) => {
+                    println!("  Signature:   {}", style("VALID").green().bold());
+                }
+                _ => {
+                    println!("  Signature:   {}", style("INVALID").red().bold());
+                }
+            }
+        }
+    }
+
+    // Check expiry
+    if expires != "perpetual" {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(expires) {
+            let days = dt.signed_duration_since(chrono::Utc::now()).num_days();
+            if days < 0 {
+                println!("  Status:      {}", style("EXPIRED").red().bold());
+            } else {
+                println!("  Status:      {} ({days} days remaining)", style("valid").green());
+            }
+        }
+    }
+
+    // Check machine fingerprint match
+    let my_fp = build_machine_fingerprint();
+    if !fp.is_empty() {
+        if fp == my_fp {
+            println!("  Machine:     {}", style("MATCH").green().bold());
+        } else {
+            println!("  Machine:     {}", style("MISMATCH").red().bold());
+            println!("               This machine: {my_fp}");
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+/// `duduclaw license fingerprint` — Print this machine's fingerprint.
+fn cmd_license_fingerprint() -> duduclaw_core::error::Result<()> {
+    let fingerprint = build_machine_fingerprint();
+    println!("{fingerprint}");
+    Ok(())
+}
+
+/// Build machine fingerprint: SHA-256(hostname::primary_mac)[..16] as hex.
+fn build_machine_fingerprint() -> String {
+    let hostname = gethostname::gethostname().to_string_lossy().to_string();
+    let mac = mac_address::get_mac_address()
+        .ok()
+        .flatten()
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "00:00:00:00:00:00".into());
+    let combined = format!("{hostname}::{mac}");
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(combined.as_bytes());
+    hex::encode(&hash[..16])
+}
+
 /// `duduclaw test <agent>` - Red-team test an agent against its behavioral contract.
 async fn cmd_test_agent(agent_name: &str) -> duduclaw_core::error::Result<()> {
     use console::style;
@@ -1877,5 +2144,85 @@ struct TestResult {
     vector: String,
     passed: bool,
     detail: String,
+}
+
+// ── Self-update ──────────────────────────────────────────────
+
+async fn cmd_update(auto_yes: bool) -> duduclaw_core::error::Result<()> {
+    println!("Checking for updates...");
+
+    let info = duduclaw_gateway::updater::check_update()
+        .await
+        .map_err(|e| DuDuClawError::Gateway(e))?;
+
+    println!("  Current version: {}", info.current_version);
+    println!("  Latest version:  {}", info.latest_version);
+    println!("  Install method:  {:?}", info.install_method);
+
+    if !info.available {
+        println!("\n  Already up to date!");
+        return Ok(());
+    }
+
+    println!("\n  New version available!");
+    if !info.release_notes.is_empty() {
+        // Show first 5 lines of release notes
+        let notes: Vec<&str> = info.release_notes.lines().take(5).collect();
+        println!("\n  Release notes:");
+        for line in &notes {
+            println!("    {line}");
+        }
+        if info.release_notes.lines().count() > 5 {
+            println!("    ...");
+        }
+    }
+
+    if info.install_method == duduclaw_gateway::updater::InstallMethod::Homebrew {
+        println!("\n  Homebrew installation detected.");
+        println!("  Please run: brew upgrade duduclaw");
+        return Ok(());
+    }
+
+    if info.download_url.is_empty() {
+        println!("\n  No pre-built binary available for this platform.");
+        println!("  Please build from source: cargo install --git https://github.com/zhixuli0406/DuDuClaw.git --tag v{}", info.latest_version);
+        return Ok(());
+    }
+
+    if !auto_yes {
+        // [L3] Detect non-TTY (piped) input
+        use std::io::{IsTerminal, Write};
+        if !std::io::stdin().is_terminal() {
+            println!("\n  Non-interactive mode detected. Use --yes to auto-confirm.");
+            return Ok(());
+        }
+        print!("\n  Apply update? [y/N] ");
+        std::io::stdout().flush().ok();
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err() {
+            println!("  Failed to read input. Use --yes to skip confirmation.");
+            return Ok(());
+        }
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            println!("  Update cancelled.");
+            return Ok(());
+        }
+    }
+
+    println!("\n  Downloading and installing...");
+    let result = duduclaw_gateway::updater::apply_update(&info.download_url, &info.checksum_url)
+        .await
+        .map_err(|e| DuDuClawError::Gateway(e))?;
+
+    if result.success {
+        println!("  {}", result.message);
+        if result.needs_restart {
+            println!("\n  Please restart DuDuClaw to use the new version.");
+        }
+        Ok(())
+    } else {
+        // [R3:L1] Return error so CLI exits with non-zero code
+        Err(DuDuClawError::Gateway(format!("Update failed: {}", result.message)))
+    }
 }
 

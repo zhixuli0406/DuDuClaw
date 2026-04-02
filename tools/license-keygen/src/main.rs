@@ -2,17 +2,29 @@
 //!
 //! Generates Ed25519-signed license keys for commercial customers.
 //! This binary is NOT distributed — used only by DuDuClaw maintainers.
+//!
+//! Output format: flat JSON matching `feature_gate.rs` expectations:
+//! ```json
+//! {
+//!   "tier": "pro",
+//!   "customer_name": "...",
+//!   "machine_fingerprint": "...",
+//!   "issued_at": "2026-04-02T12:00:00Z",
+//!   "expires_at": "2027-04-02T12:00:00Z",
+//!   "signature": "BASE64_ED25519_64_BYTES"
+//! }
+//! ```
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{DateTime, Duration, Utc};
 use clap::{Parser, Subcommand};
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
-/// License tier matching the duduclaw-license crate definition.
+/// License tier matching the feature_gate.rs definition.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 enum LicenseTier {
@@ -33,23 +45,32 @@ impl std::fmt::Display for LicenseTier {
     }
 }
 
-/// License payload that gets signed.
+/// Canonical payload — the exact fields and order that get signed.
+/// MUST match `build_canonical_payload()` in `feature_gate.rs`.
+// CANONICAL ORDER — DO NOT REORDER FIELDS.
+// serde_json serializes structs in declaration order.
+// Changing field order will invalidate ALL existing license signatures.
 #[derive(Debug, Serialize, Deserialize)]
-struct LicensePayload {
-    version: u8,
-    tier: LicenseTier,
+struct CanonicalPayload {
+    tier: String,
     customer_name: String,
     machine_fingerprint: String,
     issued_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-    features: Vec<String>,
+    expires_at: Option<DateTime<Utc>>,
 }
 
-/// Signed license key (payload + signature).
+/// Full license key written to ~/.duduclaw/license.key (flat JSON).
+/// NOTE: `features` is NOT included in the Ed25519 signature — it is informational.
+/// Only the fields in CanonicalPayload are cryptographically protected.
 #[derive(Debug, Serialize, Deserialize)]
-struct SignedLicense {
-    payload: String, // base64-encoded JSON payload
-    signature: String, // base64-encoded Ed25519 signature
+struct FlatLicense {
+    tier: String,
+    customer_name: String,
+    machine_fingerprint: String,
+    issued_at: DateTime<Utc>,
+    expires_at: Option<DateTime<Utc>>,
+    features: Vec<String>,
+    signature: String, // Base64-encoded Ed25519 signature of CanonicalPayload JSON
 }
 
 /// DuDuClaw License Key Generator
@@ -68,7 +89,7 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         output: PathBuf,
     },
-    /// Issue a single license key
+    /// Issue a single license key (flat JSON, ready for `duduclaw license activate`)
     Issue {
         /// Path to the signing private key
         #[arg(short, long)]
@@ -79,12 +100,12 @@ enum Commands {
         /// Customer name
         #[arg(short, long)]
         customer: String,
-        /// Machine fingerprint (MAC + hostname hash)
+        /// Machine fingerprint (from `duduclaw license fingerprint`)
         #[arg(short, long)]
         fingerprint: String,
-        /// License duration in days
-        #[arg(short, long, default_value = "365")]
-        days: u32,
+        /// License duration in days (omit for perpetual)
+        #[arg(short, long)]
+        days: Option<u32>,
         /// Additional feature flags (comma-separated)
         #[arg(short = 'F', long)]
         features: Option<String>,
@@ -103,10 +124,10 @@ enum Commands {
     },
     /// Verify a license key against the public key
     Verify {
-        /// Path to the verifying public key
+        /// Path to the verifying public key (base64-encoded)
         #[arg(short, long)]
         key: PathBuf,
-        /// License key string (base64)
+        /// License key (flat JSON string or path to .license file)
         #[arg(short, long)]
         license: String,
     },
@@ -127,7 +148,7 @@ fn main() {
             days,
             features,
         } => {
-            let feature_list = features
+            let feature_list: Vec<String> = features
                 .map(|f| f.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default();
             cmd_issue(&key, tier, &customer, &fingerprint, days, &feature_list);
@@ -144,16 +165,29 @@ fn cmd_keygen(output: &PathBuf) {
 
     let priv_path = output.join("license-signing.key");
     let pub_path = output.join("license-verifying.pub");
+    let pub_hex_path = output.join("license-verifying.hex");
 
     std::fs::write(&priv_path, BASE64.encode(signing_key.to_bytes()))
         .expect("Failed to write private key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&priv_path, std::fs::Permissions::from_mode(0o600))
+            .expect("Failed to set private key permissions");
+    }
     std::fs::write(&pub_path, BASE64.encode(verifying_key.to_bytes()))
-        .expect("Failed to write public key");
+        .expect("Failed to write public key (base64)");
+    std::fs::write(&pub_hex_path, hex::encode(verifying_key.to_bytes()))
+        .expect("Failed to write public key (hex)");
 
     println!("Keypair generated:");
-    println!("  Private: {}", priv_path.display());
-    println!("  Public:  {}", pub_path.display());
-    println!("\nKEEP THE PRIVATE KEY SECRET. Embed the public key in the duduclaw binary.");
+    println!("  Private (base64): {}", priv_path.display());
+    println!("  Public  (base64): {}", pub_path.display());
+    println!("  Public  (hex):    {}", pub_hex_path.display());
+    println!();
+    println!("KEEP THE PRIVATE KEY SECRET.");
+    println!("Deploy the hex public key to ~/.duduclaw/.license_pubkey");
+    println!("  or embed it as LICENSE_PUBKEY_HEX in the duduclaw binary.");
 }
 
 fn cmd_issue(
@@ -161,33 +195,29 @@ fn cmd_issue(
     tier: LicenseTier,
     customer: &str,
     fingerprint: &str,
-    days: u32,
+    days: Option<u32>,
     features: &[String],
 ) {
     let signing_key = load_signing_key(key_path);
     let now = Utc::now();
+    let expires_at = days.map(|d| now + Duration::days(i64::from(d)));
 
-    let payload = LicensePayload {
-        version: 1,
-        tier,
-        customer_name: customer.to_string(),
-        machine_fingerprint: fingerprint.to_string(),
-        issued_at: now,
-        expires_at: now + Duration::days(i64::from(days)),
-        features: features.to_vec(),
-    };
+    let flat = sign_flat_license(&signing_key, tier, customer, fingerprint, now, expires_at, features);
+    let json = serde_json::to_string_pretty(&flat).expect("Failed to serialize license");
 
-    let signed = sign_license(&signing_key, &payload);
-    let license_json = serde_json::to_string(&signed).expect("Failed to serialize license");
-    let license_b64 = BASE64.encode(license_json.as_bytes());
+    // stdout: the license key (pipe-friendly)
+    println!("{json}");
 
-    println!("{license_b64}");
+    // stderr: summary
     eprintln!("\nLicense issued:");
     eprintln!("  Customer:    {customer}");
     eprintln!("  Tier:        {tier}");
     eprintln!("  Fingerprint: {fingerprint}");
-    eprintln!("  Issued:      {}", payload.issued_at);
-    eprintln!("  Expires:     {}", payload.expires_at);
+    eprintln!("  Issued:      {now}");
+    match expires_at {
+        Some(exp) => eprintln!("  Expires:     {exp}"),
+        None => eprintln!("  Expires:     perpetual"),
+    }
 }
 
 fn cmd_batch(key_path: &PathBuf, input: &PathBuf, output: &PathBuf) {
@@ -196,9 +226,17 @@ fn cmd_batch(key_path: &PathBuf, input: &PathBuf, output: &PathBuf) {
 
     let mut reader = csv::Reader::from_path(input).expect("Failed to read CSV");
     let mut count = 0u32;
+    let mut errors = 0u32;
 
-    for result in reader.records() {
-        let record = result.expect("Failed to parse CSV row");
+    for (line_no, result) in reader.records().enumerate() {
+        let record = match result {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("  [SKIP] Line {}: CSV parse error: {e}", line_no + 2);
+                errors += 1;
+                continue;
+            }
+        };
         let customer = record.get(0).unwrap_or("unknown");
         let tier: LicenseTier = match record.get(1).unwrap_or("pro") {
             "community" => LicenseTier::Community,
@@ -207,42 +245,65 @@ fn cmd_batch(key_path: &PathBuf, input: &PathBuf, output: &PathBuf) {
             _ => LicenseTier::Pro,
         };
         let fingerprint = record.get(2).unwrap_or("");
-        let days: u32 = record
-            .get(3)
-            .and_then(|d| d.parse().ok())
-            .unwrap_or(365);
+        let days: Option<u32> = record.get(3).and_then(|d| d.parse().ok());
         let features: Vec<String> = record
             .get(4)
             .map(|f| f.split(';').map(|s| s.trim().to_string()).collect())
             .unwrap_or_default();
 
         let now = Utc::now();
-        let payload = LicensePayload {
-            version: 1,
-            tier,
-            customer_name: customer.to_string(),
-            machine_fingerprint: fingerprint.to_string(),
-            issued_at: now,
-            expires_at: now + Duration::days(i64::from(days)),
-            features,
-        };
+        let expires_at = days.map(|d| now + Duration::days(i64::from(d)));
 
-        let signed = sign_license(&signing_key, &payload);
-        let license_json = serde_json::to_string(&signed).expect("Serialize failed");
-        let license_b64 = BASE64.encode(license_json.as_bytes());
+        let flat = sign_flat_license(&signing_key, tier, customer, fingerprint, now, expires_at, &features);
+        let json = match serde_json::to_string_pretty(&flat) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("  [FAIL] {customer}: serialize error: {e}");
+                errors += 1;
+                continue;
+            }
+        };
 
         let safe_name = customer.replace(|c: char| !c.is_alphanumeric(), "_");
         let file_path = output.join(format!("{safe_name}.license"));
-        std::fs::write(&file_path, &license_b64).expect("Failed to write license file");
+        if let Err(e) = std::fs::write(&file_path, &json) {
+            eprintln!("  [FAIL] {customer}: write error: {e}");
+            errors += 1;
+            continue;
+        }
 
         count += 1;
         eprintln!("  [{count}] {customer} ({tier}) → {}", file_path.display());
     }
 
-    eprintln!("\nBatch complete: {count} licenses generated in {}", output.display());
+    eprintln!("\nBatch complete: {count} succeeded, {errors} failed in {}", output.display());
+    if errors > 0 {
+        std::process::exit(1);
+    }
 }
 
-fn cmd_verify(key_path: &PathBuf, license_b64: &str) {
+fn cmd_verify(key_path: &PathBuf, license_input: &str) {
+    // Accept either inline JSON or a file path
+    let license_json = if std::path::Path::new(license_input).exists() {
+        std::fs::read_to_string(license_input).expect("Failed to read license file")
+    } else {
+        license_input.to_string()
+    };
+
+    let flat: FlatLicense =
+        serde_json::from_str(&license_json).expect("Invalid license JSON — expected flat format");
+
+    // Reconstruct canonical payload (same as feature_gate.rs)
+    let canonical = CanonicalPayload {
+        tier: flat.tier.clone(),
+        customer_name: flat.customer_name.clone(),
+        machine_fingerprint: flat.machine_fingerprint.clone(),
+        issued_at: flat.issued_at,
+        expires_at: flat.expires_at,
+    };
+    let canonical_bytes = serde_json::to_vec(&canonical).expect("Failed to serialize canonical");
+
+    // Load public key
     let pub_bytes_b64 =
         std::fs::read_to_string(key_path).expect("Failed to read public key file");
     let pub_bytes = BASE64
@@ -254,40 +315,42 @@ fn cmd_verify(key_path: &PathBuf, license_b64: &str) {
     let verifying_key =
         VerifyingKey::from_bytes(&pub_array).expect("Invalid Ed25519 public key");
 
-    let license_json_bytes = BASE64
-        .decode(license_b64.trim())
-        .expect("Invalid base64 in license");
-    let license_json = String::from_utf8(license_json_bytes).expect("Invalid UTF-8 in license");
-    let signed: SignedLicense =
-        serde_json::from_str(&license_json).expect("Invalid license JSON");
-
-    let payload_bytes = BASE64
-        .decode(&signed.payload)
-        .expect("Invalid payload base64");
+    // Decode signature
     let sig_bytes = BASE64
-        .decode(&signed.signature)
-        .expect("Invalid signature base64");
+        .decode(&flat.signature)
+        .expect("Invalid base64 in signature");
     let signature = ed25519_dalek::Signature::from_slice(&sig_bytes)
-        .expect("Invalid signature length");
+        .expect("Invalid signature length (expected 64 bytes)");
 
-    match verifying_key.verify_strict(&payload_bytes, &signature) {
+    // Verify
+    match verifying_key.verify(&canonical_bytes, &signature) {
         Ok(()) => {
-            let payload: LicensePayload =
-                serde_json::from_slice(&payload_bytes).expect("Invalid payload JSON");
             let now = Utc::now();
-            let expired = now > payload.expires_at;
+            let expired = flat.expires_at.is_some_and(|exp| now > exp);
 
             println!("Signature: VALID");
-            println!("Customer:  {}", payload.customer_name);
-            println!("Tier:      {}", payload.tier);
-            println!("Issued:    {}", payload.issued_at);
-            println!("Expires:   {}", payload.expires_at);
-            if expired {
-                println!("Status:    EXPIRED");
-            } else {
-                let days_left = (payload.expires_at - now).num_days();
-                println!("Status:    ACTIVE ({days_left} days remaining)");
+            println!("Customer:  {}", flat.customer_name);
+            println!("Tier:      {}", flat.tier);
+            println!("Issued:    {}", flat.issued_at);
+            match flat.expires_at {
+                Some(exp) => {
+                    println!("Expires:   {exp}");
+                    if expired {
+                        println!("Status:    EXPIRED");
+                    } else {
+                        let days_left = (exp - now).num_days();
+                        println!("Status:    ACTIVE ({days_left} days remaining)");
+                    }
+                }
+                None => {
+                    println!("Expires:   perpetual");
+                    println!("Status:    ACTIVE (perpetual)");
+                }
             }
+            if !flat.features.is_empty() {
+                println!("Features:  {}", flat.features.join(", "));
+            }
+            println!("Machine:   {}", flat.machine_fingerprint);
         }
         Err(e) => {
             eprintln!("Signature: INVALID — {e}");
@@ -296,23 +359,31 @@ fn cmd_verify(key_path: &PathBuf, license_b64: &str) {
     }
 }
 
+/// Generate machine fingerprint: SHA-256(hostname::mac)[..16] as 32 hex chars.
+///
+/// MUST match `build_machine_fingerprint()` in duduclaw-cli/src/main.rs
+/// and `machine_fingerprint()` in feature_gate.rs.
 fn cmd_fingerprint() {
-    let hostname = hostname::get()
-        .map(|h| h.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
+    let hostname = gethostname::gethostname().to_string_lossy().to_string();
+    let mac = mac_address::get_mac_address()
+        .ok()
+        .flatten()
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "00:00:00:00:00:00".into());
+    let combined = format!("{hostname}::{mac}");
 
-    // Use hostname + a stable machine identifier as fingerprint source
     let mut hasher = Sha256::new();
-    hasher.update(hostname.as_bytes());
-    // On macOS, use IOPlatformSerialNumber; on Linux, /etc/machine-id
-    // For now, just use hostname as the base
+    hasher.update(combined.as_bytes());
     let hash = hasher.finalize();
-    let fingerprint = hex::encode(&hash[..16]); // 128-bit truncated
+    let fingerprint = hex::encode(&hash[..16]);
 
     println!("{fingerprint}");
-    eprintln!("Machine: {hostname}");
+    eprintln!("Machine:     {hostname}");
+    eprintln!("MAC:         {mac}");
     eprintln!("Fingerprint: {fingerprint}");
 }
+
+// ── Helpers ──────────────────────────────────────────────
 
 fn load_signing_key(path: &PathBuf) -> SigningKey {
     let key_b64 = std::fs::read_to_string(path).expect("Failed to read signing key file");
@@ -325,13 +396,42 @@ fn load_signing_key(path: &PathBuf) -> SigningKey {
     SigningKey::from_bytes(&key_array)
 }
 
-fn sign_license(signing_key: &SigningKey, payload: &LicensePayload) -> SignedLicense {
-    let payload_json = serde_json::to_string(payload).expect("Failed to serialize payload");
-    let payload_b64 = BASE64.encode(payload_json.as_bytes());
-    let signature = signing_key.sign(payload_json.as_bytes());
+/// Sign a flat license key matching the format expected by feature_gate.rs.
+///
+/// The signature covers the canonical payload (tier + customer_name +
+/// machine_fingerprint + issued_at + expires_at), serialized as JSON by serde.
+/// This MUST match `build_canonical_payload()` in feature_gate.rs exactly.
+fn sign_flat_license(
+    signing_key: &SigningKey,
+    tier: LicenseTier,
+    customer_name: &str,
+    machine_fingerprint: &str,
+    issued_at: DateTime<Utc>,
+    expires_at: Option<DateTime<Utc>>,
+    features: &[String],
+) -> FlatLicense {
+    let tier_str = tier.to_string();
 
-    SignedLicense {
-        payload: payload_b64,
+    // Build canonical payload — same struct order as feature_gate.rs
+    let canonical = CanonicalPayload {
+        tier: tier_str.clone(),
+        customer_name: customer_name.to_string(),
+        machine_fingerprint: machine_fingerprint.to_string(),
+        issued_at,
+        expires_at,
+    };
+    let canonical_bytes = serde_json::to_vec(&canonical).expect("Failed to serialize canonical payload");
+
+    // Sign canonical bytes
+    let signature = signing_key.sign(&canonical_bytes);
+
+    FlatLicense {
+        tier: tier_str,
+        customer_name: customer_name.to_string(),
+        machine_fingerprint: machine_fingerprint.to_string(),
+        issued_at,
+        expires_at,
+        features: features.to_vec(),
         signature: BASE64.encode(signature.to_bytes()),
     }
 }

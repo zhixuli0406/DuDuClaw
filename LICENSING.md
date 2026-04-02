@@ -1,47 +1,83 @@
 # DuDuClaw 授權說明 / Licensing FAQ
 
-DuDuClaw 採用 **Elastic License 2.0 (ELv2)** 授權。
+DuDuClaw 採用 **Open Core** 授權模式。
+
+- **核心程式碼**（本 repository）：[Apache License 2.0](LICENSE)
+- **商業加值模組**（`commercial/` 目錄，不在公開 repo 中）：閉源商業授權
+
+---
+
+## 開源部分（Apache 2.0）
+
+以下模組完全開源，可自由使用、修改、分發，包含商業用途：
+
+| 模組 | 說明 |
+|------|------|
+| `duduclaw-core` | 共用型別與 trait |
+| `duduclaw-gateway` | HTTP/WebSocket 伺服器、頻道路由 |
+| `duduclaw-agent` | Agent 設定、心跳排程、預算追蹤 |
+| `duduclaw-memory` | SQLite + FTS5 記憶引擎 |
+| `duduclaw-security` | AES-256-GCM 加密、SOUL.md 守衛、輸入掃描 |
+| `duduclaw-inference` | 本地推論引擎（llama.cpp / mistral.rs / Exo） |
+| `duduclaw-container` | Docker / Apple Container 沙箱 |
+| `duduclaw-bus` | tokio broadcast + mpsc 訊息匯流排 |
+| `duduclaw-cli` | CLI 入口、MCP Server、安全測試 |
+| `duduclaw-dashboard` | rust-embed 靜態資源容器 |
+| `duduclaw-odoo` | Odoo ERP JSON-RPC 橋接 |
+| `duduclaw-bridge` | Python 互操作 |
+| `web/` | React 19 Dashboard（全功能） |
+
+## 商業加值模組（閉源）
+
+以下模組為付費商業授權，不包含在公開 repository 中：
+
+| 模組 | 說明 |
+|------|------|
+| `duduclaw-license` | Ed25519 授權驗證 crate |
+| `templates-premium` | 產業專用 SOUL.md 調校版（餐飲/製造/貿易） |
+| `evolution-params` | GVU 演化引擎最佳參數集 |
+| `dashboard-enterprise` | ROI 報表、稽核匯出（PDF/CSV） |
 
 ---
 
 ## 常見問題
 
-### 我是個人開發者，需要付費嗎？
+### 我是個人開發者，可以免費用嗎？
 
-**不用。** ELv2 允許個人自由使用、修改、部署 DuDuClaw。
+**可以。** Apache 2.0 允許個人自由使用、修改、部署。
 
 ### 我在公司內部用，需要付費嗎？
 
-**不用。** 企業內部使用（例如內部客服、內部工具）完全免費。
+**不用。** 核心功能完全免費，無任何限制。
 
-### 我用 DuDuClaw 幫客戶做 AI 客服收費，需要付費嗎？
+### 我可以拿去開 SaaS 嗎？
 
-**看情況。** 如果你是提供顧問/導入服務，幫客戶在他們自己的機器上部署 → 不需要。
-如果你是將 DuDuClaw 作為託管服務（hosted/managed service）提供給客戶使用 → 這違反 ELv2 限制，需要取得商業授權。
+**可以。** Apache 2.0 不限制託管服務。但「DuDuClaw」名稱及爪印 Logo 為商標，不可冒用。
 
-### 我 Fork 後改名字賣，可以嗎？
+### 我 Fork 後改名字商業化，可以嗎？
 
-**不行。** ELv2 禁止將軟體作為託管服務提供。此外，「DuDuClaw」名稱及爪印 Logo 受商標保護。
+**可以。** Apache 2.0 允許衍生作品，但需保留原始授權聲明和版權通知。
 
-### 我可以修改原始碼自用嗎？
+### 付費模組有什麼好處？
 
-**可以。** ELv2 允許修改和製作衍生作品，只要遵守上述限制。
+- **產業模板**：經實戰驗證的 SOUL.md，開箱即用
+- **演化參數**：GVU 調校過的最佳參數，省去數週實驗時間
+- **企業報表**：ROI 分析、稽核匯出，符合企業合規需求
+- **優先支援**：SLA 保證回應時間 + 安全補丁即時推送
 
 ### 教育 / 研究用途呢？
 
-**完全免費。** 教育和研究用途不受任何限制。
+**完全免費。** 核心程式碼無任何限制。
 
 ---
 
 ## 授權等級
 
-| 等級 | 費用 | 適用對象 |
-|------|------|----------|
-| **Community** | 免費 | 個人、教育、企業內部使用 |
-| **Pro** | 付費 | 商業部署（多頻道、多 Agent） |
-| **Enterprise** | 付費 | 大型企業（SLA、稽核、客製化） |
-
-詳細功能矩陣請見官網或聯絡 sales。
+| 等級 | 費用 | 內容 |
+|------|------|------|
+| **Community** | 免費 | 全部核心功能（Apache 2.0 開源） |
+| **Pro** | 付費 | Community + 產業模板 + 演化參數 + 即時安全補丁 |
+| **Enterprise** | 付費 | Pro + 企業報表 + SLA 支援 + 客製化諮詢 |
 
 ---
 

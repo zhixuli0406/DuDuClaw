@@ -138,6 +138,8 @@ pub struct HeartbeatScheduler {
     running: Arc<AtomicBool>,
     /// Global concurrency limiter for evolution subprocesses.
     global_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Per-agent proactive rate limiting state (shared across heartbeat cycles).
+    proactive_states: Arc<tokio::sync::Mutex<HashMap<String, crate::proactive::ProactiveState>>>,
 }
 
 impl HeartbeatScheduler {
@@ -148,6 +150,7 @@ impl HeartbeatScheduler {
             agents: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(AtomicBool::new(false)),
             global_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_GLOBAL_CONCURRENT)),
+            proactive_states: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -217,8 +220,9 @@ impl HeartbeatScheduler {
             let home = self.home_dir.clone();
             let aid = agent.agent_id.clone();
             let sem = agent.active_runs.clone();
+            let ps = self.proactive_states.clone();
             tokio::spawn(async move {
-                execute_heartbeat(&home, &aid, &sem).await;
+                execute_heartbeat(&home, &aid, &sem, &ps).await;
             });
             true
         } else {
@@ -296,12 +300,13 @@ impl HeartbeatScheduler {
             // Now spawn tasks without holding any lock
             for (home, aid, sem) in to_spawn {
                 let global_sem = self.global_semaphore.clone();
+                let proactive_states = self.proactive_states.clone();
                 tokio::spawn(async move {
                     let _global_permit = match global_sem.acquire().await {
                         Ok(p) => p,
                         Err(_) => return,
                     };
-                    execute_heartbeat(&home, &aid, &sem).await;
+                    execute_heartbeat(&home, &aid, &sem, &proactive_states).await;
                 });
             }
         }
@@ -318,14 +323,15 @@ impl HeartbeatScheduler {
 
 // ── Heartbeat execution ───────────────────────────────────────
 
-/// Execute a single heartbeat cycle for one agent (bus polling only).
+/// Execute a single heartbeat cycle for one agent.
 ///
-/// Evolution reflections are driven by the prediction engine in `channel_reply`,
-/// not by the heartbeat timer.
+/// 1. Bus polling (existing): check for pending inter-agent messages
+/// 2. Proactive check (new): if PROACTIVE.md exists, execute checks and route results
 async fn execute_heartbeat(
     home_dir: &Path,
     agent_id: &str,
     semaphore: &tokio::sync::Semaphore,
+    proactive_states: &tokio::sync::Mutex<HashMap<String, crate::proactive::ProactiveState>>,
 ) {
     let _permit = match semaphore.try_acquire() {
         Ok(p) => p,
@@ -337,12 +343,174 @@ async fn execute_heartbeat(
 
     info!(agent = agent_id, "Heartbeat cycle start");
 
+    // ── Bus polling (existing) ──
     let pending = count_pending_bus_messages(home_dir, agent_id).await;
     if pending > 0 {
         info!(agent = agent_id, pending, "Agent has pending bus messages");
     }
 
+    // ── Proactive check (new) ──
+    execute_proactive_check(home_dir, agent_id, proactive_states).await;
+
     info!(agent = agent_id, "Heartbeat cycle complete");
+}
+
+/// Execute proactive checks for an agent if PROACTIVE.md exists and conditions allow.
+async fn execute_proactive_check(
+    home_dir: &Path,
+    agent_id: &str,
+    proactive_states: &tokio::sync::Mutex<HashMap<String, crate::proactive::ProactiveState>>,
+) {
+    use crate::proactive;
+
+    // Validate agent_id format (defense in depth)
+    if agent_id.contains("..") || agent_id.contains('/') || agent_id.contains('\\') || agent_id.contains('\0') {
+        warn!(agent = agent_id, "Invalid agent_id in proactive check, skipping");
+        return;
+    }
+
+    let agent_dir = home_dir.join("agents").join(agent_id);
+
+    // Load agent config for proactive settings
+    let config_path = agent_dir.join("agent.toml");
+    let config_content = match tokio::fs::read_to_string(&config_path).await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let agent_config: duduclaw_core::types::AgentConfig = match toml::from_str(&config_content) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    if !agent_config.proactive.enabled {
+        return;
+    }
+
+    // Check quiet hours
+    if proactive::is_quiet_hour(&agent_config.proactive) {
+        debug!(agent = agent_id, "Proactive check skipped: quiet hours");
+        return;
+    }
+
+    // Load PROACTIVE.md
+    let proactive_md = match proactive::load_proactive_md(&agent_dir) {
+        Some(md) => md,
+        None => return, // No PROACTIVE.md → nothing to do
+    };
+
+    info!(agent = agent_id, "Proactive check: executing");
+
+    // Build prompt and execute via Claude CLI
+    let prompt = proactive::build_proactive_prompt(&proactive_md, agent_id);
+    let claude = duduclaw_core::which_claude();
+
+    let result = match claude {
+        Some(claude_path) => {
+            let output = tokio::process::Command::new(&claude_path)
+                .args([
+                    "--print", "--no-input",
+                    "--system-prompt", &prompt,
+                    "--max-turns", "3",
+                    "-p", "Execute the proactive checks now.",
+                ])
+                .current_dir(&agent_dir)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .await;
+            match output {
+                Ok(o) if o.status.success() => {
+                    String::from_utf8_lossy(&o.stdout).to_string()
+                }
+                Ok(o) => {
+                    let stderr_snippet: String = String::from_utf8_lossy(&o.stderr).chars().take(200).collect();
+                    warn!(agent = agent_id, stderr = %stderr_snippet, "Proactive Claude failed");
+                    return;
+                }
+                Err(e) => {
+                    warn!(agent = agent_id, "Proactive exec error: {e}");
+                    return;
+                }
+            }
+        }
+        None => {
+            warn!(agent = agent_id, "Proactive check: claude CLI not found");
+            return;
+        }
+    };
+
+    // Parse result — silent or actionable?
+    match proactive::parse_proactive_result(&result) {
+        None => {
+            debug!(agent = agent_id, "Proactive check: PROACTIVE_OK (silent)");
+            let mut states = proactive_states.lock().await;
+            states
+                .entry(agent_id.to_string())
+                .or_insert_with(crate::proactive::ProactiveState::new)
+                .record_silent();
+        }
+        Some(message) => {
+            // Rate limit check
+            {
+                let mut states = proactive_states.lock().await;
+                let state = states
+                    .entry(agent_id.to_string())
+                    .or_insert_with(crate::proactive::ProactiveState::new);
+                if !state.can_send(agent_config.proactive.max_messages_per_hour) {
+                    debug!(agent = agent_id, "Proactive notification skipped: rate limit exceeded");
+                    return;
+                }
+                state.record_sent();
+            }
+
+            info!(agent = agent_id, msg_len = message.len(), "Proactive check: notification to send");
+
+            // Route notification to channel via bus_queue
+            let notify = &agent_config.proactive;
+            if !notify.notify_channel.is_empty() && !notify.notify_chat_id.is_empty() {
+                let bus_entry = serde_json::json!({
+                    "type": "proactive_notification",
+                    "agent_id": agent_id,
+                    "channel": notify.notify_channel,
+                    "chat_id": notify.notify_chat_id,
+                    "message": message,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                });
+                let queue_path = home_dir.join("bus_queue.jsonl");
+                let line = format!("{}\n", bus_entry);
+                // Use spawn_blocking + flock for safe concurrent JSONL append
+                let qp = queue_path.clone();
+                let aid = agent_id.to_string();
+                let ch = notify.notify_channel.clone();
+                tokio::task::spawn_blocking(move || {
+                    use std::io::Write;
+                    let file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&qp);
+                    if let Ok(mut f) = file {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::io::AsRawFd;
+                            let ret = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+                            if ret != 0 {
+                                tracing::warn!("flock LOCK_EX failed, proceeding without lock");
+                            }
+                        }
+                        let _ = f.write_all(line.as_bytes());
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::io::AsRawFd;
+                            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN); }
+                        }
+                        tracing::info!(agent = %aid, channel = %ch, "Proactive notification queued");
+                    }
+                }).await.ok();
+            } else {
+                warn!(agent = agent_id, "Proactive notification has no target channel configured");
+            }
+        }
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────

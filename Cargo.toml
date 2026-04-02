@@ -1,5 +1,9 @@
 [workspace]
 resolver = "2"
+exclude = [
+    "tools/license-keygen",
+    "commercial/duduclaw-license",
+]
 members = [
     "crates/duduclaw-core",
     "crates/duduclaw-gateway",
@@ -16,9 +20,9 @@ members = [
 ]
 
 [workspace.package]
-version = "0.12.0"
+version = "1.0.0"
 edition = "2024"
-license = "Elastic-2.0"
+license = "Apache-2.0"
 authors = ["DuDuClaw Contributors"]
 
 [workspace.lints.rust]

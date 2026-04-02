@@ -3,6 +3,7 @@ pub mod budget;
 pub mod contract;
 pub mod heartbeat;
 pub mod ipc;
+pub mod proactive;
 pub mod registry;
 pub mod resolver;
 pub mod runner;

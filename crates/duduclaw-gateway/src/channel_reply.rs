@@ -41,6 +41,8 @@ pub struct ReplyContext {
     pub skill_activation: Arc<tokio::sync::Mutex<SkillActivationController>>,
     /// Skill lifecycle: lift tracker store.
     pub skill_lift: Arc<tokio::sync::Mutex<LiftTrackerStore>>,
+    /// Sessions with voice reply mode enabled (toggled by /voice command).
+    pub voice_sessions: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl ReplyContext {
@@ -65,6 +67,7 @@ impl ReplyContext {
             skill_cache: Arc::new(tokio::sync::Mutex::new(CompressedSkillCache::new())),
             skill_activation: Arc::new(tokio::sync::Mutex::new(SkillActivationController::new(5))),
             skill_lift: Arc::new(tokio::sync::Mutex::new(LiftTrackerStore::new())),
+            voice_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 

@@ -90,7 +90,14 @@ impl Drop for Account {
 impl Account {
     pub fn is_available(&self) -> bool {
         if !self.is_healthy {
-            return false;
+            // Allow recovery after cooldown expires (e.g., billing-exhausted 24h).
+            // Without this, is_healthy=false + expired cooldown = permanently dead.
+            let cooldown_expired = self
+                .cooldown_until
+                .is_some_and(|cd| Utc::now() >= cd);
+            if !cooldown_expired {
+                return false;
+            }
         }
         // API key accounts have budget enforcement
         if self.auth_method == AuthMethod::ApiKey
@@ -98,7 +105,7 @@ impl Account {
         {
             return false;
         }
-        // Check cooldown
+        // Check cooldown (active, not yet expired)
         if self.cooldown_until.is_some_and(|cd| Utc::now() < cd) {
             return false;
         }
@@ -276,9 +283,15 @@ impl AccountRotator {
             }
         }
 
-        // 2. Auto-detect default OAuth session from ~/.claude/.credentials.json
+        // 2. Auto-detect default OAuth session via `claude auth status`
         if !loaded.iter().any(|a| a.auth_method == AuthMethod::OAuth) {
-            if let Some(creds) = detect_default_oauth_session() {
+            // Use spawn_blocking to avoid holding a tokio worker thread
+            // while waiting for the `claude` CLI subprocess.
+            let detected = tokio::task::spawn_blocking(detect_default_oauth_session)
+                .await
+                .ok()
+                .flatten();
+            if let Some(creds) = detected {
                 loaded.push(creds);
             }
         }
@@ -447,7 +460,12 @@ impl AccountRotator {
         let mut accounts = self.accounts.write().await;
         if let Some(acc) = accounts.iter_mut().find(|a| a.id == account_id) {
             acc.consecutive_errors = 0;
-            acc.is_healthy = true;
+            // Only restore health if not in active cooldown set by another worker.
+            // This prevents a stale success from overriding a concurrent rate-limit.
+            let in_cooldown = acc.cooldown_until.is_some_and(|cd| Utc::now() < cd);
+            if !in_cooldown {
+                acc.is_healthy = true;
+            }
             acc.spent_this_month += cost_cents;
             acc.total_requests += 1;
             acc.last_used = Some(Utc::now());
@@ -597,19 +615,28 @@ fn detect_default_oauth_session() -> Option<Account> {
 }
 
 /// Resolve OAuth credentials directory for a named profile.
+///
+/// Modern Claude CLI versions no longer use `.credentials.json` — auth is
+/// managed via OS keychain / internal storage. We check for the directory
+/// itself (which still exists) and fall back to `.credentials.json` for
+/// older versions.
 fn resolve_oauth_credentials(profile: &str) -> Option<PathBuf> {
     let claude_dir = dirs::home_dir()?.join(".claude");
 
-    if profile == "default" || profile.is_empty() {
-        // Default profile: ~/.claude/
-        let creds = claude_dir.join(".credentials.json");
-        if creds.exists() { Some(claude_dir) } else { None }
+    let dir = if profile == "default" || profile.is_empty() {
+        claude_dir.clone()
     } else {
-        // Named profile: ~/.claude/profiles/<name>/
-        let profile_dir = claude_dir.join("profiles").join(profile);
-        let creds = profile_dir.join(".credentials.json");
-        if creds.exists() { Some(profile_dir) } else { None }
+        claude_dir.join("profiles").join(profile)
+    };
+
+    if !dir.exists() {
+        return None;
     }
+
+    // Accept if directory exists — modern CLI manages auth internally.
+    // Legacy check (.credentials.json) is subsumed: if the file exists,
+    // the directory also exists.
+    Some(dir)
 }
 
 // ── API Key helpers ─────────────────────────────────────────

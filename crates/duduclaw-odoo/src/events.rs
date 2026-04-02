@@ -277,4 +277,106 @@ mod tests {
         let tracker = PollTracker::with_limit(200);
         assert_eq!(tracker.poll_limit, Some(200));
     }
+
+    #[test]
+    fn proactive_notification_format() {
+        let event = OdooEvent {
+            event_type: "odoo.inventory.low_stock".into(),
+            model: "product.product".into(),
+            record_id: 42,
+            data: json!({"name": "Widget A", "qty_available": 5, "reorder_level": 20}),
+            timestamp: "2026-04-02T10:00:00Z".into(),
+        };
+        let msg = format_proactive_notification(&event);
+        assert!(msg.is_some());
+        assert!(msg.unwrap().contains("Widget A"));
+    }
+}
+
+// ── Proactive Notification Formatting (Phase F2) ───────────────
+
+/// Format an Odoo event into a human-readable proactive notification.
+///
+/// Returns `None` for event types that don't warrant proactive notification.
+/// Sanitize a string field from Odoo for safe display in notifications.
+fn sanitize_odoo_field(s: &str, max_len: usize) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == ' ')
+        .take(max_len)
+        .collect::<String>()
+        .replace('\n', " ")
+}
+
+pub fn format_proactive_notification(event: &OdooEvent) -> Option<String> {
+    match event.event_type.as_str() {
+        "odoo.inventory.low_stock" => {
+            let name = sanitize_odoo_field(
+                event.data.get("name").and_then(|v| v.as_str()).unwrap_or("Unknown"),
+                100,
+            );
+            let qty = event.data.get("qty_available").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let reorder = event.data.get("reorder_level").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            Some(format!(
+                "📦 庫存警告：{name} 剩餘 {qty:.0} 件，低於安全水位 {reorder:.0} 件"
+            ))
+        }
+        "odoo.sale.order_confirmed" => {
+            let amount = event.data.get("amount_total").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let partner = sanitize_odoo_field(
+                event.data.get("partner_name").and_then(|v| v.as_str()).unwrap_or("Unknown"),
+                100,
+            );
+            Some(format!(
+                "🛒 新訂單確認：{partner} — ${amount:.2}"
+            ))
+        }
+        "odoo.invoice.overdue" => {
+            let partner = sanitize_odoo_field(
+                event.data.get("partner_name").and_then(|v| v.as_str()).unwrap_or("Unknown"),
+                100,
+            );
+            let days = event.data.get("days_overdue").and_then(|v| v.as_i64()).unwrap_or(0);
+            let amount = event.data.get("amount_residual").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            Some(format!(
+                "⚠️ 付款逾期：{partner} 已逾期 {days} 天，未付金額 ${amount:.2}"
+            ))
+        }
+        "odoo.crm.lead_created" => {
+            let name = sanitize_odoo_field(
+                event.data.get("name").and_then(|v| v.as_str()).unwrap_or("New Lead"),
+                100,
+            );
+            let source = sanitize_odoo_field(
+                event.data.get("source").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                100,
+            );
+            Some(format!(
+                "🎯 新商機：{name}（來源：{source}）"
+            ))
+        }
+        _ => None, // Other events don't trigger proactive notifications
+    }
+}
+
+/// Deduplicate Odoo events — returns only events not seen in the last `dedup_hours`.
+pub fn dedup_events(events: &[OdooEvent], seen_keys: &mut HashMap<String, String>, dedup_hours: u32) -> Vec<OdooEvent> {
+    let now = Utc::now();
+    let cutoff = now - chrono::Duration::hours(dedup_hours as i64);
+
+    // Prune old entries
+    seen_keys.retain(|_, ts| {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .map(|dt| dt.with_timezone(&Utc) > cutoff)
+            .unwrap_or(false)
+    });
+
+    let mut result = Vec::new();
+    for event in events {
+        let key = format!("{}:{}:{}", event.event_type, event.model, event.record_id);
+        if !seen_keys.contains_key(&key) {
+            seen_keys.insert(key, now.to_rfc3339());
+            result.push(event.clone());
+        }
+    }
+    result
 }

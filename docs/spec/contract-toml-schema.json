@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://duduclaw.dev/schemas/contract-toml-v1.json",
+  "title": "DuDuClaw CONTRACT.toml",
+  "description": "Behavioral boundary definition for a DuDuClaw agent. See docs/spec/contract-toml-spec.md for full specification.",
+  "type": "object",
+  "required": ["boundaries"],
+  "properties": {
+    "boundaries": {
+      "type": "object",
+      "description": "Core behavioral constraints",
+      "required": ["must_not", "must_always"],
+      "properties": {
+        "must_not": {
+          "type": "array",
+          "description": "Patterns or substrings the agent must NEVER output. Supports glob wildcards (*, ?, [range]).",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1
+        },
+        "must_always": {
+          "type": "array",
+          "description": "Behaviors the agent must ALWAYS exhibit. Used for red-team testing and system prompt injection.",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "max_tool_calls_per_turn": {
+          "type": "integer",
+          "description": "Maximum MCP tool calls per response turn. 0 = unlimited.",
+          "minimum": 0,
+          "default": 5
+        }
+      },
+      "additionalProperties": false
+    },
+    "browser": {
+      "type": "object",
+      "description": "Browser automation capability configuration. Omit to use system defaults (deny-by-default).",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable browser automation for this agent",
+          "default": false
+        },
+        "max_tier": {
+          "type": "string",
+          "description": "Maximum browser escalation level",
+          "enum": ["api_fetch", "static_scrape", "headless_browser", "sandbox_browser", "computer_use"],
+          "default": "api_fetch"
+        },
+        "trusted_domains": {
+          "type": "array",
+          "description": "Allowlist of domain patterns (supports glob). If set, only these domains are accessible.",
+          "items": { "type": "string" }
+        },
+        "blocked_domains": {
+          "type": "array",
+          "description": "Blocklist of domain patterns (supports glob). Always rejected.",
+          "items": { "type": "string" }
+        },
+        "restrictions": {
+          "type": "object",
+          "description": "Fine-grained browser action restrictions",
+          "properties": {
+            "allow_form_submit": {
+              "type": "boolean",
+              "description": "Can the agent submit HTML forms?",
+              "default": false
+            },
+            "allow_file_download": {
+              "type": "boolean",
+              "description": "Can the agent download files?",
+              "default": false
+            },
+            "max_pages_per_session": {
+              "type": "integer",
+              "description": "Maximum pages visited per browser session",
+              "minimum": 1,
+              "default": 20
+            },
+            "max_session_minutes": {
+              "type": "integer",
+              "description": "Maximum duration of a browser session in minutes",
+              "minimum": 1,
+              "default": 10
+            },
+            "screenshot_audit": {
+              "type": "boolean",
+              "description": "Log screenshots to browser_audit.jsonl",
+              "default": true
+            },
+            "require_human_approval_for": {
+              "type": "array",
+              "description": "Action types requiring human sign-off before execution. Supports glob patterns.",
+              "items": { "type": "string" }
+            }
+          },
+          "additionalProperties": false
+        },
+        "computer_use": {
+          "type": "object",
+          "description": "Layer 5 (Computer Use) configuration. Only applies when max_tier = 'computer_use'.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Must be explicitly enabled for L5",
+              "default": false
+            },
+            "max_actions": {
+              "type": "integer",
+              "description": "Maximum mouse/keyboard actions per session",
+              "minimum": 1,
+              "default": 50
+            },
+            "container_required": {
+              "type": "boolean",
+              "description": "Require container sandbox for Computer Use",
+              "default": true
+            },
+            "display_size": {
+              "type": "string",
+              "description": "Virtual display resolution (WxH)",
+              "pattern": "^[0-9]+x[0-9]+$",
+              "default": "1280x800"
+            },
+            "blur_patterns": {
+              "type": "array",
+              "description": "CSS selectors to blur in screenshots for privacy",
+              "items": { "type": "string" }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

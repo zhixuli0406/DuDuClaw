@@ -1,0 +1,84 @@
+# DuDuClaw Box - Docker Compose for NAS (Synology / QNAP)
+# Usage:
+#   1. Copy this file to your NAS
+#   2. Create config/ and models/ directories alongside it
+#   3. Set environment variables in .env or directly below
+#   4. docker compose -f docker-compose.nas.yml up -d
+
+services:
+  # -------------------------------------------------------------------------
+  # Model Downloader (init container — runs once, then exits)
+  # Downloads a starter GGUF model if not already present.
+  # -------------------------------------------------------------------------
+  model-downloader:
+    image: curlimages/curl:latest
+    container_name: duduclaw-model-downloader
+    volumes:
+      - ./models:/models
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        MODEL_FILE="/models/${STARTER_MODEL:-qwen2.5-7b-instruct-q4_k_m.gguf}"
+        if [ -f "$$MODEL_FILE" ]; then
+          echo "Model already exists: $$MODEL_FILE"
+          exit 0
+        fi
+        echo "Downloading starter model..."
+        curl -L --progress-bar \
+          -o "$$MODEL_FILE.part" \
+          "${STARTER_MODEL_URL:-https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf}"
+        mv "$$MODEL_FILE.part" "$$MODEL_FILE"
+        echo "Model downloaded: $$MODEL_FILE"
+    restart: "no"
+    profiles:
+      - init
+
+  # -------------------------------------------------------------------------
+  # DuDuClaw Gateway (main service)
+  # -------------------------------------------------------------------------
+  duduclaw:
+    image: ${DUDUCLAW_IMAGE:-ghcr.io/nicholasgasior/duduclaw:latest}
+    container_name: duduclaw
+    # Run as non-root user
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:${DUDUCLAW_PORT:-3120}:3120"  # Bind to localhost only; change to 0.0.0.0 for LAN access
+    volumes:
+      - ./config:/root/.duduclaw
+      - ./models:/root/.duduclaw/models
+    environment:
+      # Required: at least one API key or OAuth token
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+      # Optional: channel tokens
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET:-}
+      - LINE_CHANNEL_ACCESS_TOKEN=${LINE_CHANNEL_ACCESS_TOKEN:-}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+      # Optional: inference settings
+      - DUDUCLAW_LOG_LEVEL=${DUDUCLAW_LOG_LEVEL:-info}
+      # Default: 127.0.0.1 (localhost only). Use 0.0.0.0 if NAS exposes
+      # the port through a reverse proxy or needs LAN access.
+      - DUDUCLAW_BIND_ADDR=${DUDUCLAW_BIND_ADDR:-127.0.0.1:3120}
+    deploy:
+      resources:
+        limits:
+          memory: ${MEMORY_LIMIT:-4g}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3120/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      model-downloader:
+        condition: service_completed_successfully
+        required: false

@@ -35,3 +35,6 @@ dirs = "6"
 base64 = { workspace = true }
 scraper = "0.22"
 sha2 = "0.10"
+gethostname = "0.5"
+mac_address = "1"
+hex = "0.4"

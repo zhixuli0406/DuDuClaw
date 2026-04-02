@@ -23,9 +23,9 @@ export const useConnectionStore = create<ConnectionStore>((set) => {
         // Either way, window.location.host is the correct target.
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const url = `${protocol}//${window.location.host}/ws`;
-        console.log('[DuDuClaw] Connecting to WebSocket:', url);
+        // console.log('[DuDuClaw] Connecting to WebSocket:', url);
         await client.connect(url, token);
-        console.log('[DuDuClaw] WebSocket connected');
+        // console.log('[DuDuClaw] WebSocket connected');
       } catch (e) {
         const msg = String(e);
         console.error('[DuDuClaw] WebSocket connection failed:', msg);

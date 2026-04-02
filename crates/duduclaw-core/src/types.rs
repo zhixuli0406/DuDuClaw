@@ -337,6 +337,62 @@ pub struct AgentConfig {
     /// Defaults to all-denied if omitted from agent.toml.
     #[serde(default)]
     pub capabilities: CapabilitiesConfig,
+    /// Proactive behavior configuration (PROACTIVE.md execution + notification).
+    #[serde(default)]
+    pub proactive: ProactiveConfig,
+}
+
+/// Proactive agent configuration — scheduled checks + user notification.
+///
+/// ```toml
+/// [proactive]
+/// enabled = true
+/// check_interval = "*/30 * * * *"   # cron: every 30 min
+/// quiet_hours_start = 23
+/// quiet_hours_end = 8
+/// max_messages_per_hour = 3
+/// token_budget_per_check = 2000
+/// notify_channel = "telegram"
+/// notify_chat_id = "123456789"
+/// timezone = "Asia/Taipei"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct ProactiveConfig {
+    /// Enable proactive checks for this agent.
+    pub enabled: bool,
+    /// Cron expression for check interval (default: every 30 minutes).
+    pub check_interval: String,
+    /// Quiet hours start (0-23, local timezone). No proactive messages during quiet hours.
+    pub quiet_hours_start: u8,
+    /// Quiet hours end (0-23, local timezone).
+    pub quiet_hours_end: u8,
+    /// Maximum proactive messages per hour (rate limit).
+    pub max_messages_per_hour: u32,
+    /// Token budget per proactive check cycle.
+    pub token_budget_per_check: u32,
+    /// Channel to send proactive notifications to.
+    pub notify_channel: String,
+    /// Chat/group ID to send notifications to.
+    pub notify_chat_id: String,
+    /// IANA timezone for quiet hours (e.g., "Asia/Taipei").
+    pub timezone: String,
+}
+
+impl Default for ProactiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            check_interval: "*/30 * * * *".into(),
+            quiet_hours_start: 23,
+            quiet_hours_end: 8,
+            max_messages_per_hour: 3,
+            token_budget_per_check: 2000,
+            notify_channel: String::new(),
+            notify_chat_id: String::new(),
+            timezone: "Asia/Taipei".into(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

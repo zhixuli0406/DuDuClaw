@@ -1,0 +1,16 @@
+# Quickstart — single service, no volumes, no TLS
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: container/Dockerfile.server
+    ports:
+      - "18789:18789"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - DUDUCLAW_BIND=0.0.0.0
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

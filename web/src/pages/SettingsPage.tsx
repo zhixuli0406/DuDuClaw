@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { useSystemStore } from '@/stores/system-store';
@@ -15,9 +15,14 @@ import {
   Play,
   Plus,
   Wrench,
+  Download,
+  ArrowUpCircle,
+  RefreshCw,
+  Mic,
+  Zap,
 } from 'lucide-react';
 
-type TabId = 'general' | 'container' | 'heartbeat' | 'cron' | 'doctor';
+type TabId = 'general' | 'container' | 'heartbeat' | 'cron' | 'voice' | 'proactive' | 'doctor' | 'update';
 
 export function SettingsPage() {
   const intl = useIntl();
@@ -28,7 +33,10 @@ export function SettingsPage() {
     { id: 'container', label: intl.formatMessage({ id: 'settings.container' }), icon: Container },
     { id: 'heartbeat', label: intl.formatMessage({ id: 'settings.heartbeat' }), icon: HeartPulse },
     { id: 'cron', label: intl.formatMessage({ id: 'settings.cron' }), icon: Clock },
+    { id: 'voice', label: intl.formatMessage({ id: 'settings.voice' }), icon: Mic },
+    { id: 'proactive', label: intl.formatMessage({ id: 'settings.proactive' }), icon: Zap },
     { id: 'doctor', label: intl.formatMessage({ id: 'settings.doctor' }), icon: Stethoscope },
+    { id: 'update', label: intl.formatMessage({ id: 'settings.update' }), icon: Download },
   ];
 
   return (
@@ -63,7 +71,10 @@ export function SettingsPage() {
       {activeTab === 'container' && <ContainerTab />}
       {activeTab === 'heartbeat' && <HeartbeatTab />}
       {activeTab === 'cron' && <CronTab />}
+      {activeTab === 'voice' && <VoiceTab />}
+      {activeTab === 'proactive' && <ProactiveTab />}
       {activeTab === 'doctor' && <DoctorTab />}
+      {activeTab === 'update' && <UpdateTab />}
     </div>
   );
 }
@@ -542,6 +553,214 @@ function DoctorTab() {
   );
 }
 
+function UpdateTab() {
+  const intl = useIntl();
+  const [checking, setChecking] = useState(false);
+  const [installing, setInstalling] = useState(false);
+  const [error, setError] = useState('');
+  const [installed, setInstalled] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState<{
+    available: boolean;
+    current_version: string;
+    latest_version: string;
+    release_notes: string;
+    published_at: string;
+    download_url: string;
+    install_method: string;
+  } | null>(null);
+
+  // [H1] useRef guard prevents double-click race — declared before handleCheck
+  const installingRef = useRef(false);
+
+  const handleCheck = useCallback(async () => {
+    if (installingRef.current) return; // [R2:NM4] block check during install
+    setChecking(true);
+    setError('');
+    setInstalled(false);
+    setUpdateInfo(null); // [R2:NL3] clear stale data immediately
+    try {
+      const info = await api.system.checkUpdate();
+      setUpdateInfo(info);
+    } catch {
+      setError(intl.formatMessage({ id: 'settings.update.failed' }));
+    } finally {
+      setChecking(false);
+    }
+  }, [intl]);
+
+  // [M2] applyUpdate no longer sends URL — server uses cached URL from check_update
+  const handleInstall = async () => {
+    if (installingRef.current || !updateInfo?.download_url) return;
+    installingRef.current = true;
+    setInstalling(true);
+    setError('');
+    try {
+      const result = await api.system.applyUpdate();
+      if (result.success) {
+        setInstalled(true);
+      } else {
+        setError(result.message);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '';
+      setError(`${intl.formatMessage({ id: 'settings.update.failed' })}${msg ? `: ${msg}` : ''}`);
+    } finally {
+      setInstalling(false);
+      installingRef.current = false;
+    }
+  };
+
+  const isHomebrew = updateInfo?.install_method === 'homebrew';
+  const noBinary = updateInfo?.available && !updateInfo.download_url;
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+        <div className="flex items-center justify-between mb-6">
+          <div className="flex items-center gap-3">
+            <ArrowUpCircle className="h-5 w-5 text-amber-600 dark:text-amber-400" />
+            <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
+              {intl.formatMessage({ id: 'settings.update' })}
+            </h3>
+          </div>
+          <button
+            onClick={handleCheck}
+            disabled={checking}
+            className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
+          >
+            <RefreshCw className={cn('h-4 w-4', checking && 'animate-spin')} />
+            {checking
+              ? intl.formatMessage({ id: 'settings.update.checking' })
+              : intl.formatMessage({ id: 'settings.update.check' })}
+          </button>
+        </div>
+
+        {/* Status display */}
+        {!updateInfo && !error && (
+          <div className="flex flex-col items-center justify-center py-12 text-stone-400 dark:text-stone-500">
+            <Download className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
+            <p>{intl.formatMessage({ id: 'settings.update.check' })}</p>
+          </div>
+        )}
+
+        {error && (
+          <div className="rounded-lg border border-rose-200 bg-rose-50 p-4 dark:border-rose-800 dark:bg-rose-900/20">
+            <div className="flex items-center gap-2">
+              <XCircle className="h-5 w-5 text-rose-500" />
+              <span className="text-sm text-rose-700 dark:text-rose-400">{error}</span>
+            </div>
+          </div>
+        )}
+
+        {installed && (
+          <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 dark:border-emerald-800 dark:bg-emerald-900/20">
+            <div className="flex items-center gap-2">
+              <CheckCircle className="h-5 w-5 text-emerald-500" />
+              <span className="text-sm text-emerald-700 dark:text-emerald-400">
+                {intl.formatMessage({ id: 'settings.update.installed' })}
+              </span>
+            </div>
+          </div>
+        )}
+
+        {updateInfo && !installed && (
+          <div className="space-y-4">
+            {/* Version info */}
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="rounded-lg bg-stone-50 p-4 dark:bg-stone-800/50">
+                <span className="text-xs text-stone-400">
+                  {intl.formatMessage({ id: 'settings.update.current' })}
+                </span>
+                <p className="mt-1 text-lg font-semibold text-stone-900 dark:text-stone-50">
+                  v{updateInfo.current_version}
+                </p>
+              </div>
+              <div className={cn(
+                'rounded-lg p-4',
+                updateInfo.available
+                  ? 'bg-amber-50 dark:bg-amber-900/20'
+                  : 'bg-emerald-50 dark:bg-emerald-900/20'
+              )}>
+                <span className="text-xs text-stone-400">
+                  {intl.formatMessage({ id: 'settings.update.latest' })}
+                </span>
+                <p className={cn(
+                  'mt-1 text-lg font-semibold',
+                  updateInfo.available
+                    ? 'text-amber-700 dark:text-amber-400'
+                    : 'text-emerald-700 dark:text-emerald-400'
+                )}>
+                  v{updateInfo.latest_version}
+                </p>
+              </div>
+            </div>
+
+            {!updateInfo.available && (
+              <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-4 dark:border-emerald-800 dark:bg-emerald-900/20">
+                <CheckCircle className="h-5 w-5 text-emerald-500" />
+                <span className="text-sm text-emerald-700 dark:text-emerald-400">
+                  {intl.formatMessage({ id: 'settings.update.upToDate' })}
+                </span>
+              </div>
+            )}
+
+            {updateInfo.available && (
+              <>
+                {/* Release notes */}
+                {updateInfo.release_notes && (
+                  <div className="rounded-lg border border-stone-200 p-4 dark:border-stone-700">
+                    <h4 className="mb-2 text-sm font-medium text-stone-700 dark:text-stone-300">
+                      {intl.formatMessage({ id: 'settings.update.releaseNotes' })}
+                    </h4>
+                    <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap text-xs text-stone-600 dark:text-stone-400">
+                      {updateInfo.release_notes}
+                    </pre>
+                  </div>
+                )}
+
+                {/* Homebrew hint */}
+                {isHomebrew && (
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-900/20">
+                    <p className="text-sm text-amber-700 dark:text-amber-400">
+                      {intl.formatMessage({ id: 'settings.update.brewHint' })}
+                    </p>
+                    <code className="mt-2 block rounded bg-stone-800 px-3 py-2 text-sm text-emerald-400">
+                      brew upgrade duduclaw
+                    </code>
+                  </div>
+                )}
+
+                {/* No binary hint */}
+                {noBinary && !isHomebrew && (
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-900/20">
+                    <p className="text-sm text-amber-700 dark:text-amber-400">
+                      {intl.formatMessage({ id: 'settings.update.noBinary' })}
+                    </p>
+                  </div>
+                )}
+
+                {/* Install button */}
+                {!isHomebrew && !noBinary && (
+                  <button
+                    onClick={handleInstall}
+                    disabled={installing}
+                    className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-amber-500 px-4 py-3 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
+                  >
+                    <Download className={cn('h-4 w-4', installing && 'animate-bounce')} />
+                    {installing
+                      ? intl.formatMessage({ id: 'settings.update.installing' })
+                      : intl.formatMessage({ id: 'settings.update.install' })}
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function SettingRow({
   label,
   value,
@@ -578,6 +797,239 @@ function SettingRow({
           {value}
         </span>
       )}
+    </div>
+  );
+}
+
+// ── Voice Settings Tab ─────────────────────────────────────────
+
+function VoiceTab() {
+  const intl = useIntl();
+  const [config, setConfig] = useState({
+    asr_provider: 'auto',
+    tts_provider: 'auto',
+    asr_language: 'zh',
+    tts_voice: '',
+    voice_reply_enabled: false,
+  });
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      await api.system.updateConfig({ voice: config });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch { /* ignore */ }
+    setSaving(false);
+  };
+
+  return (
+    <div className="space-y-6 rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+      <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
+        {intl.formatMessage({ id: 'voice.title' })}
+      </h3>
+
+      <div className="grid gap-4 sm:grid-cols-2">
+        <div className="space-y-1.5">
+          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+            {intl.formatMessage({ id: 'voice.asrProvider' })}
+          </label>
+          <select
+            value={config.asr_provider}
+            onChange={(e) => setConfig({ ...config, asr_provider: e.target.value })}
+            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+          >
+            <option value="auto">Auto</option>
+            <option value="whisper-api">{intl.formatMessage({ id: 'voice.provider.whisperApi' })}</option>
+            <option value="whisper-local">Whisper Local</option>
+            <option value="sensevoice">{intl.formatMessage({ id: 'voice.provider.sensevoice' })}</option>
+          </select>
+        </div>
+
+        <div className="space-y-1.5">
+          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+            {intl.formatMessage({ id: 'voice.ttsProvider' })}
+          </label>
+          <select
+            value={config.tts_provider}
+            onChange={(e) => setConfig({ ...config, tts_provider: e.target.value })}
+            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+          >
+            <option value="auto">Auto</option>
+            <option value="edge-tts">{intl.formatMessage({ id: 'voice.provider.edgeTts' })}</option>
+            <option value="minimax">{intl.formatMessage({ id: 'voice.provider.minimax' })}</option>
+            <option value="openai-tts">{intl.formatMessage({ id: 'voice.provider.openaiTts' })}</option>
+            <option value="piper">{intl.formatMessage({ id: 'voice.provider.piper' })}</option>
+          </select>
+        </div>
+
+        <div className="space-y-1.5">
+          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+            {intl.formatMessage({ id: 'voice.language' })}
+          </label>
+          <select
+            value={config.asr_language}
+            onChange={(e) => setConfig({ ...config, asr_language: e.target.value })}
+            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+          >
+            <option value="zh">中文 (zh)</option>
+            <option value="en">English (en)</option>
+            <option value="ja">日本語 (ja)</option>
+            <option value="ko">한국어 (ko)</option>
+          </select>
+        </div>
+
+        <div className="flex items-center gap-3 pt-6">
+          <label className="relative inline-flex cursor-pointer items-center">
+            <input
+              type="checkbox"
+              checked={config.voice_reply_enabled}
+              onChange={(e) => setConfig({ ...config, voice_reply_enabled: e.target.checked })}
+              className="peer sr-only"
+            />
+            <div className="peer h-6 w-11 rounded-full bg-stone-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:bg-white after:transition-all peer-checked:bg-amber-500 peer-checked:after:translate-x-full dark:bg-stone-600"></div>
+          </label>
+          <span className="text-sm text-stone-700 dark:text-stone-300">
+            {intl.formatMessage({ id: 'voice.voiceMode' })}
+          </span>
+        </div>
+      </div>
+
+      <div className="flex justify-end pt-2">
+        <button
+          onClick={handleSave}
+          disabled={saving}
+          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
+        >
+          {saved ? intl.formatMessage({ id: 'settings.general.saved' }) : saving ? '...' : 'Save'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Proactive Settings Tab ─────────────────────────────────────
+
+function ProactiveTab() {
+  const intl = useIntl();
+  const [config, setConfig] = useState({
+    enabled: false,
+    check_interval: '*/30 * * * *',
+    quiet_hours_start: 23,
+    quiet_hours_end: 8,
+    max_messages_per_hour: 3,
+    notify_channel: '',
+    notify_chat_id: '',
+  });
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      await api.system.updateConfig({ proactive: config });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch { /* ignore */ }
+    setSaving(false);
+  };
+
+  return (
+    <div className="space-y-6 rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+      <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
+        {intl.formatMessage({ id: 'proactive.title' })}
+      </h3>
+
+      <div className="grid gap-4 sm:grid-cols-2">
+        <div className="flex items-center gap-3">
+          <label className="relative inline-flex cursor-pointer items-center">
+            <input
+              type="checkbox"
+              checked={config.enabled}
+              onChange={(e) => setConfig({ ...config, enabled: e.target.checked })}
+              className="peer sr-only"
+            />
+            <div className="peer h-6 w-11 rounded-full bg-stone-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:bg-white after:transition-all peer-checked:bg-amber-500 peer-checked:after:translate-x-full dark:bg-stone-600"></div>
+          </label>
+          <span className="text-sm text-stone-700 dark:text-stone-300">
+            {intl.formatMessage({ id: config.enabled ? 'proactive.enabled' : 'proactive.disabled' })}
+          </span>
+        </div>
+
+        <div className="space-y-1.5">
+          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+            Check Interval
+          </label>
+          <input
+            type="text"
+            value={config.check_interval}
+            onChange={(e) => setConfig({ ...config, check_interval: e.target.value })}
+            placeholder="*/30 * * * *"
+            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+          />
+          <p className="text-xs text-stone-400">Cron expression</p>
+        </div>
+
+        <div className="space-y-1.5">
+          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+            {intl.formatMessage({ id: 'proactive.quietHours' })}
+          </label>
+          <div className="flex items-center gap-2">
+            <input type="number" min={0} max={23} value={config.quiet_hours_start}
+              onChange={(e) => setConfig({ ...config, quiet_hours_start: +e.target.value })}
+              className="w-16 rounded-lg border border-stone-300 bg-white px-2 py-2 text-sm text-center dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50" />
+            <span className="text-stone-400">—</span>
+            <input type="number" min={0} max={23} value={config.quiet_hours_end}
+              onChange={(e) => setConfig({ ...config, quiet_hours_end: +e.target.value })}
+              className="w-16 rounded-lg border border-stone-300 bg-white px-2 py-2 text-sm text-center dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50" />
+          </div>
+        </div>
+
+        <div className="space-y-1.5">
+          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+            Max messages / hour
+          </label>
+          <input type="number" min={1} max={60} value={config.max_messages_per_hour}
+            onChange={(e) => setConfig({ ...config, max_messages_per_hour: +e.target.value })}
+            className="w-24 rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50" />
+        </div>
+
+        <div className="space-y-1.5">
+          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+            Notify Channel
+          </label>
+          <select value={config.notify_channel}
+            onChange={(e) => setConfig({ ...config, notify_channel: e.target.value })}
+            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50">
+            <option value="">Select...</option>
+            <option value="telegram">Telegram</option>
+            <option value="line">LINE</option>
+            <option value="discord">Discord</option>
+          </select>
+        </div>
+
+        <div className="space-y-1.5">
+          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+            Chat ID
+          </label>
+          <input type="text" value={config.notify_chat_id}
+            onChange={(e) => setConfig({ ...config, notify_chat_id: e.target.value })}
+            placeholder="e.g., 123456789"
+            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50" />
+        </div>
+      </div>
+
+      <div className="flex justify-end pt-2">
+        <button
+          onClick={handleSave}
+          disabled={saving}
+          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
+        >
+          {saved ? intl.formatMessage({ id: 'settings.general.saved' }) : saving ? '...' : 'Save'}
+        </button>
+      </div>
     </div>
   );
 }

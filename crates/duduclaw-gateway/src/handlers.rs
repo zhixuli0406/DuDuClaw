@@ -32,6 +32,29 @@ pub struct MethodHandler {
     reply_ctx: RwLock<Option<Arc<crate::channel_reply::ReplyContext>>>,
     /// Handles for running channel bot tasks (for hot-stop on remove).
     channel_handles: tokio::sync::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// [M2] Server-side cached pending update (set by check_update, consumed by apply_update).
+    pending_update: RwLock<Option<PendingUpdate>>,
+    /// Cached license tier — avoids re-reading disk + Ed25519 on every RPC call.
+    /// Invalidated by license.activate / license.deactivate.
+    feature_gate_cache: RwLock<Option<(Instant, crate::feature_gate::Tier)>>,
+}
+
+/// Cached update info from the last `system.check_update` call. [M2][R2:NM1]
+#[derive(Clone)]
+struct PendingUpdate {
+    download_url: String,
+    checksum_url: String,
+    version: String,
+    /// [R2:NM1] TTL — expires after 5 minutes to prevent stale URL replay
+    cached_at: Instant,
+}
+
+impl PendingUpdate {
+    const TTL_SECS: u64 = 300; // 5 minutes
+
+    fn is_expired(&self) -> bool {
+        self.cached_at.elapsed().as_secs() > Self::TTL_SECS
+    }
 }
 
 /// Runtime state for a connected channel.
@@ -57,6 +80,8 @@ impl MethodHandler {
             heartbeat: RwLock::new(None),
             reply_ctx: RwLock::new(None),
             channel_handles: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            pending_update: RwLock::new(None),
+            feature_gate_cache: RwLock::new(None),
         }
     }
 
@@ -111,6 +136,49 @@ impl MethodHandler {
     }
 
     /// Internal dispatch — returns a WsFrame with placeholder id (overwritten by caller).
+    /// TTL for the cached FeatureGate tier (30 seconds).
+    const FEATURE_GATE_CACHE_TTL_SECS: u64 = 30;
+
+    /// Get the current license tier, using a 30s TTL cache to avoid per-RPC disk I/O.
+    async fn cached_gate(&self) -> crate::feature_gate::FeatureGate {
+        // Fast path: read lock
+        {
+            let cache = self.feature_gate_cache.read().await;
+            if let Some((ts, tier)) = *cache {
+                if ts.elapsed().as_secs() < Self::FEATURE_GATE_CACHE_TTL_SECS {
+                    return crate::feature_gate::FeatureGate::with_tier(tier);
+                }
+            }
+        }
+        // Slow path: write lock with double-check to prevent thundering herd
+        let mut cache = self.feature_gate_cache.write().await;
+        if let Some((ts, tier)) = *cache {
+            if ts.elapsed().as_secs() < Self::FEATURE_GATE_CACHE_TTL_SECS {
+                return crate::feature_gate::FeatureGate::with_tier(tier);
+            }
+        }
+        let gate = crate::feature_gate::FeatureGate::load();
+        *cache = Some((Instant::now(), gate.tier()));
+        gate
+    }
+
+    /// Invalidate the FeatureGate cache (called after activate/deactivate).
+    async fn invalidate_gate_cache(&self) {
+        *self.feature_gate_cache.write().await = None;
+    }
+
+    /// Check if a feature is allowed by the current license tier.
+    /// Returns None if allowed, or a 402 error WsFrame if denied.
+    async fn require_feature(&self, feature: &str) -> Option<WsFrame> {
+        let gate = self.cached_gate().await;
+        if gate.check(feature) {
+            None
+        } else {
+            let msg = gate.upgrade_message(feature);
+            Some(WsFrame::error_response("", &format!("Feature requires upgrade: {msg}")))
+        }
+    }
+
     async fn dispatch(&self, method: &str, params: Value) -> WsFrame {
         match method {
             "connect.challenge" => self.handle_connect_challenge(params),
@@ -132,7 +200,10 @@ impl MethodHandler {
             "channels.remove" => self.handle_channels_remove(params).await,
             "accounts.list" => self.handle_accounts_list().await,
             "accounts.budget_summary" => self.handle_budget_summary().await,
-            "accounts.rotate" => self.handle_accounts_rotate(params).await,
+            "accounts.rotate" => match self.require_feature("account_rotation").await {
+                Some(err) => err,
+                None => self.handle_accounts_rotate(params).await,
+            },
             "accounts.health" => self.handle_accounts_health().await,
             "memory.search" => self.handle_memory_search(params).await,
             "memory.browse" => self.handle_memory_browse(params).await,
@@ -152,13 +223,30 @@ impl MethodHandler {
             "accounts.add" => self.handle_accounts_add(params).await,
             "accounts.update_budget" => self.handle_accounts_update_budget(params).await,
             "system.version" => self.handle_system_version(),
+            "system.check_update" => self.handle_system_check_update().await,
+            "system.apply_update" => self.handle_system_apply_update(params).await,
             "logs.subscribe" => self.handle_logs_subscribe(params),
             "logs.unsubscribe" => self.handle_logs_unsubscribe(params),
-            "security.audit_log" => self.handle_security_audit_log(params).await,
-            "heartbeat.status" => self.handle_heartbeat_status().await,
-            "heartbeat.trigger" => self.handle_heartbeat_trigger(params).await,
+            "security.audit_log" => match self.require_feature("audit_export").await {
+                Some(err) => err,
+                None => self.handle_security_audit_log(params).await,
+            },
+            "heartbeat.status" => match self.require_feature("heartbeat").await {
+                Some(err) => err,
+                None => self.handle_heartbeat_status().await,
+            },
+            "heartbeat.trigger" => match self.require_feature("heartbeat").await {
+                Some(err) => err,
+                None => self.handle_heartbeat_trigger(params).await,
+            },
             "evolution.status" => self.handle_evolution_status().await,
-            "evolution.skills" => self.handle_evolution_skills().await,
+            "evolution.skills" => match self.require_feature("skill_ecosystem").await {
+                Some(err) => err,
+                None => self.handle_evolution_skills().await,
+            },
+            "license.status" => self.handle_license_status().await,
+            "license.activate" => self.handle_license_activate(params).await,
+            "license.deactivate" => self.handle_license_deactivate().await,
             unknown => WsFrame::error_response("", &format!("Unknown method: {unknown}")),
         }
     }
@@ -216,6 +304,8 @@ impl MethodHandler {
                 { "name": "accounts.add", "description": "Add a new account" },
                 { "name": "accounts.update_budget", "description": "Update account monthly budget" },
                 { "name": "system.version", "description": "Version info" },
+                { "name": "system.check_update", "description": "Check for available updates" },
+                { "name": "system.apply_update", "description": "Download and apply update" },
                 { "name": "heartbeat.status", "description": "Per-agent heartbeat status" },
                 { "name": "heartbeat.trigger", "description": "Manually trigger heartbeat for an agent" },
                 { "name": "logs.subscribe", "description": "Subscribe to logs" },
@@ -1635,6 +1725,117 @@ impl MethodHandler {
         WsFrame::ok_response("", json!({ "version": env!("CARGO_PKG_VERSION") }))
     }
 
+    async fn handle_system_check_update(&self) -> WsFrame {
+        match crate::updater::check_update().await {
+            Ok(info) => {
+                // [M2] Cache the download/checksum URLs server-side
+                // so apply_update does not accept URLs from the client.
+                *self.pending_update.write().await = if info.available {
+                    Some(PendingUpdate {
+                        download_url: info.download_url.clone(),
+                        checksum_url: info.checksum_url.clone(),
+                        version: info.latest_version.clone(),
+                        cached_at: Instant::now(),
+                    })
+                } else {
+                    None
+                };
+                WsFrame::ok_response("", json!({
+                    "available": info.available,
+                    "current_version": info.current_version,
+                    "latest_version": info.latest_version,
+                    "release_notes": info.release_notes,
+                    "published_at": info.published_at,
+                    "download_url": info.download_url,
+                    "checksum_url": info.checksum_url,
+                    "install_method": info.install_method,
+                }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("Update check failed: {e}")),
+        }
+    }
+
+    async fn handle_system_apply_update(&self, _params: Value) -> WsFrame {
+        // [M2] Use server-side cached URL — never accept URL from client
+        let pending = self.pending_update.read().await.clone();
+        let pending = match pending {
+            Some(p) if !p.download_url.is_empty() => p,
+            _ => return WsFrame::error_response(
+                "",
+                "No pending update. Call system.check_update first.",
+            ),
+        };
+
+        // [R2:NM1] TTL check — reject stale cached URLs
+        if pending.is_expired() {
+            *self.pending_update.write().await = None;
+            return WsFrame::error_response(
+                "",
+                "Pending update expired. Please call system.check_update again.",
+            );
+        }
+
+        // [M5] Audit log
+        duduclaw_security::audit::append_audit_event(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "system_update",
+                "system",
+                duduclaw_security::audit::Severity::Info,
+                json!({ "action": "apply", "target_version": pending.version }),
+            ),
+        );
+
+        match crate::updater::apply_update(&pending.download_url, &pending.checksum_url).await {
+            Ok(result) => {
+                *self.pending_update.write().await = None;
+
+                if result.needs_restart {
+                    tokio::spawn(async {
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        tracing::info!("Shutting down for update — raising SIGINT for graceful shutdown");
+                        // SAFETY: getpid() and kill() are always safe to call with our own PID.
+                        #[cfg(unix)]
+                        unsafe { libc::kill(libc::getpid(), libc::SIGINT); }
+                    });
+                }
+
+                duduclaw_security::audit::append_audit_event(
+                    &self.home_dir,
+                    &duduclaw_security::audit::AuditEvent::new(
+                        "system_update_success",
+                        "system",
+                        duduclaw_security::audit::Severity::Info,
+                        json!({ "version": pending.version, "needs_restart": result.needs_restart }),
+                    ),
+                );
+
+                WsFrame::ok_response("", json!({
+                    "success": result.success,
+                    "message": result.message,
+                    "needs_restart": result.needs_restart,
+                }))
+            }
+            Err(e) => {
+                // [R2:NM5] Clear stale pending on failure so user must re-check
+                *self.pending_update.write().await = None;
+
+                // [R2:NM3] Sanitize error for audit log (strip ANSI/newlines)
+                let sanitized = e.replace('\n', " ").replace('\r', "").replace('\x1b', "");
+                duduclaw_security::audit::append_audit_event(
+                    &self.home_dir,
+                    &duduclaw_security::audit::AuditEvent::new(
+                        "system_update_failed",
+                        "system",
+                        duduclaw_security::audit::Severity::Warning,
+                        json!({ "error": sanitized }),
+                    ),
+                );
+                WsFrame::error_response("", &format!("Update failed: {e}"))
+            }
+        }
+    }
+
     // ── Security ────────────────────────────────────────────
 
     async fn handle_security_audit_log(&self, params: Value) -> WsFrame {
@@ -2001,6 +2202,156 @@ impl MethodHandler {
             "account_id": account_id,
             "monthly_budget_cents": budget_cents,
         }))
+    }
+
+    // ── License ──────────────────────────────────────────────
+
+    async fn handle_license_status(&self) -> WsFrame {
+        let gate = self.cached_gate().await;
+        let tier = gate.tier();
+        let tier_name = tier.as_str();
+        let max_agents = gate.max_agents();
+        let max_channels = gate.max_channels();
+
+        // activated = signature-verified tier above Community (not just file existence)
+        let activated = tier != crate::feature_gate::Tier::Community;
+
+        // Only read license details if signature verification passed (tier != Community)
+        let mut expires_at: Option<String> = None;
+        let mut days_remaining: Option<i64> = None;
+        let mut customer_name: Option<String> = None;
+        let mut machine_fingerprint: Option<String> = None;
+
+        if activated {
+            let license_path = self.home_dir.join("license.key");
+            if let Ok(content) = std::fs::read_to_string(&license_path) {
+                if let Ok(json) = serde_json::from_str::<Value>(&content) {
+                    customer_name = json.get("customer_name").and_then(|v| v.as_str()).map(String::from);
+                    machine_fingerprint = json.get("machine_fingerprint").and_then(|v| v.as_str()).map(String::from);
+                    if let Some(exp) = json.get("expires_at").and_then(|v| v.as_str()) {
+                        expires_at = Some(exp.to_string());
+                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(exp) {
+                            days_remaining = Some(dt.signed_duration_since(chrono::Utc::now()).num_days());
+                        }
+                    }
+                }
+            }
+        }
+
+        let features: Vec<String> = [
+            "multi_runtime", "account_rotation", "cost_telemetry", "odoo",
+            "browser_automation", "computer_use", "prometheus_metrics",
+            "evolution_enabled", "skill_ecosystem", "heartbeat", "failover",
+            "direct_api", "contract_system", "media_pipeline", "whisper",
+        ]
+        .iter()
+        .filter(|f| gate.check(f))
+        .map(|f| f.to_string())
+        .collect();
+
+        WsFrame::ok_response("", json!({
+            "tier": tier_name,
+            "activated": activated,
+            "max_agents": max_agents,
+            "max_channels": max_channels,
+            "expires_at": expires_at,
+            "days_remaining": days_remaining,
+            "customer_name": customer_name,
+            "machine_fingerprint": machine_fingerprint,
+            "features": features,
+        }))
+    }
+
+    async fn handle_license_activate(&self, params: Value) -> WsFrame {
+        let key = match params.get("key").and_then(|v| v.as_str()) {
+            Some(k) if !k.is_empty() => k,
+            _ => return WsFrame::error_response("", "Missing 'key' parameter"),
+        };
+
+        // Parse JSON
+        let json_val: Value = match serde_json::from_str(key) {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &format!("Invalid JSON: {e}")),
+        };
+
+        // Verify Ed25519 signature BEFORE writing to disk
+        let pubkey = match crate::feature_gate::FeatureGate::load_public_key() {
+            Some(k) => k,
+            None => return WsFrame::error_response("", "License public key not configured"),
+        };
+        let canonical = match crate::feature_gate::build_canonical_payload(&json_val) {
+            Some(c) => c,
+            None => return WsFrame::error_response("", "License missing required fields"),
+        };
+        let sig_b64 = match json_val.get("signature").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => return WsFrame::error_response("", "License missing signature"),
+        };
+        let sig_bytes = match crate::feature_gate::base64_decode(sig_b64) {
+            Some(b) => b,
+            None => return WsFrame::error_response("", "Invalid signature encoding"),
+        };
+        if !crate::feature_gate::verify_ed25519_signature(&pubkey, &canonical, &sig_bytes) {
+            return WsFrame::error_response("", "License signature verification failed");
+        }
+
+        // Check expiry before writing
+        if let Some(exp_str) = json_val.get("expires_at").and_then(|v| v.as_str()) {
+            if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(exp_str) {
+                if exp.with_timezone(&chrono::Utc) < chrono::Utc::now() {
+                    return WsFrame::error_response("", "License has expired");
+                }
+            }
+        }
+
+        // Check machine fingerprint before writing
+        let fp = json_val.get("machine_fingerprint").and_then(|v| v.as_str()).unwrap_or("");
+        if !fp.is_empty() {
+            let local_fp = crate::feature_gate::FeatureGate::machine_fingerprint_static();
+            if fp != local_fp {
+                return WsFrame::error_response("", &format!(
+                    "Machine fingerprint mismatch (license: {}, this machine: {})", fp, local_fp
+                ));
+            }
+        }
+
+        // Atomic write: temp + rename (with restrictive permissions)
+        let license_path = self.home_dir.join("license.key");
+        let rand_suffix = uuid::Uuid::new_v4().as_simple().to_string();
+        let tmp_path = license_path.with_extension(format!("key.{rand_suffix}.tmp"));
+        if let Err(e) = tokio::fs::write(&tmp_path, key).await {
+            return WsFrame::error_response("", &format!("Failed to write license: {e}"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = tokio::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).await;
+        }
+        if let Err(e) = tokio::fs::rename(&tmp_path, &license_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return WsFrame::error_response("", &format!("Failed to commit license: {e}"));
+        }
+
+        // Invalidate cache and reload
+        self.invalidate_gate_cache().await;
+        let gate = self.cached_gate().await;
+        info!(tier = gate.tier().as_str(), "License activated");
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "tier": gate.tier().as_str(),
+        }))
+    }
+
+    async fn handle_license_deactivate(&self) -> WsFrame {
+        let license_path = self.home_dir.join("license.key");
+        if license_path.exists() {
+            if let Err(e) = tokio::fs::remove_file(&license_path).await {
+                return WsFrame::error_response("", &format!("Failed to remove license: {e}"));
+            }
+        }
+        self.invalidate_gate_cache().await;
+        info!("License deactivated — reverting to Community tier");
+        WsFrame::ok_response("", json!({ "success": true, "tier": "Community" }))
     }
 
     // ── Helpers ─────────────────────────────────────────────

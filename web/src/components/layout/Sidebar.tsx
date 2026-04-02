@@ -1,6 +1,7 @@
 import { NavLink } from 'react-router';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
+import { useSystemStore } from '@/stores/system-store';
 import {
   LayoutDashboard,
   Bot,
@@ -12,10 +13,16 @@ import {
   Shield,
   Settings,
   ScrollText,
+  Sparkles,
+  KeyRound,
+  MessageCircle,
+  BarChart3,
+  CreditCard,
 } from 'lucide-react';
 
 const navItems = [
   { to: '/', icon: LayoutDashboard, label: 'nav.dashboard' },
+  { to: '/webchat', icon: MessageCircle, label: 'nav.webchat' },
   { to: '/agents', icon: Bot, label: 'nav.agents' },
   { to: '/org', icon: Network, label: 'nav.org' },
   { to: '/skills', icon: Puzzle, label: 'nav.skills' },
@@ -23,12 +30,16 @@ const navItems = [
   { to: '/accounts', icon: Wallet, label: 'nav.accounts' },
   { to: '/memory', icon: Brain, label: 'nav.memory' },
   { to: '/security', icon: Shield, label: 'nav.security' },
+  { to: '/reports', icon: BarChart3, label: 'nav.reports' },
+  { to: '/billing', icon: CreditCard, label: 'nav.billing' },
   { to: '/settings', icon: Settings, label: 'nav.settings' },
+  { to: '/license', icon: KeyRound, label: 'nav.license' },
   { to: '/logs', icon: ScrollText, label: 'nav.logs' },
 ] as const;
 
 export function Sidebar() {
   const intl = useIntl();
+  const status = useSystemStore((s) => s.status);
 
   return (
     <aside className="flex w-60 flex-col border-r border-stone-200 bg-stone-50/80 backdrop-blur-xl dark:border-stone-800 dark:bg-stone-900/80">
@@ -69,9 +80,27 @@ export function Sidebar() {
         ))}
       </nav>
 
+      {/* Wizard shortcut */}
+      <div className="px-3 pb-2">
+        <NavLink
+          to="/wizard"
+          className={({ isActive }) =>
+            cn(
+              'flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors',
+              isActive
+                ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
+                : 'text-stone-600 hover:bg-stone-100 hover:text-stone-900 dark:text-stone-400 dark:hover:bg-stone-800 dark:hover:text-stone-200'
+            )
+          }
+        >
+          <Sparkles className="h-[1.125rem] w-[1.125rem] shrink-0" />
+          <span>{intl.formatMessage({ id: 'nav.wizard' })}</span>
+        </NavLink>
+      </div>
+
       {/* Footer */}
       <div className="border-t border-stone-200 px-5 py-3 dark:border-stone-800">
-        <p className="text-xs text-stone-400 dark:text-stone-500">v0.6.5</p>
+        <p className="text-xs text-stone-400 dark:text-stone-500">{status?.version ?? 'v0.12.0'}</p>
       </div>
     </aside>
   );

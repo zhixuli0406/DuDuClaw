@@ -449,6 +449,23 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "limit", description: "Number of recent records (default 20)", required: false },
         ],
     },
+    // ── Voice / ASR / TTS tools ──────────────────────────────────
+    ToolDef {
+        name: "transcribe_audio",
+        description: "Transcribe audio to text using Whisper ASR. Accepts base64-encoded audio (OGG/MP3/WAV/M4A). Returns transcribed text. Default language: zh (Mandarin).",
+        params: &[
+            ParamDef { name: "audio_base64", description: "Base64-encoded audio data", required: true },
+            ParamDef { name: "language", description: "Language hint (default: zh). BCP-47 code.", required: false },
+        ],
+    },
+    ToolDef {
+        name: "synthesize_speech",
+        description: "Convert text to speech audio using TTS (edge-tts free or MiniMax paid). Returns base64-encoded MP3 audio.",
+        params: &[
+            ParamDef { name: "text", description: "Text to synthesize", required: true },
+            ParamDef { name: "voice", description: "Voice name (default: auto-detect zh-TW/en-US)", required: false },
+        ],
+    },
 ];
 
 // ── JSON-RPC helpers ─────────────────────────────────────────
@@ -3074,6 +3091,9 @@ async fn handle_tools_call(
         "cost_summary" => handle_cost_summary(&arguments, home_dir).await,
         "cost_agents" => handle_cost_agents(&arguments, home_dir).await,
         "cost_recent" => handle_cost_recent(&arguments).await,
+        // Voice / ASR / TTS tools
+        "transcribe_audio" => handle_transcribe_audio(&arguments).await,
+        "synthesize_speech" => handle_synthesize_speech(&arguments).await,
         // Odoo ERP tools
         t if t.starts_with("odoo_") => handle_odoo_tool(t, &arguments, home_dir, odoo).await,
         _ => {
@@ -3086,4 +3106,76 @@ async fn handle_tools_call(
     };
 
     jsonrpc_response(id, result)
+}
+
+// ── Voice / ASR / TTS handlers ─────────────────────────────────
+
+async fn handle_transcribe_audio(args: &Value) -> Value {
+    use base64::Engine;
+
+    let audio_b64 = match args.get("audio_base64").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return tool_error("Missing required parameter: audio_base64"),
+    };
+
+    // Limit input size: 34MB base64 ≈ 25MB decoded
+    const MAX_B64_LEN: usize = 34 * 1024 * 1024;
+    if audio_b64.len() > MAX_B64_LEN {
+        return tool_error(&format!("Audio too large: {} bytes (max 25MB)", audio_b64.len() * 3 / 4));
+    }
+
+    let language = args.get("language").and_then(|v| v.as_str()).unwrap_or("zh");
+
+    let audio_bytes = match base64::engine::general_purpose::STANDARD.decode(audio_b64) {
+        Ok(b) => b,
+        Err(e) => return tool_error(&format!("Invalid base64: {e}")),
+    };
+
+    // Transcribe via Whisper API (sends raw audio bytes, format auto-detected)
+    match duduclaw_inference::whisper::transcribe(
+        &audio_bytes,
+        Some(language),
+        &duduclaw_inference::whisper::WhisperMode::Api,
+    ).await {
+        Ok(text) => tool_text(&text),
+        Err(e) => tool_error(&format!("Transcription failed: {e}")),
+    }
+}
+
+async fn handle_synthesize_speech(args: &Value) -> Value {
+    use base64::Engine;
+    use duduclaw_gateway::tts::TtsProvider;
+
+    let text = match args.get("text").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => return tool_error("Missing required parameter: text"),
+    };
+    let voice = args.get("voice").and_then(|v| v.as_str()).unwrap_or("");
+
+    let provider = duduclaw_gateway::tts::EdgeTtsProvider::new();
+    match provider.synthesize(text, voice).await {
+        Ok(audio_bytes) => {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&audio_bytes);
+            serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Audio synthesized ({} bytes). Base64 data:\n{}", audio_bytes.len(), b64)
+                }]
+            })
+        }
+        Err(e) => tool_error(&format!("Speech synthesis failed: {e}")),
+    }
+}
+
+fn tool_text(text: &str) -> Value {
+    serde_json::json!({
+        "content": [{ "type": "text", "text": text }]
+    })
+}
+
+fn tool_error(msg: &str) -> Value {
+    serde_json::json!({
+        "content": [{ "type": "text", "text": msg }],
+        "isError": true
+    })
 }

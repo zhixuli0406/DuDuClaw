@@ -21,7 +21,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "multipart"] }
 rusqlite = { workspace = true }
 hmac = "0.12"
 sha2 = "0.10"
@@ -31,12 +31,22 @@ futures-util = { workspace = true }
 tempfile = "3"
 zeroize = "1"
 unicode-normalization = "0.1"
+flate2 = "1"
+tar = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 duduclaw-dashboard = { workspace = true, optional = true }
 
 duduclaw-inference = { workspace = true }
+async-trait = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+gethostname = "0.5"
+hex = "0.4"
+mac_address = "1"
+
+# Discord voice channel support (Songbird)
+songbird = { version = "0.5", optional = true, features = ["driver", "rustls", "receive"] }
 
 [features]
 default = ["dashboard"]
@@ -46,6 +56,6 @@ cuda = ["duduclaw-inference/cuda"]
 vulkan = ["duduclaw-inference/vulkan"]
 mistralrs-metal = ["duduclaw-inference/mistralrs-metal"]
 mistralrs-cuda = ["duduclaw-inference/mistralrs-cuda"]
+discord-voice = ["dep:songbird"]
 
 [dev-dependencies]
-hex = "0.4.3"

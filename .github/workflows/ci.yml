@@ -55,6 +55,8 @@ jobs:
         run: cd web && npm ci --legacy-peer-deps
       - name: TypeScript check
         run: cd web && npx tsc --noEmit
+      - name: Unit tests
+        run: cd web && npm test
       - name: Build frontend
         run: cd web && npm run build
       - name: Build dashboard crate

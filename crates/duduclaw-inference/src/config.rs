@@ -55,6 +55,73 @@ pub struct InferenceConfig {
 
     /// StreamingLLM session window settings
     pub streaming_llm: Option<crate::compression::streaming_llm::StreamingLlmConfig>,
+
+    /// Voice / ASR / TTS settings
+    pub voice: Option<VoiceConfig>,
+}
+
+/// Voice pipeline configuration — ASR + TTS + language settings.
+///
+/// Configured in `inference.toml` under `[voice]`:
+/// ```toml
+/// [voice]
+/// asr_provider = "auto"       # "auto" | "whisper-api" | "whisper-local" | "sensevoice"
+/// tts_provider = "auto"       # "auto" | "edge-tts" | "minimax" | "openai-tts" | "piper"
+/// asr_language = "zh"         # BCP-47 language hint
+/// tts_voice = ""              # Empty = auto-detect from text content
+/// voice_reply_enabled = false # Enable voice reply by default (overridable via /voice)
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceConfig {
+    /// ASR provider selection: "auto", "whisper-api", "whisper-local", "sensevoice"
+    pub asr_provider: String,
+    /// TTS provider selection: "auto", "edge-tts", "minimax", "openai-tts", "piper"
+    pub tts_provider: String,
+    /// Default ASR language hint (BCP-47)
+    pub asr_language: String,
+    /// Default TTS voice name (empty = auto-detect from text content)
+    pub tts_voice: String,
+    /// Enable voice reply mode by default for all sessions
+    pub voice_reply_enabled: bool,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            asr_provider: "auto".into(),
+            tts_provider: "auto".into(),
+            asr_language: "zh".into(),
+            tts_voice: String::new(),
+            voice_reply_enabled: false,
+        }
+    }
+}
+
+impl VoiceConfig {
+    /// Allowed ASR provider values.
+    const VALID_ASR_PROVIDERS: &[&str] = &["auto", "whisper-api", "whisper-local", "sensevoice"];
+    /// Allowed TTS provider values.
+    const VALID_TTS_PROVIDERS: &[&str] = &["auto", "edge-tts", "minimax", "openai-tts", "piper"];
+
+    /// Validate and normalize config values, falling back to "auto" for unknown providers.
+    pub fn validate(&mut self) {
+        if !Self::VALID_ASR_PROVIDERS.contains(&self.asr_provider.as_str()) {
+            tracing::warn!(provider = %self.asr_provider, "Unknown ASR provider, falling back to auto");
+            self.asr_provider = "auto".into();
+        }
+        if !Self::VALID_TTS_PROVIDERS.contains(&self.tts_provider.as_str()) {
+            tracing::warn!(provider = %self.tts_provider, "Unknown TTS provider, falling back to auto");
+            self.tts_provider = "auto".into();
+        }
+        // Sanitize language to alphanumeric + hyphen
+        self.asr_language = self.asr_language.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        if self.asr_language.is_empty() {
+            self.asr_language = "zh".into();
+        }
+    }
 }
 
 impl Default for InferenceConfig {
@@ -75,6 +142,7 @@ impl Default for InferenceConfig {
             mlx: None,
             llmlingua: None,
             streaming_llm: None,
+            voice: None,
         }
     }
 }
@@ -243,8 +311,14 @@ impl InferenceConfig {
     pub async fn load(home_dir: &Path) -> Self {
         let config_path = home_dir.join("inference.toml");
         match tokio::fs::read_to_string(&config_path).await {
-            Ok(content) => match toml::from_str(&content) {
-                Ok(config) => config,
+            Ok(content) => match toml::from_str::<Self>(&content) {
+                Ok(mut config) => {
+                    // Auto-validate voice config on load
+                    if let Some(ref mut voice) = config.voice {
+                        voice.validate();
+                    }
+                    config
+                }
                 Err(e) => {
                     tracing::warn!("Failed to parse inference.toml: {e}, using defaults");
                     Self::default()

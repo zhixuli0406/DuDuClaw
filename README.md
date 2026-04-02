@@ -5,8 +5,8 @@
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)](https://www.python.org/)
-[![License: Elastic-2.0](https://img.shields.io/badge/License-Elastic--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.12.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-1.0.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 
 ---
 
@@ -40,7 +40,7 @@ DuDuClaw (plumbing)
 |------|------|
 | **MCP Server 架構** | `duduclaw mcp-server` 提供 30+ 工具給 Claude Code，涵蓋通訊、記憶、Agent 管理、Skill 市場、Odoo ERP（CRM/銷售/庫存/會計）|
 | **Sub-Agent 編排** | `create_agent` 建立持久化 sub-agent + `spawn_agent` 背景派發 + `reports_to` 組織層級 + D3.js 組織架構圖 |
-| **三通道支援** | Telegram (long polling)、LINE (webhook)、Discord (Gateway WebSocket) |
+| **六通道支援** | Telegram、LINE、Discord、Slack、WhatsApp、Feishu — 含熱啟停、Dashboard 管理 |
 | **容器沙箱** | Docker / Apple Container 隔離執行（`--network=none`、tmpfs workspace、read-only rootfs、512MB limit） |
 | **Session 管理** | SQLite 持久化對話歷程，超過 50k token 自動壓縮摘要 |
 | **自主進化引擎** | 預測驅動進化（~90% 對話零 LLM 成本）+ GVU 自我博弈迴圈（Generator→Verifier→Updater, 4 層驗證）+ SOUL.md 版本控制（24h 觀察期 + 自動回滾）+ 5 種外部因素介入 |
@@ -52,6 +52,28 @@ DuDuClaw (plumbing)
 | **Claude Code 原生目錄** | Agent 目錄包含 `.claude/`、`SOUL.md`、`CLAUDE.md`、`.mcp.json`，直接相容 Claude Code |
 | **Claude Code Security Hooks** | 三層漸進式防禦 — Layer 1 黑名單（<50ms）→ Layer 2 混淆偵測（YELLOW+）→ Layer 3 Haiku AI 研判（RED only）；威脅等級自動升降級；敏感檔案 R/W 保護；Secret 洩漏掃描（20+ 模式）；async 審計日誌（相容 Rust AuditEvent） |
 | **Web Dashboard** | React + TypeScript + Tailwind CSS，溫暖 amber 色系，支援深淺色切換，含組織架構圖、Skill 市場、安全審計頁 |
+| **本地推論引擎** | 統一 `InferenceBackend` trait — llama.cpp / mistral.rs / Exo P2P / llamafile / OpenAI-compat，三層信心路由（LocalFast → LocalStrong → CloudAPI） |
+| **Token 壓縮** | Meta-Token（BPE-like 27-47% 壓縮）、LLMLingua-2（2-5x 有損壓縮）、StreamingLLM（無限長對話） |
+| **成本遙測** | SQLite token 追蹤、快取效率分析、200K 價格懸崖警告、自適應路由（快取效率 <30% 自動切本地） |
+| **Open Core 授權** | 核心 Apache 2.0 完全開源 + 商業加值模組（產業模板/演化參數/企業報表）閉源付費 |
+
+---
+
+## 競品對比
+
+| | **DuDuClaw** | **OpenClaw** | **IronClaw** | **Moltis** | **Dify** |
+|---|---|---|---|---|---|
+| 語言 | Rust | TypeScript | Rust | Rust | Python |
+| 頻道 | 6 | 25+ | 8 | 5 | 0 (API) |
+| Claude Code 原生 | **MCP Server** | - | - | - | - |
+| 自我演化引擎 | **Active Inference + GVU** | - | - | - | - |
+| 本地推論 | **三層信心路由** | - | - | - | - |
+| Token 壓縮 | **3 種策略** | - | - | - | - |
+| 成本遙測 | **快取效率分析** | - | - | 基礎 | 基礎 |
+| 行為合約 | **CONTRACT.toml + 紅隊** | - | WASM 沙箱 | - | - |
+| ERP 整合 | **Odoo 15 工具** | - | - | - | - |
+| 安全稽核 | **5 輪 / 172 項修復** | CVE-2026-25253 | WASM | 基礎 | 中等 |
+| 授權 | **Apache 2.0 (Open Core)** | MIT | 開源 | 開源 | $59+/月 |
 
 ---
 
@@ -292,7 +314,11 @@ cd web && npx tsc --noEmit
 
 ## 授權
 
-[Elastic License 2.0 (ELv2)](LICENSE) — 個人、教育、企業內部使用免費。詳見 [LICENSING.md](LICENSING.md)。
+**Open Core 模式** — 核心程式碼採用 [Apache License 2.0](LICENSE)，完全自由使用、修改、分發。
+
+商業加值模組（`commercial/` 目錄）為閉源付費，包含：產業模板、演化參數集、企業儀表板、授權驗證。
+
+詳見 [LICENSING.md](LICENSING.md)。
 
 ---
 

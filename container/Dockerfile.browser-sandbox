@@ -1,0 +1,35 @@
+# DuDuClaw Browser Sandbox — L4 Container
+# Headless Playwright + Chromium with network isolation
+#
+# Usage:
+#   docker build -f container/Dockerfile.browser-sandbox -t duduclaw/browser-sandbox .
+#   docker run --read-only --tmpfs /tmp:size=256m --network=none duduclaw/browser-sandbox
+
+FROM mcr.microsoft.com/playwright:v1.52.0-noble
+
+# Install domain-level network filtering
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    iptables \
+    dnsutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN groupadd -r sandbox && useradd -r -g sandbox -m sandbox
+
+# Copy domain filter script
+COPY container/scripts/domain-filter.sh /usr/local/bin/domain-filter.sh
+RUN chmod +x /usr/local/bin/domain-filter.sh
+
+# Working directories
+RUN mkdir -p /agent /workspace /screenshots && \
+    chown sandbox:sandbox /workspace /screenshots
+
+USER sandbox
+WORKDIR /workspace
+
+# Healthcheck
+HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
+    CMD node -e "console.log('ok')" || exit 1
+
+ENTRYPOINT ["/usr/local/bin/domain-filter.sh"]
+CMD ["npx", "playwright", "test", "--reporter=json"]

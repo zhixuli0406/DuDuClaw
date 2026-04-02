@@ -1,0 +1,46 @@
+# DuDuClaw Computer Use — L5 Container
+# Virtual display (Xvfb) + Chromium + VNC for Claude computer_use tool
+#
+# Usage:
+#   docker build -f container/Dockerfile.computer-use -t duduclaw/computer-use .
+#   docker run -p 5900:5900 duduclaw/computer-use
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DISPLAY=:99
+ENV DISPLAY_SIZE=1280x800
+
+# Install Xvfb, VNC, Chromium, and utilities
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    xvfb \
+    x11vnc \
+    chromium-browser \
+    xdotool \
+    imagemagick \
+    scrot \
+    iptables \
+    dnsutils \
+    fonts-noto-cjk \
+    fonts-noto-color-emoji \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN groupadd -r sandbox && useradd -r -g sandbox -m sandbox
+
+# Copy entrypoint and domain filter
+COPY container/scripts/computer-use-entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY container/scripts/domain-filter.sh /usr/local/bin/domain-filter.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/domain-filter.sh
+
+# Working directories
+RUN mkdir -p /agent /workspace /screenshots && \
+    chown sandbox:sandbox /workspace /screenshots
+
+# Expose VNC port
+EXPOSE 5900
+
+HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
+    CMD xdotool getactivewindow || exit 1
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

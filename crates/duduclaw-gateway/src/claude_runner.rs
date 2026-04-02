@@ -206,8 +206,13 @@ fn is_billing_error(error: &str) -> bool {
 /// Check whether an error indicates rate limiting (usage limit exhausted).
 fn is_rate_limit_error(error: &str) -> bool {
     let lower = error.to_lowercase();
-    lower.contains("rate") || lower.contains("429") || lower.contains("usage limit")
-        || lower.contains("overloaded") || lower.contains("capacity")
+    lower.contains("rate limit")
+        || lower.contains("rate-limit")
+        || lower.contains("ratelimit")
+        || lower.contains("429")
+        || lower.contains("usage limit")
+        || lower.contains("overloaded")
+        || lower.contains("capacity limit")
 }
 
 /// Try calling the Anthropic Messages API directly (bypassing Claude CLI).
@@ -261,7 +266,7 @@ async fn get_inference_mode(home_dir: &Path) -> String {
     let mode = table.get("general")
         .and_then(|g| g.get("inference_mode"))
         .and_then(|v| v.as_str())
-        .unwrap_or("claude")
+        .unwrap_or("hybrid")
         .to_string();
 
     *cache.write().await = Some((std::time::Instant::now(), mode.clone()));
@@ -270,6 +275,9 @@ async fn get_inference_mode(home_dir: &Path) -> String {
 
 /// Cached AccountRotator — avoids rebuilding on every call (BE-H4).
 static ROTATOR_CACHE: std::sync::OnceLock<tokio::sync::RwLock<Option<(std::time::Instant, std::sync::Arc<duduclaw_agent::account_rotator::AccountRotator>)>>> = std::sync::OnceLock::new();
+
+/// Mutex protecting rotator rebuild — prevents concurrent `claude auth status` subprocesses.
+static ROTATOR_INIT_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
 /// Cached InferenceEngine — singleton for local LLM inference.
 static INFERENCE_ENGINE: std::sync::OnceLock<tokio::sync::RwLock<Option<std::sync::Arc<duduclaw_inference::InferenceEngine>>>> = std::sync::OnceLock::new();
@@ -398,6 +406,20 @@ async fn get_rotator(home_dir: &Path) -> Result<std::sync::Arc<duduclaw_agent::a
         }
     }
 
+    // Serialize rebuild to prevent concurrent `claude auth status` subprocesses
+    let init_lock = ROTATOR_INIT_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
+    let _init_guard = init_lock.lock().await;
+
+    // Double-check after acquiring lock (another task may have rebuilt)
+    {
+        let guard = cache.read().await;
+        if let Some((created, rotator)) = guard.as_ref() {
+            if created.elapsed() < ttl {
+                return Ok(rotator.clone());
+            }
+        }
+    }
+
     // Rebuild
     let config_content = tokio::fs::read_to_string(home_dir.join("config.toml"))
         .await
@@ -451,7 +473,7 @@ async fn call_with_rotation(
                     if selected.auth_method == duduclaw_agent::account_rotator::AuthMethod::OAuth {
                         0
                     } else {
-                        usage.estimated_cost_millicents() / 10 // convert millicents to ~cents
+                        usage.estimated_cost_millicents() // same unit as monthly_budget_cents
                     }
                 } else if selected.auth_method == duduclaw_agent::account_rotator::AuthMethod::OAuth {
                     0
@@ -475,7 +497,7 @@ async fn call_with_rotation(
                     // Billing/credit exhaustion: long cooldown (24h), mark unhealthy immediately
                     warn!(account = %selected.id, error = %e, "Account billing exhausted — 24h cooldown");
                     rotator.on_billing_exhausted(&selected.id).await;
-                } else if e.contains("rate") || e.contains("429") {
+                } else if is_rate_limit_error(&e) {
                     rotator.on_rate_limited(&selected.id).await;
                 } else {
                     rotator.on_error(&selected.id).await;
@@ -485,22 +507,9 @@ async fn call_with_rotation(
         }
     }
 
-    // All accounts failed — fall back to direct key
-    let api_key = get_api_key(home_dir).await;
-    if !api_key.is_empty() {
-        warn!("All rotated accounts failed, using fallback key");
-        let response = call_claude(prompt, model, system_prompt, &api_key, capabilities).await?;
-
-        // Record telemetry for fallback path too
-        if let Some(ref usage) = response.usage {
-            if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
-                telemetry.record(agent_id, request_type, model, usage).await;
-            }
-        }
-
-        return Ok(response.text);
-    }
-
+    // All rotated accounts failed.
+    // Note: the AccountRotator already includes env-var and [api]-section keys
+    // as accounts, so retrying with get_api_key() here would be redundant.
     Err(format!("All accounts exhausted. Last error: {last_error}"))
 }
 
@@ -555,6 +564,17 @@ async fn call_claude_streaming(
     let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 
+    // Drain stderr asynchronously to prevent pipe buffer deadlock.
+    // Without this, if claude CLI writes >64KB to stderr (common in verbose
+    // mode), the pipe fills up and the child blocks forever.
+    let stderr = child.stderr.take();
+    tokio::spawn(async move {
+        if let Some(e) = stderr {
+            let mut lines = BufReader::new(e).lines();
+            while let Ok(Some(_)) = lines.next_line().await {}
+        }
+    });
+
     let mut result_text = String::new();
     let mut token_usage: Option<crate::cost_telemetry::TokenUsage> = None;
     let mut last_tool_reported: Option<String> = None;
@@ -587,7 +607,13 @@ async fn call_claude_streaming(
                         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
                             match event.get("type").and_then(|t| t.as_str()) {
                                 Some("result") => {
-                                    if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
+                                    if event.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                        let err_msg = event
+                                            .get("error")
+                                            .and_then(|e| e.as_str())
+                                            .unwrap_or("Unknown error");
+                                        result_text = format!("[error] {err_msg}");
+                                    } else if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
                                         result_text = text.to_string();
                                     }
                                     if let Some(usage_val) = event.get("usage") {
@@ -712,10 +738,18 @@ fn prepare_claude_cmd(
         match tempfile::NamedTempFile::new() {
             Ok(mut f) => {
                 use std::io::Write;
-                let _ = f.write_all(system_prompt.as_bytes());
-                let path = f.into_temp_path();
-                cmd.args(["--system-prompt-file", &path.to_string_lossy()]);
-                Some(path)
+                match f.write_all(system_prompt.as_bytes()) {
+                    Ok(()) => {
+                        let path = f.into_temp_path();
+                        cmd.args(["--system-prompt-file", &path.to_string_lossy()]);
+                        Some(path)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to write system prompt tempfile, using arg fallback");
+                        cmd.args(["--system-prompt", system_prompt]);
+                        None
+                    }
+                }
             }
             Err(_) => {
                 cmd.args(["--system-prompt", system_prompt]);
@@ -750,21 +784,6 @@ async fn call_claude_with_env(
             cmd.env(key, value);
         }
     }
-
-    call_claude_streaming(&mut cmd, None).await
-}
-
-/// Call the `claude` CLI binary with a prompt and return the response text.
-async fn call_claude(
-    prompt: &str,
-    model: &str,
-    system_prompt: &str,
-    api_key: &str,
-    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
-) -> Result<ClaudeResponse, String> {
-    let claude = which_claude().ok_or("Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code")?;
-    let (mut cmd, _prompt_guard) = prepare_claude_cmd(&claude, prompt, model, system_prompt, capabilities);
-    cmd.env("ANTHROPIC_API_KEY", api_key);
 
     call_claude_streaming(&mut cmd, None).await
 }

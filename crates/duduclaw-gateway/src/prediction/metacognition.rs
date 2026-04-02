@@ -142,6 +142,30 @@ pub struct MetaCognition {
 
     /// Total predictions ever made.
     pub total_predictions: u64,
+
+    // ── Proactive self-calibration (Phase D3) ───────────────────
+
+    /// Proactive message threshold (0.0-1.0). Only send proactive messages
+    /// when the motivation score exceeds this threshold.
+    /// Self-calibrates based on user accept/dismiss feedback.
+    #[serde(default = "default_proactive_threshold")]
+    pub proactive_threshold: f64,
+
+    /// Total proactive messages sent (for calibration).
+    #[serde(default)]
+    pub proactive_sent: u64,
+
+    /// Total proactive messages accepted by users.
+    #[serde(default)]
+    pub proactive_accepted: u64,
+
+    /// Total proactive messages dismissed by users.
+    #[serde(default)]
+    pub proactive_dismissed: u64,
+
+    /// Proactive evaluations since last calibration.
+    #[serde(default)]
+    pub proactive_since_last_cal: u64,
 }
 
 impl Default for MetaCognition {
@@ -152,6 +176,11 @@ impl Default for MetaCognition {
             evaluation_interval: 100,
             predictions_since_last_eval: 0,
             total_predictions: 0,
+            proactive_threshold: 0.5,
+            proactive_sent: 0,
+            proactive_accepted: 0,
+            proactive_dismissed: 0,
+            proactive_since_last_cal: 0,
         }
     }
 }
@@ -279,4 +308,74 @@ impl MetaCognition {
         let content = std::fs::read_to_string(path).ok()?;
         serde_json::from_str(&content).ok()
     }
+
+    // ── Proactive self-calibration (Phase D3) ───────────────────
+
+    /// Record that a proactive message was sent.
+    pub fn record_proactive_sent(&mut self) {
+        self.proactive_sent += 1;
+        self.proactive_since_last_cal += 1;
+    }
+
+    /// Record user feedback on a proactive message.
+    pub fn record_proactive_feedback(&mut self, accepted: bool) {
+        if accepted {
+            self.proactive_accepted += 1;
+        } else {
+            self.proactive_dismissed += 1;
+        }
+        self.proactive_since_last_cal += 1;
+
+        // Calibrate every 20 proactive interactions
+        if self.proactive_since_last_cal >= 20 {
+            self.calibrate_proactive_threshold();
+            self.proactive_since_last_cal = 0;
+        }
+    }
+
+    /// Self-calibrate the proactive threshold based on accept/dismiss ratio.
+    ///
+    /// - High accept rate (>70%) → lower threshold (more proactive)
+    /// - Low accept rate (<30%) → raise threshold (less proactive)
+    /// - Otherwise → no change
+    fn calibrate_proactive_threshold(&mut self) {
+        let total = self.proactive_accepted + self.proactive_dismissed;
+        if total < 5 {
+            return; // Not enough data
+        }
+
+        let accept_rate = self.proactive_accepted as f64 / total as f64;
+        let old_threshold = self.proactive_threshold;
+
+        if accept_rate > 0.7 {
+            // Users welcome proactive messages → lower threshold (more proactive)
+            self.proactive_threshold = (self.proactive_threshold - 0.05).max(0.2);
+        } else if accept_rate < 0.3 {
+            // Users dismiss proactive messages → raise threshold (less proactive)
+            self.proactive_threshold = (self.proactive_threshold + 0.05).min(0.9);
+        }
+
+        if (self.proactive_threshold - old_threshold).abs() > f64::EPSILON {
+            info!(
+                old = format!("{old_threshold:.2}"),
+                new = format!("{:.2}", self.proactive_threshold),
+                accept_rate = format!("{:.1}", accept_rate * 100.0),
+                "MetaCognition: proactive threshold calibrated"
+            );
+        }
+    }
+
+    /// Get the current proactive threshold.
+    pub fn proactive_threshold(&self) -> f64 {
+        self.proactive_threshold
+    }
+
+    /// Get proactive stats summary.
+    pub fn proactive_stats(&self) -> (u64, u64, u64, f64) {
+        (self.proactive_sent, self.proactive_accepted, self.proactive_dismissed, self.proactive_threshold)
+    }
+}
+
+fn default_proactive_threshold() -> f64 {
+    0.5
 }

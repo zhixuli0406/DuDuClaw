@@ -215,14 +215,14 @@ export interface BillingInvoice {
 
 export interface LicenseInfo {
   tier: string;
-  license_key?: string;
   activated: boolean;
   expires_at?: string;
   days_remaining?: number;
   features: string[];
-  fingerprint?: string;
   machine_fingerprint?: string;
   customer_name?: string;
+  max_agents?: number;
+  max_channels?: number;
 }
 
 /** Fields that can be updated on an agent via `agents.update`. All optional. */
@@ -373,6 +373,22 @@ export const api = {
       client.call('system.config') as Promise<Record<string, unknown>>,
     updateConfig: (fields: { log_level?: string; rotation_strategy?: string }) =>
       client.call('system.update_config', fields) as Promise<{ success: boolean; changes: string[] }>,
+    checkUpdate: () =>
+      client.call('system.check_update') as Promise<{
+        available: boolean;
+        current_version: string;
+        latest_version: string;
+        release_notes: string;
+        published_at: string;
+        download_url: string;
+        install_method: string;
+      }>,
+    applyUpdate: () =>
+      client.call('system.apply_update', {}) as Promise<{
+        success: boolean;
+        message: string;
+        needs_restart: boolean;
+      }>,
   },
   cron: {
     list: () =>
@@ -475,8 +491,9 @@ export const api = {
     install: (serverId: string) =>
       client.call('marketplace.install', { server_id: serverId }) as Promise<{ success: boolean }>,
   },
+  // Partner portal — backend not yet implemented; calls will reject with error
   partner: {
-    generateLicense: (params: { tier: string; customer: string; months: number }) =>
-      client.call('partner.generate_license', params) as Promise<{ key: string }>,
+    generateLicense: (_params: { tier: string; customer: string; months: number }) =>
+      Promise.reject(new Error('Partner license generation not yet available')) as Promise<{ key: string }>,
   },
 };

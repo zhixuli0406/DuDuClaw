@@ -11,6 +11,11 @@ import { SettingsPage } from './pages/SettingsPage';
 import { LogsPage } from './pages/LogsPage';
 import { OrgChartPage } from './pages/OrgChartPage';
 import { SkillMarketPage } from './pages/SkillMarketPage';
+import { LicensePage } from './pages/LicensePage';
+import { WebChatPage } from './pages/WebChatPage';
+import { BillingPage } from './pages/BillingPage';
+import { ReportPage } from './pages/ReportPage';
+import { OnboardWizardPage } from './pages/OnboardWizardPage';
 import { useConnectionStore } from './stores/connection-store';
 
 export function App() {
@@ -33,7 +38,12 @@ export function App() {
         <Route path="security" element={<SecurityPage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="logs" element={<LogsPage />} />
+        <Route path="license" element={<LicensePage />} />
+        <Route path="webchat" element={<WebChatPage />} />
+        <Route path="billing" element={<BillingPage />} />
+        <Route path="reports" element={<ReportPage />} />
       </Route>
+      <Route path="wizard" element={<OnboardWizardPage />} />
     </Routes>
   );
 }

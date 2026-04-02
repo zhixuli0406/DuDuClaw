@@ -73,7 +73,7 @@ export class DuDuClawClient {
       };
 
       this.ws.onclose = (event) => {
-        console.log('[WS] Connection closed:', event.code, event.reason);
+        // console.log('[WS] Connection closed:', event.code, event.reason);
         this.setState('disconnected');
         this.rejectAllPending('Connection closed');
         this.scheduleReconnect();
@@ -85,7 +85,7 @@ export class DuDuClawClient {
       };
 
       this.ws.onopen = async () => {
-        console.log('[WS] Connection opened');
+        // console.log('[WS] Connection opened');
         this.reconnectAttempt = 0;
         this.setState('connected');
 
@@ -226,7 +226,7 @@ export class DuDuClawClient {
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempt), 30000);
     this.reconnectAttempt++;
 
-    console.log(`[WS] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempt})`);
+    // console.log(`[WS] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempt})`);
     this.reconnectTimer = setTimeout(() => {
       this.doConnect().catch(() => { /* reconnect will retry */ });
     }, delay);

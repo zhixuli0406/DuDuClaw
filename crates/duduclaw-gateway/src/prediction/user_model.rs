@@ -139,6 +139,33 @@ pub struct UserModel {
 
     /// Last time this model was updated.
     pub last_updated: DateTime<Utc>,
+
+    // ── Proactive need prediction (Phase D) ─────────────────────
+
+    /// Predicted next conversation topic (most frequent recent topic).
+    #[serde(default)]
+    pub predicted_next_topic: Option<String>,
+
+    /// Predicted hours until user returns (based on active_hours pattern).
+    #[serde(default)]
+    pub predicted_return_hours: Option<f32>,
+
+    /// Proactive receptivity score (0.0-1.0) — how likely the user is to
+    /// welcome proactive messages. Updated by accept/dismiss feedback.
+    #[serde(default = "default_receptivity")]
+    pub proactive_receptivity: f64,
+
+    /// Number of proactive messages accepted by this user.
+    #[serde(default)]
+    pub proactive_accepted: u32,
+
+    /// Number of proactive messages dismissed/ignored by this user.
+    #[serde(default)]
+    pub proactive_dismissed: u32,
+}
+
+fn default_receptivity() -> f64 {
+    0.5 // Neutral starting point
 }
 
 impl UserModel {
@@ -156,6 +183,11 @@ impl UserModel {
             language_preference: LanguageStats::default(),
             total_conversations: 0,
             last_updated: Utc::now(),
+            predicted_next_topic: None,
+            predicted_return_hours: None,
+            proactive_receptivity: 0.5,
+            proactive_accepted: 0,
+            proactive_dismissed: 0,
         }
     }
 
