@@ -721,7 +721,7 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
     //  Controls how DuDuClaw calls the Anthropic API:
     //  "cli" = via claude binary (default, supports tools)
     //  "direct" = HTTP API call (95%+ cache hit, pure chat only)
-    //  "auto" = try direct first, fallback to CLI
+    //  "auto" = CLI first (zero-cost OAuth), fallback to Direct API when rate-limited
     let api_mode: String = if use_claude && !skip_prompts && !quick_mode {
         println!();
         println!("  {} {}", style("▸").cyan(), style("API 呼叫模式").bold());
@@ -730,7 +730,7 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
         let api_mode_options = &[
             "CLI 模式（預設）— 透過 claude 指令，支援完整工具使用",
             "Direct API — 直接呼叫 HTTP API，cache 命中率 95%+，僅支援純對話",
-            "Auto 模式（推薦）— 優先 Direct API，需要工具時自動切換 CLI",
+            "Auto 模式（推薦）— 優先 CLI（零成本），限速時自動切換 Direct API",
         ];
         let sel = Select::new()
             .with_prompt("API 呼叫模式")
@@ -968,9 +968,9 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
             };
             println!("  ├ 認證：{}", auth_status);
             let api_mode_label = match api_mode.as_str() {
-                "direct" => "Direct API（高 cache 效率）",
-                "auto" => "Auto（推薦，自動切換）",
-                _ => "CLI（完整功能）",
+                "direct" => "Direct API（高 cache 效率，純對話）",
+                "auto" => "Auto（推薦，CLI 優先 → 限速時切 Direct API）",
+                _ => "CLI（完整功能，零成本）",
             };
             println!("  ├ API 模式：{}", style(api_mode_label).cyan());
         }

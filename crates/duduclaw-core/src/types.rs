@@ -37,7 +37,7 @@ pub struct ModelConfig {
     #[serde(default)]
     pub local: Option<LocalModelConfig>,
     /// API mode for cloud calls: "cli" (default, via claude binary), "direct" (HTTP API),
-    /// or "auto" (telemetry-driven: use direct for pure chat, CLI when tools are needed).
+    /// or "auto" (CLI first for zero-cost OAuth, fallback to Direct API when rate-limited).
     #[serde(default = "default_api_mode")]
     pub api_mode: String,
 }
