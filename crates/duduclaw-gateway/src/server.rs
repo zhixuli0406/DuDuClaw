@@ -155,8 +155,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     }
     let line_router = crate::line::start_line_bot(&home_dir, reply_ctx.clone()).await;
     let webchat_ctx = reply_ctx.clone();
-    if let Some(h) = crate::discord::start_discord_bot(&home_dir, reply_ctx).await {
-        handler.register_channel_handle("discord", h).await;
+    let discord_handles = crate::discord::start_discord_bots(&home_dir, reply_ctx.clone()).await;
+    for (label, h) in discord_handles {
+        handler.register_channel_handle(&label, h).await;
     }
 
     // Start unified heartbeat scheduler (per-agent: evolution + cron + monitoring)

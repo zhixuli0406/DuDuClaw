@@ -118,6 +118,21 @@ pub async fn build_reply_with_progress(
     build_reply_with_session(text, ctx, "default", "anonymous", on_progress).await
 }
 
+/// Build a reply for a specific named agent (used by per-agent Discord bots).
+///
+/// Instead of reading `default_agent` from config.toml, this directly resolves
+/// the agent by `agent_name` in the registry.
+pub async fn build_reply_for_agent(
+    text: &str,
+    ctx: &ReplyContext,
+    agent_name: &str,
+    session_id: &str,
+    user_id: &str,
+    on_progress: Option<ProgressCallback>,
+) -> String {
+    build_reply_with_session_inner(text, ctx, Some(agent_name), session_id, user_id, on_progress).await
+}
+
 /// Build a reply with session tracking and optional progress streaming.
 ///
 /// `user_id` should be the stable per-user identifier from the channel
@@ -130,14 +145,34 @@ pub async fn build_reply_with_session(
     user_id: &str,
     on_progress: Option<ProgressCallback>,
 ) -> String {
-    // Determine which agent to use: config.toml default_agent → main_agent() → fallback
-    let default_agent_name = get_default_agent(&ctx.home_dir).await;
+    build_reply_with_session_inner(text, ctx, None, session_id, user_id, on_progress).await
+}
 
+/// Inner implementation shared by both default-agent and explicit-agent paths.
+///
+/// When `agent_override` is `Some(name)`, the named agent is looked up directly.
+/// When `None`, the default agent resolution logic (config.toml → main_agent) is used.
+async fn build_reply_with_session_inner(
+    text: &str,
+    ctx: &ReplyContext,
+    agent_override: Option<&str>,
+    session_id: &str,
+    user_id: &str,
+    on_progress: Option<ProgressCallback>,
+) -> String {
+    // Determine which agent to use
     let reg = ctx.registry.read().await;
-    let agent = if let Some(name) = &default_agent_name {
+    let agent = if let Some(name) = agent_override {
+        // Explicit agent name (per-agent Discord bot)
         reg.get(name).or_else(|| reg.main_agent())
     } else {
-        reg.main_agent()
+        // Default: config.toml default_agent → main_agent() → fallback
+        let default_agent_name = get_default_agent(&ctx.home_dir).await;
+        if let Some(name) = &default_agent_name {
+            reg.get(name).or_else(|| reg.main_agent())
+        } else {
+            reg.main_agent()
+        }
     };
 
     if let Some(a) = agent {

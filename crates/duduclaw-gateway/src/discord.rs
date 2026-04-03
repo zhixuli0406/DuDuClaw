@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
-use crate::channel_reply::{ReplyContext, build_reply_with_progress, set_channel_connected};
+use crate::channel_reply::{ReplyContext, build_reply_for_agent, build_reply_with_progress, set_channel_connected};
 
 const DISCORD_API: &str = "https://discord.com/api/v10";
 
@@ -136,7 +136,150 @@ pub async fn start_discord_bot(
     info!("   ⚠ 請確認 Discord Developer Portal 已啟用 MESSAGE CONTENT Intent");
 
     let handle = tokio::spawn(async move {
-        gateway_loop(token, bot_id, gateway_url, http, ctx).await;
+        gateway_loop(token, bot_id, gateway_url, http, ctx, "discord".to_string(), None).await;
+    });
+
+    Some(handle)
+}
+
+/// Start multiple Discord bots: one global (from config.toml) plus per-agent bots.
+///
+/// Returns a Vec of (label, JoinHandle) where label is "discord" for the global
+/// bot and "discord:{agent_name}" for per-agent bots.
+/// Deduplicates by token value — if an agent token matches the global token, it
+/// is skipped (the global bot already covers it).
+pub async fn start_discord_bots(
+    home_dir: &Path,
+    ctx: Arc<ReplyContext>,
+) -> Vec<(String, tokio::task::JoinHandle<()>)> {
+    let mut results: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
+    let mut seen_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 1. Global bot from config.toml (existing behavior)
+    if let Some(token) = read_discord_token(home_dir).await {
+        if !token.is_empty() {
+            seen_tokens.insert(token.clone());
+            if let Some(handle) = spawn_discord_bot(token, "discord".to_string(), None, ctx.clone()).await {
+                results.push(("discord".to_string(), handle));
+            }
+        }
+    }
+
+    // 2. Per-agent bots from agent configs
+    let agent_tokens: Vec<(String, String)> = {
+        let reg = ctx.registry.read().await;
+        let mut tokens = Vec::new();
+        for agent in reg.list() {
+            if let Some(channels) = &agent.config.channels {
+                if let Some(discord) = &channels.discord {
+                    // Try encrypted token first, then plain-text
+                    let token = if let Some(enc) = &discord.bot_token_enc {
+                        if !enc.is_empty() {
+                            crate::config_crypto::decrypt_value(enc, home_dir)
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+                    let token = if token.is_empty() {
+                        discord.bot_token.clone()
+                    } else {
+                        token
+                    };
+                    if !token.is_empty() {
+                        tokens.push((agent.config.agent.name.clone(), token));
+                    }
+                }
+            }
+        }
+        tokens
+    };
+
+    for (agent_name, token) in agent_tokens {
+        if seen_tokens.contains(&token) {
+            info!("Discord bot for agent '{agent_name}' shares global token — skipping duplicate");
+            continue;
+        }
+        seen_tokens.insert(token.clone());
+        let label = format!("discord:{agent_name}");
+        if let Some(handle) = spawn_discord_bot(token, label.clone(), Some(agent_name), ctx.clone()).await {
+            results.push((label, handle));
+        }
+    }
+
+    results
+}
+
+/// Spawn a single Discord bot connection (shared by global and per-agent paths).
+///
+/// Returns `None` if the token is invalid or the initial connection fails.
+async fn spawn_discord_bot(
+    token: String,
+    label: String,
+    agent_name: Option<String>,
+    ctx: Arc<ReplyContext>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .ok()?;
+
+    let channel_status = ctx.channel_status.clone();
+
+    // Verify token + get bot info
+    let bot_id = match http
+        .get(format!("{DISCORD_API}/users/@me"))
+        .header("Authorization", format!("Bot {token}"))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(user) = resp.json::<DiscordUser>().await {
+                let name = user.username.as_deref().unwrap_or("unknown");
+                let id = user.id.clone().unwrap_or_default();
+                info!("Discord bot [{label}] connected: {name} ({id})");
+                id
+            } else {
+                String::new()
+            }
+        }
+        Ok(resp) => {
+            let msg = format!("token invalid (HTTP {})", resp.status());
+            warn!("Discord bot [{label}] {msg}");
+            set_channel_connected(&channel_status, &label, false, Some(msg)).await;
+            return None;
+        }
+        Err(e) => {
+            warn!("Discord bot [{label}] connection failed: {e}");
+            set_channel_connected(&channel_status, &label, false, Some(e.to_string())).await;
+            return None;
+        }
+    };
+
+    // Get Gateway URL
+    let gateway_url = match http
+        .get(format!("{DISCORD_API}/gateway/bot"))
+        .header("Authorization", format!("Bot {token}"))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if let Ok(info) = resp.json::<GatewayInfo>().await {
+                info.url.unwrap_or_else(|| "wss://gateway.discord.gg".to_string())
+            } else {
+                "wss://gateway.discord.gg".to_string()
+            }
+        }
+        Err(_) => "wss://gateway.discord.gg".to_string(),
+    };
+
+    let gateway_url = format!("{gateway_url}/?v=10&encoding=json");
+    info!("   Discord Gateway [{label}]: {gateway_url}");
+
+    let handle = tokio::spawn(async move {
+        gateway_loop(token, bot_id, gateway_url, http, ctx, label, agent_name).await;
     });
 
     Some(handle)
@@ -150,12 +293,14 @@ async fn gateway_loop(
     gateway_url: String,
     http: reqwest::Client,
     ctx: Arc<ReplyContext>,
+    label: String,
+    agent_name: Option<String>,
 ) {
     let channel_status = ctx.channel_status.clone();
 
     loop {
-        info!("Discord Gateway connecting...");
-        set_channel_connected(&channel_status, "discord", false, Some("connecting".into())).await;
+        info!("Discord Gateway [{label}] connecting...");
+        set_channel_connected(&channel_status, &label, false, Some("connecting".into())).await;
 
         let ws = match tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -166,14 +311,14 @@ async fn gateway_loop(
                 ws
             }
             Ok(Err(e)) => {
-                warn!("Discord Gateway connection failed: {e}");
-                set_channel_connected(&channel_status, "discord", false, Some(e.to_string())).await;
+                warn!("Discord Gateway [{label}] connection failed: {e}");
+                set_channel_connected(&channel_status, &label, false, Some(e.to_string())).await;
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
             Err(_) => {
-                warn!("Discord Gateway connection timeout (15s)");
-                set_channel_connected(&channel_status, "discord", false, Some("Connection timeout".into())).await;
+                warn!("Discord Gateway [{label}] connection timeout (15s)");
+                set_channel_connected(&channel_status, &label, false, Some("Connection timeout".into())).await;
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
@@ -288,22 +433,22 @@ async fn gateway_loop(
                             if let Some(event_name) = &payload.t {
                                 if event_name == "MESSAGE_CREATE" {
                                     if let Some(d) = &payload.d {
-                                        handle_message_create(d, &bot_id, &http, &token, &ctx).await;
+                                        handle_message_create(d, &bot_id, &http, &token, &ctx, agent_name.as_deref()).await;
                                     }
                                 } else if event_name == "READY" {
-                                    info!("Discord Gateway READY");
-                                    set_channel_connected(&channel_status, "discord", true, None).await;
+                                    info!("Discord Gateway [{label}] READY");
+                                    set_channel_connected(&channel_status, &label, true, None).await;
                                 }
                             }
                         }
 
                         // Reconnect
-                        7 => { info!("Discord Gateway requested reconnect"); break; }
+                        7 => { info!("Discord Gateway [{label}] requested reconnect"); break; }
 
                         // Invalid Session
                         9 => {
-                            warn!("Discord Gateway invalid session");
-                            set_channel_connected(&channel_status, "discord", false, Some("invalid session".to_string())).await;
+                            warn!("Discord Gateway [{label}] invalid session");
+                            set_channel_connected(&channel_status, &label, false, Some("invalid session".to_string())).await;
                             identified = false;
                             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                             break;
@@ -337,8 +482,8 @@ async fn gateway_loop(
         drop(guard);
 
         let _ = identified;
-        set_channel_connected(&channel_status, "discord", false, Some("reconnecting".to_string())).await;
-        warn!("Discord Gateway disconnected, reconnecting in 5s...");
+        set_channel_connected(&channel_status, &label, false, Some("reconnecting".to_string())).await;
+        warn!("Discord Gateway [{label}] disconnected, reconnecting in 5s...");
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }
@@ -349,6 +494,7 @@ async fn handle_message_create(
     http: &reqwest::Client,
     token: &str,
     ctx: &Arc<ReplyContext>,
+    agent_name: Option<&str>,
 ) {
     // Ignore messages from the bot itself
     let author_id = data
@@ -409,7 +555,12 @@ async fn handle_message_create(
         });
     });
 
-    let reply = build_reply_with_progress(content, ctx, Some(on_progress)).await;
+    let session_id = format!("discord:{channel_id}");
+    let reply = if let Some(agent) = agent_name {
+        build_reply_for_agent(content, ctx, agent, &session_id, author_id, Some(on_progress)).await
+    } else {
+        build_reply_with_progress(content, ctx, Some(on_progress)).await
+    };
 
     // Send final reply via REST API
     match http
