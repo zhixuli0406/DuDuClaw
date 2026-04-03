@@ -96,16 +96,19 @@ impl InferenceBackend for MistralRsBackend {
             .map(|m| m.len())
             .unwrap_or(0);
 
+        let param_count = crate::model_manager::extract_param_count_from_id(&model_id);
+        let kv_cache_mb = ModelInfo::estimate_kv_cache_mb(&param_count, params.context_size);
         let info = ModelInfo {
             id: model_id,
             path: model_path.to_string(),
             architecture: "mistralrs".to_string(),
-            parameter_count: "auto".to_string(),
+            parameter_count: param_count,
             quantization: self.config.isq_bits
                 .map(|b| format!("ISQ-Q{}K", b))
                 .unwrap_or_else(|| "native".to_string()),
             file_size_bytes: file_size,
             estimated_memory_mb: file_size / (1024 * 1024) * 11 / 10,
+            kv_cache_mb,
             is_loaded: true,
             context_length: params.context_size,
         };

@@ -42,14 +42,18 @@ impl InferenceBackend for LlamaCppBackend {
             .to_string_lossy()
             .to_string();
 
+        // Attempt to extract param count from filename; "unknown" if not parseable
+        let param_count = crate::model_manager::extract_param_count_from_id(&model_id);
+        let kv_cache_mb = ModelInfo::estimate_kv_cache_mb(&param_count, params.context_size);
         let info = ModelInfo {
             id: model_id,
             path: model_path.to_string(),
             architecture: "gguf".to_string(),
-            parameter_count: "auto".to_string(),
+            parameter_count: param_count,
             quantization: "auto".to_string(),
             file_size_bytes: file_size,
             estimated_memory_mb: file_size / (1024 * 1024) * 11 / 10,
+            kv_cache_mb,
             is_loaded: true,
             context_length: params.context_size,
         };

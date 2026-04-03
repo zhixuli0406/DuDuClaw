@@ -12,7 +12,9 @@ use serde_json::json;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
+use crate::channel_format;
 use crate::channel_reply::{ReplyContext, build_reply_with_session, set_channel_connected};
+use crate::channel_settings::keys;
 
 const SLACK_API: &str = "https://slack.com/api";
 
@@ -116,6 +118,26 @@ async fn run_socket_mode(
         }
     }
 
+    // Get bot user ID via auth.test for precise mention detection
+    let bot_user_id = match http
+        .post(format!("{SLACK_API}/auth.test"))
+        .header("Authorization", format!("Bearer {bot_token}"))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if let Ok(data) = resp.json::<serde_json::Value>().await {
+                data["user_id"].as_str().unwrap_or("").to_string()
+            } else {
+                String::new()
+            }
+        }
+        Err(_) => String::new(),
+    };
+    if !bot_user_id.is_empty() {
+        info!("Slack bot user ID: {bot_user_id}");
+    }
+
     info!("Slack Socket Mode connected");
     set_channel_connected(&ctx.channel_status, "slack", true, None).await;
 
@@ -153,7 +175,7 @@ async fn run_socket_mode(
             // Handle events_api type
             if envelope.envelope_type == "events_api" {
                 if let Some(payload) = &envelope.payload {
-                    handle_event(payload, bot_token, ctx, &http).await;
+                    handle_event(payload, bot_token, &bot_user_id, ctx, &http).await;
                 }
             }
         }
@@ -203,6 +225,7 @@ async fn update_message(http: &reqwest::Client, token: &str, channel: &str, ts: 
 async fn handle_event(
     payload: &serde_json::Value,
     bot_token: &str,
+    bot_user_id: &str,
     ctx: &Arc<ReplyContext>,
     http: &reqwest::Client,
 ) {
@@ -234,6 +257,23 @@ async fn handle_event(
     let ts = event.get("ts").and_then(|v| v.as_str()).unwrap_or("");
     let channel_type = event.get("channel_type").and_then(|v| v.as_str()).unwrap_or("channel");
     let is_dm = channel_type == "im";
+
+    // ── Channel whitelist ──
+    if !is_dm && !ctx.channel_settings.is_channel_allowed("slack", "global", channel).await {
+        return;
+    }
+
+    // ── Mention-only filter ──
+    let mention_only = ctx.channel_settings.get_bool("slack", "global", keys::MENTION_ONLY, false).await;
+    // Precise mention detection: check for <@BOT_USER_ID> rather than any <@
+    let was_mentioned = if bot_user_id.is_empty() {
+        raw_text.contains("<@") // Fallback if bot_user_id unknown
+    } else {
+        raw_text.contains(&format!("<@{bot_user_id}>"))
+    };
+    if !is_dm && mention_only && !was_mentioned {
+        return;
+    }
 
     info!("📩 Slack [{user}]: {}", &text[..text.len().min(80)]);
 

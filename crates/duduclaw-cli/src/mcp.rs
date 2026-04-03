@@ -213,6 +213,25 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "agent_id", description: "Target agent name (default: main agent)", required: false },
         ],
     },
+    // ── Channel settings tools ────────────────────────────────────
+    ToolDef {
+        name: "channel_config",
+        description: "Get or set channel settings (mention_only, auto_thread, allowed_channels, agent_override, response_mode). Omit 'value' to read current setting.",
+        params: &[
+            ParamDef { name: "channel", description: "Channel type: discord, telegram, slack, line", required: true },
+            ParamDef { name: "scope_id", description: "Scope: guild_id, chat_id, or 'global'", required: true },
+            ParamDef { name: "key", description: "Setting key: mention_only, auto_thread, allowed_channels, agent_override, response_mode", required: true },
+            ParamDef { name: "value", description: "New value (omit to read current value)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "channel_config_list",
+        description: "List all channel settings for a scope",
+        params: &[
+            ParamDef { name: "channel", description: "Channel type: discord, telegram, slack, line", required: true },
+            ParamDef { name: "scope_id", description: "Scope: guild_id, chat_id, or 'global'", required: true },
+        ],
+    },
     // ── Local inference tools ─────────────────────────────────────
     ToolDef {
         name: "inference_status",
@@ -1996,14 +2015,48 @@ async fn handle_model_list(home_dir: &Path) -> Value {
         });
     }
 
+    // Check StreamingLLM config for KV cache compression
+    let config = engine.config();
+    let streaming_llm = config.streaming_llm.as_ref().filter(|s| s.enabled);
+    let effective_ctx: Option<u32> = streaming_llm.map(|s| {
+        (s.sink_size + s.window_size).try_into().unwrap_or(u32::MAX)
+    });
+
     let mut text = format!("Available models ({}):\n", models.len());
+
+    if let Some(slm) = streaming_llm {
+        text.push_str(&format!(
+            "\nStreamingLLM: ON (sink={}, window={}, effective ctx={})\n",
+            slm.sink_size, slm.window_size, slm.sink_size + slm.window_size
+        ));
+    }
+
+    text.push_str("\n  (KV cache estimates are approximate lower bounds for typical GQA models)");
+
     for m in &models {
         let loaded = if m.is_loaded { " [LOADED]" } else { "" };
         let size_mb = m.file_size_bytes / (1024 * 1024);
+        let total_mb = m.estimated_memory_mb + m.kv_cache_mb;
+
+        let kv_info = if m.kv_cache_mb == 0 {
+            format!("total ~{}MB", m.estimated_memory_mb)
+        } else if let Some(eff_ctx) = effective_ctx {
+            let compressed_kv = duduclaw_inference::ModelInfo::estimate_kv_cache_mb(
+                &m.parameter_count, eff_ctx,
+            );
+            let compressed_total = m.estimated_memory_mb + compressed_kv;
+            format!(
+                "KV ~{}→~{}MB, total ~{}→~{}MB",
+                m.kv_cache_mb, compressed_kv, total_mb, compressed_total
+            )
+        } else {
+            format!("KV ~{}MB, total ~{}MB", m.kv_cache_mb, total_mb)
+        };
+
         text.push_str(&format!(
-            "\n  {} ({} {} {}) — {}MB est. {}MB RAM{}",
+            "\n  {} ({} {} {}) — {}MB weights, {}{loaded}",
             m.id, m.architecture, m.parameter_count, m.quantization,
-            size_mb, m.estimated_memory_mb, loaded
+            size_mb, kv_info,
         ));
     }
 
@@ -3112,6 +3165,9 @@ async fn handle_tools_call(
         "submit_feedback" => handle_submit_feedback(&arguments, home_dir, default_agent).await,
         "evolution_toggle" => handle_evolution_toggle(&arguments, home_dir).await,
         "evolution_status" => handle_evolution_status_tool(&arguments, home_dir, default_agent).await,
+        // Channel settings tools
+        "channel_config" => handle_channel_config(&arguments, home_dir).await,
+        "channel_config_list" => handle_channel_config_list(&arguments, home_dir).await,
         // Local inference tools
         "inference_status" => handle_inference_status(home_dir).await,
         "model_list" => handle_model_list(home_dir).await,
@@ -3207,6 +3263,127 @@ async fn handle_synthesize_speech(args: &Value) -> Value {
             })
         }
         Err(e) => tool_error(&format!("Speech synthesis failed: {e}")),
+    }
+}
+
+// ── Channel settings tool handlers ──────────────────────────────
+
+const VALID_CHANNELS: &[&str] = &["discord", "telegram", "slack", "line", "whatsapp", "feishu"];
+const VALID_KEYS: &[&str] = &["mention_only", "auto_thread", "allowed_channels", "agent_override", "response_mode", "thread_archive_minutes"];
+
+/// Validate scope_id: max 64 chars, alphanumeric + underscore/hyphen or "global"/"dm".
+fn validate_scope_id(scope_id: &str) -> std::result::Result<(), String> {
+    if scope_id.len() > 64 {
+        return Err("scope_id too long (max 64 chars)".into());
+    }
+    if scope_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        Ok(())
+    } else {
+        Err("scope_id contains invalid characters".into())
+    }
+}
+
+/// Validate value based on key type.
+fn validate_value(key: &str, value: &str) -> std::result::Result<(), String> {
+    match key {
+        "mention_only" | "auto_thread" => {
+            if value != "true" && value != "false" {
+                return Err(format!("{key} must be 'true' or 'false'"));
+            }
+        }
+        "allowed_channels" => {
+            if serde_json::from_str::<Vec<String>>(value).is_err() {
+                return Err("allowed_channels must be a JSON array of strings, e.g. [\"ch1\",\"ch2\"]".into());
+            }
+        }
+        "response_mode" => {
+            if !["embed", "plain", "auto"].contains(&value) {
+                return Err("response_mode must be 'embed', 'plain', or 'auto'".into());
+            }
+        }
+        "thread_archive_minutes" => {
+            if !["60", "1440", "4320", "10080"].contains(&value) {
+                return Err("thread_archive_minutes must be 60, 1440, 4320, or 10080".into());
+            }
+        }
+        _ => {} // agent_override: any string is valid (checked against registry at use time)
+    }
+    Ok(())
+}
+
+async fn handle_channel_config(args: &Value, home_dir: &Path) -> Value {
+    let channel = match args.get("channel").and_then(|v| v.as_str()) {
+        Some(c) => c,
+        None => return tool_error("Missing required parameter: channel"),
+    };
+    let scope_id = match args.get("scope_id").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return tool_error("Missing required parameter: scope_id"),
+    };
+    let key = match args.get("key").and_then(|v| v.as_str()) {
+        Some(k) => k,
+        None => return tool_error("Missing required parameter: key"),
+    };
+
+    if !VALID_CHANNELS.contains(&channel) {
+        return tool_error(&format!("Invalid channel type: {channel}"));
+    }
+    if !VALID_KEYS.contains(&key) {
+        return tool_error(&format!("Invalid key: {key}. Valid keys: {}", VALID_KEYS.join(", ")));
+    }
+    if let Err(e) = validate_scope_id(scope_id) {
+        return tool_error(&format!("Invalid scope_id: {e}"));
+    }
+
+    let db_path = home_dir.join("sessions.db");
+    let mgr = match duduclaw_gateway::channel_settings::ChannelSettingsManager::from_session_db(&db_path) {
+        Ok(m) => m,
+        Err(e) => return tool_error(&format!("Failed to open settings DB: {e}")),
+    };
+
+    if let Some(value) = args.get("value").and_then(|v| v.as_str()) {
+        if let Err(e) = validate_value(key, value) {
+            return tool_error(&format!("Invalid value: {e}"));
+        }
+        match mgr.set(channel, scope_id, key, value).await {
+            Ok(()) => tool_text(&format!("Set {channel}/{scope_id}/{key} = {value}")),
+            Err(e) => tool_error(&format!("Failed to set: {e}")),
+        }
+    } else {
+        let value = mgr.get_with_fallback(channel, scope_id, key, "(not set)").await;
+        tool_text(&format!("{channel}/{scope_id}/{key} = {value}"))
+    }
+}
+
+async fn handle_channel_config_list(args: &Value, home_dir: &Path) -> Value {
+    let channel = match args.get("channel").and_then(|v| v.as_str()) {
+        Some(c) => c,
+        None => return tool_error("Missing required parameter: channel"),
+    };
+    let scope_id = match args.get("scope_id").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return tool_error("Missing required parameter: scope_id"),
+    };
+
+    if !VALID_CHANNELS.contains(&channel) {
+        return tool_error(&format!("Invalid channel type: {channel}"));
+    }
+    if let Err(e) = validate_scope_id(scope_id) {
+        return tool_error(&format!("Invalid scope_id: {e}"));
+    }
+
+    let db_path = home_dir.join("sessions.db");
+    let mgr = match duduclaw_gateway::channel_settings::ChannelSettingsManager::from_session_db(&db_path) {
+        Ok(m) => m,
+        Err(e) => return tool_error(&format!("Failed to open settings DB: {e}")),
+    };
+
+    let all = mgr.get_all(channel, scope_id).await;
+    if all.is_empty() {
+        tool_text(&format!("No settings configured for {channel}/{scope_id}. Using defaults."))
+    } else {
+        let lines: Vec<String> = all.iter().map(|(k, v)| format!("{k} = {v}")).collect();
+        tool_text(&format!("Settings for {channel}/{scope_id}:\n{}", lines.join("\n")))
     }
 }
 

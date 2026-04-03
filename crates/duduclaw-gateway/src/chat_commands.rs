@@ -156,10 +156,14 @@ async fn handle_status(ctx: &ReplyContext, session_id: &str, agent_id: &str) -> 
     )
 }
 
-async fn handle_new(_ctx: &ReplyContext, _session_id: &str) -> String {
-    // Session clearing is handled by the session manager's auto-compression.
-    // /new resets the conversation context for the next message.
-    "✅ Session cleared. Starting fresh!".to_string()
+async fn handle_new(ctx: &ReplyContext, session_id: &str) -> String {
+    match ctx.session_manager.delete_session(session_id).await {
+        Ok(()) => "✅ Session cleared. Starting fresh!".to_string(),
+        Err(e) => {
+            warn!(session_id, error = %e, "Failed to clear session");
+            format!("⚠️ Failed to clear session: {e}")
+        }
+    }
 }
 
 async fn handle_usage(_ctx: &ReplyContext, _agent_id: &str) -> String {

@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tracing::{error, info, warn};
 
+use crate::channel_format;
 use crate::channel_reply::{ChannelStatusMap, ReplyContext, build_reply_with_progress, set_channel_connected};
+use crate::channel_settings::keys;
 
 const LINE_API: &str = "https://api.line.me/v2/bot";
 
@@ -39,12 +41,24 @@ struct LineEvent {
     reply_token: Option<String>,
     source: Option<LineSource>,
     message: Option<LineMessage>,
+    postback: Option<LinePostback>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LinePostback {
+    data: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct LineSource {
+    #[serde(rename = "type")]
+    source_type: Option<String>,
     #[serde(rename = "userId")]
     user_id: Option<String>,
+    #[serde(rename = "groupId")]
+    group_id: Option<String>,
+    #[serde(rename = "roomId")]
+    room_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +69,7 @@ struct LineMessage {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 struct LineReplyBody {
     #[serde(rename = "replyToken")]
     reply_token: String,
@@ -62,6 +77,7 @@ struct LineReplyBody {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 struct LineReplyMessage {
     #[serde(rename = "type")]
     msg_type: String,
@@ -182,6 +198,20 @@ async fn line_webhook_handler(
 
     // Process events
     for event in webhook.events {
+        // Handle postback events (Quick Reply button presses)
+        if event.event_type == "postback" {
+            if let (Some(reply_token), Some(postback)) = (&event.reply_token, &event.postback) {
+                let action = postback.data.strip_prefix("duduclaw:").unwrap_or(&postback.data);
+                let reply_text = match action {
+                    "new_session" => "New session started.",
+                    _ => "OK",
+                };
+                let msg = serde_json::json!({ "type": "text", "text": reply_text });
+                send_reply_rich(&state.http, &state.token, reply_token, msg, None).await;
+            }
+            continue;
+        }
+
         if event.event_type != "message" {
             continue;
         }
@@ -191,9 +221,28 @@ async fn line_webhook_handler(
             && let Some(text) = &msg.text
             && let Some(reply_token) = &event.reply_token
         {
-            let sender = event
-                .source
-                .as_ref()
+            let source = &event.source;
+            let source_type = source.as_ref().and_then(|s| s.source_type.as_deref()).unwrap_or("user");
+            let is_group = source_type == "group" || source_type == "room";
+            let scope_id = source.as_ref()
+                .and_then(|s| s.group_id.as_deref().or(s.room_id.as_deref()))
+                .unwrap_or("global");
+
+            // ── Channel whitelist (group chats only) ──
+            if is_group && !state.ctx.channel_settings.is_channel_allowed("line", "global", scope_id).await {
+                continue;
+            }
+
+            // ── Mention-only mode (group chats only, LINE has no native @mention) ──
+            let mention_only = state.ctx.channel_settings.get_bool("line", scope_id, keys::MENTION_ONLY, false).await;
+            if is_group && mention_only {
+                // LINE has no structured mention system; skip unless text starts with bot name
+                // In practice, mention_only for LINE groups means the bot won't respond at all
+                // unless explicitly mentioned by name in the text (future: configurable trigger word)
+                continue;
+            }
+
+            let sender = source.as_ref()
                 .and_then(|s| s.user_id.as_deref())
                 .unwrap_or("unknown");
 
@@ -232,7 +281,15 @@ async fn line_webhook_handler(
             };
 
             let reply = build_reply_with_progress(text, &state.ctx, on_progress).await;
-            send_reply(&state.http, &state.token, reply_token, &reply).await;
+
+            // Use Flex Message for long replies, plain text for short ones
+            let agent_name = {
+                let reg = state.ctx.registry.read().await;
+                reg.main_agent().map(|a| a.config.agent.display_name.clone())
+            };
+            let flex_msg = channel_format::to_line_flex_message(&reply, agent_name.as_deref());
+            let quick_reply = channel_format::line_conversation_quick_reply();
+            send_reply_rich(&state.http, &state.token, reply_token, flex_msg, Some(quick_reply)).await;
         }
     }
 
@@ -266,14 +323,25 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     acc == 0
 }
 
-async fn send_reply(http: &reqwest::Client, token: &str, reply_token: &str, text: &str) {
-    let body = LineReplyBody {
-        reply_token: reply_token.to_string(),
-        messages: vec![LineReplyMessage {
-            msg_type: "text".to_string(),
-            text: text.to_string(),
-        }],
-    };
+/// Send a rich reply (Flex Message, Quick Reply, etc.) via the LINE Reply API.
+async fn send_reply_rich(
+    http: &reqwest::Client,
+    token: &str,
+    reply_token: &str,
+    message: serde_json::Value,
+    quick_reply: Option<serde_json::Value>,
+) {
+    let mut msg = message;
+    if let Some(qr) = quick_reply {
+        if let Some(obj) = msg.as_object_mut() {
+            obj.insert("quickReply".to_string(), qr);
+        }
+    }
+
+    let body = serde_json::json!({
+        "replyToken": reply_token,
+        "messages": [msg]
+    });
 
     match http
         .post(format!("{LINE_API}/message/reply"))

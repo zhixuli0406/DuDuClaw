@@ -94,6 +94,7 @@ impl InferenceBackend for OpenAiCompatBackend {
             quantization: "unknown".to_string(),
             file_size_bytes: 0,
             estimated_memory_mb: 0,
+            kv_cache_mb: 0, // remote — managed by server
             is_loaded: true,
             context_length: 4096,
         };

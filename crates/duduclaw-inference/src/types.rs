@@ -51,12 +51,60 @@ pub struct ModelInfo {
     pub quantization: String,
     /// File size in bytes
     pub file_size_bytes: u64,
-    /// Estimated VRAM/RAM required in MB
+    /// Estimated VRAM/RAM for model weights in MB
     pub estimated_memory_mb: u64,
+    /// Estimated KV cache memory in MB (based on context_length).
+    /// 0 if parameter count is unknown or remote backend.
+    pub kv_cache_mb: u64,
     /// Whether the model is currently loaded
     pub is_loaded: bool,
     /// Context length supported
     pub context_length: u32,
+}
+
+impl ModelInfo {
+    /// Estimate KV cache memory in MB based on parameter count and context length.
+    ///
+    /// Uses a lookup table of approximate FP16 KV bytes-per-token for typical GQA
+    /// architectures (LLaMA 3, Qwen 2/3, Gemma 2, Mistral). MHA models (e.g. Phi-2)
+    /// may use significantly more — treat these as lower-bound estimates.
+    ///
+    /// Returns 0 if `param_count` cannot be parsed (e.g. "unknown", "auto").
+    pub fn estimate_kv_cache_mb(param_count: &str, context_length: u32) -> u64 {
+        let Some(params_b) = parse_param_billions(param_count) else {
+            return 0;
+        };
+
+        // Approximate FP16 KV bytes per token by parameter bucket.
+        // Based on typical GQA configs; MHA models will be higher.
+        let kv_bytes_per_token: u64 = if params_b <= 1.0 {
+            24_576       // ~24 KB/token  (e.g., Qwen3-0.6B, SmolLM)
+        } else if params_b <= 3.0 {
+            49_152       // ~48 KB/token  (e.g., Gemma-2B)
+        } else if params_b <= 5.0 {
+            73_728       // ~72 KB/token  (e.g., Gemma-4B)
+        } else if params_b <= 10.0 {
+            131_072      // ~128 KB/token (e.g., LLaMA-3-8B, Qwen3-8B)
+        } else if params_b <= 20.0 {
+            196_608      // ~192 KB/token (e.g., LLaMA-3-13B)
+        } else if params_b <= 40.0 {
+            262_144      // ~256 KB/token (e.g., CodeLlama-34B)
+        } else if params_b <= 80.0 {
+            327_680      // ~320 KB/token (e.g., LLaMA-3-70B, Qwen2-72B)
+        } else {
+            524_288      // ~512 KB/token (e.g., LLaMA-405B)
+        };
+
+        (context_length as u64) * kv_bytes_per_token / (1024 * 1024)
+    }
+}
+
+/// Parse parameter count string (e.g., "8B", "0.6B", "72B") to f64 billions.
+/// Returns `None` for unparseable values like "unknown" or "auto".
+fn parse_param_billions(param_count: &str) -> Option<f64> {
+    let lower = param_count.to_lowercase();
+    let num_str = lower.trim_end_matches('b');
+    num_str.parse::<f64>().ok()
 }
 
 /// Parameters for text generation.

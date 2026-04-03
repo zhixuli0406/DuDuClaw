@@ -224,7 +224,7 @@ impl InferenceEngine {
         let path_str = model_path.to_string_lossy().to_string();
 
         let info = backend.load_model(&path_str, &self.config.generation).await?;
-        self.model_manager.set_loaded(&info.id).await;
+        self.model_manager.set_loaded(&info.id, info.context_length).await;
         Ok(info)
     }
 

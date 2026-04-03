@@ -1,5 +1,7 @@
 pub mod auth;
+pub mod channel_format;
 pub mod channel_reply;
+pub mod channel_settings;
 pub mod config_crypto;
 pub mod claude_runner;
 pub mod cost_telemetry;

@@ -875,17 +875,32 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
                 2 => {
                     println!();
                     println!("  {} {}", style("🎮").bold(), style("Discord 設定指南").bold());
-                    println!("    1. 前往 {}", style("https://discord.com/developers/applications").cyan());
-                    println!("    2. 點選 {} 建立 Application", style("New Application").yellow());
-                    println!("    3. 左側選單 → {} → Reset Token → 複製 Token", style("Bot").yellow());
-                    println!("    4. {} 啟用以下 Privileged Gateway Intents：", style("重要！").red().bold());
-                    println!("       - {} ✅ 必須開啟", style("MESSAGE CONTENT INTENT").yellow().bold());
-                    println!("       - {} ✅ 建議開啟", style("SERVER MEMBERS INTENT").yellow());
-                    println!("    5. 左側 → OAuth2 → URL Generator：");
-                    println!("       - Scopes：勾選 {}", style("bot").yellow());
-                    println!("       - Bot Permissions：勾選 {} + {} + {}",
-                        style("Send Messages").yellow(), style("Read Message History").yellow(), style("View Channels").yellow());
-                    println!("    6. 複製產生的 URL，在瀏覽器開啟，邀請 Bot 加入你的伺服器");
+                    println!();
+                    println!("    {} {}", style("【Step 1】").bold(), "建立 Application");
+                    println!("    前往 {}", style("https://discord.com/developers/applications").cyan());
+                    println!("    點選 {} 建立 Application", style("New Application").yellow());
+                    println!();
+                    println!("    {} {}", style("【Step 2】").bold(), "取得 Bot Token");
+                    println!("    左側選單 → {} → Reset Token → 複製 Token", style("Bot").yellow());
+                    println!();
+                    println!("    {} {}", style("【Step 3】").bold(), style("啟用 Privileged Gateway Intents").red().bold());
+                    println!("    在 Bot 頁面往下捲到 {}，開啟以下三項：", style("Privileged Gateway Intents").yellow());
+                    println!("      {} {} — Bot 才能讀取訊息內容", style("☑ MESSAGE CONTENT INTENT").yellow().bold(), style("（必須）").red().bold());
+                    println!("      {} {} — 接收伺服器成員資訊", style("☑ SERVER MEMBERS INTENT").yellow(), style("（建議）").dim());
+                    println!("      {} {} — 接收上線狀態", style("☑ PRESENCE INTENT").yellow(), style("（選用）").dim());
+                    println!("    ⚠  未開啟 MESSAGE CONTENT INTENT 將導致 Bot 完全無法收到訊息！");
+                    println!();
+                    println!("    {} {}", style("【Step 4】").bold(), "設定 Bot 權限並邀請至伺服器");
+                    println!("    左側 → {} → {}：", style("OAuth2").yellow(), style("URL Generator").yellow());
+                    println!("      Scopes：勾選 {}", style("bot").yellow());
+                    println!("      Bot Permissions（文字權限）：");
+                    println!("        {} — 傳送回覆訊息", style("☑ Send Messages（傳送訊息）").yellow());
+                    println!("        {} — 讀取對話上下文", style("☑ Read Message History（讀取訊息歷史記錄）").yellow());
+                    println!("      Bot Permissions（一般權限）：");
+                    println!("        {} — 存取頻道列表", style("☑ View Channels（檢視頻道）").yellow());
+                    println!("    複製產生的 URL，在瀏覽器開啟，邀請 Bot 加入你的伺服器");
+                    println!();
+                    println!("    {} 若先前已邀請但權限不足，需用新 URL 重新邀請才會更新權限", style("💡").bold());
                     println!();
                     discord_token = Password::new()
                         .with_prompt("Discord Bot Token")

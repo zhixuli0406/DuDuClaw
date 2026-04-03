@@ -314,6 +314,32 @@ impl SessionManager {
 
     /// Remove sessions that have been inactive for longer than `max_age_hours`.
     /// Returns the number of sessions removed.
+    /// Delete a session and all its messages. Used by /reset commands.
+    /// Uses a transaction to ensure atomicity (consistent with compress()).
+    pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+        let conn = self.acquire().await;
+        let tx = conn.unchecked_transaction()
+            .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
+
+        tx.execute(
+            "DELETE FROM session_messages WHERE session_id = ?1",
+            params![session_id],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+
+        tx.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            params![session_id],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+
+        tx.commit()
+            .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
+
+        info!(session_id, "Session deleted");
+        Ok(())
+    }
+
     pub async fn cleanup_inactive(&self, max_age_hours: u64) -> Result<u64> {
         let conn = self.acquire().await;
         let cutoff = chrono::Utc::now() - chrono::Duration::hours(max_age_hours as i64);

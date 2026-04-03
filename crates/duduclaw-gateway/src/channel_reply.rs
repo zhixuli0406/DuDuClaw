@@ -11,6 +11,7 @@ use duduclaw_agent::registry::AgentRegistry;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::channel_settings::ChannelSettingsManager;
 use crate::handlers::ChannelState;
 use crate::gvu::loop_::GvuLoop;
 use crate::prediction::engine::PredictionEngine;
@@ -43,6 +44,8 @@ pub struct ReplyContext {
     pub skill_lift: Arc<tokio::sync::Mutex<LiftTrackerStore>>,
     /// Sessions with voice reply mode enabled (toggled by /voice command).
     pub voice_sessions: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Per-channel, per-scope settings (mention_only, whitelist, auto_thread, etc.).
+    pub channel_settings: Arc<ChannelSettingsManager>,
 }
 
 impl ReplyContext {
@@ -56,6 +59,14 @@ impl ReplyContext {
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .unwrap_or_default();
+        // Co-locate channel settings in the session database
+        let db_path = home_dir.join("sessions.db");
+        let channel_settings = ChannelSettingsManager::from_session_db(&db_path)
+            .unwrap_or_else(|e| {
+                warn!("Channel settings init failed ({e}), using in-memory fallback");
+                ChannelSettingsManager::new(Path::new(":memory:"))
+                    .expect("in-memory DB should always succeed")
+            });
         Self {
             registry,
             home_dir,
@@ -68,6 +79,7 @@ impl ReplyContext {
             skill_activation: Arc::new(tokio::sync::Mutex::new(SkillActivationController::new(5))),
             skill_lift: Arc::new(tokio::sync::Mutex::new(LiftTrackerStore::new())),
             voice_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            channel_settings: Arc::new(channel_settings),
         }
     }
 
