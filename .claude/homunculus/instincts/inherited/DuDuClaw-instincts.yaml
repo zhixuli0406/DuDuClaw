@@ -1,0 +1,299 @@
+# Instincts generated from https://github.com/zhixuli0406/DuDuClaw
+# Generated: 2026-04-03T02:37:29.906Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: DuDuClaw-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: feat
+
+## Evidence
+
+- 1 commits analyzed
+- Detected conventional commit pattern
+- Examples: feat: support per-agent Discord bot tokens
+
+---
+id: DuDuClaw-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Commit Length
+
+## Action
+
+Keep commit messages concise (~42 characters)
+
+## Evidence
+
+- Average commit message length: 42 chars
+- Based on 1 commits
+
+---
+id: DuDuClaw-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: DuDuClaw-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: DuDuClaw-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: DuDuClaw-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: duduclaw-instinct-filename-camelcase
+trigger: "When creating a new file in the codebase"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct Filename Camelcase
+
+## Action
+
+Name the file using camelCase convention
+
+## Evidence
+
+- Pattern in namingConventions.files: camelCase
+
+---
+id: duduclaw-instinct-function-camelcase
+trigger: "When defining a new function"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct Function Camelcase
+
+## Action
+
+Name the function using camelCase convention
+
+## Evidence
+
+- Pattern in namingConventions.functions: camelCase
+
+---
+id: duduclaw-instinct-class-pascalcase
+trigger: "When defining a new class or struct"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct Class Pascalcase
+
+## Action
+
+Name the class or struct using PascalCase convention
+
+## Evidence
+
+- Pattern in namingConventions.classes: PascalCase
+
+---
+id: duduclaw-instinct-constant-screaming-snake
+trigger: "When defining a constant"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct Constant Screaming Snake
+
+## Action
+
+Name the constant using SCREAMING_SNAKE_CASE convention
+
+## Evidence
+
+- Pattern in namingConventions.constants: SCREAMING_SNAKE_CASE
+
+---
+id: duduclaw-instinct-import-relative
+trigger: "When importing modules within the codebase"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct Import Relative
+
+## Action
+
+Use relative import paths
+
+## Evidence
+
+- Pattern in importStyle: relative
+
+---
+id: duduclaw-instinct-export-named
+trigger: "When exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct Export Named
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in exportStyle: named
+
+---
+id: duduclaw-instinct-test-separate-location
+trigger: "When adding or organizing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct Test Separate Location
+
+## Action
+
+Place test files in a separate location from source files
+
+## Evidence
+
+- Pattern in architecture.testLocation: separate
+
+---
+id: duduclaw-instinct-commit-conventional-feat
+trigger: "When making a commit that adds a new feature"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct Commit Conventional Feat
+
+## Action
+
+Prefix the commit message with 'feat:' following conventional commit format
+
+## Evidence
+
+- Seen in commit: 'feat: support per-agent Discord bot tokens'
+- Pattern in commits.prefixes: feat
+
+---
+id: duduclaw-instinct-commit-length
+trigger: "When writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct Commit Length
+
+## Action
+
+Keep the commit message concise, around 42 characters on average
+
+## Evidence
+
+- Pattern in commits.averageLength: 42
+
