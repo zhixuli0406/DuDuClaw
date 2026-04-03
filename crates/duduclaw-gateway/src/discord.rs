@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
 use crate::channel_format::{self, split_text};
-use crate::channel_reply::{ReplyContext, build_reply_with_session, set_channel_connected};
+use crate::channel_reply::{ReplyContext, build_reply_for_agent, build_reply_with_session, set_channel_connected};
 use crate::channel_settings::keys;
 
 const DISCORD_API: &str = "https://discord.com/api/v10";
@@ -277,7 +277,168 @@ pub async fn start_discord_bot(
     info!("   ⚠ 請確認 Discord Developer Portal 已啟用 MESSAGE CONTENT Intent");
 
     let handle = tokio::spawn(async move {
-        gateway_loop(token, bot_id, app_id, gateway_url, http, ctx).await;
+        gateway_loop(token, bot_id, app_id, gateway_url, http, ctx, None).await;
+    });
+
+    Some(handle)
+}
+
+/// Start multiple Discord bots: one global (from config.toml) plus per-agent bots.
+///
+/// Returns a Vec of (label, JoinHandle) where label is "discord" for the global
+/// bot and "discord:{agent_name}" for per-agent bots.
+/// Deduplicates by token value — if an agent token matches the global token, it
+/// is skipped (the global bot already covers it).
+pub async fn start_discord_bots(
+    home_dir: &Path,
+    ctx: Arc<ReplyContext>,
+) -> Vec<(String, tokio::task::JoinHandle<()>)> {
+    let mut results: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
+    let mut seen_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 1. Global bot from config.toml
+    if let Some(token) = read_discord_token(home_dir).await {
+        if !token.is_empty() {
+            seen_tokens.insert(token.clone());
+            if let Some(handle) = spawn_discord_bot(token, "discord".to_string(), None, ctx.clone(), home_dir).await {
+                results.push(("discord".to_string(), handle));
+            }
+        }
+    }
+
+    // 2. Per-agent bots from agent configs
+    let agent_tokens: Vec<(String, String)> = {
+        let reg = ctx.registry.read().await;
+        let mut tokens = Vec::new();
+        for agent in reg.list() {
+            if let Some(channels) = &agent.config.channels {
+                if let Some(discord) = &channels.discord {
+                    let token = if let Some(enc) = &discord.bot_token_enc {
+                        if !enc.is_empty() {
+                            crate::config_crypto::decrypt_value(enc, home_dir)
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+                    let token = if token.is_empty() {
+                        discord.bot_token.clone()
+                    } else {
+                        token
+                    };
+                    if !token.is_empty() {
+                        tokens.push((agent.config.agent.name.clone(), token));
+                    }
+                }
+            }
+        }
+        tokens
+    };
+
+    for (agent_name, token) in agent_tokens {
+        if seen_tokens.contains(&token) {
+            info!("Discord bot for agent '{agent_name}' shares global token — skipping duplicate");
+            continue;
+        }
+        seen_tokens.insert(token.clone());
+        let label = format!("discord:{agent_name}");
+        if let Some(handle) = spawn_discord_bot(token, label.clone(), Some(agent_name), ctx.clone(), home_dir).await {
+            results.push((label, handle));
+        }
+    }
+
+    results
+}
+
+/// Spawn a single Discord bot connection (shared by global and per-agent paths).
+async fn spawn_discord_bot(
+    token: String,
+    label: String,
+    agent_name: Option<String>,
+    ctx: Arc<ReplyContext>,
+    home_dir: &Path,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .ok()?;
+
+    let channel_status = ctx.channel_status.clone();
+
+    // Verify token + get bot user info
+    let bot_id = match http
+        .get(format!("{DISCORD_API}/users/@me"))
+        .header("Authorization", format!("Bot {token}"))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(data) = resp.json::<Value>().await {
+                let name = data["username"].as_str().unwrap_or("unknown");
+                let id = data["id"].as_str().unwrap_or("").to_string();
+                info!("🎮 Discord bot [{label}] connected: {name} ({id})");
+                id
+            } else {
+                return None;
+            }
+        }
+        Ok(resp) => {
+            warn!("Discord bot [{label}] token invalid (HTTP {})", resp.status());
+            set_channel_connected(&channel_status, &label, false, Some("token invalid".into())).await;
+            return None;
+        }
+        Err(e) => {
+            warn!("Discord [{label}] connection failed: {e}");
+            set_channel_connected(&channel_status, &label, false, Some(e.to_string())).await;
+            return None;
+        }
+    };
+
+    // Get application ID
+    let app_id = match http
+        .get(format!("{DISCORD_API}/applications/@me"))
+        .header("Authorization", format!("Bot {token}"))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(data) = resp.json::<Value>().await {
+                data["id"].as_str().unwrap_or("").to_string()
+            } else {
+                bot_id.clone()
+            }
+        }
+        _ => bot_id.clone(),
+    };
+
+    // Only register slash commands for the global bot
+    if agent_name.is_none() {
+        register_slash_commands(&http, &token, &app_id).await;
+    }
+
+    let gateway_url = match http
+        .get(format!("{DISCORD_API}/gateway/bot"))
+        .header("Authorization", format!("Bot {token}"))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if let Ok(info) = resp.json::<GatewayInfo>().await {
+                info.url.unwrap_or_else(|| "wss://gateway.discord.gg".to_string())
+            } else {
+                "wss://gateway.discord.gg".to_string()
+            }
+        }
+        Err(_) => "wss://gateway.discord.gg".to_string(),
+    };
+
+    let gateway_url = format!("{gateway_url}/?v=10&encoding=json");
+    info!("   Discord [{label}] Gateway: {gateway_url}");
+
+    let handle = tokio::spawn(async move {
+        gateway_loop(token, bot_id, app_id, gateway_url, http, ctx, agent_name).await;
     });
 
     Some(handle)
@@ -327,6 +488,7 @@ async fn gateway_loop(
     gateway_url: String,
     http: reqwest::Client,
     ctx: Arc<ReplyContext>,
+    agent_name: Option<String>,
 ) {
     let channel_status = ctx.channel_status.clone();
 
@@ -466,9 +628,10 @@ async fn gateway_loop(
                                             let token = token.clone();
                                             let bot_id = bot_id.clone();
                                             let ctx = ctx.clone();
+                                            let agent = agent_name.clone();
                                             tokio::spawn(async move {
                                                 let _permit = HANDLER_SEMAPHORE.acquire().await;
-                                                handle_message_create(&d, &bot_id, &http, &token, &ctx).await;
+                                                handle_message_create(&d, &bot_id, &http, &token, &ctx, agent.as_deref()).await;
                                             });
                                         }
                                     }
@@ -556,6 +719,7 @@ async fn handle_message_create(
     http: &reqwest::Client,
     token: &str,
     ctx: &Arc<ReplyContext>,
+    agent_name: Option<&str>,
 ) {
     // Ignore messages from the bot itself or other bots
     let author = data.get("author");
@@ -698,19 +862,23 @@ async fn handle_message_create(
         });
     });
 
-    // ── Get agent name for embed footer ──
-    let agent_name = {
+    // ── Get agent display name for embed footer ──
+    let display_name = {
         let reg = ctx.registry.read().await;
         reg.main_agent().map(|a| a.config.agent.display_name.clone())
     };
 
-    let reply = build_reply_with_session(clean_content, ctx, &session_id, user_id, Some(on_progress)).await;
+    let reply = if let Some(agent) = agent_name {
+        build_reply_for_agent(clean_content, ctx, agent, &session_id, user_id, Some(on_progress)).await
+    } else {
+        build_reply_with_session(clean_content, ctx, &session_id, user_id, Some(on_progress)).await
+    };
 
     // Stop typing (explicit drop; also runs automatically on panic via Drop)
     drop(typing_guard);
 
     // ── Send reply with embed + buttons ──
-    let mut payload = channel_format::to_discord_message(&reply, agent_name.as_deref(), false);
+    let mut payload = channel_format::to_discord_message(&reply, display_name.as_deref(), false);
 
     // Add conversation buttons
     let buttons = channel_format::discord_conversation_buttons(&session_id);

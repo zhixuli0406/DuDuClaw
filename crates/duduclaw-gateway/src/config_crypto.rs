@@ -30,7 +30,7 @@ fn load_keyfile(home_dir: &Path) -> Option<[u8; 32]> {
 }
 
 /// Decrypt a base64-encoded encrypted value using the per-machine keyfile.
-fn decrypt_value(encrypted: &str, home_dir: &Path) -> Option<String> {
+pub(crate) fn decrypt_value(encrypted: &str, home_dir: &Path) -> Option<String> {
     let key = load_keyfile(home_dir).or_else(|| {
         tracing::warn!("Keyfile not found — cannot decrypt config value");
         None

@@ -309,6 +309,25 @@ pub struct ExternalFactorsConfig {
     pub peer_signals: bool,
 }
 
+/// Per-agent channel configuration (e.g., dedicated Discord bot token).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct ChannelsConfig {
+    pub discord: Option<DiscordChannelConfig>,
+}
+
+/// Per-agent Discord channel settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DiscordChannelConfig {
+    /// Plain-text bot token (or encrypted via `bot_token_enc`).
+    #[serde(default)]
+    pub bot_token: String,
+    /// AES-256-GCM encrypted bot token (base64).
+    #[serde(default)]
+    pub bot_token_enc: Option<String>,
+}
+
 /// Top-level agent identity (the `[agent]` table in agent.toml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -340,6 +359,9 @@ pub struct AgentConfig {
     /// Proactive behavior configuration (PROACTIVE.md execution + notification).
     #[serde(default)]
     pub proactive: ProactiveConfig,
+    /// Per-agent channel configuration (e.g., dedicated Discord bot token).
+    #[serde(default)]
+    pub channels: Option<ChannelsConfig>,
 }
 
 /// Proactive agent configuration — scheduled checks + user notification.

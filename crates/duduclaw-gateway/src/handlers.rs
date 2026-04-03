@@ -1030,6 +1030,18 @@ impl MethodHandler {
             }
         }
 
+        // Include per-agent Discord bots (keys like "discord:{agent_name}")
+        for (key, state) in runtime_status.iter() {
+            if key.starts_with("discord:") {
+                channels.push(json!({
+                    "name": key,
+                    "connected": state.connected,
+                    "last_connected": state.last_event.as_ref().map(|t| t.to_rfc3339()),
+                    "error": state.error.clone(),
+                }));
+            }
+        }
+
         WsFrame::ok_response("", json!({ "channels": channels }))
     }
 
