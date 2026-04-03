@@ -19,8 +19,8 @@ crates/duduclaw-dashboard/dist/
 # Internal tools (not for public distribution)
 tools/license-keygen/
 
-# Claude Code worktrees
-.claude/worktrees/
+# Claude Code local config & hooks
+.claude/
 
 # Commercial closed-source modules (not pushed to public repo)
 commercial/
