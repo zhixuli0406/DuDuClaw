@@ -492,8 +492,44 @@ async fn gateway_loop(
     agent_name: Option<String>,
 ) {
     let channel_status = ctx.channel_status.clone();
+    let mut consecutive_failures: u32 = 0;
+    const MAX_FAILURES: u32 = 10;
 
     loop {
+        // Exponential backoff: 5s, 10s, 20s, 40s, ... capped at 300s (5min)
+        if consecutive_failures > 0 {
+            let backoff = std::cmp::min(5u64 << consecutive_failures.min(6), 300);
+            warn!("Discord [{label}] reconnecting in {backoff}s (attempt {consecutive_failures}/{MAX_FAILURES})");
+            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+        }
+
+        // Re-verify token before reconnecting to avoid hammering Discord
+        if consecutive_failures >= 2 {
+            match http.get(format!("{DISCORD_API}/users/@me"))
+                .header("Authorization", format!("Bot {token}"))
+                .send().await
+            {
+                Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                    error!("Discord [{label}] token is invalid (401), stopping bot");
+                    set_channel_connected(&channel_status, &label, false, Some("token invalid — update via Dashboard".into())).await;
+                    return;
+                }
+                Ok(resp) if resp.status().as_u16() == 429 => {
+                    warn!("Discord [{label}] rate limited during token check, waiting 60s");
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    continue;
+                }
+                Err(_) => {} // network error, proceed to try gateway anyway
+                _ => {} // token ok
+            }
+        }
+
+        if consecutive_failures >= MAX_FAILURES {
+            error!("Discord [{label}] {MAX_FAILURES} consecutive failures, stopping bot");
+            set_channel_connected(&channel_status, &label, false, Some(format!("stopped after {MAX_FAILURES} failures — check token"))).await;
+            return;
+        }
+
         info!("Discord [{label}] Gateway connecting...");
         set_channel_connected(&channel_status, &label, false, Some("connecting".into())).await;
 
@@ -508,13 +544,13 @@ async fn gateway_loop(
             Ok(Err(e)) => {
                 warn!("Discord [{label}] Gateway connection failed: {e}");
                 set_channel_connected(&channel_status, &label, false, Some(e.to_string())).await;
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                consecutive_failures += 1;
                 continue;
             }
             Err(_) => {
                 warn!("Discord [{label}] Gateway connection timeout (15s)");
                 set_channel_connected(&channel_status, &label, false, Some("Connection timeout".into())).await;
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                consecutive_failures += 1;
                 continue;
             }
         };
@@ -549,7 +585,20 @@ async fn gateway_loop(
                             }
                             continue;
                         }
-                        Some(Ok(Message::Close(_))) => { warn!("Discord Gateway closed"); break; }
+                        Some(Ok(Message::Close(frame))) => {
+                            let code = frame.as_ref().map(|f| f.code);
+                            warn!("Discord [{label}] Gateway closed (code: {code:?})");
+                            // 4004 = Authentication failed, 4014 = Disallowed intents
+                            if matches!(code, Some(c) if c == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(4004)
+                                || c == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(4014))
+                            {
+                                let msg = if code == Some(4004.into()) { "authentication failed" } else { "disallowed intents" };
+                                error!("Discord [{label}] fatal close: {msg}, stopping bot");
+                                set_channel_connected(&channel_status, &label, false, Some(format!("{msg} — update via Dashboard"))).await;
+                                return;
+                            }
+                            break;
+                        }
                         Some(Err(e)) => { warn!("Discord Gateway error: {e}"); break; }
                         None => break,
                         _ => continue,
@@ -651,6 +700,7 @@ async fn gateway_loop(
                                     }
                                     "READY" => {
                                         info!("Discord [{label}] Gateway READY");
+                                        consecutive_failures = 0;
                                         set_channel_connected(&channel_status, &label, true, None).await;
                                     }
                                     "GUILD_CREATE" => {
@@ -675,7 +725,7 @@ async fn gateway_loop(
                             warn!("Discord [{label}] Gateway invalid session");
                             set_channel_connected(&channel_status, &label, false, Some("invalid session".to_string())).await;
                             _identified = false;
-                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            consecutive_failures += 1;
                             break;
                         }
 
@@ -706,9 +756,8 @@ async fn gateway_loop(
         drop(guard);
 
         let _ = _identified;
+        consecutive_failures += 1;
         set_channel_connected(&channel_status, &label, false, Some("reconnecting".to_string())).await;
-        warn!("Discord [{label}] Gateway disconnected, reconnecting in 5s...");
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }
 
