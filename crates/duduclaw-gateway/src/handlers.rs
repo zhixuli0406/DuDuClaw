@@ -1125,9 +1125,45 @@ impl MethodHandler {
             }
         }
 
-        // Include per-agent bots (keys like "discord:{agent_name}", "telegram:{agent_name}", etc.)
+        // Include per-agent channels from agent registry configs
+        let mut seen_labels = std::collections::HashSet::new();
+        {
+            let reg = self.registry.read().await;
+            for agent in reg.list() {
+                if let Some(ch) = &agent.config.channels {
+                    let name = &agent.config.agent.name;
+                    let pairs: &[(&str, bool)] = &[
+                        ("discord", ch.discord.as_ref().is_some_and(|d| !d.bot_token.is_empty() || d.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty()))),
+                        ("telegram", ch.telegram.as_ref().is_some_and(|t| !t.bot_token.is_empty() || t.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty()))),
+                        ("slack", ch.slack.as_ref().is_some_and(|s| !s.bot_token.is_empty() || s.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty()))),
+                    ];
+                    for &(platform, configured) in pairs {
+                        if configured {
+                            let label = format!("{platform}:{name}");
+                            seen_labels.insert(label.clone());
+                            let (connected, last_ts, error) = match runtime_status.get(&label) {
+                                Some(state) => (
+                                    state.connected,
+                                    state.last_event.as_ref().map(|t| t.to_rfc3339()),
+                                    state.error.clone(),
+                                ),
+                                None => (false, None, Some("connecting".to_string())),
+                            };
+                            channels.push(json!({
+                                "name": label,
+                                "connected": connected,
+                                "last_connected": last_ts,
+                                "error": error,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also include runtime-only per-agent entries not yet in registry (edge case)
         for (key, state) in runtime_status.iter() {
-            if key.contains(':') {
+            if key.contains(':') && !seen_labels.contains(key.as_str()) {
                 channels.push(json!({
                     "name": key,
                     "connected": state.connected,
