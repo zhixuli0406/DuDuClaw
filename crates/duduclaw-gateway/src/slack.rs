@@ -126,7 +126,7 @@ async fn spawn_slack_bot(
 
     let handle = tokio::spawn(async move {
         loop {
-            match run_socket_mode(&app_token, &bot_token, &ctx, agent_name.as_deref()).await {
+            match run_socket_mode(&app_token, &bot_token, &ctx, &label, agent_name.as_deref()).await {
                 Ok(()) => info!("Slack Socket Mode disconnected ({label})"),
                 Err(e) => warn!("Slack Socket Mode error ({label}): {e}"),
             }
@@ -144,6 +144,7 @@ async fn run_socket_mode(
     app_token: &str,
     bot_token: &str,
     ctx: &Arc<ReplyContext>,
+    label: &str,
     agent_name: Option<&str>,
 ) -> Result<(), String> {
     // Use shared HTTP client (Fix CR-G9)
@@ -196,8 +197,8 @@ async fn run_socket_mode(
         info!("Slack bot user ID: {bot_user_id}");
     }
 
-    info!("Slack Socket Mode connected");
-    set_channel_connected(&ctx.channel_status, "slack", true, None).await;
+    info!("Slack [{label}] Socket Mode connected");
+    set_channel_connected(&ctx.channel_status, label, true, None).await;
 
     // Connect WebSocket
     let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
@@ -239,7 +240,7 @@ async fn run_socket_mode(
         }
     }
 
-    set_channel_connected(&ctx.channel_status, "slack", false, None).await;
+    set_channel_connected(&ctx.channel_status, label, false, None).await;
     Ok(())
 }
 

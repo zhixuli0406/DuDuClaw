@@ -235,7 +235,7 @@ async fn spawn_telegram_bot(
     }
 
     let handle = tokio::spawn(async move {
-        poll_loop(client, api_base, ctx, agent_name).await;
+        poll_loop(client, api_base, ctx, label, agent_name).await;
     });
 
     Some(handle)
@@ -280,6 +280,7 @@ async fn poll_loop(
     client: reqwest::Client,
     api_base: String,
     ctx: Arc<ReplyContext>,
+    label: String,
     agent_name: Option<String>,
 ) {
     let mut offset: i64 = 0;
@@ -297,7 +298,7 @@ async fn poll_loop(
             Err(e) => {
                 consecutive_errors += 1;
                 warn!("Telegram poll error: {e}");
-                set_channel_connected(&ctx.channel_status, "telegram", false, Some(e.to_string())).await;
+                set_channel_connected(&ctx.channel_status, &label, false, Some(e.to_string())).await;
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 continue;
             }
@@ -307,8 +308,8 @@ async fn poll_loop(
             Ok(d) => d,
             Err(e) => {
                 consecutive_errors += 1;
-                warn!("Telegram parse error: {e}");
-                set_channel_connected(&ctx.channel_status, "telegram", false, Some(e.to_string())).await;
+                warn!("Telegram [{label}] parse error: {e}");
+                set_channel_connected(&ctx.channel_status, &label, false, Some(e.to_string())).await;
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 continue;
             }
@@ -317,17 +318,17 @@ async fn poll_loop(
         if !data.ok {
             consecutive_errors += 1;
             let desc = data.description.unwrap_or_default();
-            warn!("Telegram API error: {desc}");
-            set_channel_connected(&ctx.channel_status, "telegram", false, Some(desc)).await;
+            warn!("Telegram [{label}] API error: {desc}");
+            set_channel_connected(&ctx.channel_status, &label, false, Some(desc)).await;
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             continue;
         }
 
         if consecutive_errors > 0 {
-            info!("Telegram polling recovered after {consecutive_errors} errors");
+            info!("Telegram [{label}] polling recovered after {consecutive_errors} errors");
         }
         consecutive_errors = 0;
-        set_channel_connected(&ctx.channel_status, "telegram", true, None).await;
+        set_channel_connected(&ctx.channel_status, &label, true, None).await;
 
         if let Some(updates) = data.result {
             for update in updates {
