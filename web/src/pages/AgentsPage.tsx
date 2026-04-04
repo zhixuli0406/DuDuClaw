@@ -700,29 +700,74 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
           )}
 
           {tab === 'channels' && (
-            <>
-              <div className="space-y-3">
-                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400 mb-2">
-                  Discord Bot (Per-Agent)
-                </h4>
-                <p className="text-xs text-stone-400 dark:text-stone-500">
-                  Set a dedicated Discord bot token for this agent. The agent will appear as its own Discord bot user. Leave empty to use the global bot.
-                </p>
+            <div className="space-y-5">
+              <p className="text-xs text-stone-400 dark:text-stone-500">
+                Set dedicated bot tokens for this agent. Each configured channel will appear as this agent&apos;s own bot. Leave empty to use the global channel.
+              </p>
+
+              {/* Discord */}
+              <div className="space-y-2 border-b border-stone-200 pb-4 dark:border-stone-700">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">Discord</h4>
                 <FormField label="Bot Token">
-                  <input
-                    type="password"
-                    value={form.discord_bot_token ?? ''}
-                    onChange={(e) => updateField('discord_bot_token', e.target.value)}
-                    placeholder="MTIzNDU2Nzg5..."
-                    className={inputClass}
-                    autoComplete="off"
-                  />
+                  <input type="password" value={form.discord_bot_token ?? ''} onChange={(e) => updateField('discord_bot_token', e.target.value)} placeholder="MTIzNDU2Nzg5..." className={inputClass} autoComplete="off" />
                 </FormField>
-                <p className="text-xs text-stone-400 dark:text-stone-500">
-                  Token will be encrypted and stored in agent.toml. Requires restart to take effect.
-                </p>
               </div>
-            </>
+
+              {/* Telegram */}
+              <div className="space-y-2 border-b border-stone-200 pb-4 dark:border-stone-700">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">Telegram</h4>
+                <FormField label="Bot Token">
+                  <input type="password" value={form.telegram_bot_token ?? ''} onChange={(e) => updateField('telegram_bot_token', e.target.value)} placeholder="123456:ABC-DEF..." className={inputClass} autoComplete="off" />
+                </FormField>
+              </div>
+
+              {/* LINE */}
+              <div className="space-y-2 border-b border-stone-200 pb-4 dark:border-stone-700">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">LINE</h4>
+                <FormField label="Channel Token">
+                  <input type="password" value={form.line_channel_token ?? ''} onChange={(e) => updateField('line_channel_token', e.target.value)} className={inputClass} autoComplete="off" />
+                </FormField>
+                <FormField label="Channel Secret">
+                  <input type="password" value={form.line_channel_secret ?? ''} onChange={(e) => updateField('line_channel_secret', e.target.value)} className={inputClass} autoComplete="off" />
+                </FormField>
+              </div>
+
+              {/* Slack */}
+              <div className="space-y-2 border-b border-stone-200 pb-4 dark:border-stone-700">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">Slack</h4>
+                <FormField label="App Token (xapp-...)">
+                  <input type="password" value={form.slack_app_token ?? ''} onChange={(e) => updateField('slack_app_token', e.target.value)} placeholder="xapp-1-..." className={inputClass} autoComplete="off" />
+                </FormField>
+                <FormField label="Bot Token (xoxb-...)">
+                  <input type="password" value={form.slack_bot_token ?? ''} onChange={(e) => updateField('slack_bot_token', e.target.value)} placeholder="xoxb-..." className={inputClass} autoComplete="off" />
+                </FormField>
+              </div>
+
+              {/* WhatsApp */}
+              <div className="space-y-2 border-b border-stone-200 pb-4 dark:border-stone-700">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">WhatsApp</h4>
+                <FormField label="Access Token">
+                  <input type="password" value={form.whatsapp_access_token ?? ''} onChange={(e) => updateField('whatsapp_access_token', e.target.value)} className={inputClass} autoComplete="off" />
+                </FormField>
+                <FormField label="Verify Token">
+                  <input type="text" value={form.whatsapp_verify_token ?? ''} onChange={(e) => updateField('whatsapp_verify_token', e.target.value)} className={inputClass} />
+                </FormField>
+                <FormField label="Phone Number ID">
+                  <input type="text" value={form.whatsapp_phone_number_id ?? ''} onChange={(e) => updateField('whatsapp_phone_number_id', e.target.value)} className={inputClass} />
+                </FormField>
+              </div>
+
+              {/* Feishu */}
+              <div className="space-y-2">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">Feishu</h4>
+                <FormField label="App ID">
+                  <input type="password" value={form.feishu_app_id ?? ''} onChange={(e) => updateField('feishu_app_id', e.target.value)} className={inputClass} autoComplete="off" />
+                </FormField>
+                <FormField label="App Secret">
+                  <input type="password" value={form.feishu_app_secret ?? ''} onChange={(e) => updateField('feishu_app_secret', e.target.value)} className={inputClass} autoComplete="off" />
+                </FormField>
+              </div>
+            </div>
           )}
         </div>
 

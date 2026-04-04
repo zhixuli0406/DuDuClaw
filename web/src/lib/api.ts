@@ -277,6 +277,18 @@ export interface AgentUpdateParams {
   skill_token_budget?: number;
   // Per-agent channels
   discord_bot_token?: string;
+  telegram_bot_token?: string;
+  line_channel_token?: string;
+  line_channel_secret?: string;
+  slack_app_token?: string;
+  slack_bot_token?: string;
+  whatsapp_access_token?: string;
+  whatsapp_verify_token?: string;
+  whatsapp_phone_number_id?: string;
+  whatsapp_app_secret?: string;
+  feishu_app_id?: string;
+  feishu_app_secret?: string;
+  feishu_verification_token?: string;
 }
 
 // API namespace

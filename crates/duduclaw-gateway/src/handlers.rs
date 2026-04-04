@@ -871,35 +871,99 @@ impl MethodHandler {
                 }
             }
 
-            // ── Per-agent channel tokens ([channels.discord] section) ──
-            if let Some(token) = params_clone.get("discord_bot_token").and_then(|v| v.as_str()) {
-                if !token.is_empty() {
-                    let channels = table.entry("channels")
-                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-                        .as_table_mut()
-                        .ok_or_else(|| "Invalid [channels] section".to_string())?;
-                    let discord = channels.entry("discord")
-                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-                        .as_table_mut()
-                        .ok_or_else(|| "Invalid [channels.discord] section".to_string())?;
+            // ── Per-agent channel tokens ([channels.*] sections) ──
+            // Helper: write a token (+ encrypted version) into [channels.{channel}].{field}
+            // Empty token removes the entire [channels.{channel}] section.
+            let home = home_for_update.clone();
+            let mut set_channel_token = |table: &mut toml::Table,
+                                          channel: &str,
+                                          fields: &[(&str, Option<&str>)], // (param_key, toml_key) pairs
+                                          changes: &mut Vec<String>| -> Result<(), String> {
+                // Check if any field has a value
+                let has_any = fields.iter().any(|(param_key, _)| {
+                    params_clone.get(*param_key).and_then(|v| v.as_str()).map_or(false, |s| !s.is_empty())
+                });
+                let all_empty = fields.iter().all(|(param_key, _)| {
+                    params_clone.get(*param_key).and_then(|v| v.as_str()).map_or(true, |s| s.is_empty())
+                });
 
-                    // Store plaintext as fallback
-                    discord.insert("bot_token".into(), toml::Value::String(token.into()));
-
-                    // Encrypt if keyfile is available
-                    if let Some(enc) = crate::config_crypto::encrypt_value(token, &home_for_update) {
-                        discord.insert("bot_token_enc".into(), toml::Value::String(enc));
-                    }
-
-                    changes.push("channels.discord.bot_token = [REDACTED]".into());
-                } else {
-                    // Empty token = remove per-agent Discord bot
+                // If the param exists but is empty → remove
+                let param_present = fields.iter().any(|(param_key, _)| params_clone.get(*param_key).is_some());
+                if param_present && all_empty {
                     if let Some(channels) = table.get_mut("channels").and_then(|v| v.as_table_mut()) {
-                        channels.remove("discord");
-                        changes.push("channels.discord removed".into());
+                        channels.remove(channel);
+                        changes.push(format!("channels.{channel} removed"));
+                    }
+                    return Ok(());
+                }
+
+                if !has_any { return Ok(()); }
+
+                let channels = table.entry("channels")
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                    .as_table_mut()
+                    .ok_or_else(|| format!("Invalid [channels] section"))?;
+                let section = channels.entry(channel)
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                    .as_table_mut()
+                    .ok_or_else(|| format!("Invalid [channels.{channel}] section"))?;
+
+                for (param_key, toml_key_override) in fields {
+                    if let Some(val) = params_clone.get(*param_key).and_then(|v| v.as_str()) {
+                        if !val.is_empty() {
+                            let toml_key = toml_key_override.unwrap_or(param_key);
+                            section.insert(toml_key.to_string(), toml::Value::String(val.into()));
+                            // Encrypt sensitive tokens
+                            if toml_key.contains("token") || toml_key.contains("secret") || toml_key == "app_id" {
+                                let enc_key = format!("{toml_key}_enc");
+                                if let Some(enc) = crate::config_crypto::encrypt_value(val, &home) {
+                                    section.insert(enc_key, toml::Value::String(enc));
+                                }
+                            }
+                        }
                     }
                 }
-            }
+
+                changes.push(format!("channels.{channel} = [CONFIGURED]"));
+                Ok(())
+            };
+
+            // Discord
+            set_channel_token(table, "discord", &[
+                ("discord_bot_token", Some("bot_token")),
+            ], &mut changes)?;
+
+            // Telegram
+            set_channel_token(table, "telegram", &[
+                ("telegram_bot_token", Some("bot_token")),
+            ], &mut changes)?;
+
+            // LINE
+            set_channel_token(table, "line", &[
+                ("line_channel_token", Some("channel_token")),
+                ("line_channel_secret", Some("channel_secret")),
+            ], &mut changes)?;
+
+            // Slack
+            set_channel_token(table, "slack", &[
+                ("slack_app_token", Some("app_token")),
+                ("slack_bot_token", Some("bot_token")),
+            ], &mut changes)?;
+
+            // WhatsApp
+            set_channel_token(table, "whatsapp", &[
+                ("whatsapp_access_token", Some("access_token")),
+                ("whatsapp_verify_token", Some("verify_token")),
+                ("whatsapp_phone_number_id", Some("phone_number_id")),
+                ("whatsapp_app_secret", Some("app_secret")),
+            ], &mut changes)?;
+
+            // Feishu
+            set_channel_token(table, "feishu", &[
+                ("feishu_app_id", Some("app_id")),
+                ("feishu_app_secret", Some("app_secret")),
+                ("feishu_verification_token", Some("verification_token")),
+            ], &mut changes)?;
 
             if changes.is_empty() {
                 return Err("No valid fields to update".into());
