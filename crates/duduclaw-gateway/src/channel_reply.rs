@@ -11,6 +11,10 @@ use duduclaw_agent::registry::AgentRegistry;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use duduclaw_security::circuit_breaker::CircuitBreakerRegistry;
+use duduclaw_security::failsafe::FailsafeManager;
+use duduclaw_security::killswitch::KillswitchConfig;
+
 use crate::channel_settings::ChannelSettingsManager;
 use crate::handlers::ChannelState;
 use crate::gvu::loop_::GvuLoop;
@@ -46,6 +50,12 @@ pub struct ReplyContext {
     pub voice_sessions: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     /// Per-channel, per-scope settings (mention_only, whitelist, auto_thread, etc.).
     pub channel_settings: Arc<ChannelSettingsManager>,
+    /// Killswitch configuration (safety words, thresholds, escalation).
+    pub killswitch: Arc<KillswitchConfig>,
+    /// Failsafe degradation manager (per-scope level tracking).
+    pub failsafe: Option<Arc<FailsafeManager>>,
+    /// Circuit breaker registry (per-scope anomaly detection).
+    pub circuit_breakers: Option<Arc<CircuitBreakerRegistry>>,
 }
 
 impl ReplyContext {
@@ -67,6 +77,16 @@ impl ReplyContext {
                 ChannelSettingsManager::new(Path::new(":memory:"))
                     .expect("in-memory DB should always succeed")
             });
+        // Load killswitch config from ~/.duduclaw/KILLSWITCH.toml
+        let ks_path = home_dir.join("KILLSWITCH.toml");
+        let killswitch = KillswitchConfig::load(&ks_path);
+
+        // Initialize failsafe manager and circuit breaker registry
+        let failsafe = Arc::new(FailsafeManager::new(killswitch.failsafe.clone()));
+        let circuit_breakers = Arc::new(CircuitBreakerRegistry::new(
+            killswitch.circuit_breaker.clone(),
+        ));
+
         Self {
             registry,
             home_dir,
@@ -80,6 +100,9 @@ impl ReplyContext {
             skill_lift: Arc::new(tokio::sync::Mutex::new(LiftTrackerStore::new())),
             voice_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             channel_settings: Arc::new(channel_settings),
+            killswitch: Arc::new(killswitch),
+            failsafe: Some(failsafe),
+            circuit_breakers: Some(circuit_breakers),
         }
     }
 
@@ -239,11 +262,126 @@ async fn build_reply_with_session_inner(
     };
     drop(reg);
 
-    // Load session and prepend history to system prompt
     let session_mgr = &ctx.session_manager;
-    let _ = session_mgr.get_or_create(session_id, &agent_id).await;
 
-    // Scan user input for prompt injection before processing
+    // ── L0: Safety word check (highest priority, zero latency) ──
+    // Runs BEFORE session creation to avoid unnecessary DB writes for !STOP etc.
+    let safety_action = duduclaw_security::safety_word::check(text, &ctx.killswitch.safety_words);
+    if !matches!(safety_action, duduclaw_security::safety_word::SafetyWordAction::None) {
+        // Safety words are handled by chat_commands.rs, but if we reach here
+        // (e.g., direct call without command parsing), handle inline
+        match &safety_action {
+            duduclaw_security::safety_word::SafetyWordAction::Stop(scope) => {
+                if let Some(ref failsafe) = ctx.failsafe {
+                    match scope {
+                        duduclaw_security::safety_word::SafetyWordScope::CurrentScope => {
+                            failsafe.force_halt(session_id, "safety word").await;
+                            duduclaw_security::audit::log_safety_word(
+                                &ctx.home_dir, &agent_id, session_id, user_id, "stop",
+                            );
+                            return duduclaw_security::safety_word::format_response(&safety_action, session_id);
+                        }
+                        duduclaw_security::safety_word::SafetyWordScope::Global => {
+                            // Global stop requires admin — this inline path has no
+                            // admin context, so only halt the current scope as a
+                            // safeguard. The full !STOP ALL is handled via
+                            // chat_commands::handle_command which enforces admin.
+                            warn!(session_id, user_id, "!STOP ALL via inline path — halting scope only (admin check unavailable)");
+                            failsafe.force_halt(session_id, "safety word: STOP ALL (scope-only)").await;
+                            duduclaw_security::audit::log_safety_word(
+                                &ctx.home_dir, &agent_id, session_id, user_id, "stop_all_downgraded",
+                            );
+                            return "🛑 Agent stopped (scope). Global stop requires admin — use chat command.".to_string();
+                        }
+                    }
+                }
+                return duduclaw_security::safety_word::format_response(&safety_action, session_id);
+            }
+            duduclaw_security::safety_word::SafetyWordAction::Resume => {
+                if let Some(ref failsafe) = ctx.failsafe {
+                    // Only resume the current scope — global halt requires
+                    // explicit !STOP ALL scope to be cleared separately (via
+                    // chat_commands handler which has user_id for admin check).
+                    failsafe.resume(session_id).await;
+                    duduclaw_security::audit::log_safety_word(
+                        &ctx.home_dir, &agent_id, session_id, user_id, "resume",
+                    );
+                    return duduclaw_security::safety_word::format_response(&safety_action, session_id);
+                }
+                return "⚠️ Failsafe system not initialized.".to_string();
+            }
+            duduclaw_security::safety_word::SafetyWordAction::Status => {
+                if let Some(ref failsafe) = ctx.failsafe {
+                    let state = failsafe.get_state(session_id).await;
+                    return duduclaw_security::failsafe::format_status(session_id, state.as_ref());
+                }
+                return "Failsafe: not initialized".to_string();
+            }
+            duduclaw_security::safety_word::SafetyWordAction::None => {}
+        }
+    }
+
+    // ── L1: Failsafe state gate ──
+    if let Some(ref failsafe) = ctx.failsafe {
+        // Check global halt first
+        let global_level = failsafe.get_level("__global__").await;
+        let scope_level = failsafe.get_level(session_id).await;
+        let effective_level = std::cmp::max(global_level, scope_level);
+
+        use duduclaw_security::failsafe::FailsafeLevel;
+        match effective_level {
+            FailsafeLevel::L4Halted => {
+                // Halted: reply with canned message
+                return failsafe.canned_reply(effective_level)
+                    .unwrap_or("Service paused.").to_string();
+            }
+            FailsafeLevel::L3Muted => {
+                // Muted: silent drop, no reply
+                return String::new();
+            }
+            FailsafeLevel::L2Restricted => {
+                // Restricted: return canned reply, don't call AI
+                return failsafe.canned_reply(effective_level)
+                    .unwrap_or("Service restricted.").to_string();
+            }
+            FailsafeLevel::L1Degraded => {
+                // Degraded: allow through but could prefer local model
+                // (model routing is handled downstream)
+            }
+            FailsafeLevel::L0Normal => {}
+        }
+    }
+
+    // ── L2: Circuit breaker check ──
+    let mut breaker_state = duduclaw_security::circuit_breaker::BreakerState::Closed;
+    if let Some(ref cb_registry) = ctx.circuit_breakers {
+        let decision = cb_registry.check_inbound(session_id, text).await;
+        match decision {
+            duduclaw_security::circuit_breaker::BreakerDecision::Allow => {}
+            duduclaw_security::circuit_breaker::BreakerDecision::Throttle => {
+                breaker_state = duduclaw_security::circuit_breaker::BreakerState::HalfOpen;
+                // Allow through but mark for defensive prompt injection later
+            }
+            duduclaw_security::circuit_breaker::BreakerDecision::Deny(_) => {
+                debug!(session_id, "Circuit breaker denied — message dropped");
+                return String::new(); // silent drop
+            }
+            duduclaw_security::circuit_breaker::BreakerDecision::Trip(reason) => {
+                warn!(session_id, reason = %reason, "Circuit breaker tripped");
+                // Audit log
+                duduclaw_security::audit::log_circuit_breaker_trip(
+                    &ctx.home_dir, &agent_id, session_id, &reason.to_string(),
+                );
+                // Escalate failsafe
+                if let Some(ref failsafe) = ctx.failsafe {
+                    failsafe.escalate(session_id, &format!("circuit breaker: {reason}")).await;
+                }
+                return String::new(); // silent drop for this message
+            }
+        }
+    }
+
+    // ── L3: Prompt injection scan (existing) ──
     let scan = duduclaw_security::input_guard::scan_input(
         text,
         duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
@@ -257,6 +395,9 @@ async fn build_reply_with_session_inner(
         );
         return format!("⚠️ {}", scan.summary);
     }
+
+    // ── All pre-filters passed — now create/load session ──
+    let _ = session_mgr.get_or_create(session_id, &agent_id).await;
 
     // Sanitize role-prefix injection: strip any attempt to impersonate assistant/system role
     let sanitized_text = if text.starts_with("assistant:") || text.starts_with("system:") {
@@ -340,9 +481,28 @@ async fn build_reply_with_session_inner(
         },
     };
 
-    if let Some(reply) = reply {
-        // Save assistant reply to session
+    if let Some(mut reply) = reply {
+        // Record outbound for circuit breaker echo detection
         let reply_tokens = estimate_tokens(&reply);
+        if let Some(ref cb_registry) = ctx.circuit_breakers {
+            cb_registry.record_outbound(session_id, &reply, reply_tokens).await;
+        }
+
+        // Inject defensive prompt if circuit breaker is in HalfOpen (bot loop suspected)
+        if crate::defensive_prompt::should_inject(breaker_state)
+            && ctx.killswitch.defensive_prompt.enabled
+        {
+            // Extract channel type from session_id (e.g. "telegram:123" → "telegram")
+            let channel_type = session_id.split(':').next().unwrap_or("unknown");
+            reply = crate::defensive_prompt::inject_defensive_prompt(
+                &reply,
+                &ctx.killswitch.defensive_prompt.languages,
+                channel_type,
+            );
+            debug!(session_id, "Defensive prompt injected (circuit breaker HalfOpen)");
+        }
+
+        // Save assistant reply to session
         if let Err(e) = session_mgr
             .append_message(session_id, "assistant", &reply, reply_tokens)
             .await
@@ -385,11 +545,20 @@ async fn build_reply_with_session_inner(
                     0,
                 );
 
-                // 3. Calculate prediction error (< 1ms, zero LLM)
-                let error = pe.calculate_error(&prediction, &metrics).await;
+                // 3. Calculate prediction error (embedding ~5ms if available, otherwise < 1ms)
+                let (error, embedding) = pe.calculate_error(&prediction, &metrics).await;
 
-                // 4. Update user model (< 1ms)
-                pe.update_model(&metrics).await;
+                // 3.5 Log evolution event: PredictionError (Sutskever Day 1)
+                pe.log_evolution_event(
+                    "prediction_error",
+                    &agent_id_for_pred,
+                    Some(error.composite_error),
+                    Some(&format!("{:?}", error.category)),
+                    None, None, None,
+                );
+
+                // 4. Update user model — pass pre-computed embedding to avoid redundant embed()
+                pe.update_model_with_embedding(&metrics, embedding).await;
 
                 // 5. Skill lifecycle: diagnose + activate + track lift
                 {
@@ -471,9 +640,14 @@ async fn build_reply_with_session_inner(
                     }
                 }
 
-                // 7. Route to evolution action
+                // 7. Route to evolution action (with hardening: ε-floor + anti-sycophancy)
+                // Snapshot consistency first, then lock exploration (audit #1: avoid dual mutex)
                 let consecutive = pe.consecutive_significant_count(&agent_id_for_pred).await;
-                let action = crate::prediction::router::route(&error, consecutive);
+                let consistency_snapshot = pe.consistency.lock().await.clone();
+                let action = {
+                    let mut exploration = pe.exploration.lock().await;
+                    crate::prediction::router::route(&error, consecutive, &mut exploration, &consistency_snapshot)
+                };
 
                 match action {
                     crate::prediction::router::EvolutionAction::None => {}
@@ -492,6 +666,23 @@ async fn build_reply_with_session_inner(
                         } else {
                             info!(agent = %agent_id_for_pred, error = format!("{:.3}", error.composite_error), "Prediction error → triggering reflection");
                         }
+
+                        // Log evolution event: GVU trigger (Sutskever Day 1)
+                        let etype = if context.contains("Epistemic Foraging") {
+                            "epistemic_foraging"
+                        } else if context.contains("Anti-Sycophancy") {
+                            "sycophancy_alert"
+                        } else {
+                            "gvu_trigger"
+                        };
+                        pe.log_evolution_event(
+                            etype,
+                            &agent_id_for_pred,
+                            Some(error.composite_error),
+                            Some(&format!("{:?}", error.category)),
+                            Some(&context.chars().take(500).collect::<String>()),
+                            None, None,
+                        );
 
                         // Run GVU loop if available
                         if let (Some(gvu), Some(dir)) = (&gvu, &agent_dir_for_pred) {

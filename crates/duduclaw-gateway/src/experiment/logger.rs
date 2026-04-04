@@ -91,7 +91,10 @@ impl ExperimentLogger {
                 post_correction_rate REAL NOT NULL DEFAULT 0.0,
                 rollback_reason TEXT,
                 timestamp TEXT NOT NULL
-            );",
+            );
+
+",
+            // NOTE: evolution_events table is in prediction.db, not experiment.db (audit #16).
         )
         .map_err(|e| format!("Failed to create experiment tables: {e}"))?;
 
@@ -188,6 +191,11 @@ impl ExperimentLogger {
             warn!("Failed to log version outcome: {e}");
         }
     }
+
+    // NOTE: evolution_events are logged to prediction.db via PredictionEngine::log_evolution_event(),
+    // NOT via ExperimentLogger. The table was moved to prediction.db to avoid dual-table confusion
+    // (audit round 1, issue #16). The EvolutionEvent types are still exported from this module
+    // for use by PredictionEngine.
 
     /// Export experiment records as JSON array, with optional time range and agent filter.
     pub async fn export_experiments(

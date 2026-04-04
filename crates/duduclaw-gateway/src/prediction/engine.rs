@@ -16,7 +16,10 @@ use tracing::{debug, info, warn};
 
 use super::metacognition::MetaCognition;
 use super::metrics::ConversationMetrics;
+use super::router::{ConsistencyTracker, ExplorationState};
 use super::user_model::UserModel;
+
+use duduclaw_inference::embedding::EmbeddingProvider;
 
 // ---------------------------------------------------------------------------
 // Prediction + Error types
@@ -72,6 +75,154 @@ pub struct PredictionError {
 }
 
 // ---------------------------------------------------------------------------
+// DriftBudget — SOUL.md evolution drift constraint
+// ---------------------------------------------------------------------------
+
+/// Constrains how far SOUL.md can drift from its original baseline.
+///
+/// Based on the Drift Bounds Theorem from "Agent Behavioral Contracts"
+/// (arXiv:2602.22302): contracts with recovery rate γ > α (drift rate)
+/// bound drift to D* = α/γ in expectation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriftBudget {
+    /// Original SOUL.md content (or behaviors section) for distance calculation.
+    pub baseline: String,
+    /// Maximum allowed Levenshtein distance as a ratio of baseline length.
+    pub max_drift_ratio: f64,
+}
+
+impl DriftBudget {
+    pub fn new(baseline: String, max_drift_ratio: f64) -> Self {
+        Self { baseline, max_drift_ratio }
+    }
+
+    /// Check if proposed content is within the drift budget.
+    pub fn can_apply(&self, proposed: &str) -> bool {
+        if self.baseline.is_empty() {
+            return true;
+        }
+        let distance = Self::bigram_jaccard_distance(&self.baseline, proposed);
+        distance <= self.max_drift_ratio
+    }
+
+    /// Remaining drift budget (0.0 = exhausted, 1.0 = full budget).
+    pub fn remaining(&self, current: &str) -> f64 {
+        if self.baseline.is_empty() {
+            return 1.0;
+        }
+        let used = Self::bigram_jaccard_distance(&self.baseline, current);
+        (self.max_drift_ratio - used).max(0.0) / self.max_drift_ratio
+    }
+
+    /// Character-bigram Jaccard distance as a proxy for content drift.
+    ///
+    /// **Limitation**: This is order-insensitive — reordering paragraphs yields
+    /// distance ≈ 0.0 even though the structural meaning may change.
+    /// For order-sensitive drift detection, consider greedy string tiling.
+    /// Current use is acceptable because GVU proposals are appended, not reordered.
+    fn bigram_jaccard_distance(a: &str, b: &str) -> f64 {
+        let a_chars: Vec<char> = a.chars().collect();
+        let b_chars: Vec<char> = b.chars().collect();
+        let max_len = a_chars.len().max(b_chars.len());
+        if max_len == 0 {
+            return 0.0;
+        }
+
+        // Use char-bigram Jaccard distance as proxy for edit distance ratio
+        fn bigrams(chars: &[char]) -> HashMap<(char, char), u32> {
+            let mut freq = HashMap::new();
+            for w in chars.windows(2) {
+                *freq.entry((w[0], w[1])).or_insert(0) += 1;
+            }
+            freq
+        }
+
+        let a_bg = bigrams(&a_chars);
+        let b_bg = bigrams(&b_chars);
+        let all_keys: std::collections::HashSet<&(char, char)> =
+            a_bg.keys().chain(b_bg.keys()).collect();
+
+        let mut intersection = 0u32;
+        let mut union = 0u32;
+        for key in all_keys {
+            let ca = a_bg.get(key).copied().unwrap_or(0);
+            let cb = b_bg.get(key).copied().unwrap_or(0);
+            intersection += ca.min(cb);
+            union += ca.max(cb);
+        }
+
+        if union == 0 { 0.0 } else { 1.0 - (intersection as f64 / union as f64) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EvolutionHealthMonitor — mode collapse / oscillation detection
+// ---------------------------------------------------------------------------
+
+/// Monitors the health of the GVU evolution loop by tracking improvements.
+///
+/// Detects two pathological states:
+/// - **Stalled**: Expected improvement approaches zero → mode collapse.
+/// - **Oscillating**: High variance in improvements → random walk.
+///
+/// Based on the Variance Inequality from "Self-Improving AI Agents through
+/// Self-Play" (arXiv:2512.02731).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EvolutionHealth {
+    Healthy,
+    Stalled,
+    Oscillating,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvolutionHealthMonitor {
+    /// Recent GVU improvement scores (positive = improved, negative = regressed).
+    improvements: std::collections::VecDeque<f64>,
+    /// Maximum window size.
+    window_size: usize,
+}
+
+impl Default for EvolutionHealthMonitor {
+    fn default() -> Self {
+        Self {
+            improvements: std::collections::VecDeque::new(),
+            window_size: 20,
+        }
+    }
+}
+
+impl EvolutionHealthMonitor {
+    /// Record a GVU cycle's improvement score.
+    pub fn record(&mut self, improvement: f64) {
+        self.improvements.push_back(improvement);
+        while self.improvements.len() > self.window_size {
+            self.improvements.pop_front();
+        }
+    }
+
+    /// Assess current evolution health.
+    pub fn health(&self) -> EvolutionHealth {
+        if self.improvements.len() < 5 {
+            return EvolutionHealth::Healthy; // Not enough data
+        }
+
+        let mean = self.improvements.iter().sum::<f64>() / self.improvements.len() as f64;
+        let variance = self.improvements.iter()
+            .map(|x| (x - mean).powi(2))
+            .sum::<f64>() / self.improvements.len() as f64;
+
+        if mean.abs() < 0.01 && variance < 0.001 {
+            EvolutionHealth::Stalled
+        } else if variance > mean.abs() * 2.0 && variance > 0.01 {
+            // Absolute floor (0.01) prevents false Oscillating when mean ≈ 0 (audit #17)
+            EvolutionHealth::Oscillating
+        } else {
+            EvolutionHealth::Healthy
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PredictionEngine
 // ---------------------------------------------------------------------------
 
@@ -82,18 +233,45 @@ pub struct PredictionEngine {
     /// SQLite database path for persistence.
     db_path: PathBuf,
     /// Recent error history per agent (ring buffer, last 10).
-    consecutive_errors: Arc<Mutex<HashMap<String, Vec<ErrorCategory>>>>,
+    consecutive_errors: Arc<Mutex<HashMap<String, std::collections::VecDeque<ErrorCategory>>>>,
     /// Self-calibrating metacognition system.
     pub metacognition: Arc<Mutex<MetaCognition>>,
     /// How often to save models (every N updates).
     save_interval: u64,
     /// Updates since last save, per model key.
     update_counts: Arc<Mutex<HashMap<(String, String), u64>>>,
+    /// SOUL.md drift budget per agent.
+    pub drift_budgets: Arc<Mutex<HashMap<String, DriftBudget>>>,
+    /// GVU evolution health monitor per agent.
+    pub health_monitors: Arc<Mutex<HashMap<String, EvolutionHealthMonitor>>>,
+    /// Exploration state for epsilon-floor routing.
+    pub exploration: Arc<Mutex<ExplorationState>>,
+    /// Consistency tracker for anti-sycophancy.
+    pub consistency: Arc<Mutex<ConsistencyTracker>>,
+    /// Optional embedding provider for semantic topic similarity.
+    /// When available, topic_surprise uses cosine distance instead of keyword overlap.
+    /// When None, falls back to vocabulary_novelty → keyword matching.
+    embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+    /// Maximum embedding history per user-agent pair.
+    max_embedding_history: usize,
 }
 
 impl PredictionEngine {
     /// Create a new prediction engine, initializing SQLite tables and loading cached models.
-    pub fn new(db_path: PathBuf, meta_path: Option<PathBuf>) -> Self {
+    pub fn new(
+        db_path: PathBuf,
+        meta_path: Option<PathBuf>,
+    ) -> Self {
+        Self::new_with_embedding(db_path, meta_path, None, 100)
+    }
+
+    /// Create with an optional embedding provider.
+    pub fn new_with_embedding(
+        db_path: PathBuf,
+        meta_path: Option<PathBuf>,
+        embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+        max_embedding_history: usize,
+    ) -> Self {
         // Initialize database tables
         if let Ok(conn) = Connection::open(&db_path) {
             if let Err(e) = Self::init_tables(&conn) {
@@ -114,6 +292,12 @@ impl PredictionEngine {
             metacognition: Arc::new(Mutex::new(metacognition)),
             save_interval: 5,
             update_counts: Arc::new(Mutex::new(HashMap::new())),
+            drift_budgets: Arc::new(Mutex::new(HashMap::new())),
+            health_monitors: Arc::new(Mutex::new(HashMap::new())),
+            exploration: Arc::new(Mutex::new(ExplorationState::default())),
+            consistency: Arc::new(Mutex::new(ConsistencyTracker::new(50))),
+            embedding_provider,
+            max_embedding_history,
         };
 
         // Load existing models from disk
@@ -146,8 +330,66 @@ impl PredictionEngine {
                 timestamp TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_prediction_log_agent
-                ON prediction_log(agent_id);"
+                ON prediction_log(agent_id);
+
+            CREATE TABLE IF NOT EXISTS evolution_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                composite_error REAL,
+                error_category TEXT,
+                trigger_context TEXT,
+                soul_diff TEXT,
+                version_id TEXT,
+                rollback_reason TEXT,
+                ext_validation_type TEXT,
+                ext_validation_value REAL,
+                ext_validation_timestamp TEXT,
+                timestamp TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_evolution_agent_ts
+                ON evolution_events(agent_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_evolution_type
+                ON evolution_events(event_type);"
         ).map_err(|e| e.to_string())
+    }
+
+    /// Log a structured evolution event to SQLite (Sutskever Day 1 principle).
+    ///
+    /// Non-blocking: spawns a blocking task for the SQLite write.
+    pub fn log_evolution_event(
+        &self,
+        event_type: &str,
+        agent_id: &str,
+        composite_error: Option<f64>,
+        error_category: Option<&str>,
+        trigger_context: Option<&str>,
+        version_id: Option<&str>,
+        rollback_reason: Option<&str>,
+    ) {
+        let db_path = self.db_path.clone();
+        let event_id = uuid::Uuid::new_v4().to_string();
+        let agent = agent_id.to_string();
+        let etype = event_type.to_string();
+        let ce = composite_error;
+        let cat = error_category.map(String::from);
+        let ctx = trigger_context.map(|s| s.chars().take(500).collect::<String>());
+        let vid = version_id.map(String::from);
+        let rr = rollback_reason.map(String::from);
+        let ts = Utc::now().to_rfc3339();
+
+        tokio::task::spawn_blocking(move || {
+            if let Ok(conn) = Connection::open(&db_path) {
+                let _ = conn.execute(
+                    "INSERT INTO evolution_events
+                     (event_id, agent_id, event_type, composite_error, error_category,
+                      trigger_context, version_id, rollback_reason, timestamp)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![event_id, agent, etype, ce, cat, ctx, vid, rr, ts],
+                );
+            }
+        });
     }
 
     fn load_all_models(&self) -> Result<(), String> {
@@ -228,17 +470,44 @@ impl PredictionEngine {
         }
     }
 
-    /// Calculate the prediction error from actual conversation metrics.
+    /// Calculate the prediction error and optionally return the computed embedding.
     ///
-    /// Zero LLM cost — pure arithmetic.
+    /// The returned embedding (if any) should be passed to `update_model_with_embedding`
+    /// to avoid redundant embedding computation.
     pub async fn calculate_error(
         &self,
         prediction: &Prediction,
         actual: &ConversationMetrics,
-    ) -> PredictionError {
-        // Infer actual satisfaction from behavioural signals
+    ) -> (PredictionError, Option<Vec<f32>>) {
+        // --- Infer actual satisfaction from graded behavioural signals ---
         let mut inferred_satisfaction: f64 = 0.7; // neutral baseline
-        inferred_satisfaction -= actual.user_corrections as f64 * 0.3;
+
+        // Use graded feedback score instead of binary correction count.
+        // (EMNLP 2025 "User Feedback in Human-LLM Dialogues")
+        //
+        // Fallback logic: check if FeedbackDetail was actually populated (has any
+        // severity counts), not just whether the score is > 0. A Clarification-only
+        // conversation has score 0.1 but should NOT fall back to raw count * 0.3.
+        let has_feedback_detail = !actual.feedback_details.severity_counts.is_empty();
+        let correction_impact = if has_feedback_detail {
+            actual.feedback_details.weighted_correction_score * 0.3
+        } else {
+            actual.user_corrections as f64 * 0.3 // fallback for old data without FeedbackDetail
+        };
+
+        // Counterfactual robustness check (arXiv:2501.09620):
+        // If correction was detected but topics didn't change, the user may be
+        // clarifying their own intent rather than correcting the agent.
+        let counterfactual_discount = if actual.user_corrections > 0 {
+            let topics_changed = prediction.expected_topic.as_ref().map_or(true, |expected| {
+                !actual.extracted_topics.iter().any(|t| t == expected)
+            });
+            if topics_changed { 1.0 } else { 0.5 } // Discount unreliable corrections
+        } else {
+            1.0
+        };
+
+        inferred_satisfaction -= correction_impact * counterfactual_discount;
         inferred_satisfaction -= (actual.user_follow_ups.saturating_sub(1)) as f64 * 0.1;
 
         if let Some(ref feedback) = actual.feedback_signal {
@@ -253,39 +522,79 @@ impl PredictionEngine {
 
         let delta_satisfaction = prediction.expected_satisfaction - inferred_satisfaction;
 
-        // Topic surprise: partial matching via keyword overlap (0.0 - 1.0).
-        // Exact match → 0.0; partial overlap → scaled; no overlap → 0.7.
-        let topic_surprise = if let Some(ref expected) = prediction.expected_topic {
-            if actual.extracted_topics.iter().any(|t| t == expected) {
-                0.0 // exact match
+        // Topic surprise: 3-tier fallback
+        // Tier 1: Embedding cosine similarity (most accurate, requires model)
+        // Tier 2: Vocabulary novelty (HashSet-based change detection)
+        // Tier 3: Keyword overlap (original, least accurate for CJK)
+        //
+        // IMPORTANT: Embed OUTSIDE the models lock to avoid deadlock.
+        // The embed() call takes ~5ms and must not hold the mutex.
+        let current_embedding = if let Some(ref provider) = self.embedding_provider {
+            if !actual.user_text.is_empty() {
+                provider.embed(&actual.user_text).await.ok()
             } else {
-                // Check partial overlap: does any actual topic share characters with expected?
-                let best_overlap = actual.extracted_topics.iter().map(|t| {
-                    let expected_chars: std::collections::HashSet<char> = expected.chars().collect();
-                    let topic_chars: std::collections::HashSet<char> = t.chars().collect();
-                    let inter = expected_chars.intersection(&topic_chars).count() as f64;
-                    let union = expected_chars.union(&topic_chars).count().max(1) as f64;
-                    inter / union
-                }).fold(0.0_f64, f64::max);
-
-                // Scale: 0 overlap → 0.7, full overlap → 0.0
-                (1.0 - best_overlap) * 0.7
+                None
             }
         } else {
-            0.0 // no prediction → no surprise
+            None
         };
 
-        let unexpected_correction =
-            prediction.expected_satisfaction > 0.6 && actual.user_corrections > 0;
+        let (topic_surprise, has_embedding) = {
+            let models = self.models.lock().await;
+            let key = (actual.user_id.clone(), actual.agent_id.clone());
+            let model = models.get(&key);
+
+            if let Some(ref emb) = current_embedding {
+                // Tier 1: Embedding-based semantic surprise
+                let surprise = if let Some(m) = model {
+                    Self::compute_embedding_surprise(emb, &m.topic_embeddings)
+                } else {
+                    0.5 // First conversation — moderate surprise (not 0.0)
+                };
+                (surprise, true)
+            } else if let Some(m) = model {
+                // Tier 2: Vocabulary novelty (no embedding model or embed failed)
+                let surprise = Self::compute_vocabulary_novelty(&actual.user_text, &m.historical_bigrams);
+                (surprise, false)
+            } else {
+                // Tier 3: Keyword overlap (cold start, no history at all)
+                let surprise = Self::keyword_topic_surprise(prediction, actual);
+                (surprise, false)
+            }
+        };
+
+        // Unexpected correction: uses graded score when available, raw count as fallback.
+        // Consistent with the has_feedback_detail check above.
+        let unexpected_correction = prediction.expected_satisfaction > 0.6 && if has_feedback_detail {
+            actual.feedback_details.weighted_correction_score > 0.5
+        } else {
+            actual.user_corrections > 0
+        };
 
         let unexpected_follow_up = prediction.expected_follow_up_rate < 0.3
             && actual.user_follow_ups > 2;
 
-        // Weighted composite error
-        let composite_error = (0.40 * delta_satisfaction.abs()
-            + 0.20 * topic_surprise
-            + 0.20 * if unexpected_correction { 1.0 } else { 0.0 }
-            + 0.20 * if unexpected_follow_up { 1.0 } else { 0.0 })
+        // Indirect disagreement signal (from FeedbackDetail)
+        let indirect_disagreement_score = actual.feedback_details.severity_counts
+            .get("IndirectDisagreement")
+            .copied()
+            .unwrap_or(0) as f64
+            * 0.3; // Each indirect disagreement contributes 0.3
+
+        // Dynamic composite error weights based on embedding availability.
+        // With embedding: topic_surprise is semantically meaningful (20% weight).
+        // Without embedding: topic_surprise is unreliable for CJK (5% weight).
+        let (w_sat, w_topic, w_corr, w_follow, w_indirect) = if has_embedding {
+            (0.30, 0.20, 0.25, 0.15, 0.10)
+        } else {
+            (0.45, 0.05, 0.25, 0.15, 0.10)
+        };
+
+        let composite_error = (w_sat * delta_satisfaction.abs()
+            + w_topic * topic_surprise
+            + w_corr * if unexpected_correction { 1.0 } else { 0.0 }
+            + w_follow * if unexpected_follow_up { 1.0 } else { 0.0 }
+            + w_indirect * indirect_disagreement_score.min(1.0))
         .clamp(0.0, 1.0);
 
         // Classify using metacognition's adaptive thresholds
@@ -317,10 +626,10 @@ impl PredictionEngine {
         // Record in consecutive errors buffer
         {
             let mut errors = self.consecutive_errors.lock().await;
-            let buf = errors.entry(actual.agent_id.clone()).or_insert_with(Vec::new);
-            buf.push(category);
-            if buf.len() > 10 {
-                buf.remove(0);
+            let buf = errors.entry(actual.agent_id.clone()).or_insert_with(std::collections::VecDeque::new);
+            buf.push_back(category);
+            while buf.len() > 10 {
+                buf.pop_front();
             }
         }
 
@@ -344,14 +653,30 @@ impl PredictionEngine {
             agent = %actual.agent_id,
             composite = format!("{composite_error:.3}"),
             category = ?category,
+            has_embedding = current_embedding.is_some(),
             "Prediction error calculated"
         );
 
-        error
+        (error, current_embedding)
     }
 
     /// Update the user model after a conversation and optionally persist.
+    ///
+    /// Prefer `update_model_with_embedding` when an embedding was already
+    /// computed by `calculate_error` to avoid redundant computation.
     pub async fn update_model(&self, metrics: &ConversationMetrics) {
+        self.update_model_with_embedding(metrics, None).await;
+    }
+
+    /// Update the user model with a pre-computed embedding.
+    ///
+    /// Pass the embedding returned by `calculate_error` to avoid calling
+    /// `embed()` twice on the same text.
+    pub async fn update_model_with_embedding(
+        &self,
+        metrics: &ConversationMetrics,
+        embedding: Option<Vec<f32>>,
+    ) {
         let key = (metrics.user_id.clone(), metrics.agent_id.clone());
 
         {
@@ -360,6 +685,9 @@ impl PredictionEngine {
                 .entry(key.clone())
                 .or_insert_with(|| UserModel::new(metrics.user_id.clone(), metrics.agent_id.clone()));
             model.update_from_metrics(metrics);
+            if let Some(emb) = embedding {
+                model.update_embedding(emb, self.max_embedding_history);
+            }
         }
 
         // Debounced persistence
@@ -433,5 +761,94 @@ impl PredictionEngine {
             self.save_model(&user_id, &agent_id).await;
         }
         info!("Flushed all user models to disk");
+    }
+
+    // ── Embedding-based topic surprise (Hardening 2025-Q2) ─────
+
+    /// Compute topic surprise using time-weighted cosine similarity
+    /// against historical conversation embeddings.
+    ///
+    /// Surprise = 1.0 - weighted_avg_similarity. High surprise means
+    /// the current conversation is semantically distant from history.
+    ///
+    /// Uses exponential decay with 7-day half-life to prioritize recent topics.
+    fn compute_embedding_surprise(
+        current: &[f32],
+        history: &std::collections::VecDeque<(Vec<f32>, f64)>,
+    ) -> f64 {
+        if history.is_empty() {
+            // No history = first conversation with this agent.
+            // Return moderate surprise (0.5) rather than 0.0.
+            // 0.0 would mean "perfectly predicted" which is wrong for a first encounter.
+            return 0.5;
+        }
+
+        let now = chrono::Utc::now().timestamp() as f64;
+        let decay_half_life = 7.0 * 24.0 * 3600.0; // 7 days in seconds
+
+        let mut weighted_sim_sum = 0.0_f64;
+        let mut weight_sum = 0.0_f64;
+
+        for (hist_embedding, timestamp) in history {
+            let age_secs = (now - timestamp).max(0.0);
+            let weight = (-age_secs * 0.693 / decay_half_life).exp(); // ln(2) ≈ 0.693
+
+            let sim = duduclaw_memory::embedding::cosine_similarity(current, hist_embedding) as f64;
+            weighted_sim_sum += sim * weight;
+            weight_sum += weight;
+        }
+
+        if weight_sum < 1e-10 {
+            return 0.0;
+        }
+
+        let avg_similarity = weighted_sim_sum / weight_sum;
+        // Surprise = 1 - similarity, clamped to [0, 1]
+        (1.0 - avg_similarity).clamp(0.0, 1.0)
+    }
+
+    /// Compute vocabulary novelty using character-bigram set difference.
+    ///
+    /// novelty = |current_bigrams - historical_bigrams| / |current_bigrams|
+    /// High novelty means the user is discussing something entirely new.
+    /// This is the fallback when no embedding model is available.
+    fn compute_vocabulary_novelty(
+        user_text: &str,
+        historical_bigrams: &std::collections::HashSet<String>,
+    ) -> f64 {
+        let chars: Vec<char> = user_text.chars().filter(|c| !c.is_whitespace()).collect();
+        let current_bigrams: std::collections::HashSet<String> = chars
+            .windows(2)
+            .map(|w| w.iter().collect::<String>())
+            .collect();
+
+        if current_bigrams.is_empty() {
+            return 0.0;
+        }
+
+        let novel = current_bigrams.difference(historical_bigrams).count();
+        novel as f64 / current_bigrams.len() as f64
+    }
+
+    /// Keyword-based topic surprise (original Tier 3 fallback).
+    ///
+    /// Used only during cold start when no embedding or bigram history exists.
+    fn keyword_topic_surprise(prediction: &Prediction, actual: &ConversationMetrics) -> f64 {
+        if let Some(ref expected) = prediction.expected_topic {
+            if actual.extracted_topics.iter().any(|t| t == expected) {
+                0.0
+            } else {
+                let best_overlap = actual.extracted_topics.iter().map(|t| {
+                    let expected_chars: std::collections::HashSet<char> = expected.chars().collect();
+                    let topic_chars: std::collections::HashSet<char> = t.chars().collect();
+                    let inter = expected_chars.intersection(&topic_chars).count() as f64;
+                    let union = expected_chars.union(&topic_chars).count().max(1) as f64;
+                    inter / union
+                }).fold(0.0_f64, f64::max);
+                (1.0 - best_overlap) * 0.7
+            }
+        } else {
+            0.0
+        }
     }
 }
