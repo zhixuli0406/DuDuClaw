@@ -752,7 +752,10 @@ async fn handle_message_create(
     let scope_id = if guild_id.is_empty() { "dm" } else { guild_id };
 
     // ── Mention-only filter ──
-    let mention_only = settings.get_bool("discord", scope_id, keys::MENTION_ONLY, false).await;
+    // Per-agent bots default to mention-only in guilds to prevent all bots
+    // in the same server from responding to every message.
+    let default_mention_only = agent_name.is_some();
+    let mention_only = settings.get_bool("discord", scope_id, keys::MENTION_ONLY, default_mention_only).await;
     if mention_only && !guild_id.is_empty() && !bot_mentioned {
         return; // In guild, mention_only enabled, but bot not mentioned → skip
     }
