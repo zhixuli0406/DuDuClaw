@@ -275,6 +275,8 @@ export interface AgentUpdateParams {
   max_gvu_generations?: number;
   observation_period_hours?: number;
   skill_token_budget?: number;
+  // Per-agent channels
+  discord_bot_token?: string;
 }
 
 // API namespace
