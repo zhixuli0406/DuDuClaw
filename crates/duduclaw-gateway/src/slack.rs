@@ -13,7 +13,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::channel_format;
-use crate::channel_reply::{ReplyContext, build_reply_with_session, set_channel_connected};
+use crate::channel_reply::{ReplyContext, build_reply_for_agent, build_reply_with_session, set_channel_connected};
 use crate::channel_settings::keys;
 
 const SLACK_API: &str = "https://slack.com/api";
@@ -52,29 +52,86 @@ struct PostMessage {
 
 /// Start the Slack bot via Socket Mode as a background task.
 ///
-/// Returns `None` if no Slack tokens are configured.
+/// Kept for backward compatibility — delegates to `start_slack_bots()`.
 pub async fn start_slack_bot(
     home_dir: &Path,
     ctx: Arc<ReplyContext>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let app_token = read_slack_token(home_dir, "slack_app_token").await?;
-    let bot_token = read_slack_token(home_dir, "slack_bot_token").await?;
+    let mut bots = start_slack_bots(home_dir, ctx).await;
+    bots.pop().map(|(_, h)| h)
+}
 
-    if app_token.is_empty() || bot_token.is_empty() {
-        return None;
+/// Start multiple Slack bots: one global (from config.toml) plus per-agent bots.
+pub async fn start_slack_bots(
+    home_dir: &Path,
+    ctx: Arc<ReplyContext>,
+) -> Vec<(String, tokio::task::JoinHandle<()>)> {
+    let mut results = Vec::new();
+    let mut seen_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 1. Global bot from config.toml
+    if let (Some(app_token), Some(bot_token)) = (
+        read_slack_token(home_dir, "slack_app_token").await,
+        read_slack_token(home_dir, "slack_bot_token").await,
+    ) {
+        if !app_token.is_empty() && !bot_token.is_empty() {
+            seen_tokens.insert(bot_token.clone());
+            if let Some(handle) = spawn_slack_bot(app_token, bot_token, "slack".into(), None, ctx.clone()).await {
+                results.push(("slack".to_string(), handle));
+            }
+        }
     }
 
-    info!("🔌 Slack Socket Mode starting...");
+    // 2. Per-agent bots from agent configs
+    let agent_tokens: Vec<(String, String, String)> = {
+        let reg = ctx.registry.read().await;
+        let mut tokens = Vec::new();
+        for agent in reg.list() {
+            if let Some(channels) = &agent.config.channels {
+                if let Some(slack) = &channels.slack {
+                    let app = crate::config_crypto::resolve_agent_token(&slack.app_token_enc, &slack.app_token, home_dir);
+                    let bot = crate::config_crypto::resolve_agent_token(&slack.bot_token_enc, &slack.bot_token, home_dir);
+                    if !app.is_empty() && !bot.is_empty() {
+                        tokens.push((agent.config.agent.name.clone(), app, bot));
+                    }
+                }
+            }
+        }
+        tokens
+    };
+
+    for (agent_name, app_token, bot_token) in agent_tokens {
+        if seen_tokens.contains(&bot_token) {
+            info!("Slack bot for agent '{agent_name}' shares global token — skipping duplicate");
+            continue;
+        }
+        seen_tokens.insert(bot_token.clone());
+        let label = format!("slack:{agent_name}");
+        if let Some(handle) = spawn_slack_bot(app_token, bot_token, label.clone(), Some(agent_name), ctx.clone()).await {
+            results.push((label, handle));
+        }
+    }
+
+    results
+}
+
+async fn spawn_slack_bot(
+    app_token: String,
+    bot_token: String,
+    label: String,
+    agent_name: Option<String>,
+    ctx: Arc<ReplyContext>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    info!("Slack Socket Mode starting (label: {label})...");
 
     let handle = tokio::spawn(async move {
         loop {
-            match run_socket_mode(&app_token, &bot_token, &ctx).await {
-                Ok(()) => info!("Slack Socket Mode disconnected gracefully"),
-                Err(e) => warn!("Slack Socket Mode error: {e}"),
+            match run_socket_mode(&app_token, &bot_token, &ctx, agent_name.as_deref()).await {
+                Ok(()) => info!("Slack Socket Mode disconnected ({label})"),
+                Err(e) => warn!("Slack Socket Mode error ({label}): {e}"),
             }
-            // Reconnect after 5 seconds
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            info!("Slack Socket Mode reconnecting...");
+            info!("Slack Socket Mode reconnecting ({label})...");
         }
     });
 
@@ -87,6 +144,7 @@ async fn run_socket_mode(
     app_token: &str,
     bot_token: &str,
     ctx: &Arc<ReplyContext>,
+    agent_name: Option<&str>,
 ) -> Result<(), String> {
     // Use shared HTTP client (Fix CR-G9)
     let http = crate::shared_http_client().clone();
@@ -175,7 +233,7 @@ async fn run_socket_mode(
             // Handle events_api type
             if envelope.envelope_type == "events_api" {
                 if let Some(payload) = &envelope.payload {
-                    handle_event(payload, bot_token, &bot_user_id, ctx, &http).await;
+                    handle_event(payload, bot_token, &bot_user_id, ctx, &http, agent_name).await;
                 }
             }
         }
@@ -222,12 +280,14 @@ async fn update_message(http: &reqwest::Client, token: &str, channel: &str, ts: 
 
 // ── Event handling ──────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_event(
     payload: &serde_json::Value,
     bot_token: &str,
     bot_user_id: &str,
     ctx: &Arc<ReplyContext>,
     http: &reqwest::Client,
+    agent_name: Option<&str>,
 ) {
     let event = match payload.get("event") {
         Some(e) => e,
@@ -308,7 +368,11 @@ async fn handle_event(
     } else {
         format!("slack:group:{channel}")
     };
-    let reply = build_reply_with_session(text, ctx, &session_id, user, None).await;
+    let reply = if let Some(agent) = agent_name {
+        build_reply_for_agent(text, ctx, agent, &session_id, user, None).await
+    } else {
+        build_reply_with_session(text, ctx, &session_id, user, None).await
+    };
     let reply = to_slack_mrkdwn(&reply);
 
     // Split long messages (Slack limit: 4000 chars)
