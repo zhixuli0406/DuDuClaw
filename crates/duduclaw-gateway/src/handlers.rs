@@ -1216,11 +1216,30 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("Failed to write config.toml: {e}"));
         }
 
-        // Hot-stop: abort the running channel bot task
+        // Hot-stop: abort the running global channel bot task
         self.hot_stop_channel(channel_type).await;
 
-        info!(channel_type, "Channel removed and stopped");
-        WsFrame::ok_response("", json!({ "success": true, "type": channel_type }))
+        // For Discord: if per-agent bots exist, re-launch them since the global
+        // bot was deduplicating their tokens. Without the global bot, per-agent
+        // bots need to start independently.
+        let mut restarted_agents = Vec::new();
+        if channel_type == "discord" {
+            let ctx_opt = self.reply_ctx.read().await.clone();
+            if let Some(ctx) = ctx_opt {
+                let per_agent_handles = crate::discord::start_discord_bots(&self.home_dir, ctx).await;
+                for (label, h) in per_agent_handles {
+                    restarted_agents.push(label.clone());
+                    self.register_channel_handle(&label, h).await;
+                }
+            }
+        }
+
+        info!(channel_type, restarted = ?restarted_agents, "Channel removed and stopped");
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "type": channel_type,
+            "restarted_per_agent": restarted_agents,
+        }))
     }
 
     // ── Channel hot-start/stop ────────────────────────────────
