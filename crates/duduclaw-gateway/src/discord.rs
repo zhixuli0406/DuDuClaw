@@ -586,18 +586,28 @@ async fn gateway_loop(
                             continue;
                         }
                         Some(Ok(Message::Close(frame))) => {
-                            let code = frame.as_ref().map(|f| f.code);
-                            warn!("Discord [{label}] Gateway closed (code: {code:?})");
-                            // 4004 = Authentication failed, 4014 = Disallowed intents
-                            if matches!(code, Some(c) if c == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(4004)
-                                || c == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(4014))
-                            {
-                                let msg = if code == Some(4004.into()) { "authentication failed" } else { "disallowed intents" };
-                                error!("Discord [{label}] fatal close: {msg}, stopping bot");
-                                set_channel_connected(&channel_status, &label, false, Some(format!("{msg} — update via Dashboard"))).await;
-                                return;
+                            let raw_code = frame.as_ref().map(|f| u16::from(f.code));
+                            let reason = frame.as_ref().map(|f| f.reason.to_string()).unwrap_or_default();
+                            warn!("Discord [{label}] Gateway closed (code: {raw_code:?}, reason: {reason})");
+                            // Fatal Discord close codes — do not retry
+                            match raw_code {
+                                Some(4004) => {
+                                    error!("Discord [{label}] authentication failed (4004), stopping");
+                                    set_channel_connected(&channel_status, &label, false, Some("authentication failed — update token via Dashboard".into())).await;
+                                    return;
+                                }
+                                Some(4014) => {
+                                    error!("Discord [{label}] disallowed intents (4014), stopping");
+                                    set_channel_connected(&channel_status, &label, false, Some("disallowed intents — enable MESSAGE CONTENT INTENT in Discord Developer Portal".into())).await;
+                                    return;
+                                }
+                                Some(4013) => {
+                                    error!("Discord [{label}] invalid intents (4013), stopping");
+                                    set_channel_connected(&channel_status, &label, false, Some("invalid intents".into())).await;
+                                    return;
+                                }
+                                _ => break, // recoverable, will retry with backoff
                             }
-                            break;
                         }
                         Some(Err(e)) => { warn!("Discord Gateway error: {e}"); break; }
                         None => break,
