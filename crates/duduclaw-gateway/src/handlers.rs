@@ -1125,9 +1125,9 @@ impl MethodHandler {
             }
         }
 
-        // Include per-agent Discord bots (keys like "discord:{agent_name}")
+        // Include per-agent bots (keys like "discord:{agent_name}", "telegram:{agent_name}", etc.)
         for (key, state) in runtime_status.iter() {
-            if key.starts_with("discord:") {
+            if key.contains(':') {
                 channels.push(json!({
                     "name": key,
                     "connected": state.connected,
@@ -1258,6 +1258,36 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "Missing 'type' parameter"),
         };
 
+        // Per-agent channel: format "discord:agent_name", "telegram:agent_name", etc.
+        if let Some((platform, agent_name)) = channel_type.split_once(':') {
+            let channel_section = match platform {
+                "discord" | "telegram" | "slack" => platform,
+                _ => return WsFrame::error_response("", &format!("Unknown channel platform: {platform}")),
+            };
+
+            // Clear the [channels.{platform}] section in the agent's agent.toml
+            let agent_name_owned = agent_name.to_string();
+            let channel_section_owned = channel_section.to_string();
+            if let Err(e) = self.update_agent_toml(&agent_name_owned, |table| {
+                if let Some(channels) = table.get_mut("channels").and_then(|v| v.as_table_mut()) {
+                    channels.remove(&channel_section_owned);
+                }
+                Ok(())
+            }).await {
+                return WsFrame::error_response("", &format!("Failed to update agent config: {e}"));
+            }
+
+            // Hot-stop the per-agent bot
+            self.hot_stop_channel(channel_type).await;
+
+            info!(channel_type, "Per-agent channel removed and stopped");
+            return WsFrame::ok_response("", json!({
+                "success": true,
+                "type": channel_type,
+            }));
+        }
+
+        // Global channel removal
         let token_key = match channel_type {
             "line" => "line_channel_token",
             "telegram" => "telegram_bot_token",

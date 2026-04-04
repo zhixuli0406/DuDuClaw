@@ -50,8 +50,12 @@ const channelMeta: Record<
   },
 };
 
+function getChannelPlatform(name: string): string {
+  return name.split(':')[0].toLowerCase();
+}
+
 function getChannelStyle(name: string) {
-  const key = name.toLowerCase();
+  const key = getChannelPlatform(name);
   return (
     channelMeta[key] ?? {
       color: 'text-stone-600 dark:text-stone-400',

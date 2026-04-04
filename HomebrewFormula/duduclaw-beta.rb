@@ -1,5 +1,5 @@
 class DuduclawBeta < Formula
-  desc "Multi-Agent AI Assistant Platform (beta: prediction hardening + embedding)"
+  desc "Multi-Agent AI Assistant Platform (beta: per-agent bots + prediction hardening)"
   homepage "https://github.com/zhixuli0406/DuDuClaw"
   url "https://github.com/zhixuli0406/DuDuClaw.git", branch: "release/v1.2.0-beta.1"
   version "1.2.0-beta.1"
@@ -27,15 +27,16 @@ class DuduclawBeta < Formula
 
   def post_install
     ohai "DuDuClaw v1.2.0-beta.1 installed"
-    ohai "Changes: prediction hardening, embedding integration, evolution logging"
+    ohai "Changes: per-agent bot support, per-agent channel removal, prediction hardening"
     ohai "Run `duduclaw onboard` to set up, or `duduclaw serve` to start"
   end
 
   def caveats
     <<~EOS
-      This is a BETA release for testing the prediction engine hardening.
-      It includes: FeedbackSeverity grading, vocabulary_novelty fallback,
-      evolution event logging, epsilon-floor exploration, and anti-sycophancy.
+      This is a BETA release (v1.2.0-beta.1).
+      It includes: per-agent Discord/Telegram/Slack bot support, per-agent
+      channel config & removal, prediction engine hardening, embedding
+      integration, evolution event logging, and anti-sycophancy.
 
       To switch back to stable:
         brew uninstall duduclaw-beta
