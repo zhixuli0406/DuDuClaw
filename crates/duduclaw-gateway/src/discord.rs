@@ -277,7 +277,7 @@ pub async fn start_discord_bot(
     info!("   ⚠ 請確認 Discord Developer Portal 已啟用 MESSAGE CONTENT Intent");
 
     let handle = tokio::spawn(async move {
-        gateway_loop(token, bot_id, app_id, gateway_url, http, ctx, None).await;
+        gateway_loop(token, bot_id, app_id, gateway_url, http, ctx, "discord".to_string(), None).await;
     });
 
     Some(handle)
@@ -438,7 +438,7 @@ async fn spawn_discord_bot(
     info!("   Discord [{label}] Gateway: {gateway_url}");
 
     let handle = tokio::spawn(async move {
-        gateway_loop(token, bot_id, app_id, gateway_url, http, ctx, agent_name).await;
+        gateway_loop(token, bot_id, app_id, gateway_url, http, ctx, label, agent_name).await;
     });
 
     Some(handle)
@@ -488,13 +488,14 @@ async fn gateway_loop(
     gateway_url: String,
     http: reqwest::Client,
     ctx: Arc<ReplyContext>,
+    label: String,
     agent_name: Option<String>,
 ) {
     let channel_status = ctx.channel_status.clone();
 
     loop {
-        info!("Discord Gateway connecting...");
-        set_channel_connected(&channel_status, "discord", false, Some("connecting".into())).await;
+        info!("Discord [{label}] Gateway connecting...");
+        set_channel_connected(&channel_status, &label, false, Some("connecting".into())).await;
 
         let ws = match tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -505,14 +506,14 @@ async fn gateway_loop(
                 ws
             }
             Ok(Err(e)) => {
-                warn!("Discord Gateway connection failed: {e}");
-                set_channel_connected(&channel_status, "discord", false, Some(e.to_string())).await;
+                warn!("Discord [{label}] Gateway connection failed: {e}");
+                set_channel_connected(&channel_status, &label, false, Some(e.to_string())).await;
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
             Err(_) => {
-                warn!("Discord Gateway connection timeout (15s)");
-                set_channel_connected(&channel_status, "discord", false, Some("Connection timeout".into())).await;
+                warn!("Discord [{label}] Gateway connection timeout (15s)");
+                set_channel_connected(&channel_status, &label, false, Some("Connection timeout".into())).await;
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
@@ -649,8 +650,8 @@ async fn gateway_loop(
                                         }
                                     }
                                     "READY" => {
-                                        info!("Discord Gateway READY");
-                                        set_channel_connected(&channel_status, "discord", true, None).await;
+                                        info!("Discord [{label}] Gateway READY");
+                                        set_channel_connected(&channel_status, &label, true, None).await;
                                     }
                                     "GUILD_CREATE" => {
                                         if let Some(d) = &payload.d {
@@ -671,8 +672,8 @@ async fn gateway_loop(
 
                         // Invalid Session
                         9 => {
-                            warn!("Discord Gateway invalid session");
-                            set_channel_connected(&channel_status, "discord", false, Some("invalid session".to_string())).await;
+                            warn!("Discord [{label}] Gateway invalid session");
+                            set_channel_connected(&channel_status, &label, false, Some("invalid session".to_string())).await;
                             _identified = false;
                             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                             break;
@@ -705,8 +706,8 @@ async fn gateway_loop(
         drop(guard);
 
         let _ = _identified;
-        set_channel_connected(&channel_status, "discord", false, Some("reconnecting".to_string())).await;
-        warn!("Discord Gateway disconnected, reconnecting in 5s...");
+        set_channel_connected(&channel_status, &label, false, Some("reconnecting".to_string())).await;
+        warn!("Discord [{label}] Gateway disconnected, reconnecting in 5s...");
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }
