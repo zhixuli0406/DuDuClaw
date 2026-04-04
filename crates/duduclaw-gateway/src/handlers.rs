@@ -92,8 +92,12 @@ impl MethodHandler {
     }
 
     /// Register a running channel handle (for hot-stop on remove).
+    /// If a handle with the same name already exists, it is aborted first.
     pub async fn register_channel_handle(&self, name: &str, handle: tokio::task::JoinHandle<()>) {
-        self.channel_handles.lock().await.insert(name.to_string(), handle);
+        let mut handles = self.channel_handles.lock().await;
+        if let Some(old) = handles.insert(name.to_string(), handle) {
+            old.abort();
+        }
     }
 
     /// Update a channel's runtime connection state (called by channel bots).
