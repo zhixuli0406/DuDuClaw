@@ -485,7 +485,7 @@ async fn build_reply_with_session_inner(
         // Record outbound for circuit breaker echo detection
         let reply_tokens = estimate_tokens(&reply);
         if let Some(ref cb_registry) = ctx.circuit_breakers {
-            cb_registry.record_outbound(session_id, &reply, reply_tokens).await;
+            cb_registry.record_outbound(session_id, &reply, reply_tokens as usize).await;
         }
 
         // Inject defensive prompt if circuit breaker is in HalfOpen (bot loop suspected)
