@@ -1324,9 +1324,37 @@ impl MethodHandler {
         let channel_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
         info!(channel_type, "channels.test requested");
 
-        let config_path = self.home_dir.join("config.toml");
-        let table = self.read_config_table(&config_path).await;
+        // Per-agent channel test: check agent.toml
+        if let Some((platform, agent_name)) = channel_type.split_once(':') {
+            let token_field = match platform {
+                "discord" | "telegram" => "bot_token",
+                "slack" => "bot_token",
+                _ => return WsFrame::error_response("", &format!("Unknown channel platform: {platform}")),
+            };
 
+            let reg = self.registry.read().await;
+            let configured = reg.get(agent_name).is_some_and(|agent| {
+                if let Some(ch) = &agent.config.channels {
+                    match platform {
+                        "discord" => ch.discord.as_ref().is_some_and(|d| !d.bot_token.is_empty() || d.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())),
+                        "telegram" => ch.telegram.as_ref().is_some_and(|t| !t.bot_token.is_empty() || t.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())),
+                        "slack" => ch.slack.as_ref().is_some_and(|s| !s.bot_token.is_empty() || s.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())),
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            });
+            drop(reg);
+
+            return WsFrame::ok_response("", json!({
+                "success": configured,
+                "type": channel_type,
+                "message": if configured { format!("{channel_type} {token_field} is configured") } else { format!("{channel_type} token 未設定") },
+            }));
+        }
+
+        // Global channel test
         let token_key = match channel_type {
             "line" => "line_channel_token",
             "telegram" => "telegram_bot_token",
@@ -1334,14 +1362,14 @@ impl MethodHandler {
             _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
         };
 
-        let token = table
-            .get("channels")
-            .and_then(|v| v.as_table())
-            .and_then(|ch| ch.get(token_key))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let config_path = self.home_dir.join("config.toml");
+        let table = self.read_config_table(&config_path).await;
 
-        if token.is_empty() {
+        // Check both plaintext and encrypted token
+        let has_token = crate::config_crypto::decrypt_config_field(&table, "channels", token_key, &self.home_dir)
+            .is_some_and(|t| !t.is_empty());
+
+        if !has_token {
             return WsFrame::ok_response("", json!({
                 "success": false,
                 "type": channel_type,
