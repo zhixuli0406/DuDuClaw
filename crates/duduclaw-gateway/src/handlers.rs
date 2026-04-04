@@ -656,6 +656,7 @@ impl MethodHandler {
 
         let params_clone = params.clone();
         let mut changes: Vec<String> = Vec::new();
+        let home_for_update = self.home_dir.clone();
 
         let result = self.update_agent_toml(&agent_id, move |table| {
             // ── Identity fields ([agent] section) ──
@@ -866,6 +867,36 @@ impl MethodHandler {
                     if let Some(v) = params_clone.get(*key).and_then(|v| v.as_f64()) {
                         evo.insert((*key).into(), toml::Value::Float(v));
                         changes.push(format!("evolution.{key} = {v}"));
+                    }
+                }
+            }
+
+            // ── Per-agent channel tokens ([channels.discord] section) ──
+            if let Some(token) = params_clone.get("discord_bot_token").and_then(|v| v.as_str()) {
+                if !token.is_empty() {
+                    let channels = table.entry("channels")
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                        .as_table_mut()
+                        .ok_or_else(|| "Invalid [channels] section".to_string())?;
+                    let discord = channels.entry("discord")
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                        .as_table_mut()
+                        .ok_or_else(|| "Invalid [channels.discord] section".to_string())?;
+
+                    // Store plaintext as fallback
+                    discord.insert("bot_token".into(), toml::Value::String(token.into()));
+
+                    // Encrypt if keyfile is available
+                    if let Some(enc) = crate::config_crypto::encrypt_value(token, &home_for_update) {
+                        discord.insert("bot_token_enc".into(), toml::Value::String(enc));
+                    }
+
+                    changes.push("channels.discord.bot_token = [REDACTED]".into());
+                } else {
+                    // Empty token = remove per-agent Discord bot
+                    if let Some(channels) = table.get_mut("channels").and_then(|v| v.as_table_mut()) {
+                        channels.remove("discord");
+                        changes.push("channels.discord removed".into());
                     }
                 }
             }

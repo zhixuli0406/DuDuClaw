@@ -405,7 +405,7 @@ function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: 
 
 // ── Edit Agent Dialog ──
 
-type EditTab = 'identity' | 'model' | 'heartbeat' | 'container' | 'permissions';
+type EditTab = 'identity' | 'model' | 'heartbeat' | 'container' | 'permissions' | 'channels';
 
 function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | null; onClose: () => void; onSaved: () => void }) {
   const intl = useIntl();
@@ -515,6 +515,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
     { id: 'heartbeat', label: intl.formatMessage({ id: 'agents.edit.heartbeat' }) },
     { id: 'container', label: intl.formatMessage({ id: 'settings.container' }) },
     { id: 'permissions', label: intl.formatMessage({ id: 'agents.edit.permissions' }) },
+    { id: 'channels', label: 'Channels' },
   ];
 
   return (
@@ -694,6 +695,32 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
                 <FormField label={intl.formatMessage({ id: 'agents.edit.maxSilenceHours' })}>
                   <input type="number" min={1} step={0.5} value={form.max_silence_hours ?? 12} onChange={(e) => updateField('max_silence_hours', Number(e.target.value))} className={inputClass} />
                 </FormField>
+              </div>
+            </>
+          )}
+
+          {tab === 'channels' && (
+            <>
+              <div className="space-y-3">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400 mb-2">
+                  Discord Bot (Per-Agent)
+                </h4>
+                <p className="text-xs text-stone-400 dark:text-stone-500">
+                  Set a dedicated Discord bot token for this agent. The agent will appear as its own Discord bot user. Leave empty to use the global bot.
+                </p>
+                <FormField label="Bot Token">
+                  <input
+                    type="password"
+                    value={form.discord_bot_token ?? ''}
+                    onChange={(e) => updateField('discord_bot_token', e.target.value)}
+                    placeholder="MTIzNDU2Nzg5..."
+                    className={inputClass}
+                    autoComplete="off"
+                  />
+                </FormField>
+                <p className="text-xs text-stone-400 dark:text-stone-500">
+                  Token will be encrypted and stored in agent.toml. Requires restart to take effect.
+                </p>
               </div>
             </>
           )}
