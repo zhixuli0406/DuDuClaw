@@ -1290,8 +1290,9 @@ impl MethodHandler {
             let per_agent_handles: Vec<(String, tokio::task::JoinHandle<()>)> = match channel_type {
                 "discord" => crate::discord::start_discord_bots(&self.home_dir, ctx).await,
                 "telegram" => crate::telegram::start_telegram_bots(&self.home_dir, ctx).await,
-                "slack" => crate::slack::start_slack_bots(&self.home_dir, ctx).await,
-                _ => Vec::new(), // Webhook channels: no per-agent re-launch yet
+                // Slack: per-agent ready but module has unresolved deps
+                // "slack" => crate::slack::start_slack_bots(&self.home_dir, ctx).await,
+                _ => Vec::new(),
             };
             for (label, h) in per_agent_handles {
                 restarted_agents.push(label.clone());

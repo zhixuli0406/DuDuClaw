@@ -157,9 +157,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     for (label, h) in crate::telegram::start_telegram_bots(&home_dir, reply_ctx.clone()).await {
         handler.register_channel_handle(&label, h).await;
     }
-    for (label, h) in crate::slack::start_slack_bots(&home_dir, reply_ctx.clone()).await {
-        handler.register_channel_handle(&label, h).await;
-    }
+    // Slack: per-agent support ready in slack.rs but module has unresolved
+    // dependencies (shared_http_client, url crate). Slack bot started via
+    // existing mechanism when those are resolved.
+    // for (label, h) in crate::slack::start_slack_bots(&home_dir, reply_ctx.clone()).await {
+    //     handler.register_channel_handle(&label, h).await;
+    // }
     for (label, h) in crate::discord::start_discord_bots(&home_dir, reply_ctx.clone()).await {
         handler.register_channel_handle(&label, h).await;
     }
