@@ -1148,11 +1148,79 @@ impl MethodHandler {
         let config_obj = params.get("config").cloned().unwrap_or(json!({}));
         let token = config_obj.get("token").and_then(|v| v.as_str()).unwrap_or("");
         let secret = config_obj.get("secret").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_name = params.get("agent").and_then(|v| v.as_str()).unwrap_or("");
 
         if token.is_empty() {
             return WsFrame::error_response("", "Missing 'config.token' parameter");
         }
 
+        // Per-agent channel: write to agent.toml [channels.{platform}]
+        if !agent_name.is_empty() {
+            let (token_field, secret_field) = match channel_type {
+                "discord" => ("bot_token", None),
+                "telegram" => ("bot_token", None),
+                "slack" => ("bot_token", Some("app_token")),
+                _ => return WsFrame::error_response("", &format!("Per-agent channels not supported for: {channel_type}")),
+            };
+
+            let token_owned = token.to_string();
+            let secret_owned = secret.to_string();
+            let channel_type_owned = channel_type.to_string();
+            let home = self.home_dir.clone();
+
+            if let Err(e) = self.update_agent_toml(agent_name, move |table| {
+                let channels = table.entry("channels")
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                    .as_table_mut()
+                    .ok_or("Invalid [channels] section")?;
+                let section = channels.entry(&channel_type_owned)
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                    .as_table_mut()
+                    .ok_or_else(|| format!("Invalid [channels.{}] section", channel_type_owned))?;
+
+                section.insert(token_field.to_string(), toml::Value::String(token_owned.clone()));
+                if let Some(enc) = crate::config_crypto::encrypt_value(&token_owned, &home) {
+                    section.insert(format!("{token_field}_enc"), toml::Value::String(enc));
+                }
+                if let Some(sf) = secret_field {
+                    if !secret_owned.is_empty() {
+                        section.insert(sf.to_string(), toml::Value::String(secret_owned.clone()));
+                        if let Some(enc) = crate::config_crypto::encrypt_value(&secret_owned, &home) {
+                            section.insert(format!("{sf}_enc"), toml::Value::String(enc));
+                        }
+                    }
+                }
+                Ok(())
+            }).await {
+                return WsFrame::error_response("", &format!("Failed to update agent config: {e}"));
+            }
+
+            // Hot-start: stop existing per-agent bot if any, then re-launch all per-agent bots
+            let label = format!("{channel_type}:{agent_name}");
+            self.hot_stop_channel(&label).await;
+
+            let mut hot_started = false;
+            if let Some(ctx) = self.reply_ctx.read().await.clone() {
+                let handles: Vec<(String, tokio::task::JoinHandle<()>)> = match channel_type {
+                    "discord" => crate::discord::start_discord_bots(&self.home_dir, ctx).await,
+                    "telegram" => crate::telegram::start_telegram_bots(&self.home_dir, ctx).await,
+                    _ => Vec::new(),
+                };
+                for (l, h) in handles {
+                    if l == label { hot_started = true; }
+                    self.register_channel_handle(&l, h).await;
+                }
+            }
+
+            info!(channel_type, agent_name, "Per-agent channel config saved");
+            return WsFrame::ok_response("", json!({
+                "success": true,
+                "type": label,
+                "hot_started": hot_started,
+            }));
+        }
+
+        // Global channel: write to config.toml [channels]
         let (token_key, secret_key) = match channel_type {
             "line" => ("line_channel_token", Some("line_channel_secret")),
             "telegram" => ("telegram_bot_token", None),

@@ -325,8 +325,8 @@ export const api = {
   channels: {
     status: () =>
       client.call('channels.status') as Promise<{ channels: ChannelStatus[] }>,
-    add: (type: string, config: Record<string, string>) =>
-      client.call('channels.add', { type, config }),
+    add: (type: string, config: Record<string, string>, agent?: string) =>
+      client.call('channels.add', { type, config, ...(agent ? { agent } : {}) }),
     test: (type: string) =>
       client.call('channels.test', { type }) as Promise<{ success: boolean; message: string }>,
     remove: (type: string) =>
