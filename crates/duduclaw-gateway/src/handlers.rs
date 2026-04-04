@@ -1453,10 +1453,10 @@ impl MethodHandler {
         if let Some(handle) = handles.remove(channel_type) {
             handle.abort();
             info!(channel_type, "Channel bot stopped");
-            // Update runtime status
-            let mut status = self.channel_status.write().await;
-            status.remove(channel_type);
         }
+        // Always clear runtime status (handle may already be gone if bot crashed)
+        let mut status = self.channel_status.write().await;
+        status.remove(channel_type);
     }
 
     // ── Accounts ─────────────────────────────────────────────
