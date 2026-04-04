@@ -287,7 +287,7 @@ async fn handle_event(
 
     // Chat commands
     if crate::chat_commands::is_command(text) {
-        if let Some(cmd) = crate::chat_commands::parse_command(text) {
+        if let Some(cmd) = crate::chat_commands::parse_command(text, None) {
             let session_id = format!("slack:{channel}");
             let agent_id = {
                 let reg = ctx.registry.read().await;
@@ -295,7 +295,7 @@ async fn handle_event(
                     .map(|a| a.config.agent.name.clone())
                     .unwrap_or_default()
             };
-            let reply = crate::chat_commands::handle_command(&cmd, ctx, &session_id, &agent_id).await;
+            let reply = crate::chat_commands::handle_command(&cmd, ctx, &session_id, &agent_id, true).await;
             send_message(http, bot_token, channel, &reply, thread_ts.as_deref().or(Some(ts))).await;
             remove_reaction_add_done(http, bot_token, channel, ts).await;
             return;

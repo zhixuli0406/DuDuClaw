@@ -362,6 +362,51 @@ pub struct AgentConfig {
     /// Per-agent channel configuration (e.g., dedicated Discord bot token).
     #[serde(default)]
     pub channels: Option<ChannelsConfig>,
+    /// Cultural context for adjusting behavioural signal interpretation.
+    /// Defaults to zh-TW high-context settings.
+    ///
+    /// ```toml
+    /// [cultural_context]
+    /// locale = "zh-TW"
+    /// high_context = true
+    /// short_reply_threshold = 15
+    /// silence_as_agreement_weight = 0.7
+    /// indirect_disagreement_weight = 0.3
+    /// ```
+    #[serde(default)]
+    pub cultural_context: CulturalContextConfig,
+}
+
+/// Cultural context for adjusting behavioural signal interpretation.
+///
+/// High-context cultures (East Asian) use indirect communication patterns.
+/// Based on CHI 2024 "Cross-Cultural Perceptions of AI Conversational Agents"
+/// and ScienceDirect 2025 "Culturally Responsive AI Chatbots".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct CulturalContextConfig {
+    /// IANA locale (e.g., "zh-TW", "en-US").
+    pub locale: String,
+    /// High-context culture: silence/short replies may mean agreement.
+    pub high_context: bool,
+    /// Character count below which a reply is considered "short".
+    pub short_reply_threshold: usize,
+    /// Weight for silence-as-agreement interpretation (0.0-1.0).
+    pub silence_as_agreement_weight: f64,
+    /// Weight for indirect disagreement signals (0.0-1.0).
+    pub indirect_disagreement_weight: f64,
+}
+
+impl Default for CulturalContextConfig {
+    fn default() -> Self {
+        Self {
+            locale: "zh-TW".into(),
+            high_context: true,
+            short_reply_threshold: 15,
+            silence_as_agreement_weight: 0.7,
+            indirect_disagreement_weight: 0.3,
+        }
+    }
 }
 
 /// Proactive agent configuration — scheduled checks + user notification.

@@ -4,9 +4,17 @@
 //! Metacognitive Learning": the evolution engine doesn't just improve agent
 //! performance — it evaluates and adjusts its own triggering thresholds.
 //!
-//! Every `evaluation_interval` predictions, the metacognition layer checks
-//! whether each error category's triggers are effective and adjusts thresholds
-//! up (less sensitive) or down (more sensitive) accordingly.
+//! ## Hardening (2025-Q2)
+//!
+//! - **SurpriseDeficitTracker**: Forces GVU exploration when prediction errors
+//!   are consistently too low (dark room convergence). Based on Active Inference
+//!   epistemic foraging (Parr, Pezzulo & Friston 2024).
+//! - **High-confidence penalty**: Lowers thresholds when accuracy is suspiciously
+//!   high for too long (Fountas et al. 2023).
+//! - **Accumulation Principle**: Blends original baseline stats with current stats
+//!   to prevent feedback loop amplification (Gerstgrasser et al. ICLR 2025).
+//! - **CUSUM ChangePointDetector**: Replaces fixed 100-prediction evaluation
+//!   interval with adaptive shift detection (Suk 2024).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -70,7 +78,7 @@ impl AdaptiveThresholds {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayerEffectiveness {
     /// Rolling window of recent outcomes (true = improved, false = not improved).
-    pub recent_outcomes: Vec<bool>,
+    pub recent_outcomes: std::collections::VecDeque<bool>,
     /// Maximum window size (default 50).
     pub window_size: usize,
     /// Lifetime trigger count (for diagnostics only, not used in rate calculation).
@@ -80,7 +88,7 @@ pub struct LayerEffectiveness {
 impl Default for LayerEffectiveness {
     fn default() -> Self {
         Self {
-            recent_outcomes: Vec::new(),
+            recent_outcomes: std::collections::VecDeque::new(),
             window_size: 50,
             total_triggers: 0,
         }
@@ -95,10 +103,9 @@ impl LayerEffectiveness {
 
     /// Record an outcome for a previous trigger.
     pub fn record_outcome(&mut self, improved: bool) {
-        self.recent_outcomes.push(improved);
-        // Evict oldest if window exceeded
+        self.recent_outcomes.push_back(improved);
         while self.recent_outcomes.len() > self.window_size {
-            self.recent_outcomes.remove(0);
+            self.recent_outcomes.pop_front();
         }
     }
 
@@ -119,6 +126,140 @@ impl LayerEffectiveness {
 }
 
 // ---------------------------------------------------------------------------
+// SurpriseDeficitTracker — anti-dark-room
+// ---------------------------------------------------------------------------
+
+/// Tracks cumulative surprise deficit to detect dark room convergence.
+///
+/// When prediction errors are consistently below a floor, the cumulative
+/// deficit grows. Once it exceeds a budget, forced exploration is triggered.
+///
+/// Based on Active Inference epistemic foraging: agents must maintain a
+/// minimum level of surprise to ensure continued learning.
+/// (Parr, Pezzulo & Friston 2024)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SurpriseDeficitTracker {
+    /// Minimum expected surprise level (composite error floor).
+    pub expected_surprise_floor: f64,
+    /// Accumulated deficit: Σ max(0, floor - actual_error).
+    pub cumulative_deficit: f64,
+    /// Budget: when cumulative_deficit exceeds this, force exploration.
+    pub deficit_budget: f64,
+    /// How many times the deficit budget has been exceeded (lifetime).
+    pub forced_exploration_count: u64,
+}
+
+impl Default for SurpriseDeficitTracker {
+    fn default() -> Self {
+        Self {
+            expected_surprise_floor: 0.15,
+            cumulative_deficit: 0.0,
+            deficit_budget: 2.0,
+            forced_exploration_count: 0,
+        }
+    }
+}
+
+impl SurpriseDeficitTracker {
+    /// Record a prediction error and accumulate any deficit.
+    pub fn record(&mut self, composite_error: f64) {
+        let deficit = (self.expected_surprise_floor - composite_error).max(0.0);
+        self.cumulative_deficit += deficit;
+    }
+
+    /// Whether the deficit budget is exceeded (force exploration).
+    pub fn should_force_exploration(&self) -> bool {
+        self.cumulative_deficit > self.deficit_budget
+    }
+
+    /// Reset deficit after forced exploration is triggered.
+    pub fn reset(&mut self) {
+        self.cumulative_deficit = 0.0;
+        self.forced_exploration_count += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CUSUM ChangePointDetector — adaptive evaluation interval
+// ---------------------------------------------------------------------------
+
+/// Detects significant distribution shifts in prediction errors using CUSUM.
+///
+/// Replaces the fixed 100-prediction evaluation interval with adaptive
+/// detection: only recalibrate thresholds when a real shift is detected.
+///
+/// Based on Suk (2024) "Adaptive Smooth Non-Stationary Bandits".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangePointDetector {
+    /// Running mean of composite errors.
+    running_mean: f64,
+    /// Running count for mean calculation.
+    count: u64,
+    /// CUSUM positive statistic (detects upward shifts).
+    cusum_pos: f64,
+    /// CUSUM negative statistic (detects downward shifts).
+    cusum_neg: f64,
+    /// Slack parameter (minimum detectable shift / 2).
+    slack: f64,
+    /// Detection threshold.
+    threshold: f64,
+    /// Latched detection flag — set by `record()`, cleared by `acknowledge()`.
+    /// Prevents the detection from being lost between `record()` and `should_evaluate()`.
+    detected: bool,
+}
+
+impl Default for ChangePointDetector {
+    fn default() -> Self {
+        Self {
+            running_mean: 0.3,  // initial estimate
+            count: 0,
+            cusum_pos: 0.0,
+            cusum_neg: 0.0,
+            slack: 0.05,
+            threshold: 4.0,
+            detected: false,
+        }
+    }
+}
+
+impl ChangePointDetector {
+    /// Record a new composite error and check for distribution shift.
+    /// Returns `true` if a change point is detected.
+    pub fn record(&mut self, composite_error: f64) -> bool {
+        // CUSUM deviation BEFORE updating mean — otherwise the deviation is always
+        // near-zero because we'd be comparing against a mean that includes this observation.
+        // (Audit issue #3: neutered change-point detector)
+        self.cusum_pos = (self.cusum_pos + composite_error - self.running_mean - self.slack).max(0.0);
+        self.cusum_neg = (self.cusum_neg - composite_error + self.running_mean - self.slack).max(0.0);
+
+        // THEN update running mean (Welford's online mean)
+        self.count += 1;
+        let delta = composite_error - self.running_mean;
+        self.running_mean += delta / self.count as f64;
+
+        if self.cusum_pos > self.threshold || self.cusum_neg > self.threshold {
+            // Latch the detection and reset CUSUM accumulators
+            self.detected = true;
+            self.cusum_pos = 0.0;
+            self.cusum_neg = 0.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether a change point has been detected since the last acknowledgment.
+    pub fn is_detected(&self) -> bool {
+        self.detected
+    }
+
+    /// Acknowledge a detection — clears the latched flag.
+    pub fn acknowledge(&mut self) {
+        self.detected = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MetaCognition
 // ---------------------------------------------------------------------------
 
@@ -134,7 +275,7 @@ pub struct MetaCognition {
     /// Effectiveness tracking per error category.
     pub layer_stats: HashMap<String, LayerEffectiveness>,
 
-    /// How many predictions between evaluations.
+    /// How many predictions between evaluations (fallback if CUSUM disabled).
     pub evaluation_interval: u64,
 
     /// Predictions since last evaluation.
@@ -142,6 +283,28 @@ pub struct MetaCognition {
 
     /// Total predictions ever made.
     pub total_predictions: u64,
+
+    // ── Hardening: anti-dark-room (Risk 2) ─────────────────────
+
+    /// Surprise deficit tracker — forces exploration when predictions are
+    /// consistently too accurate (dark room convergence).
+    #[serde(default)]
+    pub surprise_deficit: SurpriseDeficitTracker,
+
+    /// Consecutive accurate predictions counter (for high-confidence penalty).
+    #[serde(default)]
+    pub consecutive_accurate: u64,
+
+    // ── Hardening: anti-feedback-loop (Risk 3) ─────────────────
+
+    /// CUSUM change-point detector — replaces fixed evaluation interval.
+    #[serde(default)]
+    pub change_detector: ChangePointDetector,
+
+    /// Original improvement rate for Significant category (anchored at first calibration).
+    /// Used for Accumulation Principle: blend 30% original + 70% current.
+    #[serde(default)]
+    pub original_sig_improvement_rate: Option<f64>,
 
     // ── Proactive self-calibration (Phase D3) ───────────────────
 
@@ -176,6 +339,10 @@ impl Default for MetaCognition {
             evaluation_interval: 100,
             predictions_since_last_eval: 0,
             total_predictions: 0,
+            surprise_deficit: SurpriseDeficitTracker::default(),
+            consecutive_accurate: 0,
+            change_detector: ChangePointDetector::default(),
+            original_sig_improvement_rate: None,
             proactive_threshold: 0.5,
             proactive_sent: 0,
             proactive_accepted: 0,
@@ -194,6 +361,20 @@ impl MetaCognition {
 
         self.predictions_since_last_eval += 1;
         self.total_predictions += 1;
+
+        // --- Hardening: surprise deficit tracking (Risk 2) ---
+        self.surprise_deficit.record(error.composite_error);
+
+        // Track consecutive accurate predictions (high-confidence penalty)
+        if error.category == ErrorCategory::Negligible {
+            self.consecutive_accurate += 1;
+        } else {
+            self.consecutive_accurate = 0;
+        }
+
+        // --- Hardening: CUSUM change-point detection (Risk 3) ---
+        // Feed composite error to the change detector (result used in should_evaluate)
+        self.change_detector.record(error.composite_error);
     }
 
     /// Record whether a triggered evolution actually improved things.
@@ -207,8 +388,27 @@ impl MetaCognition {
     }
 
     /// Whether it's time to evaluate and adjust thresholds.
+    ///
+    /// Uses CUSUM change-point detection as primary trigger, with fixed
+    /// interval as fallback.
     pub fn should_evaluate(&self) -> bool {
-        self.predictions_since_last_eval >= self.evaluation_interval
+        // CUSUM detected a distribution shift (latched flag, not stale values)
+        let cusum_triggered = self.change_detector.is_detected();
+
+        // Fallback: fixed interval
+        let interval_triggered = self.predictions_since_last_eval >= self.evaluation_interval;
+
+        cusum_triggered || interval_triggered
+    }
+
+    /// Whether the surprise deficit tracker requires forced exploration.
+    pub fn should_force_exploration(&self) -> bool {
+        self.surprise_deficit.should_force_exploration()
+    }
+
+    /// Reset surprise deficit after forced exploration is acted upon.
+    pub fn reset_surprise_deficit(&mut self) {
+        self.surprise_deficit.reset();
     }
 
     /// Evaluate threshold effectiveness and adjust.
@@ -222,11 +422,28 @@ impl MetaCognition {
         let crit_key = format!("{:?}", ErrorCategory::Critical);
         let mod_key = format!("{:?}", ErrorCategory::Moderate);
 
-        let sig_rate = self
+        let current_sig_rate = self
             .layer_stats
             .get(&sig_key)
             .map(|s| s.improvement_rate())
             .unwrap_or(0.5);
+
+        // --- Hardening: Accumulation Principle (Risk 3) ---
+        // Anchor first-ever sig improvement rate as baseline.
+        // Blend 30% original + 70% current to prevent feedback loop amplification.
+        // (Gerstgrasser et al. ICLR 2025 "Is Model Collapse Inevitable?")
+        if self.original_sig_improvement_rate.is_none()
+            && self.layer_stats.get(&sig_key).map(|s| s.window_count()).unwrap_or(0) >= 5
+        {
+            self.original_sig_improvement_rate = Some(current_sig_rate);
+            info!(rate = format!("{current_sig_rate:.2}"), "Anchored original sig improvement rate");
+        }
+
+        let sig_rate = if let Some(original) = self.original_sig_improvement_rate {
+            0.3 * original + 0.7 * current_sig_rate
+        } else {
+            current_sig_rate
+        };
 
         let crit_proportion = {
             let crit_triggers = self.layer_stats.get(&crit_key).map(|s| s.total_triggers).unwrap_or(0);
@@ -247,22 +464,37 @@ impl MetaCognition {
         let mut adjusted = false;
 
         // If Significant triggers rarely lead to improvement → too sensitive, raise threshold
-        // Uses window_count (rolling window) as the minimum sample guard
         if sig_rate < 0.3 && self.layer_stats.get(&sig_key).map(|s| s.window_count()).unwrap_or(0) >= 5 {
             self.thresholds.moderate_upper = (self.thresholds.moderate_upper + 0.05).min(0.85);
             adjusted = true;
         }
 
-        // If Significant triggers frequently lead to improvement → well-calibrated or too conservative
+        // If Significant triggers frequently lead to improvement → too conservative
         if sig_rate > 0.7 && self.layer_stats.get(&sig_key).map(|s| s.window_count()).unwrap_or(0) >= 5 {
             self.thresholds.moderate_upper = (self.thresholds.moderate_upper - 0.03).max(0.2);
             adjusted = true;
         }
 
-        // If Critical proportion is too high → Moderate/Significant thresholds are too high
+        // If Critical proportion is too high → thresholds are too high
         if crit_proportion > 0.2 {
             self.thresholds.significant_upper = (self.thresholds.significant_upper - 0.05).max(0.4);
             adjusted = true;
+        }
+
+        // --- Hardening: high-confidence penalty (Risk 2) ---
+        // When predictions are accurate for too long, the prediction space may
+        // have narrowed rather than improved. Lower thresholds to let more
+        // errors through. (Fountas et al. 2023)
+        if self.consecutive_accurate > 200 {
+            self.thresholds.negligible_upper = (self.thresholds.negligible_upper - 0.03).max(0.1);
+            adjusted = true;
+            info!(
+                consecutive = self.consecutive_accurate,
+                "High-confidence penalty applied — lowering negligible threshold"
+            );
+            // Reset to prevent repeated penalty application on every subsequent
+            // evaluate_and_adjust call (which would drive threshold to minimum).
+            self.consecutive_accurate = 0;
         }
 
         // Clamp all thresholds to valid ranges
@@ -289,6 +521,9 @@ impl MetaCognition {
 
         // Reset counter (but keep layer_stats for ongoing tracking)
         self.predictions_since_last_eval = 0;
+
+        // Acknowledge CUSUM detection so it doesn't re-trigger immediately
+        self.change_detector.acknowledge();
     }
 
     /// Persist state to a JSON file.

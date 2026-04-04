@@ -111,6 +111,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     }
 
     // ── Initialize prediction engine (Phase 1) ────────────────
+    // Embedding provider: None for now (Tier 2 vocabulary_novelty fallback).
+    // When BGE-small-zh is available at ~/.duduclaw/models/embedding/bge-small-zh/,
+    // pass Some(Arc::new(OnnxEmbeddingProvider::load(...))) here.
     let prediction_db_path = home_dir.join("prediction.db");
     let metacognition_path = home_dir.join("metacognition.json");
     let prediction_engine = Arc::new(
@@ -119,7 +122,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             Some(metacognition_path.clone()),
         )
     );
-    info!("Prediction engine initialized");
+    info!("Prediction engine initialized (embedding: none, using vocabulary_novelty fallback)");
 
     // ── Initialize GVU loop (Phase 2) ────────────────────────
     let gvu_db_path = home_dir.join("evolution.db");

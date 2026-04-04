@@ -26,6 +26,7 @@ pub mod server;
 pub mod session;
 pub mod telegram;
 pub mod chat_commands;
+pub mod defensive_prompt;
 pub mod updater;
 pub mod webchat;
 
