@@ -349,8 +349,10 @@ async fn poll_loop(
                 let scope_id = chat_id.to_string();
 
                 // ── Mention-only filter for groups ──
+                // Per-agent bots default to mention-only to prevent all bots responding
+                let default_mention_only = agent_name.is_some();
                 let mention_only = ctx.channel_settings
-                    .get_bool("telegram", &scope_id, keys::MENTION_ONLY, false).await;
+                    .get_bool("telegram", &scope_id, keys::MENTION_ONLY, default_mention_only).await;
 
                 let text_content = msg.text.as_deref().unwrap_or("");
                 let bot_mentioned = is_bot_mentioned(text_content, &msg.entities, &bot_username);

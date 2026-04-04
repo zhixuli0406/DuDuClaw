@@ -325,7 +325,9 @@ async fn handle_event(
     }
 
     // ── Mention-only filter ──
-    let mention_only = ctx.channel_settings.get_bool("slack", "global", keys::MENTION_ONLY, false).await;
+    // Per-agent bots default to mention-only to prevent all bots responding
+    let default_mention_only = agent_name.is_some();
+    let mention_only = ctx.channel_settings.get_bool("slack", "global", keys::MENTION_ONLY, default_mention_only).await;
     // Precise mention detection: check for <@BOT_USER_ID> rather than any <@
     let was_mentioned = if bot_user_id.is_empty() {
         raw_text.contains("<@") // Fallback if bot_user_id unknown
