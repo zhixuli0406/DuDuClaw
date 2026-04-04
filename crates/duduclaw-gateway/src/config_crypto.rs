@@ -87,6 +87,14 @@ pub fn decrypt_config_field(
 ) -> Option<String> {
     let section_table = table.get(section)?.as_table()?;
 
+    // If the plaintext field explicitly exists and is empty, the channel was removed.
+    // Respect this even if a stale _enc value remains (defensive against incomplete cleanup).
+    if let Some(plain_val) = section_table.get(field_base).and_then(|v| v.as_str()) {
+        if plain_val.is_empty() {
+            return None;
+        }
+    }
+
     // Try encrypted field first
     let enc_field = format!("{field_base}_enc");
     if let Some(enc_val) = section_table.get(&enc_field).and_then(|v| v.as_str()) {
