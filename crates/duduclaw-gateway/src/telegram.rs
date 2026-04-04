@@ -18,7 +18,7 @@ use serde_json::json;
 use tracing::{error, info, warn};
 
 use crate::channel_format;
-use crate::channel_reply::{ReplyContext, build_reply_with_session, set_channel_connected};
+use crate::channel_reply::{ReplyContext, build_reply_for_agent, build_reply_with_session, set_channel_connected};
 use crate::channel_settings::keys;
 use crate::tts::TtsProvider;
 
@@ -123,15 +123,81 @@ struct SendMessage {
 // ── Public API ──────────────────────────────────────────────
 
 /// Start the Telegram bot polling loop as a background task.
+///
+/// Kept for backward compatibility — delegates to `start_telegram_bots()`.
 pub async fn start_telegram_bot(
     home_dir: &Path,
     ctx: Arc<ReplyContext>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let token = read_telegram_token(home_dir).await?;
-    if token.is_empty() {
-        return None;
+    let mut bots = start_telegram_bots(home_dir, ctx).await;
+    bots.pop().map(|(_, h)| h)
+}
+
+/// Start multiple Telegram bots: one global (from config.toml) plus per-agent bots.
+///
+/// Returns a Vec of (label, JoinHandle) where label is "telegram" for the global
+/// bot and "telegram:{agent_name}" for per-agent bots.
+/// Deduplicates by token value — if an agent token matches the global token, it
+/// is skipped (the global bot already covers it).
+pub async fn start_telegram_bots(
+    home_dir: &Path,
+    ctx: Arc<ReplyContext>,
+) -> Vec<(String, tokio::task::JoinHandle<()>)> {
+    let mut results = Vec::new();
+    let mut seen_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 1. Global bot from config.toml
+    if let Some(token) = read_telegram_token(home_dir).await {
+        if !token.is_empty() {
+            seen_tokens.insert(token.clone());
+            if let Some(handle) = spawn_telegram_bot(token, "telegram".into(), None, ctx.clone(), home_dir).await {
+                results.push(("telegram".to_string(), handle));
+            }
+        }
     }
 
+    // 2. Per-agent bots from agent configs
+    let agent_tokens: Vec<(String, String)> = {
+        let reg = ctx.registry.read().await;
+        let mut tokens = Vec::new();
+        for agent in reg.list() {
+            if let Some(channels) = &agent.config.channels {
+                if let Some(tg) = &channels.telegram {
+                    let token = crate::config_crypto::resolve_agent_token(
+                        &tg.bot_token_enc, &tg.bot_token, home_dir,
+                    );
+                    if !token.is_empty() {
+                        tokens.push((agent.config.agent.name.clone(), token));
+                    }
+                }
+            }
+        }
+        tokens
+    };
+
+    for (agent_name, token) in agent_tokens {
+        if seen_tokens.contains(&token) {
+            info!("Telegram bot for agent '{agent_name}' shares global token — skipping duplicate");
+            continue;
+        }
+        seen_tokens.insert(token.clone());
+        let label = format!("telegram:{agent_name}");
+        if let Some(handle) = spawn_telegram_bot(token, label.clone(), Some(agent_name), ctx.clone(), home_dir).await {
+            results.push((label, handle));
+        }
+    }
+
+    results
+}
+
+/// Spawn a single Telegram bot (shared by global and per-agent paths).
+async fn spawn_telegram_bot(
+    token: String,
+    label: String,
+    agent_name: Option<String>,
+    ctx: Arc<ReplyContext>,
+    _home_dir: &Path,
+) -> Option<tokio::task::JoinHandle<()>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(35))
         .build()
@@ -146,29 +212,30 @@ pub async fn start_telegram_bot(
                 if data.ok {
                     if let Some(user) = &data.result {
                         let name = user.username.as_deref().unwrap_or("unknown");
-                        info!("🤖 Telegram bot connected: @{name}");
-
-                        // Register bot commands
-                        register_commands(&client, &api_base).await;
+                        info!("Telegram bot connected: @{name} (label: {label})");
+                        // Only register commands for the global bot
+                        if agent_name.is_none() {
+                            register_commands(&client, &api_base).await;
+                        }
                     }
-                    set_channel_connected(&ctx.channel_status, "telegram", true, None).await;
+                    set_channel_connected(&ctx.channel_status, &label, true, None).await;
                 } else {
                     let desc = data.description.unwrap_or_default();
-                    warn!("Telegram getMe failed: {desc}");
-                    set_channel_connected(&ctx.channel_status, "telegram", false, Some(desc)).await;
+                    warn!("Telegram getMe failed for {label}: {desc}");
+                    set_channel_connected(&ctx.channel_status, &label, false, Some(desc)).await;
                     return None;
                 }
             }
         }
         Err(e) => {
-            warn!("Telegram connection failed: {e}");
-            set_channel_connected(&ctx.channel_status, "telegram", false, Some(e.to_string())).await;
+            warn!("Telegram connection failed for {label}: {e}");
+            set_channel_connected(&ctx.channel_status, &label, false, Some(e.to_string())).await;
             return None;
         }
     }
 
     let handle = tokio::spawn(async move {
-        poll_loop(client, api_base, ctx).await;
+        poll_loop(client, api_base, ctx, agent_name).await;
     });
 
     Some(handle)
@@ -213,6 +280,7 @@ async fn poll_loop(
     client: reqwest::Client,
     api_base: String,
     ctx: Arc<ReplyContext>,
+    agent_name: Option<String>,
 ) {
     let mut offset: i64 = 0;
     let mut consecutive_errors: u32 = 0;
@@ -302,7 +370,7 @@ async fn poll_loop(
                 let input_text = if let Some(text) = &msg.text {
                     // Handle bot commands
                     if text.starts_with('/') {
-                        handle_command(text, &client, &api_base, chat_id, thread_id, &ctx, &scope_id).await;
+                        handle_command(text, &client, &api_base, chat_id, thread_id, &ctx, &scope_id, agent_name.as_deref()).await;
                         continue;
                     }
                     // Strip bot mention
@@ -374,7 +442,11 @@ async fn poll_loop(
                 });
 
                 let user_id = msg.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default();
-                let reply = build_reply_with_session(&input_text, &ctx, &session_id, &user_id, Some(on_progress)).await;
+                let reply = if let Some(ref agent) = agent_name {
+                    build_reply_for_agent(&input_text, &ctx, agent, &session_id, &user_id, Some(on_progress)).await
+                } else {
+                    build_reply_with_session(&input_text, &ctx, &session_id, &user_id, Some(on_progress)).await
+                };
 
                 // Check voice mode
                 let session_key = format!("telegram:{chat_id}");
@@ -412,6 +484,7 @@ async fn handle_command(
     thread_id: Option<i64>,
     ctx: &Arc<ReplyContext>,
     scope_id: &str,
+    agent_name: Option<&str>,
 ) {
     // Parse command (strip @bot_username suffix)
     let raw_cmd = text.split_whitespace().next().unwrap_or("");
@@ -430,7 +503,11 @@ async fn handle_command(
             } else {
                 format!("telegram:{chat_id}")
             };
-            let reply = build_reply_with_session(args, ctx, &session_id, scope_id, None).await;
+            let reply = if let Some(agent) = agent_name {
+                build_reply_for_agent(args, ctx, agent, &session_id, scope_id, None).await
+            } else {
+                build_reply_with_session(args, ctx, &session_id, scope_id, None).await
+            };
             send_reply(client, api_base, chat_id, &reply, thread_id, Some(channel_format::telegram_conversation_buttons())).await;
         }
         "/status" => {

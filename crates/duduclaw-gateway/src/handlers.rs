@@ -1283,18 +1283,19 @@ impl MethodHandler {
         // Hot-stop: abort the running global channel bot task
         self.hot_stop_channel(channel_type).await;
 
-        // For Discord: if per-agent bots exist, re-launch them since the global
-        // bot was deduplicating their tokens. Without the global bot, per-agent
-        // bots need to start independently.
+        // Re-launch per-agent bots since the global bot was deduplicating their tokens.
         let mut restarted_agents = Vec::new();
-        if channel_type == "discord" {
-            let ctx_opt = self.reply_ctx.read().await.clone();
-            if let Some(ctx) = ctx_opt {
-                let per_agent_handles = crate::discord::start_discord_bots(&self.home_dir, ctx).await;
-                for (label, h) in per_agent_handles {
-                    restarted_agents.push(label.clone());
-                    self.register_channel_handle(&label, h).await;
-                }
+        let ctx_opt = self.reply_ctx.read().await.clone();
+        if let Some(ctx) = ctx_opt {
+            let per_agent_handles: Vec<(String, tokio::task::JoinHandle<()>)> = match channel_type {
+                "discord" => crate::discord::start_discord_bots(&self.home_dir, ctx).await,
+                "telegram" => crate::telegram::start_telegram_bots(&self.home_dir, ctx).await,
+                "slack" => crate::slack::start_slack_bots(&self.home_dir, ctx).await,
+                _ => Vec::new(), // Webhook channels: no per-agent re-launch yet
+            };
+            for (label, h) in per_agent_handles {
+                restarted_agents.push(label.clone());
+                self.register_channel_handle(&label, h).await;
             }
         }
 

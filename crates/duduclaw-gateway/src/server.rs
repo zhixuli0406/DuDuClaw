@@ -153,15 +153,20 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Store background task handles for graceful shutdown (BE-L4)
     let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    if let Some(h) = crate::telegram::start_telegram_bot(&home_dir, reply_ctx.clone()).await {
-        handler.register_channel_handle("telegram", h).await;
-    }
-    let line_router = crate::line::start_line_bot(&home_dir, reply_ctx.clone()).await;
-    let webchat_ctx = reply_ctx.clone();
-    let discord_handles = crate::discord::start_discord_bots(&home_dir, reply_ctx.clone()).await;
-    for (label, h) in discord_handles {
+    // Start channel bots — per-agent where supported
+    for (label, h) in crate::telegram::start_telegram_bots(&home_dir, reply_ctx.clone()).await {
         handler.register_channel_handle(&label, h).await;
     }
+    for (label, h) in crate::slack::start_slack_bots(&home_dir, reply_ctx.clone()).await {
+        handler.register_channel_handle(&label, h).await;
+    }
+    for (label, h) in crate::discord::start_discord_bots(&home_dir, reply_ctx.clone()).await {
+        handler.register_channel_handle(&label, h).await;
+    }
+    // Webhook channels (LINE, WhatsApp, Feishu) — global only for now
+    // Per-agent webhook routing requires multi-path routers (TODO-per-agent-channels.md)
+    let line_router = crate::line::start_line_bot(&home_dir, reply_ctx.clone()).await;
+    let webchat_ctx = reply_ctx.clone();
 
     // Start unified heartbeat scheduler (per-agent: evolution + cron + monitoring)
     // Replaces the old start_evolution_timers — each agent's HeartbeatConfig
