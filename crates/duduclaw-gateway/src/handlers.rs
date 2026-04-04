@@ -1404,9 +1404,13 @@ impl MethodHandler {
 
         if let Some(channels) = table.get_mut("channels").and_then(|v| v.as_table_mut()) {
             channels.insert(token_key.to_string(), toml::Value::String(String::new()));
+            // Also clear the encrypted version
+            let enc_key = format!("{token_key}_enc");
+            channels.insert(enc_key, toml::Value::String(String::new()));
             // Also clear secret for LINE
             if channel_type == "line" {
                 channels.insert("line_channel_secret".to_string(), toml::Value::String(String::new()));
+                channels.insert("line_channel_secret_enc".to_string(), toml::Value::String(String::new()));
             }
         }
 
