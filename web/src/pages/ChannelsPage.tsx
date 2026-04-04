@@ -263,13 +263,20 @@ export function ChannelsPage() {
 const SUPPORTS_PER_AGENT = ['discord', 'telegram', 'slack'];
 
 function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boolean; onClose: () => void; onCreated: () => void; fixedType?: string }) {
-  const [channelType, setChannelType] = useState(fixedType ?? 'line');
-  const [selectedAgent, setSelectedAgent] = useState('');
+  // Parse fixedType: "discord:lab-bot" → platform="discord", agent="lab-bot"
+  const parsedPlatform = fixedType?.split(':')[0];
+  const parsedAgent = fixedType?.includes(':') ? fixedType.split(':').slice(1).join(':') : undefined;
+
+  const [channelType, setChannelType] = useState(parsedPlatform ?? fixedType ?? 'line');
+  const [selectedAgent, setSelectedAgent] = useState(parsedAgent ?? '');
   const [agents, setAgents] = useState<AgentInfo[]>([]);
 
   useEffect(() => {
-    if (fixedType) setChannelType(fixedType);
-  }, [fixedType]);
+    if (fixedType) {
+      setChannelType(parsedPlatform ?? fixedType);
+      setSelectedAgent(parsedAgent ?? '');
+    }
+  }, [fixedType, parsedPlatform, parsedAgent]);
 
   useEffect(() => {
     if (open) {
