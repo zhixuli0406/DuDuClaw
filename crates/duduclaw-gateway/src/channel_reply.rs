@@ -894,10 +894,12 @@ async fn call_claude_cli(
         "--model", model,
         "--output-format", "stream-json",
         "--verbose",
-        // Channel subprocess has no TTY — auto-accept tool permissions.
-        // Agent-level security is enforced by CONTRACT.toml + container sandbox,
-        // not by Claude Code's interactive permission prompts.
-        "--permission-mode", "auto",
+        // Channel subprocess has no TTY — bypass all permission prompts.
+        // Agent-level security is enforced by CONTRACT.toml + container sandbox
+        // + duduclaw security hooks, not by Claude Code's interactive prompts.
+        // "auto" mode still pauses for some high-risk ops (mkdir, write) which
+        // causes Claude to tell Discord users "please click Allow in terminal".
+        "--dangerously-skip-permissions",
         // Allow enough agentic turns for complex tasks (read files → think → write).
         // Default -p max-turns can be too low, causing Claude to stop mid-task
         // and return a text summary instead of completing the work.
