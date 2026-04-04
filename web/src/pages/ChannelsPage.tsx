@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
-import { api, type ChannelStatus } from '@/lib/api';
+import { api, type ChannelStatus, type AgentInfo } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import {
@@ -260,12 +260,23 @@ export function ChannelsPage() {
   );
 }
 
+const SUPPORTS_PER_AGENT = ['discord', 'telegram', 'slack'];
+
 function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boolean; onClose: () => void; onCreated: () => void; fixedType?: string }) {
   const [channelType, setChannelType] = useState(fixedType ?? 'line');
+  const [selectedAgent, setSelectedAgent] = useState('');
+  const [agents, setAgents] = useState<AgentInfo[]>([]);
 
   useEffect(() => {
     if (fixedType) setChannelType(fixedType);
   }, [fixedType]);
+
+  useEffect(() => {
+    if (open) {
+      api.agents.list().then((r) => setAgents(r.agents ?? [])).catch(() => {});
+    }
+  }, [open]);
+
   const [token, setToken] = useState('');
   const [secret, setSecret] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -276,11 +287,12 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
     try {
       const config: Record<string, string> = { token: token.trim() };
       if (secret.trim()) config.secret = secret.trim();
-      await api.channels.add(channelType, config);
+      await api.channels.add(channelType, config, selectedAgent || undefined);
       onCreated();
       onClose();
       setToken('');
       setSecret('');
+      setSelectedAgent('');
     } catch {
       // error
     } finally {
@@ -381,6 +393,20 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
             <option value="feishu">Feishu</option>
           </select>
         </FormField>
+
+        {SUPPORTS_PER_AGENT.includes(channelType) && agents.length > 0 && (
+          <FormField label="指定 Agent（選填）">
+            <select value={selectedAgent} onChange={(e) => setSelectedAgent(e.target.value)} className={selectClass}>
+              <option value="">全域（Global）</option>
+              {agents.map((a) => (
+                <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
+              ))}
+            </select>
+            <p className="mt-1 text-xs text-stone-500 dark:text-stone-400">
+              指定後此 Bot 僅服務該 Agent，不指定則為全域通道
+            </p>
+          </FormField>
+        )}
 
         {/* Setup guide */}
         <div className="rounded-lg bg-amber-50 p-3 text-xs text-amber-800 dark:bg-amber-900/20 dark:text-amber-300">
