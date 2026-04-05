@@ -5,7 +5,6 @@
 //! - Text, voice, and audio message handling
 //! - Supergroup topic/forum support (message_thread_id)
 //! - Mention-only mode for group chats
-//! - Inline keyboard buttons
 //! - Bot command registration (/ask, /status, /voice, /reset)
 //! - Voice transcription (Whisper) + TTS synthesis
 //! - Per-chat settings via ChannelSettingsManager
@@ -18,7 +17,7 @@ use serde_json::json;
 use tracing::{error, info, warn};
 
 use crate::channel_format;
-use crate::channel_reply::{ReplyContext, build_reply_with_session, set_channel_connected};
+use crate::channel_reply::{ReplyContext, build_reply_for_agent, build_reply_with_session, set_channel_connected};
 use crate::channel_settings::keys;
 use crate::tts::TtsProvider;
 
@@ -90,22 +89,6 @@ struct TgEntity {
 struct TgUpdate {
     update_id: i64,
     message: Option<TgMessage>,
-    callback_query: Option<TgCallbackQuery>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TgCallbackQuery {
-    id: String,
-    #[allow(dead_code)]
-    from: TgUser,
-    message: Option<TgCallbackMessage>,
-    data: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TgCallbackMessage {
-    chat: TgChat,
-    message_thread_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,22 +99,86 @@ struct SendMessage {
     parse_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message_thread_id: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reply_markup: Option<serde_json::Value>,
 }
 
 // ── Public API ──────────────────────────────────────────────
 
 /// Start the Telegram bot polling loop as a background task.
+///
+/// Kept for backward compatibility — delegates to `start_telegram_bots()`.
 pub async fn start_telegram_bot(
     home_dir: &Path,
     ctx: Arc<ReplyContext>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let token = read_telegram_token(home_dir).await?;
-    if token.is_empty() {
-        return None;
+    let mut bots = start_telegram_bots(home_dir, ctx).await;
+    bots.pop().map(|(_, h)| h)
+}
+
+/// Start multiple Telegram bots: one global (from config.toml) plus per-agent bots.
+///
+/// Returns a Vec of (label, JoinHandle) where label is "telegram" for the global
+/// bot and "telegram:{agent_name}" for per-agent bots.
+/// Deduplicates by token value — if an agent token matches the global token, it
+/// is skipped (the global bot already covers it).
+pub async fn start_telegram_bots(
+    home_dir: &Path,
+    ctx: Arc<ReplyContext>,
+) -> Vec<(String, tokio::task::JoinHandle<()>)> {
+    let mut results = Vec::new();
+    let mut seen_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 1. Global bot from config.toml
+    if let Some(token) = read_telegram_token(home_dir).await {
+        if !token.is_empty() {
+            seen_tokens.insert(token.clone());
+            if let Some(handle) = spawn_telegram_bot(token, "telegram".into(), None, ctx.clone(), home_dir).await {
+                results.push(("telegram".to_string(), handle));
+            }
+        }
     }
 
+    // 2. Per-agent bots from agent configs
+    let agent_tokens: Vec<(String, String)> = {
+        let reg = ctx.registry.read().await;
+        let mut tokens = Vec::new();
+        for agent in reg.list() {
+            if let Some(channels) = &agent.config.channels {
+                if let Some(tg) = &channels.telegram {
+                    let token = crate::config_crypto::resolve_agent_token(
+                        &tg.bot_token_enc, &tg.bot_token, home_dir,
+                    );
+                    if !token.is_empty() {
+                        tokens.push((agent.config.agent.name.clone(), token));
+                    }
+                }
+            }
+        }
+        tokens
+    };
+
+    for (agent_name, token) in agent_tokens {
+        if seen_tokens.contains(&token) {
+            info!("Telegram bot for agent '{agent_name}' shares global token — skipping duplicate");
+            continue;
+        }
+        seen_tokens.insert(token.clone());
+        let label = format!("telegram:{agent_name}");
+        if let Some(handle) = spawn_telegram_bot(token, label.clone(), Some(agent_name), ctx.clone(), home_dir).await {
+            results.push((label, handle));
+        }
+    }
+
+    results
+}
+
+/// Spawn a single Telegram bot (shared by global and per-agent paths).
+async fn spawn_telegram_bot(
+    token: String,
+    label: String,
+    agent_name: Option<String>,
+    ctx: Arc<ReplyContext>,
+    _home_dir: &Path,
+) -> Option<tokio::task::JoinHandle<()>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(35))
         .build()
@@ -146,29 +193,30 @@ pub async fn start_telegram_bot(
                 if data.ok {
                     if let Some(user) = &data.result {
                         let name = user.username.as_deref().unwrap_or("unknown");
-                        info!("🤖 Telegram bot connected: @{name}");
-
-                        // Register bot commands
-                        register_commands(&client, &api_base).await;
+                        info!("Telegram bot connected: @{name} (label: {label})");
+                        // Only register commands for the global bot
+                        if agent_name.is_none() {
+                            register_commands(&client, &api_base).await;
+                        }
                     }
-                    set_channel_connected(&ctx.channel_status, "telegram", true, None).await;
+                    set_channel_connected(&ctx.channel_status, &label, true, None, Some(&ctx.event_tx)).await;
                 } else {
                     let desc = data.description.unwrap_or_default();
-                    warn!("Telegram getMe failed: {desc}");
-                    set_channel_connected(&ctx.channel_status, "telegram", false, Some(desc)).await;
+                    warn!("Telegram getMe failed for {label}: {desc}");
+                    set_channel_connected(&ctx.channel_status, &label, false, Some(desc), Some(&ctx.event_tx)).await;
                     return None;
                 }
             }
         }
         Err(e) => {
-            warn!("Telegram connection failed: {e}");
-            set_channel_connected(&ctx.channel_status, "telegram", false, Some(e.to_string())).await;
+            warn!("Telegram connection failed for {label}: {e}");
+            set_channel_connected(&ctx.channel_status, &label, false, Some(e.to_string()), Some(&ctx.event_tx)).await;
             return None;
         }
     }
 
     let handle = tokio::spawn(async move {
-        poll_loop(client, api_base, ctx).await;
+        poll_loop(client, api_base, ctx, label, agent_name).await;
     });
 
     Some(handle)
@@ -213,6 +261,8 @@ async fn poll_loop(
     client: reqwest::Client,
     api_base: String,
     ctx: Arc<ReplyContext>,
+    label: String,
+    agent_name: Option<String>,
 ) {
     let mut offset: i64 = 0;
     let mut consecutive_errors: u32 = 0;
@@ -222,14 +272,14 @@ async fn poll_loop(
     let bot_username = get_bot_username(&client, &api_base).await.unwrap_or_default();
 
     loop {
-        let url = format!("{api_base}/getUpdates?offset={offset}&timeout=25&allowed_updates=[\"message\",\"callback_query\"]");
+        let url = format!("{api_base}/getUpdates?offset={offset}&timeout=25&allowed_updates=[\"message\"]");
 
         let resp = match client.get(&url).send().await {
             Ok(r) => r,
             Err(e) => {
                 consecutive_errors += 1;
                 warn!("Telegram poll error: {e}");
-                set_channel_connected(&ctx.channel_status, "telegram", false, Some(e.to_string())).await;
+                set_channel_connected(&ctx.channel_status, &label, false, Some(e.to_string()), Some(&ctx.event_tx)).await;
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 continue;
             }
@@ -239,8 +289,8 @@ async fn poll_loop(
             Ok(d) => d,
             Err(e) => {
                 consecutive_errors += 1;
-                warn!("Telegram parse error: {e}");
-                set_channel_connected(&ctx.channel_status, "telegram", false, Some(e.to_string())).await;
+                warn!("Telegram [{label}] parse error: {e}");
+                set_channel_connected(&ctx.channel_status, &label, false, Some(e.to_string()), Some(&ctx.event_tx)).await;
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 continue;
             }
@@ -249,27 +299,21 @@ async fn poll_loop(
         if !data.ok {
             consecutive_errors += 1;
             let desc = data.description.unwrap_or_default();
-            warn!("Telegram API error: {desc}");
-            set_channel_connected(&ctx.channel_status, "telegram", false, Some(desc)).await;
+            warn!("Telegram [{label}] API error: {desc}");
+            set_channel_connected(&ctx.channel_status, &label, false, Some(desc), Some(&ctx.event_tx)).await;
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             continue;
         }
 
         if consecutive_errors > 0 {
-            info!("Telegram polling recovered after {consecutive_errors} errors");
+            info!("Telegram [{label}] polling recovered after {consecutive_errors} errors");
         }
         consecutive_errors = 0;
-        set_channel_connected(&ctx.channel_status, "telegram", true, None).await;
+        set_channel_connected(&ctx.channel_status, &label, true, None, Some(&ctx.event_tx)).await;
 
         if let Some(updates) = data.result {
             for update in updates {
                 offset = update.update_id + 1;
-
-                // Handle callback queries (inline keyboard button presses)
-                if let Some(cb) = update.callback_query {
-                    handle_callback_query(&client, &api_base, &cb, &ctx).await;
-                    continue;
-                }
 
                 let Some(msg) = update.message else { continue };
                 let chat_id = msg.chat.id;
@@ -280,8 +324,10 @@ async fn poll_loop(
                 let scope_id = chat_id.to_string();
 
                 // ── Mention-only filter for groups ──
+                // Per-agent bots default to mention-only to prevent all bots responding
+                let default_mention_only = agent_name.is_some();
                 let mention_only = ctx.channel_settings
-                    .get_bool("telegram", &scope_id, keys::MENTION_ONLY, false).await;
+                    .get_bool("telegram", &scope_id, keys::MENTION_ONLY, default_mention_only).await;
 
                 let text_content = msg.text.as_deref().unwrap_or("");
                 let bot_mentioned = is_bot_mentioned(text_content, &msg.entities, &bot_username);
@@ -302,7 +348,7 @@ async fn poll_loop(
                 let input_text = if let Some(text) = &msg.text {
                     // Handle bot commands
                     if text.starts_with('/') {
-                        handle_command(text, &client, &api_base, chat_id, thread_id, &ctx, &scope_id).await;
+                        handle_command(text, &client, &api_base, chat_id, thread_id, &ctx, &scope_id, agent_name.as_deref()).await;
                         continue;
                     }
                     // Strip bot mention
@@ -316,7 +362,7 @@ async fn poll_loop(
                         }
                         Err(e) => {
                             warn!("Voice transcription failed: {e}");
-                            send_reply(&client, &api_base, chat_id, "⚠️ Voice transcription failed — please try again", thread_id, None).await;
+                            send_reply(&client, &api_base, chat_id, "⚠️ Voice transcription failed — please try again", thread_id).await;
                             continue;
                         }
                     }
@@ -326,7 +372,7 @@ async fn poll_loop(
                         Ok(text) => text,
                         Err(e) => {
                             warn!("Audio transcription failed: {e}");
-                            send_reply(&client, &api_base, chat_id, "⚠️ Audio transcription failed — please try again", thread_id, None).await;
+                            send_reply(&client, &api_base, chat_id, "⚠️ Audio transcription failed — please try again", thread_id).await;
                             continue;
                         }
                     }
@@ -369,12 +415,16 @@ async fn poll_loop(
                     let c = progress_client.clone();
                     let api = progress_api.clone();
                     tokio::spawn(async move {
-                        send_reply(&c, &api, progress_chat_id, &msg_text, progress_thread_id, None).await;
+                        send_reply(&c, &api, progress_chat_id, &msg_text, progress_thread_id).await;
                     });
                 });
 
                 let user_id = msg.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default();
-                let reply = build_reply_with_session(&input_text, &ctx, &session_id, &user_id, Some(on_progress)).await;
+                let reply = if let Some(ref agent) = agent_name {
+                    build_reply_for_agent(&input_text, &ctx, agent, &session_id, &user_id, Some(on_progress)).await
+                } else {
+                    build_reply_with_session(&input_text, &ctx, &session_id, &user_id, Some(on_progress)).await
+                };
 
                 // Check voice mode
                 let session_key = format!("telegram:{chat_id}");
@@ -386,17 +436,16 @@ async fn poll_loop(
                         Ok(audio_bytes) => {
                             send_voice(&client, &api_base, chat_id, audio_bytes).await;
                             if reply.len() > 200 {
-                                send_reply(&client, &api_base, chat_id, &format!("📝 {}", &reply[..200]), thread_id, None).await;
+                                send_reply(&client, &api_base, chat_id, &format!("📝 {}", &reply[..200]), thread_id).await;
                             }
                         }
                         Err(e) => {
                             warn!("TTS synthesis failed, falling back to text: {e}");
-                            send_reply(&client, &api_base, chat_id, &reply, thread_id, Some(channel_format::telegram_conversation_buttons())).await;
+                            send_reply(&client, &api_base, chat_id, &reply, thread_id).await;
                         }
                     }
                 } else {
-                    // Send with inline keyboard buttons
-                    send_reply(&client, &api_base, chat_id, &reply, thread_id, Some(channel_format::telegram_conversation_buttons())).await;
+                    send_reply(&client, &api_base, chat_id, &reply, thread_id).await;
                 }
             }
         }
@@ -412,6 +461,7 @@ async fn handle_command(
     thread_id: Option<i64>,
     ctx: &Arc<ReplyContext>,
     scope_id: &str,
+    agent_name: Option<&str>,
 ) {
     // Parse command (strip @bot_username suffix)
     let raw_cmd = text.split_whitespace().next().unwrap_or("");
@@ -422,7 +472,7 @@ async fn handle_command(
     match cmd {
         "/ask" => {
             if args.is_empty() {
-                send_reply(client, api_base, chat_id, "Usage: /ask <your question>", thread_id, None).await;
+                send_reply(client, api_base, chat_id, "Usage: /ask <your question>", thread_id).await;
                 return;
             }
             let session_id = if let Some(tid) = thread_id {
@@ -430,8 +480,12 @@ async fn handle_command(
             } else {
                 format!("telegram:{chat_id}")
             };
-            let reply = build_reply_with_session(args, ctx, &session_id, scope_id, None).await;
-            send_reply(client, api_base, chat_id, &reply, thread_id, Some(channel_format::telegram_conversation_buttons())).await;
+            let reply = if let Some(agent) = agent_name {
+                build_reply_for_agent(args, ctx, agent, &session_id, scope_id, None).await
+            } else {
+                build_reply_with_session(args, ctx, &session_id, scope_id, None).await
+            };
+            send_reply(client, api_base, chat_id, &reply, thread_id).await;
         }
         "/status" => {
             let agent_info = {
@@ -446,7 +500,7 @@ async fn handle_command(
 
             let mention_only = ctx.channel_settings.get_bool("telegram", scope_id, keys::MENTION_ONLY, false).await;
             let status = format!("{agent_info}\n\nMention Only: {}", if mention_only { "✅" } else { "❌" });
-            send_reply(client, api_base, chat_id, &status, thread_id, None).await;
+            send_reply(client, api_base, chat_id, &status, thread_id).await;
         }
         "/voice" => {
             let session_key = format!("telegram:{chat_id}");
@@ -458,7 +512,7 @@ async fn handle_command(
                 sessions.insert(session_key);
                 "🎤 Voice reply mode enabled"
             };
-            send_reply(client, api_base, chat_id, msg, thread_id, None).await;
+            send_reply(client, api_base, chat_id, msg, thread_id).await;
         }
         "/reset" => {
             let session_id = if let Some(tid) = thread_id {
@@ -470,7 +524,7 @@ async fn handle_command(
                 Ok(()) => format!("✅ Session `{session_id}` cleared."),
                 Err(e) => format!("⚠️ Failed to clear session: {e}"),
             };
-            send_reply(client, api_base, chat_id, &msg, thread_id, None).await;
+            send_reply(client, api_base, chat_id, &msg, thread_id).await;
         }
         "/help" => {
             let help = "\
@@ -479,68 +533,10 @@ async fn handle_command(
 /voice — Toggle voice reply mode\n\
 /reset — Clear conversation session\n\
 /help — Show this help";
-            send_reply(client, api_base, chat_id, help, thread_id, None).await;
+            send_reply(client, api_base, chat_id, help, thread_id).await;
         }
         _ => {} // Unknown command — ignore
     }
-}
-
-/// Handle callback queries from inline keyboard buttons.
-async fn handle_callback_query(
-    client: &reqwest::Client,
-    api_base: &str,
-    cb: &TgCallbackQuery,
-    ctx: &Arc<ReplyContext>,
-) {
-    let cb_data = cb.data.as_deref().unwrap_or("");
-    let chat_id = match cb.message.as_ref().map(|m| m.chat.id) {
-        Some(id) => id,
-        None => {
-            // No message context (e.g. inline mode) — just answer the callback
-            let _ = client
-                .post(format!("{api_base}/answerCallbackQuery"))
-                .json(&json!({ "callback_query_id": cb.id }))
-                .send()
-                .await;
-            return;
-        }
-    };
-    let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
-
-    // Parse callback data: "duduclaw:{action}"
-    if let Some(action) = cb_data.strip_prefix("duduclaw:") {
-        match action {
-            "new_session" => {
-                let session_id = if let Some(tid) = thread_id {
-                    format!("telegram:{chat_id}:{tid}")
-                } else {
-                    format!("telegram:{chat_id}")
-                };
-                let msg = format!("Started new session. Previous: `{session_id}`");
-                send_reply(client, api_base, chat_id, &msg, thread_id, None).await;
-            }
-            "voice_toggle" => {
-                let session_key = format!("telegram:{chat_id}");
-                let mut sessions = ctx.voice_sessions.lock().await;
-                let msg = if sessions.contains(&session_key) {
-                    sessions.remove(&session_key);
-                    "🔇 Voice mode disabled"
-                } else {
-                    sessions.insert(session_key);
-                    "🎤 Voice mode enabled"
-                };
-                send_reply(client, api_base, chat_id, msg, thread_id, None).await;
-            }
-            _ => {}
-        }
-    }
-
-    // Answer the callback query to dismiss the loading state
-    let _ = client
-        .post(format!("{api_base}/answerCallbackQuery"))
-        .json(&json!({ "callback_query_id": cb.id }))
-        .send()
-        .await;
 }
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -713,19 +709,16 @@ async fn send_reply(
     chat_id: i64,
     text: &str,
     message_thread_id: Option<i64>,
-    reply_markup: Option<serde_json::Value>,
 ) {
     // Split long messages
     let chunks = channel_format::split_text(text, channel_format::limits::TELEGRAM_MESSAGE);
 
-    for (i, chunk) in chunks.iter().enumerate() {
+    for chunk in chunks.iter() {
         let body = SendMessage {
             chat_id,
             text: chunk.to_string(),
             parse_mode: Some("Markdown".to_string()),
             message_thread_id,
-            // Only add buttons to the last chunk
-            reply_markup: if i == chunks.len() - 1 { reply_markup.clone() } else { None },
         };
 
         match client.post(format!("{api_base}/sendMessage")).json(&body).send().await {

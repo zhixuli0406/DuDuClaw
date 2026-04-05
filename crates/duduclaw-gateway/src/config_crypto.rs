@@ -56,6 +56,24 @@ pub fn encrypt_value(plaintext: &str, home_dir: &Path) -> Option<String> {
     engine.encrypt_string(plaintext).ok()
 }
 
+/// Resolve a per-agent channel token: try encrypted version first, fallback to plaintext.
+///
+/// Used by `start_*_bots()` to read tokens from agent.toml `[channels.*]` sections.
+pub(crate) fn resolve_agent_token(
+    encrypted: &Option<String>,
+    plaintext: &str,
+    home_dir: &Path,
+) -> String {
+    if let Some(enc) = encrypted {
+        if !enc.is_empty() {
+            if let Some(decrypted) = decrypt_value(enc, home_dir) {
+                return decrypted;
+            }
+        }
+    }
+    plaintext.to_string()
+}
+
 /// Read a config field, trying the encrypted version first.
 ///
 /// For example, `decrypt_config_field(table, "channels", "telegram_bot_token", home_dir)`
@@ -68,6 +86,14 @@ pub fn decrypt_config_field(
     home_dir: &Path,
 ) -> Option<String> {
     let section_table = table.get(section)?.as_table()?;
+
+    // If the plaintext field explicitly exists and is empty, the channel was removed.
+    // Respect this even if a stale _enc value remains (defensive against incomplete cleanup).
+    if let Some(plain_val) = section_table.get(field_base).and_then(|v| v.as_str()) {
+        if plain_val.is_empty() {
+            return None;
+        }
+    }
 
     // Try encrypted field first
     let enc_field = format!("{field_base}_enc");

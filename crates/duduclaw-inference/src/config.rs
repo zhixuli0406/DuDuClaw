@@ -58,6 +58,51 @@ pub struct InferenceConfig {
 
     /// Voice / ASR / TTS settings
     pub voice: Option<VoiceConfig>,
+
+    /// Embedding model settings for semantic similarity in the prediction engine.
+    ///
+    /// ```toml
+    /// [embedding]
+    /// enabled = true
+    /// model = "bge-small-zh"
+    /// auto_download = true
+    /// max_history = 100
+    /// ```
+    pub embedding: Option<EmbeddingConfig>,
+}
+
+/// Embedding model configuration for the prediction engine.
+///
+/// Default model: BGE-small-zh-v1.5 (33M params, 512-dim, INT8 ONNX ~24MB).
+/// Minimum hardware: +128MB RAM, +25MB disk. No GPU required.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingConfig {
+    /// Enable embedding-based prediction (requires `onnx` feature).
+    pub enabled: bool,
+    /// Model identifier: "bge-small-zh" (default) or "qwen3-embedding-0.6b"
+    pub model: String,
+    /// Custom model directory (default: ~/.duduclaw/models/embedding/)
+    pub model_dir: Option<String>,
+    /// Auto-download model on first use from HuggingFace
+    pub auto_download: bool,
+    /// Maximum embedding history per user-agent pair (rolling window)
+    pub max_history: usize,
+    /// ONNX intra-op thread count (default: auto, capped at 4)
+    pub threads: Option<usize>,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: "bge-small-zh".to_string(),
+            model_dir: None,
+            auto_download: true,
+            max_history: 100,
+            threads: None,
+        }
+    }
 }
 
 /// Voice pipeline configuration — ASR + TTS + language settings.
@@ -143,6 +188,7 @@ impl Default for InferenceConfig {
             llmlingua: None,
             streaming_llm: None,
             voice: None,
+            embedding: None,
         }
     }
 }

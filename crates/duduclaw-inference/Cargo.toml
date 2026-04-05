@@ -26,9 +26,12 @@ tokio-tungstenite = { workspace = true }
 # Audio decoding (OGG Opus, MP3, AAC, WAV, FLAC → PCM)
 symphonia = { version = "0.5", features = ["ogg", "mp3", "isomp4", "aac", "wav", "flac", "pcm"] }
 
-# ONNX Runtime for local ASR (SenseVoice), VAD (Silero), TTS (Piper)
+# ONNX Runtime for local ASR (SenseVoice), VAD (Silero), TTS (Piper), Embedding
 ort = { version = "2.0.0-rc.12", optional = true }
 ndarray = { version = "0.16", optional = true }
+
+# Tokenizer for embedding models (BERT WordPiece, etc.)
+tokenizers = { version = "0.21", optional = true, default-features = false }
 
 # Local Whisper ASR (whisper.cpp binding)
 whisper-rs = { version = "0.13", optional = true }
@@ -49,7 +52,7 @@ either = { version = "1", optional = true }
 [features]
 default = ["cpu"]
 cpu = []
-onnx = ["dep:ort", "dep:ndarray"]
+onnx = ["dep:ort", "dep:ndarray", "dep:tokenizers"]
 whisper = ["dep:whisper-rs"]
 livekit-voice = ["dep:livekit", "dep:livekit-api"]
 metal = ["llama-cpp-2/metal"]

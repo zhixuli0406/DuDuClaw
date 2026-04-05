@@ -162,6 +162,33 @@ pub struct UserModel {
     /// Number of proactive messages dismissed/ignored by this user.
     #[serde(default)]
     pub proactive_dismissed: u32,
+
+    // ── Embedding-based topic tracking (Hardening 2025-Q2) ────
+
+    /// Rolling window of conversation embedding vectors with timestamps.
+    /// Each entry: (embedding, unix_timestamp_secs).
+    /// Used for semantic topic_surprise computation via cosine similarity.
+    ///
+    /// Skipped from JSON serialization to avoid bloating model_json column.
+    /// 100 x 512-dim = ~400KB in JSON — too large for debounced persistence.
+    /// Embeddings re-accumulate from conversations after restart (acceptable
+    /// cold-start behavior, similar to user_text in ConversationMetrics).
+    #[serde(skip)]
+    pub topic_embeddings: std::collections::VecDeque<(Vec<f32>, f64)>,
+
+    /// Historical character bigrams for vocabulary_novelty fallback.
+    /// Stored as a HashSet for O(1) lookup during novelty computation.
+    /// Capped by evicting oldest entries via a companion insertion-order ring.
+    ///
+    /// Skipped from serialization to avoid bloating model_json (audit #11):
+    /// 10,000 bigrams × ~6 bytes = ~60KB per user. Re-accumulates from conversations.
+    #[serde(skip)]
+    pub historical_bigrams: std::collections::HashSet<String>,
+
+    /// Insertion-order ring for historical_bigrams eviction.
+    /// When cap is reached, pop_front to remove the oldest bigram.
+    #[serde(skip)]
+    pub bigram_insertion_order: std::collections::VecDeque<String>,
 }
 
 fn default_receptivity() -> f64 {
@@ -188,6 +215,9 @@ impl UserModel {
             proactive_receptivity: 0.5,
             proactive_accepted: 0,
             proactive_dismissed: 0,
+            topic_embeddings: std::collections::VecDeque::new(),
+            historical_bigrams: std::collections::HashSet::new(),
+            bigram_insertion_order: std::collections::VecDeque::new(),
         }
     }
 
@@ -205,9 +235,21 @@ impl UserModel {
         let correction_ratio = metrics.user_corrections as f64 / user_msgs;
         self.correction_rate.push(correction_ratio);
 
-        // Update topic distribution with extracted keywords
+        // Update topic distribution with extracted keywords (capped at 200 entries)
         for keyword in &metrics.extracted_topics {
             *self.topic_distribution.entry(keyword.clone()).or_insert(0.0) += 1.0;
+        }
+        // Evict lowest-frequency topics when cap exceeded (audit #2: unbounded growth)
+        const TOPIC_CAP: usize = 200;
+        while self.topic_distribution.len() > TOPIC_CAP {
+            if let Some(min_key) = self.topic_distribution.iter()
+                .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(k, _)| k.clone())
+            {
+                self.topic_distribution.remove(&min_key);
+            } else {
+                break;
+            }
         }
 
         // Update active hours
@@ -221,8 +263,45 @@ impl UserModel {
             self.language_preference.update(&metrics.detected_language);
         }
 
+        // Update historical bigrams for vocabulary_novelty fallback.
+        // Uses insertion-order VecDeque for FIFO eviction when cap is reached.
+        if !metrics.user_text.is_empty() {
+            let chars: Vec<char> = metrics.user_text.chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            for w in chars.windows(2) {
+                let bigram: String = w.iter().collect();
+                if self.historical_bigrams.insert(bigram.clone()) {
+                    // Only track insertion order for newly added bigrams
+                    self.bigram_insertion_order.push_back(bigram);
+                }
+            }
+            // FIFO eviction: remove oldest bigrams when cap exceeded
+            const BIGRAM_CAP: usize = 10_000;
+            while self.historical_bigrams.len() > BIGRAM_CAP {
+                if let Some(oldest) = self.bigram_insertion_order.pop_front() {
+                    self.historical_bigrams.remove(&oldest);
+                } else {
+                    break; // Safety: should never happen
+                }
+            }
+        }
+
         self.total_conversations += 1;
         self.last_updated = Utc::now();
+    }
+
+    /// Store an embedding vector for this conversation.
+    ///
+    /// Called by `PredictionEngine::update_model` when an embedding provider
+    /// is available. The embedding is stored with a timestamp for time-weighted
+    /// cosine similarity computation.
+    pub fn update_embedding(&mut self, embedding: Vec<f32>, max_history: usize) {
+        let now = Utc::now().timestamp() as f64;
+        self.topic_embeddings.push_back((embedding, now));
+        while self.topic_embeddings.len() > max_history {
+            self.topic_embeddings.pop_front();
+        }
     }
 
     /// Update satisfaction from explicit user feedback.

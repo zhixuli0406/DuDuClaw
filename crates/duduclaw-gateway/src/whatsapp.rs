@@ -120,7 +120,7 @@ pub async fn start_whatsapp_webhook(
     }
 
     info!("📱 WhatsApp webhook starting (phone: {phone_number_id})");
-    set_channel_connected(&ctx.channel_status, "whatsapp", true, None).await;
+    set_channel_connected(&ctx.channel_status, "whatsapp", true, None, Some(&ctx.event_tx)).await;
 
     let state = Arc::new(WhatsAppState {
         ctx,
@@ -233,7 +233,7 @@ async fn receive_webhook(
 
                         // Chat commands
                         if crate::chat_commands::is_command(&text.body) {
-                            if let Some(cmd) = crate::chat_commands::parse_command(&text.body) {
+                            if let Some(cmd) = crate::chat_commands::parse_command(&text.body, None) {
                                 let session_id = format!("whatsapp:{sender}");
                                 let agent_id = {
                                     let reg = state.ctx.registry.read().await;
@@ -242,7 +242,7 @@ async fn receive_webhook(
                                         .unwrap_or_default()
                                 };
                                 let reply = crate::chat_commands::handle_command(
-                                    &cmd, &state.ctx, &session_id, &agent_id,
+                                    &cmd, &state.ctx, &session_id, &agent_id, true,
                                 ).await;
                                 send_text(&state.http, &state.access_token, &phone_id, sender, &reply).await;
                                 continue;

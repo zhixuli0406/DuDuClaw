@@ -39,6 +39,7 @@ pub mod util;
 pub mod asr;
 pub mod asr_router;
 pub mod audio_decode;
+pub mod embedding;
 pub mod deepgram;
 #[cfg(feature = "onnx")]
 pub mod sensevoice;

@@ -1,7 +1,8 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
-import { api, type ChannelStatus } from '@/lib/api';
+import { api, type ChannelStatus, type AgentInfo } from '@/lib/api';
+import { client } from '@/lib/ws-client';
 import { useConnectionStore } from '@/stores/connection-store';
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import {
@@ -12,6 +13,9 @@ import {
   CheckCircle,
   XCircle,
   Pencil,
+  AlertTriangle,
+  X,
+  Loader2,
 } from 'lucide-react';
 
 const channelMeta: Record<
@@ -50,8 +54,12 @@ const channelMeta: Record<
   },
 };
 
+function getChannelPlatform(name: string): string {
+  return name.split(':')[0].toLowerCase();
+}
+
 function getChannelStyle(name: string) {
-  const key = name.toLowerCase();
+  const key = getChannelPlatform(name);
   return (
     channelMeta[key] ?? {
       color: 'text-stone-600 dark:text-stone-400',
@@ -71,11 +79,15 @@ export function ChannelsPage() {
   const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
   const toastTimerRef = useRef<ReturnType<typeof setTimeout>>(null);
-  const showToast = (type: 'success' | 'error', message: string) => {
+  const showToast = useCallback((type: 'success' | 'error', message: string) => {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     setToast({ type, message });
-    toastTimerRef.current = setTimeout(() => setToast(null), 4000);
-  };
+    toastTimerRef.current = setTimeout(() => setToast(null), type === 'error' ? 8000 : 4000);
+  }, []);
+  const dismissToast = useCallback(() => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToast(null);
+  }, []);
   useEffect(() => {
     return () => { if (toastTimerRef.current) clearTimeout(toastTimerRef.current); };
   }, []);
@@ -86,7 +98,7 @@ export function ChannelsPage() {
       const result = await api.channels.status();
       setChannels(result?.channels ?? []);
     } catch {
-      showToast('error', '無法載入通道，請稍後再試');
+      showToast('error', intl.formatMessage({ id: 'channels.loadFailed' }));
     } finally {
       setLoading(false);
     }
@@ -99,24 +111,56 @@ export function ChannelsPage() {
     }
   }, [connState, fetchChannels]);
 
+  // Subscribe to real-time channel status changes
+  useEffect(() => {
+    const unsubscribe = client.subscribe('channels.status_changed', (payload) => {
+      const update = payload as { name: string; connected: boolean; last_connected?: string; error?: string | null };
+      setChannels((prev) => {
+        const exists = prev.some((ch) => ch.name === update.name);
+        if (exists) {
+          return prev.map((ch) =>
+            ch.name === update.name
+              ? { ...ch, connected: update.connected, last_connected: update.last_connected, error: update.error ?? undefined }
+              : ch
+          );
+        }
+        // New channel appeared — add it
+        return [...prev, {
+          name: update.name,
+          connected: update.connected,
+          last_connected: update.last_connected,
+          error: update.error ?? undefined,
+        }];
+      });
+
+      // Show toast for notable status changes
+      if (update.error && update.error !== 'connecting' && update.error !== 'reconnecting') {
+        showToast('error', `${update.name}: ${update.error}`);
+      } else if (update.connected) {
+        showToast('success', intl.formatMessage({ id: 'channels.connected.toast' }, { name: update.name }));
+      }
+    });
+    return unsubscribe;
+  }, [intl]);
+
   const handleTest = async (type: string) => {
     try {
       const result = await api.channels.test(type) as { success: boolean; message: string };
       showToast(result.success ? 'success' : 'error', result.message);
       await fetchChannels();
     } catch {
-      showToast('error', '通道測試失敗，請確認設定');
+      showToast('error', intl.formatMessage({ id: 'channels.testFailed' }));
     }
   };
 
   const handleRemove = async (type: string) => {
-    if (!confirm(`確認移除 ${type} 通道？`)) return;
+    if (!confirm(intl.formatMessage({ id: 'channels.confirmRemove' }, { type }))) return;
     try {
       await api.channels.remove(type);
-      showToast('success', `${type} 通道已移除`);
+      showToast('success', intl.formatMessage({ id: 'channels.removed' }, { type }));
       await fetchChannels();
     } catch (e) {
-      showToast('error', `移除失敗: ${e}`);
+      showToast('error', intl.formatMessage({ id: 'channels.removeFailed' }, { error: String(e) }));
     }
   };
 
@@ -125,12 +169,23 @@ export function ChannelsPage() {
       {/* Toast notification */}
       {toast && (
         <div className={cn(
-          'rounded-lg px-4 py-3 text-sm',
+          'flex items-start gap-3 rounded-lg px-4 py-3 text-sm shadow-sm transition-all',
           toast.type === 'success'
             ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400'
             : 'bg-rose-50 text-rose-700 dark:bg-rose-900/20 dark:text-rose-400'
         )}>
-          {toast.message}
+          {toast.type === 'success' ? (
+            <CheckCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          ) : (
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          )}
+          <span className="flex-1">{toast.message}</span>
+          <button
+            onClick={dismissToast}
+            className="shrink-0 rounded p-0.5 opacity-60 transition-opacity hover:opacity-100"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
         </div>
       )}
 
@@ -194,6 +249,13 @@ export function ChannelsPage() {
                       <CheckCircle className="h-3 w-3" />
                       {intl.formatMessage({ id: 'status.connected' })}
                     </span>
+                  ) : channel.error === 'connecting' || channel.error === 'reconnecting' ? (
+                    <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      {channel.error === 'reconnecting'
+                        ? intl.formatMessage({ id: 'status.reconnecting' })
+                        : intl.formatMessage({ id: 'status.connecting' })}
+                    </span>
                   ) : (
                     <span className="inline-flex items-center gap-1 rounded-full bg-rose-100 px-2.5 py-0.5 text-xs font-medium text-rose-700 dark:bg-rose-900/30 dark:text-rose-400">
                       <XCircle className="h-3 w-3" />
@@ -202,10 +264,11 @@ export function ChannelsPage() {
                   )}
                 </div>
 
-                {/* Error message */}
-                {channel.error && (
-                  <div className="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
-                    {channel.error}
+                {/* Error message — hide transitional states */}
+                {channel.error && channel.error !== 'connecting' && channel.error !== 'reconnecting' && (
+                  <div className="mt-3 flex items-start gap-2 rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
+                    <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                    <span>{channel.error}</span>
                   </div>
                 )}
 
@@ -223,7 +286,7 @@ export function ChannelsPage() {
                     className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-stone-600 hover:bg-stone-100 dark:text-stone-400 dark:hover:bg-stone-800"
                   >
                     <Pencil className="h-3.5 w-3.5" />
-                    編輯
+                    {intl.formatMessage({ id: 'channels.edit' })}
                   </button>
                   <button
                     onClick={() => handleRemove(channel.name)}
@@ -256,15 +319,35 @@ export function ChannelsPage() {
   );
 }
 
+const SUPPORTS_PER_AGENT = ['discord', 'telegram', 'slack'];
+
 function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boolean; onClose: () => void; onCreated: () => void; fixedType?: string }) {
-  const [channelType, setChannelType] = useState(fixedType ?? 'line');
+  const intl = useIntl();
+  // Parse fixedType: "discord:lab-bot" → platform="discord", agent="lab-bot"
+  const parsedPlatform = fixedType?.split(':')[0];
+  const parsedAgent = fixedType?.includes(':') ? fixedType.split(':').slice(1).join(':') : undefined;
+
+  const [channelType, setChannelType] = useState(parsedPlatform ?? fixedType ?? 'line');
+  const [selectedAgent, setSelectedAgent] = useState(parsedAgent ?? '');
+  const [agents, setAgents] = useState<AgentInfo[]>([]);
 
   useEffect(() => {
-    if (fixedType) setChannelType(fixedType);
-  }, [fixedType]);
+    if (fixedType) {
+      setChannelType(parsedPlatform ?? fixedType);
+      setSelectedAgent(parsedAgent ?? '');
+    }
+  }, [fixedType, parsedPlatform, parsedAgent]);
+
+  useEffect(() => {
+    if (open) {
+      api.agents.list().then((r) => setAgents(r.agents ?? [])).catch(() => {});
+    }
+  }, [open]);
+
   const [token, setToken] = useState('');
   const [secret, setSecret] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
 
   const handleSubmit = async () => {
     if (!token.trim()) return;
@@ -272,18 +355,20 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
     try {
       const config: Record<string, string> = { token: token.trim() };
       if (secret.trim()) config.secret = secret.trim();
-      await api.channels.add(channelType, config);
+      await api.channels.add(channelType, config, selectedAgent || undefined);
       onCreated();
       onClose();
       setToken('');
       setSecret('');
-    } catch {
-      // error
+      setSelectedAgent('');
+    } catch (e) {
+      setAddError(String(e));
     } finally {
       setSubmitting(false);
     }
   };
 
+  // TODO: Move channel setup guides to i18n
   const channelGuide: Record<string, { tokenLabel: string; secretLabel?: string; steps: string[] }> = {
     telegram: {
       tokenLabel: 'Bot Token',
@@ -365,9 +450,9 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
   const guide = channelGuide[channelType] ?? { tokenLabel: 'Token', steps: [] };
 
   return (
-    <Dialog open={open} onClose={onClose} title={fixedType ? `Edit ${fixedType}` : 'Add Channel'}>
+    <Dialog open={open} onClose={onClose} title={fixedType ? intl.formatMessage({ id: 'channels.dialog.editTitle' }, { type: fixedType }) : intl.formatMessage({ id: 'channels.dialog.addTitle' })}>
       <div className="space-y-4">
-        <FormField label="Channel Type">
+        <FormField label={intl.formatMessage({ id: 'channels.dialog.type' })}>
           <select value={channelType} onChange={(e) => setChannelType(e.target.value)} disabled={!!fixedType} className={selectClass}>
             <option value="telegram">Telegram</option>
             <option value="line">LINE</option>
@@ -378,9 +463,23 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
           </select>
         </FormField>
 
+        {SUPPORTS_PER_AGENT.includes(channelType) && agents.length > 0 && (
+          <FormField label={intl.formatMessage({ id: 'channels.dialog.assignAgent' })}>
+            <select value={selectedAgent} onChange={(e) => setSelectedAgent(e.target.value)} className={selectClass}>
+              <option value="">{intl.formatMessage({ id: 'channels.dialog.global' })}</option>
+              {agents.map((a) => (
+                <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
+              ))}
+            </select>
+            <p className="mt-1 text-xs text-stone-500 dark:text-stone-400">
+              {intl.formatMessage({ id: 'channels.dialog.assignAgentHint' })}
+            </p>
+          </FormField>
+        )}
+
         {/* Setup guide */}
         <div className="rounded-lg bg-amber-50 p-3 text-xs text-amber-800 dark:bg-amber-900/20 dark:text-amber-300">
-          <p className="mb-1 font-medium">Setup Guide:</p>
+          <p className="mb-1 font-medium">{intl.formatMessage({ id: 'channels.dialog.setupGuide' })}</p>
           {guide.steps.map((step, i) => (
             <p key={i} className={step.startsWith('⚠') ? 'font-semibold text-rose-600 dark:text-rose-400' : ''}>
               {step}
@@ -393,7 +492,7 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
             type="password"
             value={token}
             onChange={(e) => setToken(e.target.value)}
-            placeholder={`Paste your ${guide.tokenLabel.toLowerCase()}...`}
+            placeholder={intl.formatMessage({ id: 'channels.dialog.pastePlaceholder' }, { tokenLabel: guide.tokenLabel.toLowerCase() })}
             className={inputClass}
           />
         </FormField>
@@ -410,10 +509,17 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
           </FormField>
         )}
 
+        {addError && (
+          <div className="flex items-start gap-2 rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
+            <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+            <span>{addError}</span>
+          </div>
+        )}
+
         <div className="flex justify-end gap-3 pt-2">
-          <button onClick={onClose} className={buttonSecondary}>Cancel</button>
-          <button onClick={handleSubmit} disabled={submitting || !token.trim()} className={buttonPrimary}>
-            {submitting ? 'Adding...' : 'Add Channel'}
+          <button onClick={onClose} className={buttonSecondary}>{intl.formatMessage({ id: 'channels.dialog.cancel' })}</button>
+          <button onClick={() => { setAddError(null); handleSubmit(); }} disabled={submitting || !token.trim()} className={buttonPrimary}>
+            {submitting ? intl.formatMessage({ id: 'channels.dialog.adding' }) : intl.formatMessage({ id: 'channels.dialog.add' })}
           </button>
         </div>
       </div>

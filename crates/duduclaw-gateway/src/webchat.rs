@@ -209,9 +209,9 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
 
                                 // Check for chat commands first
                                 if crate::chat_commands::is_command(&content) {
-                                    if let Some(cmd) = crate::chat_commands::parse_command(&content) {
+                                    if let Some(cmd) = crate::chat_commands::parse_command(&content, None) {
                                         let reply = crate::chat_commands::handle_command(
-                                            &cmd, &state.ctx, sid, &agent_id,
+                                            &cmd, &state.ctx, sid, &agent_id, true,
                                         ).await;
                                         let done = ChatMessage::AssistantDone {
                                             content: reply,

@@ -26,24 +26,6 @@ pub enum RichComponent {
         color: Option<u32>,
         footer: Option<String>,
     },
-    /// Action buttons.
-    Buttons(Vec<Button>),
-}
-
-/// A clickable button.
-#[derive(Debug, Clone)]
-pub struct Button {
-    pub label: String,
-    pub custom_id: String,
-    pub style: ButtonStyle,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum ButtonStyle {
-    Primary,   // Discord: 1 (blurple), Telegram: default
-    Secondary, // Discord: 2 (grey)
-    Success,   // Discord: 3 (green)
-    Danger,    // Discord: 4 (red)
 }
 
 /// A complete rich message ready for platform rendering.
@@ -68,10 +50,6 @@ impl RichMessage {
         }
     }
 
-    pub fn with_buttons(mut self, buttons: Vec<Button>) -> Self {
-        self.components.push(RichComponent::Buttons(buttons));
-        self
-    }
 }
 
 // ── Discord formatting ─────────────────────────────────────────
@@ -115,57 +93,7 @@ pub fn to_discord_message(text: &str, agent_name: Option<&str>, error: bool) -> 
     json!({ "embeds": &embeds[..embeds.len().min(10)] })
 }
 
-/// Format Discord action row with buttons.
-pub fn discord_buttons(buttons: &[Button], session_id: &str) -> Value {
-    let components: Vec<Value> = buttons.iter().map(|b| {
-        json!({
-            "type": 2, // Button
-            "style": match b.style {
-                ButtonStyle::Primary => 1,
-                ButtonStyle::Secondary => 2,
-                ButtonStyle::Success => 3,
-                ButtonStyle::Danger => 4,
-            },
-            "label": b.label,
-            "custom_id": format!("duduclaw:{}:{}", b.custom_id, session_id),
-        })
-    }).collect();
-
-    json!({
-        "type": 1, // Action Row
-        "components": components
-    })
-}
-
-/// Standard conversation buttons for Discord.
-pub fn discord_conversation_buttons(session_id: &str) -> Value {
-    discord_buttons(&[
-        Button { label: "Continue".into(), custom_id: "continue".into(), style: ButtonStyle::Primary },
-        Button { label: "New Session".into(), custom_id: "new_session".into(), style: ButtonStyle::Secondary },
-        Button { label: "Stop".into(), custom_id: "stop".into(), style: ButtonStyle::Danger },
-    ], session_id)
-}
-
 // ── Telegram formatting ────────────────────────────────────────
-
-/// Format Telegram inline keyboard buttons.
-pub fn telegram_inline_keyboard(buttons: &[Button]) -> Value {
-    let row: Vec<Value> = buttons.iter().map(|b| {
-        json!({
-            "text": b.label,
-            "callback_data": format!("duduclaw:{}", b.custom_id),
-        })
-    }).collect();
-    json!({ "inline_keyboard": [row] })
-}
-
-/// Standard conversation buttons for Telegram.
-pub fn telegram_conversation_buttons() -> Value {
-    telegram_inline_keyboard(&[
-        Button { label: "\u{1f504} New Session".into(), custom_id: "new_session".into(), style: ButtonStyle::Primary },
-        Button { label: "\u{1f3a4} Voice".into(), custom_id: "voice_toggle".into(), style: ButtonStyle::Secondary },
-    ])
-}
 
 // ── LINE formatting ────────────────────────────────────────────
 
@@ -214,34 +142,11 @@ pub fn to_line_flex_message(text: &str, agent_name: Option<&str>) -> Value {
     })
 }
 
-/// LINE Quick Reply buttons.
-pub fn line_quick_reply(buttons: &[Button]) -> Value {
-    let items: Vec<Value> = buttons.iter().map(|b| {
-        json!({
-            "type": "action",
-            "action": {
-                "type": "postback",
-                "label": b.label,
-                "data": format!("duduclaw:{}", b.custom_id),
-                "displayText": b.label
-            }
-        })
-    }).collect();
-    json!({ "items": items })
-}
-
-/// Standard Quick Reply buttons for LINE.
-pub fn line_conversation_quick_reply() -> Value {
-    line_quick_reply(&[
-        Button { label: "New Session".into(), custom_id: "new_session".into(), style: ButtonStyle::Primary },
-    ])
-}
-
 // ── Slack formatting ───────────────────────────────────────────
 
 /// Format a reply as Slack Block Kit message.
-pub fn to_slack_blocks(text: &str, buttons: Option<&[Button]>) -> Value {
-    let mut blocks = vec![
+pub fn to_slack_blocks(text: &str) -> Value {
+    let blocks = vec![
         json!({
             "type": "section",
             "text": {
@@ -250,25 +155,6 @@ pub fn to_slack_blocks(text: &str, buttons: Option<&[Button]>) -> Value {
             }
         })
     ];
-
-    if let Some(btns) = buttons {
-        let elements: Vec<Value> = btns.iter().map(|b| {
-            json!({
-                "type": "button",
-                "text": { "type": "plain_text", "text": b.label },
-                "action_id": format!("duduclaw_{}", b.custom_id),
-                "style": match b.style {
-                    ButtonStyle::Primary => "primary",
-                    ButtonStyle::Danger => "danger",
-                    _ => "primary",
-                }
-            })
-        }).collect();
-        blocks.push(json!({
-            "type": "actions",
-            "elements": elements
-        }));
-    }
 
     json!({ "blocks": blocks })
 }
@@ -504,17 +390,8 @@ mod tests {
 
     #[test]
     fn test_slack_blocks() {
-        let msg = to_slack_blocks("**hello**", None);
+        let msg = to_slack_blocks("**hello**");
         let block = &msg["blocks"][0];
         assert_eq!(block["text"]["text"], "*hello*");
-    }
-
-    #[test]
-    fn test_discord_buttons_format() {
-        let btns = discord_conversation_buttons("sess123");
-        assert_eq!(btns["type"], 1);
-        assert_eq!(btns["components"][0]["type"], 2);
-        let custom_id = btns["components"][0]["custom_id"].as_str().unwrap();
-        assert!(custom_id.starts_with("duduclaw:continue:sess123"));
     }
 }

@@ -275,6 +275,20 @@ export interface AgentUpdateParams {
   max_gvu_generations?: number;
   observation_period_hours?: number;
   skill_token_budget?: number;
+  // Per-agent channels
+  discord_bot_token?: string;
+  telegram_bot_token?: string;
+  line_channel_token?: string;
+  line_channel_secret?: string;
+  slack_app_token?: string;
+  slack_bot_token?: string;
+  whatsapp_access_token?: string;
+  whatsapp_verify_token?: string;
+  whatsapp_phone_number_id?: string;
+  whatsapp_app_secret?: string;
+  feishu_app_id?: string;
+  feishu_app_secret?: string;
+  feishu_verification_token?: string;
 }
 
 // API namespace
@@ -311,8 +325,8 @@ export const api = {
   channels: {
     status: () =>
       client.call('channels.status') as Promise<{ channels: ChannelStatus[] }>,
-    add: (type: string, config: Record<string, string>) =>
-      client.call('channels.add', { type, config }),
+    add: (type: string, config: Record<string, string>, agent?: string) =>
+      client.call('channels.add', { type, config, ...(agent ? { agent } : {}) }),
     test: (type: string) =>
       client.call('channels.test', { type }) as Promise<{ success: boolean; message: string }>,
     remove: (type: string) =>
@@ -411,6 +425,23 @@ export const api = {
   security: {
     auditLog: (limit = 50) =>
       client.call('security.audit_log', { limit }) as Promise<{ events: AuditEvent[] }>,
+  },
+  evolution: {
+    status: () =>
+      client.call('evolution.status') as Promise<{
+        enabled: boolean;
+        mode: string;
+        agents: Array<{
+          agent_id: string;
+          gvu_enabled: boolean;
+          cognitive_memory: boolean;
+          skill_auto_activate: boolean;
+          skill_security_scan: boolean;
+          max_silence_hours: number;
+          max_gvu_generations: number;
+          observation_period_hours: number;
+        }>;
+      }>,
   },
   skillMarket: {
     search: (query: string) =>

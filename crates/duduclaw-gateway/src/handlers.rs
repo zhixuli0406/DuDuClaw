@@ -92,8 +92,12 @@ impl MethodHandler {
     }
 
     /// Register a running channel handle (for hot-stop on remove).
+    /// If a handle with the same name already exists, it is aborted first.
     pub async fn register_channel_handle(&self, name: &str, handle: tokio::task::JoinHandle<()>) {
-        self.channel_handles.lock().await.insert(name.to_string(), handle);
+        let mut handles = self.channel_handles.lock().await;
+        if let Some(old) = handles.insert(name.to_string(), handle) {
+            old.abort();
+        }
     }
 
     /// Update a channel's runtime connection state (called by channel bots).
@@ -486,6 +490,9 @@ impl MethodHandler {
         }))
     }
 
+    /// Dashboard-initiated delegation.  Supervisor pattern is NOT enforced here
+    /// because this RPC is an operator-level action (depth always starts at 0).
+    /// Agent-to-agent delegation goes through MCP `send_to_agent` which IS enforced.
     async fn handle_agents_delegate(&self, params: Value) -> WsFrame {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
         let prompt = params.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
@@ -497,7 +504,7 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("Prompt too long: {} chars (max {MAX_PROMPT_LEN})", prompt.len()));
         }
 
-        info!(agent_id, "agents.delegate requested");
+        info!(agent_id, "agents.delegate requested (dashboard)");
 
         // Verify target agent exists
         let reg = self.registry.read().await;
@@ -505,7 +512,6 @@ impl MethodHandler {
             Some(a) => a.clone(),
             None => return WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
         };
-        let agent_dir = agent.dir.clone();
         let model = agent.config.model.preferred.clone();
         drop(reg);
 
@@ -529,25 +535,19 @@ impl MethodHandler {
             // Async delegation: write to bus queue for background processing
             let queue_path = self.home_dir.join("bus_queue.jsonl");
             let task = serde_json::json!({
-                "type": "delegate_task",
+                "type": "agent_message",
                 "message_id": &message_id,
                 "agent_id": agent_id,
-                "agent_dir": agent_dir.to_string_lossy(),
-                "prompt": prompt,
+                "payload": prompt,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
+                "delegation_depth": 0,
+                "origin_agent": "dashboard",
+                "sender_agent": "dashboard",
             });
-            let _ = tokio::task::spawn_blocking({
-                let queue_path = queue_path.clone();
-                let task_str = task.to_string();
-                move || {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true).append(true).open(&queue_path)
-                    {
-                        let _ = writeln!(f, "{task_str}");
-                    }
-                }
-            }).await;
+            let task_str = task.to_string();
+            if let Err(e) = crate::dispatcher::append_line(&queue_path, &task_str).await {
+                return WsFrame::error_response("", &format!("Failed to queue delegation: {e}"));
+            }
 
             WsFrame::ok_response("", json!({
                 "success": true,
@@ -656,6 +656,7 @@ impl MethodHandler {
 
         let params_clone = params.clone();
         let mut changes: Vec<String> = Vec::new();
+        let home_for_update = self.home_dir.clone();
 
         let result = self.update_agent_toml(&agent_id, move |table| {
             // ── Identity fields ([agent] section) ──
@@ -870,6 +871,100 @@ impl MethodHandler {
                 }
             }
 
+            // ── Per-agent channel tokens ([channels.*] sections) ──
+            // Helper: write a token (+ encrypted version) into [channels.{channel}].{field}
+            // Empty token removes the entire [channels.{channel}] section.
+            let home = home_for_update.clone();
+            let mut set_channel_token = |table: &mut toml::Table,
+                                          channel: &str,
+                                          fields: &[(&str, Option<&str>)], // (param_key, toml_key) pairs
+                                          changes: &mut Vec<String>| -> Result<(), String> {
+                // Check if any field has a value
+                let has_any = fields.iter().any(|(param_key, _)| {
+                    params_clone.get(*param_key).and_then(|v| v.as_str()).map_or(false, |s| !s.is_empty())
+                });
+                let all_empty = fields.iter().all(|(param_key, _)| {
+                    params_clone.get(*param_key).and_then(|v| v.as_str()).map_or(true, |s| s.is_empty())
+                });
+
+                // If the param exists but is empty → remove
+                let param_present = fields.iter().any(|(param_key, _)| params_clone.get(*param_key).is_some());
+                if param_present && all_empty {
+                    if let Some(channels) = table.get_mut("channels").and_then(|v| v.as_table_mut()) {
+                        channels.remove(channel);
+                        changes.push(format!("channels.{channel} removed"));
+                    }
+                    return Ok(());
+                }
+
+                if !has_any { return Ok(()); }
+
+                let channels = table.entry("channels")
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                    .as_table_mut()
+                    .ok_or_else(|| format!("Invalid [channels] section"))?;
+                let section = channels.entry(channel)
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                    .as_table_mut()
+                    .ok_or_else(|| format!("Invalid [channels.{channel}] section"))?;
+
+                for (param_key, toml_key_override) in fields {
+                    if let Some(val) = params_clone.get(*param_key).and_then(|v| v.as_str()) {
+                        if !val.is_empty() {
+                            let toml_key = toml_key_override.unwrap_or(param_key);
+                            section.insert(toml_key.to_string(), toml::Value::String(val.into()));
+                            // Encrypt sensitive tokens
+                            if toml_key.contains("token") || toml_key.contains("secret") || toml_key == "app_id" {
+                                let enc_key = format!("{toml_key}_enc");
+                                if let Some(enc) = crate::config_crypto::encrypt_value(val, &home) {
+                                    section.insert(enc_key, toml::Value::String(enc));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                changes.push(format!("channels.{channel} = [CONFIGURED]"));
+                Ok(())
+            };
+
+            // Discord
+            set_channel_token(table, "discord", &[
+                ("discord_bot_token", Some("bot_token")),
+            ], &mut changes)?;
+
+            // Telegram
+            set_channel_token(table, "telegram", &[
+                ("telegram_bot_token", Some("bot_token")),
+            ], &mut changes)?;
+
+            // LINE
+            set_channel_token(table, "line", &[
+                ("line_channel_token", Some("channel_token")),
+                ("line_channel_secret", Some("channel_secret")),
+            ], &mut changes)?;
+
+            // Slack
+            set_channel_token(table, "slack", &[
+                ("slack_app_token", Some("app_token")),
+                ("slack_bot_token", Some("bot_token")),
+            ], &mut changes)?;
+
+            // WhatsApp
+            set_channel_token(table, "whatsapp", &[
+                ("whatsapp_access_token", Some("access_token")),
+                ("whatsapp_verify_token", Some("verify_token")),
+                ("whatsapp_phone_number_id", Some("phone_number_id")),
+                ("whatsapp_app_secret", Some("app_secret")),
+            ], &mut changes)?;
+
+            // Feishu
+            set_channel_token(table, "feishu", &[
+                ("feishu_app_id", Some("app_id")),
+                ("feishu_app_secret", Some("app_secret")),
+                ("feishu_verification_token", Some("verification_token")),
+            ], &mut changes)?;
+
             if changes.is_empty() {
                 return Err("No valid fields to update".into());
             }
@@ -1030,9 +1125,45 @@ impl MethodHandler {
             }
         }
 
-        // Include per-agent Discord bots (keys like "discord:{agent_name}")
+        // Include per-agent channels from agent registry configs
+        let mut seen_labels = std::collections::HashSet::new();
+        {
+            let reg = self.registry.read().await;
+            for agent in reg.list() {
+                if let Some(ch) = &agent.config.channels {
+                    let name = &agent.config.agent.name;
+                    let pairs: &[(&str, bool)] = &[
+                        ("discord", ch.discord.as_ref().is_some_and(|d| !d.bot_token.is_empty() || d.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty()))),
+                        ("telegram", ch.telegram.as_ref().is_some_and(|t| !t.bot_token.is_empty() || t.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty()))),
+                        ("slack", ch.slack.as_ref().is_some_and(|s| !s.bot_token.is_empty() || s.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty()))),
+                    ];
+                    for &(platform, configured) in pairs {
+                        if configured {
+                            let label = format!("{platform}:{name}");
+                            seen_labels.insert(label.clone());
+                            let (connected, last_ts, error) = match runtime_status.get(&label) {
+                                Some(state) => (
+                                    state.connected,
+                                    state.last_event.as_ref().map(|t| t.to_rfc3339()),
+                                    state.error.clone(),
+                                ),
+                                None => (false, None, Some("connecting".to_string())),
+                            };
+                            channels.push(json!({
+                                "name": label,
+                                "connected": connected,
+                                "last_connected": last_ts,
+                                "error": error,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also include runtime-only per-agent entries not yet in registry (edge case)
         for (key, state) in runtime_status.iter() {
-            if key.starts_with("discord:") {
+            if key.contains(':') && !seen_labels.contains(key.as_str()) {
                 channels.push(json!({
                     "name": key,
                     "connected": state.connected,
@@ -1053,15 +1184,86 @@ impl MethodHandler {
         let config_obj = params.get("config").cloned().unwrap_or(json!({}));
         let token = config_obj.get("token").and_then(|v| v.as_str()).unwrap_or("");
         let secret = config_obj.get("secret").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_name = params.get("agent").and_then(|v| v.as_str()).unwrap_or("");
 
         if token.is_empty() {
             return WsFrame::error_response("", "Missing 'config.token' parameter");
         }
 
+        // Per-agent channel: write to agent.toml [channels.{platform}]
+        if !agent_name.is_empty() {
+            let (token_field, secret_field) = match channel_type {
+                "discord" => ("bot_token", None),
+                "telegram" => ("bot_token", None),
+                "slack" => ("bot_token", Some("app_token")),
+                _ => return WsFrame::error_response("", &format!("Per-agent channels not supported for: {channel_type}")),
+            };
+
+            let token_owned = token.to_string();
+            let secret_owned = secret.to_string();
+            let channel_type_owned = channel_type.to_string();
+            let home = self.home_dir.clone();
+
+            if let Err(e) = self.update_agent_toml(agent_name, move |table| {
+                let channels = table.entry("channels")
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                    .as_table_mut()
+                    .ok_or("Invalid [channels] section")?;
+                let section = channels.entry(&channel_type_owned)
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                    .as_table_mut()
+                    .ok_or_else(|| format!("Invalid [channels.{}] section", channel_type_owned))?;
+
+                section.insert(token_field.to_string(), toml::Value::String(token_owned.clone()));
+                if let Some(enc) = crate::config_crypto::encrypt_value(&token_owned, &home) {
+                    section.insert(format!("{token_field}_enc"), toml::Value::String(enc));
+                }
+                if let Some(sf) = secret_field {
+                    if !secret_owned.is_empty() {
+                        section.insert(sf.to_string(), toml::Value::String(secret_owned.clone()));
+                        if let Some(enc) = crate::config_crypto::encrypt_value(&secret_owned, &home) {
+                            section.insert(format!("{sf}_enc"), toml::Value::String(enc));
+                        }
+                    }
+                }
+                Ok(())
+            }).await {
+                return WsFrame::error_response("", &format!("Failed to update agent config: {e}"));
+            }
+
+            // Hot-start: stop existing per-agent bot if any, then re-launch all per-agent bots
+            let label = format!("{channel_type}:{agent_name}");
+            self.hot_stop_channel(&label).await;
+
+            let mut hot_started = false;
+            if let Some(ctx) = self.reply_ctx.read().await.clone() {
+                let handles: Vec<(String, tokio::task::JoinHandle<()>)> = match channel_type {
+                    "discord" => crate::discord::start_discord_bots(&self.home_dir, ctx).await,
+                    "telegram" => crate::telegram::start_telegram_bots(&self.home_dir, ctx).await,
+                    _ => Vec::new(),
+                };
+                for (l, h) in handles {
+                    if l == label { hot_started = true; }
+                    self.register_channel_handle(&l, h).await;
+                }
+            }
+
+            info!(channel_type, agent_name, "Per-agent channel config saved");
+            return WsFrame::ok_response("", json!({
+                "success": true,
+                "type": label,
+                "hot_started": hot_started,
+            }));
+        }
+
+        // Global channel: write to config.toml [channels]
         let (token_key, secret_key) = match channel_type {
             "line" => ("line_channel_token", Some("line_channel_secret")),
             "telegram" => ("telegram_bot_token", None),
             "discord" => ("discord_bot_token", None),
+            "slack" => ("slack_bot_token", Some("slack_app_token")),
+            "whatsapp" => ("whatsapp_access_token", Some("whatsapp_phone_number_id")),
+            "feishu" => ("feishu_app_id", Some("feishu_app_secret")),
             _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
         };
 
@@ -1125,9 +1327,37 @@ impl MethodHandler {
         let channel_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
         info!(channel_type, "channels.test requested");
 
-        let config_path = self.home_dir.join("config.toml");
-        let table = self.read_config_table(&config_path).await;
+        // Per-agent channel test: check agent.toml
+        if let Some((platform, agent_name)) = channel_type.split_once(':') {
+            let token_field = match platform {
+                "discord" | "telegram" => "bot_token",
+                "slack" => "bot_token",
+                _ => return WsFrame::error_response("", &format!("Unknown channel platform: {platform}")),
+            };
 
+            let reg = self.registry.read().await;
+            let configured = reg.get(agent_name).is_some_and(|agent| {
+                if let Some(ch) = &agent.config.channels {
+                    match platform {
+                        "discord" => ch.discord.as_ref().is_some_and(|d| !d.bot_token.is_empty() || d.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())),
+                        "telegram" => ch.telegram.as_ref().is_some_and(|t| !t.bot_token.is_empty() || t.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())),
+                        "slack" => ch.slack.as_ref().is_some_and(|s| !s.bot_token.is_empty() || s.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())),
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            });
+            drop(reg);
+
+            return WsFrame::ok_response("", json!({
+                "success": configured,
+                "type": channel_type,
+                "message": if configured { format!("{channel_type} {token_field} is configured") } else { format!("{channel_type} token 未設定") },
+            }));
+        }
+
+        // Global channel test
         let token_key = match channel_type {
             "line" => "line_channel_token",
             "telegram" => "telegram_bot_token",
@@ -1135,14 +1365,14 @@ impl MethodHandler {
             _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
         };
 
-        let token = table
-            .get("channels")
-            .and_then(|v| v.as_table())
-            .and_then(|ch| ch.get(token_key))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let config_path = self.home_dir.join("config.toml");
+        let table = self.read_config_table(&config_path).await;
 
-        if token.is_empty() {
+        // Check both plaintext and encrypted token
+        let has_token = crate::config_crypto::decrypt_config_field(&table, "channels", token_key, &self.home_dir)
+            .is_some_and(|t| !t.is_empty());
+
+        if !has_token {
             return WsFrame::ok_response("", json!({
                 "success": false,
                 "type": channel_type,
@@ -1163,6 +1393,36 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "Missing 'type' parameter"),
         };
 
+        // Per-agent channel: format "discord:agent_name", "telegram:agent_name", etc.
+        if let Some((platform, agent_name)) = channel_type.split_once(':') {
+            let channel_section = match platform {
+                "discord" | "telegram" | "slack" => platform,
+                _ => return WsFrame::error_response("", &format!("Unknown channel platform: {platform}")),
+            };
+
+            // Clear the [channels.{platform}] section in the agent's agent.toml
+            let agent_name_owned = agent_name.to_string();
+            let channel_section_owned = channel_section.to_string();
+            if let Err(e) = self.update_agent_toml(&agent_name_owned, |table| {
+                if let Some(channels) = table.get_mut("channels").and_then(|v| v.as_table_mut()) {
+                    channels.remove(&channel_section_owned);
+                }
+                Ok(())
+            }).await {
+                return WsFrame::error_response("", &format!("Failed to update agent config: {e}"));
+            }
+
+            // Hot-stop the per-agent bot
+            self.hot_stop_channel(channel_type).await;
+
+            info!(channel_type, "Per-agent channel removed and stopped");
+            return WsFrame::ok_response("", json!({
+                "success": true,
+                "type": channel_type,
+            }));
+        }
+
+        // Global channel removal
         let token_key = match channel_type {
             "line" => "line_channel_token",
             "telegram" => "telegram_bot_token",
@@ -1175,9 +1435,13 @@ impl MethodHandler {
 
         if let Some(channels) = table.get_mut("channels").and_then(|v| v.as_table_mut()) {
             channels.insert(token_key.to_string(), toml::Value::String(String::new()));
+            // Also clear the encrypted version
+            let enc_key = format!("{token_key}_enc");
+            channels.insert(enc_key, toml::Value::String(String::new()));
             // Also clear secret for LINE
             if channel_type == "line" {
                 channels.insert("line_channel_secret".to_string(), toml::Value::String(String::new()));
+                channels.insert("line_channel_secret_enc".to_string(), toml::Value::String(String::new()));
             }
         }
 
@@ -1185,11 +1449,32 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("Failed to write config.toml: {e}"));
         }
 
-        // Hot-stop: abort the running channel bot task
+        // Hot-stop: abort the running global channel bot task
         self.hot_stop_channel(channel_type).await;
 
-        info!(channel_type, "Channel removed and stopped");
-        WsFrame::ok_response("", json!({ "success": true, "type": channel_type }))
+        // Re-launch per-agent bots since the global bot was deduplicating their tokens.
+        let mut restarted_agents = Vec::new();
+        let ctx_opt = self.reply_ctx.read().await.clone();
+        if let Some(ctx) = ctx_opt {
+            let per_agent_handles: Vec<(String, tokio::task::JoinHandle<()>)> = match channel_type {
+                "discord" => crate::discord::start_discord_bots(&self.home_dir, ctx).await,
+                "telegram" => crate::telegram::start_telegram_bots(&self.home_dir, ctx).await,
+                // Slack: per-agent ready but module has unresolved deps
+                // "slack" => crate::slack::start_slack_bots(&self.home_dir, ctx).await,
+                _ => Vec::new(),
+            };
+            for (label, h) in per_agent_handles {
+                restarted_agents.push(label.clone());
+                self.register_channel_handle(&label, h).await;
+            }
+        }
+
+        info!(channel_type, restarted = ?restarted_agents, "Channel removed and stopped");
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "type": channel_type,
+            "restarted_per_agent": restarted_agents,
+        }))
     }
 
     // ── Channel hot-start/stop ────────────────────────────────
@@ -1239,10 +1524,10 @@ impl MethodHandler {
         if let Some(handle) = handles.remove(channel_type) {
             handle.abort();
             info!(channel_type, "Channel bot stopped");
-            // Update runtime status
-            let mut status = self.channel_status.write().await;
-            status.remove(channel_type);
         }
+        // Always clear runtime status (handle may already be gone if bot crashed)
+        let mut status = self.channel_status.write().await;
+        status.remove(channel_type);
     }
 
     // ── Accounts ─────────────────────────────────────────────
@@ -1373,7 +1658,7 @@ impl MethodHandler {
 
         let db_path = self.home_dir.join("memory.db");
         if !db_path.exists() {
-            return WsFrame::ok_response("", json!({ "results": [] }));
+            return WsFrame::ok_response("", json!({ "entries": [] }));
         }
 
         let engine = match SqliteMemoryEngine::new(&db_path) {

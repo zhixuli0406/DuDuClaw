@@ -1,0 +1,67 @@
+# DuDuClaw Kill Switch Configuration
+#
+# Declarative safety boundaries for AI agent operation.
+# Place at ~/.duduclaw/KILLSWITCH.toml to customize.
+#
+# Reference: https://killswitch.md/ (KILLSWITCH.md Standard, 2026-03)
+
+[triggers]
+# Max replies per minute per scope before rate-limiting.
+max_replies_per_minute = 10
+# Max consecutive errors before failsafe escalation.
+max_consecutive_errors = 5
+# Error rate (0.0-1.0) threshold for failsafe escalation.
+error_rate_threshold = 0.3
+# Daily API cost limit in USD.
+cost_limit_usd = 50.0
+
+[circuit_breaker]
+# Sliding window for frequency anomaly detection (seconds).
+frequency_window_secs = 10
+# Max replies in the frequency window before tripping.
+frequency_max_replies = 5
+# Content similarity threshold (0.0-1.0) for repetition detection.
+# 1.0 = exact match only, 0.95 = near-duplicate detection.
+similarity_threshold = 0.95
+# Token count multiplier over rolling average to detect explosion.
+token_explosion_multiplier = 3.0
+# Cooldown after tripping (seconds) before probing half-open.
+cooldown_secs = 60
+# Requests allowed through in half-open state for recovery probing.
+half_open_allow_count = 2
+
+[failsafe]
+# Auto-recover from L1 Degraded after N seconds (0 = manual only).
+l1_auto_recover_secs = 300
+# Auto-recover from L2 Restricted after N seconds (0 = manual only).
+l2_auto_recover_secs = 600
+# Auto-recover from L3 Muted after N seconds (0 = manual only).
+l3_auto_recover_secs = 0
+# Canned reply when in L2 Restricted mode.
+default_restricted_reply = "系統暫時限制回覆，請稍後再試。"
+# Canned reply when in L4 Halted mode.
+default_halted_reply = "服務已暫停。如需恢復請聯繫管理員，或輸入 !RESUME 恢復。"
+
+[safety_words]
+# Words that stop the current agent/scope.
+stop = ["!STOP", "!停止", "!緊急停止"]
+# Words that stop ALL agents globally (emergency).
+stop_all = ["!STOP ALL", "!全部停止"]
+# Words that resume a stopped agent/scope.
+resume = ["!RESUME", "!恢復", "!繼續"]
+# Words that query the current safety/failsafe status.
+status = ["!STATUS", "!狀態"]
+
+[defensive_prompt]
+# Enable defensive prompt injection for bot-loop prevention.
+# When the circuit breaker enters HalfOpen, replies include an
+# invisible directive asking other LLM bots to stop responding.
+enabled = true
+# Languages to include in the defensive prompt.
+languages = ["en", "zh-TW"]
+
+[audit]
+# Enable killswitch event audit logging.
+enabled = true
+# Path to the audit JSONL file (~ expands to ~/.duduclaw/).
+path = "~/.duduclaw/killswitch_audit.jsonl"
