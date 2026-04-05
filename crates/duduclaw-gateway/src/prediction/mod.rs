@@ -11,6 +11,7 @@
 pub mod engine;
 pub mod metacognition;
 pub mod metrics;
+pub mod outcome;
 pub mod router;
 pub mod user_model;
 

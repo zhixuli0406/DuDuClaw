@@ -29,7 +29,7 @@ export const useSystemStore = create<SystemStore>((set) => {
         const status = await api.system.status();
         set({ status, loading: false });
       } catch {
-        set({ loading: false, error: '無法取得系統狀態' });
+        set({ loading: false, error: 'system.fetchStatusError' });
       }
     },
     runDoctor: async () => {
@@ -38,7 +38,7 @@ export const useSystemStore = create<SystemStore>((set) => {
         const result = await api.system.doctor();
         set({ doctorChecks: result.checks, loading: false });
       } catch {
-        set({ loading: false, error: '健康檢查失敗' });
+        set({ loading: false, error: 'system.healthCheckError' });
       }
     },
   };

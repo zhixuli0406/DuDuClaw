@@ -314,18 +314,122 @@ pub struct ExternalFactorsConfig {
 #[serde(default, rename_all = "snake_case")]
 pub struct ChannelsConfig {
     pub discord: Option<DiscordChannelConfig>,
+    pub telegram: Option<TelegramChannelConfig>,
+    pub line: Option<LineChannelConfig>,
+    pub slack: Option<SlackChannelConfig>,
+    pub whatsapp: Option<WhatsAppChannelConfig>,
+    pub feishu: Option<FeishuChannelConfig>,
 }
 
 /// Per-agent Discord channel settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(default, rename_all = "snake_case")]
 pub struct DiscordChannelConfig {
     /// Plain-text bot token (or encrypted via `bot_token_enc`).
-    #[serde(default)]
     pub bot_token: String,
     /// AES-256-GCM encrypted bot token (base64).
-    #[serde(default)]
     pub bot_token_enc: Option<String>,
+}
+
+impl Default for DiscordChannelConfig {
+    fn default() -> Self {
+        Self { bot_token: String::new(), bot_token_enc: None }
+    }
+}
+
+/// Per-agent Telegram channel settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct TelegramChannelConfig {
+    pub bot_token: String,
+    pub bot_token_enc: Option<String>,
+}
+
+impl Default for TelegramChannelConfig {
+    fn default() -> Self {
+        Self { bot_token: String::new(), bot_token_enc: None }
+    }
+}
+
+/// Per-agent LINE channel settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct LineChannelConfig {
+    pub channel_token: String,
+    pub channel_token_enc: Option<String>,
+    pub channel_secret: String,
+    pub channel_secret_enc: Option<String>,
+}
+
+impl Default for LineChannelConfig {
+    fn default() -> Self {
+        Self {
+            channel_token: String::new(), channel_token_enc: None,
+            channel_secret: String::new(), channel_secret_enc: None,
+        }
+    }
+}
+
+/// Per-agent Slack channel settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct SlackChannelConfig {
+    pub app_token: String,
+    pub app_token_enc: Option<String>,
+    pub bot_token: String,
+    pub bot_token_enc: Option<String>,
+}
+
+impl Default for SlackChannelConfig {
+    fn default() -> Self {
+        Self {
+            app_token: String::new(), app_token_enc: None,
+            bot_token: String::new(), bot_token_enc: None,
+        }
+    }
+}
+
+/// Per-agent WhatsApp channel settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct WhatsAppChannelConfig {
+    pub access_token: String,
+    pub access_token_enc: Option<String>,
+    pub verify_token: String,
+    pub phone_number_id: String,
+    pub app_secret: String,
+    pub app_secret_enc: Option<String>,
+}
+
+impl Default for WhatsAppChannelConfig {
+    fn default() -> Self {
+        Self {
+            access_token: String::new(), access_token_enc: None,
+            verify_token: String::new(), phone_number_id: String::new(),
+            app_secret: String::new(), app_secret_enc: None,
+        }
+    }
+}
+
+/// Per-agent Feishu (Lark) channel settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct FeishuChannelConfig {
+    pub app_id: String,
+    pub app_id_enc: Option<String>,
+    pub app_secret: String,
+    pub app_secret_enc: Option<String>,
+    pub verification_token: String,
+}
+
+impl Default for FeishuChannelConfig {
+    fn default() -> Self {
+        Self {
+            app_id: String::new(), app_id_enc: None,
+            app_secret: String::new(), app_secret_enc: None,
+            verification_token: String::new(),
+        }
+    }
 }
 
 /// Top-level agent identity (the `[agent]` table in agent.toml).
@@ -362,6 +466,51 @@ pub struct AgentConfig {
     /// Per-agent channel configuration (e.g., dedicated Discord bot token).
     #[serde(default)]
     pub channels: Option<ChannelsConfig>,
+    /// Cultural context for adjusting behavioural signal interpretation.
+    /// Defaults to zh-TW high-context settings.
+    ///
+    /// ```toml
+    /// [cultural_context]
+    /// locale = "zh-TW"
+    /// high_context = true
+    /// short_reply_threshold = 15
+    /// silence_as_agreement_weight = 0.7
+    /// indirect_disagreement_weight = 0.3
+    /// ```
+    #[serde(default)]
+    pub cultural_context: CulturalContextConfig,
+}
+
+/// Cultural context for adjusting behavioural signal interpretation.
+///
+/// High-context cultures (East Asian) use indirect communication patterns.
+/// Based on CHI 2024 "Cross-Cultural Perceptions of AI Conversational Agents"
+/// and ScienceDirect 2025 "Culturally Responsive AI Chatbots".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct CulturalContextConfig {
+    /// IANA locale (e.g., "zh-TW", "en-US").
+    pub locale: String,
+    /// High-context culture: silence/short replies may mean agreement.
+    pub high_context: bool,
+    /// Character count below which a reply is considered "short".
+    pub short_reply_threshold: usize,
+    /// Weight for silence-as-agreement interpretation (0.0-1.0).
+    pub silence_as_agreement_weight: f64,
+    /// Weight for indirect disagreement signals (0.0-1.0).
+    pub indirect_disagreement_weight: f64,
+}
+
+impl Default for CulturalContextConfig {
+    fn default() -> Self {
+        Self {
+            locale: "zh-TW".into(),
+            high_context: true,
+            short_reply_threshold: 15,
+            silence_as_agreement_weight: 0.7,
+            indirect_disagreement_weight: 0.3,
+        }
+    }
 }
 
 /// Proactive agent configuration — scheduled checks + user notification.

@@ -134,7 +134,7 @@ function AgentDetailPanel({
         <InfoRow label={intl.formatMessage({ id: 'orgchart.detail.trigger' })} value={agent.trigger} />
         <InfoRow
           label={intl.formatMessage({ id: 'orgchart.detail.reportsTo' })}
-          value={agent.reports_to || '(root)'}
+          value={agent.reports_to || intl.formatMessage({ id: 'orgchart.root' })}
         />
         <InfoRow
           label={intl.formatMessage({ id: 'orgchart.detail.model' })}

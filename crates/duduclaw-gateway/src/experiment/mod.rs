@@ -9,4 +9,7 @@ mod logger;
 mod types;
 
 pub use logger::{csv_escape, ExperimentLogger};
-pub use types::{ExperimentRecord, GvuRecord, VersionOutcomeRecord};
+pub use types::{
+    EvolutionEvent, EvolutionEventType, ExperimentRecord, ExternalValidation,
+    GvuRecord, VersionOutcomeRecord,
+};

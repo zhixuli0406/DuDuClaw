@@ -1,6 +1,6 @@
 # DuDuClaw Architecture Overview
 
-## Architecture Overview (v0.10.0)
+## Architecture Overview (v1.2.0)
 
 DuDuClaw is a **Claude Code extension layer** — not a standalone AI platform. The AI brain is Claude Code SDK (`claude` CLI); DuDuClaw provides the plumbing: channel routing, session management, memory, evolution, multi-account rotation, and **local LLM inference**.
 

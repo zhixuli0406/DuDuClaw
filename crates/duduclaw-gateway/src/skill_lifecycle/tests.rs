@@ -114,6 +114,7 @@ mod diagnostician_tests {
             topic_surprise: if topics.is_empty() { 0.0 } else { 0.6 },
             unexpected_correction: corrections > 0,
             unexpected_follow_up: follow_ups > 2,
+            task_completion_failure: false,
             composite_error: composite,
             category: ErrorCategory::Moderate,
             prediction: Prediction {
@@ -128,8 +129,10 @@ mod diagnostician_tests {
                 message_count: 4, user_message_count: 2, assistant_message_count: 2,
                 avg_assistant_response_length: 200.0, total_tokens: 100, response_time_ms: 0,
                 user_follow_ups: follow_ups, user_corrections: corrections,
+                feedback_details: Default::default(),
                 detected_language: "en".into(), extracted_topics: topics,
                 ended_naturally: true, feedback_signal: None, timestamp: Utc::now(),
+                user_text: String::new(),
             },
         }
     }

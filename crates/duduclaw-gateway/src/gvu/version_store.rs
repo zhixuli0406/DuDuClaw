@@ -162,7 +162,32 @@ impl VersionStore {
             CREATE INDEX IF NOT EXISTS idx_proposals_agent
                 ON evolution_proposals(agent_id);
             CREATE INDEX IF NOT EXISTS idx_proposals_status
-                ON evolution_proposals(status);"
+                ON evolution_proposals(status);
+
+            CREATE TABLE IF NOT EXISTS deferred_gvu (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                gradients_json TEXT NOT NULL,
+                retry_after TEXT NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+            );
+            CREATE INDEX IF NOT EXISTS idx_deferred_agent
+                ON deferred_gvu(agent_id, status);
+
+            CREATE TABLE IF NOT EXISTS gvu_experiment_log (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                generations_used INTEGER NOT NULL,
+                generations_budget INTEGER NOT NULL,
+                duration_secs REAL NOT NULL,
+                outcome TEXT NOT NULL,
+                description TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_experiment_agent_time
+                ON gvu_experiment_log(agent_id, timestamp DESC);"
         ).map_err(|e| e.to_string())
     }
 
@@ -344,4 +369,282 @@ impl VersionStore {
             rollback_diff_hash: None,
         })
     }
+
+    // ── GVU Experiment Log ──────────────────────────────────
+
+    /// Record a GVU experiment outcome.
+    pub fn record_experiment(&self, entry: &ExperimentLogEntry) {
+        let conn = match self.open() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to open DB for experiment log: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = conn.execute(
+            "INSERT INTO gvu_experiment_log
+             (id, agent_id, timestamp, generations_used, generations_budget, duration_secs, outcome, description)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                entry.id,
+                entry.agent_id,
+                entry.timestamp.to_rfc3339(),
+                entry.generations_used,
+                entry.generations_budget,
+                entry.duration_secs,
+                entry.outcome,
+                entry.description,
+            ],
+        ) {
+            warn!(agent = %entry.agent_id, "Failed to record experiment: {e}");
+        } else {
+            info!(
+                agent = %entry.agent_id,
+                outcome = %entry.outcome,
+                generations = entry.generations_used,
+                duration = format!("{:.1}s", entry.duration_secs),
+                "GVU experiment logged"
+            );
+        }
+    }
+
+    /// Get recent experiment log entries for an agent (newest first).
+    pub fn get_experiments(&self, agent_id: &str, limit: usize) -> Vec<ExperimentLogEntry> {
+        let conn = match self.open() {
+            Ok(c) => c,
+            Err(_) => return vec![],
+        };
+
+        let mut stmt = match conn.prepare(
+            "SELECT id, agent_id, timestamp, generations_used, generations_budget,
+                    duration_secs, outcome, description
+             FROM gvu_experiment_log
+             WHERE agent_id = ?1
+             ORDER BY timestamp DESC
+             LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+
+        stmt.query_map(params![agent_id, limit], |row| {
+            let ts_str: String = row.get(2)?;
+            Ok(ExperimentLogEntry {
+                id: row.get(0)?,
+                agent_id: row.get(1)?,
+                timestamp: DateTime::parse_from_rfc3339(&ts_str)
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                generations_used: row.get(3)?,
+                generations_budget: row.get(4)?,
+                duration_secs: row.get(5)?,
+                outcome: row.get(6)?,
+                description: row.get(7)?,
+            })
+        })
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// Get summary statistics for an agent's GVU experiments.
+    pub fn get_experiment_summary(&self, agent_id: &str) -> ExperimentSummary {
+        let conn = match self.open() {
+            Ok(c) => c,
+            Err(_) => return ExperimentSummary::default(),
+        };
+
+        let mut summary = ExperimentSummary::default();
+
+        // Aggregate counts and averages in a single query
+        let result = conn.query_row(
+            "SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN outcome = 'applied' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN outcome = 'abandoned' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN outcome = 'deferred' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN outcome = 'timed_out' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN outcome = 'skipped' THEN 1 ELSE 0 END),
+                AVG(duration_secs),
+                AVG(generations_used)
+             FROM gvu_experiment_log
+             WHERE agent_id = ?1",
+            params![agent_id],
+            |row| {
+                summary.total_experiments = row.get::<_, i64>(0).unwrap_or(0) as u64;
+                summary.applied_count = row.get::<_, i64>(1).unwrap_or(0) as u64;
+                summary.abandoned_count = row.get::<_, i64>(2).unwrap_or(0) as u64;
+                summary.deferred_count = row.get::<_, i64>(3).unwrap_or(0) as u64;
+                summary.timed_out_count = row.get::<_, i64>(4).unwrap_or(0) as u64;
+                summary.skipped_count = row.get::<_, i64>(5).unwrap_or(0) as u64;
+                summary.avg_duration_secs = row.get::<_, f64>(6).unwrap_or(0.0);
+                summary.avg_generations_used = row.get::<_, f64>(7).unwrap_or(0.0);
+                Ok(())
+            },
+        );
+
+        if result.is_err() {
+            return summary;
+        }
+
+        let actionable = summary.total_experiments - summary.skipped_count;
+        if actionable > 0 {
+            summary.success_rate = summary.applied_count as f64 / actionable as f64;
+        }
+
+        summary
+    }
+
+    // ── Deferred GVU management (Phase 1.4) ─────────────────
+
+    /// Store a deferred GVU attempt for later retry.
+    pub fn store_deferred(
+        &self,
+        agent_id: &str,
+        gradients: &[super::text_gradient::TextGradient],
+        retry_after_hours: f64,
+        retry_count: u32,
+    ) -> Result<String, String> {
+        let conn = self.open()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let gradients_json = serde_json::to_string(gradients).map_err(|e| e.to_string())?;
+        let retry_after = chrono::Utc::now()
+            + chrono::Duration::seconds((retry_after_hours * 3600.0) as i64);
+
+        conn.execute(
+            "INSERT INTO deferred_gvu (id, agent_id, gradients_json, retry_after, retry_count, created_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
+            params![
+                id,
+                agent_id,
+                gradients_json,
+                retry_after.to_rfc3339(),
+                retry_count,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )
+        .map_err(|e| format!("Store deferred: {e}"))?;
+
+        Ok(id)
+    }
+
+    /// Get pending deferred GVU attempts that are ready for retry.
+    pub fn get_pending_deferred(
+        &self,
+        agent_id: &str,
+    ) -> Vec<DeferredGvu> {
+        let conn = match self.open() {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut stmt = match conn.prepare(
+            "SELECT id, agent_id, gradients_json, retry_after, retry_count
+             FROM deferred_gvu
+             WHERE agent_id = ?1 AND status = 'pending' AND retry_after <= ?2
+             ORDER BY created_at ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let now = chrono::Utc::now().to_rfc3339();
+        stmt.query_map(params![agent_id, now], |row| {
+            let gradients_json: String = row.get(2)?;
+            Ok(DeferredGvu {
+                id: row.get(0)?,
+                agent_id: row.get(1)?,
+                gradients: serde_json::from_str(&gradients_json).unwrap_or_default(),
+                retry_count: row.get(4)?,
+            })
+        })
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// Mark a deferred GVU as completed (either retried or abandoned).
+    pub fn mark_deferred_completed(&self, id: &str) -> Result<(), String> {
+        let conn = self.open()?;
+        conn.execute(
+            "UPDATE deferred_gvu SET status = 'completed' WHERE id = ?1",
+            params![id],
+        )
+        .map_err(|e| format!("Mark deferred completed: {e}"))?;
+        Ok(())
+    }
+}
+
+/// A pending deferred GVU retry.
+#[derive(Debug, Clone)]
+pub struct DeferredGvu {
+    pub id: String,
+    pub agent_id: String,
+    pub gradients: Vec<super::text_gradient::TextGradient>,
+    pub retry_count: u32,
+}
+
+// ── GVU Experiment Log (autoresearch-inspired) ────────────────────────────
+//
+// Unified log of ALL GVU attempts (applied/abandoned/deferred/timed_out/skipped).
+// Analogous to autoresearch's `results.tsv` — enables MetaCognition analytics
+// and historical experiment review.
+
+/// A single GVU experiment log entry.
+///
+/// Records every GVU cycle outcome with timing and generation counts,
+/// providing the data backbone for MetaCognition self-calibration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentLogEntry {
+    pub id: String,
+    pub agent_id: String,
+    pub timestamp: DateTime<Utc>,
+    /// How many generations were actually executed.
+    pub generations_used: u32,
+    /// The max_generations budget for this run.
+    pub generations_budget: u32,
+    /// Wall-clock duration of the entire cycle.
+    pub duration_secs: f64,
+    /// Outcome: "applied", "abandoned", "deferred", "timed_out", "skipped".
+    pub outcome: String,
+    /// Human-readable description of what happened.
+    pub description: String,
+}
+
+impl ExperimentLogEntry {
+    pub fn new(
+        agent_id: &str,
+        generations_used: u32,
+        generations_budget: u32,
+        duration: std::time::Duration,
+        outcome: &str,
+        description: &str,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent_id.to_string(),
+            timestamp: Utc::now(),
+            generations_used,
+            generations_budget,
+            duration_secs: duration.as_secs_f64(),
+            outcome: outcome.to_string(),
+            description: description.to_string(),
+        }
+    }
+}
+
+/// Summary statistics for an agent's GVU experiment history.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExperimentSummary {
+    pub total_experiments: u64,
+    pub applied_count: u64,
+    pub abandoned_count: u64,
+    pub deferred_count: u64,
+    pub timed_out_count: u64,
+    pub skipped_count: u64,
+    pub avg_duration_secs: f64,
+    pub avg_generations_used: f64,
+    /// Success rate: applied / (total - skipped).
+    pub success_rate: f64,
 }

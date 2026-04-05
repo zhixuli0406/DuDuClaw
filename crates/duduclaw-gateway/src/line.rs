@@ -41,12 +41,6 @@ struct LineEvent {
     reply_token: Option<String>,
     source: Option<LineSource>,
     message: Option<LineMessage>,
-    postback: Option<LinePostback>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LinePostback {
-    data: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +94,7 @@ pub struct LineState {
     ctx: Arc<ReplyContext>,
     http: reqwest::Client,
     channel_status: ChannelStatusMap,
+    event_tx: tokio::sync::broadcast::Sender<String>,
 }
 
 // ── Public API ──────────────────────────────────────────────
@@ -122,6 +117,7 @@ pub async fn start_line_bot(
         .ok()?;
 
     let channel_status = ctx.channel_status.clone();
+    let event_tx = ctx.event_tx.clone();
 
     // Verify token
     match http
@@ -137,22 +133,22 @@ pub async fn start_line_bot(
             } else {
                 info!("💬 LINE bot token verified");
             }
-            set_channel_connected(&channel_status, "line", true, None).await;
+            set_channel_connected(&channel_status, "line", true, None, Some(&event_tx)).await;
         }
         Ok(resp) => {
             let msg = format!("token invalid (HTTP {})", resp.status());
             warn!("LINE bot {msg}");
-            set_channel_connected(&channel_status, "line", false, Some(msg)).await;
+            set_channel_connected(&channel_status, "line", false, Some(msg), Some(&event_tx)).await;
             return None;
         }
         Err(e) => {
             warn!("LINE connection failed: {e}");
-            set_channel_connected(&channel_status, "line", false, Some(e.to_string())).await;
+            set_channel_connected(&channel_status, "line", false, Some(e.to_string()), Some(&event_tx)).await;
             return None;
         }
     }
 
-    let state = LineState { token, secret, ctx, http, channel_status };
+    let state = LineState { token, secret, ctx, http, channel_status, event_tx };
 
     let router = Router::new()
         .route("/webhook/line", post(line_webhook_handler))
@@ -194,24 +190,10 @@ async fn line_webhook_handler(
     };
 
     // Update last_event timestamp on each webhook call
-    set_channel_connected(&state.channel_status, "line", true, None).await;
+    set_channel_connected(&state.channel_status, "line", true, None, Some(&state.event_tx)).await;
 
     // Process events
     for event in webhook.events {
-        // Handle postback events (Quick Reply button presses)
-        if event.event_type == "postback" {
-            if let (Some(reply_token), Some(postback)) = (&event.reply_token, &event.postback) {
-                let action = postback.data.strip_prefix("duduclaw:").unwrap_or(&postback.data);
-                let reply_text = match action {
-                    "new_session" => "New session started.",
-                    _ => "OK",
-                };
-                let msg = serde_json::json!({ "type": "text", "text": reply_text });
-                send_reply_rich(&state.http, &state.token, reply_token, msg, None).await;
-            }
-            continue;
-        }
-
         if event.event_type != "message" {
             continue;
         }
@@ -288,8 +270,7 @@ async fn line_webhook_handler(
                 reg.main_agent().map(|a| a.config.agent.display_name.clone())
             };
             let flex_msg = channel_format::to_line_flex_message(&reply, agent_name.as_deref());
-            let quick_reply = channel_format::line_conversation_quick_reply();
-            send_reply_rich(&state.http, &state.token, reply_token, flex_msg, Some(quick_reply)).await;
+            send_reply_rich(&state.http, &state.token, reply_token, flex_msg).await;
         }
     }
 
@@ -323,24 +304,16 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     acc == 0
 }
 
-/// Send a rich reply (Flex Message, Quick Reply, etc.) via the LINE Reply API.
+/// Send a rich reply (Flex Message, etc.) via the LINE Reply API.
 async fn send_reply_rich(
     http: &reqwest::Client,
     token: &str,
     reply_token: &str,
     message: serde_json::Value,
-    quick_reply: Option<serde_json::Value>,
 ) {
-    let mut msg = message;
-    if let Some(qr) = quick_reply {
-        if let Some(obj) = msg.as_object_mut() {
-            obj.insert("quickReply".to_string(), qr);
-        }
-    }
-
     let body = serde_json::json!({
         "replyToken": reply_token,
-        "messages": [msg]
+        "messages": [message]
     });
 
     match http

@@ -4,7 +4,6 @@
 //! - Gateway WebSocket for MESSAGE_CREATE, INTERACTION_CREATE events
 //! - Slash Commands (/ask, /status, /config, /session, /agent)
 //! - Embed replies with DuDuClaw branding
-//! - Button / Select Menu interactions
 //! - Auto-thread creation for conversations
 //! - Per-guild settings (mention_only, channel whitelist, auto_thread)
 //! - Message splitting for 2000 char Discord limit
@@ -201,6 +200,7 @@ pub async fn start_discord_bot(
         .ok()?;
 
     let channel_status = ctx.channel_status.clone();
+    let event_tx = ctx.event_tx.clone();
 
     // Verify token + get bot user info
     let bot_id = match http
@@ -222,12 +222,12 @@ pub async fn start_discord_bot(
         Ok(resp) => {
             let msg = format!("token invalid (HTTP {})", resp.status());
             warn!("Discord bot {msg}");
-            set_channel_connected(&channel_status, "discord", false, Some(msg)).await;
+            set_channel_connected(&channel_status, "discord", false, Some(msg), Some(&event_tx)).await;
             return None;
         }
         Err(e) => {
             warn!("Discord connection failed: {e}");
-            set_channel_connected(&channel_status, "discord", false, Some(e.to_string())).await;
+            set_channel_connected(&channel_status, "discord", false, Some(e.to_string()), Some(&event_tx)).await;
             return None;
         }
     };
@@ -277,7 +277,7 @@ pub async fn start_discord_bot(
     info!("   ⚠ 請確認 Discord Developer Portal 已啟用 MESSAGE CONTENT Intent");
 
     let handle = tokio::spawn(async move {
-        gateway_loop(token, bot_id, app_id, gateway_url, http, ctx, None).await;
+        gateway_loop(token, bot_id, app_id, gateway_url, http, ctx, "discord".to_string(), None).await;
     });
 
     Some(handle)
@@ -366,6 +366,7 @@ async fn spawn_discord_bot(
         .ok()?;
 
     let channel_status = ctx.channel_status.clone();
+    let event_tx = ctx.event_tx.clone();
 
     // Verify token + get bot user info
     let bot_id = match http
@@ -386,12 +387,12 @@ async fn spawn_discord_bot(
         }
         Ok(resp) => {
             warn!("Discord bot [{label}] token invalid (HTTP {})", resp.status());
-            set_channel_connected(&channel_status, &label, false, Some("token invalid".into())).await;
+            set_channel_connected(&channel_status, &label, false, Some("token invalid".into()), Some(&event_tx)).await;
             return None;
         }
         Err(e) => {
             warn!("Discord [{label}] connection failed: {e}");
-            set_channel_connected(&channel_status, &label, false, Some(e.to_string())).await;
+            set_channel_connected(&channel_status, &label, false, Some(e.to_string()), Some(&event_tx)).await;
             return None;
         }
     };
@@ -438,7 +439,7 @@ async fn spawn_discord_bot(
     info!("   Discord [{label}] Gateway: {gateway_url}");
 
     let handle = tokio::spawn(async move {
-        gateway_loop(token, bot_id, app_id, gateway_url, http, ctx, agent_name).await;
+        gateway_loop(token, bot_id, app_id, gateway_url, http, ctx, label, agent_name).await;
     });
 
     Some(handle)
@@ -488,13 +489,51 @@ async fn gateway_loop(
     gateway_url: String,
     http: reqwest::Client,
     ctx: Arc<ReplyContext>,
+    label: String,
     agent_name: Option<String>,
 ) {
     let channel_status = ctx.channel_status.clone();
+    let event_tx = ctx.event_tx.clone();
+    let mut consecutive_failures: u32 = 0;
+    const MAX_FAILURES: u32 = 10;
 
     loop {
-        info!("Discord Gateway connecting...");
-        set_channel_connected(&channel_status, "discord", false, Some("connecting".into())).await;
+        // Exponential backoff: 5s, 10s, 20s, 40s, ... capped at 300s (5min)
+        if consecutive_failures > 0 {
+            let backoff = std::cmp::min(5u64 << consecutive_failures.min(6), 300);
+            warn!("Discord [{label}] reconnecting in {backoff}s (attempt {consecutive_failures}/{MAX_FAILURES})");
+            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+        }
+
+        // Re-verify token before reconnecting to avoid hammering Discord
+        if consecutive_failures >= 2 {
+            match http.get(format!("{DISCORD_API}/users/@me"))
+                .header("Authorization", format!("Bot {token}"))
+                .send().await
+            {
+                Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                    error!("Discord [{label}] token is invalid (401), stopping bot");
+                    set_channel_connected(&channel_status, &label, false, Some("token invalid — update via Dashboard".into()), Some(&event_tx)).await;
+                    return;
+                }
+                Ok(resp) if resp.status().as_u16() == 429 => {
+                    warn!("Discord [{label}] rate limited during token check, waiting 60s");
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    continue;
+                }
+                Err(_) => {} // network error, proceed to try gateway anyway
+                _ => {} // token ok
+            }
+        }
+
+        if consecutive_failures >= MAX_FAILURES {
+            error!("Discord [{label}] {MAX_FAILURES} consecutive failures, stopping bot");
+            set_channel_connected(&channel_status, &label, false, Some(format!("stopped after {MAX_FAILURES} failures — check token")), Some(&event_tx)).await;
+            return;
+        }
+
+        info!("Discord [{label}] Gateway connecting...");
+        set_channel_connected(&channel_status, &label, false, Some("connecting".into()), Some(&event_tx)).await;
 
         let ws = match tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -505,15 +544,15 @@ async fn gateway_loop(
                 ws
             }
             Ok(Err(e)) => {
-                warn!("Discord Gateway connection failed: {e}");
-                set_channel_connected(&channel_status, "discord", false, Some(e.to_string())).await;
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                warn!("Discord [{label}] Gateway connection failed: {e}");
+                set_channel_connected(&channel_status, &label, false, Some(e.to_string()), Some(&event_tx)).await;
+                consecutive_failures += 1;
                 continue;
             }
             Err(_) => {
-                warn!("Discord Gateway connection timeout (15s)");
-                set_channel_connected(&channel_status, "discord", false, Some("Connection timeout".into())).await;
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                warn!("Discord [{label}] Gateway connection timeout (15s)");
+                set_channel_connected(&channel_status, &label, false, Some("Connection timeout".into()), Some(&event_tx)).await;
+                consecutive_failures += 1;
                 continue;
             }
         };
@@ -548,7 +587,30 @@ async fn gateway_loop(
                             }
                             continue;
                         }
-                        Some(Ok(Message::Close(_))) => { warn!("Discord Gateway closed"); break; }
+                        Some(Ok(Message::Close(frame))) => {
+                            let raw_code = frame.as_ref().map(|f| u16::from(f.code));
+                            let reason = frame.as_ref().map(|f| f.reason.to_string()).unwrap_or_default();
+                            warn!("Discord [{label}] Gateway closed (code: {raw_code:?}, reason: {reason})");
+                            // Fatal Discord close codes — do not retry
+                            match raw_code {
+                                Some(4004) => {
+                                    error!("Discord [{label}] authentication failed (4004), stopping");
+                                    set_channel_connected(&channel_status, &label, false, Some("authentication failed — update token via Dashboard".into()), Some(&event_tx)).await;
+                                    return;
+                                }
+                                Some(4014) => {
+                                    error!("Discord [{label}] disallowed intents (4014), stopping");
+                                    set_channel_connected(&channel_status, &label, false, Some("disallowed intents — enable MESSAGE CONTENT INTENT in Discord Developer Portal".into()), Some(&event_tx)).await;
+                                    return;
+                                }
+                                Some(4013) => {
+                                    error!("Discord [{label}] invalid intents (4013), stopping");
+                                    set_channel_connected(&channel_status, &label, false, Some("invalid intents".into()), Some(&event_tx)).await;
+                                    return;
+                                }
+                                _ => break, // recoverable, will retry with backoff
+                            }
+                        }
                         Some(Err(e)) => { warn!("Discord Gateway error: {e}"); break; }
                         None => break,
                         _ => continue,
@@ -649,8 +711,9 @@ async fn gateway_loop(
                                         }
                                     }
                                     "READY" => {
-                                        info!("Discord Gateway READY");
-                                        set_channel_connected(&channel_status, "discord", true, None).await;
+                                        info!("Discord [{label}] Gateway READY");
+                                        consecutive_failures = 0;
+                                        set_channel_connected(&channel_status, &label, true, None, Some(&event_tx)).await;
                                     }
                                     "GUILD_CREATE" => {
                                         if let Some(d) = &payload.d {
@@ -671,10 +734,10 @@ async fn gateway_loop(
 
                         // Invalid Session
                         9 => {
-                            warn!("Discord Gateway invalid session");
-                            set_channel_connected(&channel_status, "discord", false, Some("invalid session".to_string())).await;
+                            warn!("Discord [{label}] Gateway invalid session");
+                            set_channel_connected(&channel_status, &label, false, Some("invalid session".to_string()), Some(&event_tx)).await;
                             _identified = false;
-                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            consecutive_failures += 1;
                             break;
                         }
 
@@ -705,9 +768,8 @@ async fn gateway_loop(
         drop(guard);
 
         let _ = _identified;
-        set_channel_connected(&channel_status, "discord", false, Some("reconnecting".to_string())).await;
-        warn!("Discord Gateway disconnected, reconnecting in 5s...");
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        consecutive_failures += 1;
+        set_channel_connected(&channel_status, &label, false, Some("reconnecting".to_string()), Some(&event_tx)).await;
     }
 }
 
@@ -751,7 +813,10 @@ async fn handle_message_create(
     let scope_id = if guild_id.is_empty() { "dm" } else { guild_id };
 
     // ── Mention-only filter ──
-    let mention_only = settings.get_bool("discord", scope_id, keys::MENTION_ONLY, false).await;
+    // Per-agent bots default to mention-only in guilds to prevent all bots
+    // in the same server from responding to every message.
+    let default_mention_only = agent_name.is_some();
+    let mention_only = settings.get_bool("discord", scope_id, keys::MENTION_ONLY, default_mention_only).await;
     if mention_only && !guild_id.is_empty() && !bot_mentioned {
         return; // In guild, mention_only enabled, but bot not mentioned → skip
     }
@@ -877,14 +942,8 @@ async fn handle_message_create(
     // Stop typing (explicit drop; also runs automatically on panic via Drop)
     drop(typing_guard);
 
-    // ── Send reply with embed + buttons ──
-    let mut payload = channel_format::to_discord_message(&reply, display_name.as_deref(), false);
-
-    // Add conversation buttons
-    let buttons = channel_format::discord_conversation_buttons(&session_id);
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("components".to_string(), json!([buttons]));
-    }
+    // ── Send reply with embed ──
+    let payload = channel_format::to_discord_message(&reply, display_name.as_deref(), false);
 
     // ── Split if needed (embed description > 4096 or plain text > 2000) ──
     send_discord_message(http, token, &reply_channel_id, payload).await;
@@ -947,14 +1006,8 @@ async fn send_discord_message(http: &reqwest::Client, token: &str, channel_id: &
     if let Some(content) = payload["content"].as_str() {
         if content.len() > channel_format::limits::DISCORD_MESSAGE {
             let chunks = split_text(content, channel_format::limits::DISCORD_MESSAGE - 100);
-            for (i, chunk) in chunks.iter().enumerate() {
-                let mut msg = json!({ "content": chunk });
-                // Only add components to the last chunk
-                if i == chunks.len() - 1 {
-                    if let Some(components) = payload.get("components") {
-                        msg["components"] = components.clone();
-                    }
-                }
+            for chunk in chunks.iter() {
+                let msg = json!({ "content": chunk });
                 send_raw(http, token, channel_id, &msg).await;
             }
             return;
@@ -965,10 +1018,20 @@ async fn send_discord_message(http: &reqwest::Client, token: &str, channel_id: &
 }
 
 async fn send_raw(http: &reqwest::Client, token: &str, channel_id: &str, payload: &Value) {
+    // Strip any `components` (buttons) from the payload — DuDuClaw does not
+    // handle Discord button interactions, so sending them only confuses users.
+    let cleaned = if payload.get("components").is_some() {
+        let mut p = payload.clone();
+        p.as_object_mut().map(|m| m.remove("components"));
+        p
+    } else {
+        payload.clone()
+    };
+
     match http
         .post(format!("{DISCORD_API}/channels/{channel_id}/messages"))
         .header("Authorization", format!("Bot {token}"))
-        .json(payload)
+        .json(&cleaned)
         .send()
         .await
     {
@@ -1000,10 +1063,6 @@ async fn handle_interaction(
         // Application Command (slash command)
         2 => {
             handle_slash_command(data, interaction_id, interaction_token, bot_id, app_id, http, token, ctx).await;
-        }
-        // Message Component (button click)
-        3 => {
-            handle_component(data, interaction_id, interaction_token, http, token, ctx).await;
         }
         _ => {
             debug!("Discord: unhandled interaction type {interaction_type}");
@@ -1238,53 +1297,6 @@ async fn handle_slash_command(
     }
 }
 
-async fn handle_component(
-    data: &Value,
-    interaction_id: &str,
-    interaction_token: &str,
-    http: &reqwest::Client,
-    _bot_token: &str,
-    _ctx: &Arc<ReplyContext>,
-) {
-    let custom_id = data["data"]["custom_id"].as_str().unwrap_or("");
-    let channel_id = data["channel_id"].as_str().unwrap_or("");
-    let user = data.get("member")
-        .and_then(|m| m.get("user"))
-        .or_else(|| data.get("user"));
-    let user_id = user.and_then(|u| u["id"].as_str()).unwrap_or("unknown");
-
-    // Parse custom_id: "duduclaw:{action}:{session_id}"
-    let parts: Vec<&str> = custom_id.splitn(3, ':').collect();
-    if parts.len() < 2 || parts[0] != "duduclaw" {
-        return;
-    }
-
-    let action = parts[1];
-    let session_id = parts.get(2).unwrap_or(&"");
-
-    info!("Discord button: {action} (session: {session_id}) from user:{user_id}");
-
-    match action {
-        "continue" => {
-            // Acknowledge — user will continue typing in the thread/channel
-            send_interaction_response(http, interaction_id, interaction_token, 6, None).await;
-        }
-        "new_session" => {
-            // Create a new session by using a timestamp-based ID
-            let new_session = format!("discord:{}:{}", channel_id, chrono::Utc::now().timestamp());
-            let msg = format!("Started new session: `{new_session}`");
-            send_interaction_response(http, interaction_id, interaction_token, 4, Some(json!({"content": msg, "flags": 64}))).await;
-        }
-        "stop" => {
-            let msg = "Session ended. Start a new conversation anytime!";
-            send_interaction_response(http, interaction_id, interaction_token, 4, Some(json!({"content": msg, "flags": 64}))).await;
-        }
-        _ => {
-            send_interaction_response(http, interaction_id, interaction_token, 6, None).await;
-        }
-    }
-}
-
 // ── Discord REST helpers ────────────────────────────────────
 
 /// Send an interaction response.
@@ -1315,8 +1327,17 @@ async fn edit_interaction_response(
     interaction_token: &str,
     data: &Value,
 ) {
+    // Strip components (buttons) — not handled by DuDuClaw
+    let cleaned = if data.get("components").is_some() {
+        let mut d = data.clone();
+        d.as_object_mut().map(|m| m.remove("components"));
+        d
+    } else {
+        data.clone()
+    };
+
     let url = format!("{DISCORD_API}/webhooks/{app_id}/{interaction_token}/messages/@original");
-    match http.patch(&url).json(data).send().await {
+    match http.patch(&url).json(&cleaned).send().await {
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();

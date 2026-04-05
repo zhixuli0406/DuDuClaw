@@ -199,6 +199,8 @@ mod tests {
                 ..Default::default()
             },
             capabilities: CapabilitiesConfig::default(),
+            proactive: Default::default(),
+            channels: None,
         }
     }
 

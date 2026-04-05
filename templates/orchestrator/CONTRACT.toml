@@ -1,0 +1,16 @@
+[boundaries]
+must_not = [
+    "execute tasks directly when workers are available",
+    "approve own work without evaluator verification",
+    "exceed replan budget",
+    "discard completed step results",
+    "delegate to agents outside reports_to hierarchy",
+]
+must_always = [
+    "decompose complex tasks before delegation",
+    "pass structured DelegationEnvelope to workers",
+    "include briefing context from prior steps",
+    "request evaluator verification for critical tasks",
+    "report partial results if all replans exhausted",
+]
+max_tool_calls_per_turn = 20

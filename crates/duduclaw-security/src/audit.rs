@@ -204,3 +204,73 @@ pub fn log_skill_quarantined(home_dir: &Path, agent_id: &str, skill_name: &str, 
     );
     append_audit_event(home_dir, &event);
 }
+
+// ── Killswitch / Safety Filter audit events ───────────────────
+
+/// Log a safety word trigger event.
+pub fn log_safety_word(
+    home_dir: &Path,
+    agent_id: &str,
+    scope: &str,
+    user_id: &str,
+    action: &str,
+) {
+    let event = AuditEvent::new(
+        "safety_word_triggered",
+        agent_id,
+        Severity::Critical,
+        serde_json::json!({
+            "scope": scope,
+            "user_id": user_id,
+            "action": action,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
+/// Log a circuit breaker trip event.
+pub fn log_circuit_breaker_trip(
+    home_dir: &Path,
+    agent_id: &str,
+    scope: &str,
+    reason: &str,
+) {
+    let event = AuditEvent::new(
+        "circuit_breaker_tripped",
+        agent_id,
+        Severity::Warning,
+        serde_json::json!({
+            "scope": scope,
+            "reason": reason,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
+/// Log a failsafe level change event.
+pub fn log_failsafe_change(
+    home_dir: &Path,
+    agent_id: &str,
+    scope: &str,
+    from_level: &str,
+    to_level: &str,
+    reason: &str,
+) {
+    let severity = if to_level.contains("L4") || to_level.contains("L3") {
+        Severity::Critical
+    } else {
+        Severity::Warning
+    };
+    let event = AuditEvent::new(
+        "failsafe_level_changed",
+        agent_id,
+        severity,
+        serde_json::json!({
+            "scope": scope,
+            "from": from_level,
+            "to": to_level,
+            "reason": reason,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}

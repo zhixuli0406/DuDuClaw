@@ -11,6 +11,10 @@ use duduclaw_agent::registry::AgentRegistry;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use duduclaw_security::circuit_breaker::CircuitBreakerRegistry;
+use duduclaw_security::failsafe::FailsafeManager;
+use duduclaw_security::killswitch::KillswitchConfig;
+
 use crate::channel_settings::ChannelSettingsManager;
 use crate::handlers::ChannelState;
 use crate::gvu::loop_::GvuLoop;
@@ -32,6 +36,8 @@ pub struct ReplyContext {
     pub http: reqwest::Client,
     pub session_manager: Arc<SessionManager>,
     pub channel_status: ChannelStatusMap,
+    /// Broadcast sender for pushing events (e.g. channel status changes) to WebSocket clients.
+    pub event_tx: tokio::sync::broadcast::Sender<String>,
     /// Prediction engine for event-driven evolution.
     pub prediction_engine: Option<Arc<PredictionEngine>>,
     /// GVU evolution loop (Phase 2).
@@ -46,6 +52,14 @@ pub struct ReplyContext {
     pub voice_sessions: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     /// Per-channel, per-scope settings (mention_only, whitelist, auto_thread, etc.).
     pub channel_settings: Arc<ChannelSettingsManager>,
+    /// Killswitch configuration (safety words, thresholds, escalation).
+    pub killswitch: Arc<KillswitchConfig>,
+    /// Failsafe degradation manager (per-scope level tracking).
+    pub failsafe: Option<Arc<FailsafeManager>>,
+    /// Circuit breaker registry (per-scope anomaly detection).
+    pub circuit_breakers: Option<Arc<CircuitBreakerRegistry>>,
+    /// Mistake notebook for grounded GVU evolution (Phase 1 GVU²).
+    pub mistake_notebook: Option<Arc<crate::gvu::mistake_notebook::MistakeNotebook>>,
 }
 
 impl ReplyContext {
@@ -54,6 +68,7 @@ impl ReplyContext {
         home_dir: PathBuf,
         session_manager: Arc<SessionManager>,
         channel_status: ChannelStatusMap,
+        event_tx: tokio::sync::broadcast::Sender<String>,
     ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
@@ -67,12 +82,23 @@ impl ReplyContext {
                 ChannelSettingsManager::new(Path::new(":memory:"))
                     .expect("in-memory DB should always succeed")
             });
+        // Load killswitch config from ~/.duduclaw/KILLSWITCH.toml
+        let ks_path = home_dir.join("KILLSWITCH.toml");
+        let killswitch = KillswitchConfig::load(&ks_path);
+
+        // Initialize failsafe manager and circuit breaker registry
+        let failsafe = Arc::new(FailsafeManager::new(killswitch.failsafe.clone()));
+        let circuit_breakers = Arc::new(CircuitBreakerRegistry::new(
+            killswitch.circuit_breaker.clone(),
+        ));
+
         Self {
             registry,
             home_dir,
             http,
             session_manager,
             channel_status,
+            event_tx,
             prediction_engine: None,
             gvu_loop: None,
             skill_cache: Arc::new(tokio::sync::Mutex::new(CompressedSkillCache::new())),
@@ -80,6 +106,10 @@ impl ReplyContext {
             skill_lift: Arc::new(tokio::sync::Mutex::new(LiftTrackerStore::new())),
             voice_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             channel_settings: Arc::new(channel_settings),
+            killswitch: Arc::new(killswitch),
+            failsafe: Some(failsafe),
+            circuit_breakers: Some(circuit_breakers),
+            mistake_notebook: None,
         }
     }
 
@@ -94,16 +124,41 @@ impl ReplyContext {
         self.gvu_loop = Some(gvu);
         self
     }
+
+    /// Create with MistakeNotebook for grounded GVU evolution.
+    pub fn with_mistake_notebook(mut self, nb: Arc<crate::gvu::mistake_notebook::MistakeNotebook>) -> Self {
+        self.mistake_notebook = Some(nb);
+        self
+    }
 }
 
-/// Helper to update a channel's connection state.
-pub async fn set_channel_connected(status: &ChannelStatusMap, name: &str, connected: bool, error: Option<String>) {
-    let mut map = status.write().await;
-    map.insert(name.to_string(), ChannelState {
-        connected,
-        last_event: Some(chrono::Utc::now()),
-        error,
-    });
+/// Helper to update a channel's connection state and broadcast the change to dashboard clients.
+pub async fn set_channel_connected(status: &ChannelStatusMap, name: &str, connected: bool, error: Option<String>, event_tx: Option<&tokio::sync::broadcast::Sender<String>>) {
+    let now = chrono::Utc::now();
+    let error_clone = error.clone();
+    {
+        let mut map = status.write().await;
+        map.insert(name.to_string(), ChannelState {
+            connected,
+            last_event: Some(now),
+            error,
+        });
+    }
+    // Broadcast status change to WebSocket clients for real-time dashboard updates
+    if let Some(tx) = event_tx {
+        let event = crate::protocol::WsFrame::event(
+            "channels.status_changed",
+            serde_json::json!({
+                "name": name,
+                "connected": connected,
+                "last_connected": now.to_rfc3339(),
+                "error": error_clone,
+            }),
+        );
+        if let Ok(json) = serde_json::to_string(&event) {
+            let _ = tx.send(json);
+        }
+    }
 }
 
 // ── Public API ──────────────────────────────────────────────
@@ -239,11 +294,126 @@ async fn build_reply_with_session_inner(
     };
     drop(reg);
 
-    // Load session and prepend history to system prompt
     let session_mgr = &ctx.session_manager;
-    let _ = session_mgr.get_or_create(session_id, &agent_id).await;
 
-    // Scan user input for prompt injection before processing
+    // ── L0: Safety word check (highest priority, zero latency) ──
+    // Runs BEFORE session creation to avoid unnecessary DB writes for !STOP etc.
+    let safety_action = duduclaw_security::safety_word::check(text, &ctx.killswitch.safety_words);
+    if !matches!(safety_action, duduclaw_security::safety_word::SafetyWordAction::None) {
+        // Safety words are handled by chat_commands.rs, but if we reach here
+        // (e.g., direct call without command parsing), handle inline
+        match &safety_action {
+            duduclaw_security::safety_word::SafetyWordAction::Stop(scope) => {
+                if let Some(ref failsafe) = ctx.failsafe {
+                    match scope {
+                        duduclaw_security::safety_word::SafetyWordScope::CurrentScope => {
+                            failsafe.force_halt(session_id, "safety word").await;
+                            duduclaw_security::audit::log_safety_word(
+                                &ctx.home_dir, &agent_id, session_id, user_id, "stop",
+                            );
+                            return duduclaw_security::safety_word::format_response(&safety_action, session_id);
+                        }
+                        duduclaw_security::safety_word::SafetyWordScope::Global => {
+                            // Global stop requires admin — this inline path has no
+                            // admin context, so only halt the current scope as a
+                            // safeguard. The full !STOP ALL is handled via
+                            // chat_commands::handle_command which enforces admin.
+                            warn!(session_id, user_id, "!STOP ALL via inline path — halting scope only (admin check unavailable)");
+                            failsafe.force_halt(session_id, "safety word: STOP ALL (scope-only)").await;
+                            duduclaw_security::audit::log_safety_word(
+                                &ctx.home_dir, &agent_id, session_id, user_id, "stop_all_downgraded",
+                            );
+                            return "🛑 Agent stopped (scope). Global stop requires admin — use chat command.".to_string();
+                        }
+                    }
+                }
+                return duduclaw_security::safety_word::format_response(&safety_action, session_id);
+            }
+            duduclaw_security::safety_word::SafetyWordAction::Resume => {
+                if let Some(ref failsafe) = ctx.failsafe {
+                    // Only resume the current scope — global halt requires
+                    // explicit !STOP ALL scope to be cleared separately (via
+                    // chat_commands handler which has user_id for admin check).
+                    failsafe.resume(session_id).await;
+                    duduclaw_security::audit::log_safety_word(
+                        &ctx.home_dir, &agent_id, session_id, user_id, "resume",
+                    );
+                    return duduclaw_security::safety_word::format_response(&safety_action, session_id);
+                }
+                return "⚠️ Failsafe system not initialized.".to_string();
+            }
+            duduclaw_security::safety_word::SafetyWordAction::Status => {
+                if let Some(ref failsafe) = ctx.failsafe {
+                    let state = failsafe.get_state(session_id).await;
+                    return duduclaw_security::failsafe::format_status(session_id, state.as_ref());
+                }
+                return "Failsafe: not initialized".to_string();
+            }
+            duduclaw_security::safety_word::SafetyWordAction::None => {}
+        }
+    }
+
+    // ── L1: Failsafe state gate ──
+    if let Some(ref failsafe) = ctx.failsafe {
+        // Check global halt first
+        let global_level = failsafe.get_level("__global__").await;
+        let scope_level = failsafe.get_level(session_id).await;
+        let effective_level = std::cmp::max(global_level, scope_level);
+
+        use duduclaw_security::failsafe::FailsafeLevel;
+        match effective_level {
+            FailsafeLevel::L4Halted => {
+                // Halted: reply with canned message
+                return failsafe.canned_reply(effective_level)
+                    .unwrap_or("Service paused.").to_string();
+            }
+            FailsafeLevel::L3Muted => {
+                // Muted: silent drop, no reply
+                return String::new();
+            }
+            FailsafeLevel::L2Restricted => {
+                // Restricted: return canned reply, don't call AI
+                return failsafe.canned_reply(effective_level)
+                    .unwrap_or("Service restricted.").to_string();
+            }
+            FailsafeLevel::L1Degraded => {
+                // Degraded: allow through but could prefer local model
+                // (model routing is handled downstream)
+            }
+            FailsafeLevel::L0Normal => {}
+        }
+    }
+
+    // ── L2: Circuit breaker check ──
+    let mut breaker_state = duduclaw_security::circuit_breaker::BreakerState::Closed;
+    if let Some(ref cb_registry) = ctx.circuit_breakers {
+        let decision = cb_registry.check_inbound(session_id, text).await;
+        match decision {
+            duduclaw_security::circuit_breaker::BreakerDecision::Allow => {}
+            duduclaw_security::circuit_breaker::BreakerDecision::Throttle => {
+                breaker_state = duduclaw_security::circuit_breaker::BreakerState::HalfOpen;
+                // Allow through but mark for defensive prompt injection later
+            }
+            duduclaw_security::circuit_breaker::BreakerDecision::Deny(_) => {
+                debug!(session_id, "Circuit breaker denied — message dropped");
+                return String::new(); // silent drop
+            }
+            duduclaw_security::circuit_breaker::BreakerDecision::Trip(reason) => {
+                warn!(session_id, reason = %reason, "Circuit breaker tripped");
+                // Audit log
+                duduclaw_security::audit::log_circuit_breaker_trip(
+                    &ctx.home_dir, &agent_id, session_id, &reason.to_string(),
+                );
+                // Escalate failsafe
+                if let Some(ref failsafe) = ctx.failsafe {
+                    failsafe.escalate(session_id, &format!("circuit breaker: {reason}")).await;
+                }
+                return String::new(); // silent drop for this message
+            }
+        }
+    }
+
+    // ── L3: Prompt injection scan (existing) ──
     let scan = duduclaw_security::input_guard::scan_input(
         text,
         duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
@@ -257,6 +427,9 @@ async fn build_reply_with_session_inner(
         );
         return format!("⚠️ {}", scan.summary);
     }
+
+    // ── All pre-filters passed — now create/load session ──
+    let _ = session_mgr.get_or_create(session_id, &agent_id).await;
 
     // Sanitize role-prefix injection: strip any attempt to impersonate assistant/system role
     let sanitized_text = if text.starts_with("assistant:") || text.starts_with("system:") {
@@ -340,9 +513,28 @@ async fn build_reply_with_session_inner(
         },
     };
 
-    if let Some(reply) = reply {
-        // Save assistant reply to session
+    if let Some(mut reply) = reply {
+        // Record outbound for circuit breaker echo detection
         let reply_tokens = estimate_tokens(&reply);
+        if let Some(ref cb_registry) = ctx.circuit_breakers {
+            cb_registry.record_outbound(session_id, &reply, reply_tokens as usize).await;
+        }
+
+        // Inject defensive prompt if circuit breaker is in HalfOpen (bot loop suspected)
+        if crate::defensive_prompt::should_inject(breaker_state)
+            && ctx.killswitch.defensive_prompt.enabled
+        {
+            // Extract channel type from session_id (e.g. "telegram:123" → "telegram")
+            let channel_type = session_id.split(':').next().unwrap_or("unknown");
+            reply = crate::defensive_prompt::inject_defensive_prompt(
+                &reply,
+                &ctx.killswitch.defensive_prompt.languages,
+                channel_type,
+            );
+            debug!(session_id, "Defensive prompt injected (circuit breaker HalfOpen)");
+        }
+
+        // Save assistant reply to session
         if let Err(e) = session_mgr
             .append_message(session_id, "assistant", &reply, reply_tokens)
             .await
@@ -351,19 +543,21 @@ async fn build_reply_with_session_inner(
         }
 
         // ── Prediction-driven evolution ──────────────────────────────
-        if ctx.prediction_engine.is_some() {
-            let pe = ctx.prediction_engine.as_ref().unwrap().clone();
+        if let Some(pe) = ctx.prediction_engine.as_ref() {
+            let pe = pe.clone();
             let gvu = ctx.gvu_loop.clone();
             let user_id_for_pred = user_id.to_string();
             let agent_id_for_pred = agent_id.clone();
             let session_id_for_pred = session_id.to_string();
             let text_clone = text.to_string();
+            let reply_clone_for_pred = reply.clone();
             let home_for_pred = ctx.home_dir.clone();
             let agent_dir_for_pred = agent_dir.clone();
             let sm_for_pred = ctx.session_manager.clone();
             let skill_cache_for_pred = ctx.skill_cache.clone();
             let skill_activation_for_pred = ctx.skill_activation.clone();
             let skill_lift_for_pred = ctx.skill_lift.clone();
+            let notebook_for_pred = ctx.mistake_notebook.clone();
 
             tokio::spawn(async move {
                 // 1. Generate prediction (< 1ms, zero LLM)
@@ -385,11 +579,64 @@ async fn build_reply_with_session_inner(
                     0,
                 );
 
-                // 3. Calculate prediction error (< 1ms, zero LLM)
-                let error = pe.calculate_error(&prediction, &metrics).await;
+                // 3. Calculate prediction error (embedding ~5ms if available, otherwise < 1ms)
+                let (error, embedding) = pe.calculate_error(&prediction, &metrics).await;
 
-                // 4. Update user model (< 1ms)
-                pe.update_model(&metrics).await;
+                // 3.5 Log evolution event: PredictionError (Sutskever Day 1)
+                pe.log_evolution_event(
+                    "prediction_error",
+                    &agent_id_for_pred,
+                    Some(error.composite_error),
+                    Some(&format!("{:?}", error.category)),
+                    None, None, None,
+                );
+
+                // 4. Update user model — pass pre-computed embedding to avoid redundant embed()
+                pe.update_model_with_embedding(&metrics, embedding).await;
+
+                // 4.5 Conversation outcome detection + MistakeNotebook (Phase 1 GVU²)
+                // Skip for very short conversations (< 4 messages) to avoid false positives (review #28)
+                let mut error = error;
+                let conv_outcome = if messages.len() >= 4 {
+                    Some(crate::prediction::outcome::ConversationOutcome::extract(
+                        &session_id_for_pred, &agent_id_for_pred, &messages,
+                    ))
+                } else {
+                    None
+                };
+                // Apply task completion signal to prediction error
+                if let Some(ref outcome) = conv_outcome {
+                    let meta = pe.metacognition.lock().await;
+                    error.apply_outcome(outcome, &meta.thresholds);
+                }
+                // Record failure to MistakeNotebook for grounded GVU
+                if let Some(ref outcome) = conv_outcome {
+                    if outcome.is_failure() {
+                        if let Some(ref nb) = notebook_for_pred {
+                            let category = match outcome.task_type {
+                                crate::prediction::outcome::TaskType::Coding => crate::gvu::mistake_notebook::MistakeCategory::Capability,
+                                crate::prediction::outcome::TaskType::QA => crate::gvu::mistake_notebook::MistakeCategory::Factual,
+                                _ => crate::gvu::mistake_notebook::MistakeCategory::Behavioral,
+                            };
+                            let what_wrong = match outcome.satisfaction {
+                                crate::prediction::outcome::SatisfactionSignal::Negative => "User expressed dissatisfaction",
+                                _ => "Task not completed",
+                            };
+                            let entry = crate::gvu::mistake_notebook::build_mistake_entry(
+                                &agent_id_for_pred,
+                                &session_id_for_pred,
+                                category,
+                                &text_clone,
+                                &reply_clone_for_pred,
+                                what_wrong,
+                                None,
+                            );
+                            if let Err(e) = nb.record(&entry) {
+                                warn!(agent = %agent_id_for_pred, "Failed to record mistake: {e}");
+                            }
+                        }
+                    }
+                }
 
                 // 5. Skill lifecycle: diagnose + activate + track lift
                 {
@@ -471,9 +718,14 @@ async fn build_reply_with_session_inner(
                     }
                 }
 
-                // 7. Route to evolution action
+                // 7. Route to evolution action (with hardening: ε-floor + anti-sycophancy)
+                // Snapshot consistency first, then lock exploration (audit #1: avoid dual mutex)
                 let consecutive = pe.consecutive_significant_count(&agent_id_for_pred).await;
-                let action = crate::prediction::router::route(&error, consecutive);
+                let consistency_snapshot = pe.consistency.lock().await.clone();
+                let action = {
+                    let mut exploration = pe.exploration.lock().await;
+                    crate::prediction::router::route(&error, consecutive, &mut exploration, &consistency_snapshot)
+                };
 
                 match action {
                     crate::prediction::router::EvolutionAction::None => {}
@@ -493,6 +745,23 @@ async fn build_reply_with_session_inner(
                             info!(agent = %agent_id_for_pred, error = format!("{:.3}", error.composite_error), "Prediction error → triggering reflection");
                         }
 
+                        // Log evolution event: GVU trigger (Sutskever Day 1)
+                        let etype = if context.contains("Epistemic Foraging") {
+                            "epistemic_foraging"
+                        } else if context.contains("Anti-Sycophancy") {
+                            "sycophancy_alert"
+                        } else {
+                            "gvu_trigger"
+                        };
+                        pe.log_evolution_event(
+                            etype,
+                            &agent_id_for_pred,
+                            Some(error.composite_error),
+                            Some(&format!("{:?}", error.category)),
+                            Some(&context.chars().take(500).collect::<String>()),
+                            None, None,
+                        );
+
                         // Run GVU loop if available
                         if let (Some(gvu), Some(dir)) = (&gvu, &agent_dir_for_pred) {
                             let contract = duduclaw_agent::contract::load_contract(dir);
@@ -509,7 +778,16 @@ async fn build_reply_with_session_inner(
                                 }
                             };
 
-                            let outcome = gvu.run(
+                            // Query MistakeNotebook for grounded generation context
+                            let relevant_mistakes = notebook_for_pred
+                                .as_ref()
+                                .map(|nb| nb.query_by_agent(&agent_id_for_pred, 5))
+                                .unwrap_or_default();
+
+                            // Get MetaCognition snapshot for adaptive depth
+                            let meta_snapshot = pe.metacognition.lock().await.clone();
+
+                            let outcome = gvu.run_with_context(
                                 &agent_id_for_pred,
                                 dir,
                                 &context,
@@ -517,6 +795,8 @@ async fn build_reply_with_session_inner(
                                 &contract.boundaries.must_not,
                                 &contract.boundaries.must_always,
                                 call_llm,
+                                Some(&meta_snapshot),
+                                relevant_mistakes,
                             ).await;
 
                             // Log outcome and feed back to metacognition
@@ -545,6 +825,24 @@ async fn build_reply_with_session_inner(
                                         let mut meta = pe.metacognition.lock().await;
                                         meta.record_outcome(error.category, false);
                                     }
+                                }
+                                crate::gvu::loop_::GvuOutcome::Deferred { retry_count, retry_after_hours, .. } => {
+                                    info!(
+                                        agent = %agent_id_for_pred,
+                                        retry_count,
+                                        retry_after_hours,
+                                        "GVU deferred — will retry with accumulated gradients"
+                                    );
+                                    // Don't record as outcome yet — will be evaluated on retry
+                                }
+                                crate::gvu::loop_::GvuOutcome::TimedOut { elapsed, generations_completed, .. } => {
+                                    warn!(
+                                        agent = %agent_id_for_pred,
+                                        elapsed_secs = elapsed.as_secs(),
+                                        generations_completed,
+                                        "GVU timed out — wall-clock budget exceeded"
+                                    );
+                                    // Treat as inconclusive — don't record outcome
                                 }
                             }
                         } else {
@@ -703,10 +1001,12 @@ async fn call_claude_cli(
         "--model", model,
         "--output-format", "stream-json",
         "--verbose",
-        // Channel subprocess has no TTY — auto-accept tool permissions.
-        // Agent-level security is enforced by CONTRACT.toml + container sandbox,
-        // not by Claude Code's interactive permission prompts.
-        "--permission-mode", "auto",
+        // Channel subprocess has no TTY — bypass all permission prompts.
+        // Agent-level security is enforced by CONTRACT.toml + container sandbox
+        // + duduclaw security hooks, not by Claude Code's interactive prompts.
+        // "auto" mode still pauses for some high-risk ops (mkdir, write) which
+        // causes Claude to tell Discord users "please click Allow in terminal".
+        "--dangerously-skip-permissions",
         // Allow enough agentic turns for complex tasks (read files → think → write).
         // Default -p max-turns can be too low, causing Claude to stop mid-task
         // and return a text summary instead of completing the work.
