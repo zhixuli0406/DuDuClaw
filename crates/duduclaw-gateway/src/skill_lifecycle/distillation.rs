@@ -97,5 +97,6 @@ pub fn build_distillation_input(
         trigger_context,
         previous_gradients: vec![],
         generation: 1,
+        relevant_mistakes: vec![],
     }
 }

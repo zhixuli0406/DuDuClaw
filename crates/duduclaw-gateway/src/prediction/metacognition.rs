@@ -16,13 +16,98 @@
 //! - **CUSUM ChangePointDetector**: Replaces fixed 100-prediction evaluation
 //!   interval with adaptive shift detection (Suk 2024).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::engine::{ErrorCategory, PredictionError};
+
+// ---------------------------------------------------------------------------
+// GVU Generation Stats — adaptive iteration depth
+// ---------------------------------------------------------------------------
+
+/// Record of a single GVU loop execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GvuAttemptRecord {
+    /// Which generation was accepted (None = all rejected / abandoned).
+    pub accepted_at_generation: Option<u32>,
+    /// How many generations were attempted.
+    pub max_generations_used: u32,
+}
+
+/// Tracks GVU generation outcomes for adaptive depth calculation.
+///
+/// If late-generation acceptances are common, the system increases
+/// max_generations to allow more attempts. If most acceptances happen
+/// early, the default of 3 is sufficient.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GvuGenerationStats {
+    pub recent_outcomes: VecDeque<GvuAttemptRecord>,
+    pub window_size: usize,
+}
+
+impl Default for GvuGenerationStats {
+    fn default() -> Self {
+        Self {
+            recent_outcomes: VecDeque::new(),
+            window_size: 20,
+        }
+    }
+}
+
+impl GvuGenerationStats {
+    /// Record the outcome of a GVU loop execution.
+    pub fn record(&mut self, accepted_at: Option<u32>, max_used: u32) {
+        self.recent_outcomes.push_back(GvuAttemptRecord {
+            accepted_at_generation: accepted_at,
+            max_generations_used: max_used,
+        });
+        while self.recent_outcomes.len() > self.window_size {
+            self.recent_outcomes.pop_front();
+        }
+    }
+
+    /// Calculate adaptive max_generations based on historical outcomes.
+    ///
+    /// Logic:
+    /// - If >30% of acceptances happen at generation >= 3 → extend to 5
+    /// - If >10% at generation >= 3 → extend to 4
+    /// - Otherwise → default 3
+    /// - Hard cap: 7
+    pub fn adaptive_max_generations(&self) -> u32 {
+        if self.recent_outcomes.len() < 3 {
+            return 3; // Not enough data
+        }
+
+        // Only count non-abandoned runs — abandoned entries would deflate the
+        // late_rate and prevent depth extension (review #25).
+        let accepted: Vec<_> = self.recent_outcomes.iter()
+            .filter(|r| r.accepted_at_generation.is_some())
+            .collect();
+
+        if accepted.len() < 3 {
+            return 3; // Not enough accepted data
+        }
+
+        let late_successes = accepted.iter()
+            .filter(|r| r.accepted_at_generation.map(|g| g >= 3).unwrap_or(false))
+            .count() as f64;
+
+        let late_rate = late_successes / accepted.len() as f64;
+
+        let depth = if late_rate > 0.3 {
+            5
+        } else if late_rate > 0.1 {
+            4
+        } else {
+            3
+        };
+
+        depth.min(7)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // AdaptiveThresholds
@@ -329,6 +414,13 @@ pub struct MetaCognition {
     /// Proactive evaluations since last calibration.
     #[serde(default)]
     pub proactive_since_last_cal: u64,
+
+    // ── GVU adaptive depth (Phase 1.3) ─────────────────────
+
+    /// GVU generation outcome tracking for adaptive iteration depth.
+    /// Determines whether to extend beyond the default 3 generations.
+    #[serde(default)]
+    pub gvu_generation_stats: GvuGenerationStats,
 }
 
 impl Default for MetaCognition {
@@ -348,7 +440,23 @@ impl Default for MetaCognition {
             proactive_accepted: 0,
             proactive_dismissed: 0,
             proactive_since_last_cal: 0,
+            gvu_generation_stats: GvuGenerationStats::default(),
         }
+    }
+}
+
+impl MetaCognition {
+    /// Get the adaptive max_generations for GVU loops.
+    ///
+    /// Delegates to `GvuGenerationStats::adaptive_max_generations()`.
+    /// Returns 3 if not enough data.
+    pub fn adaptive_max_generations(&self) -> u32 {
+        self.gvu_generation_stats.adaptive_max_generations()
+    }
+
+    /// Record a GVU loop outcome for adaptive depth tracking.
+    pub fn record_gvu_outcome(&mut self, accepted_at: Option<u32>, max_used: u32) {
+        self.gvu_generation_stats.record(accepted_at, max_used);
     }
 }
 

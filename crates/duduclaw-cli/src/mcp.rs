@@ -63,7 +63,7 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "send_to_agent",
-        description: "Delegate task to another agent",
+        description: "Delegate task to another agent. Delegation depth is tracked automatically via environment to prevent infinite loops (max 5 hops).",
         params: &[
             ParamDef { name: "agent_id", description: "Target agent ID", required: true },
             ParamDef { name: "prompt", description: "Prompt/task for the agent", required: true },
@@ -129,7 +129,7 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "spawn_agent",
-        description: "Spawn a persistent sub-agent task. The agent runs in the background with its own session, executing the given prompt. Use agent_status to check progress.",
+        description: "Spawn a persistent sub-agent task. The agent runs in the background with its own session, executing the given prompt. Use agent_status to check progress. Delegation depth tracked automatically (max 5 hops).",
         params: &[
             ParamDef { name: "agent_id", description: "Target agent name", required: true },
             ParamDef { name: "task", description: "Task prompt for the agent to execute", required: true },
@@ -833,7 +833,19 @@ async fn handle_memory_store(
 }
 
 /// Send a message to another agent via the bus queue.
-async fn handle_send_to_agent(params: &Value, home_dir: &Path) -> Value {
+async fn handle_send_to_agent(params: &Value, home_dir: &Path, caller: &str) -> Value {
+    send_to_agent_with_ctx(params, home_dir, caller, DelegationContext::from_env()).await
+}
+
+/// Core implementation with injectable delegation context.
+/// Production callers use `DelegationContext::from_env()`;
+/// tests inject a specific context to avoid unsafe env var mutation.
+async fn send_to_agent_with_ctx(
+    params: &Value,
+    home_dir: &Path,
+    caller: &str,
+    ctx: DelegationContext,
+) -> Value {
     let target = params.get("agent_id").or_else(|| params.get("agent")).and_then(|v| v.as_str()).unwrap_or("");
     let prompt = params.get("prompt").or_else(|| params.get("message")).and_then(|v| v.as_str()).unwrap_or("");
 
@@ -852,6 +864,33 @@ async fn handle_send_to_agent(params: &Value, home_dir: &Path) -> Value {
         });
     }
 
+    // ── Supervisor pattern enforcement ─────────────────────────
+    if let Err(reason) = check_supervisor_relation(home_dir, caller, target).await {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: {reason}")}],
+            "isError": true
+        });
+    }
+
+    // ── Delegation depth tracking ──────────────────────────────
+    let incoming_depth = ctx.depth;
+    let outgoing_depth = incoming_depth.saturating_add(1);
+
+    if outgoing_depth >= duduclaw_core::MAX_DELEGATION_DEPTH {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "Error: delegation depth limit ({}) would be exceeded. \
+                 Current depth: {incoming_depth}, chain origin: {}. \
+                 Cannot delegate further to prevent infinite loops.",
+                duduclaw_core::MAX_DELEGATION_DEPTH,
+                ctx.origin.as_deref().unwrap_or("unknown"),
+            )}],
+            "isError": true
+        });
+    }
+
+    let origin = ctx.origin.as_deref().unwrap_or(caller);
+
     let msg_id = uuid::Uuid::new_v4().to_string();
     let queue_path = home_dir.join("bus_queue.jsonl");
     let task = serde_json::json!({
@@ -860,6 +899,9 @@ async fn handle_send_to_agent(params: &Value, home_dir: &Path) -> Value {
         "agent_id": target,
         "payload": prompt,
         "timestamp": chrono::Utc::now().to_rfc3339(),
+        "delegation_depth": outgoing_depth,
+        "origin_agent": origin,
+        "sender_agent": caller,
     });
 
     let queued = tokio::task::spawn_blocking({
@@ -870,7 +912,7 @@ async fn handle_send_to_agent(params: &Value, home_dir: &Path) -> Value {
 
     serde_json::json!({
         "content": [{"type": "text", "text": if queued {
-            format!("Message queued for agent '{target}' (id: {msg_id})")
+            format!("Message queued for agent '{target}' (id: {msg_id}, depth: {outgoing_depth})")
         } else {
             format!("Failed to queue message for agent '{target}'")
         }}]
@@ -1093,6 +1135,14 @@ async fn handle_create_agent(params: &Value, home_dir: &Path) -> Value {
     } else {
         reports_to.to_string()
     };
+
+    // Validate reports_to references an existing agent and won't create a cycle
+    if let Err(reason) = validate_reports_to(home_dir, name, &reports_to).await {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: {reason}")}],
+            "isError": true
+        });
+    }
 
     // Create directory structure
     if let Err(e) = tokio::fs::create_dir_all(&agent_dir).await {
@@ -1368,7 +1418,17 @@ async fn handle_agent_status(params: &Value, home_dir: &Path) -> Value {
 }
 
 /// Spawn a persistent sub-agent task in the background.
-async fn handle_spawn_agent(params: &Value, home_dir: &Path) -> Value {
+async fn handle_spawn_agent(params: &Value, home_dir: &Path, caller: &str) -> Value {
+    spawn_agent_with_ctx(params, home_dir, caller, DelegationContext::from_env()).await
+}
+
+/// Core spawn_agent with injectable delegation context.
+async fn spawn_agent_with_ctx(
+    params: &Value,
+    home_dir: &Path,
+    caller: &str,
+    ctx: DelegationContext,
+) -> Value {
     let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
     let task = params.get("task").and_then(|v| v.as_str()).unwrap_or("");
     let session_key = params.get("session_key").and_then(|v| v.as_str()).unwrap_or("");
@@ -1395,6 +1455,31 @@ async fn handle_spawn_agent(params: &Value, home_dir: &Path) -> Value {
         });
     }
 
+    // ── Supervisor pattern enforcement ─────────────────────────
+    if let Err(reason) = check_supervisor_relation(home_dir, caller, agent_id).await {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: {reason}")}],
+            "isError": true
+        });
+    }
+
+    // ── Delegation depth tracking ────────────────────────────────
+    let incoming_depth = ctx.depth;
+    let outgoing_depth = incoming_depth.saturating_add(1);
+
+    if outgoing_depth >= duduclaw_core::MAX_DELEGATION_DEPTH {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "Error: delegation depth limit ({}) would be exceeded. \
+                 Current depth: {incoming_depth}. Cannot spawn further agents.",
+                duduclaw_core::MAX_DELEGATION_DEPTH,
+            )}],
+            "isError": true
+        });
+    }
+
+    let origin = ctx.origin.as_deref().unwrap_or(caller);
+
     let task_id = uuid::Uuid::new_v4().to_string();
 
     // Write a structured task entry to bus_queue.jsonl with spawn metadata
@@ -1407,6 +1492,9 @@ async fn handle_spawn_agent(params: &Value, home_dir: &Path) -> Value {
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "session_key": if session_key.is_empty() { &task_id } else { session_key },
         "persistent": true,
+        "delegation_depth": outgoing_depth,
+        "origin_agent": origin,
+        "sender_agent": caller,
     });
 
     let queued = tokio::task::spawn_blocking({
@@ -1528,6 +1616,13 @@ async fn handle_agent_update(params: &Value, home_dir: &Path) -> Value {
         changes.push(format!("icon = \"{v}\""));
     }
     if let Some(v) = params.get("reports_to").and_then(|v| v.as_str()) {
+        // Validate reports_to references an existing agent and won't create a cycle
+        if let Err(reason) = validate_reports_to(home_dir, agent_id, v).await {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: {reason}")}],
+                "isError": true
+            });
+        }
         config.agent.reports_to = v.to_string();
         changes.push(format!("reports_to = \"{v}\""));
     }
@@ -2914,6 +3009,152 @@ async fn handle_skill_list(params: &Value, home_dir: &Path) -> Value {
 }
 
 /// Resolve the main agent name from the agents directory.
+// ── Delegation safety helpers ────────────────────────────────
+
+/// Delegation context read from environment variables (or injected for testing).
+#[derive(Debug, Clone)]
+struct DelegationContext {
+    depth: u8,
+    origin: Option<String>,
+    sender: Option<String>,
+}
+
+impl DelegationContext {
+    /// Read from env vars set by the dispatcher. This is the ONLY trusted source
+    /// in production — tool params are ignored to prevent LLM agents from spoofing.
+    fn from_env() -> Self {
+        let depth = std::env::var(duduclaw_core::ENV_DELEGATION_DEPTH)
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(0);
+        let origin = std::env::var(duduclaw_core::ENV_DELEGATION_ORIGIN)
+            .ok()
+            .filter(|s| !s.is_empty());
+        let sender = std::env::var(duduclaw_core::ENV_DELEGATION_SENDER)
+            .ok()
+            .filter(|s| !s.is_empty());
+        Self { depth, origin, sender }
+    }
+}
+
+/// Read delegation context from environment (production entry point).
+fn read_delegation_env() -> (u8, Option<String>, Option<String>) {
+    let ctx = DelegationContext::from_env();
+    (ctx.depth, ctx.origin, ctx.sender)
+}
+
+/// Check whether `sender` is allowed to delegate to `target` under the
+/// supervisor pattern.  Allowed directions:
+///   - Parent → Child  (target.reports_to == sender)
+///   - Child  → Parent (sender.reports_to == target) — for replies
+///
+/// Returns `Ok(())` if allowed, or `Err(reason)` if denied.
+/// Normalize reports_to: both "" and "none" mean root (no parent).
+fn normalize_reports_to(value: &str) -> &str {
+    if value.is_empty() || value == "none" { "" } else { value }
+}
+
+async fn check_supervisor_relation(
+    home_dir: &Path,
+    sender: &str,
+    target: &str,
+) -> std::result::Result<(), String> {
+    // Self-delegation is always forbidden (would be an echo loop)
+    if sender == target {
+        return Err(format!("Cannot delegate to self ('{sender}')"));
+    }
+
+    let agents_dir = home_dir.join("agents");
+
+    // Read target agent's reports_to
+    let target_config = read_agent_config(&agents_dir, target).await
+        .ok_or_else(|| format!("Target agent '{target}' not found"))?;
+    let target_reports_to = normalize_reports_to(&target_config.agent.reports_to);
+
+    // Parent → Child: target reports to sender
+    if target_reports_to == sender {
+        return Ok(());
+    }
+
+    // Child → Parent: sender reports to target
+    let sender_config = read_agent_config(&agents_dir, sender).await
+        .ok_or_else(|| format!("Sender agent '{sender}' not found"))?;
+    let sender_reports_to = normalize_reports_to(&sender_config.agent.reports_to);
+    if sender_reports_to == target {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Supervisor pattern violation: '{sender}' cannot delegate to '{target}'. \
+         Only parent→child or child→parent delegation is allowed. \
+         ('{target}'.reports_to='{}', '{sender}'.reports_to='{}')",
+        target_reports_to, sender_reports_to,
+    ))
+}
+
+/// Validate that a `reports_to` value references an existing agent (or is empty
+/// for root agents) and does not create a cycle.
+async fn validate_reports_to(
+    home_dir: &Path,
+    agent_name: &str,
+    reports_to: &str,
+) -> std::result::Result<(), String> {
+    if reports_to.is_empty() || reports_to == "none" {
+        return Ok(()); // root agent
+    }
+
+    // Cannot report to self
+    if reports_to == agent_name {
+        return Err(format!("Agent '{agent_name}' cannot report to itself"));
+    }
+
+    let agents_dir = home_dir.join("agents");
+
+    // Target must exist
+    if !agents_dir.join(reports_to).join("agent.toml").exists() {
+        return Err(format!(
+            "reports_to '{reports_to}' does not exist. \
+             Create the agent first or use an empty string for root."
+        ));
+    }
+
+    // Walk up the chain to detect cycles (max 20 hops as safety bound)
+    let mut current = reports_to.to_string();
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(agent_name.to_string());
+
+    for _ in 0..20 {
+        if !visited.insert(current.clone()) {
+            return Err(format!(
+                "Circular reports_to detected: setting '{agent_name}'.reports_to='{reports_to}' \
+                 would create a cycle involving '{current}'"
+            ));
+        }
+        match read_agent_config(&agents_dir, &current).await {
+            Some(cfg) => {
+                let next = &cfg.agent.reports_to;
+                if next.is_empty() || next == "none" {
+                    break; // reached root
+                }
+                current = next.clone();
+            }
+            None => break, // dangling reference — not our problem here
+        }
+    }
+
+    Ok(())
+}
+
+/// Read an agent's config from disk.
+async fn read_agent_config(
+    agents_dir: &Path,
+    agent_id: &str,
+) -> Option<duduclaw_core::types::AgentConfig> {
+    let toml_path = agents_dir.join(agent_id).join("agent.toml");
+    let content = tokio::fs::read_to_string(&toml_path).await.ok()?;
+    toml::from_str(&content).ok()
+}
+
 async fn resolve_main_agent_name(home_dir: &Path) -> String {
     let agents_dir = home_dir.join("agents");
     let mut entries = match tokio::fs::read_dir(&agents_dir).await {
@@ -3148,7 +3389,7 @@ async fn handle_tools_call(
         "web_search" => handle_web_search(&arguments, http).await,
         "memory_search" => handle_memory_search(&arguments, memory, default_agent).await,
         "memory_store" => handle_memory_store(&arguments, memory, default_agent).await,
-        "send_to_agent" => handle_send_to_agent(&arguments, home_dir).await,
+        "send_to_agent" => handle_send_to_agent(&arguments, home_dir, default_agent).await,
         "send_photo" => handle_send_media(&arguments, home_dir, http, "photo").await,
         "send_sticker" => handle_send_media(&arguments, home_dir, http, "sticker").await,
         "log_mood" => handle_log_mood(&arguments, home_dir, memory, default_agent).await,
@@ -3156,7 +3397,7 @@ async fn handle_tools_call(
         "create_agent" => handle_create_agent(&arguments, home_dir).await,
         "list_agents" => handle_list_agents(home_dir).await,
         "agent_status" => handle_agent_status(&arguments, home_dir).await,
-        "spawn_agent" => handle_spawn_agent(&arguments, home_dir).await,
+        "spawn_agent" => handle_spawn_agent(&arguments, home_dir, default_agent).await,
         "agent_update" => handle_agent_update(&arguments, home_dir).await,
         "agent_remove" => handle_agent_remove(&arguments, home_dir).await,
         "agent_update_soul" => handle_agent_update_soul(&arguments, home_dir).await,
@@ -3398,4 +3639,424 @@ fn tool_error(msg: &str) -> Value {
         "content": [{ "type": "text", "text": msg }],
         "isError": true
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Create a temporary test directory that is cleaned up on drop.
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("duduclaw-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &std::path::Path { &self.0 }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Create a minimal agent directory for testing.
+    fn create_test_agent(agents_dir: &std::path::Path, name: &str, reports_to: &str) {
+        let agent_dir = agents_dir.join(name);
+        fs::create_dir_all(&agent_dir).unwrap();
+        let toml_content = format!(
+            r#"[agent]
+name = "{name}"
+display_name = "{name}"
+role = "specialist"
+status = "active"
+trigger = "@{name}"
+reports_to = "{reports_to}"
+icon = "🤖"
+
+[model]
+preferred = "claude-sonnet-4-6"
+fallback = ""
+api_mode = "cli"
+account_pool = []
+
+[budget]
+monthly_limit_cents = 1000
+warn_threshold_percent = 80
+hard_stop = false
+
+[container]
+sandbox_enabled = false
+network_access = false
+timeout_ms = 60000
+max_concurrent = 2
+readonly_project = false
+additional_mounts = []
+
+[heartbeat]
+enabled = false
+interval_seconds = 300
+max_concurrent_runs = 1
+cron = ""
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = false
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = []
+
+[evolution]
+skill_auto_activate = false
+skill_security_scan = false
+
+[capabilities]
+computer_use = false
+browser_via_bash = false
+allowed_tools = []
+denied_tools = []
+
+[proactive]
+enabled = false
+
+[cultural_context]
+locale = "zh-TW"
+high_context = true
+"#
+        );
+        fs::write(agent_dir.join("agent.toml"), toml_content).unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervisor_parent_to_child_allowed() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+
+        create_test_agent(&agents_dir, "main", "");
+        create_test_agent(&agents_dir, "researcher", "main");
+
+        // main → researcher: allowed (parent → child)
+        let result = check_supervisor_relation(home, "main", "researcher").await;
+        assert!(result.is_ok(), "Parent→child should be allowed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn supervisor_child_to_parent_allowed() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+
+        create_test_agent(&agents_dir, "main", "");
+        create_test_agent(&agents_dir, "researcher", "main");
+
+        // researcher → main: allowed (child → parent reply)
+        let result = check_supervisor_relation(home, "researcher", "main").await;
+        assert!(result.is_ok(), "Child→parent should be allowed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn supervisor_sibling_blocked() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+
+        create_test_agent(&agents_dir, "main", "");
+        create_test_agent(&agents_dir, "researcher", "main");
+        create_test_agent(&agents_dir, "writer", "main");
+
+        // researcher → writer: blocked (siblings cannot delegate directly)
+        let result = check_supervisor_relation(home, "researcher", "writer").await;
+        assert!(result.is_err(), "Sibling→sibling should be blocked");
+        assert!(result.unwrap_err().contains("Supervisor pattern violation"));
+    }
+
+    #[tokio::test]
+    async fn supervisor_self_delegation_blocked() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+
+        create_test_agent(&agents_dir, "main", "");
+
+        let result = check_supervisor_relation(home, "main", "main").await;
+        assert!(result.is_err(), "Self-delegation should be blocked");
+        assert!(result.unwrap_err().contains("Cannot delegate to self"));
+    }
+
+    #[tokio::test]
+    async fn validate_reports_to_existing_agent() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+
+        create_test_agent(&agents_dir, "main", "");
+
+        // Valid: new agent reports to existing "main"
+        let result = validate_reports_to(home, "worker", "main").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_reports_to_nonexistent_agent() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+
+        // Invalid: references non-existent agent
+        let result = validate_reports_to(home, "worker", "ghost").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn validate_reports_to_self_blocked() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+
+        create_test_agent(&agents_dir, "worker", "");
+
+        let result = validate_reports_to(home, "worker", "worker").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cannot report to itself"));
+    }
+
+    #[tokio::test]
+    async fn validate_reports_to_cycle_detected() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+
+        // Create A → B → C, then try to set C → A (cycle)
+        create_test_agent(&agents_dir, "a", "");
+        create_test_agent(&agents_dir, "b", "a");
+        create_test_agent(&agents_dir, "c", "b");
+
+        // Setting a.reports_to = c would create: a → c → b → a (cycle)
+        let result = validate_reports_to(home, "a", "c").await;
+        assert!(result.is_err(), "Cycle should be detected: {result:?}");
+        assert!(result.unwrap_err().contains("Circular"));
+    }
+
+    #[tokio::test]
+    async fn validate_reports_to_empty_is_root() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+
+        // Empty reports_to is valid (root agent)
+        let result = validate_reports_to(home, "any", "").await;
+        assert!(result.is_ok());
+
+        let result = validate_reports_to(home, "any", "none").await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn delegation_context_fields() {
+        // Test DelegationContext construction directly — no env var mutation needed.
+        let ctx = DelegationContext { depth: 3, origin: Some("main".into()), sender: Some("worker".into()) };
+        assert_eq!(ctx.depth, 3);
+        assert_eq!(ctx.origin.as_deref(), Some("main"));
+        assert_eq!(ctx.sender.as_deref(), Some("worker"));
+
+        // Default-like: depth 0, no origin/sender
+        let ctx0 = DelegationContext { depth: 0, origin: None, sender: None };
+        assert_eq!(ctx0.depth, 0);
+        assert!(ctx0.origin.is_none());
+        assert!(ctx0.sender.is_none());
+    }
+
+    /// Test DelegationContext::from_env reads process env vars correctly.
+    /// Uses sync #[test] (NOT #[tokio::test]) — sync tests run on the harness
+    /// thread and are sequenced by --test-threads=1, making env var mutation safe.
+    #[test]
+    fn delegation_context_from_env() {
+        // Set env → read → verify → cleanup
+        unsafe {
+            std::env::set_var(duduclaw_core::ENV_DELEGATION_DEPTH, "3");
+            std::env::set_var(duduclaw_core::ENV_DELEGATION_ORIGIN, "main-agent");
+            std::env::set_var(duduclaw_core::ENV_DELEGATION_SENDER, "researcher");
+        }
+        let ctx = DelegationContext::from_env();
+        unsafe {
+            std::env::remove_var(duduclaw_core::ENV_DELEGATION_DEPTH);
+            std::env::remove_var(duduclaw_core::ENV_DELEGATION_ORIGIN);
+            std::env::remove_var(duduclaw_core::ENV_DELEGATION_SENDER);
+        }
+        assert_eq!(ctx.depth, 3);
+        assert_eq!(ctx.origin.as_deref(), Some("main-agent"));
+        assert_eq!(ctx.sender.as_deref(), Some("researcher"));
+    }
+
+    /// Verify from_env defaults when no env vars are set.
+    #[test]
+    fn delegation_context_from_env_defaults() {
+        unsafe {
+            std::env::remove_var(duduclaw_core::ENV_DELEGATION_DEPTH);
+            std::env::remove_var(duduclaw_core::ENV_DELEGATION_ORIGIN);
+            std::env::remove_var(duduclaw_core::ENV_DELEGATION_SENDER);
+        }
+        let ctx = DelegationContext::from_env();
+        assert_eq!(ctx.depth, 0);
+        assert!(ctx.origin.is_none());
+        assert!(ctx.sender.is_none());
+    }
+
+    /// Verify from_env filters empty strings to None.
+    #[test]
+    fn delegation_context_from_env_empty_strings() {
+        unsafe {
+            std::env::set_var(duduclaw_core::ENV_DELEGATION_DEPTH, "0");
+            std::env::set_var(duduclaw_core::ENV_DELEGATION_ORIGIN, "");
+            std::env::set_var(duduclaw_core::ENV_DELEGATION_SENDER, "");
+        }
+        let ctx = DelegationContext::from_env();
+        unsafe {
+            std::env::remove_var(duduclaw_core::ENV_DELEGATION_DEPTH);
+            std::env::remove_var(duduclaw_core::ENV_DELEGATION_ORIGIN);
+            std::env::remove_var(duduclaw_core::ENV_DELEGATION_SENDER);
+        }
+        assert_eq!(ctx.depth, 0);
+        assert!(ctx.origin.is_none(), "Empty string should filter to None");
+        assert!(ctx.sender.is_none(), "Empty string should filter to None");
+    }
+
+    /// Verify from_env handles invalid depth gracefully (defaults to 0).
+    #[test]
+    fn delegation_context_from_env_invalid_depth() {
+        unsafe {
+            std::env::set_var(duduclaw_core::ENV_DELEGATION_DEPTH, "not_a_number");
+        }
+        let ctx = DelegationContext::from_env();
+        unsafe {
+            std::env::remove_var(duduclaw_core::ENV_DELEGATION_DEPTH);
+        }
+        assert_eq!(ctx.depth, 0, "Invalid depth should default to 0");
+    }
+
+    #[test]
+    fn normalize_reports_to_handles_variants() {
+        assert_eq!(normalize_reports_to(""), "");
+        assert_eq!(normalize_reports_to("none"), "");
+        assert_eq!(normalize_reports_to("main"), "main");
+        assert_eq!(normalize_reports_to("some-agent"), "some-agent");
+    }
+
+    // ── E2E delegation depth integration tests ──────────────────
+    // These call send_to_agent_with_ctx / spawn_agent_with_ctx directly with
+    // injected DelegationContext — no unsafe env var mutation needed, fully
+    // thread-safe and parallelizable.
+
+    #[tokio::test]
+    async fn e2e_send_to_agent_increments_depth() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+
+        create_test_agent(&agents_dir, "main", "");
+        create_test_agent(&agents_dir, "worker", "main");
+
+        let ctx = DelegationContext { depth: 2, origin: Some("main".into()), sender: Some("main".into()) };
+        let params = serde_json::json!({ "agent_id": "worker", "prompt": "do something" });
+        let result = send_to_agent_with_ctx(&params, home, "main", ctx).await;
+
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Message queued"), "Expected success, got: {text}");
+        assert!(text.contains("depth: 3"), "Expected depth 3 (2+1), got: {text}");
+
+        let queue_path = home.join("bus_queue.jsonl");
+        let content = fs::read_to_string(&queue_path).unwrap();
+        let msg: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(msg["delegation_depth"], 3);
+        assert_eq!(msg["origin_agent"], "main");
+        assert_eq!(msg["sender_agent"], "main");
+        assert_eq!(msg["agent_id"], "worker");
+    }
+
+    #[tokio::test]
+    async fn e2e_send_to_agent_rejects_at_depth_limit() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+
+        create_test_agent(&agents_dir, "main", "");
+        create_test_agent(&agents_dir, "worker", "main");
+
+        // depth=4 → outgoing=5 >= MAX(5) → rejected
+        let ctx = DelegationContext { depth: 4, origin: Some("main".into()), sender: Some("researcher".into()) };
+        let params = serde_json::json!({ "agent_id": "worker", "prompt": "do something" });
+        let result = send_to_agent_with_ctx(&params, home, "main", ctx).await;
+
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("delegation depth limit"), "Expected depth limit error, got: {text}");
+
+        let queue_path = home.join("bus_queue.jsonl");
+        assert!(!queue_path.exists(), "Queue should not have been written to");
+    }
+
+    #[tokio::test]
+    async fn e2e_spawn_agent_increments_depth() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+
+        create_test_agent(&agents_dir, "main", "");
+        create_test_agent(&agents_dir, "worker", "main");
+
+        let ctx = DelegationContext { depth: 1, origin: Some("root-agent".into()), sender: Some("main".into()) };
+        let params = serde_json::json!({ "agent_id": "worker", "task": "background work" });
+        let result = spawn_agent_with_ctx(&params, home, "main", ctx).await;
+
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("spawned successfully"), "Expected success, got: {text}");
+
+        let queue_path = home.join("bus_queue.jsonl");
+        let content = fs::read_to_string(&queue_path).unwrap();
+        let msg: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(msg["delegation_depth"], 2, "Expected depth 2 (1+1)");
+        assert_eq!(msg["origin_agent"], "root-agent", "Origin should be preserved");
+        assert_eq!(msg["sender_agent"], "main");
+    }
+
+    #[tokio::test]
+    async fn e2e_depth_zero_defaults_origin_to_caller() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+
+        create_test_agent(&agents_dir, "main", "");
+        create_test_agent(&agents_dir, "worker", "main");
+
+        // No origin/sender set — simulates first delegation (no dispatcher context)
+        let ctx = DelegationContext { depth: 0, origin: None, sender: None };
+        let params = serde_json::json!({ "agent_id": "worker", "prompt": "first delegation" });
+        let result = send_to_agent_with_ctx(&params, home, "main", ctx).await;
+
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("depth: 1"), "Expected depth 1 (0+1), got: {text}");
+
+        let queue_path = home.join("bus_queue.jsonl");
+        let content = fs::read_to_string(&queue_path).unwrap();
+        let msg: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(msg["delegation_depth"], 1);
+        assert_eq!(msg["origin_agent"], "main", "Should fall back to caller");
+    }
 }

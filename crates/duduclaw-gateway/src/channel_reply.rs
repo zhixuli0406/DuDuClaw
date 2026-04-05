@@ -36,6 +36,8 @@ pub struct ReplyContext {
     pub http: reqwest::Client,
     pub session_manager: Arc<SessionManager>,
     pub channel_status: ChannelStatusMap,
+    /// Broadcast sender for pushing events (e.g. channel status changes) to WebSocket clients.
+    pub event_tx: tokio::sync::broadcast::Sender<String>,
     /// Prediction engine for event-driven evolution.
     pub prediction_engine: Option<Arc<PredictionEngine>>,
     /// GVU evolution loop (Phase 2).
@@ -56,6 +58,8 @@ pub struct ReplyContext {
     pub failsafe: Option<Arc<FailsafeManager>>,
     /// Circuit breaker registry (per-scope anomaly detection).
     pub circuit_breakers: Option<Arc<CircuitBreakerRegistry>>,
+    /// Mistake notebook for grounded GVU evolution (Phase 1 GVU²).
+    pub mistake_notebook: Option<Arc<crate::gvu::mistake_notebook::MistakeNotebook>>,
 }
 
 impl ReplyContext {
@@ -64,6 +68,7 @@ impl ReplyContext {
         home_dir: PathBuf,
         session_manager: Arc<SessionManager>,
         channel_status: ChannelStatusMap,
+        event_tx: tokio::sync::broadcast::Sender<String>,
     ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
@@ -93,6 +98,7 @@ impl ReplyContext {
             http,
             session_manager,
             channel_status,
+            event_tx,
             prediction_engine: None,
             gvu_loop: None,
             skill_cache: Arc::new(tokio::sync::Mutex::new(CompressedSkillCache::new())),
@@ -103,6 +109,7 @@ impl ReplyContext {
             killswitch: Arc::new(killswitch),
             failsafe: Some(failsafe),
             circuit_breakers: Some(circuit_breakers),
+            mistake_notebook: None,
         }
     }
 
@@ -117,16 +124,41 @@ impl ReplyContext {
         self.gvu_loop = Some(gvu);
         self
     }
+
+    /// Create with MistakeNotebook for grounded GVU evolution.
+    pub fn with_mistake_notebook(mut self, nb: Arc<crate::gvu::mistake_notebook::MistakeNotebook>) -> Self {
+        self.mistake_notebook = Some(nb);
+        self
+    }
 }
 
-/// Helper to update a channel's connection state.
-pub async fn set_channel_connected(status: &ChannelStatusMap, name: &str, connected: bool, error: Option<String>) {
-    let mut map = status.write().await;
-    map.insert(name.to_string(), ChannelState {
-        connected,
-        last_event: Some(chrono::Utc::now()),
-        error,
-    });
+/// Helper to update a channel's connection state and broadcast the change to dashboard clients.
+pub async fn set_channel_connected(status: &ChannelStatusMap, name: &str, connected: bool, error: Option<String>, event_tx: Option<&tokio::sync::broadcast::Sender<String>>) {
+    let now = chrono::Utc::now();
+    let error_clone = error.clone();
+    {
+        let mut map = status.write().await;
+        map.insert(name.to_string(), ChannelState {
+            connected,
+            last_event: Some(now),
+            error,
+        });
+    }
+    // Broadcast status change to WebSocket clients for real-time dashboard updates
+    if let Some(tx) = event_tx {
+        let event = crate::protocol::WsFrame::event(
+            "channels.status_changed",
+            serde_json::json!({
+                "name": name,
+                "connected": connected,
+                "last_connected": now.to_rfc3339(),
+                "error": error_clone,
+            }),
+        );
+        if let Ok(json) = serde_json::to_string(&event) {
+            let _ = tx.send(json);
+        }
+    }
 }
 
 // ── Public API ──────────────────────────────────────────────
@@ -511,19 +543,21 @@ async fn build_reply_with_session_inner(
         }
 
         // ── Prediction-driven evolution ──────────────────────────────
-        if ctx.prediction_engine.is_some() {
-            let pe = ctx.prediction_engine.as_ref().unwrap().clone();
+        if let Some(pe) = ctx.prediction_engine.as_ref() {
+            let pe = pe.clone();
             let gvu = ctx.gvu_loop.clone();
             let user_id_for_pred = user_id.to_string();
             let agent_id_for_pred = agent_id.clone();
             let session_id_for_pred = session_id.to_string();
             let text_clone = text.to_string();
+            let reply_clone_for_pred = reply.clone();
             let home_for_pred = ctx.home_dir.clone();
             let agent_dir_for_pred = agent_dir.clone();
             let sm_for_pred = ctx.session_manager.clone();
             let skill_cache_for_pred = ctx.skill_cache.clone();
             let skill_activation_for_pred = ctx.skill_activation.clone();
             let skill_lift_for_pred = ctx.skill_lift.clone();
+            let notebook_for_pred = ctx.mistake_notebook.clone();
 
             tokio::spawn(async move {
                 // 1. Generate prediction (< 1ms, zero LLM)
@@ -559,6 +593,50 @@ async fn build_reply_with_session_inner(
 
                 // 4. Update user model — pass pre-computed embedding to avoid redundant embed()
                 pe.update_model_with_embedding(&metrics, embedding).await;
+
+                // 4.5 Conversation outcome detection + MistakeNotebook (Phase 1 GVU²)
+                // Skip for very short conversations (< 4 messages) to avoid false positives (review #28)
+                let mut error = error;
+                let conv_outcome = if messages.len() >= 4 {
+                    Some(crate::prediction::outcome::ConversationOutcome::extract(
+                        &session_id_for_pred, &agent_id_for_pred, &messages,
+                    ))
+                } else {
+                    None
+                };
+                // Apply task completion signal to prediction error
+                if let Some(ref outcome) = conv_outcome {
+                    let meta = pe.metacognition.lock().await;
+                    error.apply_outcome(outcome, &meta.thresholds);
+                }
+                // Record failure to MistakeNotebook for grounded GVU
+                if let Some(ref outcome) = conv_outcome {
+                    if outcome.is_failure() {
+                        if let Some(ref nb) = notebook_for_pred {
+                            let category = match outcome.task_type {
+                                crate::prediction::outcome::TaskType::Coding => crate::gvu::mistake_notebook::MistakeCategory::Capability,
+                                crate::prediction::outcome::TaskType::QA => crate::gvu::mistake_notebook::MistakeCategory::Factual,
+                                _ => crate::gvu::mistake_notebook::MistakeCategory::Behavioral,
+                            };
+                            let what_wrong = match outcome.satisfaction {
+                                crate::prediction::outcome::SatisfactionSignal::Negative => "User expressed dissatisfaction",
+                                _ => "Task not completed",
+                            };
+                            let entry = crate::gvu::mistake_notebook::build_mistake_entry(
+                                &agent_id_for_pred,
+                                &session_id_for_pred,
+                                category,
+                                &text_clone,
+                                &reply_clone_for_pred,
+                                what_wrong,
+                                None,
+                            );
+                            if let Err(e) = nb.record(&entry) {
+                                warn!(agent = %agent_id_for_pred, "Failed to record mistake: {e}");
+                            }
+                        }
+                    }
+                }
 
                 // 5. Skill lifecycle: diagnose + activate + track lift
                 {
@@ -700,7 +778,16 @@ async fn build_reply_with_session_inner(
                                 }
                             };
 
-                            let outcome = gvu.run(
+                            // Query MistakeNotebook for grounded generation context
+                            let relevant_mistakes = notebook_for_pred
+                                .as_ref()
+                                .map(|nb| nb.query_by_agent(&agent_id_for_pred, 5))
+                                .unwrap_or_default();
+
+                            // Get MetaCognition snapshot for adaptive depth
+                            let meta_snapshot = pe.metacognition.lock().await.clone();
+
+                            let outcome = gvu.run_with_context(
                                 &agent_id_for_pred,
                                 dir,
                                 &context,
@@ -708,6 +795,8 @@ async fn build_reply_with_session_inner(
                                 &contract.boundaries.must_not,
                                 &contract.boundaries.must_always,
                                 call_llm,
+                                Some(&meta_snapshot),
+                                relevant_mistakes,
                             ).await;
 
                             // Log outcome and feed back to metacognition
@@ -736,6 +825,24 @@ async fn build_reply_with_session_inner(
                                         let mut meta = pe.metacognition.lock().await;
                                         meta.record_outcome(error.category, false);
                                     }
+                                }
+                                crate::gvu::loop_::GvuOutcome::Deferred { retry_count, retry_after_hours, .. } => {
+                                    info!(
+                                        agent = %agent_id_for_pred,
+                                        retry_count,
+                                        retry_after_hours,
+                                        "GVU deferred — will retry with accumulated gradients"
+                                    );
+                                    // Don't record as outcome yet — will be evaluated on retry
+                                }
+                                crate::gvu::loop_::GvuOutcome::TimedOut { elapsed, generations_completed, .. } => {
+                                    warn!(
+                                        agent = %agent_id_for_pred,
+                                        elapsed_secs = elapsed.as_secs(),
+                                        generations_completed,
+                                        "GVU timed out — wall-clock budget exceeded"
+                                    );
+                                    // Treat as inconclusive — don't record outcome
                                 }
                             }
                         } else {

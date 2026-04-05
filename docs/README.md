@@ -18,8 +18,8 @@ Open standards that define the DuDuClaw agent ecosystem.
 
 | Document | Description | Status |
 |----------|-------------|--------|
-| [CLAUDE.md](CLAUDE.md) | Architecture overview | Current |
-| [evolution-engine.md](evolution-engine.md) | Evolution Engine v2 — Prediction + GVU + Cognitive Memory | Current |
+| [CLAUDE.md](CLAUDE.md) | Architecture overview (v1.2.0) | Current |
+| [evolution-engine.md](evolution-engine.md) | Evolution Engine v2 — Prediction + GVU² + Cognitive Memory | Current |
 
 ## User & Developer Guides
 

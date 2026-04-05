@@ -137,11 +137,11 @@ pub async fn start_feishu_webhook(
     // Pre-fetch token
     match state.get_token().await {
         Ok(_) => {
-            set_channel_connected(&state.ctx.channel_status, "feishu", true, None).await;
+            set_channel_connected(&state.ctx.channel_status, "feishu", true, None, Some(&state.ctx.event_tx)).await;
         }
         Err(e) => {
             warn!("Feishu token error: {e}");
-            set_channel_connected(&state.ctx.channel_status, "feishu", false, Some(e)).await;
+            set_channel_connected(&state.ctx.channel_status, "feishu", false, Some(e), Some(&state.ctx.event_tx)).await;
         }
     }
 

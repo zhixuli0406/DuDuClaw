@@ -53,6 +53,8 @@ pub enum ErrorCategory {
     Critical,
 }
 
+use super::outcome::{ConversationOutcome, SatisfactionSignal};
+
 /// The measured gap between prediction and reality.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PredictionError {
@@ -64,6 +66,9 @@ pub struct PredictionError {
     pub unexpected_correction: bool,
     /// User had many follow-ups when we predicted few.
     pub unexpected_follow_up: bool,
+    /// Task was detected as incomplete/failed (Phase 1 GVU²).
+    #[serde(default)]
+    pub task_completion_failure: bool,
     /// Weighted combination of all error signals.
     pub composite_error: f64,
     /// Classification based on composite_error magnitude.
@@ -72,6 +77,29 @@ pub struct PredictionError {
     pub prediction: Prediction,
     /// The actual conversation metrics.
     pub actual: ConversationMetrics,
+}
+
+impl PredictionError {
+    /// Apply a ConversationOutcome to adjust the composite error (Phase 1 GVU²).
+    ///
+    /// Call this after `calculate_error()` to incorporate task completion signals.
+    /// Adjusts composite_error by adding a weighted task_completion penalty,
+    /// then reclassifies the error category.
+    pub fn apply_outcome(&mut self, outcome: &ConversationOutcome, metacognition: &super::metacognition::AdaptiveThresholds) {
+        if outcome.task_completed == Some(false) || outcome.satisfaction == SatisfactionSignal::Negative {
+            self.task_completion_failure = true;
+
+            // Proportional penalty: boost error by 15% of remaining headroom (review #24).
+            // Low errors get a larger absolute bump; high errors barely change.
+            // E.g., 0.15 → 0.15 + 0.85*0.15 = 0.278 (Negligible→Moderate)
+            //        0.85 → 0.85 + 0.15*0.15 = 0.873 (barely changes)
+            let headroom = 1.0 - self.composite_error;
+            self.composite_error = (self.composite_error + headroom * 0.15).clamp(0.0, 1.0);
+
+            // Reclassify with updated composite
+            self.category = metacognition.category_for(self.composite_error);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -608,6 +636,7 @@ impl PredictionEngine {
             topic_surprise,
             unexpected_correction,
             unexpected_follow_up,
+            task_completion_failure: false, // Set by caller via apply_outcome()
             composite_error,
             category,
             prediction: prediction.clone(),

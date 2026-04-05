@@ -318,7 +318,16 @@ async fn main() {
     // Must be called before any TLS connection is attempted (Discord, edge-tts, etc.).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    tracing_subscriber::fmt::init();
+    // Build a layered subscriber: fmt (terminal) + BroadcastLayer (WebSocket log streaming).
+    // BroadcastLayer is safe to add before init_log_broadcaster() — it checks LOG_TX
+    // lazily and silently drops events until the channel is initialised in start_gateway().
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(tracing_subscriber::fmt::layer())
+        .with(duduclaw_gateway::log::BroadcastLayer)
+        .init();
 
     let cli = Cli::parse();
 

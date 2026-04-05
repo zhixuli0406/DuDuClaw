@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use duduclaw_agent::registry::AgentRegistry;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Build a system prompt from an agent's loaded markdown files.
 ///
@@ -58,6 +58,9 @@ pub async fn call_claude_for_agent(
 }
 
 /// Like [`call_claude_for_agent`] but allows specifying the request type for telemetry.
+///
+/// Delegation context (depth, origin, sender) is read from the [`DELEGATION_ENV`]
+/// task-local — set by the dispatcher before calling this function.
 pub async fn call_claude_for_agent_with_type(
     home_dir: &Path,
     registry: &Arc<RwLock<AgentRegistry>>,
@@ -697,6 +700,16 @@ async fn call_claude_streaming(
     Ok(ClaudeResponse { text: result_text, usage: token_usage })
 }
 
+// ── Delegation context (task-local) ──────────────────────────
+
+tokio::task_local! {
+    /// Delegation environment injected by the bus dispatcher before calling
+    /// Claude CLI.  `prepare_claude_cmd` reads this to set per-subprocess
+    /// env vars.  Thread-safe because each dispatch runs in its own
+    /// `tokio::spawn` task with its own task-local scope.
+    pub static DELEGATION_ENV: std::collections::HashMap<String, String>;
+}
+
 /// Prepare a `claude` CLI command with common args and env vars.
 ///
 /// When `capabilities` is provided, high-risk tools not explicitly enabled
@@ -762,6 +775,22 @@ fn prepare_claude_cmd(
 
     // Prevent "nested session" error when gateway was launched from a Claude Code session
     cmd.env_remove("CLAUDECODE");
+
+    // Inject delegation context if running inside a dispatcher/cron task.
+    // These env vars propagate to the MCP server subprocess so it can
+    // enforce depth limits without trusting LLM-supplied tool params.
+    match DELEGATION_ENV.try_with(|env| {
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+    }) {
+        Ok(()) => { /* delegation context injected */ }
+        Err(_) => {
+            // Task-local not set — this is normal for regular chat (non-delegation).
+            // Delegation depth tracking is not needed for direct user→agent chat.
+            debug!("No DELEGATION_ENV task-local — delegation depth tracking inactive");
+        }
+    }
 
     (cmd, prompt_guard)
 }

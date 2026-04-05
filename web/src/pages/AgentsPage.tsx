@@ -228,7 +228,7 @@ function CreateAgentDialog({ open, onClose, onCreated }: { open: boolean; onClos
       setRole('specialist');
       setTrigger('');
     } catch {
-      setError('Agent 建立失敗，請確認名稱格式正確');
+      setError(intl.formatMessage({ id: 'agents.create.error' }));
     } finally {
       setSubmitting(false);
     }
@@ -267,6 +267,7 @@ function CreateAgentDialog({ open, onClose, onCreated }: { open: boolean; onClos
 }
 
 function DelegateDialog({ open, agentName, onClose }: { open: boolean; agentName: string; onClose: () => void }) {
+  const intl = useIntl();
   const [prompt, setPrompt] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<string | null>(null);
@@ -276,10 +277,10 @@ function DelegateDialog({ open, agentName, onClose }: { open: boolean; agentName
     setSubmitting(true);
     try {
       const res = await api.agents.delegate(agentName, prompt.trim());
-      setResult(`已委派任務 (ID: ${res.message_id})`);
+      setResult(intl.formatMessage({ id: 'agents.delegate.success' }, { id: res.message_id }));
       setPrompt('');
     } catch {
-      setResult('委派失敗');
+      setResult(intl.formatMessage({ id: 'agents.delegate.error' }));
     } finally {
       setSubmitting(false);
     }
@@ -292,26 +293,26 @@ function DelegateDialog({ open, agentName, onClose }: { open: boolean; agentName
   };
 
   return (
-    <Dialog open={open} onClose={handleClose} title={`委派任務給 ${agentName}`}>
+    <Dialog open={open} onClose={handleClose} title={intl.formatMessage({ id: 'agents.delegate.title' }, { name: agentName })}>
       <div className="space-y-4">
         {result && (
           <div className="rounded-lg bg-emerald-50 p-3 text-sm text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400">
             {result}
           </div>
         )}
-        <FormField label="任務描述">
+        <FormField label={intl.formatMessage({ id: 'agents.delegate.taskLabel' })}>
           <textarea
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
-            placeholder="請描述你要委派的任務..."
+            placeholder={intl.formatMessage({ id: 'agents.delegate.placeholder' })}
             rows={4}
             className={cn(inputClass, 'resize-none')}
           />
         </FormField>
         <div className="flex justify-end gap-3 pt-2">
-          <button onClick={handleClose} className={buttonSecondary}>關閉</button>
+          <button onClick={handleClose} className={buttonSecondary}>{intl.formatMessage({ id: 'agents.delegate.close' })}</button>
           <button onClick={handleSubmit} disabled={submitting || !prompt.trim()} className={buttonPrimary}>
-            {submitting ? '委派中...' : '委派'}
+            {submitting ? intl.formatMessage({ id: 'agents.delegate.submitting' }) : intl.formatMessage({ id: 'agents.delegate.submit' })}
           </button>
         </div>
       </div>
@@ -326,31 +327,31 @@ function InspectDialog({ agent, onClose, onEdit }: { agent: AgentDetail | null; 
   return (
     <Dialog open={agent !== null} onClose={onClose} title={`${agent.icon || '🤖'} ${agent.display_name}`} className="max-w-2xl">
       <div className="space-y-4 max-h-[60vh] overflow-y-auto">
-        <Section title="基本資訊">
-          <InfoRow label="名稱" value={agent.name} />
-          <InfoRow label="角色" value={agent.role} />
-          <InfoRow label="狀態" value={agent.status} />
-          <InfoRow label="觸發詞" value={agent.trigger} />
-          <InfoRow label="上級" value={agent.reports_to || '(無)'} />
+        <Section title={intl.formatMessage({ id: 'agents.inspect.basicInfo' })}>
+          <InfoRow label={intl.formatMessage({ id: 'agents.inspect.name' })} value={agent.name} />
+          <InfoRow label={intl.formatMessage({ id: 'agents.inspect.role' })} value={agent.role} />
+          <InfoRow label={intl.formatMessage({ id: 'agents.inspect.status' })} value={agent.status} />
+          <InfoRow label={intl.formatMessage({ id: 'agents.inspect.trigger' })} value={agent.trigger} />
+          <InfoRow label={intl.formatMessage({ id: 'agents.inspect.reportsTo' })} value={agent.reports_to || intl.formatMessage({ id: 'agents.inspect.noParent' })} />
         </Section>
 
-        <Section title="模型設定">
-          <InfoRow label="首選模型" value={agent.model?.preferred ?? '—'} />
-          <InfoRow label="備用模型" value={agent.model?.fallback ?? '—'} />
-          <InfoRow label="帳號池" value={agent.model?.account_pool?.join(', ') ?? '—'} />
+        <Section title={intl.formatMessage({ id: 'agents.inspect.modelConfig' })}>
+          <InfoRow label={intl.formatMessage({ id: 'agents.inspect.preferred' })} value={agent.model?.preferred ?? '—'} />
+          <InfoRow label={intl.formatMessage({ id: 'agents.inspect.fallback' })} value={agent.model?.fallback ?? '—'} />
+          <InfoRow label={intl.formatMessage({ id: 'agents.inspect.accountPool' })} value={agent.model?.account_pool?.join(', ') ?? '—'} />
         </Section>
 
         {agent.budget && (
-          <Section title="預算">
-            <InfoRow label="月限額" value={`$${(agent.budget.monthly_limit_cents / 100).toFixed(2)}`} />
-            <InfoRow label="已使用" value={`$${(agent.budget.spent_cents / 100).toFixed(2)}`} />
-            <InfoRow label="警告閾值" value={`${agent.budget.warn_threshold_percent}%`} />
-            <InfoRow label="硬停機" value={agent.budget.hard_stop ? '是' : '否'} />
+          <Section title={intl.formatMessage({ id: 'agents.inspect.budget' })}>
+            <InfoRow label={intl.formatMessage({ id: 'agents.inspect.monthlyLimit' })} value={`$${(agent.budget.monthly_limit_cents / 100).toFixed(2)}`} />
+            <InfoRow label={intl.formatMessage({ id: 'agents.inspect.spent' })} value={`$${(agent.budget.spent_cents / 100).toFixed(2)}`} />
+            <InfoRow label={intl.formatMessage({ id: 'agents.inspect.warnThreshold' })} value={`${agent.budget.warn_threshold_percent}%`} />
+            <InfoRow label={intl.formatMessage({ id: 'agents.inspect.hardStop' })} value={agent.budget.hard_stop ? intl.formatMessage({ id: 'agents.inspect.hardStop.yes' }) : intl.formatMessage({ id: 'agents.inspect.hardStop.no' })} />
           </Section>
         )}
 
         {agent.skills && agent.skills.length > 0 && (
-          <Section title="技能">
+          <Section title={intl.formatMessage({ id: 'agents.inspect.skills' })}>
             <div className="flex flex-wrap gap-2">
               {agent.skills.map((s) => (
                 <span key={s} className="rounded-full bg-amber-100 px-2.5 py-0.5 text-xs text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
@@ -501,7 +502,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
       await updateAgent(agent.name, submitForm);
       onSaved();
     } catch {
-      setError('儲存失敗');
+      setError(intl.formatMessage({ id: 'common.saveError' }));
     } finally {
       setSaving(false);
     }
@@ -515,7 +516,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
     { id: 'heartbeat', label: intl.formatMessage({ id: 'agents.edit.heartbeat' }) },
     { id: 'container', label: intl.formatMessage({ id: 'settings.container' }) },
     { id: 'permissions', label: intl.formatMessage({ id: 'agents.edit.permissions' }) },
-    { id: 'channels', label: 'Channels' },
+    { id: 'channels', label: intl.formatMessage({ id: 'channels.title' }) },
   ];
 
   return (
@@ -607,13 +608,13 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
                   </select>
                 </FormField>
 
-                <Toggle checked={form.use_router ?? false} onChange={(v) => updateField('use_router', v)} label="信心路由（自動判斷本地/雲端）" />
+                <Toggle checked={form.use_router ?? false} onChange={(v) => updateField('use_router', v)} label={intl.formatMessage({ id: 'agents.edit.confidenceRouter' })} />
 
                 {/* Local model advanced config — shown when a local model is selected */}
                 {hasLocalSelected && (
                   <div className="rounded-lg border border-amber-200 bg-amber-50/50 p-4 dark:border-amber-800 dark:bg-amber-900/10">
-                    <h4 className="mb-3 text-xs font-semibold uppercase text-amber-700 dark:text-amber-400">本地推理設定</h4>
-                    <FormField label="推理後端">
+                    <h4 className="mb-3 text-xs font-semibold uppercase text-amber-700 dark:text-amber-400">{intl.formatMessage({ id: 'agents.edit.localInference' })}</h4>
+                    <FormField label={intl.formatMessage({ id: 'agents.edit.inferenceBackend' })}>
                       <select value={form.local_backend ?? 'llama_cpp'} onChange={(e) => updateField('local_backend', e.target.value)} className={selectClass}>
                         <option value="llama_cpp">llama.cpp (Metal/CUDA)</option>
                         <option value="mistral_rs">mistral.rs (Rust-native)</option>
@@ -621,10 +622,10 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
                       </select>
                     </FormField>
                     <div className="grid grid-cols-2 gap-3">
-                      <FormField label="Context 長度">
+                      <FormField label={intl.formatMessage({ id: 'agents.edit.contextLength' })}>
                         <input type="number" min={512} value={form.local_context_length ?? 4096} onChange={(e) => updateField('local_context_length', Number(e.target.value))} className={inputClass} />
                       </FormField>
-                      <FormField label="GPU Layers (-1=全部)">
+                      <FormField label={intl.formatMessage({ id: 'agents.edit.gpuLayers' })}>
                         <input type="number" min={-1} value={form.local_gpu_layers ?? -1} onChange={(e) => updateField('local_gpu_layers', Number(e.target.value))} className={inputClass} />
                       </FormField>
                     </div>
@@ -659,13 +660,13 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
 
           {tab === 'container' && (
             <>
-              <Toggle checked={form.sandbox_enabled ?? false} onChange={(v) => updateField('sandbox_enabled', v)} label="Sandbox 隔離" />
-              <Toggle checked={form.network_access ?? false} onChange={(v) => updateField('network_access', v)} label="容器網路存取" />
-              <Toggle checked={form.readonly_project ?? true} onChange={(v) => updateField('readonly_project', v)} label="唯讀專案掛載" />
-              <FormField label="任務逾時 (ms)">
+              <Toggle checked={form.sandbox_enabled ?? false} onChange={(v) => updateField('sandbox_enabled', v)} label={intl.formatMessage({ id: 'agents.edit.sandbox' })} />
+              <Toggle checked={form.network_access ?? false} onChange={(v) => updateField('network_access', v)} label={intl.formatMessage({ id: 'agents.edit.networkAccess' })} />
+              <Toggle checked={form.readonly_project ?? true} onChange={(v) => updateField('readonly_project', v)} label={intl.formatMessage({ id: 'agents.edit.readonlyProject' })} />
+              <FormField label={intl.formatMessage({ id: 'agents.edit.taskTimeout' })}>
                 <input type="number" min={0} value={form.timeout_ms ?? 1800000} onChange={(e) => updateField('timeout_ms', Number(e.target.value))} className={inputClass} />
               </FormField>
-              <FormField label="最大並行數">
+              <FormField label={intl.formatMessage({ id: 'agents.edit.maxConcurrent' })}>
                 <input type="number" min={1} max={10} value={form.max_concurrent ?? 1} onChange={(e) => updateField('max_concurrent', Number(e.target.value))} className={inputClass} />
               </FormField>
             </>
@@ -702,7 +703,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
           {tab === 'channels' && (
             <div className="space-y-5">
               <p className="text-xs text-stone-400 dark:text-stone-500">
-                Set dedicated bot tokens for this agent. Each configured channel will appear as this agent&apos;s own bot. Leave empty to use the global channel.
+                {intl.formatMessage({ id: 'agents.edit.channelsDesc' })}
               </p>
 
               {/* Discord */}

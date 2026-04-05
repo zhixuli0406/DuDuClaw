@@ -49,6 +49,24 @@ pub async fn run_sandboxed(
     timeout: Duration,
     network_access: bool,
 ) -> Result<SandboxResult, String> {
+    run_sandboxed_with_env(agent_dir, prompt, model, system_prompt, api_key, timeout, network_access, &[], &[]).await
+}
+
+/// Like [`run_sandboxed`] but accepts additional environment variables
+/// to inject into the container (e.g., delegation depth tracking).
+/// Like [`run_sandboxed`] but accepts additional environment variables
+/// (e.g., delegation depth tracking) and tool restrictions.
+pub async fn run_sandboxed_with_env(
+    agent_dir: &Path,
+    prompt: &str,
+    model: &str,
+    system_prompt: &str,
+    api_key: &str,
+    timeout: Duration,
+    network_access: bool,
+    extra_env: &[(String, String)],
+    disallowed_tools: &[String],
+) -> Result<SandboxResult, String> {
     let client = Docker::connect_with_local_defaults()
         .map_err(|e| format!("Docker connect failed: {e}"))?;
 
@@ -90,9 +108,8 @@ pub async fn run_sandboxed(
         safe_prompt
     };
 
-    // Build command: call claude CLI with the prompt
-    // TODO: Add --allowedTools restriction based on agent CONTRACT.toml capabilities
-    let cmd = vec![
+    // Build command: call claude CLI with the prompt and tool restrictions
+    let mut cmd = vec![
         "claude".to_string(),
         "-p".to_string(),
         prompt.to_string(),
@@ -104,8 +121,21 @@ pub async fn run_sandboxed(
         safe_prompt,
     ];
 
-    // Environment variables: point to the secret file instead of embedding key in env string
-    let env = vec!["ANTHROPIC_API_KEY_FILE=/run/secrets/api_key".to_string()];
+    // Apply tool restrictions (deny-by-default from agent capabilities)
+    if !disallowed_tools.is_empty() {
+        let denied_csv = disallowed_tools.join(",");
+        cmd.push("--disallowedTools".to_string());
+        cmd.push(denied_csv);
+    }
+
+    // Environment variables: API key file + any extra env (e.g., delegation context).
+    // SAFETY: Keys and values are assumed pre-validated (agent IDs pass
+    // is_valid_agent_id: [a-zA-Z0-9_-]; depth is u8). If adding arbitrary
+    // user input here in the future, escape or reject `=` and newlines in keys.
+    let mut env = vec!["ANTHROPIC_API_KEY_FILE=/run/secrets/api_key".to_string()];
+    for (k, v) in extra_env {
+        env.push(format!("{k}={v}"));
+    }
 
     let network_mode = if network_access {
         None // Use default bridge network

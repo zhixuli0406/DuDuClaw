@@ -55,6 +55,8 @@ struct AppState {
     auth: AuthManager,
     handler: MethodHandler,
     tx: broadcast::Sender<String>,
+    /// Broadcast channel for real-time events (channel status, etc.) pushed to clients.
+    event_tx: broadcast::Sender<String>,
 }
 
 /// Start the WebSocket RPC gateway and block until it shuts down.
@@ -136,6 +138,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     ));
     info!("GVU evolution loop initialized (encryption: {})", if gvu_encryption_key.is_some() { "enabled" } else { "disabled" });
 
+    // Event broadcast channel for pushing real-time updates (e.g. channel status) to dashboard
+    let (event_tx, _) = broadcast::channel::<String>(64);
+
     // Start channel bots if configured
     let reply_ctx = Arc::new(
         crate::channel_reply::ReplyContext::new(
@@ -143,6 +148,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             home_dir.clone(),
             session_manager,
             handler.channel_status().clone(),
+            event_tx.clone(),
         )
         .with_prediction_engine(prediction_engine.clone())
         .with_gvu_loop(gvu_loop.clone())
@@ -195,10 +201,53 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     ));
     info!("Agent dispatcher started ({} background tasks)", bg_handles.len());
 
+    // ── Periodic update check (every 6 hours) — broadcast to dashboard ──
+    {
+        let etx = event_tx.clone();
+        tokio::spawn(async move {
+            // First check after 30 seconds (let gateway finish startup)
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            loop {
+                match crate::updater::check_update().await {
+                    Ok(info) if info.available => {
+                        let event = WsFrame::Event {
+                            event: "system.update_available".to_string(),
+                            payload: serde_json::json!({
+                                "available": true,
+                                "current_version": info.current_version,
+                                "latest_version": info.latest_version,
+                                "release_notes": info.release_notes,
+                                "published_at": info.published_at,
+                                "install_method": info.install_method,
+                            }),
+                            seq: None,
+                            state_version: None,
+                        };
+                        if let Ok(json) = serde_json::to_string(&event) {
+                            let _ = etx.send(json);
+                        }
+                        info!(
+                            latest = %info.latest_version,
+                            "New version available — notified dashboard clients"
+                        );
+                    }
+                    Ok(_) => { /* up to date, no broadcast */ }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "Periodic update check failed (will retry)");
+                    }
+                }
+                // Check every 6 hours
+                tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+            }
+        });
+        info!("Periodic update checker started (every 6h)");
+    }
+
     let state = Arc::new(AppState {
         auth: AuthManager::new(config.auth_token),
         handler,
         tx,
+        event_tx,
     });
 
     // WebChat endpoint — separate state from main /ws (different auth model)
@@ -402,6 +451,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     // Split the socket so we can drive sending and receiving concurrently.
     let (mut sink, mut stream) = socket.split();
     let mut log_rx = state.tx.subscribe();
+    let mut event_rx = state.event_tx.subscribe();
     let mut logs_subscribed = false;
 
     loop {
@@ -469,6 +519,18 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         };
                         let text = serde_json::to_string(&push).unwrap_or_default();
                         if sink.send(Message::Text(text.into())).await.is_err() { break; }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {} // drop missed events
+                    Err(_) => break,
+                }
+            }
+
+            // ── Outbound event broadcast (always active for authenticated clients) ─
+            event_line = event_rx.recv() => {
+                match event_line {
+                    Ok(json) => {
+                        // Events are already serialized as WsFrame::Event JSON
+                        if sink.send(Message::Text(json.into())).await.is_err() { break; }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {} // drop missed events
                     Err(_) => break,

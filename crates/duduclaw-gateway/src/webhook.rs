@@ -166,13 +166,16 @@ async fn handle_webhook(
         Err(_) => String::from_utf8_lossy(&body).to_string(),
     };
 
-    // Write to bus_queue.jsonl
+    // Write to bus_queue.jsonl with delegation metadata (external trigger, depth=0)
     let message = serde_json::json!({
         "type": "agent_message",
         "message_id": uuid::Uuid::new_v4().to_string(),
         "agent_id": agent_id,
         "payload": format!("[Webhook event]\n{payload}"),
         "timestamp": Utc::now().to_rfc3339(),
+        "delegation_depth": 0,
+        "origin_agent": "webhook",
+        "sender_agent": "webhook",
     });
 
     let queue_path = state.home_dir.join("bus_queue.jsonl");
@@ -216,7 +219,9 @@ async fn handle_webhook(
                             "source": "webhook",
                         });
                         let notif_line = serde_json::to_string(&notification).unwrap_or_default();
-                        let _ = crate::dispatcher::append_line(&queue_path, &notif_line).await;
+                        if let Err(e) = crate::dispatcher::append_line(&queue_path, &notif_line).await {
+                            warn!(agent_id, error = %e, "Webhook: failed to write notification to queue");
+                        }
                         info!(agent_id, "Webhook: immediate notification queued");
                     }
                 }

@@ -37,7 +37,7 @@ export function SecurityPage() {
       {isStaticData && (
         <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900/50 dark:bg-amber-900/20 dark:text-amber-300">
           <AlertTriangle className="h-4 w-4 shrink-0" />
-          <span>部分安全面板顯示的是預設靜態數值，尚未連接實際系統狀態。審計日誌為即時資料。</span>
+          <span>{intl.formatMessage({ id: 'security.static.banner' })}</span>
         </div>
       )}
 

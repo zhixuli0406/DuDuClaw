@@ -52,7 +52,7 @@ export const useAgentsStore = create<AgentsStore>((set, get) => {
           ),
         });
       } catch {
-        set({ error: `無法暫停 agent: ${id}` });
+        set({ error: 'agents.error.pause' });
       }
     },
     resumeAgent: async (id) => {
@@ -64,7 +64,7 @@ export const useAgentsStore = create<AgentsStore>((set, get) => {
           ),
         });
       } catch {
-        set({ error: `無法恢復 agent: ${id}` });
+        set({ error: 'agents.error.resume' });
       }
     },
     updateAgent: async (id, fields) => {
@@ -73,7 +73,7 @@ export const useAgentsStore = create<AgentsStore>((set, get) => {
         // Re-fetch to get the authoritative state after update
         await get().fetchAgents();
       } catch {
-        set({ error: `無法更新 agent: ${id}` });
+        set({ error: 'agents.error.update' });
       }
     },
     removeAgent: async (id) => {
@@ -81,7 +81,7 @@ export const useAgentsStore = create<AgentsStore>((set, get) => {
         await api.agents.remove(id);
         set({ agents: get().agents.filter((a) => a.name !== id) });
       } catch {
-        set({ error: `無法刪除 agent: ${id}` });
+        set({ error: 'agents.error.remove' });
       }
     },
   };

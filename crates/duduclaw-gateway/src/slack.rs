@@ -198,7 +198,7 @@ async fn run_socket_mode(
     }
 
     info!("Slack [{label}] Socket Mode connected");
-    set_channel_connected(&ctx.channel_status, label, true, None).await;
+    set_channel_connected(&ctx.channel_status, label, true, None, Some(&ctx.event_tx)).await;
 
     // Connect WebSocket
     let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
@@ -240,7 +240,7 @@ async fn run_socket_mode(
         }
     }
 
-    set_channel_connected(&ctx.channel_status, label, false, None).await;
+    set_channel_connected(&ctx.channel_status, label, false, None, Some(&ctx.event_tx)).await;
     Ok(())
 }
 
