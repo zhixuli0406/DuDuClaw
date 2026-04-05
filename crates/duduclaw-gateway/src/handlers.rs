@@ -490,6 +490,9 @@ impl MethodHandler {
         }))
     }
 
+    /// Dashboard-initiated delegation.  Supervisor pattern is NOT enforced here
+    /// because this RPC is an operator-level action (depth always starts at 0).
+    /// Agent-to-agent delegation goes through MCP `send_to_agent` which IS enforced.
     async fn handle_agents_delegate(&self, params: Value) -> WsFrame {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
         let prompt = params.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
@@ -501,7 +504,7 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("Prompt too long: {} chars (max {MAX_PROMPT_LEN})", prompt.len()));
         }
 
-        info!(agent_id, "agents.delegate requested");
+        info!(agent_id, "agents.delegate requested (dashboard)");
 
         // Verify target agent exists
         let reg = self.registry.read().await;
@@ -509,7 +512,6 @@ impl MethodHandler {
             Some(a) => a.clone(),
             None => return WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
         };
-        let agent_dir = agent.dir.clone();
         let model = agent.config.model.preferred.clone();
         drop(reg);
 
@@ -533,25 +535,19 @@ impl MethodHandler {
             // Async delegation: write to bus queue for background processing
             let queue_path = self.home_dir.join("bus_queue.jsonl");
             let task = serde_json::json!({
-                "type": "delegate_task",
+                "type": "agent_message",
                 "message_id": &message_id,
                 "agent_id": agent_id,
-                "agent_dir": agent_dir.to_string_lossy(),
-                "prompt": prompt,
+                "payload": prompt,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
+                "delegation_depth": 0,
+                "origin_agent": "dashboard",
+                "sender_agent": "dashboard",
             });
-            let _ = tokio::task::spawn_blocking({
-                let queue_path = queue_path.clone();
-                let task_str = task.to_string();
-                move || {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true).append(true).open(&queue_path)
-                    {
-                        let _ = writeln!(f, "{task_str}");
-                    }
-                }
-            }).await;
+            let task_str = task.to_string();
+            if let Err(e) = crate::dispatcher::append_line(&queue_path, &task_str).await {
+                return WsFrame::error_response("", &format!("Failed to queue delegation: {e}"));
+            }
 
             WsFrame::ok_response("", json!({
                 "success": true,
@@ -1265,6 +1261,9 @@ impl MethodHandler {
             "line" => ("line_channel_token", Some("line_channel_secret")),
             "telegram" => ("telegram_bot_token", None),
             "discord" => ("discord_bot_token", None),
+            "slack" => ("slack_bot_token", Some("slack_app_token")),
+            "whatsapp" => ("whatsapp_access_token", Some("whatsapp_phone_number_id")),
+            "feishu" => ("feishu_app_id", Some("feishu_app_secret")),
             _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
         };
 
@@ -1659,7 +1658,7 @@ impl MethodHandler {
 
         let db_path = self.home_dir.join("memory.db");
         if !db_path.exists() {
-            return WsFrame::ok_response("", json!({ "results": [] }));
+            return WsFrame::ok_response("", json!({ "entries": [] }));
         }
 
         let engine = match SqliteMemoryEngine::new(&db_path) {

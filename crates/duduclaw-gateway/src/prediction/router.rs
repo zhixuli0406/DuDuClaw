@@ -118,7 +118,8 @@ pub struct ExplorationState {
     /// Initial exploration rate (decays with sqrt(total_routes)).
     pub epsilon_init: f64,
     /// Simple PRNG state for deterministic testing.
-    rng_counter: u64,
+    /// `pub(crate)` allows tests to seed the counter for reproducible results.
+    pub(crate) rng_counter: u64,
 }
 
 impl Default for ExplorationState {
@@ -289,6 +290,15 @@ fn format_reflection_context(error: &PredictionError) -> String {
             "## Unexpected Follow-ups\n\
              The user asked multiple follow-up questions when few were expected. \
              This may indicate the agent's responses lack sufficient depth or clarity."
+                .to_string(),
+        );
+    }
+
+    if error.task_completion_failure {
+        sections.push(
+            "## Task Completion Failure\n\
+             The user's task was detected as incomplete or failed. \
+             The agent may need to improve its ability to fully address user requests."
                 .to_string(),
         );
     }

@@ -1,6 +1,8 @@
 import { useIntl } from 'react-intl';
+import { useNavigate } from 'react-router';
 import { useConnectionStore } from '@/stores/connection-store';
-import { Sun, Moon, Monitor, RefreshCw } from 'lucide-react';
+import { useUpdateStore } from '@/stores/update-store';
+import { Sun, Moon, Monitor, RefreshCw, ArrowUpCircle, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useEffect, useState } from 'react';
 
@@ -8,10 +10,22 @@ type Theme = 'light' | 'dark' | 'system';
 
 export function Header() {
   const intl = useIntl();
+  const navigate = useNavigate();
   const connectionState = useConnectionStore((s) => s.state);
   const connectionError = useConnectionStore((s) => s.error);
   const reconnect = useConnectionStore((s) => s.connect);
+  const updateNotification = useUpdateStore((s) => s.notification);
+  const updateDismissed = useUpdateStore((s) => s.dismissed);
+  const dismissUpdate = useUpdateStore((s) => s.dismiss);
+  const checkUpdate = useUpdateStore((s) => s.checkNow);
   const [theme, setTheme] = useState<Theme>('system');
+
+  // Check for updates on mount (in case gateway already has cached info)
+  useEffect(() => {
+    if (connectionState === 'authenticated') {
+      checkUpdate();
+    }
+  }, [connectionState, checkUpdate]);
 
   useEffect(() => {
     const stored = localStorage.getItem('duduclaw-theme') as Theme | null;
@@ -63,17 +77,43 @@ export function Header() {
       {/* Connection error banner */}
       {connectionState === 'disconnected' && connectionError && (
         <div className="flex items-center gap-2 text-xs text-rose-600 dark:text-rose-400">
-          <span>連線失敗: {connectionError.slice(0, 80)}</span>
+          <span>{intl.formatMessage({ id: 'header.connectionError' })}: {connectionError.slice(0, 80)}</span>
           <button
             onClick={() => reconnect()}
             className="inline-flex items-center gap-1 rounded-md bg-rose-100 px-2 py-1 text-xs font-medium text-rose-700 hover:bg-rose-200 dark:bg-rose-900/30 dark:text-rose-400 dark:hover:bg-rose-900/50"
           >
             <RefreshCw className="h-3 w-3" />
-            重連
+            {intl.formatMessage({ id: 'header.reconnect' })}
           </button>
         </div>
       )}
-      {(connectionState !== 'disconnected' || !connectionError) && <div />}
+      {/* Update notification banner */}
+      {updateNotification?.available && !updateDismissed && connectionState !== 'disconnected' && (
+        <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 dark:border-amber-800 dark:bg-amber-900/20">
+          <ArrowUpCircle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+          <span className="text-xs text-amber-700 dark:text-amber-400">
+            {intl.formatMessage(
+              { id: 'update.notification' },
+              { version: updateNotification.latest_version }
+            )}
+          </span>
+          <button
+            onClick={() => navigate('/settings')}
+            className="whitespace-nowrap rounded-md bg-amber-500 px-2 py-0.5 text-xs font-medium text-white transition-colors hover:bg-amber-600"
+          >
+            {intl.formatMessage({ id: 'update.viewDetails' })}
+          </button>
+          <button
+            onClick={dismissUpdate}
+            className="rounded p-0.5 text-amber-400 transition-colors hover:bg-amber-100 hover:text-amber-600 dark:hover:bg-amber-900/40"
+            title={intl.formatMessage({ id: 'update.dismiss' })}
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
+
+      {(connectionState !== 'disconnected' || !connectionError) && !(updateNotification?.available && !updateDismissed && connectionState !== 'disconnected') && <div />}
 
       <div className="flex items-center gap-4">
         {/* Connection Status */}

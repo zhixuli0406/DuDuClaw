@@ -5,7 +5,6 @@
 //! - Text, voice, and audio message handling
 //! - Supergroup topic/forum support (message_thread_id)
 //! - Mention-only mode for group chats
-//! - Inline keyboard buttons
 //! - Bot command registration (/ask, /status, /voice, /reset)
 //! - Voice transcription (Whisper) + TTS synthesis
 //! - Per-chat settings via ChannelSettingsManager
@@ -90,22 +89,6 @@ struct TgEntity {
 struct TgUpdate {
     update_id: i64,
     message: Option<TgMessage>,
-    callback_query: Option<TgCallbackQuery>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TgCallbackQuery {
-    id: String,
-    #[allow(dead_code)]
-    from: TgUser,
-    message: Option<TgCallbackMessage>,
-    data: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TgCallbackMessage {
-    chat: TgChat,
-    message_thread_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,8 +99,6 @@ struct SendMessage {
     parse_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message_thread_id: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reply_markup: Option<serde_json::Value>,
 }
 
 // ── Public API ──────────────────────────────────────────────
@@ -218,18 +199,18 @@ async fn spawn_telegram_bot(
                             register_commands(&client, &api_base).await;
                         }
                     }
-                    set_channel_connected(&ctx.channel_status, &label, true, None).await;
+                    set_channel_connected(&ctx.channel_status, &label, true, None, Some(&ctx.event_tx)).await;
                 } else {
                     let desc = data.description.unwrap_or_default();
                     warn!("Telegram getMe failed for {label}: {desc}");
-                    set_channel_connected(&ctx.channel_status, &label, false, Some(desc)).await;
+                    set_channel_connected(&ctx.channel_status, &label, false, Some(desc), Some(&ctx.event_tx)).await;
                     return None;
                 }
             }
         }
         Err(e) => {
             warn!("Telegram connection failed for {label}: {e}");
-            set_channel_connected(&ctx.channel_status, &label, false, Some(e.to_string())).await;
+            set_channel_connected(&ctx.channel_status, &label, false, Some(e.to_string()), Some(&ctx.event_tx)).await;
             return None;
         }
     }
@@ -291,14 +272,14 @@ async fn poll_loop(
     let bot_username = get_bot_username(&client, &api_base).await.unwrap_or_default();
 
     loop {
-        let url = format!("{api_base}/getUpdates?offset={offset}&timeout=25&allowed_updates=[\"message\",\"callback_query\"]");
+        let url = format!("{api_base}/getUpdates?offset={offset}&timeout=25&allowed_updates=[\"message\"]");
 
         let resp = match client.get(&url).send().await {
             Ok(r) => r,
             Err(e) => {
                 consecutive_errors += 1;
                 warn!("Telegram poll error: {e}");
-                set_channel_connected(&ctx.channel_status, &label, false, Some(e.to_string())).await;
+                set_channel_connected(&ctx.channel_status, &label, false, Some(e.to_string()), Some(&ctx.event_tx)).await;
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 continue;
             }
@@ -309,7 +290,7 @@ async fn poll_loop(
             Err(e) => {
                 consecutive_errors += 1;
                 warn!("Telegram [{label}] parse error: {e}");
-                set_channel_connected(&ctx.channel_status, &label, false, Some(e.to_string())).await;
+                set_channel_connected(&ctx.channel_status, &label, false, Some(e.to_string()), Some(&ctx.event_tx)).await;
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 continue;
             }
@@ -319,7 +300,7 @@ async fn poll_loop(
             consecutive_errors += 1;
             let desc = data.description.unwrap_or_default();
             warn!("Telegram [{label}] API error: {desc}");
-            set_channel_connected(&ctx.channel_status, &label, false, Some(desc)).await;
+            set_channel_connected(&ctx.channel_status, &label, false, Some(desc), Some(&ctx.event_tx)).await;
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             continue;
         }
@@ -328,17 +309,11 @@ async fn poll_loop(
             info!("Telegram [{label}] polling recovered after {consecutive_errors} errors");
         }
         consecutive_errors = 0;
-        set_channel_connected(&ctx.channel_status, &label, true, None).await;
+        set_channel_connected(&ctx.channel_status, &label, true, None, Some(&ctx.event_tx)).await;
 
         if let Some(updates) = data.result {
             for update in updates {
                 offset = update.update_id + 1;
-
-                // Handle callback queries (inline keyboard button presses)
-                if let Some(cb) = update.callback_query {
-                    handle_callback_query(&client, &api_base, &cb, &ctx).await;
-                    continue;
-                }
 
                 let Some(msg) = update.message else { continue };
                 let chat_id = msg.chat.id;
@@ -387,7 +362,7 @@ async fn poll_loop(
                         }
                         Err(e) => {
                             warn!("Voice transcription failed: {e}");
-                            send_reply(&client, &api_base, chat_id, "⚠️ Voice transcription failed — please try again", thread_id, None).await;
+                            send_reply(&client, &api_base, chat_id, "⚠️ Voice transcription failed — please try again", thread_id).await;
                             continue;
                         }
                     }
@@ -397,7 +372,7 @@ async fn poll_loop(
                         Ok(text) => text,
                         Err(e) => {
                             warn!("Audio transcription failed: {e}");
-                            send_reply(&client, &api_base, chat_id, "⚠️ Audio transcription failed — please try again", thread_id, None).await;
+                            send_reply(&client, &api_base, chat_id, "⚠️ Audio transcription failed — please try again", thread_id).await;
                             continue;
                         }
                     }
@@ -440,7 +415,7 @@ async fn poll_loop(
                     let c = progress_client.clone();
                     let api = progress_api.clone();
                     tokio::spawn(async move {
-                        send_reply(&c, &api, progress_chat_id, &msg_text, progress_thread_id, None).await;
+                        send_reply(&c, &api, progress_chat_id, &msg_text, progress_thread_id).await;
                     });
                 });
 
@@ -461,17 +436,16 @@ async fn poll_loop(
                         Ok(audio_bytes) => {
                             send_voice(&client, &api_base, chat_id, audio_bytes).await;
                             if reply.len() > 200 {
-                                send_reply(&client, &api_base, chat_id, &format!("📝 {}", &reply[..200]), thread_id, None).await;
+                                send_reply(&client, &api_base, chat_id, &format!("📝 {}", &reply[..200]), thread_id).await;
                             }
                         }
                         Err(e) => {
                             warn!("TTS synthesis failed, falling back to text: {e}");
-                            send_reply(&client, &api_base, chat_id, &reply, thread_id, Some(channel_format::telegram_conversation_buttons())).await;
+                            send_reply(&client, &api_base, chat_id, &reply, thread_id).await;
                         }
                     }
                 } else {
-                    // Send with inline keyboard buttons
-                    send_reply(&client, &api_base, chat_id, &reply, thread_id, Some(channel_format::telegram_conversation_buttons())).await;
+                    send_reply(&client, &api_base, chat_id, &reply, thread_id).await;
                 }
             }
         }
@@ -498,7 +472,7 @@ async fn handle_command(
     match cmd {
         "/ask" => {
             if args.is_empty() {
-                send_reply(client, api_base, chat_id, "Usage: /ask <your question>", thread_id, None).await;
+                send_reply(client, api_base, chat_id, "Usage: /ask <your question>", thread_id).await;
                 return;
             }
             let session_id = if let Some(tid) = thread_id {
@@ -511,7 +485,7 @@ async fn handle_command(
             } else {
                 build_reply_with_session(args, ctx, &session_id, scope_id, None).await
             };
-            send_reply(client, api_base, chat_id, &reply, thread_id, Some(channel_format::telegram_conversation_buttons())).await;
+            send_reply(client, api_base, chat_id, &reply, thread_id).await;
         }
         "/status" => {
             let agent_info = {
@@ -526,7 +500,7 @@ async fn handle_command(
 
             let mention_only = ctx.channel_settings.get_bool("telegram", scope_id, keys::MENTION_ONLY, false).await;
             let status = format!("{agent_info}\n\nMention Only: {}", if mention_only { "✅" } else { "❌" });
-            send_reply(client, api_base, chat_id, &status, thread_id, None).await;
+            send_reply(client, api_base, chat_id, &status, thread_id).await;
         }
         "/voice" => {
             let session_key = format!("telegram:{chat_id}");
@@ -538,7 +512,7 @@ async fn handle_command(
                 sessions.insert(session_key);
                 "🎤 Voice reply mode enabled"
             };
-            send_reply(client, api_base, chat_id, msg, thread_id, None).await;
+            send_reply(client, api_base, chat_id, msg, thread_id).await;
         }
         "/reset" => {
             let session_id = if let Some(tid) = thread_id {
@@ -550,7 +524,7 @@ async fn handle_command(
                 Ok(()) => format!("✅ Session `{session_id}` cleared."),
                 Err(e) => format!("⚠️ Failed to clear session: {e}"),
             };
-            send_reply(client, api_base, chat_id, &msg, thread_id, None).await;
+            send_reply(client, api_base, chat_id, &msg, thread_id).await;
         }
         "/help" => {
             let help = "\
@@ -559,68 +533,10 @@ async fn handle_command(
 /voice — Toggle voice reply mode\n\
 /reset — Clear conversation session\n\
 /help — Show this help";
-            send_reply(client, api_base, chat_id, help, thread_id, None).await;
+            send_reply(client, api_base, chat_id, help, thread_id).await;
         }
         _ => {} // Unknown command — ignore
     }
-}
-
-/// Handle callback queries from inline keyboard buttons.
-async fn handle_callback_query(
-    client: &reqwest::Client,
-    api_base: &str,
-    cb: &TgCallbackQuery,
-    ctx: &Arc<ReplyContext>,
-) {
-    let cb_data = cb.data.as_deref().unwrap_or("");
-    let chat_id = match cb.message.as_ref().map(|m| m.chat.id) {
-        Some(id) => id,
-        None => {
-            // No message context (e.g. inline mode) — just answer the callback
-            let _ = client
-                .post(format!("{api_base}/answerCallbackQuery"))
-                .json(&json!({ "callback_query_id": cb.id }))
-                .send()
-                .await;
-            return;
-        }
-    };
-    let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
-
-    // Parse callback data: "duduclaw:{action}"
-    if let Some(action) = cb_data.strip_prefix("duduclaw:") {
-        match action {
-            "new_session" => {
-                let session_id = if let Some(tid) = thread_id {
-                    format!("telegram:{chat_id}:{tid}")
-                } else {
-                    format!("telegram:{chat_id}")
-                };
-                let msg = format!("Started new session. Previous: `{session_id}`");
-                send_reply(client, api_base, chat_id, &msg, thread_id, None).await;
-            }
-            "voice_toggle" => {
-                let session_key = format!("telegram:{chat_id}");
-                let mut sessions = ctx.voice_sessions.lock().await;
-                let msg = if sessions.contains(&session_key) {
-                    sessions.remove(&session_key);
-                    "🔇 Voice mode disabled"
-                } else {
-                    sessions.insert(session_key);
-                    "🎤 Voice mode enabled"
-                };
-                send_reply(client, api_base, chat_id, msg, thread_id, None).await;
-            }
-            _ => {}
-        }
-    }
-
-    // Answer the callback query to dismiss the loading state
-    let _ = client
-        .post(format!("{api_base}/answerCallbackQuery"))
-        .json(&json!({ "callback_query_id": cb.id }))
-        .send()
-        .await;
 }
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -793,19 +709,16 @@ async fn send_reply(
     chat_id: i64,
     text: &str,
     message_thread_id: Option<i64>,
-    reply_markup: Option<serde_json::Value>,
 ) {
     // Split long messages
     let chunks = channel_format::split_text(text, channel_format::limits::TELEGRAM_MESSAGE);
 
-    for (i, chunk) in chunks.iter().enumerate() {
+    for chunk in chunks.iter() {
         let body = SendMessage {
             chat_id,
             text: chunk.to_string(),
             parse_mode: Some("Markdown".to_string()),
             message_thread_id,
-            // Only add buttons to the last chunk
-            reply_markup: if i == chunks.len() - 1 { reply_markup.clone() } else { None },
         };
 
         match client.post(format!("{api_base}/sendMessage")).json(&body).send().await {

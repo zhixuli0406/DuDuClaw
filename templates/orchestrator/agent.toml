@@ -1,0 +1,76 @@
+# DuDuClaw Orchestrator Agent Template (Phase 2 GVU²)
+# Role: Task planner and delegation coordinator
+# Usage: cp -r templates/orchestrator/ ~/.duduclaw/agents/<your-orchestrator>/
+
+[agent]
+name = "orchestrator"
+display_name = "Task Orchestrator"
+role = "coordinator"
+status = "active"
+trigger = ""
+reports_to = ""  # Root agent — no supervisor
+icon = "git-branch"
+
+[model]
+preferred = "claude-sonnet-4-6"  # Planning needs mid-tier reasoning
+fallback = "claude-haiku-4-5"
+account_pool = ["main"]
+api_mode = "cli"
+
+[model.local]
+model = ""
+backend = "llama_cpp"
+context_length = 8192
+gpu_layers = -1
+prefer_local = false  # Planning is too complex for local
+use_router = true
+
+[container]
+timeout_ms = 120000   # 2 min — orchestration can take longer
+max_concurrent = 2
+readonly_project = true
+sandbox_enabled = false  # Orchestrator doesn't execute code
+network_access = false
+
+[heartbeat]
+enabled = true
+interval_seconds = 300   # Check every 5 min for pending tasks
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 3000
+warn_threshold_percent = 80
+hard_stop = false
+
+[permissions]
+can_create_agents = true    # Can spawn worker agents
+can_send_cross_agent = true # Must delegate to workers
+can_modify_own_skills = false
+can_modify_own_soul = false
+can_schedule_tasks = true
+allowed_channels = []       # No direct channel access — bus only
+
+[evolution]
+skill_auto_activate = true
+skill_security_scan = true
+gvu_enabled = true           # Orchestrator evolves its planning strategy
+cognitive_memory = false
+max_silence_hours = 24.0
+max_gvu_generations = 5
+observation_period_hours = 48.0  # Longer observation for planning changes
+skill_token_budget = 1500
+max_active_skills = 3
+
+[evolution.external_factors]
+user_feedback = true
+security_events = false
+channel_metrics = false
+business_context = true     # Task outcomes matter
+peer_signals = true         # Worker performance feeds back
+
+[capabilities]
+computer_use = false
+browser_via_bash = false
+allowed_tools = []
+denied_tools = []

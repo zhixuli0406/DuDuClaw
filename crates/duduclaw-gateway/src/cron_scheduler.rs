@@ -199,10 +199,33 @@ async fn execute_cron_task(
         task.name, task.task
     );
 
-    match call_claude_for_agent_with_type(
-        home_dir, registry, &task.agent_id, &prompt,
-        crate::cost_telemetry::RequestType::Cron,
-    ).await {
+    // Wrap cron execution in DELEGATION_ENV scope so the Claude CLI subprocess
+    // receives delegation context. Cron tasks start at depth 0 with origin="cron".
+    let mut delegation_env = std::collections::HashMap::new();
+    delegation_env.insert(
+        duduclaw_core::ENV_DELEGATION_DEPTH.to_string(),
+        "0".to_string(),
+    );
+    delegation_env.insert(
+        duduclaw_core::ENV_DELEGATION_ORIGIN.to_string(),
+        "cron".to_string(),
+    );
+    delegation_env.insert(
+        duduclaw_core::ENV_DELEGATION_SENDER.to_string(),
+        task.agent_id.clone(),
+    );
+
+    let result = crate::claude_runner::DELEGATION_ENV
+        .scope(delegation_env, async {
+            call_claude_for_agent_with_type(
+                home_dir, registry, &task.agent_id, &prompt,
+                crate::cost_telemetry::RequestType::Cron,
+            )
+            .await
+        })
+        .await;
+
+    match result {
         Ok(response) => {
             info!(
                 id = %task.id,

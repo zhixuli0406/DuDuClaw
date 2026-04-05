@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type SkillIndexEntry } from '@/lib/api';
-import { Search, Download, Tag, User, ExternalLink } from 'lucide-react';
+import { Search, Tag, User, ExternalLink } from 'lucide-react';
 
 export function SkillMarketPage() {
   const intl = useIntl();
@@ -114,6 +114,7 @@ export function SkillMarketPage() {
 }
 
 function SkillCard({ skill }: { skill: SkillIndexEntry }) {
+  const intl = useIntl();
   return (
     <div className="rounded-xl border border-stone-200 bg-white p-5 transition-shadow hover:shadow-md dark:border-stone-800 dark:bg-stone-900">
       <div className="mb-3 flex items-start justify-between">
@@ -133,7 +134,7 @@ function SkillCard({ skill }: { skill: SkillIndexEntry }) {
       </div>
 
       <p className="mb-3 text-sm text-stone-600 dark:text-stone-400">
-        {skill.description || 'No description'}
+        {skill.description || intl.formatMessage({ id: 'common.noData' })}
       </p>
 
       {skill.tags.length > 0 && (
@@ -156,13 +157,17 @@ function SkillCard({ skill }: { skill: SkillIndexEntry }) {
             {skill.author}
           </span>
         )}
-        <button
-          onClick={() => alert('Skill 安裝功能尚未實作，敬請期待！')}
-          className="inline-flex items-center gap-1 rounded-md bg-amber-100 px-2.5 py-1.5 text-xs font-medium text-amber-700 transition-colors hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50"
-        >
-          <Download className="h-3.5 w-3.5" />
-          Install
-        </button>
+        {skill.url && /^https?:\/\//i.test(skill.url) && (
+          <a
+            href={skill.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 rounded-md bg-amber-100 px-2.5 py-1.5 text-xs font-medium text-amber-700 transition-colors hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50"
+          >
+            <ExternalLink className="h-3.5 w-3.5" />
+            GitHub
+          </a>
+        )}
       </div>
     </div>
   );

@@ -157,6 +157,7 @@ function AddAccountDialog({
   onClose: () => void;
   onCreated: () => void;
 }) {
+  const intl = useIntl();
   const [name, setName] = useState('');
   const [accountType, setAccountType] = useState('api_key');
   const [apiKey, setApiKey] = useState('');
@@ -169,7 +170,7 @@ function AddAccountDialog({
   const handleSubmit = async () => {
     if (!name.trim()) return;
     if (!apiKey.trim()) {
-      setError('請輸入 API Key');
+      setError(intl.formatMessage({ id: 'accounts.provider.keyRequired' }));
       return;
     }
     setSubmitting(true);
@@ -189,26 +190,26 @@ function AddAccountDialog({
       setBudget('50');
       setPriority('1');
     } catch {
-      setError('帳號新增失敗，請稍後再試');
+      setError(intl.formatMessage({ id: 'accounts.provider.addFailed' }));
     } finally {
       setSubmitting(false);
     }
   };
 
   return (
-    <Dialog open={open} onClose={onClose} title="新增帳號">
+    <Dialog open={open} onClose={onClose} title={intl.formatMessage({ id: 'accounts.add' })}>
       <div className="space-y-4">
-        <FormField label="帳號名稱">
+        <FormField label={intl.formatMessage({ id: 'accounts.provider.name' })}>
           <input
             type="text"
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="例：main、backup"
+            placeholder={intl.formatMessage({ id: 'accounts.name.placeholder' })}
             className={inputClass}
           />
         </FormField>
 
-        <FormField label="認證方式">
+        <FormField label={intl.formatMessage({ id: 'accounts.provider.authMethod' })}>
           <select
             value={accountType}
             onChange={(e) => setAccountType(e.target.value)}
@@ -230,7 +231,7 @@ function AddAccountDialog({
         </FormField>
 
         <div className="grid grid-cols-2 gap-4">
-          <FormField label="月預算 (USD)">
+          <FormField label={intl.formatMessage({ id: 'accounts.provider.budget' })}>
             <input
               type="number"
               value={budget}
@@ -239,7 +240,7 @@ function AddAccountDialog({
               className={inputClass}
             />
           </FormField>
-          <FormField label="優先級" hint="數字越小越優先">
+          <FormField label={intl.formatMessage({ id: 'accounts.provider.priority' })} hint={intl.formatMessage({ id: 'accounts.provider.priorityHint' })}>
             <input
               type="number"
               value={priority}
@@ -257,10 +258,10 @@ function AddAccountDialog({
 
         <div className="flex justify-end gap-3 pt-2">
           <button onClick={onClose} className={buttonSecondary}>
-            取消
+            {intl.formatMessage({ id: 'common.cancel' })}
           </button>
           <button onClick={handleSubmit} disabled={submitting || !name.trim()} className={buttonPrimary}>
-            {submitting ? '新增中...' : '新增帳號'}
+            {submitting ? intl.formatMessage({ id: 'common.loading' }) : intl.formatMessage({ id: 'accounts.add' })}
           </button>
         </div>
       </div>
@@ -326,7 +327,7 @@ function AccountCard({
 
       <div className="mt-3 flex items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
         <span>
-          Priority: <strong>{account.priority}</strong>
+          {intl.formatMessage({ id: 'accounts.priority' })}: <strong>{account.priority}</strong>
         </span>
       </div>
 

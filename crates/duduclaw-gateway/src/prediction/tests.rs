@@ -66,11 +66,13 @@ mod user_model_tests {
             response_time_ms: 0,
             user_follow_ups: follow_ups,
             user_corrections: corrections,
+            feedback_details: Default::default(),
             detected_language: "zh".to_string(),
             extracted_topics: vec!["test".to_string()],
             ended_naturally: true,
             feedback_signal: None,
             timestamp: Utc::now(),
+            user_text: String::new(),
         }
     }
 
@@ -197,7 +199,7 @@ mod metrics_tests {
 mod router_tests {
     use crate::prediction::engine::{ErrorCategory, Prediction, PredictionError};
     use crate::prediction::metrics::ConversationMetrics;
-    use crate::prediction::router::{route, EvolutionAction};
+    use crate::prediction::router::{route, ConsistencyTracker, EvolutionAction, ExplorationState};
     use chrono::Utc;
 
     fn make_error(composite: f64, category: ErrorCategory) -> PredictionError {
@@ -206,6 +208,7 @@ mod router_tests {
             topic_surprise: 0.0,
             unexpected_correction: false,
             unexpected_follow_up: false,
+            task_completion_failure: false,
             composite_error: composite,
             category,
             prediction: Prediction {
@@ -227,43 +230,67 @@ mod router_tests {
                 response_time_ms: 0,
                 user_follow_ups: 0,
                 user_corrections: 0,
+                feedback_details: Default::default(),
                 detected_language: "en".into(),
                 extracted_topics: vec![],
                 ended_naturally: true,
                 feedback_signal: None,
                 timestamp: Utc::now(),
+                user_text: String::new(),
             },
         }
+    }
+
+    /// Create an exploration state that won't trigger forced exploration.
+    /// Sets epsilon_init/min to 0 (the hard floor EPSILON_FLOOR_ABSOLUTE=0.05 still
+    /// applies) and seeds the PRNG counter so should_explore() returns false.
+    fn no_exploration() -> ExplorationState {
+        let mut state = ExplorationState::default();
+        state.epsilon_min = 0.0;
+        state.epsilon_init = 0.0;
+        // Seed=5 → first PRNG output ≈ 0.40 which is > EPSILON_FLOOR (0.05)
+        state.rng_counter = 5;
+        state
     }
 
     #[test]
     fn negligible_routes_to_none() {
         let error = make_error(0.1, ErrorCategory::Negligible);
-        assert!(matches!(route(&error, 0), EvolutionAction::None));
+        let mut exploration = no_exploration();
+        let consistency = ConsistencyTracker::new(50);
+        assert!(matches!(route(&error, 0, &mut exploration, &consistency), EvolutionAction::None));
     }
 
     #[test]
     fn moderate_routes_to_store_episodic() {
         let error = make_error(0.35, ErrorCategory::Moderate);
-        assert!(matches!(route(&error, 0), EvolutionAction::StoreEpisodic { .. }));
+        let mut exploration = no_exploration();
+        let consistency = ConsistencyTracker::new(50);
+        assert!(matches!(route(&error, 0, &mut exploration, &consistency), EvolutionAction::StoreEpisodic { .. }));
     }
 
     #[test]
     fn significant_routes_to_reflection() {
         let error = make_error(0.6, ErrorCategory::Significant);
-        assert!(matches!(route(&error, 0), EvolutionAction::TriggerReflection { .. }));
+        let mut exploration = no_exploration();
+        let consistency = ConsistencyTracker::new(50);
+        assert!(matches!(route(&error, 0, &mut exploration, &consistency), EvolutionAction::TriggerReflection { .. }));
     }
 
     #[test]
     fn significant_with_consecutive_escalates() {
         let error = make_error(0.6, ErrorCategory::Significant);
-        assert!(matches!(route(&error, 3), EvolutionAction::TriggerEmergencyEvolution { .. }));
+        let mut exploration = no_exploration();
+        let consistency = ConsistencyTracker::new(50);
+        assert!(matches!(route(&error, 3, &mut exploration, &consistency), EvolutionAction::TriggerEmergencyEvolution { .. }));
     }
 
     #[test]
     fn critical_routes_to_emergency() {
         let error = make_error(0.9, ErrorCategory::Critical);
-        assert!(matches!(route(&error, 0), EvolutionAction::TriggerEmergencyEvolution { .. }));
+        let mut exploration = no_exploration();
+        let consistency = ConsistencyTracker::new(50);
+        assert!(matches!(route(&error, 0, &mut exploration, &consistency), EvolutionAction::TriggerEmergencyEvolution { .. }));
     }
 }
 
@@ -299,6 +326,7 @@ mod metacognition_tests {
             topic_surprise: 0.0,
             unexpected_correction: false,
             unexpected_follow_up: false,
+            task_completion_failure: false,
             composite_error: 0.5,
             category,
             prediction: Prediction {
@@ -313,8 +341,10 @@ mod metacognition_tests {
                 message_count: 2, user_message_count: 1, assistant_message_count: 1,
                 avg_assistant_response_length: 100.0, total_tokens: 50, response_time_ms: 0,
                 user_follow_ups: 0, user_corrections: 0,
+                feedback_details: Default::default(),
                 detected_language: "en".into(), extracted_topics: vec![],
                 ended_naturally: true, feedback_signal: None, timestamp: Utc::now(),
+                user_text: String::new(),
             },
         }
     }

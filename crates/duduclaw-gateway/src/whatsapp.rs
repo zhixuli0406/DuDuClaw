@@ -120,7 +120,7 @@ pub async fn start_whatsapp_webhook(
     }
 
     info!("📱 WhatsApp webhook starting (phone: {phone_number_id})");
-    set_channel_connected(&ctx.channel_status, "whatsapp", true, None).await;
+    set_channel_connected(&ctx.channel_status, "whatsapp", true, None, Some(&ctx.event_tx)).await;
 
     let state = Arc::new(WhatsAppState {
         ctx,
