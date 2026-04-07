@@ -801,6 +801,10 @@ async fn handle_message_create(
     let guild_id = data["guild_id"].as_str().unwrap_or(""); // empty for DMs
     let message_id = data["id"].as_str().unwrap_or("");
     let author_name = author.and_then(|a| a["username"].as_str()).unwrap_or("someone");
+    let author_display = author
+        .and_then(|a| a["global_name"].as_str())
+        .or_else(|| author.and_then(|a| a["username"].as_str()))
+        .unwrap_or("someone");
     let user_id = author_id;
 
     // Check if bot is mentioned
@@ -933,10 +937,15 @@ async fn handle_message_create(
         reg.main_agent().map(|a| a.config.agent.display_name.clone())
     };
 
+    // Prefix message with Discord author metadata so the agent can identify the speaker
+    let prefixed_content = format!(
+        "[Discord user: {author_display} (username: {author_name}, id: {user_id})] {clean_content}"
+    );
+
     let reply = if let Some(agent) = agent_name {
-        build_reply_for_agent(clean_content, ctx, agent, &session_id, user_id, Some(on_progress)).await
+        build_reply_for_agent(&prefixed_content, ctx, agent, &session_id, user_id, Some(on_progress)).await
     } else {
-        build_reply_with_session(clean_content, ctx, &session_id, user_id, Some(on_progress)).await
+        build_reply_with_session(&prefixed_content, ctx, &session_id, user_id, Some(on_progress)).await
     };
 
     // Stop typing (explicit drop; also runs automatically on panic via Drop)
