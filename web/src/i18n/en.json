@@ -487,7 +487,7 @@
   "login.password": "Password",
   "login.submit": "Sign In",
   "login.loading": "Signing in...",
-  "login.footer": "First time? Sign in with admin@local / admin",
+  "login.footer": "First time? Sign in with admin@local / admin, then change your password",
 
   "auth.logout": "Sign Out",
   "auth.unauthorized": "You don't have permission to access this page",

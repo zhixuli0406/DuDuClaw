@@ -603,7 +603,7 @@
   "login.password": "パスワード",
   "login.submit": "ログイン",
   "login.loading": "ログイン中...",
-  "login.footer": "初回は admin@local / admin でログインしてください",
+  "login.footer": "初回は admin@local / admin でログイン後、パスワードを変更してください",
 
   "auth.logout": "ログアウト",
   "auth.unauthorized": "このページへのアクセス権限がありません",

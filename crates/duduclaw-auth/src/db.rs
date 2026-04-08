@@ -529,11 +529,10 @@ impl UserDb {
             .map_err(|e| format!("count error: {e}"))?;
 
         if count == 0 {
-            // Generate cryptographically random 24-char password
-            let password = generate_random_password(24);
+            let default_password = "admin";
             let id = uuid::Uuid::new_v4().to_string();
             let now = chrono::Utc::now().to_rfc3339();
-            let password_hash = hash_password(&password)?;
+            let password_hash = hash_password(default_password)?;
 
             conn.execute(
                 "INSERT OR IGNORE INTO users (id, email, display_name, password_hash, role, status, created_at, updated_at)
@@ -551,9 +550,9 @@ impl UserDb {
                 warn!("╔════════════════════════════════════════════════════════╗");
                 warn!("║  DEFAULT ADMIN CREATED — CHANGE PASSWORD IMMEDIATELY  ║");
                 warn!("║  Email:    admin@local                                ║");
-                warn!("║  Password: {:24}                    ║", &password);
+                warn!("║  Password: admin                                      ║");
                 warn!("╚════════════════════════════════════════════════════════╝");
-                return Ok(Some(password));
+                return Ok(Some(default_password.to_string()));
             }
         }
         Ok(None)
