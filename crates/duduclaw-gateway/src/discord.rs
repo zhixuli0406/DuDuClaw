@@ -836,7 +836,9 @@ async fn handle_message_create(
     info!("📩 Discord [{author_name}] (guild:{guild_id}): {}", &clean_content[..clean_content.len().min(80)]);
 
     // ── Auto-thread ──
-    let auto_thread = settings.get_bool("discord", scope_id, keys::AUTO_THREAD, false).await;
+    // Default to true in guilds so conversations are organized into threads
+    let auto_thread_default = !guild_id.is_empty();
+    let auto_thread = settings.get_bool("discord", scope_id, keys::AUTO_THREAD, auto_thread_default).await;
     // Detect if message is in a thread: Discord threads have channel_type 11 (PUBLIC_THREAD) or 12 (PRIVATE_THREAD)
     // Note: channel_type is not always present in MESSAGE_CREATE, but the gateway sends it for threads.
     // Fallback: check if thread metadata exists in the payload.
@@ -896,7 +898,7 @@ async fn handle_message_create(
         format!("discord:{reply_channel_id}")
     };
 
-    // ── Progress callback ──
+    // ── Progress callback (edit-in-place to avoid flooding) ──
     let progress_http = http.clone();
     let progress_token = token.to_string();
     let progress_channel = reply_channel_id.clone();
@@ -905,6 +907,9 @@ async fn handle_message_create(
             .checked_sub(std::time::Duration::from_secs(60))
             .unwrap_or_else(std::time::Instant::now),
     ));
+    // Shared message ID so we can EDIT the same progress message instead of creating new ones
+    let progress_msg_id: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let progress_msg_id_cb = progress_msg_id.clone();
     let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
         let mut last = last_progress.lock().unwrap();
         if last.elapsed().as_secs() < 30 {
@@ -917,15 +922,38 @@ async fn handle_message_create(
         let c = progress_http.clone();
         let t = progress_token.clone();
         let ch = progress_channel.clone();
+        let mid = progress_msg_id_cb.clone();
         tokio::spawn(async move {
-            let _ = c
-                .post(format!("{DISCORD_API}/channels/{ch}/messages"))
-                .header("Authorization", format!("Bot {t}"))
-                .json(&json!({ "content": msg_text }))
-                .send()
-                .await;
+            let existing_id = mid.lock().unwrap().clone();
+            if let Some(msg_id) = existing_id {
+                // Edit the existing progress message
+                let _ = c
+                    .patch(format!("{DISCORD_API}/channels/{ch}/messages/{msg_id}"))
+                    .header("Authorization", format!("Bot {t}"))
+                    .json(&json!({ "content": msg_text }))
+                    .send()
+                    .await;
+            } else {
+                // Send the first progress message and save its ID
+                let resp = c
+                    .post(format!("{DISCORD_API}/channels/{ch}/messages"))
+                    .header("Authorization", format!("Bot {t}"))
+                    .json(&json!({ "content": msg_text }))
+                    .send()
+                    .await;
+                if let Ok(r) = resp {
+                    if let Ok(body) = r.json::<serde_json::Value>().await {
+                        if let Some(id) = body["id"].as_str() {
+                            *mid.lock().unwrap() = Some(id.to_string());
+                        }
+                    }
+                }
+            }
         });
     });
+    let cleanup_http = http.clone();
+    let cleanup_token = token.to_string();
+    let cleanup_channel = reply_channel_id.clone();
 
     // ── Get agent display name for embed footer ──
     let display_name = {
@@ -957,6 +985,20 @@ async fn handle_message_create(
     let buttons = channel_format::discord_conversation_buttons(&session_id);
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("components".to_string(), json!([buttons]));
+    }
+
+    // ── Delete progress message now that we have the real reply ──
+    if let Some(pmid) = progress_msg_id.lock().unwrap().take() {
+        let c = cleanup_http;
+        let t = cleanup_token;
+        let ch = cleanup_channel;
+        tokio::spawn(async move {
+            let _ = c
+                .delete(format!("{DISCORD_API}/channels/{ch}/messages/{pmid}"))
+                .header("Authorization", format!("Bot {t}"))
+                .send()
+                .await;
+        });
     }
 
     // ── Split if needed (embed description > 4096 or plain text > 2000) ──
