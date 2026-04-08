@@ -103,7 +103,7 @@ export function Header() {
             )}
           </span>
           <button
-            onClick={() => navigate('/settings')}
+            onClick={() => navigate('/settings?tab=update')}
             className="whitespace-nowrap rounded-md bg-amber-500 px-2 py-0.5 text-xs font-medium text-white transition-colors hover:bg-amber-600"
           >
             {intl.formatMessage({ id: 'update.viewDetails' })}
