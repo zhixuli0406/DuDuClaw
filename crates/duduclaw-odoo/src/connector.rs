@@ -12,16 +12,38 @@ use crate::edition::EditionGate;
 use crate::rpc;
 
 /// Sensitive models that are never allowed via generic search/execute.
+/// Covers system internals, PII-heavy tables, financial records, and communications.
 const BLOCKED_MODELS: &[&str] = &[
+    // System internals & schema
     "ir.config_parameter",
-    "res.users",
     "ir.cron",
     "ir.actions.server",
     "ir.rule",
     "ir.model.access",
+    "ir.model",
+    "ir.model.fields",
+    "ir.attachment",
     "base.automation",
     "fetchmail.server",
     "ir.mail_server",
+    // Authentication & access
+    "res.users",
+    "res.groups",
+    // PII — contacts & banking
+    "res.partner",
+    "res.partner.bank",
+    // Financial records
+    "account.move",
+    "account.move.line",
+    "account.payment",
+    "payment.token",
+    // HR — employee PII & payroll
+    "hr.employee",
+    "hr.employee.private",
+    "hr.payslip",
+    // Communications
+    "mail.message",
+    "mail.channel",
 ];
 
 /// Main Odoo connection handle.

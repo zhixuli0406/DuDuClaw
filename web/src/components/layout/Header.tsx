@@ -2,9 +2,10 @@ import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useUpdateStore } from '@/stores/update-store';
+import { useAuthStore } from '@/stores/auth-store';
 import { Sun, Moon, Monitor, RefreshCw, ArrowUpCircle, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 
 type Theme = 'light' | 'dark' | 'system';
 
@@ -13,7 +14,11 @@ export function Header() {
   const navigate = useNavigate();
   const connectionState = useConnectionStore((s) => s.state);
   const connectionError = useConnectionStore((s) => s.error);
-  const reconnect = useConnectionStore((s) => s.connect);
+  const connectWithAuth = useConnectionStore((s) => s.connectWithAuth);
+  const reconnect = useCallback(
+    () => connectWithAuth(() => useAuthStore.getState().jwt ?? undefined),
+    [connectWithAuth]
+  );
   const updateNotification = useUpdateStore((s) => s.notification);
   const updateDismissed = useUpdateStore((s) => s.dismissed);
   const dismissUpdate = useUpdateStore((s) => s.dismiss);
@@ -77,13 +82,13 @@ export function Header() {
       {/* Connection error banner */}
       {connectionState === 'disconnected' && connectionError && (
         <div className="flex items-center gap-2 text-xs text-rose-600 dark:text-rose-400">
-          <span>{intl.formatMessage({ id: 'header.connectionError' })}: {connectionError.slice(0, 80)}</span>
+          <span>{intl.formatMessage({ id: 'status.connection_error' }, { msg: connectionError.slice(0, 80) })}</span>
           <button
             onClick={() => reconnect()}
             className="inline-flex items-center gap-1 rounded-md bg-rose-100 px-2 py-1 text-xs font-medium text-rose-700 hover:bg-rose-200 dark:bg-rose-900/30 dark:text-rose-400 dark:hover:bg-rose-900/50"
           >
             <RefreshCw className="h-3 w-3" />
-            {intl.formatMessage({ id: 'header.reconnect' })}
+            {intl.formatMessage({ id: 'status.reconnect' })}
           </button>
         </div>
       )}

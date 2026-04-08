@@ -59,12 +59,13 @@ interface FormFieldProps {
   label: string;
   children: ReactNode;
   hint?: string;
+  htmlFor?: string;
 }
 
-export function FormField({ label, children, hint }: FormFieldProps) {
+export function FormField({ label, children, hint, htmlFor }: FormFieldProps) {
   return (
     <div className="space-y-1.5">
-      <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+      <label htmlFor={htmlFor} className="block text-sm font-medium text-stone-700 dark:text-stone-300">
         {label}
       </label>
       {children}

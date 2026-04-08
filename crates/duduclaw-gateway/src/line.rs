@@ -19,7 +19,7 @@ use sha2::Sha256;
 use tracing::{error, info, warn};
 
 use crate::channel_format;
-use crate::channel_reply::{ChannelStatusMap, ReplyContext, build_reply_with_progress, set_channel_connected};
+use crate::channel_reply::{ChannelStatusMap, ReplyContext, build_reply_with_progress, build_reply_with_session, set_channel_connected};
 use crate::channel_settings::keys;
 
 const LINE_API: &str = "https://api.line.me/v2/bot";
@@ -262,7 +262,16 @@ async fn line_webhook_handler(
                 None
             };
 
-            let reply = build_reply_with_progress(text, &state.ctx, on_progress).await;
+            // Build session ID scoped to group/room or user DM
+            let session_id = if let Some(gid) = source.as_ref().and_then(|s| s.group_id.as_deref()) {
+                format!("line:{gid}")
+            } else if let Some(rid) = source.as_ref().and_then(|s| s.room_id.as_deref()) {
+                format!("line:{rid}")
+            } else {
+                format!("line:{sender}")
+            };
+
+            let reply = build_reply_with_session(text, &state.ctx, &session_id, sender, on_progress).await;
 
             // Use Flex Message for long replies, plain text for short ones
             let agent_name = {

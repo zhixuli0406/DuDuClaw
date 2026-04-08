@@ -115,6 +115,94 @@ pub fn verify_deterministic(
 }
 
 // ---------------------------------------------------------------------------
+// Layer 1b: Wiki proposal deterministic validation
+// ---------------------------------------------------------------------------
+
+/// Validate wiki proposals against deterministic safety rules.
+///
+/// Zero LLM cost — checks path safety, content size, and format.
+pub fn verify_wiki_proposals(
+    proposals: &[duduclaw_memory::wiki::WikiProposal],
+) -> Result<(), TextGradient> {
+    for (i, proposal) in proposals.iter().enumerate() {
+        let path = &proposal.page_path;
+
+        // Path safety
+        if path.contains("..") || path.starts_with('/') || path.starts_with('\\') {
+            return Err(TextGradient::blocking(
+                "L1-WikiValidation",
+                &format!("wiki_proposals[{}].page_path", i),
+                &format!("Wiki page path contains path traversal: '{path}'"),
+                "Use a relative path within the wiki directory (e.g. 'concepts/topic.md')",
+            ));
+        }
+
+        if !path.ends_with(".md") {
+            return Err(TextGradient::blocking(
+                "L1-WikiValidation",
+                &format!("wiki_proposals[{}].page_path", i),
+                &format!("Wiki page path must end with .md: '{path}'"),
+                "Add .md extension to the page path",
+            ));
+        }
+
+        // Reserved file protection
+        let reserved = ["_schema.md", "_index.md", "_log.md"];
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
+        if reserved.contains(&filename) {
+            return Err(TextGradient::blocking(
+                "L1-WikiValidation",
+                &format!("wiki_proposals[{}].page_path", i),
+                &format!("Cannot modify reserved wiki file: '{filename}'"),
+                "Use a different filename — _schema.md, _index.md, _log.md are system-managed",
+            ));
+        }
+
+        // Content size check (for create/update)
+        if let Some(ref content) = proposal.content {
+            if content.len() > 512 * 1024 {
+                return Err(TextGradient::blocking(
+                    "L1-WikiValidation",
+                    &format!("wiki_proposals[{}].content", i),
+                    &format!("Wiki page content too large: {} bytes (max 512KB)", content.len()),
+                    "Reduce content size or split into multiple pages",
+                ));
+            }
+
+            // Sensitive content check
+            let sensitive = ["sk-ant-", "sk-", "api_key=", "password=", "ANTHROPIC_API_KEY"];
+            for pat in &sensitive {
+                if content.contains(pat) {
+                    return Err(TextGradient::blocking(
+                        "L1-WikiValidation",
+                        &format!("wiki_proposals[{}].content", i),
+                        &format!("Wiki page contains sensitive pattern: '{pat}'"),
+                        "Remove API keys, tokens, or credentials from wiki content",
+                    ));
+                }
+            }
+        }
+
+        // Create/Update must have content
+        if matches!(proposal.action, duduclaw_memory::wiki::WikiAction::Create | duduclaw_memory::wiki::WikiAction::Update) {
+            if proposal.content.as_ref().map(|c| c.trim().is_empty()).unwrap_or(true) {
+                return Err(TextGradient::blocking(
+                    "L1-WikiValidation",
+                    &format!("wiki_proposals[{}].content", i),
+                    "Create/Update proposal must have non-empty content",
+                    "Provide the full page content including YAML frontmatter",
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Layer 2: Metrics/history prediction
 // ---------------------------------------------------------------------------
 

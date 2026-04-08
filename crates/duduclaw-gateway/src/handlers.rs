@@ -3,12 +3,16 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use duduclaw_agent::registry::AgentRegistry;
+use duduclaw_auth::{self, UserContext, UserDb, JwtConfig};
+use duduclaw_auth::acl;
+use duduclaw_auth::models::{UserRole, AccessLevel};
 use duduclaw_core::traits::MemoryEngine;
 use duduclaw_memory::SqliteMemoryEngine;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use crate::gvu::version_store::VersionStore;
 use crate::protocol::WsFrame;
 
 /// Validate agent ID is safe for filesystem paths (no traversal).
@@ -37,6 +41,10 @@ pub struct MethodHandler {
     /// Cached license tier — avoids re-reading disk + Ed25519 on every RPC call.
     /// Invalidated by license.activate / license.deactivate.
     feature_gate_cache: RwLock<Option<(Instant, crate::feature_gate::Tier)>>,
+    /// User database for multi-user auth (injected after gateway start).
+    user_db: RwLock<Option<Arc<UserDb>>>,
+    /// JWT configuration for token issuance (injected after gateway start).
+    jwt_config: RwLock<Option<Arc<JwtConfig>>>,
 }
 
 /// Cached update info from the last `system.check_update` call. [M2][R2:NM1]
@@ -82,7 +90,15 @@ impl MethodHandler {
             channel_handles: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             pending_update: RwLock::new(None),
             feature_gate_cache: RwLock::new(None),
+            user_db: RwLock::new(None),
+            jwt_config: RwLock::new(None),
         }
+    }
+
+    /// Inject user database and JWT config (called once after gateway start).
+    pub async fn set_user_db(&self, db: Arc<UserDb>, jwt: Arc<JwtConfig>) {
+        *self.user_db.write().await = Some(db);
+        *self.jwt_config.write().await = Some(jwt);
     }
 
     /// Inject the reply context for hot-starting channels. Called once after
@@ -134,8 +150,8 @@ impl MethodHandler {
     ///
     /// `request_id` is carried through so that all response frames are correctly
     /// correlated with the originating client request.
-    pub async fn handle(&self, method: &str, params: Value) -> WsFrame {
-        let response = self.dispatch(method, params).await;
+    pub async fn handle(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
+        let response = self.dispatch(method, params, ctx).await;
         response
     }
 
@@ -183,74 +199,208 @@ impl MethodHandler {
         }
     }
 
-    async fn dispatch(&self, method: &str, params: Value) -> WsFrame {
+    async fn dispatch(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
+        // ── ACL macros ───────────────────────────────────────
+        // Helper: require minimum role, return error frame on failure.
+        macro_rules! require_admin {
+            () => {
+                if let Err(e) = acl::require_role(ctx, UserRole::Admin) {
+                    return WsFrame::error_response("", &e);
+                }
+            };
+        }
+        macro_rules! require_manager {
+            () => {
+                if let Err(e) = acl::require_role(ctx, UserRole::Manager) {
+                    return WsFrame::error_response("", &e);
+                }
+            };
+        }
+        // Helper: check agent access from params, return error frame on failure.
+        macro_rules! check_agent {
+            ($min_level:expr) => {
+                match acl::extract_and_check_agent(ctx, &params, $min_level) {
+                    Ok(id) => id,
+                    Err(e) => return WsFrame::error_response("", &e),
+                }
+            };
+        }
+
         match method {
             "connect.challenge" => self.handle_connect_challenge(params),
             "connect" => self.handle_connect(params),
             "hello-ok" => self.handle_hello_ok(params),
             "tools.catalog" => self.handle_tools_catalog(params),
-            "agents.list" => self.handle_agents_list().await,
-            "agents.status" => self.handle_agents_status(params).await,
-            "agents.create" => self.handle_agents_create(params).await,
-            "agents.delegate" => self.handle_agents_delegate(params).await,
-            "agents.pause" => self.handle_agents_pause(params).await,
-            "agents.resume" => self.handle_agents_resume(params).await,
-            "agents.update" => self.handle_agents_update(params).await,
-            "agents.remove" => self.handle_agents_remove(params).await,
-            "agents.inspect" => self.handle_agents_inspect(params).await,
-            "channels.status" => self.handle_channels_status().await,
-            "channels.add" => self.handle_channels_add(params).await,
-            "channels.test" => self.handle_channels_test(params).await,
-            "channels.remove" => self.handle_channels_remove(params).await,
-            "accounts.list" => self.handle_accounts_list().await,
-            "accounts.budget_summary" => self.handle_budget_summary().await,
-            "accounts.rotate" => match self.require_feature("account_rotation").await {
-                Some(err) => err,
-                None => self.handle_accounts_rotate(params).await,
-            },
-            "accounts.health" => self.handle_accounts_health().await,
-            "memory.search" => self.handle_memory_search(params).await,
-            "memory.browse" => self.handle_memory_browse(params).await,
+
+            // ── Agent methods (filtered by binding) ──────────
+            "agents.list" => self.handle_agents_list_filtered(ctx).await,
+            "agents.status" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_agents_status(params).await
+            }
+            "agents.create" => { require_admin!(); self.handle_agents_create(params).await }
+            "agents.delegate" => {
+                // H1 fix: delegate is high-risk — requires operator-level access
+                let _ = check_agent!(AccessLevel::Operator);
+                self.handle_agents_delegate(params).await
+            }
+            "agents.pause" => { require_manager!(); self.handle_agents_pause(params).await }
+            "agents.resume" => { require_manager!(); self.handle_agents_resume(params).await }
+            "agents.update" => {
+                let _ = check_agent!(AccessLevel::Owner);
+                self.handle_agents_update(params).await
+            }
+            "agents.remove" => { require_admin!(); self.handle_agents_remove(params).await }
+            "agents.inspect" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_agents_inspect(params).await
+            }
+
+            // ── Channel methods (admin only) ─────────────────
+            "channels.status" => { require_admin!(); self.handle_channels_status().await }
+            "channels.add" => { require_admin!(); self.handle_channels_add(params).await }
+            "channels.test" => { require_admin!(); self.handle_channels_test(params).await }
+            "channels.remove" => { require_admin!(); self.handle_channels_remove(params).await }
+
+            // ── Account methods (admin only) ─────────────────
+            "accounts.list" => { require_admin!(); self.handle_accounts_list().await }
+            "accounts.budget_summary" => { require_manager!(); self.handle_budget_summary().await }
+            "accounts.rotate" => {
+                require_admin!();
+                match self.require_feature("account_rotation").await {
+                    Some(err) => err,
+                    None => self.handle_accounts_rotate(params).await,
+                }
+            }
+            "accounts.health" => { require_admin!(); self.handle_accounts_health().await }
+            "accounts.add" => { require_admin!(); self.handle_accounts_add(params).await }
+            "accounts.update_budget" => { require_admin!(); self.handle_accounts_update_budget(params).await }
+
+            // ── Memory (agent-scoped, H2 fix) ────────────────
+            "memory.search" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_memory_search(params).await
+            }
+            "memory.browse" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_memory_browse(params).await
+            }
+
+            // ── Wiki (open to all authenticated users) ───────
+            "wiki.pages" => self.handle_wiki_pages(params).await,
+            "wiki.read" => self.handle_wiki_read(params).await,
+            "wiki.search" => self.handle_wiki_search(params).await,
+            "wiki.lint" => self.handle_wiki_lint(params).await,
+            "wiki.stats" => self.handle_wiki_stats(params).await,
+
+            // ── Skills (open to all) ─────────────────────────
             "skills.list" => self.handle_skills_list(params).await,
             "skills.search" => self.handle_skills_search(params).await,
             "skills.content" => self.handle_skills_content(params).await,
-            "cron.list" => self.handle_cron_list(),
-            "cron.add" => self.handle_cron_add(params),
-            "cron.pause" => self.handle_cron_pause(params),
-            "cron.remove" => self.handle_cron_remove(params),
+
+            // ── Cron (admin only) ────────────────────────────
+            "cron.list" => { require_admin!(); self.handle_cron_list() }
+            "cron.add" => { require_admin!(); self.handle_cron_add(params) }
+            "cron.pause" => { require_admin!(); self.handle_cron_pause(params) }
+            "cron.remove" => { require_admin!(); self.handle_cron_remove(params) }
+
+            // ── System (admin only for config changes) ───────
             "system.status" => self.handle_system_status().await,
-            "system.doctor" => self.handle_system_doctor().await,
-            "system.doctor_repair" => self.handle_system_doctor_repair().await,
+            "system.doctor" => { require_admin!(); self.handle_system_doctor().await }
+            "system.doctor_repair" => { require_admin!(); self.handle_system_doctor_repair().await }
             "models.list" => self.handle_models_list().await,
-            "system.config" => self.handle_system_config().await,
-            "system.update_config" => self.handle_system_update_config(params).await,
-            "accounts.add" => self.handle_accounts_add(params).await,
-            "accounts.update_budget" => self.handle_accounts_update_budget(params).await,
+            "system.config" => { require_admin!(); self.handle_system_config().await }
+            "system.update_config" => { require_admin!(); self.handle_system_update_config(params).await }
             "system.version" => self.handle_system_version(),
-            "system.check_update" => self.handle_system_check_update().await,
-            "system.apply_update" => self.handle_system_apply_update(params).await,
-            "logs.subscribe" => self.handle_logs_subscribe(params),
+            "system.check_update" => { require_admin!(); self.handle_system_check_update().await }
+            "system.apply_update" => { require_admin!(); self.handle_system_apply_update(params).await }
+
+            // ── Logs (manager+) ──────────────────────────────
+            "logs.subscribe" => { require_manager!(); self.handle_logs_subscribe(params) }
             "logs.unsubscribe" => self.handle_logs_unsubscribe(params),
-            "security.audit_log" => match self.require_feature("audit_export").await {
-                Some(err) => err,
-                None => self.handle_security_audit_log(params).await,
-            },
-            "heartbeat.status" => match self.require_feature("heartbeat").await {
-                Some(err) => err,
-                None => self.handle_heartbeat_status().await,
-            },
-            "heartbeat.trigger" => match self.require_feature("heartbeat").await {
-                Some(err) => err,
-                None => self.handle_heartbeat_trigger(params).await,
-            },
-            "evolution.status" => self.handle_evolution_status().await,
-            "evolution.skills" => match self.require_feature("skill_ecosystem").await {
-                Some(err) => err,
-                None => self.handle_evolution_skills().await,
-            },
-            "license.status" => self.handle_license_status().await,
-            "license.activate" => self.handle_license_activate(params).await,
-            "license.deactivate" => self.handle_license_deactivate().await,
+
+            // ── Security (admin only) ────────────────────────
+            "security.audit_log" => {
+                require_admin!();
+                match self.require_feature("audit_export").await {
+                    Some(err) => err,
+                    None => self.handle_security_audit_log(params).await,
+                }
+            }
+
+            // ── Heartbeat (manager+) ─────────────────────────
+            "heartbeat.status" => {
+                require_manager!();
+                match self.require_feature("heartbeat").await {
+                    Some(err) => err,
+                    None => self.handle_heartbeat_status().await,
+                }
+            }
+            "heartbeat.trigger" => {
+                require_manager!();
+                match self.require_feature("heartbeat").await {
+                    Some(err) => err,
+                    None => self.handle_heartbeat_trigger(params).await,
+                }
+            }
+
+            // ── Evolution (manager+, H3 fix) ─────────────────
+            "evolution.status" => { require_manager!(); self.handle_evolution_status().await }
+            "evolution.history" => { require_manager!(); self.handle_evolution_history(params).await }
+            "evolution.skills" => {
+                require_manager!();
+                match self.require_feature("skill_ecosystem").await {
+                    Some(err) => err,
+                    None => self.handle_evolution_skills().await,
+                }
+            }
+
+            // ── License (admin only, H3 fix) ─────────────────
+            "license.status" => { require_manager!(); self.handle_license_status().await }
+            "license.activate" => { require_admin!(); self.handle_license_activate(params).await }
+            "license.deactivate" => { require_admin!(); self.handle_license_deactivate().await }
+
+            // ── Odoo (admin only) ────────────────────────────
+            "odoo.status" => {
+                require_admin!();
+                match self.require_feature("odoo").await {
+                    Some(err) => err,
+                    None => self.handle_odoo_status().await,
+                }
+            }
+            "odoo.config" => {
+                require_admin!();
+                match self.require_feature("odoo").await {
+                    Some(err) => err,
+                    None => self.handle_odoo_config().await,
+                }
+            }
+            "odoo.configure" => {
+                require_admin!();
+                match self.require_feature("odoo").await {
+                    Some(err) => err,
+                    None => self.handle_odoo_configure(params).await,
+                }
+            }
+            "odoo.test" => {
+                require_admin!();
+                match self.require_feature("odoo").await {
+                    Some(err) => err,
+                    None => self.handle_odoo_test().await,
+                }
+            }
+
+            // ── User management (admin only) ─────────────────
+            "users.list" => { require_admin!(); self.handle_users_list().await }
+            "users.create" => { require_admin!(); self.handle_users_create(params, ctx).await }
+            "users.update" => { require_admin!(); self.handle_users_update(params, ctx).await }
+            "users.remove" => { require_admin!(); self.handle_users_remove(params, ctx).await }
+            "users.bind_agent" => { require_admin!(); self.handle_users_bind_agent(params, ctx).await }
+            "users.unbind_agent" => { require_admin!(); self.handle_users_unbind_agent(params, ctx).await }
+            "users.offboard" => { require_admin!(); self.handle_users_offboard(params, ctx).await }
+            "users.me" => self.handle_users_me(ctx).await,
+            "users.audit_log" => { require_admin!(); self.handle_users_audit_log(params).await }
+
             unknown => WsFrame::error_response("", &format!("Unknown method: {unknown}")),
         }
     }
@@ -293,6 +443,11 @@ impl MethodHandler {
                 { "name": "accounts.health", "description": "Account health check" },
                 { "name": "memory.search", "description": "Search agent memory" },
                 { "name": "memory.browse", "description": "Browse recent memory entries" },
+                { "name": "wiki.pages", "description": "List wiki pages for an agent" },
+                { "name": "wiki.read", "description": "Read a wiki page" },
+                { "name": "wiki.search", "description": "Search wiki pages" },
+                { "name": "wiki.lint", "description": "Wiki health check" },
+                { "name": "wiki.stats", "description": "Wiki statistics" },
                 { "name": "skills.list", "description": "List agent skills" },
                 { "name": "skills.content", "description": "Read skill content" },
                 { "name": "cron.list", "description": "List cron jobs" },
@@ -319,68 +474,6 @@ impl MethodHandler {
     }
 
     // ── Agents ───────────────────────────────────────────────
-
-    async fn handle_agents_list(&self) -> WsFrame {
-        // Re-scan to pick up changes — only acquire write lock for scan,
-        // then drop it immediately before reading (MCP-M3).
-        if let Ok(mut reg) = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            self.registry.write(),
-        ).await {
-            let _ = reg.scan().await;
-        }
-
-        let reg = self.registry.read().await;
-        // Pre-compute total spend once (MCP-L5) — shared across all agents for now
-        let total_spent = self.get_total_spent().await;
-        let agents: Vec<Value> = reg.list().iter().map(|a| {
-            let cfg = &a.config;
-            json!({
-                "name": cfg.agent.name,
-                "display_name": cfg.agent.display_name,
-                "role": format!("{:?}", cfg.agent.role).to_lowercase(),
-                "status": format!("{:?}", cfg.agent.status).to_lowercase(),
-                "trigger": cfg.agent.trigger,
-                "icon": cfg.agent.icon,
-                "reports_to": cfg.agent.reports_to,
-                "model": {
-                    "preferred": cfg.model.preferred,
-                    "fallback": cfg.model.fallback,
-                    "account_pool": cfg.model.account_pool,
-                    "api_mode": cfg.model.api_mode,
-                    "local": cfg.model.local.as_ref().map(|l| json!({
-                        "model": l.model,
-                        "backend": l.backend,
-                        "context_length": l.context_length,
-                        "gpu_layers": l.gpu_layers,
-                        "prefer_local": l.prefer_local,
-                        "use_router": l.use_router,
-                    })),
-                },
-                "budget": {
-                    "monthly_limit_cents": cfg.budget.monthly_limit_cents,
-                    "spent_cents": total_spent,
-                    "warn_threshold_percent": cfg.budget.warn_threshold_percent,
-                    "hard_stop": cfg.budget.hard_stop,
-                },
-                "heartbeat": {
-                    "enabled": cfg.heartbeat.enabled,
-                    "interval_seconds": cfg.heartbeat.interval_seconds,
-                },
-                "skills": a.skills.iter().map(|s| &s.name).collect::<Vec<_>>(),
-                "permissions": {
-                    "can_create_agents": cfg.permissions.can_create_agents,
-                    "can_send_cross_agent": cfg.permissions.can_send_cross_agent,
-                    "can_modify_own_skills": cfg.permissions.can_modify_own_skills,
-                    "can_modify_own_soul": cfg.permissions.can_modify_own_soul,
-                    "can_schedule_tasks": cfg.permissions.can_schedule_tasks,
-                },
-            })
-        }).collect();
-
-        info!("agents.list: found {} agents", agents.len());
-        WsFrame::ok_response("", json!({ "agents": agents }))
-    }
 
     async fn handle_agents_status(&self, params: Value) -> WsFrame {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -411,6 +504,13 @@ impl MethodHandler {
         }
         if !is_valid_agent_id(name) {
             return WsFrame::error_response("", "Agent name must be lowercase alphanumeric with hyphens, max 64 chars");
+        }
+
+        // If creating as main, demote the current main agent first
+        if role == "main" {
+            if let Err(e) = self.demote_current_main(name).await {
+                return WsFrame::error_response("", &e);
+            }
         }
 
         // Create agent directory and files
@@ -644,6 +744,28 @@ impl MethodHandler {
         Ok(())
     }
 
+    /// Demote the current main agent to "specialist", skipping `except_id`.
+    /// This ensures at most one agent has the "main" role at any time.
+    async fn demote_current_main(&self, except_id: &str) -> Result<(), String> {
+        let current_main = {
+            let reg = self.registry.read().await;
+            reg.main_agent()
+                .filter(|a| a.config.agent.name != except_id)
+                .map(|a| a.config.agent.name.clone())
+        };
+        if let Some(old_main) = current_main {
+            info!(old_main = old_main.as_str(), "Demoting current main agent to specialist");
+            self.update_agent_toml(&old_main, |table| {
+                let agent_section = table.get_mut("agent")
+                    .and_then(|v| v.as_table_mut())
+                    .ok_or_else(|| "agent.toml missing [agent] section".to_string())?;
+                agent_section.insert("role".into(), toml::Value::String("specialist".into()));
+                Ok(())
+            }).await?;
+        }
+        Ok(())
+    }
+
     /// Update one or more fields of an agent's `agent.toml`.
     ///
     /// Supports identity, model, budget, heartbeat, permissions, and evolution fields.
@@ -653,6 +775,13 @@ impl MethodHandler {
             Some(id) if !id.is_empty() => id.to_string(),
             _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
         };
+
+        // If promoting to main, demote the current main agent first
+        if let Some("main") = params.get("role").and_then(|v| v.as_str()) {
+            if let Err(e) = self.demote_current_main(&agent_id).await {
+                return WsFrame::error_response("", &e);
+            }
+        }
 
         let params_clone = params.clone();
         let mut changes: Vec<String> = Vec::new();
@@ -1647,16 +1776,24 @@ impl MethodHandler {
 
     // ── Memory ──────────────────────────────────────────────
 
+    /// Resolve the per-agent memory.db path.
+    /// Prefers `agents/<id>/state/memory.db`, falls back to `agents/<id>/memory.db`.
+    fn agent_memory_db_path(&self, agent_id: &str) -> PathBuf {
+        let agent_dir = self.home_dir.join("agents").join(agent_id);
+        let state_path = agent_dir.join("state").join("memory.db");
+        if state_path.exists() { state_path } else { agent_dir.join("memory.db") }
+    }
+
     async fn handle_memory_search(&self, params: Value) -> WsFrame {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
         let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
         let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).min(200) as usize;
 
-        if agent_id.is_empty() || query.is_empty() {
-            return WsFrame::error_response("", "Missing 'agent_id' or 'query' parameter");
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) || query.is_empty() {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' or 'query' parameter");
         }
 
-        let db_path = self.home_dir.join("memory.db");
+        let db_path = self.agent_memory_db_path(agent_id);
         if !db_path.exists() {
             return WsFrame::ok_response("", json!({ "entries": [] }));
         }
@@ -1685,13 +1822,13 @@ impl MethodHandler {
 
     async fn handle_memory_browse(&self, params: Value) -> WsFrame {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).min(200) as usize;
 
-        if agent_id.is_empty() {
-            return WsFrame::error_response("", "Missing 'agent_id' parameter");
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         }
 
-        let db_path = self.home_dir.join("memory.db");
+        let db_path = self.agent_memory_db_path(agent_id);
         if !db_path.exists() {
             return WsFrame::ok_response("", json!({ "entries": [] }));
         }
@@ -1716,6 +1853,165 @@ impl MethodHandler {
             }
             Err(e) => WsFrame::error_response("", &format!("Memory browse failed: {e}")),
         }
+    }
+
+    // ── Wiki Knowledge Base ──────────────────────────────────
+
+    async fn handle_wiki_pages(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if agent_id.is_empty() {
+            return WsFrame::error_response("", "Missing 'agent_id' parameter");
+        }
+        if !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+
+        let wiki_dir = self.home_dir.join("agents").join(agent_id).join("wiki");
+        if !wiki_dir.exists() {
+            return WsFrame::ok_response("", json!({ "pages": [], "exists": false }));
+        }
+
+        let store = duduclaw_memory::WikiStore::new(wiki_dir);
+        match store.list_pages() {
+            Ok(pages) => {
+                let items: Vec<Value> = pages.iter().map(|p| {
+                    json!({
+                        "path": p.path,
+                        "title": p.title,
+                        "updated": p.updated.to_rfc3339(),
+                        "tags": p.tags,
+                    })
+                }).collect();
+                WsFrame::ok_response("", json!({ "pages": items, "exists": true }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("Failed to list wiki pages: {e}")),
+        }
+    }
+
+    async fn handle_wiki_read(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let page_path = params.get("page_path").and_then(|v| v.as_str()).unwrap_or("");
+        if agent_id.is_empty() || page_path.is_empty() {
+            return WsFrame::error_response("", "Missing 'agent_id' or 'page_path' parameter");
+        }
+        if !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+
+        let wiki_dir = self.home_dir.join("agents").join(agent_id).join("wiki");
+        let store = duduclaw_memory::WikiStore::new(wiki_dir);
+
+        // Allow reading reserved files like _index.md, _schema.md
+        match store.read_raw(page_path) {
+            Ok(content) => WsFrame::ok_response("", json!({ "content": content, "path": page_path })),
+            Err(e) => WsFrame::error_response("", &format!("Failed to read page: {e}")),
+        }
+    }
+
+    async fn handle_wiki_search(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = (params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize).min(100);
+
+        if agent_id.is_empty() || query.is_empty() {
+            return WsFrame::error_response("", "Missing 'agent_id' or 'query' parameter");
+        }
+        if !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+
+        let wiki_dir = self.home_dir.join("agents").join(agent_id).join("wiki");
+        if !wiki_dir.exists() {
+            return WsFrame::ok_response("", json!({ "hits": [] }));
+        }
+
+        let store = duduclaw_memory::WikiStore::new(wiki_dir);
+        match store.search(query, limit) {
+            Ok(hits) => {
+                let items: Vec<Value> = hits.iter().map(|h| {
+                    json!({
+                        "path": h.path,
+                        "title": h.title,
+                        "score": h.score,
+                        "context_lines": h.context_lines,
+                    })
+                }).collect();
+                WsFrame::ok_response("", json!({ "hits": items }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("Wiki search failed: {e}")),
+        }
+    }
+
+    async fn handle_wiki_lint(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if agent_id.is_empty() {
+            return WsFrame::error_response("", "Missing 'agent_id' parameter");
+        }
+        if !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+
+        let wiki_dir = self.home_dir.join("agents").join(agent_id).join("wiki");
+        if !wiki_dir.exists() {
+            return WsFrame::ok_response("", json!({ "total_pages": 0, "healthy": true }));
+        }
+
+        let store = duduclaw_memory::WikiStore::new(wiki_dir);
+        match store.lint() {
+            Ok(report) => WsFrame::ok_response("", json!({
+                "total_pages": report.total_pages,
+                "index_entries": report.index_entries,
+                "orphan_pages": report.orphan_pages,
+                "broken_links": report.broken_links,
+                "stale_pages": report.stale_pages,
+                "healthy": report.orphan_pages.is_empty() && report.broken_links.is_empty(),
+            })),
+            Err(e) => WsFrame::error_response("", &format!("Wiki lint failed: {e}")),
+        }
+    }
+
+    async fn handle_wiki_stats(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if agent_id.is_empty() {
+            return WsFrame::error_response("", "Missing 'agent_id' parameter");
+        }
+        if !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+
+        let wiki_dir = self.home_dir.join("agents").join(agent_id).join("wiki");
+        if !wiki_dir.exists() {
+            return WsFrame::ok_response("", json!({ "exists": false, "total_pages": 0 }));
+        }
+
+        let store = duduclaw_memory::WikiStore::new(wiki_dir);
+        let pages = match store.list_pages() {
+            Ok(p) => p,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to list pages: {e}")),
+        };
+
+        let mut by_dir: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for p in &pages {
+            let dir = std::path::Path::new(&p.path)
+                .parent()
+                .and_then(|d| d.to_str())
+                .unwrap_or("root")
+                .to_string();
+            *by_dir.entry(dir).or_insert(0) += 1;
+        }
+
+        let most_recent = pages.first().map(|p| json!({
+            "title": p.title,
+            "path": p.path,
+            "updated": p.updated.to_rfc3339(),
+        }));
+
+        WsFrame::ok_response("", json!({
+            "exists": true,
+            "total_pages": pages.len(),
+            "by_directory": by_dir,
+            "most_recent": most_recent,
+        }))
     }
 
     // ── Skills ──────────────────────────────────────────────
@@ -2255,6 +2551,64 @@ impl MethodHandler {
         }))
     }
 
+    async fn handle_evolution_history(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).min(100) as usize;
+
+        let db_path = self.home_dir.join("evolution.db");
+        if !db_path.exists() {
+            return WsFrame::ok_response("", json!({ "versions": [] }));
+        }
+
+        let vs = VersionStore::new(&db_path);
+
+        // If agent_id is specified, show that agent's history; otherwise show all agents
+        let reg = self.registry.read().await;
+        let agent_ids: Vec<String> = if agent_id.is_empty() {
+            reg.list().iter().map(|a| a.config.agent.name.clone()).collect()
+        } else {
+            vec![agent_id.to_string()]
+        };
+        drop(reg);
+
+        let mut versions = Vec::new();
+        for aid in &agent_ids {
+            for v in vs.get_history(aid, limit) {
+                versions.push(json!({
+                    "version_id": v.version_id,
+                    "agent_id": v.agent_id,
+                    "soul_summary": v.soul_summary,
+                    "soul_hash": v.soul_hash,
+                    "applied_at": v.applied_at.to_rfc3339(),
+                    "observation_end": v.observation_end.to_rfc3339(),
+                    "status": format!("{:?}", v.status),
+                    "pre_metrics": {
+                        "positive_feedback_ratio": v.pre_metrics.positive_feedback_ratio,
+                        "prediction_error": v.pre_metrics.avg_prediction_error,
+                        "user_correction_rate": v.pre_metrics.user_correction_rate,
+                        "contract_violations": v.pre_metrics.contract_violations,
+                    },
+                    "post_metrics": v.post_metrics.as_ref().map(|m| json!({
+                        "positive_feedback_ratio": m.positive_feedback_ratio,
+                        "prediction_error": m.avg_prediction_error,
+                        "user_correction_rate": m.user_correction_rate,
+                        "contract_violations": m.contract_violations,
+                    })),
+                }));
+            }
+        }
+
+        // Sort by applied_at descending
+        versions.sort_by(|a, b| {
+            let ta = a.get("applied_at").and_then(|v| v.as_str()).unwrap_or("");
+            let tb = b.get("applied_at").and_then(|v| v.as_str()).unwrap_or("");
+            tb.cmp(ta)
+        });
+        versions.truncate(limit);
+
+        WsFrame::ok_response("", json!({ "versions": versions }))
+    }
+
     async fn handle_evolution_skills(&self) -> WsFrame {
         let reg = self.registry.read().await;
         let mut all_skills = Vec::new();
@@ -2748,6 +3102,392 @@ impl MethodHandler {
         ]
     }
 
+    // ── Odoo ERP ─────────────────────────────────────────────────
+
+    /// Return the current Odoo connection status.
+    ///
+    /// Reads `[odoo]` from config.toml, attempts to connect if configured,
+    /// and returns connected/edition/version info.
+    async fn handle_odoo_status(&self) -> WsFrame {
+        let config_path = self.home_dir.join("config.toml");
+        let table = self.read_config_table(&config_path).await;
+        let odoo_cfg = duduclaw_odoo::OdooConfig::from_toml(&table);
+
+        if !odoo_cfg.is_configured() {
+            return WsFrame::ok_response("", json!({
+                "connected": false,
+            }));
+        }
+
+        // Decrypt credential
+        let credential = match self.resolve_odoo_credential(&table) {
+            Some(c) if !c.is_empty() => c,
+            _ => return WsFrame::ok_response("", json!({
+                "connected": false,
+                "error": "No credential configured",
+            })),
+        };
+
+        match duduclaw_odoo::OdooConnector::connect(&odoo_cfg, &credential).await {
+            Ok(conn) => {
+                let st = conn.status();
+                WsFrame::ok_response("", json!({
+                    "connected": st.connected,
+                    "edition": st.edition,
+                    "version": st.version,
+                    "uid": st.uid,
+                }))
+            }
+            Err(e) => {
+                warn!("Odoo connection failed: {e}");
+                WsFrame::ok_response("", json!({
+                    "connected": false,
+                    "error": "Connection failed",
+                }))
+            }
+        }
+    }
+
+    /// Return the current Odoo config (without secrets).
+    /// Returns `null` if Odoo is not configured.
+    async fn handle_odoo_config(&self) -> WsFrame {
+        let config_path = self.home_dir.join("config.toml");
+        let table = self.read_config_table(&config_path).await;
+        let cfg = duduclaw_odoo::OdooConfig::from_toml(&table);
+
+        if !cfg.is_configured() {
+            return WsFrame::ok_response("", json!(null));
+        }
+
+        WsFrame::ok_response("", json!({
+            "url": cfg.url,
+            "db": cfg.db,
+            "protocol": cfg.protocol,
+            "auth_method": cfg.auth_method,
+            "username": cfg.username,
+            "poll_enabled": cfg.poll_enabled,
+            "poll_interval_seconds": cfg.poll_interval_seconds,
+            "poll_models": cfg.poll_models,
+            "webhook_enabled": cfg.webhook_enabled,
+            "features_crm": cfg.features_crm,
+            "features_sale": cfg.features_sale,
+            "features_inventory": cfg.features_inventory,
+            "features_accounting": cfg.features_accounting,
+            "features_project": cfg.features_project,
+            "features_hr": cfg.features_hr,
+        }))
+    }
+
+    /// Validate an Odoo model name (e.g. `crm.lead`, `sale.order`).
+    /// Rejects blocked models (security-sensitive Odoo internals).
+    fn is_valid_odoo_model(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() < 100
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+            && !duduclaw_odoo::OdooConnector::is_model_blocked(name)
+    }
+
+    /// Validate that a URL is safe for Odoo connections.
+    /// Requires HTTPS with non-private host, except for strict localhost.
+    fn is_safe_odoo_url(url: &str) -> bool {
+        if url.len() > 512 {
+            return false;
+        }
+        // Allow HTTP only for strict localhost — must be followed by '/' or ':' or end of string
+        for prefix in &["http://127.0.0.1", "http://localhost", "http://[::1]"] {
+            if let Some(rest) = url.strip_prefix(prefix) {
+                if rest.is_empty() || rest.starts_with('/') || rest.starts_with(':') {
+                    return true;
+                }
+            }
+        }
+        if url.starts_with("https://") {
+            // Reject private/reserved IPs to prevent SSRF against cloud metadata, LAN, etc.
+            let host_part = &url["https://".len()..];
+            // Extract host (before first '/' or ':' for port)
+            let host = host_part.split(&['/', ':'][..]).next().unwrap_or("");
+            return !Self::is_private_host(host);
+        }
+        false
+    }
+
+    /// Check if a hostname is a private/reserved IP or a known metadata endpoint.
+    /// Uses `std::net::IpAddr` parsing to correctly handle all IPv4/IPv6 representations,
+    /// including IPv4-mapped IPv6 (`::ffff:10.0.0.1`), compressed forms, etc.
+    fn is_private_host(host: &str) -> bool {
+        // Strip brackets for IPv6 literals (e.g. "[::1]" → "::1")
+        let raw = host.trim_start_matches('[').trim_end_matches(']');
+
+        // Bare IPv6 without brackets (contains ':' but no '[') — reject as ambiguous
+        if !host.starts_with('[') && raw.contains(':') {
+            return true;
+        }
+
+        if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
+            return Self::is_private_ip(ip);
+        }
+
+        // Hostname-based checks
+        let lower = host.to_ascii_lowercase();
+        lower == "localhost" || lower.ends_with(".localhost")
+            || lower == "metadata.google.internal"
+            || lower == "metadata.azure.internal"
+    }
+
+    /// Check if an IP address is private, loopback, link-local, or otherwise reserved.
+    fn is_private_ip(ip: std::net::IpAddr) -> bool {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()           // 127.0.0.0/8
+                    || v4.is_private()      // 10/8, 172.16/12, 192.168/16
+                    || v4.is_link_local()   // 169.254/16
+                    || v4.is_unspecified()  // 0.0.0.0
+                    || v4.is_broadcast()    // 255.255.255.255
+                    || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64 // 100.64/10 (CGNAT)
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()           // ::1
+                    || v6.is_unspecified()  // ::
+                    // IPv4-mapped (::ffff:x.x.x.x) — check the embedded v4
+                    || v6.to_ipv4_mapped().is_some_and(|v4| Self::is_private_ip(std::net::IpAddr::V4(v4)))
+                    // Link-local (fe80::/10)
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+                    // Unique Local Address (fc00::/7)
+                    || (v6.octets()[0] & 0xfe) == 0xfc
+            }
+        }
+    }
+
+    /// Save Odoo configuration to config.toml `[odoo]` section.
+    ///
+    /// Encrypts api_key/password/webhook_secret before storing.
+    /// Refuses to store credentials if encryption is unavailable.
+    /// Uses atomic write (temp + rename).
+    async fn handle_odoo_configure(&self, params: Value) -> WsFrame {
+        // Validate URL
+        let url = match params.get("url").and_then(|v| v.as_str()).map(str::trim) {
+            Some(u) if Self::is_safe_odoo_url(u) => u,
+            Some(_) => return WsFrame::error_response("", "Odoo URL must use HTTPS (http:// only allowed for localhost/127.0.0.1)"),
+            _ => return WsFrame::error_response("", "Missing 'url' parameter"),
+        };
+        // Validate database name
+        let db = match params.get("db").and_then(|v| v.as_str()).map(str::trim) {
+            Some(d) if !d.is_empty() && d.len() < 64
+                && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') => d,
+            Some(_) => return WsFrame::error_response("", "Invalid database name (alphanumeric, _, - only, max 63 chars)"),
+            _ => return WsFrame::error_response("", "Missing 'db' parameter"),
+        };
+
+        // Validate protocol (whitelist)
+        let protocol = match params.get("protocol").and_then(|v| v.as_str()) {
+            Some("xmlrpc") => "xmlrpc",
+            Some("jsonrpc") | None => "jsonrpc",
+            _ => return WsFrame::error_response("", "Invalid protocol: must be 'jsonrpc' or 'xmlrpc'"),
+        };
+
+        // Validate auth_method (whitelist)
+        let auth_method = match params.get("auth_method").and_then(|v| v.as_str()) {
+            Some("password") => "password",
+            Some("api_key") | None => "api_key",
+            _ => return WsFrame::error_response("", "Invalid auth_method: must be 'api_key' or 'password'"),
+        };
+
+        let config_path = self.home_dir.join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+
+        // Build the [odoo] section
+        let mut odoo = toml::map::Map::new();
+        odoo.insert("url".into(), toml::Value::String(url.into()));
+        odoo.insert("db".into(), toml::Value::String(db.into()));
+        odoo.insert("protocol".into(), toml::Value::String(protocol.into()));
+        odoo.insert("auth_method".into(), toml::Value::String(auth_method.into()));
+        let username = params.get("username").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if username.len() > 256 {
+            return WsFrame::error_response("", "Username too long (max 256 chars)");
+        }
+        odoo.insert("username".into(), toml::Value::String(username.into()));
+
+        // Encrypt credentials — refuse to store if encryption is unavailable (CRIT-1)
+        if let Some(api_key) = params.get("api_key").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            match crate::config_crypto::encrypt_value(api_key, &self.home_dir) {
+                Some(enc) => { odoo.insert("api_key_enc".into(), toml::Value::String(enc)); }
+                None => return WsFrame::error_response("", "Encryption unavailable — cannot store API key securely. Ensure keyfile exists."),
+            }
+        } else {
+            // Preserve existing encrypted key if not provided
+            if let Some(existing) = table.get("odoo")
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("api_key_enc"))
+                .and_then(|v| v.as_str())
+            {
+                odoo.insert("api_key_enc".into(), toml::Value::String(existing.into()));
+            }
+        }
+
+        if let Some(password) = params.get("password").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            match crate::config_crypto::encrypt_value(password, &self.home_dir) {
+                Some(enc) => { odoo.insert("password_enc".into(), toml::Value::String(enc)); }
+                None => return WsFrame::error_response("", "Encryption unavailable — cannot store password securely. Ensure keyfile exists."),
+            }
+        } else {
+            // Preserve existing encrypted password if not provided
+            if let Some(existing) = table.get("odoo")
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("password_enc"))
+                .and_then(|v| v.as_str())
+            {
+                odoo.insert("password_enc".into(), toml::Value::String(existing.into()));
+            }
+        }
+
+        // Polling config
+        odoo.insert(
+            "poll_enabled".into(),
+            toml::Value::Boolean(params.get("poll_enabled").and_then(|v| v.as_bool()).unwrap_or(false)),
+        );
+        odoo.insert(
+            "poll_interval_seconds".into(),
+            toml::Value::Integer(
+                params.get("poll_interval_seconds")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(300)
+                    .clamp(60, 86400),
+            ),
+        );
+        if let Some(models) = params.get("poll_models").and_then(|v| v.as_array()) {
+            let arr: Vec<toml::Value> = models
+                .iter()
+                .take(50) // cap at 50 models to prevent oversized config
+                .filter_map(|v| v.as_str()
+                    .filter(|s| Self::is_valid_odoo_model(s))
+                    .map(|s| toml::Value::String(s.into())))
+                .collect();
+            odoo.insert("poll_models".into(), toml::Value::Array(arr));
+        }
+
+        // Webhook config
+        odoo.insert(
+            "webhook_enabled".into(),
+            toml::Value::Boolean(params.get("webhook_enabled").and_then(|v| v.as_bool()).unwrap_or(false)),
+        );
+        if let Some(secret) = params.get("webhook_secret").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            match crate::config_crypto::encrypt_value(secret, &self.home_dir) {
+                Some(enc) => { odoo.insert("webhook_secret_enc".into(), toml::Value::String(enc)); }
+                None => return WsFrame::error_response("", "Encryption unavailable — cannot store webhook secret securely."),
+            }
+        } else {
+            // Preserve existing webhook secret
+            if let Some(existing) = table.get("odoo")
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("webhook_secret_enc"))
+                .and_then(|v| v.as_str())
+            {
+                odoo.insert("webhook_secret_enc".into(), toml::Value::String(existing.into()));
+            }
+        }
+
+        // Feature toggles
+        for feature in &["features_crm", "features_sale", "features_inventory", "features_accounting", "features_project", "features_hr"] {
+            if let Some(v) = params.get(*feature).and_then(|v| v.as_bool()) {
+                odoo.insert((*feature).into(), toml::Value::Boolean(v));
+            }
+        }
+
+        table.insert("odoo".into(), toml::Value::Table(odoo));
+
+        // Atomic write: temp + rename
+        let tmp_path = config_path.with_extension("toml.tmp");
+        if let Err(e) = self.write_config_table(&tmp_path, &table).await {
+            return WsFrame::error_response("", &format!("Failed to write config: {e}"));
+        }
+        if let Err(e) = tokio::fs::rename(&tmp_path, &config_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return WsFrame::error_response("", &format!("Failed to commit config: {e}"));
+        }
+
+        info!("odoo.configure completed");
+        WsFrame::ok_response("", json!({ "success": true }))
+    }
+
+    /// Test the Odoo connection using stored config.
+    async fn handle_odoo_test(&self) -> WsFrame {
+        let config_path = self.home_dir.join("config.toml");
+        let table = self.read_config_table(&config_path).await;
+        let odoo_cfg = duduclaw_odoo::OdooConfig::from_toml(&table);
+
+        if !odoo_cfg.is_configured() {
+            return WsFrame::ok_response("", json!({
+                "success": false,
+                "message": "Odoo not configured — set URL and database first",
+            }));
+        }
+
+        let credential = match self.resolve_odoo_credential(&table) {
+            Some(c) if !c.is_empty() => c,
+            _ => return WsFrame::ok_response("", json!({
+                "success": false,
+                "message": "No API key or password configured",
+            })),
+        };
+
+        match duduclaw_odoo::OdooConnector::connect(&odoo_cfg, &credential).await {
+            Ok(conn) => {
+                let st = conn.status();
+                WsFrame::ok_response("", json!({
+                    "success": true,
+                    "message": format!("Connected — {} {}", st.edition, st.version),
+                }))
+            }
+            Err(e) => {
+                warn!("Odoo test connection failed: {e}");
+                WsFrame::ok_response("", json!({
+                    "success": false,
+                    "message": "Connection failed — check URL, credentials, and network",
+                }))
+            }
+        }
+    }
+
+    /// Resolve the Odoo credential from config.toml (encrypted or plaintext).
+    ///
+    /// Returns `None` if decryption fails — never returns raw ciphertext (CRIT-2).
+    fn resolve_odoo_credential(&self, table: &toml::Table) -> Option<String> {
+        let odoo_section = table.get("odoo")?.as_table()?;
+        let auth_method = odoo_section.get("auth_method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("api_key");
+
+        let (enc_field, plain_field) = if auth_method == "password" {
+            ("password_enc", "password")
+        } else {
+            ("api_key_enc", "api_key")
+        };
+
+        // Try encrypted first
+        if let Some(enc_val) = odoo_section.get(enc_field).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(key) = crate::config_crypto::load_keyfile_public(&self.home_dir) {
+                if let Ok(engine) = duduclaw_security::crypto::CryptoEngine::new(&key) {
+                    if let Ok(decrypted) = engine.decrypt_string(enc_val) {
+                        return Some(decrypted);
+                    }
+                }
+            }
+            // Decryption failed — do NOT return raw ciphertext as credential
+            warn!("Failed to decrypt Odoo credential — keyfile may have changed");
+            return None;
+        }
+
+        // Fallback to plaintext field (legacy / dev environments)
+        let plain = odoo_section.get(plain_field)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        if plain.is_some() {
+            warn!(field = plain_field, "Odoo credential stored in plaintext — re-save config to encrypt");
+        }
+        plain
+    }
+
     /// Mask sensitive values (tokens, secrets, keys) in a TOML table.
     fn mask_sensitive_fields(table: &mut toml::Table) {
         let sensitive_patterns = ["token", "secret", "key", "password"];
@@ -2761,6 +3501,362 @@ impl MethodHandler {
                 toml::Value::Table(t) => Self::mask_sensitive_fields(t),
                 _ => {}
             }
+        }
+    }
+
+    // ── Filtered agent list (respects UserContext) ────────────
+
+    async fn handle_agents_list_filtered(&self, ctx: &UserContext) -> WsFrame {
+        // Re-scan to pick up changes
+        if let Ok(mut reg) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            self.registry.write(),
+        ).await {
+            let _ = reg.scan().await;
+        }
+
+        let reg = self.registry.read().await;
+        let total_spent = self.get_total_spent().await;
+        let visible = ctx.visible_agents();
+
+        let agents: Vec<Value> = reg.list().iter()
+            .filter(|a| {
+                match &visible {
+                    None => true, // Admin sees all
+                    Some(names) => names.contains(&a.config.agent.name),
+                }
+            })
+            .map(|a| {
+                let cfg = &a.config;
+                json!({
+                    "name": cfg.agent.name,
+                    "display_name": cfg.agent.display_name,
+                    "role": format!("{:?}", cfg.agent.role).to_lowercase(),
+                    "status": format!("{:?}", cfg.agent.status).to_lowercase(),
+                    "trigger": cfg.agent.trigger,
+                    "icon": cfg.agent.icon,
+                    "reports_to": cfg.agent.reports_to,
+                    "model": {
+                        "preferred": cfg.model.preferred,
+                        "fallback": cfg.model.fallback,
+                        "account_pool": cfg.model.account_pool,
+                        "api_mode": cfg.model.api_mode,
+                        "local": cfg.model.local.as_ref().map(|l| json!({
+                            "model": l.model,
+                            "backend": l.backend,
+                            "context_length": l.context_length,
+                            "gpu_layers": l.gpu_layers,
+                            "prefer_local": l.prefer_local,
+                            "use_router": l.use_router,
+                        })),
+                    },
+                    "budget": {
+                        "monthly_limit_cents": cfg.budget.monthly_limit_cents,
+                        "spent_cents": total_spent,
+                        "warn_threshold_percent": cfg.budget.warn_threshold_percent,
+                        "hard_stop": cfg.budget.hard_stop,
+                    },
+                    "heartbeat": {
+                        "enabled": cfg.heartbeat.enabled,
+                        "interval_seconds": cfg.heartbeat.interval_seconds,
+                    },
+                    "skills": a.skills.iter().map(|s| &s.name).collect::<Vec<_>>(),
+                    "permissions": {
+                        "can_create_agents": cfg.permissions.can_create_agents,
+                        "can_send_cross_agent": cfg.permissions.can_send_cross_agent,
+                        "can_modify_own_skills": cfg.permissions.can_modify_own_skills,
+                        "can_modify_own_soul": cfg.permissions.can_modify_own_soul,
+                        "can_schedule_tasks": cfg.permissions.can_schedule_tasks,
+                    },
+                })
+            }).collect();
+
+        info!("agents.list: returning {} agents for user {}", agents.len(), ctx.email);
+        WsFrame::ok_response("", json!({ "agents": agents }))
+    }
+
+    // ── User management handlers (admin only) ────────────────
+
+    async fn handle_users_list(&self) -> WsFrame {
+        let db = match self.user_db.read().await.as_ref() {
+            Some(db) => db.clone(),
+            None => return WsFrame::error_response("", "user system not initialized"),
+        };
+        match db.list_users() {
+            Ok(users) => {
+                let mut result: Vec<Value> = Vec::new();
+                for u in &users {
+                    let bindings = db.get_user_agents(&u.id).unwrap_or_default();
+                    result.push(json!({
+                        "id": u.id,
+                        "email": u.email,
+                        "display_name": u.display_name,
+                        "role": u.role,
+                        "status": u.status,
+                        "created_at": u.created_at,
+                        "updated_at": u.updated_at,
+                        "last_login": u.last_login,
+                        "bindings": bindings,
+                    }));
+                }
+                WsFrame::ok_response("", json!({ "users": result }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("failed to list users: {e}")),
+        }
+    }
+
+    async fn handle_users_create(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let db = match self.user_db.read().await.as_ref() {
+            Some(db) => db.clone(),
+            None => return WsFrame::error_response("", "user system not initialized"),
+        };
+
+        let email = params.get("email").and_then(|v| v.as_str()).unwrap_or("");
+        let display_name = params.get("display_name").and_then(|v| v.as_str()).unwrap_or("");
+        let password = params.get("password").and_then(|v| v.as_str()).unwrap_or("");
+        let role_str = params.get("role").and_then(|v| v.as_str()).unwrap_or("employee");
+
+        if email.is_empty() || display_name.is_empty() || password.is_empty() {
+            return WsFrame::error_response("", "email, display_name, and password are required");
+        }
+        // Email format validation (MEDIUM fix)
+        if !email.contains('@') || email.len() > 254 {
+            return WsFrame::error_response("", "invalid email format");
+        }
+        // Display name length limit
+        if display_name.len() > 200 {
+            return WsFrame::error_response("", "display_name too long (max 200 chars)");
+        }
+        if password.len() < 8 {
+            return WsFrame::error_response("", "password must be at least 8 characters");
+        }
+        if password.len() > 1024 {
+            return WsFrame::error_response("", "password too long");
+        }
+
+        let role: UserRole = match role_str.parse() {
+            Ok(r) => r,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+
+        match db.create_user(email, display_name, password, role) {
+            Ok(user) => {
+                let _ = db.log_action(Some(&ctx.user_id), "user.create", Some(&user.id), Some(&format!("email={email}")), None);
+                WsFrame::ok_response("", json!({ "user": user }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("failed to create user: {e}")),
+        }
+    }
+
+    async fn handle_users_update(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let db = match self.user_db.read().await.as_ref() {
+            Some(db) => db.clone(),
+            None => return WsFrame::error_response("", "user system not initialized"),
+        };
+
+        let user_id = match params.get("user_id").and_then(|v| v.as_str()) {
+            Some(id) => id,
+            None => return WsFrame::error_response("", "user_id is required"),
+        };
+
+        let display_name = params.get("display_name").and_then(|v| v.as_str());
+        let role = params.get("role").and_then(|v| v.as_str()).and_then(|r| r.parse::<UserRole>().ok());
+        let password = params.get("password").and_then(|v| v.as_str());
+
+        if let Some(pw) = password {
+            if pw.len() < 8 {
+                return WsFrame::error_response("", "password must be at least 8 characters");
+            }
+            if pw.len() > 1024 {
+                return WsFrame::error_response("", "password too long");
+            }
+        }
+        if let Some(name) = display_name {
+            if name.len() > 200 {
+                return WsFrame::error_response("", "display_name too long (max 200 chars)");
+            }
+        }
+
+        match db.update_user(user_id, display_name, role, password) {
+            Ok(()) => {
+                let _ = db.log_action(Some(&ctx.user_id), "user.update", Some(user_id), None, None);
+                WsFrame::ok_response("", json!({"status": "updated"}))
+            }
+            Err(e) => WsFrame::error_response("", &format!("failed to update user: {e}")),
+        }
+    }
+
+    async fn handle_users_remove(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let db = match self.user_db.read().await.as_ref() {
+            Some(db) => db.clone(),
+            None => return WsFrame::error_response("", "user system not initialized"),
+        };
+
+        let user_id = match params.get("user_id").and_then(|v| v.as_str()) {
+            Some(id) => id,
+            None => return WsFrame::error_response("", "user_id is required"),
+        };
+
+        match db.set_user_status(user_id, duduclaw_auth::UserStatus::Suspended) {
+            Ok(()) => {
+                let _ = db.log_action(Some(&ctx.user_id), "user.suspend", Some(user_id), None, None);
+                WsFrame::ok_response("", json!({"status": "suspended"}))
+            }
+            Err(e) => WsFrame::error_response("", &format!("failed to suspend user: {e}")),
+        }
+    }
+
+    async fn handle_users_bind_agent(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let db = match self.user_db.read().await.as_ref() {
+            Some(db) => db.clone(),
+            None => return WsFrame::error_response("", "user system not initialized"),
+        };
+
+        let user_id = match params.get("user_id").and_then(|v| v.as_str()) {
+            Some(id) => id,
+            None => return WsFrame::error_response("", "user_id is required"),
+        };
+        let agent_name = match params.get("agent_name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => return WsFrame::error_response("", "agent_name is required"),
+        };
+        let access_level_str = params.get("access_level").and_then(|v| v.as_str()).unwrap_or("owner");
+        let access_level: AccessLevel = match access_level_str.parse() {
+            Ok(l) => l,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+
+        // Verify agent exists
+        let reg = self.registry.read().await;
+        if reg.get(agent_name).is_none() {
+            return WsFrame::error_response("", &format!("agent not found: {agent_name}"));
+        }
+        drop(reg);
+
+        match db.bind_agent(user_id, agent_name, access_level) {
+            Ok(()) => {
+                let _ = db.log_action(Some(&ctx.user_id), "user.bind_agent", Some(agent_name),
+                    Some(&format!("user={user_id}, level={access_level}")), None);
+                WsFrame::ok_response("", json!({"status": "bound"}))
+            }
+            Err(e) => WsFrame::error_response("", &format!("failed to bind agent: {e}")),
+        }
+    }
+
+    async fn handle_users_unbind_agent(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let db = match self.user_db.read().await.as_ref() {
+            Some(db) => db.clone(),
+            None => return WsFrame::error_response("", "user system not initialized"),
+        };
+
+        let user_id = match params.get("user_id").and_then(|v| v.as_str()) {
+            Some(id) => id,
+            None => return WsFrame::error_response("", "user_id is required"),
+        };
+        let agent_name = match params.get("agent_name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => return WsFrame::error_response("", "agent_name is required"),
+        };
+
+        match db.unbind_agent(user_id, agent_name) {
+            Ok(()) => {
+                let _ = db.log_action(Some(&ctx.user_id), "user.unbind_agent", Some(agent_name),
+                    Some(&format!("user={user_id}")), None);
+                WsFrame::ok_response("", json!({"status": "unbound"}))
+            }
+            Err(e) => WsFrame::error_response("", &format!("failed to unbind agent: {e}")),
+        }
+    }
+
+    async fn handle_users_offboard(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let db = match self.user_db.read().await.as_ref() {
+            Some(db) => db.clone(),
+            None => return WsFrame::error_response("", "user system not initialized"),
+        };
+
+        let user_id = match params.get("user_id").and_then(|v| v.as_str()) {
+            Some(id) => id,
+            None => return WsFrame::error_response("", "user_id is required"),
+        };
+        let transfer_to = params.get("transfer_to").and_then(|v| v.as_str());
+
+        // Get user's bound agents before offboarding
+        let bindings = db.get_user_agents(user_id).unwrap_or_default();
+
+        // Set user status to offboarded
+        if let Err(e) = db.set_user_status(user_id, duduclaw_auth::UserStatus::Offboarded) {
+            return WsFrame::error_response("", &format!("failed to offboard user: {e}"));
+        }
+
+        // Transfer agent ownership if specified
+        let mut transferred = Vec::new();
+        if let Some(new_owner_id) = transfer_to {
+            for binding in &bindings {
+                // Unbind from old user
+                let _ = db.unbind_agent(user_id, &binding.agent_name);
+                // Bind to new owner
+                let _ = db.bind_agent(new_owner_id, &binding.agent_name, binding.access_level);
+                transferred.push(binding.agent_name.clone());
+            }
+        }
+
+        let _ = db.log_action(Some(&ctx.user_id), "user.offboard", Some(user_id),
+            Some(&format!("transferred_agents={transferred:?}, transfer_to={transfer_to:?}")), None);
+
+        WsFrame::ok_response("", json!({
+            "status": "offboarded",
+            "transferred_agents": transferred,
+        }))
+    }
+
+    async fn handle_users_me(&self, ctx: &UserContext) -> WsFrame {
+        let db = match self.user_db.read().await.as_ref() {
+            Some(db) => db.clone(),
+            None => {
+                // No user DB — return context from JWT
+                return WsFrame::ok_response("", json!({
+                    "user": {
+                        "id": ctx.user_id,
+                        "email": ctx.email,
+                        "role": ctx.role.to_string(),
+                    },
+                    "bindings": [],
+                }));
+            }
+        };
+
+        match db.get_user(&ctx.user_id) {
+            Ok(Some(user)) => {
+                let bindings = db.get_user_agents(&user.id).unwrap_or_default();
+                WsFrame::ok_response("", json!({
+                    "user": user,
+                    "bindings": bindings,
+                }))
+            }
+            _ => WsFrame::ok_response("", json!({
+                "user": {
+                    "id": ctx.user_id,
+                    "email": ctx.email,
+                    "role": ctx.role.to_string(),
+                },
+                "bindings": [],
+            })),
+        }
+    }
+
+    async fn handle_users_audit_log(&self, params: Value) -> WsFrame {
+        let db = match self.user_db.read().await.as_ref() {
+            Some(db) => db.clone(),
+            None => return WsFrame::error_response("", "user system not initialized"),
+        };
+
+        let user_id = params.get("user_id").and_then(|v| v.as_str());
+        let action = params.get("action").and_then(|v| v.as_str());
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).min(1000) as u32;
+
+        match db.query_audit_log(user_id, action, limit) {
+            Ok(entries) => WsFrame::ok_response("", json!({ "entries": entries })),
+            Err(e) => WsFrame::error_response("", &format!("failed to query audit log: {e}")),
         }
     }
 }

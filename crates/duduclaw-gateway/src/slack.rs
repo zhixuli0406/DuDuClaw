@@ -376,7 +376,12 @@ async fn handle_event(
     } else {
         build_reply_with_session(text, ctx, &session_id, user, None).await
     };
-    let reply = to_slack_mrkdwn(&reply);
+    // Mention the sender in group channels so they get notified
+    let reply = if !is_dm {
+        format!("<@{user}> {}", to_slack_mrkdwn(&reply))
+    } else {
+        to_slack_mrkdwn(&reply)
+    };
 
     // Split long messages (Slack limit: 4000 chars)
     let reply_thread = thread_ts.as_deref().or(Some(ts));

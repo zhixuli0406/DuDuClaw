@@ -297,6 +297,12 @@ impl GvuLoop {
             info!(agent = agent_id, generation = attempt, "GVU loop generation {attempt}");
 
             // 1. Generate
+            // Load wiki index if the agent has a wiki directory
+            let wiki_index = {
+                let wiki_index_path = agent_dir.join("wiki").join("_index.md");
+                std::fs::read_to_string(&wiki_index_path).ok()
+            };
+
             let input = GeneratorInput {
                 agent_id: agent_id.to_string(),
                 agent_soul: current_soul.clone(),
@@ -304,6 +310,7 @@ impl GvuLoop {
                 previous_gradients: gradients.clone(),
                 generation: attempt,
                 relevant_mistakes: relevant_mistakes.clone(),
+                wiki_index,
             };
 
             let prompt = self.generator.generate(&input, &mut proposal);
@@ -334,6 +341,25 @@ impl GvuLoop {
                 }
             };
 
+            // Verify wiki proposals (L1b) if present — strip invalid ones
+            let verified_wiki_proposals: Vec<duduclaw_memory::wiki::WikiProposal> =
+                if !output.wiki_proposals.is_empty() {
+                    match verifier::verify_wiki_proposals(&output.wiki_proposals) {
+                        Ok(()) => output.wiki_proposals.clone(),
+                        Err(gradient) => {
+                            warn!(
+                                agent = agent_id,
+                                generation = attempt,
+                                critique = %gradient.critique,
+                                "Wiki proposals stripped due to validation failure"
+                            );
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+
             let result = verifier::verify_all_with_mistakes(
                 &proposal,
                 &current_soul,
@@ -357,9 +383,32 @@ impl GvuLoop {
                     );
                     proposal.status = ProposalStatus::Approved;
 
-                    // 3. Apply
+                    // 3. Apply SOUL.md
                     match self.updater.apply(&proposal, agent_dir, pre_metrics) {
                         Ok(version) => {
+                            // 3b. Apply verified wiki proposals (non-blocking)
+                            if !verified_wiki_proposals.is_empty() {
+                                let wiki_dir = agent_dir.join("wiki");
+                                let wiki_store = duduclaw_memory::WikiStore::new(wiki_dir);
+                                if let Err(e) = wiki_store.ensure_scaffold() {
+                                    warn!(agent = agent_id, "Failed to create wiki scaffold: {e}");
+                                } else {
+                                    match wiki_store.apply_proposals(&verified_wiki_proposals) {
+                                        Ok(count) => {
+                                            info!(
+                                                agent = agent_id,
+                                                applied = count,
+                                                total = verified_wiki_proposals.len(),
+                                                "Wiki proposals applied alongside SOUL.md update"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(agent = agent_id, "Failed to apply wiki proposals: {e}");
+                                        }
+                                    }
+                                }
+                            }
+
                             proposal.status = ProposalStatus::Observing;
                             let elapsed = deadline.elapsed();
 

@@ -245,8 +245,9 @@ function CreateAgentDialog({ open, onClose, onCreated }: { open: boolean; onClos
         </FormField>
         <FormField label={intl.formatMessage({ id: 'orgchart.detail.role' })}>
           <select value={role} onChange={(e) => setRole(e.target.value)} className={selectClass}>
-            <option value="specialist">{intl.formatMessage({ id: 'agents.role.specialist' })}</option>
-            <option value="worker">{intl.formatMessage({ id: 'agents.role.worker' })}</option>
+            {['main', 'specialist', 'worker', 'developer', 'qa', 'planner'].map((r) => (
+              <option key={r} value={r}>{intl.formatMessage({ id: `agents.role.${r}` })}</option>
+            ))}
           </select>
         </FormField>
         <FormField label={intl.formatMessage({ id: 'orgchart.detail.trigger' })} hint={intl.formatMessage({ id: 'agents.create.triggerHint' })}>

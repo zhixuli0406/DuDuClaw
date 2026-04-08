@@ -29,6 +29,21 @@ pub struct SkillGap {
     pub evidence: Vec<String>,
 }
 
+/// Action the diagnostician recommends.
+///
+/// Note: Wiki-based reconstruction is handled by the caller (channel_reply.rs)
+/// when it receives `ReportGap` — the diagnostician doesn't have async wiki access.
+#[derive(Debug, Clone)]
+pub enum DiagnosisAction {
+    /// Activate existing skills.
+    ActivateSkills(Vec<String>),
+    /// Report a knowledge gap — caller should attempt wiki reconstruction first,
+    /// then fall back to `inject_skill_gap` if no wiki pages match.
+    ReportGap(SkillGap),
+    /// No action needed.
+    None,
+}
+
 /// Result of diagnosing a prediction error.
 #[derive(Debug, Clone)]
 pub struct ErrorDiagnosis {
@@ -38,6 +53,8 @@ pub struct ErrorDiagnosis {
     pub suggested_skills: Vec<String>,
     /// If no existing skill matches, a gap is reported.
     pub skill_gap: Option<SkillGap>,
+    /// Recommended action (includes wiki reconstruction option).
+    pub action: DiagnosisAction,
 }
 
 /// Diagnose a prediction error and suggest skills to activate.
@@ -89,10 +106,12 @@ pub fn diagnose(
         }
     }
 
-    // If no skills match, report a gap
-    let skill_gap = if suggested_skills.is_empty() && !topics.is_empty() {
+    // Determine action based on what's available
+    let (skill_gap, action) = if !suggested_skills.is_empty() {
+        (None, DiagnosisAction::ActivateSkills(suggested_skills.clone()))
+    } else if !topics.is_empty() {
         let topic = topics.first().cloned().unwrap_or_default();
-        Some(SkillGap {
+        let gap = SkillGap {
             suggested_name: format!("{}_expertise", topic.chars().take(20).collect::<String>()),
             suggested_description: format!(
                 "Agent needs better handling of '{}' related conversations",
@@ -103,9 +122,13 @@ pub fn diagnose(
                 error.composite_error,
                 topics.join(", ")
             )],
-        })
+        };
+        // Note: wiki search is done by the caller (channel_reply.rs) since
+        // it requires async WikiStore access. We report the gap and the caller
+        // decides whether to attempt reconstruction.
+        (Some(gap.clone()), DiagnosisAction::ReportGap(gap))
     } else {
-        None
+        (None, DiagnosisAction::None)
     };
 
     Some(ErrorDiagnosis {
@@ -113,5 +136,6 @@ pub fn diagnose(
         related_topics: topics.clone(),
         suggested_skills,
         skill_gap,
+        action,
     })
 }

@@ -2,6 +2,8 @@ import { NavLink } from 'react-router';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { useSystemStore } from '@/stores/system-store';
+import { useAuthStore, type UserRole } from '@/stores/auth-store';
+import { hasMinRole } from '@/lib/roles';
 import {
   LayoutDashboard,
   Bot,
@@ -10,36 +12,56 @@ import {
   Radio,
   Wallet,
   Brain,
+  BookOpen,
   Shield,
   Settings,
   ScrollText,
-  Sparkles,
   KeyRound,
   MessageCircle,
   BarChart3,
   CreditCard,
+  Building2,
+  Users,
+  LogOut,
 } from 'lucide-react';
 
-const navItems = [
+type NavItem = {
+  to: string;
+  icon: typeof LayoutDashboard;
+  label: string;
+  /** Minimum role required to see this item. Omit for all roles. */
+  minRole?: UserRole;
+};
+
+const navItems: NavItem[] = [
   { to: '/', icon: LayoutDashboard, label: 'nav.dashboard' },
   { to: '/webchat', icon: MessageCircle, label: 'nav.webchat' },
   { to: '/agents', icon: Bot, label: 'nav.agents' },
-  { to: '/org', icon: Network, label: 'nav.org' },
+  { to: '/org', icon: Network, label: 'nav.org', minRole: 'manager' },
   { to: '/skills', icon: Puzzle, label: 'nav.skills' },
-  { to: '/channels', icon: Radio, label: 'nav.channels' },
-  { to: '/accounts', icon: Wallet, label: 'nav.accounts' },
+  { to: '/channels', icon: Radio, label: 'nav.channels', minRole: 'admin' },
+  { to: '/accounts', icon: Wallet, label: 'nav.accounts', minRole: 'admin' },
   { to: '/memory', icon: Brain, label: 'nav.memory' },
-  { to: '/security', icon: Shield, label: 'nav.security' },
-  { to: '/reports', icon: BarChart3, label: 'nav.reports' },
-  { to: '/billing', icon: CreditCard, label: 'nav.billing' },
-  { to: '/settings', icon: Settings, label: 'nav.settings' },
-  { to: '/license', icon: KeyRound, label: 'nav.license' },
-  { to: '/logs', icon: ScrollText, label: 'nav.logs' },
-] as const;
+  { to: '/wiki', icon: BookOpen, label: 'nav.wiki' },
+  { to: '/security', icon: Shield, label: 'nav.security', minRole: 'admin' },
+  { to: '/reports', icon: BarChart3, label: 'nav.reports', minRole: 'manager' },
+  { to: '/billing', icon: CreditCard, label: 'nav.billing', minRole: 'manager' },
+  { to: '/odoo', icon: Building2, label: 'nav.odoo', minRole: 'admin' },
+  { to: '/users', icon: Users, label: 'nav.users', minRole: 'admin' },
+  { to: '/settings', icon: Settings, label: 'nav.settings', minRole: 'admin' },
+  { to: '/license', icon: KeyRound, label: 'nav.license', minRole: 'admin' },
+  { to: '/logs', icon: ScrollText, label: 'nav.logs', minRole: 'manager' },
+];
 
 export function Sidebar() {
   const intl = useIntl();
   const status = useSystemStore((s) => s.status);
+  const user = useAuthStore((s) => s.user);
+  const logout = useAuthStore((s) => s.logout);
+
+  const filteredNavItems = navItems.filter((item) =>
+    hasMinRole(user?.role, item.minRole)
+  );
 
   return (
     <aside className="flex w-60 flex-col border-r border-stone-200 bg-stone-50/80 backdrop-blur-xl dark:border-stone-800 dark:bg-stone-900/80">
@@ -59,8 +81,8 @@ export function Sidebar() {
       </div>
 
       {/* Navigation */}
-      <nav className="flex-1 space-y-1 px-3 py-2">
-        {navItems.map(({ to, icon: Icon, label }) => (
+      <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-2">
+        {filteredNavItems.map(({ to, icon: Icon, label }) => (
           <NavLink
             key={to}
             to={to}
@@ -80,26 +102,27 @@ export function Sidebar() {
         ))}
       </nav>
 
-      {/* Wizard shortcut */}
-      <div className="px-3 pb-2">
-        <NavLink
-          to="/wizard"
-          className={({ isActive }) =>
-            cn(
-              'flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors',
-              isActive
-                ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
-                : 'text-stone-600 hover:bg-stone-100 hover:text-stone-900 dark:text-stone-400 dark:hover:bg-stone-800 dark:hover:text-stone-200'
-            )
-          }
-        >
-          <Sparkles className="h-[1.125rem] w-[1.125rem] shrink-0" />
-          <span>{intl.formatMessage({ id: 'nav.wizard' })}</span>
-        </NavLink>
-      </div>
-
-      {/* Footer */}
-      <div className="border-t border-stone-200 px-5 py-3 dark:border-stone-800">
+      {/* User Info + Footer */}
+      <div className="border-t border-stone-200 px-4 py-3 dark:border-stone-800">
+        {user && (
+          <div className="mb-2 flex items-center justify-between">
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-medium text-stone-700 dark:text-stone-300">
+                {user.display_name}
+              </p>
+              <p className="truncate text-xs text-stone-400 dark:text-stone-500">
+                {user.role}
+              </p>
+            </div>
+            <button
+              onClick={logout}
+              className="rounded p-1.5 text-stone-400 transition-colors hover:bg-stone-100 hover:text-stone-600 dark:hover:bg-stone-800 dark:hover:text-stone-300"
+              title={intl.formatMessage({ id: 'auth.logout' })}
+            >
+              <LogOut className="h-4 w-4" />
+            </button>
+          </div>
+        )}
         <p className="text-xs text-stone-400 dark:text-stone-500">{status?.version ?? 'v0.12.0'}</p>
       </div>
     </aside>

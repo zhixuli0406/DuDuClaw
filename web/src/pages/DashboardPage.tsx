@@ -1,11 +1,30 @@
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router';
 import { useIntl } from 'react-intl';
+import { Link } from 'react-router';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useSystemStore } from '@/stores/system-store';
 import { useConnectionStore } from '@/stores/connection-store';
-import { api, type BudgetSummary, type DoctorCheck, type LicenseInfo } from '@/lib/api';
-import { Bot, Radio, Wallet, HeartPulse, Shield, ArrowUpRight } from 'lucide-react';
+import {
+  api,
+  type BudgetSummary,
+  type DoctorCheck,
+  type LicenseInfo,
+  type WikiPageMeta,
+  type WikiStats,
+} from '@/lib/api';
+import { WikiGraph } from '@/components/WikiGraph';
+import {
+  Bot,
+  Radio,
+  Wallet,
+  HeartPulse,
+  Shield,
+  ArrowUpRight,
+  BookOpen,
+  FileText,
+  Clock,
+  ExternalLink,
+} from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 function StatCard({
@@ -43,33 +62,57 @@ function StatCard({
 
 export function DashboardPage() {
   const intl = useIntl();
-  const navigate = useNavigate();
-  const { agents, loading, fetchAgents } = useAgentsStore();
+  const { agents, fetchAgents } = useAgentsStore();
   const { status, fetchStatus } = useSystemStore();
   const connectionState = useConnectionStore((s) => s.state);
   const [budget, setBudget] = useState<BudgetSummary | null>(null);
   const [doctor, setDoctor] = useState<{ checks: DoctorCheck[]; summary: { pass: number; warn: number; fail: number } } | null>(null);
   const [license, setLicense] = useState<LicenseInfo | null>(null);
-  const [initialLoadDone, setInitialLoadDone] = useState(false);
+  const [wikiPages, setWikiPages] = useState<ReadonlyArray<WikiPageMeta>>([]);
+  const [wikiStats, setWikiStats] = useState<WikiStats | null>(null);
+  const [wikiContents, setWikiContents] = useState<Record<string, string>>({});
 
-  // Redirect to wizard on first visit when no agents exist
-  useEffect(() => {
-    if (!initialLoadDone || loading) return;
-    if (agents.length === 0) {
-      navigate('/wizard', { replace: true });
-    }
-  }, [agents.length, loading, initialLoadDone, navigate]);
-
-  // Fetch data only after WebSocket is authenticated.
+// Fetch data only after WebSocket is authenticated.
   // Re-fetches on reconnect (connectionState goes back to 'authenticated').
   useEffect(() => {
     if (connectionState !== 'authenticated') return;
 
-    fetchAgents().then(() => setInitialLoadDone(true));
+    fetchAgents();
     fetchStatus();
     api.accounts.budgetSummary().then(setBudget).catch(() => {});
     api.system.doctor().then(setDoctor).catch(() => {});
     api.license.status().then(setLicense).catch(() => {});
+
+    // Fetch wiki data for the default (first) agent
+    api.agents.list().then(async (res) => {
+      const agentList = res?.agents ?? [];
+      if (agentList.length === 0) return;
+      const mainAgent = agentList[0].name;
+
+      const [pagesRes, statsRes] = await Promise.all([
+        api.wiki.pages(mainAgent).catch(() => null),
+        api.wiki.stats(mainAgent).catch(() => null),
+      ]);
+
+      if (pagesRes?.pages) setWikiPages(pagesRes.pages);
+      if (statsRes) setWikiStats(statsRes);
+
+      // Fetch contents for graph (batched, max 20 pages)
+      if (pagesRes?.pages && pagesRes.pages.length > 0) {
+        const contents: Record<string, string> = {};
+        const pagesToFetch = pagesRes.pages.slice(0, 20);
+        for (let i = 0; i < pagesToFetch.length; i += 5) {
+          const batch = pagesToFetch.slice(i, i + 5);
+          await Promise.all(batch.map(async (p) => {
+            try {
+              const r = await api.wiki.read(mainAgent, p.path);
+              contents[p.path] = r?.content ?? '';
+            } catch { /* skip */ }
+          }));
+        }
+        setWikiContents(contents);
+      }
+    }).catch(() => {});
 
     // Lightweight budget refresh every 60s
     const interval = setInterval(() => {
@@ -147,13 +190,13 @@ export function DashboardPage() {
               </p>
             </div>
           </div>
-          <button
-            onClick={() => navigate('/settings')}
+          <a
+            href="mailto:info@dudustudio.monster"
             className="inline-flex items-center gap-1 rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-amber-600"
           >
             {intl.formatMessage({ id: 'dashboard.license.upgrade' })}
             <ArrowUpRight className="h-3 w-3" />
-          </button>
+          </a>
         </div>
       )}
 
@@ -176,6 +219,90 @@ export function DashboardPage() {
                 </div>
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {/* Wiki Knowledge Graph + Recent Pages */}
+      {wikiStats?.exists && wikiPages.length > 0 && (
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+          {/* Knowledge Graph */}
+          <div className="lg:col-span-2 rounded-xl border border-stone-200 bg-white dark:border-stone-800 dark:bg-stone-900 overflow-hidden">
+            <div className="flex items-center justify-between border-b border-stone-200 px-5 py-3 dark:border-stone-800">
+              <h3 className="flex items-center gap-2 text-lg font-medium text-stone-900 dark:text-stone-50">
+                <BookOpen className="h-5 w-5 text-amber-500" />
+                {intl.formatMessage({ id: 'dashboard.wiki.graph' })}
+              </h3>
+              <Link
+                to="/wiki"
+                className="flex items-center gap-1 text-xs text-amber-600 hover:text-amber-700 dark:text-amber-400"
+              >
+                {intl.formatMessage({ id: 'dashboard.wiki.viewAll' })}
+                <ExternalLink className="h-3 w-3" />
+              </Link>
+            </div>
+            <WikiGraph
+              pages={wikiPages}
+              pageContents={wikiContents}
+              width={650}
+              height={350}
+            />
+          </div>
+
+          {/* Recent Wiki Pages */}
+          <div className="rounded-xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="flex items-center gap-2 text-lg font-medium text-stone-900 dark:text-stone-50">
+                <FileText className="h-5 w-5 text-amber-500" />
+                {intl.formatMessage({ id: 'dashboard.wiki.recentPages' })}
+              </h3>
+              <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+                {wikiStats?.total_pages ?? 0}
+              </span>
+            </div>
+
+            {/* Stats summary */}
+            {wikiStats?.by_directory && (
+              <div className="mb-4 flex flex-wrap gap-2">
+                {Object.entries(wikiStats.by_directory).map(([dir, count]) => (
+                  <span key={dir} className="inline-flex items-center gap-1 rounded-full bg-stone-100 px-2.5 py-1 text-xs text-stone-600 dark:bg-stone-800 dark:text-stone-400">
+                    {dir}/ <span className="font-medium">{count}</span>
+                  </span>
+                ))}
+              </div>
+            )}
+
+            {/* Recent pages list */}
+            <div className="space-y-2">
+              {wikiPages.slice(0, 8).map((page) => (
+                <Link
+                  key={page.path}
+                  to="/wiki"
+                  className="flex items-center justify-between rounded-lg px-3 py-2 text-sm transition-colors hover:bg-stone-50 dark:hover:bg-stone-800"
+                >
+                  <div className="flex items-center gap-2 min-w-0">
+                    <FileText className="h-3.5 w-3.5 shrink-0 text-stone-400" />
+                    <span className="truncate text-stone-700 dark:text-stone-300">
+                      {page.title}
+                    </span>
+                  </div>
+                  <span className="ml-2 shrink-0 flex items-center gap-1 text-xs text-stone-400">
+                    <Clock className="h-3 w-3" />
+                    {new Date(page.updated).toLocaleDateString('zh-TW', { month: 'short', day: 'numeric' })}
+                  </span>
+                </Link>
+              ))}
+            </div>
+
+            {wikiPages.length > 8 && (
+              <Link
+                to="/wiki"
+                className="mt-3 flex items-center justify-center gap-1 rounded-lg bg-stone-50 py-2 text-xs text-stone-500 transition-colors hover:bg-stone-100 dark:bg-stone-800 dark:text-stone-400 dark:hover:bg-stone-700"
+              >
+                {intl.formatMessage({ id: 'dashboard.wiki.viewAll' })}
+                <ExternalLink className="h-3 w-3" />
+              </Link>
+            )}
           </div>
         </div>
       )}

@@ -4,6 +4,28 @@
 
 ---
 
+## Feature Highlights
+
+Detailed introductions to DuDuClaw's standout features, with metaphors and flow diagrams for developers.
+
+| Document | Description |
+|----------|-------------|
+| [features/README.md](features/README.md) | Feature index + full inventory |
+| [features/01-prediction-driven-evolution.md](features/01-prediction-driven-evolution.md) | Prediction-driven evolution — 90% zero-cost conversations |
+| [features/02-gvu-self-play-loop.md](features/02-gvu-self-play-loop.md) | GVU self-play loop — agent self-improvement pipeline |
+| [features/03-confidence-router.md](features/03-confidence-router.md) | Confidence router & local inference — smart model selection |
+| [features/04-file-based-ipc.md](features/04-file-based-ipc.md) | File-based IPC — zero-dependency agent communication |
+| [features/05-security-defense.md](features/05-security-defense.md) | Three-phase security defense — layered threat filtering |
+| [features/06-soul-versioning.md](features/06-soul-versioning.md) | SOUL.md versioning — atomic updates with auto-rollback |
+| [features/07-account-rotation.md](features/07-account-rotation.md) | Multi-account rotation — intelligent credential scheduling |
+| [features/08-browser-automation.md](features/08-browser-automation.md) | 5-layer browser automation — progressive escalation |
+| [features/09-behavioral-contracts.md](features/09-behavioral-contracts.md) | Behavioral contracts — machine-enforceable agent boundaries |
+| [features/10-cognitive-memory.md](features/10-cognitive-memory.md) | Cognitive memory — human-inspired memory with forgetting |
+| [features/11-token-compression.md](features/11-token-compression.md) | Token compression triad — lossless, lossy, and streaming |
+| [features/12-industry-templates.md](features/12-industry-templates.md) | Industry templates & Odoo ERP bridge |
+
+---
+
 ## Format Specifications
 
 Open standards that define the DuDuClaw agent ecosystem.
@@ -42,20 +64,83 @@ Open standards that define the DuDuClaw agent ecosystem.
 
 ```
 docs/
-├── README.md                    # This index
-├── CLAUDE.md                    # System architecture overview
-├── evolution-engine.md          # Evolution Engine v2 spec
-├── deployment-guide.md          # Production deployment guide
-├── development-guide.md         # Developer setup guide
+├── README.md                          # This index
+├── features/                          # Feature highlight articles
+│   ├── README.md                      #   Feature index
+│   ├── feature-inventory.md           #   Complete feature inventory
+│   ├── 01-prediction-driven-evolution.md
+│   ├── 02-gvu-self-play-loop.md
+│   ├── 03-confidence-router.md
+│   ├── 04-file-based-ipc.md
+│   ├── 05-security-defense.md
+│   ├── 06-soul-versioning.md
+│   ├── 07-account-rotation.md
+│   ├── 08-browser-automation.md
+│   ├── 09-behavioral-contracts.md
+│   ├── 10-cognitive-memory.md
+│   ├── 11-token-compression.md
+│   └── 12-industry-templates.md
+├── spec/                              # Open format specifications
+│   ├── soul-md-spec.md                #   SOUL.md format v1.0
+│   ├── contract-toml-spec.md          #   CONTRACT.toml format v1.0
+│   └── contract-toml-schema.json
 ├── api/
-│   ├── README.md                # WebSocket RPC protocol
-│   └── openapi.yaml             # OpenAPI spec
+│   ├── README.md                      # WebSocket RPC protocol
+│   └── openapi.yaml                   # OpenAPI spec
 ├── guides/
-│   └── custom-mcp-tool.md       # MCP tool development guide
-└── spec/
-    ├── soul-md-spec.md          # SOUL.md format v1.0
-    ├── contract-toml-spec.md    # CONTRACT.toml format v1.0
-    └── contract-toml-schema.json
+│   └── custom-mcp-tool.md             # MCP tool development guide
+│
+├── # Architecture
+├── CLAUDE.md                          # System architecture overview
+├── evolution-engine.md                # Evolution Engine v2 spec
+├── odoo-integration-plan.md           # Odoo ERP bridge design
+├── feasibility-kubernetes.md          # K8s feasibility study
+│
+├── # Guides
+├── deployment-guide.md                # Production deployment
+├── development-guide.md               # Developer setup
+├── account-rotation-guide.md          # Multi-account rotation
+│
+├── # Business
+├── business-plan.md                   # Commercial plan v2.0
+├── TODO-commercialization.md          # Commercialization tasks
+├── content-policy.md                  # Content tiering rules
+├── security-patch-sop.md              # Patch release SOP
+├── implementation-methodology/        # 5-phase SI delivery
+│   ├── 01-discovery.md
+│   ├── 02-poc.md
+│   ├── 03-build.md
+│   ├── 04-pilot.md
+│   ├── 05-handover.md
+│   └── templates/quotation-template.md
+│
+├── # Competitive
+├── duduclaw-vs-openclaw.md            # Feature comparison
+├── gap-analysis-vs-openclaw.md        # Gap tracker
+├── claw-ecosystem-report.md           # Ecosystem survey
+│
+├── # Active TODOs
+├── TODO-roadmap-v0.10-v0.12.md        # Master roadmap (97%)
+├── TODO-browser-automation.md
+├── TODO-evolution-engine-v2.md
+├── TODO-local-inference.md
+├── TODO-model-registry.md
+├── TODO-token-cost-defense.md
+├── TODO-cli-streaming-keepalive.md
+│
+└── archive/                           # Completed work
+    ├── TODO-memory-collaboration.md
+    ├── TODO-security-hooks.md
+    ├── TODO-skill-lifecycle.md
+    ├── TODO-dashboard-settings.md
+    └── reviews/
+        ├── CODE-REVIEW-R1.md
+        ├── REVIEW-memory-collaboration.md
+        ├── code-review-fixes-evolution-v2.md
+        ├── code-review-local-inference.md
+        ├── code-review-model-registry.md
+        ├── code-review-security-hooks.md
+        └── code-review-v0.6.0.md
 ```
 
 > Implementation TODOs, business plans, competitive analysis, and research documents are maintained in the private `commercial/` repository.

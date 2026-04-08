@@ -239,6 +239,7 @@ async fn handle_message(event: &serde_json::Value, state: &FeishuState) {
     }
 
     let chat_id = message.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
+    let msg_id = message.get("message_id").and_then(|v| v.as_str()).unwrap_or("");
     let sender = event
         .get("sender")
         .and_then(|s| s.get("sender_id"))
@@ -266,7 +267,12 @@ async fn handle_message(event: &serde_json::Value, state: &FeishuState) {
 
     let session_id = format!("feishu:{chat_id}");
     let reply = build_reply_with_session(&text, &state.ctx, &session_id, sender, None).await;
-    send_message(state, chat_id, &reply).await;
+    // Reply to the original message so the sender gets a threaded notification
+    if !msg_id.is_empty() {
+        reply_message(state, msg_id, &reply).await;
+    } else {
+        send_message(state, chat_id, &reply).await;
+    }
 }
 
 async fn send_message(state: &FeishuState, chat_id: &str, text: &str) {
@@ -299,6 +305,40 @@ async fn send_message(state: &FeishuState, chat_id: &str, text: &str) {
             error!("Feishu send failed ({status}): {}", &text[..text.len().min(200)]);
         }
         Err(e) => error!("Feishu send error: {e}"),
+        _ => {}
+    }
+}
+
+/// Reply to a specific message (threaded reply in Feishu).
+async fn reply_message(state: &FeishuState, message_id: &str, text: &str) {
+    let token = match state.get_token().await {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Feishu token error: {e}");
+            return;
+        }
+    };
+
+    let content = serde_json::json!({ "text": text }).to_string();
+    let body = serde_json::json!({
+        "msg_type": "text",
+        "content": content,
+    });
+
+    match state
+        .http
+        .post(format!("{FEISHU_API}/im/v1/messages/{message_id}/reply"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if !resp.status().is_success() => {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            error!("Feishu reply failed ({status}): {}", &text[..text.len().min(200)]);
+        }
+        Err(e) => error!("Feishu reply error: {e}"),
         _ => {}
     }
 }

@@ -438,6 +438,13 @@ async fn build_reply_with_session_inner(
         text.to_string()
     };
 
+    // Prepend sender metadata so the agent can identify who is talking
+    let sanitized_text = if user_id != "anonymous" && !user_id.is_empty() {
+        format!("[sender_id: {user_id}]\n{sanitized_text}")
+    } else {
+        sanitized_text
+    };
+
     // Append user message to session using improved CJK-aware token estimate
     let user_tokens = estimate_tokens(&sanitized_text);
     if let Err(e) = session_mgr
@@ -853,6 +860,24 @@ async fn build_reply_with_session_inner(
                         }
                     }
                 }
+            });
+        }
+
+        // ── Wiki ingest (async, non-blocking) ────────────────────
+        {
+            let user_text_for_wiki = sanitized_text.clone();
+            let reply_for_wiki = reply.clone();
+            let agent_id_for_wiki = agent_id.clone();
+            let session_for_wiki = session_id.to_string();
+            let home_for_wiki = ctx.home_dir.clone();
+            tokio::spawn(async move {
+                crate::wiki_ingest::run_ingest(
+                    &user_text_for_wiki,
+                    &reply_for_wiki,
+                    &agent_id_for_wiki,
+                    &session_for_wiki,
+                    &home_for_wiki,
+                ).await;
             });
         }
 
