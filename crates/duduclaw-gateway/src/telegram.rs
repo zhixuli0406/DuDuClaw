@@ -87,9 +87,17 @@ struct TgEntity {
 }
 
 #[derive(Debug, Deserialize)]
+struct TgCallbackQuery {
+    id: String,
+    data: Option<String>,
+    message: Option<TgMessage>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TgUpdate {
     update_id: i64,
     message: Option<TgMessage>,
+    callback_query: Option<TgCallbackQuery>,
 }
 
 #[derive(Debug, Serialize)]

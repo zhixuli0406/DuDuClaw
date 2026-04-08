@@ -328,6 +328,39 @@ pub fn split_text(text: &str, max_len: usize) -> Vec<String> {
     chunks
 }
 
+// ── Conversation buttons ──────────────────────────────────────
+
+/// Discord action row with conversation control buttons.
+pub fn discord_conversation_buttons(session_id: &str) -> Value {
+    json!({
+        "type": 1,
+        "components": [
+            {
+                "type": 2,
+                "style": 2,
+                "label": "🔄 New Session",
+                "custom_id": format!("duduclaw:new_session:{session_id}")
+            },
+            {
+                "type": 2,
+                "style": 2,
+                "label": "🎤 Voice Toggle",
+                "custom_id": "duduclaw:voice_toggle"
+            }
+        ]
+    })
+}
+
+/// Telegram inline keyboard with conversation control buttons.
+pub fn telegram_conversation_buttons() -> Value {
+    json!({
+        "inline_keyboard": [[
+            { "text": "🔄 New Session", "callback_data": "duduclaw:new_session" },
+            { "text": "🎤 Voice Toggle", "callback_data": "duduclaw:voice_toggle" }
+        ]]
+    })
+}
+
 // ── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
