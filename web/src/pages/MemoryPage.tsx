@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
-import { api, type MemoryEntry, type SkillInfo, type EvolutionVersion } from '@/lib/api';
+import { api, type MemoryEntry, type SkillInfo } from '@/lib/api';
 import {
   Brain,
   Search,
@@ -14,8 +14,6 @@ import {
   CheckCircle,
   XCircle,
   Eye,
-  TrendingUp,
-  TrendingDown,
 } from 'lucide-react';
 
 type TabId = 'memories' | 'skills' | 'evolution';
