@@ -593,23 +593,6 @@ export const api = {
     auditLog: (limit = 50) =>
       client.call('security.audit_log', { limit }) as Promise<{ events: AuditEvent[] }>,
   },
-  evolution: {
-    status: () =>
-      client.call('evolution.status') as Promise<{
-        enabled: boolean;
-        mode: string;
-        agents: Array<{
-          agent_id: string;
-          gvu_enabled: boolean;
-          cognitive_memory: boolean;
-          skill_auto_activate: boolean;
-          skill_security_scan: boolean;
-          max_silence_hours: number;
-          max_gvu_generations: number;
-          observation_period_hours: number;
-        }>;
-      }>,
-  },
   skillMarket: {
     search: (query: string) =>
       client.call('skills.search', { query }) as Promise<{ skills: SkillIndexEntry[] }>,
