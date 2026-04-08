@@ -516,6 +516,19 @@ export const api = {
         agent_id: agentId,
         skill_name: skillName,
       }) as Promise<{ content: string }>,
+    vet: (url: string) =>
+      client.call('skills.vet', { url }) as Promise<{
+        skill_name: string;
+        content: string;
+        vet_result: { passed: boolean; findings: Array<{ severity: string; category: string; description: string }>; score: number };
+        passed: boolean;
+      }>,
+    install: (url: string, scope: string, content: string) =>
+      client.call('skills.install', { url, scope, content }) as Promise<{
+        success: boolean;
+        skill_name: string;
+        scope: string;
+      }>,
   },
   evolution: {
     status: () =>

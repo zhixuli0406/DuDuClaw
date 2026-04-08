@@ -1,7 +1,34 @@
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type SkillIndexEntry } from '@/lib/api';
-import { Search, Tag, User, ExternalLink } from 'lucide-react';
+import { useAgentsStore } from '@/stores/agents-store';
+import { Dialog } from '@/components/shared/Dialog';
+import {
+  Search,
+  Tag,
+  User,
+  ExternalLink,
+  Download,
+  Shield,
+  ShieldCheck,
+  ShieldAlert,
+  AlertTriangle,
+  CheckCircle,
+  Loader2,
+} from 'lucide-react';
+
+interface VetResult {
+  passed: boolean;
+  findings: Array<{ severity: string; category: string; description: string }>;
+  score: number;
+}
+
+interface VetResponse {
+  skill_name: string;
+  content: string;
+  vet_result: VetResult;
+  passed: boolean;
+}
 
 export function SkillMarketPage() {
   const intl = useIntl();
@@ -9,6 +36,7 @@ export function SkillMarketPage() {
   const [results, setResults] = useState<SkillIndexEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
+  const [installSkill, setInstallSkill] = useState<SkillIndexEntry | null>(null);
 
   const handleSearchQuery = async (q: string) => {
     if (!q.trim()) return;
@@ -79,7 +107,11 @@ export function SkillMarketPage() {
       {!loading && results.length > 0 && (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {results.map((skill) => (
-            <SkillCard key={skill.name} skill={skill} />
+            <SkillCard
+              key={skill.name}
+              skill={skill}
+              onInstall={() => setInstallSkill(skill)}
+            />
           ))}
         </div>
       )}
@@ -109,11 +141,25 @@ export function SkillMarketPage() {
           </div>
         </div>
       )}
+
+      {/* Install dialog */}
+      {installSkill && (
+        <InstallDialog
+          skill={installSkill}
+          onClose={() => setInstallSkill(null)}
+        />
+      )}
     </div>
   );
 }
 
-function SkillCard({ skill }: { skill: SkillIndexEntry }) {
+function SkillCard({
+  skill,
+  onInstall,
+}: {
+  skill: SkillIndexEntry;
+  onInstall: () => void;
+}) {
   const intl = useIntl();
   return (
     <div className="rounded-xl border border-stone-200 bg-white p-5 transition-shadow hover:shadow-md dark:border-stone-800 dark:bg-stone-900">
@@ -157,18 +203,288 @@ function SkillCard({ skill }: { skill: SkillIndexEntry }) {
             {skill.author}
           </span>
         )}
-        {skill.url && /^https?:\/\//i.test(skill.url) && (
-          <a
-            href={skill.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 rounded-md bg-amber-100 px-2.5 py-1.5 text-xs font-medium text-amber-700 transition-colors hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50"
+        <div className="flex items-center gap-2">
+          {skill.url && /^https?:\/\//i.test(skill.url) && (
+            <a
+              href={skill.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 rounded-md bg-amber-100 px-2.5 py-1.5 text-xs font-medium text-amber-700 transition-colors hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50"
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+              GitHub
+            </a>
+          )}
+          <button
+            onClick={onInstall}
+            className="inline-flex items-center gap-1 rounded-md bg-emerald-100 px-2.5 py-1.5 text-xs font-medium text-emerald-700 transition-colors hover:bg-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-400 dark:hover:bg-emerald-900/50"
           >
-            <ExternalLink className="h-3.5 w-3.5" />
-            GitHub
-          </a>
-        )}
+            <Download className="h-3.5 w-3.5" />
+            {intl.formatMessage({ id: 'skills.market.install' })}
+          </button>
+        </div>
       </div>
+    </div>
+  );
+}
+
+const SEVERITY_COLORS: Record<string, string> = {
+  critical: 'text-rose-500',
+  high: 'text-orange-500',
+  medium: 'text-amber-500',
+  low: 'text-stone-400',
+};
+
+const SEVERITY_BG: Record<string, string> = {
+  critical: 'bg-rose-50 border-rose-200 dark:bg-rose-900/20 dark:border-rose-800',
+  high: 'bg-orange-50 border-orange-200 dark:bg-orange-900/20 dark:border-orange-800',
+  medium: 'bg-amber-50 border-amber-200 dark:bg-amber-900/20 dark:border-amber-800',
+  low: 'bg-stone-50 border-stone-200 dark:bg-stone-800/50 dark:border-stone-700',
+};
+
+function InstallDialog({
+  skill,
+  onClose,
+}: {
+  skill: SkillIndexEntry;
+  onClose: () => void;
+}) {
+  const intl = useIntl();
+  const { agents, fetchAgents } = useAgentsStore();
+  const [scope, setScope] = useState('global');
+  const [scanning, setScanning] = useState(false);
+  const [scanResult, setScanResult] = useState<VetResponse | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const [installed, setInstalled] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetchAgents();
+  }, [fetchAgents]);
+
+  const handleScan = useCallback(async () => {
+    if (!skill.url) return;
+    setScanning(true);
+    setError(null);
+    setScanResult(null);
+    try {
+      const result = await api.skills.vet(skill.url);
+      setScanResult(result);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setScanning(false);
+    }
+  }, [skill.url]);
+
+  const handleInstall = useCallback(async () => {
+    if (!scanResult?.passed || !skill.url) return;
+    setInstalling(true);
+    setError(null);
+    try {
+      await api.skills.install(skill.url, scope, scanResult.content);
+      setInstalled(true);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setInstalling(false);
+    }
+  }, [scanResult, skill.url, scope]);
+
+  const scanPassed = scanResult?.passed === true;
+  const scanFailed = scanResult !== null && !scanResult.passed;
+
+  return (
+    <Dialog
+      open
+      onClose={onClose}
+      title={intl.formatMessage({ id: 'skills.install.title' })}
+      className="max-w-xl"
+    >
+      <div className="space-y-5">
+        {/* Skill info */}
+        <div>
+          <h4 className="font-semibold text-stone-900 dark:text-stone-50">{skill.name}</h4>
+          <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
+            {skill.description || intl.formatMessage({ id: 'common.noData' })}
+          </p>
+        </div>
+
+        {/* Scope selector */}
+        <div className="space-y-1.5">
+          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+            {intl.formatMessage({ id: 'skills.install.scope' })}
+          </label>
+          <select
+            value={scope}
+            onChange={(e) => setScope(e.target.value)}
+            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/20 dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50 dark:focus:border-amber-400"
+          >
+            <option value="global">
+              {intl.formatMessage({ id: 'skills.install.scopeGlobal' })}
+            </option>
+            {agents.map((agent) => (
+              <option key={agent.name} value={agent.name}>
+                {intl.formatMessage(
+                  { id: 'skills.install.scopeAgent' },
+                  { agent: agent.display_name || agent.name },
+                )}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {/* Security scan button */}
+        <div>
+          <button
+            onClick={handleScan}
+            disabled={scanning || !skill.url}
+            className="inline-flex items-center gap-2 rounded-lg border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-50 disabled:opacity-50 dark:border-stone-600 dark:bg-stone-800 dark:text-stone-300 dark:hover:bg-stone-700"
+          >
+            {scanning ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {intl.formatMessage({ id: 'skills.install.scanning' })}
+              </>
+            ) : (
+              <>
+                <Shield className="h-4 w-4" />
+                {intl.formatMessage({ id: 'skills.install.scan' })}
+              </>
+            )}
+          </button>
+        </div>
+
+        {/* Scan results */}
+        {scanPassed && scanResult && (
+          <div className="space-y-3">
+            <div className="flex items-center gap-2 text-emerald-600 dark:text-emerald-400">
+              <ShieldCheck className="h-5 w-5" />
+              <span className="text-sm font-medium">
+                {intl.formatMessage({ id: 'skills.install.scanPassed' })}
+              </span>
+              <span className="ml-auto text-sm text-stone-500 dark:text-stone-400">
+                {intl.formatMessage(
+                  { id: 'skills.install.score' },
+                  { score: scanResult.vet_result.score },
+                )}
+              </span>
+            </div>
+            {scanResult.vet_result.findings.length > 0 ? (
+              <FindingsList findings={scanResult.vet_result.findings} />
+            ) : (
+              <p className="text-sm text-stone-400 dark:text-stone-500">
+                {intl.formatMessage({ id: 'skills.install.noFindings' })}
+              </p>
+            )}
+          </div>
+        )}
+
+        {scanFailed && scanResult && (
+          <div className="space-y-3">
+            <div className="flex items-center gap-2 text-rose-600 dark:text-rose-400">
+              <ShieldAlert className="h-5 w-5" />
+              <span className="text-sm font-medium">
+                {intl.formatMessage({ id: 'skills.install.scanFailed' })}
+              </span>
+              <span className="ml-auto text-sm text-stone-500 dark:text-stone-400">
+                {intl.formatMessage(
+                  { id: 'skills.install.score' },
+                  { score: scanResult.vet_result.score },
+                )}
+              </span>
+            </div>
+            {scanResult.vet_result.findings.length > 0 && (
+              <FindingsList findings={scanResult.vet_result.findings} />
+            )}
+          </div>
+        )}
+
+        {/* Error */}
+        {error && (
+          <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-400">
+            {error}
+          </div>
+        )}
+
+        {/* Success message */}
+        {installed && scanResult && (
+          <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700 dark:border-emerald-800 dark:bg-emerald-900/20 dark:text-emerald-400">
+            <CheckCircle className="h-4 w-4 flex-shrink-0" />
+            {intl.formatMessage(
+              { id: 'skills.install.success' },
+              { name: scanResult.skill_name || skill.name },
+            )}
+          </div>
+        )}
+
+        {/* Action buttons */}
+        <div className="flex items-center justify-end gap-3 border-t border-stone-200 pt-4 dark:border-stone-700">
+          <button
+            onClick={onClose}
+            className="inline-flex items-center justify-center gap-2 rounded-lg border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-50 dark:border-stone-600 dark:bg-stone-800 dark:text-stone-300 dark:hover:bg-stone-700"
+          >
+            {intl.formatMessage({ id: 'common.cancel' })}
+          </button>
+          {!installed && (
+            <button
+              onClick={handleInstall}
+              disabled={!scanPassed || installing}
+              title={!scanPassed ? intl.formatMessage({ id: 'skills.install.requireScan' }) : undefined}
+              className="inline-flex items-center justify-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
+            >
+              {installing ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  {intl.formatMessage({ id: 'skills.install.installing' })}
+                </>
+              ) : (
+                <>
+                  <Download className="h-4 w-4" />
+                  {intl.formatMessage({ id: 'skills.install.installBtn' })}
+                </>
+              )}
+            </button>
+          )}
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+function FindingsList({
+  findings,
+}: {
+  findings: ReadonlyArray<{ severity: string; category: string; description: string }>;
+}) {
+  const intl = useIntl();
+
+  return (
+    <div className="space-y-2">
+      <p className="text-xs font-medium text-stone-500 dark:text-stone-400">
+        {intl.formatMessage({ id: 'skills.install.findings' })}
+      </p>
+      <ul className="space-y-1.5">
+        {findings.map((f, i) => {
+          const severityKey = f.severity.toLowerCase();
+          return (
+            <li
+              key={i}
+              className={`flex items-start gap-2 rounded-lg border p-2.5 text-sm ${SEVERITY_BG[severityKey] ?? SEVERITY_BG.low}`}
+            >
+              <AlertTriangle className={`mt-0.5 h-3.5 w-3.5 flex-shrink-0 ${SEVERITY_COLORS[severityKey] ?? SEVERITY_COLORS.low}`} />
+              <div className="min-w-0">
+                <span className={`text-xs font-semibold uppercase ${SEVERITY_COLORS[severityKey] ?? SEVERITY_COLORS.low}`}>
+                  {intl.formatMessage({ id: `skills.install.severity.${severityKey}` })}
+                </span>
+                <span className="mx-1.5 text-stone-300 dark:text-stone-600">|</span>
+                <span className="text-xs text-stone-500 dark:text-stone-400">{f.category}</span>
+                <p className="mt-0.5 text-stone-700 dark:text-stone-300">{f.description}</p>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
     </div>
   );
 }
