@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
+import { useSearchParams } from 'react-router';
 import { cn } from '@/lib/utils';
 import { useSystemStore } from '@/stores/system-store';
 import { api } from '@/lib/api';
@@ -26,7 +27,9 @@ type TabId = 'general' | 'container' | 'heartbeat' | 'cron' | 'voice' | 'proacti
 
 export function SettingsPage() {
   const intl = useIntl();
-  const [activeTab, setActiveTab] = useState<TabId>('general');
+  const [searchParams] = useSearchParams();
+  const initialTab = (searchParams.get('tab') as TabId) || 'general';
+  const [activeTab, setActiveTab] = useState<TabId>(initialTab);
 
   const tabs: ReadonlyArray<{ id: TabId; label: string; icon: React.ComponentType<{ className?: string }> }> = [
     { id: 'general', label: intl.formatMessage({ id: 'settings.general' }), icon: Settings },
