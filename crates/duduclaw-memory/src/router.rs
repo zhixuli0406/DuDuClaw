@@ -42,6 +42,12 @@ pub fn classify(content: &str, source: &str) -> Classification {
         // Security events — high importance episodic
         "security_event" => (MemoryLayer::Episodic, 9.0),
 
+        // Wiki candidates — episodic entries pending batch ingest into wiki
+        "wiki_candidate" => (MemoryLayer::Episodic, 4.0),
+
+        // Wiki lint results
+        "wiki_lint_report" => (MemoryLayer::Semantic, 5.0),
+
         // Default: episodic
         _ => (MemoryLayer::Episodic, 5.0),
     };

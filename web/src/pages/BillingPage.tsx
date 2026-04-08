@@ -10,11 +10,9 @@ import {
   Bot,
   Radio,
   Cpu,
-  Check,
   Receipt,
+  Mail,
 } from 'lucide-react';
-
-const PLAN_TIERS = ['community', 'pro', 'enterprise'] as const;
 
 const PLAN_COLORS: Record<string, string> = {
   community: 'border-stone-200 dark:border-stone-700',
@@ -26,12 +24,6 @@ const PLAN_BADGE: Record<string, string> = {
   community: 'bg-stone-100 text-stone-700 dark:bg-stone-800 dark:text-stone-300',
   pro: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
   enterprise: 'bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-400',
-};
-
-const PLAN_PRICES: Record<string, string> = {
-  community: 'NT$0',
-  pro: 'NT$48,000',
-  enterprise: 'NT$150,000',
 };
 
 const STATUS_COLORS: Record<string, string> = {
@@ -276,64 +268,24 @@ export function BillingPage() {
         </button>
       </div>
 
-      {/* Plan Comparison */}
+      {/* Upgrade Contact */}
       <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
-        <h3 className="mb-5 text-lg font-medium text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'billing.plans' })}
-        </h3>
-        <div className="grid gap-4 sm:grid-cols-3">
-          {PLAN_TIERS.map((tier) => {
-            const isCurrent = tier === currentPlan;
-            return (
-              <div
-                key={tier}
-                className={cn(
-                  'relative rounded-xl border-2 p-5 transition-shadow',
-                  isCurrent
-                    ? cn(PLAN_COLORS[tier], 'bg-stone-50 shadow-md dark:bg-stone-800/50')
-                    : 'border-stone-200 bg-white dark:border-stone-700 dark:bg-stone-900',
-                )}
-              >
-                {isCurrent && (
-                  <span className="absolute -top-3 right-4 inline-flex items-center gap-1 rounded-full bg-amber-500 px-2.5 py-0.5 text-xs font-medium text-white">
-                    <Check className="h-3 w-3" />
-                    {intl.formatMessage({ id: 'billing.currentLabel' })}
-                  </span>
-                )}
-                <div className="mb-3">
-                  <span
-                    className={cn(
-                      'inline-flex rounded-full px-3 py-0.5 text-sm font-semibold',
-                      PLAN_BADGE[tier],
-                    )}
-                  >
-                    {intl.formatMessage({ id: `license.${tier}` })}
-                  </span>
-                </div>
-                <p className="text-3xl font-bold text-stone-900 dark:text-stone-50">
-                  {PLAN_PRICES[tier]}
-                  <span className="text-sm font-normal text-stone-500 dark:text-stone-400">
-                    {tier !== 'community' ? ` ${intl.formatMessage({ id: 'billing.oneTime' })}` : ''}
-                  </span>
-                </p>
-                <div className="mt-4">
-                  {!isCurrent && (
-                    <button
-                      className={cn(
-                        'w-full rounded-lg px-4 py-2 text-sm font-medium transition-colors',
-                        tier === 'enterprise'
-                          ? 'bg-violet-500 text-white hover:bg-violet-600'
-                          : 'bg-amber-500 text-white hover:bg-amber-600',
-                      )}
-                    >
-                      {intl.formatMessage({ id: 'billing.selectPlan' })}
-                    </button>
-                  )}
-                </div>
-              </div>
-            );
-          })}
+        <div className="flex items-center gap-3 mb-3">
+          <Crown className="h-5 w-5 text-amber-600 dark:text-amber-400" />
+          <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
+            {intl.formatMessage({ id: 'billing.upgradeTitle' })}
+          </h3>
         </div>
+        <p className="mb-4 text-sm text-stone-500 dark:text-stone-400">
+          {intl.formatMessage({ id: 'billing.upgradeContact' })}
+        </p>
+        <a
+          href="mailto:info@dudustudio.monster"
+          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600"
+        >
+          <Mail className="h-4 w-4" />
+          {intl.formatMessage({ id: 'billing.contactSales' })}
+        </a>
       </div>
     </div>
   );

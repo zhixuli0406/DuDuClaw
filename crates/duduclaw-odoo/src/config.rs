@@ -13,15 +13,18 @@ pub struct OdooConfig {
     pub protocol: String,
     pub auth_method: String,
     pub username: String,
+    #[serde(skip_serializing)]
     pub api_key_enc: String,
+    #[serde(skip_serializing)]
     pub password_enc: String,
     pub poll_enabled: bool,
     pub poll_interval_seconds: u64,
     pub poll_models: Vec<String>,
     pub webhook_enabled: bool,
+    #[serde(skip_serializing)]
     pub webhook_secret: String,
     /// Encrypted webhook secret (takes precedence over `webhook_secret`).
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub webhook_secret_enc: String,
     pub features_crm: bool,
     pub features_sale: bool,

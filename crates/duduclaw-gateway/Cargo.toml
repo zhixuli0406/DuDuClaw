@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 duduclaw-core = { workspace = true }
+duduclaw-auth = { workspace = true }
 duduclaw-agent = { workspace = true }
 duduclaw-memory = { workspace = true }
 duduclaw-security = { workspace = true }

@@ -301,7 +301,7 @@ mod distillation_tests {
         for _ in 0..15 { tracker.record_with(0.1); tracker.record_without(0.4); }
         let candidate = DistillationCandidate::from_tracker(&tracker);
 
-        let input = build_distillation_input(&skill, &candidate, "current soul");
+        let input = build_distillation_input(&skill, &candidate, "current soul", None);
         assert!(input.trigger_context.contains("<skill_to_distill>"));
         assert!(input.trigger_context.contains("</skill_to_distill>"));
         assert!(input.trigger_context.contains("2-5"));

@@ -16,6 +16,9 @@ type PendingRequest = {
 
 type EventHandler = (payload: unknown) => void;
 
+// H7 fix: token getter type — called on each connect/reconnect for fresh value
+type TokenGetter = () => string | undefined;
+
 export class DuDuClawClient {
   private ws: WebSocket | null = null;
   private pendingRequests = new Map<string, PendingRequest>();
@@ -27,7 +30,7 @@ export class DuDuClawClient {
   private _state: ConnectionState = 'disconnected';
   private _onStateChange: ((state: ConnectionState) => void) | null = null;
   private url = '';
-  private token?: string;
+  private getToken?: TokenGetter;
 
   get state(): ConnectionState {
     return this._state;
@@ -42,9 +45,10 @@ export class DuDuClawClient {
     this._onStateChange?.(state);
   }
 
-  connect(url: string, token?: string): Promise<void> {
+  // H7 fix: accept a getter function instead of a static token
+  connect(url: string, getToken?: TokenGetter): Promise<void> {
     this.url = url;
-    this.token = token;
+    this.getToken = getToken;
     this.maxReconnectAttempts = 10;
     return this.doConnect();
   }
@@ -56,7 +60,6 @@ export class DuDuClawClient {
       try {
         this.ws = new WebSocket(this.url);
       } catch (e) {
-        console.error('[WS] Failed to create WebSocket:', e);
         this.setState('disconnected');
         reject(e);
         return;
@@ -67,48 +70,55 @@ export class DuDuClawClient {
         try {
           const frame: WsFrame = JSON.parse(event.data);
           this.handleFrame(frame);
-        } catch (e) {
-          console.warn('[WS] Failed to parse frame:', event.data, e);
+        } catch {
+          // Ignore parse errors
         }
       };
 
-      this.ws.onclose = (_event) => {
-        // console.log('[WS] Connection closed:', event.code, event.reason);
+      this.ws.onclose = () => {
+        if (this.ws === null) return; // Intentional disconnect — skip
         this.setState('disconnected');
         this.rejectAllPending('Connection closed');
         this.scheduleReconnect();
       };
 
-      this.ws.onerror = (event) => {
-        console.error('[WS] Connection error:', event);
+      this.ws.onerror = () => {
         // onclose will fire after this
       };
 
       this.ws.onopen = async () => {
-        // console.log('[WS] Connection opened');
         this.reconnectAttempt = 0;
         this.setState('connected');
 
-        // If token is provided, authenticate first
-        if (this.token) {
+        // H7 fix: get fresh token on each connect/reconnect
+        const token = this.getToken?.();
+
+        if (token) {
           try {
-            await this.call('connect', { token: this.token }, true);
+            // JWT if contains dots, otherwise legacy token
+            const params = token.includes('.')
+              ? { jwt: token }
+              : { token };
+            await this.call('connect', params, true);
             this.setState('authenticated');
           } catch (e) {
-            console.error('[WS] Authentication failed:', e);
+            // H10 fix: do NOT set authenticated on failure
             this.ws?.close();
             reject(e);
             return;
           }
         } else {
-          // No token configured — still verify connection with server handshake
+          // No token — try server handshake for local-only mode
           try {
             await this.call('connect', { version: '0.6.5' }, true);
             this.setState('authenticated');
           } catch {
-            // Server may not require auth — allow connection for local-only dashboard
-            console.warn('[WS] No auth configured — operating in local-only mode');
-            this.setState('authenticated');
+            // H10 fix: if server requires auth and we have no token, don't fake authenticated
+            // Only allow local-only mode if server explicitly accepts it
+            this.setState('disconnected');
+            this.ws?.close();
+            reject(new Error('Authentication required'));
+            return;
           }
         }
         resolve();
@@ -132,7 +142,7 @@ export class DuDuClawClient {
       const handlers = this.eventHandlers.get(frame.event);
       if (handlers) {
         for (const handler of handlers) {
-          try { handler(frame.payload); } catch (e) { console.error('[WS] Event handler error:', e); }
+          try { handler(frame.payload); } catch { /* ignore */ }
         }
       }
       // Wildcard handlers
@@ -215,9 +225,11 @@ export class DuDuClawClient {
       this.reconnectTimer = null;
     }
     this.maxReconnectAttempts = 0;
-    this.ws?.close();
-    this.ws = null;
+    const ws = this.ws;
+    this.ws = null; // Clear ref BEFORE close — onclose guard checks this
+    ws?.close();
     this.setState('disconnected');
+    this.rejectAllPending('Disconnected');
   }
 
   private scheduleReconnect() {
@@ -226,7 +238,6 @@ export class DuDuClawClient {
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempt), 30000);
     this.reconnectAttempt++;
 
-    // console.log(`[WS] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempt})`);
     this.reconnectTimer = setTimeout(() => {
       this.doConnect().catch(() => { /* reconnect will retry */ });
     }, delay);

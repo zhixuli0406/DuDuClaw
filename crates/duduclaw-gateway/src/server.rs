@@ -1,10 +1,10 @@
 use axum::{
-    Router,
+    Json, Router,
     extract::State,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::ConnectInfo,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -14,11 +14,13 @@ use std::time::Instant;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
+use duduclaw_auth::{JwtConfig, UserContext, UserDb};
+
 static WS_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<IpAddr, (Instant, u32)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn check_ws_rate_limit(ip: IpAddr) -> bool {
-    let mut map = WS_RATE_LIMITER.lock().unwrap();
+    let mut map = WS_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     // Cleanup stale entries every time the map grows large
     if map.len() > 1000 {
@@ -31,6 +33,25 @@ fn check_ws_rate_limit(ip: IpAddr) -> bool {
     }
     entry.1 += 1;
     entry.1 <= 30 // max 30 WS connections per minute per IP
+}
+
+/// Login attempt rate limiter: max 5 attempts per email per 15 minutes.
+static LOGIN_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<String, (Instant, u32)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn check_login_rate_limit(email: &str) -> bool {
+    let mut map = LOGIN_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if map.len() > 10000 {
+        map.retain(|_, (t, _)| now.duration_since(*t).as_secs() < 900);
+    }
+    let entry = map.entry(email.to_string()).or_insert((now, 0));
+    if now.duration_since(entry.0).as_secs() > 900 {
+        *entry = (now, 1);
+        return true;
+    }
+    entry.1 += 1;
+    entry.1 <= 5
 }
 
 use crate::auth::AuthManager;
@@ -57,6 +78,10 @@ struct AppState {
     tx: broadcast::Sender<String>,
     /// Broadcast channel for real-time events (channel status, etc.) pushed to clients.
     event_tx: broadcast::Sender<String>,
+    /// User database for multi-user authentication.
+    user_db: Arc<UserDb>,
+    /// JWT configuration for token issuance and verification.
+    jwt_config: Arc<JwtConfig>,
 }
 
 /// Start the WebSocket RPC gateway and block until it shuts down.
@@ -72,6 +97,35 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     if let Err(e) = crate::cost_telemetry::init_telemetry(&home_dir) {
         tracing::warn!(error = %e, "Failed to initialize cost telemetry — continuing without it");
     }
+
+    // ── Initialize user database & JWT ───────────────────────
+    let user_db_path = home_dir.join("users.db");
+    let user_db = Arc::new(
+        UserDb::new(&user_db_path)
+            .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(
+                format!("Failed to initialize user database: {e}")
+            ))?,
+    );
+    // Ensure a default admin exists on first run
+    match user_db.ensure_default_admin() {
+        Ok(Some(_password)) => {
+            // Password already printed by ensure_default_admin
+        }
+        Ok(None) => {} // Admin already exists
+        Err(e) => {
+            // C2 fix: fail hard if we can't create admin — don't silently continue
+            return Err(duduclaw_core::error::DuDuClawError::Gateway(
+                format!("Failed to initialize user database: {e}")
+            ));
+        }
+    }
+    let jwt_config = Arc::new(
+        JwtConfig::load_or_generate(&home_dir)
+            .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(
+                format!("Failed to initialize JWT: {e}")
+            ))?,
+    );
+    info!("User authentication system initialized");
 
     // Initialize session manager
     let session_db_path = home_dir.join("sessions.db");
@@ -243,11 +297,23 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         info!("Periodic update checker started (every 6h)");
     }
 
+    // Start reminder scheduler (time-wheel based, 10s disk polling for cross-process pickup)
+    bg_handles.push(crate::reminder_scheduler::start_reminder_scheduler(
+        home_dir.clone(),
+        handler.registry().clone(),
+    ));
+    info!("Reminder scheduler started");
+
+    // Inject user_db into handler for user management RPC methods
+    handler.set_user_db(user_db.clone(), jwt_config.clone()).await;
+
     let state = Arc::new(AppState {
         auth: AuthManager::new(config.auth_token),
         handler,
         tx,
         event_tx,
+        user_db,
+        jwt_config,
     });
 
     // WebChat endpoint — separate state from main /ws (different auth model)
@@ -256,10 +322,18 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/ws/chat", get(crate::webchat::ws_chat_handler))
         .with_state(webchat_state);
 
+    // ── REST API endpoints for authentication ────────────────
+    let auth_router = Router::new()
+        .route("/api/login", post(handle_login))
+        .route("/api/refresh", post(handle_refresh))
+        .route("/api/me", get(handle_me))
+        .with_state(state.clone());
+
     let mut app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health_handler))
         .with_state(state)
+        .merge(auth_router)
         .merge(webchat_router);
 
     // Mount LINE webhook endpoint
@@ -298,6 +372,238 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     Ok(())
 }
 
+// ── REST Auth Handlers ───────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct LoginRequest {
+    email: String,
+    password: String,
+}
+
+#[derive(serde::Serialize)]
+struct LoginResponse {
+    access_token: String,
+    refresh_token: String,
+    user: duduclaw_auth::User,
+}
+
+#[derive(serde::Deserialize)]
+struct RefreshRequest {
+    refresh_token: String,
+}
+
+#[derive(serde::Serialize)]
+struct TokenResponse {
+    access_token: String,
+}
+
+#[derive(serde::Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+/// POST /api/login — Authenticate with email + password, return JWT tokens.
+async fn handle_login(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LoginRequest>,
+) -> impl IntoResponse {
+    // Rate limit login attempts
+    if !check_login_rate_limit(&body.email) {
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "too many login attempts, try again in 15 minutes"})),
+        ).into_response();
+    }
+
+    // Verify credentials
+    let user = match state.user_db.verify_password(&body.email, &body.password) {
+        Ok(u) => u,
+        Err(e) => {
+            warn!(email = %body.email, "Login failed: {e}");
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "invalid email or password"})),
+            ).into_response();
+        }
+    };
+
+    // Get agent bindings for this user
+    let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
+    let agent_access: Vec<(String, duduclaw_auth::AccessLevel)> = bindings
+        .iter()
+        .map(|b| (b.agent_name.clone(), b.access_level))
+        .collect();
+
+    // Issue tokens
+    let access_token = match state.jwt_config.issue_access_token(&user, &agent_access) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Failed to issue access token: {e}");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "token generation failed"})),
+            ).into_response();
+        }
+    };
+
+    let refresh_token = match state.jwt_config.issue_refresh_token(&user.id) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Failed to issue refresh token: {e}");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "token generation failed"})),
+            ).into_response();
+        }
+    };
+
+    // Update last login
+    let _ = state.user_db.update_last_login(&user.id);
+
+    // Audit log
+    let _ = state.user_db.log_action(
+        Some(&user.id),
+        "login",
+        None,
+        None,
+        None,
+    );
+
+    Json(serde_json::json!({
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "user": user,
+    })).into_response()
+}
+
+/// Refresh endpoint rate limiter: max 10 per IP per 5 minutes (H9 fix).
+static REFRESH_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<IpAddr, (Instant, u32)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn check_refresh_rate_limit(ip: IpAddr) -> bool {
+    let mut map = REFRESH_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if map.len() > 10000 {
+        map.retain(|_, (t, _)| now.duration_since(*t).as_secs() < 300);
+    }
+    let entry = map.entry(ip).or_insert((now, 0));
+    if now.duration_since(entry.0).as_secs() > 300 {
+        *entry = (now, 1);
+        return true;
+    }
+    entry.1 += 1;
+    entry.1 <= 10
+}
+
+/// POST /api/refresh — Exchange a refresh token for a new access token.
+async fn handle_refresh(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<RefreshRequest>,
+) -> impl IntoResponse {
+    // H9 fix: rate limit refresh endpoint
+    if !check_refresh_rate_limit(addr.ip()) {
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "too many refresh attempts"})),
+        ).into_response();
+    }
+
+    // Verify refresh token — generic error messages to prevent info leakage
+    let claims = match state.jwt_config.verify_refresh_token(&body.refresh_token) {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "invalid or expired refresh token"})),
+            ).into_response();
+        }
+    };
+
+    // Fetch fresh user data and bindings
+    let user = match state.user_db.get_user(&claims.sub) {
+        Ok(Some(u)) if u.status == duduclaw_auth::UserStatus::Active => u,
+        _ => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "user not found or inactive"})),
+            ).into_response();
+        }
+    };
+
+    let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
+    let agent_access: Vec<(String, duduclaw_auth::AccessLevel)> = bindings
+        .iter()
+        .map(|b| (b.agent_name.clone(), b.access_level))
+        .collect();
+
+    let access_token = match state.jwt_config.issue_access_token(&user, &agent_access) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Failed to issue access token: {e}");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "token generation failed"})),
+            ).into_response();
+        }
+    };
+
+    Json(serde_json::json!({"access_token": access_token})).into_response()
+}
+
+/// GET /api/me — Return the current user's info from the Authorization header.
+async fn handle_me(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let token = match extract_bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "missing Authorization header"})),
+            ).into_response();
+        }
+    };
+
+    let claims = match state.jwt_config.verify_access_token(token) {
+        Ok(c) => c,
+        _ => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "invalid or expired token"})),
+            ).into_response();
+        }
+    };
+
+    let user = match state.user_db.get_user(&claims.sub) {
+        Ok(Some(u)) => u,
+        _ => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "user not found"})),
+            ).into_response();
+        }
+    };
+
+    let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
+
+    Json(serde_json::json!({
+        "user": user,
+        "bindings": bindings,
+    })).into_response()
+}
+
+/// Extract Bearer token from Authorization header.
+fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+// ── WebSocket Handlers ───────────────────────────────────────
+
 /// Axum handler that upgrades HTTP to WebSocket.
 async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -332,12 +638,17 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     info!("New WebSocket connection established");
 
     // --- Authentication gate ---
-    // If auth is required, the first message MUST be a "connect" request
-    // carrying a valid token. Reject and close otherwise.
-    if state.auth.is_auth_required() {
+    // Resolve a UserContext from the first "connect" message.
+    // Supports 3 modes:
+    //   1. JWT token: { "method": "connect", "params": { "jwt": "..." } }
+    //   2. Legacy token: { "method": "connect", "params": { "token": "..." } }
+    //   3. Ed25519 challenge-response (existing flow)
+    //   4. No auth configured: admin fallback
+
+    let user_ctx: UserContext = if state.auth.is_auth_required() || has_users(&state.user_db) {
         // Timeout auth handshake to prevent Slowloris-style resource exhaustion (BE-C4)
         let auth_timeout = std::time::Duration::from_secs(10);
-        let authenticated = match tokio::time::timeout(auth_timeout, socket.recv()).await {
+        let result = match tokio::time::timeout(auth_timeout, socket.recv()).await {
             Err(_) => {
                 warn!("WebSocket auth timeout — closing connection");
                 let _ = socket.send(Message::Close(None)).await;
@@ -347,12 +658,37 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             Some(Ok(Message::Text(text))) => {
                 match serde_json::from_str::<WsFrame>(&text) {
                     Ok(WsFrame::Request { id, method, params }) if method == "connect" => {
+                        // ── JWT authentication (new) ─────────────────────
+                        if let Some(jwt_str) = params.get("jwt").and_then(|v| v.as_str()) {
+                            match authenticate_jwt(&state, jwt_str) {
+                                Ok(ctx) => {
+                                    let ok = WsFrame::ok_response(
+                                        &id,
+                                        serde_json::json!({
+                                            "status": "authenticated",
+                                            "user": {
+                                                "id": ctx.user_id,
+                                                "email": ctx.email,
+                                                "role": ctx.role.to_string(),
+                                            }
+                                        }),
+                                    );
+                                    let _ = socket.send(Message::Text(
+                                        serde_json::to_string(&ok).unwrap_or_default().into(),
+                                    )).await;
+                                    Ok(ctx)
+                                }
+                                Err(e) => {
+                                    let err = WsFrame::error_response(&id, &format!("JWT authentication failed: {e}"));
+                                    let _ = socket.send(Message::Text(
+                                        serde_json::to_string(&err).unwrap_or_default().into(),
+                                    )).await;
+                                    Err(())
+                                }
+                            }
+                        }
                         // ── Ed25519 challenge-response ──────────────────────
-                        // If the client sends `{ "method": "connect", "params": {} }`
-                        // (no token) and Ed25519 is configured, issue a challenge.
-                        // The client must then send `{ "method": "authenticate",
-                        // "params": { "signature": "<b64>" } }`.
-                        if state.auth.is_ed25519() {
+                        else if state.auth.is_ed25519() {
                             let challenge = state.auth.issue_challenge();
                             let resp = WsFrame::ok_response(
                                 &id,
@@ -382,14 +718,15 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                                     let _ = socket.send(Message::Text(
                                                         serde_json::to_string(&ok).unwrap_or_default().into(),
                                                     )).await;
-                                                    true
+                                                    // Ed25519 users get admin context (backward compat)
+                                                    Ok(UserContext::admin_fallback())
                                                 }
                                                 Err(_) => {
                                                     let err = WsFrame::error_response(&auth_id, "Ed25519 authentication failed");
                                                     let _ = socket.send(Message::Text(
                                                         serde_json::to_string(&err).unwrap_or_default().into(),
                                                     )).await;
-                                                    false
+                                                    Err(())
                                                 }
                                             }
                                         }
@@ -398,14 +735,15 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                             let _ = socket.send(Message::Text(
                                                 serde_json::to_string(&err).unwrap_or_default().into(),
                                             )).await;
-                                            false
+                                            Err(())
                                         }
                                     }
                                 }
-                                _ => false,
+                                _ => Err(()),
                             }
-                        } else {
-                            // ── Token authentication ────────────────────────
+                        }
+                        // ── Legacy token authentication ────────────────────
+                        else if state.auth.is_auth_required() {
                             let token = params.get("token").and_then(|v| v.as_str()).unwrap_or("");
                             match state.auth.validate(token) {
                                 Ok(()) => {
@@ -416,37 +754,54 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                     let _ = socket.send(Message::Text(
                                         serde_json::to_string(&ok).unwrap_or_default().into(),
                                     )).await;
-                                    true
+                                    // Legacy token users get admin context (backward compat)
+                                    Ok(UserContext::admin_fallback())
                                 }
                                 Err(_) => {
                                     let err = WsFrame::error_response(&id, "authentication failed");
                                     let _ = socket.send(Message::Text(
                                         serde_json::to_string(&err).unwrap_or_default().into(),
                                     )).await;
-                                    false
+                                    Err(())
                                 }
                             }
                         }
+                        // ── User DB exists but no legacy auth — require JWT ──
+                        else {
+                            let err = WsFrame::error_response(&id, "authentication required — provide jwt parameter");
+                            let _ = socket.send(Message::Text(
+                                serde_json::to_string(&err).unwrap_or_default().into(),
+                            )).await;
+                            Err(())
+                        }
                     }
                     _ => {
-                        let err = WsFrame::error_response("", "expected connect message with token");
+                        let err = WsFrame::error_response("", "expected connect message");
                         let _ = socket.send(Message::Text(
                             serde_json::to_string(&err).unwrap_or_default().into(),
                         )).await;
-                        false
+                        Err(())
                     }
                 }
             }
-            _ => false,
+            _ => Err(()),
         } // match recv_result
         }; // match tokio::time::timeout
 
-        if !authenticated {
-            warn!("WebSocket auth failed – closing connection");
-            let _ = socket.send(Message::Close(None)).await;
-            return;
+        match result {
+            Ok(ctx) => ctx,
+            Err(()) => {
+                warn!("WebSocket auth failed – closing connection");
+                let _ = socket.send(Message::Close(None)).await;
+                return;
+            }
         }
-    }
+    } else {
+        // No auth required and no users in DB — admin fallback (local-only dashboard)
+        UserContext::admin_fallback()
+    };
+
+    info!(user = %user_ctx.email, role = %user_ctx.role, "WebSocket authenticated");
 
     // Split the socket so we can drive sending and receiving concurrently.
     let (mut sink, mut stream) = socket.split();
@@ -486,7 +841,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                     logs_subscribed = false;
                                 }
 
-                                let mut response = state.handler.handle(&method, params).await;
+                                let mut response = state.handler.handle(&method, params, &user_ctx).await;
                                 if let WsFrame::Response { id: ref mut resp_id, .. } = response {
                                     *resp_id = id;
                                 }
@@ -540,6 +895,28 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     }
 
     info!("WebSocket connection terminated");
+}
+
+/// Verify a JWT access token and build a UserContext.
+/// Single DB lookup, fail-closed on error (R2 fix for double-lookup + fail-open).
+fn authenticate_jwt(state: &AppState, jwt_str: &str) -> Result<UserContext, String> {
+    let claims = state.jwt_config.verify_access_token(jwt_str)?;
+
+    // Single DB lookup — fail-closed: DB error = reject
+    match state.user_db.get_user(&claims.sub) {
+        Ok(Some(user)) if user.status == duduclaw_auth::UserStatus::Active => {}
+        Ok(Some(_)) => return Err("account is suspended or offboarded".to_string()),
+        Ok(None) => return Err("user not found".to_string()),
+        Err(_) => return Err("authentication service unavailable".to_string()),
+    }
+
+    UserContext::from_claims(&claims)
+}
+
+/// Check if any users exist in the database (to decide whether auth is needed).
+/// Fail-closed: if the DB query fails, assume users exist and require auth (C2 fix).
+fn has_users(user_db: &UserDb) -> bool {
+    user_db.list_users().map(|u| !u.is_empty()).unwrap_or(true)
 }
 
 /// Simple health-check endpoint.

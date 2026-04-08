@@ -112,6 +112,40 @@ export interface MemoryEntry {
   tags: string[];
 }
 
+export interface WikiPageMeta {
+  path: string;
+  title: string;
+  updated: string;
+  tags: string[];
+}
+
+export interface WikiSearchHit {
+  path: string;
+  title: string;
+  score: number;
+  context_lines: string[];
+}
+
+export interface WikiLintReport {
+  total_pages: number;
+  index_entries: number;
+  orphan_pages: string[];
+  broken_links: [string, string][];
+  stale_pages: string[];
+  healthy: boolean;
+}
+
+export interface WikiStats {
+  exists: boolean;
+  total_pages: number;
+  by_directory: Record<string, number>;
+  most_recent?: {
+    title: string;
+    path: string;
+    updated: string;
+  };
+}
+
 export interface SkillInfo {
   name: string;
   agent_id?: string;
@@ -146,6 +180,25 @@ export interface SkillIndexEntry {
   author: string;
   url: string;
   compatible: string[];
+}
+
+export interface EvolutionMetrics {
+  positive_feedback_ratio: number;
+  prediction_error: number;
+  user_correction_rate: number;
+  contract_violations: number;
+}
+
+export interface EvolutionVersion {
+  version_id: string;
+  agent_id: string;
+  soul_summary: string;
+  soul_hash: string;
+  applied_at: string;
+  observation_end: string;
+  status: string;
+  pre_metrics: EvolutionMetrics;
+  post_metrics: EvolutionMetrics | null;
 }
 
 export interface BrowserAuditEntry {
@@ -223,6 +276,87 @@ export interface LicenseInfo {
   customer_name?: string;
   max_agents?: number;
   max_channels?: number;
+}
+
+// ── User management types ────────────────────────────────────
+
+export interface UserInfo {
+  id: string;
+  email: string;
+  display_name: string;
+  role: 'admin' | 'manager' | 'employee';
+  status: 'active' | 'suspended' | 'offboarded';
+  created_at: string;
+  updated_at: string;
+  last_login?: string;
+}
+
+export interface UserAgentBinding {
+  user_id: string;
+  agent_name: string;
+  access_level: 'owner' | 'operator' | 'viewer';
+  bound_at: string;
+}
+
+export interface UserDetail extends UserInfo {
+  bindings: UserAgentBinding[];
+}
+
+export interface AuditEntry {
+  id: number;
+  user_id?: string;
+  action: string;
+  target?: string;
+  detail?: string;
+  ip?: string;
+  timestamp: string;
+}
+
+export interface OdooStatus {
+  connected: boolean;
+  edition?: string;
+  version?: string;
+  uid?: number;
+  error?: string;
+}
+
+export interface OdooConfig {
+  url: string;
+  db: string;
+  protocol: string;
+  auth_method: string;
+  username: string;
+  poll_enabled: boolean;
+  poll_interval_seconds: number;
+  poll_models: string[];
+  webhook_enabled: boolean;
+  features_crm: boolean;
+  features_sale: boolean;
+  features_inventory: boolean;
+  features_accounting: boolean;
+  features_project: boolean;
+  features_hr: boolean;
+}
+
+export interface OdooConfigUpdate {
+  url: string;
+  db: string;
+  protocol: string;
+  auth_method: string;
+  username: string;
+  api_key?: string;
+  password?: string;
+  poll_enabled: boolean;
+  poll_interval_seconds: number;
+  poll_models: string[];
+  webhook_enabled: boolean;
+  webhook_secret?: string;
+  features_crm: boolean;
+  features_sale: boolean;
+  features_inventory: boolean;
+  features_accounting: boolean;
+  features_project: boolean;
+  features_hr: boolean;
 }
 
 /** Fields that can be updated on an agent via `agents.update`. All optional. */
@@ -362,6 +496,18 @@ export const api = {
         limit,
       }) as Promise<{ entries: MemoryEntry[] }>,
   },
+  wiki: {
+    pages: (agentId: string) =>
+      client.call('wiki.pages', { agent_id: agentId }) as Promise<{ pages: WikiPageMeta[]; exists: boolean }>,
+    read: (agentId: string, pagePath: string) =>
+      client.call('wiki.read', { agent_id: agentId, page_path: pagePath }) as Promise<{ content: string; path: string }>,
+    search: (agentId: string, query: string, limit = 10) =>
+      client.call('wiki.search', { agent_id: agentId, query, limit }) as Promise<{ hits: WikiSearchHit[] }>,
+    lint: (agentId: string) =>
+      client.call('wiki.lint', { agent_id: agentId }) as Promise<WikiLintReport>,
+    stats: (agentId: string) =>
+      client.call('wiki.stats', { agent_id: agentId }) as Promise<WikiStats>,
+  },
   skills: {
     list: (agentId?: string) =>
       client.call('skills.list', { agent_id: agentId }) as Promise<{ skills: SkillInfo[] }>,
@@ -370,6 +516,27 @@ export const api = {
         agent_id: agentId,
         skill_name: skillName,
       }) as Promise<{ content: string }>,
+  },
+  evolution: {
+    status: () =>
+      client.call('evolution.status') as Promise<{
+        enabled: boolean;
+        mode: string;
+        agents: Array<{
+          agent_id: string;
+          gvu_enabled: boolean;
+          cognitive_memory: boolean;
+          skill_auto_activate: boolean;
+          skill_security_scan: boolean;
+          max_silence_hours: number;
+          max_gvu_generations: number;
+          observation_period_hours: number;
+        }>;
+      }>,
+    history: (agentId?: string, limit = 20) =>
+      client.call('evolution.history', { agent_id: agentId ?? '', limit }) as Promise<{
+        versions: EvolutionVersion[];
+      }>,
   },
   system: {
     status: () =>
@@ -522,9 +689,46 @@ export const api = {
     install: (serverId: string) =>
       client.call('marketplace.install', { server_id: serverId }) as Promise<{ success: boolean }>,
   },
+  odoo: {
+    status: () =>
+      client.call('odoo.status') as Promise<OdooStatus>,
+    config: () =>
+      client.call('odoo.config') as Promise<OdooConfig | null>,
+    configure: (config: OdooConfigUpdate) =>
+      client.call('odoo.configure', { ...config }) as Promise<{ success: boolean }>,
+    test: () =>
+      client.call('odoo.test') as Promise<{ success: boolean; message: string }>,
+  },
   // Partner portal — backend not yet implemented; calls will reject with error
   partner: {
     generateLicense: (_params: { tier: string; customer: string; months: number }) =>
       Promise.reject(new Error('Partner license generation not yet available')) as Promise<{ key: string }>,
+  },
+  users: {
+    list: () =>
+      client.call('users.list') as Promise<{ users: UserDetail[] }>,
+    create: (params: { email: string; display_name: string; password: string; role?: string }) =>
+      client.call('users.create', params) as Promise<{ user: UserInfo }>,
+    update: (params: { user_id: string; display_name?: string; role?: string; password?: string }) =>
+      client.call('users.update', params) as Promise<{ status: string }>,
+    remove: (userId: string) =>
+      client.call('users.remove', { user_id: userId }) as Promise<{ status: string }>,
+    bindAgent: (userId: string, agentName: string, accessLevel?: string) =>
+      client.call('users.bind_agent', {
+        user_id: userId,
+        agent_name: agentName,
+        access_level: accessLevel ?? 'owner',
+      }) as Promise<{ status: string }>,
+    unbindAgent: (userId: string, agentName: string) =>
+      client.call('users.unbind_agent', { user_id: userId, agent_name: agentName }) as Promise<{ status: string }>,
+    offboard: (userId: string, transferTo?: string) =>
+      client.call('users.offboard', { user_id: userId, transfer_to: transferTo }) as Promise<{
+        status: string;
+        transferred_agents: string[];
+      }>,
+    me: () =>
+      client.call('users.me') as Promise<{ user: UserInfo; bindings: UserAgentBinding[] }>,
+    auditLog: (params?: { user_id?: string; action?: string; limit?: number }) =>
+      client.call('users.audit_log', params ?? {}) as Promise<{ entries: AuditEntry[] }>,
   },
 };

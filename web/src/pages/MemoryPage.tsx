@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
-import { api, type MemoryEntry, type SkillInfo } from '@/lib/api';
+import { api, type MemoryEntry, type SkillInfo, type EvolutionVersion } from '@/lib/api';
 import {
   Brain,
   Search,
@@ -14,6 +14,8 @@ import {
   CheckCircle,
   XCircle,
   Eye,
+  TrendingUp,
+  TrendingDown,
 } from 'lucide-react';
 
 type TabId = 'memories' | 'skills' | 'evolution';
@@ -197,9 +199,11 @@ function SkillsTab() {
   const [loading, setLoading] = useState(false);
   const [expandedSkill, setExpandedSkill] = useState<string | null>(null);
   const [skillContent, setSkillContent] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
 
   const fetchSkills = useCallback(async () => {
     setLoading(true);
+    setError(null);
     try {
       const result = await api.skills.list() as Record<string, unknown>;
       if (Array.isArray(result.skills)) {
@@ -214,7 +218,7 @@ function SkillsTab() {
         setSkills(all);
       }
     } catch {
-      // error handled silently
+      setError(intl.formatMessage({ id: 'common.error' }));
     } finally {
       setLoading(false);
     }
@@ -249,11 +253,16 @@ function SkillsTab() {
 
   return (
     <div className="space-y-4">
+      {error && (
+        <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-400">
+          {error}
+        </div>
+      )}
       {loading ? (
         <div className="py-12 text-center text-stone-400">
           {intl.formatMessage({ id: 'common.loading' })}
         </div>
-      ) : skills.length === 0 ? (
+      ) : skills.length === 0 && !error ? (
         <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
           <BookOpen className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
           <p className="text-stone-500 dark:text-stone-400">

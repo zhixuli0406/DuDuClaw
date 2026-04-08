@@ -32,5 +32,7 @@ pub mod defensive_prompt;
 pub mod updater;
 pub mod webchat;
 pub mod webhook;
+pub mod reminder_scheduler;
+pub mod wiki_ingest;
 
 pub use server::{start_gateway, GatewayConfig};

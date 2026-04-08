@@ -942,8 +942,22 @@ async fn handle_message_create(
     // Stop typing (explicit drop; also runs automatically on panic via Drop)
     drop(typing_guard);
 
-    // ── Send reply with embed ──
-    let payload = channel_format::to_discord_message(&reply, display_name.as_deref(), false);
+    // ── Send reply with embed + buttons ──
+    let mut payload = channel_format::to_discord_message(&reply, display_name.as_deref(), false);
+
+    // Reply to the original message so the sender gets a notification
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("message_reference".to_string(), json!({
+            "message_id": message_id,
+            "channel_id": reply_channel_id,
+        }));
+    }
+
+    // Add conversation buttons
+    let buttons = channel_format::discord_conversation_buttons(&session_id);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("components".to_string(), json!([buttons]));
+    }
 
     // ── Split if needed (embed description > 4096 or plain text > 2000) ──
     send_discord_message(http, token, &reply_channel_id, payload).await;

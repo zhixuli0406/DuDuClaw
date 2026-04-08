@@ -85,6 +85,34 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "description", description: "Task description", required: true },
         ],
     },
+    // ── Reminder tools ────────────────────────────────────────────
+    ToolDef {
+        name: "create_reminder",
+        description: "Create a one-shot reminder that sends a message to a channel at a specified time. Supports relative time (5m, 2h, 1d, 1h30m) or absolute ISO 8601 timestamps. Two modes: 'direct' sends a static message (zero LLM cost), 'agent_callback' wakes the agent to generate a dynamic response.",
+        params: &[
+            ParamDef { name: "time", description: "When to trigger: relative (5m, 2h, 1d, 1h30m) or absolute ISO 8601 (2026-04-07T15:00:00+08:00)", required: true },
+            ParamDef { name: "message", description: "Message text to send (required for direct mode)", required: true },
+            ParamDef { name: "channel", description: "Channel type (telegram, line, discord)", required: true },
+            ParamDef { name: "chat_id", description: "Chat/group/channel ID to send the reminder to", required: true },
+            ParamDef { name: "mode", description: "Delivery mode: 'direct' (default, zero cost) or 'agent_callback' (wakes agent with prompt)", required: false },
+            ParamDef { name: "prompt", description: "Prompt for the agent (required when mode=agent_callback)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "list_reminders",
+        description: "List reminders, optionally filtered by status and agent",
+        params: &[
+            ParamDef { name: "status", description: "Filter by status: pending, delivered, failed, cancelled (default: pending)", required: false },
+            ParamDef { name: "agent_id", description: "Filter by agent ID", required: false },
+        ],
+    },
+    ToolDef {
+        name: "cancel_reminder",
+        description: "Cancel a pending reminder by ID",
+        params: &[
+            ParamDef { name: "id", description: "Reminder ID to cancel", required: true },
+        ],
+    },
     ToolDef {
         name: "memory_search",
         description: "Search agent memory",
@@ -483,6 +511,72 @@ const TOOLS: &[ToolDef] = &[
         params: &[
             ParamDef { name: "text", description: "Text to synthesize", required: true },
             ParamDef { name: "voice", description: "Voice name (default: auto-detect zh-TW/en-US)", required: false },
+        ],
+    },
+    // ── Wiki Knowledge Base tools ───────────────────────────────
+    ToolDef {
+        name: "wiki_ls",
+        description: "List wiki pages for an agent. Returns directory tree with page titles and last-updated timestamps from YAML frontmatter.",
+        params: &[
+            ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "wiki_read",
+        description: "Read a wiki page (frontmatter + body). Use wiki_ls or wiki_search to find page paths first.",
+        params: &[
+            ParamDef { name: "page_path", description: "Page path relative to wiki/ (e.g. 'entities/wang-ming.md')", required: true },
+            ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "wiki_write",
+        description: "Create or update a wiki page. Automatically updates _index.md and appends to _log.md. Uses atomic write (temp + rename).",
+        params: &[
+            ParamDef { name: "page_path", description: "Page path relative to wiki/ (e.g. 'concepts/return-policy.md')", required: true },
+            ParamDef { name: "content", description: "Full page content including YAML frontmatter", required: true },
+            ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
+            ParamDef { name: "update_index", description: "Update _index.md automatically (default: true)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "wiki_search",
+        description: "Full-text search across wiki pages. Searches _index.md first, then drills into matching pages for context.",
+        params: &[
+            ParamDef { name: "query", description: "Search query (keywords)", required: true },
+            ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
+            ParamDef { name: "limit", description: "Max results (default: 10)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "wiki_lint",
+        description: "Run a health check on the wiki: find orphan pages, broken links, stale pages. Returns a lint report.",
+        params: &[
+            ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "wiki_stats",
+        description: "Get wiki statistics: total pages, index entries, recent activity, health score.",
+        params: &[
+            ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "wiki_export",
+        description: "Export the wiki as Obsidian vault (directory of .md files with wikilinks) or a single HTML file. Returns the output path or HTML content.",
+        params: &[
+            ParamDef { name: "format", description: "Export format: 'obsidian' or 'html' (default: html)", required: false },
+            ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
+        ],
+    },
+    // ── Skill Internalization tools ─────────────────────────────
+    ToolDef {
+        name: "skill_extract",
+        description: "Extract structured knowledge from a skill into the agent's wiki. Creates concept pages, entity pages, and a source summary. Zero LLM cost (heuristic mode).",
+        params: &[
+            ParamDef { name: "skill_name", description: "Name of the skill to extract from", required: true },
+            ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
         ],
     },
 ];
@@ -1088,6 +1182,222 @@ async fn handle_schedule_task(params: &Value, home_dir: &Path) -> Value {
             "Error: Failed to persist task (queue full or write error)".to_string()
         }}]
     })
+}
+
+// ── Reminder handlers ─────���──────────────────────────────────
+
+/// Create a one-shot reminder.
+async fn handle_create_reminder(params: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    use duduclaw_gateway::reminder_scheduler::{
+        parse_time_spec, append_reminder_checked, AppendResult,
+        Reminder, ReminderMode, ReminderStatus,
+        is_valid_discord_chat_id,
+        MAX_REMINDERS_PER_AGENT, MAX_MESSAGE_LEN, MAX_PROMPT_LEN, MAX_FUTURE_DAYS,
+    };
+
+    let time_str = params.get("time").and_then(|v| v.as_str()).unwrap_or("");
+    let message = params.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    let channel = params.get("channel").and_then(|v| v.as_str()).unwrap_or("");
+    let chat_id = params.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
+    let mode_str = params.get("mode").and_then(|v| v.as_str()).unwrap_or("direct");
+    let prompt = params.get("prompt").and_then(|v| v.as_str());
+    let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
+
+    if time_str.is_empty() || channel.is_empty() || chat_id.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: time, channel, and chat_id are required"}],
+            "isError": true
+        });
+    }
+
+    // Validate agent_id format
+    if !duduclaw_core::is_valid_agent_id(agent_id) {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: invalid agent_id format"}],
+            "isError": true
+        });
+    }
+
+    let mode = match mode_str {
+        "agent_callback" => ReminderMode::AgentCallback,
+        _ => ReminderMode::Direct,
+    };
+
+    // Validate: direct mode needs message, agent_callback needs prompt
+    if mode == ReminderMode::Direct && message.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: message is required for direct mode"}],
+            "isError": true
+        });
+    }
+    if mode == ReminderMode::AgentCallback && prompt.is_none() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: prompt is required for agent_callback mode"}],
+            "isError": true
+        });
+    }
+
+    // Validate field lengths (resource exhaustion prevention)
+    if message.len() > MAX_MESSAGE_LEN {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: message too long ({} chars, max {MAX_MESSAGE_LEN})", message.len())}],
+            "isError": true
+        });
+    }
+    if let Some(p) = prompt {
+        if p.len() > MAX_PROMPT_LEN {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: prompt too long ({} chars, max {MAX_PROMPT_LEN})", p.len())}],
+                "isError": true
+            });
+        }
+    }
+
+    // Validate channel
+    if !matches!(channel, "telegram" | "line" | "discord") {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: unknown channel '{channel}', must be telegram/line/discord")}],
+            "isError": true
+        });
+    }
+
+    // Validate Discord chat_id is numeric at creation time (fail-fast)
+    if channel == "discord" && !is_valid_discord_chat_id(chat_id) {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: Discord channel ID must be numeric, got '{chat_id}'")}],
+            "isError": true
+        });
+    }
+
+    // Parse time
+    let trigger_at = match parse_time_spec(time_str) {
+        Ok(dt) => dt,
+        Err(e) => {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: invalid time specification: {e}")}],
+                "isError": true
+            });
+        }
+    };
+
+    let now = chrono::Utc::now();
+
+    // Validate trigger is in the future
+    if trigger_at <= now {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: trigger time must be in the future"}],
+            "isError": true
+        });
+    }
+
+    // Validate trigger is not too far in the future
+    if trigger_at > now + chrono::Duration::days(MAX_FUTURE_DAYS) {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: trigger time too far in the future (max {MAX_FUTURE_DAYS} days)")}],
+            "isError": true
+        });
+    }
+
+    let reminder = Reminder {
+        id: uuid::Uuid::new_v4().to_string(),
+        agent_id: agent_id.to_string(),
+        trigger_at,
+        channel: channel.to_string(),
+        chat_id: chat_id.to_string(),
+        message: if message.is_empty() { None } else { Some(message.to_string()) },
+        prompt: prompt.map(|s| s.to_string()),
+        mode,
+        status: ReminderStatus::Pending,
+        created_at: Some(chrono::Utc::now().to_rfc3339()),
+        error: None,
+    };
+
+    let id = reminder.id.clone();
+    let trigger_display = trigger_at.to_rfc3339();
+
+    // Atomic count-check + append (no TOCTOU race)
+    match append_reminder_checked(home_dir, &reminder, MAX_REMINDERS_PER_AGENT).await {
+        Ok(AppendResult::Ok) => serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "Reminder created (id: {id}, trigger: {trigger_display}, channel: {channel})"
+            )}]
+        }),
+        Ok(AppendResult::LimitReached(count)) => serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "Error: agent '{agent_id}' has {count} pending reminders (max {MAX_REMINDERS_PER_AGENT})"
+            )}],
+            "isError": true
+        }),
+        Err(e) => serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: failed to save reminder: {e}")}],
+            "isError": true
+        }),
+    }
+}
+
+/// List reminders with optional filters.
+/// Scoped to the calling agent by default to prevent cross-agent info disclosure.
+async fn handle_list_reminders(params: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    use duduclaw_gateway::reminder_scheduler::list_reminders;
+
+    let status = params.get("status").and_then(|v| v.as_str());
+    // Default to caller's own reminders (prevent cross-agent info leak)
+    let agent_id = Some(
+        params.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent)
+    );
+
+    let reminders = list_reminders(home_dir, status, agent_id).await;
+
+    let entries: Vec<serde_json::Value> = reminders
+        .iter()
+        .map(|r| serde_json::json!({
+            "id": r.id,
+            "trigger_at": r.trigger_at.to_rfc3339(),
+            "channel": r.channel,
+            "chat_id": r.chat_id,
+            "message": r.message,
+            "mode": r.mode,
+            "status": r.status,
+            "agent_id": r.agent_id,
+        }))
+        .collect();
+
+    let text = if entries.is_empty() {
+        "No reminders found.".to_string()
+    } else {
+        serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string())
+    };
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": text}]
+    })
+}
+
+/// Cancel a pending reminder.
+async fn handle_cancel_reminder(params: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    use duduclaw_gateway::reminder_scheduler::cancel_reminder;
+
+    let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+
+    if id.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: id is required"}],
+            "isError": true
+        });
+    }
+
+    match cancel_reminder(home_dir, id, Some(default_agent)).await {
+        Ok(true) => serde_json::json!({
+            "content": [{"type": "text", "text": format!("Reminder '{id}' cancelled successfully.")}]
+        }),
+        Ok(false) => serde_json::json!({
+            "content": [{"type": "text", "text": format!("Reminder '{id}' not found or already completed.")}]
+        }),
+        Err(e) => serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: {e}")}],
+            "isError": true
+        }),
+    }
 }
 
 // ── Sub-agent management handlers ───────────────────────────
@@ -3394,6 +3704,9 @@ async fn handle_tools_call(
         "send_sticker" => handle_send_media(&arguments, home_dir, http, "sticker").await,
         "log_mood" => handle_log_mood(&arguments, home_dir, memory, default_agent).await,
         "schedule_task" => handle_schedule_task(&arguments, home_dir).await,
+        "create_reminder" => handle_create_reminder(&arguments, home_dir, default_agent).await,
+        "list_reminders" => handle_list_reminders(&arguments, home_dir, default_agent).await,
+        "cancel_reminder" => handle_cancel_reminder(&arguments, home_dir, default_agent).await,
         "create_agent" => handle_create_agent(&arguments, home_dir).await,
         "list_agents" => handle_list_agents(home_dir).await,
         "agent_status" => handle_agent_status(&arguments, home_dir).await,
@@ -3434,6 +3747,16 @@ async fn handle_tools_call(
         // Voice / ASR / TTS tools
         "transcribe_audio" => handle_transcribe_audio(&arguments).await,
         "synthesize_speech" => handle_synthesize_speech(&arguments).await,
+        // Wiki Knowledge Base tools
+        "wiki_ls" => handle_wiki_ls(&arguments, home_dir, default_agent).await,
+        "wiki_read" => handle_wiki_read(&arguments, home_dir, default_agent).await,
+        "wiki_write" => handle_wiki_write(&arguments, home_dir, default_agent).await,
+        "wiki_search" => handle_wiki_search(&arguments, home_dir, default_agent).await,
+        "wiki_lint" => handle_wiki_lint(&arguments, home_dir, default_agent).await,
+        "wiki_stats" => handle_wiki_stats(&arguments, home_dir, default_agent).await,
+        "wiki_export" => handle_wiki_export(&arguments, home_dir, default_agent).await,
+        // Skill Internalization tools
+        "skill_extract" => handle_skill_extract(&arguments, home_dir, default_agent).await,
         // Odoo ERP tools
         t if t.starts_with("odoo_") => handle_odoo_tool(t, &arguments, home_dir, odoo).await,
         _ => {
@@ -3625,6 +3948,751 @@ async fn handle_channel_config_list(args: &Value, home_dir: &Path) -> Value {
     } else {
         let lines: Vec<String> = all.iter().map(|(k, v)| format!("{k} = {v}")).collect();
         tool_text(&format!("Settings for {channel}/{scope_id}:\n{}", lines.join("\n")))
+    }
+}
+
+// ── Wiki Knowledge Base handlers ────────────────────────────
+
+/// Reserved wiki filenames that cannot be overwritten by wiki_write.
+const WIKI_RESERVED: &[&str] = &["_schema.md", "_index.md", "_log.md"];
+
+/// Maximum wiki page size (512 KB).
+const WIKI_MAX_PAGE_SIZE: usize = 512 * 1024;
+
+/// Default wiki _schema.md content.
+const WIKI_DEFAULT_SCHEMA: &str = r#"# Wiki Schema
+
+## Directory Structure
+- `entities/` — People, organizations, products, customers
+- `concepts/` — Domain concepts, processes, principles
+- `sources/` — Summaries of raw source materials
+- `synthesis/` — Cross-topic analysis, comparisons, trends
+
+## Page Format
+Every page MUST have YAML frontmatter:
+```yaml
+---
+title: <page title>
+created: <ISO 8601>
+updated: <ISO 8601>
+tags: [tag1, tag2]
+related: [path/to/related1.md, path/to/related2.md]
+sources: [source1, source2]
+---
+```
+
+## Naming Convention
+- Filename: kebab-case (e.g. `wang-ming-customer.md`)
+- Entity pages: `entities/{name}.md`
+- Concept pages: `concepts/{topic}.md`
+- Source summaries: `sources/{date}-{title}.md`
+- Synthesis: `synthesis/{topic}.md`
+
+## Cross-Reference Format
+Use relative markdown links: `[Display Text](../concepts/topic.md)`
+
+## Operations
+### Ingest (adding new source)
+1. Read the source material
+2. Create `sources/{date}-{title}.md` summary
+3. Update or create relevant entity/concept pages
+4. Update `_index.md` with new pages
+5. Check for contradictions with existing pages
+
+### Query (answering questions)
+1. Read `_index.md` to locate relevant pages
+2. Read relevant pages
+3. Synthesize answer
+4. If answer is valuable, file as new `synthesis/` page
+
+### Lint (health check)
+1. Find contradictions between pages
+2. Find orphan pages (not in _index.md or no inbound links)
+3. Find stale pages (not updated in >30 days, related sources newer)
+4. Suggest missing pages for mentioned-but-uncreated entities
+"#;
+
+/// Resolve the wiki directory for an agent, creating it if needed.
+/// Returns `Err` on invalid agent_id or filesystem failures.
+fn resolve_wiki_dir(home_dir: &Path, agent_id: &str) -> std::result::Result<std::path::PathBuf, String> {
+    if !is_valid_agent_id(agent_id) {
+        return Err("Invalid agent_id".to_string());
+    }
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    if !agent_dir.exists() {
+        return Err(format!("Agent '{}' does not exist", agent_id));
+    }
+    Ok(agent_dir.join("wiki"))
+}
+
+/// Ensure the wiki directory structure exists, creating scaffold if needed.
+fn ensure_wiki_dir(wiki_dir: &Path) -> std::result::Result<(), String> {
+    let subdirs = ["entities", "concepts", "sources", "synthesis"];
+    for sub in &subdirs {
+        let p = wiki_dir.join(sub);
+        if !p.exists() {
+            std::fs::create_dir_all(&p).map_err(|e| format!("Failed to create {}: {e}", p.display()))?;
+        }
+    }
+
+    // Create _schema.md if missing
+    let schema_path = wiki_dir.join("_schema.md");
+    if !schema_path.exists() {
+        std::fs::write(&schema_path, WIKI_DEFAULT_SCHEMA)
+            .map_err(|e| format!("Failed to write _schema.md: {e}"))?;
+    }
+
+    // Create _index.md if missing
+    let index_path = wiki_dir.join("_index.md");
+    if !index_path.exists() {
+        std::fs::write(&index_path, "# Wiki Index\n\n<!-- Auto-maintained by wiki_write. One entry per page. -->\n")
+            .map_err(|e| format!("Failed to write _index.md: {e}"))?;
+    }
+
+    // Create _log.md if missing
+    let log_path = wiki_dir.join("_log.md");
+    if !log_path.exists() {
+        std::fs::write(&log_path, "# Wiki Log\n\n<!-- Append-only operation log. -->\n")
+            .map_err(|e| format!("Failed to write _log.md: {e}"))?;
+    }
+
+    Ok(())
+}
+
+/// Validate a wiki page path: no traversal, must end with .md, not reserved.
+fn validate_wiki_page_path(page_path: &str) -> std::result::Result<(), String> {
+    if page_path.is_empty() {
+        return Err("page_path is required".to_string());
+    }
+    if page_path.contains("..") {
+        return Err("Path traversal (..) is not allowed".to_string());
+    }
+    if page_path.starts_with('/') || page_path.starts_with('\\') {
+        return Err("Absolute paths are not allowed".to_string());
+    }
+    if !page_path.ends_with(".md") {
+        return Err("Page path must end with .md".to_string());
+    }
+    // Check reserved filenames
+    let filename = std::path::Path::new(page_path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("");
+    if WIKI_RESERVED.contains(&filename) {
+        return Err(format!("'{}' is a reserved wiki file and cannot be overwritten", filename));
+    }
+    Ok(())
+}
+
+/// Extract title from YAML frontmatter (best-effort, no YAML parser dependency).
+fn extract_frontmatter_title(content: &str) -> Option<String> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return None;
+    }
+    // Find the closing ---
+    let rest = &trimmed[3..];
+    let end = rest.find("\n---")?;
+    let frontmatter = &rest[..end];
+    for line in frontmatter.lines() {
+        let line = line.trim();
+        if let Some(after) = line.strip_prefix("title:") {
+            let title = after.trim().trim_matches('"').trim_matches('\'');
+            if !title.is_empty() {
+                return Some(title.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Extract the updated field from YAML frontmatter.
+fn extract_frontmatter_updated(content: &str) -> Option<String> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return None;
+    }
+    let rest = &trimmed[3..];
+    let end = rest.find("\n---")?;
+    let frontmatter = &rest[..end];
+    for line in frontmatter.lines() {
+        let line = line.trim();
+        if let Some(after) = line.strip_prefix("updated:") {
+            let val = after.trim().trim_matches('"').trim_matches('\'');
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Update _index.md with an entry for a page.
+/// Format: `- [{title}]({page_path}) — updated {date}`
+fn update_wiki_index(wiki_dir: &Path, page_path: &str, title: &str) -> std::result::Result<(), String> {
+    let index_path = wiki_dir.join("_index.md");
+    let existing = std::fs::read_to_string(&index_path).unwrap_or_default();
+
+    // Build the new entry line
+    let now = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let entry_line = format!("- [{}]({}) — updated {}", title, page_path, now);
+
+    // Check if this page already has an entry and replace it
+    let link_pattern = format!("]({})", page_path);
+    let mut lines: Vec<String> = existing.lines().map(String::from).collect();
+    let mut found = false;
+    for line in &mut lines {
+        if line.contains(&link_pattern) {
+            *line = entry_line.clone();
+            found = true;
+            break;
+        }
+    }
+
+    if !found {
+        lines.push(entry_line);
+    }
+
+    let new_content = lines.join("\n") + "\n";
+    std::fs::write(&index_path, new_content)
+        .map_err(|e| format!("Failed to update _index.md: {e}"))
+}
+
+/// Append a log entry to _log.md.
+fn append_wiki_log(wiki_dir: &Path, action: &str, page_path: &str) -> std::result::Result<(), String> {
+    let log_path = wiki_dir.join("_log.md");
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let entry = format!("## [{}] {} | {}\n", now, action, page_path);
+
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("Failed to open _log.md: {e}"))?;
+    f.write_all(entry.as_bytes())
+        .map_err(|e| format!("Failed to append to _log.md: {e}"))?;
+    Ok(())
+}
+
+/// Collect all .md files under `dir` recursively (relative to `base`).
+fn collect_md_files(base: &Path, dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut result = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return result,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            result.extend(collect_md_files(base, &path));
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            if let Ok(rel) = path.strip_prefix(base) {
+                // Skip reserved files
+                let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+                if !WIKI_RESERVED.contains(&fname) {
+                    result.push(rel.to_path_buf());
+                }
+            }
+        }
+    }
+    result
+}
+
+async fn handle_wiki_ls(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
+
+    let wiki_dir = match resolve_wiki_dir(home_dir, agent_id) {
+        Ok(d) => d,
+        Err(e) => return tool_error(&e),
+    };
+
+    if !wiki_dir.exists() {
+        return tool_text(&format!("No wiki found for agent '{}'. Use wiki_write to create the first page.", agent_id));
+    }
+
+    let pages = collect_md_files(&wiki_dir, &wiki_dir);
+    if pages.is_empty() {
+        return tool_text("Wiki directory exists but contains no pages.");
+    }
+
+    let mut lines = Vec::with_capacity(pages.len() + 1);
+    lines.push(format!("Wiki for agent '{}' ({} pages):\n", agent_id, pages.len()));
+
+    for rel_path in &pages {
+        let full_path = wiki_dir.join(rel_path);
+        let content = std::fs::read_to_string(&full_path).unwrap_or_default();
+        let title = extract_frontmatter_title(&content)
+            .unwrap_or_else(|| rel_path.to_string_lossy().to_string());
+        let updated = extract_frontmatter_updated(&content).unwrap_or_else(|| "?".to_string());
+        lines.push(format!("  {} — {} (updated: {})", rel_path.display(), title, updated));
+    }
+
+    tool_text(&lines.join("\n"))
+}
+
+async fn handle_wiki_read(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
+    let page_path = match args.get("page_path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return tool_error("Missing required parameter: page_path"),
+    };
+
+    // Allow reading reserved files (e.g. _index.md, _schema.md) — validation only blocks writes
+    if page_path.contains("..") || page_path.starts_with('/') || page_path.starts_with('\\') {
+        return tool_error("Path traversal is not allowed");
+    }
+
+    let wiki_dir = match resolve_wiki_dir(home_dir, agent_id) {
+        Ok(d) => d,
+        Err(e) => return tool_error(&e),
+    };
+
+    let full_path = wiki_dir.join(page_path);
+
+    // Verify the resolved path is still under wiki_dir (symlink protection)
+    if let (Ok(canon_wiki), Ok(canon_page)) = (wiki_dir.canonicalize(), full_path.canonicalize()) {
+        if !canon_page.starts_with(&canon_wiki) {
+            return tool_error("Path escapes wiki directory");
+        }
+    }
+
+    match std::fs::read_to_string(&full_path) {
+        Ok(content) => tool_text(&content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tool_error(&format!("Page not found: {}", page_path))
+        }
+        Err(e) => tool_error(&format!("Failed to read page: {e}")),
+    }
+}
+
+async fn handle_wiki_write(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
+    let page_path = match args.get("page_path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return tool_error("Missing required parameter: page_path"),
+    };
+    let content = match args.get("content").and_then(|v| v.as_str()) {
+        Some(c) => c,
+        None => return tool_error("Missing required parameter: content"),
+    };
+
+    if let Err(e) = validate_wiki_page_path(page_path) {
+        return tool_error(&e);
+    }
+
+    if content.len() > WIKI_MAX_PAGE_SIZE {
+        return tool_error(&format!("Content too large: {} bytes (max {})", content.len(), WIKI_MAX_PAGE_SIZE));
+    }
+
+    let wiki_dir = match resolve_wiki_dir(home_dir, agent_id) {
+        Ok(d) => d,
+        Err(e) => return tool_error(&e),
+    };
+
+    // Ensure wiki scaffold exists
+    if let Err(e) = ensure_wiki_dir(&wiki_dir) {
+        return tool_error(&e);
+    }
+
+    let full_path = wiki_dir.join(page_path);
+
+    // Ensure parent directory exists
+    if let Some(parent) = full_path.parent() {
+        if !parent.exists() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return tool_error(&format!("Failed to create directory: {e}"));
+            }
+        }
+    }
+
+    let is_new = !full_path.exists();
+
+    // Atomic write: temp file + rename
+    let tmp_path = full_path.with_extension("md.tmp");
+    if let Err(e) = std::fs::write(&tmp_path, content) {
+        return tool_error(&format!("Failed to write temp file: {e}"));
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &full_path) {
+        // Clean up temp file on rename failure
+        let _ = std::fs::remove_file(&tmp_path);
+        return tool_error(&format!("Failed to rename temp file: {e}"));
+    }
+
+    // Update _index.md
+    let update_index = args
+        .get("update_index")
+        .and_then(|v| v.as_str())
+        .map(|s| s != "false")
+        .unwrap_or(true);
+
+    if update_index {
+        let title = extract_frontmatter_title(content)
+            .unwrap_or_else(|| page_path.to_string());
+        if let Err(e) = update_wiki_index(&wiki_dir, page_path, &title) {
+            warn!("Failed to update wiki index: {e}");
+        }
+    }
+
+    // Append to _log.md
+    let action = if is_new { "create" } else { "update" };
+    if let Err(e) = append_wiki_log(&wiki_dir, action, page_path) {
+        warn!("Failed to append wiki log: {e}");
+    }
+
+    let verb = if is_new { "Created" } else { "Updated" };
+    tool_text(&format!("{} wiki page: {}", verb, page_path))
+}
+
+async fn handle_wiki_search(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
+    let query = match args.get("query").and_then(|v| v.as_str()) {
+        Some(q) if !q.is_empty() => q,
+        _ => return tool_error("Missing required parameter: query"),
+    };
+    let limit: usize = args
+        .get("limit")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10)
+        .min(100);
+
+    let wiki_dir = match resolve_wiki_dir(home_dir, agent_id) {
+        Ok(d) => d,
+        Err(e) => return tool_error(&e),
+    };
+
+    if !wiki_dir.exists() {
+        return tool_text("No wiki found. Use wiki_write to create the first page.");
+    }
+
+    let query_terms: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
+    let pages = collect_md_files(&wiki_dir, &wiki_dir);
+
+    // Score each page by keyword match count in content
+    let mut scored: Vec<(usize, String, String, Vec<String>)> = Vec::new(); // (score, path, title, matching_lines)
+
+    for rel_path in &pages {
+        let full_path = wiki_dir.join(rel_path);
+        let content = match std::fs::read_to_string(&full_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let content_lower = content.to_lowercase();
+        let score: usize = query_terms.iter().filter(|t| content_lower.contains(t.as_str())).count();
+
+        if score == 0 {
+            continue;
+        }
+
+        let title = extract_frontmatter_title(&content)
+            .unwrap_or_else(|| rel_path.to_string_lossy().to_string());
+
+        // Collect matching lines (up to 3 per page)
+        let matching_lines: Vec<String> = content
+            .lines()
+            .filter(|line| {
+                let ll = line.to_lowercase();
+                query_terms.iter().any(|t| ll.contains(t.as_str()))
+            })
+            .take(3)
+            .map(|l| {
+                let trimmed = l.trim();
+                if trimmed.len() > 120 {
+                    format!("  {}...", &trimmed[..117])
+                } else {
+                    format!("  {}", trimmed)
+                }
+            })
+            .collect();
+
+        scored.push((score, rel_path.to_string_lossy().to_string(), title, matching_lines));
+    }
+
+    // Also search _index.md for additional context
+    let index_path = wiki_dir.join("_index.md");
+    if let Ok(index_content) = std::fs::read_to_string(&index_path) {
+        let index_lower = index_content.to_lowercase();
+        for term in &query_terms {
+            if index_lower.contains(term.as_str()) {
+                // Boost pages mentioned in matching index lines
+                for line in index_content.lines() {
+                    let ll = line.to_lowercase();
+                    if ll.contains(term.as_str()) {
+                        // Extract page path from markdown link [title](path)
+                        if let Some(start) = line.find("](") {
+                            if let Some(end) = line[start + 2..].find(')') {
+                                let linked_path = &line[start + 2..start + 2 + end];
+                                // Boost this page's score
+                                for entry in &mut scored {
+                                    if entry.1 == linked_path {
+                                        entry.0 += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by score descending
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.truncate(limit);
+
+    if scored.is_empty() {
+        return tool_text(&format!("No wiki pages match query: '{}'", query));
+    }
+
+    let mut output = format!("Found {} matching pages for '{}':\n\n", scored.len(), query);
+    for (score, path, title, lines) in &scored {
+        output.push_str(&format!("**{}** ({}) — relevance: {}\n", title, path, score));
+        for line in lines {
+            output.push_str(&format!("{}\n", line));
+        }
+        output.push('\n');
+    }
+
+    tool_text(&output)
+}
+
+async fn handle_wiki_lint(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
+
+    let wiki_dir = match resolve_wiki_dir(home_dir, agent_id) {
+        Ok(d) => d,
+        Err(e) => return tool_error(&e),
+    };
+
+    if !wiki_dir.exists() {
+        return tool_text("No wiki found. Use wiki_write to create the first page.");
+    }
+
+    let store = duduclaw_memory::WikiStore::new(wiki_dir);
+    match store.lint() {
+        Ok(report) => {
+            let mut output = format!("Wiki Lint Report for '{}'\n\n", agent_id);
+            output.push_str(&format!("Total pages: {}\n", report.total_pages));
+            output.push_str(&format!("Index entries: {}\n\n", report.index_entries));
+
+            if report.orphan_pages.is_empty() && report.broken_links.is_empty() && report.stale_pages.is_empty() {
+                output.push_str("All clear — no issues found.\n");
+            } else {
+                if !report.orphan_pages.is_empty() {
+                    output.push_str(&format!("Orphan pages ({}):\n", report.orphan_pages.len()));
+                    for p in &report.orphan_pages {
+                        output.push_str(&format!("  - {}\n", p));
+                    }
+                    output.push('\n');
+                }
+
+                if !report.broken_links.is_empty() {
+                    output.push_str(&format!("Broken links ({}):\n", report.broken_links.len()));
+                    for (from, to) in &report.broken_links {
+                        output.push_str(&format!("  - {} -> {} (not found)\n", from, to));
+                    }
+                    output.push('\n');
+                }
+
+                if !report.stale_pages.is_empty() {
+                    output.push_str(&format!("Stale pages (>30 days) ({}):\n", report.stale_pages.len()));
+                    for p in &report.stale_pages {
+                        output.push_str(&format!("  - {}\n", p));
+                    }
+                }
+            }
+
+            tool_text(&output)
+        }
+        Err(e) => tool_error(&format!("Lint failed: {e}")),
+    }
+}
+
+async fn handle_wiki_stats(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
+
+    let wiki_dir = match resolve_wiki_dir(home_dir, agent_id) {
+        Ok(d) => d,
+        Err(e) => return tool_error(&e),
+    };
+
+    if !wiki_dir.exists() {
+        return tool_text(&format!("No wiki found for agent '{}'.", agent_id));
+    }
+
+    let store = duduclaw_memory::WikiStore::new(wiki_dir.clone());
+    let pages = match store.list_pages() {
+        Ok(p) => p,
+        Err(e) => return tool_error(&format!("Failed to list pages: {e}")),
+    };
+
+    let index_content = std::fs::read_to_string(wiki_dir.join("_index.md")).unwrap_or_default();
+    let index_entries = index_content.lines().filter(|l| l.starts_with("- [")).count();
+
+    let log_content = std::fs::read_to_string(wiki_dir.join("_log.md")).unwrap_or_default();
+    let log_entries = log_content.lines().filter(|l| l.starts_with("## [")).count();
+
+    // Count by directory
+    let mut by_dir: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for page in &pages {
+        let dir = std::path::Path::new(&page.path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("root")
+            .to_string();
+        *by_dir.entry(dir).or_insert(0) += 1;
+    }
+
+    let most_recent = pages.first().map(|p| {
+        format!("{} ({})", p.title, p.updated.format("%Y-%m-%d"))
+    }).unwrap_or_else(|| "none".to_string());
+
+    let mut output = format!("Wiki Stats for '{}'\n\n", agent_id);
+    output.push_str(&format!("Total pages: {}\n", pages.len()));
+    output.push_str(&format!("Index entries: {}\n", index_entries));
+    output.push_str(&format!("Log entries: {}\n", log_entries));
+    output.push_str(&format!("Most recent: {}\n\n", most_recent));
+
+    output.push_str("By directory:\n");
+    let mut dirs: Vec<_> = by_dir.into_iter().collect();
+    dirs.sort_by(|a, b| b.1.cmp(&a.1));
+    for (dir, count) in &dirs {
+        output.push_str(&format!("  {}: {} pages\n", dir, count));
+    }
+
+    tool_text(&output)
+}
+
+async fn handle_wiki_export(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
+    let format = args.get("format").and_then(|v| v.as_str()).unwrap_or("html");
+
+    let wiki_dir = match resolve_wiki_dir(home_dir, agent_id) {
+        Ok(d) => d,
+        Err(e) => return tool_error(&e),
+    };
+
+    if !wiki_dir.exists() {
+        return tool_text("No wiki found. Nothing to export.");
+    }
+
+    let store = duduclaw_memory::WikiStore::new(wiki_dir);
+
+    match format {
+        "obsidian" => {
+            let export_dir = home_dir.join("exports").join(format!("{}-wiki-obsidian", agent_id));
+            if let Err(e) = std::fs::create_dir_all(&export_dir) {
+                return tool_error(&format!("Failed to create export directory: {e}"));
+            }
+            match store.export_obsidian(&export_dir) {
+                Ok(count) => tool_text(&format!(
+                    "Exported {} pages as Obsidian vault to:\n{}",
+                    count,
+                    export_dir.display()
+                )),
+                Err(e) => tool_error(&format!("Export failed: {e}")),
+            }
+        }
+        "html" => {
+            match store.export_html() {
+                Ok(html) => {
+                    let export_path = home_dir.join("exports").join(format!("{}-wiki.html", agent_id));
+                    if let Some(parent) = export_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    match std::fs::write(&export_path, &html) {
+                        Ok(()) => tool_text(&format!(
+                            "Exported wiki as HTML ({} bytes) to:\n{}",
+                            html.len(),
+                            export_path.display()
+                        )),
+                        Err(e) => tool_error(&format!("Failed to write HTML: {e}")),
+                    }
+                }
+                Err(e) => tool_error(&format!("Export failed: {e}")),
+            }
+        }
+        _ => tool_error(&format!("Unknown format '{}'. Use 'obsidian' or 'html'.", format)),
+    }
+}
+
+async fn handle_skill_extract(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
+    let skill_name = match args.get("skill_name").and_then(|v| v.as_str()) {
+        Some(n) if !n.is_empty() => n,
+        _ => return tool_error("Missing required parameter: skill_name"),
+    };
+
+    // Validate skill_name to prevent path traversal
+    if skill_name.contains("..") || skill_name.contains('/') || skill_name.contains('\\')
+        || skill_name.contains('\0') || skill_name.len() > 128
+        || !skill_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return tool_error("Invalid skill_name: use alphanumeric, hyphens, underscores only");
+    }
+
+    let wiki_dir = match resolve_wiki_dir(home_dir, agent_id) {
+        Ok(d) => d,
+        Err(e) => return tool_error(&e),
+    };
+
+    // Check if already extracted
+    if duduclaw_gateway::skill_lifecycle::extraction::is_already_extracted(skill_name, &wiki_dir) {
+        return tool_text(&format!("Skill '{}' has already been extracted to wiki.", skill_name));
+    }
+
+    // Find the skill file
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    let skills_dir = agent_dir.join("skills");
+    let skill_path = skills_dir.join(format!("{}.md", skill_name));
+
+    let skill_content = if skill_path.exists() {
+        std::fs::read_to_string(&skill_path).unwrap_or_default()
+    } else {
+        // Try without .md extension (might already include it)
+        let alt_path = skills_dir.join(skill_name);
+        if alt_path.exists() {
+            std::fs::read_to_string(&alt_path).unwrap_or_default()
+        } else {
+            return tool_error(&format!("Skill file not found: {}", skill_path.display()));
+        }
+    };
+
+    if skill_content.trim().is_empty() {
+        return tool_error("Skill file is empty");
+    }
+
+    let compressed = duduclaw_gateway::skill_lifecycle::compression::CompressedSkill::compress(
+        skill_name, &skill_content, None,
+    );
+
+    let result = duduclaw_gateway::skill_lifecycle::extraction::extract_heuristic(&compressed, agent_id);
+    let proposals = result.all_proposals();
+    let concept_count = result.concepts.len();
+    let entity_count = result.entities.len();
+
+    if proposals.is_empty() {
+        return tool_text("No extractable knowledge found in skill.");
+    }
+
+    // Validate
+    if let Err(gradient) = duduclaw_gateway::gvu::verifier::verify_wiki_proposals(&proposals) {
+        return tool_error(&format!("Proposals rejected: {}", gradient.critique));
+    }
+
+    // Apply
+    let store = duduclaw_memory::WikiStore::new(wiki_dir);
+    if let Err(e) = store.ensure_scaffold() {
+        return tool_error(&format!("Wiki scaffold failed: {e}"));
+    }
+    match store.apply_proposals(&proposals) {
+        Ok(count) => tool_text(&format!(
+            "Extracted knowledge from skill '{}':\n- {} concept pages\n- {} entity pages\n- 1 source summary\n- {} total pages written",
+            skill_name, concept_count, entity_count, count
+        )),
+        Err(e) => tool_error(&format!("Failed to apply proposals: {e}")),
     }
 }
 
