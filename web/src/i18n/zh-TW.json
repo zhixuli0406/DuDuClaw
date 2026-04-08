@@ -487,7 +487,7 @@
   "login.password": "密碼",
   "login.submit": "登入",
   "login.loading": "登入中...",
-  "login.footer": "首次使用請以 admin@local / admin 登入",
+  "login.footer": "首次使用請以 admin@local / admin 登入，登入後請立即更改密碼",
 
   "auth.logout": "登出",
   "auth.unauthorized": "您沒有權限存取此頁面",
