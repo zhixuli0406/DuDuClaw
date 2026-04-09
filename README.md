@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.2.0--beta.1-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.3.7-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 
 ---
 
@@ -27,7 +27,7 @@ DuDuClaw (plumbing)
   ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu
   ├─ Multi-Runtime — Claude / Codex / Gemini / OpenAI-compat 自動偵測
   ├─ Session Manager — SQLite, 50k token 自動壓縮
-  ├─ MCP Server — 30+ 工具（通訊、記憶、Agent、Skill、ERP）
+  ├─ MCP Server — 70+ 工具（通訊、記憶、Agent、Skill、ERP）
   ├─ Evolution Engine — GVU² 雙迴圈進化 + 預測驅動 + MistakeNotebook
   ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / ONNX
   ├─ Voice Pipeline — ASR (SenseVoice / Whisper) + TTS (Piper) + VAD (Silero)
@@ -54,7 +54,7 @@ DuDuClaw (plumbing)
 
 | 特色 | 說明 |
 |------|------|
-| **MCP Server 架構** | `duduclaw mcp-server` 提供 30+ 工具，涵蓋通訊、記憶、Agent 管理、Skill 市場、Odoo ERP |
+| **MCP Server 架構** | `duduclaw mcp-server` 提供 70+ 工具，涵蓋通訊、記憶、Agent 管理、Skill 市場、Odoo ERP |
 | **Multi-Runtime** | `AgentRuntime` trait — Claude / Codex / Gemini / OpenAI-compat 四種後端，`RuntimeRegistry` 自動偵測，per-agent 設定 |
 | **本地推論引擎** | 統一 `InferenceBackend` trait — llama.cpp（Metal/CUDA/Vulkan）/ mistral.rs / Exo P2P 叢集 / llamafile / OpenAI-compat HTTP |
 | **三層信心路由** | LocalFast → LocalStrong → CloudAPI，基於啟發式信心評分自動分流 |
@@ -128,11 +128,11 @@ DuDuClaw (plumbing)
 | 特色 | 說明 |
 |------|------|
 | **技術棧** | React 19 + TypeScript + Tailwind CSS 4 + shadcn/ui，溫暖 amber 色系 |
-| **18 個頁面** | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / SettingsPage |
+| **21 個頁面** | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / KnowledgeHub / Odoo / Login / Users |
 | **即時日誌** | BroadcastLayer tracing → WebSocket 推播 |
 | **組織架構圖** | D3.js 互動式 Agent 層級視覺化 |
 | **深淺色切換** | 跟隨系統偏好，支援手動切換 |
-| **國際化** | zh-TW / en / ja-JP 三語支援（315+ 翻譯鍵）|
+| **國際化** | zh-TW / en / ja-JP 三語支援（540+ 翻譯鍵）|
 
 ---
 
@@ -304,9 +304,10 @@ duduclaw version             # 版本資訊
 
 ```
 DuDuClaw/
-├── crates/                         # Rust crates (12 個)
+├── crates/                         # Rust crates (13 個)
 │   ├── duduclaw-core/              # 共用型別、traits (Channel, MemoryEngine)、錯誤定義
 │   ├── duduclaw-agent/             # Agent 註冊、心跳、預算、契約、skill loader/registry
+│   ├── duduclaw-auth/              # 多用戶認證（Argon2 密碼、JWT、ACL 角色權限）
 │   ├── duduclaw-security/          # AES-256-GCM、SOUL guard、input guard、audit、key vault
 │   ├── duduclaw-container/         # Docker / Apple Container / WSL2 沙箱執行
 │   ├── duduclaw-memory/            # SQLite + FTS5 全文搜尋 + 向量嵌入
@@ -327,8 +328,8 @@ DuDuClaw/
 ├── web/                            # React Dashboard
 │   └── src/
 │       ├── components/             # UI 元件 (OrgChart, ApprovalModal, SessionReplay)
-│       ├── pages/                  # 18 個頁面
-│       ├── stores/                 # Zustand 狀態管理 (6 stores)
+│       ├── pages/                  # 21 個頁面
+│       ├── stores/                 # Zustand 狀態管理 (8 stores)
 │       ├── lib/                    # API client (WebSocket JSON-RPC)
 │       └── i18n/                   # zh-TW / en / ja-JP
 │
@@ -337,7 +338,8 @@ DuDuClaw/
 │   ├── manufacturing/              # 製造業（設備監控、SOP、異常告警）
 │   ├── trading/                    # 貿易業（報價、訂單、庫存、價目表）
 │   ├── evaluator/                  # Evaluator Agent（對抗式驗證）
-│   └── orchestrator/               # Orchestrator Agent（任務編排）
+│   ├── orchestrator/               # Orchestrator Agent（任務編排）
+│   └── wiki/                       # Wiki 知識庫模板
 │
 ├── .claude/                        # Claude Code Hook 安全系統
 │   ├── settings.local.json         # Hook 設定（6 事件 × 10 腳本）
