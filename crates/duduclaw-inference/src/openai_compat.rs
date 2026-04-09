@@ -9,6 +9,23 @@ use crate::config::OpenAiCompatConfig;
 use crate::error::{InferenceError, Result};
 use crate::types::*;
 
+// ── Prefix Caching Compatibility ──────────────────────────────
+// SGLang: RadixAttention automatically caches KV for shared prefixes.
+//   - Ensure system prompt is byte-identical across requests.
+//   - No special configuration needed beyond --enable-prefix-caching.
+// vLLM: Automatic Prefix Caching (APC) enabled via --enable-prefix-caching.
+//   - System prompt must be byte-identical including whitespace.
+// Both engines benefit from DuDuClaw's frozen SystemPromptSnapshot.
+// ──────────────────────────────────────────────────────────────
+
+/// Custom header for monitoring prompt cache hit rates with SGLang/vLLM.
+///
+/// Set this to a hash of the system prompt content so that external monitoring
+/// can correlate cache effectiveness across requests. SGLang RadixAttention
+/// and vLLM APC automatically cache matching prefixes; this header enables
+/// observability without affecting inference behavior.
+const PREFIX_HASH_HEADER: &str = "X-DuDuClaw-Prefix-Hash";
+
 /// Backend that calls an OpenAI-compatible HTTP API.
 pub struct OpenAiCompatBackend {
     config: OpenAiCompatConfig,
@@ -16,6 +33,8 @@ pub struct OpenAiCompatBackend {
     loaded_model: RwLock<Option<ModelInfo>>,
     chat_url: String,
     models_url: String,
+    /// Optional system prompt content hash for cache monitoring.
+    prefix_hash: Option<String>,
 }
 
 impl OpenAiCompatBackend {
@@ -35,7 +54,18 @@ impl OpenAiCompatBackend {
             loaded_model: RwLock::new(None),
             chat_url,
             models_url,
+            prefix_hash: None,
         }
+    }
+
+    /// Set the system prompt content hash for cache monitoring.
+    ///
+    /// SGLang RadixAttention and vLLM APC automatically cache matching prefixes;
+    /// this header enables external monitoring of cache effectiveness.
+    /// The hash is sent as an `X-DuDuClaw-Prefix-Hash` header on every request.
+    pub fn with_prefix_hash(mut self, hash: &str) -> Self {
+        self.prefix_hash = Some(hash.to_string());
+        self
     }
 }
 
@@ -145,6 +175,9 @@ impl InferenceBackend for OpenAiCompatBackend {
         let mut req = self.client.post(url).json(&body);
         if let Some(ref key) = self.config.api_key {
             req = req.bearer_auth(key);
+        }
+        if let Some(ref hash) = self.prefix_hash {
+            req = req.header(PREFIX_HASH_HEADER, hash.as_str());
         }
 
         let resp = req.send().await.map_err(|e| InferenceError::Http(e.to_string()))?;

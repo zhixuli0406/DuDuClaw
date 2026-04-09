@@ -35,6 +35,14 @@ export interface AgentModel {
   local?: AgentLocalModel | null;
 }
 
+export interface AgentSticker {
+  enabled: boolean;
+  probability: number;
+  intensity_threshold: number;
+  cooldown_messages: number;
+  expressiveness: 'minimal' | 'moderate' | 'expressive';
+}
+
 export interface AgentDetail extends AgentInfo {
   budget: AgentBudget;
   model: AgentModel;
@@ -48,6 +56,7 @@ export interface AgentDetail extends AgentInfo {
   };
   skills: string[];
   permissions: Record<string, boolean>;
+  sticker?: AgentSticker;
 }
 
 export interface ChannelStatus {
@@ -423,6 +432,12 @@ export interface AgentUpdateParams {
   feishu_app_id?: string;
   feishu_app_secret?: string;
   feishu_verification_token?: string;
+  // Sticker
+  sticker_enabled?: boolean;
+  sticker_probability?: number;
+  sticker_intensity_threshold?: number;
+  sticker_cooldown_messages?: number;
+  sticker_expressiveness?: 'minimal' | 'moderate' | 'expressive';
 }
 
 // API namespace

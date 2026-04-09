@@ -30,6 +30,11 @@ pub async fn vet_skill(
         cmd.args(["--quarantine-dir", &qd.to_string_lossy()]);
     }
 
+    // SECURITY: Clear all inherited env vars (prevents API key leakage),
+    // then whitelist only what the Python subprocess needs.
+    cmd.env_clear();
+    cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
+    cmd.env("HOME", std::env::var("HOME").unwrap_or_default());
     cmd.env("PYTHONPATH", &python_path);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());

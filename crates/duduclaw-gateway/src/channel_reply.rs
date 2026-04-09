@@ -20,6 +20,9 @@ use crate::handlers::ChannelState;
 use crate::gvu::loop_::GvuLoop;
 use crate::prediction::engine::PredictionEngine;
 use crate::session::SessionManager;
+use crate::skill_extraction::recorder::{
+    Sentiment, SkillCache, SkillExtractor, TrajectoryOutcome, TrajectoryRecorder,
+};
 use crate::skill_lifecycle::activation::SkillActivationController;
 use crate::skill_lifecycle::compression::CompressedSkillCache;
 use crate::skill_lifecycle::lift::LiftTrackerStore;
@@ -60,6 +63,10 @@ pub struct ReplyContext {
     pub circuit_breakers: Option<Arc<CircuitBreakerRegistry>>,
     /// Mistake notebook for grounded GVU evolution (Phase 1 GVU²).
     pub mistake_notebook: Option<Arc<crate::gvu::mistake_notebook::MistakeNotebook>>,
+    /// Trajectory recorder for skill extraction (Phase 3).
+    pub skill_recorder: Arc<tokio::sync::Mutex<TrajectoryRecorder>>,
+    /// Persistent skill bank for extracted skills (Phase 3).
+    pub skill_bank: Arc<tokio::sync::Mutex<SkillCache>>,
 }
 
 impl ReplyContext {
@@ -110,6 +117,8 @@ impl ReplyContext {
             failsafe: Some(failsafe),
             circuit_breakers: Some(circuit_breakers),
             mistake_notebook: None,
+            skill_recorder: Arc::new(tokio::sync::Mutex::new(TrajectoryRecorder::new())),
+            skill_bank: Arc::new(tokio::sync::Mutex::new(SkillCache::new())),
         }
     }
 
@@ -158,6 +167,58 @@ pub async fn set_channel_connected(status: &ChannelStatusMap, name: &str, connec
         if let Ok(json) = serde_json::to_string(&event) {
             let _ = tx.send(json);
         }
+    }
+}
+
+// ── User sentiment detection ───────────────────────────────
+
+/// Detect user satisfaction heuristic from message text (zero LLM cost).
+///
+/// Positive signals: gratitude, approval, emoji thumbs-up, CJK equivalents.
+/// Negative signals: corrections, complaints, error reports, CJK equivalents.
+/// Returns `None` if no clear signal detected (neutral message).
+fn detect_user_sentiment(text: &str) -> Option<Sentiment> {
+    let lower = text.to_lowercase();
+    let positive_signals = [
+        "thanks",
+        "thank you",
+        "great",
+        "good",
+        "perfect",
+        "awesome",
+        "nice",
+        "\u{1f44d}", // 👍
+        "\u{1f389}", // 🎉
+        "\u{2705}",  // ✅
+        "\u{8b1d}\u{8b1d}",     // 謝謝
+        "\u{611f}\u{8b1d}",     // 感謝
+        "\u{5b8c}\u{7f8e}",     // 完美
+        "\u{597d}\u{7684}",     // 好的
+        "\u{8b9a}",             // 讚
+        "\u{592a}\u{597d}\u{4e86}", // 太好了
+        "\u{5f88}\u{597d}",     // 很好
+    ];
+    let negative_signals = [
+        "no",
+        "wrong",
+        "incorrect",
+        "fix",
+        "error",
+        "bug",
+        "\u{4e0d}\u{5c0d}",     // 不對
+        "\u{932f}\u{4e86}",     // 錯了
+        "\u{91cd}\u{4f86}",     // 重來
+        "\u{4e0d}\u{884c}",     // 不行
+        "\u{4fee}\u{6b63}",     // 修正
+        "\u{6709}\u{554f}\u{984c}", // 有問題
+    ];
+
+    if positive_signals.iter().any(|s| lower.contains(s)) {
+        Some(Sentiment::Positive)
+    } else if negative_signals.iter().any(|s| lower.contains(s)) {
+        Some(Sentiment::Negative)
+    } else {
+        None
     }
 }
 
@@ -430,6 +491,73 @@ async fn build_reply_with_session_inner(
 
     // ── All pre-filters passed — now create/load session ──
     let _ = session_mgr.get_or_create(session_id, &agent_id).await;
+
+    // ── Phase 3: Check if previous trajectory should get feedback ──
+    // The current user message may contain feedback (positive/negative) for
+    // the assistant's previous reply, completing the "within 2 turns" window.
+    {
+        let sentiment = detect_user_sentiment(text);
+        if let Some(sentiment) = sentiment {
+            let session_key = format!("{session_id}:{agent_id}");
+            let mut recorder = ctx.skill_recorder.lock().await;
+            if recorder.is_recording(&session_key) {
+                // Record this feedback turn, then finalize with detected sentiment
+                recorder.record_turn(&session_key, "user", text, vec![]);
+                let outcome = match sentiment {
+                    Sentiment::Positive => TrajectoryOutcome::Success,
+                    Sentiment::Negative => TrajectoryOutcome::Failure,
+                };
+                if let Some(trajectory) = recorder.finalize(&session_key, outcome, Some(sentiment)) {
+                    // Extract skill heuristically (zero LLM cost)
+                    if let Some(skill) = SkillExtractor::extract_heuristic(&trajectory) {
+                        info!(
+                            skill_name = %skill.name,
+                            tools = ?skill.tools_used,
+                            confidence = skill.confidence,
+                            "Auto-extracted skill from trajectory (feedback-triggered)"
+                        );
+
+                        // Persist to SkillCache
+                        {
+                            let mut bank = ctx.skill_bank.lock().await;
+                            bank.add(skill.clone());
+                            debug!(bank_size = bank.len(), "Skill added to SkillCache");
+                        }
+
+                        // Log extraction event to audit log
+                        let audit_entry = serde_json::json!({
+                            "event": "skill_extracted",
+                            "trigger": "user_feedback",
+                            "skill_id": skill.id,
+                            "skill_name": skill.name,
+                            "tools_used": skill.tools_used,
+                            "confidence": skill.confidence,
+                            "sentiment": format!("{sentiment:?}"),
+                            "source_session": session_key,
+                            "timestamp": chrono::Utc::now().to_rfc3339(),
+                        });
+                        if let Ok(audit_line) = serde_json::to_string(&audit_entry) {
+                            let audit_path = ctx.home_dir.join("skill_extraction_audit.jsonl");
+                            if let Ok(mut f) = tokio::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&audit_path)
+                                .await
+                            {
+                                use tokio::io::AsyncWriteExt;
+                                let _ = f.write_all(format!("{audit_line}\n").as_bytes()).await;
+                            }
+                        }
+                    }
+                }
+                debug!(
+                    session = %session_key,
+                    sentiment = ?sentiment,
+                    "User feedback detected for active trajectory"
+                );
+            }
+        }
+    }
 
     // Sanitize role-prefix injection: strip any attempt to impersonate assistant/system role
     let sanitized_text = if text.starts_with("assistant:") || text.starts_with("system:") {
@@ -879,6 +1007,23 @@ async fn build_reply_with_session_inner(
                     &home_for_wiki,
                 ).await;
             });
+        }
+
+        // ── Phase 3: Record trajectory for skill extraction ──────
+        // Start or continue recording the conversation trajectory.
+        // Recording is finalized when the next user message contains
+        // positive/negative feedback (see "within 2 turns" check above).
+        {
+            let session_key = format!("{session_id}:{agent_id}");
+            let mut recorder = ctx.skill_recorder.lock().await;
+            if !recorder.is_recording(&session_key) {
+                recorder.start(&session_key, &agent_id);
+                recorder.record_turn(&session_key, "user", text, vec![]);
+            }
+            // Record the assistant reply turn
+            // Tool names are not available here (streamed via CLI), so empty for now.
+            // Future: parse tool_use events from streaming and pass them through.
+            recorder.record_turn(&session_key, "assistant", &reply, vec![]);
         }
 
         // Check if compression needed; generate Claude summary then compress in background

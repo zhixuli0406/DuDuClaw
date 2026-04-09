@@ -113,6 +113,13 @@ impl SessionManager {
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
+        // Phase 4: Add hidden column for hide/restore mechanism (Sculptor, arXiv 2508.04664)
+        let _ = conn.execute(
+            "ALTER TABLE session_messages ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // Ignore error — column already exists on subsequent runs
+
         Ok(())
     }
 
@@ -199,7 +206,7 @@ impl SessionManager {
             .prepare(
                 "SELECT role, content, tokens, timestamp
                  FROM session_messages
-                 WHERE session_id = ?1
+                 WHERE session_id = ?1 AND hidden = 0
                  ORDER BY id ASC",
             )
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
@@ -365,5 +372,160 @@ impl SessionManager {
         }
 
         Ok(deleted as u64)
+    }
+
+    /// Hide a message from the active context (Sculptor hide/restore).
+    ///
+    /// The message remains in the database and can be restored later.
+    pub async fn hide_message(&self, session_id: &str, message_id: i64) -> Result<bool> {
+        let conn = self.acquire().await;
+        let rows = conn
+            .execute(
+                "UPDATE session_messages SET hidden = 1 WHERE id = ?1 AND session_id = ?2",
+                params![message_id, session_id],
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        Ok(rows > 0)
+    }
+
+    /// Restore a previously hidden message back to active context.
+    pub async fn restore_message(&self, session_id: &str, message_id: i64) -> Result<bool> {
+        let conn = self.acquire().await;
+        let rows = conn
+            .execute(
+                "UPDATE session_messages SET hidden = 0 WHERE id = ?1 AND session_id = ?2",
+                params![message_id, session_id],
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        Ok(rows > 0)
+    }
+
+    /// Search hidden messages for potential restoration.
+    pub async fn search_hidden_messages(
+        &self,
+        session_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, SessionMessage)>> {
+        let conn = self.acquire().await;
+        // Escape LIKE wildcards to prevent wildcard injection
+        let escaped_query = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped_query}%");
+        let safe_limit = limit.min(200); // Cap at 200 to prevent memory abuse
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, role, content, tokens, timestamp
+                 FROM session_messages
+                 WHERE session_id = ?1 AND hidden = 1 AND content LIKE ?2 ESCAPE '\\'
+                 ORDER BY id DESC
+                 LIMIT ?3",
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![session_id, pattern, safe_limit as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    SessionMessage {
+                        role: row.get(1)?,
+                        content: row.get(2)?,
+                        tokens: row.get(3)?,
+                        timestamp: row.get(4)?,
+                    },
+                ))
+            })
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| DuDuClawError::Gateway(e.to_string()))?);
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn test_hide_restore_message() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+
+        // Create session and add messages
+        mgr.get_or_create("test-session", "test-agent").await.unwrap();
+        mgr.append_message("test-session", "user", "hello", 5).await.unwrap();
+        mgr.append_message("test-session", "assistant", "world", 5).await.unwrap();
+
+        // Should have 2 visible messages
+        let msgs = mgr.get_messages("test-session").await.unwrap();
+        assert_eq!(msgs.len(), 2);
+
+        // Hide first message (id=1)
+        let hidden = mgr.hide_message("test-session", 1).await.unwrap();
+        assert!(hidden);
+
+        // Should have 1 visible message
+        let msgs = mgr.get_messages("test-session").await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "world");
+
+        // Restore
+        let restored = mgr.restore_message("test-session", 1).await.unwrap();
+        assert!(restored);
+
+        // Should have 2 visible messages again
+        let msgs = mgr.get_messages("test-session").await.unwrap();
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_search_hidden_messages() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+
+        mgr.get_or_create("test-session", "test-agent").await.unwrap();
+        mgr.append_message("test-session", "tool", "search result: found 5 items", 10)
+            .await
+            .unwrap();
+        mgr.append_message("test-session", "assistant", "I found 5 items", 5)
+            .await
+            .unwrap();
+
+        // Hide the tool result
+        mgr.hide_message("test-session", 1).await.unwrap();
+
+        // Search hidden messages
+        let found = mgr
+            .search_hidden_messages("test-session", "search result", 10)
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(found[0].1.content.contains("search result"));
+    }
+
+    #[tokio::test]
+    async fn test_get_messages_excludes_hidden() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+
+        mgr.get_or_create("s1", "agent").await.unwrap();
+        mgr.append_message("s1", "user", "msg1", 5).await.unwrap();
+        mgr.append_message("s1", "assistant", "msg2", 5).await.unwrap();
+        mgr.append_message("s1", "user", "msg3", 5).await.unwrap();
+
+        // Hide middle message
+        mgr.hide_message("s1", 2).await.unwrap();
+
+        let msgs = mgr.get_messages("s1").await.unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "msg1");
+        assert_eq!(msgs[1].content, "msg3");
     }
 }

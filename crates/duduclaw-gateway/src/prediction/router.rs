@@ -175,6 +175,21 @@ impl ExplorationState {
 }
 
 // ---------------------------------------------------------------------------
+// Skill extraction hook
+// ---------------------------------------------------------------------------
+
+/// Check if the current context warrants skill extraction alongside evolution.
+///
+/// When the prediction engine triggers a Reflect or GVU loop, we also check
+/// if the recent conversation trajectory could yield a reusable skill.
+///
+/// Phase 3: Also evaluate if recent trajectory is skill-extractable.
+/// Dual purpose: evolve SOUL.md (GVU) + extract procedural skill (SkillBank).
+pub fn should_extract_skill(tool_call_count: u32) -> bool {
+    tool_call_count >= 5 // Same threshold as TrajectoryRecorder
+}
+
+// ---------------------------------------------------------------------------
 // Main routing function
 // ---------------------------------------------------------------------------
 

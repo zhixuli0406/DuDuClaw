@@ -1096,6 +1096,45 @@ impl MethodHandler {
                 ("feishu_verification_token", Some("verification_token")),
             ], &mut changes)?;
 
+            // ── Sticker fields ([sticker] section) ──
+            let sticker = table.entry("sticker")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut();
+            if let Some(sticker) = sticker {
+                if let Some(v) = params_clone.get("sticker_enabled").and_then(|v| v.as_bool()) {
+                    sticker.insert("enabled".into(), toml::Value::Boolean(v));
+                    changes.push(format!("sticker.enabled = {v}"));
+                }
+                if let Some(v) = params_clone.get("sticker_probability").and_then(|v| v.as_f64()) {
+                    if !(0.0..=1.0).contains(&v) {
+                        return Err("sticker_probability must be 0.0-1.0".into());
+                    }
+                    sticker.insert("probability".into(), toml::Value::Float(v));
+                    changes.push(format!("sticker.probability = {v}"));
+                }
+                if let Some(v) = params_clone.get("sticker_intensity_threshold").and_then(|v| v.as_f64()) {
+                    if !(0.0..=1.0).contains(&v) {
+                        return Err("sticker_intensity_threshold must be 0.0-1.0".into());
+                    }
+                    sticker.insert("intensity_threshold".into(), toml::Value::Float(v));
+                    changes.push(format!("sticker.intensity_threshold = {v}"));
+                }
+                if let Some(v) = params_clone.get("sticker_cooldown_messages").and_then(|v| v.as_u64()) {
+                    if v > 100 {
+                        return Err("sticker_cooldown_messages must be 0-100".into());
+                    }
+                    sticker.insert("cooldown_messages".into(), toml::Value::Integer(v as i64));
+                    changes.push(format!("sticker.cooldown_messages = {v}"));
+                }
+                if let Some(v) = params_clone.get("sticker_expressiveness").and_then(|v| v.as_str()) {
+                    if !["minimal", "moderate", "expressive"].contains(&v) {
+                        return Err("sticker_expressiveness must be minimal|moderate|expressive".into());
+                    }
+                    sticker.insert("expressiveness".into(), toml::Value::String(v.into()));
+                    changes.push(format!("sticker.expressiveness = \"{v}\""));
+                }
+            }
+
             if changes.is_empty() {
                 return Err("No valid fields to update".into());
             }
@@ -1211,6 +1250,17 @@ impl MethodHandler {
                         "can_modify_own_skills": cfg.permissions.can_modify_own_skills,
                         "can_modify_own_soul": cfg.permissions.can_modify_own_soul,
                         "can_schedule_tasks": cfg.permissions.can_schedule_tasks,
+                    },
+                    "sticker": {
+                        "enabled": cfg.sticker.enabled,
+                        "probability": cfg.sticker.probability,
+                        "intensity_threshold": cfg.sticker.intensity_threshold,
+                        "cooldown_messages": cfg.sticker.cooldown_messages,
+                        "expressiveness": match cfg.sticker.expressiveness {
+                            duduclaw_core::types::Expressiveness::Minimal => "minimal",
+                            duduclaw_core::types::Expressiveness::Moderate => "moderate",
+                            duduclaw_core::types::Expressiveness::Expressive => "expressive",
+                        },
                     },
                 }))
             }

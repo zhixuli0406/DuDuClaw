@@ -181,6 +181,37 @@ impl Default for CapabilitiesConfig {
     }
 }
 
+/// Programmatic Tool Calling (PTC) configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PtcConfig {
+    /// Enable PTC for this agent.
+    pub enabled: bool,
+    /// MCP tools the script may call via RPC.
+    pub allowed_tools: Vec<String>,
+    /// Max output tokens from script stdout.
+    pub max_output_tokens: usize,
+    /// Script execution timeout in seconds.
+    pub timeout_seconds: u32,
+}
+
+impl Default for PtcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_tools: vec![
+                "web_search".to_string(),
+                "memory_search".to_string(),
+                "memory_store".to_string(),
+                "send_message".to_string(),
+                "send_to_agent".to_string(),
+            ],
+            max_output_tokens: 4096,
+            timeout_seconds: 30,
+        }
+    }
+}
+
 impl CapabilitiesConfig {
     /// Compute the list of tools that should be disallowed for Claude CLI.
     ///
@@ -254,7 +285,7 @@ impl Default for EvolutionConfig {
             skill_security_scan: true,
             external_factors: Default::default(),
             gvu_enabled: true,
-            cognitive_memory: false,
+            cognitive_memory: true,
             max_silence_hours: 12.0,
             max_gvu_generations: 3,
             observation_period_hours: 24.0,
@@ -479,6 +510,13 @@ pub struct AgentConfig {
     /// ```
     #[serde(default)]
     pub cultural_context: CulturalContextConfig,
+    /// Programmatic Tool Calling configuration.
+    #[serde(default)]
+    pub ptc: PtcConfig,
+    /// Emotion-based sticker/reaction auto-sending configuration.
+    /// Disabled by default — enable per-agent in `agent.toml [sticker]`.
+    #[serde(default)]
+    pub sticker: StickerConfig,
 }
 
 /// Cultural context for adjusting behavioural signal interpretation.
@@ -509,6 +547,72 @@ impl Default for CulturalContextConfig {
             short_reply_threshold: 15,
             silence_as_agreement_weight: 0.7,
             indirect_disagreement_weight: 0.3,
+        }
+    }
+}
+
+/// Expressiveness level for sticker sending frequency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Expressiveness {
+    /// 0.5x probability multiplier — very sparse stickers.
+    Minimal,
+    /// 1.0x probability multiplier — balanced (default).
+    Moderate,
+    /// 2.0x probability multiplier — more frequent stickers.
+    Expressive,
+}
+
+impl Default for Expressiveness {
+    fn default() -> Self {
+        Self::Moderate
+    }
+}
+
+impl Expressiveness {
+    /// Probability multiplier for this expressiveness level.
+    pub fn multiplier(self) -> f32 {
+        match self {
+            Self::Minimal => 0.5,
+            Self::Moderate => 1.0,
+            Self::Expressive => 2.0,
+        }
+    }
+}
+
+/// Emotion-based sticker auto-sending configuration.
+///
+/// ```toml
+/// [sticker]
+/// enabled = true
+/// probability = 0.3
+/// intensity_threshold = 0.7
+/// cooldown_messages = 5
+/// expressiveness = "moderate"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct StickerConfig {
+    /// Enable emotion-based sticker sending for this agent.
+    pub enabled: bool,
+    /// Base probability of sending a sticker when emotion is detected (0.0-1.0).
+    pub probability: f32,
+    /// Minimum emotion intensity to trigger sticker (0.0-1.0).
+    pub intensity_threshold: f32,
+    /// Minimum messages between stickers in the same session.
+    pub cooldown_messages: u32,
+    /// How expressive this agent is (multiplies probability).
+    pub expressiveness: Expressiveness,
+}
+
+impl Default for StickerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            probability: 0.3,
+            intensity_threshold: 0.7,
+            cooldown_messages: 5,
+            expressiveness: Expressiveness::Moderate,
         }
     }
 }

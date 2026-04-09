@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::unicode_normalizer::{SanitizeConfig, UnicodeNormalizer};
+
 /// Result of an input security scan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputScanResult {
@@ -117,9 +119,23 @@ const RULES: &[Rule] = &[
 /// Default risk threshold above which messages are blocked.
 pub const DEFAULT_BLOCK_THRESHOLD: u32 = 60;
 
+/// Sanitize input text using Unicode normalization before security scanning.
+///
+/// Applies the full sanitization pipeline (ANSI stripping, invisible char removal,
+/// NFKC normalization with CJK fullwidth preservation, mixed script detection,
+/// grapheme cluster limiting) to defend against Unicode-based attacks.
+pub fn sanitize_unicode(text: &str) -> String {
+    let config = SanitizeConfig::default();
+    let result = UnicodeNormalizer::sanitize(text, &config);
+    result.sanitized
+}
+
 /// Scan an input message for prompt injection patterns.
+///
+/// Unicode sanitization is applied first to normalize the input before pattern matching.
 pub fn scan_input(text: &str, block_threshold: u32) -> InputScanResult {
-    let lower = text.to_lowercase();
+    let sanitized = sanitize_unicode(text);
+    let lower = sanitized.to_lowercase();
     let mut total_score: u32 = 0;
     let mut matched = Vec::new();
     let mut force_block = false;
@@ -140,6 +156,8 @@ pub fn scan_input(text: &str, block_threshold: u32) -> InputScanResult {
     }
 
     // Check for zero-width characters (Unicode injection)
+    // Note: most ZW chars are already stripped by sanitize_unicode(),
+    // but we check the original text to detect the attempt.
     let zwc_count = text
         .chars()
         .filter(|c| {

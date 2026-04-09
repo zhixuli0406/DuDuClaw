@@ -407,7 +407,7 @@ function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: 
 
 // ── Edit Agent Dialog ──
 
-type EditTab = 'identity' | 'model' | 'heartbeat' | 'container' | 'permissions' | 'channels';
+type EditTab = 'identity' | 'model' | 'heartbeat' | 'container' | 'permissions' | 'sticker' | 'channels';
 
 function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | null; onClose: () => void; onSaved: () => void }) {
   const intl = useIntl();
@@ -465,6 +465,11 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
         skill_security_scan: true,
         gvu_enabled: true,
         cognitive_memory: false,
+        sticker_enabled: agent.sticker?.enabled ?? false,
+        sticker_probability: agent.sticker?.probability ?? 0.3,
+        sticker_intensity_threshold: agent.sticker?.intensity_threshold ?? 0.7,
+        sticker_cooldown_messages: agent.sticker?.cooldown_messages ?? 5,
+        sticker_expressiveness: (agent.sticker?.expressiveness ?? 'moderate') as 'minimal' | 'moderate' | 'expressive',
       });
       setTab('identity');
       setError(null);
@@ -517,6 +522,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
     { id: 'heartbeat', label: intl.formatMessage({ id: 'agents.edit.heartbeat' }) },
     { id: 'container', label: intl.formatMessage({ id: 'settings.container' }) },
     { id: 'permissions', label: intl.formatMessage({ id: 'agents.edit.permissions' }) },
+    { id: 'sticker', label: intl.formatMessage({ id: 'agents.edit.sticker' }) },
     { id: 'channels', label: intl.formatMessage({ id: 'channels.title' }) },
   ];
 
@@ -699,6 +705,33 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
                 </FormField>
               </div>
             </>
+          )}
+
+          {tab === 'sticker' && (
+            <div className="space-y-4">
+              <p className="text-xs text-stone-400 dark:text-stone-500">
+                {intl.formatMessage({ id: 'agents.edit.stickerDesc' })}
+              </p>
+              <Toggle checked={form.sticker_enabled ?? false} onChange={(v) => updateField('sticker_enabled', v)} label={intl.formatMessage({ id: 'agents.edit.stickerEnabled' })} />
+              <FormField label={intl.formatMessage({ id: 'agents.edit.stickerProbability' })}>
+                <input type="range" min={0} max={1} step={0.05} value={form.sticker_probability ?? 0.3} onChange={(e) => updateField('sticker_probability', Number(e.target.value))} className="w-full accent-amber-500" />
+                <span className="text-xs text-stone-500 dark:text-stone-400 ml-2">{((form.sticker_probability ?? 0.3) * 100).toFixed(0)}%</span>
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'agents.edit.stickerIntensity' })}>
+                <input type="range" min={0} max={1} step={0.05} value={form.sticker_intensity_threshold ?? 0.7} onChange={(e) => updateField('sticker_intensity_threshold', Number(e.target.value))} className="w-full accent-amber-500" />
+                <span className="text-xs text-stone-500 dark:text-stone-400 ml-2">{((form.sticker_intensity_threshold ?? 0.7) * 100).toFixed(0)}%</span>
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'agents.edit.stickerCooldown' })}>
+                <input type="number" min={0} max={100} value={form.sticker_cooldown_messages ?? 5} onChange={(e) => updateField('sticker_cooldown_messages', Number(e.target.value))} className={inputClass} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'agents.edit.stickerExpressiveness' })}>
+                <select value={form.sticker_expressiveness ?? 'moderate'} onChange={(e) => updateField('sticker_expressiveness', e.target.value as 'minimal' | 'moderate' | 'expressive')} className={selectClass}>
+                  <option value="minimal">{intl.formatMessage({ id: 'agents.edit.stickerMinimal' })}</option>
+                  <option value="moderate">{intl.formatMessage({ id: 'agents.edit.stickerModerate' })}</option>
+                  <option value="expressive">{intl.formatMessage({ id: 'agents.edit.stickerExpressive' })}</option>
+                </select>
+              </FormField>
+            </div>
           )}
 
           {tab === 'channels' && (

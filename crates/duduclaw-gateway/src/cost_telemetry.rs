@@ -46,6 +46,17 @@ impl TokenUsage {
         self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
     }
 
+    /// Estimated cost savings from prompt caching (in millicents).
+    ///
+    /// Without caching, all cache_read_tokens would be full-price input tokens.
+    /// Savings = cache_read_tokens * (full_price - cached_price) per token.
+    /// Sonnet 4.6: full=$3/M, cached=$0.30/M → savings = cache_read * $2.70/M
+    pub fn cache_savings_millicents(&self) -> u64 {
+        // $2.70 per million tokens saved = 270 millicents per million
+        // = 0.00027 millicents per token
+        (self.cache_read_tokens as f64 * 0.27 / 1000.0) as u64
+    }
+
     /// Whether the total input is approaching the 200K price cliff.
     ///
     /// Anthropic doubles input pricing when input exceeds 200K tokens.
@@ -138,6 +149,11 @@ pub struct CostRecord {
     pub output_tokens: u64,
     pub cache_efficiency: f64,
     pub cost_millicents: u64,
+    /// Redundant with `cache_efficiency` — kept for SQLite schema compatibility.
+    /// Both are computed from `TokenUsage::cache_efficiency()`.
+    pub cache_hit_rate: f64,
+    /// Estimated savings from prompt caching (millicents).
+    pub cache_savings_millicents: u64,
     pub created_at: String,
 }
 
@@ -152,6 +168,11 @@ pub struct CostSummary {
     pub total_output_tokens: u64,
     pub avg_cache_efficiency: f64,
     pub total_cost_millicents: u64,
+    /// Redundant with `avg_cache_efficiency` — kept for SQLite schema compatibility.
+    /// Both are computed from `TokenUsage::cache_efficiency()`.
+    pub avg_cache_hit_rate: f64,
+    /// Total estimated savings from prompt caching (millicents).
+    pub total_cache_savings_millicents: u64,
 }
 
 /// Per-agent summary with cache health indicator.
@@ -207,6 +228,8 @@ impl CostTelemetry {
                 output_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_efficiency REAL NOT NULL DEFAULT 0.0,
                 cost_millicents INTEGER NOT NULL DEFAULT 0,
+                cache_hit_rate REAL NOT NULL DEFAULT 0.0,
+                cache_savings_millicents INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             );
 
@@ -231,13 +254,16 @@ impl CostTelemetry {
         let now = chrono::Utc::now().to_rfc3339();
         let efficiency = usage.cache_efficiency();
         let cost = usage.estimated_cost_millicents();
+        let cache_hit_rate = usage.cache_efficiency();
+        let cache_savings = usage.cache_savings_millicents();
 
         let conn = self.conn.lock().await;
         let result = conn.execute(
             "INSERT INTO token_usage
              (agent_id, request_type, model, input_tokens, cache_read_tokens,
-              cache_creation_tokens, output_tokens, cache_efficiency, cost_millicents, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              cache_creation_tokens, output_tokens, cache_efficiency, cost_millicents,
+              cache_hit_rate, cache_savings_millicents, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 agent_id,
                 request_type.as_str(),
@@ -248,6 +274,8 @@ impl CostTelemetry {
                 usage.output_tokens,
                 efficiency,
                 cost,
+                cache_hit_rate,
+                cache_savings,
                 now,
             ],
         );
@@ -258,12 +286,12 @@ impl CostTelemetry {
         }
 
         // Log warnings for anomalies
-        if efficiency < 0.3 && usage.total_input() > 1000 {
+        if cache_hit_rate < 0.3 && usage.total_input() > 1000 {
             warn!(
                 agent_id,
-                cache_efficiency = format!("{:.1}%", efficiency * 100.0),
+                cache_hit_rate = %format!("{:.1}%", cache_hit_rate * 100.0),
                 cache_creation = usage.cache_creation_tokens,
-                "Low cache efficiency detected — consider switching to Direct API path"
+                "Low cache hit rate — consider stabilizing system prompt prefix"
             );
         }
 
@@ -284,6 +312,7 @@ impl CostTelemetry {
             output = usage.output_tokens,
             cache_eff = format!("{:.1}%", efficiency * 100.0),
             cost_mc = cost,
+            cache_savings_mc = cache_savings,
             "Token usage recorded"
         );
     }
@@ -304,7 +333,9 @@ impl CostTelemetry {
                 COALESCE(SUM(cache_creation_tokens), 0),
                 COALESCE(SUM(output_tokens), 0),
                 COALESCE(AVG(cache_efficiency), 0.0),
-                COALESCE(SUM(cost_millicents), 0)
+                COALESCE(SUM(cost_millicents), 0),
+                COALESCE(AVG(cache_hit_rate), 0.0),
+                COALESCE(SUM(cache_savings_millicents), 0)
              FROM token_usage
              WHERE created_at >= ?1",
             params![cutoff],
@@ -318,6 +349,8 @@ impl CostTelemetry {
                     total_output_tokens: safe_u64(row.get::<_, i64>(4)?),
                     avg_cache_efficiency: row.get(5)?,
                     total_cost_millicents: safe_u64(row.get::<_, i64>(6)?),
+                    avg_cache_hit_rate: row.get(7)?,
+                    total_cache_savings_millicents: safe_u64(row.get::<_, i64>(8)?),
                 })
             },
         )
@@ -343,7 +376,9 @@ impl CostTelemetry {
                     COALESCE(SUM(cache_creation_tokens), 0),
                     COALESCE(SUM(output_tokens), 0),
                     COALESCE(AVG(cache_efficiency), 0.0),
-                    COALESCE(SUM(cost_millicents), 0)
+                    COALESCE(SUM(cost_millicents), 0),
+                    COALESCE(AVG(cache_hit_rate), 0.0),
+                    COALESCE(SUM(cache_savings_millicents), 0)
                  FROM token_usage
                  WHERE agent_id = ?1 AND created_at >= ?2",
                 params![agent_id, cutoff],
@@ -357,6 +392,8 @@ impl CostTelemetry {
                         total_output_tokens: safe_u64(row.get::<_, i64>(4)?),
                         avg_cache_efficiency: row.get(5)?,
                         total_cost_millicents: safe_u64(row.get::<_, i64>(6)?),
+                        avg_cache_hit_rate: row.get(7)?,
+                        total_cache_savings_millicents: safe_u64(row.get::<_, i64>(8)?),
                     })
                 },
             )
@@ -397,7 +434,9 @@ impl CostTelemetry {
                     COALESCE(SUM(cache_creation_tokens), 0),
                     COALESCE(SUM(output_tokens), 0),
                     COALESCE(AVG(cache_efficiency), 0.0),
-                    COALESCE(SUM(cost_millicents), 0)
+                    COALESCE(SUM(cost_millicents), 0),
+                    COALESCE(AVG(cache_hit_rate), 0.0),
+                    COALESCE(SUM(cache_savings_millicents), 0)
                  FROM token_usage
                  WHERE created_at >= ?1
                  GROUP BY agent_id
@@ -429,6 +468,8 @@ impl CostTelemetry {
                         total_output_tokens: row.get::<_, i64>(5)? as u64,
                         avg_cache_efficiency: avg_eff,
                         total_cost_millicents: safe_u64(row.get::<_, i64>(7)?),
+                        avg_cache_hit_rate: row.get(8)?,
+                        total_cache_savings_millicents: safe_u64(row.get::<_, i64>(9)?),
                     },
                     cache_health,
                 })
@@ -450,7 +491,7 @@ impl CostTelemetry {
             .prepare(
                 "SELECT agent_id, request_type, model, input_tokens, cache_read_tokens,
                         cache_creation_tokens, output_tokens, cache_efficiency,
-                        cost_millicents, created_at
+                        cost_millicents, cache_hit_rate, cache_savings_millicents, created_at
                  FROM token_usage
                  ORDER BY id DESC
                  LIMIT ?1",
@@ -469,7 +510,9 @@ impl CostTelemetry {
                     output_tokens: safe_u64(row.get::<_, i64>(6)?),
                     cache_efficiency: row.get(7)?,
                     cost_millicents: safe_u64(row.get::<_, i64>(8)?),
-                    created_at: row.get(9)?,
+                    cache_hit_rate: row.get(9)?,
+                    cache_savings_millicents: safe_u64(row.get::<_, i64>(10)?),
+                    created_at: row.get(11)?,
                 })
             })
             .map_err(|e| format!("recent_records query: {e}"))?;

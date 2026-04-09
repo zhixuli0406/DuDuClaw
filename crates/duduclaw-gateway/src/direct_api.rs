@@ -7,7 +7,7 @@
 //! Reference: <https://docs.anthropic.com/en/api/messages>
 
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::cost_telemetry::TokenUsage;
 
@@ -158,7 +158,7 @@ pub async fn call_direct_api(
     let messages = vec![Message {
         role: "user".to_string(),
         content: user_prompt.to_string(),
-        cache_control: None,
+        cache_control: None, // Single-turn: user message changes every call
     }];
 
     let body = MessagesRequest {
@@ -219,6 +219,18 @@ pub async fn call_direct_api(
             cache_eff = format!("{:.1}%", u.cache_efficiency() * 100.0),
             "Direct API call completed"
         );
+        // Detailed cache metrics at debug level for monitoring dashboards
+        let total = u.input_tokens + u.cache_read_tokens + u.cache_creation_tokens;
+        if total > 0 {
+            let efficiency = u.cache_read_tokens as f64 / total as f64;
+            debug!(
+                cache_efficiency = %format!("{:.1}%", efficiency * 100.0),
+                cache_read = u.cache_read_tokens,
+                cache_creation = u.cache_creation_tokens,
+                input = u.input_tokens,
+                "Anthropic API cache metrics"
+            );
+        }
     }
 
     if text.is_empty() {
