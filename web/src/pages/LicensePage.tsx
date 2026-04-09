@@ -76,8 +76,9 @@ export function LicensePage() {
       const updated = await api.license.status();
       setLicense(updated);
       setTimeout(() => setActivateSuccess(false), 3000);
-    } catch {
-      setActivateError(intl.formatMessage({ id: 'common.error' }));
+    } catch (err) {
+      const msg = typeof err === 'string' ? err : err instanceof Error ? err.message : '';
+      setActivateError(msg || intl.formatMessage({ id: 'common.error' }));
     } finally {
       setActivating(false);
     }
