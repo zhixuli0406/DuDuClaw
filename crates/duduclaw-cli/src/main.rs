@@ -1498,6 +1498,7 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
         port,
         auth_token,
         home_dir: home,
+        extension: std::sync::Arc::new(duduclaw_gateway::NullExtension),
     };
 
     duduclaw_gateway::start_gateway(config).await

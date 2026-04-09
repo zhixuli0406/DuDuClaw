@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod channel_format;
 pub mod channel_reply;
+pub mod extension;
 pub mod channel_settings;
 pub mod config_crypto;
 pub mod claude_runner;
@@ -42,4 +43,5 @@ pub mod rl;
 pub mod skill_extraction;
 pub mod tool_classifier;
 
+pub use extension::{GatewayExtension, NullExtension};
 pub use server::{start_gateway, GatewayConfig};
