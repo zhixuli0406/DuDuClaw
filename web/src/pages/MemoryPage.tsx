@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type MemoryEntry, type SkillInfo } from '@/lib/api';
+import { Link } from 'react-router';
 import {
   Brain,
   Search,
@@ -14,6 +15,7 @@ import {
   CheckCircle,
   XCircle,
   Eye,
+  ArrowRight,
 } from 'lucide-react';
 
 type TabId = 'memories' | 'skills' | 'evolution';
@@ -147,9 +149,16 @@ function MemoriesTab() {
       ) : entries.length === 0 ? (
         <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
           <Brain className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-          <p className="text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'common.noData' })}
+          <p className="mb-2 text-stone-500 dark:text-stone-400">
+            {intl.formatMessage({ id: 'memory.empty.memories' })}
           </p>
+          <Link
+            to="/agents"
+            className="inline-flex items-center gap-1.5 text-sm font-medium text-amber-600 hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300"
+          >
+            {intl.formatMessage({ id: 'memory.empty.memories.action' })}
+            <ArrowRight className="h-3.5 w-3.5" />
+          </Link>
         </div>
       ) : (
         <div className="space-y-3">
@@ -263,9 +272,16 @@ function SkillsTab() {
       ) : skills.length === 0 && !error ? (
         <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
           <BookOpen className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-          <p className="text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'common.noData' })}
+          <p className="mb-2 text-stone-500 dark:text-stone-400">
+            {intl.formatMessage({ id: 'memory.empty.skills' })}
           </p>
+          <Link
+            to="/skills"
+            className="inline-flex items-center gap-1.5 text-sm font-medium text-amber-600 hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300"
+          >
+            {intl.formatMessage({ id: 'memory.empty.skills.action' })}
+            <ArrowRight className="h-3.5 w-3.5" />
+          </Link>
         </div>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">

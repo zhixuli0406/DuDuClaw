@@ -25,6 +25,7 @@ pub mod protocol;
 pub mod skill_lifecycle;
 pub mod server;
 pub mod session;
+pub mod sticker;
 pub mod task_spec;
 pub mod telegram;
 pub mod chat_commands;
@@ -34,5 +35,11 @@ pub mod webchat;
 pub mod webhook;
 pub mod reminder_scheduler;
 pub mod wiki_ingest;
+
+// ── Hermes-learnings modules (Phase 3, 4, 6) ──
+pub mod compression;
+pub mod rl;
+pub mod skill_extraction;
+pub mod tool_classifier;
 
 pub use server::{start_gateway, GatewayConfig};

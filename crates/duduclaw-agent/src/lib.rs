@@ -4,6 +4,7 @@ pub mod contract;
 pub mod heartbeat;
 pub mod ipc;
 pub mod proactive;
+pub mod prompt_snapshot;
 pub mod registry;
 pub mod resolver;
 pub mod runner;

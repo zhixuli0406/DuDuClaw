@@ -336,6 +336,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .merge(auth_router)
         .merge(webchat_router);
 
+    // ── .well-known endpoints for protocol discovery ──────────────
+    app = app
+        .route("/.well-known/mcp-server.json", get(well_known_mcp_server_card))
+        .route("/.well-known/agent.json", get(well_known_agent_card));
+
     // Mount LINE webhook endpoint
     if let Some(line) = line_router {
         app = app.merge(line);
@@ -922,4 +927,44 @@ fn has_users(user_db: &UserDb) -> bool {
 /// Simple health-check endpoint.
 async fn health_handler() -> &'static str {
     "ok"
+}
+
+// ── .well-known endpoints for protocol discovery ──────────────
+
+async fn well_known_mcp_server_card() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "name": "DuDuClaw MCP Server",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "Claude Code extension layer with channel routing, memory, agent orchestration, and local inference",
+        "tools": [
+            {"name": "send_message", "description": "Send message to channel"},
+            {"name": "memory_search", "description": "Search agent memory"},
+            {"name": "memory_store", "description": "Store memory entry"},
+            {"name": "execute_program", "description": "Execute PTC script"},
+            {"name": "skill_bank_search", "description": "Search skill bank"},
+            {"name": "session_restore_context", "description": "Restore hidden context"},
+            {"name": "create_agent", "description": "Create sub-agent"},
+            {"name": "send_to_agent", "description": "Delegate to agent"},
+        ],
+        "capabilities": ["memory", "agents", "channels", "inference", "skills", "evolution"],
+    }))
+}
+
+async fn well_known_agent_card() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "name": "DuDuClaw Agent",
+        "description": "AI agent with channel routing, memory, and self-evolution",
+        "url": format!("http://localhost:{}", std::env::var("DUDUCLAW_PORT").unwrap_or_else(|_| "3000".to_string())),
+        "version": env!("CARGO_PKG_VERSION"),
+        "capabilities": {
+            "streaming": true,
+            "multi_turn": true,
+            "tool_use": true,
+        },
+        "skills": [
+            {"name": "chat", "description": "Multi-turn conversation", "tags": ["conversation"]},
+            {"name": "channel_messaging", "description": "Telegram/LINE/Discord messaging", "tags": ["messaging"]},
+            {"name": "memory", "description": "Search and store memories", "tags": ["memory"]},
+        ],
+    }))
 }

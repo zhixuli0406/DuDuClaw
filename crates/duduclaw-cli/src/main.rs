@@ -4,8 +4,10 @@ use clap::{Parser, Subcommand};
 use duduclaw_agent::AgentRunner;
 use duduclaw_core::error::DuDuClawError;
 use duduclaw_core::types::CheckStatus;
+mod acp;
 mod mcp;
 mod migrate;
+mod ptc;
 mod service;
 mod wizard;
 
@@ -210,6 +212,13 @@ enum Commands {
         yes: bool,
     },
 
+    /// RL trajectory management
+    #[command(subcommand)]
+    Rl(RlCommands),
+
+    /// ACP (Agent Client Protocol) server for IDE integration
+    AcpServer,
+
     /// Print version information
     Version,
 }
@@ -299,6 +308,34 @@ enum LicenseCommands {
     Fingerprint,
 }
 
+#[derive(Subcommand)]
+enum RlCommands {
+    /// Export agent sessions as RL training trajectories
+    Export {
+        /// Agent ID to export
+        #[arg(long)]
+        agent: String,
+        /// Export sessions since this date (ISO 8601)
+        #[arg(long)]
+        since: Option<String>,
+        /// Output format (default: jsonl)
+        #[arg(long, default_value = "jsonl")]
+        format: String,
+    },
+    /// Show trajectory export statistics
+    Stats {
+        /// Agent ID
+        #[arg(long)]
+        agent: String,
+    },
+    /// Compute reward for a trajectory file
+    Reward {
+        /// Path to trajectory JSONL file
+        #[arg(long)]
+        trajectory: String,
+    },
+}
+
 /// Resolve the DuDuClaw home directory (~/.duduclaw).
 ///
 /// Panics if the home directory cannot be determined — running from "."
@@ -376,6 +413,28 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         },
         Commands::Test { name } => cmd_test_agent(&name).await,
         Commands::Update { yes } => cmd_update(yes).await,
+        Commands::Rl(rl_cmd) => {
+            match rl_cmd {
+                RlCommands::Export { agent, since, format } => {
+                    println!("RL export: agent={agent}, since={since:?}, format={format}");
+                    println!("Use duduclaw-gateway rl module for trajectory export.");
+                }
+                RlCommands::Stats { agent } => {
+                    println!("RL stats: agent={agent}");
+                }
+                RlCommands::Reward { trajectory } => {
+                    println!("RL reward: trajectory={trajectory}");
+                }
+            }
+            Ok(())
+        }
+        Commands::AcpServer => {
+            println!("ACP server mode — IDE integration via Agent Client Protocol");
+            println!("Listens on stdin/stdout with JSON-RPC 2.0");
+            println!("Connect from Zed, JetBrains, or Neovim.");
+            // Future: wire to acp::AcpServer
+            Ok(())
+        }
         Commands::Version => {
             println!("duduclaw {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -1655,7 +1714,62 @@ async fn cmd_doctor() -> duduclaw_core::error::Result<()> {
         ));
     }
 
-    // Check 3: Docker availability
+    // Check 3: Claude Code CLI
+    match duduclaw_core::which_claude() {
+        Some(path) => {
+            // Try `claude auth status --json` to verify auth
+            match tokio::process::Command::new(&path)
+                .args(["auth", "status", "--json"])
+                .env_remove("CLAUDECODE")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .await
+            {
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let logged_in = stdout.contains("\"loggedIn\":true")
+                        || stdout.contains("\"loggedIn\": true");
+                    if logged_in {
+                        checks.push((
+                            "Claude Code".into(),
+                            CheckStatus::Pass,
+                            format!("Found at {path}, authenticated"),
+                        ));
+                    } else {
+                        checks.push((
+                            "Claude Code".into(),
+                            CheckStatus::Fail,
+                            format!("Found at {path}, but NOT logged in. Run: claude auth login"),
+                        ));
+                    }
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    checks.push((
+                        "Claude Code".into(),
+                        CheckStatus::Warn,
+                        format!("Found at {path}, auth check failed: {}", stderr.trim().chars().take(100).collect::<String>()),
+                    ));
+                }
+                Err(e) => {
+                    checks.push((
+                        "Claude Code".into(),
+                        CheckStatus::Warn,
+                        format!("Found at {path}, but could not run: {e}"),
+                    ));
+                }
+            }
+        }
+        None => {
+            checks.push((
+                "Claude Code".into(),
+                CheckStatus::Fail,
+                "claude CLI not found in PATH. Install: npm install -g @anthropic-ai/claude-code".into(),
+            ));
+        }
+    }
+
+    // Check 4: Docker availability
     match bollard::Docker::connect_with_local_defaults() {
         Ok(docker) => match docker.ping().await {
             Ok(_) => {

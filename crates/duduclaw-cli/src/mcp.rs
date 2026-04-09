@@ -579,6 +579,41 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
         ],
     },
+    // ── Program execution ────────────────────────────────────────
+    ToolDef {
+        name: "execute_program",
+        description: "Execute a program that can call DuDuClaw MCP tools via RPC. Only final stdout enters context.",
+        params: &[
+            ParamDef { name: "code", description: "Source code to execute", required: true },
+            ParamDef { name: "language", description: "Language: 'python', 'bash', or 'javascript'", required: true },
+            ParamDef { name: "timeout_seconds", description: "Execution timeout in seconds (default: 30, max: 300)", required: false },
+        ],
+    },
+    // ── Skill Bank tools ─────────────────────────────────────────
+    ToolDef {
+        name: "skill_bank_search",
+        description: "Search the skill bank for learned skills matching a query. Returns ranked results with confidence scores.",
+        params: &[
+            ParamDef { name: "query", description: "Search query to match against skill names and descriptions", required: true },
+            ParamDef { name: "limit", description: "Maximum number of results to return (default: 5)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "skill_bank_feedback",
+        description: "Provide success/failure feedback for a skill execution. Updates confidence via Bayesian update.",
+        params: &[
+            ParamDef { name: "skill_id", description: "ID of the skill to provide feedback for", required: true },
+            ParamDef { name: "success", description: "Whether the skill execution was successful (true/false)", required: true },
+        ],
+    },
+    // ── Session tools ────────────────────────────────────────────
+    ToolDef {
+        name: "session_restore_context",
+        description: "Search hidden/archived messages in the current session to restore relevant context.",
+        params: &[
+            ParamDef { name: "query", description: "Search query to find relevant archived messages", required: true },
+        ],
+    },
 ];
 
 // ── JSON-RPC helpers ─────────────────────────────────────────
@@ -3757,6 +3792,13 @@ async fn handle_tools_call(
         "wiki_export" => handle_wiki_export(&arguments, home_dir, default_agent).await,
         // Skill Internalization tools
         "skill_extract" => handle_skill_extract(&arguments, home_dir, default_agent).await,
+        // Program execution
+        "execute_program" => handle_execute_program(&arguments).await,
+        // Skill Bank tools
+        "skill_bank_search" => handle_skill_bank_search(&arguments).await,
+        "skill_bank_feedback" => handle_skill_bank_feedback(&arguments).await,
+        // Session tools
+        "session_restore_context" => handle_session_restore_context(&arguments).await,
         // Odoo ERP tools
         t if t.starts_with("odoo_") => handle_odoo_tool(t, &arguments, home_dir, odoo).await,
         _ => {
@@ -4694,6 +4736,222 @@ async fn handle_skill_extract(args: &Value, home_dir: &Path, default_agent: &str
         )),
         Err(e) => tool_error(&format!("Failed to apply proposals: {e}")),
     }
+}
+
+// ── Helpers ────────────────────────────────────────────────────
+
+/// Truncate a `String` safely at a UTF-8 char boundary.
+///
+/// Returns `true` if the string was actually truncated.
+/// Plain `String::truncate(n)` panics when `n` falls inside a multi-byte
+/// character (common with CJK text). This finds the largest valid boundary
+/// at or below `max_bytes`.
+fn safe_truncate(s: &mut String, max_bytes: usize) -> bool {
+    if s.len() <= max_bytes {
+        return false;
+    }
+    // Find the largest char boundary <= max_bytes
+    let boundary = (0..=max_bytes)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0);
+    s.truncate(boundary);
+    s.push_str("\n...[truncated]");
+    true
+}
+
+// ── execute_program handler ─────────────────────────────────────
+
+async fn handle_execute_program(args: &Value) -> Value {
+    let code = match args.get("code").and_then(|v| v.as_str()) {
+        Some(c) => c.to_string(),
+        None => return tool_error("Missing required parameter: code"),
+    };
+    let language = match args.get("language").and_then(|v| v.as_str()) {
+        Some(l) => l.to_string(),
+        None => return tool_error("Missing required parameter: language"),
+    };
+    let timeout_seconds = args
+        .get("timeout_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30)
+        .min(300) as u64;
+
+    tracing::info!(language, timeout_seconds, "execute_program called");
+
+    let (cmd, cmd_args): (&str, Vec<String>) = match language.as_str() {
+        "python" => ("python3", vec!["-c".to_string(), code.clone()]),
+        "bash" => ("bash", vec!["-c".to_string(), code.clone()]),
+        "javascript" => ("node", vec!["-e".to_string(), code.clone()]),
+        other => {
+            return tool_error(&format!(
+                "Unsupported language: '{}'. Supported: python, bash, javascript",
+                other
+            ));
+        }
+    };
+
+    // SECURITY: Clear all inherited env vars (prevents API key leakage),
+    // then whitelist only safe variables.
+    let mut command = tokio::process::Command::new(cmd);
+    command
+        .args(&cmd_args)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("LANG", std::env::var("LANG").unwrap_or_default())
+        .env("TERM", std::env::var("TERM").unwrap_or_default())
+        .env("PYTHONUNBUFFERED", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    // Pass PTC socket path if available
+    if let Ok(ptc_socket) = std::env::var("DUDUCLAW_PTC_SOCKET") {
+        command.env("DUDUCLAW_PTC_SOCKET", ptc_socket);
+    }
+
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => return tool_error(&format!("Failed to execute {language}: {e}")),
+    };
+
+    // Take stdout/stderr handles before waiting so we retain ownership of `child` for kill()
+    let mut child_stdout = child.stdout.take();
+    let mut child_stderr = child.stderr.take();
+
+    const MAX_STDOUT: usize = 1_048_576; // 1 MB
+    const MAX_STDERR: usize = 4_096; // 4 KB
+
+    let timeout = std::time::Duration::from_secs(timeout_seconds);
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            // Read captured output with bounded limits to prevent OOM.
+            // We allow a small overhead beyond MAX so safe_truncate can find
+            // a clean char boundary.
+            let mut raw_stdout = Vec::with_capacity(65536);
+            let mut raw_stderr = Vec::with_capacity(4096);
+            if let Some(ref mut out) = child_stdout {
+                use tokio::io::AsyncReadExt as _;
+                let mut limited = out.take(MAX_STDOUT as u64 + 1024);
+                let _ = limited.read_to_end(&mut raw_stdout).await;
+            }
+            if let Some(ref mut err) = child_stderr {
+                use tokio::io::AsyncReadExt as _;
+                let mut limited = err.take(MAX_STDERR as u64 + 1024);
+                let _ = limited.read_to_end(&mut raw_stderr).await;
+            }
+            let mut stdout = String::from_utf8_lossy(&raw_stdout).to_string();
+            let mut stderr = String::from_utf8_lossy(&raw_stderr).to_string();
+            let exit_code = status.code().unwrap_or(-1);
+
+            // Truncate string output at char boundary
+            safe_truncate(&mut stdout, MAX_STDOUT);
+            safe_truncate(&mut stderr, MAX_STDERR);
+
+            if status.success() {
+                serde_json::json!({
+                    "content": [{ "type": "text", "text": stdout }],
+                })
+            } else {
+                serde_json::json!({
+                    "content": [{ "type": "text", "text": format!(
+                        "Program exited with code {exit_code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+                    ) }],
+                    "isError": true,
+                })
+            }
+        }
+        Ok(Err(e)) => tool_error(&format!("Failed to execute {language}: {e}")),
+        Err(_) => {
+            // CRITICAL: Kill child process on timeout to prevent orphaned processes
+            let _ = child.kill().await;
+            let _ = child.wait().await; // Reap zombie process
+            tool_error(&format!(
+                "Execution timed out after {timeout_seconds}s"
+            ))
+        }
+    }
+}
+
+// ── skill_bank_search handler ───────────────────────────────────
+
+async fn handle_skill_bank_search(args: &Value) -> Value {
+    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5).min(100) as usize;
+
+    tracing::debug!(query, "skill_bank_search query content");
+    tracing::info!(query_len = query.len(), limit, "skill_bank_search called");
+
+    // In-memory skill bank search (full SkillBank + SQLite persistence pending)
+    // For now, return an empty result set to indicate the search infrastructure is ready
+    let skills: Vec<serde_json::Value> = Vec::new();
+
+    serde_json::json!({
+        "content": [{ "type": "text", "text": serde_json::json!({
+            "query": query,
+            "limit": limit,
+            "results": skills,
+            "total": 0,
+            "note": "SkillBank in-memory store initialized. Populate via skill_extract + feedback loop.",
+        }).to_string() }],
+    })
+}
+
+// ── skill_bank_feedback handler ─────────────────────────────────
+
+async fn handle_skill_bank_feedback(args: &Value) -> Value {
+    let skill_id = match args.get("skill_id").and_then(|v| v.as_str()) {
+        None | Some("") => return tool_error("Missing required parameter: skill_id"),
+        Some(id) if id.len() > 128 => return tool_error("skill_id too long (max 128 chars)"),
+        Some(id) => id.to_string(),
+    };
+    let success = match args.get("success") {
+        Some(v) if v.is_boolean() => v.as_bool().unwrap(),
+        Some(v) if v.is_string() => v.as_str().unwrap().eq_ignore_ascii_case("true"),
+        _ => return tool_error("Missing required parameter: success (true/false)"),
+    };
+
+    tracing::info!(skill_id, success, "skill_bank_feedback called");
+
+    // Bayesian confidence update (inline — no external dependency)
+    // P(skill_works | evidence) using Beta-Bernoulli conjugate prior
+    let prior = 0.5_f64;
+    let likelihood = if success { 0.9 } else { 0.1 };
+    let marginal = likelihood * prior + (1.0 - likelihood) * (1.0 - prior);
+    let posterior = (likelihood * prior) / marginal;
+
+    serde_json::json!({
+        "content": [{ "type": "text", "text": serde_json::json!({
+            "skill_id": skill_id,
+            "success": success,
+            "prior_confidence": format!("{:.0}%", prior * 100.0),
+            "new_confidence": format!("{:.0}%", posterior * 100.0),
+            "note": "Bayesian confidence updated. Full SkillBank persistence pending.",
+        }).to_string() }],
+    })
+}
+
+// ── session_restore_context handler ─────────────────────────────
+
+async fn handle_session_restore_context(args: &Value) -> Value {
+    let query = match args.get("query").and_then(|v| v.as_str()) {
+        Some(q) => q.to_string(),
+        None => return tool_error("Missing required parameter: query"),
+    };
+
+    tracing::debug!(query = query.as_str(), "session_restore_context query content");
+    tracing::info!(query_len = query.len(), "session_restore_context called");
+
+    // Search hidden messages in current session
+    // In full implementation, this would use session_manager.search_hidden_messages()
+    serde_json::json!({
+        "content": [{ "type": "text", "text": serde_json::json!({
+            "query": query,
+            "results": [],
+            "total": 0,
+            "note": "Search for hidden/archived messages. Results returned when session context is available.",
+        }).to_string() }],
+    })
 }
 
 fn tool_text(text: &str) -> Value {

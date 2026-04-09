@@ -200,6 +200,9 @@ mod tests {
             },
             capabilities: CapabilitiesConfig::default(),
             proactive: Default::default(),
+            cultural_context: Default::default(),
+            sticker: Default::default(),
+            ptc: Default::default(),
             channels: None,
         }
     }

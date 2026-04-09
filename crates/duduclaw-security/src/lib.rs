@@ -12,3 +12,7 @@ pub mod rate_limiter;
 pub mod rbac;
 pub mod safety_word;
 pub mod soul_guard;
+pub mod unicode_normalizer;
+
+#[cfg(test)]
+mod tests;

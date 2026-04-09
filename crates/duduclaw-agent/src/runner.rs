@@ -9,10 +9,12 @@
 
 use std::path::PathBuf;
 
+use chrono::Utc;
 use duduclaw_core::error::{DuDuClawError, Result};
 use tracing::{info, warn};
 
 use crate::account_rotator::{AccountRotator, AuthMethod};
+use crate::prompt_snapshot::{PromptModule, SystemPromptSnapshot, SHARED_BASE};
 use crate::registry::{AgentRegistry, LoadedAgent};
 
 /// Hard max timeout — absolute safety net to kill hung processes.
@@ -69,8 +71,15 @@ impl AgentRunner {
             "Starting interactive session"
         );
 
-        // Build system prompt with deterministic skill ordering (cache-friendly)
-        let system_prompt = build_system_prompt(agent);
+        // Build system prompt snapshot — frozen for the entire session to
+        // maximize prompt cache hits (Anthropic API + local inference).
+        let snapshot = build_system_prompt(agent);
+        info!(
+            content_hash = %snapshot.content_hash,
+            modules = snapshot.module_order.len(),
+            bytes = snapshot.frozen_prompt.len(),
+            "System prompt snapshot frozen"
+        );
 
         // Initialize AccountRotator for multi-account support
         let rotator = self.init_rotator().await;
@@ -102,7 +111,7 @@ impl AgentRunner {
             eprint!("\n");
 
             let response = call_with_streaming(
-                &system_prompt,
+                snapshot.prompt(),
                 input,
                 &model_id,
                 &rotator,
@@ -154,36 +163,85 @@ impl AgentRunner {
 
 // ── System prompt builder ───────────────────────────────────
 
-/// Build a system prompt from an agent's loaded markdown files.
+/// Build a system prompt snapshot from an agent's loaded markdown files.
 ///
-/// Skills are sorted alphabetically by name to ensure deterministic byte
-/// sequences across calls — this maximizes prompt cache hit rates.
-fn build_system_prompt(agent: &LoadedAgent) -> String {
-    let mut parts = Vec::new();
+/// The prompt is assembled with `<!-- MODULE: name -->` delimiters in a strict
+/// order to ensure byte-identical prefixes across turns (prompt cache friendly).
+/// Skills are sorted alphabetically by name for deterministic ordering.
+///
+/// Module order:
+///   SHARED_BASE → IDENTITY (SOUL.md + IDENTITY.md) → SKILLS → MEMORY → DYNAMIC
+fn build_system_prompt(agent: &LoadedAgent) -> SystemPromptSnapshot {
+    let mut buf = String::new();
+    let mut modules = Vec::new();
 
-    if let Some(soul) = &agent.soul {
-        parts.push(format!("# Soul\n{}", soul.trim_end()));
-    }
-    if let Some(identity) = &agent.identity {
-        parts.push(format!("# Identity\n{}", identity.trim_end()));
-    }
-
-    // Sort skills by name for deterministic ordering (cache-friendly)
-    let mut skills: Vec<_> = agent.skills.iter().collect();
-    skills.sort_by(|a, b| a.name.cmp(&b.name));
-    for skill in skills {
-        parts.push(format!(
-            "# Skill: {}\n{}",
-            skill.name,
-            skill.content.trim_end()
-        ));
+    // Helper: append a module with delimiter tracking.
+    macro_rules! append_module {
+        ($name:expr, $content:expr) => {{
+            let offset = buf.len();
+            buf.push_str(&format!("<!-- MODULE: {} -->\n", $name));
+            buf.push_str($content);
+            buf.push_str("\n\n");
+            modules.push(PromptModule {
+                name: $name.to_string(),
+                byte_offset: offset,
+                byte_length: buf.len() - offset,
+            });
+        }};
     }
 
+    // 1. Shared base — identical across all agents for prefix cache sharing.
+    append_module!("SHARED_BASE", SHARED_BASE);
+
+    // 2. Identity — SOUL.md + IDENTITY.md
+    {
+        let mut identity_parts = String::new();
+        if let Some(soul) = &agent.soul {
+            identity_parts.push_str("# Soul\n");
+            identity_parts.push_str(soul.trim_end());
+        }
+        if let Some(identity) = &agent.identity {
+            if !identity_parts.is_empty() {
+                identity_parts.push_str("\n\n---\n\n");
+            }
+            identity_parts.push_str("# Identity\n");
+            identity_parts.push_str(identity.trim_end());
+        }
+        if !identity_parts.is_empty() {
+            append_module!("IDENTITY", &identity_parts);
+        }
+    }
+
+    // 3. Skills — alphabetically sorted for deterministic byte sequences.
+    {
+        let mut skills: Vec<_> = agent.skills.iter().collect();
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        if !skills.is_empty() {
+            let mut skills_text = String::new();
+            for (i, skill) in skills.iter().enumerate() {
+                if i > 0 {
+                    skills_text.push_str("\n\n---\n\n");
+                }
+                skills_text.push_str(&format!("# Skill: {}\n{}", skill.name, skill.content.trim_end()));
+            }
+            append_module!("SKILLS", &skills_text);
+        }
+    }
+
+    // 4. Memory context
     if let Some(memory) = &agent.memory {
-        parts.push(format!("# Memory\n{}", memory.trim_end()));
+        append_module!("MEMORY", memory.trim_end());
     }
 
-    parts.join("\n\n---\n\n")
+    // 5. Dynamic — timestamp and session-specific metadata.
+    //    This section is intentionally last so the frozen prefix above
+    //    stays byte-identical even if dynamic content varies.
+    {
+        let dynamic = format!("Session started: {}", Utc::now().to_rfc3339());
+        append_module!("DYNAMIC", &dynamic);
+    }
+
+    SystemPromptSnapshot::new(buf, modules)
 }
 
 // ── CLI banner ──────────────────────────────────────────────

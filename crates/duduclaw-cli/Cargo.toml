@@ -39,3 +39,6 @@ gethostname = "0.5"
 mac_address = "1"
 hex = "0.4"
 rustls = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

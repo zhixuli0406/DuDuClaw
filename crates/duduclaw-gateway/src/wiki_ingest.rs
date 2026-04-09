@@ -157,10 +157,13 @@ pub fn generate_local_proposals(
 ) -> Vec<WikiProposal> {
     let now = Utc::now();
     let date = now.format("%Y-%m-%d").to_string();
+    let time = now.format("%H%M%S").to_string();
     let mut proposals = Vec::new();
 
     // Always create a source summary for non-trivial conversations
-    let source_path = format!("sources/{}-{}.md", date, sanitize_filename(session_id));
+    // Include timestamp so each conversation turn gets its own page
+    // (session_id is channel-scoped, so without timestamp all turns overwrite the same file)
+    let source_path = format!("sources/{}-{}-{}.md", date, sanitize_filename(session_id), time);
     let source_content = format!(
         "---\ntitle: Conversation {}\ncreated: {}\nupdated: {}\ntags: [conversation, auto-ingest]\nrelated: []\nsources: [{}]\n---\n\n## User\n{}\n\n## Assistant\n{}\n",
         &session_id[..8.min(session_id.len())],
@@ -531,6 +534,12 @@ mod tests {
         );
         assert!(!proposals.is_empty());
         assert!(proposals[0].page_path.starts_with("sources/"));
+        // Path should contain session id AND timestamp (HHMMSS) to avoid overwrites
+        assert!(proposals[0].page_path.contains("session-abc123"));
+        let parts: Vec<&str> = proposals[0].page_path.trim_end_matches(".md").split('-').collect();
+        // Format: sources/YYYY-MM-DD-session-abc123-HHMMSS.md — last segment is time
+        let last = parts.last().unwrap();
+        assert_eq!(last.len(), 6, "timestamp segment should be 6 digits (HHMMSS)");
         assert!(proposals[0].content.as_ref().unwrap().contains("return policy"));
     }
 
