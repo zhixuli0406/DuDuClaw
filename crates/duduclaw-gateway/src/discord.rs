@@ -973,12 +973,18 @@ async fn handle_message_create(
     // ── Send reply with embed + buttons ──
     let mut payload = channel_format::to_discord_message(&reply, display_name.as_deref(), false);
 
-    // Reply to the original message so the sender gets a notification
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("message_reference".to_string(), json!({
-            "message_id": message_id,
-            "channel_id": reply_channel_id,
-        }));
+    // Reply to the original message so the sender gets a notification.
+    // Skip message_reference when replying inside a newly created thread —
+    // the original message lives in the parent channel, not the thread,
+    // so Discord would reject with MESSAGE_REFERENCE_UNKNOWN_MESSAGE.
+    let in_new_thread = reply_channel_id != channel_id;
+    if !in_new_thread {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("message_reference".to_string(), json!({
+                "message_id": message_id,
+                "channel_id": channel_id,
+            }));
+        }
     }
 
     // Add conversation buttons
