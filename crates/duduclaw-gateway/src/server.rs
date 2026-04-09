@@ -55,6 +55,7 @@ fn check_login_rate_limit(email: &str) -> bool {
 }
 
 use crate::auth::AuthManager;
+use crate::extension::{GatewayExtension, NullExtension};
 use crate::handlers::MethodHandler;
 use crate::protocol::WsFrame;
 
@@ -69,6 +70,9 @@ pub struct GatewayConfig {
     pub auth_token: Option<String>,
     /// Path to the DuDuClaw home directory (e.g. `~/.duduclaw`).
     pub home_dir: std::path::PathBuf,
+    /// Extension point for Pro/Enterprise features.
+    /// Defaults to [`NullExtension`] in CE builds.
+    pub extension: Arc<dyn GatewayExtension>,
 }
 
 /// Internal shared state for the Axum application.
@@ -91,7 +95,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let tx = log_tx;
 
     let home_dir = config.home_dir.clone();
-    let handler = MethodHandler::new(config.home_dir).await;
+    let extension = config.extension.clone();
+    let handler = MethodHandler::with_extension(config.home_dir, extension.clone()).await;
 
     // Initialize cost telemetry (must happen before any Claude CLI calls)
     if let Err(e) = crate::cost_telemetry::init_telemetry(&home_dir) {
@@ -344,6 +349,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Mount LINE webhook endpoint
     if let Some(line) = line_router {
         app = app.merge(line);
+    }
+
+    // Merge extension routes (Pro/Enterprise dashboard, API endpoints)
+    if let Some(extra) = extension.extra_routes() {
+        app = app.merge(extra);
     }
 
     #[cfg(feature = "dashboard")]

@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use crate::extension::GatewayExtension;
 use crate::gvu::version_store::VersionStore;
 use crate::protocol::WsFrame;
 
@@ -45,6 +46,8 @@ pub struct MethodHandler {
     user_db: RwLock<Option<Arc<UserDb>>>,
     /// JWT configuration for token issuance (injected after gateway start).
     jwt_config: RwLock<Option<Arc<JwtConfig>>>,
+    /// Extension point for Pro/Enterprise features (NullExtension in CE).
+    extension: Arc<dyn GatewayExtension>,
 }
 
 /// Cached update info from the last `system.check_update` call. [M2][R2:NM1]
@@ -75,6 +78,14 @@ pub struct ChannelState {
 
 impl MethodHandler {
     pub async fn new(home_dir: PathBuf) -> Self {
+        Self::with_extension(home_dir, Arc::new(crate::extension::NullExtension)).await
+    }
+
+    /// Create a new handler with a custom extension (used by Pro binary).
+    pub async fn with_extension(
+        home_dir: PathBuf,
+        extension: Arc<dyn GatewayExtension>,
+    ) -> Self {
         let agents_dir = home_dir.join("agents");
         let mut registry = AgentRegistry::new(agents_dir);
         if let Err(e) = registry.scan().await {
@@ -92,7 +103,13 @@ impl MethodHandler {
             feature_gate_cache: RwLock::new(None),
             user_db: RwLock::new(None),
             jwt_config: RwLock::new(None),
+            extension,
         }
+    }
+
+    /// Get the extension reference.
+    pub fn extension(&self) -> &Arc<dyn GatewayExtension> {
+        &self.extension
     }
 
     /// Inject user database and JWT config (called once after gateway start).
@@ -200,6 +217,12 @@ impl MethodHandler {
     }
 
     async fn dispatch(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
+        // ── Extension dispatch (Pro/Enterprise methods) ──────
+        // Try extension first; if it returns Some, the method is handled.
+        if let Some(frame) = self.extension.handle_method(method, params.clone(), ctx).await {
+            return frame;
+        }
+
         // ── ACL macros ───────────────────────────────────────
         // Helper: require minimum role, return error frame on failure.
         macro_rules! require_admin {
@@ -267,10 +290,7 @@ impl MethodHandler {
             "accounts.budget_summary" => { require_manager!(); self.handle_budget_summary().await }
             "accounts.rotate" => {
                 require_admin!();
-                match self.require_feature("account_rotation").await {
-                    Some(err) => err,
-                    None => self.handle_accounts_rotate(params).await,
-                }
+                self.handle_accounts_rotate(params).await
             }
             "accounts.health" => { require_admin!(); self.handle_accounts_health().await }
             "accounts.add" => { require_admin!(); self.handle_accounts_add(params).await }
@@ -324,26 +344,17 @@ impl MethodHandler {
             // ── Security (admin only) ────────────────────────
             "security.audit_log" => {
                 require_admin!();
-                match self.require_feature("audit_export").await {
-                    Some(err) => err,
-                    None => self.handle_security_audit_log(params).await,
-                }
+                self.handle_security_audit_log(params).await
             }
 
             // ── Heartbeat (manager+) ─────────────────────────
             "heartbeat.status" => {
                 require_manager!();
-                match self.require_feature("heartbeat").await {
-                    Some(err) => err,
-                    None => self.handle_heartbeat_status().await,
-                }
+                self.handle_heartbeat_status().await
             }
             "heartbeat.trigger" => {
                 require_manager!();
-                match self.require_feature("heartbeat").await {
-                    Some(err) => err,
-                    None => self.handle_heartbeat_trigger(params).await,
-                }
+                self.handle_heartbeat_trigger(params).await
             }
 
             // ── Evolution (manager+, H3 fix) ─────────────────
@@ -351,10 +362,7 @@ impl MethodHandler {
             "evolution.history" => { require_manager!(); self.handle_evolution_history(params).await }
             "evolution.skills" => {
                 require_manager!();
-                match self.require_feature("skill_ecosystem").await {
-                    Some(err) => err,
-                    None => self.handle_evolution_skills().await,
-                }
+                self.handle_evolution_skills().await
             }
 
             // ── License (admin only, H3 fix) ─────────────────
@@ -363,34 +371,10 @@ impl MethodHandler {
             "license.deactivate" => { require_admin!(); self.handle_license_deactivate().await }
 
             // ── Odoo (admin only) ────────────────────────────
-            "odoo.status" => {
-                require_admin!();
-                match self.require_feature("odoo").await {
-                    Some(err) => err,
-                    None => self.handle_odoo_status().await,
-                }
-            }
-            "odoo.config" => {
-                require_admin!();
-                match self.require_feature("odoo").await {
-                    Some(err) => err,
-                    None => self.handle_odoo_config().await,
-                }
-            }
-            "odoo.configure" => {
-                require_admin!();
-                match self.require_feature("odoo").await {
-                    Some(err) => err,
-                    None => self.handle_odoo_configure(params).await,
-                }
-            }
-            "odoo.test" => {
-                require_admin!();
-                match self.require_feature("odoo").await {
-                    Some(err) => err,
-                    None => self.handle_odoo_test().await,
-                }
-            }
+            "odoo.status" => { require_admin!(); self.handle_odoo_status().await }
+            "odoo.config" => { require_admin!(); self.handle_odoo_config().await }
+            "odoo.configure" => { require_admin!(); self.handle_odoo_configure(params).await }
+            "odoo.test" => { require_admin!(); self.handle_odoo_test().await }
 
             // ── User management (admin only) ─────────────────
             "users.list" => { require_admin!(); self.handle_users_list().await }
@@ -2671,6 +2655,8 @@ impl MethodHandler {
         drop(channel_map);
         WsFrame::ok_response("", json!({
             "version": env!("CARGO_PKG_VERSION"),
+            "edition": self.extension.name(),
+            "tier": self.extension.tier(),
             "uptime_seconds": uptime,
             "agents_count": reg.list().len(),
             "channels_connected": channels_connected,
@@ -3275,59 +3261,20 @@ impl MethodHandler {
     // ── License ──────────────────────────────────────────────
 
     async fn handle_license_status(&self) -> WsFrame {
-        let gate = self.cached_gate().await;
-        let tier = gate.tier();
-        let tier_name = tier.as_str();
-        let max_agents = gate.max_agents();
-        let max_channels = gate.max_channels();
+        // Delegate to extension for Pro/Enterprise license details.
+        // CE returns basic community info; Pro overrides with full details.
+        let mut info = self.extension.license_info();
 
-        // activated = signature-verified tier above Community (not just file existence)
-        let activated = tier != crate::feature_gate::Tier::Community;
-
-        // Only read license details if signature verification passed (tier != Community)
-        let mut expires_at: Option<String> = None;
-        let mut days_remaining: Option<i64> = None;
-        let mut customer_name: Option<String> = None;
-        let mut machine_fingerprint: Option<String> = None;
-
-        if activated {
-            let license_path = self.home_dir.join("license.key");
-            if let Ok(content) = std::fs::read_to_string(&license_path) {
-                if let Ok(json) = serde_json::from_str::<Value>(&content) {
-                    customer_name = json.get("customer_name").and_then(|v| v.as_str()).map(String::from);
-                    machine_fingerprint = json.get("machine_fingerprint").and_then(|v| v.as_str()).map(String::from);
-                    if let Some(exp) = json.get("expires_at").and_then(|v| v.as_str()) {
-                        expires_at = Some(exp.to_string());
-                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(exp) {
-                            days_remaining = Some(dt.signed_duration_since(chrono::Utc::now()).num_days());
-                        }
-                    }
-                }
-            }
+        // Always include machine fingerprint for diagnostics
+        let fingerprint = crate::feature_gate::FeatureGate::machine_fingerprint_static();
+        if let Some(obj) = info.as_object_mut() {
+            obj.insert("machine_fingerprint".to_string(), json!(fingerprint));
+            // All tiers get unlimited agents/channels in Open Core
+            obj.insert("max_agents".to_string(), json!(0));
+            obj.insert("max_channels".to_string(), json!(0));
         }
 
-        let features: Vec<String> = [
-            "multi_runtime", "account_rotation", "cost_telemetry", "odoo",
-            "browser_automation", "computer_use", "prometheus_metrics",
-            "evolution_enabled", "skill_ecosystem", "heartbeat", "failover",
-            "direct_api", "contract_system", "media_pipeline", "whisper",
-        ]
-        .iter()
-        .filter(|f| gate.check(f))
-        .map(|f| f.to_string())
-        .collect();
-
-        WsFrame::ok_response("", json!({
-            "tier": tier_name,
-            "activated": activated,
-            "max_agents": max_agents,
-            "max_channels": max_channels,
-            "expires_at": expires_at,
-            "days_remaining": days_remaining,
-            "customer_name": customer_name,
-            "machine_fingerprint": machine_fingerprint,
-            "features": features,
-        }))
+        WsFrame::ok_response("", info)
     }
 
     async fn handle_license_activate(&self, params: Value) -> WsFrame {

@@ -269,61 +269,21 @@ impl FeatureGate {
     }
 
     /// Return the minimum tier required for a given feature.
+    ///
+    /// Open Core (Apache-2.0): ALL core features are available to all tiers.
+    /// Pro/Enterprise add NEW features via the private repo's `GatewayExtension`,
+    /// not by gating existing CE features.
+    ///
+    /// Only OEM-exclusive features (white-label, redistribution) remain gated
+    /// here as they represent contractual rights, not functionality.
     fn min_tier_for_feature(feature: &str) -> Tier {
         match feature {
-            // Pro+ features
-            "multi_runtime" => Tier::Pro,
-            "federated_memory" => Tier::Pro,
-            "account_rotation" => Tier::Pro,
-            "cost_telemetry" => Tier::Pro,
-            "direct_api" => Tier::Pro,
-            "heartbeat" => Tier::Pro,
-            "contract_system" => Tier::Pro,
-            "redteam_cli" => Tier::Pro,
-            "skill_ecosystem" => Tier::Pro,
-            "channel_hot_start" => Tier::Pro,
-            "failover" => Tier::Pro,
-            "media_pipeline" => Tier::Pro,
-            "whisper" => Tier::Pro,
-            "tts" => Tier::Pro,
-            "premium_templates" => Tier::Pro,
-            "evolution_distillation" => Tier::Pro,
-
-            // Enterprise+ features
-            "odoo" | "odoo_enabled" => Tier::Enterprise,
-            "browser_automation" => Tier::Enterprise,
-            "computer_use" => Tier::Enterprise,
-            "browserbase" => Tier::Enterprise,
-            "screenshot_audit" => Tier::Enterprise,
-            "human_in_the_loop" => Tier::Enterprise,
-            "rbac" | "security_rbac" => Tier::Enterprise,
-            "prometheus_metrics" => Tier::Enterprise,
-            "security_soul_guard" => Tier::Enterprise,
-            "security_credential_proxy" => Tier::Enterprise,
-            "security_emergency_stop" => Tier::Enterprise,
-            "security_tool_approval" => Tier::Enterprise,
-            "security_capabilities_config" => Tier::Enterprise,
-            "security_rate_limiter" => Tier::Enterprise,
-            "security_pairing_system" => Tier::Enterprise,
-            "industry_params" => Tier::Enterprise,
-            "industry_templates" => Tier::Enterprise,
-            "audit_export" => Tier::Enterprise,
-
-            // OEM value-add services
+            // OEM-only: contractual rights, not functionality
             "white_label" => Tier::Oem,
             "redistribution" => Tier::Oem,
 
-            // Open Core: core features available to all tiers (Apache 2.0)
-            "hosted_service" | "hosted_service_allowed" => Tier::Community,
-            "evolution_enabled" => Tier::Community,
-            "security_input_guard" => Tier::Community,
-            "basic_memory" => Tier::Community,
-            "basic_session" => Tier::Community,
-            "single_agent" => Tier::Community,
-            "single_channel" => Tier::Community,
-
-            // Unknown features are DENIED by default — require highest tier
-            _ => Tier::Oem,
+            // Everything else is open to all tiers (Apache-2.0 Community)
+            _ => Tier::Community,
         }
     }
 }
@@ -433,50 +393,23 @@ mod tests {
     }
 
     #[test]
-    fn community_feature_checks() {
+    fn community_all_core_features_open() {
+        // Open Core: Community tier has ALL core features (Apache-2.0)
         let gate = FeatureGate::with_tier(Tier::Community);
-        // Community has basic features
         assert!(gate.check("evolution_enabled"));
         assert!(gate.check("security_input_guard"));
-        // Community does NOT have Pro+ features
-        assert!(!gate.check("multi_runtime"));
-        assert!(!gate.check("account_rotation"));
-        assert!(!gate.check("federated_memory"));
-        // Community does NOT have Enterprise+ features
-        assert!(!gate.check("odoo"));
-        assert!(!gate.check("browser_automation"));
-        assert!(!gate.check("rbac"));
-        assert!(!gate.check("prometheus_metrics"));
-    }
-
-    #[test]
-    fn pro_feature_checks() {
-        let gate = FeatureGate::with_tier(Tier::Pro);
-        // Pro has Community features
-        assert!(gate.check("evolution_enabled"));
-        // Pro has Pro features
         assert!(gate.check("multi_runtime"));
         assert!(gate.check("account_rotation"));
         assert!(gate.check("federated_memory"));
-        assert!(gate.check("cost_telemetry"));
-        assert!(gate.check("direct_api"));
-        // Pro does NOT have Enterprise features
-        assert!(!gate.check("odoo"));
-        assert!(!gate.check("browser_automation"));
-        assert!(!gate.check("rbac"));
-        assert!(!gate.check("prometheus_metrics"));
-    }
-
-    #[test]
-    fn enterprise_feature_checks() {
-        let gate = FeatureGate::with_tier(Tier::Enterprise);
-        // Enterprise has everything except OEM
-        assert!(gate.check("multi_runtime"));
         assert!(gate.check("odoo"));
         assert!(gate.check("browser_automation"));
         assert!(gate.check("rbac"));
         assert!(gate.check("prometheus_metrics"));
-        // Enterprise does NOT have OEM features
+        assert!(gate.check("cost_telemetry"));
+        assert!(gate.check("heartbeat"));
+        assert!(gate.check("skill_ecosystem"));
+        assert!(gate.check("hosted_service"));
+        // Only OEM contractual rights are gated
         assert!(!gate.check("white_label"));
         assert!(!gate.check("redistribution"));
     }
@@ -513,29 +446,21 @@ mod tests {
     #[test]
     fn upgrade_message_includes_tier_info() {
         let gate = FeatureGate::with_tier(Tier::Community);
+        // Open Core: core features show Community tier (always allowed)
         let msg = gate.upgrade_message("multi_runtime");
-        assert!(msg.contains("Pro"));
         assert!(msg.contains("Community"));
         assert!(msg.contains("multi_runtime"));
 
-        let msg2 = gate.upgrade_message("odoo");
-        assert!(msg2.contains("Enterprise"));
+        // OEM-only features still show OEM tier requirement
+        let msg2 = gate.upgrade_message("white_label");
+        assert!(msg2.contains("OEM"));
     }
 
     #[test]
-    fn unknown_feature_defaults_to_deny() {
+    fn unknown_feature_defaults_to_open() {
+        // Open Core: unknown features default to Community (open)
         let gate = FeatureGate::with_tier(Tier::Community);
-        // Unknown features require OEM tier, so they are denied for everyone else
-        assert!(!gate.check("some_unknown_feature"));
-
-        let gate_pro = FeatureGate::with_tier(Tier::Pro);
-        assert!(!gate_pro.check("some_unknown_feature"));
-
-        let gate_enterprise = FeatureGate::with_tier(Tier::Enterprise);
-        assert!(!gate_enterprise.check("some_unknown_feature"));
-
-        // Only OEM can access unknown features
-        let gate_oem = FeatureGate::with_tier(Tier::Oem);
-        assert!(gate_oem.check("some_unknown_feature"));
+        assert!(gate.check("some_unknown_feature"));
+        assert!(gate.check("any_new_feature"));
     }
 }

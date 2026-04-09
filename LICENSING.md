@@ -27,16 +27,23 @@ DuDuClaw 採用 **Open Core** 授權模式。
 | `duduclaw-bridge` | Python 互操作 |
 | `web/` | React 19 Dashboard（全功能） |
 
-## 商業加值模組（閉源）
+## 商業加值模組（閉源，獨立 Repository）
 
-以下模組為付費商業授權，不包含在公開 repository 中：
+Pro/Enterprise 功能位於獨立的私有 repository (`duduclaw-pro`)，
+**不修改 CE 的任何功能**，而是透過 `GatewayExtension` trait 注入額外功能：
 
 | 模組 | 說明 |
 |------|------|
-| `duduclaw-license` | Ed25519 授權驗證 crate |
-| `templates-premium` | 產業專用 SOUL.md 調校版（餐飲/製造/貿易） |
-| `evolution-params` | GVU 演化引擎最佳參數集 |
-| `dashboard-enterprise` | ROI 報表、稽核匯出（PDF/CSV） |
+| `duduclaw-license` | Ed25519 授權驗證 |
+| `duduclaw-pro-gateway` | Pro RPC 方法 (`pro.templates.*`, `pro.audit.*`, `pro.report.*`) |
+| `duduclaw-pro-evolution` | GVU 自適應深度 (3-7 輪) + 產業參數集 |
+| `duduclaw-pro-audit` | PDF/CSV 稽核匯出 |
+| `duduclaw-pro-report` | ROI 分析 + 對話品質趨勢 |
+| `duduclaw-pro-dashboard` | Pro Dashboard 擴展頁面 |
+| `templates/` | 10+ 產業 SOUL.md 模板 |
+| `evolution-params/` | GVU 最佳參數集 |
+
+Pro binary (`duduclaw-pro`) 是 CE 的超集 — 包含所有 CE 功能加上上述增值模組。
 
 ---
 
