@@ -1,0 +1,6 @@
+interface:
+  display_name: "DuDuClaw"
+  short_description: "Repo-specific patterns and workflows for DuDuClaw"
+  default_prompt: "Use the DuDuClaw repo skill to follow existing architecture, testing, and workflow conventions."
+policy:
+  allow_implicit_invocation: true
