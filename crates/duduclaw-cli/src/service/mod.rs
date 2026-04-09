@@ -124,6 +124,9 @@ WantedBy=multi-user.target
 mod launchd {
     use duduclaw_core::error::Result;
 
+    /// Default port used by the DuDuClaw gateway.
+    const DEFAULT_PORT: u16 = 18789;
+
     /// Generate and print the launchd plist.
     pub async fn install() -> Result<()> {
         let exe = std::env::current_exe().unwrap_or_default();
@@ -173,10 +176,73 @@ mod launchd {
     }
 
     pub async fn stop() -> Result<()> {
+        let port: u16 = std::env::var("DUDUCLAW_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(DEFAULT_PORT);
+
+        // 1. Unload from launchctl (stops auto-restart via KeepAlive)
         let home = dirs::home_dir().unwrap_or_default();
         let plist_path = home.join("Library/LaunchAgents/dev.duduclaw.plist");
-        println!("Run: launchctl unload {}", plist_path.display());
-        Ok(())
+        println!("Unloading LaunchAgent...");
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", &plist_path.to_string_lossy()])
+            .status();
+
+        // 2. Find process occupying the port
+        let pids = find_pids_on_port(port);
+        if pids.is_empty() {
+            println!("✓ No process found on port {port}. Service stopped.");
+            return Ok(());
+        }
+
+        // 3. Send SIGTERM and wait for graceful exit (up to 5 seconds)
+        println!("Sending SIGTERM to PID(s): {:?}", pids);
+        for &pid in &pids {
+            unsafe { libc::kill(pid, libc::SIGTERM); }
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let remaining = find_pids_on_port(port);
+            if remaining.is_empty() {
+                println!("✓ Service stopped gracefully. Port {port} released.");
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                // 4. SIGKILL remaining processes
+                println!("Graceful shutdown timed out. Sending SIGKILL to: {:?}", remaining);
+                for &pid in &remaining {
+                    unsafe { libc::kill(pid, libc::SIGKILL); }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+
+                let still_alive = find_pids_on_port(port);
+                if still_alive.is_empty() {
+                    println!("✓ Service killed. Port {port} released.");
+                } else {
+                    eprintln!("⚠ Could not kill process(es): {:?}. Try: kill -9 {}", still_alive, still_alive.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" "));
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    /// Find PIDs of processes listening on the given port via `lsof`.
+    fn find_pids_on_port(port: u16) -> Vec<i32> {
+        let output = std::process::Command::new("lsof")
+            .args(["-ti", &format!(":{port}")])
+            .output();
+        match output {
+            Ok(out) => {
+                String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .filter_map(|s| s.parse::<i32>().ok())
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        }
     }
 
     pub async fn status() -> Result<()> {

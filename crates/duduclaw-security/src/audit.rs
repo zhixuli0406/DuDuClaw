@@ -205,6 +205,131 @@ pub fn log_skill_quarantined(home_dir: &Path, agent_id: &str, skill_name: &str, 
     append_audit_event(home_dir, &event);
 }
 
+// ── Tool call audit trail ─────────────────────────────────────
+
+/// Log a successful MCP tool call for post-action audit verification.
+///
+/// Written to `tool_calls.jsonl` (separate from security_audit.jsonl)
+/// so the action claim verifier can cross-reference agent outputs.
+pub fn append_tool_call(
+    home_dir: &Path,
+    agent_id: &str,
+    tool_name: &str,
+    params_summary: &str,
+    success: bool,
+) {
+    let path = home_dir.join("tool_calls.jsonl");
+    let record = serde_json::json!({
+        "timestamp": Utc::now().to_rfc3339(),
+        "agent_id": agent_id,
+        "tool_name": tool_name,
+        "params_summary": params_summary,
+        "success": success,
+    });
+    let json = match serde_json::to_string(&record) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!("Failed to serialize tool call record: {e}");
+            return;
+        }
+    };
+
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let _ = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+            }
+            if let Err(e) = writeln!(f, "{json}") {
+                warn!("Failed to write tool call record: {e}");
+            }
+        }
+        Err(e) => {
+            warn!("Failed to open tool_calls.jsonl: {e}");
+        }
+    }
+}
+
+/// Read tool call records for a specific agent within a time window.
+///
+/// Uses `flock(LOCK_SH)` to prevent reading partially-written lines
+/// while `append_tool_call()` holds `LOCK_EX`.
+pub fn read_tool_calls_since(
+    home_dir: &Path,
+    agent_id: &str,
+    since: &str,
+) -> Vec<serde_json::Value> {
+    let path = home_dir.join("tool_calls.jsonl");
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+
+    // Acquire shared lock to prevent reading during a concurrent write
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: fd is valid from the open File handle above.
+        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
+    }
+
+    use std::io::Read;
+    let mut content = String::new();
+    let mut reader = std::io::BufReader::new(file);
+    if reader.read_to_string(&mut content).is_err() {
+        return Vec::new();
+    }
+
+    // Fallback to 0 seconds ago (empty window) if `since` is unparseable,
+    // to avoid accidentally including old records.
+    let since_dt = chrono::DateTime::parse_from_rfc3339(since)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|record| {
+            let matches_agent = record
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| id == agent_id);
+            let after_since = record
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                .is_some_and(|dt| dt.with_timezone(&chrono::Utc) >= since_dt);
+            matches_agent && after_since
+        })
+        .collect()
+}
+
+/// Log a tool hallucination detection event.
+pub fn log_tool_hallucination(
+    home_dir: &Path,
+    agent_id: &str,
+    claimed_action: &str,
+    expected_tool: &str,
+) {
+    let event = AuditEvent::new(
+        "tool_hallucination",
+        agent_id,
+        Severity::Critical,
+        serde_json::json!({
+            "claimed_action": claimed_action,
+            "expected_tool": expected_tool,
+            "explanation": "Agent claimed to perform an action without calling the corresponding MCP tool",
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
 // ── Killswitch / Safety Filter audit events ───────────────────
 
 /// Log a safety word trigger event.

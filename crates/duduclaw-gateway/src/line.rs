@@ -57,9 +57,31 @@ struct LineSource {
 
 #[derive(Debug, Deserialize)]
 struct LineMessage {
+    /// Message ID, used to download content for image/video/audio/file.
+    id: Option<String>,
     #[serde(rename = "type")]
     msg_type: String,
     text: Option<String>,
+    /// Original filename (for file type messages).
+    #[serde(rename = "fileName")]
+    file_name: Option<String>,
+    /// File size in bytes (for file type messages).
+    #[serde(rename = "fileSize")]
+    #[allow(dead_code)]
+    file_size: Option<u64>,
+    /// Content provider info (for image/video/audio).
+    #[serde(rename = "contentProvider")]
+    content_provider: Option<LineContentProvider>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LineContentProvider {
+    /// "line" for LINE-hosted content, "external" for external URLs.
+    #[serde(rename = "type")]
+    provider_type: String,
+    /// URL when provider_type is "external".
+    #[serde(rename = "originalContentUrl")]
+    original_content_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -198,10 +220,15 @@ async fn line_webhook_handler(
             continue;
         }
 
-        if let Some(msg) = &event.message
-            && msg.msg_type == "text"
-            && let Some(text) = &msg.text
-            && let Some(reply_token) = &event.reply_token
+        let Some(msg) = &event.message else { continue };
+        let Some(reply_token) = &event.reply_token else { continue };
+
+        // Skip unsupported message types (e.g., location, sticker)
+        let supported_types = ["text", "image", "video", "audio", "file"];
+        if !supported_types.contains(&msg.msg_type.as_str()) {
+            continue;
+        }
+
         {
             let source = &event.source;
             let source_type = source.as_ref().and_then(|s| s.source_type.as_deref()).unwrap_or("user");
@@ -218,9 +245,6 @@ async fn line_webhook_handler(
             // ── Mention-only mode (group chats only, LINE has no native @mention) ──
             let mention_only = state.ctx.channel_settings.get_bool("line", scope_id, keys::MENTION_ONLY, false).await;
             if is_group && mention_only {
-                // LINE has no structured mention system; skip unless text starts with bot name
-                // In practice, mention_only for LINE groups means the bot won't respond at all
-                // unless explicitly mentioned by name in the text (future: configurable trigger word)
                 continue;
             }
 
@@ -228,7 +252,61 @@ async fn line_webhook_handler(
                 .and_then(|s| s.user_id.as_deref())
                 .unwrap_or("unknown");
 
-            info!("📩 LINE [{sender}]: {}", &text[..text.len().min(80)]);
+            // ── Build input text + attachment references ──
+            let mut attachment_lines: Vec<String> = Vec::new();
+            let base_text = msg.text.as_deref().unwrap_or("").to_string();
+
+            // Handle non-text message types: download content and save to disk
+            if msg.msg_type != "text" {
+                if let Some(msg_id) = &msg.id {
+                    let type_label = &msg.msg_type;
+                    info!("📩 LINE [{sender}]: {type_label} message");
+
+                    // Determine content URL: LINE-hosted or external
+                    let content_data = if let Some(cp) = &msg.content_provider
+                        && cp.provider_type == "external"
+                        && let Some(url) = &cp.original_content_url
+                    {
+                        // External URL — download directly
+                        crate::media::download_url(&state.http, url, None, crate::media::MAX_FILE_SIZE as usize).await.ok()
+                    } else {
+                        // LINE-hosted — download via Content API
+                        download_line_content(&state.http, &state.token, msg_id).await.ok()
+                    };
+
+                    if let Some(data) = content_data {
+                        let mime = crate::media::detect_mime(&data);
+                        let mt = crate::media::media_type_from_mime(&mime);
+                        let fname = if let Some(name) = &msg.file_name {
+                            name.clone()
+                        } else {
+                            let ext = crate::media::extension_from_mime(&mime);
+                            format!("{type_label}.{ext}")
+                        };
+                        match crate::media::save_attachment_to_disk(&state.ctx.home_dir, &data, &fname).await {
+                            Ok(path) => {
+                                attachment_lines.push(crate::media::format_attachment_ref(&mt, &fname, &path));
+                            }
+                            Err(e) => warn!("Failed to save LINE {type_label}: {e}"),
+                        }
+                    }
+                }
+            }
+
+            // Combine text + attachment references
+            let input_text = if attachment_lines.is_empty() {
+                base_text.clone()
+            } else if base_text.trim().is_empty() {
+                attachment_lines.join("\n")
+            } else {
+                format!("{base_text}\n\n{}", attachment_lines.join("\n"))
+            };
+
+            if input_text.trim().is_empty() {
+                continue;
+            }
+
+            info!("📩 LINE [{sender}]: {}", &input_text[..input_text.len().min(80)]);
 
             // Progress callback via Push API (requires userId).
             // LINE Push API has monthly message quotas — debounce at 60s
@@ -271,7 +349,7 @@ async fn line_webhook_handler(
                 format!("line:{sender}")
             };
 
-            let reply = build_reply_with_session(text, &state.ctx, &session_id, sender, on_progress).await;
+            let reply = build_reply_with_session(&input_text, &state.ctx, &session_id, sender, on_progress).await;
 
             // Use Flex Message for long replies, plain text for short ones
             let agent_name = {
@@ -311,6 +389,21 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         acc |= x ^ y;
     }
     acc == 0
+}
+
+/// Download message content (image/video/audio/file) from LINE Content API.
+async fn download_line_content(
+    http: &reqwest::Client,
+    token: &str,
+    message_id: &str,
+) -> Result<Vec<u8>, String> {
+    let url = format!("https://api-data.line.me/v2/bot/message/{message_id}/content");
+    crate::media::download_url(
+        http,
+        &url,
+        Some(("Authorization", &format!("Bearer {token}"))),
+        crate::media::MAX_FILE_SIZE as usize,
+    ).await
 }
 
 /// Send a rich reply (Flex Message, etc.) via the LINE Reply API.

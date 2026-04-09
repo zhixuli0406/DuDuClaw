@@ -54,8 +54,25 @@ struct WaMessage {
     #[serde(rename = "type")]
     msg_type: String,
     text: Option<WaText>,
+    image: Option<WaMedia>,
+    audio: Option<WaMedia>,
+    video: Option<WaMedia>,
+    document: Option<WaDocument>,
     #[allow(dead_code)]
     timestamp: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WaMedia {
+    id: String,
+    mime_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WaDocument {
+    id: String,
+    filename: Option<String>,
+    mime_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,49 +229,104 @@ async fn receive_webhook(
 
             if let Some(messages) = &change.value.messages {
                 for msg in messages {
-                    // Handle image messages
-                    if msg.msg_type == "image" {
-                        let reply = "\u{1f4f7} Image received. Vision processing coming soon.";
-                        send_text(&state.http, &state.access_token, &phone_id, &msg.from, reply).await;
+                    let supported_types = ["text", "image", "audio", "video", "document"];
+                    if !supported_types.contains(&msg.msg_type.as_str()) {
                         continue;
                     }
-                    // Handle audio messages
-                    if msg.msg_type == "audio" {
-                        let reply = "\u{1f3b5} Audio received. Transcription coming soon.";
-                        send_text(&state.http, &state.access_token, &phone_id, &msg.from, reply).await;
-                        continue;
-                    }
-                    if msg.msg_type != "text" {
-                        continue;
-                    }
-                    if let Some(text) = &msg.text {
-                        let sender = &msg.from;
-                        info!("📩 WhatsApp [{sender}]: {}", &text.body[..text.body.len().min(80)]);
 
-                        // Chat commands
-                        if crate::chat_commands::is_command(&text.body) {
-                            if let Some(cmd) = crate::chat_commands::parse_command(&text.body, None) {
-                                let session_id = format!("whatsapp:{sender}");
-                                let agent_id = {
-                                    let reg = state.ctx.registry.read().await;
-                                    reg.main_agent()
-                                        .map(|a| a.config.agent.name.clone())
-                                        .unwrap_or_default()
-                                };
-                                let reply = crate::chat_commands::handle_command(
-                                    &cmd, &state.ctx, &session_id, &agent_id, true,
-                                ).await;
-                                send_text(&state.http, &state.access_token, &phone_id, sender, &reply).await;
-                                continue;
+                    let sender = &msg.from;
+                    let base_text = msg.text.as_ref().map(|t| t.body.clone()).unwrap_or_default();
+                    let mut attachment_lines: Vec<String> = Vec::new();
+
+                    // ── Download and save media attachments ──
+                    let media_info: Option<(&str, &str, &str)> = match msg.msg_type.as_str() {
+                        "image" => msg.image.as_ref().map(|m| {
+                            (m.id.as_str(), m.mime_type.as_deref().unwrap_or("image/jpeg"), "image")
+                        }),
+                        "audio" => msg.audio.as_ref().map(|m| {
+                            (m.id.as_str(), m.mime_type.as_deref().unwrap_or("audio/ogg"), "audio")
+                        }),
+                        "video" => msg.video.as_ref().map(|m| {
+                            (m.id.as_str(), m.mime_type.as_deref().unwrap_or("video/mp4"), "video")
+                        }),
+                        _ => None,
+                    };
+
+                    if let Some((media_id, mime, type_label)) = media_info {
+                        info!("📩 WhatsApp [{sender}]: {type_label} message");
+                        match download_media(&state.http, &state.access_token, media_id).await {
+                            Ok(data) => {
+                                let mt = crate::media::media_type_from_mime(mime);
+                                let ext = crate::media::extension_from_mime(mime);
+                                let fname = format!("{type_label}.{ext}");
+                                match crate::media::save_attachment_to_disk(&state.ctx.home_dir, &data, &fname).await {
+                                    Ok(path) => {
+                                        attachment_lines.push(crate::media::format_attachment_ref(&mt, &fname, &path));
+                                    }
+                                    Err(e) => warn!("Failed to save WhatsApp {type_label}: {e}"),
+                                }
                             }
+                            Err(e) => warn!("Failed to download WhatsApp {type_label}: {e}"),
                         }
-
-                        let session_id = format!("whatsapp:{sender}");
-                        let reply = build_reply_with_session(
-                            &text.body, &state.ctx, &session_id, sender, None,
-                        ).await;
-                        send_text(&state.http, &state.access_token, &phone_id, sender, &reply).await;
                     }
+
+                    // Handle document (has filename)
+                    if let Some(doc) = &msg.document {
+                        let mime = doc.mime_type.as_deref().unwrap_or("application/octet-stream");
+                        let fname = doc.filename.as_deref().unwrap_or("document");
+                        info!("📩 WhatsApp [{sender}]: document ({fname})");
+                        match download_media(&state.http, &state.access_token, &doc.id).await {
+                            Ok(data) => {
+                                let mt = crate::media::media_type_from_mime(mime);
+                                match crate::media::save_attachment_to_disk(&state.ctx.home_dir, &data, fname).await {
+                                    Ok(path) => {
+                                        attachment_lines.push(crate::media::format_attachment_ref(&mt, fname, &path));
+                                    }
+                                    Err(e) => warn!("Failed to save WhatsApp document: {e}"),
+                                }
+                            }
+                            Err(e) => warn!("Failed to download WhatsApp document: {e}"),
+                        }
+                    }
+
+                    // Combine text + attachments
+                    let input_text = if attachment_lines.is_empty() {
+                        base_text.clone()
+                    } else if base_text.trim().is_empty() {
+                        attachment_lines.join("\n")
+                    } else {
+                        format!("{base_text}\n\n{}", attachment_lines.join("\n"))
+                    };
+
+                    if input_text.trim().is_empty() {
+                        continue;
+                    }
+
+                    info!("📩 WhatsApp [{sender}]: {}", &input_text[..input_text.len().min(80)]);
+
+                    // Chat commands
+                    if crate::chat_commands::is_command(&input_text) {
+                        if let Some(cmd) = crate::chat_commands::parse_command(&input_text, None) {
+                            let session_id = format!("whatsapp:{sender}");
+                            let agent_id = {
+                                let reg = state.ctx.registry.read().await;
+                                reg.main_agent()
+                                    .map(|a| a.config.agent.name.clone())
+                                    .unwrap_or_default()
+                            };
+                            let reply = crate::chat_commands::handle_command(
+                                &cmd, &state.ctx, &session_id, &agent_id, true,
+                            ).await;
+                            send_text(&state.http, &state.access_token, &phone_id, sender, &reply).await;
+                            continue;
+                        }
+                    }
+
+                    let session_id = format!("whatsapp:{sender}");
+                    let reply = build_reply_with_session(
+                        &input_text, &state.ctx, &session_id, sender, None,
+                    ).await;
+                    send_text(&state.http, &state.access_token, &phone_id, sender, &reply).await;
                 }
             }
         }
@@ -298,8 +370,6 @@ async fn send_text(
 }
 
 /// Download a media file from the WhatsApp Cloud API.
-/// TODO: Wire up for voice/image message handling in WhatsApp.
-#[allow(dead_code)]
 async fn download_media(
     http: &reqwest::Client,
     token: &str,

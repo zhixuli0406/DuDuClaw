@@ -1,3 +1,4 @@
+pub mod action_claim_verifier;
 pub mod audit;
 pub mod circuit_breaker;
 pub mod credential_proxy;

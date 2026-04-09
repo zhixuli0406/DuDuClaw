@@ -40,6 +40,10 @@ pub enum MistakeCategory {
     Capability,
     /// Agent violated safety constraints or leaked sensitive info.
     Safety,
+    /// Agent claimed to perform tool actions (create_agent, etc.) without
+    /// actually calling the corresponding MCP tool. Ref: Grid-Mind (2602.20683),
+    /// AgentHallu (2601.06818).
+    Hallucination,
 }
 
 impl MistakeCategory {
@@ -49,6 +53,7 @@ impl MistakeCategory {
             Self::Behavioral => "behavioral",
             Self::Capability => "capability",
             Self::Safety => "safety",
+            Self::Hallucination => "hallucination",
         }
     }
 
@@ -58,14 +63,21 @@ impl MistakeCategory {
             "behavioral" => Self::Behavioral,
             "capability" => Self::Capability,
             "safety" => Self::Safety,
+            "hallucination" => Self::Hallucination,
             _ => Self::Behavioral,
         }
     }
 
-    /// Priority weight for GVU — Safety > Factual > Capability > Behavioral.
+    /// Priority weight for GVU — Safety > Hallucination > Factual > Capability > Behavioral.
+    ///
+    /// Hallucination ranks between Safety and Factual because tool-use
+    /// hallucination erodes system trustworthiness (the agent claims actions
+    /// it never performed), but doesn't directly leak sensitive data.
+    /// Ref: AgentHallu (2601.06818), The Reasoning Trap (2510.22977).
     pub fn priority(&self) -> u8 {
         match self {
-            Self::Safety => 4,
+            Self::Safety => 5,
+            Self::Hallucination => 4,
             Self::Factual => 3,
             Self::Capability => 2,
             Self::Behavioral => 1,
@@ -216,10 +228,11 @@ impl MistakeNotebook {
              WHERE agent_id = ?1 AND resolved = 0
              ORDER BY
                  CASE category
-                     WHEN 'safety' THEN 0
-                     WHEN 'factual' THEN 1
-                     WHEN 'capability' THEN 2
-                     ELSE 3
+                     WHEN 'safety'        THEN 0
+                     WHEN 'hallucination' THEN 1
+                     WHEN 'factual'       THEN 2
+                     WHEN 'capability'    THEN 3
+                     ELSE 4
                  END,
                  timestamp DESC
              LIMIT ?2",
@@ -327,6 +340,54 @@ impl MistakeNotebook {
             |row| row.get::<_, u32>(0),
         )
         .unwrap_or(0)
+    }
+
+    /// Record a tool-use hallucination as a Hallucination-category mistake.
+    ///
+    /// This is a convenience method called by the dispatcher when the
+    /// action claim verifier detects ungrounded action claims.
+    pub fn record_hallucination(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        claimed_action: &str,
+        expected_tool: &str,
+        agent_output_summary: &str,
+    ) -> Result<(), String> {
+        let entry = MistakeEntry {
+            id: Uuid::new_v4().to_string(),
+            agent_id: agent_id.to_string(),
+            timestamp: Utc::now(),
+            category: MistakeCategory::Hallucination,
+            session_id: session_id.to_string(),
+            input_summary: "(dispatcher task)".to_string(),
+            agent_response_summary: truncate_str(agent_output_summary, 200),
+            what_went_wrong: format!(
+                "Agent claimed '{}' but never called MCP tool '{}'",
+                claimed_action, expected_tool,
+            ),
+            ground_truth: Some(format!(
+                "Must call '{}' MCP tool to perform this action",
+                expected_tool,
+            )),
+            gradient: TextGradient {
+                target: "SOUL.md — 工具使用原則".to_string(),
+                critique: format!(
+                    "Agent fabricated action '{}' without tool call. \
+                     Ref: Grid-Mind forced routing, AgentHallu tool-use category.",
+                    claimed_action,
+                ),
+                suggestion: format!(
+                    "Add explicit constraint: '{}' action MUST be performed via '{}' \
+                     MCP tool call. Never claim completion without tool confirmation.",
+                    claimed_action, expected_tool,
+                ),
+                severity: super::text_gradient::GradientSeverity::Blocking,
+                source_layer: "action_claim_verifier".to_string(),
+            },
+            resolved: false,
+        };
+        self.record(&entry)
     }
 
     /// Evict oldest unresolved entries beyond the per-agent cap.

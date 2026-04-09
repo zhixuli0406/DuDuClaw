@@ -65,11 +65,50 @@ struct TgFile {
 }
 
 #[derive(Debug, Deserialize)]
+struct TgPhotoSize {
+    file_id: String,
+    #[allow(dead_code)]
+    width: Option<u32>,
+    #[allow(dead_code)]
+    height: Option<u32>,
+    #[allow(dead_code)]
+    file_size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgDocument {
+    file_id: String,
+    file_name: Option<String>,
+    mime_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgVideo {
+    file_id: String,
+    #[allow(dead_code)]
+    duration: Option<u32>,
+    mime_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgSticker {
+    file_id: String,
+    emoji: Option<String>,
+    #[allow(dead_code)]
+    is_animated: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TgMessage {
     message_id: Option<i64>,
     text: Option<String>,
     voice: Option<TgVoice>,
     audio: Option<TgAudio>,
+    photo: Option<Vec<TgPhotoSize>>,
+    document: Option<TgDocument>,
+    video: Option<TgVideo>,
+    sticker: Option<TgSticker>,
+    caption: Option<String>,
     chat: TgChat,
     from: Option<TgUser>,
     /// Thread ID for supergroup topics/forums.
@@ -358,7 +397,11 @@ async fn poll_loop(
                     continue;
                 }
 
-                // Extract text — from text field or transcribed from voice
+                // Extract text — from text field or transcribed from voice/audio
+                // Also collect attachment references for photo/document/video/sticker
+                let mut attachment_lines: Vec<String> = Vec::new();
+                let caption_text = msg.caption.as_deref().unwrap_or("");
+
                 let input_text = if let Some(text) = &msg.text {
                     // Handle bot commands
                     if text.starts_with('/') {
@@ -391,7 +434,102 @@ async fn poll_loop(
                         }
                     }
                 } else {
-                    continue;
+                    // No text/voice/audio — use caption as base text (or empty)
+                    caption_text.to_string()
+                };
+
+                // ── Attachment handling: photo/document/video/sticker ──
+                let home_for_attach = ctx.home_dir.clone();
+                if let Some(photos) = &msg.photo {
+                    // Telegram sends multiple sizes; take the largest (last element)
+                    if let Some(largest) = photos.last() {
+                        info!("🖼️ Telegram [{sender}]: photo attachment");
+                        match download_telegram_file(&client, &api_base, &largest.file_id).await {
+                            Ok(data) => {
+                                let mime = crate::media::detect_mime(&data);
+                                let ext = crate::media::extension_from_mime(&mime);
+                                let fname = format!("photo.{ext}");
+                                match crate::media::save_attachment_to_disk(&home_for_attach, &data, &fname).await {
+                                    Ok(path) => {
+                                        attachment_lines.push(crate::media::format_attachment_ref(
+                                            &crate::media::MediaType::Image, &fname, &path,
+                                        ));
+                                    }
+                                    Err(e) => warn!("Failed to save photo: {e}"),
+                                }
+                            }
+                            Err(e) => warn!("Failed to download photo: {e}"),
+                        }
+                    }
+                }
+
+                if let Some(doc) = &msg.document {
+                    info!("📎 Telegram [{sender}]: document attachment");
+                    let fname = doc.file_name.as_deref().unwrap_or("document");
+                    match download_telegram_file(&client, &api_base, &doc.file_id).await {
+                        Ok(data) => {
+                            let mime = doc.mime_type.as_deref().unwrap_or("application/octet-stream");
+                            let mt = crate::media::media_type_from_mime(mime);
+                            match crate::media::save_attachment_to_disk(&home_for_attach, &data, fname).await {
+                                Ok(path) => {
+                                    attachment_lines.push(crate::media::format_attachment_ref(&mt, fname, &path));
+                                }
+                                Err(e) => warn!("Failed to save document: {e}"),
+                            }
+                        }
+                        Err(e) => warn!("Failed to download document: {e}"),
+                    }
+                }
+
+                if let Some(video) = &msg.video {
+                    info!("🎬 Telegram [{sender}]: video attachment");
+                    let mime = video.mime_type.as_deref().unwrap_or("video/mp4");
+                    let ext = crate::media::extension_from_mime(mime);
+                    let fname = format!("video.{ext}");
+                    match download_telegram_file(&client, &api_base, &video.file_id).await {
+                        Ok(data) => {
+                            match crate::media::save_attachment_to_disk(&home_for_attach, &data, &fname).await {
+                                Ok(path) => {
+                                    attachment_lines.push(crate::media::format_attachment_ref(
+                                        &crate::media::MediaType::Video, &fname, &path,
+                                    ));
+                                }
+                                Err(e) => warn!("Failed to save video: {e}"),
+                            }
+                        }
+                        Err(e) => warn!("Failed to download video: {e}"),
+                    }
+                }
+
+                if let Some(sticker) = &msg.sticker {
+                    let emoji_label = sticker.emoji.as_deref().unwrap_or("sticker");
+                    info!("🏷️ Telegram [{sender}]: sticker {emoji_label}");
+                    match download_telegram_file(&client, &api_base, &sticker.file_id).await {
+                        Ok(data) => {
+                            let mime = crate::media::detect_mime(&data);
+                            let ext = crate::media::extension_from_mime(&mime);
+                            let fname = format!("sticker.{ext}");
+                            match crate::media::save_attachment_to_disk(&home_for_attach, &data, &fname).await {
+                                Ok(path) => {
+                                    let label = format!("sticker {emoji_label}");
+                                    attachment_lines.push(crate::media::format_attachment_ref(
+                                        &crate::media::MediaType::Image, &label, &path,
+                                    ));
+                                }
+                                Err(e) => warn!("Failed to save sticker: {e}"),
+                            }
+                        }
+                        Err(e) => warn!("Failed to download sticker: {e}"),
+                    }
+                }
+
+                // Combine text + attachment references
+                let input_text = if attachment_lines.is_empty() {
+                    input_text
+                } else if input_text.trim().is_empty() {
+                    attachment_lines.join("\n")
+                } else {
+                    format!("{input_text}\n\n{}", attachment_lines.join("\n"))
                 };
 
                 if input_text.trim().is_empty() {
@@ -687,6 +825,57 @@ fn percent_decode(input: &str) -> String {
         }
     }
     out
+}
+
+/// Download a file from Telegram by file_id. Returns raw bytes.
+///
+/// Uses the same getFile → download flow as `transcribe_voice`, but returns
+/// the raw bytes instead of transcribing. Used for photo/document/video/sticker.
+async fn download_telegram_file(
+    client: &reqwest::Client,
+    api_base: &str,
+    file_id: &str,
+) -> Result<Vec<u8>, String> {
+    let resp = client
+        .get(format!("{api_base}/getFile"))
+        .query(&[("file_id", file_id)])
+        .send()
+        .await
+        .map_err(|e| format!("getFile: {e}"))?;
+    let data: TgResponse<TgFile> = resp.json().await.map_err(|e| format!("getFile parse: {e}"))?;
+    let file_path = data
+        .result
+        .and_then(|f| f.file_path)
+        .ok_or_else(|| "getFile returned no file_path".to_string())?;
+
+    let is_safe = |p: &str| -> bool {
+        !p.contains("..") && !p.starts_with('/') && !p.contains('\0')
+            && p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
+    };
+    let decoded = percent_decode(&file_path);
+    if !is_safe(&file_path) || !is_safe(&decoded) {
+        return Err("Invalid file_path from Telegram".to_string());
+    }
+
+    let file_url = api_base.replace("/bot", "/file/bot");
+    let resp = client
+        .get(format!("{file_url}/{file_path}"))
+        .send()
+        .await
+        .map_err(|e| format!("Download: {e}"))?;
+
+    if let Some(len) = resp.content_length() {
+        if len > MAX_TELEGRAM_AUDIO_BYTES as u64 {
+            return Err(format!("File too large: {len} bytes (max {MAX_TELEGRAM_AUDIO_BYTES})"));
+        }
+    }
+
+    let bytes = resp.bytes().await.map_err(|e| format!("Download bytes: {e}"))?;
+    if bytes.len() > MAX_TELEGRAM_AUDIO_BYTES {
+        return Err(format!("File too large: {} bytes", bytes.len()));
+    }
+
+    Ok(bytes.to_vec())
 }
 
 async fn transcribe_voice(
