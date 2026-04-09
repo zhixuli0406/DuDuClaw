@@ -3261,17 +3261,69 @@ impl MethodHandler {
     // ── License ──────────────────────────────────────────────
 
     async fn handle_license_status(&self) -> WsFrame {
-        // Delegate to extension for Pro/Enterprise license details.
-        // CE returns basic community info; Pro overrides with full details.
-        let mut info = self.extension.license_info();
-
-        // Always include machine fingerprint for diagnostics
+        let gate = self.cached_gate().await;
+        let tier = gate.tier();
         let fingerprint = crate::feature_gate::FeatureGate::machine_fingerprint_static();
+
+        // Read license.key for detailed info (customer_name, expires_at, etc.)
+        let license_path = self.home_dir.join("license.key");
+        let (customer_name, expires_at, days_remaining, activated) =
+            if let Ok(content) = tokio::fs::read_to_string(&license_path).await {
+                if let Ok(license) = serde_json::from_str::<serde_json::Value>(&content) {
+                    let customer = license
+                        .get("customer_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let exp = license
+                        .get("expires_at")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let days = exp.as_deref().and_then(|s| {
+                        chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| {
+                            let remaining = dt
+                                .with_timezone(&chrono::Utc)
+                                .signed_duration_since(chrono::Utc::now());
+                            remaining.num_days().max(0)
+                        })
+                    });
+                    let is_active = tier > crate::feature_gate::Tier::Community;
+                    (customer, exp, days, is_active)
+                } else {
+                    (String::new(), None, None, false)
+                }
+            } else {
+                (String::new(), None, None, false)
+            };
+
+        let mut info = json!({
+            "tier": tier.as_str(),
+            "activated": activated,
+            "machine_fingerprint": fingerprint,
+            "max_agents": 0,
+            "max_channels": 0,
+        });
+
         if let Some(obj) = info.as_object_mut() {
-            obj.insert("machine_fingerprint".to_string(), json!(fingerprint));
-            // All tiers get unlimited agents/channels in Open Core
-            obj.insert("max_agents".to_string(), json!(0));
-            obj.insert("max_channels".to_string(), json!(0));
+            if !customer_name.is_empty() {
+                obj.insert("customer_name".to_string(), json!(customer_name));
+            }
+            if let Some(exp) = expires_at {
+                obj.insert("expires_at".to_string(), json!(exp));
+            }
+            if let Some(days) = days_remaining {
+                obj.insert("days_remaining".to_string(), json!(days));
+            }
+
+            // Merge extension info (Pro/Enterprise may add extra fields)
+            let ext_info = self.extension.license_info();
+            if let Some(ext_obj) = ext_info.as_object() {
+                for (k, v) in ext_obj {
+                    if k != "tier" && k != "activated" {
+                        obj.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+            }
         }
 
         WsFrame::ok_response("", info)
