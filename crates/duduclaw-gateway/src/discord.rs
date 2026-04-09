@@ -878,10 +878,15 @@ async fn handle_message_create(
     let is_thread = channel_type == 11 || channel_type == 12
         || data.get("thread").is_some();
 
+    // Track whether we created a new thread (for guide message later)
+    let mut created_thread = false;
     let reply_channel_id = if auto_thread && !is_thread && !guild_id.is_empty() {
         // Create a thread from this message
         match create_thread(http, token, channel_id, message_id, clean_content).await {
-            Some(thread_id) => thread_id,
+            Some(thread_id) => {
+                created_thread = true;
+                thread_id
+            }
             None => channel_id.to_string(), // Fallback to main channel
         }
     } else {
@@ -1038,6 +1043,46 @@ async fn handle_message_create(
 
     // ── Split if needed (embed description > 4096 or plain text > 2000) ──
     send_discord_message(http, token, &reply_channel_id, payload).await;
+
+    // ── Guide message in original channel when a new thread was created ──
+    // Users may not notice the thread indicator on their message, so send a
+    // brief pointer in the channel (as a reply) that auto-deletes after 30s.
+    if created_thread {
+        let guide_http = http.clone();
+        let guide_token = token.to_string();
+        let guide_channel = channel_id.to_string();
+        let guide_msg_id = message_id.to_string();
+        tokio::spawn(async move {
+            let guide = json!({
+                "content": "💬 已在對話串中回覆 ↓",
+                "message_reference": {
+                    "message_id": guide_msg_id,
+                    "channel_id": guide_channel,
+                    "fail_if_not_exists": false,
+                },
+            });
+            let resp = guide_http
+                .post(format!("{DISCORD_API}/channels/{guide_channel}/messages"))
+                .header("Authorization", format!("Bot {guide_token}"))
+                .json(&guide)
+                .send()
+                .await;
+            // Auto-delete the guide message after 30 seconds to keep channel clean
+            if let Ok(r) = resp {
+                if let Ok(body) = r.json::<serde_json::Value>().await {
+                    if let Some(mid) = body["id"].as_str() {
+                        let mid = mid.to_string();
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        let _ = guide_http
+                            .delete(format!("{DISCORD_API}/channels/{guide_channel}/messages/{mid}"))
+                            .header("Authorization", format!("Bot {guide_token}"))
+                            .send()
+                            .await;
+                    }
+                }
+            }
+        });
+    }
 }
 
 /// Strip `<@BOT_ID>` mentions from message content.
