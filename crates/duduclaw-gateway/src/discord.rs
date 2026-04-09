@@ -1011,14 +1011,17 @@ async fn handle_message_create(
     let mut payload = channel_format::to_discord_message(&reply, display_name.as_deref(), false);
 
     // Reply to the original message so the sender gets a notification.
-    // Use fail_if_not_exists: false so Discord sends the message even if the
-    // referenced message is gone (deleted, thread context, race condition).
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("message_reference".to_string(), json!({
-            "message_id": message_id,
-            "channel_id": channel_id,
-            "fail_if_not_exists": false,
-        }));
+    // Skip message_reference when replying in a newly created thread — Discord
+    // does not allow referencing a message from a different channel (the
+    // original message lives in the parent channel, not the thread).
+    if !created_thread {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("message_reference".to_string(), json!({
+                "message_id": message_id,
+                "channel_id": channel_id,
+                "fail_if_not_exists": false,
+            }));
+        }
     }
 
     // Add conversation buttons

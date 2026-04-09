@@ -43,6 +43,14 @@ export interface AgentSticker {
   expressiveness: 'minimal' | 'moderate' | 'expressive';
 }
 
+export interface AgentEvolution {
+  gvu_enabled: boolean;
+  cognitive_memory: boolean;
+  skill_auto_activate: boolean;
+  skill_security_scan: boolean;
+  max_silence_hours: number;
+}
+
 export interface AgentDetail extends AgentInfo {
   budget: AgentBudget;
   model: AgentModel;
@@ -57,6 +65,7 @@ export interface AgentDetail extends AgentInfo {
   skills: string[];
   permissions: Record<string, boolean>;
   sticker?: AgentSticker;
+  evolution?: AgentEvolution;
 }
 
 export interface ChannelStatus {
