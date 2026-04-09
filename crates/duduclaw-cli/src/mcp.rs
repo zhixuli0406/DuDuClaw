@@ -13,6 +13,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{info, warn};
 
+
 // ── Tool definitions ─────────────────────────────────────────
 
 struct ToolDef {
@@ -3729,6 +3730,18 @@ async fn handle_tools_call(
 
     info!(tool = %tool_name, "MCP tools/call");
 
+    // Record state-changing tool calls for post-action hallucination audit.
+    // Only tools that mutate agent/system state are tracked.
+    let is_state_changing = matches!(
+        tool_name,
+        "create_agent"
+            | "agent_remove"
+            | "agent_update"
+            | "agent_update_soul"
+            | "spawn_agent"
+            | "send_to_agent"
+            | "schedule_task"
+    );
     let result = match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http).await,
         "web_search" => handle_web_search(&arguments, http).await,
@@ -3810,7 +3823,68 @@ async fn handle_tools_call(
         }
     };
 
+    // ── Tool call audit trail (L1 anti-hallucination) ──────────
+    // Use the actual calling agent's ID, not just default_agent.
+    // In delegated contexts, DUDUCLAW_DELEGATION_SENDER identifies the real caller.
+    if is_state_changing {
+        let success = !result
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let actual_agent = std::env::var(duduclaw_core::ENV_DELEGATION_SENDER)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| default_agent.to_string());
+        let params_summary = build_params_summary(tool_name, &arguments);
+        duduclaw_security::audit::append_tool_call(
+            home_dir,
+            &actual_agent,
+            tool_name,
+            &params_summary,
+            success,
+        );
+    }
+
     jsonrpc_response(id, result)
+}
+
+/// Build a short summary of tool call parameters for audit logging.
+/// Avoids logging full payloads (which may contain sensitive data).
+fn build_params_summary(tool_name: &str, args: &Value) -> String {
+    match tool_name {
+        "create_agent" => {
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let display = args.get("display_name").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("name={name} display_name={display}")
+        }
+        "agent_remove" => {
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("name={name}")
+        }
+        "agent_update" => {
+            let agent = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let field = args.get("field").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("agent_id={agent} field={field}")
+        }
+        "agent_update_soul" => {
+            let agent = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("agent_id={agent}")
+        }
+        "spawn_agent" | "send_to_agent" => {
+            let agent = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("agent_id={agent}")
+        }
+        "schedule_task" => {
+            let task_type = args.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+            let agent = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("type={task_type} agent_id={agent}")
+        }
+        _ => {
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+            format!("name={name} agent_id={id}")
+        }
+    }
 }
 
 // ── Voice / ASR / TTS handlers ─────────────────────────────────

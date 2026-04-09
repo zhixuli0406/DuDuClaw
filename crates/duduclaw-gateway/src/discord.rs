@@ -793,7 +793,28 @@ async fn handle_message_create(
     }
 
     let content = data["content"].as_str().unwrap_or("");
-    if content.is_empty() {
+
+    // Extract image attachment URLs from the message
+    let attachment_lines: Vec<String> = data["attachments"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|att| {
+                    let url = att["url"].as_str()?;
+                    let content_type = att["content_type"].as_str().unwrap_or("");
+                    let filename = att["filename"].as_str().unwrap_or("file");
+                    // Only forward image attachments (Claude supports vision)
+                    if content_type.starts_with("image/") {
+                        Some(format!("[Attached image: {filename}]({url})"))
+                    } else {
+                        Some(format!("[Attached file: {filename}]({url})"))
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if content.is_empty() && attachment_lines.is_empty() {
         return;
     }
 
@@ -826,9 +847,20 @@ async fn handle_message_create(
         return;
     }
 
-    // Strip bot mention from content
-    let clean_content = strip_bot_mention(content, bot_id);
-    let clean_content = clean_content.trim();
+    // Strip bot mention from content and append attachment info
+    let stripped = strip_bot_mention(content, bot_id);
+    let stripped = stripped.trim();
+
+    // Combine text content with attachment references
+    let combined = if attachment_lines.is_empty() {
+        stripped.to_string()
+    } else if stripped.is_empty() {
+        attachment_lines.join("\n")
+    } else {
+        format!("{stripped}\n\n{}", attachment_lines.join("\n"))
+    };
+    let clean_content = combined.trim();
+
     if clean_content.is_empty() {
         return;
     }

@@ -312,6 +312,7 @@ async fn poll_and_dispatch(
         let queue = queue.clone();
 
         handles.push(tokio::spawn(async move {
+            let dispatch_start = Utc::now().to_rfc3339();
             let delegation_env = DelegationEnv {
                 depth: msg.delegation_depth,
                 origin: msg.origin_agent.clone().unwrap_or_default(),
@@ -319,10 +320,91 @@ async fn poll_and_dispatch(
             };
             let result = dispatch_to_agent(&home, &reg, &msg.agent_id, &msg.payload, &delegation_env).await;
 
-            let response_text = match &result {
+            let mut response_text = match &result {
                 Ok(text) => text.clone(),
                 Err(e) => format!("Error: {e}"),
             };
+
+            // ── L2+L4: Post-Action Hallucination Audit ──────────
+            // Cross-reference agent output claims against MCP tool call log.
+            // Zero LLM cost — pure regex + log lookup.
+            // Wrapped in spawn_blocking to avoid blocking the Tokio runtime
+            // (file I/O + SQLite operations are synchronous).
+            if result.is_ok() {
+                let home_bl = home.clone();
+                let agent_bl = msg.agent_id.clone();
+                let msg_id_bl = msg.message_id.clone();
+                let resp_bl = response_text.clone();
+                let start_bl = dispatch_start.clone();
+
+                let hallucination_warning = tokio::task::spawn_blocking(move || {
+                    let hallucinations = duduclaw_security::action_claim_verifier::detect_hallucinations(
+                        &home_bl,
+                        &agent_bl,
+                        &resp_bl,
+                        &start_bl,
+                    );
+                    if hallucinations.is_empty() {
+                        return None;
+                    }
+
+                    tracing::warn!(
+                        agent = %agent_bl,
+                        count = hallucinations.len(),
+                        "Tool-use hallucination detected in agent output"
+                    );
+
+                    // Log each hallucination to security audit
+                    for h in &hallucinations {
+                        if let duduclaw_security::action_claim_verifier::VerifyResult::Hallucination { claim, reason } = h {
+                            duduclaw_security::audit::log_tool_hallucination(
+                                &home_bl,
+                                &agent_bl,
+                                &claim.matched_text,
+                                claim.claim_type.expected_tool(),
+                            );
+                            tracing::info!(
+                                agent = %agent_bl,
+                                claim = %claim.matched_text,
+                                reason = %reason,
+                                "Hallucination detail"
+                            );
+                        }
+                    }
+
+                    // Record hallucination in MistakeNotebook for GVU evolution (L5)
+                    // Pre-truncate response to avoid allocating large Vec<char> in truncate_str
+                    let resp_summary: String = resp_bl.chars().take(200).collect();
+                    let db_path = home_bl.join("evolution.db");
+                    let notebook = crate::gvu::mistake_notebook::MistakeNotebook::new(&db_path);
+                    for h in &hallucinations {
+                        if let duduclaw_security::action_claim_verifier::VerifyResult::Hallucination { claim, .. } = h {
+                            if let Err(e) = notebook.record_hallucination(
+                                &agent_bl,
+                                &msg_id_bl,
+                                &claim.matched_text,
+                                claim.claim_type.expected_tool(),
+                                &resp_summary,
+                            ) {
+                                tracing::warn!(agent = %agent_bl, error = %e, "Failed to record hallucination in MistakeNotebook");
+                            }
+                        }
+                    }
+
+                    Some(hallucinations.len())
+                }).await.ok().flatten();
+
+                if let Some(count) = hallucination_warning {
+                    // Use structured metadata marker for channel gateway filtering.
+                    // Channels should strip lines starting with [DUDUCLAW_INTERNAL].
+                    response_text.push_str(&format!(
+                        "\n\n[DUDUCLAW_INTERNAL:HALLUCINATION] {} action claim(s) in this response \
+                         have no corresponding MCP tool call. The claimed actions were NOT \
+                         actually performed. Please retry with actual tool calls.",
+                        count,
+                    ));
+                }
+            }
 
             info!(
                 message_id = %msg.message_id,

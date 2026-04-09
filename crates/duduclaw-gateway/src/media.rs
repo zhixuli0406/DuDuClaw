@@ -128,6 +128,118 @@ pub fn vision_content_block(base64_data: &str, media_type: &str) -> serde_json::
     })
 }
 
+// ── Attachment persistence ──────────────────────────────────────
+
+/// Save attachment bytes to `{home_dir}/attachments/{unique_name}` and return the
+/// absolute path. Creates the directory if it does not exist.
+///
+/// The saved path can be included in the message text so that Claude Code's
+/// `Read` tool can access the file directly.
+pub async fn save_attachment_to_disk(
+    home_dir: &std::path::Path,
+    data: &[u8],
+    filename: &str,
+) -> Result<std::path::PathBuf, String> {
+    let dir = home_dir.join("attachments");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("Failed to create attachments dir: {e}"))?;
+
+    // Sanitize filename: keep only safe characters
+    let safe_name: String = filename
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let unique_name = format!("{ts}_{safe_name}");
+    let path = dir.join(&unique_name);
+
+    tokio::fs::write(&path, data)
+        .await
+        .map_err(|e| format!("Failed to write attachment: {e}"))?;
+
+    Ok(path)
+}
+
+/// Format an attachment reference for inclusion in message text sent to the agent.
+///
+/// Returns a markdown-style line like `[📎 photo.jpg (image)](file:///path/to/file)`.
+pub fn format_attachment_ref(media_type: &MediaType, filename: &str, path: &std::path::Path) -> String {
+    let emoji = match media_type {
+        MediaType::Image => "🖼️",
+        MediaType::Audio => "🎵",
+        MediaType::Video => "🎬",
+        MediaType::File => "📎",
+    };
+    let type_label = match media_type {
+        MediaType::Image => "image",
+        MediaType::Audio => "audio",
+        MediaType::Video => "video",
+        MediaType::File => "file",
+    };
+    format!("[{emoji} {filename} ({type_label})]({})", path.display())
+}
+
+/// Download a file from a URL with an optional auth header.
+pub async fn download_url(
+    http: &reqwest::Client,
+    url: &str,
+    auth_header: Option<(&str, &str)>,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let mut req = http.get(url);
+    if let Some((key, value)) = auth_header {
+        req = req.header(key, value);
+    }
+    let resp = req.send().await.map_err(|e| format!("Download failed: {e}"))?;
+
+    if let Some(len) = resp.content_length() {
+        if len > max_bytes as u64 {
+            return Err(format!("File too large: {len} bytes (max {max_bytes})"));
+        }
+    }
+
+    let bytes = resp.bytes().await.map_err(|e| format!("Download bytes: {e}"))?;
+    if bytes.len() > max_bytes {
+        return Err(format!("File too large: {} bytes (max {max_bytes})", bytes.len()));
+    }
+    Ok(bytes.to_vec())
+}
+
+/// Infer media type from MIME string.
+pub fn media_type_from_mime(mime: &str) -> MediaType {
+    if mime.starts_with("image/") {
+        MediaType::Image
+    } else if mime.starts_with("audio/") {
+        MediaType::Audio
+    } else if mime.starts_with("video/") {
+        MediaType::Video
+    } else {
+        MediaType::File
+    }
+}
+
+/// Infer a file extension from MIME type.
+pub fn extension_from_mime(mime: &str) -> &str {
+    match mime {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "audio/ogg" => "ogg",
+        "audio/mpeg" => "mp3",
+        "audio/wav" => "wav",
+        "audio/aac" => "aac",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "application/pdf" => "pdf",
+        _ => "bin",
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
