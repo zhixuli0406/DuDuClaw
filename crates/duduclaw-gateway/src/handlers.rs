@@ -1246,6 +1246,13 @@ impl MethodHandler {
                             duduclaw_core::types::Expressiveness::Expressive => "expressive",
                         },
                     },
+                    "evolution": {
+                        "gvu_enabled": cfg.evolution.gvu_enabled,
+                        "cognitive_memory": cfg.evolution.cognitive_memory,
+                        "skill_auto_activate": cfg.evolution.skill_auto_activate,
+                        "skill_security_scan": cfg.evolution.skill_security_scan,
+                        "max_silence_hours": cfg.evolution.max_silence_hours,
+                    },
                 }))
             }
             None => WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
