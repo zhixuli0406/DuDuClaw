@@ -226,6 +226,18 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
             })?;
     }
 
+    // Install agent-file-guard PreToolUse hook for the new agent.
+    {
+        let bin = duduclaw_gateway::agent_hook_installer::resolve_duduclaw_bin();
+        if let Err(e) = duduclaw_gateway::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin).await {
+            tracing::warn!(
+                agent = %agent_name,
+                error = %e,
+                "Failed to install agent-file-guard hook (wizard)"
+            );
+        }
+    }
+
     println!(
         "\n  {} Agent '{}' created at {}",
         style("✓").green().bold(),

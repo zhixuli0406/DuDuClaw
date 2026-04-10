@@ -33,17 +33,27 @@ interface FeatureRow {
   readonly enterprise: boolean;
 }
 
-// Plan B: All features are open source. Table shows value-add services.
+// Open Core: All core features are open source (Apache-2.0).
+// Pro/Enterprise add value-add services via private repo extension.
 const FEATURES: ReadonlyArray<FeatureRow> = [
+  // ── Open Source Core (all tiers) ──
   { labelKey: 'license.feature.fullProduct', community: true, pro: true, enterprise: true },
   { labelKey: 'license.feature.unlimitedAgents', community: true, pro: true, enterprise: true },
   { labelKey: 'license.feature.allChannels', community: true, pro: true, enterprise: true },
+  { labelKey: 'license.feature.localInference', community: true, pro: true, enterprise: true },
   { labelKey: 'license.feature.evolutionEngine', community: true, pro: true, enterprise: true },
+  { labelKey: 'license.feature.accountRotation', community: true, pro: true, enterprise: true },
   { labelKey: 'license.feature.securityFull', community: true, pro: true, enterprise: true },
+  { labelKey: 'license.feature.costTelemetry', community: true, pro: true, enterprise: true },
+  { labelKey: 'license.feature.odoo', community: true, pro: true, enterprise: true },
+  // ── Pro value-add ──
   { labelKey: 'license.feature.industryTemplates', community: false, pro: true, enterprise: true },
+  { labelKey: 'license.feature.gvuAdaptive', community: false, pro: true, enterprise: true },
   { labelKey: 'license.feature.gvuParams', community: false, pro: true, enterprise: true },
   { labelKey: 'license.feature.autoUpdate', community: false, pro: true, enterprise: true },
+  // ── Enterprise value-add ──
   { labelKey: 'license.feature.auditExport', community: false, pro: false, enterprise: true },
+  { labelKey: 'license.feature.roiReport', community: false, pro: false, enterprise: true },
   { labelKey: 'license.feature.slaSupport', community: false, pro: false, enterprise: true },
   { labelKey: 'license.feature.onboarding', community: false, pro: false, enterprise: true },
 ];

@@ -1568,6 +1568,17 @@ async fn handle_create_agent(params: &Value, home_dir: &Path) -> Value {
     // Write empty MEMORY.md
     let _ = tokio::fs::write(agent_dir.join("MEMORY.md"), "").await;
 
+    // Install agent-file-guard PreToolUse hook so the newly-created agent
+    // immediately gets protected against out-of-tree Write/Edit.
+    let bin = duduclaw_gateway::agent_hook_installer::resolve_duduclaw_bin();
+    if let Err(e) = duduclaw_gateway::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin).await {
+        tracing::warn!(
+            agent = %name,
+            error = %e,
+            "Failed to install agent-file-guard hook via MCP create_agent"
+        );
+    }
+
     serde_json::json!({
         "content": [{"type": "text", "text": format!(
             "Agent '{display_name}' ({name}) created successfully.\n\

@@ -3,9 +3,13 @@ name = "duduclaw-cli"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "duduclaw_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "duduclaw"
-path = "src/main.rs"
+path = "src/bin/duduclaw.rs"
 
 [dependencies]
 duduclaw-core = { workspace = true }

@@ -86,6 +86,22 @@ pub async fn call_claude_for_agent_with_type(
     let capabilities = agent.config.capabilities.clone();
     drop(reg);
 
+    // Install agent-file-guard PreToolUse hook before any spawn.
+    // Blocks the sub-agent from using raw Write/Edit to create
+    // agent-structure files outside <home>/agents/<name>/.
+    // Best-effort — logs warning on failure and continues.
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    if agent_dir.exists() {
+        let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
+        if let Err(e) = crate::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin).await {
+            warn!(
+                agent = %agent_name,
+                error = %e,
+                "Failed to install agent-file-guard hook — continuing without enforcement"
+            );
+        }
+    }
+
     // P0 fix: global mode gate BEFORE per-agent routing
     let inference_mode = get_inference_mode(home_dir).await;
     match inference_mode.as_str() {
@@ -196,7 +212,7 @@ pub async fn call_claude_for_agent_with_type(
 ///
 /// These errors should NOT be retried with the same account — the account
 /// needs a long cooldown (topped up manually).
-fn is_billing_error(error: &str) -> bool {
+pub(crate) fn is_billing_error(error: &str) -> bool {
     let lower = error.to_lowercase();
     lower.contains("credit")
         || lower.contains("balance")
@@ -207,7 +223,7 @@ fn is_billing_error(error: &str) -> bool {
 }
 
 /// Check whether an error indicates rate limiting (usage limit exhausted).
-fn is_rate_limit_error(error: &str) -> bool {
+pub(crate) fn is_rate_limit_error(error: &str) -> bool {
     let lower = error.to_lowercase();
     lower.contains("rate limit")
         || lower.contains("rate-limit")

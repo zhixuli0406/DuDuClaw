@@ -1,3 +1,4 @@
+pub mod agent_hook_installer;
 pub mod auth;
 pub mod channel_format;
 pub mod channel_reply;
