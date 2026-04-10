@@ -1,15 +1,38 @@
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use clap::{Parser, Subcommand};
 use duduclaw_agent::AgentRunner;
 use duduclaw_core::error::DuDuClawError;
 use duduclaw_core::types::CheckStatus;
+use duduclaw_gateway::GatewayExtension;
+
 mod acp;
 mod mcp;
 mod migrate;
 mod ptc;
 mod service;
 mod wizard;
+
+/// Global extension override — set by Pro binary before calling [`entry_point`].
+/// CE binary leaves this empty, causing [`current_extension`] to return `NullExtension`.
+static EXTENSION_OVERRIDE: OnceLock<Arc<dyn GatewayExtension>> = OnceLock::new();
+
+/// Set the gateway extension for this process.
+///
+/// Must be called before [`entry_point`] if a non-default extension is desired.
+/// Only the first call takes effect (subsequent calls are ignored).
+pub fn set_extension(ext: Arc<dyn GatewayExtension>) {
+    let _ = EXTENSION_OVERRIDE.set(ext);
+}
+
+/// Get the currently registered extension, or `NullExtension` if none was set.
+fn current_extension() -> Arc<dyn GatewayExtension> {
+    EXTENSION_OVERRIDE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(duduclaw_gateway::NullExtension))
+}
 
 // ── Credential helpers (M-4) ────────────────────────────────
 
@@ -219,8 +242,26 @@ enum Commands {
     /// ACP (Agent Client Protocol) server for IDE integration
     AcpServer,
 
+    /// Internal hook entry points (called by Claude Code PreToolUse hooks).
+    ///
+    /// Reads hook JSON from stdin and exits 0 (allow) or 2 (block).
+    /// Not intended for direct user invocation.
+    #[command(subcommand)]
+    Hook(HookCommands),
+
     /// Print version information
     Version,
+}
+
+#[derive(Subcommand)]
+enum HookCommands {
+    /// Guard Write/Edit/MultiEdit against creating agent-structure files
+    /// outside the canonical `<home>/agents/<name>/` tree.
+    ///
+    /// Reads Claude Code hook JSON on stdin. On block, writes a
+    /// human-readable reason to stderr and exits with code 2 so Claude
+    /// Code surfaces the block to the agent.
+    AgentFileGuard,
 }
 
 #[derive(Subcommand)]
@@ -349,8 +390,11 @@ fn duduclaw_home() -> PathBuf {
         .join(".duduclaw")
 }
 
-#[tokio::main]
-async fn main() {
+/// Entry point for the `duduclaw` / `duduclaw-pro` binaries.
+///
+/// Installs rustls provider, tracing subscriber, parses CLI args, and dispatches.
+/// Pro binary calls [`set_extension`] before this to inject Pro features into the gateway.
+pub async fn entry_point() {
     // Install ring as the default rustls CryptoProvider (required for TLS WebSocket connections).
     // Must be called before any TLS connection is attempted (Discord, edge-tts, etc.).
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -435,11 +479,78 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             // Future: wire to acp::AcpServer
             Ok(())
         }
+        Commands::Hook(HookCommands::AgentFileGuard) => cmd_hook_agent_file_guard().await,
         Commands::Version => {
             println!("duduclaw {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }
+}
+
+/// `duduclaw hook agent-file-guard` — PreToolUse hook for Claude Code.
+///
+/// Reads the hook JSON envelope from stdin and inspects `tool_input.file_path`
+/// against [`duduclaw_core::check_agent_file_write`]. On block:
+/// - Writes the user-facing reason to stderr (Claude Code surfaces stderr
+///   back into the agent's transcript on exit code 2).
+/// - Exits with code 2 (blocks the tool call).
+///
+/// On allow, exits 0 silently so the Write / Edit proceeds normally.
+///
+/// Cross-platform by design: pure Rust, no bash, no shell quoting issues.
+async fn cmd_hook_agent_file_guard() -> duduclaw_core::error::Result<()> {
+    use std::io::Read;
+    use std::path::PathBuf;
+
+    let mut buf = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+        // Fail open on I/O error — we'd rather not break the agent over a
+        // transient read problem. Log to stderr for diagnostics.
+        eprintln!("duduclaw hook agent-file-guard: stdin read error: {e}");
+        return Ok(());
+    }
+
+    let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&buf) else {
+        // Malformed envelope: fail open, log for diagnostics.
+        eprintln!("duduclaw hook agent-file-guard: invalid JSON envelope (ignoring)");
+        return Ok(());
+    };
+
+    // Claude Code PreToolUse envelope shape:
+    //   { "tool_name": "Write" | "Edit" | "MultiEdit", "tool_input": { "file_path": "..." } }
+    let tool_name = envelope
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Only guard file-writing tools — other tool calls (Read, Bash, Grep, etc.)
+    // are none of our business.
+    if !matches!(tool_name, "Write" | "Edit" | "MultiEdit") {
+        return Ok(());
+    }
+
+    let Some(file_path_str) = envelope
+        .pointer("/tool_input/file_path")
+        .and_then(|v| v.as_str())
+    else {
+        // MultiEdit uses /tool_input/file_path too; if it's missing,
+        // there's nothing we can check — fail open.
+        return Ok(());
+    };
+
+    let file_path = PathBuf::from(file_path_str);
+    let home = duduclaw_home();
+
+    let decision = duduclaw_core::check_agent_file_write(&file_path, &home);
+    if let Some(msg) = decision.block_message() {
+        eprintln!("{msg}");
+        // Exit 2 — Claude Code interprets this as a block and surfaces
+        // stderr back to the agent so the model learns to retry with
+        // the `create_agent` MCP tool instead.
+        std::process::exit(2);
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1493,12 +1604,18 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
         println!("     Set DUDUCLAW_AUTH_TOKEN env var or [gateway].auth_token in config.toml\n");
     }
 
+    let extension = current_extension();
+    let edition = extension.name();
+    if edition != "Community" {
+        println!("   Edition: {edition}");
+    }
+
     let config = duduclaw_gateway::GatewayConfig {
         bind,
         port,
         auth_token,
         home_dir: home,
-        extension: std::sync::Arc::new(duduclaw_gateway::NullExtension),
+        extension,
     };
 
     duduclaw_gateway::start_gateway(config).await

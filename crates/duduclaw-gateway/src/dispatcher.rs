@@ -304,12 +304,19 @@ async fn poll_and_dispatch(
     let reg = registry.clone();
     let queue = queue_path.clone();
 
+    // Pre-initialize MistakeNotebook once for all dispatch tasks (review R2-5).
+    // Shared via Arc to avoid repeated init_table() + SQLite open per task.
+    let notebook = Arc::new(crate::gvu::mistake_notebook::MistakeNotebook::new(
+        &home.join("evolution.db"),
+    ));
+
     let mut handles = Vec::new();
     for msg in to_dispatch {
         let permit = semaphore.clone().acquire_owned().await.map_err(|e| e.to_string())?;
         let home = home.clone();
         let reg = reg.clone();
         let queue = queue.clone();
+        let notebook = notebook.clone();
 
         handles.push(tokio::spawn(async move {
             let dispatch_start = Utc::now().to_rfc3339();
@@ -336,6 +343,7 @@ async fn poll_and_dispatch(
                 let msg_id_bl = msg.message_id.clone();
                 let resp_bl = response_text.clone();
                 let start_bl = dispatch_start.clone();
+                let notebook_bl = notebook.clone();
 
                 let hallucination_warning = tokio::task::spawn_blocking(move || {
                     let hallucinations = duduclaw_security::action_claim_verifier::detect_hallucinations(
@@ -375,11 +383,9 @@ async fn poll_and_dispatch(
                     // Record hallucination in MistakeNotebook for GVU evolution (L5)
                     // Pre-truncate response to avoid allocating large Vec<char> in truncate_str
                     let resp_summary: String = resp_bl.chars().take(200).collect();
-                    let db_path = home_bl.join("evolution.db");
-                    let notebook = crate::gvu::mistake_notebook::MistakeNotebook::new(&db_path);
                     for h in &hallucinations {
                         if let duduclaw_security::action_claim_verifier::VerifyResult::Hallucination { claim, .. } = h {
-                            if let Err(e) = notebook.record_hallucination(
+                            if let Err(e) = notebook_bl.record_hallucination(
                                 &agent_bl,
                                 &msg_id_bl,
                                 &claim.matched_text,

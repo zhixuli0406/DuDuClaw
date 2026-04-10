@@ -252,7 +252,7 @@ pub struct EvolutionConfig {
     pub gvu_enabled: bool,
 
     /// Enable cognitive memory layer with episodic/semantic separation.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub cognitive_memory: bool,
 
     /// Maximum hours of silence before the heartbeat silence-breaker fires.

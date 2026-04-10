@@ -219,6 +219,7 @@ pub fn append_tool_call(
     success: bool,
 ) {
     let path = home_dir.join("tool_calls.jsonl");
+    maybe_rotate_tool_calls(&path);
     let record = serde_json::json!({
         "timestamp": Utc::now().to_rfc3339(),
         "agent_id": agent_id,
@@ -288,8 +289,11 @@ pub fn read_tool_calls_since(
 
     // Fallback to 0 seconds ago (empty window) if `since` is unparseable,
     // to avoid accidentally including old records.
+    // Apply 2-second grace period to handle clock precision issues between
+    // the dispatcher recording dispatch_start and the MCP server recording
+    // tool call timestamps (review round 2).
     let since_dt = chrono::DateTime::parse_from_rfc3339(since)
-        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map(|dt| dt.with_timezone(&chrono::Utc) - chrono::Duration::seconds(2))
         .unwrap_or_else(|_| chrono::Utc::now());
 
     content
@@ -308,6 +312,37 @@ pub fn read_tool_calls_since(
             matches_agent && after_since
         })
         .collect()
+}
+
+/// Rotate `tool_calls.jsonl` if it exceeds 5 MB.
+///
+/// Renames the current file to `.jsonl.old` (overwriting any previous backup)
+/// and starts a fresh file. Only checks file size every 64 calls to avoid
+/// a `metadata()` syscall on every tool call (review R3-L1).
+/// Concurrent callers may both attempt `rename` — the loser gets ENOENT
+/// which is silently ignored since a fresh file will be created on the
+/// next `append` (review R3-L4).
+fn maybe_rotate_tool_calls(path: &std::path::Path) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    // Check every 64 calls (~1 metadata syscall per 64 tool invocations)
+    if CALL_COUNT.fetch_add(1, Ordering::Relaxed) % 64 != 0 {
+        return;
+    }
+
+    const MAX_SIZE: u64 = 5 * 1024 * 1024; // 5 MB
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_SIZE {
+            let backup = path.with_extension("jsonl.old");
+            // Ignore ENOENT: a concurrent caller may have already rotated.
+            match std::fs::rename(path, &backup) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!("Failed to rotate tool_calls.jsonl: {e}"),
+            }
+        }
+    }
 }
 
 /// Log a tool hallucination detection event.

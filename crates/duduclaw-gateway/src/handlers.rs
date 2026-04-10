@@ -87,9 +87,34 @@ impl MethodHandler {
         extension: Arc<dyn GatewayExtension>,
     ) -> Self {
         let agents_dir = home_dir.join("agents");
-        let mut registry = AgentRegistry::new(agents_dir);
+        let mut registry = AgentRegistry::new(agents_dir.clone());
         if let Err(e) = registry.scan().await {
             tracing::warn!("Failed to scan agents directory: {e}");
+        }
+
+        // Install the agent-file-guard PreToolUse hook into every existing
+        // agent's .claude/settings.json on startup. Idempotent — merges into
+        // existing settings without clobbering user-added hooks.
+        let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
+        if let Ok(mut entries) = tokio::fs::read_dir(&agents_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                // Skip _trash and other non-agent directories.
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with('_') || name.is_empty() {
+                    continue;
+                }
+                if let Err(e) = crate::agent_hook_installer::ensure_agent_hook_settings(&path, &bin).await {
+                    tracing::warn!(
+                        agent = %name,
+                        error = %e,
+                        "Failed to install agent-file-guard hook on startup"
+                    );
+                }
+            }
         }
         Self {
             registry: Arc::new(RwLock::new(registry)),
@@ -568,6 +593,17 @@ impl MethodHandler {
 
         let soul = format!("# {display_name}\n\nI am {display_name}, a specialist AI agent.\n");
         let _ = tokio::fs::write(agent_dir.join("SOUL.md"), &soul).await;
+
+        // Install the agent-file-guard PreToolUse hook so this newly-created
+        // agent immediately gets protected against out-of-tree Write/Edit.
+        let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
+        if let Err(e) = crate::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin).await {
+            tracing::warn!(
+                agent = %name,
+                error = %e,
+                "Failed to install agent-file-guard hook on agents.create"
+            );
+        }
 
         info!(name, "Agent created");
         WsFrame::ok_response("", json!({

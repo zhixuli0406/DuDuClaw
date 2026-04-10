@@ -611,8 +611,16 @@ async fn build_reply_with_session_inner(
         format!("{system_prompt}{history}")
     };
 
-    // 1. Try `claude` CLI directly (Claude Code SDK — has built-in tools)
-    let reply = match call_claude_cli(&sanitized_text, &model, &full_system_prompt, &ctx.home_dir, agent_dir.as_deref(), on_progress.as_ref(), capabilities.as_ref()).await {
+    // Track the last underlying failure so the fallback message can
+    // accurately describe what went wrong (rate limit vs timeout vs
+    // missing binary etc.) instead of always blaming "not installed".
+    let mut last_cli_error: Option<String> = None;
+
+    // 1. Try `claude` CLI with multi-account rotation (OAuth + API keys)
+    let reply = match call_claude_cli_rotated(
+        &sanitized_text, &model, &full_system_prompt, &ctx.home_dir,
+        agent_dir.as_deref(), on_progress.as_ref(), capabilities.as_ref(),
+    ).await {
         Ok(reply) => {
             info!("Claude replied via Claude Code SDK ({} chars)", reply.len());
             Some(reply)
@@ -624,6 +632,7 @@ async fn build_reply_with_session_inner(
                 .open(ctx.home_dir.join("debug.log")).await
                 .map(|mut f| { use tokio::io::AsyncWriteExt; tokio::spawn(async move { let _ = f.write_all(log_line.as_bytes()).await; }); });
             warn!("claude CLI unavailable: {e}");
+            last_cli_error = Some(e);
             None
         }
     };
@@ -643,6 +652,10 @@ async fn build_reply_with_session_inner(
                     .open(ctx.home_dir.join("debug.log")).await
                     .map(|mut f| { use tokio::io::AsyncWriteExt; tokio::spawn(async move { let _ = f.write_all(log_line.as_bytes()).await; }); });
                 warn!("Python SDK unavailable: {e}");
+                // Only overwrite if we don't already have a more specific CLI error.
+                if last_cli_error.is_none() {
+                    last_cli_error = Some(e);
+                }
                 None
             }
         },
@@ -1055,17 +1068,444 @@ async fn build_reply_with_session_inner(
         return reply;
     }
 
-    // 3. Fallback: static error
+    // 3. Fallback: classified error message
     let reg = ctx.registry.read().await;
     let name = reg
         .main_agent()
-        .map(|a| a.config.agent.display_name.as_str())
-        .unwrap_or("DuDuClaw");
-    format!(
-        "{name} 收到你的訊息，但目前無法回覆。\n\
-        請確認 Claude Code 已安裝並登入：\n\
-        $ claude auth status"
-    )
+        .map(|a| a.config.agent.display_name.clone())
+        .unwrap_or_else(|| "DuDuClaw".to_string());
+    drop(reg);
+
+    let err_str = last_cli_error.clone().unwrap_or_else(|| "No error info".to_string());
+    let reason = classify_cli_failure(&err_str);
+    warn!(
+        agent = %name,
+        reason = ?reason,
+        last_error = %err_str.chars().take(200).collect::<String>(),
+        "Channel reply fallback — all providers failed"
+    );
+
+    // Append a structured audit line so the dashboard can surface failure trends.
+    let audit = serde_json::json!({
+        "event": "channel_reply_fallback",
+        "agent": name,
+        "session_id": session_id,
+        "reason": format!("{reason:?}"),
+        "error": err_str.chars().take(300).collect::<String>(),
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    if let Ok(line) = serde_json::to_string(&audit) {
+        let path = ctx.home_dir.join("channel_failures.jsonl");
+        if let Ok(mut f) = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+        {
+            use tokio::io::AsyncWriteExt;
+            let _ = f.write_all(format!("{line}\n").as_bytes()).await;
+        }
+    }
+
+    format_fallback_message(&name, reason)
+}
+
+/// Classified failure category for `claude` CLI / Python SDK calls.
+///
+/// Drives the user-facing fallback message so we tell the user *why*
+/// it actually failed (rate limit, timeout, etc.) rather than always
+/// suggesting they re-run `claude auth status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FailureReason {
+    /// `claude` binary was not found on the filesystem.
+    BinaryMissing,
+    /// All rotator accounts exhausted due to rate-limit / usage-limit / 429.
+    RateLimited,
+    /// Billing / credit exhausted (402, insufficient_quota).
+    Billing,
+    /// 30-minute hard timeout tripped.
+    Timeout,
+    /// Subprocess failed to spawn or exited non-zero without recognizable cause.
+    SpawnError,
+    /// CLI returned empty output after trimming.
+    EmptyResponse,
+    /// No rotator accounts configured.
+    NoAccounts,
+    /// Fallback — unrecognized error string.
+    Unknown,
+}
+
+/// Classify an error string produced by `call_claude_cli_rotated` or `call_python_sdk_v2`.
+pub(crate) fn classify_cli_failure(err: &str) -> FailureReason {
+    let lower = err.to_lowercase();
+
+    if lower.contains("claude cli not found") {
+        return FailureReason::BinaryMissing;
+    }
+    if lower.contains("hard timeout") {
+        return FailureReason::Timeout;
+    }
+    if lower.contains("empty response") {
+        return FailureReason::EmptyResponse;
+    }
+    if lower.contains("no accounts") || lower.contains("no account configured") {
+        return FailureReason::NoAccounts;
+    }
+    // Reuse the shared billing/rate classifiers so we stay in sync with claude_runner.
+    if crate::claude_runner::is_billing_error(err) {
+        return FailureReason::Billing;
+    }
+    if crate::claude_runner::is_rate_limit_error(err) {
+        return FailureReason::RateLimited;
+    }
+    if lower.contains("spawn error")
+        || lower.contains("no such file")
+        || lower.contains("exit ")
+        || lower.contains("read error")
+    {
+        return FailureReason::SpawnError;
+    }
+    FailureReason::Unknown
+}
+
+/// Build a zh-TW user-facing message for a classified failure.
+pub(crate) fn format_fallback_message(agent_name: &str, reason: FailureReason) -> String {
+    match reason {
+        FailureReason::BinaryMissing => format!(
+            "{agent_name} 暫時無法回應：系統找不到 Claude Code CLI。\n\
+             請確認已安裝，並執行：\n\
+             $ claude auth status"
+        ),
+        FailureReason::RateLimited => format!(
+            "{agent_name} 暫時忙線中（API 使用量已達上限），請稍後再試。\n\
+             若持續發生，可在儀表板加入備用 OAuth 帳號以啟用自動輪替。"
+        ),
+        FailureReason::Billing => format!(
+            "{agent_name} 無法回應：目前帳號額度已用完。\n\
+             請於 Anthropic Console 儲值，或在儀表板切換到其他有效帳號。"
+        ),
+        FailureReason::Timeout => format!(
+            "{agent_name} 這次處理超時（已達 30 分鐘安全上限）。\n\
+             請重新送出訊息，或將任務拆成較小的步驟。"
+        ),
+        FailureReason::SpawnError => format!(
+            "{agent_name} 啟動 Claude Code 子程序失敗。\n\
+             請查看 ~/.duduclaw/debug.log 取得詳細錯誤。"
+        ),
+        FailureReason::EmptyResponse => format!(
+            "{agent_name} 這次沒有回覆內容（空回應）。\n\
+             請重送訊息；若持續發生請回報。"
+        ),
+        FailureReason::NoAccounts => format!(
+            "{agent_name} 目前沒有可用的 Claude 帳號。\n\
+             請先到儀表板設定 OAuth 或 API Key。"
+        ),
+        FailureReason::Unknown => format!(
+            "{agent_name} 暫時無法回應。\n\
+             請稍後再試，或查看 ~/.duduclaw/debug.log 取得詳細原因。"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    #[test]
+    fn classify_rate_limit_variants() {
+        assert_eq!(classify_cli_failure("Error 429 rate limit reached"), FailureReason::RateLimited);
+        assert_eq!(classify_cli_failure("usage limit exceeded"), FailureReason::RateLimited);
+        assert_eq!(classify_cli_failure("All accounts exhausted. Last error: overloaded"), FailureReason::RateLimited);
+    }
+
+    #[test]
+    fn classify_billing_variants() {
+        assert_eq!(classify_cli_failure("insufficient_quota credit balance"), FailureReason::Billing);
+        assert_eq!(classify_cli_failure("HTTP 402 payment required"), FailureReason::Billing);
+    }
+
+    #[test]
+    fn classify_timeout() {
+        assert_eq!(
+            classify_cli_failure("claude CLI hard timeout (1800s, no output)"),
+            FailureReason::Timeout
+        );
+    }
+
+    #[test]
+    fn classify_binary_missing() {
+        assert_eq!(classify_cli_failure("claude CLI not found in PATH"), FailureReason::BinaryMissing);
+    }
+
+    #[test]
+    fn classify_empty_response() {
+        assert_eq!(classify_cli_failure("Empty response from claude CLI"), FailureReason::EmptyResponse);
+    }
+
+    #[test]
+    fn classify_spawn_error() {
+        assert_eq!(classify_cli_failure("claude CLI spawn error: No such file"), FailureReason::SpawnError);
+        assert_eq!(classify_cli_failure("claude CLI exit 127"), FailureReason::SpawnError);
+    }
+
+    #[test]
+    fn classify_unknown_fallthrough() {
+        assert_eq!(classify_cli_failure("some weird unrelated thing"), FailureReason::Unknown);
+    }
+
+    #[test]
+    fn message_rate_limited_contains_busy_string_not_auth_status() {
+        let msg = format_fallback_message("Agnes", FailureReason::RateLimited);
+        assert!(msg.contains("Agnes"));
+        assert!(msg.contains("忙線中"));
+        assert!(!msg.contains("auth status"));
+    }
+
+    #[test]
+    fn message_binary_missing_keeps_auth_status_hint() {
+        let msg = format_fallback_message("Agnes", FailureReason::BinaryMissing);
+        assert!(msg.contains("找不到 Claude Code"));
+        assert!(msg.contains("auth status"));
+    }
+
+    #[test]
+    fn message_timeout_mentions_30_min() {
+        let msg = format_fallback_message("Agnes", FailureReason::Timeout);
+        assert!(msg.contains("30 分鐘"));
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    use duduclaw_agent::account_rotator::{
+        Account, AccountRotator, AuthMethod, RotationStrategy,
+    };
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Build a synthetic OAuth account for testing.
+    ///
+    /// Sets `credentials_dir` to a fake path so `is_available()` returns true
+    /// without needing real keychain state.
+    fn fake_oauth_account(id: &str, priority: u32) -> Account {
+        Account {
+            id: id.to_string(),
+            auth_method: AuthMethod::OAuth,
+            priority,
+            monthly_budget_cents: 0,
+            tags: vec![],
+            profile: "test".to_string(),
+            email: format!("{id}@example.com"),
+            subscription: "pro".to_string(),
+            label: id.to_string(),
+            expires_at: None,
+            api_key: String::new(),
+            oauth_token: Some(format!("tok_{id}")),
+            credentials_dir: Some(PathBuf::from(format!("/tmp/fake/{id}"))),
+            is_healthy: true,
+            consecutive_errors: 0,
+            spent_this_month: 0,
+            cooldown_until: None,
+            last_used: None,
+            total_requests: 0,
+        }
+    }
+
+    /// Scenario: first account rate-limited, second succeeds.
+    ///
+    /// Verifies:
+    /// 1. rotate_cli_spawn advances to the second account after a rate-limit error
+    /// 2. first account is placed in cooldown via on_rate_limited
+    /// 3. successful result is returned from the second account
+    #[tokio::test]
+    async fn rotation_advances_past_rate_limited_account() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        // Lower priority number = selected first under Priority strategy.
+        rotator.push_account_for_test(fake_oauth_account("first", 1)).await;
+        rotator.push_account_for_test(fake_oauth_account("second", 2)).await;
+        assert_eq!(rotator.count().await, 2);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_cloned = call_count.clone();
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            move |env_vars| {
+                let n = call_count_cloned.fetch_add(1, Ordering::SeqCst);
+                // First attempt: simulate rate limit.
+                // Second attempt: return success with a distinctive body.
+                async move {
+                    // Sanity: env_vars should contain OAuth token for the selected account.
+                    assert!(env_vars.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
+                    if n == 0 {
+                        Err("Error 429 rate limit reached".to_string())
+                    } else {
+                        Ok("hello from second".to_string())
+                    }
+                }
+            },
+            100,
+        )
+        .await;
+
+        assert_eq!(result.as_deref(), Ok("hello from second"));
+        assert_eq!(call_count.load(Ordering::SeqCst), 2, "both accounts should be tried");
+
+        // First account should now be unavailable (cooldown), second still healthy.
+        let statuses = rotator.status().await;
+        let first = statuses.iter().find(|s| s.id == "first").unwrap();
+        let second = statuses.iter().find(|s| s.id == "second").unwrap();
+        assert!(!first.is_available, "first account should be in cooldown after rate-limit");
+        assert!(second.is_available, "second account should remain available");
+        assert_eq!(second.total_requests, 1, "second account should have one success recorded");
+    }
+
+    /// Scenario: both accounts fail with the same error.
+    ///
+    /// Verifies:
+    /// 1. Both accounts are exercised
+    /// 2. Final Err carries the last underlying error string (not a generic message)
+    /// 3. The error is classifiable (so the fallback message will be specific)
+    #[tokio::test]
+    async fn rotation_all_fail_propagates_last_error() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("a", 1)).await;
+        rotator.push_account_for_test(fake_oauth_account("b", 2)).await;
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            |_env_vars| async move {
+                Err::<String, _>("claude CLI hard timeout (1800s, no output)".to_string())
+            },
+            100,
+        )
+        .await;
+
+        let err = result.expect_err("should fail when all accounts fail");
+        assert!(err.contains("All accounts exhausted"), "expected aggregator prefix, got: {err}");
+        assert!(
+            err.contains("hard timeout"),
+            "expected last error to be propagated, got: {err}"
+        );
+
+        // Extracted error must still be classifiable as Timeout (not Unknown).
+        assert_eq!(classify_cli_failure(&err), FailureReason::Timeout);
+    }
+
+    /// Scenario: billing-exhausted error places the account on a 24h cooldown.
+    #[tokio::test]
+    async fn rotation_billing_error_triggers_long_cooldown() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("broke", 1)).await;
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            |_env_vars| async move {
+                Err::<String, _>("HTTP 402 insufficient_quota credit balance".to_string())
+            },
+            100,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let statuses = rotator.status().await;
+        let broke = &statuses[0];
+        assert!(!broke.is_healthy, "billing-exhausted account should be marked unhealthy");
+        assert!(!broke.is_available, "should be unavailable during 24h cooldown");
+    }
+
+    /// T4.7 smoke replacement: single good OAuth account — no regression.
+    ///
+    /// When exactly one healthy account exists and the spawn closure succeeds
+    /// immediately, we should return that response on the first attempt and
+    /// record success.
+    #[tokio::test]
+    async fn single_account_success_is_first_try() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("only", 1)).await;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_cloned = attempts.clone();
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            move |_env_vars| {
+                attempts_cloned.fetch_add(1, Ordering::SeqCst);
+                async move { Ok::<String, String>("OK".to_string()) }
+            },
+            50,
+        )
+        .await;
+
+        assert_eq!(result.as_deref(), Ok("OK"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let status = &rotator.status().await[0];
+        assert_eq!(status.total_requests, 1);
+        assert!(status.is_available);
+    }
+
+    /// T4.9 smoke replacement: forced rate-limit → user sees 忙線中 message.
+    ///
+    /// End-to-end path from spawn failure → rotator exhaustion → error
+    /// propagation → `classify_cli_failure` → `format_fallback_message`.
+    /// Asserts the user-facing text is the RateLimited variant, not
+    /// the misleading BinaryMissing "please install and auth" hint.
+    #[tokio::test]
+    async fn end_to_end_rate_limit_yields_busy_message() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("one", 1)).await;
+        rotator.push_account_for_test(fake_oauth_account("two", 2)).await;
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            |_env_vars| async move {
+                Err::<String, _>("Error 429 rate limit: usage limit exceeded".to_string())
+            },
+            50,
+        )
+        .await;
+
+        let err = result.expect_err("should fail");
+        let reason = classify_cli_failure(&err);
+        assert_eq!(reason, FailureReason::RateLimited);
+
+        let user_msg = format_fallback_message("Agnes", reason);
+        assert!(user_msg.contains("Agnes"));
+        assert!(user_msg.contains("忙線中"), "must say busy: {user_msg}");
+        assert!(
+            !user_msg.contains("auth status"),
+            "must NOT suggest re-running auth status on rate limit: {user_msg}"
+        );
+        assert!(
+            !user_msg.contains("找不到"),
+            "must NOT say 'binary not found' on rate limit: {user_msg}"
+        );
+    }
+
+    /// T4.8 smoke replacement: empty-rotator → `call_claude_cli_rotated`
+    /// fresh-install passthrough. We can't actually spawn `claude`, but the
+    /// primitive behaviour of "empty rotator returns exhausted-Err" is
+    /// verified below; the outer function's fall-through to
+    /// `call_claude_cli` is a one-liner trivially correct by inspection.
+    #[tokio::test]
+    async fn rotation_empty_rotator_returns_empty_exhausted() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        assert_eq!(rotator.count().await, 0);
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            |_env_vars| async move { Ok::<String, String>("never called".to_string()) },
+            100,
+        )
+        .await;
+
+        let err = result.expect_err("empty rotator should return err from primitive");
+        assert!(err.contains("All accounts exhausted"));
+        // Last error is empty because no attempt was made
+        assert!(err.ends_with("Last error: "));
+    }
 }
 
 // ── Python SDK subprocess ───────────────────────────────────
@@ -1147,6 +1587,11 @@ pub(crate) async fn call_claude_cli_public(
 /// Uses `--output-format stream-json --verbose` to read incremental events.
 /// Instead of killing on idle, sends keepalive progress to the channel via
 /// `on_progress` callback. A hard max timeout (30 min) acts as safety net.
+///
+/// Thin wrapper around [`spawn_claude_cli_with_env`] that uses the ambient
+/// environment (and any configured `ANTHROPIC_API_KEY` as fallback). This is
+/// the no-rotation path — used by compression and GVU reflection helpers.
+/// The main channel-reply path goes through [`call_claude_cli_rotated`].
 async fn call_claude_cli(
     user_message: &str,
     model: &str,
@@ -1156,6 +1601,150 @@ async fn call_claude_cli(
     on_progress: Option<&ProgressCallback>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
+    let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    spawn_claude_cli_with_env(
+        user_message, model, system_prompt, home_dir, work_dir,
+        on_progress, capabilities, &empty,
+    ).await
+}
+
+/// Try the `claude` CLI with rotation across configured `AccountRotator` accounts.
+///
+/// On each attempt the rotator selects an account and yields its env vars
+/// (`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`, or `ANTHROPIC_API_KEY`).
+/// Classifies failures and feeds them back to the rotator so unhealthy
+/// accounts cool down correctly. Falls through to the non-rotated path
+/// when no accounts are configured (fresh-install passthrough).
+pub(crate) async fn call_claude_cli_rotated(
+    user_message: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+    work_dir: Option<&Path>,
+    on_progress: Option<&ProgressCallback>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+) -> Result<String, String> {
+    let rotator = match crate::claude_runner::get_rotator_cached(home_dir).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "Rotator unavailable — falling back to non-rotated CLI path");
+            return call_claude_cli(
+                user_message, model, system_prompt, home_dir, work_dir,
+                on_progress, capabilities,
+            ).await;
+        }
+    };
+
+    let account_count = rotator.count().await;
+    if account_count == 0 {
+        // Fresh install — no accounts configured. Use ambient env.
+        return call_claude_cli(
+            user_message, model, system_prompt, home_dir, work_dir,
+            on_progress, capabilities,
+        ).await;
+    }
+
+    // Delegate to the testable primitive with a closure that actually spawns the CLI.
+    let input_len = user_message.len();
+    rotate_cli_spawn(&rotator, move |env_vars| {
+        let user_message = user_message.to_string();
+        let model = model.to_string();
+        let system_prompt = system_prompt.to_string();
+        let home_dir = home_dir.to_path_buf();
+        let work_dir = work_dir.map(|p| p.to_path_buf());
+        let on_progress = on_progress;
+        let capabilities = capabilities.cloned();
+        async move {
+            spawn_claude_cli_with_env(
+                &user_message, &model, &system_prompt, &home_dir,
+                work_dir.as_deref(), on_progress, capabilities.as_ref(), &env_vars,
+            ).await
+        }
+    }, input_len).await
+}
+
+/// Rotation-loop primitive, decoupled from the actual subprocess spawn.
+///
+/// Iterates `rotator.select()` up to `rotator.count()` times. For each
+/// selected account, calls the provided `spawn` closure with the env-var
+/// map. On success, records cost telemetry and returns. On failure,
+/// classifies the error and feeds it back to the rotator (`on_billing_exhausted`,
+/// `on_rate_limited`, or `on_error`). Returns the last error when all
+/// accounts are exhausted.
+///
+/// `input_size_hint` is used for rough API-key cost accounting when the
+/// spawn closure doesn't extract token usage from the CLI stream.
+pub(crate) async fn rotate_cli_spawn<F, Fut>(
+    rotator: &duduclaw_agent::account_rotator::AccountRotator,
+    spawn: F,
+    input_size_hint: usize,
+) -> Result<String, String>
+where
+    F: Fn(std::collections::HashMap<String, String>) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    let account_count = rotator.count().await;
+    let max_attempts = account_count.max(1);
+    let mut last_error = String::new();
+
+    for attempt in 0..max_attempts {
+        let Some(selected) = rotator.select().await else {
+            break;
+        };
+        info!(account = %selected.id, attempt, "Channel CLI attempt");
+
+        match spawn(selected.env_vars.clone()).await {
+            Ok(text) => {
+                // Channel calls don't extract token usage from streams, so cost
+                // is 0 (OAuth subscription) or a rough estimate (API key).
+                let cost = if selected.auth_method == duduclaw_agent::account_rotator::AuthMethod::OAuth {
+                    0
+                } else {
+                    ((input_size_hint + text.len()) / 1000).max(1) as u64
+                };
+                rotator.on_success(&selected.id, cost).await;
+                return Ok(text);
+            }
+            Err(e) => {
+                last_error = e.clone();
+                if crate::claude_runner::is_billing_error(&e) {
+                    warn!(account = %selected.id, error = %e, "Account billing exhausted — 24h cooldown");
+                    rotator.on_billing_exhausted(&selected.id).await;
+                } else if crate::claude_runner::is_rate_limit_error(&e) {
+                    warn!(account = %selected.id, error = %e, "Account rate-limited — cooldown");
+                    rotator.on_rate_limited(&selected.id).await;
+                } else {
+                    warn!(account = %selected.id, error = %e, "Account CLI attempt failed");
+                    rotator.on_error(&selected.id).await;
+                }
+            }
+        }
+    }
+
+    Err(format!("All accounts exhausted. Last error: {last_error}"))
+}
+
+/// Core primitive: spawn the `claude` CLI subprocess with a streaming JSON reader.
+///
+/// `env_vars` allows the caller to inject per-account credentials
+/// (e.g. `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`, `ANTHROPIC_API_KEY`).
+/// When `env_vars` is empty, falls back to the ambient env plus any
+/// `ANTHROPIC_API_KEY` discovered via [`get_api_key`].
+///
+/// An empty-string value in `env_vars` is treated as a `remove` directive —
+/// this matches `AccountRotator::select()` semantics (it emits an empty
+/// `ANTHROPIC_API_KEY` to force OAuth paths not to leak an API key).
+#[allow(clippy::too_many_arguments)] // pure extraction of existing call_claude_cli body
+async fn spawn_claude_cli_with_env(
+    user_message: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+    work_dir: Option<&Path>,
+    on_progress: Option<&ProgressCallback>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Result<String, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     // Find claude binary
@@ -1163,7 +1752,12 @@ async fn call_claude_cli(
 
     // API key is optional — OAuth users authenticate via OS keychain.
     // Only set ANTHROPIC_API_KEY env var if we have one (as backup/override).
-    let api_key = get_api_key(home_dir).await;
+    // Skipped when the caller provides explicit env_vars (rotator path).
+    let api_key = if env_vars.is_empty() {
+        get_api_key(home_dir).await
+    } else {
+        None
+    };
 
     let mut cmd = tokio::process::Command::new(&claude_path);
     cmd.args([
@@ -1199,10 +1793,34 @@ async fn call_claude_cli(
     // Set working directory to agent dir so Claude can access agent config
     // (.claude/, CLAUDE.md, .mcp.json) and project files (docs/, etc.)
     if let Some(dir) = work_dir {
+        // Install the agent-file-guard PreToolUse hook into
+        // <agent_dir>/.claude/settings.json before spawning. This blocks
+        // the sub-agent from using raw Write/Edit to create agent-structure
+        // files (agent.toml/SOUL.md/…) outside <home>/agents/<name>/.
+        // Best-effort — logs warning on failure but does not abort spawn.
+        let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
+        if let Err(e) = crate::agent_hook_installer::ensure_agent_hook_settings(dir, &bin).await {
+            warn!(
+                agent_dir = %dir.display(),
+                error = %e,
+                "Failed to install agent-file-guard hook — spawn continuing without enforcement"
+            );
+        }
         cmd.current_dir(dir);
     }
     if let Some(ref key) = api_key {
         cmd.env("ANTHROPIC_API_KEY", key);
+    }
+
+    // Apply rotator-provided env vars (overrides any ambient/api_key values).
+    // Empty-string values mean "remove this env var" — used by AccountRotator
+    // to force OAuth paths to not leak a stale ANTHROPIC_API_KEY.
+    for (key, value) in env_vars {
+        if value.is_empty() {
+            cmd.env_remove(key);
+        } else {
+            cmd.env(key, value);
+        }
     }
 
     // Pass system prompt via temp file to avoid exposure in /proc/PID/cmdline (BE-C1)

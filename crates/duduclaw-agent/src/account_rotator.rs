@@ -548,6 +548,20 @@ impl AccountRotator {
     pub async fn count(&self) -> usize {
         self.accounts.read().await.len()
     }
+
+    /// Test-only: push a pre-built account directly into the rotator.
+    ///
+    /// Bypasses config file loading and OAuth auto-detection. Cross-crate
+    /// integration tests need deterministic account state — in particular,
+    /// channel-reply rotation tests inject synthetic OAuth accounts so the
+    /// spawn closure can simulate rate-limit / success patterns.
+    ///
+    /// Not intended for production code. Marked `#[doc(hidden)]` so it does
+    /// not appear in public API docs.
+    #[doc(hidden)]
+    pub async fn push_account_for_test(&self, account: Account) {
+        self.accounts.write().await.push(account);
+    }
 }
 
 // ── OAuth helpers ───────────────────────────────────────────

@@ -346,6 +346,10 @@ impl MistakeNotebook {
     ///
     /// This is a convenience method called by the dispatcher when the
     /// action claim verifier detects ungrounded action claims.
+    ///
+    /// `agent_output_summary` should be pre-truncated by the caller
+    /// (dispatcher passes `chars().take(200)`). No double-truncation here
+    /// (review R3-L2).
     pub fn record_hallucination(
         &self,
         agent_id: &str,
@@ -361,7 +365,7 @@ impl MistakeNotebook {
             category: MistakeCategory::Hallucination,
             session_id: session_id.to_string(),
             input_summary: "(dispatcher task)".to_string(),
-            agent_response_summary: truncate_str(agent_output_summary, 200),
+            agent_response_summary: agent_output_summary.to_string(),
             what_went_wrong: format!(
                 "Agent claimed '{}' but never called MCP tool '{}'",
                 claimed_action, expected_tool,

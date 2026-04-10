@@ -464,7 +464,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
         skill_auto_activate: agent.evolution?.skill_auto_activate ?? false,
         skill_security_scan: agent.evolution?.skill_security_scan ?? true,
         gvu_enabled: agent.evolution?.gvu_enabled ?? true,
-        cognitive_memory: agent.evolution?.cognitive_memory ?? false,
+        cognitive_memory: agent.evolution?.cognitive_memory ?? true,
         sticker_enabled: agent.sticker?.enabled ?? false,
         sticker_probability: agent.sticker?.probability ?? 0.3,
         sticker_intensity_threshold: agent.sticker?.intensity_threshold ?? 0.7,
