@@ -1,112 +1,113 @@
-//! Cron task scheduler — reads `cron_tasks.jsonl`, evaluates cron expressions,
-//! and executes due tasks by calling the Claude CLI for the target agent.
+//! Cron task scheduler — reads tasks from [`CronStore`], evaluates cron
+//! expressions, and executes due tasks by calling the Claude CLI for the
+//! target agent. Supports **hot reload** via a `tokio::sync::Notify` signal
+//! so that dashboard/MCP edits take effect immediately instead of waiting
+//! for the next baseline poll.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
 use cron::Schedule;
-use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tracing::{info, warn};
 
 use crate::claude_runner::call_claude_for_agent_with_type;
+use crate::cron_store::{CronStore, CronTaskRow};
 use duduclaw_agent::registry::AgentRegistry;
 
-/// A single persisted cron task entry from `cron_tasks.jsonl`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CronTask {
-    pub id: String,
-    #[serde(default = "default_name")]
-    pub name: String,
-    #[serde(default = "default_agent")]
-    pub agent_id: String,
-    pub cron: String,
-    #[serde(alias = "description")]
-    pub task: String,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub created_at: Option<String>,
-}
+/// Re-export the DB row type under the historical name so external callers
+/// that used `cron_scheduler::CronTask` keep compiling. Prefer
+/// [`crate::cron_store::CronTaskRow`] in new code.
+pub type CronTask = CronTaskRow;
 
-fn default_name() -> String {
-    "unnamed".to_string()
-}
-fn default_agent() -> String {
-    "default".to_string()
-}
-fn default_true() -> bool {
-    true
-}
+/// Maximum concurrent cron task executions.
+const MAX_CONCURRENT_CRON: usize = 4;
+
+/// Baseline reload/fire-check interval. Hot reload via [`CronScheduler::reload_now`]
+/// will wake the loop earlier; this interval is the safety net that picks up
+/// changes made by *other processes* (e.g. the MCP subprocess writing directly
+/// to the shared SQLite DB).
+const TICK_INTERVAL_SECS: u64 = 30;
 
 /// In-memory representation with parsed schedule and last-run tracking.
 struct LiveTask {
-    task: CronTask,
+    task: CronTaskRow,
     schedule: Schedule,
     last_run: Option<chrono::DateTime<Utc>>,
 }
 
-/// Cron scheduler that loads tasks from `cron_tasks.jsonl` and fires them on time.
-/// Maximum concurrent cron task executions.
-const MAX_CONCURRENT_CRON: usize = 4;
-
+/// Cron scheduler that loads tasks from a [`CronStore`] and fires them on time.
 pub struct CronScheduler {
     home_dir: PathBuf,
+    store: Arc<CronStore>,
     registry: Arc<RwLock<AgentRegistry>>,
     tasks: Arc<RwLock<Vec<LiveTask>>>,
     semaphore: Arc<tokio::sync::Semaphore>,
+    /// Fired by [`CronScheduler::reload_now`] to wake the run loop for an
+    /// immediate reload. Consumed inside a `tokio::select!`.
+    reload_notify: Arc<Notify>,
 }
 
 impl CronScheduler {
-    pub fn new(home_dir: PathBuf, registry: Arc<RwLock<AgentRegistry>>) -> Self {
+    pub fn new(
+        home_dir: PathBuf,
+        store: Arc<CronStore>,
+        registry: Arc<RwLock<AgentRegistry>>,
+    ) -> Self {
         Self {
             home_dir,
+            store,
             registry,
             tasks: Arc::new(RwLock::new(Vec::new())),
             semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CRON)),
+            reload_notify: Arc::new(Notify::new()),
         }
     }
 
-    /// Load tasks from `cron_tasks.jsonl`. Skips invalid lines gracefully.
-    async fn load_tasks(&self) -> Vec<CronTask> {
-        let path = self.home_dir.join("cron_tasks.jsonl");
-        let content = match tokio::fs::read_to_string(&path).await {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
-
-        content
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|line| {
-                serde_json::from_str::<CronTask>(line)
-                    .map_err(|e| warn!("Skipping invalid cron task line: {e}"))
-                    .ok()
-            })
-            .filter(|t| t.enabled)
-            .collect()
+    /// Signal the run loop to reload from the store **immediately**. Safe to
+    /// call from any thread; returns instantly and never blocks.
+    pub fn reload_now(&self) {
+        self.reload_notify.notify_one();
     }
 
-    /// Reload tasks from disk into memory, merging with existing last_run state.
+    /// Reload tasks from the store into memory, preserving `last_run` for
+    /// tasks that already existed. Tasks with invalid cron expressions are
+    /// logged and dropped.
     async fn reload(&self) {
-        let raw_tasks = self.load_tasks().await;
+        let raw_tasks = match self.store.list_enabled().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!("failed to load cron tasks from store: {e}");
+                return;
+            }
+        };
+
         let mut live = self.tasks.write().await;
 
-        // Preserve last_run for tasks that already existed
+        // Preserve in-memory last_run for tasks that already existed so we
+        // don't re-fire the same minute after a reload triggered mid-cycle.
         let old_runs: std::collections::HashMap<String, chrono::DateTime<Utc>> = live
             .iter()
             .filter_map(|lt| lt.last_run.map(|lr| (lt.task.id.clone(), lr)))
             .collect();
 
-        let mut new_live = Vec::new();
+        let mut new_live = Vec::with_capacity(raw_tasks.len());
         for task in raw_tasks {
-            // The `cron` crate expects 6-field or 7-field expressions.
-            // Normalise 5-field (standard) to 6-field by prepending "0" for seconds.
             let expr = normalise_cron(&task.cron);
             match expr.parse::<Schedule>() {
                 Ok(schedule) => {
-                    let last_run = old_runs.get(&task.id).copied();
+                    // Start from whichever is newer: in-memory cache, or the DB's persisted last_run_at.
+                    let db_last_run = task
+                        .last_run_at
+                        .as_deref()
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|dt| dt.with_timezone(&Utc));
+                    let last_run = match (old_runs.get(&task.id).copied(), db_last_run) {
+                        (Some(mem), Some(db)) => Some(mem.max(db)),
+                        (Some(mem), None) => Some(mem),
+                        (None, db) => db,
+                    };
                     new_live.push(LiveTask {
                         task,
                         schedule,
@@ -114,52 +115,57 @@ impl CronScheduler {
                     });
                 }
                 Err(e) => {
-                    warn!(id = %task.id, cron = %task.cron, "Invalid cron expression: {e}");
+                    warn!(id = %task.id, cron = %task.cron, "invalid cron expression: {e}");
                 }
             }
         }
 
-        info!(count = new_live.len(), "Cron tasks loaded");
+        info!(count = new_live.len(), "cron tasks loaded");
         *live = new_live;
     }
 
-    /// Start the scheduler loop. Checks every 30 seconds and reloads from disk
-    /// every 5 minutes to pick up new tasks added by `schedule_task`.
+    /// Start the scheduler loop. Wakes on a 30-second timer OR on
+    /// [`Self::reload_now`] (whichever comes first). On every wake:
+    ///   1. reload from the store (cheap)
+    ///   2. scan for due tasks and spawn them
     pub async fn run(self: Arc<Self>) {
+        // One-shot migration from the legacy JSONL file. Idempotent — if the
+        // file is absent or already archived, this is a no-op.
+        if let Err(e) = self.store.migrate_from_jsonl(&self.home_dir).await {
+            warn!("cron JSONL migration failed: {e}");
+        }
+
         self.reload().await;
 
-        let mut tick = 0u64;
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            tick += 1;
-
-            // Reload from disk every 5 minutes (10 ticks * 30s)
-            if tick % 10 == 0 {
-                self.reload().await;
+            // Wake on timer or on explicit reload request — whichever fires first.
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(TICK_INTERVAL_SECS)) => {}
+                _ = self.reload_notify.notified() => {
+                    info!("cron scheduler hot-reload signal received");
+                }
             }
 
-            let now = Utc::now();
+            self.reload().await;
 
-            // Collect tasks to spawn while holding write lock, then release before spawning (BE-M2)
+            let now = Utc::now();
             let mut to_spawn = Vec::new();
             {
                 let mut tasks = self.tasks.write().await;
                 for lt in tasks.iter_mut() {
                     let should_fire = match lt.last_run {
-                        Some(last) => {
-                            lt.schedule
-                                .after(&last)
-                                .next()
-                                .map(|next| next <= now)
-                                .unwrap_or(false)
-                        }
-                        None => {
-                            lt.schedule
-                                .after(&(now - chrono::Duration::hours(1)))
-                                .next()
-                                .map(|next| next <= now)
-                                .unwrap_or(false)
-                        }
+                        Some(last) => lt
+                            .schedule
+                            .after(&last)
+                            .next()
+                            .map(|next| next <= now)
+                            .unwrap_or(false),
+                        None => lt
+                            .schedule
+                            .after(&(now - chrono::Duration::hours(1)))
+                            .next()
+                            .map(|next| next <= now)
+                            .unwrap_or(false),
                     };
 
                     if should_fire {
@@ -167,7 +173,7 @@ impl CronScheduler {
                             id = %lt.task.id,
                             name = %lt.task.name,
                             agent = %lt.task.agent_id,
-                            "Cron task firing"
+                            "cron task firing"
                         );
                         lt.last_run = Some(now);
                         to_spawn.push(lt.task.clone());
@@ -178,26 +184,26 @@ impl CronScheduler {
             for task in to_spawn {
                 let home = self.home_dir.clone();
                 let registry = self.registry.clone();
+                let store = self.store.clone();
                 let sem = self.semaphore.clone();
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await;
-                    execute_cron_task(&home, &registry, &task).await;
+                    execute_cron_task(&home, &store, &registry, &task).await;
                 });
             }
         }
     }
 }
 
-/// Execute a cron task by calling the Claude CLI for the target agent.
+/// Execute a cron task by calling the Claude CLI for the target agent, then
+/// persist the run outcome to the store.
 async fn execute_cron_task(
-    home_dir: &Path,
+    home_dir: &std::path::Path,
+    store: &Arc<CronStore>,
     registry: &Arc<RwLock<AgentRegistry>>,
-    task: &CronTask,
+    task: &CronTaskRow,
 ) {
-    let prompt = format!(
-        "[Scheduled Task: {}] {}",
-        task.name, task.task
-    );
+    let prompt = format!("[Scheduled Task: {}] {}", task.name, task.task);
 
     // Wrap cron execution in DELEGATION_ENV scope so the Claude CLI subprocess
     // receives delegation context. Cron tasks start at depth 0 with origin="cron".
@@ -218,7 +224,10 @@ async fn execute_cron_task(
     let result = crate::claude_runner::DELEGATION_ENV
         .scope(delegation_env, async {
             call_claude_for_agent_with_type(
-                home_dir, registry, &task.agent_id, &prompt,
+                home_dir,
+                registry,
+                &task.agent_id,
+                &prompt,
                 crate::cost_telemetry::RequestType::Cron,
             )
             .await
@@ -231,18 +240,24 @@ async fn execute_cron_task(
                 id = %task.id,
                 name = %task.name,
                 response_len = response.len(),
-                "Cron task completed"
+                "cron task completed"
             );
+            if let Err(e) = store.record_run(&task.id, true, None).await {
+                warn!(id = %task.id, "failed to record successful run: {e}");
+            }
         }
         Err(e) => {
-            warn!(id = %task.id, name = %task.name, "Cron task failed: {e}");
+            warn!(id = %task.id, name = %task.name, "cron task failed: {e}");
+            if let Err(re) = store.record_run(&task.id, false, Some(&e)).await {
+                warn!(id = %task.id, "failed to record failed run: {re}");
+            }
         }
     }
 }
 
-/// Normalise a cron expression to 6-field format (with seconds).
-/// If the expression has 5 fields, prepend "0" for seconds.
-fn normalise_cron(expr: &str) -> String {
+/// Normalise a cron expression to 6-field format (with seconds). If the
+/// expression has 5 fields, prepend "0" for seconds.
+pub fn normalise_cron(expr: &str) -> String {
     let fields: Vec<&str> = expr.split_whitespace().collect();
     if fields.len() == 5 {
         format!("0 {expr}")
@@ -251,13 +266,20 @@ fn normalise_cron(expr: &str) -> String {
     }
 }
 
-/// Start the cron scheduler as a background task.
+/// Start the cron scheduler as a background task. Returns the join handle
+/// **and** a shared handle to the scheduler so other components
+/// (dashboard handlers, MCP bridge) can call [`CronScheduler::reload_now`].
 pub fn start_cron_scheduler(
     home_dir: PathBuf,
+    store: Arc<CronStore>,
     registry: Arc<RwLock<AgentRegistry>>,
-) -> tokio::task::JoinHandle<()> {
-    let scheduler = Arc::new(CronScheduler::new(home_dir, registry));
-    tokio::spawn(async move {
-        scheduler.run().await;
-    })
+) -> (tokio::task::JoinHandle<()>, Arc<CronScheduler>) {
+    let scheduler = Arc::new(CronScheduler::new(home_dir, store, registry));
+    let handle = {
+        let sched = scheduler.clone();
+        tokio::spawn(async move {
+            sched.run().await;
+        })
+    };
+    (handle, scheduler)
 }

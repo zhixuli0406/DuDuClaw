@@ -1166,8 +1166,14 @@ async fn handle_log_mood(
     }
 }
 
-/// Schedule a recurring or one-shot task.
+/// Schedule a recurring or one-shot task. Writes directly to the shared
+/// SQLite cron store (`<home>/cron_tasks.db`). The gateway's running
+/// `CronScheduler` picks up the new task on its next baseline tick
+/// (≤ 30 seconds) — no inter-process signal is required because both
+/// processes use WAL-mode SQLite.
 async fn handle_schedule_task(params: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::cron_store::{CronStore, CronTaskRow};
+
     let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("default");
     let cron = params.get("cron").and_then(|v| v.as_str()).unwrap_or("");
     let task = params.get("task").or_else(|| params.get("prompt")).or_else(|| params.get("description")).and_then(|v| v.as_str()).unwrap_or("");
@@ -1180,7 +1186,7 @@ async fn handle_schedule_task(params: &Value, home_dir: &Path) -> Value {
         });
     }
 
-    // Validate cron expression before persisting
+    // Validate cron expression before persisting.
     let normalised_cron = if cron.split_whitespace().count() == 5 {
         format!("0 {cron}")
     } else {
@@ -1193,31 +1199,34 @@ async fn handle_schedule_task(params: &Value, home_dir: &Path) -> Value {
         });
     }
 
+    let store = match CronStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: open cron store: {e}")}],
+                "isError": true
+            });
+        }
+    };
+
     let task_id = uuid::Uuid::new_v4().to_string();
-    let cron_path = home_dir.join("cron_tasks.jsonl");
-    let entry = serde_json::json!({
-        "id": &task_id,
-        "name": name,
-        "agent_id": agent_id,
-        "cron": cron,
-        "task": task,
-        "enabled": true,
-        "created_at": chrono::Utc::now().to_rfc3339(),
-    });
+    let row = CronTaskRow::new(
+        task_id.clone(),
+        name.to_string(),
+        agent_id.to_string(),
+        cron.to_string(),
+        task.to_string(),
+    );
 
-    let queued = tokio::task::spawn_blocking({
-        let path = cron_path;
-        let entry_str = entry.to_string();
-        move || append_to_jsonl_sync(&path, &entry_str)
-    }).await.unwrap_or(false);
-
-    serde_json::json!({
-        "content": [{"type": "text", "text": if queued {
-            format!("Task '{name}' scheduled (id: {task_id}, cron: {cron})")
-        } else {
-            "Error: Failed to persist task (queue full or write error)".to_string()
-        }}]
-    })
+    match store.insert(&row).await {
+        Ok(()) => serde_json::json!({
+            "content": [{"type": "text", "text": format!("Task '{name}' scheduled (id: {task_id}, cron: {cron})")}]
+        }),
+        Err(e) => serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: failed to persist task: {e}")}],
+            "isError": true
+        }),
+    }
 }
 
 // ── Reminder handlers ─────���──────────────────────────────────
