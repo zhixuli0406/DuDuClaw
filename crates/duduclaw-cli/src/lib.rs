@@ -271,8 +271,33 @@ enum AgentCommands {
 
     /// Create a new agent from template
     Create {
-        /// Agent name
+        /// Agent name (lowercase-kebab, used as directory name + registry id)
         name: String,
+
+        /// Display name shown in dashboards / Discord handles.
+        /// Defaults to a title-cased version of `name`.
+        #[arg(long)]
+        display_name: Option<String>,
+
+        /// Role. Accepts any canonical `AgentRole` variant (kebab-case)
+        /// plus common aliases: `main|specialist|worker|developer|engineer|
+        /// qa|quality-assurance|planner|team-leader|tl|product-manager|pm`.
+        /// Defaults to `specialist`.
+        #[arg(long)]
+        role: Option<String>,
+
+        /// Parent agent this one reports to. Empty string means top-level.
+        #[arg(long)]
+        reports_to: Option<String>,
+
+        /// Unicode emoji shown next to the agent's name. Default: `🤖`.
+        #[arg(long)]
+        icon: Option<String>,
+
+        /// Invocation trigger string, e.g. `@Agnes`. Defaults to
+        /// `@<display_name>` (following the existing agnes convention).
+        #[arg(long)]
+        trigger: Option<String>,
     },
 
     /// Inspect agent details
@@ -426,7 +451,14 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Agent { command } => match command {
             None => cmd_agent_interactive(None).await,
             Some(AgentCommands::List) => cmd_agent_list().await,
-            Some(AgentCommands::Create { name }) => cmd_agent_create(&name).await,
+            Some(AgentCommands::Create {
+                name,
+                display_name,
+                role,
+                reports_to,
+                icon,
+                trigger,
+            }) => cmd_agent_create(&name, display_name, role, reports_to, icon, trigger).await,
             Some(AgentCommands::Inspect { agent }) => cmd_agent_inspect(&agent).await,
             Some(AgentCommands::Pause { agent }) => cmd_agent_set_status(&agent, "paused").await,
             Some(AgentCommands::Resume { agent }) => cmd_agent_set_status(&agent, "active").await,
@@ -1947,16 +1979,53 @@ async fn cmd_doctor() -> duduclaw_core::error::Result<()> {
 }
 
 /// `duduclaw agent create <name>` - Create a new agent from template.
-async fn cmd_agent_create(name: &str) -> duduclaw_core::error::Result<()> {
+async fn cmd_agent_create(
+    name: &str,
+    display_name_opt: Option<String>,
+    role_opt: Option<String>,
+    reports_to_opt: Option<String>,
+    icon_opt: Option<String>,
+    trigger_opt: Option<String>,
+) -> duduclaw_core::error::Result<()> {
     use console::style;
+    use std::str::FromStr;
 
     let home = duduclaw_home();
     let agent_name = name.to_lowercase().replace(' ', "-");
-    let display_name = name.to_string();
+
+    if !is_valid_agent_id(&agent_name) {
+        return Err(DuDuClawError::Agent(format!(
+            "Invalid agent name '{agent_name}'. Must be lowercase \
+             alphanumeric + hyphen, 1-64 chars, no leading/trailing dash."
+        )));
+    }
+
+    let display_name = display_name_opt.unwrap_or_else(|| name.to_string());
+
+    // Parse + normalise role via the canonical AgentRole::from_str so
+    // aliases (`engineer`, `pm`, `team-leader`, …) all land on the right
+    // variant and the written agent.toml contains the canonical kebab-case
+    // form instead of whatever the user typed.
+    let role_str = match role_opt.as_deref() {
+        Some(v) => duduclaw_core::types::AgentRole::from_str(v)
+            .map_err(|e| DuDuClawError::Agent(format!("--role: {e}")))?
+            .as_str(),
+        None => "specialist",
+    };
+
+    let reports_to = reports_to_opt.unwrap_or_default();
+    let icon = icon_opt.unwrap_or_else(|| "🤖".to_string());
+    let trigger = trigger_opt.unwrap_or_else(|| format!("@{display_name}"));
+
     let agent_dir = home.join("agents").join(&agent_name);
 
     if agent_dir.exists() {
-        println!("  {} Agent '{}' already exists at {}", style("✗").red(), agent_name, agent_dir.display());
+        println!(
+            "  {} Agent '{}' already exists at {}",
+            style("✗").red(),
+            agent_name,
+            agent_dir.display()
+        );
         return Ok(());
     }
 
@@ -1965,6 +2034,7 @@ async fn cmd_agent_create(name: &str) -> duduclaw_core::error::Result<()> {
         agent_dir.clone(),
         agent_dir.join("SKILLS"),
         agent_dir.join("memory"),
+        agent_dir.join(".claude"),
     ] {
         tokio::fs::create_dir_all(dir).await.map_err(|e| {
             DuDuClawError::Agent(format!("Failed to create {}: {e}", dir.display()))
@@ -1972,14 +2042,15 @@ async fn cmd_agent_create(name: &str) -> duduclaw_core::error::Result<()> {
     }
 
     // agent.toml
-    let agent_toml = format!(r#"[agent]
+    let agent_toml = format!(
+        r#"[agent]
 name = "{agent_name}"
 display_name = "{display_name}"
-role = "specialist"
+role = "{role_str}"
 status = "active"
-trigger = "@{display_name}"
-reports_to = ""
-icon = "🤖"
+trigger = "{trigger}"
+reports_to = "{reports_to}"
+icon = "{icon}"
 
 [model]
 preferred = "claude-sonnet-4-6"
@@ -2018,24 +2089,75 @@ meso_reflection = true
 macro_reflection = true
 skill_auto_activate = false
 skill_security_scan = true
-"#);
-    tokio::fs::write(agent_dir.join("agent.toml"), &agent_toml).await.map_err(|e| {
-        DuDuClawError::Agent(format!("Failed to write agent.toml: {e}"))
-    })?;
+"#
+    );
+    tokio::fs::write(agent_dir.join("agent.toml"), &agent_toml)
+        .await
+        .map_err(|e| DuDuClawError::Agent(format!("Failed to write agent.toml: {e}")))?;
 
     // SOUL.md
-    let soul = format!("# {display_name}\n\nI am {display_name}, a specialist AI agent powered by DuDuClaw.\n\n## Core Values\n\n- Helpful and precise\n- Clear in communication\n- Focused on the task at hand\n");
-    tokio::fs::write(agent_dir.join("SOUL.md"), &soul).await.map_err(|e| {
-        DuDuClawError::Agent(format!("Failed to write SOUL.md: {e}"))
+    let soul = format!(
+        "# {display_name}\n\nI am {display_name}, a {role_str} AI agent powered by DuDuClaw.\n\n\
+         ## Core Values\n\n- Helpful and precise\n- Clear in communication\n\
+         - Focused on the task at hand\n\n\
+         ## Tool Use\n\n\
+         - To create sub-agents, call the `create_agent` MCP tool. Never fabricate \
+         agent creation in plain text.\n\
+         - To delegate work, use `send_to_agent` or `spawn_agent`.\n\
+         - When uncertain about state, call `list_agents` first.\n"
+    );
+    tokio::fs::write(agent_dir.join("SOUL.md"), &soul)
+        .await
+        .map_err(|e| DuDuClawError::Agent(format!("Failed to write SOUL.md: {e}")))?;
+
+    // CLAUDE.md — helps Claude Code sessions pick up context
+    let claude_md = format!(
+        "# {display_name}\n\nAgent managed by DuDuClaw v{}.\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    tokio::fs::write(agent_dir.join("CLAUDE.md"), &claude_md)
+        .await
+        .ok();
+
+    // .mcp.json — wires the duduclaw MCP server into the agent's Claude
+    // Code session so that create_agent / spawn_agent / list_agents /
+    // send_to_agent / etc. tools are actually available to the model.
+    //
+    // Without this file, SOUL.md's `create_agent` rule is unenforceable
+    // because the tool literally does not exist in the agent's toolbelt —
+    // the model either falls back to raw Bash writes (blocked by
+    // agent-file-guard since v1.3.15) or fabricates results in plain text.
+    let mcp_bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
+        .unwrap_or_else(|| "duduclaw".to_string());
+    let mcp_json = serde_json::json!({
+        "mcpServers": {
+            "duduclaw": {
+                "command": mcp_bin,
+                "args": ["mcp-server"],
+                "env": {}
+            }
+        }
+    });
+    let mcp_content = serde_json::to_string_pretty(&mcp_json).map_err(|e| {
+        DuDuClawError::Agent(format!("Failed to serialise .mcp.json: {e}"))
     })?;
+    tokio::fs::write(agent_dir.join(".mcp.json"), mcp_content)
+        .await
+        .map_err(|e| DuDuClawError::Agent(format!("Failed to write .mcp.json: {e}")))?;
 
-    // .claude/ and CLAUDE.md for Claude Code compatibility
-    tokio::fs::create_dir_all(agent_dir.join(".claude")).await.ok();
-    let claude_md = format!("# {display_name}\n\nAgent managed by DuDuClaw v{}.\n", env!("CARGO_PKG_VERSION"));
-    tokio::fs::write(agent_dir.join("CLAUDE.md"), &claude_md).await.ok();
-
-    println!("  {} Created agent '{}' at {}", style("✓").green().bold(), agent_name, agent_dir.display());
-    println!("  {} {}", style("→").cyan(), style("Run `duduclaw agent run {agent_name}` to start a session").dim());
+    println!(
+        "  {} Created agent '{}' ({role_str}) at {}",
+        style("✓").green().bold(),
+        agent_name,
+        agent_dir.display()
+    );
+    println!(
+        "  {} {}",
+        style("→").cyan(),
+        style(format!("Run `duduclaw agent run {agent_name}` to start a session")).dim()
+    );
     Ok(())
 }
 

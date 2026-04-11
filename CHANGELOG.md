@@ -3,6 +3,74 @@
 All notable changes to DuDuClaw are documented here. For the authoritative
 version history and per-commit detail, see `git log`.
 
+## [v1.3.16] — 2026-04-12
+
+### Fixed
+
+- **`duduclaw agent create` now writes `.mcp.json`.** New agents created
+  via the CLI (or the `wizard` subcommand) previously got every scaffold
+  file *except* `.mcp.json`, which meant the duduclaw MCP server never
+  attached to their Claude Code sessions and tools like `create_agent`,
+  `spawn_agent`, `list_agents`, `send_to_agent` were silently unavailable.
+  SOUL.md's "always call `create_agent`" rule became unenforceable
+  because the tool literally didn't exist in the model's toolbelt — the
+  model either fell back to raw Bash writes (blocked by agent-file-guard
+  since v1.3.15) or fabricated agent creation in plain text. Both the
+  CLI (`cmd_agent_create`) and the industry wizard now write a
+  `.mcp.json` pointing at the currently-running duduclaw binary.
+
+- **Hint message placeholder not expanded.** `duduclaw agent create`
+  used to print `Run \`duduclaw agent run {agent_name}\` to start a
+  session` literally with `{agent_name}` unexpanded (because the string
+  was passed to `style()` instead of `format!()`). The hint now shows
+  the real agent name.
+
+### Added
+
+- **`duduclaw agent create` flags.** The subcommand previously took
+  only a positional `name`. It now accepts `--display-name`, `--role`,
+  `--reports-to`, `--icon`, and `--trigger` so teams can be scripted
+  without post-hoc `sed` on `agent.toml`:
+
+  ```sh
+  duduclaw agent create xianwen-tl \
+    --display-name "Xianwen TL" \
+    --role team-leader \
+    --icon 🎯
+  ```
+
+- **`AgentRole` enum gained `TeamLeader` and `ProductManager`** so
+  planner/coordinator agents can declare a more specific role. The enum
+  serialisation switched from `rename_all = "lowercase"` to
+  `rename_all = "kebab-case"`; single-word variants (`main`, `worker`,
+  `qa`, `planner`, …) look identical to the old encoding so existing
+  `agent.toml` files keep parsing unchanged. Multi-word variants use
+  kebab-case (`team-leader`, `product-manager`).
+
+- **Lenient role parsing.** `AgentRole::from_str` normalises spacing /
+  case / underscore vs hyphen and accepts common aliases: `engineer`
+  (→ Developer), `tl`/`lead`/`teamlead` (→ TeamLeader), `pm`
+  (→ ProductManager), `quality`/`quality-assurance` (→ Qa). The same
+  aliases are accepted by serde via `#[serde(alias = …)]`, so
+  round-tripping natural-language role input through `agent.toml`
+  resolves to the canonical form on the next read.
+
+- **`AgentRole::as_str()` + `Display` impl + `valid_values_help()`**
+  helpers for error messages. The MCP `agent_update` handler now uses
+  `AgentRole::from_str` with a single shared help string instead of its
+  own private match table.
+
+### Tests
+
+- 6 new unit tests in `duduclaw_core::types::tests` covering round-trip
+  (`agent_role_roundtrip_via_serde_json`), wire format
+  (`agent_role_kebab_case_wire_format`), serde aliases
+  (`agent_role_serde_aliases_accepted`), lenient `FromStr` parsing
+  (`agent_role_from_str_lenient_normalisation`), rejection of garbage
+  (`agent_role_from_str_rejects_garbage`), and `Display` round-trip.
+
+---
+
 ## [v1.3.15] — 2026-04-11
 
 ### Fixed
