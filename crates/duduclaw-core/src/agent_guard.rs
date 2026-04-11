@@ -119,6 +119,66 @@ pub fn check_agent_file_write(file_path: &Path, home: &Path) -> GuardDecision {
     }
 }
 
+/// Check whether a `Bash` tool command is permitted.
+///
+/// This is the Bash-tool analogue of [`check_agent_file_write`]. Agents can
+/// otherwise bypass the Write/Edit guard by running shell commands like:
+///
+/// ```text
+/// mkdir -p /some/project/.claude/agents/foo
+/// cat > /some/project/.claude/agents/foo/agent.toml
+/// cp template.toml /some/project/.claude/agents/foo/agent.toml
+/// ```
+///
+/// # Policy
+///
+/// We reject any command whose text contains the substring `.claude/agents/`
+/// anywhere. Rationale:
+///
+/// - The **canonical** agent root is `<home>/agents/<name>/` — it never
+///   contains a `.claude/agents/` path segment, so the presence of this
+///   substring is always suspicious.
+/// - Each canonical agent has a `<home>/agents/<name>/.claude/` subdirectory
+///   (for hooks/settings), but it contains `hooks/`/`settings.json`, never
+///   a nested `agents/` — so `.claude/agents/` never appears in a legitimate
+///   write path.
+/// - Projects that the agent *works on* (e.g. a cloned git repo) should
+///   never have an in-tree `.claude/agents/` — Claude Code's own config
+///   lives at `~/.claude/`, not inside arbitrary project trees.
+///
+/// This is a conservative heuristic: any Bash command that even *mentions*
+/// this path segment is blocked, including read-only listings. False
+/// positives are acceptable — the agent can use the `Read` tool directly
+/// or the `list_agents` MCP tool instead.
+pub fn check_bash_command(command: &str, _home: &Path) -> GuardDecision {
+    const SENTINEL: &str = ".claude/agents/";
+
+    // Fast path — no sentinel anywhere means nothing to inspect.
+    let Some(idx) = command.find(SENTINEL) else {
+        return GuardDecision::NotAgentFile;
+    };
+
+    // Try to recover a readable "attempted path" for the error message.
+    // Walk backwards from the match start to the nearest whitespace or
+    // shell quote so the user sees something like
+    // `/project/.claude/agents/foo` instead of a random slice.
+    let prefix = &command[..idx];
+    let path_start = prefix
+        .rfind(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '`' | ';' | '&' | '|' | '(' | ')' | '='))
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let suffix = &command[idx..];
+    let path_end_rel = suffix
+        .find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '`' | ';' | '&' | '|' | '(' | ')'))
+        .unwrap_or(suffix.len());
+    let attempted = &command[path_start..idx + path_end_rel];
+
+    GuardDecision::BlockedOutsideHome {
+        file_name: SENTINEL.trim_end_matches('/').to_string(),
+        attempted_path: PathBuf::from(attempted),
+    }
+}
+
 /// Lexical path normalization — resolves `.`, `..`, and duplicate separators
 /// without touching the filesystem. Does **not** follow symlinks or require
 /// the path to exist.
@@ -292,5 +352,94 @@ mod tests {
             lexical_normalize(Path::new("/../../x")),
             PathBuf::from("/x")
         );
+    }
+
+    // ── Bash command guard ─────────────────────────────────────────
+
+    #[test]
+    fn bash_mkdir_in_foreign_project_is_blocked() {
+        let cmd = "mkdir -p /Users/lizhixu/Project/xianwen-online/.claude/agents/pm";
+        let decision = check_bash_command(cmd, &home());
+        match decision {
+            GuardDecision::BlockedOutsideHome { attempted_path, .. } => {
+                assert!(
+                    attempted_path
+                        .to_string_lossy()
+                        .contains(".claude/agents/")
+                );
+            }
+            other => panic!("expected block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bash_write_to_agent_toml_via_heredoc_is_blocked() {
+        let cmd = "cat > /tmp/proj/.claude/agents/foo/agent.toml <<EOF\nname='x'\nEOF";
+        assert!(matches!(
+            check_bash_command(cmd, &home()),
+            GuardDecision::BlockedOutsideHome { .. }
+        ));
+    }
+
+    #[test]
+    fn bash_with_quoted_path_is_blocked() {
+        let cmd = r#"cp template.toml "/a b/.claude/agents/x/agent.toml""#;
+        assert!(matches!(
+            check_bash_command(cmd, &home()),
+            GuardDecision::BlockedOutsideHome { .. }
+        ));
+    }
+
+    #[test]
+    fn bash_ls_mentioning_sentinel_is_also_blocked() {
+        // Conservative: even read-only listings that mention `.claude/agents/`
+        // are blocked. Agents should use `list_agents` MCP tool instead.
+        let cmd = "ls /project/.claude/agents/";
+        assert!(matches!(
+            check_bash_command(cmd, &home()),
+            GuardDecision::BlockedOutsideHome { .. }
+        ));
+    }
+
+    #[test]
+    fn bash_git_status_is_allowed() {
+        let cmd = "git status --short";
+        assert_eq!(
+            check_bash_command(cmd, &home()),
+            GuardDecision::NotAgentFile
+        );
+    }
+
+    #[test]
+    fn bash_ls_canonical_agent_dotclaude_is_allowed() {
+        // `<home>/agents/<name>/.claude/` is legitimate (hooks/settings)
+        // and does NOT contain the `.claude/agents/` sentinel, so it passes.
+        let cmd = "ls /Users/alice/.duduclaw/agents/agnes/.claude/settings.json";
+        assert_eq!(
+            check_bash_command(cmd, &home()),
+            GuardDecision::NotAgentFile
+        );
+    }
+
+    #[test]
+    fn bash_touching_claude_hooks_subdir_is_allowed() {
+        // Writing into `.claude/hooks/` is fine — only `.claude/agents/`
+        // triggers the guard.
+        let cmd = "mkdir -p /project/.claude/hooks";
+        assert_eq!(
+            check_bash_command(cmd, &home()),
+            GuardDecision::NotAgentFile
+        );
+    }
+
+    #[test]
+    fn bash_nested_agents_under_home_is_still_blocked() {
+        // Even under `<home>/agents/<name>/.claude/agents/` — that would be
+        // a nested parallel hierarchy and is wrong.
+        let cmd = "mkdir -p /Users/alice/.duduclaw/agents/agnes/.claude/agents/bad";
+        assert!(matches!(
+            check_bash_command(cmd, &home()),
+            GuardDecision::BlockedOutsideHome { .. }
+        ));
     }
 }

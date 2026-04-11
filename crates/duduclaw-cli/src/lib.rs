@@ -516,32 +516,40 @@ async fn cmd_hook_agent_file_guard() -> duduclaw_core::error::Result<()> {
         return Ok(());
     };
 
-    // Claude Code PreToolUse envelope shape:
-    //   { "tool_name": "Write" | "Edit" | "MultiEdit", "tool_input": { "file_path": "..." } }
+    // Claude Code PreToolUse envelope shapes:
+    //   Write / Edit / MultiEdit → tool_input.file_path
+    //   Bash                     → tool_input.command
     let tool_name = envelope
         .get("tool_name")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // Only guard file-writing tools — other tool calls (Read, Bash, Grep, etc.)
-    // are none of our business.
-    if !matches!(tool_name, "Write" | "Edit" | "MultiEdit") {
-        return Ok(());
-    }
-
-    let Some(file_path_str) = envelope
-        .pointer("/tool_input/file_path")
-        .and_then(|v| v.as_str())
-    else {
-        // MultiEdit uses /tool_input/file_path too; if it's missing,
-        // there's nothing we can check — fail open.
-        return Ok(());
-    };
-
-    let file_path = PathBuf::from(file_path_str);
     let home = duduclaw_home();
 
-    let decision = duduclaw_core::check_agent_file_write(&file_path, &home);
+    let decision = match tool_name {
+        "Write" | "Edit" | "MultiEdit" => {
+            let Some(file_path_str) = envelope
+                .pointer("/tool_input/file_path")
+                .and_then(|v| v.as_str())
+            else {
+                // No file_path — nothing to check, fail open.
+                return Ok(());
+            };
+            duduclaw_core::check_agent_file_write(&PathBuf::from(file_path_str), &home)
+        }
+        "Bash" => {
+            let Some(command) = envelope
+                .pointer("/tool_input/command")
+                .and_then(|v| v.as_str())
+            else {
+                return Ok(());
+            };
+            duduclaw_core::check_bash_command(command, &home)
+        }
+        // Other tool calls (Read, Grep, WebSearch, etc.) are none of our business.
+        _ => return Ok(()),
+    };
+
     if let Some(msg) = decision.block_message() {
         eprintln!("{msg}");
         // Exit 2 — Claude Code interprets this as a block and surfaces

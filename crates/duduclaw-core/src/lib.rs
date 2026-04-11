@@ -3,7 +3,7 @@ pub mod error;
 pub mod traits;
 pub mod types;
 
-pub use agent_guard::{check_agent_file_write, GuardDecision, AGENT_STRUCTURE_FILES};
+pub use agent_guard::{check_agent_file_write, check_bash_command, GuardDecision, AGENT_STRUCTURE_FILES};
 pub use error::{DuDuClawError, Result};
 pub use traits::{Channel, ContainerRuntime, MemoryEngine};
 pub use types::*;
