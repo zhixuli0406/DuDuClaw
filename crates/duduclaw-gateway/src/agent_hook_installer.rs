@@ -131,9 +131,12 @@ fn merge_agent_file_guard_hook(root: &mut Value, duduclaw_bin: &Path) -> bool {
     }
 
     let desired_command = build_hook_command(duduclaw_bin);
+    // Bash is included so the guard can catch agents that bypass Write/Edit
+    // by running `mkdir -p /project/.claude/agents/foo` or `cat > .../agent.toml`
+    // via the shell. The CLI handler dispatches on tool name internally.
     let desired_entry = json!({
         HOOK_TAG: HOOK_ID,
-        "matcher": "Write|Edit|MultiEdit",
+        "matcher": "Write|Edit|MultiEdit|Bash",
         "hooks": [{
             "type": "command",
             "command": desired_command,
@@ -214,7 +217,7 @@ mod tests {
             .expect("PreToolUse must be array");
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0][HOOK_TAG], HOOK_ID);
-        assert_eq!(arr[0]["matcher"], "Write|Edit|MultiEdit");
+        assert_eq!(arr[0]["matcher"], "Write|Edit|MultiEdit|Bash");
         assert!(
             arr[0]["hooks"][0]["command"]
                 .as_str()

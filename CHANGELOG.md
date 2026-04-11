@@ -3,6 +3,47 @@
 All notable changes to DuDuClaw are documented here. For the authoritative
 version history and per-commit detail, see `git log`.
 
+## [v1.3.15] — 2026-04-11
+
+### Fixed
+
+- **agent-file-guard now blocks Bash-based agent-structure writes.** The
+  PreToolUse hook matcher was previously `Write|Edit|MultiEdit` only, so a
+  sub-agent could silently bypass the guard by invoking
+  `Bash mkdir -p /some/project/.claude/agents/foo` or
+  `Bash cat > /some/project/.claude/agents/foo/agent.toml`. The guard now
+  also matches `Bash`, and `cmd_hook_agent_file_guard` dispatches on
+  `tool_name` so that Bash commands are inspected against the new
+  [`duduclaw_core::check_bash_command`] helper.
+
+  **Policy:** any Bash command whose text contains the substring
+  `.claude/agents/` is blocked. Rationale — the canonical agent root is
+  `~/.duduclaw/agents/<name>/` and never contains that path segment, and
+  project trees that an agent *works on* should never have an in-tree
+  `.claude/agents/` directory (Claude Code's own config lives at
+  `~/.claude/`, not nested in project repos). The rule is intentionally
+  conservative: even read-only listings that mention `.claude/agents/`
+  are blocked, since the correct replacement is the `list_agents` MCP
+  tool or a direct `Read` on a known canonical path.
+
+  Existing agents get the updated matcher automatically on next invocation
+  (the hook installer runs on every `call_claude_for_agent_with_type` and
+  updates the tagged hook entry in place — no manual action required).
+
+### Tests
+
+- 8 new unit tests in `duduclaw_core::agent_guard::tests`
+  (`bash_mkdir_in_foreign_project_is_blocked`,
+  `bash_write_to_agent_toml_via_heredoc_is_blocked`,
+  `bash_with_quoted_path_is_blocked`,
+  `bash_ls_mentioning_sentinel_is_also_blocked`,
+  `bash_git_status_is_allowed`,
+  `bash_ls_canonical_agent_dotclaude_is_allowed`,
+  `bash_touching_claude_hooks_subdir_is_allowed`,
+  `bash_nested_agents_under_home_is_still_blocked`).
+
+---
+
 ## [v1.3.14] — 2026-04-11
 
 ### Added
