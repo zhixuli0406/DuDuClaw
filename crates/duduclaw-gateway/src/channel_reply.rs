@@ -1260,6 +1260,26 @@ mod fallback_tests {
         assert_eq!(classify_cli_failure("Empty response from claude CLI"), FailureReason::EmptyResponse);
     }
 
+    /// Regression lock: v1.3.13 added diagnostic suffixes to Empty / exit
+    /// errors. The classifier's substring match must still identify the
+    /// reason so user-facing messages stay specific.
+    #[test]
+    fn classify_empty_response_with_diagnostic_suffix() {
+        let err = "Empty response from claude CLI (exit=0 lines=42 events=30 \
+                   assistant=2 text_blocks=0 thinking=1 tool_use=0 result_events=1 \
+                   result_subtype=Some(\"success\") stop_reason=Some(\"tool_use\") \
+                   last_line=\"{\\\"type\\\":\\\"result\\\"...}\" stderr_tail=\"\")";
+        assert_eq!(classify_cli_failure(err), FailureReason::EmptyResponse);
+    }
+
+    #[test]
+    fn classify_exit_code_with_diagnostic_suffix() {
+        let err = "claude CLI exit 1 (exit=1 lines=3 events=2 \
+                   assistant=0 text_blocks=0 thinking=0 tool_use=0 result_events=0 \
+                   result_subtype=None stop_reason=None last_line=\"\" stderr_tail=\"\")";
+        assert_eq!(classify_cli_failure(err), FailureReason::SpawnError);
+    }
+
     #[test]
     fn classify_spawn_error() {
         assert_eq!(classify_cli_failure("claude CLI spawn error: No such file"), FailureReason::SpawnError);
@@ -1940,9 +1960,62 @@ async fn spawn_claude_cli_with_env(
     let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 
+    // Drain stderr concurrently and keep the last ~2 KiB for error diagnostics.
+    // Without draining, claude CLI may block if stderr pipe fills up (>64 KiB).
+    let stderr_pipe = child.stderr.take();
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    if let Some(pipe) = stderr_pipe {
+        let buf = stderr_buf.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut reader = tokio::io::BufReader::new(pipe);
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                if let Ok(mut guard) = buf.lock() {
+                    guard.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                    // Keep only the last 2 KiB — we only need tail for diagnostics.
+                    if guard.len() > 2048 {
+                        let cut = guard.len() - 2048;
+                        *guard = guard[cut..].to_string();
+                    }
+                }
+            }
+        });
+    }
+
+    // Optional raw-stream logging for deep debugging. Enable with
+    // `DUDUCLAW_STREAM_DEBUG=1` in the gateway process environment — every
+    // line from `claude`'s stdout is appended to `<home>/claude_stream.log`.
+    // Intentionally off by default (can be large and contains prompts).
+    let stream_debug = std::env::var("DUDUCLAW_STREAM_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let stream_debug_path = if stream_debug {
+        Some(home_dir.join("claude_stream.log"))
+    } else {
+        None
+    };
+
     let mut result_text = String::new();
     // Track last tool type to suppress duplicate progress messages
     let mut last_tool_reported: Option<String> = None;
+
+    // Diagnostic counters — included in the "Empty response" error message
+    // so the next occurrence is immediately actionable (no more needing to
+    // reproduce manually in a shell).
+    let mut lines_seen: u32 = 0;
+    let mut events_parsed: u32 = 0;
+    let mut assistant_events: u32 = 0;
+    let mut text_blocks: u32 = 0;
+    let mut thinking_blocks: u32 = 0;
+    let mut tool_use_blocks: u32 = 0;
+    let mut result_events: u32 = 0;
+    let mut last_raw_line: String = String::new();
+    let mut last_result_subtype: Option<String> = None;
+    let mut last_stop_reason: Option<String> = None;
 
     // Keepalive timer — fires periodically when no stream events arrive
     let mut keepalive = tokio::time::interval(
@@ -1977,7 +2050,25 @@ async fn spawn_claude_cli_with_env(
                             continue;
                         }
 
+                        lines_seen += 1;
+                        // Keep only a truncated tail for diagnostics (full line
+                        // can contain the user's prompt — we don't want it on disk).
+                        last_raw_line = line.chars().take(400).collect();
+
+                        // Optional raw-stream debug log.
+                        if let Some(ref p) = stream_debug_path {
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(p)
+                            {
+                                use std::io::Write;
+                                let _ = writeln!(f, "{line}");
+                            }
+                        }
+
                         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+                            events_parsed += 1;
                             match event.get("type").and_then(|t| t.as_str()) {
                                 // Final result event — contains the complete response.
                                 //
@@ -1988,6 +2079,11 @@ async fn spawn_claude_cli_with_env(
                                 // Without this check we would swallow the error text
                                 // into `result_text` and return Ok to the caller.
                                 Some("result") => {
+                                    result_events += 1;
+                                    last_result_subtype = event
+                                        .get("subtype")
+                                        .and_then(|s| s.as_str())
+                                        .map(String::from);
                                     let is_error = event
                                         .get("is_error")
                                         .and_then(|v| v.as_bool())
@@ -2008,6 +2104,7 @@ async fn spawn_claude_cli_with_env(
                                 }
                                 // Assistant message with content blocks
                                 Some("assistant") => {
+                                    assistant_events += 1;
                                     // Also check the envelope-level `error` field that
                                     // newer claude-code versions emit alongside the
                                     // synthetic assistant message on auth failure.
@@ -2017,6 +2114,14 @@ async fn spawn_claude_cli_with_env(
                                             "claude CLI assistant error: {err}"
                                         ));
                                     }
+                                    // Capture stop_reason for diagnostics (max_tokens,
+                                    // tool_use, end_turn, stop_sequence, ...).
+                                    if let Some(sr) = event
+                                        .pointer("/message/stop_reason")
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        last_stop_reason = Some(sr.to_string());
+                                    }
                                     if let Some(content) = event
                                         .pointer("/message/content")
                                         .and_then(|c| c.as_array())
@@ -2025,11 +2130,16 @@ async fn spawn_claude_cli_with_env(
                                             let block_type = block.get("type").and_then(|t| t.as_str());
                                             match block_type {
                                                 Some("text") => {
+                                                    text_blocks += 1;
                                                     if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                                                         result_text = text.to_string();
                                                     }
                                                 }
+                                                Some("thinking") => {
+                                                    thinking_blocks += 1;
+                                                }
                                                 Some("tool_use") => {
+                                                    tool_use_blocks += 1;
                                                     // Extract tool name and detail for progress
                                                     if let Some(cb) = on_progress {
                                                         let tool = block.get("name")
@@ -2051,7 +2161,7 @@ async fn spawn_claude_cli_with_env(
                                                         }
                                                     }
                                                 }
-                                                _ => {} // thinking, tool_result, etc.
+                                                _ => {} // tool_result, etc.
                                             }
                                         }
                                     }
@@ -2093,6 +2203,32 @@ async fn spawn_claude_cli_with_env(
     // Wait for process to exit
     let status = child.wait().await.map_err(|e| format!("wait error: {e}"))?;
 
+    // Snapshot stderr tail for error diagnostics.
+    let stderr_tail: String = stderr_buf
+        .lock()
+        .ok()
+        .map(|g| g.chars().take(400).collect::<String>())
+        .unwrap_or_default();
+
+    // Compose the diagnostic summary that all error sites below embed.
+    // With this in the error string, `channel_failures.jsonl` becomes
+    // self-describing: we can tell whether the CLI produced any output
+    // at all, whether it only produced thinking, whether stop_reason
+    // was "max_tokens" / "tool_use", etc.
+    let diag = format!(
+        "exit={} lines={lines_seen} events={events_parsed} \
+         assistant={assistant_events} text_blocks={text_blocks} \
+         thinking={thinking_blocks} tool_use={tool_use_blocks} \
+         result_events={result_events} \
+         result_subtype={:?} stop_reason={:?} \
+         last_line={:?} stderr_tail={:?}",
+        status.code().unwrap_or(-1),
+        last_result_subtype,
+        last_stop_reason,
+        last_raw_line,
+        stderr_tail,
+    );
+
     // Any non-zero exit is now a hard failure. Previously we only errored
     // when `result_text.is_empty()`, which hid synthetic error messages
     // (e.g. "Not logged in · Please run /login") that Claude CLI emits as
@@ -2101,15 +2237,14 @@ async fn spawn_claude_cli_with_env(
     // reach here, but the exit-code gate is a defensive backstop.
     if !status.success() {
         return Err(format!(
-            "claude CLI exit {} (stream tail: {:?})",
-            status.code().unwrap_or(-1),
-            result_text.chars().take(120).collect::<String>()
+            "claude CLI exit {} ({diag})",
+            status.code().unwrap_or(-1)
         ));
     }
 
     let result_text = result_text.trim().to_string();
     if result_text.is_empty() {
-        return Err("Empty response from claude CLI".to_string());
+        return Err(format!("Empty response from claude CLI ({diag})"));
     }
 
     Ok(result_text)
