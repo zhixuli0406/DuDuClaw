@@ -246,12 +246,22 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     handler.set_heartbeat(heartbeat).await;
     info!("Heartbeat scheduler started (per-agent evolution + monitoring)");
 
-    // Start cron scheduler (reads cron_tasks.jsonl, fires on schedule)
-    bg_handles.push(crate::cron_scheduler::start_cron_scheduler(
+    // Start cron scheduler (reads from SQLite cron_tasks.db, fires on schedule)
+    let cron_store = Arc::new(
+        crate::cron_store::CronStore::open(&home_dir)
+            .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(
+                format!("Failed to open cron store: {e}")
+            ))?,
+    );
+    handler.set_cron_store(cron_store.clone()).await;
+    let (cron_handle, cron_scheduler) = crate::cron_scheduler::start_cron_scheduler(
         home_dir.clone(),
+        cron_store.clone(),
         handler.registry().clone(),
-    ));
-    info!("Cron scheduler started");
+    );
+    handler.set_cron_scheduler(cron_scheduler).await;
+    bg_handles.push(cron_handle);
+    info!("Cron scheduler started (SQLite-backed with hot reload)");
 
     // Start agent dispatcher (consumes bus_queue.jsonl, spawns sub-agents)
     bg_handles.push(crate::dispatcher::start_agent_dispatcher(

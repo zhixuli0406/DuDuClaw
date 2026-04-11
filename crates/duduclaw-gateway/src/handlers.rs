@@ -12,6 +12,8 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use crate::cron_scheduler::CronScheduler;
+use crate::cron_store::{CronStore, CronTaskRow};
 use crate::extension::GatewayExtension;
 use crate::gvu::version_store::VersionStore;
 use crate::protocol::WsFrame;
@@ -48,6 +50,11 @@ pub struct MethodHandler {
     jwt_config: RwLock<Option<Arc<JwtConfig>>>,
     /// Extension point for Pro/Enterprise features (NullExtension in CE).
     extension: Arc<dyn GatewayExtension>,
+    /// SQLite-backed cron task store. Injected after gateway starts.
+    cron_store: RwLock<Option<Arc<CronStore>>>,
+    /// Handle to the running cron scheduler — used to trigger hot reload
+    /// after mutating `cron_store`. Injected after gateway starts.
+    cron_scheduler: RwLock<Option<Arc<CronScheduler>>>,
 }
 
 /// Cached update info from the last `system.check_update` call. [M2][R2:NM1]
@@ -129,6 +136,27 @@ impl MethodHandler {
             user_db: RwLock::new(None),
             jwt_config: RwLock::new(None),
             extension,
+            cron_store: RwLock::new(None),
+            cron_scheduler: RwLock::new(None),
+        }
+    }
+
+    /// Inject the SQLite-backed cron task store (called once after gateway start).
+    pub async fn set_cron_store(&self, store: Arc<CronStore>) {
+        *self.cron_store.write().await = Some(store);
+    }
+
+    /// Inject the running cron scheduler handle (called once after gateway start).
+    pub async fn set_cron_scheduler(&self, scheduler: Arc<CronScheduler>) {
+        *self.cron_scheduler.write().await = Some(scheduler);
+    }
+
+    /// Notify the cron scheduler to reload immediately. Call this after any
+    /// mutation (add / update / delete / enable-toggle). No-op if the
+    /// scheduler has not been injected yet.
+    async fn notify_cron_reload(&self) {
+        if let Some(scheduler) = self.cron_scheduler.read().await.as_ref() {
+            scheduler.reload_now();
         }
     }
 
@@ -346,10 +374,12 @@ impl MethodHandler {
             "skills.install" => { require_admin!(); self.handle_skills_install(params).await }
 
             // ── Cron (admin only) ────────────────────────────
-            "cron.list" => { require_admin!(); self.handle_cron_list() }
-            "cron.add" => { require_admin!(); self.handle_cron_add(params) }
-            "cron.pause" => { require_admin!(); self.handle_cron_pause(params) }
-            "cron.remove" => { require_admin!(); self.handle_cron_remove(params) }
+            "cron.list" => { require_admin!(); self.handle_cron_list().await }
+            "cron.add" => { require_admin!(); self.handle_cron_add(params).await }
+            "cron.update" => { require_admin!(); self.handle_cron_update(params).await }
+            "cron.pause" => { require_admin!(); self.handle_cron_set_enabled(params, false).await }
+            "cron.resume" => { require_admin!(); self.handle_cron_set_enabled(params, true).await }
+            "cron.remove" => { require_admin!(); self.handle_cron_remove(params).await }
 
             // ── System (admin only for config changes) ───────
             "system.status" => self.handle_system_status().await,
@@ -2583,109 +2613,235 @@ impl MethodHandler {
 
     // ── Cron ────────────────────────────────────────────────
 
-    fn cron_tasks_path(&self) -> std::path::PathBuf {
-        self.home_dir.join("cron_tasks.jsonl")
-    }
-
-    fn read_cron_tasks(&self) -> Vec<Value> {
-        let path = self.cron_tasks_path();
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        content
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-            .collect()
-    }
-
-    fn write_cron_tasks(&self, tasks: &[Value]) {
-        let path = self.cron_tasks_path();
-        let content = tasks
-            .iter()
-            .filter_map(|t| serde_json::to_string(t).ok())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let _ = std::fs::write(&path, content);
-    }
-
-    fn handle_cron_list(&self) -> WsFrame {
-        let tasks = self.read_cron_tasks();
-        WsFrame::ok_response("", json!({ "tasks": tasks }))
-    }
-
-    fn handle_cron_add(&self, params: Value) -> WsFrame {
-        let name = match params.get("name").and_then(|v| v.as_str()) {
-            Some(n) if !n.is_empty() => n,
-            _ => return WsFrame::error_response("", "Missing 'name' parameter"),
-        };
-        let schedule = params.get("schedule").and_then(|v| v.as_str()).unwrap_or("*/60 * * * *");
-
-        // Validate cron expression format (basic: 5 fields separated by spaces)
-        let cron_parts: Vec<&str> = schedule.split_whitespace().collect();
-        if cron_parts.len() != 5 {
-            return WsFrame::error_response("", "Invalid cron expression: expected 5 space-separated fields (minute hour day month weekday)");
+    /// Return a reference to the injected cron store, or an error frame if
+    /// the gateway has not finished initializing the store yet.
+    async fn cron_store(&self) -> Result<Arc<CronStore>, WsFrame> {
+        match self.cron_store.read().await.as_ref() {
+            Some(store) => Ok(store.clone()),
+            None => Err(WsFrame::error_response(
+                "",
+                "Cron store not initialized yet — retry in a moment",
+            )),
         }
-
-        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-        let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("heartbeat");
-
-        let mut tasks = self.read_cron_tasks();
-        if tasks.iter().any(|t| t.get("name").and_then(|v| v.as_str()) == Some(name)) {
-            return WsFrame::error_response("", &format!("Cron task '{name}' already exists"));
-        }
-
-        let task = json!({
-            "name": name,
-            "schedule": schedule,
-            "agent_id": agent_id,
-            "action": action,
-            "enabled": true,
-            "created_at": chrono::Utc::now().to_rfc3339(),
-            "last_run": null,
-        });
-        tasks.push(task.clone());
-        self.write_cron_tasks(&tasks);
-
-        info!(name, schedule, agent_id, "Cron task added");
-        WsFrame::ok_response("", json!({ "success": true, "task": task }))
     }
 
-    fn handle_cron_pause(&self, params: Value) -> WsFrame {
-        let name = match params.get("name").and_then(|v| v.as_str()) {
-            Some(n) if !n.is_empty() => n,
-            _ => return WsFrame::error_response("", "Missing 'name' parameter"),
-        };
+    /// Serialize a `CronTaskRow` into the JSON shape the dashboard expects.
+    fn cron_row_to_json(row: &CronTaskRow) -> Value {
+        json!({
+            "id": row.id,
+            "name": row.name,
+            "agent_id": row.agent_id,
+            "cron": row.cron,
+            // Alias kept for legacy dashboard clients that read `schedule`.
+            "schedule": row.cron,
+            "task": row.task,
+            "enabled": row.enabled,
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+            "last_run_at": row.last_run_at,
+            "last_status": row.last_status,
+            "last_error": row.last_error,
+            "run_count": row.run_count,
+            "failure_count": row.failure_count,
+        })
+    }
 
-        let mut tasks = self.read_cron_tasks();
-        let found = tasks.iter_mut().find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name));
-        match found {
-            Some(task) => {
-                task["enabled"] = json!(false);
-                self.write_cron_tasks(&tasks);
-                info!(name, "Cron task paused");
-                WsFrame::ok_response("", json!({ "success": true, "name": name, "enabled": false }))
+    async fn handle_cron_list(&self) -> WsFrame {
+        let store = match self.cron_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        match store.list_all().await {
+            Ok(rows) => {
+                let tasks: Vec<Value> = rows.iter().map(Self::cron_row_to_json).collect();
+                WsFrame::ok_response("", json!({ "tasks": tasks }))
             }
-            None => WsFrame::error_response("", &format!("Cron task '{name}' not found")),
+            Err(e) => WsFrame::error_response("", &format!("list cron tasks: {e}")),
         }
     }
 
-    fn handle_cron_remove(&self, params: Value) -> WsFrame {
+    async fn handle_cron_add(&self, params: Value) -> WsFrame {
         let name = match params.get("name").and_then(|v| v.as_str()) {
-            Some(n) if !n.is_empty() => n,
+            Some(n) if !n.is_empty() => n.to_string(),
             _ => return WsFrame::error_response("", "Missing 'name' parameter"),
         };
-
-        let tasks = self.read_cron_tasks();
-        let before = tasks.len();
-        let filtered: Vec<Value> = tasks.into_iter()
-            .filter(|t| t.get("name").and_then(|v| v.as_str()) != Some(name))
-            .collect();
-
-        if filtered.len() == before {
-            return WsFrame::error_response("", &format!("Cron task '{name}' not found"));
+        // Accept both `cron` (new) and `schedule` (legacy) from the dashboard.
+        let cron_expr = params
+            .get("cron")
+            .or_else(|| params.get("schedule"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if cron_expr.is_empty() {
+            return WsFrame::error_response("", "Missing 'cron' parameter");
         }
-        self.write_cron_tasks(&filtered);
-        info!(name, "Cron task removed");
-        WsFrame::ok_response("", json!({ "success": true, "name": name }))
+        // Validate (accept 5- or 6-field). `normalise_cron` turns 5 fields into 6.
+        let normalised = crate::cron_scheduler::normalise_cron(&cron_expr);
+        if normalised.parse::<cron::Schedule>().is_err() {
+            return WsFrame::error_response(
+                "",
+                &format!("Invalid cron expression: {cron_expr}"),
+            );
+        }
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default")
+            .to_string();
+        // `task` is the actual prompt body; `action` is kept as a legacy alias.
+        let task_body = params
+            .get("task")
+            .or_else(|| params.get("prompt"))
+            .or_else(|| params.get("action"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("heartbeat")
+            .to_string();
+
+        let store = match self.cron_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+
+        // Enforce unique name for friendly dashboard UX.
+        match store.get_by_name(&name).await {
+            Ok(Some(_)) => {
+                return WsFrame::error_response("", &format!("Cron task '{name}' already exists"));
+            }
+            Ok(None) => {}
+            Err(e) => return WsFrame::error_response("", &format!("lookup: {e}")),
+        }
+
+        let row = CronTaskRow::new(
+            uuid::Uuid::new_v4().to_string(),
+            name.clone(),
+            agent_id.clone(),
+            cron_expr.clone(),
+            task_body,
+        );
+        if let Err(e) = store.insert(&row).await {
+            return WsFrame::error_response("", &format!("insert: {e}"));
+        }
+        self.notify_cron_reload().await;
+        info!(name = %name, cron = %cron_expr, agent_id = %agent_id, "Cron task added");
+        WsFrame::ok_response("", json!({ "success": true, "task": Self::cron_row_to_json(&row) }))
+    }
+
+    async fn handle_cron_update(&self, params: Value) -> WsFrame {
+        let id = match params.get("id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'id' parameter"),
+        };
+
+        let store = match self.cron_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+
+        let existing = match store.get(&id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return WsFrame::error_response("", &format!("Cron task '{id}' not found")),
+            Err(e) => return WsFrame::error_response("", &format!("lookup: {e}")),
+        };
+
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or(existing.name);
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or(existing.agent_id);
+        let cron_expr = params
+            .get("cron")
+            .or_else(|| params.get("schedule"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or(existing.cron);
+        let task_body = params
+            .get("task")
+            .or_else(|| params.get("prompt"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or(existing.task);
+        let enabled = params
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(existing.enabled);
+
+        // Validate cron expression before persisting.
+        let normalised = crate::cron_scheduler::normalise_cron(&cron_expr);
+        if normalised.parse::<cron::Schedule>().is_err() {
+            return WsFrame::error_response(
+                "",
+                &format!("Invalid cron expression: {cron_expr}"),
+            );
+        }
+
+        match store
+            .update_fields(&id, &name, &agent_id, &cron_expr, &task_body, enabled)
+            .await
+        {
+            Ok(true) => {
+                self.notify_cron_reload().await;
+                info!(id = %id, "Cron task updated");
+                WsFrame::ok_response("", json!({ "success": true, "id": id }))
+            }
+            Ok(false) => WsFrame::error_response("", &format!("Cron task '{id}' not found")),
+            Err(e) => WsFrame::error_response("", &format!("update: {e}")),
+        }
+    }
+
+    async fn handle_cron_set_enabled(&self, params: Value, enabled: bool) -> WsFrame {
+        let store = match self.cron_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+
+        // Accept either `id` (preferred) or `name` (legacy).
+        let result = if let Some(id) = params.get("id").and_then(|v| v.as_str()) {
+            store.set_enabled(id, enabled).await
+        } else if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
+            store.set_enabled_by_name(name, enabled).await
+        } else {
+            return WsFrame::error_response("", "Missing 'id' or 'name' parameter");
+        };
+
+        match result {
+            Ok(true) => {
+                self.notify_cron_reload().await;
+                info!(enabled, "Cron task enable state changed");
+                WsFrame::ok_response("", json!({ "success": true, "enabled": enabled }))
+            }
+            Ok(false) => WsFrame::error_response("", "Cron task not found"),
+            Err(e) => WsFrame::error_response("", &format!("set_enabled: {e}")),
+        }
+    }
+
+    async fn handle_cron_remove(&self, params: Value) -> WsFrame {
+        let store = match self.cron_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+
+        let result = if let Some(id) = params.get("id").and_then(|v| v.as_str()) {
+            store.delete(id).await
+        } else if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
+            store.delete_by_name(name).await
+        } else {
+            return WsFrame::error_response("", "Missing 'id' or 'name' parameter");
+        };
+
+        match result {
+            Ok(true) => {
+                self.notify_cron_reload().await;
+                info!("Cron task removed");
+                WsFrame::ok_response("", json!({ "success": true }))
+            }
+            Ok(false) => WsFrame::error_response("", "Cron task not found"),
+            Err(e) => WsFrame::error_response("", &format!("delete: {e}")),
+        }
     }
 
     // ── System ───────────────────────────────────────────────

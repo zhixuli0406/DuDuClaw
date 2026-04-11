@@ -8,6 +8,7 @@ pub mod config_crypto;
 pub mod claude_runner;
 pub mod cost_telemetry;
 pub mod cron_scheduler;
+pub mod cron_store;
 pub mod direct_api;
 pub mod delegation;
 pub mod discord;
