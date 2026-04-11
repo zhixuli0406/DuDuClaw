@@ -433,8 +433,28 @@ impl AccountRotator {
                         // setup-token account: inject token via env var
                         env_vars.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone());
                     } else if let Some(dir) = &a.credentials_dir {
-                        // OS keychain account: point to config dir
-                        env_vars.insert("CLAUDE_CONFIG_DIR".to_string(), dir.to_string_lossy().to_string());
+                        // OS keychain account: only set CLAUDE_CONFIG_DIR when it differs
+                        // from the default `~/.claude`.
+                        //
+                        // CRITICAL: setting `CLAUDE_CONFIG_DIR=~/.claude` explicitly —
+                        // even with the SAME value as the default — makes `claude` CLI
+                        // stop looking at the OS keychain for credentials, producing
+                        // "Not logged in · Please run /login" for every call. The CLI
+                        // only uses the keychain when no `CLAUDE_CONFIG_DIR` is set.
+                        //
+                        // Leave the env var unset for the default session so claude
+                        // CLI picks up keychain auth normally. Non-default profile
+                        // directories (e.g. `~/.claude/profiles/work`) still get the
+                        // env var because they need explicit pointing.
+                        let is_default_home = dirs::home_dir()
+                            .map(|h| h.join(".claude"))
+                            .is_some_and(|default_dir| default_dir == *dir);
+                        if !is_default_home {
+                            env_vars.insert(
+                                "CLAUDE_CONFIG_DIR".to_string(),
+                                dir.to_string_lossy().to_string(),
+                            );
+                        }
                     }
                     // Ensure API key doesn't override OAuth
                     env_vars.insert("ANTHROPIC_API_KEY".to_string(), String::new());
@@ -692,4 +712,83 @@ pub fn create_from_config(config: &toml::Table) -> AccountRotator {
     let strategy_str = rotation.and_then(|r| r.get("strategy")).and_then(|v| v.as_str()).unwrap_or("priority");
     let cooldown = rotation.and_then(|r| r.get("cooldown_after_rate_limit_seconds")).and_then(|v| v.as_integer()).unwrap_or(120) as u64;
     AccountRotator::new(RotationStrategy::from_str(strategy_str), cooldown)
+}
+
+#[cfg(test)]
+mod select_env_tests {
+    use super::*;
+
+    fn account_with_credentials_dir(dir: PathBuf) -> Account {
+        Account {
+            id: "test".to_string(),
+            auth_method: AuthMethod::OAuth,
+            priority: 1,
+            monthly_budget_cents: 0,
+            tags: vec![],
+            profile: "default".to_string(),
+            email: String::new(),
+            subscription: "max".to_string(),
+            label: "test".to_string(),
+            expires_at: None,
+            api_key: String::new(),
+            oauth_token: None,
+            credentials_dir: Some(dir),
+            is_healthy: true,
+            consecutive_errors: 0,
+            spent_this_month: 0,
+            cooldown_until: None,
+            last_used: None,
+            total_requests: 0,
+        }
+    }
+
+    /// Regression test for the bug where the auto-detected default OAuth
+    /// session would have `CLAUDE_CONFIG_DIR=~/.claude` injected into the
+    /// subprocess env, which makes `claude` CLI stop looking at the OS
+    /// keychain and return "Not logged in · Please run /login" forever.
+    ///
+    /// Fix: when `credentials_dir == ~/.claude` (the default location),
+    /// `select()` must NOT set `CLAUDE_CONFIG_DIR` at all. Claude CLI then
+    /// uses its normal default config + keychain lookup.
+    #[tokio::test]
+    async fn default_keychain_session_does_not_set_claude_config_dir() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        // Mimic what `detect_default_oauth_session()` produces.
+        let default_dir = dirs::home_dir().expect("home").join(".claude");
+        rotator
+            .push_account_for_test(account_with_credentials_dir(default_dir))
+            .await;
+
+        let env = rotator.select().await.expect("should select account");
+        assert!(
+            !env.env_vars.contains_key("CLAUDE_CONFIG_DIR"),
+            "CLAUDE_CONFIG_DIR must not be set for default keychain session; \
+             setting it — even to the same path — breaks Claude CLI auth \
+             lookup. Got env_vars: {:?}",
+            env.env_vars
+        );
+        // ANTHROPIC_API_KEY must still be set empty to prevent ambient
+        // api key from overriding OAuth.
+        assert_eq!(env.env_vars.get("ANTHROPIC_API_KEY").map(String::as_str), Some(""));
+    }
+
+    /// A non-default profile directory (e.g. `~/.claude/profiles/work`)
+    /// MUST still have `CLAUDE_CONFIG_DIR` injected, otherwise claude CLI
+    /// wouldn't know to pick up that profile's credentials.
+    #[tokio::test]
+    async fn non_default_profile_dir_still_sets_claude_config_dir() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        let profile_dir = dirs::home_dir()
+            .expect("home")
+            .join(".claude/profiles/work");
+        rotator
+            .push_account_for_test(account_with_credentials_dir(profile_dir.clone()))
+            .await;
+
+        let env = rotator.select().await.expect("should select account");
+        assert_eq!(
+            env.env_vars.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(profile_dir.to_string_lossy().as_ref())
+        );
+    }
 }

@@ -1123,6 +1123,9 @@ pub(crate) enum FailureReason {
     RateLimited,
     /// Billing / credit exhausted (402, insufficient_quota).
     Billing,
+    /// Claude CLI reported "Not logged in" / authentication failure.
+    /// Distinct from BinaryMissing (binary exists, just not authenticated).
+    AuthFailed,
     /// 30-minute hard timeout tripped.
     Timeout,
     /// Subprocess failed to spawn or exited non-zero without recognizable cause.
@@ -1141,6 +1144,15 @@ pub(crate) fn classify_cli_failure(err: &str) -> FailureReason {
 
     if lower.contains("claude cli not found") {
         return FailureReason::BinaryMissing;
+    }
+    // Auth failures come through the stream-json `is_error` branch as
+    // "claude CLI stream error: Not logged in · Please run /login" or
+    // "claude CLI assistant error: authentication_failed".
+    if lower.contains("not logged in")
+        || lower.contains("authentication_failed")
+        || lower.contains("please run /login")
+    {
+        return FailureReason::AuthFailed;
     }
     if lower.contains("hard timeout") {
         return FailureReason::Timeout;
@@ -1175,6 +1187,12 @@ pub(crate) fn format_fallback_message(agent_name: &str, reason: FailureReason) -
             "{agent_name} 暫時無法回應：系統找不到 Claude Code CLI。\n\
              請確認已安裝，並執行：\n\
              $ claude auth status"
+        ),
+        FailureReason::AuthFailed => format!(
+            "{agent_name} 無法回應：Claude Code 未登入或認證失效。\n\
+             請在終端執行：\n\
+             $ claude /login\n\
+             登入完成後，可繼續對我說話。"
         ),
         FailureReason::RateLimited => format!(
             "{agent_name} 暫時忙線中（API 使用量已達上限），請稍後再試。\n\
@@ -1251,6 +1269,36 @@ mod fallback_tests {
     #[test]
     fn classify_unknown_fallthrough() {
         assert_eq!(classify_cli_failure("some weird unrelated thing"), FailureReason::Unknown);
+    }
+
+    #[test]
+    fn classify_auth_failed_variants() {
+        // Stream-json error path — what channel_reply surfaces after the fix.
+        assert_eq!(
+            classify_cli_failure("claude CLI stream error: Not logged in · Please run /login"),
+            FailureReason::AuthFailed
+        );
+        // Assistant event error field path.
+        assert_eq!(
+            classify_cli_failure("claude CLI assistant error: authentication_failed"),
+            FailureReason::AuthFailed
+        );
+        // Raw "please run /login" text without the prefix.
+        assert_eq!(
+            classify_cli_failure("Please run /login to authenticate"),
+            FailureReason::AuthFailed
+        );
+    }
+
+    #[test]
+    fn message_auth_failed_tells_user_to_login() {
+        let msg = format_fallback_message("Agnes", FailureReason::AuthFailed);
+        assert!(msg.contains("Agnes"));
+        assert!(msg.contains("未登入") || msg.contains("認證失效"));
+        assert!(msg.contains("/login"));
+        // Must NOT say "claude auth status" (that's the BinaryMissing hint
+        // and doesn't fix an auth problem on its own).
+        assert!(!msg.contains("auth status"));
     }
 
     #[test]
@@ -1481,6 +1529,45 @@ mod rotation_tests {
         assert!(
             !user_msg.contains("找不到"),
             "must NOT say 'binary not found' on rate limit: {user_msg}"
+        );
+    }
+
+    /// Regression test for the v1.3.12 bug: stream parser used to
+    /// swallow `is_error: true` result events as valid text, which led
+    /// to "Not logged in · Please run /login" being delivered to users
+    /// as Agnes's reply. After the fix, `spawn_claude_cli_with_env`
+    /// returns `Err("claude CLI stream error: Not logged in ...")` and
+    /// the classifier + message builder surface the AuthFailed reason.
+    ///
+    /// We exercise the rotator→classifier→message pipeline by having the
+    /// spawn closure return exactly the error shape the new stream parser
+    /// now produces.
+    #[tokio::test]
+    async fn end_to_end_not_logged_in_yields_auth_failed_message() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("broken", 1)).await;
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            |_env_vars| async move {
+                Err::<String, _>(
+                    "claude CLI stream error: Not logged in · Please run /login".to_string(),
+                )
+            },
+            50,
+        )
+        .await;
+
+        let err = result.expect_err("auth failure must surface as Err");
+        let reason = classify_cli_failure(&err);
+        assert_eq!(reason, FailureReason::AuthFailed);
+
+        let msg = format_fallback_message("Agnes", reason);
+        assert!(msg.contains("Agnes"));
+        assert!(msg.contains("/login"));
+        assert!(
+            !msg.contains("Not logged in · Please run /login"),
+            "user-facing message must be our zh-TW explanation, not raw CLI text"
         );
     }
 
@@ -1892,14 +1979,44 @@ async fn spawn_claude_cli_with_env(
 
                         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
                             match event.get("type").and_then(|t| t.as_str()) {
-                                // Final result event — contains the complete response
+                                // Final result event — contains the complete response.
+                                //
+                                // CRITICAL: the stream-json schema signals terminal
+                                // errors via `is_error: true` on the `result` event
+                                // (e.g. "Not logged in · Please run /login", auth
+                                // failures, rate limits surfaced as synthetic replies).
+                                // Without this check we would swallow the error text
+                                // into `result_text` and return Ok to the caller.
                                 Some("result") => {
+                                    let is_error = event
+                                        .get("is_error")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    if is_error {
+                                        let err_text = event
+                                            .get("result")
+                                            .and_then(|r| r.as_str())
+                                            .unwrap_or("Unknown stream-json error");
+                                        let _ = child.kill().await;
+                                        return Err(format!(
+                                            "claude CLI stream error: {err_text}"
+                                        ));
+                                    }
                                     if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
                                         result_text = text.to_string();
                                     }
                                 }
                                 // Assistant message with content blocks
                                 Some("assistant") => {
+                                    // Also check the envelope-level `error` field that
+                                    // newer claude-code versions emit alongside the
+                                    // synthetic assistant message on auth failure.
+                                    if let Some(err) = event.get("error").and_then(|e| e.as_str()) {
+                                        let _ = child.kill().await;
+                                        return Err(format!(
+                                            "claude CLI assistant error: {err}"
+                                        ));
+                                    }
                                     if let Some(content) = event
                                         .pointer("/message/content")
                                         .and_then(|c| c.as_array())
@@ -1975,8 +2092,19 @@ async fn spawn_claude_cli_with_env(
 
     // Wait for process to exit
     let status = child.wait().await.map_err(|e| format!("wait error: {e}"))?;
-    if !status.success() && result_text.is_empty() {
-        return Err(format!("claude CLI exit {}", status.code().unwrap_or(-1)));
+
+    // Any non-zero exit is now a hard failure. Previously we only errored
+    // when `result_text.is_empty()`, which hid synthetic error messages
+    // (e.g. "Not logged in · Please run /login") that Claude CLI emits as
+    // a real result event with `is_error: true` and exit code 1. The
+    // stream-json error check above should have caught those before we
+    // reach here, but the exit-code gate is a defensive backstop.
+    if !status.success() {
+        return Err(format!(
+            "claude CLI exit {} (stream tail: {:?})",
+            status.code().unwrap_or(-1),
+            result_text.chars().take(120).collect::<String>()
+        ));
     }
 
     let result_text = result_text.trim().to_string();
