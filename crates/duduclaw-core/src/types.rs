@@ -6,15 +6,107 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Role an agent plays in the system.
+///
+/// Serialised as kebab-case in `agent.toml`. Single-word variants look
+/// identical to the old lowercase encoding (`main`, `worker`, `qa`, …) so
+/// existing agent configs keep parsing. Multi-word variants use kebab-case
+/// (e.g. `team-leader`, `product-manager`) which matches typical job-title
+/// writing conventions.
+///
+/// When adding a new variant, also update the string-to-enum map in
+/// [`crates/duduclaw-cli/src/mcp.rs`](../../../duduclaw-cli/src/mcp.rs)'s
+/// `create_agent` MCP handler.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum AgentRole {
+    /// The top-level user-facing agent (only one per home directory).
     Main,
+    /// Generic specialist — fallback when nothing more specific fits.
     Specialist,
+    /// Low-privilege worker — used by the RBAC layer for leaf sub-agents.
     Worker,
+    /// Software engineer / implementer (frontend, backend, devops, ML, …).
+    #[serde(alias = "engineer")]
     Developer,
+    /// Quality assurance — runs review / testing / red-team workflows.
+    #[serde(alias = "quality-assurance", alias = "quality")]
     Qa,
+    /// Planning / coordination — used for generic planners that don't
+    /// cleanly fit `TeamLeader` or `ProductManager`.
     Planner,
+    /// Team Leader — coordinates a sub-team, integrates reports, assigns
+    /// work. Typically has `reports_to = ""` or a parent org.
+    #[serde(alias = "tl", alias = "lead", alias = "teamlead")]
+    TeamLeader,
+    /// Product Manager — drives research and feature proposals for a
+    /// specific project / domain.
+    #[serde(alias = "pm")]
+    ProductManager,
+}
+
+impl AgentRole {
+    /// The canonical kebab-case string used in `agent.toml` and on the
+    /// wire. This is the inverse of [`std::str::FromStr::from_str`].
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Specialist => "specialist",
+            Self::Worker => "worker",
+            Self::Developer => "developer",
+            Self::Qa => "qa",
+            Self::Planner => "planner",
+            Self::TeamLeader => "team-leader",
+            Self::ProductManager => "product-manager",
+        }
+    }
+
+    /// Comma-separated list of all valid role strings, suitable for
+    /// embedding in error messages.
+    pub fn valid_values_help() -> &'static str {
+        "main, specialist, worker, developer, qa, planner, team-leader, product-manager"
+    }
+}
+
+impl std::str::FromStr for AgentRole {
+    type Err = String;
+
+    /// Parse an `AgentRole` from its canonical kebab-case encoding, with
+    /// lenient matching on common aliases so old configs and natural-
+    /// language inputs (`"team leader"`, `"product_manager"`, …) keep
+    /// working.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Normalise separators + case so `team_leader`, `team leader`,
+        // `Team-Leader`, etc. all land on the same variant.
+        let normalised: String = s
+            .trim()
+            .to_lowercase()
+            .chars()
+            .map(|c| if c == '_' || c == ' ' { '-' } else { c })
+            .collect();
+
+        Ok(match normalised.as_str() {
+            "main" => Self::Main,
+            "specialist" => Self::Specialist,
+            "worker" => Self::Worker,
+            "developer" | "engineer" => Self::Developer,
+            "qa" | "quality-assurance" | "quality" => Self::Qa,
+            "planner" => Self::Planner,
+            "team-leader" | "teamleader" | "tl" | "lead" => Self::TeamLeader,
+            "product-manager" | "productmanager" | "pm" => Self::ProductManager,
+            _ => {
+                return Err(format!(
+                    "invalid role '{s}'. valid values: {}",
+                    Self::valid_values_help()
+                ))
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for AgentRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Current lifecycle status of an agent.
@@ -825,4 +917,87 @@ pub struct DoctorCheck {
     pub message: String,
     pub can_repair: bool,
     pub repair_hint: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn agent_role_roundtrip_via_serde_json() {
+        for role in [
+            AgentRole::Main,
+            AgentRole::Specialist,
+            AgentRole::Worker,
+            AgentRole::Developer,
+            AgentRole::Qa,
+            AgentRole::Planner,
+            AgentRole::TeamLeader,
+            AgentRole::ProductManager,
+        ] {
+            let encoded = serde_json::to_string(&role).unwrap();
+            let decoded: AgentRole = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(role, decoded, "roundtrip failed for {role:?}");
+        }
+    }
+
+    #[test]
+    fn agent_role_kebab_case_wire_format() {
+        assert_eq!(serde_json::to_string(&AgentRole::TeamLeader).unwrap(), "\"team-leader\"");
+        assert_eq!(serde_json::to_string(&AgentRole::ProductManager).unwrap(), "\"product-manager\"");
+        // Single-word variants stay identical to the old lowercase encoding.
+        assert_eq!(serde_json::to_string(&AgentRole::Main).unwrap(), "\"main\"");
+        assert_eq!(serde_json::to_string(&AgentRole::Qa).unwrap(), "\"qa\"");
+    }
+
+    #[test]
+    fn agent_role_serde_aliases_accepted() {
+        let cases = [
+            ("\"engineer\"",           AgentRole::Developer),
+            ("\"quality-assurance\"",  AgentRole::Qa),
+            ("\"tl\"",                 AgentRole::TeamLeader),
+            ("\"pm\"",                 AgentRole::ProductManager),
+        ];
+        for (input, expected) in cases {
+            let decoded: AgentRole = serde_json::from_str(input)
+                .unwrap_or_else(|e| panic!("serde alias failed for {input}: {e}"));
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn agent_role_from_str_lenient_normalisation() {
+        let cases = [
+            ("team-leader",      AgentRole::TeamLeader),
+            ("team_leader",      AgentRole::TeamLeader),
+            ("Team Leader",      AgentRole::TeamLeader),
+            ("  TEAM-LEADER  ",  AgentRole::TeamLeader),
+            ("product_manager",  AgentRole::ProductManager),
+            ("engineer",         AgentRole::Developer),
+            ("quality",          AgentRole::Qa),
+            ("main",             AgentRole::Main),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                AgentRole::from_str(input).unwrap(),
+                expected,
+                "from_str({input:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_role_from_str_rejects_garbage() {
+        assert!(AgentRole::from_str("xyz").is_err());
+        assert!(AgentRole::from_str("").is_err());
+    }
+
+    #[test]
+    fn agent_role_display_roundtrip() {
+        for role in [AgentRole::TeamLeader, AgentRole::ProductManager, AgentRole::Qa] {
+            let s = role.to_string();
+            assert_eq!(AgentRole::from_str(&s).unwrap(), role);
+        }
+    }
 }

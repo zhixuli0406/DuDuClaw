@@ -1945,20 +1945,20 @@ async fn handle_agent_update(params: &Value, home_dir: &Path) -> Value {
         changes.push(format!("display_name = \"{v}\""));
     }
     if let Some(v) = params.get("role").and_then(|v| v.as_str()) {
-        let role = match v.to_lowercase().as_str() {
-            "main" => duduclaw_core::types::AgentRole::Main,
-            "specialist" => duduclaw_core::types::AgentRole::Specialist,
-            "worker" => duduclaw_core::types::AgentRole::Worker,
-            "developer" => duduclaw_core::types::AgentRole::Developer,
-            "qa" => duduclaw_core::types::AgentRole::Qa,
-            "planner" => duduclaw_core::types::AgentRole::Planner,
-            _ => return serde_json::json!({
-                "content": [{"type": "text", "text": format!("Error: invalid role '{v}'. Valid: main, specialist, worker, developer, qa, planner")}],
+        use std::str::FromStr;
+        let role = match duduclaw_core::types::AgentRole::from_str(v) {
+            Ok(r) => r,
+            Err(_) => return serde_json::json!({
+                "content": [{"type": "text", "text": format!(
+                    "Error: invalid role '{v}'. Valid: {}",
+                    duduclaw_core::types::AgentRole::valid_values_help()
+                )}],
                 "isError": true
             }),
         };
+        let canonical = role.as_str().to_string();
         config.agent.role = role;
-        changes.push(format!("role = \"{v}\""));
+        changes.push(format!("role = \"{canonical}\""));
     }
     if let Some(v) = params.get("status").and_then(|v| v.as_str()) {
         let status = match v.to_lowercase().as_str() {

@@ -226,6 +226,33 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
             })?;
     }
 
+    // Ensure .mcp.json exists so the newly-created agent actually has the
+    // duduclaw MCP tool suite (`create_agent`, `list_agents`, `spawn_agent`,
+    // `send_to_agent`, …) available in its Claude Code sessions. Without
+    // this file SOUL.md's "always use create_agent" rule is unenforceable
+    // because the tool literally isn't registered.
+    let mcp_path = agent_dir.join(".mcp.json");
+    if !mcp_path.exists() {
+        let mcp_bin = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
+            .unwrap_or_else(|| "duduclaw".to_string());
+        let mcp_json = serde_json::json!({
+            "mcpServers": {
+                "duduclaw": {
+                    "command": mcp_bin,
+                    "args": ["mcp-server"],
+                    "env": {}
+                }
+            }
+        });
+        let mcp_content = serde_json::to_string_pretty(&mcp_json)
+            .unwrap_or_else(|_| "{}".to_string());
+        tokio::fs::write(&mcp_path, mcp_content)
+            .await
+            .map_err(|e| DuDuClawError::Agent(format!("Failed to write .mcp.json: {e}")))?;
+    }
+
     // Install agent-file-guard PreToolUse hook for the new agent.
     {
         let bin = duduclaw_gateway::agent_hook_installer::resolve_duduclaw_bin();
