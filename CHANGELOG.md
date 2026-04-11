@@ -3,6 +3,51 @@
 All notable changes to DuDuClaw are documented here. For the authoritative
 version history and per-commit detail, see `git log`.
 
+## [v1.3.12] — 2026-04-11
+
+### Fixed
+
+- **Rotator broke keychain auth by injecting `CLAUDE_CONFIG_DIR=~/.claude`**
+  (regression from the multi-account rotation introduced in v1.3.11). When
+  the auto-detected default OAuth session was selected, `select()` set
+  `CLAUDE_CONFIG_DIR` to `~/.claude` even though that *is* the claude CLI
+  default — and the `claude` CLI, when the env var is set explicitly, stops
+  looking at the macOS keychain for credentials. Every channel reply call
+  then hit "Not logged in · Please run /login".
+  Fix: `account_rotator::select()` now skips the `CLAUDE_CONFIG_DIR`
+  injection when `credentials_dir` equals the default `~/.claude`, so
+  claude CLI picks up keychain auth normally. Non-default profile
+  directories (`~/.claude/profiles/work`, etc.) still get the env var.
+  Regression tests in `account_rotator::select_env_tests` lock this in.
+
+- **Stream parser silently swallowed `is_error: true` results.** The
+  `claude` CLI emits terminal errors (auth failure, synthetic responses)
+  as `type="result"` stream-json events with `is_error: true`, with the
+  error text in the `result` field. Both `channel_reply::spawn_claude_cli_with_env`
+  and `claude_runner::call_claude_streaming` were capturing the error
+  text as `result_text` and returning `Ok(...)`, so users saw
+  "Not logged in · Please run /login" posted to Discord/LINE/Telegram as
+  Agnes's actual reply. Now:
+  - `is_error: true` on a `result` event → `return Err("claude CLI stream error: ...")`
+  - `error` field on an `assistant` event → same
+  - Post-loop: any non-zero exit code is a hard failure (previously we
+    only errored when `result_text` was empty, which let partial output
+    leak through).
+
+- **`FailureReason::AuthFailed` classifier** — new branch in
+  `classify_cli_failure` detects `"Not logged in"` / `"authentication_failed"` /
+  `"please run /login"` and surfaces a zh-TW message that actually tells
+  the user to run `claude /login` instead of the misleading
+  "`claude auth status`" hint (which only checks state, doesn't fix auth).
+
+### Tests
+
+- 2 new regression tests in `duduclaw-agent::account_rotator::select_env_tests`
+- 2 new classifier tests + 1 end-to-end pipeline test in `channel_reply::fallback_tests` / `rotation_tests`
+- **413 tests total passing** (core: 21, gateway: 375, agent: 17)
+
+---
+
 ## [v1.3.11] — 2026-04-11
 
 ### Added

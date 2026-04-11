@@ -626,13 +626,23 @@ async fn call_claude_streaming(
                         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
                             match event.get("type").and_then(|t| t.as_str()) {
                                 Some("result") => {
+                                    // Terminal error from stream-json — promote to Err
+                                    // so the caller (rotator / classifier) can route it.
+                                    // Previously this embedded "[error] ..." into
+                                    // result_text which was then returned as Ok,
+                                    // silently surfacing CLI errors as the reply.
                                     if event.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                        let err_msg = event
-                                            .get("error")
-                                            .and_then(|e| e.as_str())
-                                            .unwrap_or("Unknown error");
-                                        result_text = format!("[error] {err_msg}");
-                                    } else if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
+                                        let err_text = event
+                                            .get("result")
+                                            .and_then(|r| r.as_str())
+                                            .or_else(|| event.get("error").and_then(|e| e.as_str()))
+                                            .unwrap_or("Unknown stream-json error");
+                                        let _ = child.kill().await;
+                                        return Err(format!(
+                                            "claude CLI stream error: {err_text}"
+                                        ));
+                                    }
+                                    if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
                                         result_text = text.to_string();
                                     }
                                     if let Some(usage_val) = event.get("usage") {
@@ -640,6 +650,13 @@ async fn call_claude_streaming(
                                     }
                                 }
                                 Some("assistant") => {
+                                    // Envelope-level error field (newer claude-code)
+                                    if let Some(err) = event.get("error").and_then(|e| e.as_str()) {
+                                        let _ = child.kill().await;
+                                        return Err(format!(
+                                            "claude CLI assistant error: {err}"
+                                        ));
+                                    }
                                     if let Some(content) = event.pointer("/message/content").and_then(|c| c.as_array()) {
                                         for block in content {
                                             let block_type = block.get("type").and_then(|t| t.as_str());
@@ -704,8 +721,15 @@ async fn call_claude_streaming(
     }
 
     let status = child.wait().await.map_err(|e| format!("wait error: {e}"))?;
-    if !status.success() && result_text.is_empty() {
-        return Err(format!("claude CLI exit {}", status.code().unwrap_or(-1)));
+    // Any non-zero exit is now a hard failure. Previously we only errored
+    // when result_text was empty, which would surface CLI error text as
+    // the "reply" whenever the stream-json layer accidentally wrote it.
+    if !status.success() {
+        return Err(format!(
+            "claude CLI exit {} (stream tail: {:?})",
+            status.code().unwrap_or(-1),
+            result_text.chars().take(120).collect::<String>()
+        ));
     }
 
     let result_text = result_text.trim().to_string();
