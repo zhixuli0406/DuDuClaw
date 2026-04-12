@@ -19,7 +19,7 @@ jobs:
             os: macos-latest
             artifact: duduclaw-darwin-arm64
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             artifact: duduclaw-darwin-x64
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
@@ -51,7 +51,7 @@ jobs:
 
       - name: Build binary (cross-compile)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cross build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard
+        run: cross build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
         env:
           PKG_CONFIG_ALLOW_CROSS: 1
 
