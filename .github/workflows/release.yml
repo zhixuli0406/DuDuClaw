@@ -27,9 +27,10 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: duduclaw-linux-arm64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            artifact: duduclaw-windows-x64
+          # Windows disabled: ptc/rpc_bridge uses UnixStream (unix-only)
+          # - target: x86_64-pc-windows-msvc
+          #   os: windows-latest
+          #   artifact: duduclaw-windows-x64
 
     steps:
       - uses: actions/checkout@v4
