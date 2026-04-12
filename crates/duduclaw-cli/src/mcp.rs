@@ -5299,71 +5299,65 @@ high_context = true
         assert!(ctx0.sender.is_none());
     }
 
-    /// Test DelegationContext::from_env reads process env vars correctly.
-    /// Uses sync #[test] (NOT #[tokio::test]) — sync tests run on the harness
-    /// thread and are sequenced by --test-threads=1, making env var mutation safe.
+    // Mutex to serialize env-var-mutating tests (env is process-global).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn clear_delegation_env() {
+        unsafe {
+            std::env::remove_var(duduclaw_core::ENV_DELEGATION_DEPTH);
+            std::env::remove_var(duduclaw_core::ENV_DELEGATION_ORIGIN);
+            std::env::remove_var(duduclaw_core::ENV_DELEGATION_SENDER);
+        }
+    }
+
     #[test]
     fn delegation_context_from_env() {
-        // Set env → read → verify → cleanup
+        let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var(duduclaw_core::ENV_DELEGATION_DEPTH, "3");
             std::env::set_var(duduclaw_core::ENV_DELEGATION_ORIGIN, "main-agent");
             std::env::set_var(duduclaw_core::ENV_DELEGATION_SENDER, "researcher");
         }
         let ctx = DelegationContext::from_env();
-        unsafe {
-            std::env::remove_var(duduclaw_core::ENV_DELEGATION_DEPTH);
-            std::env::remove_var(duduclaw_core::ENV_DELEGATION_ORIGIN);
-            std::env::remove_var(duduclaw_core::ENV_DELEGATION_SENDER);
-        }
+        clear_delegation_env();
         assert_eq!(ctx.depth, 3);
         assert_eq!(ctx.origin.as_deref(), Some("main-agent"));
         assert_eq!(ctx.sender.as_deref(), Some("researcher"));
     }
 
-    /// Verify from_env defaults when no env vars are set.
     #[test]
     fn delegation_context_from_env_defaults() {
-        unsafe {
-            std::env::remove_var(duduclaw_core::ENV_DELEGATION_DEPTH);
-            std::env::remove_var(duduclaw_core::ENV_DELEGATION_ORIGIN);
-            std::env::remove_var(duduclaw_core::ENV_DELEGATION_SENDER);
-        }
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_delegation_env();
         let ctx = DelegationContext::from_env();
         assert_eq!(ctx.depth, 0);
         assert!(ctx.origin.is_none());
         assert!(ctx.sender.is_none());
     }
 
-    /// Verify from_env filters empty strings to None.
     #[test]
     fn delegation_context_from_env_empty_strings() {
+        let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var(duduclaw_core::ENV_DELEGATION_DEPTH, "0");
             std::env::set_var(duduclaw_core::ENV_DELEGATION_ORIGIN, "");
             std::env::set_var(duduclaw_core::ENV_DELEGATION_SENDER, "");
         }
         let ctx = DelegationContext::from_env();
-        unsafe {
-            std::env::remove_var(duduclaw_core::ENV_DELEGATION_DEPTH);
-            std::env::remove_var(duduclaw_core::ENV_DELEGATION_ORIGIN);
-            std::env::remove_var(duduclaw_core::ENV_DELEGATION_SENDER);
-        }
+        clear_delegation_env();
         assert_eq!(ctx.depth, 0);
         assert!(ctx.origin.is_none(), "Empty string should filter to None");
         assert!(ctx.sender.is_none(), "Empty string should filter to None");
     }
 
-    /// Verify from_env handles invalid depth gracefully (defaults to 0).
     #[test]
     fn delegation_context_from_env_invalid_depth() {
+        let _lock = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var(duduclaw_core::ENV_DELEGATION_DEPTH, "not_a_number");
         }
         let ctx = DelegationContext::from_env();
-        unsafe {
-            std::env::remove_var(duduclaw_core::ENV_DELEGATION_DEPTH);
-        }
+        clear_delegation_env();
         assert_eq!(ctx.depth, 0, "Invalid depth should default to 0");
     }
 
