@@ -570,6 +570,7 @@ function UpdateTab() {
     published_at: string;
     download_url: string;
     install_method: string;
+    brew_formula?: string;
   } | null>(null);
 
   // [H1] useRef guard prevents double-click race — declared before handleCheck
@@ -728,7 +729,7 @@ function UpdateTab() {
                       {intl.formatMessage({ id: 'settings.update.brewHint' })}
                     </p>
                     <code className="mt-2 block rounded bg-stone-800 px-3 py-2 text-sm text-emerald-400">
-                      brew upgrade duduclaw
+                      brew upgrade {updateInfo.brew_formula ?? 'duduclaw'}
                     </code>
                   </div>
                 )}
