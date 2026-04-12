@@ -3,6 +3,46 @@
 All notable changes to DuDuClaw are documented here. For the authoritative
 version history and per-commit detail, see `git log`.
 
+## [v1.3.17] — 2026-04-12
+
+### Added
+
+- **Action-claim verifier wired into live reply path (shadow mode).**
+  The existing `duduclaw_security::action_claim_verifier` module (420
+  lines, 13 unit tests, pure regex + audit-log cross-reference, zero
+  LLM cost) was built but **never called from production code**. It is
+  now invoked at two critical points:
+
+  1. **Channel replies** ([channel_reply.rs](crates/duduclaw-gateway/src/channel_reply.rs)):
+     immediately after the Claude CLI subprocess returns and before the
+     reply is saved to the session / shipped to Discord / Telegram / LINE.
+  2. **Cron task execution** ([cron_scheduler.rs](crates/duduclaw-gateway/src/cron_scheduler.rs)):
+     after the scheduled agent responds and before `record_run` marks
+     the task as successful.
+
+  On both paths, a `dispatch_start_time` is captured before the CLI
+  call. After the reply arrives, `detect_hallucinations(home_dir,
+  agent_id, &reply, &dispatch_start_time)` extracts action claims via
+  regex (zh-TW + English patterns for AgentCreated / AgentDeleted /
+  SoulUpdated / MessageSent / AgentSpawned), reads the MCP tool-call
+  audit log (`tool_calls.jsonl`) filtered to this turn + this agent,
+  and cross-references each claim against actual successful tool calls.
+
+  **Shadow mode**: detections are logged at `warn!` level and written
+  to `security_audit.jsonl` via `log_tool_hallucination()`, but the
+  reply text is **not modified**. This lets us collect a baseline
+  `ungrounded_claim_rate` before flipping to enforce mode.
+
+- **Implementation plan document** at [docs/TODO-agent-honesty.md](docs/TODO-agent-honesty.md):
+  3-phase defence-in-depth roadmap (Action-Claim Verifier → Proxy State
+  Verifier + Abstain Actions → Tool Receipts / NabaOS), backed by 6
+  verified arxiv papers (ToolBeHonest 2406.20015, Agent-as-a-Judge
+  2410.10934, Relign 2412.04141, MCPVerse 2508.16260, Agent Hallucination
+  Survey 2509.18970, Tool Receipts 2603.10060). Day-by-day schedule,
+  success metrics, known limitations, and enforce-mode policy options.
+
+---
+
 ## [v1.3.16] — 2026-04-12
 
 ### Fixed

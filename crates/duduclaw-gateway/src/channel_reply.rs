@@ -616,6 +616,13 @@ async fn build_reply_with_session_inner(
     // missing binary etc.) instead of always blaming "not installed".
     let mut last_cli_error: Option<String> = None;
 
+    // Record the moment we dispatched the CLI call. This is the lower
+    // time bound used by the action-claim verifier when scanning
+    // tool_calls.jsonl for receipts that back up the agent's text
+    // assertions — anything before this timestamp belongs to a
+    // previous turn and must not be credited to this one.
+    let dispatch_start_time = chrono::Utc::now().to_rfc3339();
+
     // 1. Try `claude` CLI with multi-account rotation (OAuth + API keys)
     let reply = match call_claude_cli_rotated(
         &sanitized_text, &model, &full_system_prompt, &ctx.home_dir,
@@ -662,6 +669,65 @@ async fn build_reply_with_session_inner(
     };
 
     if let Some(mut reply) = reply {
+        // ── Action-claim verifier (shadow mode) ─────────────────────
+        //
+        // Cross-reference factual assertions in `reply` against the
+        // MCP tool-call audit trail (`tool_calls.jsonl`) that was
+        // populated during this turn. Catches "Agnes-class" bugs where
+        // the agent narrates having done something (created 12 agents,
+        // sent a message, updated a SOUL file) without actually calling
+        // the corresponding MCP tool.
+        //
+        // Currently runs in SHADOW MODE: detections are logged to the
+        // security audit log and emitted as tracing events, but the
+        // reply is NOT altered. This lets us gather a `ungrounded_claim_rate`
+        // baseline before flipping to enforce mode.
+        //
+        // Zero LLM cost — pure regex + log diff.
+        // Zero marginal latency — runs on a value we already have.
+        if !agent_id.is_empty() {
+            let hallucinations = duduclaw_security::action_claim_verifier::detect_hallucinations(
+                &ctx.home_dir,
+                &agent_id,
+                &reply,
+                &dispatch_start_time,
+            );
+            if !hallucinations.is_empty() {
+                warn!(
+                    agent = %agent_id,
+                    session_id,
+                    count = hallucinations.len(),
+                    "🚨 Action-claim verifier flagged {} ungrounded claim(s) in reply (shadow mode — not blocking)",
+                    hallucinations.len()
+                );
+                for h in &hallucinations {
+                    if let duduclaw_security::action_claim_verifier::VerifyResult::Hallucination {
+                        claim,
+                        reason,
+                    } = h
+                    {
+                        warn!(
+                            agent = %agent_id,
+                            claim_type = ?claim.claim_type,
+                            target = %claim.target_id,
+                            matched_text = %claim.matched_text,
+                            reason = %reason,
+                            "ungrounded claim"
+                        );
+                        // Append a structured entry to security_audit.jsonl
+                        // so dashboards and forensic tooling can surface
+                        // the event. One row per claim.
+                        duduclaw_security::audit::log_tool_hallucination(
+                            &ctx.home_dir,
+                            &agent_id,
+                            &claim.matched_text,
+                            claim.claim_type.expected_tool(),
+                        );
+                    }
+                }
+            }
+        }
+
         // Record outbound for circuit breaker echo detection
         let reply_tokens = estimate_tokens(&reply);
         if let Some(ref cb_registry) = ctx.circuit_breakers {
