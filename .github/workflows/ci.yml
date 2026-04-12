@@ -22,7 +22,7 @@ jobs:
         # NOTE: dtolnay/rust-toolchain is maintained by a trusted Rust community
         # member and does not follow SHA-pinning conventions upstream. Pinning
         # by tag is accepted here as a documented trust decision.
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd3b9a  # v2.7.8
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
       - name: Build core crates
         run: cargo build --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
       - name: Build gateway (no dashboard)
@@ -50,7 +50,7 @@ jobs:
         # NOTE: dtolnay/rust-toolchain is maintained by a trusted Rust community
         # member and does not follow SHA-pinning conventions upstream. Pinning
         # by tag is accepted here as a documented trust decision.
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd3b9a  # v2.7.8
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
       - name: Install frontend dependencies
         run: cd web && npm ci --legacy-peer-deps
       - name: TypeScript check

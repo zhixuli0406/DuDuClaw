@@ -73,7 +73,7 @@ class AgentTools:
 
         # Validate agent name to prevent path traversal (C3)
         if not _is_valid_agent_id(agent_name):
-            return {"success": False, "error": f"Invalid agent name: must be lowercase alphanumeric with hyphens, 1-64 chars"}
+            return {"success": False, "error": "Invalid agent name: must be lowercase alphanumeric with hyphens, 1-64 chars"}
 
         agents_dir = _get_agents_dir()
         agent_dir = agents_dir / agent_name
