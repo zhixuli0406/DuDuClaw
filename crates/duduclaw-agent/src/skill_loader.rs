@@ -156,13 +156,11 @@ fn scan_tool_scripts(dir: &Path) -> Vec<String> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if matches!(ext, "js" | "ts" | "py") {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && matches!(ext, "js" | "ts" | "py")
+                    && let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         scripts.push(name.to_string());
                     }
-                }
-            }
         }
     }
     scripts.sort();

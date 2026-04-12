@@ -244,7 +244,7 @@ impl HeartbeatScheduler {
             tick += 1;
 
             // Re-sync from registry every 5 minutes (10 * 30s)
-            if tick % 10 == 0 {
+            if tick.is_multiple_of(10) {
                 self.sync_from_registry().await;
             }
 

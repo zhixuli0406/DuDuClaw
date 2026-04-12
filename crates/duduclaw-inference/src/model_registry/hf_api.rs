@@ -146,7 +146,7 @@ fn convert_hf_models(models: Vec<HfModel>) -> Vec<RegistryEntry> {
         };
 
         let tags = model.tags.unwrap_or_default();
-        let name = repo.split('/').last().unwrap_or(repo)
+        let name = repo.split('/').next_back().unwrap_or(repo)
             .replace("-GGUF", "")
             .replace("-gguf", "");
 
@@ -209,11 +209,10 @@ fn extract_quantization(filename: &str) -> String {
 fn extract_params(name: &str) -> String {
     let lower = name.to_lowercase();
     for part in lower.split(&['-', '_', '.'][..]) {
-        if part.ends_with('b') {
-            let num = &part[..part.len() - 1];
-            if num.parse::<f64>().is_ok() {
-                return part.to_uppercase();
-            }
+        if let Some(num) = part.strip_suffix('b')
+            && num.parse::<f64>().is_ok()
+        {
+            return part.to_uppercase();
         }
     }
     "?B".to_string()

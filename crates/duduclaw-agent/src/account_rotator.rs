@@ -110,13 +110,11 @@ impl Account {
             return false;
         }
         // Check token expiry for OAuth accounts
-        if let Some(ref exp) = self.expires_at {
-            if let Ok(expiry) = exp.parse::<DateTime<Utc>>() {
-                if Utc::now() > expiry {
+        if let Some(ref exp) = self.expires_at
+            && let Ok(expiry) = exp.parse::<DateTime<Utc>>()
+                && Utc::now() > expiry {
                     return false;
                 }
-            }
-        }
         match self.auth_method {
             AuthMethod::ApiKey => !self.api_key.is_empty(),
             // OAuth: either has explicit token (setup-token) or credentials_dir (OS keychain)
@@ -152,6 +150,7 @@ pub enum RotationStrategy {
 }
 
 impl RotationStrategy {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "round_robin" => Self::RoundRobin,
@@ -297,8 +296,8 @@ impl AccountRotator {
         }
 
         // 3. Fallback: single API key from [api] or env var
-        if loaded.is_empty() {
-            if let Some(api) = table.get("api").and_then(|v| v.as_table()) {
+        if loaded.is_empty()
+            && let Some(api) = table.get("api").and_then(|v| v.as_table()) {
                 let api_key = resolve_api_key(home_dir, api).await;
                 if !api_key.is_empty() {
                     loaded.push(Account {
@@ -324,11 +323,10 @@ impl AccountRotator {
                     });
                 }
             }
-        }
 
-        if loaded.is_empty() {
-            if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-                if !key.is_empty() {
+        if loaded.is_empty()
+            && let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
+                && !key.is_empty() {
                     loaded.push(Account {
                         id: "env".to_string(),
                         auth_method: AuthMethod::ApiKey,
@@ -351,8 +349,6 @@ impl AccountRotator {
                         total_requests: 0,
                     });
                 }
-            }
-        }
 
         let oauth_count = loaded.iter().filter(|a| a.auth_method == AuthMethod::OAuth).count();
         let apikey_count = loaded.iter().filter(|a| a.auth_method == AuthMethod::ApiKey).count();
@@ -678,21 +674,18 @@ fn resolve_oauth_credentials(profile: &str) -> Option<PathBuf> {
 /// Resolve API key from a TOML table (encrypted first, then plaintext).
 async fn resolve_api_key(home_dir: &Path, table: &toml::Table) -> String {
     for key_name in &["anthropic_api_key_enc", "api_key_enc"] {
-        if let Some(enc) = table.get(*key_name).and_then(|v| v.as_str()) {
-            if !enc.is_empty() {
-                if let Some(decrypted) = decrypt_with_keyfile(home_dir, enc) {
+        if let Some(enc) = table.get(*key_name).and_then(|v| v.as_str())
+            && !enc.is_empty()
+                && let Some(decrypted) = decrypt_with_keyfile(home_dir, enc) {
                     return decrypted;
                 }
-            }
-        }
     }
     for key_name in &["anthropic_api_key", "api_key"] {
-        if let Some(key) = table.get(*key_name).and_then(|v| v.as_str()) {
-            if !key.is_empty() {
+        if let Some(key) = table.get(*key_name).and_then(|v| v.as_str())
+            && !key.is_empty() {
                 warn!("Using plaintext API key — run `duduclaw onboard` to encrypt");
                 return key.to_string();
             }
-        }
     }
     String::new()
 }

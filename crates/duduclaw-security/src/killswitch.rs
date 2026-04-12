@@ -16,6 +16,7 @@ use tracing::warn;
 /// Top-level killswitch configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct KillswitchConfig {
     pub triggers: TriggersConfig,
     pub circuit_breaker: CircuitBreakerConfig,
@@ -132,18 +133,6 @@ pub struct AuditConfig {
 
 // ── Defaults ───────────────────────────────────────────────────
 
-impl Default for KillswitchConfig {
-    fn default() -> Self {
-        Self {
-            triggers: TriggersConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            failsafe: FailsafeConfig::default(),
-            safety_words: SafetyWordsConfig::default(),
-            defensive_prompt: DefensivePromptConfig::default(),
-            audit: AuditConfig::default(),
-        }
-    }
-}
 
 impl Default for TriggersConfig {
     fn default() -> Self {

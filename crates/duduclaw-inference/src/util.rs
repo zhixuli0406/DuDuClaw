@@ -8,11 +8,10 @@ pub fn expand_tilde(path: &str) -> PathBuf {
         if let Ok(home) = std::env::var("HOME") {
             return PathBuf::from(home);
         }
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
+    } else if let Some(rest) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME") {
             return PathBuf::from(home).join(rest);
         }
-    }
     PathBuf::from(path)
 }
 

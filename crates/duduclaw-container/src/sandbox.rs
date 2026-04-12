@@ -56,6 +56,7 @@ pub async fn run_sandboxed(
 /// to inject into the container (e.g., delegation depth tracking).
 /// Like [`run_sandboxed`] but accepts additional environment variables
 /// (e.g., delegation depth tracking) and tool restrictions.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_sandboxed_with_env(
     agent_dir: &Path,
     prompt: &str,
@@ -100,8 +101,7 @@ pub async fn run_sandboxed_with_env(
 
     // Sanitize system_prompt: remove newlines and prevent CLI flag injection (R3-H5)
     let safe_prompt = system_prompt
-        .replace('\n', " ")
-        .replace('\r', " ");
+        .replace(['\n', '\r'], " ");
     let safe_prompt = if safe_prompt.starts_with('-') {
         format!(" {safe_prompt}")
     } else {

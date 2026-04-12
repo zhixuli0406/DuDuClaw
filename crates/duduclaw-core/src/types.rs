@@ -241,6 +241,7 @@ pub struct PermissionsConfig {
 /// removes it from the `--disallowedTools` list passed to the Claude CLI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub struct CapabilitiesConfig {
     /// Allow Claude Code's `computer_use` tool (screenshot + mouse + keyboard).
     /// WARNING: operates on the host display — only enable for attended local use.
@@ -262,16 +263,6 @@ pub struct CapabilitiesConfig {
     pub denied_tools: Vec<String>,
 }
 
-impl Default for CapabilitiesConfig {
-    fn default() -> Self {
-        Self {
-            computer_use: false,
-            browser_via_bash: false,
-            allowed_tools: Vec::new(),
-            denied_tools: Vec::new(),
-        }
-    }
-}
 
 /// Programmatic Tool Calling (PTC) configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -447,6 +438,7 @@ pub struct ChannelsConfig {
 /// Per-agent Discord channel settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
+#[derive(Default)]
 pub struct DiscordChannelConfig {
     /// Plain-text bot token (or encrypted via `bot_token_enc`).
     pub bot_token: String,
@@ -454,29 +446,21 @@ pub struct DiscordChannelConfig {
     pub bot_token_enc: Option<String>,
 }
 
-impl Default for DiscordChannelConfig {
-    fn default() -> Self {
-        Self { bot_token: String::new(), bot_token_enc: None }
-    }
-}
 
 /// Per-agent Telegram channel settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
+#[derive(Default)]
 pub struct TelegramChannelConfig {
     pub bot_token: String,
     pub bot_token_enc: Option<String>,
 }
 
-impl Default for TelegramChannelConfig {
-    fn default() -> Self {
-        Self { bot_token: String::new(), bot_token_enc: None }
-    }
-}
 
 /// Per-agent LINE channel settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
+#[derive(Default)]
 pub struct LineChannelConfig {
     pub channel_token: String,
     pub channel_token_enc: Option<String>,
@@ -484,18 +468,11 @@ pub struct LineChannelConfig {
     pub channel_secret_enc: Option<String>,
 }
 
-impl Default for LineChannelConfig {
-    fn default() -> Self {
-        Self {
-            channel_token: String::new(), channel_token_enc: None,
-            channel_secret: String::new(), channel_secret_enc: None,
-        }
-    }
-}
 
 /// Per-agent Slack channel settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
+#[derive(Default)]
 pub struct SlackChannelConfig {
     pub app_token: String,
     pub app_token_enc: Option<String>,
@@ -503,18 +480,11 @@ pub struct SlackChannelConfig {
     pub bot_token_enc: Option<String>,
 }
 
-impl Default for SlackChannelConfig {
-    fn default() -> Self {
-        Self {
-            app_token: String::new(), app_token_enc: None,
-            bot_token: String::new(), bot_token_enc: None,
-        }
-    }
-}
 
 /// Per-agent WhatsApp channel settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
+#[derive(Default)]
 pub struct WhatsAppChannelConfig {
     pub access_token: String,
     pub access_token_enc: Option<String>,
@@ -524,19 +494,11 @@ pub struct WhatsAppChannelConfig {
     pub app_secret_enc: Option<String>,
 }
 
-impl Default for WhatsAppChannelConfig {
-    fn default() -> Self {
-        Self {
-            access_token: String::new(), access_token_enc: None,
-            verify_token: String::new(), phone_number_id: String::new(),
-            app_secret: String::new(), app_secret_enc: None,
-        }
-    }
-}
 
 /// Per-agent Feishu (Lark) channel settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
+#[derive(Default)]
 pub struct FeishuChannelConfig {
     pub app_id: String,
     pub app_id_enc: Option<String>,
@@ -545,15 +507,6 @@ pub struct FeishuChannelConfig {
     pub verification_token: String,
 }
 
-impl Default for FeishuChannelConfig {
-    fn default() -> Self {
-        Self {
-            app_id: String::new(), app_id_enc: None,
-            app_secret: String::new(), app_secret_enc: None,
-            verification_token: String::new(),
-        }
-    }
-}
 
 /// Top-level agent identity (the `[agent]` table in agent.toml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -646,20 +599,17 @@ impl Default for CulturalContextConfig {
 /// Expressiveness level for sticker sending frequency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Expressiveness {
     /// 0.5x probability multiplier — very sparse stickers.
     Minimal,
     /// 1.0x probability multiplier — balanced (default).
+    #[default]
     Moderate,
     /// 2.0x probability multiplier — more frequent stickers.
     Expressive,
 }
 
-impl Default for Expressiveness {
-    fn default() -> Self {
-        Self::Moderate
-    }
-}
 
 impl Expressiveness {
     /// Probability multiplier for this expressiveness level.
@@ -802,17 +752,14 @@ pub struct Message {
 /// Procedural: reserved for future use (skills, SOUL.md are tracked separately).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum MemoryLayer {
+    #[default]
     Episodic,
     Semantic,
     Procedural,
 }
 
-impl Default for MemoryLayer {
-    fn default() -> Self {
-        Self::Episodic
-    }
-}
 
 impl MemoryLayer {
     pub fn as_str(&self) -> &str {
@@ -823,7 +770,7 @@ impl MemoryLayer {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s {
             "semantic" => Self::Semantic,
             "procedural" => Self::Procedural,

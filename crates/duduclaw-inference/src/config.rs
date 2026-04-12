@@ -385,20 +385,18 @@ impl InferenceConfig {
 
     /// Validate configuration.
     pub fn validate(&self) -> crate::error::Result<()> {
-        if let Some(ref compat) = self.openai_compat {
-            if compat.base_url.is_empty() {
+        if let Some(ref compat) = self.openai_compat
+            && compat.base_url.is_empty() {
                 return Err(InferenceError::Config(
                     "openai_compat.base_url cannot be empty".to_string(),
                 ));
             }
-        }
-        if let Some(ref router) = self.router {
-            if router.enabled && router.fast_threshold <= router.strong_threshold {
+        if let Some(ref router) = self.router
+            && router.enabled && router.fast_threshold <= router.strong_threshold {
                 return Err(InferenceError::Config(
                     "router.fast_threshold must be > router.strong_threshold".to_string(),
                 ));
             }
-        }
         Ok(())
     }
 }

@@ -15,6 +15,12 @@ pub struct AppleContainerRuntime {
     binary: String,
 }
 
+impl Default for AppleContainerRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppleContainerRuntime {
     /// Check if the `container` CLI is available on this system.
     pub fn is_available() -> bool {

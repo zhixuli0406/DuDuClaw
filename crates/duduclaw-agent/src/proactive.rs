@@ -40,6 +40,12 @@ pub struct ProactiveState {
     pub total_silent: u64,
 }
 
+impl Default for ProactiveState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProactiveState {
     pub fn new() -> Self {
         Self {
@@ -156,6 +162,12 @@ pub fn parse_proactive_result(result: &str) -> Option<String> {
 pub struct RuleEvaluator {
     /// Last fire time per rule source_contract string.
     last_fired: std::collections::HashMap<String, Instant>,
+}
+
+impl Default for RuleEvaluator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RuleEvaluator {

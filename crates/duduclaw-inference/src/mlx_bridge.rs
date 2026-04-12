@@ -99,11 +99,10 @@ impl MlxBridge {
         if !Self::is_safe_model_path(&self.config.model) {
             return Err(InferenceError::GenerationFailed("Invalid model path".to_string()));
         }
-        if let Some(ref adapter) = self.config.adapter_path {
-            if !Self::is_safe_model_path(adapter) {
+        if let Some(ref adapter) = self.config.adapter_path
+            && !Self::is_safe_model_path(adapter) {
                 return Err(InferenceError::GenerationFailed("Invalid adapter path".to_string()));
             }
-        }
 
         let payload = serde_json::json!({
             "model": self.config.model,

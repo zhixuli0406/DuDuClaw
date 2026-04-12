@@ -314,7 +314,7 @@ impl SqliteMemoryEngine {
             timestamp,
             tags,
             embedding: None,
-            layer: duduclaw_core::types::MemoryLayer::from_str(&layer_str),
+            layer: duduclaw_core::types::MemoryLayer::parse(&layer_str),
             importance,
             access_count,
             last_accessed,

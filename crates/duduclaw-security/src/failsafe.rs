@@ -94,6 +94,7 @@ pub struct FailsafeState {
 }
 
 impl FailsafeState {
+    #[allow(dead_code)]
     fn normal() -> Self {
         Self {
             level: FailsafeLevel::L0Normal,
@@ -126,13 +127,12 @@ impl FailsafeManager {
         let mut map = self.states.write().await;
         if let Some(state) = map.get(scope) {
             // Check auto-recovery
-            if let Some(recover_at) = state.auto_recover_at {
-                if Instant::now() >= recover_at {
+            if let Some(recover_at) = state.auto_recover_at
+                && Instant::now() >= recover_at {
                     info!(scope, from = %state.level, "Failsafe auto-recovering to L0");
                     map.remove(scope);
                     return FailsafeLevel::L0Normal;
                 }
-            }
             state.level
         } else {
             FailsafeLevel::L0Normal
@@ -147,13 +147,12 @@ impl FailsafeManager {
         let mut map = self.states.write().await;
         if let Some(state) = map.get_mut(scope) {
             // Check auto-recovery before returning
-            if let Some(recover_at) = state.auto_recover_at {
-                if Instant::now() >= recover_at {
+            if let Some(recover_at) = state.auto_recover_at
+                && Instant::now() >= recover_at {
                     info!(scope, from = %state.level, "Failsafe auto-recovering to L0 (via get_state)");
                     map.remove(scope);
                     return None;
                 }
-            }
             // Only return non-normal states
             if state.level == FailsafeLevel::L0Normal {
                 None

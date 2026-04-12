@@ -18,6 +18,7 @@ use tracing::{info, warn};
 
 /// Agent behavior contract loaded from `CONTRACT.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct Contract {
     #[serde(default)]
     pub boundaries: Boundaries,
@@ -71,13 +72,6 @@ pub fn load_contract(agent_dir: &Path) -> Contract {
     }
 }
 
-impl Default for Contract {
-    fn default() -> Self {
-        Self {
-            boundaries: Boundaries::default(),
-        }
-    }
-}
 
 /// Validate an agent response against its behavioral contract.
 ///
@@ -103,15 +97,14 @@ pub fn validate_response(contract: &Contract, response: &str) -> ValidationResul
         // Second: try as glob pattern (if it looks like one)
         if rule.contains('*') || rule.contains('?') || rule.contains('[') {
             let pattern = glob_to_regex_pattern(&rule_lower);
-            if let Ok(re) = regex_lite_match(&pattern, &lower) {
-                if re {
+            if let Ok(re) = regex_lite_match(&pattern, &lower)
+                && re {
                     violations.push(ContractViolation {
                         rule: rule.clone(),
                         category: "must_not".to_string(),
                         matched_text: "(regex match)".to_string(),
                     });
                 }
-            }
         }
     }
 

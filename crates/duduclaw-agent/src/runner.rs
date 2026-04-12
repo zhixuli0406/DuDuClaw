@@ -108,7 +108,7 @@ impl AgentRunner {
                 continue;
             }
 
-            eprint!("\n");
+            eprintln!();
 
             let response = call_with_streaming(
                 snapshot.prompt(),

@@ -274,19 +274,17 @@ impl LlamafileManager {
             // Check if process is still alive
             {
                 let mut child_guard = self.child.write().await;
-                if let Some(ref mut child) = *child_guard {
-                    if let Ok(Some(status)) = child.try_wait() {
+                if let Some(ref mut child) = *child_guard
+                    && let Ok(Some(status)) = child.try_wait() {
                         warn!(exit_code = ?status.code(), "llamafile exited prematurely");
                         return false;
                     }
-                }
             }
 
-            if let Ok(resp) = self.client.get(&health_url).send().await {
-                if resp.status().is_success() {
+            if let Ok(resp) = self.client.get(&health_url).send().await
+                && resp.status().is_success() {
                     return true;
                 }
-            }
         }
         false
     }

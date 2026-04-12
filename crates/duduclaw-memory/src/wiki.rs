@@ -184,13 +184,11 @@ impl WikiStore {
         }
         let full = self.wiki_dir.join(path);
         // Canonicalize check — prevent symlink escape
-        if full.exists() {
-            if let (Ok(canon_full), Ok(canon_wiki)) = (full.canonicalize(), self.wiki_dir.canonicalize()) {
-                if !canon_full.starts_with(&canon_wiki) {
+        if full.exists()
+            && let (Ok(canon_full), Ok(canon_wiki)) = (full.canonicalize(), self.wiki_dir.canonicalize())
+                && !canon_full.starts_with(&canon_wiki) {
                     return Err(DuDuClawError::Memory("resolved path escapes wiki directory".into()));
                 }
-            }
-        }
         std::fs::read_to_string(&full)
             .map_err(|e| DuDuClawError::Memory(format!("read {path}: {e}")))
     }
@@ -242,12 +240,11 @@ impl WikiStore {
         let full = self.wiki_dir.join(path);
 
         // Ensure parent directory
-        if let Some(parent) = full.parent() {
-            if !parent.exists() {
+        if let Some(parent) = full.parent()
+            && !parent.exists() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| DuDuClawError::Memory(format!("create dir: {e}")))?;
             }
-        }
 
         let is_new = !full.exists();
 
@@ -401,19 +398,18 @@ impl WikiStore {
             let dst = output_dir.join(&page.path);
 
             // Ensure parent dir
-            if let Some(parent) = dst.parent() {
-                if !parent.exists() {
+            if let Some(parent) = dst.parent()
+                && !parent.exists() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| DuDuClawError::Memory(format!("mkdir: {e}")))?;
                 }
-            }
 
             let content = std::fs::read_to_string(&src)
                 .map_err(|e| DuDuClawError::Memory(format!("read {}: {e}", page.path)))?;
 
             // Append Obsidian wikilinks for related pages
             let related = extract_string_list(&content, "related");
-            let body = extract_body(&content);
+            let _body = extract_body(&content);
             if related.is_empty() {
                 std::fs::write(&dst, &content)
                     .map_err(|e| DuDuClawError::Memory(format!("write export: {e}")))?;
@@ -686,13 +682,11 @@ impl WikiStore {
         }
         // Canonicalize check — verify resolved path stays within wiki_dir
         let full = self.wiki_dir.join(path);
-        if full.exists() {
-            if let (Ok(canon_full), Ok(canon_wiki)) = (full.canonicalize(), self.wiki_dir.canonicalize()) {
-                if !canon_full.starts_with(&canon_wiki) {
+        if full.exists()
+            && let (Ok(canon_full), Ok(canon_wiki)) = (full.canonicalize(), self.wiki_dir.canonicalize())
+                && !canon_full.starts_with(&canon_wiki) {
                     return Err(DuDuClawError::Memory("resolved path escapes wiki directory".into()));
                 }
-            }
-        }
         Ok(())
     }
 
@@ -703,10 +697,10 @@ impl WikiStore {
         let lock_path = self.wiki_dir.join("_index.lock");
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .open(&lock_path)
             .map_err(|e| format!("open lock: {e}"))?;
-        use std::io::Write;
         // Advisory lock — blocks until acquired
         fs_lock(&lock_file).map_err(|e| format!("acquire lock: {e}"))?;
 
@@ -751,6 +745,7 @@ impl WikiStore {
         let lock_path = self.wiki_dir.join("_index.lock");
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .open(&lock_path)
             .map_err(|e| format!("open lock: {e}"))?;
@@ -1002,11 +997,10 @@ fn collect_md_files_inner(base: &Path, dir: &Path, depth: usize) -> Vec<PathBuf>
             result.extend(collect_md_files_inner(base, &path, depth + 1));
         } else if ftype.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
             let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
-            if !RESERVED_FILES.contains(&fname) {
-                if let Ok(rel) = path.strip_prefix(base) {
+            if !RESERVED_FILES.contains(&fname)
+                && let Ok(rel) = path.strip_prefix(base) {
                     result.push(rel.to_path_buf());
                 }
-            }
         }
         // Symlinks are silently skipped (neither is_dir nor is_file on DirEntry::file_type)
     }
@@ -1025,12 +1019,12 @@ fn html_escape(s: &str) -> String {
 fn html_escape_body(body: &str) -> String {
     let mut html = String::new();
     for line in body.lines() {
-        if line.starts_with("# ") {
-            html.push_str(&format!("<h3>{}</h3>\n", html_escape(&line[2..])));
-        } else if line.starts_with("## ") {
-            html.push_str(&format!("<h4>{}</h4>\n", html_escape(&line[3..])));
-        } else if line.starts_with("- ") {
-            html.push_str(&format!("<li>{}</li>\n", html_escape(&line[2..])));
+        if let Some(stripped) = line.strip_prefix("# ") {
+            html.push_str(&format!("<h3>{}</h3>\n", html_escape(stripped)));
+        } else if let Some(stripped) = line.strip_prefix("## ") {
+            html.push_str(&format!("<h4>{}</h4>\n", html_escape(stripped)));
+        } else if let Some(stripped) = line.strip_prefix("- ") {
+            html.push_str(&format!("<li>{}</li>\n", html_escape(stripped)));
         } else if line.trim().is_empty() {
             html.push_str("<br>\n");
         } else {

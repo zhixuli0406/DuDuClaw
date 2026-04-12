@@ -5,7 +5,7 @@
 //!
 //! Requires the `onnx` feature flag.
 
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::error::InferenceError;
 

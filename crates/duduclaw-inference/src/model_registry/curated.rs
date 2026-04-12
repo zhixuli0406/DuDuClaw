@@ -26,7 +26,7 @@ pub const TRUSTED_UPLOADERS: &[&str] = &[
 pub fn is_trusted(repo: &str) -> bool {
     let owner = repo.split('/').next().unwrap_or("");
     // H-S2: exact case-sensitive match (HF org names are case-sensitive)
-    TRUSTED_UPLOADERS.iter().any(|t| *t == owner)
+    TRUSTED_UPLOADERS.contains(&owner)
 }
 
 /// Built-in curated model list — fallback when network is unavailable.

@@ -327,13 +327,13 @@ fn maybe_rotate_tool_calls(path: &std::path::Path) {
     static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
 
     // Check every 64 calls (~1 metadata syscall per 64 tool invocations)
-    if CALL_COUNT.fetch_add(1, Ordering::Relaxed) % 64 != 0 {
+    if !CALL_COUNT.fetch_add(1, Ordering::Relaxed).is_multiple_of(64) {
         return;
     }
 
     const MAX_SIZE: u64 = 5 * 1024 * 1024; // 5 MB
-    if let Ok(meta) = std::fs::metadata(path) {
-        if meta.len() > MAX_SIZE {
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.len() > MAX_SIZE {
             let backup = path.with_extension("jsonl.old");
             // Ignore ENOENT: a concurrent caller may have already rotated.
             match std::fs::rename(path, &backup) {
@@ -342,7 +342,6 @@ fn maybe_rotate_tool_calls(path: &std::path::Path) {
                 Err(e) => warn!("Failed to rotate tool_calls.jsonl: {e}"),
             }
         }
-    }
 }
 
 /// Log a tool hallucination detection event.

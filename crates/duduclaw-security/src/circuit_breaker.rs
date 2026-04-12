@@ -224,8 +224,8 @@ impl CircuitBreaker {
         if self.state == BreakerState::HalfOpen {
             // Echo check even during probing — bot loops must not survive half-open
             let hash = text_hash(text);
-            if let Some(outbound_hash) = self.last_outbound_hash {
-                if hash == outbound_hash && !text.is_empty() {
+            if let Some(outbound_hash) = self.last_outbound_hash
+                && hash == outbound_hash && !text.is_empty() {
                     let prefix: String = text.chars().take(200).collect();
                     let prefix_match = self
                         .last_outbound_prefix
@@ -238,7 +238,6 @@ impl CircuitBreaker {
                         return BreakerDecision::Trip(reason);
                     }
                 }
-            }
 
             if self.half_open_passes >= self.config.half_open_allow_count {
                 // Probing succeeded — close the breaker
@@ -258,8 +257,8 @@ impl CircuitBreaker {
 
         // Check 1: Echo detection (highest priority, immediate trip)
         // Uses hash for fast path + prefix comparison to avoid false positives.
-        if let Some(outbound_hash) = self.last_outbound_hash {
-            if hash == outbound_hash && !text.is_empty() {
+        if let Some(outbound_hash) = self.last_outbound_hash
+            && hash == outbound_hash && !text.is_empty() {
                 // Secondary check: verify the prefix actually matches to
                 // rule out hash collisions (DefaultHasher is not collision-resistant).
                 let prefix: String = text.chars().take(200).collect();
@@ -273,7 +272,6 @@ impl CircuitBreaker {
                     return BreakerDecision::Trip(reason);
                 }
             }
-        }
 
         // Check 2: Frequency anomaly
         let window = Duration::from_secs(self.config.frequency_window_secs);
@@ -319,8 +317,8 @@ impl CircuitBreaker {
         if self.recent_token_counts.len() >= 5 {
             let avg: usize =
                 self.recent_token_counts.iter().sum::<usize>() / self.recent_token_counts.len();
-            if let Some(&last) = self.recent_token_counts.back() {
-                if avg > 0
+            if let Some(&last) = self.recent_token_counts.back()
+                && avg > 0
                     && last as f64 > avg as f64 * self.config.token_explosion_multiplier
                 {
                     let reason = TripReason::TokenExplosion {
@@ -330,7 +328,6 @@ impl CircuitBreaker {
                     self.trip(reason.clone());
                     return BreakerDecision::Trip(reason);
                 }
-            }
         }
 
         BreakerDecision::Allow
@@ -446,7 +443,7 @@ impl CircuitBreakerRegistry {
         let cutoff = Instant::now() - max_age;
         map.retain(|_, b| {
             b.state != BreakerState::Closed
-                || b.inbound_timestamps.back().map_or(false, |t| *t > cutoff)
+                || b.inbound_timestamps.back().is_some_and(|t| *t > cutoff)
         });
     }
 }

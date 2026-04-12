@@ -120,11 +120,10 @@ impl ExoCluster {
                     status.latency_ms = Some(latency);
 
                     // Try to parse node count from response
-                    if let Ok(body) = resp.json::<serde_json::Value>().await {
-                        if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
+                    if let Ok(body) = resp.json::<serde_json::Value>().await
+                        && let Some(data) = body.get("data").and_then(|d| d.as_array()) {
                             status.node_count = Some(data.len() as u32);
                         }
-                    }
 
                     info!(endpoint = %ep, latency_ms = latency, "Exo cluster healthy");
                     return true;

@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::error::InferenceError;
 use crate::realtime_voice::{PartialTranscript, StreamingAsrProvider};
@@ -131,8 +131,8 @@ impl StreamingAsrProvider for DeepgramStreamingAsr {
         tokio::spawn(async move {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(300), async move {
                 while let Some(Ok(msg)) = ws_read.next().await {
-                    if let Message::Text(text) = msg {
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Message::Text(text) = msg
+                        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                             let is_final = json.get("is_final").and_then(|v| v.as_bool()).unwrap_or(false);
                             let channel = json.get("channel").and_then(|c| c.get("alternatives"))
                                 .and_then(|a| a.get(0));
@@ -165,7 +165,6 @@ impl StreamingAsrProvider for DeepgramStreamingAsr {
                                 }
                             }
                         }
-                    }
                 }
             }).await;
             // Timeout or normal end — tx_clone dropped here, notifying receiver
