@@ -726,8 +726,8 @@ mod tests {
 
     #[test]
     fn test_derive_agent_name_special_chars() {
-        assert_eq!(derive_agent_name("Café & Bistro!"), "caf--bistro");
-        // Note: non-ASCII mapped to hyphen, consecutive collapsed
+        assert_eq!(derive_agent_name("Café & Bistro!"), "caf-bistro");
+        // é and & are non-ASCII/special → hyphens, consecutive collapsed
     }
 
     #[test]
