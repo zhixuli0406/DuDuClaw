@@ -18,6 +18,7 @@ pub enum Protocol {
 }
 
 impl Protocol {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "xmlrpc" | "xml-rpc" | "xml_rpc" => Self::XmlRpc,
@@ -102,6 +103,7 @@ pub async fn version(http: &reqwest::Client, url: &str) -> Result<Value, String>
 }
 
 /// Execute an ORM method via `execute_kw`.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_kw(
     http: &reqwest::Client,
     url: &str,

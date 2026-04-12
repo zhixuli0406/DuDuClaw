@@ -209,8 +209,8 @@ impl UnicodeNormalizer {
 
         for ch in input.chars() {
             let script = ch.script();
-            if script != Script::Common && script != Script::Inherited && script != dominant {
-                if is_confusable(script) {
+            if script != Script::Common && script != Script::Inherited && script != dominant
+                && is_confusable(script) {
                     warnings.push(MixedScriptWarning {
                         position: byte_pos,
                         character: ch,
@@ -218,7 +218,6 @@ impl UnicodeNormalizer {
                         actual_script: format!("{:?}", script),
                     });
                 }
-            }
             byte_pos += ch.len_utf8();
         }
 

@@ -169,7 +169,7 @@ async fn download_with_resume(
         resp.headers()
             .get("content-range")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split('/').last())
+            .and_then(|s| s.split('/').next_back())
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0)
     } else {

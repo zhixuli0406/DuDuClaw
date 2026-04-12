@@ -16,10 +16,9 @@
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
 
 use crate::error::InferenceError;
-use crate::realtime_voice::{AudioChunk, AudioFormat, PartialTranscript, VoiceEvent, VoiceSessionConfig};
+use crate::realtime_voice::{AudioChunk, VoiceEvent};
 
 /// LiveKit room configuration.
 ///
@@ -82,6 +81,12 @@ pub trait LiveKitSession: Send + Sync {
 
 /// Stub implementation when `livekit` feature is not enabled.
 pub struct LiveKitStub;
+
+impl Default for LiveKitStub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl LiveKitStub {
     pub fn new() -> Self {

@@ -9,7 +9,7 @@ use tokio::net::UnixListener;
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
-use duduclaw_core::error::{DuDuClawError, Result};
+use duduclaw_core::error::Result;
 
 /// Handler function type for routing tool calls.
 ///

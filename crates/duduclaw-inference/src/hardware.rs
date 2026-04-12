@@ -107,15 +107,14 @@ async fn detect_amd() -> Option<String> {
         .output()
         .await;
 
-    if let Ok(o) = output {
-        if o.status.success() {
+    if let Ok(o) = output
+        && o.status.success() {
             let text = String::from_utf8_lossy(&o.stdout);
             if let Some(line) = text.lines().find(|l| l.contains("GPU")) {
                 return Some(line.trim().to_string());
             }
             return Some("AMD GPU (ROCm)".to_string());
         }
-    }
 
     None
 }

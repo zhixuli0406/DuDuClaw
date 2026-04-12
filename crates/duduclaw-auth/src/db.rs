@@ -593,6 +593,7 @@ fn verify_password_hash(password: &str, stored_hash: &str) -> Result<(), String>
 
 /// Generate a cryptographically random password of the given length.
 /// Uses rejection sampling to avoid modulo bias.
+#[allow(dead_code)]
 fn generate_random_password(len: usize) -> String {
     use ring::rand::SecureRandom;
     // 64 chars = power of 2, no modulo bias with u8 & 0x3F

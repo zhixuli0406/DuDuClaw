@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+#![allow(clippy::empty_line_after_doc_comments)]
+#![allow(clippy::format_in_format_args)]
+#![allow(clippy::ptr_arg)]
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -97,13 +101,12 @@ async fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
 /// Load or generate the per-machine AES-256 key stored in `~/.duduclaw/.keyfile`.
 fn load_or_create_keyfile(home: &PathBuf) -> [u8; 32] {
     let keyfile = home.join(".keyfile");
-    if let Ok(bytes) = std::fs::read(&keyfile) {
-        if bytes.len() == 32 {
+    if let Ok(bytes) = std::fs::read(&keyfile)
+        && bytes.len() == 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&bytes);
             return key;
         }
-    }
     // Generate fresh key — fail loudly instead of falling back to all-zeros
     let key = match duduclaw_security::crypto::CryptoEngine::generate_key() {
         Ok(k) => k,
@@ -113,7 +116,7 @@ fn load_or_create_keyfile(home: &PathBuf) -> [u8; 32] {
             std::process::exit(1);
         }
     };
-    if let Err(e) = std::fs::write(&keyfile, &key) {
+    if let Err(e) = std::fs::write(&keyfile, key) {
         eprintln!("FATAL: Failed to write keyfile {}: {e}", keyfile.display());
         eprintln!("Cannot proceed — encrypted data would be permanently unrecoverable.");
         std::process::exit(1);
@@ -145,18 +148,15 @@ pub fn decrypt_api_key_from_config(home: &PathBuf) -> Option<String> {
     let api = table.get("api")?.as_table()?;
 
     // Check encrypted first
-    if let Some(enc) = api.get("anthropic_api_key_enc").and_then(|v| v.as_str()) {
-        if !enc.is_empty() {
+    if let Some(enc) = api.get("anthropic_api_key_enc").and_then(|v| v.as_str())
+        && !enc.is_empty() {
             let key = load_or_create_keyfile(home);
-            if let Ok(engine) = duduclaw_security::crypto::CryptoEngine::new(&key) {
-                if let Ok(plain) = engine.decrypt_string(enc) {
-                    if !plain.is_empty() {
+            if let Ok(engine) = duduclaw_security::crypto::CryptoEngine::new(&key)
+                && let Ok(plain) = engine.decrypt_string(enc)
+                    && !plain.is_empty() {
                         return Some(plain);
                     }
-                }
-            }
         }
-    }
     // Fallback: plaintext (backwards compat)
     let plain = api.get("anthropic_api_key")?.as_str()?;
     if plain.is_empty() { None } else { Some(plain.to_string()) }
@@ -1095,11 +1095,11 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
                     println!();
                     println!("  {} {}", style("🎮").bold(), style("Discord 設定指南").bold());
                     println!();
-                    println!("    {} {}", style("【Step 1】").bold(), "建立 Application");
+                    println!("    {} 建立 Application", style("【Step 1】").bold());
                     println!("    前往 {}", style("https://discord.com/developers/applications").cyan());
                     println!("    點選 {} 建立 Application", style("New Application").yellow());
                     println!();
-                    println!("    {} {}", style("【Step 2】").bold(), "取得 Bot Token");
+                    println!("    {} 取得 Bot Token", style("【Step 2】").bold());
                     println!("    左側選單 → {} → Reset Token → 複製 Token", style("Bot").yellow());
                     println!();
                     println!("    {} {}", style("【Step 3】").bold(), style("啟用 Privileged Gateway Intents").red().bold());
@@ -1109,7 +1109,7 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
                     println!("      {} {} — 接收上線狀態", style("☑ PRESENCE INTENT").yellow(), style("（選用）").dim());
                     println!("    ⚠  未開啟 MESSAGE CONTENT INTENT 將導致 Bot 完全無法收到訊息！");
                     println!();
-                    println!("    {} {}", style("【Step 4】").bold(), "設定 Bot 權限並邀請至伺服器");
+                    println!("    {} 設定 Bot 權限並邀請至伺服器", style("【Step 4】").bold());
                     println!("    左側 → {} → {}：", style("OAuth2").yellow(), style("URL Generator").yellow());
                     println!("      Scopes：勾選 {}", style("bot").yellow());
                     println!("      Bot Permissions（文字權限）：");
@@ -2257,8 +2257,8 @@ async fn cmd_license_status() -> duduclaw_core::error::Result<()> {
     println!("  Tier:        {tier_display}");
 
     if license_path.exists() {
-        if let Ok(content) = tokio::fs::read_to_string(&license_path).await {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+        if let Ok(content) = tokio::fs::read_to_string(&license_path).await
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(customer) = json.get("customer_name").and_then(|v| v.as_str()) {
                     println!("  Customer:    {customer}");
                 }
@@ -2281,7 +2281,6 @@ async fn cmd_license_status() -> duduclaw_core::error::Result<()> {
                     println!("  Fingerprint: {fp}");
                 }
             }
-        }
     } else {
         println!("  License:     {}", style("Not activated").dim());
     }
@@ -2402,8 +2401,8 @@ async fn cmd_license_verify(key: &str) -> duduclaw_core::error::Result<()> {
     }
 
     // Check expiry
-    if expires != "perpetual" {
-        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(expires) {
+    if expires != "perpetual"
+        && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(expires) {
             let days = dt.signed_duration_since(chrono::Utc::now()).num_days();
             if days < 0 {
                 println!("  Status:      {}", style("EXPIRED").red().bold());
@@ -2411,7 +2410,6 @@ async fn cmd_license_verify(key: &str) -> duduclaw_core::error::Result<()> {
                 println!("  Status:      {} ({days} days remaining)", style("valid").green());
             }
         }
-    }
 
     // Check machine fingerprint match
     let my_fp = build_machine_fingerprint();
@@ -2623,7 +2621,7 @@ async fn cmd_update(auto_yes: bool) -> duduclaw_core::error::Result<()> {
 
     let info = duduclaw_gateway::updater::check_update()
         .await
-        .map_err(|e| DuDuClawError::Gateway(e))?;
+        .map_err(DuDuClawError::Gateway)?;
 
     println!("  Current version: {}", info.current_version);
     println!("  Latest version:  {}", info.latest_version);
@@ -2682,7 +2680,7 @@ async fn cmd_update(auto_yes: bool) -> duduclaw_core::error::Result<()> {
     println!("\n  Downloading and installing...");
     let result = duduclaw_gateway::updater::apply_update(&info.download_url, &info.checksum_url)
         .await
-        .map_err(|e| DuDuClawError::Gateway(e))?;
+        .map_err(DuDuClawError::Gateway)?;
 
     if result.success {
         println!("  {}", result.message);

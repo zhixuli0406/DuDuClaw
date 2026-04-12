@@ -41,6 +41,12 @@ pub struct PollTracker {
     pub poll_limit: Option<usize>,
 }
 
+impl Default for PollTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PollTracker {
     pub fn new() -> Self {
         Self { last_poll: HashMap::new(), poll_limit: None }
@@ -373,8 +379,8 @@ pub fn dedup_events(events: &[OdooEvent], seen_keys: &mut HashMap<String, String
     let mut result = Vec::new();
     for event in events {
         let key = format!("{}:{}:{}", event.event_type, event.model, event.record_id);
-        if !seen_keys.contains_key(&key) {
-            seen_keys.insert(key, now.to_rfc3339());
+        if let std::collections::hash_map::Entry::Vacant(e) = seen_keys.entry(key) {
+            e.insert(now.to_rfc3339());
             result.push(event.clone());
         }
     }

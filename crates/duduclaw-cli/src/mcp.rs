@@ -645,12 +645,11 @@ const MAX_QUEUE_FILE_SIZE: u64 = 10 * 1024 * 1024;
 /// The dispatcher uses its own Mutex for read-modify-write operations.
 fn append_to_jsonl_sync(path: &std::path::Path, line: &str) -> bool {
     // Check size limit
-    if let Ok(meta) = std::fs::metadata(path) {
-        if meta.len() > MAX_QUEUE_FILE_SIZE {
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.len() > MAX_QUEUE_FILE_SIZE {
             tracing::warn!("Queue file {} exceeds size limit", path.display());
             return false;
         }
-    }
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         writeln!(f, "{line}").is_ok()
@@ -1289,14 +1288,13 @@ async fn handle_create_reminder(params: &Value, home_dir: &Path, default_agent: 
             "isError": true
         });
     }
-    if let Some(p) = prompt {
-        if p.len() > MAX_PROMPT_LEN {
+    if let Some(p) = prompt
+        && p.len() > MAX_PROMPT_LEN {
             return serde_json::json!({
                 "content": [{"type": "text", "text": format!("Error: prompt too long ({} chars, max {MAX_PROMPT_LEN})", p.len())}],
                 "isError": true
             });
         }
-    }
 
     // Validate channel
     if !matches!(channel, "telegram" | "line" | "discord") {
@@ -1627,8 +1625,8 @@ async fn handle_list_agents(home_dir: &Path) -> Value {
         }
 
         let toml_path = path.join("agent.toml");
-        if let Ok(content) = tokio::fs::read_to_string(&toml_path).await {
-            if let Ok(config) = toml::from_str::<duduclaw_core::types::AgentConfig>(&content) {
+        if let Ok(content) = tokio::fs::read_to_string(&toml_path).await
+            && let Ok(config) = toml::from_str::<duduclaw_core::types::AgentConfig>(&content) {
                 agents.push(serde_json::json!({
                     "name": config.agent.name,
                     "display_name": config.agent.display_name,
@@ -1641,7 +1639,6 @@ async fn handle_list_agents(home_dir: &Path) -> Value {
                     "can_schedule_tasks": config.permissions.can_schedule_tasks,
                 }));
             }
-        }
     }
 
     if agents.is_empty() {
@@ -1870,11 +1867,10 @@ async fn spawn_agent_with_ctx(
             use std::io::Write;
             // Enforce bus_queue.jsonl size limit (CLI-H4)
             const MAX_QUEUE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
-            if let Ok(meta) = std::fs::metadata(&path) {
-                if meta.len() > MAX_QUEUE_SIZE {
+            if let Ok(meta) = std::fs::metadata(&path)
+                && meta.len() > MAX_QUEUE_SIZE {
                     return false;
                 }
-            }
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
                 writeln!(f, "{entry_str}").is_ok()
             } else {
@@ -2028,12 +2024,11 @@ async fn handle_agent_update(params: &Value, home_dir: &Path) -> Value {
     }
 
     // -- Heartbeat fields --
-    if let Some(v) = params.get("heartbeat_enabled") {
-        if let Some(b) = v.as_bool() {
+    if let Some(v) = params.get("heartbeat_enabled")
+        && let Some(b) = v.as_bool() {
             config.heartbeat.enabled = b;
             changes.push(format!("heartbeat.enabled = {b}"));
         }
-    }
     if let Some(v) = params.get("heartbeat_cron").and_then(|v| v.as_str()) {
         config.heartbeat.cron = v.to_string();
         changes.push(format!("heartbeat.cron = \"{v}\""));
@@ -2104,14 +2099,13 @@ async fn handle_agent_remove(params: &Value, home_dir: &Path) -> Value {
     };
 
     // Refuse to remove main agent
-    if let Ok(config) = toml::from_str::<duduclaw_core::types::AgentConfig>(&content) {
-        if config.agent.role == duduclaw_core::types::AgentRole::Main {
+    if let Ok(config) = toml::from_str::<duduclaw_core::types::AgentConfig>(&content)
+        && config.agent.role == duduclaw_core::types::AgentRole::Main {
             return serde_json::json!({
                 "content": [{"type": "text", "text": format!("Error: cannot remove main agent '{agent_id}'. Change its role first if you really mean to.")}],
                 "isError": true
             });
         }
-    }
 
     // Move to trash instead of hard delete
     let trash_dir = home_dir.join("agents").join("_trash");
@@ -2228,13 +2222,12 @@ async fn count_pending_tasks(home_dir: &Path, agent_id: &str) -> usize {
 
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() { continue; }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-            if v.get("type").and_then(|t| t.as_str()) == Some("agent_message")
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+            && v.get("type").and_then(|t| t.as_str()) == Some("agent_message")
                 && v.get("agent_id").and_then(|a| a.as_str()) == Some(agent_id)
             {
                 count += 1;
             }
-        }
     }
 
     count
@@ -3534,13 +3527,11 @@ async fn resolve_main_agent_name(home_dir: &Path) -> String {
             continue;
         }
         let toml_path = path.join("agent.toml");
-        if let Ok(content) = tokio::fs::read_to_string(&toml_path).await {
-            if let Ok(config) = toml::from_str::<duduclaw_core::types::AgentConfig>(&content) {
-                if config.agent.role == duduclaw_core::types::AgentRole::Main {
+        if let Ok(content) = tokio::fs::read_to_string(&toml_path).await
+            && let Ok(config) = toml::from_str::<duduclaw_core::types::AgentConfig>(&content)
+                && config.agent.role == duduclaw_core::types::AgentRole::Main {
                     return config.agent.name;
                 }
-            }
-        }
     }
 
     String::new()
@@ -3583,11 +3574,10 @@ fn decrypt_channel_token(config: &toml::Table, enc_key: &str, plain_key: &str, h
     let channels = config.get("channels").and_then(|c| c.as_table());
 
     // Try encrypted field first
-    if let Some(enc_val) = channels.and_then(|c| c.get(enc_key)).and_then(|v| v.as_str()) {
-        if let Some(decrypted) = decrypt_encrypted_value(enc_val, home_dir) {
+    if let Some(enc_val) = channels.and_then(|c| c.get(enc_key)).and_then(|v| v.as_str())
+        && let Some(decrypted) = decrypt_encrypted_value(enc_val, home_dir) {
             return decrypted;
         }
-    }
 
     // Fallback: plaintext field (backwards compat)
     channels
@@ -4322,15 +4312,14 @@ fn collect_md_files(base: &Path, dir: &Path) -> Vec<std::path::PathBuf> {
         let path = entry.path();
         if path.is_dir() {
             result.extend(collect_md_files(base, &path));
-        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
-            if let Ok(rel) = path.strip_prefix(base) {
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md")
+            && let Ok(rel) = path.strip_prefix(base) {
                 // Skip reserved files
                 let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
                 if !WIKI_RESERVED.contains(&fname) {
                     result.push(rel.to_path_buf());
                 }
             }
-        }
     }
     result
 }
@@ -4387,11 +4376,10 @@ async fn handle_wiki_read(args: &Value, home_dir: &Path, default_agent: &str) ->
     let full_path = wiki_dir.join(page_path);
 
     // Verify the resolved path is still under wiki_dir (symlink protection)
-    if let (Ok(canon_wiki), Ok(canon_page)) = (wiki_dir.canonicalize(), full_path.canonicalize()) {
-        if !canon_page.starts_with(&canon_wiki) {
+    if let (Ok(canon_wiki), Ok(canon_page)) = (wiki_dir.canonicalize(), full_path.canonicalize())
+        && !canon_page.starts_with(&canon_wiki) {
             return tool_error("Path escapes wiki directory");
         }
-    }
 
     match std::fs::read_to_string(&full_path) {
         Ok(content) => tool_text(&content),
@@ -4434,13 +4422,11 @@ async fn handle_wiki_write(args: &Value, home_dir: &Path, default_agent: &str) -
     let full_path = wiki_dir.join(page_path);
 
     // Ensure parent directory exists
-    if let Some(parent) = full_path.parent() {
-        if !parent.exists() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
+    if let Some(parent) = full_path.parent()
+        && !parent.exists()
+            && let Err(e) = std::fs::create_dir_all(parent) {
                 return tool_error(&format!("Failed to create directory: {e}"));
             }
-        }
-    }
 
     let is_new = !full_path.exists();
 
@@ -4557,8 +4543,8 @@ async fn handle_wiki_search(args: &Value, home_dir: &Path, default_agent: &str) 
                     let ll = line.to_lowercase();
                     if ll.contains(term.as_str()) {
                         // Extract page path from markdown link [title](path)
-                        if let Some(start) = line.find("](") {
-                            if let Some(end) = line[start + 2..].find(')') {
+                        if let Some(start) = line.find("](")
+                            && let Some(end) = line[start + 2..].find(')') {
                                 let linked_path = &line[start + 2..start + 2 + end];
                                 // Boost this page's score
                                 for entry in &mut scored {
@@ -4567,7 +4553,6 @@ async fn handle_wiki_search(args: &Value, home_dir: &Path, default_agent: &str) 
                                     }
                                 }
                             }
-                        }
                     }
                 }
             }
@@ -4869,7 +4854,7 @@ async fn handle_execute_program(args: &Value) -> Value {
         .get("timeout_seconds")
         .and_then(|v| v.as_u64())
         .unwrap_or(30)
-        .min(300) as u64;
+        .min(300);
 
     tracing::info!(language, timeout_seconds, "execute_program called");
 

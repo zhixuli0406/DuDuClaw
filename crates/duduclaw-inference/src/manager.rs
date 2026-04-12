@@ -106,7 +106,7 @@ impl InferenceManager {
         // Re-check if interval elapsed
         let should_recheck = {
             let last = self.last_health_check.read().await;
-            last.map_or(true, |t| t.elapsed() > self.health_check_interval)
+            last.is_none_or(|t| t.elapsed() > self.health_check_interval)
         };
 
         if should_recheck {
@@ -207,15 +207,14 @@ impl InferenceManager {
     /// Select the best available mode based on health checks.
     async fn select_best_mode(&self) -> InferenceMode {
         // 1. Try Exo cluster (highest priority — can run largest models)
-        if let Some(ref exo) = self.exo {
-            if exo.is_enabled() && exo.health_check().await {
+        if let Some(ref exo) = self.exo
+            && exo.is_enabled() && exo.health_check().await {
                 return InferenceMode::ExoCluster;
             }
-        }
 
         // 2. Try llamafile (portable, already running)
-        if let Some(ref lf) = self.llamafile {
-            if lf.is_enabled() {
+        if let Some(ref lf) = self.llamafile
+            && lf.is_enabled() {
                 if lf.is_healthy().await {
                     return InferenceMode::Llamafile;
                 }
@@ -224,7 +223,6 @@ impl InferenceManager {
                     return InferenceMode::Llamafile;
                 }
             }
-        }
 
         // 3. Direct backend is handled by InferenceEngine
         // We return CloudOnly and let the engine decide

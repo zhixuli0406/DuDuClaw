@@ -179,11 +179,10 @@ fn extract_param_count(filename: &str) -> String {
     let lower = filename.to_lowercase();
     // Split on `-` and `_` only (not `.`) to preserve decimals like "0.6b"
     for part in lower.split(&['-', '_'][..]) {
-        if part.ends_with('b') {
-            let num = &part[..part.len() - 1];
-            if num.parse::<f64>().is_ok() {
-                return part.to_uppercase();
-            }
+        if let Some(num) = part.strip_suffix('b')
+            && num.parse::<f64>().is_ok()
+        {
+            return part.to_uppercase();
         }
     }
     "unknown".to_string()

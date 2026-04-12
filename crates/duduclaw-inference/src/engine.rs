@@ -82,8 +82,8 @@ impl InferenceEngine {
         info!(count = models.len(), "Models available");
 
         // Log router status
-        if let Some(ref router) = self.router {
-            if router.is_enabled() {
+        if let Some(ref router) = self.router
+            && router.is_enabled() {
                 info!(
                     fast_model = ?router.config().fast_model,
                     strong_model = ?router.config().strong_model,
@@ -92,7 +92,6 @@ impl InferenceEngine {
                     "Confidence router enabled"
                 );
             }
-        }
 
         // Initialize InferenceManager (Exo, llamafile)
         let mgr_mode = self.manager.init().await.unwrap_or(InferenceMode::CloudOnly);
@@ -112,21 +111,19 @@ impl InferenceEngine {
         }
 
         // Check MLX availability
-        if let Some(ref mlx) = self.mlx {
-            if mlx.is_available().await {
+        if let Some(ref mlx) = self.mlx
+            && mlx.is_available().await {
                 info!("MLX bridge available for evolution reflections");
             }
-        }
 
         // Auto-load default model if configured
-        if self.config.auto_load {
-            if let Some(ref default_model) = self.config.default_model {
+        if self.config.auto_load
+            && let Some(ref default_model) = self.config.default_model {
                 match self.load_model(default_model).await {
                     Ok(info) => info!(model = %info.id, "Auto-loaded default model"),
                     Err(e) => warn!(model = default_model, error = %e, "Failed to auto-load model"),
                 }
             }
-        }
 
         Ok(())
     }

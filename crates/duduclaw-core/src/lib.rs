@@ -50,14 +50,12 @@ pub fn which_claude() -> Option<String> {
     if let Ok(output) = std::process::Command::new("which")
         .arg("claude")
         .output()
-    {
-        if output.status.success() {
+        && output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path.is_empty() && std::path::Path::new(&path).exists() {
                 return Some(path);
             }
         }
-    }
 
     // 2-3. Scan fixed + dynamic HOME-rooted candidates
     let home = std::env::var("HOME").unwrap_or_default();

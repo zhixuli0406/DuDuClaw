@@ -24,6 +24,7 @@ pub enum AsrStrategy {
 /// ASR Router that dispatches to the best available provider.
 pub struct AsrRouter {
     providers: Vec<Box<dyn AsrProvider>>,
+    #[allow(dead_code)]
     strategy: AsrStrategy,
     #[cfg(feature = "onnx")]
     vad: Option<crate::vad::SileroVad>,
@@ -61,7 +62,7 @@ impl AsrRouter {
     /// Build a router with all available providers auto-detected.
     ///
     /// Checks for local models in `models_dir`, cloud API keys in env.
-    pub fn auto_detect(models_dir: &std::path::Path, strategy: AsrStrategy) -> Self {
+    pub fn auto_detect(_models_dir: &std::path::Path, strategy: AsrStrategy) -> Self {
         let mut router = Self::new(strategy);
 
         // Try SenseVoice (local ONNX)
@@ -101,12 +102,11 @@ impl AsrRouter {
         }
 
         // Try Whisper API (cloud)
-        if strategy != AsrStrategy::LocalOnly {
-            if let Ok(provider) = crate::asr::WhisperApiProvider::from_env() {
+        if strategy != AsrStrategy::LocalOnly
+            && let Ok(provider) = crate::asr::WhisperApiProvider::from_env() {
                 info!("ASR Router: Whisper API available");
                 router.providers.push(Box::new(provider));
             }
-        }
 
         if router.providers.is_empty() {
             warn!("ASR Router: no providers available — transcription will fail");

@@ -173,11 +173,10 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
         find_templates_dir().join(dir)
     });
 
-    if let Some(ref tpl_dir) = template_dir {
-        if tpl_dir.exists() {
+    if let Some(ref tpl_dir) = template_dir
+        && tpl_dir.exists() {
             copy_template_files(tpl_dir, &agent_dir).await?;
         }
-    }
 
     // Ensure agent.toml exists even if no template was copied
     let agent_toml_path = agent_dir.join("agent.toml");
@@ -426,8 +425,8 @@ fn find_templates_dir() -> PathBuf {
     }
 
     // Next to executable
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent() {
             let candidate = parent.join("templates");
             if candidate.is_dir() {
                 return candidate;
@@ -440,7 +439,6 @@ fn find_templates_dir() -> PathBuf {
                 }
             }
         }
-    }
 
     // Current working directory
     let cwd_templates = PathBuf::from("templates");
@@ -537,15 +535,14 @@ async fn patch_agent_toml(
     }
 
     // Add features as a custom field for reference
-    if !features.is_empty() {
-        if let Some(agent_table) = doc.get_mut("agent").and_then(|v| v.as_table_mut()) {
+    if !features.is_empty()
+        && let Some(agent_table) = doc.get_mut("agent").and_then(|v| v.as_table_mut()) {
             let feat_array: Vec<toml::Value> = features
                 .iter()
                 .map(|f| toml::Value::String(f.to_string()))
                 .collect();
             agent_table.insert("features".into(), toml::Value::Array(feat_array));
         }
-    }
 
     let serialized = toml::to_string_pretty(&doc).map_err(|e| {
         DuDuClawError::Agent(format!("Failed to serialize agent.toml: {e}"))
