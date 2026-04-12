@@ -42,25 +42,20 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools
+      - name: Install cross (aarch64-linux)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo dpkg --add-architecture arm64
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config libssl-dev:arm64
-        env:
-          PKG_CONFIG_ALLOW_CROSS: 1
-          PKG_CONFIG_SYSROOT_DIR: /usr/aarch64-linux-gnu
+        run: cargo install cross --locked
 
       - name: Build frontend
         run: cd web && npm ci --legacy-peer-deps && npm run build
 
+      - name: Build binary (cross-compile)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cross build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard
+
       - name: Build binary
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
         run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          PKG_CONFIG_ALLOW_CROSS: 1
-          PKG_CONFIG_SYSROOT_DIR: /usr/aarch64-linux-gnu
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
