@@ -45,7 +45,7 @@ hex = "0.4"
 rustls = { workspace = true }
 
 [features]
-default = ["dashboard"]
+default = []
 dashboard = ["duduclaw-gateway/dashboard"]
 
 [target.'cfg(unix)'.dependencies]
