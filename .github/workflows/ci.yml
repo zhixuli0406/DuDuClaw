@@ -23,12 +23,18 @@ jobs:
         # member and does not follow SHA-pinning conventions upstream. Pinning
         # by tag is accepted here as a documented trust decision.
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
-      - name: Build core crates
-        run: cargo build --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard
-      - name: Test
-        run: cargo test --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard
-      - name: Clippy
-        run: cargo clippy --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard -- -D warnings
+      - name: Build core crates (no dashboard)
+        run: cargo build --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
+      - name: Build gateway (no dashboard)
+        run: cargo build -p duduclaw-gateway --no-default-features
+      - name: Test (no dashboard)
+        run: cargo test --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
+      - name: Test gateway
+        run: cargo test -p duduclaw-gateway --no-default-features
+      - name: Clippy (no dashboard)
+        run: cargo clippy --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway -- -D warnings
+      - name: Clippy gateway
+        run: cargo clippy -p duduclaw-gateway --no-default-features -- -D warnings
 
   dashboard:
     name: Dashboard
