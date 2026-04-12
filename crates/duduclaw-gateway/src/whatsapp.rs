@@ -326,6 +326,13 @@ async fn receive_webhook(
                     let reply = build_reply_with_session(
                         &input_text, &state.ctx, &session_id, sender, None,
                     ).await;
+
+                    // Guard: don't send empty replies
+                    if reply.trim().is_empty() {
+                        warn!("WhatsApp: reply is empty for {sender} — skipping send");
+                        continue;
+                    }
+
                     send_text(&state.http, &state.access_token, &phone_id, sender, &reply).await;
                 }
             }

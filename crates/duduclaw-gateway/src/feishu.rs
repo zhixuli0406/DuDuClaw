@@ -260,13 +260,22 @@ async fn handle_message(event: &serde_json::Value, state: &FeishuState) {
                     .unwrap_or_default()
             };
             let reply = crate::chat_commands::handle_command(&cmd, &state.ctx, &session_id, &agent_id, true).await;
-            send_message(state, chat_id, &reply).await;
+            if !reply.trim().is_empty() {
+                send_message(state, chat_id, &reply).await;
+            }
             return;
         }
     }
 
     let session_id = format!("feishu:{chat_id}");
     let reply = build_reply_with_session(&text, &state.ctx, &session_id, sender, None).await;
+
+    // Guard: don't send empty replies
+    if reply.trim().is_empty() {
+        warn!(chat_id, "Feishu: reply is empty — skipping send");
+        return;
+    }
+
     // Reply to the original message so the sender gets a threaded notification
     if !msg_id.is_empty() {
         reply_message(state, msg_id, &reply).await;

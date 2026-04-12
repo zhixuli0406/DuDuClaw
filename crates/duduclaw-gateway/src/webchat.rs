@@ -229,6 +229,12 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     &content, &state.ctx, sid, &user_id, None,
                                 ).await;
 
+                                // Guard: don't send empty replies
+                                if reply.trim().is_empty() {
+                                    warn!("WebChat: reply is empty — skipping send");
+                                    continue;
+                                }
+
                                 let tokens = crate::cost_telemetry::estimate_tokens(&reply) as u32;
                                 let done = ChatMessage::AssistantDone {
                                     content: reply,

@@ -351,13 +351,27 @@ async fn line_webhook_handler(
 
             let reply = build_reply_with_session(&input_text, &state.ctx, &session_id, sender, on_progress).await;
 
+            // Guard: don't send empty replies
+            if reply.trim().is_empty() {
+                warn!("LINE: reply is empty — skipping send for {sender}");
+                continue;
+            }
+
             // Use Flex Message for long replies, plain text for short ones
             let agent_name = {
                 let reg = state.ctx.registry.read().await;
                 reg.main_agent().map(|a| a.config.agent.display_name.clone())
             };
             let flex_msg = channel_format::to_line_flex_message(&reply, agent_name.as_deref());
-            send_reply_rich(&state.http, &state.token, reply_token, flex_msg).await;
+
+            // Try Reply API first; if it fails (e.g. reply token expired after
+            // long AI processing), fall back to Push API which doesn't require
+            // a reply token but counts against the monthly message quota.
+            if !send_reply_rich(&state.http, &state.token, reply_token, flex_msg.clone()).await {
+                warn!("LINE: reply API failed — falling back to push API for {sender}");
+                let push_msg = channel_format::to_line_flex_message(&reply, agent_name.as_deref());
+                push_message_rich(&state.http, &state.token, sender, push_msg).await;
+            }
         }
     }
 
@@ -407,12 +421,14 @@ async fn download_line_content(
 }
 
 /// Send a rich reply (Flex Message, etc.) via the LINE Reply API.
+///
+/// Returns `true` on success, `false` on failure (e.g. reply token expired).
 async fn send_reply_rich(
     http: &reqwest::Client,
     token: &str,
     reply_token: &str,
     message: serde_json::Value,
-) {
+) -> bool {
     let body = serde_json::json!({
         "replyToken": reply_token,
         "messages": [message]
@@ -430,9 +446,41 @@ async fn send_reply_rich(
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             error!("LINE reply failed ({status}): {}", &text[..text.len().min(200)]);
+            false
         }
-        Err(e) => error!("LINE reply error: {e}"),
-        _ => {}
+        Err(e) => {
+            error!("LINE reply error: {e}");
+            false
+        }
+        _ => true,
+    }
+}
+
+/// Send a rich push message (Flex Message) to a specific LINE user.
+///
+/// Used as fallback when the Reply API fails (e.g. reply token expired after
+/// long AI processing). Counts against the monthly message quota.
+async fn push_message_rich(http: &reqwest::Client, token: &str, user_id: &str, message: serde_json::Value) {
+    let body = serde_json::json!({
+        "to": user_id,
+        "messages": [message]
+    });
+
+    match http
+        .post(format!("{LINE_API}/message/push"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if !resp.status().is_success() => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            error!("LINE push (rich) failed ({status}): {}", &body[..body.len().min(200)]);
+        }
+        Err(e) => error!("LINE push (rich) error: {e}"),
+        _ => info!("LINE: push fallback succeeded for {user_id}"),
     }
 }
 

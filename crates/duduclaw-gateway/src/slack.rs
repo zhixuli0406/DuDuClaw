@@ -376,6 +376,13 @@ async fn handle_event(
     } else {
         build_reply_with_session(text, ctx, &session_id, user, None).await
     };
+
+    // Guard: don't send empty replies
+    if reply.trim().is_empty() {
+        warn!(channel, "Slack: reply is empty — skipping send");
+        return;
+    }
+
     // Mention the sender in group channels so they get notified
     let reply = if !is_dm {
         format!("<@{user}> {}", to_slack_mrkdwn(&reply))
