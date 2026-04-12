@@ -1,18 +1,33 @@
 # Ignored advisories — upstream dependencies with no available fix.
 # Review periodically and remove once upstream publishes a fix.
+#
+# NOTE: cargo-audit reads this via `--ignore` flags in CI, not from this file.
+# This file serves as documentation for why each advisory is ignored.
 
 [advisories]
 ignore = [
-    # rsa 0.9.10: Marvin Attack (timing sidechannel) — no fix available upstream.
-    # Via: jsonwebtoken → livekit-api → duduclaw-inference
+    # rsa 0.9.10: Marvin Attack timing sidechannel — no fix upstream.
+    # Via: jsonwebtoken → livekit-api
     "RUSTSEC-2023-0071",
 
-    # rustls-webpki 0.102.8: CRL Distribution Point matching logic — fix requires
-    # rustls 0.23+ but serenity/songbird pin rustls 0.22.x.
-    # Via: rustls 0.22 → serenity → songbird → duduclaw-gateway
+    # derivative 2.2.0: unmaintained — blocked by songbird 0.5.x
+    "RUSTSEC-2024-0388",
+
+    # paste: unmaintained — transitive dep, no alternative available
+    "RUSTSEC-2024-0436",
+
+    # fxhash: unmaintained — transitive dep via mistralrs/candle
+    "RUSTSEC-2025-0057",
+
+    # number_prefix: unmaintained — transitive dep
+    "RUSTSEC-2025-0119",
+
+    # rustls-pemfile: unmaintained — via serenity/songbird old rustls stack
+    "RUSTSEC-2025-0134",
+
+    # rustls-webpki 0.102.8: CRL matching logic — serenity pins rustls 0.22
     "RUSTSEC-2026-0049",
 
-    # derivative 2.2.0: unmaintained — no alternative until songbird drops it.
-    # Via: songbird → duduclaw-gateway
-    "RUSTSEC-2024-0388",
+    # rand: unsound with custom logger — no custom logger used in DuDuClaw
+    "RUSTSEC-2026-0097",
 ]
