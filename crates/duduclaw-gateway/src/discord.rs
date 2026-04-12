@@ -561,6 +561,11 @@ async fn gateway_loop(
         let sequence = Arc::new(AtomicU64::new(u64::MAX));
         let mut heartbeat_interval_ms: u64 = 41250;
         let mut _identified = false;
+        // Track last heartbeat ACK to detect zombied connections.
+        // Discord requires: if no ACK received within heartbeat_interval,
+        // the client MUST close and reconnect.
+        let mut last_heartbeat_ack = std::time::Instant::now();
+        let mut awaiting_heartbeat_ack = false;
 
         let (heartbeat_tx, mut heartbeat_rx) = tokio::sync::mpsc::channel::<()>(1);
         let heartbeat_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
@@ -676,8 +681,11 @@ async fn gateway_loop(
                             info!("Discord Gateway identified (heartbeat: {heartbeat_interval_ms}ms)");
                         }
 
-                        // Heartbeat ACK
-                        11 => {}
+                        // Heartbeat ACK — record timestamp for zombie detection
+                        11 => {
+                            last_heartbeat_ack = std::time::Instant::now();
+                            awaiting_heartbeat_ack = false;
+                        }
 
                         // Dispatch (events)
                         0 => {
@@ -746,6 +754,19 @@ async fn gateway_loop(
                 }
 
                 Some(()) = heartbeat_rx.recv() => {
+                    // Check for zombied connection: if we sent a heartbeat
+                    // but never got an ACK before the next heartbeat fires,
+                    // the connection is dead.
+                    if awaiting_heartbeat_ack {
+                        let elapsed = last_heartbeat_ack.elapsed();
+                        warn!(
+                            "Discord [{label}] no heartbeat ACK received in {:.1}s — zombied connection, reconnecting",
+                            elapsed.as_secs_f64()
+                        );
+                        consecutive_failures += 1;
+                        break;
+                    }
+
                     let seq_val = sequence.load(Ordering::Relaxed);
                     let seq_json: Value = if seq_val == u64::MAX {
                         Value::Null
@@ -756,6 +777,7 @@ async fn gateway_loop(
                     if write.send(Message::Text(hb.to_string().into())).await.is_err() {
                         break;
                     }
+                    awaiting_heartbeat_ack = true;
                 }
             }
         }

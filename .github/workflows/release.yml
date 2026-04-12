@@ -59,18 +59,26 @@ jobs:
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.artifact }}.tar.gz duduclaw
-          cd ../../..
+          mkdir -p _pkg
+          cp target/${{ matrix.target }}/release/duduclaw _pkg/
+          cp -r python _pkg/python
+          cd _pkg
+          tar czf ../${{ matrix.artifact }}.tar.gz duduclaw python
+          cd ..
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+          rm -rf _pkg
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.artifact }}.zip duduclaw.exe
-          cd ../../..
+          New-Item -ItemType Directory -Force -Path _pkg
+          Copy-Item target/${{ matrix.target }}/release/duduclaw.exe _pkg/
+          Copy-Item -Recurse python _pkg/python
+          cd _pkg
+          7z a ../${{ matrix.artifact }}.zip duduclaw.exe python
+          cd ..
           Get-FileHash ${{ matrix.artifact }}.zip -Algorithm SHA256 | Format-List Hash > ${{ matrix.artifact }}.zip.sha256
+          Remove-Item -Recurse -Force _pkg
 
       - uses: actions/upload-artifact@v4
         with:

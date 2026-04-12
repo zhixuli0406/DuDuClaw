@@ -2358,6 +2358,15 @@ pub fn find_python_path_static(home_dir: &Path) -> String {
             .to_string(),
         // Homebrew / source install
         "/opt/duduclaw".to_string(),
+        // Homebrew Cellar (Apple Silicon) — libexec/python/
+        "/opt/homebrew/opt/duduclaw-pro/libexec/python".to_string(),
+        // Homebrew Cellar (Intel Mac) — libexec/python/
+        "/usr/local/opt/duduclaw-pro/libexec/python".to_string(),
+        // User-local fallback
+        format!(
+            "{}/.duduclaw/python",
+            home_dir.to_string_lossy()
+        ),
     ];
 
     for path in &candidates {
