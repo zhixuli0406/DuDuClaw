@@ -578,11 +578,17 @@ async fn poll_loop(
                     build_reply_with_session(&input_text, &ctx, &session_id, &user_id, Some(on_progress)).await
                 };
 
+                // Guard: don't send empty replies (Telegram rejects empty text)
+                if reply.trim().is_empty() {
+                    warn!(chat_id, "Telegram: reply is empty — skipping send");
+                    continue;
+                }
+
                 // Check voice mode
                 let session_key = format!("telegram:{chat_id}");
                 let voice_enabled = ctx.voice_sessions.lock().await.contains(&session_key);
 
-                if voice_enabled && !reply.is_empty() {
+                if voice_enabled {
                     let tts_provider = crate::tts::EdgeTtsProvider::new();
                     match tts_provider.synthesize(&reply, "").await {
                         Ok(audio_bytes) => {
@@ -990,7 +996,7 @@ async fn send_reply(
             text: chunk.to_string(),
             parse_mode: Some("Markdown".to_string()),
             message_thread_id,
-            reply_parameters: reply_params,
+            reply_parameters: reply_params.clone(),
             // Only add buttons to the last chunk
             reply_markup: if i == chunks.len() - 1 { reply_markup.clone() } else { None },
         };
@@ -1000,7 +1006,35 @@ async fn send_reply(
                 if let Ok(data) = resp.json::<TgResponse<serde_json::Value>>().await
                     && !data.ok
                 {
-                    error!("Telegram send failed: {}", data.description.unwrap_or_default());
+                    let desc = data.description.unwrap_or_default();
+                    error!("Telegram send failed: {desc}");
+
+                    // Retry without reply_parameters if the referenced message
+                    // is invalid (deleted, wrong chat, etc.)
+                    if reply_params.is_some() && (desc.contains("message not found")
+                        || desc.contains("replied message not found")
+                        || desc.contains("Bad Request"))
+                    {
+                        warn!("Telegram: retrying without reply_parameters");
+                        let fallback = SendMessage {
+                            chat_id,
+                            text: chunk.to_string(),
+                            parse_mode: Some("Markdown".to_string()),
+                            message_thread_id,
+                            reply_parameters: None,
+                            reply_markup: if i == chunks.len() - 1 { reply_markup.clone() } else { None },
+                        };
+                        match client.post(format!("{api_base}/sendMessage")).json(&fallback).send().await {
+                            Ok(r2) => {
+                                if let Ok(d2) = r2.json::<TgResponse<serde_json::Value>>().await
+                                    && !d2.ok
+                                {
+                                    error!("Telegram retry also failed: {}", d2.description.unwrap_or_default());
+                                }
+                            }
+                            Err(e2) => error!("Telegram retry error: {e2}"),
+                        }
+                    }
                 }
             }
             Err(e) => error!("Telegram send error: {e}"),

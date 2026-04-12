@@ -895,10 +895,12 @@ async fn handle_message_create(
     let auto_thread = settings.get_bool("discord", scope_id, keys::AUTO_THREAD, auto_thread_default).await;
     // Detect if message is in a thread: Discord threads have channel_type 11 (PUBLIC_THREAD) or 12 (PRIVATE_THREAD)
     // Note: channel_type is not always present in MESSAGE_CREATE, but the gateway sends it for threads.
-    // Fallback: check if thread metadata exists in the payload.
+    // Fallback: check if thread metadata exists in the payload, or if the message
+    // carries a `thread_id` / `position` field (present for messages inside threads).
     let channel_type = data["channel_type"].as_u64().unwrap_or(0);
     let is_thread = channel_type == 11 || channel_type == 12
-        || data.get("thread").is_some();
+        || data.get("thread").is_some()
+        || data.get("position").is_some();
 
     // Track whether we created a new thread (for guide message later)
     let mut created_thread = false;
@@ -1029,14 +1031,21 @@ async fn handle_message_create(
     // Stop typing (explicit drop; also runs automatically on panic via Drop)
     drop(typing_guard);
 
+    // ── Guard: don't send empty replies (Discord rejects empty content) ──
+    if reply.trim().is_empty() {
+        warn!(channel_id, "Discord: reply is empty — skipping send");
+        return;
+    }
+
     // ── Send reply with embed + buttons ──
     let mut payload = channel_format::to_discord_message(&reply, display_name.as_deref(), false);
 
     // Reply to the original message so the sender gets a notification.
-    // Skip message_reference when replying in a newly created thread — Discord
-    // does not allow referencing a message from a different channel (the
-    // original message lives in the parent channel, not the thread).
-    if !created_thread {
+    // Skip message_reference when:
+    // 1. We just created a new thread (original message is in the parent channel)
+    // 2. The reply target channel differs from the original message's channel
+    //    (can happen when thread detection missed or gateway state is stale)
+    if !created_thread && reply_channel_id == channel_id {
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("message_reference".to_string(), json!({
                 "message_id": message_id,
@@ -1239,6 +1248,50 @@ async fn send_raw(http: &reqwest::Client, token: &str, channel_id: &str, payload
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             let detail = body[..body.len().min(200)].to_string();
+
+            // Retry without message_reference when Discord reports a cross-channel
+            // reference error.  This can happen when gateway channel metadata is
+            // stale (e.g. thread detection missed), or during the first message
+            // after a reconnect when channel state hasn't fully propagated.
+            if status.as_u16() == 400 && detail.contains("REPLIES_CANNOT_REFERENCE_OTHER_CHANNEL") {
+                warn!("Discord: cross-channel message_reference detected — retrying without reference");
+                let mut fallback = cleaned.clone();
+                if let Some(obj) = fallback.as_object_mut() {
+                    obj.remove("message_reference");
+                }
+                match http
+                    .post(format!("{DISCORD_API}/channels/{channel_id}/messages"))
+                    .header("Authorization", format!("Bot {token}"))
+                    .json(&fallback)
+                    .send()
+                    .await
+                {
+                    Ok(r2) if r2.status().is_success() => {
+                        info!("Discord: retry without message_reference succeeded");
+                        return Ok(());
+                    }
+                    Ok(r2) => {
+                        let s2 = r2.status();
+                        let b2 = r2.text().await.unwrap_or_default();
+                        let d2 = b2[..b2.len().min(200)].to_string();
+                        error!("Discord send failed on retry ({s2}): {d2}");
+                        return Err(DiscordSendError {
+                            status: Some(s2.as_u16()),
+                            detail: d2,
+                            channel_id: channel_id.to_string(),
+                        });
+                    }
+                    Err(e2) => {
+                        error!("Discord send error on retry: {e2}");
+                        return Err(DiscordSendError {
+                            status: None,
+                            detail: e2.to_string(),
+                            channel_id: channel_id.to_string(),
+                        });
+                    }
+                }
+            }
+
             error!("Discord send failed ({status}): {detail}");
             Err(DiscordSendError {
                 status: Some(status.as_u16()),
