@@ -35,16 +35,16 @@ unicode-normalization = "0.1"
 flate2 = "1"
 tar = "0.4"
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-duduclaw-dashboard = { workspace = true, optional = true }
-
 duduclaw-inference = { workspace = true }
+duduclaw-dashboard = { workspace = true, optional = true }
 async-trait = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 gethostname = "0.5"
 hex = "0.4"
 mac_address = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Discord voice channel support (Songbird)
 songbird = { version = "0.5", optional = true, features = ["driver", "rustls", "receive"] }
