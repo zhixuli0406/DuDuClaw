@@ -22,7 +22,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 
-const GITHUB_REPO: &str = "zhixuli0406/DuDuClaw";
+const GITHUB_REPO_COMMUNITY: &str = "zhixuli0406/DuDuClaw";
+const GITHUB_REPO_PRO: &str = "zhixuli0406/duduclaw-pro-releases";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Maximum download + decompressed binary size: 200 MB. [H5][R2:NC2]
 const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
@@ -73,6 +74,24 @@ pub struct ApplyResult {
 // Installation method detection (includes linuxbrew [L2])
 // ---------------------------------------------------------------------------
 
+/// Detect whether the running binary is the Pro edition (by exe name).
+pub fn is_pro_edition() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().contains("duduclaw-pro")))
+        .unwrap_or(false)
+}
+
+/// Return the GitHub repo slug for update checking based on edition.
+fn github_repo() -> &'static str {
+    if is_pro_edition() { GITHUB_REPO_PRO } else { GITHUB_REPO_COMMUNITY }
+}
+
+/// Return the Homebrew formula name based on edition.
+pub fn brew_formula_name() -> &'static str {
+    if is_pro_edition() { "duduclaw-pro" } else { "duduclaw" }
+}
+
 pub fn detect_install_method() -> InstallMethod {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -80,7 +99,8 @@ pub fn detect_install_method() -> InstallMethod {
     };
     let exe_str = exe.to_string_lossy();
 
-    if exe_str.contains("/Cellar/duduclaw/")
+    if exe_str.contains("/Cellar/duduclaw-pro/")
+        || exe_str.contains("/Cellar/duduclaw/")
         || exe_str.contains("/homebrew/")
         || exe_str.contains("/linuxbrew/")
     {
@@ -143,6 +163,12 @@ fn platform_asset_suffix() -> &'static str {
 }
 
 fn binary_name() -> &'static str {
+    if is_pro_edition() {
+        #[cfg(target_os = "windows")]
+        { return "duduclaw-pro.exe"; }
+        #[cfg(not(target_os = "windows"))]
+        { return "duduclaw-pro"; }
+    }
     #[cfg(target_os = "windows")]
     { "duduclaw.exe" }
     #[cfg(not(target_os = "windows"))]
@@ -155,7 +181,9 @@ fn binary_name() -> &'static str {
 
 /// Validate that a URL points to the official GitHub release assets.
 pub fn is_valid_download_url(url: &str) -> bool {
-    url.starts_with("https://github.com/zhixuli0406/DuDuClaw/releases/download/")
+    let repo = github_repo();
+    let prefix = format!("https://github.com/{repo}/releases/download/");
+    url.starts_with(&prefix)
         && !url.contains("..")
         && url.len() < 512
 }
@@ -183,7 +211,8 @@ pub async fn check_update() -> Result<UpdateInfo, String> {
         .build()
         .map_err(|e| format!("HTTP client error: {e}"))?;
 
-    let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
+    let repo = github_repo();
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let resp = client
         .get(&url)
         .send()
@@ -254,7 +283,7 @@ pub async fn apply_update(download_url: &str, checksum_url: &str) -> Result<Appl
     if detect_install_method() == InstallMethod::Homebrew {
         return Ok(ApplyResult {
             success: false,
-            message: "Homebrew installation detected. Please run: brew upgrade duduclaw".into(),
+            message: format!("Homebrew installation detected. Please run: brew upgrade {}", brew_formula_name()),
             needs_restart: false,
         });
     }
@@ -301,8 +330,10 @@ pub async fn apply_update(download_url: &str, checksum_url: &str) -> Result<Appl
             let url = attempt.url().clone();
             let target = url.as_str();
             // Allow GitHub CDN redirects (objects.githubusercontent.com)
+            let repo = github_repo();
+            let repo_prefix = format!("https://github.com/{repo}/");
             if target.starts_with("https://objects.githubusercontent.com/")
-                || target.starts_with("https://github.com/zhixuli0406/DuDuClaw/")
+                || target.starts_with(&repo_prefix)
             {
                 attempt.follow()
             } else {

@@ -2944,6 +2944,7 @@ impl MethodHandler {
                     "download_url": info.download_url,
                     "checksum_url": info.checksum_url,
                     "install_method": info.install_method,
+                    "brew_formula": crate::updater::brew_formula_name(),
                 }))
             }
             Err(e) => WsFrame::error_response("", &format!("Update check failed: {e}")),

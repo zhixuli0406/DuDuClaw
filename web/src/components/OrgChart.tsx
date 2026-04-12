@@ -74,11 +74,17 @@ function buildTree(agents: ReadonlyArray<AgentDetail>): OrgNode {
       (a) => !childNames.has(a.name) && a.name !== root.name,
     );
 
-    // Attach orphans directly under root
+    // Only attach top-level orphans (those not reporting to another orphan).
+    // toNode() recursively expands children, so attaching all orphans
+    // causes agents reporting to a fellow orphan to appear twice.
     if (orphans.length > 0) {
+      const orphanNames = new Set(orphans.map((a) => a.name));
+      const topOrphans = orphans.filter(
+        (a) => !a.reports_to || !orphanNames.has(a.reports_to),
+      );
       rootNode.children = [
         ...(rootNode.children ?? []),
-        ...orphans.map((a) => toNode(a)),
+        ...topOrphans.map((a) => toNode(a)),
       ];
     }
 

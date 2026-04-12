@@ -2647,7 +2647,7 @@ async fn cmd_update(auto_yes: bool) -> duduclaw_core::error::Result<()> {
 
     if info.install_method == duduclaw_gateway::updater::InstallMethod::Homebrew {
         println!("\n  Homebrew installation detected.");
-        println!("  Please run: brew upgrade duduclaw");
+        println!("  Please run: brew upgrade {}", duduclaw_gateway::updater::brew_formula_name());
         return Ok(());
     }
 
