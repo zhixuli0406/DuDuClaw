@@ -1067,7 +1067,26 @@ async fn handle_message_create(
     }
 
     // ── Split if needed (embed description > 4096 or plain text > 2000) ──
-    send_discord_message(http, token, &reply_channel_id, payload).await;
+    if let Err(e) = send_discord_message(http, token, &reply_channel_id, payload).await {
+        warn!(
+            channel_id = %e.channel_id,
+            status = ?e.status,
+            "Discord reply delivery failed: {e}"
+        );
+        let event = crate::protocol::WsFrame::event(
+            "channels.send_failed",
+            json!({
+                "channel": "discord",
+                "target_channel_id": e.channel_id,
+                "http_status": e.status,
+                "error": e.detail,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }),
+        );
+        if let Ok(json) = serde_json::to_string(&event) {
+            let _ = ctx.event_tx.send(json);
+        }
+    }
 
     // ── Guide message in original channel when a new thread was created ──
     // Users may not notice the thread indicator on their message, so send a
@@ -1161,24 +1180,44 @@ async fn create_thread(
     Some(thread_id)
 }
 
+/// Error type for Discord message send failures, carrying enough context
+/// for the caller to emit a structured dashboard event.
+#[derive(Debug)]
+struct DiscordSendError {
+    status: Option<u16>,
+    detail: String,
+    channel_id: String,
+}
+
+impl std::fmt::Display for DiscordSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(code) = self.status {
+            write!(f, "HTTP {code}: {}", self.detail)
+        } else {
+            write!(f, "{}", self.detail)
+        }
+    }
+}
+
 /// Send a message to a Discord channel, handling 2000 char limit.
-async fn send_discord_message(http: &reqwest::Client, token: &str, channel_id: &str, payload: Value) {
+/// Returns `Ok(())` on success, or `Err(DiscordSendError)` on the first failure.
+async fn send_discord_message(http: &reqwest::Client, token: &str, channel_id: &str, payload: Value) -> Result<(), DiscordSendError> {
     // Check if the payload has plain content that needs splitting
     if let Some(content) = payload["content"].as_str() {
         if content.len() > channel_format::limits::DISCORD_MESSAGE {
             let chunks = split_text(content, channel_format::limits::DISCORD_MESSAGE - 100);
             for chunk in chunks.iter() {
                 let msg = json!({ "content": chunk });
-                send_raw(http, token, channel_id, &msg).await;
+                send_raw(http, token, channel_id, &msg).await?;
             }
-            return;
+            return Ok(());
         }
     }
 
-    send_raw(http, token, channel_id, &payload).await;
+    send_raw(http, token, channel_id, &payload).await
 }
 
-async fn send_raw(http: &reqwest::Client, token: &str, channel_id: &str, payload: &Value) {
+async fn send_raw(http: &reqwest::Client, token: &str, channel_id: &str, payload: &Value) -> Result<(), DiscordSendError> {
     // Strip any `components` (buttons) from the payload — DuDuClaw does not
     // handle Discord button interactions, so sending them only confuses users.
     let cleaned = if payload.get("components").is_some() {
@@ -1199,10 +1238,23 @@ async fn send_raw(http: &reqwest::Client, token: &str, channel_id: &str, payload
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            error!("Discord send failed ({status}): {}", &body[..body.len().min(200)]);
+            let detail = body[..body.len().min(200)].to_string();
+            error!("Discord send failed ({status}): {detail}");
+            Err(DiscordSendError {
+                status: Some(status.as_u16()),
+                detail,
+                channel_id: channel_id.to_string(),
+            })
         }
-        Err(e) => error!("Discord send error: {e}"),
-        _ => {}
+        Err(e) => {
+            error!("Discord send error: {e}");
+            Err(DiscordSendError {
+                status: None,
+                detail: e.to_string(),
+                channel_id: channel_id.to_string(),
+            })
+        }
+        _ => Ok(()),
     }
 }
 
