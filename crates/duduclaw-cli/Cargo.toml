@@ -44,5 +44,9 @@ mac_address = "1"
 hex = "0.4"
 rustls = { workspace = true }
 
+[features]
+default = ["dashboard"]
+dashboard = ["duduclaw-gateway/dashboard"]
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

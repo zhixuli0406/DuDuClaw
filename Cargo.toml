@@ -83,7 +83,7 @@ reqwest = { version = "0.12", features = ["json"] }
 # Internal crates
 duduclaw-core = { path = "crates/duduclaw-core" }
 duduclaw-inference = { path = "crates/duduclaw-inference", default-features = false }
-duduclaw-gateway = { path = "crates/duduclaw-gateway" }
+duduclaw-gateway = { path = "crates/duduclaw-gateway", default-features = false }
 duduclaw-bus = { path = "crates/duduclaw-bus" }
 duduclaw-security = { path = "crates/duduclaw-security" }
 duduclaw-memory = { path = "crates/duduclaw-memory" }
