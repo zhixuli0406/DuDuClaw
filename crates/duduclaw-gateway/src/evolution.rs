@@ -58,8 +58,16 @@ pub async fn vet_skill(
 
 fn find_python_path(home_dir: &Path) -> String {
     let candidates = [
+        // Development: project root python/
         home_dir.parent().unwrap_or(home_dir).join("python").to_string_lossy().to_string(),
+        // Homebrew / source install
         "/opt/duduclaw".to_string(),
+        // Homebrew Cellar (Apple Silicon) — libexec/python/
+        "/opt/homebrew/opt/duduclaw-pro/libexec/python".to_string(),
+        // Homebrew Cellar (Intel Mac) — libexec/python/
+        "/usr/local/opt/duduclaw-pro/libexec/python".to_string(),
+        // User-local fallback
+        format!("{}/.duduclaw/python", home_dir.to_string_lossy()),
     ];
     for path in &candidates {
         if !path.is_empty() && Path::new(path).join("duduclaw").exists() {

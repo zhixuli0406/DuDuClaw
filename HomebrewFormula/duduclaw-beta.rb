@@ -23,6 +23,7 @@ class DuduclawBeta < Formula
     system "cargo", "build", "--release", "-p", "duduclaw-cli",
            "-p", "duduclaw-gateway", "--features", "duduclaw-gateway/dashboard"
     bin.install "target/release/duduclaw"
+    (libexec/"python").install Dir["python/duduclaw"]
   end
 
   def post_install
