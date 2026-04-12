@@ -1,0 +1,18 @@
+# Ignored advisories — upstream dependencies with no available fix.
+# Review periodically and remove once upstream publishes a fix.
+
+[advisories]
+ignore = [
+    # rsa 0.9.10: Marvin Attack (timing sidechannel) — no fix available upstream.
+    # Via: jsonwebtoken → livekit-api → duduclaw-inference
+    "RUSTSEC-2023-0071",
+
+    # rustls-webpki 0.102.8: CRL Distribution Point matching logic — fix requires
+    # rustls 0.23+ but serenity/songbird pin rustls 0.22.x.
+    # Via: rustls 0.22 → serenity → songbird → duduclaw-gateway
+    "RUSTSEC-2026-0049",
+
+    # derivative 2.2.0: unmaintained — no alternative until songbird drops it.
+    # Via: songbird → duduclaw-gateway
+    "RUSTSEC-2024-0388",
+]
