@@ -221,6 +221,10 @@ async fn execute_cron_task(
         task.agent_id.clone(),
     );
 
+    // Record dispatch time *before* the CLI call — this is the lower
+    // bound for action-claim verification below.
+    let dispatch_start_time = chrono::Utc::now().to_rfc3339();
+
     let result = crate::claude_runner::DELEGATION_ENV
         .scope(delegation_env, async {
             call_claude_for_agent_with_type(
@@ -242,6 +246,58 @@ async fn execute_cron_task(
                 response_len = response.len(),
                 "cron task completed"
             );
+
+            // ── Action-claim verifier (shadow mode) ─────────────
+            // Same logic as channel_reply.rs: scan the response text
+            // for factual assertions and cross-reference against the
+            // MCP tool-call audit log. Cron tasks are particularly
+            // vulnerable because (a) no user sees the reply in real
+            // time, so fabrications go unchallenged longer, and
+            // (b) the current success criterion is just "exit code
+            // = 0", which a fabricating agent always satisfies.
+            //
+            // Shadow mode: log + audit, do not flip record_run to
+            // failure. Enforce mode can be enabled later by setting
+            // `last_status = "partial"` when hallucinations > 0.
+            let hallucinations = duduclaw_security::action_claim_verifier::detect_hallucinations(
+                home_dir,
+                &task.agent_id,
+                &response,
+                &dispatch_start_time,
+            );
+            if !hallucinations.is_empty() {
+                warn!(
+                    id = %task.id,
+                    name = %task.name,
+                    agent = %task.agent_id,
+                    count = hallucinations.len(),
+                    "🚨 cron task produced {} ungrounded claim(s) (shadow mode)",
+                    hallucinations.len()
+                );
+                for h in &hallucinations {
+                    if let duduclaw_security::action_claim_verifier::VerifyResult::Hallucination {
+                        claim,
+                        reason,
+                    } = h
+                    {
+                        warn!(
+                            id = %task.id,
+                            claim_type = ?claim.claim_type,
+                            target = %claim.target_id,
+                            matched_text = %claim.matched_text,
+                            reason = %reason,
+                            "cron ungrounded claim"
+                        );
+                        duduclaw_security::audit::log_tool_hallucination(
+                            home_dir,
+                            &task.agent_id,
+                            &claim.matched_text,
+                            claim.claim_type.expected_tool(),
+                        );
+                    }
+                }
+            }
+
             if let Err(e) = store.record_run(&task.id, true, None).await {
                 warn!(id = %task.id, "failed to record successful run: {e}");
             }
