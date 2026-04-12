@@ -1,2 +1,8 @@
 [target.aarch64-unknown-linux-gnu]
-pre-build = ["apt-get update && apt-get install -y libssl-dev pkg-config"]
+# Install OpenSSL build dependencies inside the cross container.
+# The container runs the target arch so libssl-dev is for the correct platform.
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update",
+    "apt-get install --assume-yes libssl-dev:$CROSS_DEB_ARCH"
+]
