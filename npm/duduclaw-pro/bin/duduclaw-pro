@@ -8,6 +8,7 @@ const path = require("path");
 const PLATFORM_PACKAGES = {
   "darwin-arm64": "@duduclaw/pro-darwin-arm64",
   "darwin-x64": "@duduclaw/pro-darwin-x64",
+  "win32-x64": "@duduclaw/pro-win32-x64",
 };
 
 function getBinaryPath() {
@@ -16,13 +17,14 @@ function getBinaryPath() {
   if (!pkg) {
     throw new Error(
       `DuDuClaw Pro does not support ${process.platform}-${process.arch} yet.\n` +
-        `Currently supported: macOS (ARM64 / x64).`
+        `Currently supported: macOS (ARM64 / x64), Windows (x64).`
     );
   }
 
   try {
     const pkgDir = path.dirname(require.resolve(`${pkg}/package.json`));
-    return path.join(pkgDir, "bin", "duduclaw-pro");
+    const binName = process.platform === "win32" ? "duduclaw-pro.exe" : "duduclaw-pro";
+    return path.join(pkgDir, "bin", binName);
   } catch {
     throw new Error(
       `Could not find ${pkg}. Please reinstall duduclaw-pro:\n  npm install -g duduclaw-pro`

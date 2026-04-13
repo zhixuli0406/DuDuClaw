@@ -30,6 +30,7 @@
   },
   "optionalDependencies": {
     "@duduclaw/pro-darwin-arm64": "1.4.4",
-    "@duduclaw/pro-darwin-x64": "1.4.4"
+    "@duduclaw/pro-darwin-x64": "1.4.4",
+    "@duduclaw/pro-win32-x64": "1.4.4"
   }
 }
