@@ -1752,7 +1752,9 @@ pub(crate) async fn call_claude_cli_public(
     if !ALLOWED_EVOLUTION_MODELS.contains(&model) {
         return Err(format!("Model '{model}' not allowed for evolution calls"));
     }
-    call_claude_cli(user_message, model, system_prompt, home_dir, None, None, None).await
+    // Use account-rotated path so GVU benefits from multi-account failover
+    // instead of failing silently when the ambient account is rate-limited.
+    call_claude_cli_rotated(user_message, model, system_prompt, home_dir, None, None, None).await
 }
 
 /// Call the `claude` CLI (Claude Code SDK) with streaming output.

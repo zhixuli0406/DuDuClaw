@@ -86,6 +86,42 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "description", description: "Task description", required: true },
         ],
     },
+    ToolDef {
+        name: "list_cron_tasks",
+        description: "List scheduled cron tasks. Returns tasks owned by the calling agent (or all tasks if agent_id is omitted).",
+        params: &[
+            ParamDef { name: "agent_id", description: "Filter by agent ID (default: calling agent)", required: false },
+            ParamDef { name: "enabled_only", description: "Only show enabled tasks (default: false)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "update_cron_task",
+        description: "Update a scheduled cron task by ID or name. Only the fields you provide will be changed.",
+        params: &[
+            ParamDef { name: "id", description: "Task ID to update", required: false },
+            ParamDef { name: "name", description: "Task name to update (used if id is omitted)", required: false },
+            ParamDef { name: "cron", description: "New cron expression", required: false },
+            ParamDef { name: "task", description: "New task description/prompt", required: false },
+            ParamDef { name: "new_name", description: "Rename the task", required: false },
+        ],
+    },
+    ToolDef {
+        name: "delete_cron_task",
+        description: "Delete a scheduled cron task by ID or name",
+        params: &[
+            ParamDef { name: "id", description: "Task ID to delete", required: false },
+            ParamDef { name: "name", description: "Task name to delete (used if id is omitted)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "pause_cron_task",
+        description: "Pause or resume a scheduled cron task by ID or name",
+        params: &[
+            ParamDef { name: "id", description: "Task ID", required: false },
+            ParamDef { name: "name", description: "Task name (used if id is omitted)", required: false },
+            ParamDef { name: "enabled", description: "Set to true to resume, false to pause (default: false)", required: false },
+        ],
+    },
     // ── Reminder tools ────────────────────────────────────────────
     ToolDef {
         name: "create_reminder",
@@ -1225,6 +1261,254 @@ async fn handle_schedule_task(params: &Value, home_dir: &Path) -> Value {
             "content": [{"type": "text", "text": format!("Error: failed to persist task: {e}")}],
             "isError": true
         }),
+    }
+}
+
+// ── Cron task management handlers ─────────────────────────────
+
+/// List cron tasks, optionally filtered by agent_id and enabled status.
+async fn handle_list_cron_tasks(params: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    use duduclaw_gateway::cron_store::CronStore;
+
+    let agent_id = params
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(default_agent);
+    let enabled_only = params
+        .get("enabled_only")
+        .and_then(|v| v.as_bool())
+        .or_else(|| {
+            params
+                .get("enabled_only")
+                .and_then(|v| v.as_str())
+                .map(|s| s == "true")
+        })
+        .unwrap_or(false);
+
+    let store = match CronStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open cron store: {e}")),
+    };
+
+    let all_tasks = match if enabled_only {
+        store.list_enabled().await
+    } else {
+        store.list_all().await
+    } {
+        Ok(t) => t,
+        Err(e) => return tool_error(&format!("list cron tasks: {e}")),
+    };
+
+    // Filter by agent_id (empty string means show all).
+    let tasks: Vec<_> = if agent_id.is_empty() {
+        all_tasks
+    } else {
+        all_tasks
+            .into_iter()
+            .filter(|t| t.agent_id == agent_id)
+            .collect()
+    };
+
+    if tasks.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!("No cron tasks found for agent '{agent_id}'.")}]
+        });
+    }
+
+    let mut lines = Vec::with_capacity(tasks.len() + 1);
+    lines.push(format!("Found {} cron task(s):\n", tasks.len()));
+    for t in &tasks {
+        let status_icon = if t.enabled { "▶" } else { "⏸" };
+        let last_run = t
+            .last_run_at
+            .as_deref()
+            .unwrap_or("never");
+        let last_status = t
+            .last_status
+            .as_deref()
+            .unwrap_or("-");
+        lines.push(format!(
+            "{status_icon} [{id}] {name}\n  cron: {cron} | agent: {agent} | runs: {runs} (fail: {fail})\n  last_run: {last_run} | last_status: {last_status}\n  task: {task}\n",
+            id = &t.id[..8],
+            name = t.name,
+            cron = t.cron,
+            agent = t.agent_id,
+            runs = t.run_count,
+            fail = t.failure_count,
+            task = if t.task.len() > 120 {
+                format!("{}…", &t.task[..120])
+            } else {
+                t.task.clone()
+            },
+        ));
+    }
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": lines.join("")}]
+    })
+}
+
+/// Update an existing cron task by ID or name. Only provided fields are changed.
+async fn handle_update_cron_task(params: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::cron_store::CronStore;
+
+    let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+
+    if id.is_empty() && name.is_empty() {
+        return tool_error("Either 'id' or 'name' is required");
+    }
+
+    let store = match CronStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open cron store: {e}")),
+    };
+
+    // Resolve the existing row.
+    let existing = if !id.is_empty() {
+        store.get(id).await
+    } else {
+        store.get_by_name(name).await
+    };
+    let existing = match existing {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            let key = if !id.is_empty() { id } else { name };
+            return tool_error(&format!("Cron task not found: {key}"));
+        }
+        Err(e) => return tool_error(&format!("lookup cron task: {e}")),
+    };
+
+    // Merge provided fields over existing values.
+    let new_name = params
+        .get("new_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&existing.name);
+    let new_cron = params
+        .get("cron")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&existing.cron);
+    let new_task = params
+        .get("task")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&existing.task);
+
+    // Validate cron expression if changed.
+    if new_cron != existing.cron {
+        let normalised = if new_cron.split_whitespace().count() == 5 {
+            format!("0 {new_cron}")
+        } else {
+            new_cron.to_string()
+        };
+        if normalised.parse::<cron::Schedule>().is_err() {
+            return tool_error(&format!("invalid cron expression: {new_cron}"));
+        }
+    }
+
+    match store
+        .update_fields(
+            &existing.id,
+            new_name,
+            &existing.agent_id,
+            new_cron,
+            new_task,
+            existing.enabled,
+        )
+        .await
+    {
+        Ok(true) => serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "Cron task '{}' updated (id: {}).",
+                new_name, &existing.id[..8]
+            )}]
+        }),
+        Ok(false) => tool_error("update returned no rows changed"),
+        Err(e) => tool_error(&format!("update cron task: {e}")),
+    }
+}
+
+/// Delete a cron task by ID or name.
+async fn handle_delete_cron_task(params: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::cron_store::CronStore;
+
+    let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+
+    if id.is_empty() && name.is_empty() {
+        return tool_error("Either 'id' or 'name' is required");
+    }
+
+    let store = match CronStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open cron store: {e}")),
+    };
+
+    let deleted = if !id.is_empty() {
+        store.delete(id).await
+    } else {
+        store.delete_by_name(name).await
+    };
+
+    match deleted {
+        Ok(true) => {
+            let key = if !id.is_empty() { id } else { name };
+            serde_json::json!({
+                "content": [{"type": "text", "text": format!("Cron task '{key}' deleted.")}]
+            })
+        }
+        Ok(false) => {
+            let key = if !id.is_empty() { id } else { name };
+            tool_error(&format!("Cron task not found: {key}"))
+        }
+        Err(e) => tool_error(&format!("delete cron task: {e}")),
+    }
+}
+
+/// Pause or resume a cron task by ID or name.
+async fn handle_pause_cron_task(params: &Value, home_dir: &Path) -> Value {
+    use duduclaw_gateway::cron_store::CronStore;
+
+    let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let enabled = params
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .or_else(|| {
+            params
+                .get("enabled")
+                .and_then(|v| v.as_str())
+                .map(|s| s == "true")
+        })
+        .unwrap_or(false);
+
+    if id.is_empty() && name.is_empty() {
+        return tool_error("Either 'id' or 'name' is required");
+    }
+
+    let store = match CronStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open cron store: {e}")),
+    };
+
+    let changed = if !id.is_empty() {
+        store.set_enabled(id, enabled).await
+    } else {
+        store.set_enabled_by_name(name, enabled).await
+    };
+
+    let action = if enabled { "resumed" } else { "paused" };
+    match changed {
+        Ok(true) => {
+            let key = if !id.is_empty() { id } else { name };
+            serde_json::json!({
+                "content": [{"type": "text", "text": format!("Cron task '{key}' {action}.")}]
+            })
+        }
+        Ok(false) => {
+            let key = if !id.is_empty() { id } else { name };
+            tool_error(&format!("Cron task not found: {key}"))
+        }
+        Err(e) => tool_error(&format!("{action} cron task: {e}")),
     }
 }
 
@@ -3751,6 +4035,9 @@ async fn handle_tools_call(
             | "spawn_agent"
             | "send_to_agent"
             | "schedule_task"
+            | "update_cron_task"
+            | "delete_cron_task"
+            | "pause_cron_task"
     );
     let result = match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http).await,
@@ -3762,6 +4049,10 @@ async fn handle_tools_call(
         "send_sticker" => handle_send_media(&arguments, home_dir, http, "sticker").await,
         "log_mood" => handle_log_mood(&arguments, home_dir, memory, default_agent).await,
         "schedule_task" => handle_schedule_task(&arguments, home_dir).await,
+        "list_cron_tasks" => handle_list_cron_tasks(&arguments, home_dir, default_agent).await,
+        "update_cron_task" => handle_update_cron_task(&arguments, home_dir).await,
+        "delete_cron_task" => handle_delete_cron_task(&arguments, home_dir).await,
+        "pause_cron_task" => handle_pause_cron_task(&arguments, home_dir).await,
         "create_reminder" => handle_create_reminder(&arguments, home_dir, default_agent).await,
         "list_reminders" => handle_list_reminders(&arguments, home_dir, default_agent).await,
         "cancel_reminder" => handle_cancel_reminder(&arguments, home_dir, default_agent).await,
@@ -3888,6 +4179,22 @@ fn build_params_summary(tool_name: &str, args: &Value) -> String {
             let task_type = args.get("type").and_then(|v| v.as_str()).unwrap_or("?");
             let agent = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
             format!("type={task_type} agent_id={agent}")
+        }
+        "update_cron_task" => {
+            let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("id={id} name={name}")
+        }
+        "delete_cron_task" => {
+            let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("id={id} name={name}")
+        }
+        "pause_cron_task" => {
+            let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let enabled = args.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            format!("id={id} name={name} enabled={enabled}")
         }
         _ => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");

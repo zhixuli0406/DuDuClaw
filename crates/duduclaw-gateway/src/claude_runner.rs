@@ -118,9 +118,10 @@ pub async fn call_claude_for_agent_with_type(
         "claude" => {
             // Skip local entirely, go straight to Claude API
             info!(agent = %agent_name, model = %claude_model, "Claude-only mode");
+            let wd = agent_dir.exists().then_some(agent_dir.as_path());
             return call_with_rotation(
                 home_dir, agent_id, prompt, &claude_model, &system_prompt,
-                request_type, Some(&capabilities),
+                request_type, Some(&capabilities), wd,
             ).await;
         }
         _ => {
@@ -179,11 +180,12 @@ pub async fn call_claude_for_agent_with_type(
     // if CLI fails with rate limit (all OAuth accounts exhausted).
     // In "cli" mode: CLI is the only cloud path.
     // In "direct" mode: skip CLI, go straight to Direct API.
+    let wd = agent_dir.exists().then_some(agent_dir.as_path());
     if api_mode != "direct" {
         info!(agent = %agent_name, model = %claude_model, "Calling Claude CLI (SDK primary)");
         match call_with_rotation(
             home_dir, agent_id, prompt, &claude_model, &system_prompt, request_type,
-            Some(&capabilities),
+            Some(&capabilities), wd,
         ).await {
             Ok(text) => return Ok(text),
             Err(e) => {
@@ -462,6 +464,7 @@ async fn call_with_rotation(
     system_prompt: &str,
     request_type: crate::cost_telemetry::RequestType,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    work_dir: Option<&Path>,
 ) -> Result<String, String> {
     // Pre-flight: check 200K price cliff
     if let Some(estimated) = crate::cost_telemetry::check_price_cliff(system_prompt, prompt) {
@@ -474,6 +477,22 @@ async fn call_with_rotation(
 
     let rotator = get_rotator(home_dir).await?;
 
+    // Fresh-install passthrough: no accounts configured → fall back to ambient
+    // env (user's default `claude auth login` session). Matches the same guard
+    // in `call_claude_cli_rotated` so both paths behave identically.
+    if rotator.count().await == 0 {
+        info!(agent_id, "No rotator accounts — using ambient env fallback");
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let resp = call_claude_with_env(prompt, model, system_prompt, &empty, capabilities, work_dir).await?;
+
+        if let Some(ref usage) = resp.usage {
+            if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
+                telemetry.record(agent_id, request_type, model, usage).await;
+            }
+        }
+        return Ok(resp.text);
+    }
+
     let max_attempts = rotator.count().await.max(1);
     let mut last_error = String::new();
 
@@ -485,7 +504,7 @@ async fn call_with_rotation(
 
         info!(account = %selected.id, method = ?selected.auth_method, attempt, "Trying account");
 
-        match call_claude_with_env(prompt, model, system_prompt, &selected.env_vars, capabilities).await {
+        match call_claude_with_env(prompt, model, system_prompt, &selected.env_vars, capabilities, work_dir).await {
             Ok(response) => {
                 // Use telemetry-based cost if usage available, else rough estimate
                 let cost = if let Some(ref usage) = response.usage {
@@ -760,8 +779,15 @@ fn prepare_claude_cmd(
     model: &str,
     system_prompt: &str,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    work_dir: Option<&Path>,
 ) -> (tokio::process::Command, Option<tempfile::TempPath>) {
     let mut cmd = tokio::process::Command::new(claude_path);
+
+    // Set working directory so Claude CLI auto-discovers the agent's
+    // .mcp.json and .claude/settings.json from the project root.
+    if let Some(dir) = work_dir {
+        cmd.current_dir(dir);
+    }
     cmd.args([
         "-p", prompt,
         "--model", model,
@@ -842,9 +868,10 @@ async fn call_claude_with_env(
     system_prompt: &str,
     env_vars: &std::collections::HashMap<String, String>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    work_dir: Option<&Path>,
 ) -> Result<ClaudeResponse, String> {
     let claude = which_claude().ok_or("Claude CLI not found")?;
-    let (mut cmd, _prompt_guard) = prepare_claude_cmd(&claude, prompt, model, system_prompt, capabilities);
+    let (mut cmd, _prompt_guard) = prepare_claude_cmd(&claude, prompt, model, system_prompt, capabilities, work_dir);
 
     for (key, value) in env_vars {
         if value.is_empty() {
