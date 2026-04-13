@@ -1445,15 +1445,13 @@ context_size = 4096
                     style(format!("正在下載 {}", entry.name)).bold(),
                     entry.size_display());
                 println!("  來源：{}", style(&entry.repo).dim());
+                if entry.is_split() {
+                    println!("  分片：{} 個 GGUF shard", entry.shards.len());
+                }
                 println!();
 
-                let _progress_style = style("").clone();
-                let result = duduclaw_inference::model_registry::downloader::download_model(
-                    &entry.download_url(),
-                    &entry.mirror_url(),
-                    &models_dir,
-                    &entry.filename,
-                    Some(Box::new(move |p| {
+                let progress_cb = || {
+                    Some(Box::new(move |p: duduclaw_inference::model_registry::downloader::DownloadProgress| {
                         let bar_width = 40;
                         let filled = (p.percent() / 100.0 * bar_width as f64) as usize;
                         let empty = bar_width - filled;
@@ -1465,8 +1463,25 @@ context_size = 4096
                             p.display_speed(),
                             p.display_eta(),
                         );
-                    })),
-                ).await;
+                    }) as Box<dyn Fn(duduclaw_inference::model_registry::downloader::DownloadProgress) + Send>)
+                };
+
+                let result = if entry.is_split() {
+                    let shard_urls = entry.shard_urls();
+                    duduclaw_inference::model_registry::downloader::download_model_shards(
+                        &shard_urls,
+                        &models_dir,
+                        progress_cb(),
+                    ).await
+                } else {
+                    duduclaw_inference::model_registry::downloader::download_model(
+                        &entry.download_url(),
+                        &entry.mirror_url(),
+                        &models_dir,
+                        &entry.filename,
+                        progress_cb(),
+                    ).await
+                };
 
                 eprintln!(); // newline after progress bar
                 match result {

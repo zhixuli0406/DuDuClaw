@@ -167,6 +167,7 @@ fn convert_hf_models(models: Vec<HfModel>) -> Vec<RegistryEntry> {
             description: format!("{name} ({params})"),
             tier,
             downloads: model.downloads.unwrap_or(0),
+            shards: vec![],
         });
     }
 

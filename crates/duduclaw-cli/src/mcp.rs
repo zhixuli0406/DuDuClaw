@@ -3043,6 +3043,7 @@ async fn handle_model_download(params: &Value, home_dir: &Path) -> Value {
         size_bytes: 0, quantization: String::new(), params: String::new(),
         languages: vec![], tags: vec![], min_ram_mb: 0, description: String::new(),
         tier: duduclaw_inference::model_registry::ModelTier::Community, downloads: 0,
+        shards: vec![],
     };
 
     match duduclaw_inference::model_registry::downloader::download_model(
