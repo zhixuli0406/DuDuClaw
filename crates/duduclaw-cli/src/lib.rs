@@ -51,8 +51,8 @@ fn detect_claude_auth() -> (bool, Option<String>) {
         None => return (false, None),
     };
 
-    let output = std::process::Command::new(&claude)
-        .args(["auth", "status"])
+    let output = duduclaw_core::platform::command_for(&claude)
+        .args(["auth", "status", "--json"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output();
@@ -63,18 +63,33 @@ fn detect_claude_auth() -> (bool, Option<String>) {
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value = match serde_json::from_str(&stdout) {
-        Ok(v) => v,
-        Err(_) => return (false, None),
-    };
 
-    let logged_in = json.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
-    let sub_type = json
-        .get("subscriptionType")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    // Try JSON parse first (--json flag output)
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+        let logged_in = json.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
+        let sub_type = json
+            .get("subscriptionType")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        return (logged_in, sub_type);
+    }
 
-    (logged_in, sub_type)
+    // Fallback: parse plain text output (e.g., "Logged in as ... (Max)")
+    let text = stdout.to_lowercase();
+    if text.contains("logged in") || text.contains("authenticated") {
+        let sub_type = if text.contains("max") {
+            Some("max".to_string())
+        } else if text.contains("pro") {
+            Some("pro".to_string())
+        } else if text.contains("team") {
+            Some("team".to_string())
+        } else {
+            Some("free".to_string())
+        };
+        return (true, sub_type);
+    }
+
+    (false, None)
 }
 
 /// Recursively copy a directory (for config backup).
@@ -1898,7 +1913,7 @@ async fn cmd_doctor() -> duduclaw_core::error::Result<()> {
     match duduclaw_core::which_claude() {
         Some(path) => {
             // Try `claude auth status --json` to verify auth
-            match tokio::process::Command::new(&path)
+            match duduclaw_core::platform::async_command_for(&path)
                 .args(["auth", "status", "--json"])
                 .env_remove("CLAUDECODE")
                 .stdin(std::process::Stdio::null())

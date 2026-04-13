@@ -406,7 +406,7 @@ async fn execute_proactive_check(
 
     let result = match claude {
         Some(claude_path) => {
-            let output = tokio::process::Command::new(&claude_path)
+            let output = duduclaw_core::platform::async_command_for(&claude_path)
                 .args([
                     "--print", "--no-input",
                     "--system-prompt", &prompt,

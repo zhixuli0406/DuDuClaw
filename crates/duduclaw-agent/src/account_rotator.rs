@@ -591,7 +591,7 @@ fn detect_default_oauth_session() -> Option<Account> {
     let claude = duduclaw_core::which_claude()?;
     let claude_dir = dirs::home_dir()?.join(".claude");
 
-    let output = std::process::Command::new(&claude)
+    let output = duduclaw_core::platform::command_for(&claude)
         .args(["auth", "status"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
