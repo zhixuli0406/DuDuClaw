@@ -6,6 +6,17 @@
 use std::fs::File;
 use std::path::Path;
 
+// ── Home directory ───────────────────────────────────────────
+
+/// Get the user's home directory, cross-platform.
+///
+/// Returns `$HOME` on Unix, `%USERPROFILE%` on Windows.
+pub fn home_dir() -> String {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default()
+}
+
 // ── File locking ─────────────────────────────────────────────
 
 /// Acquire an exclusive (write) lock on an open file handle.

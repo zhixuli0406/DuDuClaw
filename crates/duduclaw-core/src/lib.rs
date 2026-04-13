@@ -47,19 +47,24 @@ pub fn is_valid_agent_id(s: &str) -> bool {
 /// omits Homebrew and Node version-manager paths, so the fixed candidates
 /// are critical for zero-config install discovery.
 pub fn which_claude() -> Option<String> {
-    // 1. Check PATH via `which`
-    if let Ok(output) = std::process::Command::new("which")
+    // 1. Check PATH via `which` (Unix) or `where` (Windows)
+    let lookup_cmd = if cfg!(windows) { "where" } else { "which" };
+    if let Ok(output) = std::process::Command::new(lookup_cmd)
         .arg("claude")
         .output()
         && output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // `where` on Windows may return multiple lines; take the first
+            let path = String::from_utf8_lossy(&output.stdout)
+                .lines().next().unwrap_or("").trim().to_string();
             if !path.is_empty() && std::path::Path::new(&path).exists() {
                 return Some(path);
             }
         }
 
     // 2-3. Scan fixed + dynamic HOME-rooted candidates
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
     which_claude_in_home(std::path::Path::new(&home))
 }
 
@@ -70,7 +75,10 @@ pub fn which_claude() -> Option<String> {
 /// Returns the first candidate that exists as a real filesystem entry.
 pub fn which_claude_in_home(home: &std::path::Path) -> Option<String> {
     let home_str = home.to_string_lossy();
-    let candidates = [
+
+    // Platform-specific candidates
+    #[cfg(not(windows))]
+    let candidates = vec![
         // macOS Apple Silicon Homebrew
         "/opt/homebrew/bin/claude".to_string(),
         // macOS Intel / Linux Homebrew
@@ -88,19 +96,60 @@ pub fn which_claude_in_home(home: &std::path::Path) -> Option<String> {
         // asdf shim
         format!("{home_str}/.asdf/shims/claude"),
     ];
+
+    #[cfg(windows)]
+    let candidates = {
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        vec![
+            // npm global (default Windows npm install location)
+            format!("{appdata}\\npm\\claude.cmd"),
+            format!("{appdata}\\npm\\claude"),
+            // Bun on Windows
+            format!("{home_str}\\.bun\\bin\\claude.exe"),
+            // Volta on Windows
+            format!("{home_str}\\.volta\\bin\\claude.exe"),
+            // Claude Code native installer
+            format!("{localappdata}\\Programs\\claude\\claude.exe"),
+            format!("{home_str}\\.claude\\bin\\claude.exe"),
+            // Scoop
+            format!("{home_str}\\scoop\\shims\\claude.exe"),
+            format!("{home_str}\\scoop\\shims\\claude.cmd"),
+        ]
+    };
+
     for path in &candidates {
         if std::path::Path::new(path).exists() {
             return Some(path.clone());
         }
     }
 
-    // NVM: $HOME/.nvm/versions/node/<version>/bin/claude — scan all versions
-    let nvm_root = home.join(".nvm/versions/node");
-    if let Ok(entries) = std::fs::read_dir(&nvm_root) {
-        for entry in entries.flatten() {
-            let candidate = entry.path().join("bin").join("claude");
-            if candidate.exists() {
-                return Some(candidate.to_string_lossy().to_string());
+    // NVM: scan all node versions for claude binary
+    #[cfg(not(windows))]
+    {
+        let nvm_root = home.join(".nvm/versions/node");
+        if let Ok(entries) = std::fs::read_dir(&nvm_root) {
+            for entry in entries.flatten() {
+                let candidate = entry.path().join("bin").join("claude");
+                if candidate.exists() {
+                    return Some(candidate.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // NVM for Windows: %APPDATA%\nvm\<version>\claude.cmd
+        let nvm_root = std::path::Path::new(&std::env::var("APPDATA").unwrap_or_default()).join("nvm");
+        if let Ok(entries) = std::fs::read_dir(&nvm_root) {
+            for entry in entries.flatten() {
+                for name in ["claude.cmd", "claude.exe"] {
+                    let candidate = entry.path().join(name);
+                    if candidate.exists() {
+                        return Some(candidate.to_string_lossy().to_string());
+                    }
+                }
             }
         }
     }
