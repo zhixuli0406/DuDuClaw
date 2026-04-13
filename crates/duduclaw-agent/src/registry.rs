@@ -119,7 +119,8 @@ impl AgentRegistry {
         }
 
         self.agents = loaded;
-        info!(count = self.agents.len(), "agent scan complete");
+        let names: Vec<&str> = self.agents.keys().map(|s| s.as_str()).collect();
+        info!(count = self.agents.len(), agents = ?names, "agent registry scan complete");
         Ok(())
     }
 

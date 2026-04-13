@@ -424,14 +424,25 @@ pub async fn entry_point() {
     // Must be called before any TLS connection is attempted (Discord, edge-tts, etc.).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Build a layered subscriber: fmt (terminal) + BroadcastLayer (WebSocket log streaming).
+    // Build a layered subscriber: fmt (terminal) + file appender + BroadcastLayer (WebSocket).
     // BroadcastLayer is safe to add before init_log_broadcaster() — it checks LOG_TX
     // lazily and silently drops events until the channel is initialised in start_gateway().
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
+
+    // Persistent file log — ensures gateway events survive restarts for diagnostics.
+    let log_dir = duduclaw_home().join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "gateway.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    // Keep the guard alive for the lifetime of the process by leaking it.
+    // Dropping it would flush and close the writer prematurely.
+    std::mem::forget(_guard);
+
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(non_blocking))
         .with(duduclaw_gateway::log::BroadcastLayer)
         .init();
 
