@@ -952,22 +952,9 @@ fn extract_body_links(content: &str) -> Vec<String> {
     links
 }
 
-/// Advisory file lock (POSIX flock). Blocks until acquired.
-#[cfg(unix)]
+/// Advisory file lock. Blocks until acquired.
 fn fs_lock(file: &std::fs::File) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if ret != 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(unix))]
-fn fs_lock(_file: &std::fs::File) -> std::io::Result<()> {
-    // On non-Unix platforms, skip locking (best-effort)
-    Ok(())
+    duduclaw_core::platform::flock_exclusive(file)
 }
 
 /// Collect all `.md` files recursively under `dir`, relative to `base`.

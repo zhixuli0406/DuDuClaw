@@ -9,7 +9,7 @@ set -euo pipefail
 #   - npm logged in with publish access to @duduclaw scope
 #
 # Example:
-#   VERSION=1.3.22
+#   VERSION=1.3.24
 #   mkdir -p artifacts && cd artifacts
 #   gh release download "v${VERSION}" --repo zhixuli0406/DuDuClaw
 #   cd ..
@@ -22,7 +22,7 @@ DRY_RUN="${2:-}"
 
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-./artifacts}"
 
-# Mapping: artifact tarball name → npm platform directory → binary name
+# Mapping: artifact tarball name → npm platform directory
 declare -A PLATFORM_MAP=(
   ["duduclaw-darwin-arm64"]="darwin-arm64"
   ["duduclaw-darwin-x64"]="darwin-x64"
@@ -34,9 +34,8 @@ echo "=== DuDuClaw CE npm publish v${VERSION} ==="
 
 # Step 1: Update version in all package.json files
 echo "--- Updating versions ---"
-for dir in duduclaw darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+for dir in duduclaw darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
   pkg_json="${NPM_DIR}/${dir}/package.json"
-  # Use node to update version (cross-platform JSON handling)
   node -e "
     const fs = require('fs');
     const pkg = JSON.parse(fs.readFileSync('${pkg_json}', 'utf8'));
@@ -51,7 +50,7 @@ for dir in duduclaw darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
   echo "  Updated ${dir}/package.json → ${VERSION}"
 done
 
-# Step 2: Extract binaries into platform packages
+# Step 2: Extract binaries into platform packages (Unix tarballs)
 echo "--- Extracting binaries ---"
 for artifact in "${!PLATFORM_MAP[@]}"; do
   platform_dir="${PLATFORM_MAP[$artifact]}"
@@ -65,11 +64,25 @@ for artifact in "${!PLATFORM_MAP[@]}"; do
   bin_dir="${NPM_DIR}/${platform_dir}/bin"
   mkdir -p "$bin_dir"
 
-  # Extract only the duduclaw binary from tarball
   tar xzf "$tarball" -C "$bin_dir" --strip-components=0 duduclaw
   chmod +x "${bin_dir}/duduclaw"
   echo "  Extracted ${artifact} → ${platform_dir}/bin/duduclaw"
 done
+
+# Step 2b: Extract Windows binary from zip
+WIN_ZIP="${ARTIFACTS_DIR}/duduclaw-windows-x64.zip"
+if [ -f "$WIN_ZIP" ]; then
+  win_bin_dir="${NPM_DIR}/win32-x64/bin"
+  mkdir -p "$win_bin_dir"
+  unzip -o -j "$WIN_ZIP" "duduclaw.exe" -d "$win_bin_dir" 2>/dev/null || \
+    python3 -c "import zipfile,sys; zipfile.ZipFile('${WIN_ZIP}').extract('duduclaw.exe','${win_bin_dir}')" 2>/dev/null || \
+    echo "  WARNING: could not extract Windows zip"
+  if [ -f "${win_bin_dir}/duduclaw.exe" ]; then
+    echo "  Extracted duduclaw-windows-x64 → win32-x64/bin/duduclaw.exe"
+  fi
+else
+  echo "  SKIP: ${WIN_ZIP} not found"
+fi
 
 # Step 3: Publish platform packages first, then main package
 echo "--- Publishing platform packages ---"
@@ -82,6 +95,14 @@ for dir in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
   echo "  Publishing @duduclaw/${dir}..."
   npm publish "$pkg_dir" --access public ${DRY_RUN}
 done
+
+# Publish Windows package
+if [ -f "${NPM_DIR}/win32-x64/bin/duduclaw.exe" ]; then
+  echo "  Publishing @duduclaw/win32-x64..."
+  npm publish "${NPM_DIR}/win32-x64" --access public ${DRY_RUN}
+else
+  echo "  SKIP: win32-x64 (no binary)"
+fi
 
 echo "--- Publishing main package ---"
 npm publish "${NPM_DIR}/duduclaw" --access public ${DRY_RUN}

@@ -1993,7 +1993,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-agent"
-version = "1.3.23"
+version = "1.3.24"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -2001,7 +2001,6 @@ dependencies = [
  "dirs",
  "duduclaw-core",
  "duduclaw-security",
- "libc",
  "reqwest 0.12.28",
  "ring",
  "serde",
@@ -2017,7 +2016,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-auth"
-version = "1.3.23"
+version = "1.3.24"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -2037,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-bridge"
-version = "1.3.23"
+version = "1.3.24"
 dependencies = [
  "chrono",
  "duduclaw-core",
@@ -2048,7 +2047,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-bus"
-version = "1.3.23"
+version = "1.3.24"
 dependencies = [
  "duduclaw-core",
  "serde",
@@ -2059,7 +2058,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-cli"
-version = "1.3.23"
+version = "1.3.24"
 dependencies = [
  "base64 0.22.1",
  "bollard",
@@ -2079,7 +2078,6 @@ dependencies = [
  "duduclaw-security",
  "gethostname",
  "hex",
- "libc",
  "mac_address",
  "reqwest 0.12.28",
  "rustls 0.23.37",
@@ -2098,7 +2096,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-container"
-version = "1.3.23"
+version = "1.3.24"
 dependencies = [
  "async-trait",
  "bollard",
@@ -2114,10 +2112,11 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-core"
-version = "1.3.23"
+version = "1.3.24"
 dependencies = [
  "async-trait",
  "chrono",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -2126,11 +2125,12 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "uuid 1.23.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "duduclaw-dashboard"
-version = "1.3.23"
+version = "1.3.24"
 dependencies = [
  "axum",
  "mime_guess",
@@ -2139,7 +2139,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-gateway"
-version = "1.3.23"
+version = "1.3.24"
 dependencies = [
  "async-trait",
  "axum",
@@ -2161,7 +2161,6 @@ dependencies = [
  "hex",
  "hmac",
  "image",
- "libc",
  "mac_address",
  "openssl-sys",
  "reqwest 0.12.28",
@@ -2187,7 +2186,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-inference"
-version = "1.3.23"
+version = "1.3.24"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2220,13 +2219,12 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-memory"
-version = "1.3.23"
+version = "1.3.24"
 dependencies = [
  "async-trait",
  "chrono",
  "csv",
  "duduclaw-core",
- "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2238,7 +2236,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-odoo"
-version = "1.3.23"
+version = "1.3.24"
 dependencies = [
  "chrono",
  "duduclaw-core",
@@ -2252,12 +2250,11 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-security"
-version = "1.3.23"
+version = "1.3.24"
 dependencies = [
  "base64 0.22.1",
  "chrono",
  "duduclaw-core",
- "libc",
  "regex",
  "ring",
  "serde",

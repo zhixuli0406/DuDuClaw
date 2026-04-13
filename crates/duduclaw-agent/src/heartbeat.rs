@@ -489,20 +489,11 @@ async fn execute_proactive_check(
                         .append(true)
                         .open(&qp);
                     if let Ok(mut f) = file {
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::io::AsRawFd;
-                            let ret = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
-                            if ret != 0 {
-                                tracing::warn!("flock LOCK_EX failed, proceeding without lock");
-                            }
+                        if let Err(e) = duduclaw_core::platform::flock_exclusive(&f) {
+                            tracing::warn!("flock LOCK_EX failed, proceeding without lock: {e}");
                         }
                         let _ = f.write_all(line.as_bytes());
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::io::AsRawFd;
-                            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN); }
-                        }
+                        // Lock is released on drop
                         tracing::info!(agent = %aid, channel = %ch, "Proactive notification queued");
                     }
                 }).await.ok();

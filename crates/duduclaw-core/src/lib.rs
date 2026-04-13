@@ -1,5 +1,6 @@
 pub mod agent_guard;
 pub mod error;
+pub mod platform;
 pub mod traits;
 pub mod types;
 
@@ -111,16 +112,13 @@ pub fn which_claude_in_home(home: &std::path::Path) -> Option<String> {
 mod which_claude_tests {
     use super::which_claude_in_home;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     /// Create an executable shim at `path` so `.exists()` returns true.
     fn write_shim(path: &Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
-        let mut perms = fs::metadata(path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).unwrap();
+        crate::platform::set_executable(path).unwrap();
     }
 
     #[test]

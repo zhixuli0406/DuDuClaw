@@ -121,12 +121,8 @@ fn load_or_create_keyfile(home: &PathBuf) -> [u8; 32] {
         eprintln!("Cannot proceed — encrypted data would be permanently unrecoverable.");
         std::process::exit(1);
     }
-    // Restrict permissions on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&keyfile, std::fs::Permissions::from_mode(0o600));
-    }
+    // Restrict permissions
+    duduclaw_core::platform::set_owner_only(&keyfile).ok();
     key
 }
 
@@ -2349,11 +2345,7 @@ async fn cmd_license_activate(key: &str) -> duduclaw_core::error::Result<()> {
     tokio::fs::write(&tmp_path, key).await.map_err(|e| {
         DuDuClawError::Config(format!("Failed to write license: {e}"))
     })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = tokio::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).await;
-    }
+    duduclaw_core::platform::set_owner_only(&tmp_path).ok();
     if let Err(e) = tokio::fs::rename(&tmp_path, &license_path).await {
         let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(DuDuClawError::Config(format!("Failed to commit license: {e}")));

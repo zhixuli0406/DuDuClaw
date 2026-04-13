@@ -309,15 +309,9 @@ pub async fn apply_update(download_url: &str, checksum_url: &str) -> Result<Appl
         .parent()
         .ok_or("Cannot determine binary directory")?;
 
-    // [H3] Verify directory permissions (Unix)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let dir_meta = std::fs::metadata(exe_dir)
-            .map_err(|e| format!("Cannot stat binary directory: {e}"))?;
-        if dir_meta.mode() & 0o022 != 0 {
-            return Err("Binary directory is world/group writable — refusing update for safety".into());
-        }
+    // [H3] Verify directory permissions
+    if duduclaw_core::platform::is_world_writable(exe_dir) {
+        return Err("Binary directory is world/group writable — refusing update for safety".into());
     }
 
     info!(url = download_url, "Downloading update...");
@@ -446,14 +440,8 @@ async fn apply_update_inner(
     _exe_dir: &std::path::Path,
 ) -> Result<ApplyResult, String> {
     // Set executable permissions [M4]
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        tokio::fs::set_permissions(tmp_path, perms)
-            .await
-            .map_err(|e| format!("Failed to set permissions: {e}"))?;
-    }
+    duduclaw_core::platform::set_executable(tmp_path)
+        .map_err(|e| format!("Failed to set permissions: {e}"))?;
 
     // [R2:NL1] Verify with timeout
     let tmp_for_verify = tmp_path.to_path_buf();

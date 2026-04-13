@@ -69,14 +69,8 @@ pub fn append_audit_event(home_dir: &Path, event: &AuditEvent) {
     {
         Ok(mut f) => {
             // Use advisory file lock to prevent multi-process write corruption (MW-H2)
-            #[cfg(unix)]
-            {
-                use std::os::unix::io::AsRawFd;
-                // SAFETY: fd comes from a valid, open File handle obtained above.
-                // flock is async-signal-safe and the fd remains valid for the duration of this call.
-                if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-                    warn!("flock failed on audit log: {}", std::io::Error::last_os_error());
-                }
+            if let Err(e) = duduclaw_core::platform::flock_exclusive(&f) {
+                warn!("flock failed on audit log: {e}");
             }
             if let Err(e) = writeln!(f, "{json}") {
                 warn!("Failed to write audit event: {e}");
@@ -242,11 +236,7 @@ pub fn append_tool_call(
         .open(&path)
     {
         Ok(mut f) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::io::AsRawFd;
-                let _ = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
-            }
+            let _ = duduclaw_core::platform::flock_exclusive(&f);
             if let Err(e) = writeln!(f, "{json}") {
                 warn!("Failed to write tool call record: {e}");
             }
@@ -273,12 +263,7 @@ pub fn read_tool_calls_since(
     };
 
     // Acquire shared lock to prevent reading during a concurrent write
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: fd is valid from the open File handle above.
-        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
-    }
+    let _ = duduclaw_core::platform::flock_shared(&file);
 
     use std::io::Read;
     let mut content = String::new();

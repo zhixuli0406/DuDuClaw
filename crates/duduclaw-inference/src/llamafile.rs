@@ -146,16 +146,8 @@ impl LlamafileManager {
             return Err(InferenceError::ModelNotFound { path: msg });
         }
 
-        // Ensure executable permission on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&file_path) {
-                let mut perms = meta.permissions();
-                perms.set_mode(perms.mode() | 0o111);
-                let _ = std::fs::set_permissions(&file_path, perms);
-            }
-        }
+        // Ensure executable permission
+        duduclaw_core::platform::set_executable(&file_path).ok();
 
         info!(
             file = %file_name,
