@@ -229,7 +229,7 @@ mod sys {
         use windows_sys::Win32::Foundation::CloseHandle;
 
         let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-        if handle == 0 {
+        if handle.is_null() {
             return Err(std::io::Error::last_os_error());
         }
         let result = unsafe { TerminateProcess(handle, 1) };
