@@ -1934,7 +1934,7 @@ async fn spawn_claude_cli_with_env(
         None
     };
 
-    let mut cmd = tokio::process::Command::new(&claude_path);
+    let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);
     cmd.args([
         "-p", user_message,
         "--model", model,

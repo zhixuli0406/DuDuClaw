@@ -17,6 +17,33 @@ pub fn home_dir() -> String {
         .unwrap_or_default()
 }
 
+// ── Command execution helpers ────────────────────────────────
+
+/// Create a `std::process::Command` that correctly invokes a `.cmd` file on Windows.
+///
+/// On Windows, `.cmd` scripts must be run via `cmd /C "path" args...`.
+/// On Unix, this is a simple pass-through to `Command::new(program)`.
+pub fn command_for(program: &str) -> std::process::Command {
+    if cfg!(windows) && (program.ends_with(".cmd") || program.ends_with(".CMD")) {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.arg("/C").arg(program);
+        cmd
+    } else {
+        std::process::Command::new(program)
+    }
+}
+
+/// Create a `tokio::process::Command` that correctly invokes a `.cmd` file on Windows.
+pub fn async_command_for(program: &str) -> tokio::process::Command {
+    if cfg!(windows) && (program.ends_with(".cmd") || program.ends_with(".CMD")) {
+        let mut cmd = tokio::process::Command::new("cmd");
+        cmd.arg("/C").arg(program);
+        cmd
+    } else {
+        tokio::process::Command::new(program)
+    }
+}
+
 // ── File locking ─────────────────────────────────────────────
 
 /// Acquire an exclusive (write) lock on an open file handle.

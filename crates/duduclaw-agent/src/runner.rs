@@ -403,7 +403,7 @@ async fn call_claude_streaming(
     let claude = duduclaw_core::which_claude()
         .ok_or("Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code")?;
 
-    let mut cmd = tokio::process::Command::new(&claude);
+    let mut cmd = duduclaw_core::platform::async_command_for(&claude);
     cmd.args([
         "-p",
         prompt,

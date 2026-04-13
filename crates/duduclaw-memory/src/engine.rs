@@ -537,7 +537,7 @@ async fn call_claude_summarize(raw_memories: &str) -> String {
          <memory_entries>\n{escaped_memories}\n</memory_entries>"
     );
 
-    let mut cmd = tokio::process::Command::new(&claude);
+    let mut cmd = duduclaw_core::platform::async_command_for(&claude);
     cmd.args(["-p", &prompt, "--model", "claude-haiku-4-5", "--output-format", "text"]);
     cmd.env("ANTHROPIC_API_KEY", &api_key);
     cmd.stdin(std::process::Stdio::null());
