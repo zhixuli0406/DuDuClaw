@@ -128,7 +128,11 @@ fn detect_ram() -> (u64, u64) {
     {
         detect_ram_linux()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        detect_ram_windows()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         (0, 0)
     }
@@ -195,6 +199,71 @@ fn parse_meminfo_kb(text: &str, field: &str) -> u64 {
                 .and_then(|v| v.parse::<u64>().ok())
         })
         .unwrap_or(0)
+}
+
+#[cfg(target_os = "windows")]
+fn detect_ram_windows() -> (u64, u64) {
+    use std::process::Command;
+
+    // Use PowerShell to query total and available physical memory.
+    // This avoids adding windows-sys as a dependency to this crate.
+    let total = Command::new("powershell")
+        .args(["-NoProfile", "-Command",
+            "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()
+        })
+        .unwrap_or(0)
+        / (1024 * 1024);
+
+    let available = Command::new("powershell")
+        .args(["-NoProfile", "-Command",
+            "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            // FreePhysicalMemory is in KB
+            String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()
+        })
+        .unwrap_or(0)
+        / 1024; // KB → MB
+
+    if total == 0 {
+        // Fallback: try wmic (deprecated but widely available)
+        let wmic_total = Command::new("wmic")
+            .args(["computersystem", "get", "TotalPhysicalMemory", "/value"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                let text = String::from_utf8_lossy(&o.stdout);
+                text.lines()
+                    .find(|l| l.starts_with("TotalPhysicalMemory="))
+                    .and_then(|l| l.split('=').nth(1))
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+            / (1024 * 1024);
+
+        let wmic_available = Command::new("wmic")
+            .args(["os", "get", "FreePhysicalMemory", "/value"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                let text = String::from_utf8_lossy(&o.stdout);
+                text.lines()
+                    .find(|l| l.starts_with("FreePhysicalMemory="))
+                    .and_then(|l| l.split('=').nth(1))
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+            / 1024; // KB → MB
+
+        return (wmic_total, wmic_available);
+    }
+
+    (total, available)
 }
 
 async fn detect_vram(gpu_type: &GpuType, ram_total: u64, ram_available: u64) -> (u64, u64) {
