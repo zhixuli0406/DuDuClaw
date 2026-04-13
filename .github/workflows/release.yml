@@ -109,6 +109,35 @@ jobs:
             duduclaw-*.zip
             duduclaw-*.sha256
 
+  # Publish CE to npm
+  npm-publish:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: artifacts
+
+      - name: Prepare and publish npm packages
+        if: env.HAS_TOKEN == 'true'
+        env:
+          HAS_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          ARTIFACTS_DIR: ./artifacts
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ./npm/scripts/publish-ce.sh "$VERSION"
+
   # Trigger Pro repo rebuild after CE release
   trigger-pro-rebuild:
     needs: release

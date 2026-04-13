@@ -1,0 +1,35 @@
+{
+  "name": "duduclaw-pro",
+  "version": "1.4.4",
+  "description": "DuDuClaw Pro — Multi-Agent AI Assistant Platform (Pro Edition)",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zhixuli0406/DuDuClaw.git",
+    "directory": "npm/duduclaw-pro"
+  },
+  "homepage": "https://github.com/zhixuli0406/DuDuClaw",
+  "keywords": [
+    "ai",
+    "agent",
+    "claude",
+    "multi-agent",
+    "assistant",
+    "duduclaw",
+    "pro"
+  ],
+  "bin": {
+    "duduclaw-pro": "bin/duduclaw-pro"
+  },
+  "files": [
+    "bin",
+    "scripts"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "optionalDependencies": {
+    "@duduclaw/pro-darwin-arm64": "1.4.4",
+    "@duduclaw/pro-darwin-x64": "1.4.4"
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "name": "duduclaw",
+  "version": "1.3.23",
+  "description": "DuDuClaw — Multi-Agent AI Assistant Platform (Community Edition)",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zhixuli0406/DuDuClaw.git",
+    "directory": "npm/duduclaw"
+  },
+  "homepage": "https://github.com/zhixuli0406/DuDuClaw",
+  "keywords": [
+    "ai",
+    "agent",
+    "claude",
+    "multi-agent",
+    "assistant",
+    "duduclaw"
+  ],
+  "bin": {
+    "duduclaw": "bin/duduclaw"
+  },
+  "files": [
+    "bin",
+    "scripts"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "optionalDependencies": {
+    "@duduclaw/darwin-arm64": "1.3.23",
+    "@duduclaw/darwin-x64": "1.3.23",
+    "@duduclaw/linux-x64": "1.3.23",
+    "@duduclaw/linux-arm64": "1.3.23"
+  }
+}

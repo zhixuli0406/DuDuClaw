@@ -239,6 +239,69 @@ async fn download_with_resume(
     Ok(dest)
 }
 
+/// Download a multi-shard (split) GGUF model.
+///
+/// Each shard is downloaded individually; the caller passes a list of
+/// `(primary_url, mirror_url, local_filename)` tuples produced by
+/// `RegistryEntry::shard_urls()`.
+pub async fn download_model_shards(
+    shard_urls: &[(String, String, String)],
+    dest_dir: &Path,
+    on_progress: Option<ProgressCallback>,
+) -> Result<PathBuf> {
+    if shard_urls.is_empty() {
+        return Err(InferenceError::Config("No shards to download".to_string()));
+    }
+
+    tokio::fs::create_dir_all(dest_dir).await?;
+
+    let total_shards = shard_urls.len();
+    for (i, (url, mirror_url, filename)) in shard_urls.iter().enumerate() {
+        validate_shard_filename(filename)?;
+
+        let dest = dest_dir.join(filename);
+        if dest.exists() {
+            info!(shard = i + 1, total = total_shards, path = %dest.display(), "Shard already exists, skipping");
+            continue;
+        }
+
+        info!(shard = i + 1, total = total_shards, filename = %filename, "Downloading shard");
+
+        let result = download_with_resume(url, dest_dir, filename, &on_progress, true).await;
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                if mirror_url.is_empty() || mirror_url == url {
+                    return Err(e);
+                }
+                warn!(error = %e, shard = i + 1, "Primary download failed for shard, trying mirror");
+                download_with_resume(mirror_url, dest_dir, filename, &on_progress, false).await?;
+            }
+        }
+    }
+
+    // Return the first shard path (used for loading by llama.cpp)
+    let first_filename = &shard_urls[0].2;
+    Ok(dest_dir.join(first_filename))
+}
+
+/// Validate shard filename — allows the split GGUF `-NNNNN-of-NNNNN` pattern.
+fn validate_shard_filename(filename: &str) -> Result<()> {
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+        || filename.starts_with('.')
+        || !filename.ends_with(".gguf")
+    {
+        return Err(InferenceError::Config(format!("Invalid shard filename: {filename}")));
+    }
+    if !filename.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return Err(InferenceError::Config(format!("Shard filename contains invalid characters: {filename}")));
+    }
+    Ok(())
+}
+
 /// Check if HuggingFace CDN is reachable (5s timeout).
 pub async fn is_hf_reachable() -> bool {
     let client = reqwest::Client::builder()

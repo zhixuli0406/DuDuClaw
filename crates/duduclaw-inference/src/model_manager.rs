@@ -28,6 +28,9 @@ impl ModelManager {
     }
 
     /// Scan the models directory for GGUF files and populate metadata.
+    ///
+    /// Split GGUF shards (e.g., `Model-00001-of-00004.gguf`) are grouped
+    /// into a single model entry with aggregated file size.
     pub async fn scan(&self) -> Result<Vec<ModelInfo>> {
         let dir = &self.models_dir;
         if !tokio::fs::try_exists(dir).await.unwrap_or(false) {
@@ -35,7 +38,8 @@ impl ModelManager {
             return Ok(Vec::new());
         }
 
-        let mut models = Vec::new();
+        // Collect all .gguf files with their sizes
+        let mut gguf_files: Vec<(String, std::path::PathBuf, u64)> = Vec::new();
         let mut entries = tokio::fs::read_dir(dir).await?;
 
         while let Some(entry) = entries.next_entry().await? {
@@ -43,28 +47,62 @@ impl ModelManager {
             if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
                 continue;
             }
-
             let metadata = entry.metadata().await?;
-            let file_size = metadata.len();
-            let filename = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            gguf_files.push((stem, path, metadata.len()));
+        }
 
-            let param_count = extract_param_count(&filename);
-            let context_length: u32 = 4096; // default, refreshed on load
+        // Group split models: detect "-NNNNN-of-NNNNN" suffix
+        let shard_re = regex_lite::Regex::new(r"-(\d{5})-of-(\d{5})$").unwrap();
+        let mut shard_groups: HashMap<String, (std::path::PathBuf, u64)> = HashMap::new();
+        let mut models = Vec::new();
+
+        for (stem, path, size) in &gguf_files {
+            if let Some(caps) = shard_re.captures(stem) {
+                let base = stem[..caps.get(0).unwrap().start()].to_string();
+                let entry = shard_groups.entry(base).or_insert_with(|| (path.clone(), 0));
+                entry.1 += size;
+                // Keep the first shard path (lowest number)
+                if path < &entry.0 {
+                    entry.0 = path.clone();
+                }
+            } else {
+                // Single-file model
+                let param_count = extract_param_count(stem);
+                let context_length: u32 = 4096;
+                let kv_cache_mb = ModelInfo::estimate_kv_cache_mb(&param_count, context_length);
+                models.push(ModelInfo {
+                    id: stem.clone(),
+                    path: path.to_string_lossy().to_string(),
+                    architecture: extract_architecture(stem),
+                    parameter_count: param_count,
+                    quantization: extract_quantization(stem),
+                    file_size_bytes: *size,
+                    estimated_memory_mb: size / (1024 * 1024) * 11 / 10,
+                    kv_cache_mb,
+                    is_loaded: false,
+                    context_length,
+                });
+            }
+        }
+
+        // Add grouped shard models
+        for (base_name, (first_shard_path, total_size)) in &shard_groups {
+            let param_count = extract_param_count(base_name);
+            let context_length: u32 = 4096;
             let kv_cache_mb = ModelInfo::estimate_kv_cache_mb(&param_count, context_length);
-            let info = ModelInfo {
-                id: filename.clone(),
-                path: path.to_string_lossy().to_string(),
-                architecture: extract_architecture(&filename),
+            models.push(ModelInfo {
+                id: base_name.clone(),
+                path: first_shard_path.to_string_lossy().to_string(),
+                architecture: extract_architecture(base_name),
                 parameter_count: param_count,
-                quantization: extract_quantization(&filename),
-                file_size_bytes: file_size,
-                estimated_memory_mb: file_size / (1024 * 1024) * 11 / 10,
+                quantization: extract_quantization(base_name),
+                file_size_bytes: *total_size,
+                estimated_memory_mb: total_size / (1024 * 1024) * 11 / 10,
                 kv_cache_mb,
                 is_loaded: false,
                 context_length,
-            };
-
-            models.push(info);
+            });
         }
 
         // Update cache
@@ -101,6 +139,9 @@ impl ModelManager {
     }
 
     /// Resolve a model id to its full path (confined to models_dir).
+    ///
+    /// For split GGUF models, the id is the base name (without the shard suffix).
+    /// We look for the first shard (`-00001-of-NNNNN.gguf`).
     pub async fn resolve_path(&self, model_id: &str) -> Result<PathBuf> {
         // Reject path traversal attempts
         if model_id.contains('/') || model_id.contains('\\') || model_id.contains("..") {
@@ -118,6 +159,28 @@ impl ModelManager {
         let exact = self.models_dir.join(model_id);
         if tokio::fs::try_exists(&exact).await.unwrap_or(false) {
             return Ok(exact);
+        }
+
+        // Check for split model: look for first shard pattern
+        // Scan for files matching "{model_id}-NNNNN-of-NNNNN.gguf"
+        if let Ok(mut entries) = tokio::fs::read_dir(&self.models_dir).await {
+            let prefix = format!("{model_id}-");
+            let shard_re = regex_lite::Regex::new(r"-\d{5}-of-\d{5}\.gguf$").unwrap();
+            let mut first_shard: Option<PathBuf> = None;
+
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(&prefix) && shard_re.is_match(&name) {
+                    let path = entry.path();
+                    if first_shard.as_ref().is_none_or(|existing| path < *existing) {
+                        first_shard = Some(path);
+                    }
+                }
+            }
+
+            if let Some(path) = first_shard {
+                return Ok(path);
+            }
         }
 
         Err(InferenceError::ModelNotFound {
@@ -161,6 +224,8 @@ fn extract_architecture(filename: &str) -> String {
         "mistral".to_string()
     } else if lower.contains("deepseek") {
         "deepseek".to_string()
+    } else if lower.contains("minimax") {
+        "minimax".to_string()
     } else {
         "unknown".to_string()
     }

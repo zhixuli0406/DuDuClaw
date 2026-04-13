@@ -19,9 +19,9 @@ pub struct RegistryEntry {
     pub name: String,
     /// HuggingFace repo id (e.g., "Qwen/Qwen3-8B-GGUF")
     pub repo: String,
-    /// GGUF filename within the repo
+    /// GGUF filename within the repo (first shard if split model)
     pub filename: String,
-    /// File size in bytes
+    /// File size in bytes (total across all shards)
     pub size_bytes: u64,
     /// Quantization type (e.g., "Q4_K_M")
     pub quantization: String,
@@ -39,6 +39,11 @@ pub struct RegistryEntry {
     pub tier: ModelTier,
     /// HF download count (for sorting)
     pub downloads: u64,
+    /// Split GGUF shard paths relative to repo root.
+    /// Empty = single file model. Non-empty = multi-shard model.
+    /// Example: `["Q4_K_M/Model-Q4_K_M-00001-of-00003.gguf", ...]`
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shards: Vec<String>,
 }
 
 /// Trust tier for a model entry.
@@ -72,12 +77,23 @@ impl RegistryEntry {
         }
     }
 
-    /// Model id for inference.toml (filename without .gguf).
+    /// Model id for inference.toml (filename without .gguf and shard suffix).
     pub fn model_id(&self) -> String {
-        self.filename.trim_end_matches(".gguf").to_string()
+        let base = self.filename.trim_end_matches(".gguf");
+        // Strip split-model suffix like "-00001-of-00004"
+        if let Some(idx) = base.rfind("-00001-of-") {
+            base[..idx].to_string()
+        } else {
+            base.to_string()
+        }
     }
 
-    /// Full HF download URL.
+    /// Whether this is a multi-shard (split) GGUF model.
+    pub fn is_split(&self) -> bool {
+        !self.shards.is_empty()
+    }
+
+    /// Full HF download URL (for single-file models).
     pub fn download_url(&self) -> String {
         format!(
             "https://huggingface.co/{}/resolve/main/{}",
@@ -91,5 +107,19 @@ impl RegistryEntry {
             "https://hf-mirror.com/{}/resolve/main/{}",
             self.repo, self.filename
         )
+    }
+
+    /// All shard download URLs with (hf_url, mirror_url, local_filename).
+    /// For single-file models, returns one entry.
+    pub fn shard_urls(&self) -> Vec<(String, String, String)> {
+        if self.shards.is_empty() {
+            return vec![(self.download_url(), self.mirror_url(), self.filename.clone())];
+        }
+        self.shards.iter().map(|shard_path| {
+            let local_name = shard_path.rsplit('/').next().unwrap_or(shard_path).to_string();
+            let url = format!("https://huggingface.co/{}/resolve/main/{}", self.repo, shard_path);
+            let mirror = format!("https://hf-mirror.com/{}/resolve/main/{}", self.repo, shard_path);
+            (url, mirror, local_name)
+        }).collect()
     }
 }

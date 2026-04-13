@@ -1,0 +1,20 @@
+{
+  "name": "@duduclaw/linux-arm64",
+  "version": "1.3.23",
+  "description": "DuDuClaw CE binary for Linux ARM64",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zhixuli0406/DuDuClaw.git",
+    "directory": "npm/linux-arm64"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
