@@ -155,18 +155,19 @@ mod sys {
     use std::path::Path;
 
     pub fn flock_exclusive(file: &File) -> std::io::Result<()> {
-        use windows_sys::Win32::Storage::FileSystem::{
-            LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
-        };
         use windows_sys::Win32::Foundation::HANDLE;
-        use std::mem::zeroed;
+        use windows_sys::Win32::Storage::FileSystem::{
+            LOCKFILE_EXCLUSIVE_LOCK, LOCK_FILE_FLAGS,
+        };
+        use windows_sys::Win32::System::IO::OVERLAPPED;
 
         let handle = file.as_raw_handle() as HANDLE;
-        let mut overlapped = unsafe { zeroed() };
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        // LockFileEx: flags = LOCKFILE_EXCLUSIVE_LOCK for exclusive lock
         let result = unsafe {
-            LockFileEx(
+            windows_sys::Win32::Storage::FileSystem::LockFileEx(
                 handle,
-                LOCKFILE_EXCLUSIVE_LOCK,
+                LOCKFILE_EXCLUSIVE_LOCK as LOCK_FILE_FLAGS,
                 0,
                 u32::MAX,
                 u32::MAX,
@@ -181,15 +182,21 @@ mod sys {
     }
 
     pub fn flock_shared(file: &File) -> std::io::Result<()> {
-        use windows_sys::Win32::Storage::FileSystem::LockFileEx;
         use windows_sys::Win32::Foundation::HANDLE;
-        use std::mem::zeroed;
+        use windows_sys::Win32::System::IO::OVERLAPPED;
 
         let handle = file.as_raw_handle() as HANDLE;
-        let mut overlapped = unsafe { zeroed() };
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
         // flags = 0 means shared lock (no LOCKFILE_EXCLUSIVE_LOCK flag)
         let result = unsafe {
-            LockFileEx(handle, 0, 0, u32::MAX, u32::MAX, &mut overlapped)
+            windows_sys::Win32::Storage::FileSystem::LockFileEx(
+                handle,
+                0,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
         };
         if result == 0 {
             Err(std::io::Error::last_os_error())
@@ -222,7 +229,7 @@ mod sys {
         use windows_sys::Win32::Foundation::CloseHandle;
 
         let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-        if handle.is_null() {
+        if handle == 0 {
             return Err(std::io::Error::last_os_error());
         }
         let result = unsafe { TerminateProcess(handle, 1) };
