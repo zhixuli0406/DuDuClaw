@@ -244,18 +244,12 @@ impl FeatureGate {
         #[cfg(debug_assertions)]
         {
             let path = Self::pubkey_path();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    if meta.mode() & 0o077 != 0 {
-                        warn!(
-                            path = %path.display(),
-                            "License public key file has overly permissive permissions — rejecting"
-                        );
-                        return None;
-                    }
-                }
+            if duduclaw_core::platform::has_loose_permissions(&path) {
+                warn!(
+                    path = %path.display(),
+                    "License public key file has overly permissive permissions — rejecting"
+                );
+                return None;
             }
             let hex_str = std::fs::read_to_string(&path).ok()?;
             return hex::decode(hex_str.trim()).ok().filter(|b: &Vec<u8>| b.len() == 32);

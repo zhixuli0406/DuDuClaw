@@ -52,11 +52,7 @@ pub fn write_mcp_config(agent_dir: &Path, config: &McpConfig) -> Result<bool, St
     match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(mut f) => {
             f.write_all(json.as_bytes()).map_err(|e| format!("Failed to write MCP config: {e}"))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-            }
+            duduclaw_core::platform::set_owner_only(&path).ok();
             info!(path = %path.display(), "MCP config written");
             Ok(true)
         }
@@ -147,11 +143,7 @@ pub fn ensure_browserbase_in_config(
         .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
     std::fs::write(&path, json)
         .map_err(|e| format!("Failed to write MCP config: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+    duduclaw_core::platform::set_owner_only(&path).ok();
 
     info!(path = %path.display(), "Browserbase MCP server added to config");
     Ok(())

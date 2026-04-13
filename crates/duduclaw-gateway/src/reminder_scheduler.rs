@@ -340,30 +340,15 @@ fn lock_path(home_dir: &Path) -> PathBuf {
 
 /// Acquire an exclusive file lock on `reminders.lock`.
 /// Returns the locked File handle; the lock is released on drop.
-#[cfg(unix)]
 fn acquire_lock(home_dir: &Path) -> Result<std::fs::File, String> {
-    use std::os::unix::io::AsRawFd;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .open(lock_path(home_dir))
         .map_err(|e| format!("Failed to open lockfile: {e}"))?;
-    // SAFETY: fd is valid and open; flock is async-signal-safe.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        return Err(format!("flock failed: {}", std::io::Error::last_os_error()));
-    }
+    duduclaw_core::platform::flock_exclusive(&file)
+        .map_err(|e| format!("flock failed: {e}"))?;
     Ok(file)
-}
-
-#[cfg(not(unix))]
-fn acquire_lock(_home_dir: &Path) -> Result<std::fs::File, String> {
-    // On non-Unix platforms, skip locking (best-effort).
-    Ok(std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(lock_path(_home_dir))
-        .map_err(|e| format!("Failed to open lockfile: {e}"))?)
 }
 
 /// Load all reminders from `reminders.jsonl` (sync, for use inside spawn_blocking).

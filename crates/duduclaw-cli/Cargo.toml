@@ -48,6 +48,3 @@ rustls = { workspace = true }
 [features]
 default = []
 dashboard = ["duduclaw-gateway/dashboard"]
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"

@@ -199,7 +199,7 @@ mod launchd {
         // 3. Send SIGTERM and wait for graceful exit (up to 5 seconds)
         println!("Sending SIGTERM to PID(s): {:?}", pids);
         for &pid in &pids {
-            unsafe { libc::kill(pid, libc::SIGTERM); }
+            duduclaw_core::platform::terminate_process(pid as u32).ok();
         }
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -214,7 +214,7 @@ mod launchd {
                 // 4. SIGKILL remaining processes
                 println!("Graceful shutdown timed out. Sending SIGKILL to: {:?}", remaining);
                 for &pid in &remaining {
-                    unsafe { libc::kill(pid, libc::SIGKILL); }
+                    duduclaw_core::platform::kill_process(pid as u32).ok();
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
 

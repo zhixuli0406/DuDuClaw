@@ -82,14 +82,7 @@ pub async fn run_sandboxed_with_env(
     let key_path = key_file.into_temp_path();
     std::fs::write(&key_path, api_key)
         .map_err(|e| format!("Failed to write API key to temp file: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
-            &key_path,
-            std::fs::Permissions::from_mode(0o600),
-        );
-    }
+    duduclaw_core::platform::set_owner_only(&key_path).ok();
     let key_path_str = key_path.to_string_lossy().to_string();
 
     // Build mount: agent dir as read-only, key file as read-only bind mount

@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
@@ -16,11 +15,11 @@ use duduclaw_core::error::Result;
 /// Receives (tool_name, params) and returns the tool result as JSON value.
 pub type ToolHandler = Arc<dyn Fn(String, Value) -> Result<Value> + Send + Sync>;
 
-/// JSON-RPC server over Unix Domain Socket for PTC script-to-agent RPC.
+/// JSON-RPC server for PTC script-to-agent RPC.
 ///
-/// During script execution, this server listens on a UDS and forwards
-/// tool calls from the subprocess to the host MCP tool handler, enforcing
-/// a whitelist of allowed tool names.
+/// On Unix, uses a Unix Domain Socket at `socket_path`.
+/// On Windows, uses a TCP listener on localhost with a random port,
+/// writing the port number to `socket_path` so the subprocess can connect.
 pub struct PtcUdsServer {
     socket_path: PathBuf,
     allowed_tools: HashSet<String>,
@@ -42,61 +41,43 @@ impl PtcUdsServer {
         }
     }
 
-    /// Start listening on the UDS. Returns a join handle and a shutdown sender.
+    /// Start listening. Returns a join handle and a shutdown sender.
     ///
     /// Send `()` on the `oneshot::Sender` to gracefully stop the server.
     pub async fn start(&self) -> Result<(tokio::task::JoinHandle<()>, oneshot::Sender<()>)> {
-        // Clean up stale socket file if it exists
+        // Clean up stale socket/port file if it exists
         let _ = std::fs::remove_file(&self.socket_path);
 
-        let listener = UnixListener::bind(&self.socket_path)?;
-
-        // SECURITY: Restrict socket permissions to owner-only (prevent other users from connecting)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &self.socket_path,
-                std::fs::Permissions::from_mode(0o600),
-            );
-        }
-
-        debug!(path = %self.socket_path.display(), "PTC RPC server listening");
-
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let allowed_tools = self.allowed_tools.clone();
         let tool_handler = Arc::clone(&self.tool_handler);
         let call_count = Arc::clone(&self.call_count);
 
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    accept_result = listener.accept() => {
-                        match accept_result {
-                            Ok((stream, _addr)) => {
-                                let allowed = allowed_tools.clone();
-                                let handler = Arc::clone(&tool_handler);
-                                let count = Arc::clone(&call_count);
+        #[cfg(unix)]
+        let handle = {
+            let listener = tokio::net::UnixListener::bind(&self.socket_path)?;
 
-                                tokio::spawn(async move {
-                                    if let Err(e) = handle_connection(stream, &allowed, &handler, &count).await {
-                                        warn!(error = %e, "PTC RPC connection error");
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "PTC RPC accept error");
-                            }
-                        }
-                    }
-                    _ = &mut shutdown_rx => {
-                        debug!("PTC RPC server shutting down");
-                        break;
-                    }
-                }
-            }
-        });
+            // SECURITY: Restrict socket permissions to owner-only
+            duduclaw_core::platform::set_owner_only(&self.socket_path).ok();
+
+            debug!(path = %self.socket_path.display(), "PTC RPC server listening (UDS)");
+
+            tokio::spawn(accept_loop_unix(listener, shutdown_rx, allowed_tools, tool_handler, call_count))
+        };
+
+        #[cfg(windows)]
+        let handle = {
+            // Bind to localhost with port 0 (OS picks a free port)
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let port = listener.local_addr()?.port();
+
+            // Write the port number to socket_path so the subprocess knows where to connect
+            std::fs::write(&self.socket_path, port.to_string())?;
+
+            debug!(port = port, path = %self.socket_path.display(), "PTC RPC server listening (TCP localhost)");
+
+            tokio::spawn(accept_loop_tcp(listener, shutdown_rx, allowed_tools, tool_handler, call_count))
+        };
 
         Ok((handle, shutdown_tx))
     }
@@ -106,7 +87,7 @@ impl PtcUdsServer {
         self.call_count.load(Ordering::Relaxed)
     }
 
-    /// Path to the Unix Domain Socket.
+    /// Path to the socket file (or port file on Windows).
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
@@ -114,20 +95,105 @@ impl PtcUdsServer {
 
 impl Drop for PtcUdsServer {
     fn drop(&mut self) {
-        // Best-effort cleanup of socket file
+        // Best-effort cleanup of socket/port file
         let _ = std::fs::remove_file(&self.socket_path);
     }
 }
 
-/// Handle a single UDS connection: read line-delimited JSON-RPC requests,
-/// dispatch to the tool handler, and write responses.
-async fn handle_connection(
-    stream: tokio::net::UnixStream,
+// ── Unix: UDS accept loop ────────────────────────────────────
+
+#[cfg(unix)]
+async fn accept_loop_unix(
+    listener: tokio::net::UnixListener,
+    mut shutdown_rx: oneshot::Receiver<()>,
+    allowed_tools: HashSet<String>,
+    tool_handler: ToolHandler,
+    call_count: Arc<AtomicU32>,
+) {
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, _addr)) => {
+                        let allowed = allowed_tools.clone();
+                        let handler = Arc::clone(&tool_handler);
+                        let count = Arc::clone(&call_count);
+                        let (reader, writer) = stream.into_split();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_connection(reader, writer, &allowed, &handler, &count).await {
+                                warn!(error = %e, "PTC RPC connection error");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "PTC RPC accept error");
+                    }
+                }
+            }
+            _ = &mut shutdown_rx => {
+                debug!("PTC RPC server shutting down");
+                break;
+            }
+        }
+    }
+}
+
+// ── Windows: TCP accept loop ─────────────────────────────────
+
+#[cfg(windows)]
+async fn accept_loop_tcp(
+    listener: tokio::net::TcpListener,
+    mut shutdown_rx: oneshot::Receiver<()>,
+    allowed_tools: HashSet<String>,
+    tool_handler: ToolHandler,
+    call_count: Arc<AtomicU32>,
+) {
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, addr)) => {
+                        // SECURITY: Only accept connections from localhost
+                        if !addr.ip().is_loopback() {
+                            warn!(remote = %addr, "PTC RPC: rejected non-loopback connection");
+                            continue;
+                        }
+                        let allowed = allowed_tools.clone();
+                        let handler = Arc::clone(&tool_handler);
+                        let count = Arc::clone(&call_count);
+                        let (reader, writer) = stream.into_split();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_connection(reader, writer, &allowed, &handler, &count).await {
+                                warn!(error = %e, "PTC RPC connection error");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "PTC RPC accept error");
+                    }
+                }
+            }
+            _ = &mut shutdown_rx => {
+                debug!("PTC RPC server shutting down");
+                break;
+            }
+        }
+    }
+}
+
+// ── Shared connection handler (generic over AsyncRead + AsyncWrite) ──
+
+async fn handle_connection<R, W>(
+    reader: R,
+    mut writer: W,
     allowed_tools: &HashSet<String>,
     tool_handler: &ToolHandler,
     call_count: &AtomicU32,
-) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let mut lines = BufReader::new(reader).lines();
 
     while let Some(line) = lines.next_line().await? {

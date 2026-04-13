@@ -901,20 +901,8 @@ pub async fn append_line(path: &Path, line: &str) -> Result<(), String> {
             .open(&path)
             .map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            // SAFETY: fd comes from a valid, open File handle obtained above.
-            // flock is async-signal-safe and the fd remains valid for the duration of this call.
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if rc != 0 {
-                return Err(format!(
-                    "flock failed on {}: {}",
-                    path.display(),
-                    std::io::Error::last_os_error()
-                ));
-            }
-        }
+        duduclaw_core::platform::flock_exclusive(&file)
+            .map_err(|e| format!("flock failed on {}: {e}", path.display()))?;
 
         writeln!(file, "{line}")
             .map_err(|e| format!("Failed to write to {}: {e}", path.display()))?;

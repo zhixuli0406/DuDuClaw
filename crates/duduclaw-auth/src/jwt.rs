@@ -76,12 +76,7 @@ impl JwtConfig {
                 .map_err(|e| format!("failed to write jwt_secret.tmp: {e}"))?;
 
             // Set restrictive permissions BEFORE rename (R2 fix: no permission window)
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o600);
-                let _ = std::fs::set_permissions(&tmp_path, perms);
-            }
+            duduclaw_core::platform::set_owner_only(&tmp_path).ok();
 
             std::fs::rename(&tmp_path, &secret_path)
                 .map_err(|e| format!("failed to rename jwt_secret: {e}"))?;

@@ -2990,9 +2990,7 @@ impl MethodHandler {
                     tokio::spawn(async {
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                         tracing::info!("Shutting down for update — raising SIGINT for graceful shutdown");
-                        // SAFETY: getpid() and kill() are always safe to call with our own PID.
-                        #[cfg(unix)]
-                        unsafe { libc::kill(libc::getpid(), libc::SIGINT); }
+                        duduclaw_core::platform::self_interrupt();
                     });
                 }
 
@@ -3589,11 +3587,7 @@ impl MethodHandler {
         if let Err(e) = tokio::fs::write(&tmp_path, key).await {
             return WsFrame::error_response("", &format!("Failed to write license: {e}"));
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = tokio::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).await;
-        }
+        duduclaw_core::platform::set_owner_only(&tmp_path).ok();
         if let Err(e) = tokio::fs::rename(&tmp_path, &license_path).await {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return WsFrame::error_response("", &format!("Failed to commit license: {e}"));
