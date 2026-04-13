@@ -45,51 +45,103 @@ fn current_extension() -> Arc<dyn GatewayExtension> {
 /// Returns (logged_in, subscription_type) — e.g., (true, Some("max")).
 /// Works with all Claude Code versions (doesn't depend on credentials.json).
 fn detect_claude_auth() -> (bool, Option<String>) {
-    let claude = duduclaw_core::which_claude();
-    let claude = match claude {
-        Some(c) => c,
-        None => return (false, None),
-    };
+    // Strategy 1: Try `claude auth status --json` command
+    if let Some(claude) = duduclaw_core::which_claude() {
+        let output = duduclaw_core::platform::command_for(&claude)
+            .args(["auth", "status", "--json"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output();
 
-    let output = duduclaw_core::platform::command_for(&claude)
-        .args(["auth", "status", "--json"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output();
+        if let Ok(o) = output
+            && o.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&o.stdout);
 
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return (false, None),
-    };
+            // Try JSON parse first
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                let logged_in = json.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
+                let sub_type = json
+                    .get("subscriptionType")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                if logged_in {
+                    return (true, sub_type);
+                }
+            }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Try JSON parse first (--json flag output)
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
-        let logged_in = json.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
-        let sub_type = json
-            .get("subscriptionType")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        return (logged_in, sub_type);
+            // Fallback: parse plain text output
+            let text = stdout.to_lowercase();
+            if text.contains("logged in") || text.contains("authenticated") {
+                let sub_type = if text.contains("max") {
+                    Some("max".to_string())
+                } else if text.contains("pro") {
+                    Some("pro".to_string())
+                } else if text.contains("team") {
+                    Some("team".to_string())
+                } else {
+                    Some("free".to_string())
+                };
+                return (true, sub_type);
+            }
+        }
     }
 
-    // Fallback: parse plain text output (e.g., "Logged in as ... (Max)")
-    let text = stdout.to_lowercase();
-    if text.contains("logged in") || text.contains("authenticated") {
-        let sub_type = if text.contains("max") {
-            Some("max".to_string())
-        } else if text.contains("pro") {
-            Some("pro".to_string())
-        } else if text.contains("team") {
-            Some("team".to_string())
-        } else {
-            Some("free".to_string())
-        };
-        return (true, sub_type);
+    // Strategy 2: Direct credential file detection
+    // `claude auth status` has known issues on Windows (anthropics/claude-code#8002).
+    // Fall back to reading ~/.claude/.credentials.json directly.
+    if let Some(result) = detect_claude_auth_from_file() {
+        return result;
     }
 
     (false, None)
+}
+
+/// Read OAuth credentials directly from ~/.claude/.credentials.json.
+///
+/// This bypasses `claude auth status` which can fail on Windows even when
+/// valid credentials exist (anthropics/claude-code#8002).
+fn detect_claude_auth_from_file() -> Option<(bool, Option<String>)> {
+    let home = duduclaw_core::platform::home_dir();
+    if home.is_empty() {
+        return None;
+    }
+
+    let cred_path = std::path::Path::new(&home).join(".claude").join(".credentials.json");
+    let content = std::fs::read_to_string(&cred_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    // Check claudeAiOauth field
+    if let Some(oauth) = json.get("claudeAiOauth") {
+        let has_token = oauth.get("accessToken")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| !t.is_empty());
+
+        if has_token {
+            let sub_type = oauth.get("subscriptionType")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            return Some((true, sub_type));
+        }
+    }
+
+    // Check oauthAccount field (newer format)
+    if let Some(account) = json.get("oauthAccount") {
+        let has_token = account.get("accessToken")
+            .or_else(|| account.get("token"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| !t.is_empty());
+
+        if has_token {
+            let sub_type = account.get("subscriptionType")
+                .or_else(|| account.get("planType"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            return Some((true, sub_type));
+        }
+    }
+
+    None
 }
 
 /// Recursively copy a directory (for config backup).
