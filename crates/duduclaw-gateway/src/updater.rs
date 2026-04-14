@@ -24,7 +24,28 @@ use tracing::{info, warn};
 
 const GITHUB_REPO_COMMUNITY: &str = "zhixuli0406/DuDuClaw";
 const GITHUB_REPO_PRO: &str = "zhixuli0406/duduclaw-pro-releases";
-const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Current version: prefers build-time `DUDUCLAW_VERSION` env (set by Pro build script),
+/// then runtime `DUDUCLAW_VERSION` env, finally falls back to this crate's `CARGO_PKG_VERSION`.
+pub fn current_version() -> &'static str {
+    // 1. Build-time override (Pro binary sets this via build.rs / cargo env)
+    if let Some(v) = option_env!("DUDUCLAW_VERSION") {
+        return v;
+    }
+    // 2. Runtime override (set by Pro binary's main() before starting gateway)
+    static RUNTIME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let rv = RUNTIME.get_or_init(|| std::env::var("DUDUCLAW_VERSION").ok());
+    if let Some(v) = rv.as_deref() {
+        return v;
+    }
+    // 3. Fallback: this crate's own version (= CE version)
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Allow the Pro binary to set the version at runtime before calling `check_update`.
+pub fn set_version_override(version: &str) {
+    // SAFETY: called once at startup before any concurrent reads.
+    unsafe { std::env::set_var("DUDUCLAW_VERSION", version) };
+}
 /// Maximum download + decompressed binary size: 200 MB. [H5][R2:NC2]
 const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 /// Maximum release notes length: 8 KB. [M1]
@@ -74,8 +95,17 @@ pub struct ApplyResult {
 // Installation method detection (includes linuxbrew [L2])
 // ---------------------------------------------------------------------------
 
-/// Detect whether the running binary is the Pro edition (by exe name).
+/// Detect whether the running binary is the Pro edition.
+///
+/// Detection order:
+/// 1. `DUDUCLAW_EDITION` env var (set by gateway on startup from extension name)
+/// 2. Binary filename contains "duduclaw-pro" (release builds)
 pub fn is_pro_edition() -> bool {
+    // Env var takes priority — set by gateway startup from GatewayExtension::tier()
+    if let Ok(edition) = std::env::var("DUDUCLAW_EDITION") {
+        return edition.eq_ignore_ascii_case("pro") || edition.eq_ignore_ascii_case("enterprise");
+    }
+    // Fallback: check binary filename (works for renamed release binaries)
     std::env::current_exe()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().contains("duduclaw-pro")))
@@ -194,8 +224,10 @@ pub fn is_valid_download_url(url: &str) -> bool {
 
 pub async fn check_update() -> Result<UpdateInfo, String> {
     // [R3:M2] Redirect policy for check_update — only allow GitHub API/CDN
+    let ver = current_version();
+    let ua = format!("{}/{ver}", if is_pro_edition() { "duduclaw-pro" } else { "duduclaw" });
     let client = reqwest::Client::builder()
-        .user_agent(format!("duduclaw/{CURRENT_VERSION}"))
+        .user_agent(&ua)
         .timeout(std::time::Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             let url = attempt.url().clone();
@@ -229,7 +261,7 @@ pub async fn check_update() -> Result<UpdateInfo, String> {
         .map_err(|e| format!("Failed to parse release JSON: {e}"))?;
 
     let latest = release.tag_name.strip_prefix('v').unwrap_or(&release.tag_name);
-    let available = is_newer(CURRENT_VERSION, latest);
+    let available = is_newer(current_version(), latest);
     let install_method = detect_install_method();
 
     let suffix = platform_asset_suffix();
@@ -255,7 +287,7 @@ pub async fn check_update() -> Result<UpdateInfo, String> {
 
     Ok(UpdateInfo {
         available,
-        current_version: CURRENT_VERSION.to_string(),
+        current_version: current_version().to_string(),
         latest_version: latest.to_string(),
         release_notes,
         published_at: release.published_at.unwrap_or_default(),
@@ -317,8 +349,10 @@ pub async fn apply_update(download_url: &str, checksum_url: &str) -> Result<Appl
     info!(url = download_url, "Downloading update...");
 
     // [R2:NM2] Custom redirect policy — re-validate redirect targets
+    let ver = current_version();
+    let ua = format!("{}/{ver}", if is_pro_edition() { "duduclaw-pro" } else { "duduclaw" });
     let client = reqwest::Client::builder()
-        .user_agent(format!("duduclaw/{CURRENT_VERSION}"))
+        .user_agent(&ua)
         .timeout(std::time::Duration::from_secs(300))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             let url = attempt.url().clone();

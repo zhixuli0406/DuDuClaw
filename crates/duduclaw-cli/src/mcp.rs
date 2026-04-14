@@ -3991,8 +3991,8 @@ fn handle_initialize(id: &Value, _request: &Value) -> Value {
                 "tools": {}
             },
             "serverInfo": {
-                "name": "duduclaw",
-                "version": env!("CARGO_PKG_VERSION")
+                "name": if duduclaw_gateway::updater::is_pro_edition() { "duduclaw-pro" } else { "duduclaw" },
+                "version": duduclaw_gateway::updater::current_version()
             }
         }),
     )
