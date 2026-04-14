@@ -5926,8 +5926,8 @@ high_context = true
         let result = send_to_agent_with_ctx(&params, home, "main", ctx).await;
 
         let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("Message queued"), "Expected success, got: {text}");
-        assert!(text.contains("depth: 3"), "Expected depth 3 (2+1), got: {text}");
+        assert!(text.contains("status=queued"), "Expected success, got: {text}");
+        assert!(text.contains("depth=3"), "Expected depth 3 (2+1), got: {text}");
 
         let queue_path = home.join("bus_queue.jsonl");
         let content = fs::read_to_string(&queue_path).unwrap();
@@ -6002,7 +6002,7 @@ high_context = true
         let result = send_to_agent_with_ctx(&params, home, "main", ctx).await;
 
         let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("depth: 1"), "Expected depth 1 (0+1), got: {text}");
+        assert!(text.contains("depth=1"), "Expected depth 1 (0+1), got: {text}");
 
         let queue_path = home.join("bus_queue.jsonl");
         let content = fs::read_to_string(&queue_path).unwrap();
