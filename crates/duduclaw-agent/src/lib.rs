@@ -3,6 +3,7 @@ pub mod budget;
 pub mod contract;
 pub mod heartbeat;
 pub mod ipc;
+pub mod mcp_template;
 pub mod proactive;
 pub mod prompt_snapshot;
 pub mod registry;

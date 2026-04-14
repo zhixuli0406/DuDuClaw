@@ -377,6 +377,27 @@ export interface OdooConfigUpdate {
   features_hr: boolean;
 }
 
+export interface McpServerDef {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+}
+
+export interface McpAgentConfig {
+  agent_id: string;
+  servers: Record<string, McpServerDef>;
+}
+
+export interface McpCatalogItem {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  requires_oauth: boolean;
+  default_def: McpServerDef;
+  required_env: string[];
+}
+
 /** Fields that can be updated on an agent via `agents.update`. All optional. */
 export interface AgentUpdateParams {
   // Identity
@@ -718,6 +739,17 @@ export const api = {
       client.call('odoo.configure', { ...config }) as Promise<{ success: boolean }>,
     test: () =>
       client.call('odoo.test') as Promise<{ success: boolean; message: string }>,
+  },
+  mcp: {
+    list: () =>
+      client.call('mcp.list') as Promise<{ agents: McpAgentConfig[]; catalog: McpCatalogItem[] }>,
+    update: (agentId: string, action: 'add' | 'remove', serverName: string, serverDef?: McpServerDef) =>
+      client.call('mcp.update', {
+        agent_id: agentId,
+        action,
+        server_name: serverName,
+        ...(serverDef ? { server_def: serverDef } : {}),
+      }) as Promise<{ success: boolean }>,
   },
   // Partner portal — backend not yet implemented; calls will reject with error
   partner: {
