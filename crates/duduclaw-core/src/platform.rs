@@ -19,47 +19,101 @@ pub fn home_dir() -> String {
 
 // ── Command execution helpers ────────────────────────────────
 
-/// Create a `std::process::Command` that correctly invokes scripts on Windows.
+/// Create a `std::process::Command` for a program, handling Windows npm shims.
 ///
-/// On Windows, non-`.exe` files (`.cmd`, `.bat`, or extensionless npm shims)
-/// must be run via `cmd /C`. Without this, Windows returns os error 193
-/// ("%1 is not a valid Win32 application").
+/// On Windows, `.cmd` npm shims cannot be run directly (os error 193) and
+/// `cmd /C` mangles arguments (special chars, quotes, long system prompts).
+/// Instead, we parse the `.cmd` shim to find the underlying `node.exe` +
+/// script path and invoke Node directly — clean argument passing, no shell.
+///
 /// On Unix, this is a simple pass-through to `Command::new(program)`.
 pub fn command_for(program: &str) -> std::process::Command {
-    if cfg!(windows) && needs_cmd_wrapper(program) {
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.arg("/C").arg(program);
-        cmd
-    } else {
-        std::process::Command::new(program)
+    #[cfg(windows)]
+    if let Some((node, script)) = resolve_cmd_to_node(program) {
+        let mut cmd = std::process::Command::new(node);
+        cmd.arg(script);
+        return cmd;
     }
+    std::process::Command::new(program)
 }
 
-/// Create a `tokio::process::Command` that correctly invokes scripts on Windows.
+/// Create a `tokio::process::Command`, handling Windows npm shims.
 pub fn async_command_for(program: &str) -> tokio::process::Command {
-    if cfg!(windows) && needs_cmd_wrapper(program) {
-        let mut cmd = tokio::process::Command::new("cmd");
-        cmd.arg("/C").arg(program);
-        cmd
-    } else {
-        tokio::process::Command::new(program)
+    #[cfg(windows)]
+    if let Some((node, script)) = resolve_cmd_to_node(program) {
+        let mut cmd = tokio::process::Command::new(node);
+        cmd.arg(script);
+        return cmd;
     }
+    tokio::process::Command::new(program)
 }
 
-/// Check if a program path needs `cmd /C` wrapping on Windows.
+/// On Windows, resolve an npm `.cmd` shim to its underlying (node, script) pair.
 ///
-/// Returns true for `.cmd`, `.bat` files, and extensionless files
-/// (npm shims like `%APPDATA%\npm\claude` are Node.js scripts without
-/// an extension — they cannot be executed directly by CreateProcess).
-fn needs_cmd_wrapper(program: &str) -> bool {
+/// npm `.cmd` shims have a standard format ending with:
+/// ```text
+/// "%_prog%" "%dp0%\node_modules\...\cli.mjs" %*
+/// ```
+///
+/// We parse this to extract the script path and find `node.exe`, then
+/// call `node.exe script.mjs args...` directly — avoiding `cmd /C`
+/// which mangles arguments containing quotes, `&`, `|`, `>`, newlines, etc.
+///
+/// Returns `None` if the file is not a parseable npm shim (falls back to
+/// direct execution or `cmd /C`).
+#[cfg(windows)]
+fn resolve_cmd_to_node(program: &str) -> Option<(String, String)> {
     let lower = program.to_lowercase();
-    if lower.ends_with(".cmd") || lower.ends_with(".bat") {
-        return true;
+    // Only attempt for .cmd files or extensionless files
+    if lower.ends_with(".exe") {
+        return None;
     }
-    // If the file has no extension (no `.` after the last path separator),
-    // it's likely an npm shim script that needs cmd /C.
-    let basename = program.rsplit(&['\\', '/'][..]).next().unwrap_or(program);
-    !basename.contains('.')
+
+    // Try the .cmd version if given an extensionless path
+    let cmd_path = if !lower.ends_with(".cmd") && !lower.ends_with(".bat") {
+        let with_cmd = format!("{program}.cmd");
+        if std::path::Path::new(&with_cmd).exists() {
+            with_cmd
+        } else {
+            program.to_string()
+        }
+    } else {
+        program.to_string()
+    };
+
+    let content = std::fs::read_to_string(&cmd_path).ok()?;
+    let dir = std::path::Path::new(&cmd_path).parent()?;
+
+    // Find the script path: look for node_modules\...\*.mjs or *.js in the last lines
+    // npm shims end with: "%_prog%" "%dp0%\node_modules\...\cli.mjs" %*
+    for line in content.lines().rev() {
+        // Look for a quoted path containing node_modules
+        if !line.contains("node_modules") {
+            continue;
+        }
+        // Extract path between quotes: "%dp0%\node_modules\...\cli.mjs"
+        for segment in line.split('"') {
+            if segment.contains("node_modules") && (segment.ends_with(".mjs") || segment.ends_with(".js")) {
+                // Resolve %dp0% → the directory of the .cmd file
+                let resolved = segment
+                    .replace("%dp0%", "")
+                    .replace("%~dp0", "");
+                let script = dir.join(resolved.trim_start_matches(['\\', '/']));
+                if script.exists() {
+                    // Find node.exe: check alongside the .cmd, then PATH
+                    let node = dir.join("node.exe");
+                    let node_path = if node.exists() {
+                        node.to_string_lossy().to_string()
+                    } else {
+                        "node".to_string() // rely on PATH
+                    };
+                    return Some((node_path, script.to_string_lossy().to_string()));
+                }
+            }
+        }
+    }
+
+    None
 }
 
 // ── File locking ─────────────────────────────────────────────
