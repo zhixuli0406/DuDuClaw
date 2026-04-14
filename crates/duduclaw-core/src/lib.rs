@@ -53,11 +53,38 @@ pub fn which_claude() -> Option<String> {
         .arg("claude")
         .output()
         && output.status.success() {
-            // `where` on Windows may return multiple lines; take the first
-            let path = String::from_utf8_lossy(&output.stdout)
-                .lines().next().unwrap_or("").trim().to_string();
-            if !path.is_empty() && std::path::Path::new(&path).exists() {
-                return Some(path);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            if cfg!(windows) {
+                // `where` returns multiple lines. On Windows, prefer .cmd/.exe
+                // over extensionless npm shims (which are shell scripts that
+                // cause os error 193 or argument-passing issues with cmd /C).
+                let lines: Vec<&str> = stdout.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+
+                // First pass: prefer .exe or .cmd
+                for line in &lines {
+                    let lower = line.to_lowercase();
+                    if (lower.ends_with(".exe") || lower.ends_with(".cmd"))
+                        && std::path::Path::new(line).exists()
+                    {
+                        return Some(line.to_string());
+                    }
+                }
+                // Fallback: take the first result and try appending .cmd
+                if let Some(first) = lines.first() {
+                    let cmd_path = format!("{first}.cmd");
+                    if std::path::Path::new(&cmd_path).exists() {
+                        return Some(cmd_path);
+                    }
+                    if std::path::Path::new(first).exists() {
+                        return Some(first.to_string());
+                    }
+                }
+            } else {
+                let path = stdout.lines().next().unwrap_or("").trim().to_string();
+                if !path.is_empty() && std::path::Path::new(&path).exists() {
+                    return Some(path);
+                }
             }
         }
 
