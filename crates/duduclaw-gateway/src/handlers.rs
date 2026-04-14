@@ -442,6 +442,9 @@ impl MethodHandler {
             "users.me" => self.handle_users_me(ctx).await,
             "users.audit_log" => { require_admin!(); self.handle_users_audit_log(params).await }
 
+            "mcp.list" => { require_admin!(); self.handle_mcp_list().await }
+            "mcp.update" => { require_admin!(); self.handle_mcp_update(&params).await }
+
             unknown => WsFrame::error_response("", &format!("Unknown method: {unknown}")),
         }
     }
@@ -508,6 +511,8 @@ impl MethodHandler {
                 { "name": "system.apply_update", "description": "Download and apply update" },
                 { "name": "heartbeat.status", "description": "Per-agent heartbeat status" },
                 { "name": "heartbeat.trigger", "description": "Manually trigger heartbeat for an agent" },
+                { "name": "mcp.list", "description": "List MCP servers for all agents + catalog" },
+                { "name": "mcp.update", "description": "Add or remove an MCP server for an agent" },
                 { "name": "logs.subscribe", "description": "Subscribe to logs" },
                 { "name": "logs.unsubscribe", "description": "Unsubscribe from logs" },
             ]
@@ -4453,6 +4458,111 @@ impl MethodHandler {
         match db.query_audit_log(user_id, action, limit) {
             Ok(entries) => WsFrame::ok_response("", json!({ "entries": entries })),
             Err(e) => WsFrame::error_response("", &format!("failed to query audit log: {e}")),
+        }
+    }
+
+    // ── MCP Management ──────────────────────────────────────────
+
+    async fn handle_mcp_list(&self) -> WsFrame {
+        use duduclaw_agent::mcp_template::{marketplace_catalog, read_mcp_config};
+
+        let agents_dir = self.home_dir.join("agents");
+        let mut agents = Vec::new();
+
+        if let Ok(mut entries) = tokio::fs::read_dir(&agents_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let dir = entry.path();
+                if !dir.is_dir() {
+                    continue;
+                }
+                let name = match dir.file_name().and_then(|n| n.to_str()) {
+                    Some(n) if !n.starts_with('_') && !n.starts_with('.') => n.to_string(),
+                    _ => continue,
+                };
+                let config = match read_mcp_config(&dir) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let servers: Vec<Value> = config.mcp_servers.iter().map(|(k, v)| {
+                    json!({
+                        "name": k,
+                        "command": v.command,
+                        "args": v.args,
+                        "env": v.env,
+                    })
+                }).collect();
+                agents.push(json!({
+                    "agent_id": name,
+                    "servers": servers,
+                }));
+            }
+        }
+
+        let catalog: Vec<Value> = marketplace_catalog().iter().map(|item| {
+            json!({
+                "id": item.id,
+                "name": item.name,
+                "description": item.description,
+                "category": item.category,
+                "requires_oauth": item.requires_oauth,
+                "default_def": {
+                    "command": item.default_def.command,
+                    "args": item.default_def.args,
+                    "env": item.default_def.env,
+                },
+                "required_env": item.required_env,
+            })
+        }).collect();
+
+        WsFrame::ok_response("", json!({ "agents": agents, "catalog": catalog }))
+    }
+
+    async fn handle_mcp_update(&self, params: &Value) -> WsFrame {
+        use duduclaw_agent::mcp_template::{add_server_to_config, remove_server_from_config, McpServerDef};
+
+        let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+            Some(id) => id,
+            None => return WsFrame::error_response("", "agent_id is required"),
+        };
+        let action = match params.get("action").and_then(|v| v.as_str()) {
+            Some(a) => a,
+            None => return WsFrame::error_response("", "action is required (add/remove)"),
+        };
+        let server_name = match params.get("server_name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => return WsFrame::error_response("", "server_name is required"),
+        };
+
+        if !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id");
+        }
+
+        let agent_dir = self.home_dir.join("agents").join(agent_id);
+        if !agent_dir.is_dir() {
+            return WsFrame::error_response("", &format!("Agent '{agent_id}' not found"));
+        }
+
+        match action {
+            "add" => {
+                let def: McpServerDef = match params.get("server_def") {
+                    Some(v) => match serde_json::from_value(v.clone()) {
+                        Ok(d) => d,
+                        Err(e) => return WsFrame::error_response("", &format!("Invalid server_def: {e}")),
+                    },
+                    None => return WsFrame::error_response("", "server_def is required for add action"),
+                };
+                match add_server_to_config(&agent_dir, server_name, &def) {
+                    Ok(()) => WsFrame::ok_response("", json!({ "success": true })),
+                    Err(e) => WsFrame::error_response("", &e),
+                }
+            }
+            "remove" => {
+                match remove_server_from_config(&agent_dir, server_name) {
+                    Ok(()) => WsFrame::ok_response("", json!({ "success": true })),
+                    Err(e) => WsFrame::error_response("", &e),
+                }
+            }
+            _ => WsFrame::error_response("", &format!("Unknown action: {action}. Use 'add' or 'remove'")),
         }
     }
 }

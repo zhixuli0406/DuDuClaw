@@ -149,6 +149,215 @@ pub fn ensure_browserbase_in_config(
     Ok(())
 }
 
+/// An entry in the MCP marketplace catalog.
+#[derive(Debug, Clone, Serialize)]
+pub struct McpCatalogItem {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    pub requires_oauth: bool,
+    pub default_def: McpServerDef,
+    pub required_env: Vec<String>,
+}
+
+/// Return the built-in MCP marketplace catalog.
+pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
+    vec![
+        McpCatalogItem {
+            id: "playwright".into(),
+            name: "Playwright".into(),
+            description: "Browser automation".into(),
+            category: "browser".into(),
+            requires_oauth: false,
+            default_def: McpServerDef {
+                command: "npx".into(),
+                args: vec!["@anthropic-ai/mcp-server-playwright".into(), "--headless".into()],
+                env: Default::default(),
+            },
+            required_env: vec![],
+        },
+        McpCatalogItem {
+            id: "browserbase".into(),
+            name: "Browserbase".into(),
+            description: "Cloud browser".into(),
+            category: "browser".into(),
+            requires_oauth: false,
+            default_def: McpServerDef {
+                command: "npx".into(),
+                args: vec!["@anthropic-ai/mcp-server-browserbase".into()],
+                env: [
+                    ("BROWSERBASE_API_KEY".into(), "${BROWSERBASE_API_KEY}".into()),
+                    ("BROWSERBASE_PROJECT_ID".into(), "${BROWSERBASE_PROJECT_ID}".into()),
+                ].into_iter().collect(),
+            },
+            required_env: vec!["BROWSERBASE_API_KEY".into(), "BROWSERBASE_PROJECT_ID".into()],
+        },
+        McpCatalogItem {
+            id: "filesystem".into(),
+            name: "Filesystem".into(),
+            description: "File access".into(),
+            category: "data".into(),
+            requires_oauth: false,
+            default_def: McpServerDef {
+                command: "npx".into(),
+                args: vec!["@anthropic-ai/mcp-server-filesystem".into(), ".".into()],
+                env: Default::default(),
+            },
+            required_env: vec![],
+        },
+        McpCatalogItem {
+            id: "github".into(),
+            name: "GitHub".into(),
+            description: "GitHub API".into(),
+            category: "data".into(),
+            requires_oauth: false,
+            default_def: McpServerDef {
+                command: "npx".into(),
+                args: vec!["@anthropic-ai/mcp-server-github".into()],
+                env: [("GITHUB_TOKEN".into(), "${GITHUB_TOKEN}".into())].into_iter().collect(),
+            },
+            required_env: vec!["GITHUB_TOKEN".into()],
+        },
+        McpCatalogItem {
+            id: "slack".into(),
+            name: "Slack".into(),
+            description: "Slack".into(),
+            category: "communication".into(),
+            requires_oauth: false,
+            default_def: McpServerDef {
+                command: "npx".into(),
+                args: vec!["@anthropic-ai/mcp-server-slack".into()],
+                env: [("SLACK_BOT_TOKEN".into(), "${SLACK_BOT_TOKEN}".into())].into_iter().collect(),
+            },
+            required_env: vec!["SLACK_BOT_TOKEN".into()],
+        },
+        McpCatalogItem {
+            id: "postgres".into(),
+            name: "PostgreSQL".into(),
+            description: "PostgreSQL".into(),
+            category: "data".into(),
+            requires_oauth: false,
+            default_def: McpServerDef {
+                command: "npx".into(),
+                args: vec!["@anthropic-ai/mcp-server-postgres".into()],
+                env: [("DATABASE_URL".into(), "${DATABASE_URL}".into())].into_iter().collect(),
+            },
+            required_env: vec!["DATABASE_URL".into()],
+        },
+        McpCatalogItem {
+            id: "sqlite".into(),
+            name: "SQLite".into(),
+            description: "SQLite".into(),
+            category: "data".into(),
+            requires_oauth: false,
+            default_def: McpServerDef {
+                command: "npx".into(),
+                args: vec!["@anthropic-ai/mcp-server-sqlite".into()],
+                env: Default::default(),
+            },
+            required_env: vec![],
+        },
+        McpCatalogItem {
+            id: "memory".into(),
+            name: "Memory".into(),
+            description: "Persistent memory".into(),
+            category: "data".into(),
+            requires_oauth: false,
+            default_def: McpServerDef {
+                command: "npx".into(),
+                args: vec!["@anthropic-ai/mcp-server-memory".into()],
+                env: Default::default(),
+            },
+            required_env: vec![],
+        },
+        McpCatalogItem {
+            id: "fetch".into(),
+            name: "Fetch".into(),
+            description: "HTTP fetch".into(),
+            category: "data".into(),
+            requires_oauth: false,
+            default_def: McpServerDef {
+                command: "npx".into(),
+                args: vec!["@anthropic-ai/mcp-server-fetch".into()],
+                env: Default::default(),
+            },
+            required_env: vec![],
+        },
+        McpCatalogItem {
+            id: "brave-search".into(),
+            name: "Brave Search".into(),
+            description: "Brave Search".into(),
+            category: "data".into(),
+            requires_oauth: false,
+            default_def: McpServerDef {
+                command: "npx".into(),
+                args: vec!["@anthropic-ai/mcp-server-brave-search".into()],
+                env: [("BRAVE_API_KEY".into(), "${BRAVE_API_KEY}".into())].into_iter().collect(),
+            },
+            required_env: vec!["BRAVE_API_KEY".into()],
+        },
+    ]
+}
+
+/// Read and parse `.mcp.json` from an agent directory.
+/// Returns an empty config if the file does not exist.
+pub fn read_mcp_config(agent_dir: &Path) -> Result<McpConfig, String> {
+    let path = agent_dir.join(".mcp.json");
+    if !path.exists() {
+        return Ok(McpConfig { mcp_servers: std::collections::HashMap::new() });
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read MCP config: {e}"))?;
+    serde_json::from_str::<McpConfig>(&content)
+        .map_err(|e| format!("Failed to parse MCP config: {e}"))
+}
+
+/// Add a server entry to an agent's `.mcp.json`, creating the file if needed.
+/// Writes atomically via temp file + rename.
+pub fn add_server_to_config(agent_dir: &Path, name: &str, def: &McpServerDef) -> Result<(), String> {
+    let path = agent_dir.join(".mcp.json");
+    let mut config = read_mcp_config(agent_dir)?;
+    config.mcp_servers.insert(name.to_string(), def.clone());
+
+    let json = serde_json::to_string_pretty(&config)
+        .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
+
+    let tmp_path = agent_dir.join(".mcp.json.tmp");
+    std::fs::write(&tmp_path, &json)
+        .map_err(|e| format!("Failed to write temp MCP config: {e}"))?;
+    std::fs::rename(&tmp_path, &path)
+        .map_err(|e| format!("Failed to rename temp MCP config: {e}"))?;
+    duduclaw_core::platform::set_owner_only(&path).ok();
+
+    info!(path = %path.display(), server = name, "MCP server added to config");
+    Ok(())
+}
+
+/// Remove a server entry from an agent's `.mcp.json`.
+/// Returns an error if the server does not exist.
+pub fn remove_server_from_config(agent_dir: &Path, server_name: &str) -> Result<(), String> {
+    let path = agent_dir.join(".mcp.json");
+    let mut config = read_mcp_config(agent_dir)?;
+
+    if config.mcp_servers.remove(server_name).is_none() {
+        return Err(format!("MCP server '{server_name}' not found in config"));
+    }
+
+    let json = serde_json::to_string_pretty(&config)
+        .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
+
+    let tmp_path = agent_dir.join(".mcp.json.tmp");
+    std::fs::write(&tmp_path, &json)
+        .map_err(|e| format!("Failed to write temp MCP config: {e}"))?;
+    std::fs::rename(&tmp_path, &path)
+        .map_err(|e| format!("Failed to rename temp MCP config: {e}"))?;
+    duduclaw_core::platform::set_owner_only(&path).ok();
+
+    info!(path = %path.display(), server = server_name, "MCP server removed from config");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

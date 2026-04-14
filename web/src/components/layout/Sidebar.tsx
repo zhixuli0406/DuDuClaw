@@ -22,6 +22,7 @@ import {
   CreditCard,
   Building2,
   Users,
+  Plug,
   LogOut,
 } from 'lucide-react';
 
@@ -46,6 +47,7 @@ const navItems: NavItem[] = [
   { to: '/security', icon: Shield, label: 'nav.security', minRole: 'admin' },
   { to: '/reports', icon: BarChart3, label: 'nav.reports', minRole: 'manager' },
   { to: '/billing', icon: CreditCard, label: 'nav.billing', minRole: 'manager' },
+  { to: '/mcp', icon: Plug, label: 'nav.mcp', minRole: 'admin' },
   { to: '/odoo', icon: Building2, label: 'nav.odoo', minRole: 'admin' },
   { to: '/users', icon: Users, label: 'nav.users', minRole: 'admin' },
   { to: '/settings', icon: Settings, label: 'nav.settings', minRole: 'admin' },

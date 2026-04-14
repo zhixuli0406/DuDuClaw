@@ -21,6 +21,7 @@ import { KnowledgeHubPage } from './pages/KnowledgeHubPage';
 import { OnboardWizardPage } from './pages/OnboardWizardPage';
 import { OdooPage } from './pages/OdooPage';
 import { UsersPage } from './pages/UsersPage';
+import { McpPage } from './pages/McpPage';
 import { useConnectionStore } from './stores/connection-store';
 import { useAuthStore } from './stores/auth-store';
 
@@ -70,6 +71,7 @@ export function App() {
             <Route path="security" element={<SecurityPage />} />
             <Route path="settings" element={<SettingsPage />} />
             <Route path="license" element={<LicensePage />} />
+            <Route path="mcp" element={<McpPage />} />
             <Route path="odoo" element={<OdooPage />} />
             <Route path="users" element={<UsersPage />} />
           </Route>
