@@ -781,7 +781,7 @@ fn prepare_claude_cmd(
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
     work_dir: Option<&Path>,
 ) -> (tokio::process::Command, Option<tempfile::TempPath>) {
-    let mut cmd = tokio::process::Command::new(claude_path);
+    let mut cmd = duduclaw_core::platform::async_command_for(claude_path);
 
     // Set working directory so Claude CLI auto-discovers the agent's
     // .mcp.json and .claude/settings.json from the project root.
