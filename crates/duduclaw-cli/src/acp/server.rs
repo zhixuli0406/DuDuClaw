@@ -39,7 +39,7 @@ impl AcpServer {
             name: name.to_string(),
             description: description.to_string(),
             url: url.to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: duduclaw_gateway::updater::current_version().to_string(),
             capabilities: AgentCapabilities {
                 streaming: true,
                 multi_turn: true,

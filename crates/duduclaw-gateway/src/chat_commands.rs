@@ -237,7 +237,7 @@ async fn handle_status(ctx: &ReplyContext, session_id: &str, agent_id: &str) -> 
         } else {
             channels.join(", ")
         },
-        env!("CARGO_PKG_VERSION"),
+        crate::updater::current_version(),
     )
 }
 

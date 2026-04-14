@@ -96,6 +96,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     let home_dir = config.home_dir.clone();
     let extension = config.extension.clone();
+
+    // Publish edition tier so updater (and child processes) can detect Pro/Enterprise
+    // without relying on binary filename — fixes update page fetching CE versions.
+    // SAFETY: Called once at startup before spawning threads; no concurrent reads yet.
+    unsafe { std::env::set_var("DUDUCLAW_EDITION", extension.tier()) };
+
     let handler = MethodHandler::with_extension(config.home_dir, extension.clone()).await;
 
     // Initialize cost telemetry (must happen before any Claude CLI calls)
@@ -954,7 +960,7 @@ async fn health_handler() -> &'static str {
 async fn well_known_mcp_server_card() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
         "name": "DuDuClaw MCP Server",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": crate::updater::current_version(),
         "description": "Claude Code extension layer with channel routing, memory, agent orchestration, and local inference",
         "tools": [
             {"name": "send_message", "description": "Send message to channel"},
@@ -975,7 +981,7 @@ async fn well_known_agent_card() -> axum::Json<serde_json::Value> {
         "name": "DuDuClaw Agent",
         "description": "AI agent with channel routing, memory, and self-evolution",
         "url": format!("http://localhost:{}", std::env::var("DUDUCLAW_PORT").unwrap_or_else(|_| "3000".to_string())),
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": crate::updater::current_version(),
         "capabilities": {
             "streaming": true,
             "multi_turn": true,

@@ -19,12 +19,14 @@ pub fn home_dir() -> String {
 
 // ── Command execution helpers ────────────────────────────────
 
-/// Create a `std::process::Command` that correctly invokes a `.cmd` file on Windows.
+/// Create a `std::process::Command` that correctly invokes scripts on Windows.
 ///
-/// On Windows, `.cmd` scripts must be run via `cmd /C "path" args...`.
+/// On Windows, non-`.exe` files (`.cmd`, `.bat`, or extensionless npm shims)
+/// must be run via `cmd /C`. Without this, Windows returns os error 193
+/// ("%1 is not a valid Win32 application").
 /// On Unix, this is a simple pass-through to `Command::new(program)`.
 pub fn command_for(program: &str) -> std::process::Command {
-    if cfg!(windows) && (program.ends_with(".cmd") || program.ends_with(".CMD")) {
+    if cfg!(windows) && needs_cmd_wrapper(program) {
         let mut cmd = std::process::Command::new("cmd");
         cmd.arg("/C").arg(program);
         cmd
@@ -33,15 +35,31 @@ pub fn command_for(program: &str) -> std::process::Command {
     }
 }
 
-/// Create a `tokio::process::Command` that correctly invokes a `.cmd` file on Windows.
+/// Create a `tokio::process::Command` that correctly invokes scripts on Windows.
 pub fn async_command_for(program: &str) -> tokio::process::Command {
-    if cfg!(windows) && (program.ends_with(".cmd") || program.ends_with(".CMD")) {
+    if cfg!(windows) && needs_cmd_wrapper(program) {
         let mut cmd = tokio::process::Command::new("cmd");
         cmd.arg("/C").arg(program);
         cmd
     } else {
         tokio::process::Command::new(program)
     }
+}
+
+/// Check if a program path needs `cmd /C` wrapping on Windows.
+///
+/// Returns true for `.cmd`, `.bat` files, and extensionless files
+/// (npm shims like `%APPDATA%\npm\claude` are Node.js scripts without
+/// an extension — they cannot be executed directly by CreateProcess).
+fn needs_cmd_wrapper(program: &str) -> bool {
+    let lower = program.to_lowercase();
+    if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+        return true;
+    }
+    // If the file has no extension (no `.` after the last path separator),
+    // it's likely an npm shim script that needs cmd /C.
+    let basename = program.rsplit(&['\\', '/'][..]).next().unwrap_or(program);
+    !basename.contains('.')
 }
 
 // ── File locking ─────────────────────────────────────────────

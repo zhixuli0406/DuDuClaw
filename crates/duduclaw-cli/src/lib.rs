@@ -587,7 +587,8 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         }
         Commands::Hook(HookCommands::AgentFileGuard) => cmd_hook_agent_file_guard().await,
         Commands::Version => {
-            println!("duduclaw {}", env!("CARGO_PKG_VERSION"));
+            let name = if duduclaw_gateway::updater::is_pro_edition() { "duduclaw-pro" } else { "duduclaw" };
+            println!("{name} {}", duduclaw_gateway::updater::current_version());
             Ok(())
         }
     }
@@ -752,7 +753,7 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
 
     // ── Welcome ──────────────────────────────────────────────
     println!();
-    println!("  {} {}", style("🐾").bold(), style(format!("歡迎使用 DuDuClaw v{}", env!("CARGO_PKG_VERSION"))).bold());
+    println!("  {} {}", style("🐾").bold(), style(format!("歡迎使用 DuDuClaw v{}", duduclaw_gateway::updater::current_version())).bold());
     println!("  {}", style("Multi-Agent AI Assistant Platform").dim());
     println!();
 
@@ -2202,7 +2203,7 @@ skill_security_scan = true
     // CLAUDE.md — helps Claude Code sessions pick up context
     let claude_md = format!(
         "# {display_name}\n\nAgent managed by DuDuClaw v{}.\n",
-        env!("CARGO_PKG_VERSION")
+        duduclaw_gateway::updater::current_version()
     );
     tokio::fs::write(agent_dir.join("CLAUDE.md"), &claude_md)
         .await

@@ -455,7 +455,7 @@ impl MethodHandler {
 
     fn handle_connect(&self, params: Value) -> WsFrame {
         let version = params.get("version").and_then(|v| v.as_str()).unwrap_or("unknown");
-        WsFrame::ok_response("", json!({ "version": env!("CARGO_PKG_VERSION"), "client_version": version, "status": "connected" }))
+        WsFrame::ok_response("", json!({ "version": crate::updater::current_version(), "client_version": version, "status": "connected" }))
     }
 
     fn handle_hello_ok(&self, _params: Value) -> WsFrame {
@@ -2853,7 +2853,7 @@ impl MethodHandler {
         let channels_connected = channel_map.values().filter(|s| s.connected).count();
         drop(channel_map);
         WsFrame::ok_response("", json!({
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": crate::updater::current_version(),
             "edition": self.extension.name(),
             "tier": self.extension.tier(),
             "uptime_seconds": uptime,
@@ -2917,7 +2917,7 @@ impl MethodHandler {
     }
 
     fn handle_system_version(&self) -> WsFrame {
-        WsFrame::ok_response("", json!({ "version": env!("CARGO_PKG_VERSION") }))
+        WsFrame::ok_response("", json!({ "version": crate::updater::current_version() }))
     }
 
     async fn handle_system_check_update(&self) -> WsFrame {
