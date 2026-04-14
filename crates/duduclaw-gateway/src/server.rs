@@ -269,10 +269,34 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     bg_handles.push(cron_handle);
     info!("Cron scheduler started (SQLite-backed with hot reload)");
 
-    // Start agent dispatcher (consumes bus_queue.jsonl, spawns sub-agents)
-    bg_handles.push(crate::dispatcher::start_agent_dispatcher(
+    // Fix MCP server paths before starting dispatcher — ensures subprocess-spawned
+    // Claude CLI can discover the duduclaw MCP server without PATH inheritance.
+    {
+        let agents_dir = home_dir.join("agents");
+        let fixed = duduclaw_agent::mcp_template::ensure_mcp_absolute_paths_all(&agents_dir);
+        if fixed > 0 {
+            info!(count = fixed, "Fixed relative MCP paths for agent subprocess discovery");
+        }
+    }
+
+    // Initialize SQLite message queue (Phase 3 Hybrid TaskPipeline)
+    let message_queue = match crate::message_queue::MessageQueue::open(&home_dir) {
+        Ok(mq) => {
+            info!("SQLite message queue initialized");
+            Some(std::sync::Arc::new(mq))
+        }
+        Err(e) => {
+            warn!("Failed to open SQLite message queue: {e} — falling back to JSONL only");
+            None
+        }
+    };
+
+    // Start agent dispatcher (consumes bus_queue.jsonl + SQLite queue, spawns sub-agents)
+    bg_handles.push(crate::dispatcher::start_agent_dispatcher_with_crypto(
         home_dir.clone(),
         handler.registry().clone(),
+        None,
+        message_queue,
     ));
     info!("Agent dispatcher started ({} background tasks)", bg_handles.len());
 
@@ -353,6 +377,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let mut app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health_handler))
+        .route("/api/mcp/oauth/callback", get(handle_mcp_oauth_callback))
         .with_state(state)
         .merge(auth_router)
         .merge(webchat_router);
@@ -953,6 +978,85 @@ fn has_users(user_db: &UserDb) -> bool {
 /// Simple health-check endpoint.
 async fn health_handler() -> &'static str {
     "ok"
+}
+
+// ── MCP OAuth callback endpoint ─────────────────────────────
+
+/// Query parameters from the OAuth provider redirect.
+#[derive(serde::Deserialize)]
+struct OAuthCallbackParams {
+    code: String,
+    state: String,
+}
+
+/// GET /api/mcp/oauth/callback — Handles the OAuth redirect from the provider.
+async fn handle_mcp_oauth_callback(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<OAuthCallbackParams>,
+) -> impl IntoResponse {
+    // Look up the pending OAuth flow by state nonce
+    let pending = {
+        let mut map = state.handler.mcp_oauth_pending().write().await;
+        crate::mcp_oauth::cleanup_pending(&mut map);
+        map.remove(&params.state)
+    };
+
+    let pending = match pending {
+        Some(p) => p,
+        None => {
+            warn!("MCP OAuth callback with unknown state parameter");
+            return axum::response::Html(
+                "<html><body><h2>Authentication failed</h2>\
+                 <p>Unknown or expired OAuth state. Please try again from the dashboard.</p>\
+                 </body></html>"
+                    .to_string(),
+            );
+        }
+    };
+
+    // Exchange the authorization code for tokens
+    let token = match crate::mcp_oauth::exchange_code(
+        &pending.config,
+        &params.code,
+        &pending.code_verifier,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(provider = %pending.provider_id, error = %e, "MCP OAuth token exchange failed");
+            return axum::response::Html(format!(
+                "<html><body><h2>Authentication failed</h2>\
+                 <p>Token exchange error: {e}</p>\
+                 <p>Please close this window and try again.</p>\
+                 </body></html>"
+            ));
+        }
+    };
+
+    // Save the token to disk
+    let home_dir = state.handler.home_dir();
+    if let Err(e) = crate::mcp_oauth::upsert_token(home_dir, token) {
+        warn!(error = %e, "Failed to save MCP OAuth token");
+        return axum::response::Html(format!(
+            "<html><body><h2>Authentication failed</h2>\
+             <p>Failed to save token: {e}</p>\
+             </body></html>"
+        ));
+    }
+
+    info!(provider = %pending.provider_id, "MCP OAuth authentication successful");
+
+    axum::response::Html(
+        "<html><body style=\"font-family: system-ui, sans-serif; display: flex; \
+         justify-content: center; align-items: center; height: 100vh; margin: 0; \
+         background: #fafaf9;\">\
+         <div style=\"text-align: center;\">\
+         <h2 style=\"color: #1c1917;\">Authentication Successful</h2>\
+         <p style=\"color: #78716c;\">You can close this window and return to the dashboard.</p>\
+         </div></body></html>"
+            .to_string(),
+    )
 }
 
 // ── .well-known endpoints for protocol discovery ──────────────

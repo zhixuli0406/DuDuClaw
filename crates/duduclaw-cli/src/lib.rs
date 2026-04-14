@@ -2217,10 +2217,9 @@ skill_security_scan = true
     // because the tool literally does not exist in the agent's toolbelt —
     // the model either falls back to raw Bash writes (blocked by
     // agent-file-guard since v1.3.15) or fabricates results in plain text.
-    let mcp_bin = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
-        .unwrap_or_else(|| "duduclaw".to_string());
+    let mcp_bin = duduclaw_core::resolve_duduclaw_bin()
+        .to_string_lossy()
+        .into_owned();
     let mcp_json = serde_json::json!({
         "mcpServers": {
             "duduclaw": {

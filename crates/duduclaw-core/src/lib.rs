@@ -23,6 +23,26 @@ pub const ENV_DELEGATION_DEPTH: &str = "DUDUCLAW_DELEGATION_DEPTH";
 pub const ENV_DELEGATION_ORIGIN: &str = "DUDUCLAW_DELEGATION_ORIGIN";
 pub const ENV_DELEGATION_SENDER: &str = "DUDUCLAW_DELEGATION_SENDER";
 
+/// Resolve the absolute path to the current DuDuClaw binary.
+///
+/// Used to populate `.mcp.json` and hook commands so Claude CLI
+/// subprocesses can find the MCP server without relying on PATH
+/// inheritance (which is frequently incomplete when launched from
+/// launchd, Finder, or Dock).
+///
+/// Preference order:
+/// 1. `DUDUCLAW_BIN` env var (test / override hook)
+/// 2. `std::env::current_exe()` — the actual binary path
+/// 3. Fallback to `"duduclaw"` (PATH-dependent, least robust)
+pub fn resolve_duduclaw_bin() -> std::path::PathBuf {
+    if let Ok(override_path) = std::env::var("DUDUCLAW_BIN")
+        && !override_path.is_empty()
+    {
+        return std::path::PathBuf::from(override_path);
+    }
+    std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("duduclaw"))
+}
+
 /// Validate that an agent ID is safe for filesystem and log use.
 ///
 /// A valid agent ID contains only lowercase alphanumerics, hyphens, and

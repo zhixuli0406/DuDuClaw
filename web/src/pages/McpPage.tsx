@@ -4,7 +4,7 @@ import { cn } from '@/lib/utils';
 import { useMcpStore } from '@/stores/mcp-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useConnectionStore } from '@/stores/connection-store';
-import { type McpServerDef, type McpCatalogItem } from '@/lib/api';
+import { type McpServerDef, type McpCatalogItem, type McpOAuthProvider } from '@/lib/api';
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import {
   Plug,
@@ -20,9 +20,11 @@ import {
   AlertTriangle,
   X,
   Loader2,
+  Shield,
+  KeyRound,
 } from 'lucide-react';
 
-type Tab = 'agents' | 'marketplace';
+type Tab = 'agents' | 'marketplace' | 'oauth';
 
 const categoryIcons: Record<string, typeof Globe> = {
   browser: Globe,
@@ -38,7 +40,7 @@ function getCategoryIcon(category: string) {
 export function McpPage() {
   const intl = useIntl();
   const connState = useConnectionStore((s) => s.state);
-  const { agentConfigs, catalog, loading, fetchAll } = useMcpStore();
+  const { agentConfigs, catalog, loading, fetchAll, oauthProviders, fetchOAuthProviders } = useMcpStore();
   const { agents, fetchAgents } = useAgentsStore();
   const [activeTab, setActiveTab] = useState<Tab>('agents');
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
@@ -65,8 +67,9 @@ export function McpPage() {
     if (connState === 'authenticated') {
       fetchAll();
       fetchAgents();
+      fetchOAuthProviders();
     }
-  }, [connState, fetchAll, fetchAgents]);
+  }, [connState, fetchAll, fetchAgents, fetchOAuthProviders]);
 
   // Auto-select first agent
   useEffect(() => {
@@ -172,6 +175,17 @@ export function McpPage() {
           )}
         >
           {intl.formatMessage({ id: 'mcp.tab.marketplace' })}
+        </button>
+        <button
+          onClick={() => setActiveTab('oauth')}
+          className={cn(
+            'flex-1 rounded-md px-4 py-2 text-sm font-medium transition-colors',
+            activeTab === 'oauth'
+              ? 'bg-white text-stone-900 shadow-sm dark:bg-stone-700 dark:text-stone-50'
+              : 'text-stone-500 hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-300'
+          )}
+        >
+          {intl.formatMessage({ id: 'mcp.tab.oauth' })}
         </button>
       </div>
 
@@ -393,6 +407,11 @@ export function McpPage() {
         </div>
       )}
 
+      {/* Tab 3: OAuth */}
+      {!loading && activeTab === 'oauth' && (
+        <OAuthTab providers={oauthProviders} showToast={showToast} />
+      )}
+
       {/* Add Server Dialog */}
       <AddServerDialog
         open={showAddDialog}
@@ -408,6 +427,290 @@ export function McpPage() {
         }}
       />
     </div>
+  );
+}
+
+function getStatusBadge(provider: McpOAuthProvider, intl: ReturnType<typeof useIntl>) {
+  if (!provider.configured) {
+    return {
+      label: intl.formatMessage({ id: 'mcp.oauth.notConfigured' }),
+      className: 'bg-stone-100 text-stone-500 dark:bg-stone-800 dark:text-stone-400',
+    };
+  }
+  switch (provider.token_status) {
+    case 'authenticated':
+      return {
+        label: intl.formatMessage({ id: 'mcp.oauth.authenticated' }),
+        className: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
+      };
+    case 'expired':
+      return {
+        label: intl.formatMessage({ id: 'mcp.oauth.expired' }),
+        className: 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400',
+      };
+    default:
+      return {
+        label: intl.formatMessage({ id: 'mcp.oauth.notAuthenticated' }),
+        className: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
+      };
+  }
+}
+
+function OAuthTab({
+  providers,
+  showToast,
+}: {
+  providers: ReadonlyArray<McpOAuthProvider>;
+  showToast: (type: 'success' | 'error', message: string) => void;
+}) {
+  const intl = useIntl();
+  const [pendingProvider, setPendingProvider] = useState<string | null>(null);
+  const [configureProvider, setConfigureProvider] = useState<McpOAuthProvider | null>(null);
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Cleanup polling on unmount
+  useEffect(() => {
+    return () => {
+      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+    };
+  }, []);
+
+  const handleAuthenticate = async (provider: McpOAuthProvider) => {
+    setPendingProvider(provider.provider_id);
+    try {
+      const authUrl = await useMcpStore.getState().startOAuth(provider.provider_id);
+      window.open(authUrl, '_blank');
+
+      // Start local polling for UI feedback
+      let attempts = 0;
+      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+      pollTimerRef.current = setInterval(async () => {
+        attempts += 1;
+        if (attempts > 100) {
+          if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+          setPendingProvider(null);
+          return;
+        }
+        const updatedProviders = useMcpStore.getState().oauthProviders;
+        const updated = updatedProviders.find((p) => p.provider_id === provider.provider_id);
+        if (updated?.token_status === 'authenticated') {
+          if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+          setPendingProvider(null);
+          showToast('success', intl.formatMessage({ id: 'mcp.oauth.success' }, { provider: provider.name }));
+        }
+      }, 3000);
+    } catch {
+      setPendingProvider(null);
+      showToast('error', intl.formatMessage({ id: 'mcp.loadFailed' }));
+    }
+  };
+
+  const handleRevoke = async (provider: McpOAuthProvider) => {
+    if (!confirm(intl.formatMessage({ id: 'mcp.oauth.revokeConfirm' }, { provider: provider.name }))) return;
+    try {
+      await useMcpStore.getState().revokeOAuth(provider.provider_id);
+      showToast('success', intl.formatMessage({ id: 'mcp.oauth.revoked' }, { provider: provider.name }));
+    } catch {
+      showToast('error', intl.formatMessage({ id: 'mcp.loadFailed' }));
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <h3 className="text-lg font-semibold text-stone-900 dark:text-stone-50">
+        {intl.formatMessage({ id: 'mcp.oauth.title' })}
+      </h3>
+
+      {providers.length === 0 ? (
+        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
+          <Shield className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
+          <p className="text-stone-500 dark:text-stone-400">
+            {intl.formatMessage({ id: 'mcp.empty' })}
+          </p>
+        </div>
+      ) : (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {providers.map((provider) => {
+            const status = getStatusBadge(provider, intl);
+            const isPending = pendingProvider === provider.provider_id;
+
+            return (
+              <div
+                key={provider.provider_id}
+                className="rounded-xl border border-stone-200 bg-white p-5 transition-shadow hover:shadow-md dark:border-stone-800 dark:bg-stone-900"
+              >
+                <div className="flex items-start justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="rounded-lg bg-amber-100 p-2.5 dark:bg-amber-900/30">
+                      <Globe className="h-5 w-5 text-amber-600 dark:text-amber-400" />
+                    </div>
+                    <div>
+                      <h3 className="font-semibold text-stone-900 dark:text-stone-50">{provider.name}</h3>
+                      <span className={cn('inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium', status.className)}>
+                        {status.label}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Scopes */}
+                {provider.scopes.length > 0 && (
+                  <div className="mt-3">
+                    <p className="text-xs font-medium text-stone-500 dark:text-stone-400">
+                      {intl.formatMessage({ id: 'mcp.oauth.scopes' })}
+                    </p>
+                    <div className="mt-1 flex flex-wrap gap-1">
+                      {provider.scopes.map((scope) => (
+                        <span
+                          key={scope}
+                          className="inline-flex items-center rounded bg-stone-100 px-1.5 py-0.5 text-xs font-mono text-stone-600 dark:bg-stone-800 dark:text-stone-400"
+                        >
+                          {scope}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Expires at */}
+                {provider.token_status === 'authenticated' && provider.expires_at && (
+                  <p className="mt-2 text-xs text-stone-400 dark:text-stone-500">
+                    {intl.formatMessage({ id: 'mcp.oauth.expiresAt' }, { date: new Date(provider.expires_at).toLocaleDateString() })}
+                  </p>
+                )}
+
+                {/* Pending state */}
+                {isPending && (
+                  <div className="mt-3 flex items-center gap-2 text-sm text-amber-600 dark:text-amber-400">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    {intl.formatMessage({ id: 'mcp.oauth.waiting' })}
+                  </div>
+                )}
+
+                {/* Actions */}
+                <div className="mt-4 flex gap-2 border-t border-stone-100 pt-3 dark:border-stone-800">
+                  {!provider.configured && (
+                    <button
+                      onClick={() => setConfigureProvider(provider)}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-amber-600"
+                    >
+                      <KeyRound className="h-3.5 w-3.5" />
+                      {intl.formatMessage({ id: 'mcp.oauth.configure' })}
+                    </button>
+                  )}
+                  {provider.configured && provider.token_status !== 'authenticated' && !isPending && (
+                    <button
+                      onClick={() => handleAuthenticate(provider)}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-amber-600"
+                    >
+                      <Shield className="h-3.5 w-3.5" />
+                      {intl.formatMessage({ id: 'mcp.oauth.authenticate' })}
+                    </button>
+                  )}
+                  {provider.token_status === 'authenticated' && (
+                    <button
+                      onClick={() => handleRevoke(provider)}
+                      className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-900/20"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      {intl.formatMessage({ id: 'mcp.oauth.revoke' })}
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Configure OAuth Credentials Dialog */}
+      {configureProvider && (
+        <ConfigureOAuthDialog
+          provider={configureProvider}
+          onClose={() => setConfigureProvider(null)}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+function ConfigureOAuthDialog({
+  provider,
+  onClose,
+  showToast,
+}: {
+  provider: McpOAuthProvider;
+  onClose: () => void;
+  showToast: (type: 'success' | 'error', message: string) => void;
+}) {
+  const intl = useIntl();
+  const [clientId, setClientId] = useState('');
+  const [clientSecret, setClientSecret] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const helpKey = `mcp.oauth.help${provider.provider_id.charAt(0).toUpperCase()}${provider.provider_id.slice(1)}` as const;
+
+  const handleSubmit = async () => {
+    if (!clientId.trim()) return;
+    setSubmitting(true);
+    try {
+      const authUrl = await useMcpStore.getState().startOAuth(provider.provider_id, clientId.trim(), clientSecret.trim() || undefined);
+      window.open(authUrl, '_blank');
+      showToast('success', intl.formatMessage({ id: 'mcp.oauth.waiting' }));
+      onClose();
+    } catch {
+      showToast('error', intl.formatMessage({ id: 'mcp.loadFailed' }));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open onClose={onClose} title={intl.formatMessage({ id: 'mcp.oauth.configureTitle' })}>
+      <div className="space-y-4">
+        <FormField label="Provider">
+          <input type="text" value={provider.name} readOnly className={cn(inputClass, 'bg-stone-50 dark:bg-stone-800')} />
+        </FormField>
+
+        <FormField label={intl.formatMessage({ id: 'mcp.oauth.clientId' })}>
+          <input
+            type="text"
+            value={clientId}
+            onChange={(e) => setClientId(e.target.value)}
+            placeholder="Client ID"
+            className={inputClass}
+          />
+        </FormField>
+
+        <FormField label={intl.formatMessage({ id: 'mcp.oauth.clientSecret' })}>
+          <input
+            type="password"
+            value={clientSecret}
+            onChange={(e) => setClientSecret(e.target.value)}
+            placeholder="Client Secret"
+            className={inputClass}
+          />
+        </FormField>
+
+        <p className="text-xs text-stone-400 dark:text-stone-500">
+          {intl.formatMessage({ id: helpKey, defaultMessage: '' })}
+        </p>
+
+        <div className="flex justify-end gap-3 pt-2">
+          <button onClick={onClose} className={buttonSecondary}>
+            {intl.formatMessage({ id: 'mcp.cancel' })}
+          </button>
+          <button
+            onClick={handleSubmit}
+            disabled={submitting || !clientId.trim()}
+            className={buttonPrimary}
+          >
+            {submitting ? intl.formatMessage({ id: 'mcp.adding' }) : intl.formatMessage({ id: 'mcp.oauth.authenticate' })}
+          </button>
+        </div>
+      </div>
+    </Dialog>
   );
 }
 

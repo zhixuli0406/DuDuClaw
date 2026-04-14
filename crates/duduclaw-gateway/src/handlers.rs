@@ -55,6 +55,8 @@ pub struct MethodHandler {
     /// Handle to the running cron scheduler — used to trigger hot reload
     /// after mutating `cron_store`. Injected after gateway starts.
     cron_scheduler: RwLock<Option<Arc<CronScheduler>>>,
+    /// Pending OAuth flows awaiting callback (keyed by state nonce).
+    mcp_oauth_pending: RwLock<std::collections::HashMap<String, crate::mcp_oauth::PendingOAuth>>,
 }
 
 /// Cached update info from the last `system.check_update` call. [M2][R2:NM1]
@@ -138,6 +140,7 @@ impl MethodHandler {
             extension,
             cron_store: RwLock::new(None),
             cron_scheduler: RwLock::new(None),
+            mcp_oauth_pending: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -209,6 +212,11 @@ impl MethodHandler {
     /// Get the home directory path.
     pub fn home_dir(&self) -> &Path {
         &self.home_dir
+    }
+
+    /// Get the pending OAuth flows map (used by HTTP callback handler).
+    pub fn mcp_oauth_pending(&self) -> &RwLock<std::collections::HashMap<String, crate::mcp_oauth::PendingOAuth>> {
+        &self.mcp_oauth_pending
     }
 
     /// Set the heartbeat scheduler reference (called after gateway start).
@@ -445,6 +453,12 @@ impl MethodHandler {
             "mcp.list" => { require_admin!(); self.handle_mcp_list().await }
             "mcp.update" => { require_admin!(); self.handle_mcp_update(&params).await }
 
+            // ── MCP OAuth (admin only) ──────────────────────────
+            "mcp.oauth.providers" => { require_admin!(); self.handle_mcp_oauth_providers().await }
+            "mcp.oauth.start" => { require_admin!(); self.handle_mcp_oauth_start(params).await }
+            "mcp.oauth.status" => { require_admin!(); self.handle_mcp_oauth_status(params).await }
+            "mcp.oauth.revoke" => { require_admin!(); self.handle_mcp_oauth_revoke(params).await }
+
             unknown => WsFrame::error_response("", &format!("Unknown method: {unknown}")),
         }
     }
@@ -513,6 +527,10 @@ impl MethodHandler {
                 { "name": "heartbeat.trigger", "description": "Manually trigger heartbeat for an agent" },
                 { "name": "mcp.list", "description": "List MCP servers for all agents + catalog" },
                 { "name": "mcp.update", "description": "Add or remove an MCP server for an agent" },
+                { "name": "mcp.oauth.providers", "description": "List available OAuth providers and their auth status" },
+                { "name": "mcp.oauth.start", "description": "Start OAuth flow for a provider" },
+                { "name": "mcp.oauth.status", "description": "Check OAuth status for a provider" },
+                { "name": "mcp.oauth.revoke", "description": "Revoke OAuth token for a provider" },
                 { "name": "logs.subscribe", "description": "Subscribe to logs" },
                 { "name": "logs.unsubscribe", "description": "Unsubscribe from logs" },
             ]
@@ -4563,6 +4581,159 @@ impl MethodHandler {
                 }
             }
             _ => WsFrame::error_response("", &format!("Unknown action: {action}. Use 'add' or 'remove'")),
+        }
+    }
+
+    // ── MCP OAuth handlers ──────────────────────────────────
+
+    /// List available OAuth providers with configuration and token status.
+    async fn handle_mcp_oauth_providers(&self) -> WsFrame {
+        use crate::mcp_oauth;
+
+        let redirect_uri = format!("http://localhost:3000/api/mcp/oauth/callback");
+        let providers = mcp_oauth::builtin_providers(&redirect_uri);
+
+        let results: Vec<Value> = providers.iter().map(|p| {
+            let token = mcp_oauth::get_token(&self.home_dir, &p.provider_id);
+            let status = match &token {
+                Some(t) => {
+                    if let Some(exp) = t.expires_at {
+                        if chrono::Utc::now() >= exp {
+                            "expired"
+                        } else {
+                            "authenticated"
+                        }
+                    } else {
+                        "authenticated"
+                    }
+                }
+                None => "none",
+            };
+            json!({
+                "provider_id": p.provider_id,
+                "auth_url": p.auth_url,
+                "scopes": p.scopes,
+                "configured": !p.client_id.is_empty(),
+                "status": status,
+                "expires_at": token.and_then(|t| t.expires_at),
+            })
+        }).collect();
+
+        WsFrame::ok_response("", json!({ "providers": results }))
+    }
+
+    /// Start an OAuth flow: generate PKCE, store pending state, return auth URL.
+    async fn handle_mcp_oauth_start(&self, params: Value) -> WsFrame {
+        use crate::mcp_oauth;
+
+        let provider_id = match params.get("provider_id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => return WsFrame::error_response("", "provider_id is required"),
+        };
+
+        let client_id = params.get("client_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let client_secret = params.get("client_secret").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        // Find the built-in provider or create a custom one
+        let redirect_uri = format!("http://localhost:3000/api/mcp/oauth/callback");
+        let mut config = mcp_oauth::builtin_providers(&redirect_uri)
+            .into_iter()
+            .find(|p| p.provider_id == provider_id)
+            .unwrap_or_else(|| mcp_oauth::McpOAuthConfig {
+                provider_id: provider_id.clone(),
+                client_id: String::new(),
+                client_secret: String::new(),
+                auth_url: params.get("auth_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                token_url: params.get("token_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                scopes: params.get("scopes")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|s| s.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default(),
+                redirect_uri: redirect_uri.clone(),
+            });
+
+        // Override client_id/secret if provided in params
+        if !client_id.is_empty() {
+            config.client_id = client_id;
+        }
+        if !client_secret.is_empty() {
+            config.client_secret = client_secret;
+        }
+
+        if config.client_id.is_empty() {
+            return WsFrame::error_response("", "client_id is required (provide in params or pre-configure)");
+        }
+        if config.auth_url.is_empty() || config.token_url.is_empty() {
+            return WsFrame::error_response("", "auth_url and token_url are required for custom providers");
+        }
+
+        // Generate PKCE
+        let (code_verifier, code_challenge) = mcp_oauth::generate_pkce();
+        let state = uuid::Uuid::new_v4().to_string();
+
+        let auth_url = mcp_oauth::build_auth_url(&config, &state, &code_challenge);
+
+        // Store pending
+        let pending = mcp_oauth::PendingOAuth {
+            provider_id: provider_id.clone(),
+            state: state.clone(),
+            code_verifier,
+            config,
+            created_at: std::time::Instant::now(),
+        };
+
+        {
+            let mut map = self.mcp_oauth_pending.write().await;
+            // Cleanup expired entries
+            mcp_oauth::cleanup_pending(&mut map);
+            map.insert(state.clone(), pending);
+        }
+
+        info!(provider = %provider_id, "MCP OAuth flow started");
+
+        WsFrame::ok_response("", json!({
+            "auth_url": auth_url,
+            "state": state,
+        }))
+    }
+
+    /// Check if a provider's OAuth flow has completed (token exists).
+    async fn handle_mcp_oauth_status(&self, params: Value) -> WsFrame {
+        use crate::mcp_oauth;
+
+        let provider_id = match params.get("provider_id").and_then(|v| v.as_str()) {
+            Some(id) => id,
+            None => return WsFrame::error_response("", "provider_id is required"),
+        };
+
+        let token = mcp_oauth::get_token(&self.home_dir, provider_id);
+        match token {
+            Some(t) => WsFrame::ok_response("", json!({
+                "authenticated": true,
+                "expires_at": t.expires_at,
+                "scopes": t.scopes,
+            })),
+            None => WsFrame::ok_response("", json!({
+                "authenticated": false,
+            })),
+        }
+    }
+
+    /// Revoke (remove) a stored OAuth token for a provider.
+    async fn handle_mcp_oauth_revoke(&self, params: Value) -> WsFrame {
+        use crate::mcp_oauth;
+
+        let provider_id = match params.get("provider_id").and_then(|v| v.as_str()) {
+            Some(id) => id,
+            None => return WsFrame::error_response("", "provider_id is required"),
+        };
+
+        match mcp_oauth::remove_token(&self.home_dir, provider_id) {
+            Ok(()) => {
+                info!(provider = %provider_id, "MCP OAuth token revoked");
+                WsFrame::ok_response("", json!({ "success": true }))
+            }
+            Err(e) => WsFrame::error_response("", &e),
         }
     }
 }
