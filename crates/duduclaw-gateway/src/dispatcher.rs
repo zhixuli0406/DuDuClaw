@@ -59,14 +59,16 @@ pub fn start_agent_dispatcher(
     home_dir: PathBuf,
     registry: Arc<RwLock<AgentRegistry>>,
 ) -> tokio::task::JoinHandle<()> {
-    start_agent_dispatcher_with_crypto(home_dir, registry, None)
+    start_agent_dispatcher_with_crypto(home_dir, registry, None, None)
 }
 
-/// Start the dispatcher with optional encryption key for deferred GVU (review #30).
+/// Start the dispatcher with optional encryption key for deferred GVU (review #30)
+/// and optional SQLite message queue (Phase 3 Hybrid TaskPipeline).
 pub fn start_agent_dispatcher_with_crypto(
     home_dir: PathBuf,
     registry: Arc<RwLock<AgentRegistry>>,
     encryption_key: Option<[u8; 32]>,
+    message_queue: Option<Arc<crate::message_queue::MessageQueue>>,
 ) -> tokio::task::JoinHandle<()> {
     // Mutex protects the read-modify-write cycle on bus_queue.jsonl
     let dispatch_lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -77,15 +79,111 @@ pub fn start_agent_dispatcher_with_crypto(
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             tick += 1;
             let _guard = dispatch_lock.lock().await;
+
+            // Poll JSONL bus queue (legacy path — kept for backward compat)
             if let Err(e) = poll_and_dispatch(&home_dir, &registry).await {
                 warn!("Dispatcher poll error: {e}");
             }
+
+            // Poll SQLite message queue (new path)
+            if let Some(ref mq) = message_queue {
+                if let Err(e) = poll_and_dispatch_sqlite(mq, &home_dir, &registry).await {
+                    warn!("SQLite dispatcher poll error: {e}");
+                }
+                // Sweep stale messages every 12 ticks (~60 seconds)
+                if tick % 12 == 0 {
+                    if let Err(e) = sweep_stale_messages(mq).await {
+                        warn!("Stale message sweep error: {e}");
+                    }
+                }
+            }
+
             // Deferred GVU polling every 60 ticks (~5 min)
             if tick % 60 == 0 {
                 poll_deferred_gvu(&home_dir, encryption_key.as_ref()).await;
             }
+            // TaskSpec polling every 2 ticks (~10 seconds)
+            if tick % 2 == 0 {
+                poll_pending_taskspecs(&home_dir, &registry).await;
+            }
         }
     })
+}
+
+/// Poll the SQLite message queue for pending messages and dispatch them.
+async fn poll_and_dispatch_sqlite(
+    queue: &Arc<crate::message_queue::MessageQueue>,
+    home_dir: &Path,
+    registry: &Arc<RwLock<AgentRegistry>>,
+) -> Result<(), String> {
+    let messages = queue.pending_messages(10).await?;
+    if messages.is_empty() {
+        return Ok(());
+    }
+
+    info!(count = messages.len(), "SQLite queue: dispatching pending messages");
+
+    for msg in messages {
+        // ACK immediately to prevent double-pickup
+        queue.ack(&msg.id).await?;
+
+        let delegation = DelegationEnv {
+            depth: msg.delegation_depth as u8,
+            origin: msg.origin_agent.clone().unwrap_or_default(),
+            sender: msg.sender_agent.clone().unwrap_or_default(),
+        };
+
+        match dispatch_to_agent(home_dir, registry, &msg.target, &msg.payload, &delegation).await
+        {
+            Ok(response) => {
+                queue.complete(&msg.id, &response).await?;
+                info!(
+                    msg_id = %msg.id,
+                    target = %msg.target,
+                    "SQLite queue: message dispatched successfully"
+                );
+            }
+            Err(e) => {
+                queue.fail(&msg.id, &e).await?;
+                warn!(
+                    msg_id = %msg.id,
+                    target = %msg.target,
+                    error = %e,
+                    "SQLite queue: message dispatch failed"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Reset stale acked messages back to pending, or fail them if retries exhausted.
+async fn sweep_stale_messages(
+    queue: &Arc<crate::message_queue::MessageQueue>,
+) -> Result<(), String> {
+    let stale = queue.stale_messages(60).await?;
+    for msg in stale {
+        if msg.retry_count < 3 {
+            queue.reset_to_pending(&msg.id).await?;
+            warn!(
+                msg_id = %msg.id,
+                target = %msg.target,
+                retry = msg.retry_count + 1,
+                "SQLite queue: stale message reset for retry"
+            );
+        } else {
+            queue
+                .fail(&msg.id, "Timeout: unacked after 60s, retries exhausted")
+                .await?;
+            warn!(
+                msg_id = %msg.id,
+                target = %msg.target,
+                "SQLite queue: stale message abandoned after 3 retries"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Poll deferred GVU entries from evolution.db and write bus messages for retry.
@@ -401,13 +499,15 @@ async fn poll_and_dispatch(
                 }).await.ok().flatten();
 
                 if let Some(count) = hallucination_warning {
-                    // Use structured metadata marker for channel gateway filtering.
-                    // Channels should strip lines starting with [DUDUCLAW_INTERNAL].
+                    // Inject a system correction so downstream agents / users see the truth.
+                    // The original hallucinated text remains in the response but is clearly
+                    // flagged — full redaction would break response coherence.
                     response_text.push_str(&format!(
-                        "\n\n[DUDUCLAW_INTERNAL:HALLUCINATION] {} action claim(s) in this response \
-                         have no corresponding MCP tool call. The claimed actions were NOT \
-                         actually performed. Please retry with actual tool calls.",
-                        count,
+                        "\n\n[DUDUCLAW_SYSTEM:HALLUCINATION_DETECTED] ⚠️ This response contains \
+                         {count} action claim(s) that have NO corresponding MCP tool call in the \
+                         audit log. The claimed actions were NOT actually performed. \
+                         Do NOT trust these claims. If re-delegating, use the create_task tool \
+                         for reliable deterministic execution.",
                     ));
                 }
             }
@@ -590,6 +690,71 @@ async fn dispatch_sandboxed(
         Ok("(empty response from sandbox)".to_string())
     } else {
         Ok(text)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TaskSpec polling — picks up tasks created by create_task MCP tool
+// ---------------------------------------------------------------------------
+
+/// Scan all agents for pending TaskSpecs and dispatch them.
+///
+/// A TaskSpec is picked up if its `status` is `Planned`. It is immediately
+/// marked `Running` to prevent double-pickup by concurrent poll cycles.
+async fn poll_pending_taskspecs(
+    home_dir: &Path,
+    registry: &Arc<RwLock<AgentRegistry>>,
+) {
+    let agents_dir = home_dir.join("agents");
+    let entries = match std::fs::read_dir(&agents_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let agent_dir = entry.path();
+        if !agent_dir.is_dir() {
+            continue;
+        }
+        let agent_name = match agent_dir.file_name().and_then(|n| n.to_str()) {
+            Some(n) if !n.starts_with('_') && !n.starts_with('.') => n.to_string(),
+            _ => continue,
+        };
+
+        let task_ids = crate::task_spec::TaskSpec::list(&agent_dir);
+        for task_id in task_ids {
+            let mut spec = match crate::task_spec::TaskSpec::load(&agent_dir, &task_id) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            if spec.status != crate::task_spec::TaskStatus::Planned {
+                continue;
+            }
+
+            info!(
+                task = %spec.task_id,
+                agent = %agent_name,
+                goal = %spec.goal,
+                steps = spec.steps.len(),
+                "Picking up planned TaskSpec for execution"
+            );
+
+            // Clone for the spawned task.
+            let home = home_dir.to_path_buf();
+            let reg = registry.clone();
+            let dir = agent_dir.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = dispatch_taskspec(&home, &reg, &mut spec, &dir).await {
+                    warn!(
+                        task = %spec.task_id,
+                        error = %e,
+                        "TaskSpec execution failed"
+                    );
+                }
+            });
+        }
     }
 }
 

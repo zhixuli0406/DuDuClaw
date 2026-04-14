@@ -149,6 +149,110 @@ pub fn ensure_browserbase_in_config(
     Ok(())
 }
 
+/// Ensure the `duduclaw` MCP server entry in `.mcp.json` uses an absolute path.
+///
+/// Reads the existing config, checks if the `duduclaw` server's `command` is
+/// a relative name (e.g., `"duduclaw"` or `"duduclaw-pro"`).  If so, replaces
+/// it with the resolved absolute path from [`duduclaw_core::resolve_duduclaw_bin`].
+/// All other servers are preserved untouched.
+///
+/// Returns `Ok(true)` if the file was updated, `Ok(false)` if no change needed.
+pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
+    let path = agent_dir.join(".mcp.json");
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let mut config: McpConfig = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+
+    // Check if duduclaw server needs updating.
+    let needs_update = config
+        .mcp_servers
+        .get("duduclaw")
+        .is_some_and(|e| !std::path::Path::new(&e.command).is_absolute());
+
+    if !needs_update {
+        return Ok(false);
+    }
+
+    let abs_bin = duduclaw_core::resolve_duduclaw_bin();
+    let abs_str = abs_bin.to_string_lossy().into_owned();
+
+    // Still relative after resolution (fallback "duduclaw") — skip.
+    if !std::path::Path::new(&abs_str).is_absolute() {
+        return Ok(false);
+    }
+
+    config
+        .mcp_servers
+        .get_mut("duduclaw")
+        .expect("checked above")
+        .command = abs_str.clone();
+
+    let json = serde_json::to_string_pretty(&config)
+        .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
+    std::fs::write(&path, json)
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+
+    info!(
+        path = %path.display(),
+        command = %abs_str,
+        "Updated duduclaw MCP server to absolute path"
+    );
+    Ok(true)
+}
+
+/// Scan all agent directories and fix relative `duduclaw` MCP server paths.
+///
+/// Called on gateway startup to ensure subprocess-spawned Claude CLI can
+/// discover the MCP server without PATH inheritance.
+pub fn ensure_mcp_absolute_paths_all(agents_dir: &Path) -> usize {
+    let mut fixed = 0usize;
+    let entries = match std::fs::read_dir(agents_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(
+                dir = %agents_dir.display(),
+                error = %e,
+                "Cannot read agents directory for MCP path fixup"
+            );
+            return 0;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        // Skip trash / defaults directories
+        if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with('_') || name.starts_with('.') {
+                continue;
+            }
+        }
+        match ensure_duduclaw_absolute_path(&dir) {
+            Ok(true) => fixed += 1,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    agent_dir = %dir.display(),
+                    error = %e,
+                    "Failed to fix MCP path"
+                );
+            }
+        }
+    }
+
+    if fixed > 0 {
+        info!(count = fixed, "Fixed relative MCP paths on startup");
+    }
+    fixed
+}
+
 /// An entry in the MCP marketplace catalog.
 #[derive(Debug, Clone, Serialize)]
 pub struct McpCatalogItem {

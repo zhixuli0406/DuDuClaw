@@ -398,6 +398,16 @@ export interface McpCatalogItem {
   required_env: string[];
 }
 
+export interface McpOAuthProvider {
+  provider_id: string;
+  name: string;
+  auth_url: string;
+  scopes: string[];
+  configured: boolean;
+  token_status: 'none' | 'authenticated' | 'expired';
+  expires_at: string | null;
+}
+
 /** Fields that can be updated on an agent via `agents.update`. All optional. */
 export interface AgentUpdateParams {
   // Identity
@@ -750,6 +760,21 @@ export const api = {
         server_name: serverName,
         ...(serverDef ? { server_def: serverDef } : {}),
       }) as Promise<{ success: boolean }>,
+    oauthProviders: () =>
+      client.call('mcp.oauth.providers') as Promise<{ providers: McpOAuthProvider[] }>,
+    oauthStart: (providerId: string, clientId?: string, clientSecret?: string) =>
+      client.call('mcp.oauth.start', {
+        provider_id: providerId,
+        ...(clientId ? { client_id: clientId } : {}),
+        ...(clientSecret ? { client_secret: clientSecret } : {}),
+      }) as Promise<{ auth_url: string; state: string }>,
+    oauthStatus: (providerId: string) =>
+      client.call('mcp.oauth.status', { provider_id: providerId }) as Promise<{
+        authenticated: boolean;
+        expires_at: string | null;
+      }>,
+    oauthRevoke: (providerId: string) =>
+      client.call('mcp.oauth.revoke', { provider_id: providerId }) as Promise<{ success: boolean }>,
   },
   // Partner portal — backend not yet implemented; calls will reject with error
   partner: {

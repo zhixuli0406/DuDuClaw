@@ -184,12 +184,7 @@ fn build_hook_command(duduclaw_bin: &Path) -> String {
 /// 3. Fallback to "duduclaw" (relies on PATH at hook invocation time —
 ///    less robust, used only if current_exe fails)
 pub fn resolve_duduclaw_bin() -> PathBuf {
-    if let Ok(override_path) = std::env::var("DUDUCLAW_BIN")
-        && !override_path.is_empty()
-    {
-        return PathBuf::from(override_path);
-    }
-    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("duduclaw"))
+    duduclaw_core::resolve_duduclaw_bin()
 }
 
 #[cfg(test)]

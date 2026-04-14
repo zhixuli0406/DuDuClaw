@@ -186,6 +186,24 @@ const TOOLS: &[ToolDef] = &[
         params: &[],
     },
     ToolDef {
+        name: "create_task",
+        description: "Submit a structured multi-step task for deterministic execution by the gateway dispatcher. \
+                      Each step is dispatched to the specified agent, verified against acceptance criteria, \
+                      with automatic retry (3x) and replan (2x) on failure. Use this instead of send_to_agent \
+                      chains for reliable multi-step workflows.",
+        params: &[
+            ParamDef { name: "goal", description: "Overall task goal / description", required: true },
+            ParamDef { name: "steps", description: "JSON array of steps. Each step: {\"description\": \"...\", \"agent\": \"agent-id\" (optional, default=caller), \"depends_on\": [step_indices] (optional), \"acceptance_criteria\": [{\"description\": \"...\"}] (optional)}", required: true },
+        ],
+    },
+    ToolDef {
+        name: "task_status",
+        description: "Check the status of a previously created task (from create_task)",
+        params: &[
+            ParamDef { name: "task_id", description: "Task ID returned by create_task", required: true },
+        ],
+    },
+    ToolDef {
         name: "agent_status",
         description: "Get detailed status and configuration of a specific agent",
         params: &[
@@ -1069,19 +1087,64 @@ async fn send_to_agent_with_ctx(
         "sender_agent": caller,
     });
 
+    // Write to both JSONL (legacy) and SQLite (new) for dual-rail migration.
     let queued = tokio::task::spawn_blocking({
         let path = queue_path.clone();
         let task_str = task.to_string();
         move || append_to_jsonl_sync(&path, &task_str)
     }).await.unwrap_or(false);
 
-    serde_json::json!({
-        "content": [{"type": "text", "text": if queued {
-            format!("Message queued for agent '{target}' (id: {msg_id}, depth: {outgoing_depth})")
-        } else {
-            format!("Failed to queue message for agent '{target}'")
-        }}]
-    })
+    // Also write to SQLite message queue (Phase 3).
+    // Uses raw rusqlite to avoid circular dependency on duduclaw-gateway.
+    {
+        let db_path = home_dir.join("message_queue.db");
+        let msg_id_cl = msg_id.clone();
+        let caller_cl = caller.to_string();
+        let target_cl = target.to_string();
+        let prompt_cl = prompt.to_string();
+        let origin_cl = origin.to_string();
+        let ts_now = chrono::Utc::now().to_rfc3339();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO message_queue \
+                     (id, sender, target, payload, status, retry_count, delegation_depth, \
+                      origin_agent, sender_agent, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![
+                        msg_id_cl, caller_cl, target_cl, prompt_cl,
+                        outgoing_depth, origin_cl, caller_cl, ts_now,
+                    ],
+                );
+            }
+        }).await;
+    }
+
+    let ts = chrono::Utc::now().to_rfc3339();
+    if queued {
+        serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "Receipt: message_id={msg_id}, target={target}, depth={outgoing_depth}, \
+                 status=queued, timestamp={ts}. \
+                 The gateway dispatcher will deliver this message."
+            )}],
+            "_receipt": {
+                "message_id": msg_id,
+                "target": target,
+                "status": "queued",
+                "depth": outgoing_depth,
+                "timestamp": ts,
+            }
+        })
+    } else {
+        serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "Failed to queue message for agent '{target}'"
+            )}],
+            "isError": true
+        })
+    }
 }
 
 /// Send a photo or sticker via a channel.
@@ -2062,6 +2125,180 @@ async fn handle_agent_status(params: &Value, home_dir: &Path) -> Value {
     serde_json::json!({
         "content": [{"type": "text", "text": info}]
     })
+}
+
+/// Create a structured multi-step task for deterministic execution by the dispatcher.
+///
+/// The task is persisted as a TaskSpec JSON file; the gateway dispatcher picks it
+/// up on its next poll cycle and executes steps sequentially with retry/replan.
+async fn handle_create_task(params: &Value, home_dir: &Path, caller: &str) -> Value {
+    let goal = match params.get("goal").and_then(|v| v.as_str()) {
+        Some(g) if !g.is_empty() => g,
+        _ => return mcp_error("'goal' is required"),
+    };
+
+    let steps_raw = match params.get("steps") {
+        Some(v) => v,
+        None => return mcp_error("'steps' is required (JSON array)"),
+    };
+
+    // Parse steps — accept either a JSON array directly or a JSON string.
+    let steps_array = if let Some(arr) = steps_raw.as_array() {
+        arr.clone()
+    } else if let Some(s) = steps_raw.as_str() {
+        match serde_json::from_str::<Vec<serde_json::Value>>(s) {
+            Ok(arr) => arr,
+            Err(e) => return mcp_error(&format!("failed to parse steps JSON: {e}")),
+        }
+    } else {
+        return mcp_error("'steps' must be a JSON array or JSON string");
+    };
+
+    if steps_array.is_empty() {
+        return mcp_error("'steps' must contain at least one step");
+    }
+
+    // Convert raw JSON to Step structs.
+    use duduclaw_gateway::task_spec::{Step, StepStatus, Criterion, VerificationMethod};
+    let mut steps = Vec::with_capacity(steps_array.len());
+    for (i, raw) in steps_array.iter().enumerate() {
+        let description = raw
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if description.is_empty() {
+            return mcp_error(&format!("step {i} missing 'description'"));
+        }
+
+        let agent = raw
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let depends_on: Vec<u8> = raw
+            .get("depends_on")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_u64().map(|n| n as u8))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let acceptance_criteria: Vec<Criterion> = raw
+            .get("acceptance_criteria")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| {
+                        v.get("description")
+                            .and_then(|d| d.as_str())
+                            .map(|desc| Criterion {
+                                description: desc.to_string(),
+                                method: VerificationMethod::Auto,
+                            })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        steps.push(Step {
+            id: i as u8,
+            description,
+            agent,
+            depends_on,
+            acceptance_criteria,
+            status: StepStatus::Pending,
+            result: None,
+            retry_count: 0,
+        });
+    }
+
+    // Create TaskSpec and persist it.
+    use duduclaw_gateway::task_spec::TaskSpec;
+    let spec = TaskSpec::new(caller, goal, steps);
+    let task_id = spec.task_id.clone();
+    let step_count = spec.steps.len();
+
+    let agent_dir = home_dir.join("agents").join(caller);
+    if let Err(e) = spec.save(&agent_dir) {
+        return mcp_error(&format!("failed to save task: {e}"));
+    }
+
+    // Write a signal to bus_queue.jsonl so the dispatcher picks up the new task.
+    let signal = serde_json::json!({
+        "type": "task_created",
+        "task_id": task_id,
+        "agent_id": caller,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    let queue_path = home_dir.join("bus_queue.jsonl");
+    if let Ok(line) = serde_json::to_string(&signal) {
+        let _ = tokio::task::spawn_blocking(move || {
+            append_to_jsonl_sync(&queue_path, &line);
+        })
+        .await;
+    }
+
+    mcp_text(&format!(
+        "Task created: id={task_id}, steps={step_count}, status=planned. \
+         The gateway dispatcher will execute steps automatically."
+    ))
+}
+
+/// Check the status of a previously created task.
+async fn handle_task_status(params: &Value, home_dir: &Path, caller: &str) -> Value {
+    let task_id = match params.get("task_id").and_then(|v| v.as_str()) {
+        Some(id) if !id.is_empty() => id,
+        _ => return mcp_error("'task_id' is required"),
+    };
+
+    use duduclaw_gateway::task_spec::TaskSpec;
+    let agent_dir = home_dir.join("agents").join(caller);
+
+    match TaskSpec::load(&agent_dir, task_id) {
+        Ok(spec) => {
+            let passed = spec
+                .steps
+                .iter()
+                .filter(|s| s.status == duduclaw_gateway::task_spec::StepStatus::Passed)
+                .count();
+            let failed = spec
+                .steps
+                .iter()
+                .filter(|s| s.status == duduclaw_gateway::task_spec::StepStatus::Failed)
+                .count();
+            let pending = spec
+                .steps
+                .iter()
+                .filter(|s| s.status == duduclaw_gateway::task_spec::StepStatus::Pending)
+                .count();
+
+            let mut report = format!(
+                "Task: {}\nGoal: {}\nStatus: {:?}\nSteps: {} total, {} passed, {} failed, {} pending\n",
+                spec.task_id, spec.goal, spec.status, spec.steps.len(), passed, failed, pending
+            );
+
+            for step in &spec.steps {
+                report.push_str(&format!(
+                    "\n  [{}] {:?} — {}{}",
+                    step.id,
+                    step.status,
+                    step.description,
+                    if let Some(ref result) = step.result {
+                        format!("\n      Output: {}...", &result.output[..result.output.len().min(200)])
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+
+            mcp_text(&report)
+        }
+        Err(e) => mcp_error(&format!("failed to load task '{task_id}': {e}")),
+    }
 }
 
 /// Spawn a persistent sub-agent task in the background.
@@ -3516,6 +3753,10 @@ fn mcp_error(msg: &str) -> Value {
     serde_json::json!({ "content": [{"type": "text", "text": format!("Error: {msg}")}], "isError": true })
 }
 
+fn mcp_text(msg: &str) -> Value {
+    serde_json::json!({ "content": [{"type": "text", "text": msg}] })
+}
+
 // ── Skill management handlers ───────────────────────────────
 
 /// Search the local skill registry.
@@ -4035,6 +4276,7 @@ async fn handle_tools_call(
             | "agent_update_soul"
             | "spawn_agent"
             | "send_to_agent"
+            | "create_task"
             | "schedule_task"
             | "update_cron_task"
             | "delete_cron_task"
@@ -4059,6 +4301,8 @@ async fn handle_tools_call(
         "cancel_reminder" => handle_cancel_reminder(&arguments, home_dir, default_agent).await,
         "create_agent" => handle_create_agent(&arguments, home_dir).await,
         "list_agents" => handle_list_agents(home_dir).await,
+        "create_task" => handle_create_task(&arguments, home_dir, default_agent).await,
+        "task_status" => handle_task_status(&arguments, home_dir, default_agent).await,
         "agent_status" => handle_agent_status(&arguments, home_dir).await,
         "spawn_agent" => handle_spawn_agent(&arguments, home_dir, default_agent).await,
         "agent_update" => handle_agent_update(&arguments, home_dir).await,

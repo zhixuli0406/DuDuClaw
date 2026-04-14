@@ -109,11 +109,15 @@ pub async fn migrate(home_dir: &Path) -> Result<()> {
                 ))
             })?;
 
-        // Generate .mcp.json
+        // Generate .mcp.json — use absolute path so Claude CLI subprocesses
+        // can find the MCP server without PATH inheritance.
+        let mcp_bin = duduclaw_core::resolve_duduclaw_bin()
+            .to_string_lossy()
+            .into_owned();
         let mcp_json = serde_json::json!({
             "mcpServers": {
                 "duduclaw": {
-                    "command": "duduclaw",
+                    "command": mcp_bin,
                     "args": ["mcp-server"],
                     "env": {}
                 }
