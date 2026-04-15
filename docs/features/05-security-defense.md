@@ -176,6 +176,12 @@ Beyond the three layers, the hook system provides targeted protections:
 
 **Configuration Guard** — Critical configuration files are monitored for unauthorized changes. If a configuration file is modified outside of approved channels, the system alerts.
 
+**Unicode Normalization** — All input is NFKC-normalized before processing to detect homograph attacks (e.g., using Cyrillic characters that look like Latin letters). This prevents visual-spoofing bypass attempts.
+
+**Action Claim Verifier** — Validates cryptographic signatures on tool execution claims, ensuring that claimed tool results actually came from the expected tool.
+
+**RBAC (Role-Based Access Control)** — A role-based access control matrix governs what each user/agent can do. Different roles (admin, operator, viewer) have different permission sets, enforced at the API layer.
+
 ---
 
 ## Why This Matters

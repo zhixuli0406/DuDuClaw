@@ -1,6 +1,6 @@
-# Multi-Account Rotation
+# Multi-Account Rotation & Cross-Provider Failover
 
-> Intelligent API credential scheduling — never hit a rate limit again.
+> Intelligent credential scheduling across Claude, Codex, Gemini — never hit a rate limit again.
 
 ---
 
@@ -201,15 +201,72 @@ The entire system is automatic. Once configured, operators don't need to manuall
 
 ---
 
+## Cross-Provider Failover
+
+With DuDuClaw's Multi-Runtime architecture (Claude / Codex / Gemini / OpenAI-compat), account rotation extends across providers. The **FailoverManager** coordinates cross-provider health:
+
+```
+Primary provider (Claude) rate-limited
+     |
+     v
+FailoverManager checks alternatives:
+  - Codex CLI available? → Route there
+  - Gemini CLI available? → Route there
+  - Local inference available? → Route there
+     |
+     v
+Non-retryable error? (auth failure, billing suspension)
+  → Mark provider as unhealthy, longer cooldown
+Retryable error? (timeout, temporary server error)
+  → Short cooldown, retry soon
+```
+
+### Channel Failure Tracking
+
+When a channel reply fails (the user-facing path), the system records structured failure data:
+
+```
+Failure record → ~/.duduclaw/channel_failures.jsonl:
+  {
+    "ts": "2026-04-15T10:30:00Z",
+    "agent": "dudu",
+    "channel": "telegram",
+    "reason": "RateLimited",      // or Billing, Timeout, BinaryMissing, etc.
+    "account": "oauth-pro-1",
+    "message_zh": "API 用量已達上限..."
+  }
+```
+
+Failure categories render **category-specific zh-TW messages** instead of the old generic "please run `claude auth status`" hint. The failure log feeds into the dashboard for observability.
+
+### CLI Binary Discovery
+
+DuDuClaw runs as a system service (via `duduclaw service install`), which means `PATH` may not include the AI CLI binary locations. The `which_claude()` function probes:
+
+- Homebrew (Intel + Apple Silicon paths)
+- Bun global installs
+- Volta toolchain
+- npm global
+- `.claude/bin`
+- `.local/bin`
+- asdf shims
+- NVM version directories
+
+This ensures launchd/systemd-launched gateways discover the CLI binary without depending on `PATH` inheritance.
+
+---
+
 ## Interaction with Other Systems
 
+- **Multi-Runtime**: Account rotation works across Claude, Codex, Gemini, and OpenAI-compat providers.
 - **Confidence Router**: Queries routed to local inference don't consume any API account, extending quota lifetime.
 - **CostTelemetry**: Provides the data that informs budget enforcement and cache efficiency feedback.
+- **FailoverManager**: Coordinates cross-provider health tracking and failover decisions.
 - **Direct API**: Provides a high-cache-hit bypass for simple queries.
-- **Dashboard**: Shows real-time account health, usage, and remaining budget.
+- **Dashboard**: Shows real-time account health, usage, remaining budget, and channel failure logs.
 
 ---
 
 ## The Takeaway
 
-API credentials are a limited resource. Multi-account rotation treats them like a managed fleet — automatically selecting the best available option, cooling down overloaded accounts, enforcing budgets, and shifting to local inference when cloud usage is inefficient.
+API credentials are a limited resource — and in a multi-provider world, they're a *fleet* of limited resources. Multi-account rotation treats them like a managed fleet — automatically selecting the best available option across providers, cooling down overloaded accounts, enforcing budgets, and shifting to local inference when cloud usage is inefficient.
