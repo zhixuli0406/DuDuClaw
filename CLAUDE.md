@@ -1,11 +1,12 @@
 # DuDuClaw Project Guidelines
 
-## Architecture Overview (v1.3.7)
+## Architecture Overview (v1.4.27)
 
-DuDuClaw is a **Claude Code extension layer** — not a standalone AI platform. The AI brain is Claude Code SDK (`claude` CLI); DuDuClaw provides the plumbing: channel routing, session management, memory, evolution, multi-account rotation, and **local LLM inference**.
+DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code / Codex / Gemini** CLI as AI backends via a unified `AgentRuntime` trait with auto-detection and per-agent configuration. DuDuClaw provides the plumbing: channel routing, session management, memory, evolution, multi-account rotation, local LLM inference, and browser automation.
 
 Key architectural decisions:
-- **MCP Server** (`duduclaw mcp-server`) exposes channel, memory, agent, and skill tools to Claude Code via JSON-RPC 2.0 over stdin/stdout
+- **Multi-Runtime** (`AgentRuntime` trait) — Claude / Codex / Gemini / OpenAI-compat four backends, `RuntimeRegistry` auto-detection, per-agent config in `agent.toml [runtime]`
+- **MCP Server** (`duduclaw mcp-server`) exposes channel, memory, agent, and skill tools to AI Runtime via JSON-RPC 2.0 over stdin/stdout
 - **Agent directories** are Claude Code compatible: each contains `.claude/`, `SOUL.md`, `CLAUDE.md`, `.mcp.json`
 - **Sub-agent orchestration** via `create_agent` / `spawn_agent` / `list_agents` MCP tools with `reports_to` hierarchy
 - **Session Manager** persists conversations in SQLite with 50k token auto-compression (CJK-aware token estimation)
@@ -45,7 +46,7 @@ Key architectural decisions:
 ## Design Context
 
 ### Users
-DuDuClaw is a **Claude Code extension layer** for individual developers and power users, primarily in Taiwan (zh-TW). Users interact through a web dashboard to manage AI agents, monitor channels (LINE/Telegram/Discord), track API budgets, and observe agent self-evolution. They expect a tool that feels like a trusted companion — not a cold enterprise console.
+DuDuClaw is a **Multi-Runtime AI Agent Platform** for individual developers and power users, primarily in Taiwan (zh-TW). It supports Claude Code / Codex / Gemini CLI as interchangeable AI backends. Users interact through a web dashboard to manage AI agents, monitor channels (LINE/Telegram/Discord/Slack/WhatsApp/Feishu), track API budgets, and observe agent self-evolution. They expect a tool that feels like a trusted companion — not a cold enterprise console.
 
 ### Brand Personality
 **Professional · Efficient · Precise** — with a warm, approachable surface.

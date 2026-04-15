@@ -1,38 +1,43 @@
 # DuDuClaw 🐾
 
-> **Claude Code Extension Layer** — 讓 Claude Code 成為你的多通道 AI 助理
+> **Multi-Runtime AI Agent Platform** — 統一 Claude / Codex / Gemini 三大 CLI，打造你的多通道 AI 助理
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
-[![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.3.7-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.4.27-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
+[![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
 ---
 
 ## 什麼是 DuDuClaw？
 
-DuDuClaw **不是**一個獨立的 AI 平台。它是 **Claude Code 的擴充層 (extension layer)**——替 Claude Code 接上通訊通道、記憶、進化與帳號管理能力。
+DuDuClaw 是一個 **Multi-Runtime AI Agent 平台**——同時支援 **Claude Code / Codex / Gemini** 三大 CLI 作為 AI 後端，並透過統一的 `AgentRuntime` trait 實現無縫切換與自動偵測。
+
+它不綁定任何單一 AI 供應商，而是為你的 AI Agent 接上通訊通道、記憶、自我進化、本地推論與帳號管理等完整基礎設施。
 
 核心概念：
 
-- **Brain = Claude Code SDK** — AI 對話由 `claude` CLI 處理，享受內建的 bash、web search、file ops 等工具
-- **Plumbing = DuDuClaw** — 負責通道路由、session 管理、記憶搜尋、帳號輪替等基礎設施
-- **橋接 = MCP Protocol** — `duduclaw mcp-server` 作為 MCP Server，將通道與記憶工具暴露給 Claude Code
+- **Multi-Runtime** — `AgentRuntime` trait 統一 Claude / Codex / Gemini / OpenAI-compat 四種後端，`RuntimeRegistry` 自動偵測，per-agent 設定
+- **Plumbing = DuDuClaw** — 負責通道路由、session 管理、記憶搜尋、帳號輪替、本地推論等基礎設施
+- **橋接 = MCP Protocol** — `duduclaw mcp-server` 作為 MCP Server，將通道與記憶工具暴露給 AI Runtime
 
 ```
-Claude Code SDK (brain)
+AI Runtime (brain) — Claude CLI / Codex CLI / Gemini CLI / OpenAI-compat
   ↕ MCP Protocol (JSON-RPC 2.0, stdin/stdout)
 DuDuClaw (plumbing)
-  ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu
-  ├─ Multi-Runtime — Claude / Codex / Gemini / OpenAI-compat 自動偵測
-  ├─ Session Manager — SQLite, 50k token 自動壓縮
-  ├─ MCP Server — 70+ 工具（通訊、記憶、Agent、Skill、ERP）
+  ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu / WebChat
+  ├─ Multi-Runtime — Claude / Codex / Gemini / OpenAI-compat 自動偵測 + per-agent 設定
+  ├─ Session Manager — SQLite, 50k token 自動壓縮（CJK-aware）
+  ├─ MCP Server — 70+ 工具（通訊、記憶、Agent、Skill、推論、ERP）
   ├─ Evolution Engine — GVU² 雙迴圈進化 + 預測驅動 + MistakeNotebook
-  ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / ONNX
-  ├─ Voice Pipeline — ASR (SenseVoice / Whisper) + TTS (Piper) + VAD (Silero)
-  ├─ Account Rotator — 多 OAuth + API Key 輪替、預算追蹤、健康檢查
-  └─ Web Dashboard — React SPA, 透過 rust-embed 嵌入 binary
+  ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / MLX / ONNX
+  ├─ Voice Pipeline — ASR (SenseVoice / Whisper) + TTS (Piper / MiniMax) + VAD (Silero)
+  ├─ Account Rotator — 多 OAuth + API Key 輪替、預算追蹤、健康檢查、Cross-Provider Failover
+  ├─ Browser Automation — 5 層自動路由（API Fetch → Scrape → Headless → Sandbox → Computer Use）
+  └─ Web Dashboard — React 19 SPA（23 頁面），透過 rust-embed 嵌入 binary
 ```
 
 ---
@@ -43,24 +48,27 @@ DuDuClaw (plumbing)
 
 | 特色 | 說明 |
 |------|------|
-| **六通道支援** | Telegram（long polling）、LINE（webhook）、Discord（Gateway WebSocket）、Slack（Socket Mode）、WhatsApp（Cloud API）、Feishu（Open Platform v2）|
+| **七通道支援** | Telegram（long polling）、LINE（webhook）、Discord（Gateway WebSocket）、Slack（Socket Mode）、WhatsApp（Cloud API）、Feishu（Open Platform v2）、WebChat（WebSocket）|
 | **Per-Agent Bot** | 每個 Agent 可擁有獨立的 Bot Token，同平台多 Agent 並行 |
 | **通道熱啟停** | Dashboard 新增/移除通道即時生效，無需重啟 gateway |
 | **WebChat** | 內建 `/ws/chat` WebSocket 端點，React 前端即時對話 |
 | **Generic Webhook** | `POST /webhook/{agent_id}` + HMAC-SHA256 簽章驗證 |
-| **Media Pipeline** | 圖片自動縮放（max 1568px）+ MIME 偵測 + Claude Vision 整合 |
+| **Media Pipeline** | 圖片自動縮放（max 1568px）+ MIME 偵測 + Vision 整合 |
+| **Sticker 系統** | LINE 貼圖目錄 + 情緒偵測 + Discord emoji 等價映射 |
 
 ### AI 執行與推論
 
 | 特色 | 說明 |
 |------|------|
-| **MCP Server 架構** | `duduclaw mcp-server` 提供 70+ 工具，涵蓋通訊、記憶、Agent 管理、Skill 市場、Odoo ERP |
+| **MCP Server 架構** | `duduclaw mcp-server` 提供 70+ 工具，涵蓋通訊、記憶、Agent 管理、推論、排程、Skill 市場、Odoo ERP |
 | **Multi-Runtime** | `AgentRuntime` trait — Claude / Codex / Gemini / OpenAI-compat 四種後端，`RuntimeRegistry` 自動偵測，per-agent 設定 |
-| **本地推論引擎** | 統一 `InferenceBackend` trait — llama.cpp（Metal/CUDA/Vulkan）/ mistral.rs / Exo P2P 叢集 / llamafile / OpenAI-compat HTTP |
-| **三層信心路由** | LocalFast → LocalStrong → CloudAPI，基於啟發式信心評分自動分流 |
+| **本地推論引擎** | 統一 `InferenceBackend` trait — llama.cpp（Metal/CUDA/Vulkan）/ mistral.rs（ISQ + PagedAttention）/ Exo P2P 叢集 / llamafile / MLX（Apple Silicon）/ OpenAI-compat HTTP |
+| **三層信心路由** | LocalFast → LocalStrong → CloudAPI，基於啟發式信心評分自動分流，CJK-aware token estimation |
+| **InferenceManager** | 多模式自動切換：Exo P2P → llamafile → Direct backend → OpenAI-compat → Cloud API，週期性健康檢查 + 自動 failover |
 | **Direct API** | 繞過 CLI 直接呼叫 Anthropic Messages API，`cache_control: ephemeral` 達 95%+ 快取命中率 |
 | **Token 壓縮** | Meta-Token（BPE-like 27-47%）、LLMLingua-2（2-5x 有損）、StreamingLLM（無限長對話）|
 | **Cross-Provider Failover** | `FailoverManager` 健康追蹤、冷卻、不可重試錯誤偵測 |
+| **Browser 自動化** | 5 層路由（API Fetch → Static Scrape → Headless Playwright → Sandbox Container → Computer Use），deny-by-default |
 
 ### 語音與多媒體
 
@@ -87,8 +95,10 @@ DuDuClaw (plumbing)
 | **SOUL.md 版控** | 24h 觀察期 + 自動回滾，atomic write（SHA-256 fingerprint）|
 | **Agent-as-Evaluator** | 獨立 Evaluator Agent（Haiku 成本控制）進行對抗式驗證，結構化 JSON verdict |
 | **DelegationEnvelope** | 結構化交接協議 — context / constraints / task_chain / expected_output，向後相容 Raw payload |
-| **TaskSpec 工作流** | 多步驟任務規劃 — dependency-aware scheduling / auto-retry / replan（最多 2 次）/ persistence |
+| **TaskSpec 工作流** | 多步驟任務規劃 — dependency-aware scheduling / auto-retry（3x）/ replan（最多 2 次）/ persistence |
 | **Orchestrator 模板** | 5 步規劃策略（Analyze → Decompose → Delegate → Evaluate → Synthesize）+ 複雜度路由 |
+| **Skill 生命週期** | 7 階段管理 — Activation → Compression → Extraction → Reconstruction → Distillation → Diagnostician → Gap Analysis |
+| **Reminder 排程** | 一次性提醒（相對時間 `5m`/`2h`/`1d` 或 ISO 8601 絕對時間），`direct` 靜態訊息或 `agent_callback` 喚醒模式 |
 
 ### 安全防護
 
@@ -118,21 +128,24 @@ DuDuClaw (plumbing)
 
 | 特色 | 說明 |
 |------|------|
-| **Odoo ERP 整合** | `duduclaw-odoo` 中間層 — 15 個 MCP 工具（CRM/銷售/庫存/會計/通用搜尋報表），支援 CE/EE |
+| **Odoo ERP 整合** | `duduclaw-odoo` 中間層 — 15 個 MCP 工具（CRM/銷售/庫存/會計/通用搜尋報表），支援 CE/EE，EditionGate 自動偵測 |
 | **Skill 市場** | GitHub Search API 即時索引 + 24h 本地快取 + 安全掃描 + Dashboard 市場頁面 |
 | **Prometheus 指標** | `GET /metrics` — requests、tokens、duration histogram、channel status |
 | **CronScheduler** | `cron_tasks.jsonl` + cron 表達式，定時任務自動觸發 |
+| **ONNX 嵌入** | BERT WordPiece tokenizer + ONNX Runtime 向量嵌入，語意搜尋支援 |
+| **Experiment Logger** | Trajectory recording，支援 RL/RLHF 離線分析 |
 
 ### Web Dashboard
 
 | 特色 | 說明 |
 |------|------|
 | **技術棧** | React 19 + TypeScript + Tailwind CSS 4 + shadcn/ui，溫暖 amber 色系 |
-| **21 個頁面** | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / KnowledgeHub / Odoo / Login / Users |
+| **23 個頁面** | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / KnowledgeHub / Odoo / Login / Users / Analytics / Export |
 | **即時日誌** | BroadcastLayer tracing → WebSocket 推播 |
 | **組織架構圖** | D3.js 互動式 Agent 層級視覺化 |
 | **深淺色切換** | 跟隨系統偏好，支援手動切換 |
 | **國際化** | zh-TW / en / ja-JP 三語支援（540+ 翻譯鍵）|
+| **Session Replay** | 對話回放元件，支援時間軸檢視 |
 
 ---
 
@@ -141,13 +154,14 @@ DuDuClaw (plumbing)
 | | **DuDuClaw** | **OpenClaw** | **IronClaw** | **Moltis** | **Dify** |
 |---|---|---|---|---|---|
 | 語言 | Rust | TypeScript | Rust | Rust | Python |
-| 頻道 | 6 | 25+ | 8 | 5 | 0 (API) |
-| Claude Code 原生 | **MCP Server** | - | - | - | - |
-| Multi-Runtime | **4 後端** | - | - | - | 多 LLM |
+| 頻道 | 7 | 25+ | 8 | 5 | 0 (API) |
+| Multi-Runtime | **4 後端（Claude/Codex/Gemini/OpenAI）** | - | - | - | 多 LLM |
+| MCP Server | **70+ 工具** | - | - | - | - |
 | 自我演化引擎 | **GVU² 雙迴圈** | - | - | - | - |
-| 本地推論 | **三層信心路由** | - | - | - | - |
-| 語音 (ASR/TTS) | **SenseVoice + Piper** | - | - | - | - |
+| 本地推論 | **6 後端 + 三層信心路由** | - | - | - | - |
+| 語音 (ASR/TTS) | **4 ASR + 4 TTS provider** | - | - | - | - |
 | Token 壓縮 | **3 種策略** | - | - | - | - |
+| Browser 自動化 | **5 層路由** | - | - | - | - |
 | 成本遙測 | **快取效率分析** | - | 基礎 | 基礎 | 基礎 |
 | 行為合約 | **CONTRACT.toml + 紅隊** | - | WASM 沙箱 | - | - |
 | ERP 整合 | **Odoo 15 工具** | - | - | - | - |
@@ -227,6 +241,14 @@ DuDuClaw 在 Claude Code 的 Hook 系統上建構了三層漸進式防禦：
 
 ## 安裝
 
+### npm（推薦）
+
+```bash
+npm install -g duduclaw
+```
+
+安裝完成後會自動下載對應平台的預編譯 binary（支援 macOS ARM64/x64、Linux x64/ARM64、Windows x64）。
+
 ### Homebrew（macOS / Linux）
 
 ```bash
@@ -239,11 +261,36 @@ brew install zhixuli0406/tap/duduclaw
 curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | sh
 ```
 
+### Python SDK（必要依賴）
+
+DuDuClaw 的進化引擎（Skill Vetter）與部分通道橋接需要 Python 環境：
+
+```bash
+pip install duduclaw
+```
+
+此命令會安裝以下必要依賴：
+
+| 套件 | 最低版本 | 用途 |
+|------|---------|------|
+| `anthropic` | ≥ 0.40 | Claude API 直接呼叫、Skill 安全掃描 |
+| `httpx` | ≥ 0.27 | 非同步 HTTP 客戶端（帳號輪替、健康檢查）|
+
+開發環境額外安裝：
+
+```bash
+pip install duduclaw[dev]
+# 包含：pytest>=8, pytest-asyncio>=0.24, ruff>=0.8
+```
+
 ### 從原始碼建構
 
 ```bash
 git clone https://github.com/zhixuli0406/DuDuClaw.git
 cd DuDuClaw
+
+# 安裝 Python 依賴
+pip install duduclaw
 
 # 建構 Dashboard
 cd web && npm ci --legacy-peer-deps && npm run build && cd ..
@@ -258,7 +305,7 @@ cargo build --release -p duduclaw-cli -p duduclaw-gateway --features duduclaw-ga
 ./target/release/duduclaw run
 ```
 
-> **前置需求**：[Rust](https://rustup.rs/) 1.85+、[Python](https://www.python.org/) 3.10+、[Node.js](https://nodejs.org/) 20+、[Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude` CLI)
+> **前置需求**：[Rust](https://rustup.rs/) 1.85+、[Python](https://www.python.org/) 3.9+、[Node.js](https://nodejs.org/) 20+，以及至少一個 AI CLI：[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)（擇一或多個）
 
 ---
 
@@ -325,10 +372,18 @@ DuDuClaw/
 │   ├── evolution/                  # Skill Vetter 安全掃描
 │   └── tools/                      # Agent 動態管理工具
 │
+├── npm/                            # npm 發布套件
+│   ├── duduclaw/                   # 主套件（平台無關 wrapper + postinstall binary 下載）
+│   ├── darwin-arm64/               # macOS Apple Silicon 預編譯 binary
+│   ├── darwin-x64/                 # macOS Intel 預編譯 binary
+│   ├── linux-x64/                  # Linux x86-64 預編譯 binary
+│   ├── linux-arm64/                # Linux ARM64 預編譯 binary
+│   └── win32-x64/                  # Windows x64 預編譯 binary
+│
 ├── web/                            # React Dashboard
 │   └── src/
 │       ├── components/             # UI 元件 (OrgChart, ApprovalModal, SessionReplay)
-│       ├── pages/                  # 21 個頁面
+│       ├── pages/                  # 23 個頁面
 │       ├── stores/                 # Zustand 狀態管理 (8 stores)
 │       ├── lib/                    # API client (WebSocket JSON-RPC)
 │       └── i18n/                   # zh-TW / en / ja-JP
@@ -361,7 +416,7 @@ DuDuClaw/
 
 | 項目 | 選擇 | 理由 |
 |------|------|------|
-| AI 對話 | **Claude Code SDK (`claude` CLI)** | 內建工具鏈、MCP 相容、官方支援 |
+| AI 對話 | **Multi-Runtime（Claude / Codex / Gemini CLI）** | 不綁定單一供應商、自動偵測 + per-agent 設定 |
 | 核心語言 | **Rust** | 記憶體安全、高效能、單 binary 部署 |
 | 擴充語言 | **Python (PyO3)** | Claude Code SDK 整合、通道插件彈性 |
 | 前端框架 | **React 19 + TypeScript** | 即時資料更新、生態成熟 |
