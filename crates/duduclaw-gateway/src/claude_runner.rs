@@ -796,6 +796,10 @@ fn prepare_claude_cmd(
         // Subprocess has no TTY — auto-accept tool permissions.
         // Security is enforced by DuDuClaw's CONTRACT.toml + container sandbox.
         "--permission-mode", "auto",
+        // Auto-approve all DuDuClaw MCP tools — --permission-mode auto only
+        // covers built-in Claude Code tools (Read/Write/Bash), not MCP tools.
+        // Without this, the sub-agent sees "permission denied" for every MCP call.
+        "--allowedTools", "mcp__duduclaw__*",
         // Allow enough agentic turns for complex tasks (read → think → write).
         "--max-turns", "50",
     ]);

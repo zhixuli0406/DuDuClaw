@@ -197,6 +197,16 @@ const TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
+        name: "check_responses",
+        description: "Check responses from agents you sent messages to via send_to_agent. \
+                      Returns the most recent responses from the bus queue for a given agent. \
+                      Use this to verify whether an agent actually responded to your message.",
+        params: &[
+            ParamDef { name: "agent_id", description: "Agent ID to check responses from", required: true },
+            ParamDef { name: "limit", description: "Max number of responses to return (default: 5)", required: false },
+        ],
+    },
+    ToolDef {
         name: "task_status",
         description: "Check the status of a previously created task (from create_task)",
         params: &[
@@ -2125,6 +2135,106 @@ async fn handle_agent_status(params: &Value, home_dir: &Path) -> Value {
     serde_json::json!({
         "content": [{"type": "text", "text": info}]
     })
+}
+
+/// Check responses from a specific agent in the bus queue.
+///
+/// Reads bus_queue.jsonl and SQLite message_queue for `agent_response` entries
+/// from the specified agent, returning the most recent ones.
+async fn handle_check_responses(params: &Value, home_dir: &Path) -> Value {
+    let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+        Some(id) if !id.is_empty() => id,
+        _ => return mcp_error("'agent_id' is required"),
+    };
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5) as usize;
+
+    let mut responses: Vec<(String, String, usize)> = Vec::new(); // (timestamp, payload_preview, full_len)
+
+    // 1. Check JSONL bus queue
+    let queue_path = home_dir.join("bus_queue.jsonl");
+    if let Ok(content) = std::fs::read_to_string(&queue_path) {
+        for line in content.lines().rev() {
+            if responses.len() >= limit {
+                break;
+            }
+            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) {
+                let is_response = msg.get("type").and_then(|v| v.as_str()) == Some("agent_response");
+                let matches_agent = msg.get("agent_id").and_then(|v| v.as_str()) == Some(agent_id);
+                if is_response && matches_agent {
+                    let ts = msg
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let payload = msg
+                        .get("payload")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let full_len = payload.len();
+                    let preview: String = payload.chars().take(500).collect();
+                    responses.push((ts, preview, full_len));
+                }
+            }
+        }
+    }
+
+    // 2. Check SQLite message queue
+    let db_path = home_dir.join("message_queue.db");
+    if db_path.exists() {
+        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+            let _ = conn.execute_batch("PRAGMA busy_timeout=3000;");
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT created_at, substr(response, 1, 500), length(response), status \
+                 FROM message_queue WHERE target = ?1 AND status = 'done' AND response IS NOT NULL \
+                 ORDER BY created_at DESC LIMIT ?2",
+            ) {
+                if let Ok(rows) = stmt.query_map(
+                    rusqlite::params![agent_id, limit as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)? as usize,
+                        ))
+                    },
+                ) {
+                    for row in rows.flatten() {
+                        if responses.len() < limit {
+                            responses.push(row);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if responses.is_empty() {
+        return mcp_text(&format!(
+            "No responses found from agent '{agent_id}'. The agent may not have \
+             responded yet, or its responses may have expired from the queue."
+        ));
+    }
+
+    let mut report = format!(
+        "Found {} response(s) from agent '{agent_id}':\n",
+        responses.len()
+    );
+    for (i, (ts, preview, full_len)) in responses.iter().enumerate() {
+        let truncated = if *full_len > 500 {
+            format!(" [truncated, full={full_len} chars]")
+        } else {
+            String::new()
+        };
+        report.push_str(&format!(
+            "\n--- Response {} ({ts}){truncated} ---\n{preview}\n",
+            i + 1
+        ));
+    }
+
+    mcp_text(&report)
 }
 
 /// Create a structured multi-step task for deterministic execution by the dispatcher.
@@ -4302,6 +4412,7 @@ async fn handle_tools_call(
         "create_agent" => handle_create_agent(&arguments, home_dir).await,
         "list_agents" => handle_list_agents(home_dir).await,
         "create_task" => handle_create_task(&arguments, home_dir, default_agent).await,
+        "check_responses" => handle_check_responses(&arguments, home_dir).await,
         "task_status" => handle_task_status(&arguments, home_dir, default_agent).await,
         "agent_status" => handle_agent_status(&arguments, home_dir).await,
         "spawn_agent" => handle_spawn_agent(&arguments, home_dir, default_agent).await,

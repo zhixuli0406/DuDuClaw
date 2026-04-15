@@ -1,6 +1,6 @@
 {
   "name": "@duduclaw/pro-win32-x64",
-  "version": "1.4.26",
+  "version": "1.4.27",
   "description": "DuDuClaw Pro binary for Windows x64",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -8,8 +8,12 @@
     "url": "https://github.com/zhixuli0406/DuDuClaw.git",
     "directory": "npm/pro-win32-x64"
   },
-  "os": ["win32"],
-  "cpu": ["x64"],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
   "publishConfig": {
     "access": "public"
   }

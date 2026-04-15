@@ -1,13 +1,27 @@
 [build-system]
-requires = ["maturin>=1.7"]
-build-backend = "maturin"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "duduclaw"
-version = "0.1.0"
-description = "DuDuClaw - Multi-Agent AI Assistant Platform"
-requires-python = ">=3.10"
-license = {text = "MIT"}
+version = "1.4.27"
+description = "DuDuClaw Python SDK — evolution vetter, channel bridges, and Claude Code SDK integration"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+authors = [{ name = "DuDuClaw Contributors" }]
+readme = "python/README.md"
+keywords = ["ai", "agent", "claude", "multi-agent", "duduclaw"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Software Development :: Libraries",
+]
 dependencies = [
     "anthropic>=0.40",
     "httpx>=0.27",
@@ -16,9 +30,16 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.8"]
 
-[tool.maturin]
-features = ["pyo3/extension-module"]
-module-name = "duduclaw._native"
+[project.urls]
+Homepage = "https://github.com/zhixuli0406/DuDuClaw"
+Repository = "https://github.com/zhixuli0406/DuDuClaw"
+Issues = "https://github.com/zhixuli0406/DuDuClaw/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["python/duduclaw"]
+
+[tool.hatch.build.targets.sdist]
+include = ["python/duduclaw/**", "python/README.md", "LICENSE"]
 
 [tool.ruff]
 target-version = "py310"

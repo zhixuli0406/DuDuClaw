@@ -1,7 +1,7 @@
 {
   "name": "duduclaw-pro",
-  "version": "1.4.26",
-  "description": "DuDuClaw Pro — Multi-Agent AI Assistant Platform (Pro Edition)",
+  "version": "1.4.27",
+  "description": "DuDuClaw Pro \u2014 Multi-Agent AI Assistant Platform (Pro Edition)",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
     "type": "git",
@@ -29,8 +29,8 @@
     "postinstall": "node scripts/install.js"
   },
   "optionalDependencies": {
-    "@duduclaw/pro-darwin-arm64": "1.4.26",
-    "@duduclaw/pro-darwin-x64": "1.4.26",
-    "@duduclaw/pro-win32-x64": "1.4.26"
+    "@duduclaw/pro-darwin-arm64": "1.4.27",
+    "@duduclaw/pro-darwin-x64": "1.4.27",
+    "@duduclaw/pro-win32-x64": "1.4.27"
   }
 }
