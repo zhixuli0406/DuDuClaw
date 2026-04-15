@@ -3,6 +3,18 @@
 All notable changes to DuDuClaw are documented here. For the authoritative
 version history and per-commit detail, see `git log`.
 
+## [v1.4.28] — 2026-04-15
+
+### Fixed
+
+- **Cognitive memory not persisted to database.** `StoreEpisodic` action
+  from the prediction router was only debug-logged but never written to
+  the per-agent `memory.db`. Dashboard Memory & Skills page showed empty
+  even with cognitive memory enabled. Now creates
+  `agents/<id>/state/memory.db` and stores `MemoryEntry` via
+  `SqliteMemoryEngine`, making episodic observations queryable from the
+  dashboard and MCP `memory.search` / `memory.browse` tools.
+
 ## [v1.3.17] — 2026-04-12
 
 ### Added
