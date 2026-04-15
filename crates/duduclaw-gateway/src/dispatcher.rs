@@ -512,10 +512,43 @@ async fn poll_and_dispatch(
                 }
             }
 
+            // ── L5: MCP Permission Failure Detection ──────────
+            // When an agent's response indicates it couldn't use MCP tools
+            // due to permission issues, inject a system-level escalation
+            // so the sender (and user) can see the real problem.
+            let permission_blocked = result.is_ok()
+                && (response_text.contains("權限")
+                    || response_text.contains("permission")
+                    || response_text.contains("無法存取")
+                    || response_text.contains("需要授權")
+                    || response_text.contains("尚未授權")
+                    || response_text.contains("工具權限受阻"))
+                && (response_text.contains("list_agents")
+                    || response_text.contains("wiki_")
+                    || response_text.contains("send_to_agent")
+                    || response_text.contains("mcp__duduclaw"));
+
+            if permission_blocked {
+                warn!(
+                    agent = %msg.agent_id,
+                    sender = ?msg.sender_agent,
+                    "Agent response indicates MCP tool permission failure — \
+                     likely missing --allowedTools in CLI spawn"
+                );
+                response_text.push_str(
+                    "\n\n[DUDUCLAW_SYSTEM:MCP_PERMISSION_BLOCKED] ⚠️ This agent reported \
+                     MCP tool permission failures. This is a system configuration issue, \
+                     not an agent error. The gateway needs to pass --allowedTools \
+                     'mcp__duduclaw__*' when spawning sub-agents. Please update the \
+                     gateway binary to fix this.",
+                );
+            }
+
             info!(
                 message_id = %msg.message_id,
                 agent = %msg.agent_id,
                 ok = result.is_ok(),
+                permission_blocked,
                 "Agent dispatch completed"
             );
 

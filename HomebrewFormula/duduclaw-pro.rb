@@ -6,7 +6,7 @@
 class DuduclawPro < Formula
   desc "DuDuClaw Pro — Multi-Agent AI Assistant Platform"
   homepage "https://github.com/zhixuli0406/DuDuClaw"
-  version "1.4.26"
+  version "1.4.27"
   license :cannot_represent
 
   on_arm do

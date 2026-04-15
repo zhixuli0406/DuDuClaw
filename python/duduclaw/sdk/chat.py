@@ -9,6 +9,8 @@ which provides built-in tools (bash, web search, file ops, etc.).
 Supports multi-account rotation via AccountRotator.
 """
 
+from __future__ import annotations  # PEP 604 union syntax on Python 3.9
+
 import argparse
 import asyncio
 import logging

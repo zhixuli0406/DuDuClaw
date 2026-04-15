@@ -1,6 +1,6 @@
 {
   "name": "@duduclaw/pro-darwin-arm64",
-  "version": "1.4.26",
+  "version": "1.4.27",
   "description": "DuDuClaw Pro binary for macOS ARM64 (Apple Silicon)",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -8,8 +8,12 @@
     "url": "https://github.com/zhixuli0406/DuDuClaw.git",
     "directory": "npm/pro-darwin-arm64"
   },
-  "os": ["darwin"],
-  "cpu": ["arm64"],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
   "publishConfig": {
     "access": "public"
   }
