@@ -11,6 +11,7 @@ use duduclaw_agent::registry::AgentRegistry;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use duduclaw_core::MemoryEngine;
 use duduclaw_security::circuit_breaker::CircuitBreakerRegistry;
 use duduclaw_security::failsafe::FailsafeManager;
 use duduclaw_security::killswitch::KillswitchConfig;
@@ -943,9 +944,40 @@ async fn build_reply_with_session_inner(
 
                 match action {
                     crate::prediction::router::EvolutionAction::None => {}
-                    crate::prediction::router::EvolutionAction::StoreEpisodic { content, importance: _ } => {
+                    crate::prediction::router::EvolutionAction::StoreEpisodic { content, importance } => {
                         let preview: String = content.chars().take(80).collect();
                         debug!(agent = %agent_id_for_pred, "Storing episodic observation: {preview}");
+
+                        // Persist to per-agent memory.db
+                        let mem_dir = home_for_pred.join("agents").join(&agent_id_for_pred).join("state");
+                        if let Err(e) = std::fs::create_dir_all(&mem_dir) {
+                            warn!(agent = %agent_id_for_pred, "Failed to create memory state dir: {e}");
+                        } else {
+                            let db_path = mem_dir.join("memory.db");
+                            match duduclaw_memory::engine::SqliteMemoryEngine::new(&db_path) {
+                                Ok(engine) => {
+                                    let entry = duduclaw_core::types::MemoryEntry {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        agent_id: agent_id_for_pred.clone(),
+                                        content,
+                                        timestamp: chrono::Utc::now(),
+                                        tags: vec![],
+                                        embedding: None,
+                                        layer: duduclaw_core::types::MemoryLayer::Episodic,
+                                        importance,
+                                        access_count: 0,
+                                        last_accessed: None,
+                                        source_event: "prediction_episodic".to_string(),
+                                    };
+                                    if let Err(e) = engine.store(&agent_id_for_pred, entry).await {
+                                        warn!(agent = %agent_id_for_pred, "Failed to store episodic memory: {e}");
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(agent = %agent_id_for_pred, "Failed to open memory db: {e}");
+                                }
+                            }
+                        }
                     }
                     crate::prediction::router::EvolutionAction::TriggerReflection { ref context }
                     | crate::prediction::router::EvolutionAction::TriggerEmergencyEvolution { ref context } => {
