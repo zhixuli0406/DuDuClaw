@@ -137,6 +137,43 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           ./npm/scripts/publish-ce.sh "$VERSION"
 
+  # Publish Python SDK to PyPI
+  pypi-publish:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Required for PyPI Trusted Publisher (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build Python package
+        run: |
+          pip install build
+          python -m build
+
+      - name: Publish to PyPI (Trusted Publisher)
+        if: env.HAS_PYPI == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # Uses OIDC Trusted Publisher — no API token needed.
+        # Set up at: https://pypi.org/manage/project/duduclaw/settings/publishing/
+        # Add GitHub publisher: zhixuli0406/DuDuClaw, workflow: release.yml, environment: (blank)
+
+      - name: Publish to PyPI (token fallback)
+        if: env.HAS_PYPI != 'true' && env.HAS_TOKEN == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
+        env:
+          HAS_TOKEN: ${{ secrets.PYPI_TOKEN != '' }}
+
+    env:
+      HAS_PYPI: ${{ vars.PYPI_TRUSTED_PUBLISHER == 'true' }}
+
   # Trigger Pro repo rebuild after CE release
   trigger-pro-rebuild:
     needs: release
