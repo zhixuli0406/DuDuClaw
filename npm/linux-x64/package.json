@@ -1,6 +1,6 @@
 {
   "name": "@duduclaw/linux-x64",
-  "version": "1.4.27",
+  "version": "1.4.28",
   "description": "DuDuClaw CE binary for Linux x64",
   "license": "Apache-2.0",
   "repository": {
