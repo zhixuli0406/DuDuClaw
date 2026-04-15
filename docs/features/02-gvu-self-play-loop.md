@@ -1,10 +1,10 @@
-# GVU Self-Play Loop
+# GVU² Self-Play Loop
 
-> The agent writes, reviews, and refines its own personality — automatically.
+> The agent writes, reviews, and refines its own personality — automatically, across two feedback loops.
 
 ---
 
-## The Metaphor: A One-Person Writer's Room
+## The Metaphor: A One-Person Writer's Room — With a Director's Cut
 
 Imagine a screenwriter who has to write, edit, and approve their own script — but with a strict process:
 
@@ -14,13 +14,37 @@ Imagine a screenwriter who has to write, edit, and approve their own script — 
 
 If the ratings drop, the original version is immediately restored. No permanent damage.
 
-This is exactly how the GVU (Generator-Verifier-Updater) loop evolves an agent's personality file.
+Now imagine the writer also keeps a **notebook of past failures** — every plot hole, every bad dialogue choice, every scene that flopped. Before writing the next draft, they flip through the notebook to avoid repeating those mistakes.
+
+And sometimes, instead of rewriting the whole script, they do a quick **scene fix** — adjusting just the part that didn't land, live, between episodes.
+
+This is the GVU² (Generator-Verifier-Updater, Squared) dual-loop architecture.
 
 ---
 
 ## How It Works
 
-### The Three Roles
+### The Dual-Loop Architecture
+
+GVU² operates two complementary feedback loops:
+
+**Outer Loop (Behavioral GVU)** — Evolves the agent's personality file (SOUL.md). This is the strategic, long-term loop. It fires when the prediction engine detects significant behavioral drift, and produces a new version of the agent's core identity.
+
+**Inner Loop (Task GVU)** — Handles instant task-level retries. When a specific task fails, the inner loop can retry with adjusted parameters *without* modifying the personality. This is the tactical, immediate loop.
+
+```
+Outer Loop (Behavioral)          Inner Loop (Task)
+┌─────────────────────┐          ┌──────────────────┐
+│ Evolve SOUL.md      │          │ Retry failed task │
+│ (long-term growth)  │  ←───→  │ (instant fix)     │
+│ 24h observation     │          │ No SOUL.md change │
+│ MistakeNotebook     │          │ Max 3 retries     │
+└─────────────────────┘          └──────────────────┘
+```
+
+Both loops share the **MistakeNotebook** — a persistent log of failure patterns that prevents the same errors from recurring across loops.
+
+### The Three Roles (Outer Loop)
 
 **Generator** — Creates a candidate revision of the agent's personality file. It doesn't work in a vacuum; it receives:
 - Specific feedback from the verification layer about *what* to improve
@@ -29,16 +53,18 @@ This is exactly how the GVU (Generator-Verifier-Updater) loop evolves an agent's
 
 The Generator's output is always a complete, valid personality file — not a diff or patch.
 
-**Verifier** — Evaluates the candidate through four layers of checks:
+**Verifier** — Evaluates the candidate through a 4+2 layer verification pipeline:
 
 | Layer | What It Checks | How | Cost |
 |-------|---------------|-----|------|
 | **L1: Format** | Structure valid? Required sections present? Length within bounds? | Rule-based parsing | Zero |
-| **L2: Compliance** | Does it respect the agent's behavioral contract? Any forbidden patterns? | String matching against CONTRACT.toml | Zero |
-| **L3: Quality** | Is it actually *better*? Does it address the feedback? Is the voice consistent? | LLM-as-judge evaluation | One LLM call |
-| **L4: Regression** | Is anything *worse* than before? Did improvements in one area break another? | Deterministic comparison metrics | Zero |
+| **L2: Metrics** | Does it respect the agent's behavioral contract? Any forbidden patterns? | String matching against CONTRACT.toml | Zero |
+| **L2.5: MistakeRegression** | Does the candidate repeat any known failure patterns? | Compare against MistakeNotebook entries | Zero |
+| **L3: LLM Judge** | Is it actually *better*? Does it address the feedback? Is the voice consistent? | LLM-as-judge evaluation | One LLM call |
+| **L3.5: SandboxCanary** | Does it work correctly in a real conversation? | Execute test conversation in container sandbox | One LLM call |
+| **L4: Safety** | Is anything *worse* than before? Did improvements break safety invariants? | Deterministic comparison metrics | Zero |
 
-The order matters: cheap checks run first. If L1 fails (bad format), there's no point running L3 (expensive quality check). This alone saves significant cost.
+The order matters: cheap checks run first. If L1 fails (bad format), there's no point running L3 (expensive quality check). L2.5 and L3.5 are the new additions — they catch regression against *historical* failures and verify *real-world* behavior in a sandbox, respectively. Four of the six layers are zero-cost deterministic checks.
 
 **Updater** — If all four layers pass, the Updater:
 1. Writes the new version to a temporary file
@@ -64,15 +90,68 @@ Feedback-based (what GVU actually does):
 
 This is inspired by the TextGrad approach — treating text like a differentiable signal. The Generator can directly act on specific suggestions rather than guessing what "6/10" means.
 
-### Convergence Control
+### Adaptive Depth & Convergence Control
 
-The loop runs at most **3 rounds**. Here's why:
+The loop doesn't have a fixed round limit — the **MetaCognition** module dynamically adjusts iteration depth based on the agent's history:
 
+```
+MetaCognition evaluates:
+  - Historical GVU success rates
+  - Current error severity
+  - Budget remaining
+     |
+     v
+Set iteration depth: 3-7 rounds
+  - Low complexity + good history → 3 rounds
+  - High complexity + weak history → up to 7 rounds
+```
+
+Within each run:
 - **Round 1**: Addresses the primary feedback. Fixes the biggest issues.
 - **Round 2**: Refines based on any new issues introduced in Round 1.
-- **Round 3**: Final polish. If it still doesn't pass after 3 rounds, the system keeps the current version.
+- **Round 3+**: Deeper refinement as needed.
 
-The system also detects **convergence** — if Round 2's output is nearly identical to Round 1's, it stops early. No point burning tokens on diminishing returns.
+The system detects **convergence** — if a round's output is nearly identical to the previous round's, it stops early. No point burning tokens on diminishing returns.
+
+### Deferred GVU: Patient Evolution
+
+Not every trigger needs immediate full evolution. The **Deferred GVU** mechanism accumulates gradient signals before committing to a cycle:
+
+```
+Significant error detected
+     |
+     v
+Gradient buffer full enough?
+  |
+  +---> Yes → Fire GVU now
+  |
+  +---> No  → Accumulate and defer
+              (max 3 deferrals across 72 hours)
+              → 9-21 effective iterations
+                 spread over days
+```
+
+This prevents over-reaction to isolated incidents and produces more stable evolution.
+
+### Agent-as-Evaluator
+
+For high-stakes evolution decisions, an independent **Evaluator Agent** (running on Haiku for cost control) performs adversarial verification:
+
+```
+GVU candidate passes L1-L4
+     |
+     v
+Evaluator Agent (separate process):
+  - Receives candidate SOUL.md
+  - Runs structured evaluation
+  - Returns JSON verdict: {accept, reject, revise}
+  - Includes justification and specific concerns
+     |
+     v
+Verdict informs Updater's final decision
+```
+
+This "second opinion" catches subtle quality issues that automated layers might miss.
 
 ---
 
@@ -120,19 +199,23 @@ The 4-layer verification + 24-hour observation + automatic rollback means the sy
 
 ### Cost-Efficient Refinement
 
-Of the 4 verification layers, 3 are zero-cost deterministic checks. The LLM is only called for quality judgment (L3) and generation. A typical evolution cycle costs 2-3 LLM calls total, regardless of how many checks are performed.
+Of the 4+2 verification layers, 4 are zero-cost deterministic checks (L1, L2, L2.5, L4). The LLM is only called for quality judgment (L3) and sandbox testing (L3.5). A typical evolution cycle costs 2-4 LLM calls total, regardless of how many checks are performed.
 
 ---
 
 ## Interaction with Other Systems
 
 - **Prediction Engine**: Decides *when* GVU fires. GVU decides *what* to change.
+- **MistakeNotebook**: Shared across both loops — the outer loop records failures, the inner loop avoids repeating them.
 - **CONTRACT.toml**: L2 verification ensures evolution never violates behavioral boundaries.
 - **Security Layer**: SHA-256 fingerprinting ensures no unauthorized modifications happen outside the GVU pipeline.
+- **MetaCognition**: Drives adaptive iteration depth based on historical performance.
+- **Deferred GVU**: Accumulates gradient signals for patient, evidence-based evolution.
+- **Agent-as-Evaluator**: Independent adversarial verification for high-stakes decisions.
 - **Dashboard**: Evolution history is visible in the web interface, showing each version, its feedback, and its observation metrics.
 
 ---
 
 ## The Takeaway
 
-GVU turns prompt optimization from a manual, error-prone process into an automated, safe, and cost-efficient pipeline. The agent doesn't just *run* — it *grows*.
+GVU² turns prompt optimization from a manual, error-prone process into an automated, safe, and cost-efficient pipeline. The dual-loop architecture separates strategic growth (Behavioral GVU) from tactical fixes (Task GVU), while the MistakeNotebook ensures the agent never forgets its past failures. The agent doesn't just *run* — it *grows*, learns from mistakes, and evolves with patience.

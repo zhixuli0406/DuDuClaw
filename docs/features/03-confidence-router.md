@@ -87,6 +87,11 @@ Behind the router sits a unified inference engine that supports multiple backend
 - llamafile single-binary servers
 - vLLM, SGLang, and other serving frameworks
 
+**MLX Bridge** — For Apple Silicon users, a Python subprocess calling `mlx_lm`:
+- Local reflections without API calls
+- LoRA adapter support for agent personality fine-tuning
+- Saves API tokens by running reflections locally
+
 ### The InferenceManager State Machine
 
 The system doesn't just pick one backend and stick with it. The InferenceManager maintains a priority chain with automatic failover:
@@ -167,11 +172,30 @@ If the cloud API is down, rate-limited, or slow, local models keep the system ru
 
 ---
 
+## Model Management via MCP
+
+The inference engine is fully manageable through MCP tools:
+
+| Tool | Purpose |
+|------|---------|
+| `model_list` | List GGUF files in `~/.duduclaw/models/` |
+| `model_load` / `model_unload` | Load/unload model lifecycle |
+| `inference_status` | Loaded model, hardware, memory usage, backend type |
+| `hardware_info` | GPU auto-detect, VRAM, RAM, recommendations |
+| `route_query` | Preview routing decision without generation |
+| `inference_mode` | Current mode (exo-cluster/llamafile/direct/cloud-only) |
+| `model_search` | Search HuggingFace + curated repos with RAM filtering |
+| `model_download` | Download to `~/.duduclaw/models/` with resume + mirror fallback |
+| `model_recommend` | Hardware-aware model suggestions |
+
+---
+
 ## Interaction with Other Systems
 
 - **Account Rotation**: When local inference handles a query, no API account is consumed. This extends the effective lifetime of API quotas.
-- **CostTelemetry**: Tracks which tier handled each query, enabling operators to tune thresholds for optimal cost/quality balance.
+- **CostTelemetry**: Tracks which tier handled each query, enabling operators to tune thresholds for optimal cost/quality balance. Adaptive routing auto-prefers local when cache efficiency drops below 30%.
 - **Evolution Engine**: The router's decisions feed into the prediction engine's accuracy metrics.
+- **Multi-Runtime**: The Confidence Router sits *below* the runtime layer — it decides the model, while the runtime decides the CLI backend.
 
 ---
 

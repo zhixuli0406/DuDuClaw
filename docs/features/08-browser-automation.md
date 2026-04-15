@@ -140,6 +140,8 @@ When it works: Anything that a human sitting at a computer could do. This is the
 
 When it fails: It doesn't. But it's the slowest and most expensive option, so it should be the last resort.
 
+**Alternative: Browserbase** — For teams that don't want to manage virtual displays locally, DuDuClaw supports Browserbase as a cloud browser alternative for L5. The browser runs in Browserbase's infrastructure, and DuDuClaw sends commands via API. Same capability, zero local resource cost (but requires a Browserbase account).
+
 ### The Routing Decision
 
 The router doesn't always start at L1. Based on the task and target, it may skip directly to the appropriate layer:

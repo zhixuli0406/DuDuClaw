@@ -1,6 +1,6 @@
 # File-Based IPC Message Bus
 
-> Zero-dependency inter-agent communication via append-only JSONL.
+> Structured inter-agent delegation with TaskSpec workflows via append-only JSONL.
 
 ---
 
@@ -137,15 +137,93 @@ This approach has a natural ceiling: it works well for tens of agents exchanging
 
 ---
 
+## DelegationEnvelope: Structured Handoffs
+
+Raw JSONL messages work for simple tasks, but complex multi-agent workflows need structure. The **DelegationEnvelope** provides a standardized handoff protocol:
+
+```
+DelegationEnvelope:
+  context:         Background information the recipient needs
+  constraints:     Boundaries and requirements
+  task_chain:      History of who delegated what to whom
+  expected_output: What the sender expects back
+  delegation_depth: Current hop count (max 5)
+```
+
+The envelope travels with the message through the bus. Each agent that processes it adds to the `task_chain`, creating a traceable audit trail of the delegation path:
+
+```
+Agent A → Agent B → Agent C
+  |          |          |
+  v          v          v
+depth=1    depth=2    depth=3
+```
+
+The system enforces a maximum delegation depth (5 hops) to prevent infinite delegation loops. The envelope format is backward-compatible — agents that don't understand envelopes can still process the raw payload.
+
+---
+
+## TaskSpec: Multi-Step Workflow Planning
+
+For tasks that span multiple steps with dependencies, the **TaskSpec** system provides structured workflow planning:
+
+```
+TaskSpec:
+  steps:
+    - id: "step-1"
+      action: "research"
+      dependencies: []
+      status: completed
+
+    - id: "step-2"
+      action: "draft"
+      dependencies: ["step-1"]
+      status: in_progress
+
+    - id: "step-3"
+      action: "review"
+      dependencies: ["step-2"]
+      status: pending
+```
+
+The workflow engine handles:
+- **Dependency-aware scheduling**: Steps only execute when their dependencies are complete
+- **Auto-retry**: Failed steps retry up to 3 times with backoff
+- **Auto-replan**: If retries exhaust, the system can replan (up to 2 times) with adjusted steps
+- **Persistence**: TaskSpec state is saved to `tasks/` directory, surviving process restarts
+
+```
+Step fails
+     |
+     v
+Retry (up to 3x)
+     |
+  +--+--+
+  |     |
+Pass    Still failing
+  |     |
+  v     v
+Continue  Replan (up to 2x)
+            |
+            v
+          Generate adjusted steps
+          and retry from there
+```
+
+---
+
 ## Interaction with Other Systems
 
 - **HeartbeatScheduler**: Drives the polling rhythm for each agent.
 - **Agent Registry**: The dispatcher knows which agents exist and their concurrency limits.
 - **Container Sandbox**: When a task requires isolation, the dispatcher spawns the subprocess inside a container instead of directly on the host.
+- **DelegationEnvelope**: Provides structured context for complex multi-agent handoffs.
+- **TaskSpec**: Enables dependency-aware multi-step workflows with retry and replan.
+- **Multi-Runtime**: The dispatcher spawns the appropriate CLI backend (Claude/Codex/Gemini) based on each agent's runtime configuration.
 - **Audit Log**: All dispatched tasks are recorded in the JSONL audit trail.
 
 ---
 
 ## The Takeaway
 
-The simplest solution that works is usually the best solution. For inter-agent communication at DuDuClaw's scale, a JSONL file provides everything a message broker would — persistence, concurrency safety, observability — without any operational overhead.
+The simplest solution that works is usually the best solution. For inter-agent communication at DuDuClaw's scale, a JSONL file provides everything a message broker would — persistence, concurrency safety, observability — without any operational overhead. And when tasks grow complex, DelegationEnvelope and TaskSpec add structure without sacrificing the simplicity of the underlying transport.
