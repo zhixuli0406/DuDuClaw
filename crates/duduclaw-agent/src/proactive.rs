@@ -58,8 +58,13 @@ impl ProactiveState {
 
     /// Check if sending a proactive message is allowed (rate limit).
     pub fn can_send(&self, max_per_hour: u32) -> bool {
-        let one_hour_ago = Instant::now() - std::time::Duration::from_secs(3600);
-        let recent_count = self.recent_messages.iter().filter(|t| **t > one_hour_ago).count();
+        let now = Instant::now();
+        let one_hour = std::time::Duration::from_secs(3600);
+        let recent_count = self
+            .recent_messages
+            .iter()
+            .filter(|t| now.duration_since(**t) < one_hour)
+            .count();
         (recent_count as u32) < max_per_hour
     }
 
@@ -68,8 +73,9 @@ impl ProactiveState {
         self.recent_messages.push_back(Instant::now());
         self.total_sent += 1;
         // Prune old entries (keep last 2 hours)
-        let cutoff = Instant::now() - std::time::Duration::from_secs(7200);
-        while self.recent_messages.front().is_some_and(|t| *t < cutoff) {
+        let now = Instant::now();
+        let two_hours = std::time::Duration::from_secs(7200);
+        while self.recent_messages.front().is_some_and(|t| now.duration_since(*t) > two_hours) {
             self.recent_messages.pop_front();
         }
     }
