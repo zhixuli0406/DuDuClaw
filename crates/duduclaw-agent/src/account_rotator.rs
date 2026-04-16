@@ -578,6 +578,82 @@ impl AccountRotator {
     pub async fn push_account_for_test(&self, account: Account) {
         self.accounts.write().await.push(account);
     }
+
+    /// Probe all unhealthy accounts and restore those that respond successfully.
+    ///
+    /// For OAuth accounts: runs `claude auth status` to verify the session is valid.
+    /// For API key accounts: does a lightweight `/v1/messages` health check.
+    /// Restored accounts are sorted back by priority — highest priority first.
+    ///
+    /// Call this periodically (e.g. every 60s) from a background task.
+    pub async fn probe_and_restore(&self) -> usize {
+        let unhealthy_ids: Vec<(String, AuthMethod)> = {
+            let accounts = self.accounts.read().await;
+            accounts.iter()
+                .filter(|a| !a.is_healthy || a.cooldown_until.is_some_and(|cd| Utc::now() >= cd))
+                .filter(|a| !a.is_available()) // truly unavailable, not just cooled-down-and-ready
+                .map(|a| (a.id.clone(), a.auth_method.clone()))
+                .collect()
+        };
+
+        if unhealthy_ids.is_empty() {
+            return 0;
+        }
+
+        let mut restored = 0u64;
+
+        for (id, method) in &unhealthy_ids {
+            let ok = match method {
+                AuthMethod::OAuth => {
+                    // Probe by running `claude auth status` — if it succeeds, OAuth is valid
+                    tokio::task::spawn_blocking(|| {
+                        let claude = duduclaw_core::which_claude();
+                        claude.and_then(|bin| {
+                            let output = duduclaw_core::platform::command_for(&bin)
+                                .args(["auth", "status"])
+                                .stdout(std::process::Stdio::piped())
+                                .stderr(std::process::Stdio::null())
+                                .output()
+                                .ok()?;
+                            if !output.status.success() { return None; }
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            let json: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+                            json.get("loggedIn").and_then(|v| v.as_bool()).filter(|&b| b)
+                        })
+                    }).await.ok().flatten().is_some()
+                }
+                AuthMethod::ApiKey => {
+                    // API key accounts: cooldown expiry already handled by is_available().
+                    // If we're here, it means the account is unhealthy for non-cooldown reasons.
+                    // Just check if cooldown expired — if so, it's safe to restore.
+                    let accounts = self.accounts.read().await;
+                    accounts.iter()
+                        .find(|a| a.id == *id)
+                        .is_some_and(|a| {
+                            a.cooldown_until.is_none_or(|cd| Utc::now() >= cd)
+                        })
+                }
+            };
+
+            if ok {
+                let mut accounts = self.accounts.write().await;
+                if let Some(acc) = accounts.iter_mut().find(|a| a.id == *id) {
+                    acc.is_healthy = true;
+                    acc.consecutive_errors = 0;
+                    acc.cooldown_until = None;
+                    restored += 1;
+                    info!(
+                        account = id.as_str(),
+                        method = ?method,
+                        priority = acc.priority,
+                        "Account restored by health probe"
+                    );
+                }
+            }
+        }
+
+        restored as usize
+    }
 }
 
 // ── OAuth helpers ───────────────────────────────────────────

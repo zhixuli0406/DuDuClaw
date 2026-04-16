@@ -663,7 +663,44 @@ async fn build_reply_with_session_inner(
         }
     };
 
-    // 2. Fallback: Python wrapper (with account rotator)
+    // 2. Fallback: Local model inference (if configured)
+    let reply = match reply {
+        Some(r) => Some(r),
+        None => {
+            // Resolve agent's local model config (if any)
+            let local_model_id = agent_dir.as_ref().and_then(|d| {
+                let toml_path = d.join("agent.toml");
+                let content = std::fs::read_to_string(&toml_path).ok()?;
+                let table: toml::Table = content.parse().ok()?;
+                table.get("model")?.as_table()?
+                    .get("local")?.as_table()?
+                    .get("model")?.as_str().map(|s| s.to_string())
+            });
+            match crate::claude_runner::try_local_inference(
+                &ctx.home_dir, &sanitized_text, &full_system_prompt, local_model_id.as_deref(),
+            ).await {
+                Ok(local_reply) => {
+                    info!("Replied via local model ({} chars)", local_reply.len());
+                    // Prepend a notice so the user knows CLI failed and local model is answering
+                    let cli_err = last_cli_error.as_deref().unwrap_or("unknown");
+                    let hint = classify_cli_error_hint(cli_err);
+                    let notice = format!(
+                        "⚠️ Claude CLI 暫時不可用（{hint}），本次由本地模型代為回應。\n\
+                         系統會在背景自動偵測恢復。\n\n"
+                    );
+                    Some(format!("{notice}{local_reply}"))
+                }
+                Err(e) => {
+                    if e != "ROUTER_ESCALATE_TO_CLOUD" {
+                        warn!("Local inference unavailable: {e}");
+                    }
+                    None
+                }
+            }
+        }
+    };
+
+    // 3. Fallback: Python wrapper (with account rotator)
     let reply = match reply {
         Some(r) => Some(r),
         None => match call_python_sdk_v2(&sanitized_text, &model, &full_system_prompt, &ctx.home_dir).await {
@@ -1380,6 +1417,9 @@ pub(crate) enum FailureReason {
     EmptyResponse,
     /// No rotator accounts configured.
     NoAccounts,
+    /// CLI failed but local model replied successfully.
+    /// Contains the original CLI error for user transparency.
+    LocalModelFallback(String),
     /// Fallback — unrecognized error string.
     Unknown,
 }
@@ -1427,6 +1467,9 @@ pub(crate) fn classify_cli_failure(err: &str) -> FailureReason {
 }
 
 /// Build a zh-TW user-facing message for a classified failure.
+///
+/// Messages directly tell the user *why* CLI failed (rate limit, billing, etc.)
+/// and whether a local model fallback was used.
 pub(crate) fn format_fallback_message(agent_name: &str, reason: FailureReason) -> String {
     match reason {
         FailureReason::BinaryMissing => format!(
@@ -1442,6 +1485,7 @@ pub(crate) fn format_fallback_message(agent_name: &str, reason: FailureReason) -
         ),
         FailureReason::RateLimited => format!(
             "{agent_name} 暫時忙線中（API 使用量已達上限），請稍後再試。\n\
+             系統會在背景自動偵測恢復，屆時將自動切回 Claude。\n\
              若持續發生，可在儀表板加入備用 OAuth 帳號以啟用自動輪替。"
         ),
         FailureReason::Billing => format!(
@@ -1464,10 +1508,33 @@ pub(crate) fn format_fallback_message(agent_name: &str, reason: FailureReason) -
             "{agent_name} 目前沒有可用的 Claude 帳號。\n\
              請先到儀表板設定 OAuth 或 API Key。"
         ),
+        FailureReason::LocalModelFallback(ref cli_err) => {
+            let reason_hint = classify_cli_error_hint(cli_err);
+            format!(
+                "⚠️ Claude CLI 暫時不可用（{reason_hint}），本次由本地模型代為回應。\n\
+                 系統會在背景自動偵測 CLI 恢復，屆時將自動切回 Claude。"
+            )
+        }
         FailureReason::Unknown => format!(
             "{agent_name} 暫時無法回應。\n\
              請稍後再試，或查看 ~/.duduclaw/debug.log 取得詳細原因。"
         ),
+    }
+}
+
+/// Translate a raw CLI error into a short zh-TW hint for the user.
+fn classify_cli_error_hint(err: &str) -> &'static str {
+    let reason = classify_cli_failure(err);
+    match reason {
+        FailureReason::RateLimited => "使用量已達上限",
+        FailureReason::Billing => "帳號額度用完",
+        FailureReason::AuthFailed => "認證失效",
+        FailureReason::Timeout => "處理超時",
+        FailureReason::EmptyResponse => "空回應",
+        FailureReason::BinaryMissing => "CLI 未安裝",
+        FailureReason::NoAccounts => "無可用帳號",
+        FailureReason::SpawnError => "程序啟動失敗",
+        _ => "連線異常",
     }
 }
 

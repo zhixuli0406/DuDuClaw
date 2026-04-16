@@ -2,7 +2,7 @@
 //!
 //! Used by both the cron scheduler and the agent dispatcher.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use duduclaw_agent::registry::AgentRegistry;
@@ -349,6 +349,17 @@ async fn get_inference_engine(home_dir: &std::path::Path) -> Option<std::sync::A
 ///
 /// If the confidence router is enabled, it may decide to escalate to Cloud API
 /// (returns `Err` with a special marker so the caller knows to try Cloud).
+///
+/// Public wrapper for channel_reply fallback chain.
+pub async fn try_local_inference(
+    home_dir: &std::path::Path,
+    prompt: &str,
+    system_prompt: &str,
+    model_id: Option<&str>,
+) -> Result<String, String> {
+    call_local_inference(home_dir, prompt, system_prompt, model_id).await
+}
+
 async fn call_local_inference(
     home_dir: &std::path::Path,
     prompt: &str,
@@ -451,6 +462,35 @@ async fn get_rotator(home_dir: &Path) -> Result<std::sync::Arc<duduclaw_agent::a
     let arc = std::sync::Arc::new(rotator);
     *cache.write().await = Some((std::time::Instant::now(), arc.clone()));
     Ok(arc)
+}
+
+/// Spawn a background task that periodically probes unhealthy accounts and
+/// restores them when they recover. This ensures that rate-limited or
+/// temporarily failed accounts are automatically brought back online
+/// according to their priority, without waiting for the next user request.
+///
+/// Runs every `interval_secs` (default: 60 seconds from config.toml
+/// `[rotation].health_check_interval_seconds`).
+pub fn spawn_health_probe(home_dir: PathBuf, interval_secs: u64) {
+    let interval = std::time::Duration::from_secs(interval_secs.max(10));
+    tokio::spawn(async move {
+        // Wait a bit before first probe — let the system fully boot
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+
+        loop {
+            tokio::time::sleep(interval).await;
+
+            let rotator = match get_rotator(&home_dir).await {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            let restored = rotator.probe_and_restore().await;
+            if restored > 0 {
+                info!(restored, "Health probe restored accounts");
+            }
+        }
+    });
 }
 
 /// Call Claude CLI with account rotation — tries next account on failure.

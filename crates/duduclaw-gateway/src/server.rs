@@ -289,6 +289,18 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     bg_handles.push(cron_handle);
     info!("Cron scheduler started (SQLite-backed with hot reload)");
 
+    // Account health probe — periodically tests unhealthy CLI accounts and restores
+    // them by priority when they recover (e.g. rate-limit cooldown expired).
+    {
+        let probe_interval = std::fs::read_to_string(home_dir.join("config.toml"))
+            .ok()
+            .and_then(|s| s.parse::<toml::Table>().ok())
+            .and_then(|t| t.get("rotation")?.as_table()?.get("health_check_interval_seconds")?.as_integer())
+            .unwrap_or(60) as u64;
+        crate::claude_runner::spawn_health_probe(home_dir.clone(), probe_interval);
+        info!(interval_secs = probe_interval, "Account health probe started");
+    }
+
     // Fix MCP server paths before starting dispatcher — ensures subprocess-spawned
     // Claude CLI can discover the duduclaw MCP server without PATH inheritance.
     {
