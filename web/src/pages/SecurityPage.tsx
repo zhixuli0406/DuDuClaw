@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type AuditEvent } from '@/lib/api';
+import { useConnectionStore } from '@/stores/connection-store';
 import {
   Shield,
   Lock,
@@ -29,8 +30,10 @@ export function SecurityPage() {
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
   const [status, setStatus] = useState<SecurityStatus | null>(null);
+  const connectionState = useConnectionStore((s) => s.state);
 
   useEffect(() => {
+    if (connectionState !== 'authenticated') return;
     setAuditLoading(true);
     api.security
       .auditLog(30)
@@ -42,7 +45,7 @@ export function SecurityPage() {
       .status()
       .then(setStatus)
       .catch(() => setStatus(null));
-  }, []);
+  }, [connectionState]);
 
   return (
     <div className="space-y-6">
