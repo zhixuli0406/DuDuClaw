@@ -106,14 +106,10 @@ impl BudgetManager {
     pub async fn can_spend(&self, agent_id: &str) -> bool {
         let trackers = self.trackers.read().await;
         match trackers.get(agent_id) {
-            Some(tracker) => {
-                if tracker.config.hard_stop {
-                    tracker.spent_cents < tracker.config.monthly_limit_cents
-                } else {
-                    true
-                }
+            Some(tracker) if tracker.config.hard_stop => {
+                tracker.spent_cents < tracker.config.monthly_limit_cents
             }
-            None => true, // no tracker = no limit
+            _ => true, // no tracker or soft limit = allow
         }
     }
 

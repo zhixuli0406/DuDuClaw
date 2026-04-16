@@ -386,8 +386,8 @@ fn strip_json_fences(s: &str) -> &str {
     // We search for both "```json" and bare "```" variants.
     let fence_start = [
         // Check start-of-string first (fast path)
-        trimmed.starts_with("```json").then(|| 7usize),    // "```json".len()
-        trimmed.starts_with("```").then(|| 3usize),        // "```".len()
+        trimmed.starts_with("```json").then_some(7usize),    // "```json".len()
+        trimmed.starts_with("```").then_some(3usize),      // "```".len()
         // Then check after newline (preamble path)
         trimmed.find("\n```json").map(|pos| pos + 8),      // "\n```json".len()
         trimmed.find("\n```").map(|pos| pos + 4),           // "\n```".len()
