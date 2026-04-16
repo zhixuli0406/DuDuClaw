@@ -874,7 +874,7 @@ async fn call_claude_with_env(
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
     work_dir: Option<&Path>,
 ) -> Result<ClaudeResponse, String> {
-    let claude = which_claude().ok_or("Claude CLI not found")?;
+    let claude = duduclaw_core::which_claude().ok_or("Claude CLI not found")?;
     let (mut cmd, _prompt_guard) = prepare_claude_cmd(&claude, prompt, model, system_prompt, capabilities, work_dir);
 
     for (key, value) in env_vars {
@@ -886,9 +886,4 @@ async fn call_claude_with_env(
     }
 
     call_claude_streaming(&mut cmd, None).await
-}
-
-/// Find the `claude` CLI binary — delegates to shared impl in duduclaw-core (BE-L1).
-fn which_claude() -> Option<String> {
-    duduclaw_core::which_claude()
 }

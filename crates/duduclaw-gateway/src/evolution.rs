@@ -20,7 +20,7 @@ pub async fn vet_skill(
 ) -> Result<Value, String> {
     let python_path = find_python_path(home_dir);
 
-    let mut cmd = tokio::process::Command::new("python3");
+    let mut cmd = tokio::process::Command::new(duduclaw_core::platform::python3_command());
     cmd.args(["-m", "duduclaw.evolution.run", "vet", "--skill-name", skill_name]);
 
     if let Some(sd) = skills_dir {
@@ -34,7 +34,8 @@ pub async fn vet_skill(
     // then whitelist only what the Python subprocess needs.
     cmd.env_clear();
     cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
-    cmd.env("HOME", std::env::var("HOME").unwrap_or_default());
+    cmd.env("HOME", std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default());
+    cmd.env("USERPROFILE", std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default());
     cmd.env("PYTHONPATH", &python_path);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
@@ -57,18 +58,29 @@ pub async fn vet_skill(
 // ── Internal ────────────────────────────────────────────────
 
 fn find_python_path(home_dir: &Path) -> String {
-    let candidates = [
+    let mut candidates = vec![
         // Development: project root python/
         home_dir.parent().unwrap_or(home_dir).join("python").to_string_lossy().to_string(),
-        // Homebrew / source install
-        "/opt/duduclaw".to_string(),
-        // Homebrew Cellar (Apple Silicon) — libexec/python/
-        "/opt/homebrew/opt/duduclaw-pro/libexec/python".to_string(),
-        // Homebrew Cellar (Intel Mac) — libexec/python/
-        "/usr/local/opt/duduclaw-pro/libexec/python".to_string(),
-        // User-local fallback
-        format!("{}/.duduclaw/python", home_dir.to_string_lossy()),
     ];
+    #[cfg(not(windows))]
+    {
+        // Homebrew / source install
+        candidates.push("/opt/duduclaw".to_string());
+        // Homebrew Cellar (Apple Silicon)
+        candidates.push("/opt/homebrew/opt/duduclaw-pro/libexec/python".to_string());
+        // Homebrew Cellar (Intel Mac)
+        candidates.push("/usr/local/opt/duduclaw-pro/libexec/python".to_string());
+    }
+    #[cfg(windows)]
+    {
+        // Windows: check common install locations
+        if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+            candidates.push(format!("{appdata}\\Programs\\duduclaw\\python"));
+        }
+    }
+    // User-local fallback
+    candidates.push(home_dir.join(".duduclaw").join("python").to_string_lossy().to_string());
+
     for path in &candidates {
         if !path.is_empty() && Path::new(path).join("duduclaw").exists() {
             return path.clone();

@@ -92,9 +92,11 @@ mod tests {
 
     #[test]
     fn configured_when_url_and_db_set() {
-        let mut config = OdooConfig::default();
-        config.url = "https://odoo.example.com".to_string();
-        config.db = "mydb".to_string();
+        let config = OdooConfig {
+            url: "https://odoo.example.com".to_string(),
+            db: "mydb".to_string(),
+            ..Default::default()
+        };
         assert!(config.is_configured());
     }
 

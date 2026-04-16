@@ -12,7 +12,7 @@ use std::path::Path;
 use chrono::Utc;
 use tracing::{debug, info, warn};
 
-use duduclaw_memory::wiki::{WikiAction, WikiProposal, WikiStore};
+use duduclaw_memory::wiki::{WikiAction, WikiProposal, WikiStore, WikiTarget};
 
 use super::compression::CompressedSkill;
 
@@ -115,6 +115,7 @@ pub fn extract_heuristic(
             content: Some(content),
             rationale: format!("Extracted from skill '{}' section '{}'", skill.name, section.heading),
             related_pages: vec![format!("sources/skill-{}.md", skill_tag)],
+            target: WikiTarget::default(),
         });
     }
 
@@ -152,6 +153,7 @@ pub fn extract_heuristic(
             content: Some(content),
             rationale: format!("Entity '{}' extracted from skill '{}'", entity_name, skill.name),
             related_pages: vec![format!("sources/skill-{}.md", skill_tag)],
+            target: WikiTarget::default(),
         });
     }
 
@@ -202,6 +204,7 @@ pub fn extract_heuristic(
         content: Some(source_content),
         rationale: format!("Source summary for skill '{}'", skill.name),
         related_pages: all_related,
+        target: WikiTarget::default(),
     };
 
     ExtractionResult {

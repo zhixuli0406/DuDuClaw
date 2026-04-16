@@ -51,11 +51,11 @@ pub struct BroadcastLayer;
 impl<S: Subscriber> Layer<S> for BroadcastLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let level = match *event.metadata().level() {
-            Level::ERROR => "ERROR",
-            Level::WARN => "WARN",
-            Level::INFO => "INFO",
-            Level::DEBUG => "DEBUG",
-            Level::TRACE => "TRACE",
+            Level::ERROR => "error",
+            Level::WARN => "warn",
+            Level::INFO => "info",
+            Level::DEBUG => "debug",
+            Level::TRACE => "trace",
         };
 
         // Capture the message field from the event

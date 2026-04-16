@@ -340,7 +340,7 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
 
   useEffect(() => {
     if (open) {
-      api.agents.list().then((r) => setAgents(r.agents ?? [])).catch(() => {});
+      api.agents.list().then((r) => setAgents(r.agents ?? [])).catch((e) => console.warn("[api]", e));
     }
   }, [open]);
 

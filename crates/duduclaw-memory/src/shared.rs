@@ -78,6 +78,7 @@ impl SharedMemoryEngine {
     pub fn new(db_path: &Path) -> Result<Self> {
         let conn =
             Connection::open(db_path).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
         Self::init_tables(&conn)?;
         info!(?db_path, "Shared memory engine initialised");
         Ok(Self {

@@ -43,7 +43,7 @@ impl ExperimentLogger {
             .map_err(|e| format!("Failed to open experiment.db: {e}"))?;
 
         // Enable WAL mode for concurrent read/write
-        conn.execute_batch("PRAGMA journal_mode=WAL;")
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
             .map_err(|e| format!("Failed to set WAL mode: {e}"))?;
 
         conn.execute_batch(

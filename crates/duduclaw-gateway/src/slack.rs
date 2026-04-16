@@ -267,18 +267,6 @@ fn to_slack_mrkdwn(text: &str) -> String {
     text.replace("**", "*")
 }
 
-/// Update an existing Slack message (for progress indicators).
-/// TODO: Wire up for streaming/progress display in Slack channels.
-#[allow(dead_code)]
-async fn update_message(http: &reqwest::Client, token: &str, channel: &str, ts: &str, text: &str) {
-    let _ = http
-        .post(format!("{SLACK_API}/chat.update"))
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&serde_json::json!({ "channel": channel, "ts": ts, "text": text }))
-        .send()
-        .await;
-}
-
 // ── Event handling ──────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]

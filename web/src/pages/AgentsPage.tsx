@@ -425,7 +425,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
   useEffect(() => {
     if (agent) {
       // Fetch available models
-      api.models.list().then((res) => setAvailableModels(res?.models ?? [])).catch(() => {});
+      api.models.list().then((res) => setAvailableModels(res?.models ?? [])).catch((e) => console.warn("[api]", e));
 
       // Determine current preferred/fallback as unified IDs
       const localModel = agent.model?.local?.model ?? '';

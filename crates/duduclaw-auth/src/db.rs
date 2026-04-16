@@ -591,25 +591,6 @@ fn verify_password_hash(password: &str, stored_hash: &str) -> Result<(), String>
         .map_err(|_| "invalid email or password".to_string())
 }
 
-/// Generate a cryptographically random password of the given length.
-/// Uses rejection sampling to avoid modulo bias.
-#[allow(dead_code)]
-fn generate_random_password(len: usize) -> String {
-    use ring::rand::SecureRandom;
-    // 64 chars = power of 2, no modulo bias with u8 & 0x3F
-    const CHARSET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*";
-    const MASK: u8 = 63; // 0b00111111 — maps to indices 0..63
-    let rng = ring::rand::SystemRandom::new();
-    let mut result = Vec::with_capacity(len);
-    let mut buf = [0u8; 1];
-    while result.len() < len {
-        rng.fill(&mut buf).expect("RNG should not fail");
-        let idx = buf[0] & MASK;
-        result.push(CHARSET[idx as usize] as char);
-    }
-    result.into_iter().collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

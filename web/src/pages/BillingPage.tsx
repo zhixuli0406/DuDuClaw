@@ -93,18 +93,18 @@ export function BillingPage() {
     api.billing
       .usage()
       .then(setUsage)
-      .catch(() => {});
+      .catch((e) => console.warn("[api]", e));
     api.billing
       .history()
       .then((r) => setInvoices(r.invoices))
-      .catch(() => {});
+      .catch((e) => console.warn("[api]", e));
     api.license
       .status()
       .then((info) => {
         setLicenseInfo(info);
         setCurrentPlan(info.tier?.toLowerCase() ?? 'community');
       })
-      .catch(() => {});
+      .catch((e) => console.warn("[api]", e));
   }, [connectionState]);
 
   const renewalDate = licenseInfo?.expires_at ?? null;

@@ -70,7 +70,7 @@ export function LicensePage() {
 
   useEffect(() => {
     if (connectionState !== 'authenticated') return;
-    api.license.status().then(setLicense).catch(() => {});
+    api.license.status().then(setLicense).catch((e) => console.warn("[api]", e));
   }, [connectionState]);
 
   const handleActivate = async () => {

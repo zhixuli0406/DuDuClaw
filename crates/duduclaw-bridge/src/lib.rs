@@ -11,7 +11,9 @@ fn get_duduclaw_home() -> std::path::PathBuf {
     if let Ok(home) = std::env::var("DUDUCLAW_HOME") {
         return std::path::PathBuf::from(home);
     }
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
     std::path::PathBuf::from(home).join(".duduclaw")
 }
 

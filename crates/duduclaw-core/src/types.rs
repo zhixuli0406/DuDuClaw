@@ -241,7 +241,6 @@ pub struct PermissionsConfig {
 /// removes it from the `--disallowedTools` list passed to the Claude CLI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[derive(Default)]
 pub struct CapabilitiesConfig {
     /// Allow Claude Code's `computer_use` tool (screenshot + mouse + keyboard).
     /// WARNING: operates on the host display — only enable for attended local use.
@@ -261,8 +260,30 @@ pub struct CapabilitiesConfig {
     /// even if allowed by other flags. Evaluated after `allowed_tools`.
     #[serde(default)]
     pub denied_tools: Vec<String>,
+
+    /// Wiki visibility control — which agents can read this agent's wiki.
+    /// `["*"]` = all agents (default, backward compatible).
+    /// `[]` = no one except self (fully private).
+    /// `["agnes", "bob"]` = only these agents can read.
+    #[serde(default = "default_wiki_visible_to")]
+    pub wiki_visible_to: Vec<String>,
 }
 
+fn default_wiki_visible_to() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+impl Default for CapabilitiesConfig {
+    fn default() -> Self {
+        Self {
+            computer_use: false,
+            browser_via_bash: false,
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            wiki_visible_to: default_wiki_visible_to(),
+        }
+    }
+}
 
 /// Programmatic Tool Calling (PTC) configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,6 +380,67 @@ pub struct EvolutionConfig {
     /// Maximum concurrently active skills per agent (default 5).
     #[serde(default = "default_max_active_skills")]
     pub max_active_skills: usize,
+
+    // ── Skill auto-synthesis (P0) ──
+
+    /// Enable automatic skill synthesis from episodic memory when repeated
+    /// domain gaps are detected.
+    #[serde(default)]
+    pub skill_synthesis_enabled: bool,
+
+    /// Number of repeated gap detections required before triggering synthesis.
+    #[serde(default = "default_skill_synthesis_threshold")]
+    pub skill_synthesis_threshold: u32,
+
+    /// Cooldown hours after synthesizing a skill for the same topic.
+    #[serde(default = "default_skill_synthesis_cooldown_hours")]
+    pub skill_synthesis_cooldown_hours: u64,
+
+    /// TTL (in conversations) for sandboxed trial skills before evaluation.
+    #[serde(default = "default_skill_trial_ttl")]
+    pub skill_trial_ttl: u32,
+
+    // ── Cross-agent skill migration (P2) ──
+
+    /// Enable automatic skill graduation to global scope when lift is proven.
+    #[serde(default)]
+    pub skill_graduation_enabled: bool,
+
+    /// Minimum lift required for skill graduation.
+    #[serde(default = "default_skill_graduation_min_lift")]
+    pub skill_graduation_min_lift: f64,
+
+    /// Enable cross-agent skill recommendations for new agents.
+    #[serde(default)]
+    pub skill_recommendation_enabled: bool,
+
+    /// Minimum combined score for auto-activating recommended skills.
+    #[serde(default = "default_skill_recommendation_threshold")]
+    pub skill_recommendation_threshold: f64,
+
+    // ── Curiosity-driven exploration (P4) ──
+
+    /// Enable curiosity-driven proactive exploration of underexplored domains.
+    #[serde(default)]
+    pub curiosity_enabled: bool,
+
+    /// Curiosity score threshold for triggering exploration.
+    #[serde(default = "default_curiosity_threshold")]
+    pub curiosity_threshold: f64,
+
+    /// Maximum exploration actions per day (cost control).
+    #[serde(default = "default_curiosity_max_daily")]
+    pub curiosity_max_daily: u32,
+
+    // ── Behavior monitoring (P1) ──
+
+    /// Enable behavioral drift detection after skill activation.
+    #[serde(default)]
+    pub skill_behavior_monitor_enabled: bool,
+
+    /// Drift magnitude threshold for flagging anomalous behavior (0.0–1.0).
+    #[serde(default = "default_skill_behavior_drift_threshold")]
+    pub skill_behavior_drift_threshold: f64,
 }
 
 impl Default for EvolutionConfig {
@@ -374,6 +456,23 @@ impl Default for EvolutionConfig {
             observation_period_hours: 24.0,
             skill_token_budget: 2500,
             max_active_skills: 5,
+            // Skill auto-synthesis
+            skill_synthesis_enabled: false,
+            skill_synthesis_threshold: 3,
+            skill_synthesis_cooldown_hours: 24,
+            skill_trial_ttl: 20,
+            // Cross-agent migration
+            skill_graduation_enabled: false,
+            skill_graduation_min_lift: 0.1,
+            skill_recommendation_enabled: false,
+            skill_recommendation_threshold: 0.3,
+            // Curiosity
+            curiosity_enabled: false,
+            curiosity_threshold: 0.6,
+            curiosity_max_daily: 3,
+            // Behavior monitoring
+            skill_behavior_monitor_enabled: false,
+            skill_behavior_drift_threshold: 0.3,
         }
     }
 }
@@ -400,6 +499,38 @@ fn default_skill_token_budget() -> u32 {
 
 fn default_max_active_skills() -> usize {
     5
+}
+
+fn default_skill_synthesis_threshold() -> u32 {
+    3
+}
+
+fn default_skill_synthesis_cooldown_hours() -> u64 {
+    24
+}
+
+fn default_skill_trial_ttl() -> u32 {
+    20
+}
+
+fn default_skill_graduation_min_lift() -> f64 {
+    0.1
+}
+
+fn default_skill_recommendation_threshold() -> f64 {
+    0.3
+}
+
+fn default_curiosity_threshold() -> f64 {
+    0.6
+}
+
+fn default_curiosity_max_daily() -> u32 {
+    3
+}
+
+fn default_skill_behavior_drift_threshold() -> f64 {
+    0.3
 }
 
 /// Configuration for external factors that feed into the evolution engine.
@@ -659,6 +790,14 @@ impl Default for StickerConfig {
     }
 }
 
+impl StickerConfig {
+    /// Clamp values to valid ranges after deserialization.
+    pub fn sanitize(&mut self) {
+        self.probability = self.probability.clamp(0.0, 1.0);
+        self.intensity_threshold = self.intensity_threshold.clamp(0.0, 1.0);
+    }
+}
+
 /// Proactive agent configuration — scheduled checks + user notification.
 ///
 /// ```toml
@@ -708,6 +847,26 @@ impl Default for ProactiveConfig {
             notify_channel: String::new(),
             notify_chat_id: String::new(),
             timezone: "Asia/Taipei".into(),
+        }
+    }
+}
+
+impl ProactiveConfig {
+    /// Clamp values to valid ranges after deserialization.
+    pub fn sanitize(&mut self) {
+        if self.quiet_hours_start > 23 {
+            tracing::warn!(
+                value = self.quiet_hours_start,
+                "quiet_hours_start out of range (0-23), clamping to 23"
+            );
+            self.quiet_hours_start = 23;
+        }
+        if self.quiet_hours_end > 23 {
+            tracing::warn!(
+                value = self.quiet_hours_end,
+                "quiet_hours_end out of range (0-23), clamping to 23"
+            );
+            self.quiet_hours_end = 23;
         }
     }
 }

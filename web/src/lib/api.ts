@@ -164,6 +164,19 @@ export interface WikiStats {
   };
 }
 
+export interface SharedWikiStats {
+  exists: boolean;
+  total_pages: number;
+  by_author: Record<string, number>;
+  by_directory: Record<string, number>;
+  most_recent?: {
+    title: string;
+    path: string;
+    updated: string;
+    author: string | null;
+  };
+}
+
 export interface SkillInfo {
   name: string;
   agent_id?: string;
@@ -198,6 +211,136 @@ export interface SkillIndexEntry {
   author: string;
   url: string;
   compatible: string[];
+}
+
+// ── Task Board types ────────────────────────────────────────
+
+export type TaskStatus = 'todo' | 'in_progress' | 'done' | 'blocked';
+export type TaskPriority = 'low' | 'medium' | 'high' | 'urgent';
+
+export interface TaskInfo {
+  id: string;
+  title: string;
+  description: string;
+  status: TaskStatus;
+  priority: TaskPriority;
+  assigned_to: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string;
+  blocked_reason?: string;
+  parent_task_id?: string;
+  tags: string[];
+  message_id?: string;
+}
+
+export interface TaskCreateParams {
+  title: string;
+  description?: string;
+  priority?: TaskPriority;
+  assigned_to: string;
+  tags?: string[];
+  parent_task_id?: string;
+}
+
+export interface TaskUpdateParams {
+  title?: string;
+  description?: string;
+  status?: TaskStatus;
+  priority?: TaskPriority;
+  assigned_to?: string;
+  blocked_reason?: string;
+  tags?: string[];
+}
+
+// ── Activity Feed types ─────────────────────────────────────
+
+export type ActivityType =
+  | 'task_created'
+  | 'task_completed'
+  | 'task_blocked'
+  | 'task_assigned'
+  | 'agent_reply'
+  | 'skill_learned'
+  | 'evolution_triggered'
+  | 'error';
+
+export interface ActivityEvent {
+  id: string;
+  type: ActivityType;
+  agent_id: string;
+  task_id?: string;
+  summary: string;
+  timestamp: string;
+  metadata?: Record<string, unknown>;
+}
+
+// ── Autopilot types ─────────────────────────────────────────
+
+export type AutopilotTriggerEvent =
+  | 'task_created'
+  | 'task_status_changed'
+  | 'channel_message'
+  | 'agent_idle'
+  | 'schedule';
+
+export type AutopilotActionType = 'delegate' | 'notify' | 'run_skill';
+
+export interface AutopilotCondition {
+  from_status?: TaskStatus;
+  to_status?: TaskStatus;
+  agent_id?: string;
+  channel_type?: string;
+  idle_minutes?: number;
+  cron?: string;
+}
+
+export interface AutopilotAction {
+  type: AutopilotActionType;
+  agent_id: string;
+  prompt_template?: string;
+  skill_name?: string;
+}
+
+export interface AutopilotRule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  trigger_event: AutopilotTriggerEvent;
+  conditions: AutopilotCondition;
+  action: AutopilotAction;
+  created_at: string;
+  last_triggered_at?: string;
+  trigger_count: number;
+}
+
+export interface AutopilotCreateParams {
+  name: string;
+  trigger_event: AutopilotTriggerEvent;
+  conditions: AutopilotCondition;
+  action: AutopilotAction;
+}
+
+export interface AutopilotHistoryEntry {
+  id: string;
+  rule_id: string;
+  rule_name: string;
+  triggered_at: string;
+  result: 'success' | 'failure';
+  details?: string;
+}
+
+// ── Skill Sharing types ─────────────────────────────────────
+
+export interface SharedSkillInfo {
+  name: string;
+  description: string;
+  shared_by: string;
+  shared_at: string;
+  adopted_by: string[];
+  usage_count: number;
+  tags: string[];
 }
 
 export interface EvolutionMetrics {
@@ -563,6 +706,16 @@ export const api = {
     stats: (agentId: string) =>
       client.call('wiki.stats', { agent_id: agentId }) as Promise<WikiStats>,
   },
+  sharedWiki: {
+    pages: () =>
+      client.call('shared_wiki.pages') as Promise<{ pages: WikiPageMeta[]; exists: boolean }>,
+    read: (pagePath: string) =>
+      client.call('shared_wiki.read', { page_path: pagePath }) as Promise<{ content: string; path: string }>,
+    search: (query: string, limit = 10) =>
+      client.call('shared_wiki.search', { query, limit }) as Promise<{ hits: WikiSearchHit[] }>,
+    stats: () =>
+      client.call('shared_wiki.stats') as Promise<SharedWikiStats>,
+  },
   skills: {
     list: (agentId?: string) =>
       client.call('skills.list', { agent_id: agentId }) as Promise<{ skills: SkillInfo[] }>,
@@ -617,7 +770,7 @@ export const api = {
     doctorRepair: () =>
       client.call('system.doctor_repair'),
     version: () =>
-      client.call('system.version') as Promise<{ version: string }>,
+      client.call('system.version') as Promise<{ version: string; auto_update: boolean; edition: string }>,
     config: () =>
       client.call('system.config') as Promise<Record<string, unknown>>,
     updateConfig: (fields: Record<string, unknown>) =>
@@ -631,6 +784,7 @@ export const api = {
         published_at: string;
         download_url: string;
         install_method: string;
+        auto_update: boolean;
       }>,
     applyUpdate: () =>
       client.call('system.apply_update', {}) as Promise<{
@@ -660,6 +814,18 @@ export const api = {
   security: {
     auditLog: (limit = 50) =>
       client.call('security.audit_log', { limit }) as Promise<{ events: AuditEvent[] }>,
+    status: () =>
+      client.call('security.status') as Promise<{
+        credential_proxy: { active: boolean; vault_backend: string; injected_secrets: number };
+        mount_guard: { rules: Array<{ path: string; access: string }> };
+        rbac: Array<{
+          agent_id: string; role: string;
+          tool_use: boolean; web_access: boolean;
+          file_write: boolean; shell_exec: boolean; delegate: boolean;
+        }>;
+        rate_limiter: { requests_per_minute: number; concurrent_requests: number };
+        soul_drift: Array<{ agent_id: string; soul_exists: boolean; gvu_enabled: boolean }>;
+      }>,
   },
   skillMarket: {
     search: (query: string) =>
@@ -775,6 +941,46 @@ export const api = {
       }>,
     oauthRevoke: (providerId: string) =>
       client.call('mcp.oauth.revoke', { provider_id: providerId }) as Promise<{ success: boolean }>,
+  },
+  tasks: {
+    list: (filters?: { status?: TaskStatus; agent_id?: string; priority?: TaskPriority }) =>
+      client.call('tasks.list', filters ?? {}) as Promise<{ tasks: TaskInfo[] }>,
+    create: (params: TaskCreateParams) =>
+      client.call('tasks.create', { ...params }) as Promise<{ task: TaskInfo }>,
+    update: (taskId: string, fields: TaskUpdateParams) =>
+      client.call('tasks.update', { task_id: taskId, ...fields }) as Promise<{ task: TaskInfo }>,
+    remove: (taskId: string) =>
+      client.call('tasks.remove', { task_id: taskId }) as Promise<{ success: boolean }>,
+    assign: (taskId: string, agentId: string) =>
+      client.call('tasks.assign', { task_id: taskId, agent_id: agentId }) as Promise<{ task: TaskInfo }>,
+  },
+  activity: {
+    list: (params?: { agent_id?: string; type?: ActivityType; limit?: number; offset?: number }) =>
+      client.call('activity.list', params ?? {}) as Promise<{ events: ActivityEvent[]; total: number }>,
+    subscribe: () =>
+      client.call('activity.subscribe'),
+    unsubscribe: () =>
+      client.call('activity.unsubscribe'),
+  },
+  autopilot: {
+    list: () =>
+      client.call('autopilot.list') as Promise<{ rules: AutopilotRule[] }>,
+    create: (params: AutopilotCreateParams) =>
+      client.call('autopilot.create', { ...params }) as Promise<{ rule: AutopilotRule }>,
+    update: (ruleId: string, fields: Partial<AutopilotCreateParams> & { enabled?: boolean }) =>
+      client.call('autopilot.update', { rule_id: ruleId, ...fields }) as Promise<{ rule: AutopilotRule }>,
+    remove: (ruleId: string) =>
+      client.call('autopilot.remove', { rule_id: ruleId }) as Promise<{ success: boolean }>,
+    history: (ruleId?: string, limit = 20) =>
+      client.call('autopilot.history', { rule_id: ruleId, limit }) as Promise<{ entries: AutopilotHistoryEntry[] }>,
+  },
+  sharedSkills: {
+    list: () =>
+      client.call('skills.shared') as Promise<{ skills: SharedSkillInfo[] }>,
+    share: (agentId: string, skillName: string) =>
+      client.call('skills.share', { agent_id: agentId, skill_name: skillName }) as Promise<{ success: boolean }>,
+    adopt: (skillName: string, targetAgentId: string) =>
+      client.call('skills.adopt', { skill_name: skillName, target_agent_id: targetAgentId }) as Promise<{ success: boolean }>,
   },
   // Partner portal — backend not yet implemented; calls will reject with error
   partner: {

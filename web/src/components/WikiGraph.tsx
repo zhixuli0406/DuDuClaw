@@ -10,8 +10,8 @@ interface GraphNode extends d3.SimulationNodeDatum {
 }
 
 interface GraphLink extends d3.SimulationLinkDatum<GraphNode> {
-  source: string;
-  target: string;
+  source: string | GraphNode;
+  target: string | GraphNode;
 }
 
 interface WikiGraphProps {
@@ -192,11 +192,13 @@ export function WikiGraph({ pages, pageContents, width = 700, height = 500, onSe
     node.append('title').text((d) => `${d.title}\n${d.id}`);
 
     simulation.on('tick', () => {
+      const nodeX = (n: string | GraphNode) => typeof n === 'object' ? n.x ?? 0 : 0;
+      const nodeY = (n: string | GraphNode) => typeof n === 'object' ? n.y ?? 0 : 0;
       link
-        .attr('x1', (d) => (d.source as unknown as GraphNode).x ?? 0)
-        .attr('y1', (d) => (d.source as unknown as GraphNode).y ?? 0)
-        .attr('x2', (d) => (d.target as unknown as GraphNode).x ?? 0)
-        .attr('y2', (d) => (d.target as unknown as GraphNode).y ?? 0);
+        .attr('x1', (d) => nodeX(d.source))
+        .attr('y1', (d) => nodeY(d.source))
+        .attr('x2', (d) => nodeX(d.target))
+        .attr('y2', (d) => nodeY(d.target));
 
       node
         .attr('cx', (d) => d.x ?? 0)

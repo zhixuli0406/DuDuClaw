@@ -12,12 +12,23 @@ import {
   History,
 } from 'lucide-react';
 
+interface SecurityStatus {
+  credential_proxy: { active: boolean; vault_backend: string; injected_secrets: number };
+  mount_guard: { rules: Array<{ path: string; access: string }> };
+  rbac: Array<{
+    agent_id: string; role: string;
+    tool_use: boolean; web_access: boolean;
+    file_write: boolean; shell_exec: boolean; delegate: boolean;
+  }>;
+  rate_limiter: { requests_per_minute: number; concurrent_requests: number };
+  soul_drift: Array<{ agent_id: string; soul_exists: boolean; gvu_enabled: boolean }>;
+}
+
 export function SecurityPage() {
   const intl = useIntl();
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
-  // FE-H1: Security panels below show static placeholder data, not live system state.
-  const isStaticData = true;
+  const [status, setStatus] = useState<SecurityStatus | null>(null);
 
   useEffect(() => {
     setAuditLoading(true);
@@ -26,6 +37,11 @@ export function SecurityPage() {
       .then((res) => setAuditEvents(res?.events ?? []))
       .catch(() => setAuditEvents([]))
       .finally(() => setAuditLoading(false));
+
+    api.security
+      .status()
+      .then(setStatus)
+      .catch(() => setStatus(null));
   }, []);
 
   return (
@@ -33,13 +49,6 @@ export function SecurityPage() {
       <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
         {intl.formatMessage({ id: 'security.title' })}
       </h2>
-
-      {isStaticData && (
-        <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900/50 dark:bg-amber-900/20 dark:text-amber-300">
-          <AlertTriangle className="h-4 w-4 shrink-0" />
-          <span>{intl.formatMessage({ id: 'security.static.banner' })}</span>
-        </div>
-      )}
 
       <div className="grid gap-6 lg:grid-cols-2">
         {/* Audit Log */}
@@ -72,9 +81,18 @@ export function SecurityPage() {
           description="Credential injection via secure proxy. No secrets exposed to agents."
         >
           <div className="space-y-3">
-            <StatusRow label="Proxy Status" status="active" />
-            <StatusRow label="Vault Backend" value="env" />
-            <StatusRow label="Injected Secrets" value="3" />
+            <StatusRow
+              label="Proxy Status"
+              status={status?.credential_proxy.active ? 'active' : 'inactive'}
+            />
+            <StatusRow
+              label="Vault Backend"
+              value={status?.credential_proxy.vault_backend ?? '—'}
+            />
+            <StatusRow
+              label="Injected Secrets"
+              value={String(status?.credential_proxy.injected_secrets ?? 0)}
+            />
           </div>
         </SecurityCard>
 
@@ -85,10 +103,15 @@ export function SecurityPage() {
           description="Container filesystem mount rules. Controls what agents can access."
         >
           <div className="space-y-2">
-            <RuleRow path="/workspace" access="rw" />
-            <RuleRow path="/tmp" access="rw" />
-            <RuleRow path="/etc" access="ro" />
-            <RuleRow path="/var/run/docker.sock" access="deny" />
+            {status?.mount_guard.rules && status.mount_guard.rules.length > 0 ? (
+              status.mount_guard.rules.map((rule) => (
+                <RuleRow key={rule.path} path={rule.path} access={rule.access} />
+              ))
+            ) : (
+              <p className="py-2 text-center text-sm text-stone-400">
+                {intl.formatMessage({ id: 'common.noData' })}
+              </p>
+            )}
           </div>
         </SecurityCard>
 
@@ -103,25 +126,42 @@ export function SecurityPage() {
               <thead>
                 <tr className="border-b border-stone-200 dark:border-stone-700">
                   <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">
-                    Permission
+                    Agent
                   </th>
                   <th className="py-2 text-center font-medium text-stone-500 dark:text-stone-400">
-                    Main
+                    Tool
                   </th>
                   <th className="py-2 text-center font-medium text-stone-500 dark:text-stone-400">
-                    Specialist
+                    Web
                   </th>
                   <th className="py-2 text-center font-medium text-stone-500 dark:text-stone-400">
-                    Worker
+                    File
+                  </th>
+                  <th className="py-2 text-center font-medium text-stone-500 dark:text-stone-400">
+                    Shell
                   </th>
                 </tr>
               </thead>
               <tbody className="text-stone-700 dark:text-stone-300">
-                <PermRow perm="tool_use" main warn={false} specialist worker={false} />
-                <PermRow perm="web_access" main warn={false} specialist={false} worker={false} />
-                <PermRow perm="file_write" main warn={false} specialist worker />
-                <PermRow perm="shell_exec" main warn specialist={false} worker={false} />
-                <PermRow perm="delegate" main warn={false} specialist={false} worker={false} />
+                {(status?.rbac ?? []).map((agent) => (
+                  <tr key={agent.agent_id} className="border-b border-stone-100 dark:border-stone-800">
+                    <td className="py-2 text-stone-700 dark:text-stone-300">
+                      <code className="text-xs">{agent.agent_id}</code>
+                      <span className="ml-1 text-xs text-stone-400">({agent.role})</span>
+                    </td>
+                    <PermCell allowed={agent.tool_use} />
+                    <PermCell allowed={agent.web_access} />
+                    <PermCell allowed={agent.file_write} />
+                    <PermCell allowed={agent.shell_exec} />
+                  </tr>
+                ))}
+                {(!status?.rbac || status.rbac.length === 0) && (
+                  <tr>
+                    <td colSpan={5} className="py-4 text-center text-sm text-stone-400">
+                      {intl.formatMessage({ id: 'common.noData' })}
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
@@ -134,14 +174,30 @@ export function SecurityPage() {
           description="API call rate limiting per agent per time window."
         >
           <div className="space-y-3">
-            <LimitRow label="Requests / minute" value="60" />
-            <LimitRow label="Tokens / minute" value="100,000" />
-            <LimitRow label="Concurrent requests" value="5" />
-            <LimitRow label="Burst allowance" value="10" />
+            <LimitRow
+              label="Requests / minute"
+              value={String(status?.rate_limiter.requests_per_minute ?? 60)}
+            />
+            <LimitRow
+              label="Concurrent requests"
+              value={String(status?.rate_limiter.concurrent_requests ?? 5)}
+            />
           </div>
         </SecurityCard>
       </div>
     </div>
+  );
+}
+
+function PermCell({ allowed }: { allowed: boolean }) {
+  return (
+    <td className="py-2 text-center">
+      {allowed ? (
+        <span className="text-emerald-500">&#10003;</span>
+      ) : (
+        <span className="text-stone-300 dark:text-stone-600">&#10005;</span>
+      )}
+    </td>
   );
 }
 
@@ -224,6 +280,10 @@ function StatusRow({
           <Shield className="h-3 w-3" />
           Active
         </span>
+      ) : status === 'inactive' ? (
+        <span className="inline-flex items-center gap-1 rounded-full bg-stone-100 px-2.5 py-0.5 text-xs font-medium text-stone-500 dark:bg-stone-800 dark:text-stone-400">
+          Inactive
+        </span>
       ) : (
         <span className="font-medium text-stone-900 dark:text-stone-50">
           {value}
@@ -251,46 +311,6 @@ function RuleRow({ path, access }: { path: string; access: string }) {
         {access}
       </span>
     </div>
-  );
-}
-
-function PermRow({
-  perm,
-  main,
-  specialist,
-  worker,
-  warn = false,
-}: {
-  perm: string;
-  main: boolean;
-  specialist: boolean;
-  worker: boolean;
-  warn?: boolean;
-}) {
-  const renderCell = (allowed: boolean) => (
-    <td className="py-2 text-center">
-      {allowed ? (
-        <span className="text-emerald-500">&#10003;</span>
-      ) : (
-        <span className="text-stone-300 dark:text-stone-600">&#10005;</span>
-      )}
-    </td>
-  );
-
-  return (
-    <tr className="border-b border-stone-100 dark:border-stone-800">
-      <td className="py-2 text-stone-700 dark:text-stone-300">
-        <code className="text-xs">{perm}</code>
-        {warn && (
-          <span className="ml-1 text-xs text-amber-500" title="Requires approval">
-            &#9888;
-          </span>
-        )}
-      </td>
-      {renderCell(main)}
-      {renderCell(specialist)}
-      {renderCell(worker)}
-    </tr>
   );
 }
 

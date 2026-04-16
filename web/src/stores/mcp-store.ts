@@ -7,6 +7,8 @@ interface McpStore {
   readonly loading: boolean;
   readonly error: string | null;
   readonly oauthProviders: ReadonlyArray<McpOAuthProvider>;
+  /** Internal: tracks the OAuth polling timer so it can be cancelled. */
+  _oauthPollTimer?: ReturnType<typeof setTimeout>;
   fetchAll: () => Promise<void>;
   addServer: (agentId: string, name: string, def: McpServerDef) => Promise<void>;
   removeServer: (agentId: string, name: string) => Promise<void>;
@@ -74,25 +76,33 @@ export const useMcpStore = create<McpStore>((set, get) => ({
     const result = await api.mcp.oauthStart(providerId, clientId, clientSecret);
     const authUrl = result.auth_url;
 
+    // Cancel any existing polling
+    const prev = get()._oauthPollTimer;
+    if (prev) clearTimeout(prev);
+
     // Start polling for auth completion (every 3s, up to 5 minutes)
     const maxAttempts = 100;
     let attempt = 0;
     const poll = () => {
       attempt += 1;
-      if (attempt > maxAttempts) return;
-      setTimeout(async () => {
+      if (attempt > maxAttempts) {
+        set({ _oauthPollTimer: undefined });
+        return;
+      }
+      const timer = setTimeout(async () => {
         try {
           const status = await api.mcp.oauthStatus(providerId);
           if (status.authenticated) {
-            // Re-fetch all providers to update state
+            set({ _oauthPollTimer: undefined });
             await get().fetchOAuthProviders();
             return;
           }
           poll();
         } catch {
-          // Stop polling on error
+          set({ _oauthPollTimer: undefined });
         }
       }, 3000);
+      set({ _oauthPollTimer: timer });
     };
     poll();
 

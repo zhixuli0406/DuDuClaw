@@ -174,7 +174,7 @@ pub fn which_claude_in_home(home: &std::path::Path) -> Option<String> {
     // NVM: scan all node versions for claude binary
     #[cfg(not(windows))]
     {
-        let nvm_root = home.join(".nvm/versions/node");
+        let nvm_root = home.join(".nvm").join("versions").join("node");
         if let Ok(entries) = std::fs::read_dir(&nvm_root) {
             for entry in entries.flatten() {
                 let candidate = entry.path().join("bin").join("claude");
@@ -217,8 +217,19 @@ mod which_claude_tests {
         crate::platform::set_executable(path).unwrap();
     }
 
+    /// Guard: skip tests that rely on HOME-rooted candidates winning when the
+    /// host already has a system-level claude install (which takes priority).
+    fn host_has_system_claude() -> bool {
+        Path::new("/opt/homebrew/bin/claude").exists()
+            || Path::new("/usr/local/bin/claude").exists()
+    }
+
     #[test]
     fn discovers_bun_candidate() {
+        if host_has_system_claude() {
+            eprintln!("skipping: host has a system claude install");
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let claude = tmp.path().join(".bun/bin/claude");
         write_shim(&claude);
@@ -228,6 +239,10 @@ mod which_claude_tests {
 
     #[test]
     fn discovers_volta_candidate() {
+        if host_has_system_claude() {
+            eprintln!("skipping: host has a system claude install");
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let claude = tmp.path().join(".volta/bin/claude");
         write_shim(&claude);
@@ -237,6 +252,10 @@ mod which_claude_tests {
 
     #[test]
     fn discovers_asdf_shim() {
+        if host_has_system_claude() {
+            eprintln!("skipping: host has a system claude install");
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let claude = tmp.path().join(".asdf/shims/claude");
         write_shim(&claude);
@@ -246,6 +265,10 @@ mod which_claude_tests {
 
     #[test]
     fn discovers_npm_global() {
+        if host_has_system_claude() {
+            eprintln!("skipping: host has a system claude install");
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let claude = tmp.path().join(".npm-global/bin/claude");
         write_shim(&claude);
@@ -290,6 +313,10 @@ mod which_claude_tests {
 
     #[test]
     fn fixed_candidate_order_bun_beats_npm_global() {
+        if host_has_system_claude() {
+            eprintln!("skipping: host has a system claude install");
+            return;
+        }
         // When both .bun/bin/claude and .npm-global/bin/claude exist,
         // Bun should win because it's earlier in the candidate list.
         let tmp = tempfile::tempdir().unwrap();

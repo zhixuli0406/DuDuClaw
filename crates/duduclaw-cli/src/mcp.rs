@@ -279,6 +279,30 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
         ],
     },
+    // ── Skill lifecycle tools ──────────────────────────────────────
+    ToolDef {
+        name: "skill_security_scan",
+        description: "Run a security scan on a skill file and report risk level and findings",
+        params: &[
+            ParamDef { name: "agent_id", description: "Agent name", required: true },
+            ParamDef { name: "skill_name", description: "Skill name to scan", required: true },
+        ],
+    },
+    ToolDef {
+        name: "skill_graduate",
+        description: "Manually graduate a proven agent-local skill to global scope (~/.duduclaw/skills/)",
+        params: &[
+            ParamDef { name: "agent_id", description: "Agent that owns the skill", required: true },
+            ParamDef { name: "skill_name", description: "Skill name to graduate", required: true },
+        ],
+    },
+    ToolDef {
+        name: "skill_synthesis_status",
+        description: "Report auto-synthesis status: sandboxed skills, gap accumulator state, recent synthesis events",
+        params: &[
+            ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
+        ],
+    },
     // ── Feedback tool ────────────────────────────────────────────
     ToolDef {
         name: "submit_feedback",
@@ -633,6 +657,55 @@ const TOOLS: &[ToolDef] = &[
         params: &[
             ParamDef { name: "format", description: "Export format: 'obsidian' or 'html' (default: html)", required: false },
             ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
+        ],
+    },
+    // ── Shared Wiki Knowledge Base tools ─────────────────────────
+    ToolDef {
+        name: "shared_wiki_ls",
+        description: "List pages in the shared wiki (~/.duduclaw/shared/wiki/). The shared wiki is a cross-agent public knowledge base.",
+        params: &[],
+    },
+    ToolDef {
+        name: "shared_wiki_read",
+        description: "Read a page from the shared wiki. Use shared_wiki_ls or shared_wiki_search to find page paths first.",
+        params: &[
+            ParamDef { name: "page_path", description: "Page path relative to shared/wiki/ (e.g. 'concepts/return-policy.md')", required: true },
+        ],
+    },
+    ToolDef {
+        name: "shared_wiki_write",
+        description: "Create or update a page in the shared wiki. Author is automatically tracked. All agents can contribute to the shared knowledge base.",
+        params: &[
+            ParamDef { name: "page_path", description: "Page path relative to shared/wiki/ (e.g. 'concepts/company-sop.md')", required: true },
+            ParamDef { name: "content", description: "Full page content including YAML frontmatter (author field auto-injected)", required: true },
+        ],
+    },
+    ToolDef {
+        name: "shared_wiki_search",
+        description: "Full-text search across shared wiki pages.",
+        params: &[
+            ParamDef { name: "query", description: "Search query (keywords)", required: true },
+            ParamDef { name: "limit", description: "Max results (default: 10)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "shared_wiki_delete",
+        description: "Delete a page from the shared wiki. Only the original author or the main agent can delete.",
+        params: &[
+            ParamDef { name: "page_path", description: "Page path to delete", required: true },
+        ],
+    },
+    ToolDef {
+        name: "shared_wiki_stats",
+        description: "Get shared wiki statistics: total pages, contributor breakdown, recent activity.",
+        params: &[],
+    },
+    ToolDef {
+        name: "wiki_share",
+        description: "Share a page from your wiki to the shared wiki. Creates a source-attributed copy in shared/wiki/sources/.",
+        params: &[
+            ParamDef { name: "page_path", description: "Page path in your own wiki to share", required: true },
+            ParamDef { name: "summary", description: "Optional custom summary (default: first 500 chars of body)", required: false },
         ],
     },
     // ── Skill Internalization tools ─────────────────────────────
@@ -2183,29 +2256,29 @@ async fn handle_check_responses(params: &Value, home_dir: &Path) -> Value {
 
     // 2. Check SQLite message queue
     let db_path = home_dir.join("message_queue.db");
-    if db_path.exists() {
-        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-            let _ = conn.execute_batch("PRAGMA busy_timeout=3000;");
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT created_at, substr(response, 1, 500), length(response), status \
-                 FROM message_queue WHERE target = ?1 AND status = 'done' AND response IS NOT NULL \
-                 ORDER BY created_at DESC LIMIT ?2",
-            ) {
-                if let Ok(rows) = stmt.query_map(
-                    rusqlite::params![agent_id, limit as i64],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)? as usize,
-                        ))
-                    },
-                ) {
-                    for row in rows.flatten() {
-                        if responses.len() < limit {
-                            responses.push(row);
-                        }
-                    }
+    if db_path.exists()
+        && let Ok(conn) = rusqlite::Connection::open(&db_path)
+    {
+        let _ = conn.execute_batch("PRAGMA busy_timeout=3000;");
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT created_at, substr(response, 1, 500), length(response), status \
+             FROM message_queue WHERE target = ?1 AND status = 'done' AND response IS NOT NULL \
+             ORDER BY created_at DESC LIMIT ?2",
+        )
+            && let Ok(rows) = stmt.query_map(
+                rusqlite::params![agent_id, limit as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? as usize,
+                    ))
+                },
+            )
+        {
+            for row in rows.flatten() {
+                if responses.len() < limit {
+                    responses.push(row);
                 }
             }
         }
@@ -4003,6 +4076,271 @@ async fn handle_skill_list(params: &Value, home_dir: &Path) -> Value {
     }
 }
 
+/// Validate that a string is safe to use as a file path component.
+/// Prevents path traversal attacks via agent_id or skill_name.
+fn is_safe_path_component(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+        && !s.contains('.')
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.contains('\0')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Run a security scan on an agent's installed skill.
+async fn handle_skill_security_scan(params: &Value, home_dir: &Path) -> Value {
+    let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+    let skill_name = params.get("skill_name").and_then(|v| v.as_str()).unwrap_or("");
+
+    if agent_id.is_empty() || skill_name.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: agent_id and skill_name are required"}],
+            "isError": true
+        });
+    }
+
+    // Validate inputs to prevent path traversal
+    if !is_safe_path_component(agent_id) {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: invalid agent_id (alphanumeric, hyphens, underscores only)"}],
+            "isError": true
+        });
+    }
+    if !is_safe_path_component(skill_name) {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: invalid skill_name (alphanumeric, hyphens, underscores only)"}],
+            "isError": true
+        });
+    }
+
+    // Try agent-local first, then global (read directly to avoid TOCTOU race)
+    let agent_path = home_dir.join("agents").join(agent_id).join("SKILLS").join(format!("{skill_name}.md"));
+    let global_path = home_dir.join("skills").join(format!("{skill_name}.md"));
+
+    let content = match tokio::fs::read_to_string(&agent_path).await {
+        Ok(c) => c,
+        Err(_) => match tokio::fs::read_to_string(&global_path).await {
+            Ok(c) => c,
+            Err(_) => return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: Skill '{skill_name}' not found for agent '{agent_id}'")}],
+                "isError": true
+            }),
+        },
+    };
+
+    // Load CONTRACT.toml must_not patterns if available
+    let contract_path = home_dir.join("agents").join(agent_id).join("CONTRACT.toml");
+    let must_not: Option<Vec<String>> = tokio::fs::read_to_string(&contract_path)
+        .await
+        .ok()
+        .and_then(|c| {
+            // Simple extraction of must_not patterns from TOML
+            let mut patterns = Vec::new();
+            let mut in_must_not = false;
+            for line in c.lines() {
+                if line.trim().starts_with("must_not") {
+                    in_must_not = true;
+                    continue;
+                }
+                if in_must_not {
+                    let trimmed = line.trim().trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == ']');
+                    if trimmed.is_empty() || trimmed.starts_with('[') {
+                        continue;
+                    }
+                    if line.contains(']') {
+                        in_must_not = false;
+                    }
+                    if !trimmed.is_empty() {
+                        patterns.push(trimmed.to_string());
+                    }
+                }
+            }
+            if patterns.is_empty() { None } else { Some(patterns) }
+        });
+
+    use duduclaw_gateway::skill_lifecycle::security_scanner;
+    let result = security_scanner::scan_skill(&content, must_not.as_deref());
+
+    let findings_text: Vec<String> = result.findings.iter().map(|f| {
+        format!(
+            "- [{:?}] {:?} (line {}): {} [pattern: {}]",
+            f.severity,
+            f.category,
+            f.line_number.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string()),
+            f.description,
+            f.matched_pattern,
+        )
+    }).collect();
+
+    let text = format!(
+        "**Security scan: {skill_name}**\n\
+         Risk level: {:?}\n\
+         Passed: {}\n\
+         Findings ({}):\n{}",
+        result.risk_level,
+        result.passed,
+        result.findings.len(),
+        if findings_text.is_empty() { "  (none)".to_string() } else { findings_text.join("\n") },
+    );
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": text}]
+    })
+}
+
+/// Graduate a skill from agent-local to global scope.
+async fn handle_skill_graduate(params: &Value, home_dir: &Path) -> Value {
+    let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+    let skill_name = params.get("skill_name").and_then(|v| v.as_str()).unwrap_or("");
+
+    if agent_id.is_empty() || skill_name.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: agent_id and skill_name are required"}],
+            "isError": true
+        });
+    }
+
+    // Validate inputs to prevent path traversal
+    if !is_safe_path_component(agent_id) || !is_safe_path_component(skill_name) {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: invalid agent_id or skill_name (alphanumeric, hyphens, underscores only)"}],
+            "isError": true
+        });
+    }
+
+    let agent_skills_dir = home_dir.join("agents").join(agent_id).join("SKILLS");
+    let global_skills_dir = home_dir.join("skills");
+
+    // [H-4] Security scan before graduation to global scope
+    let skill_path = agent_skills_dir.join(format!("{skill_name}.md"));
+    let content = match tokio::fs::read_to_string(&skill_path).await {
+        Ok(c) => c,
+        Err(e) => return serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: Failed to read skill: {e}")}],
+            "isError": true
+        }),
+    };
+    {
+        use duduclaw_gateway::skill_lifecycle::security_scanner;
+        let scan = security_scanner::scan_skill(&content, None);
+        if !scan.passed {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!(
+                    "Error: Security scan failed before graduation (risk: {:?}, {} findings). \
+                     Fix the issues or use skill_security_scan for details.",
+                    scan.risk_level, scan.findings.len()
+                )}],
+                "isError": true
+            });
+        }
+    }
+
+    use duduclaw_gateway::skill_lifecycle::graduation;
+
+    let candidate = graduation::GraduationCandidate {
+        skill_name: skill_name.to_string(),
+        source_agent_id: agent_id.to_string(),
+        lift: 0.0, // manual graduation — no lift data
+        load_count: 0,
+        is_stable: true,
+        first_activated: chrono::Utc::now(),
+    };
+
+    match graduation::graduate_to_global(&candidate, &agent_skills_dir, &global_skills_dir).await {
+        Ok(record) => {
+            let home_clone = home_dir.to_path_buf();
+            let record_clone = record.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                graduation::append_graduation_log(&record_clone, &home_clone);
+            }).await;
+            serde_json::json!({
+                "content": [{"type": "text", "text": format!(
+                    "Skill '{skill_name}' graduated from agent '{agent_id}' to global scope.\n\
+                     Location: ~/.duduclaw/skills/{skill_name}.md"
+                )}]
+            })
+        }
+        Err(e) => serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: Graduation failed: {e}")}],
+            "isError": true
+        }),
+    }
+}
+
+/// Report skill synthesis and sandbox trial status.
+async fn handle_skill_synthesis_status(params: &Value, home_dir: &Path) -> Value {
+    let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+
+    let agent_name = if agent_id.is_empty() {
+        resolve_main_agent_name(home_dir).await
+    } else {
+        agent_id.to_string()
+    };
+
+    // Read recent synthesis events from feedback.jsonl (tail only, max 64KB)
+    let feedback_path = home_dir.join("feedback.jsonl");
+    let mut synthesis_events = Vec::new();
+    let tail_content = {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut buf = String::new();
+        if let Ok(mut file) = tokio::fs::File::open(&feedback_path).await {
+            let file_len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+            const MAX_TAIL: u64 = 64_000;
+            if file_len > MAX_TAIL {
+                let _ = file.seek(std::io::SeekFrom::End(-(MAX_TAIL as i64))).await;
+            }
+            let _ = file.read_to_string(&mut buf).await;
+        }
+        buf
+    };
+    if !tail_content.is_empty() {
+        for line in tail_content.lines().rev().take(50) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
+                && val.get("signal_type").and_then(|v| v.as_str()) == Some("synthesis_trigger")
+                && val.get("agent_id").and_then(|v| v.as_str()) == Some(&agent_name)
+            {
+                let topic = val.get("topic").and_then(|v| v.as_str()).unwrap_or("?");
+                let gaps = val.get("gap_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                let err = val.get("avg_composite_error").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                synthesis_events.push(format!(
+                    "topic: {topic}, gaps: {gaps}, avg_error: {err:.2}"
+                ));
+            }
+        }
+    }
+
+    // Read graduation log
+    let graduation_records = duduclaw_gateway::skill_lifecycle::graduation::load_graduation_log(home_dir);
+    let agent_graduations: Vec<_> = graduation_records
+        .iter()
+        .filter(|r| r.source_agent == agent_name)
+        .map(|r| format!("- {} (lift: {:.1}%, at: {})", r.skill_name, r.lift * 100.0, r.graduated_at.format("%Y-%m-%d")))
+        .collect();
+
+    let text = format!(
+        "**Skill Lifecycle Status: {agent_name}**\n\n\
+         ## Recent Synthesis Triggers\n{synthesis}\n\n\
+         ## Graduated Skills\n{graduated}",
+        synthesis = if synthesis_events.is_empty() {
+            "  (none)".to_string()
+        } else {
+            synthesis_events.iter().map(|s| format!("- {s}")).collect::<Vec<_>>().join("\n")
+        },
+        graduated = if agent_graduations.is_empty() {
+            "  (none)".to_string()
+        } else {
+            agent_graduations.join("\n")
+        },
+    );
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": text}]
+    })
+}
+
 /// Resolve the main agent name from the agents directory.
 // ── Delegation safety helpers ────────────────────────────────
 
@@ -4421,6 +4759,9 @@ async fn handle_tools_call(
         "agent_update_soul" => handle_agent_update_soul(&arguments, home_dir).await,
         "skill_search" => handle_skill_search(&arguments, home_dir).await,
         "skill_list" => handle_skill_list(&arguments, home_dir).await,
+        "skill_security_scan" => handle_skill_security_scan(&arguments, home_dir).await,
+        "skill_graduate" => handle_skill_graduate(&arguments, home_dir).await,
+        "skill_synthesis_status" => handle_skill_synthesis_status(&arguments, home_dir).await,
         "submit_feedback" => handle_submit_feedback(&arguments, home_dir, default_agent).await,
         "evolution_toggle" => handle_evolution_toggle(&arguments, home_dir).await,
         "evolution_status" => handle_evolution_status_tool(&arguments, home_dir, default_agent).await,
@@ -4460,6 +4801,14 @@ async fn handle_tools_call(
         "wiki_lint" => handle_wiki_lint(&arguments, home_dir, default_agent).await,
         "wiki_stats" => handle_wiki_stats(&arguments, home_dir, default_agent).await,
         "wiki_export" => handle_wiki_export(&arguments, home_dir, default_agent).await,
+        // Shared Wiki tools
+        "shared_wiki_ls" => handle_shared_wiki_ls(home_dir).await,
+        "shared_wiki_read" => handle_shared_wiki_read(&arguments, home_dir).await,
+        "shared_wiki_write" => handle_shared_wiki_write(&arguments, home_dir, default_agent).await,
+        "shared_wiki_search" => handle_shared_wiki_search(&arguments, home_dir).await,
+        "shared_wiki_delete" => handle_shared_wiki_delete(&arguments, home_dir, default_agent).await,
+        "shared_wiki_stats" => handle_shared_wiki_stats(home_dir).await,
+        "wiki_share" => handle_wiki_share(&arguments, home_dir, default_agent).await,
         // Skill Internalization tools
         "skill_extract" => handle_skill_extract(&arguments, home_dir, default_agent).await,
         // Program execution
@@ -4814,6 +5163,74 @@ fn resolve_wiki_dir(home_dir: &Path, agent_id: &str) -> std::result::Result<std:
     Ok(agent_dir.join("wiki"))
 }
 
+/// Check whether `caller_agent` is allowed to read `target_agent`'s wiki.
+///
+/// Returns `Ok(true)` if access is allowed, `Ok(false)` if denied.
+/// Always allows self-access (caller == target).
+fn check_wiki_visibility(home_dir: &Path, target_agent: &str, caller_agent: &str) -> std::result::Result<bool, String> {
+    // Self-access always allowed
+    if caller_agent == target_agent {
+        return Ok(true);
+    }
+
+    let agent_toml_path = home_dir.join("agents").join(target_agent).join("agent.toml");
+    let toml_content = match std::fs::read_to_string(&agent_toml_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(true), // If agent.toml unreadable, default to open (backward compat)
+    };
+
+    // Parse wiki_visible_to from [capabilities] section
+    // Simple TOML field extraction without a full parser
+    let visible_to = extract_toml_string_array(&toml_content, "wiki_visible_to");
+
+    // If field is absent, default to ["*"] (backward compatible)
+    let visible_to = match visible_to {
+        Some(v) => v,
+        None => return Ok(true),
+    };
+
+    // ["*"] means all agents can read
+    if visible_to.iter().any(|v| v == "*") {
+        return Ok(true);
+    }
+
+    // Empty list means fully private
+    if visible_to.is_empty() {
+        return Ok(false);
+    }
+
+    // Check if caller is in the list
+    Ok(visible_to.iter().any(|v| v == caller_agent))
+}
+
+/// Extract a string array value from TOML content (simple parser, no dependency).
+/// Handles format: `field_name = ["a", "b", "c"]`
+fn extract_toml_string_array(content: &str, field: &str) -> Option<Vec<String>> {
+    let prefix = format!("{} = ", field);
+    let alt_prefix = format!("{}=", field);
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let rest = if let Some(r) = trimmed.strip_prefix(&prefix) {
+            r
+        } else if let Some(r) = trimmed.strip_prefix(&alt_prefix) {
+            r
+        } else {
+            continue;
+        };
+        let rest = rest.trim();
+        if rest.starts_with('[') && rest.ends_with(']') {
+            let inner = &rest[1..rest.len() - 1];
+            let items: Vec<String> = inner
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            return Some(items);
+        }
+    }
+    None
+}
+
 /// Ensure the wiki directory structure exists, creating scaffold if needed.
 fn ensure_wiki_dir(wiki_dir: &Path) -> std::result::Result<(), String> {
     let subdirs = ["entities", "concepts", "sources", "synthesis"];
@@ -4990,6 +5407,18 @@ fn collect_md_files(base: &Path, dir: &Path) -> Vec<std::path::PathBuf> {
 async fn handle_wiki_ls(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
     let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
 
+    // Visibility check for cross-agent access
+    if agent_id != default_agent {
+        match check_wiki_visibility(home_dir, agent_id, default_agent) {
+            Ok(false) => return tool_error(&format!(
+                "Agent '{}' wiki is not visible to '{}'. Ask the owner to add you to wiki_visible_to.",
+                agent_id, default_agent
+            )),
+            Err(e) => return tool_error(&format!("Visibility check failed: {e}")),
+            _ => {}
+        }
+    }
+
     let wiki_dir = match resolve_wiki_dir(home_dir, agent_id) {
         Ok(d) => d,
         Err(e) => return tool_error(&e),
@@ -5025,6 +5454,18 @@ async fn handle_wiki_read(args: &Value, home_dir: &Path, default_agent: &str) ->
         Some(p) => p,
         None => return tool_error("Missing required parameter: page_path"),
     };
+
+    // Visibility check for cross-agent access
+    if agent_id != default_agent {
+        match check_wiki_visibility(home_dir, agent_id, default_agent) {
+            Ok(false) => return tool_error(&format!(
+                "Agent '{}' wiki is not visible to '{}'. Ask the owner to add you to wiki_visible_to.",
+                agent_id, default_agent
+            )),
+            Err(e) => return tool_error(&format!("Visibility check failed: {e}")),
+            _ => {}
+        }
+    }
 
     // Allow reading reserved files (e.g. _index.md, _schema.md) — validation only blocks writes
     if page_path.contains("..") || page_path.starts_with('/') || page_path.starts_with('\\') {
@@ -5131,6 +5572,19 @@ async fn handle_wiki_write(args: &Value, home_dir: &Path, default_agent: &str) -
 
 async fn handle_wiki_search(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
     let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
+
+    // Visibility check for cross-agent access
+    if agent_id != default_agent {
+        match check_wiki_visibility(home_dir, agent_id, default_agent) {
+            Ok(false) => return tool_error(&format!(
+                "Agent '{}' wiki is not visible to '{}'. Ask the owner to add you to wiki_visible_to.",
+                agent_id, default_agent
+            )),
+            Err(e) => return tool_error(&format!("Visibility check failed: {e}")),
+            _ => {}
+        }
+    }
+
     let query = match args.get("query").and_then(|v| v.as_str()) {
         Some(q) if !q.is_empty() => q,
         _ => return tool_error("Missing required parameter: query"),
@@ -5353,6 +5807,18 @@ async fn handle_wiki_export(args: &Value, home_dir: &Path, default_agent: &str) 
     let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
     let format = args.get("format").and_then(|v| v.as_str()).unwrap_or("html");
 
+    // Visibility check for cross-agent access
+    if agent_id != default_agent {
+        match check_wiki_visibility(home_dir, agent_id, default_agent) {
+            Ok(false) => return tool_error(&format!(
+                "Agent '{}' wiki is not visible to '{}'. Ask the owner to add you to wiki_visible_to.",
+                agent_id, default_agent
+            )),
+            Err(e) => return tool_error(&format!("Visibility check failed: {e}")),
+            _ => {}
+        }
+    }
+
     let wiki_dir = match resolve_wiki_dir(home_dir, agent_id) {
         Ok(d) => d,
         Err(e) => return tool_error(&e),
@@ -5399,6 +5865,442 @@ async fn handle_wiki_export(args: &Value, home_dir: &Path, default_agent: &str) 
             }
         }
         _ => tool_error(&format!("Unknown format '{}'. Use 'obsidian' or 'html'.", format)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared Wiki handlers
+// ---------------------------------------------------------------------------
+
+/// Resolve the shared wiki directory.
+fn resolve_shared_wiki_dir(home_dir: &Path) -> std::path::PathBuf {
+    home_dir.join("shared").join("wiki")
+}
+
+/// Ensure the shared wiki scaffold exists.
+fn ensure_shared_wiki_dir(wiki_dir: &Path) -> std::result::Result<(), String> {
+    let subdirs = ["entities", "concepts", "sources", "synthesis"];
+    for sub in &subdirs {
+        let p = wiki_dir.join(sub);
+        std::fs::create_dir_all(&p).map_err(|e| format!("create dir {}: {e}", p.display()))?;
+    }
+    // Scaffold reserved files
+    let scaffold: &[(&str, &str)] = &[
+        ("_schema.md", "# Shared Wiki Schema\n\nThis is the shared knowledge base accessible to all agents.\n\n## Subdirectories\n- `entities/` — people, products, organizations\n- `concepts/` — procedures, policies, domain knowledge\n- `sources/` — shared pages from agent wikis\n- `synthesis/` — cross-agent analysis and summaries\n"),
+        ("_index.md", "# Shared Wiki Index\n\n<!-- Auto-maintained. One entry per page. -->\n"),
+        ("_log.md", "# Shared Wiki Log\n\n<!-- Append-only operation log with author attribution. -->\n"),
+    ];
+    for (name, content) in scaffold {
+        let path = wiki_dir.join(name);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(content.as_bytes()).map_err(|e| format!("write {name}: {e}"))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("create {name}: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// Detect sensitive patterns in content (secret scanner for wiki writes).
+fn contains_sensitive_pattern(content: &str) -> Option<&'static str> {
+    let patterns: &[(&str, &str)] = &[
+        ("sk-ant-", "Anthropic API key"),
+        ("sk-proj-", "OpenAI API key"),
+        ("api_key=", "API key assignment"),
+        ("password=", "password assignment"),
+        ("PRIVATE KEY", "private key"),
+        ("ghp_", "GitHub personal access token"),
+        ("gho_", "GitHub OAuth token"),
+        ("xoxb-", "Slack bot token"),
+        ("xoxp-", "Slack user token"),
+    ];
+    for (pattern, label) in patterns {
+        if content.contains(pattern) {
+            return Some(label);
+        }
+    }
+    None
+}
+
+async fn handle_shared_wiki_ls(home_dir: &Path) -> Value {
+    let wiki_dir = resolve_shared_wiki_dir(home_dir);
+    if !wiki_dir.exists() {
+        return tool_text("No shared wiki found. Use shared_wiki_write to create the first page.");
+    }
+
+    let pages = collect_md_files(&wiki_dir, &wiki_dir);
+    if pages.is_empty() {
+        return tool_text("Shared wiki directory exists but contains no pages.");
+    }
+
+    let mut lines = Vec::with_capacity(pages.len() + 1);
+    lines.push(format!("Shared wiki ({} pages):\n", pages.len()));
+
+    for rel_path in &pages {
+        let full_path = wiki_dir.join(rel_path);
+        let content = std::fs::read_to_string(&full_path).unwrap_or_default();
+        let title = extract_frontmatter_title(&content)
+            .unwrap_or_else(|| rel_path.to_string_lossy().to_string());
+        let updated = extract_frontmatter_updated(&content).unwrap_or_else(|| "?".to_string());
+        let author = extract_frontmatter_field(&content, "author")
+            .unwrap_or_else(|| "unknown".to_string());
+        lines.push(format!("  {} — {} (by: {}, updated: {})", rel_path.display(), title, author, updated));
+    }
+
+    tool_text(&lines.join("\n"))
+}
+
+async fn handle_shared_wiki_read(args: &Value, home_dir: &Path) -> Value {
+    let page_path = match args.get("page_path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return tool_error("Missing required parameter: page_path"),
+    };
+
+    if page_path.contains("..") || page_path.starts_with('/') || page_path.starts_with('\\') {
+        return tool_error("Path traversal is not allowed");
+    }
+
+    let wiki_dir = resolve_shared_wiki_dir(home_dir);
+    let full_path = wiki_dir.join(page_path);
+
+    // Symlink protection
+    if full_path.exists()
+        && let (Ok(canon_wiki), Ok(canon_page)) = (wiki_dir.canonicalize(), full_path.canonicalize())
+        && !canon_page.starts_with(&canon_wiki)
+    {
+        return tool_error("Path escapes shared wiki directory");
+    }
+
+    match std::fs::read_to_string(&full_path) {
+        Ok(content) => tool_text(&content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tool_error(&format!("Page not found: {}", page_path))
+        }
+        Err(e) => tool_error(&format!("Failed to read page: {e}")),
+    }
+}
+
+async fn handle_shared_wiki_write(args: &Value, home_dir: &Path, caller_agent: &str) -> Value {
+    let page_path = match args.get("page_path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return tool_error("Missing required parameter: page_path"),
+    };
+    let content = match args.get("content").and_then(|v| v.as_str()) {
+        Some(c) => c,
+        None => return tool_error("Missing required parameter: content"),
+    };
+
+    if let Err(e) = validate_wiki_page_path(page_path) {
+        return tool_error(&e);
+    }
+
+    if content.len() > WIKI_MAX_PAGE_SIZE {
+        return tool_error(&format!("Content too large: {} bytes (max {})", content.len(), WIKI_MAX_PAGE_SIZE));
+    }
+
+    // Secret scanner
+    if let Some(label) = contains_sensitive_pattern(content) {
+        return tool_error(&format!("Content contains sensitive data ({label}). Remove it before writing to shared wiki."));
+    }
+
+    let wiki_dir = resolve_shared_wiki_dir(home_dir);
+    if let Err(e) = ensure_shared_wiki_dir(&wiki_dir) {
+        return tool_error(&e);
+    }
+
+    let store = duduclaw_memory::WikiStore::new_shared(home_dir);
+    match store.write_page_with_author(page_path, content, caller_agent) {
+        Ok(()) => tool_text(&format!("Written shared wiki page: {} (by: {})", page_path, caller_agent)),
+        Err(e) => tool_error(&format!("Failed to write shared wiki page: {e}")),
+    }
+}
+
+async fn handle_shared_wiki_search(args: &Value, home_dir: &Path) -> Value {
+    let query = match args.get("query").and_then(|v| v.as_str()) {
+        Some(q) if !q.is_empty() => q,
+        _ => return tool_error("Missing required parameter: query"),
+    };
+    let limit: usize = args
+        .get("limit")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10)
+        .min(100);
+
+    let wiki_dir = resolve_shared_wiki_dir(home_dir);
+    if !wiki_dir.exists() {
+        return tool_text("No shared wiki found. Use shared_wiki_write to create the first page.");
+    }
+
+    let query_terms: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
+    let pages = collect_md_files(&wiki_dir, &wiki_dir);
+
+    let mut scored: Vec<(usize, String, String, String, Vec<String>)> = Vec::new(); // (score, path, title, author, lines)
+
+    for rel_path in &pages {
+        let full_path = wiki_dir.join(rel_path);
+        let content = match std::fs::read_to_string(&full_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let content_lower = content.to_lowercase();
+        let score: usize = query_terms.iter().filter(|t| content_lower.contains(t.as_str())).count();
+        if score == 0 {
+            continue;
+        }
+
+        let title = extract_frontmatter_title(&content)
+            .unwrap_or_else(|| rel_path.to_string_lossy().to_string());
+        let author = extract_frontmatter_field(&content, "author")
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let matching_lines: Vec<String> = content
+            .lines()
+            .filter(|line| {
+                let ll = line.to_lowercase();
+                query_terms.iter().any(|t| ll.contains(t.as_str()))
+            })
+            .take(3)
+            .map(|l| {
+                let trimmed = l.trim();
+                if trimmed.chars().count() > 120 {
+                    let truncated: String = trimmed.chars().take(117).collect();
+                    format!("  {}...", truncated)
+                } else {
+                    format!("  {}", trimmed)
+                }
+            })
+            .collect();
+
+        scored.push((score, rel_path.to_string_lossy().to_string(), title, author, matching_lines));
+    }
+
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.truncate(limit);
+
+    if scored.is_empty() {
+        return tool_text(&format!("No shared wiki pages match '{}'.", query));
+    }
+
+    let mut output = format!("Found {} shared wiki results for '{}':\n\n", scored.len(), query);
+    for (score, path, title, author, lines) in &scored {
+        output.push_str(&format!("📄 {} — {} (by: {}, relevance: {})\n", path, title, author, score));
+        for line in lines {
+            output.push_str(&format!("{}\n", line));
+        }
+        output.push('\n');
+    }
+
+    tool_text(&output)
+}
+
+async fn handle_shared_wiki_delete(args: &Value, home_dir: &Path, caller_agent: &str) -> Value {
+    let page_path = match args.get("page_path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return tool_error("Missing required parameter: page_path"),
+    };
+
+    if let Err(e) = validate_wiki_page_path(page_path) {
+        return tool_error(&e);
+    }
+
+    let wiki_dir = resolve_shared_wiki_dir(home_dir);
+    let full_path = wiki_dir.join(page_path);
+
+    if !full_path.exists() {
+        return tool_error(&format!("Page not found: {}", page_path));
+    }
+
+    // ACL: only author or main agent can delete
+    let content = std::fs::read_to_string(&full_path).unwrap_or_default();
+    let page_author = extract_frontmatter_field(&content, "author").unwrap_or_default();
+
+    // Check if caller is the main agent
+    let is_main = std::fs::read_to_string(home_dir.join("agents").join(caller_agent).join("agent.toml"))
+        .map(|c| c.contains("role = \"main\""))
+        .unwrap_or(false);
+
+    if page_author != caller_agent && !is_main {
+        return tool_error(&format!(
+            "Permission denied: page was authored by '{}'. Only the author or a main agent can delete shared wiki pages.",
+            page_author
+        ));
+    }
+
+    let store = duduclaw_memory::WikiStore::new_shared(home_dir);
+    match store.delete_page(page_path) {
+        Ok(()) => tool_text(&format!("Deleted shared wiki page: {} (by: {})", page_path, caller_agent)),
+        Err(e) => tool_error(&format!("Failed to delete: {e}")),
+    }
+}
+
+async fn handle_shared_wiki_stats(home_dir: &Path) -> Value {
+    let wiki_dir = resolve_shared_wiki_dir(home_dir);
+    if !wiki_dir.exists() {
+        return tool_text("No shared wiki found.");
+    }
+
+    let pages = collect_md_files(&wiki_dir, &wiki_dir);
+    if pages.is_empty() {
+        return tool_text("Shared wiki exists but has no pages.");
+    }
+
+    let mut author_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut dir_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut latest_updated = String::new();
+
+    for rel_path in &pages {
+        let full_path = wiki_dir.join(rel_path);
+        let content = std::fs::read_to_string(&full_path).unwrap_or_default();
+
+        let author = extract_frontmatter_field(&content, "author")
+            .unwrap_or_else(|| "unknown".to_string());
+        *author_counts.entry(author).or_default() += 1;
+
+        let dir = rel_path.parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("root")
+            .to_string();
+        *dir_counts.entry(dir).or_default() += 1;
+
+        let updated = extract_frontmatter_updated(&content).unwrap_or_default();
+        if updated > latest_updated {
+            latest_updated = updated;
+        }
+    }
+
+    let mut output = format!("Shared Wiki Stats\n\nTotal pages: {}\nLast updated: {}\n\n", pages.len(), latest_updated);
+
+    output.push_str("Contributors:\n");
+    let mut authors: Vec<_> = author_counts.into_iter().collect();
+    authors.sort_by(|a, b| b.1.cmp(&a.1));
+    for (author, count) in &authors {
+        output.push_str(&format!("  {} — {} pages\n", author, count));
+    }
+
+    output.push_str("\nBy directory:\n");
+    let mut dirs: Vec<_> = dir_counts.into_iter().collect();
+    dirs.sort_by(|a, b| b.1.cmp(&a.1));
+    for (dir, count) in &dirs {
+        output.push_str(&format!("  {} — {} pages\n", dir, count));
+    }
+
+    tool_text(&output)
+}
+
+async fn handle_wiki_share(args: &Value, home_dir: &Path, caller_agent: &str) -> Value {
+    let page_path = match args.get("page_path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return tool_error("Missing required parameter: page_path"),
+    };
+    let custom_summary = args.get("summary").and_then(|v| v.as_str());
+
+    // Read source page from caller's wiki
+    let wiki_dir = match resolve_wiki_dir(home_dir, caller_agent) {
+        Ok(d) => d,
+        Err(e) => return tool_error(&e),
+    };
+
+    let full_path = wiki_dir.join(page_path);
+    let source_content = match std::fs::read_to_string(&full_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return tool_error(&format!("Page not found in your wiki: {}", page_path));
+        }
+        Err(e) => return tool_error(&format!("Failed to read source page: {e}")),
+    };
+
+    let source_title = extract_frontmatter_title(&source_content)
+        .unwrap_or_else(|| page_path.to_string());
+    let source_body = extract_frontmatter_body(&source_content);
+
+    // Generate summary
+    let summary = match custom_summary {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            let chars: String = source_body.chars().take(500).collect();
+            if source_body.chars().count() > 500 {
+                format!("{}...", chars)
+            } else {
+                chars
+            }
+        }
+    };
+
+    // Secret scanner on summary
+    if let Some(label) = contains_sensitive_pattern(&summary) {
+        return tool_error(&format!("Summary contains sensitive data ({label}). Redact before sharing."));
+    }
+
+    // Build shared page name: sources/{caller}--{page_stem}.md
+    let page_stem = std::path::Path::new(page_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("page");
+    let shared_page_path = format!("sources/{}--{}.md", caller_agent, page_stem);
+
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let shared_content = format!(
+        "---\ntitle: \"{}\"\nauthor: \"{}\"\nsource_agent: \"{}\"\nsource_page: \"{}\"\nshared_at: \"{}\"\nupdated: \"{}\"\ntags: [shared, from-{}]\n---\n\n{}\n\n---\n*Shared from {}'s wiki (`{}`)*\n",
+        source_title, caller_agent, caller_agent, page_path, now, now, caller_agent,
+        summary,
+        caller_agent, page_path,
+    );
+
+    // Write to shared wiki
+    let shared_wiki_dir = resolve_shared_wiki_dir(home_dir);
+    if let Err(e) = ensure_shared_wiki_dir(&shared_wiki_dir) {
+        return tool_error(&e);
+    }
+
+    let store = duduclaw_memory::WikiStore::new_shared(home_dir);
+    match store.write_page_with_author(&shared_page_path, &shared_content, caller_agent) {
+        Ok(()) => tool_text(&format!(
+            "Shared '{}' to shared wiki as '{}' (by: {})",
+            page_path, shared_page_path, caller_agent
+        )),
+        Err(e) => tool_error(&format!("Failed to write shared page: {e}")),
+    }
+}
+
+/// Extract a named field from frontmatter (helper for shared wiki).
+fn extract_frontmatter_field(content: &str, field: &str) -> Option<String> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return None;
+    }
+    let rest = &trimmed[3..];
+    let end = rest.find("\n---")?;
+    let fm = &rest[..end];
+    let prefix = format!("{}:", field);
+    for line in fm.lines() {
+        let line = line.trim();
+        if let Some(after) = line.strip_prefix(&prefix) {
+            let val = after.trim().trim_matches('"').trim_matches('\'');
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Extract body text (after frontmatter closing `---`).
+fn extract_frontmatter_body(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return content.to_string();
+    }
+    let rest = &trimmed[3..];
+    if let Some(end) = rest.find("\n---") {
+        let after = &rest[end + 4..];
+        after.trim_start_matches('\n').to_string()
+    } else {
+        content.to_string()
     }
 }
 
@@ -5522,8 +6424,11 @@ async fn handle_execute_program(args: &Value) -> Value {
     tracing::info!(language, timeout_seconds, "execute_program called");
 
     let (cmd, cmd_args): (&str, Vec<String>) = match language.as_str() {
-        "python" => ("python3", vec!["-c".to_string(), code.clone()]),
+        "python" => (duduclaw_core::platform::python3_command(), vec!["-c".to_string(), code.clone()]),
+        #[cfg(not(windows))]
         "bash" => ("bash", vec!["-c".to_string(), code.clone()]),
+        #[cfg(windows)]
+        "bash" => ("cmd", vec!["/C".to_string(), code.clone()]),
         "javascript" => ("node", vec!["-e".to_string(), code.clone()]),
         other => {
             return tool_error(&format!(
@@ -5540,7 +6445,8 @@ async fn handle_execute_program(args: &Value) -> Value {
         .args(&cmd_args)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default())
+        .env("USERPROFILE", std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default())
         .env("LANG", std::env::var("LANG").unwrap_or_default())
         .env("TERM", std::env::var("TERM").unwrap_or_default())
         .env("PYTHONUNBUFFERED", "1")

@@ -46,6 +46,33 @@ pub fn set_version_override(version: &str) {
     // SAFETY: called once at startup before any concurrent reads.
     unsafe { std::env::set_var("DUDUCLAW_VERSION", version) };
 }
+/// Check whether automatic update is enabled.
+///
+/// Pro editions default to `true`; CE defaults to `false`.
+/// Overridable via `[gateway].auto_update` in config.toml or
+/// `DUDUCLAW_AUTO_UPDATE` env var (`1`/`true` to enable, `0`/`false` to disable).
+pub fn auto_update_enabled(home_dir: &std::path::Path) -> bool {
+    // 1. Env override takes priority
+    if let Ok(val) = std::env::var("DUDUCLAW_AUTO_UPDATE") {
+        return matches!(val.as_str(), "1" | "true" | "yes");
+    }
+
+    // 2. config.toml [gateway].auto_update
+    let config_path = home_dir.join("config.toml");
+    if let Ok(content) = std::fs::read_to_string(&config_path) {
+        if let Ok(table) = content.parse::<toml::Table>() {
+            if let Some(gw) = table.get("gateway").and_then(|v| v.as_table()) {
+                if let Some(val) = gw.get("auto_update").and_then(|v| v.as_bool()) {
+                    return val;
+                }
+            }
+        }
+    }
+
+    // 3. Default: Pro = true, CE = false
+    is_pro_edition()
+}
+
 /// Maximum download + decompressed binary size: 200 MB. [H5][R2:NC2]
 const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 /// Maximum release notes length: 8 KB. [M1]
@@ -845,6 +872,37 @@ mod tests {
     }
 
     // [R2:NL2] Test isolation: use compare_exchange to avoid polluting parallel tests
+    #[test]
+    fn test_auto_update_defaults() {
+        // With no env var and no config.toml, CE defaults to false
+        let tmp = std::env::temp_dir().join("duduclaw-test-auto-update");
+        let _ = std::fs::create_dir_all(&tmp);
+        // No config.toml → falls through to is_pro_edition() which is false in CE tests
+        let result = auto_update_enabled(&tmp);
+        // In test environment, is_pro_edition() returns false → auto_update = false
+        assert!(!result);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_auto_update_config_override() {
+        let tmp = std::env::temp_dir().join("duduclaw-test-auto-update-cfg");
+        let _ = std::fs::create_dir_all(&tmp);
+        std::fs::write(
+            tmp.join("config.toml"),
+            "[gateway]\nauto_update = true\n",
+        ).unwrap();
+        assert!(auto_update_enabled(&tmp));
+
+        std::fs::write(
+            tmp.join("config.toml"),
+            "[gateway]\nauto_update = false\n",
+        ).unwrap();
+        assert!(!auto_update_enabled(&tmp));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn test_update_guard_resets_flag() {
         let was_false = UPDATE_IN_PROGRESS

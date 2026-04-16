@@ -3,6 +3,50 @@
 All notable changes to DuDuClaw are documented here. For the authoritative
 version history and per-commit detail, see `git log`.
 
+## [v1.4.29] — 2026-04-16
+
+### Added
+
+- **Skill auto-synthesis (Phase 3-4).** Gap accumulator detects repeated
+  domain gaps → synthesizes skills from episodic memory (Voyager-inspired)
+  → sandbox trial with TTL management → cross-agent graduation to global
+  scope. New MCP tools: `skill_security_scan`, `skill_graduate`,
+  `skill_synthesis_status`.
+
+- **Task Board.** SQLite-backed task management with status/priority/
+  assignment tracking and real-time Activity Feed via WebSocket. MCP tools:
+  `tasks.list`, `tasks.create`, `tasks.update`, `tasks.assign`,
+  `activity.list`, `activity.subscribe`.
+
+- **Shared Knowledge Base.** Cross-agent wiki at `~/.duduclaw/shared/wiki/`
+  for organizational knowledge (SOPs, policies, product specs). Wiki target
+  classification (agent/shared/both), visibility control via `wiki_visible_to`
+  capability, full-text search with author attribution. MCP tools:
+  `shared_wiki_ls`, `shared_wiki_read`, `shared_wiki_write`,
+  `shared_wiki_search`, `shared_wiki_delete`, `shared_wiki_stats`, `wiki_share`.
+
+- **Autopilot rule engine.** Event-driven automation — triggers: task_created,
+  task_status_changed, channel_message, agent_idle, cron. Actions: task_delegate,
+  notify, skill_execute. Dashboard Settings → Autopilot tab for rule management
+  and execution history.
+
+- **Skill Market three-tab UI.** Marketplace / Shared Skills / My Skills with
+  skill adoption flow and usage statistics.
+
+- **Security status endpoint.** Exposes credential proxy, mount guard, RBAC,
+  rate limiter, and SOUL drift state via API.
+
+- **Analytics endpoints.** Conversation summaries and cost savings tracking.
+
+### Enhanced
+
+- MCP Server expanded from 70+ to 80+ tools.
+- Dashboard i18n keys expanded from 540+ to 600+ (zh-TW / en / ja-JP).
+- Evolution config extensibility for skill synthesis thresholds, graduation
+  criteria, and curiosity-driven exploration.
+- `CapabilitiesConfig` now includes `wiki_visible_to` with explicit `Default`
+  implementation and `sanitize()` for safe deserialization.
+
 ## [v1.4.28] — 2026-04-15
 
 ### Fixed

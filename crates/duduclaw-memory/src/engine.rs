@@ -52,6 +52,7 @@ impl SqliteMemoryEngine {
     pub fn new(db_path: &Path) -> Result<Self> {
         let conn =
             Connection::open(db_path).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
         Self::init_tables(&conn)?;
         info!(?db_path, "SQLite memory engine initialised");
         Ok(Self {
@@ -70,6 +71,14 @@ impl SqliteMemoryEngine {
             conn: Mutex::new(conn),
             retrieval_weights: RetrievalWeights::default(),
         })
+    }
+
+    /// Acquire the database connection for maintenance tasks (e.g., decay/archival).
+    ///
+    /// Callers hold the lock for the duration of their work, preventing concurrent
+    /// writes during multi-statement maintenance operations.
+    pub async fn conn_for_maintenance(&self) -> tokio::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().await
     }
 
     /// Select clause for all memory columns (qualified with table alias `m.`).
@@ -139,6 +148,58 @@ impl SqliteMemoryEngine {
             .query_map(params![sanitized_query, agent_id, layer.as_str(), limit as i64], Self::row_to_entry)
             .map_err(|e| {
                 tracing::warn!("FTS5 layer search error: {e}");
+                DuDuClawError::Memory("Search query error".to_string())
+            })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
+    /// Search episodic memories by topic keywords, filtering for higher-importance entries.
+    ///
+    /// Used by the skill synthesizer to find successful conversation patterns
+    /// related to a specific topic for auto-synthesis.
+    pub async fn search_successful_conversations(
+        &self,
+        agent_id: &str,
+        topic: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().await;
+
+        let cleaned: String = topic
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\'' | ':' | '^' | '{' | '}' | '*' | '(' | ')'))
+            .take(500)
+            .collect();
+        if cleaned.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let sanitized_query = format!("\"{}\"", cleaned.replace('"', ""));
+
+        let sql = "SELECT m.content
+             FROM memories_fts AS f
+             JOIN memories AS m ON m.id = f.memory_id
+             WHERE f.memories_fts MATCH ?1
+               AND f.agent_id = ?2
+               AND m.layer = 'episodic'
+               AND m.importance >= 5.0
+             ORDER BY m.timestamp DESC
+             LIMIT ?3";
+
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![sanitized_query, agent_id, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| {
+                tracing::warn!("FTS5 synthesis search error: {e}");
                 DuDuClawError::Memory("Search query error".to_string())
             })?;
 
@@ -520,7 +581,7 @@ async fn call_claude_summarize(raw_memories: &str) -> String {
         None => return String::new(),
     };
 
-    let claude = match which_claude_bin() {
+    let claude = match duduclaw_core::which_claude() {
         Some(p) => p,
         None => return String::new(),
     };
@@ -553,9 +614,6 @@ async fn call_claude_summarize(raw_memories: &str) -> String {
     }
 }
 
-fn which_claude_bin() -> Option<String> {
-    duduclaw_core::which_claude()
-}
 
 #[cfg(test)]
 mod tests {
