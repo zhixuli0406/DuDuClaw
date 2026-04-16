@@ -378,29 +378,42 @@ use super::generator::escape_xml_tag as escape_xml_tag_verifier;
 
 /// Strip markdown code fences (` ```json ... ``` ` or ` ``` ... ``` `)
 /// that LLMs commonly wrap around JSON responses.
-/// Also handles responses with preamble text before the fence (e.g., "Sure:\n```json\n{...}\n```").
+/// Handles: bare fences, preamble text before fence, and trailing text after closing fence.
 fn strip_json_fences(s: &str) -> &str {
     let trimmed = s.trim();
-    // Fast path: response starts with fence
-    if let Some(rest) = trimmed.strip_prefix("```json") {
-        return rest.strip_suffix("```").unwrap_or(rest).trim();
-    }
-    if let Some(rest) = trimmed.strip_prefix("```") {
-        return rest.strip_suffix("```").unwrap_or(rest).trim();
-    }
-    // Slow path: preamble text before fence (e.g., "Sure:\n```json\n{...}\n```")
-    // Only match fences at line start (after \n) to avoid matching inside JSON string values.
-    if let Some(fence_start) = trimmed.find("\n```json") {
-        let after_fence = &trimmed[fence_start + 8..]; // skip "\n```json"
-        return after_fence.strip_suffix("```").unwrap_or(after_fence).trim();
-    }
-    if let Some(fence_start) = trimmed.find("\n```") {
-        let after_fence = &trimmed[fence_start + 4..]; // skip "\n```"
-        if let Some(end) = after_fence.rfind("```") {
-            return after_fence[..end].trim();
+
+    // Find the opening fence — either at the start or after preamble text.
+    // We search for both "```json" and bare "```" variants.
+    let fence_start = [
+        // Check start-of-string first (fast path)
+        trimmed.starts_with("```json").then(|| 7usize),    // "```json".len()
+        trimmed.starts_with("```").then(|| 3usize),        // "```".len()
+        // Then check after newline (preamble path)
+        trimmed.find("\n```json").map(|pos| pos + 8),      // "\n```json".len()
+        trimmed.find("\n```").map(|pos| pos + 4),           // "\n```".len()
+    ]
+    .into_iter()
+    .flatten()
+    .next();
+
+    let content_start = match fence_start {
+        Some(start) => {
+            // Skip optional newline right after the opening fence tag
+            let after_tag = &trimmed[start..];
+            if after_tag.starts_with('\n') { start + 1 } else { start }
         }
+        None => return trimmed,
+    };
+
+    let content = &trimmed[content_start..];
+
+    // Find the closing fence using rfind to handle trailing text after ```
+    if let Some(close_pos) = content.rfind("```") {
+        return content[..close_pos].trim();
     }
-    trimmed
+
+    // No closing fence found — return everything after opening fence
+    content.trim()
 }
 
 fn extract_score(text: &str) -> Option<f64> {
