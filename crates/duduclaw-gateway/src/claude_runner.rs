@@ -767,6 +767,12 @@ tokio::task_local! {
     /// env vars.  Thread-safe because each dispatch runs in its own
     /// `tokio::spawn` task with its own task-local scope.
     pub static DELEGATION_ENV: std::collections::HashMap<String, String>;
+
+    /// Channel context injected by channel handlers (Telegram, LINE, Discord, etc.)
+    /// before spawning a CLI session.  Format: `<channel_type>:<channel_id>[:<thread_id>]`.
+    /// The MCP `send_to_agent` tool reads this to register a delegation callback
+    /// so the dispatcher can forward sub-agent responses back to the originating channel.
+    pub static REPLY_CHANNEL: String;
 }
 
 /// Prepare a `claude` CLI command with common args and env vars.
@@ -860,6 +866,12 @@ fn prepare_claude_cmd(
             // Delegation depth tracking is not needed for direct user→agent chat.
             debug!("No DELEGATION_ENV task-local — delegation depth tracking inactive");
         }
+    }
+
+    // Inject channel reply context so `send_to_agent` MCP tool can register
+    // delegation callbacks for sub-agent response forwarding.
+    if let Ok(channel) = REPLY_CHANNEL.try_with(|ch| ch.clone()) {
+        cmd.env(duduclaw_core::ENV_REPLY_CHANNEL, &channel);
     }
 
     (cmd, prompt_guard)

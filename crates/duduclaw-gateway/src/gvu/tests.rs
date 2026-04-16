@@ -137,6 +137,30 @@ mod verifier_tests {
         let response2 = "approved: false\nscore: 0.3\nfeedback: violates boundaries";
         let result2 = parse_judge_response(response2);
         assert!(!result2.approved);
+
+        // Markdown-wrapped JSON (common LLM output format)
+        let response3 = "```json\n{\"approved\": true, \"score\": 0.83, \"feedback\": \"Well-reasoned evolution\"}\n```";
+        let result3 = parse_judge_response(response3);
+        assert!(result3.approved);
+        assert!((result3.score - 0.83).abs() < 0.01);
+
+        // Bare ``` fence without json tag
+        let response4 = "```\n{\"approved\": true, \"score\": 0.75, \"feedback\": \"ok\"}\n```";
+        let result4 = parse_judge_response(response4);
+        assert!(result4.approved);
+        assert!((result4.score - 0.75).abs() < 0.01);
+
+        // Already valid JSON (no fences) still works
+        let response5 = r#"{"approved": true, "score": 0.90, "feedback": "great"}"#;
+        let result5 = parse_judge_response(response5);
+        assert!(result5.approved);
+        assert!((result5.score - 0.90).abs() < 0.01);
+
+        // Preamble text before JSON fence (common LLM pattern)
+        let response6 = "Sure, here is my evaluation:\n```json\n{\"approved\": true, \"score\": 0.82, \"feedback\": \"solid\"}\n```";
+        let result6 = parse_judge_response(response6);
+        assert!(result6.approved);
+        assert!((result6.score - 0.82).abs() < 0.01);
     }
 
     #[test]

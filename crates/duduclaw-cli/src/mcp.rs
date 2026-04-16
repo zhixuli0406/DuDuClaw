@@ -1204,6 +1204,59 @@ async fn send_to_agent_with_ctx(
         }).await;
     }
 
+    // Register delegation callback if running inside a channel context.
+    // The dispatcher will use this to forward the sub-agent's response
+    // back to the originating channel (Telegram/LINE/Discord/etc.).
+    if let Ok(reply_channel) = std::env::var(duduclaw_core::ENV_REPLY_CHANNEL) {
+        let db_path = home_dir.join("message_queue.db");
+        let msg_id_cb = msg_id.clone();
+        let caller_cb = caller.to_string();
+        let channel_str = reply_channel;
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+                // Ensure table exists (MCP process may open DB before gateway).
+                // Schema must match message_queue.rs init_schema — keep in sync.
+                let _ = conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS delegation_callbacks (
+                         message_id   TEXT PRIMARY KEY,
+                         agent_id     TEXT NOT NULL,
+                         channel_type TEXT NOT NULL,
+                         channel_id   TEXT NOT NULL,
+                         thread_id    TEXT,
+                         retry_count  INTEGER NOT NULL DEFAULT 0,
+                         created_at   TEXT NOT NULL
+                     );
+                     CREATE INDEX IF NOT EXISTS idx_dc_agent ON delegation_callbacks(agent_id);"
+                );
+                // Parse channel context: "telegram:12345" or "telegram:12345:6789"
+                let parts: Vec<&str> = channel_str.splitn(3, ':').collect();
+                if parts.len() >= 2 && duduclaw_core::SUPPORTED_CHANNEL_TYPES.contains(&parts[0]) {
+                    // Rate limit: max 100 pending callbacks per agent to prevent DoS
+                    let count: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM delegation_callbacks WHERE agent_id = ?1",
+                        rusqlite::params![caller_cb],
+                        |r| r.get(0),
+                    ).unwrap_or(0);
+                    if count >= 100 {
+                        tracing::warn!(agent = %caller_cb, "delegation_callbacks per-agent limit (100) reached");
+                    } else {
+                    let ch_type = parts[0];
+                    let ch_id = parts[1];
+                    let thread = parts.get(2).map(|s| s.to_string());
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let _ = conn.execute(
+                        "INSERT OR IGNORE INTO delegation_callbacks \
+                         (message_id, agent_id, channel_type, channel_id, thread_id, created_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![msg_id_cb, caller_cb, ch_type, ch_id, thread, now],
+                    );
+                    }
+                }
+            }
+        }).await;
+    }
+
     let ts = chrono::Utc::now().to_rfc3339();
     if queued {
         serde_json::json!({
