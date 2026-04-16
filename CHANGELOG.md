@@ -3,6 +3,22 @@
 All notable changes to DuDuClaw are documented here. For the authoritative
 version history and per-commit detail, see `git log`.
 
+## [v1.4.31] — 2026-04-16
+
+### Fixed
+
+- **GVU JSON fence parsing.** Rewrote `strip_json_fences()` to handle LLM
+  responses with trailing text after the closing ` ``` ` fence. Previous
+  implementation used `strip_suffix` which failed when judges appended
+  commentary, causing 22 consecutive GVU trigger failures since 4/07.
+  Unified fast-path and preamble-path into a single `rfind`-based approach.
+
+### Changed
+
+- Dashboard live data, logs fix, analytics API (from v1.4.30)
+
+---
+
 ## [v1.4.29] — 2026-04-16
 
 ### Added
