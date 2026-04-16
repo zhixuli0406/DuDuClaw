@@ -69,14 +69,9 @@ impl TopicCoverage {
 }
 
 /// Map of all topics encountered by an agent.
+#[derive(Default)]
 pub struct TopicCoverageMap {
     topics: HashMap<String, TopicCoverage>,
-}
-
-impl Default for TopicCoverageMap {
-    fn default() -> Self {
-        Self { topics: HashMap::new() }
-    }
 }
 
 impl TopicCoverageMap {

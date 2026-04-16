@@ -207,15 +207,10 @@ pub fn evaluate_trial(
 // ---------------------------------------------------------------------------
 
 /// Manages all sandboxed skills across agents.
+#[derive(Default)]
 pub struct SandboxStore {
     /// (agent_id, skill_name) → sandboxed skill.
     skills: HashMap<(String, String), SandboxedSkill>,
-}
-
-impl Default for SandboxStore {
-    fn default() -> Self {
-        Self { skills: HashMap::new() }
-    }
 }
 
 impl SandboxStore {
