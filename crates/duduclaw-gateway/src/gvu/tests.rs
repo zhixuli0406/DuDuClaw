@@ -161,6 +161,18 @@ mod verifier_tests {
         let result6 = parse_judge_response(response6);
         assert!(result6.approved);
         assert!((result6.score - 0.82).abs() < 0.01);
+
+        // Trailing text after closing fence (the production bug scenario)
+        let response7 = "Sure, here is my evaluation:\n```json\n{\"approved\": true, \"score\": 0.88, \"feedback\": \"well-reasoned\"}\n```\nLet me know if you need any changes.";
+        let result7 = parse_judge_response(response7);
+        assert!(result7.approved, "trailing text after closing fence should not break parsing");
+        assert!((result7.score - 0.88).abs() < 0.01);
+
+        // Trailing text after closing fence — fence at start
+        let response8 = "```json\n{\"approved\": true, \"score\": 0.91, \"feedback\": \"good\"}\n```\nHope this helps!";
+        let result8 = parse_judge_response(response8);
+        assert!(result8.approved, "start-fence with trailing text should parse correctly");
+        assert!((result8.score - 0.91).abs() < 0.01);
     }
 
     #[test]
