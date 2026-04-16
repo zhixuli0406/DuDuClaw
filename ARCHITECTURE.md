@@ -1,7 +1,7 @@
 # DuDuClaw 系統架構設計
 
-> 版本：1.2.0-beta.1
-> 日期：2026-04-05
+> 版本：1.4.29
+> 日期：2026-04-16
 
 ---
 
@@ -696,3 +696,46 @@ Per-agent 排程系統，負責 bus polling 和靜默破壞器：
 - 靜默破壞器：超過 `max_silence_hours`（預設 12h）無進化觸發 → 記錄警告
 - 進化反思由預測引擎在對話後事件驅動觸發（見 [第七節](#七自主進化引擎prediction-driven--gvu)）
 - RPC 方法：`heartbeat.status` + `heartbeat.trigger`
+
+## 十四、v1.4.29 新增模組
+
+### 14.1 Skill 自動合成（Phase 3-4）
+
+Voyager-inspired 技能自動合成管線：
+
+1. **Gap Accumulator** — 追蹤重複出現的領域缺口
+2. **Skill Synthesis** — 從情境記憶（episodic memory）自動合成新 Skill
+3. **Sandbox Trial** — 沙箱環境試用評估（TTL 管理）
+4. **Cross-Agent Graduation** — 經驗證的 Skill 自動升級至全域可用
+5. **Skill Recommendation** — 為新 Agent 推薦已驗證的 Skill
+
+MCP 工具：`skill_security_scan`、`skill_graduate`、`skill_synthesis_status`
+
+### 14.2 Task Board
+
+SQLite-backed 任務管理系統：
+
+- 狀態追蹤（pending / in_progress / completed / cancelled）
+- 優先級（low / medium / high / critical）
+- Agent 指派與轉派
+- 即時 Activity Feed（WebSocket 推播）
+- MCP 工具：`tasks.list`、`tasks.create`、`tasks.update`、`tasks.assign`、`activity.list`、`activity.subscribe`
+
+### 14.3 共享知識庫（Shared Wiki）
+
+跨 Agent 共享知識管理：
+
+- 儲存路徑：`~/.duduclaw/shared/wiki/`
+- Wiki Target 分類：agent / shared / both（自動路由）
+- `wiki_visible_to` capability 控制可見性
+- 全文搜尋 + 作者歸屬
+- MCP 工具：`shared_wiki_ls`、`shared_wiki_read`、`shared_wiki_write`、`shared_wiki_search`、`shared_wiki_delete`、`shared_wiki_stats`、`wiki_share`
+
+### 14.4 Autopilot 規則引擎
+
+事件驅動的自動化系統：
+
+- 觸發器：task_created / task_status_changed / channel_message / agent_idle / cron
+- 動作：task_delegate / notify / skill_execute
+- Dashboard 設定頁面（Autopilot tab）
+- 歷史紀錄與執行監控

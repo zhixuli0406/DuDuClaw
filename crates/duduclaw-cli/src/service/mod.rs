@@ -30,22 +30,6 @@ pub async fn handle_service(action: ServiceAction) -> Result<()> {
     }
 }
 
-/// Detect the current platform and print service manager info.
-#[allow(dead_code)] // Public API — will be called from future `service install` command
-pub fn detect_platform() {
-    #[cfg(target_os = "macos")]
-    println!("Platform: macOS — will use launchd");
-
-    #[cfg(target_os = "linux")]
-    println!("Platform: Linux — will use systemd");
-
-    #[cfg(target_os = "windows")]
-    println!("Platform: Windows — will use Windows Service");
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    println!("Platform: unsupported for service management");
-}
-
 // ---------------------------------------------------------------------------
 // Linux — systemd
 // ---------------------------------------------------------------------------
@@ -204,7 +188,7 @@ mod launchd {
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let remaining = find_pids_on_port(port);
             if remaining.is_empty() {
                 println!("✓ Service stopped gracefully. Port {port} released.");
@@ -216,7 +200,7 @@ mod launchd {
                 for &pid in &remaining {
                     duduclaw_core::platform::kill_process(pid as u32).ok();
                 }
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
                 let still_alive = find_pids_on_port(port);
                 if still_alive.is_empty() {

@@ -1159,8 +1159,9 @@ mod tests {
     #[test]
     fn depth_limit_constant_is_reasonable() {
         // Ensure MAX_DELEGATION_DEPTH is between 2 and 10
-        assert!(MAX_DELEGATION_DEPTH >= 2);
-        assert!(MAX_DELEGATION_DEPTH <= 10);
+        let depth = MAX_DELEGATION_DEPTH;
+        assert!(depth >= 2, "MAX_DELEGATION_DEPTH too small: {depth}");
+        assert!(depth <= 10, "MAX_DELEGATION_DEPTH too large: {depth}");
     }
 
     #[test]

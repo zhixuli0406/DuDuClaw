@@ -26,7 +26,7 @@ export const useLogsStore = create<LogsStore>((set, get) => {
     subscribe: () => {
       // Guard against double subscription (e.g. React Strict Mode)
       unsubscribeFn?.();
-      api.logs.subscribe().catch(() => {});
+      api.logs.subscribe().catch((e) => console.warn("[api]", e));
       unsubscribeFn = client.subscribe('logs.entry', (payload) => {
         if (get().paused) return;
         const entry = { ...payload as LogEntry, _id: nextId++ };
@@ -37,7 +37,7 @@ export const useLogsStore = create<LogsStore>((set, get) => {
       });
     },
     unsubscribe: () => {
-      api.logs.unsubscribe().catch(() => {});
+      api.logs.unsubscribe().catch((e) => console.warn("[api]", e));
       unsubscribeFn?.();
       unsubscribeFn = null;
     },

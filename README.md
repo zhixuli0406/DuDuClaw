@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.4.27-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.4.29-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -31,7 +31,7 @@ DuDuClaw (plumbing)
   ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu / WebChat
   ├─ Multi-Runtime — Claude / Codex / Gemini / OpenAI-compat 自動偵測 + per-agent 設定
   ├─ Session Manager — SQLite, 50k token 自動壓縮（CJK-aware）
-  ├─ MCP Server — 70+ 工具（通訊、記憶、Agent、Skill、推論、ERP）
+  ├─ MCP Server — 80+ 工具（通訊、記憶、Agent、Skill、推論、任務、知識庫、ERP）
   ├─ Evolution Engine — GVU² 雙迴圈進化 + 預測驅動 + MistakeNotebook
   ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / MLX / ONNX
   ├─ Voice Pipeline — ASR (SenseVoice / Whisper) + TTS (Piper / MiniMax) + VAD (Silero)
@@ -60,7 +60,7 @@ DuDuClaw (plumbing)
 
 | 特色 | 說明 |
 |------|------|
-| **MCP Server 架構** | `duduclaw mcp-server` 提供 70+ 工具，涵蓋通訊、記憶、Agent 管理、推論、排程、Skill 市場、Odoo ERP |
+| **MCP Server 架構** | `duduclaw mcp-server` 提供 80+ 工具，涵蓋通訊、記憶、Agent 管理、推論、排程、Skill 市場、任務看板、共享知識庫、Odoo ERP |
 | **Multi-Runtime** | `AgentRuntime` trait — Claude / Codex / Gemini / OpenAI-compat 四種後端，`RuntimeRegistry` 自動偵測，per-agent 設定 |
 | **本地推論引擎** | 統一 `InferenceBackend` trait — llama.cpp（Metal/CUDA/Vulkan）/ mistral.rs（ISQ + PagedAttention）/ Exo P2P 叢集 / llamafile / MLX（Apple Silicon）/ OpenAI-compat HTTP |
 | **三層信心路由** | LocalFast → LocalStrong → CloudAPI，基於啟發式信心評分自動分流，CJK-aware token estimation |
@@ -98,6 +98,10 @@ DuDuClaw (plumbing)
 | **TaskSpec 工作流** | 多步驟任務規劃 — dependency-aware scheduling / auto-retry（3x）/ replan（最多 2 次）/ persistence |
 | **Orchestrator 模板** | 5 步規劃策略（Analyze → Decompose → Delegate → Evaluate → Synthesize）+ 複雜度路由 |
 | **Skill 生命週期** | 7 階段管理 — Activation → Compression → Extraction → Reconstruction → Distillation → Diagnostician → Gap Analysis |
+| **Skill 自動合成** | 偵測重複領域缺口 → 從情境記憶合成新 Skill → 沙箱試用（TTL 管理）→ 跨 Agent 畢業升級 |
+| **Task Board** | SQLite 任務管理 — 狀態/優先級/指派追蹤 + 即時 Activity Feed（WebSocket 推播）|
+| **Autopilot 規則引擎** | 自動化任務委派、通知、Skill 觸發 — 支援任務建立/狀態變更/頻道訊息/閒置偵測/Cron 排程 |
+| **共享知識庫** | `~/.duduclaw/shared/wiki/` 跨 Agent 共享知識（SOP、政策、產品規格）+ 全文搜尋 + 作者歸屬 |
 | **Reminder 排程** | 一次性提醒（相對時間 `5m`/`2h`/`1d` 或 ISO 8601 絕對時間），`direct` 靜態訊息或 `agent_callback` 喚醒模式 |
 
 ### 安全防護
@@ -144,7 +148,9 @@ DuDuClaw (plumbing)
 | **即時日誌** | BroadcastLayer tracing → WebSocket 推播 |
 | **組織架構圖** | D3.js 互動式 Agent 層級視覺化 |
 | **深淺色切換** | 跟隨系統偏好，支援手動切換 |
-| **國際化** | zh-TW / en / ja-JP 三語支援（540+ 翻譯鍵）|
+| **國際化** | zh-TW / en / ja-JP 三語支援（600+ 翻譯鍵）|
+| **Skill Market 三分頁** | Marketplace / Shared Skills / My Skills 三分頁架構 + Skill 採用流程 |
+| **Autopilot 設定** | 自動化規則建立/管理/監控 + 歷史紀錄檢視 |
 | **Session Replay** | 對話回放元件，支援時間軸檢視 |
 
 ---
@@ -156,7 +162,7 @@ DuDuClaw (plumbing)
 | 語言 | Rust | TypeScript | Rust | Rust | Python |
 | 頻道 | 7 | 25+ | 8 | 5 | 0 (API) |
 | Multi-Runtime | **4 後端（Claude/Codex/Gemini/OpenAI）** | - | - | - | 多 LLM |
-| MCP Server | **70+ 工具** | - | - | - | - |
+| MCP Server | **80+ 工具** | - | - | - | - |
 | 自我演化引擎 | **GVU² 雙迴圈** | - | - | - | - |
 | 本地推論 | **6 後端 + 三層信心路由** | - | - | - | - |
 | 語音 (ASR/TTS) | **4 ASR + 4 TTS provider** | - | - | - | - |

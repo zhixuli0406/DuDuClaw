@@ -18,10 +18,12 @@ import { WebChatPage } from './pages/WebChatPage';
 import { BillingPage } from './pages/BillingPage';
 import { ReportPage } from './pages/ReportPage';
 import { KnowledgeHubPage } from './pages/KnowledgeHubPage';
+import { SharedWikiPage } from './pages/SharedWikiPage';
 import { OnboardWizardPage } from './pages/OnboardWizardPage';
 import { OdooPage } from './pages/OdooPage';
 import { UsersPage } from './pages/UsersPage';
 import { McpPage } from './pages/McpPage';
+import { TaskBoardPage } from './pages/TaskBoardPage';
 import { useConnectionStore } from './stores/connection-store';
 import { useAuthStore } from './stores/auth-store';
 
@@ -52,9 +54,11 @@ export function App() {
           <Route index element={<DashboardPage />} />
           <Route path="webchat" element={<WebChatPage />} />
           <Route path="agents" element={<AgentsPage />} />
+          <Route path="tasks" element={<TaskBoardPage />} />
           <Route path="skills" element={<SkillMarketPage />} />
           <Route path="memory" element={<MemoryPage />} />
           <Route path="wiki" element={<KnowledgeHubPage />} />
+          <Route path="shared-wiki" element={<SharedWikiPage />} />
 
           {/* manager+ routes */}
           <Route element={<RoleGuard minRole="manager" />}>

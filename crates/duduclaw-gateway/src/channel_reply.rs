@@ -26,7 +26,9 @@ use crate::skill_extraction::recorder::{
 };
 use crate::skill_lifecycle::activation::SkillActivationController;
 use crate::skill_lifecycle::compression::CompressedSkillCache;
+use crate::skill_lifecycle::gap_accumulator::GapAccumulator;
 use crate::skill_lifecycle::lift::LiftTrackerStore;
+use crate::skill_lifecycle::sandbox_trial::SandboxStore;
 
 /// Shared channel status map, accessible by both channel bots and the RPC handler.
 pub type ChannelStatusMap = Arc<RwLock<std::collections::HashMap<String, ChannelState>>>;
@@ -52,6 +54,10 @@ pub struct ReplyContext {
     pub skill_activation: Arc<tokio::sync::Mutex<SkillActivationController>>,
     /// Skill lifecycle: lift tracker store.
     pub skill_lift: Arc<tokio::sync::Mutex<LiftTrackerStore>>,
+    /// Skill lifecycle: gap accumulator for auto-synthesis triggering.
+    pub gap_accumulator: Arc<tokio::sync::Mutex<GapAccumulator>>,
+    /// Skill lifecycle: sandbox store for trial skills.
+    pub sandbox_store: Arc<tokio::sync::Mutex<SandboxStore>>,
     /// Sessions with voice reply mode enabled (toggled by /voice command).
     pub voice_sessions: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     /// Per-channel, per-scope settings (mention_only, whitelist, auto_thread, etc.).
@@ -112,6 +118,8 @@ impl ReplyContext {
             skill_cache: Arc::new(tokio::sync::Mutex::new(CompressedSkillCache::new())),
             skill_activation: Arc::new(tokio::sync::Mutex::new(SkillActivationController::new(5))),
             skill_lift: Arc::new(tokio::sync::Mutex::new(LiftTrackerStore::new())),
+            gap_accumulator: Arc::new(tokio::sync::Mutex::new(GapAccumulator::new(3, 24))),
+            sandbox_store: Arc::new(tokio::sync::Mutex::new(SandboxStore::new())),
             voice_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             channel_settings: Arc::new(channel_settings),
             killswitch: Arc::new(killswitch),
@@ -587,14 +595,13 @@ async fn build_reply_with_session_inner(
     let history = match session_mgr.get_messages(session_id).await {
         Ok(msgs) => {
             if msgs.len() > 1 {
-                let history_text = msgs
-                    .iter()
-                    .rev()
-                    .skip(1) // skip the message we just appended
-                    .rev()
-                    .map(|m| format!("{}: {}", m.role, m.content))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let mut history_text = String::with_capacity(msgs.len() * 200);
+                // All messages except the last one (which we just appended)
+                for m in msgs.iter().take(msgs.len().saturating_sub(1)) {
+                    if !history_text.is_empty() { history_text.push('\n'); }
+                    use std::fmt::Write;
+                    let _ = write!(history_text, "{}: {}", m.role, m.content);
+                }
                 format!("\n\n## Conversation History\n{history_text}")
             } else {
                 String::new()
@@ -772,6 +779,8 @@ async fn build_reply_with_session_inner(
             let skill_cache_for_pred = ctx.skill_cache.clone();
             let skill_activation_for_pred = ctx.skill_activation.clone();
             let skill_lift_for_pred = ctx.skill_lift.clone();
+            let gap_acc_for_pred = ctx.gap_accumulator.clone();
+            let sandbox_for_pred = ctx.sandbox_store.clone();
             let notebook_for_pred = ctx.mistake_notebook.clone();
 
             tokio::spawn(async move {
@@ -869,9 +878,61 @@ async fn build_reply_with_session_inner(
                                 ctrl.activate(&agent_id_for_pred, skill_name, error.composite_error);
                             }
                         }
-                        // Report skill gap to evolution engine
+                        // Report skill gap to evolution engine + accumulate for synthesis
                         if let Some(ref gap) = diagnosis.skill_gap {
                             crate::skill_lifecycle::gap::inject_skill_gap(gap, &home_for_pred, &agent_id_for_pred);
+
+                            // Accumulate gap for potential auto-synthesis
+                            let trigger = {
+                                let mut acc = gap_acc_for_pred.lock().await;
+                                acc.record_gap(&agent_id_for_pred, gap, error.composite_error)
+                            };
+                            if let Some(trigger) = trigger {
+                                info!(
+                                    agent = %agent_id_for_pred,
+                                    topic = %trigger.topic,
+                                    gap_count = trigger.gap_count,
+                                    "Skill synthesis trigger fired — queuing synthesis"
+                                );
+                                // Log synthesis trigger event to feedback.jsonl
+                                // Use structured fields to prevent second-order injection via topic
+                                let signal = serde_json::json!({
+                                    "signal_type": "synthesis_trigger",
+                                    "agent_id": &agent_id_for_pred,
+                                    "topic": &trigger.topic,
+                                    "gap_count": trigger.gap_count,
+                                    "avg_composite_error": trigger.avg_composite_error,
+                                    "channel": "skill_synthesis",
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                });
+                                let feedback_path = home_for_pred.join("feedback.jsonl");
+                                let feedback_clone = feedback_path.clone();
+                                let signal_str = signal.to_string();
+                                // Non-blocking write to avoid stalling async runtime
+                                tokio::task::spawn_blocking(move || {
+                                    use std::io::Write;
+                                    if let Err(e) = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(&feedback_clone)
+                                        .and_then(|mut f| writeln!(f, "{}", signal_str))
+                                    {
+                                        tracing::warn!(
+                                            path = %feedback_clone.display(),
+                                            error = %e,
+                                            "Failed to write synthesis trigger to feedback.jsonl"
+                                        );
+                                    }
+                                });
+
+                                // Mark topic as pending to prevent re-triggering during
+                                // async synthesis. Call confirm_synthesis() on success or
+                                // cancel_pending() on failure to resume gap accumulation.
+                                {
+                                    let mut acc = gap_acc_for_pred.lock().await;
+                                    acc.mark_pending(&agent_id_for_pred, &trigger.topic);
+                                }
+                            }
                         }
                     }
 
@@ -929,6 +990,77 @@ async fn build_reply_with_session_inner(
                             );
                             // Distillation via GVU would be triggered here in production
                             // (requires async GVU call — deferred to dedicated distillation task)
+                        }
+
+                        // Scan for graduation candidates (cross-agent migration)
+                        {
+                            let lift_store = skill_lift_for_pred.lock().await;
+                            let trackers = lift_store.get_all(&agent_id_for_pred);
+                            let criteria = crate::skill_lifecycle::graduation::GraduationCriteria::default();
+                            for tracker in &trackers {
+                                if let Some(candidate) = crate::skill_lifecycle::graduation::check_graduation(tracker, &criteria) {
+                                    info!(
+                                        agent = %agent_id_for_pred,
+                                        skill = %candidate.skill_name,
+                                        lift = format!("{:.3}", candidate.lift),
+                                        "Skill eligible for graduation to global scope"
+                                    );
+                                }
+                            }
+                        }
+
+                        // Evaluate sandbox trials
+                        // Lock ordering: collect data from each lock independently,
+                        // never hold lift_store and sandbox_store simultaneously.
+                        {
+                            let sandbox_names = {
+                                let store = sandbox_for_pred.lock().await;
+                                store.active_names(&agent_id_for_pred)
+                            };
+
+                            // Collect tracker snapshots (lift data) — release lift_store before sandbox
+                            let tracker_snapshots: Vec<_> = {
+                                let lift_store = skill_lift_for_pred.lock().await;
+                                sandbox_names.iter().filter_map(|name| {
+                                    lift_store.get_all(&agent_id_for_pred)
+                                        .into_iter()
+                                        .find(|t| t.skill_name == *name)
+                                        .map(|t| (name.clone(), t.clone()))
+                                }).collect()
+                            }; // lift_store released here
+
+                            for (name, tracker) in &tracker_snapshots {
+                                let sandboxed = {
+                                    let store = sandbox_for_pred.lock().await;
+                                    store.get(&agent_id_for_pred, name).cloned()
+                                };
+                                if let Some(sandboxed) = sandboxed {
+                                    let outcome = crate::skill_lifecycle::sandbox_trial::evaluate_trial(tracker, &sandboxed);
+                                    match outcome.decision {
+                                        crate::skill_lifecycle::sandbox_trial::TrialDecision::Graduate => {
+                                            info!(agent = %agent_id_for_pred, skill = %name, "Sandbox trial → GRADUATE");
+                                            let mut store = sandbox_for_pred.lock().await;
+                                            store.graduate(&agent_id_for_pred, name);
+                                        }
+                                        crate::skill_lifecycle::sandbox_trial::TrialDecision::Discard => {
+                                            info!(agent = %agent_id_for_pred, skill = %name, reason = %outcome.reason, "Sandbox trial → DISCARD");
+                                            let mut store = sandbox_for_pred.lock().await;
+                                            store.discard(&agent_id_for_pred, name);
+                                            let mut ctrl = skill_activation_for_pred.lock().await;
+                                            ctrl.deactivate(&agent_id_for_pred, name);
+                                        }
+                                        crate::skill_lifecycle::sandbox_trial::TrialDecision::ExtendTrial(extra) => {
+                                            if extra > 0 {
+                                                let mut store = sandbox_for_pred.lock().await;
+                                                store.extend_ttl(&agent_id_for_pred, name, extra);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Tick all sandbox TTLs
+                            let mut store = sandbox_for_pred.lock().await;
+                            store.tick_agent(&agent_id_for_pred);
                         }
                     }
                 }
@@ -1145,10 +1277,15 @@ async fn build_reply_with_session_inner(
             if sm.should_compress(&sid).await {
                 // Gather last messages to summarise
                 let msgs = sm.get_messages(&sid).await.unwrap_or_default();
-                let transcript: String = msgs.iter()
-                    .map(|m| format!("[{}] {}", m.role, &m.content[..m.content.len().min(300)]))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let transcript = {
+                    let mut buf = String::with_capacity(msgs.len() * 350);
+                    for m in &msgs {
+                        if !buf.is_empty() { buf.push('\n'); }
+                        use std::fmt::Write;
+                        let _ = write!(buf, "[{}] {}", m.role, &m.content[..m.content.len().min(300)]);
+                    }
+                    buf
+                };
                 let prompt = format!(
                     "Summarize the following conversation history concisely for use as context \
                      in future turns. Include key facts, decisions, and outcomes. Max 400 words.\n\n{transcript}"
@@ -1955,7 +2092,7 @@ async fn spawn_claude_cli_with_env(
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     // Find claude binary
-    let claude_path = which_claude().ok_or_else(|| "claude CLI not found in PATH".to_string())?;
+    let claude_path = duduclaw_core::which_claude().ok_or_else(|| "claude CLI not found in PATH".to_string())?;
 
     // API key is optional — OAuth users authenticate via OS keychain.
     // Only set ANTHROPIC_API_KEY env var if we have one (as backup/override).
@@ -2350,11 +2487,6 @@ async fn spawn_claude_cli_with_env(
     Ok(result_text)
 }
 
-/// Find the `claude` binary — delegates to shared impl in duduclaw-core (BE-L1).
-fn which_claude() -> Option<String> {
-    duduclaw_core::which_claude()
-}
-
 /// Extract a human-readable detail from a `tool_use` content block's `input`.
 ///
 /// Tries common field names: `file_path`, `path`, `command`, `pattern`, `query`.
@@ -2380,7 +2512,7 @@ fn find_python_path(home_dir: &Path) -> String {
 /// Public version usable from other modules (e.g. handlers).
 pub fn find_python_path_static(home_dir: &Path) -> String {
     // Try common locations
-    let candidates = [
+    let mut candidates = vec![
         // Installed via pip
         String::new(), // use system PYTHONPATH
         // Development: project root python/
@@ -2390,18 +2522,24 @@ pub fn find_python_path_static(home_dir: &Path) -> String {
             .join("python")
             .to_string_lossy()
             .to_string(),
-        // Homebrew / source install
-        "/opt/duduclaw".to_string(),
-        // Homebrew Cellar (Apple Silicon) — libexec/python/
-        "/opt/homebrew/opt/duduclaw-pro/libexec/python".to_string(),
-        // Homebrew Cellar (Intel Mac) — libexec/python/
-        "/usr/local/opt/duduclaw-pro/libexec/python".to_string(),
-        // User-local fallback
-        format!(
-            "{}/.duduclaw/python",
-            home_dir.to_string_lossy()
-        ),
     ];
+    #[cfg(not(windows))]
+    {
+        // Homebrew / source install
+        candidates.push("/opt/duduclaw".to_string());
+        // Homebrew Cellar (Apple Silicon)
+        candidates.push("/opt/homebrew/opt/duduclaw-pro/libexec/python".to_string());
+        // Homebrew Cellar (Intel Mac)
+        candidates.push("/usr/local/opt/duduclaw-pro/libexec/python".to_string());
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+            candidates.push(format!("{appdata}\\Programs\\duduclaw\\python"));
+        }
+    }
+    // User-local fallback
+    candidates.push(home_dir.join(".duduclaw").join("python").to_string_lossy().to_string());
 
     for path in &candidates {
         if !path.is_empty() && Path::new(path).join("duduclaw").exists() {
@@ -2444,7 +2582,7 @@ async fn call_python_sdk_v2(
     let config_path = home_dir.join("config.toml");
     let python_path = find_python_path(home_dir);
 
-    let mut child = Command::new("python3")
+    let mut child = Command::new(duduclaw_core::platform::python3_command())
         .args([
             "-m",
             "duduclaw.sdk.chat",

@@ -8,6 +8,32 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+/// Skill type in a hierarchical composition (SkillRL-inspired).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillType {
+    /// Single-capability skill (leaf node).
+    #[default]
+    Atomic,
+    /// Composes 2-3 atomic skills into a cohesive workflow.
+    Functional,
+    /// Task-level orchestration that coordinates functional/atomic skills.
+    Planning,
+}
+
+/// How dependencies are composed when activated together.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ComposeMode {
+    /// All dependencies loaded simultaneously (default).
+    #[default]
+    Parallel,
+    /// Dependencies loaded in order, output of one feeds next.
+    Sequential,
+    /// Dependencies loaded based on runtime conditions.
+    Conditional,
+}
+
 /// Parsed skill metadata from frontmatter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillMeta {
@@ -24,6 +50,15 @@ pub struct SkillMeta {
     pub author: String,
     #[serde(default)]
     pub version: String,
+    /// Other skills this skill depends on (by name).
+    #[serde(default)]
+    pub requires: Vec<String>,
+    /// Skill complexity level in the hierarchy.
+    #[serde(default)]
+    pub skill_type: SkillType,
+    /// How dependencies should be composed.
+    #[serde(default)]
+    pub compose_mode: ComposeMode,
 }
 
 /// A fully loaded skill with metadata and content.
@@ -90,6 +125,9 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<(SkillMeta, String), 
                 tags: Vec::new(),
                 author: String::new(),
                 version: String::new(),
+                requires: Vec::new(),
+                skill_type: SkillType::default(),
+                compose_mode: ComposeMode::default(),
             },
             content.to_string(),
         ));
@@ -123,6 +161,9 @@ fn parse_simple_yaml(yaml: &str, path: &Path) -> Result<SkillMeta, String> {
         tags: Vec<String>,
         author: String,
         version: String,
+        requires: Vec<String>,
+        skill_type: SkillType,
+        compose_mode: ComposeMode,
     }
 
     let raw: RawMeta = serde_yaml::from_str(yaml).unwrap_or_else(|e| {
@@ -147,6 +188,9 @@ fn parse_simple_yaml(yaml: &str, path: &Path) -> Result<SkillMeta, String> {
         tags: raw.tags,
         author: raw.author,
         version: raw.version,
+        requires: raw.requires,
+        skill_type: raw.skill_type,
+        compose_mode: raw.compose_mode,
     })
 }
 
@@ -178,19 +222,23 @@ pub async fn install_skill(
     let parsed = parse_skill_file(skill_path)?;
 
     // Create directories
-    std::fs::create_dir_all(agent_skills_dir)
+    tokio::fs::create_dir_all(agent_skills_dir)
+        .await
         .map_err(|e| format!("Failed to create skills dir: {e}"))?;
-    std::fs::create_dir_all(quarantine_dir)
+    tokio::fs::create_dir_all(quarantine_dir)
+        .await
         .map_err(|e| format!("Failed to create quarantine dir: {e}"))?;
 
     let filename = format!("{}.md", parsed.meta.name);
     let dest = agent_skills_dir.join(&filename);
 
     // Copy skill content
-    let content = std::fs::read_to_string(skill_path)
+    let content = tokio::fs::read_to_string(skill_path)
+        .await
         .map_err(|e| format!("Failed to read skill: {e}"))?;
 
-    std::fs::write(&dest, &content)
+    tokio::fs::write(&dest, &content)
+        .await
         .map_err(|e| format!("Failed to write skill: {e}"))?;
 
     info!(

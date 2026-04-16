@@ -3,14 +3,16 @@
 use std::path::PathBuf;
 
 /// Expand `~` or `~/...` prefix to the HOME directory.
+/// Uses `HOME` on Unix, `USERPROFILE` on Windows.
 pub fn expand_tilde(path: &str) -> PathBuf {
+    let home = || std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
     if path == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home);
+        if let Ok(h) = home() {
+            return PathBuf::from(h);
         }
     } else if let Some(rest) = path.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
+        && let Ok(h) = home() {
+            return PathBuf::from(h).join(rest);
         }
     PathBuf::from(path)
 }

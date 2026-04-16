@@ -6,13 +6,23 @@
 
 pub mod activation;
 pub mod compression;
+pub mod curiosity;
+pub mod dependency_resolver;
 pub mod diagnostician;
 pub mod distillation;
 pub mod extraction;
 pub mod gap;
+pub mod gap_accumulator;
+pub mod graduation;
 pub mod lift;
+pub mod recommender;
 pub mod reconstruction;
 pub mod relevance;
+pub mod sandbox_trial;
+pub mod security_scanner;
+pub mod sensitive_patterns;
+pub mod synthesizer;
+pub mod vetting;
 
 #[cfg(test)]
 mod tests;

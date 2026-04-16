@@ -1,6 +1,6 @@
 {
   "name": "@duduclaw/win32-x64",
-  "version": "1.4.28",
+  "version": "1.4.29",
   "description": "DuDuClaw CE binary for Windows x64",
   "license": "Apache-2.0",
   "repository": {

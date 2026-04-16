@@ -3,7 +3,9 @@ import { useIntl } from 'react-intl';
 import { useSearchParams } from 'react-router';
 import { cn } from '@/lib/utils';
 import { useSystemStore } from '@/stores/system-store';
-import { api } from '@/lib/api';
+import { useAgentsStore } from '@/stores/agents-store';
+import { api, type AutopilotRule, type AutopilotHistoryEntry } from '@/lib/api';
+import { Dialog } from '@/components/shared/Dialog';
 import {
   Settings,
   Container,
@@ -21,9 +23,10 @@ import {
   RefreshCw,
   Mic,
   Zap,
+  Workflow,
 } from 'lucide-react';
 
-type TabId = 'general' | 'container' | 'heartbeat' | 'cron' | 'voice' | 'proactive' | 'doctor' | 'update';
+type TabId = 'general' | 'container' | 'heartbeat' | 'cron' | 'voice' | 'proactive' | 'autopilot' | 'doctor' | 'update';
 
 export function SettingsPage() {
   const intl = useIntl();
@@ -38,6 +41,7 @@ export function SettingsPage() {
     { id: 'cron', label: intl.formatMessage({ id: 'settings.cron' }), icon: Clock },
     { id: 'voice', label: intl.formatMessage({ id: 'settings.voice' }), icon: Mic },
     { id: 'proactive', label: intl.formatMessage({ id: 'settings.proactive' }), icon: Zap },
+    { id: 'autopilot', label: intl.formatMessage({ id: 'settings.autopilot' }), icon: Workflow },
     { id: 'doctor', label: intl.formatMessage({ id: 'settings.doctor' }), icon: Stethoscope },
     { id: 'update', label: intl.formatMessage({ id: 'settings.update' }), icon: Download },
   ];
@@ -76,6 +80,7 @@ export function SettingsPage() {
       {activeTab === 'cron' && <CronTab />}
       {activeTab === 'voice' && <VoiceTab />}
       {activeTab === 'proactive' && <ProactiveTab />}
+      {activeTab === 'autopilot' && <AutopilotTab />}
       {activeTab === 'doctor' && <DoctorTab />}
       {activeTab === 'update' && <UpdateTab />}
     </div>
@@ -89,6 +94,8 @@ function GeneralTab() {
   const [rotationStrategy, setRotationStrategy] = useState('priority');
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
 
   // Load current config on mount
   useEffect(() => {
@@ -101,7 +108,7 @@ function GeneralTab() {
         const rotMatch = raw.match(/strategy\s*=\s*"(\w+)"/);
         if (rotMatch) setRotationStrategy(rotMatch[1]);
       }
-    }).catch(() => {});
+    }).catch((e) => console.warn("[api]", e));
   }, []);
 
   const handleSave = async () => {
@@ -110,7 +117,7 @@ function GeneralTab() {
     try {
       await api.system.updateConfig({ log_level: logLevel, rotation_strategy: rotationStrategy });
       setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
+      savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
     } catch {
       // error handled silently
     } finally {
@@ -216,12 +223,12 @@ function HeartbeatTab() {
     api.heartbeat
       .status()
       .then((r) => setHeartbeats(r?.heartbeats ?? []))
-      .catch(() => {});
+      .catch((e) => console.warn("[api]", e));
     const interval = setInterval(() => {
       api.heartbeat
         .status()
         .then((r) => setHeartbeats(r?.heartbeats ?? []))
-        .catch(() => {});
+        .catch((e) => console.warn("[api]", e));
     }, 15_000);
     return () => clearInterval(interval);
   }, []);
@@ -268,7 +275,7 @@ function HeartbeatTab() {
                       setHeartbeats((prev) =>
                         prev.map((h) => h.agent_id === hb.agent_id ? { ...h, enabled: !h.enabled } : h)
                       );
-                    }).catch(() => {});
+                    }).catch((e) => console.warn("[api]", e));
                   }}
                   title={intl.formatMessage({ id: 'settings.heartbeat.toggle' })}
                   className={cn(
@@ -277,7 +284,7 @@ function HeartbeatTab() {
                   )}
                 />
                 <button
-                  onClick={() => api.heartbeat.trigger(hb.agent_id).catch(() => {})}
+                  onClick={() => api.heartbeat.trigger(hb.agent_id).catch((e) => console.warn("[api]", e))}
                   className="rounded px-1.5 py-0.5 text-xs text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-amber-900/20"
                 >
                   <Play className="h-3 w-3" />
@@ -562,6 +569,8 @@ function UpdateTab() {
   const [installing, setInstalling] = useState(false);
   const [error, setError] = useState('');
   const [installed, setInstalled] = useState(false);
+  const [autoUpdate, setAutoUpdate] = useState(false);
+  const [edition, setEdition] = useState('community');
   const [updateInfo, setUpdateInfo] = useState<{
     available: boolean;
     current_version: string;
@@ -571,7 +580,16 @@ function UpdateTab() {
     download_url: string;
     install_method: string;
     brew_formula?: string;
+    auto_update?: boolean;
   } | null>(null);
+
+  // Load edition + auto_update state on mount
+  useEffect(() => {
+    api.system.version().then((info) => {
+      setEdition(info.edition ?? 'community');
+      setAutoUpdate(info.auto_update ?? false);
+    }).catch((e) => console.warn("[api]", e));
+  }, []);
 
   // [H1] useRef guard prevents double-click race — declared before handleCheck
   const installingRef = useRef(false);
@@ -616,9 +634,44 @@ function UpdateTab() {
 
   const isHomebrew = updateInfo?.install_method === 'homebrew';
   const noBinary = updateInfo?.available && !updateInfo.download_url;
+  const isPro = edition !== 'community';
+
+  const handleAutoUpdateToggle = useCallback(async (enabled: boolean) => {
+    try {
+      await api.system.updateConfig({ auto_update: enabled });
+      setAutoUpdate(enabled);
+    } catch {
+      // revert on failure
+    }
+  }, []);
 
   return (
     <div className="space-y-4">
+      {/* Auto-update toggle — Pro only */}
+      {isPro && (
+        <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-medium text-stone-900 dark:text-stone-50">
+                {intl.formatMessage({ id: 'settings.update.autoUpdate' })}
+              </h3>
+              <p className="mt-1 text-xs text-stone-500 dark:text-stone-400">
+                {intl.formatMessage({ id: 'settings.update.autoUpdate.desc' })}
+              </p>
+            </div>
+            <label className="relative inline-flex cursor-pointer items-center">
+              <input
+                type="checkbox"
+                checked={autoUpdate}
+                onChange={(e) => handleAutoUpdateToggle(e.target.checked)}
+                className="peer sr-only"
+              />
+              <div className="peer h-6 w-11 rounded-full bg-stone-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:bg-white after:transition-all peer-checked:bg-amber-500 peer-checked:after:translate-x-full dark:bg-stone-600" />
+            </label>
+          </div>
+        </div>
+      )}
+
       <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
         <div className="flex items-center justify-between mb-6">
           <div className="flex items-center gap-3">
@@ -818,13 +871,15 @@ function VoiceTab() {
   });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
 
   const handleSave = async () => {
     setSaving(true);
     try {
       await api.system.updateConfig({ voice: config });
       setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
+      savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
     } catch { /* ignore */ }
     setSaving(false);
   };
@@ -929,13 +984,15 @@ function ProactiveTab() {
   });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
 
   const handleSave = async () => {
     setSaving(true);
     try {
       await api.system.updateConfig({ proactive: config });
       setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
+      savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
     } catch { /* ignore */ }
     setSaving(false);
   };
@@ -1035,6 +1092,445 @@ function ProactiveTab() {
         </button>
       </div>
     </div>
+  );
+}
+
+// ── Autopilot Tab ───────────────────────────────────────────
+
+function AutopilotTab() {
+  const intl = useIntl();
+  const [rules, setRules] = useState<AutopilotRule[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showCreate, setShowCreate] = useState(false);
+  const [historyRuleId, setHistoryRuleId] = useState<string | null>(null);
+  const [historyEntries, setHistoryEntries] = useState<AutopilotHistoryEntry[]>([]);
+  const [removeTarget, setRemoveTarget] = useState<{ id: string; name: string } | null>(null);
+
+  const fetchRules = useCallback(async () => {
+    setLoading(true);
+    try {
+      const result = await api.autopilot.list();
+      setRules(result?.rules ?? []);
+    } catch {
+      setRules([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { fetchRules(); }, [fetchRules]);
+
+  const handleToggle = useCallback(async (ruleId: string, enabled: boolean) => {
+    setRules((prev) => prev.map((r) => (r.id === ruleId ? { ...r, enabled } : r)));
+    try {
+      await api.autopilot.update(ruleId, { enabled });
+    } catch {
+      setRules((prev) => prev.map((r) => (r.id === ruleId ? { ...r, enabled: !enabled } : r)));
+    }
+  }, []);
+
+  const handleRemove = useCallback(async () => {
+    if (!removeTarget) return;
+    try {
+      await api.autopilot.remove(removeTarget.id);
+      setRules((prev) => prev.filter((r) => r.id !== removeTarget.id));
+    } catch { /* noop */ }
+    setRemoveTarget(null);
+  }, [removeTarget]);
+
+  const handleViewHistory = useCallback(async (ruleId: string) => {
+    setHistoryRuleId(ruleId);
+    try {
+      const result = await api.autopilot.history(ruleId);
+      setHistoryEntries(result?.entries ?? []);
+    } catch {
+      setHistoryEntries([]);
+    }
+  }, []);
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
+            {intl.formatMessage({ id: 'autopilot.title' })}
+          </h3>
+          <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
+            {intl.formatMessage({ id: 'autopilot.subtitle' })}
+          </p>
+        </div>
+        <button
+          onClick={() => setShowCreate(true)}
+          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600"
+        >
+          <Plus className="h-4 w-4" />
+          {intl.formatMessage({ id: 'autopilot.create' })}
+        </button>
+      </div>
+
+      {loading ? (
+        <div className="py-12 text-center text-stone-400">
+          {intl.formatMessage({ id: 'common.loading' })}
+        </div>
+      ) : rules.length === 0 ? (
+        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
+          <Workflow className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
+          <p className="text-stone-500 dark:text-stone-400">
+            {intl.formatMessage({ id: 'autopilot.empty' })}
+          </p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {rules.map((rule) => (
+            <div
+              key={rule.id}
+              className="rounded-xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900"
+            >
+              <div className="flex items-start justify-between">
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => handleToggle(rule.id, !rule.enabled)}
+                    className={cn(
+                      'relative h-6 w-11 rounded-full transition-colors',
+                      rule.enabled ? 'bg-emerald-500' : 'bg-stone-300 dark:bg-stone-600',
+                    )}
+                  >
+                    <span
+                      className={cn(
+                        'absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform',
+                        rule.enabled ? 'left-[22px]' : 'left-0.5',
+                      )}
+                    />
+                  </button>
+                  <div>
+                    <h4 className="font-medium text-stone-900 dark:text-stone-50">{rule.name}</h4>
+                    <div className="mt-1 flex items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
+                      <span className="rounded-full bg-blue-100 px-2 py-0.5 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
+                        {intl.formatMessage({ id: `autopilot.trigger.${rule.trigger_event}` })}
+                      </span>
+                      <span>→</span>
+                      <span className="rounded-full bg-amber-100 px-2 py-0.5 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+                        {intl.formatMessage({ id: `autopilot.action.${rule.action.type}` })}
+                      </span>
+                      <span className="text-stone-400">({rule.action.agent_id})</span>
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => handleViewHistory(rule.id)}
+                    className="rounded-lg p-1.5 text-stone-400 transition-colors hover:bg-stone-100 hover:text-stone-600 dark:hover:bg-stone-800 dark:hover:text-stone-300"
+                    title={intl.formatMessage({ id: 'autopilot.history' })}
+                  >
+                    <Clock className="h-4 w-4" />
+                  </button>
+                  <button
+                    onClick={() => setRemoveTarget({ id: rule.id, name: rule.name })}
+                    className="rounded-lg p-1.5 text-stone-400 transition-colors hover:bg-rose-50 hover:text-rose-500 dark:hover:bg-rose-900/20"
+                  >
+                    <XCircle className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="mt-3 flex items-center gap-4 text-xs text-stone-400 dark:text-stone-500">
+                <span>{intl.formatMessage({ id: 'autopilot.triggerCount' }, { count: rule.trigger_count })}</span>
+                {rule.last_triggered_at && (
+                  <span>
+                    {intl.formatMessage({ id: 'autopilot.lastTriggered' })}: {new Date(rule.last_triggered_at).toLocaleString('zh-TW')}
+                  </span>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Create Rule Dialog */}
+      {showCreate && (
+        <AutopilotCreateDialog
+          onClose={() => setShowCreate(false)}
+          onCreated={() => { setShowCreate(false); fetchRules(); }}
+        />
+      )}
+
+      {/* History Dialog */}
+      {historyRuleId && (
+        <AutopilotHistoryDialog
+          entries={historyEntries}
+          onClose={() => setHistoryRuleId(null)}
+        />
+      )}
+
+      {/* Remove Confirmation */}
+      {removeTarget && (
+        <Dialog open onClose={() => setRemoveTarget(null)} title={intl.formatMessage({ id: 'autopilot.remove' })}>
+          <div className="space-y-4">
+            <p className="text-sm text-stone-600 dark:text-stone-400">
+              {intl.formatMessage({ id: 'autopilot.remove.confirm' }, { name: removeTarget.name })}
+            </p>
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => setRemoveTarget(null)}
+                className="rounded-lg border border-stone-300 px-4 py-2 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-50 dark:border-stone-600 dark:text-stone-300 dark:hover:bg-stone-800"
+              >
+                {intl.formatMessage({ id: 'common.cancel' })}
+              </button>
+              <button
+                onClick={handleRemove}
+                className="rounded-lg bg-rose-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-rose-600"
+              >
+                {intl.formatMessage({ id: 'autopilot.remove' })}
+              </button>
+            </div>
+          </div>
+        </Dialog>
+      )}
+    </div>
+  );
+}
+
+function AutopilotCreateDialog({
+  onClose,
+  onCreated,
+}: {
+  onClose: () => void;
+  onCreated: () => void;
+}) {
+  const intl = useIntl();
+  const { agents, fetchAgents } = useAgentsStore();
+  const [name, setName] = useState('');
+  const [triggerEvent, setTriggerEvent] = useState<string>('task_created');
+  const [actionType, setActionType] = useState<string>('delegate');
+  const [actionAgent, setActionAgent] = useState('');
+  const [promptTemplate, setPromptTemplate] = useState('');
+  const [skillName, setSkillName] = useState('');
+  const [fromStatus, setFromStatus] = useState('');
+  const [toStatus, setToStatus] = useState('');
+  const [idleMinutes, setIdleMinutes] = useState('30');
+  const [cronExpr, setCronExpr] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => { fetchAgents(); }, [fetchAgents]);
+  useEffect(() => { if (agents.length > 0 && !actionAgent) setActionAgent(agents[0].name); }, [agents, actionAgent]);
+
+  const triggerEvents = ['task_created', 'task_status_changed', 'channel_message', 'agent_idle', 'schedule'] as const;
+  const actionTypes = ['delegate', 'notify', 'run_skill'] as const;
+  const statuses = ['todo', 'in_progress', 'done', 'blocked'] as const;
+
+  const handleSubmit = useCallback(async () => {
+    if (!name.trim() || !actionAgent) return;
+    setSubmitting(true);
+    try {
+      const conditions: Record<string, unknown> = {};
+      if (triggerEvent === 'task_status_changed') {
+        if (fromStatus) conditions.from_status = fromStatus;
+        if (toStatus) conditions.to_status = toStatus;
+      }
+      if (triggerEvent === 'agent_idle' && idleMinutes) {
+        conditions.idle_minutes = parseInt(idleMinutes, 10);
+      }
+      if (triggerEvent === 'schedule' && cronExpr) {
+        conditions.cron = cronExpr;
+      }
+
+      await api.autopilot.create({
+        name: name.trim(),
+        trigger_event: triggerEvent as typeof triggerEvents[number],
+        conditions,
+        action: {
+          type: actionType as typeof actionTypes[number],
+          agent_id: actionAgent,
+          ...(actionType === 'delegate' && promptTemplate ? { prompt_template: promptTemplate } : {}),
+          ...(actionType === 'run_skill' && skillName ? { skill_name: skillName } : {}),
+        },
+      });
+      onCreated();
+    } catch { /* noop */ } finally {
+      setSubmitting(false);
+    }
+  }, [name, triggerEvent, actionType, actionAgent, promptTemplate, skillName, fromStatus, toStatus, idleMinutes, cronExpr, onCreated]);
+
+  const inputCls = 'w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/20 dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50';
+  const selectCls = inputCls;
+
+  return (
+    <Dialog open onClose={onClose} title={intl.formatMessage({ id: 'autopilot.create' })} className="max-w-lg">
+      <div className="space-y-4">
+        <div className="space-y-1.5">
+          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+            {intl.formatMessage({ id: 'autopilot.field.name' })}
+          </label>
+          <input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} autoFocus />
+        </div>
+
+        <div className="space-y-1.5">
+          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+            {intl.formatMessage({ id: 'autopilot.field.triggerEvent' })}
+          </label>
+          <select className={selectCls} value={triggerEvent} onChange={(e) => setTriggerEvent(e.target.value)}>
+            {triggerEvents.map((t) => (
+              <option key={t} value={t}>{intl.formatMessage({ id: `autopilot.trigger.${t}` })}</option>
+            ))}
+          </select>
+        </div>
+
+        {/* Conditional fields based on trigger type */}
+        {triggerEvent === 'task_status_changed' && (
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+                {intl.formatMessage({ id: 'autopilot.field.fromStatus' })}
+              </label>
+              <select className={selectCls} value={fromStatus} onChange={(e) => setFromStatus(e.target.value)}>
+                <option value="">{intl.formatMessage({ id: 'tasks.filter.all' })}</option>
+                {statuses.map((s) => (
+                  <option key={s} value={s}>{intl.formatMessage({ id: `tasks.status.${s}` })}</option>
+                ))}
+              </select>
+            </div>
+            <div className="space-y-1.5">
+              <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+                {intl.formatMessage({ id: 'autopilot.field.toStatus' })}
+              </label>
+              <select className={selectCls} value={toStatus} onChange={(e) => setToStatus(e.target.value)}>
+                <option value="">{intl.formatMessage({ id: 'tasks.filter.all' })}</option>
+                {statuses.map((s) => (
+                  <option key={s} value={s}>{intl.formatMessage({ id: `tasks.status.${s}` })}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+        )}
+
+        {triggerEvent === 'agent_idle' && (
+          <div className="space-y-1.5">
+            <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+              {intl.formatMessage({ id: 'autopilot.field.idleMinutes' })}
+            </label>
+            <input className={inputCls} type="number" min="1" value={idleMinutes} onChange={(e) => setIdleMinutes(e.target.value)} />
+          </div>
+        )}
+
+        {triggerEvent === 'schedule' && (
+          <div className="space-y-1.5">
+            <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+              {intl.formatMessage({ id: 'autopilot.field.cron' })}
+            </label>
+            <input className={inputCls} value={cronExpr} onChange={(e) => setCronExpr(e.target.value)} placeholder="0 9 * * 1-5" />
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-3">
+          <div className="space-y-1.5">
+            <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+              {intl.formatMessage({ id: 'autopilot.field.action' })}
+            </label>
+            <select className={selectCls} value={actionType} onChange={(e) => setActionType(e.target.value)}>
+              {actionTypes.map((a) => (
+                <option key={a} value={a}>{intl.formatMessage({ id: `autopilot.action.${a}` })}</option>
+              ))}
+            </select>
+          </div>
+          <div className="space-y-1.5">
+            <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+              {intl.formatMessage({ id: 'autopilot.field.actionAgent' })}
+            </label>
+            <select className={selectCls} value={actionAgent} onChange={(e) => setActionAgent(e.target.value)}>
+              {agents.map((a) => (
+                <option key={a.name} value={a.name}>{a.icon || '🤖'} {a.display_name}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {actionType === 'delegate' && (
+          <div className="space-y-1.5">
+            <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+              {intl.formatMessage({ id: 'autopilot.field.promptTemplate' })}
+            </label>
+            <textarea
+              className={cn(inputCls, 'min-h-[80px] resize-y')}
+              value={promptTemplate}
+              onChange={(e) => setPromptTemplate(e.target.value)}
+              placeholder="Handle the newly created task: {{task.title}}"
+            />
+          </div>
+        )}
+
+        {actionType === 'run_skill' && (
+          <div className="space-y-1.5">
+            <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
+              {intl.formatMessage({ id: 'autopilot.field.skillName' })}
+            </label>
+            <input className={inputCls} value={skillName} onChange={(e) => setSkillName(e.target.value)} />
+          </div>
+        )}
+
+        <div className="flex justify-end gap-3 pt-2">
+          <button
+            onClick={onClose}
+            className="rounded-lg border border-stone-300 px-4 py-2 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-50 dark:border-stone-600 dark:text-stone-300 dark:hover:bg-stone-800"
+          >
+            {intl.formatMessage({ id: 'common.cancel' })}
+          </button>
+          <button
+            onClick={handleSubmit}
+            disabled={submitting || !name.trim() || !actionAgent}
+            className="rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
+          >
+            {intl.formatMessage({ id: 'autopilot.create' })}
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+function AutopilotHistoryDialog({
+  entries,
+  onClose,
+}: {
+  entries: ReadonlyArray<AutopilotHistoryEntry>;
+  onClose: () => void;
+}) {
+  const intl = useIntl();
+  return (
+    <Dialog open onClose={onClose} title={intl.formatMessage({ id: 'autopilot.history' })}>
+      <div className="max-h-[400px] space-y-2 overflow-y-auto">
+        {entries.length === 0 ? (
+          <p className="py-8 text-center text-sm text-stone-400 dark:text-stone-500">
+            {intl.formatMessage({ id: 'autopilot.history.empty' })}
+          </p>
+        ) : (
+          entries.map((entry) => (
+            <div
+              key={entry.id}
+              className="flex items-center justify-between rounded-lg border border-stone-200 px-4 py-3 dark:border-stone-700"
+            >
+              <div>
+                <span className="text-sm text-stone-700 dark:text-stone-300">
+                  {new Date(entry.triggered_at).toLocaleString('zh-TW')}
+                </span>
+                {entry.details && (
+                  <p className="mt-0.5 text-xs text-stone-400 dark:text-stone-500">{entry.details}</p>
+                )}
+              </div>
+              <span
+                className={cn(
+                  'rounded-full px-2 py-0.5 text-xs font-medium',
+                  entry.result === 'success'
+                    ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'
+                    : 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400',
+                )}
+              >
+                {intl.formatMessage({ id: `autopilot.history.${entry.result}` })}
+              </span>
+            </div>
+          ))
+        )}
+      </div>
+    </Dialog>
   );
 }
 

@@ -77,7 +77,7 @@ function MemoriesTab() {
       if (list.length > 0 && !selectedAgent) {
         setSelectedAgent(list[0].name);
       }
-    }).catch(() => {});
+    }).catch((e) => console.warn("[api]", e));
   }, []);
 
   // Auto-browse when agent changes
@@ -369,7 +369,7 @@ function EvolutionTab() {
     api.evolution.status().then((res) => {
       setAgents(res?.agents ?? []);
       setMode(res?.mode ?? '');
-    }).catch(() => {}).finally(() => setLoading(false));
+    }).catch((e) => console.warn("[api]", e)).finally(() => setLoading(false));
   }, []);
 
   return (

@@ -321,7 +321,10 @@ async fn line_webhook_handler(
                     .checked_sub(std::time::Duration::from_secs(120))
                     .unwrap_or_else(std::time::Instant::now)));
                 Some(Box::new(move |event: crate::channel_reply::ProgressEvent| {
-                    let mut last = last_progress.lock().unwrap();
+                    let mut last = match last_progress.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
                     if last.elapsed().as_secs() < 60 {
                         return;
                     }

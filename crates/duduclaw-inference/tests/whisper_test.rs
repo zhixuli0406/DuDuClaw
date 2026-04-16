@@ -36,14 +36,8 @@ fn test_audio_format_detection() {
 #[test]
 fn test_local_mode_feature_gate() {
     // whisper-rs is behind a feature flag
-    #[cfg(feature = "whisper")]
-    {
-        // If whisper feature is enabled, local mode should be available
-        assert!(true);
-    }
-    #[cfg(not(feature = "whisper"))]
-    {
-        // Without whisper feature, only API mode is available
-        assert!(true);
-    }
+    // Verify the test compiles regardless of feature flag.
+    // When whisper feature is enabled, local mode is available;
+    // otherwise only API mode is available.
+    let _has_whisper = cfg!(feature = "whisper");
 }

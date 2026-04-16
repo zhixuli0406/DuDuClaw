@@ -156,7 +156,7 @@ export function LogsPage() {
           <div className="space-y-px">
             {filteredEntries.map((entry, i) => (
               <div
-                key={(entry as unknown as Record<string, unknown>)._id as number ?? `${entry.timestamp}-${i}`}
+                key={`${entry.target}-${entry.timestamp}-${i}`}
                 className={cn(
                   'flex items-start gap-3 rounded px-3 py-1.5 font-mono text-xs',
                   levelBg[entry.level] ?? 'bg-transparent'

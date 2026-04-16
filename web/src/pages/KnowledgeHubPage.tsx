@@ -41,7 +41,7 @@ export function KnowledgeHubPage() {
       if (list.length > 0 && !selectedAgent) {
         setSelectedAgent(list[0].name);
       }
-    }).catch(() => {});
+    }).catch((e) => console.warn("[api]", e));
   }, []);
 
   const tabs: ReadonlyArray<{ id: TabId; label: string }> = [

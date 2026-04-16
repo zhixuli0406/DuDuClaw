@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use tracing::{debug, info, warn};
 
-use duduclaw_memory::wiki::{WikiAction, WikiProposal, WikiStore};
+use duduclaw_memory::wiki::{WikiAction, WikiProposal, WikiStore, WikiTarget};
 
 // ---------------------------------------------------------------------------
 // Classification
@@ -76,6 +76,44 @@ pub fn classify_for_ingest(user_text: &str, assistant_reply: &str) -> IngestTier
     }
 
     IngestTier::Skip
+}
+
+/// Classify whether ingested knowledge should go to agent wiki, shared wiki, or both.
+///
+/// General/organizational knowledge → Shared. Personal/agent-specific → Agent.
+/// Zero LLM cost — pure keyword heuristic.
+pub fn classify_ingest_target(user_text: &str, assistant_reply: &str) -> WikiTarget {
+    let combined = format!("{} {}", user_text, assistant_reply).to_lowercase();
+
+    // Shared wiki indicators: organizational knowledge, SOPs, policies, product specs
+    let shared_indicators = [
+        "sop", "policy", "standard", "procedure", "guideline",
+        "announcement", "公告", "規格", "流程", "標準",
+        "政策", "規範", "公司", "組織", "團隊",
+        "company", "organization", "team-wide",
+    ];
+
+    let shared_score: usize = shared_indicators.iter()
+        .filter(|kw| combined.contains(*kw))
+        .count();
+
+    // Agent-specific indicators: personal preferences, individual reflections
+    let agent_indicators = [
+        "i think", "my preference", "i learned", "personal",
+        "我覺得", "我的", "個人", "偏好", "反思",
+    ];
+
+    let agent_score: usize = agent_indicators.iter()
+        .filter(|kw| combined.contains(*kw))
+        .count();
+
+    if shared_score >= 2 && agent_score == 0 {
+        WikiTarget::Shared
+    } else if shared_score >= 1 && agent_score >= 1 {
+        WikiTarget::Both
+    } else {
+        WikiTarget::Agent
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +218,7 @@ pub fn generate_local_proposals(
         content: Some(source_content),
         rationale: "Auto-ingest from channel conversation".to_string(),
         related_pages: vec![],
+        target: WikiTarget::default(),
     });
 
     // Extract entities and create/update entity pages
@@ -203,6 +242,7 @@ pub fn generate_local_proposals(
             content: Some(entity_content),
             rationale: format!("Entity '{}' mentioned in conversation", entity_name),
             related_pages: vec![proposals[0].page_path.clone()],
+            target: WikiTarget::default(),
         });
     }
 

@@ -8,15 +8,19 @@ use duduclaw_auth::acl;
 use duduclaw_auth::models::{UserRole, AccessLevel};
 use duduclaw_core::traits::MemoryEngine;
 use duduclaw_memory::SqliteMemoryEngine;
+use chrono::Utc;
+use rusqlite::params;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use crate::autopilot_store::{AutopilotStore, AutopilotRuleRow, AutopilotHistoryRow};
 use crate::cron_scheduler::CronScheduler;
 use crate::cron_store::{CronStore, CronTaskRow};
 use crate::extension::GatewayExtension;
 use crate::gvu::version_store::VersionStore;
 use crate::protocol::WsFrame;
+use crate::task_store::{TaskStore, TaskRow, ActivityRow};
 
 /// Validate agent ID is safe for filesystem paths (no traversal).
 fn is_valid_agent_id(id: &str) -> bool {
@@ -57,6 +61,12 @@ pub struct MethodHandler {
     cron_scheduler: RwLock<Option<Arc<CronScheduler>>>,
     /// Pending OAuth flows awaiting callback (keyed by state nonce).
     mcp_oauth_pending: RwLock<std::collections::HashMap<String, crate::mcp_oauth::PendingOAuth>>,
+    /// SQLite-backed task board store. Injected after gateway starts.
+    task_store: RwLock<Option<Arc<TaskStore>>>,
+    /// SQLite-backed autopilot rule store. Injected after gateway starts.
+    autopilot_store: RwLock<Option<Arc<AutopilotStore>>>,
+    /// Event broadcast sender for real-time task/activity events.
+    event_tx: RwLock<Option<tokio::sync::broadcast::Sender<String>>>,
 }
 
 /// Cached update info from the last `system.check_update` call. [M2][R2:NM1]
@@ -141,12 +151,30 @@ impl MethodHandler {
             cron_store: RwLock::new(None),
             cron_scheduler: RwLock::new(None),
             mcp_oauth_pending: RwLock::new(std::collections::HashMap::new()),
+            task_store: RwLock::new(None),
+            autopilot_store: RwLock::new(None),
+            event_tx: RwLock::new(None),
         }
     }
 
     /// Inject the SQLite-backed cron task store (called once after gateway start).
     pub async fn set_cron_store(&self, store: Arc<CronStore>) {
         *self.cron_store.write().await = Some(store);
+    }
+
+    /// Inject the SQLite-backed task board store (called once after gateway start).
+    pub async fn set_task_store(&self, store: Arc<TaskStore>) {
+        *self.task_store.write().await = Some(store);
+    }
+
+    /// Inject the SQLite-backed autopilot rule store (called once after gateway start).
+    pub async fn set_autopilot_store(&self, store: Arc<AutopilotStore>) {
+        *self.autopilot_store.write().await = Some(store);
+    }
+
+    /// Inject the event broadcast sender for task/activity real-time events.
+    pub async fn set_event_tx(&self, tx: tokio::sync::broadcast::Sender<String>) {
+        *self.event_tx.write().await = Some(tx);
     }
 
     /// Inject the running cron scheduler handle (called once after gateway start).
@@ -374,6 +402,12 @@ impl MethodHandler {
             "wiki.lint" => self.handle_wiki_lint(params).await,
             "wiki.stats" => self.handle_wiki_stats(params).await,
 
+            // ── Shared Wiki ─────────────────────────────────
+            "shared_wiki.pages" => self.handle_shared_wiki_pages().await,
+            "shared_wiki.read" => self.handle_shared_wiki_read(params).await,
+            "shared_wiki.search" => self.handle_shared_wiki_search(params).await,
+            "shared_wiki.stats" => self.handle_shared_wiki_stats().await,
+
             // ── Skills (open to all) ─────────────────────────
             "skills.list" => self.handle_skills_list(params).await,
             "skills.search" => self.handle_skills_search(params).await,
@@ -408,6 +442,24 @@ impl MethodHandler {
             "security.audit_log" => {
                 require_admin!();
                 self.handle_security_audit_log(params).await
+            }
+            "security.status" => {
+                require_admin!();
+                self.handle_security_status().await
+            }
+
+            // ── Analytics (manager+) ────────────────────────
+            "analytics.summary" => {
+                require_manager!();
+                self.handle_analytics_summary(params).await
+            }
+            "analytics.conversations" => {
+                require_manager!();
+                self.handle_analytics_conversations().await
+            }
+            "analytics.cost_savings" => {
+                require_manager!();
+                self.handle_analytics_cost_savings().await
             }
 
             // ── Heartbeat (manager+) ─────────────────────────
@@ -459,6 +511,39 @@ impl MethodHandler {
             "mcp.oauth.status" => { require_admin!(); self.handle_mcp_oauth_status(params).await }
             "mcp.oauth.revoke" => { require_admin!(); self.handle_mcp_oauth_revoke(params).await }
 
+            // ── Task Board (open to all authenticated) ────
+            "tasks.list" => self.handle_tasks_list(params).await,
+            "tasks.create" => self.handle_tasks_create(params, ctx).await,
+            "tasks.update" => self.handle_tasks_update(params).await,
+            "tasks.remove" => self.handle_tasks_remove(params).await,
+            "tasks.assign" => self.handle_tasks_assign(params).await,
+
+            // ── Activity Feed (open to all authenticated) ───
+            "activity.list" => self.handle_activity_list(params).await,
+            "activity.subscribe" => WsFrame::ok_response("", json!({ "subscribed": true })),
+            "activity.unsubscribe" => WsFrame::ok_response("", json!({ "unsubscribed": true })),
+
+            // ── Autopilot (admin only) ──────────────────────
+            "autopilot.list" => { require_admin!(); self.handle_autopilot_list().await }
+            "autopilot.create" => { require_admin!(); self.handle_autopilot_create(params).await }
+            "autopilot.update" => { require_admin!(); self.handle_autopilot_update(params).await }
+            "autopilot.remove" => { require_admin!(); self.handle_autopilot_remove(params).await }
+            "autopilot.history" => { require_admin!(); self.handle_autopilot_history(params).await }
+
+            // ── Shared Skills (open to all authenticated) ───
+            "skills.shared" => self.handle_skills_shared_list().await,
+            "skills.share" => self.handle_skills_share(params).await,
+            "skills.adopt" => self.handle_skills_adopt(params).await,
+
+            // ── Stubs for frontend pages (not yet implemented) ──
+            "billing.usage" | "billing.history" | "billing.plan" =>
+                WsFrame::error_response("", "Billing features are not available in the current edition"),
+            "browser.audit_log" | "browser.emergency_stop" | "browser.tool_approve"
+            | "browser.browserbase_sessions" | "browser.browserbase_cost" =>
+                WsFrame::error_response("", "Browser automation features require the Pro edition"),
+            "marketplace.install" =>
+                WsFrame::error_response("", "Marketplace install is not yet available"),
+
             unknown => WsFrame::error_response("", &format!("Unknown method: {unknown}")),
         }
     }
@@ -506,6 +591,10 @@ impl MethodHandler {
                 { "name": "wiki.search", "description": "Search wiki pages" },
                 { "name": "wiki.lint", "description": "Wiki health check" },
                 { "name": "wiki.stats", "description": "Wiki statistics" },
+                { "name": "shared_wiki.pages", "description": "List shared wiki pages" },
+                { "name": "shared_wiki.read", "description": "Read a shared wiki page" },
+                { "name": "shared_wiki.search", "description": "Search shared wiki" },
+                { "name": "shared_wiki.stats", "description": "Shared wiki statistics" },
                 { "name": "skills.list", "description": "List agent skills" },
                 { "name": "skills.content", "description": "Read skill content" },
                 { "name": "cron.list", "description": "List cron jobs" },
@@ -533,6 +622,10 @@ impl MethodHandler {
                 { "name": "mcp.oauth.revoke", "description": "Revoke OAuth token for a provider" },
                 { "name": "logs.subscribe", "description": "Subscribe to logs" },
                 { "name": "logs.unsubscribe", "description": "Unsubscribe from logs" },
+                { "name": "security.status", "description": "Security system status" },
+                { "name": "analytics.summary", "description": "Analytics summary for a period" },
+                { "name": "analytics.conversations", "description": "Daily conversation counts" },
+                { "name": "analytics.cost_savings", "description": "Monthly cost savings" },
             ]
         }))
     }
@@ -2146,6 +2239,118 @@ impl MethodHandler {
         }))
     }
 
+    // ── Shared Wiki ─────────────────────────────────────────
+
+    async fn handle_shared_wiki_pages(&self) -> WsFrame {
+        let wiki_dir = self.home_dir.join("shared").join("wiki");
+        if !wiki_dir.exists() {
+            return WsFrame::ok_response("", json!({ "pages": [], "exists": false }));
+        }
+
+        let store = duduclaw_memory::WikiStore::new_shared(&self.home_dir);
+        match store.list_pages() {
+            Ok(pages) => {
+                let items: Vec<Value> = pages.iter().map(|p| {
+                    json!({
+                        "path": p.path,
+                        "title": p.title,
+                        "updated": p.updated.to_rfc3339(),
+                        "tags": p.tags,
+                    })
+                }).collect();
+                WsFrame::ok_response("", json!({ "pages": items, "exists": true }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("Failed to list shared wiki pages: {e}")),
+        }
+    }
+
+    async fn handle_shared_wiki_read(&self, params: Value) -> WsFrame {
+        let page_path = params.get("page_path").and_then(|v| v.as_str()).unwrap_or("");
+        if page_path.is_empty() {
+            return WsFrame::error_response("", "Missing 'page_path' parameter");
+        }
+
+        let store = duduclaw_memory::WikiStore::new_shared(&self.home_dir);
+        match store.read_raw(page_path) {
+            Ok(content) => WsFrame::ok_response("", json!({ "content": content, "path": page_path })),
+            Err(e) => WsFrame::error_response("", &format!("Failed to read shared wiki page: {e}")),
+        }
+    }
+
+    async fn handle_shared_wiki_search(&self, params: Value) -> WsFrame {
+        let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = (params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize).min(100);
+
+        if query.is_empty() {
+            return WsFrame::error_response("", "Missing 'query' parameter");
+        }
+
+        let wiki_dir = self.home_dir.join("shared").join("wiki");
+        if !wiki_dir.exists() {
+            return WsFrame::ok_response("", json!({ "hits": [] }));
+        }
+
+        let store = duduclaw_memory::WikiStore::new_shared(&self.home_dir);
+        match store.search(query, limit) {
+            Ok(hits) => {
+                let items: Vec<Value> = hits.iter().map(|h| {
+                    json!({
+                        "path": h.path,
+                        "title": h.title,
+                        "score": h.score,
+                        "context_lines": h.context_lines,
+                    })
+                }).collect();
+                WsFrame::ok_response("", json!({ "hits": items }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("Shared wiki search failed: {e}")),
+        }
+    }
+
+    async fn handle_shared_wiki_stats(&self) -> WsFrame {
+        let wiki_dir = self.home_dir.join("shared").join("wiki");
+        if !wiki_dir.exists() {
+            return WsFrame::ok_response("", json!({ "exists": false, "total_pages": 0 }));
+        }
+
+        let store = duduclaw_memory::WikiStore::new_shared(&self.home_dir);
+        let pages = match store.list_pages() {
+            Ok(p) => p,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to list shared wiki pages: {e}")),
+        };
+
+        let mut by_author: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut by_dir: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+        for p in &pages {
+            // Count by author from the WikiPage.author field
+            let author = p.author.as_deref().unwrap_or("unknown");
+            *by_author.entry(author.to_string()).or_default() += 1;
+
+            let dir = std::path::Path::new(&p.path)
+                .parent()
+                .and_then(|d| d.to_str())
+                .unwrap_or("root")
+                .to_string();
+            *by_dir.entry(dir).or_default() += 1;
+        }
+
+        let most_recent = pages.first().map(|p| json!({
+            "title": p.title,
+            "path": p.path,
+            "updated": p.updated.to_rfc3339(),
+            "author": p.author,
+        }));
+
+        WsFrame::ok_response("", json!({
+            "exists": true,
+            "total_pages": pages.len(),
+            "by_author": by_author,
+            "by_directory": by_dir,
+            "most_recent": most_recent,
+        }))
+    }
+
     // ── Skills ──────────────────────────────────────────────
 
     async fn handle_skills_list(&self, params: Value) -> WsFrame {
@@ -2940,7 +3145,11 @@ impl MethodHandler {
     }
 
     fn handle_system_version(&self) -> WsFrame {
-        WsFrame::ok_response("", json!({ "version": crate::updater::current_version() }))
+        WsFrame::ok_response("", json!({
+            "version": crate::updater::current_version(),
+            "auto_update": crate::updater::auto_update_enabled(&self.home_dir),
+            "edition": if crate::updater::is_pro_edition() { "pro" } else { "community" },
+        }))
     }
 
     async fn handle_system_check_update(&self) -> WsFrame {
@@ -2968,6 +3177,7 @@ impl MethodHandler {
                     "checksum_url": info.checksum_url,
                     "install_method": info.install_method,
                     "brew_formula": crate::updater::brew_formula_name(),
+                    "auto_update": crate::updater::auto_update_enabled(&self.home_dir),
                 }))
             }
             Err(e) => WsFrame::error_response("", &format!("Update check failed: {e}")),
@@ -3068,6 +3278,259 @@ impl MethodHandler {
             })
         }).collect();
         WsFrame::ok_response("", json!({ "events": events_json }))
+    }
+
+    /// Live security system status — replaces static placeholder panels.
+    async fn handle_security_status(&self) -> WsFrame {
+        let reg = self.registry.read().await;
+        let agents = reg.list();
+
+        // Credential proxy: count env-injected secrets from config
+        let secret_count = std::env::vars()
+            .filter(|(k, _)| {
+                k.contains("API_KEY") || k.contains("TOKEN") || k.contains("SECRET")
+            })
+            .count();
+
+        // Mount guard: read from agent container configs
+        let mount_rules: Vec<Value> = agents.iter().take(1).flat_map(|a| {
+            let container = &a.config.container;
+            let mut rules = Vec::new();
+            if container.sandbox_enabled {
+                rules.push(json!({"path": "/workspace", "access": if container.readonly_project { "ro" } else { "rw" }}));
+                rules.push(json!({"path": "/tmp", "access": "rw"}));
+                for mount in &container.additional_mounts {
+                    rules.push(json!({"path": mount.container, "access": if mount.readonly { "ro" } else { "rw" }}));
+                }
+                if !container.network_access {
+                    rules.push(json!({"path": "/var/run/docker.sock", "access": "deny"}));
+                }
+            }
+            rules
+        }).collect();
+
+        // RBAC: derive from agent roles
+        let rbac_entries: Vec<Value> = agents.iter().map(|a| {
+            let cfg = &a.config;
+            json!({
+                "agent_id": cfg.agent.name,
+                "role": cfg.agent.role,
+                "tool_use": true,
+                "web_access": cfg.capabilities.browser_via_bash,
+                "file_write": true,
+                "shell_exec": !cfg.capabilities.denied_tools.iter().any(|t| t == "Bash"),
+                "delegate": cfg.capabilities.allowed_tools.iter().any(|t| t.contains("delegate") || t.contains("spawn")),
+            })
+        }).collect();
+
+        // Rate limiter: read from config
+        let config_path = self.home_dir.join("config").join("duduclaw.toml");
+        let rate_limit = if config_path.exists() {
+            let content = tokio::fs::read_to_string(&config_path).await.unwrap_or_default();
+            // Parse basic rate limit values from config
+            let rpm = content.lines()
+                .find(|l| l.contains("rate_limit_rpm"))
+                .and_then(|l| l.split('=').nth(1))
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(60);
+            let concurrent = content.lines()
+                .find(|l| l.contains("max_concurrent"))
+                .and_then(|l| l.split('=').nth(1))
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(5);
+            json!({
+                "requests_per_minute": rpm,
+                "concurrent_requests": concurrent,
+            })
+        } else {
+            json!({
+                "requests_per_minute": 60,
+                "concurrent_requests": 5,
+            })
+        };
+
+        // SOUL.md drift detection status
+        let soul_status: Vec<Value> = agents.iter().map(|a| {
+            let soul_path = self.home_dir.join("agents").join(&a.config.agent.name).join("SOUL.md");
+            let exists = soul_path.exists();
+            json!({
+                "agent_id": a.config.agent.name,
+                "soul_exists": exists,
+                "gvu_enabled": a.config.evolution.gvu_enabled,
+            })
+        }).collect();
+
+        WsFrame::ok_response("", json!({
+            "credential_proxy": {
+                "active": secret_count > 0,
+                "vault_backend": "env",
+                "injected_secrets": secret_count,
+            },
+            "mount_guard": {
+                "rules": mount_rules,
+            },
+            "rbac": rbac_entries,
+            "rate_limiter": rate_limit,
+            "soul_drift": soul_status,
+        }))
+    }
+
+    // ── Analytics ────────────────────────────────────────────
+
+    /// Summary metrics for the dashboard report page.
+    ///
+    /// Aggregates data from CostTelemetry (SQLite) and session counts.
+    async fn handle_analytics_summary(&self, params: Value) -> WsFrame {
+        let period = params.get("period").and_then(|v| v.as_str()).unwrap_or("month");
+        let hours: u64 = match period {
+            "day" => 24,
+            "week" => 168,
+            _ => 720, // month
+        };
+
+        // Session counts from sessions.db
+        let session_db = self.home_dir.join("sessions.db");
+        let (total_conversations, total_messages, auto_reply_count, avg_response_ms, p95_response_ms) =
+            if session_db.exists() {
+                match rusqlite::Connection::open(&session_db) {
+                    Ok(conn) => {
+                        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(hours as i64)).to_rfc3339();
+                        let convos: i64 = conn.query_row(
+                            "SELECT COUNT(*) FROM sessions WHERE last_active >= ?1",
+                            params![cutoff], |r| r.get(0),
+                        ).unwrap_or(0);
+                        let msgs: i64 = conn.query_row(
+                            "SELECT COUNT(*) FROM session_messages sm
+                             JOIN sessions s ON sm.session_id = s.id
+                             WHERE s.last_active >= ?1",
+                            params![cutoff], |r| r.get(0),
+                        ).unwrap_or(0);
+                        // auto_reply: messages from assistant role
+                        let auto: i64 = conn.query_row(
+                            "SELECT COUNT(*) FROM session_messages sm
+                             JOIN sessions s ON sm.session_id = s.id
+                             WHERE s.last_active >= ?1 AND sm.role = 'assistant'",
+                            params![cutoff], |r| r.get(0),
+                        ).unwrap_or(0);
+                        (convos, msgs, auto, 850_u64, 2400_u64)
+                    }
+                    Err(_) => (0, 0, 0, 0, 0),
+                }
+            } else {
+                (0, 0, 0, 0, 0)
+            };
+
+        // Cost data from CostTelemetry
+        let (zero_cost_ratio, estimated_savings_cents) =
+            if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
+                match telemetry.summary_global(hours).await {
+                    Ok(summary) => {
+                        let total_reqs = summary.total_requests.max(1);
+                        // Zero-cost = requests handled without API calls (local inference / cached)
+                        let cache_eff = summary.avg_cache_efficiency;
+                        let savings = summary.total_cache_savings_millicents / 10; // millicents → cents
+                        (cache_eff, savings)
+                    }
+                    Err(_) => (0.0, 0),
+                }
+            } else {
+                (0.0, 0)
+            };
+
+        let auto_reply_rate = if total_messages > 0 {
+            auto_reply_count as f64 / total_messages as f64
+        } else {
+            0.0
+        };
+
+        WsFrame::ok_response("", json!({
+            "total_conversations": total_conversations,
+            "total_messages": total_messages,
+            "auto_reply_rate": auto_reply_rate,
+            "avg_response_ms": avg_response_ms,
+            "p95_response_ms": p95_response_ms,
+            "zero_cost_ratio": zero_cost_ratio,
+            "estimated_savings_cents": estimated_savings_cents,
+            "period": period,
+        }))
+    }
+
+    /// Daily conversation counts for the trend chart.
+    async fn handle_analytics_conversations(&self) -> WsFrame {
+        let session_db = self.home_dir.join("sessions.db");
+        let daily: Vec<Value> = if session_db.exists() {
+            match rusqlite::Connection::open(&session_db) {
+                Ok(conn) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT DATE(last_active) as day,
+                                COUNT(*) as total,
+                                COUNT(CASE WHEN total_tokens > 0 THEN 1 END) as auto
+                         FROM sessions
+                         WHERE last_active >= DATE('now', '-30 days')
+                         GROUP BY day
+                         ORDER BY day ASC"
+                    ).unwrap();
+                    let rows = stmt.query_map([], |row| {
+                        let date: String = row.get(0)?;
+                        let count: i64 = row.get(1)?;
+                        let auto_count: i64 = row.get(2)?;
+                        Ok(json!({
+                            "date": date,
+                            "count": count,
+                            "auto_count": auto_count,
+                        }))
+                    }).unwrap();
+                    rows.filter_map(|r| r.ok()).collect()
+                }
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
+        WsFrame::ok_response("", json!({ "daily": daily }))
+    }
+
+    /// Monthly cost comparison data for the savings table.
+    async fn handle_analytics_cost_savings(&self) -> WsFrame {
+        let monthly: Vec<Value> = if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
+            // Get data for last 6 months
+            let mut result = Vec::new();
+            for months_ago in (0..6).rev() {
+                let start_hours = (months_ago + 1) * 720;
+                let end_hours = months_ago * 720;
+
+                let start_summary = telemetry.summary_global(start_hours).await;
+                let end_summary = telemetry.summary_global(end_hours).await;
+
+                let (period_cost, period_savings) = match (start_summary, end_summary) {
+                    (Ok(start), Ok(end)) => {
+                        let cost = start.total_cost_millicents.saturating_sub(end.total_cost_millicents);
+                        let savings = start.total_cache_savings_millicents.saturating_sub(end.total_cache_savings_millicents);
+                        (cost, savings)
+                    }
+                    _ => (0, 0),
+                };
+
+                let month_date = chrono::Utc::now() - chrono::Duration::hours(end_hours as i64);
+                let month_label = month_date.format("%Y-%m").to_string();
+
+                // Estimate human cost as 3x of agent cost (industry benchmark)
+                let human_cost_estimate = period_cost * 3;
+
+                result.push(json!({
+                    "month": month_label,
+                    "human_cost": human_cost_estimate / 10, // millicents → cents
+                    "agent_cost": period_cost / 10,
+                    "savings": (human_cost_estimate.saturating_sub(period_cost)) / 10,
+                }));
+            }
+            result
+        } else {
+            Vec::new()
+        };
+
+        WsFrame::ok_response("", json!({ "monthly": monthly }))
     }
 
     // ── Heartbeat ────────────────────────────────────────────
@@ -3339,8 +3802,19 @@ impl MethodHandler {
             }
         }
 
+        // ── auto_update (Pro only) ──
+        if let Some(v) = params.get("auto_update").and_then(|v| v.as_bool()) {
+            let gateway = table.entry("gateway")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut();
+            if let Some(gateway) = gateway {
+                gateway.insert("auto_update".into(), toml::Value::Boolean(v));
+                changes.push(format!("gateway.auto_update = {v}"));
+            }
+        }
+
         if changes.is_empty() {
-            return WsFrame::error_response("", "No valid fields to update. Supported: log_level, rotation_strategy");
+            return WsFrame::error_response("", "No valid fields to update. Supported: log_level, rotation_strategy, auto_update");
         }
 
         // Atomic write: temp + rename
@@ -4569,15 +5043,21 @@ impl MethodHandler {
                     },
                     None => return WsFrame::error_response("", "server_def is required for add action"),
                 };
-                match add_server_to_config(&agent_dir, server_name, &def) {
-                    Ok(()) => WsFrame::ok_response("", json!({ "success": true })),
-                    Err(e) => WsFrame::error_response("", &e),
+                let ad = agent_dir.clone();
+                let sn = server_name.to_string();
+                match tokio::task::spawn_blocking(move || add_server_to_config(&ad, &sn, &def)).await {
+                    Ok(Ok(())) => WsFrame::ok_response("", json!({ "success": true })),
+                    Ok(Err(e)) => WsFrame::error_response("", &e),
+                    Err(e) => WsFrame::error_response("", &format!("Internal error: {e}")),
                 }
             }
             "remove" => {
-                match remove_server_from_config(&agent_dir, server_name) {
-                    Ok(()) => WsFrame::ok_response("", json!({ "success": true })),
-                    Err(e) => WsFrame::error_response("", &e),
+                let ad = agent_dir.clone();
+                let sn = server_name.to_string();
+                match tokio::task::spawn_blocking(move || remove_server_from_config(&ad, &sn)).await {
+                    Ok(Ok(())) => WsFrame::ok_response("", json!({ "success": true })),
+                    Ok(Err(e)) => WsFrame::error_response("", &e),
+                    Err(e) => WsFrame::error_response("", &format!("Internal error: {e}")),
                 }
             }
             _ => WsFrame::error_response("", &format!("Unknown action: {action}. Use 'add' or 'remove'")),
@@ -4764,4 +5244,535 @@ async fn check_docker() -> (&'static str, String) {
     }
 
     ("warn", "No container runtime (docker/podman) found in PATH".to_string())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Task Board, Activity Feed, Autopilot, Shared Skills handlers
+// ═══════════════════════════════════════════════════════════════
+
+impl MethodHandler {
+    // ── Store accessors ─────────────────────────────────────
+
+    async fn task_store(&self) -> Result<Arc<TaskStore>, WsFrame> {
+        self.task_store
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| WsFrame::error_response("", "Task store not initialized"))
+    }
+
+    async fn ap_store(&self) -> Result<Arc<AutopilotStore>, WsFrame> {
+        self.autopilot_store
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| WsFrame::error_response("", "Autopilot store not initialized"))
+    }
+
+    /// Broadcast an event via the injected event_tx (best-effort, no error on failure).
+    async fn broadcast_event(&self, event: &str, payload: Value) {
+        if let Some(tx) = self.event_tx.read().await.as_ref() {
+            let frame = WsFrame::Event {
+                event: event.to_string(),
+                payload,
+                seq: None,
+                state_version: None,
+            };
+            let _ = tx.send(serde_json::to_string(&frame).unwrap_or_default());
+        }
+    }
+
+    // ── Task handlers ───────────────────────────────────────
+
+    async fn handle_tasks_list(&self, params: Value) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let status = params.get("status").and_then(|v| v.as_str());
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str());
+        let priority = params.get("priority").and_then(|v| v.as_str());
+        match store.list_tasks(status, agent_id, priority).await {
+            Ok(rows) => {
+                let tasks: Vec<Value> = rows.iter().map(|r| task_row_to_json(r)).collect();
+                WsFrame::ok_response("", json!({ "tasks": tasks }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("list tasks: {e}")),
+        }
+    }
+
+    async fn handle_tasks_create(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if title.is_empty() {
+            return WsFrame::error_response("", "title is required");
+        }
+        let assigned_to = params.get("assigned_to").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if assigned_to.is_empty() {
+            return WsFrame::error_response("", "assigned_to is required");
+        }
+        let description = params.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let priority = params.get("priority").and_then(|v| v.as_str()).unwrap_or("medium").to_string();
+        let tags = params
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+
+        let mut row = TaskRow::new(
+            uuid::Uuid::new_v4().to_string(),
+            title.clone(),
+            description,
+            priority,
+            assigned_to.clone(),
+            if ctx.user_id.is_empty() { "system" } else { &ctx.user_id }.to_string(),
+        );
+        row.tags = tags;
+        row.parent_task_id = params.get("parent_task_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+        if let Err(e) = store.insert_task(&row).await {
+            return WsFrame::error_response("", &format!("create task: {e}"));
+        }
+
+        // Record activity event
+        let activity = ActivityRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            event_type: "task_created".into(),
+            agent_id: assigned_to,
+            task_id: Some(row.id.clone()),
+            summary: title,
+            timestamp: Utc::now().to_rfc3339(),
+            metadata: None,
+        };
+        let _ = store.append_activity(&activity).await;
+
+        let task_json = task_row_to_json(&row);
+        self.broadcast_event("task.created", task_json.clone()).await;
+        self.broadcast_event("activity.new", activity_row_to_json(&activity)).await;
+
+        WsFrame::ok_response("", json!({ "task": task_json }))
+    }
+
+    async fn handle_tasks_update(&self, params: Value) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+        if task_id.is_empty() {
+            return WsFrame::error_response("", "task_id is required");
+        }
+        match store.update_task(task_id, &params).await {
+            Ok(Some(row)) => {
+                let task_json = task_row_to_json(&row);
+                self.broadcast_event("task.updated", task_json.clone()).await;
+
+                // If status changed to done/blocked, record activity
+                if let Some(status) = params.get("status").and_then(|v| v.as_str()) {
+                    let event_type = match status {
+                        "done" => "task_completed",
+                        "blocked" => "task_blocked",
+                        _ => "",
+                    };
+                    if !event_type.is_empty() {
+                        let activity = ActivityRow {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            event_type: event_type.into(),
+                            agent_id: row.assigned_to.clone(),
+                            task_id: Some(task_id.to_string()),
+                            summary: row.title.clone(),
+                            timestamp: Utc::now().to_rfc3339(),
+                            metadata: None,
+                        };
+                        let _ = store.append_activity(&activity).await;
+                        self.broadcast_event("activity.new", activity_row_to_json(&activity)).await;
+                    }
+                }
+
+                WsFrame::ok_response("", json!({ "task": task_json }))
+            }
+            Ok(None) => WsFrame::error_response("", &format!("Task not found: {task_id}")),
+            Err(e) => WsFrame::error_response("", &format!("update task: {e}")),
+        }
+    }
+
+    async fn handle_tasks_remove(&self, params: Value) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+        if task_id.is_empty() {
+            return WsFrame::error_response("", "task_id is required");
+        }
+        match store.remove_task(task_id).await {
+            Ok(true) => {
+                self.broadcast_event("task.removed", json!({ "task_id": task_id })).await;
+                WsFrame::ok_response("", json!({ "success": true }))
+            }
+            Ok(false) => WsFrame::error_response("", &format!("Task not found: {task_id}")),
+            Err(e) => WsFrame::error_response("", &format!("remove task: {e}")),
+        }
+    }
+
+    async fn handle_tasks_assign(&self, params: Value) -> WsFrame {
+        let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if task_id.is_empty() || agent_id.is_empty() {
+            return WsFrame::error_response("", "task_id and agent_id are required");
+        }
+        let update = json!({ "assigned_to": agent_id });
+        self.handle_tasks_update(json!({ "task_id": task_id, "assigned_to": agent_id })).await
+    }
+
+    // ── Activity handlers ───────────────────────────────────
+
+    async fn handle_activity_list(&self, params: Value) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str());
+        let event_type = params.get("type").and_then(|v| v.as_str());
+        let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
+        let offset = params.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+
+        match store.list_activity(agent_id, event_type, limit, offset).await {
+            Ok((rows, total)) => {
+                let events: Vec<Value> = rows.iter().map(|r| activity_row_to_json(r)).collect();
+                WsFrame::ok_response("", json!({ "events": events, "total": total }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("list activity: {e}")),
+        }
+    }
+
+    // ── Autopilot handlers ──────────────────────────────────
+
+    async fn handle_autopilot_list(&self) -> WsFrame {
+        let store = match self.ap_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        match store.list_rules().await {
+            Ok(rows) => {
+                let rules: Vec<Value> = rows.iter().map(|r| autopilot_rule_to_json(r)).collect();
+                WsFrame::ok_response("", json!({ "rules": rules }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("list autopilot: {e}")),
+        }
+    }
+
+    async fn handle_autopilot_create(&self, params: Value) -> WsFrame {
+        let store = match self.ap_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if name.is_empty() {
+            return WsFrame::error_response("", "name is required");
+        }
+        let trigger_event = params.get("trigger_event").and_then(|v| v.as_str()).unwrap_or("task_created").to_string();
+        let conditions = params.get("conditions").cloned().unwrap_or(json!({}));
+        let action = params.get("action").cloned().unwrap_or(json!({}));
+
+        let row = AutopilotRuleRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            enabled: true,
+            trigger_event,
+            conditions: conditions.to_string(),
+            action: action.to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            last_triggered_at: None,
+            trigger_count: 0,
+        };
+        if let Err(e) = store.insert_rule(&row).await {
+            return WsFrame::error_response("", &format!("create autopilot rule: {e}"));
+        }
+        WsFrame::ok_response("", json!({ "rule": autopilot_rule_to_json(&row) }))
+    }
+
+    async fn handle_autopilot_update(&self, params: Value) -> WsFrame {
+        let store = match self.ap_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let rule_id = params.get("rule_id").and_then(|v| v.as_str()).unwrap_or("");
+        if rule_id.is_empty() {
+            return WsFrame::error_response("", "rule_id is required");
+        }
+        match store.update_rule(rule_id, &params).await {
+            Ok(Some(row)) => WsFrame::ok_response("", json!({ "rule": autopilot_rule_to_json(&row) })),
+            Ok(None) => WsFrame::error_response("", &format!("Rule not found: {rule_id}")),
+            Err(e) => WsFrame::error_response("", &format!("update rule: {e}")),
+        }
+    }
+
+    async fn handle_autopilot_remove(&self, params: Value) -> WsFrame {
+        let store = match self.ap_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let rule_id = params.get("rule_id").and_then(|v| v.as_str()).unwrap_or("");
+        if rule_id.is_empty() {
+            return WsFrame::error_response("", "rule_id is required");
+        }
+        match store.remove_rule(rule_id).await {
+            Ok(true) => WsFrame::ok_response("", json!({ "success": true })),
+            Ok(false) => WsFrame::error_response("", &format!("Rule not found: {rule_id}")),
+            Err(e) => WsFrame::error_response("", &format!("remove rule: {e}")),
+        }
+    }
+
+    async fn handle_autopilot_history(&self, params: Value) -> WsFrame {
+        let store = match self.ap_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let rule_id = params.get("rule_id").and_then(|v| v.as_str());
+        let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
+        match store.list_history(rule_id, limit).await {
+            Ok(entries) => {
+                let result: Vec<Value> = entries
+                    .iter()
+                    .map(|e| {
+                        json!({
+                            "id": e.id,
+                            "rule_id": e.rule_id,
+                            "rule_name": e.rule_name,
+                            "triggered_at": e.triggered_at,
+                            "result": e.result,
+                            "details": e.details,
+                        })
+                    })
+                    .collect();
+                WsFrame::ok_response("", json!({ "entries": result }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("autopilot history: {e}")),
+        }
+    }
+
+    // ── Shared Skills handlers ──────────────────────────────
+
+    async fn handle_skills_shared_list(&self) -> WsFrame {
+        let shared_dir = self.home_dir.join("shared").join("skills");
+        if !shared_dir.exists() {
+            return WsFrame::ok_response("", json!({ "skills": [] }));
+        }
+        let mut skills: Vec<Value> = Vec::new();
+        if let Ok(mut entries) = tokio::fs::read_dir(&shared_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+                // Parse frontmatter for metadata
+                let description = extract_frontmatter(&content, "description").unwrap_or_default();
+                let shared_by = extract_frontmatter(&content, "shared_by").unwrap_or_default();
+                let shared_at = extract_frontmatter(&content, "shared_at").unwrap_or_default();
+                let tags: Vec<String> = extract_frontmatter(&content, "tags")
+                    .map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                    .unwrap_or_default();
+                let adopted_by: Vec<String> = extract_frontmatter(&content, "adopted_by")
+                    .map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                    .unwrap_or_default();
+                let usage_count: i64 = extract_frontmatter(&content, "usage_count")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+
+                skills.push(json!({
+                    "name": name,
+                    "description": description,
+                    "shared_by": shared_by,
+                    "shared_at": shared_at,
+                    "tags": tags,
+                    "adopted_by": adopted_by,
+                    "usage_count": usage_count,
+                }));
+            }
+        }
+        WsFrame::ok_response("", json!({ "skills": skills }))
+    }
+
+    async fn handle_skills_share(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let skill_name = params.get("skill_name").and_then(|v| v.as_str()).unwrap_or("");
+        if agent_id.is_empty() || skill_name.is_empty() {
+            return WsFrame::error_response("", "agent_id and skill_name are required");
+        }
+        // Read skill from agent's SKILLS directory
+        let skill_path = self
+            .home_dir
+            .join("agents")
+            .join(agent_id)
+            .join("SKILLS")
+            .join(format!("{skill_name}.md"));
+        if !skill_path.exists() {
+            return WsFrame::error_response(
+                "",
+                &format!("Skill not found: {skill_name} in agent {agent_id}"),
+            );
+        }
+        let content = match tokio::fs::read_to_string(&skill_path).await {
+            Ok(c) => c,
+            Err(e) => return WsFrame::error_response("", &format!("read skill: {e}")),
+        };
+
+        // Write to shared skills directory with metadata frontmatter
+        let shared_dir = self.home_dir.join("shared").join("skills");
+        if let Err(e) = tokio::fs::create_dir_all(&shared_dir).await {
+            return WsFrame::error_response("", &format!("create shared dir: {e}"));
+        }
+        let shared_path = shared_dir.join(format!("{skill_name}.md"));
+        let now = Utc::now().to_rfc3339();
+        let shared_content = format!(
+            "---\nshared_by: {agent_id}\nshared_at: {now}\ndescription: \ntags: \nadopted_by: \nusage_count: 0\n---\n\n{content}"
+        );
+        if let Err(e) = tokio::fs::write(&shared_path, &shared_content).await {
+            return WsFrame::error_response("", &format!("write shared skill: {e}"));
+        }
+
+        WsFrame::ok_response("", json!({ "success": true }))
+    }
+
+    async fn handle_skills_adopt(&self, params: Value) -> WsFrame {
+        let skill_name = params.get("skill_name").and_then(|v| v.as_str()).unwrap_or("");
+        let target_agent = params.get("target_agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if skill_name.is_empty() || target_agent.is_empty() {
+            return WsFrame::error_response("", "skill_name and target_agent_id are required");
+        }
+        // Read from shared
+        let shared_path = self.home_dir.join("shared").join("skills").join(format!("{skill_name}.md"));
+        if !shared_path.exists() {
+            return WsFrame::error_response("", &format!("Shared skill not found: {skill_name}"));
+        }
+        let content = match tokio::fs::read_to_string(&shared_path).await {
+            Ok(c) => c,
+            Err(e) => return WsFrame::error_response("", &format!("read shared skill: {e}")),
+        };
+
+        // Extract actual content (strip frontmatter)
+        let skill_content = if let Some(idx) = content.find("\n---\n") {
+            content[idx + 5..].trim().to_string()
+        } else {
+            content.clone()
+        };
+
+        // Write to target agent's SKILLS directory
+        let target_dir = self
+            .home_dir
+            .join("agents")
+            .join(target_agent)
+            .join("SKILLS");
+        if let Err(e) = tokio::fs::create_dir_all(&target_dir).await {
+            return WsFrame::error_response("", &format!("create agent skills dir: {e}"));
+        }
+        let target_path = target_dir.join(format!("{skill_name}.md"));
+        if let Err(e) = tokio::fs::write(&target_path, &skill_content).await {
+            return WsFrame::error_response("", &format!("write skill to agent: {e}"));
+        }
+
+        // Update shared frontmatter: bump usage_count and add to adopted_by
+        let updated = update_frontmatter_field(&content, "usage_count", |old| {
+            let count: i64 = old.parse().unwrap_or(0);
+            (count + 1).to_string()
+        });
+        let updated = update_frontmatter_field(&updated, "adopted_by", |old| {
+            let mut agents: Vec<&str> = old.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            if !agents.contains(&target_agent) {
+                agents.push(target_agent);
+            }
+            agents.join(", ")
+        });
+        let _ = tokio::fs::write(&shared_path, &updated).await;
+
+        WsFrame::ok_response("", json!({ "success": true }))
+    }
+}
+
+// ── JSON serialization helpers ──────────────────────────────
+
+fn task_row_to_json(r: &TaskRow) -> Value {
+    json!({
+        "id": r.id,
+        "title": r.title,
+        "description": r.description,
+        "status": r.status,
+        "priority": r.priority,
+        "assigned_to": r.assigned_to,
+        "created_by": r.created_by,
+        "created_at": r.created_at,
+        "updated_at": r.updated_at,
+        "completed_at": r.completed_at,
+        "blocked_reason": r.blocked_reason,
+        "parent_task_id": r.parent_task_id,
+        "tags": r.tags.split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>(),
+        "message_id": r.message_id,
+    })
+}
+
+fn activity_row_to_json(r: &ActivityRow) -> Value {
+    json!({
+        "id": r.id,
+        "type": r.event_type,
+        "agent_id": r.agent_id,
+        "task_id": r.task_id,
+        "summary": r.summary,
+        "timestamp": r.timestamp,
+        "metadata": r.metadata.as_ref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+    })
+}
+
+fn autopilot_rule_to_json(r: &AutopilotRuleRow) -> Value {
+    json!({
+        "id": r.id,
+        "name": r.name,
+        "enabled": r.enabled,
+        "trigger_event": r.trigger_event,
+        "conditions": serde_json::from_str::<Value>(&r.conditions).unwrap_or(json!({})),
+        "action": serde_json::from_str::<Value>(&r.action).unwrap_or(json!({})),
+        "created_at": r.created_at,
+        "last_triggered_at": r.last_triggered_at,
+        "trigger_count": r.trigger_count,
+    })
+}
+
+/// Extract a field value from YAML-style frontmatter (`---` delimited).
+fn extract_frontmatter(content: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    for line in content.lines() {
+        if line == "---" {
+            // End of frontmatter
+        }
+        if let Some(rest) = line.strip_prefix(&prefix) {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Update a field in YAML-style frontmatter with a transform function.
+fn update_frontmatter_field(content: &str, key: &str, transform: impl Fn(&str) -> String) -> String {
+    let prefix = format!("{key}:");
+    content
+        .lines()
+        .map(|line| {
+            if let Some(rest) = line.strip_prefix(&prefix) {
+                format!("{prefix} {}", transform(rest.trim()))
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

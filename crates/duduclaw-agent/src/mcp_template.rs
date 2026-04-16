@@ -229,10 +229,10 @@ pub fn ensure_mcp_absolute_paths_all(agents_dir: &Path) -> usize {
             continue;
         }
         // Skip trash / defaults directories
-        if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with('_') || name.starts_with('.') {
-                continue;
-            }
+        if let Some(name) = dir.file_name().and_then(|n| n.to_str())
+            && (name.starts_with('_') || name.starts_with('.'))
+        {
+            continue;
         }
         match ensure_duduclaw_absolute_path(&dir) {
             Ok(true) => fixed += 1,

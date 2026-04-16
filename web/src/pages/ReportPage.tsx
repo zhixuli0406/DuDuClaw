@@ -88,9 +88,9 @@ export function ReportPage() {
 
   const fetchData = useCallback(
     (p: Period) => {
-      api.analytics.summary(p).then(setSummary).catch(() => {});
-      api.analytics.conversations().then((r) => setDaily(r?.daily ?? [])).catch(() => {});
-      api.analytics.costSavings().then((r) => setCosts(r?.monthly ?? [])).catch(() => {});
+      api.analytics.summary(p).then(setSummary).catch((e) => console.warn("[api]", e));
+      api.analytics.conversations().then((r) => setDaily(r?.daily ?? [])).catch((e) => console.warn("[api]", e));
+      api.analytics.costSavings().then((r) => setCosts(r?.monthly ?? [])).catch((e) => console.warn("[api]", e));
     },
     [],
   );

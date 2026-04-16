@@ -73,3 +73,4 @@ computer_use = false
 browser_via_bash = false
 allowed_tools = []
 denied_tools = []
+wiki_visible_to = ["*"]  # Which agents can read this agent's wiki. ["*"] = all, [] = private

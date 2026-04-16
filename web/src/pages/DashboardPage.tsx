@@ -13,6 +13,7 @@ import {
   type WikiStats,
 } from '@/lib/api';
 import { WikiGraph } from '@/components/WikiGraph';
+import { ActivityFeed } from '@/components/ActivityFeed';
 import {
   Bot,
   Radio,
@@ -79,9 +80,9 @@ export function DashboardPage() {
 
     fetchAgents();
     fetchStatus();
-    api.accounts.budgetSummary().then(setBudget).catch(() => {});
-    api.system.doctor().then(setDoctor).catch(() => {});
-    api.license.status().then(setLicense).catch(() => {});
+    api.accounts.budgetSummary().then(setBudget).catch((e) => console.warn("[api]", e));
+    api.system.doctor().then(setDoctor).catch((e) => console.warn("[api]", e));
+    api.license.status().then(setLicense).catch((e) => console.warn("[api]", e));
 
     // Fetch wiki data for the default (first) agent
     api.agents.list().then(async (res) => {
@@ -112,11 +113,11 @@ export function DashboardPage() {
         }
         setWikiContents(contents);
       }
-    }).catch(() => {});
+    }).catch((e) => console.warn("[api]", e));
 
     // Lightweight budget refresh every 60s
     const interval = setInterval(() => {
-      api.accounts.budgetSummary().then(setBudget).catch(() => {});
+      api.accounts.budgetSummary().then(setBudget).catch((e) => console.warn("[api]", e));
     }, 60_000);
     return () => clearInterval(interval);
   }, [connectionState, fetchAgents, fetchStatus]);
@@ -310,11 +311,9 @@ export function DashboardPage() {
       {/* Activity Feed */}
       <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
         <h3 className="mb-4 text-lg font-medium text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'dashboard.activity.title' })}
+          {intl.formatMessage({ id: 'activity.title' })}
         </h3>
-        <div className="flex items-center justify-center py-12 text-stone-400 dark:text-stone-500">
-          <p>{intl.formatMessage({ id: 'common.noData' })}</p>
-        </div>
+        <ActivityFeed limit={10} showFilter agents={agents} />
       </div>
     </div>
   );

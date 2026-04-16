@@ -972,7 +972,10 @@ async fn handle_message_create(
     let progress_msg_id: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
     let progress_msg_id_cb = progress_msg_id.clone();
     let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
-        let mut last = last_progress.lock().unwrap();
+        let mut last = match last_progress.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         if last.elapsed().as_secs() < 30 {
             return;
         }
@@ -985,7 +988,10 @@ async fn handle_message_create(
         let ch = progress_channel.clone();
         let mid = progress_msg_id_cb.clone();
         tokio::spawn(async move {
-            let existing_id = mid.lock().unwrap().clone();
+            let existing_id = match mid.lock() {
+                Ok(g) => g.clone(),
+                Err(e) => e.into_inner().clone(),
+            };
             if let Some(msg_id) = existing_id {
                 // Edit the existing progress message
                 let _ = c
@@ -1005,7 +1011,10 @@ async fn handle_message_create(
                 if let Ok(r) = resp {
                     if let Ok(body) = r.json::<serde_json::Value>().await {
                         if let Some(id) = body["id"].as_str() {
-                            *mid.lock().unwrap() = Some(id.to_string());
+                            match mid.lock() {
+                                Ok(mut g) => *g = Some(id.to_string()),
+                                Err(e) => *e.into_inner() = Some(id.to_string()),
+                            };
                         }
                     }
                 }
@@ -1062,7 +1071,11 @@ async fn handle_message_create(
     }
 
     // ── Delete progress message now that we have the real reply ──
-    if let Some(pmid) = progress_msg_id.lock().unwrap().take() {
+    let pmid_val = match progress_msg_id.lock() {
+        Ok(mut g) => g.take(),
+        Err(e) => e.into_inner().take(),
+    };
+    if let Some(pmid) = pmid_val {
         let c = cleanup_http;
         let t = cleanup_token;
         let ch = cleanup_channel;

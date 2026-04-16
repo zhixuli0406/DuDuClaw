@@ -1710,10 +1710,18 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
     }
 
     let bind = std::env::var("DUDUCLAW_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    if bind.parse::<std::net::IpAddr>().is_err() {
+        eprintln!("ERROR: Invalid bind address '{bind}'. Must be a valid IP (e.g. 127.0.0.1 or 0.0.0.0)");
+        std::process::exit(1);
+    }
     let port: u16 = std::env::var("DUDUCLAW_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(18789);
+    if port == 0 {
+        eprintln!("ERROR: Port 0 is not valid for a server. Use a port between 1024-65535.");
+        std::process::exit(1);
+    }
 
     println!("🐾 DuDuClaw Server Starting...");
     println!("   Gateway: http://{bind}:{port}");

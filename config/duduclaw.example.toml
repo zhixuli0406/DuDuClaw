@@ -16,7 +16,41 @@ cooldown_after_rate_limit_seconds = 120
 [gateway]
 bind = "127.0.0.1"
 port = 18789
+# auto_update = true  # Pro default: true (auto-download + install + restart)
+                       # CE default: false (notify only). Override with env DUDUCLAW_AUTO_UPDATE.
 
 [logging]
 level = "info"  # trace | debug | info | warn | error
 format = "pretty"  # pretty | json
+
+# ── Evolution Engine ────────────────────────────────────────
+# Per-agent overrides go in agent.toml [evolution]; these are global defaults.
+# [evolution]
+# gvu_enabled = true                        # Enable GVU (Generator-Verifier-Updater) loop
+# cognitive_memory = true                   # Episodic/semantic memory layer
+# max_silence_hours = 12.0                  # Silence breaker threshold
+# max_gvu_generations = 3                   # Max attempts per GVU cycle (adaptive up to 7)
+# observation_period_hours = 24.0           # SOUL.md observation window before confirm/rollback
+# skill_token_budget = 2500                 # Max tokens for skills in system prompt
+# max_active_skills = 5                     # Max concurrent active skills per agent
+
+# ── Skill Auto-Synthesis (Voyager-inspired) ─────────────────
+# skill_synthesis_enabled = false           # Enable auto-synthesis from episodic memory
+# skill_synthesis_threshold = 3             # Gap occurrences before triggering synthesis
+# skill_synthesis_cooldown_hours = 24       # Cooldown after successful synthesis
+# skill_trial_ttl = 20                      # Conversations before sandbox trial evaluation
+
+# ── Cross-Agent Skill Migration ────────────────────────────
+# skill_graduation_enabled = false          # Auto-graduate proven skills to global scope
+# skill_graduation_min_lift = 0.1           # Min error reduction (10%) for graduation
+# skill_recommendation_enabled = false      # Recommend graduated skills to new agents
+# skill_recommendation_threshold = 0.3      # Min combined score for auto-activation
+
+# ── Curiosity-Driven Exploration ────────────────────────────
+# curiosity_enabled = false                 # Proactive frontier topic exploration
+# curiosity_threshold = 0.6                 # Min curiosity score to trigger
+# curiosity_max_daily = 3                   # Max exploration actions per day
+
+# ── Behavior Monitoring ────────────────────────────────────
+# skill_behavior_monitor_enabled = false    # Detect behavioral drift after skill activation
+# skill_behavior_drift_threshold = 0.3      # Drift magnitude (0.0–1.0) to flag anomaly

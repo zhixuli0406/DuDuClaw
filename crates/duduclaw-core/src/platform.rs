@@ -17,6 +17,17 @@ pub fn home_dir() -> String {
         .unwrap_or_default()
 }
 
+/// Return the Python 3 command name for the current platform.
+///
+/// On Windows, Python is often installed as `python` (the Microsoft Store
+/// `python3` stub is unreliable). On Unix, `python3` is preferred.
+pub fn python3_command() -> &'static str {
+    #[cfg(windows)]
+    { "python" }
+    #[cfg(not(windows))]
+    { "python3" }
+}
+
 // ── Command execution helpers ────────────────────────────────
 
 /// Create a `std::process::Command` for a program, handling Windows npm shims.

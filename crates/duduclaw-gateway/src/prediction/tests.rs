@@ -245,9 +245,11 @@ mod router_tests {
     /// Sets epsilon_init/min to 0 (the hard floor EPSILON_FLOOR_ABSOLUTE=0.05 still
     /// applies) and seeds the PRNG counter so should_explore() returns false.
     fn no_exploration() -> ExplorationState {
-        let mut state = ExplorationState::default();
-        state.epsilon_min = 0.0;
-        state.epsilon_init = 0.0;
+        let mut state = ExplorationState {
+            epsilon_min: 0.0,
+            epsilon_init: 0.0,
+            ..Default::default()
+        };
         // Seed=5 → first PRNG output ≈ 0.40 which is > EPSILON_FLOOR (0.05)
         state.rng_counter = 5;
         state

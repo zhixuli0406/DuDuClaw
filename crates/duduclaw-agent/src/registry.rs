@@ -136,10 +136,12 @@ impl AgentRegistry {
             ))
         })?;
 
-        let config: AgentConfig = toml::from_str(&toml_content).map_err(|e| {
+        let mut config: AgentConfig = toml::from_str(&toml_content).map_err(|e| {
             error!(path = %toml_path.display(), error = %e, "failed to parse agent.toml");
             DuDuClawError::TomlDeser(e)
         })?;
+        config.proactive.sanitize();
+        config.sticker.sanitize();
 
         let soul = Self::load_optional_md(&dir.join("SOUL.md")).await;
         let identity = Self::load_optional_md(&dir.join("IDENTITY.md")).await;

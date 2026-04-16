@@ -205,6 +205,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     // Event broadcast channel for pushing real-time updates (e.g. channel status) to dashboard
     let (event_tx, _) = broadcast::channel::<String>(64);
+    handler.set_event_tx(event_tx.clone()).await;
 
     // Start channel bots if configured
     let reply_ctx = Arc::new(
@@ -260,6 +261,25 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             ))?,
     );
     handler.set_cron_store(cron_store.clone()).await;
+
+    // Initialize task board store (SQLite tasks.db + activity feed)
+    match crate::task_store::TaskStore::open(&home_dir) {
+        Ok(ts) => {
+            handler.set_task_store(Arc::new(ts)).await;
+            info!("Task board store initialized");
+        }
+        Err(e) => warn!("Failed to open task store: {e}"),
+    }
+
+    // Initialize autopilot rule store (SQLite autopilot.db)
+    match crate::autopilot_store::AutopilotStore::open(&home_dir) {
+        Ok(ap) => {
+            handler.set_autopilot_store(Arc::new(ap)).await;
+            info!("Autopilot store initialized");
+        }
+        Err(e) => warn!("Failed to open autopilot store: {e}"),
+    }
+
     let (cron_handle, cron_scheduler) = crate::cron_scheduler::start_cron_scheduler(
         home_dir.clone(),
         cron_store.clone(),
@@ -301,8 +321,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     info!("Agent dispatcher started ({} background tasks)", bg_handles.len());
 
     // ── Periodic update check (every 6 hours) — broadcast to dashboard ──
+    // Pro edition: auto-download + install + graceful restart (unless disabled).
+    // CE edition: notify dashboard only.
+    let auto_update = crate::updater::auto_update_enabled(&home_dir);
     {
         let etx = event_tx.clone();
+        let home_for_update = home_dir.clone();
         tokio::spawn(async move {
             // First check after 30 seconds (let gateway finish startup)
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -318,6 +342,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                                 "release_notes": info.release_notes,
                                 "published_at": info.published_at,
                                 "install_method": info.install_method,
+                                "auto_update": auto_update,
                             }),
                             seq: None,
                             state_version: None,
@@ -325,10 +350,102 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                         if let Ok(json) = serde_json::to_string(&event) {
                             let _ = etx.send(json);
                         }
-                        info!(
-                            latest = %info.latest_version,
-                            "New version available — notified dashboard clients"
-                        );
+
+                        if auto_update {
+                            // Pro auto-update: download, verify, install, restart
+                            info!(
+                                latest = %info.latest_version,
+                                "Auto-update: downloading v{}...",
+                                info.latest_version,
+                            );
+
+                            // Audit log
+                            duduclaw_security::audit::append_audit_event(
+                                &home_for_update,
+                                &duduclaw_security::audit::AuditEvent::new(
+                                    "auto_update_start",
+                                    "system",
+                                    duduclaw_security::audit::Severity::Info,
+                                    serde_json::json!({
+                                        "from": info.current_version,
+                                        "to": info.latest_version,
+                                    }),
+                                ),
+                            );
+
+                            match crate::updater::apply_update(
+                                &info.download_url,
+                                &info.checksum_url,
+                            ).await {
+                                Ok(result) if result.success => {
+                                    info!("Auto-update installed v{}", info.latest_version);
+
+                                    // Notify dashboard before restart
+                                    let done_event = WsFrame::Event {
+                                        event: "system.update_installed".to_string(),
+                                        payload: serde_json::json!({
+                                            "version": info.latest_version,
+                                            "needs_restart": result.needs_restart,
+                                            "message": result.message,
+                                        }),
+                                        seq: None,
+                                        state_version: None,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&done_event) {
+                                        let _ = etx.send(json);
+                                    }
+
+                                    duduclaw_security::audit::append_audit_event(
+                                        &home_for_update,
+                                        &duduclaw_security::audit::AuditEvent::new(
+                                            "auto_update_success",
+                                            "system",
+                                            duduclaw_security::audit::Severity::Info,
+                                            serde_json::json!({
+                                                "version": info.latest_version,
+                                                "needs_restart": result.needs_restart,
+                                            }),
+                                        ),
+                                    );
+
+                                    if result.needs_restart {
+                                        // Graceful shutdown after 3s to let WebSocket
+                                        // clients receive the notification
+                                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                        info!("Auto-update: restarting for v{}", info.latest_version);
+                                        duduclaw_core::platform::self_interrupt();
+                                    }
+                                }
+                                Ok(result) => {
+                                    // apply_update returned success=false (e.g. Homebrew)
+                                    warn!(
+                                        msg = %result.message,
+                                        "Auto-update skipped"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Auto-update failed — will retry next cycle");
+
+                                    duduclaw_security::audit::append_audit_event(
+                                        &home_for_update,
+                                        &duduclaw_security::audit::AuditEvent::new(
+                                            "auto_update_failed",
+                                            "system",
+                                            duduclaw_security::audit::Severity::Warning,
+                                            serde_json::json!({
+                                                "target_version": info.latest_version,
+                                                "error": e.replace('\n', " "),
+                                            }),
+                                        ),
+                                    );
+                                }
+                            }
+                        } else {
+                            info!(
+                                latest = %info.latest_version,
+                                "New version available — notified dashboard clients"
+                            );
+                        }
                     }
                     Ok(_) => { /* up to date, no broadcast */ }
                     Err(e) => {
@@ -339,7 +456,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
             }
         });
-        info!("Periodic update checker started (every 6h)");
+        info!(
+            auto_update,
+            "Periodic update checker started (every 6h, auto_update={})",
+            auto_update,
+        );
     }
 
     // Start reminder scheduler (time-wheel based, 10s disk polling for cross-process pickup)

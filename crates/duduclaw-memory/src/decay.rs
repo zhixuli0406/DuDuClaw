@@ -146,12 +146,17 @@ pub async fn run_decay(engine: &SqliteMemoryEngine, policy: &MemoryDecayPolicy) 
     // A record survives: archive_after_days (in memories) + delete_after_days (in archive).
     // Wrapped in a transaction so a partial delete is rolled back on error.
     let phase2_result: std::result::Result<u64, String> = (|| {
-        let tx = conn.transaction().map_err(|e| format!("BEGIN phase2 failed: {e}"))?;
-        let count = tx.execute(
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| format!("BEGIN phase2 failed: {e}"))?;
+        let count = conn.execute(
             "DELETE FROM memories_archive WHERE archived_at < ?1",
             params![delete_cutoff],
-        ).map_err(|e| format!("Delete phase failed: {e}"))?;
-        tx.commit().map_err(|e| format!("COMMIT phase2 failed: {e}"))?;
+        ).map_err(|e| {
+            let _ = conn.execute_batch("ROLLBACK");
+            format!("Delete phase failed: {e}")
+        })?;
+        conn.execute_batch("COMMIT")
+            .map_err(|e| format!("COMMIT phase2 failed: {e}"))?;
         Ok(count as u64)
     })();
 

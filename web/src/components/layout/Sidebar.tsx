@@ -7,6 +7,7 @@ import { hasMinRole } from '@/lib/roles';
 import {
   LayoutDashboard,
   Bot,
+  KanbanSquare,
   Network,
   Puzzle,
   Radio,
@@ -23,6 +24,7 @@ import {
   Building2,
   Users,
   Plug,
+  Globe,
   LogOut,
 } from 'lucide-react';
 
@@ -38,12 +40,14 @@ const navItems: NavItem[] = [
   { to: '/', icon: LayoutDashboard, label: 'nav.dashboard' },
   { to: '/webchat', icon: MessageCircle, label: 'nav.webchat' },
   { to: '/agents', icon: Bot, label: 'nav.agents' },
+  { to: '/tasks', icon: KanbanSquare, label: 'nav.tasks' },
   { to: '/org', icon: Network, label: 'nav.org', minRole: 'manager' },
   { to: '/skills', icon: Puzzle, label: 'nav.skills' },
   { to: '/channels', icon: Radio, label: 'nav.channels', minRole: 'admin' },
   { to: '/accounts', icon: Wallet, label: 'nav.accounts', minRole: 'admin' },
   { to: '/memory', icon: Brain, label: 'nav.memory' },
   { to: '/wiki', icon: BookOpen, label: 'nav.wiki' },
+  { to: '/shared-wiki', icon: Globe, label: 'nav.sharedWiki' },
   { to: '/security', icon: Shield, label: 'nav.security', minRole: 'admin' },
   { to: '/reports', icon: BarChart3, label: 'nav.reports', minRole: 'manager' },
   { to: '/billing', icon: CreditCard, label: 'nav.billing', minRole: 'manager' },

@@ -30,6 +30,8 @@ pub struct WikiPage {
     pub related: Vec<String>,
     /// Source identifiers (free-form).
     pub sources: Vec<String>,
+    /// Author agent ID (used in shared wiki to track who wrote the page).
+    pub author: Option<String>,
     /// Markdown body (without frontmatter).
     pub body: String,
 }
@@ -41,6 +43,8 @@ pub struct PageMeta {
     pub title: String,
     pub updated: DateTime<Utc>,
     pub tags: Vec<String>,
+    /// Author agent ID (populated for shared wiki pages).
+    pub author: Option<String>,
 }
 
 /// A search hit with relevance score.
@@ -71,6 +75,19 @@ pub struct LintReport {
     pub index_entries: usize,
 }
 
+/// Target for a wiki write — agent-private or shared knowledge base.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WikiTarget {
+    /// Write to the agent's own wiki (default).
+    #[default]
+    Agent,
+    /// Write to the shared wiki (`~/.duduclaw/shared/wiki/`).
+    Shared,
+    /// Write to both agent and shared wiki.
+    Both,
+}
+
 /// Proposed wiki change (used by GVU integration in Phase 2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WikiProposal {
@@ -79,6 +96,9 @@ pub struct WikiProposal {
     pub content: Option<String>,
     pub rationale: String,
     pub related_pages: Vec<String>,
+    /// Where to apply this proposal. Defaults to the agent's own wiki.
+    #[serde(default)]
+    pub target: WikiTarget,
 }
 
 /// Action type for a wiki proposal.
@@ -110,17 +130,32 @@ const MAX_RECURSION_DEPTH: usize = 20;
 // WikiStore
 // ---------------------------------------------------------------------------
 
-/// File-system backed wiki store for a single agent.
+/// File-system backed wiki store for a single agent or the shared knowledge base.
 pub struct WikiStore {
-    /// Root wiki directory (e.g. `~/.duduclaw/agents/agnes/wiki/`).
+    /// Root wiki directory (e.g. `~/.duduclaw/agents/agnes/wiki/` or `~/.duduclaw/shared/wiki/`).
     wiki_dir: PathBuf,
+    /// Whether this is the shared wiki (`~/.duduclaw/shared/wiki/`).
+    shared: bool,
 }
 
 impl WikiStore {
     /// Open a wiki store at the given directory.
     /// Does NOT create the directory — call `ensure_scaffold()` first if needed.
     pub fn new(wiki_dir: PathBuf) -> Self {
-        Self { wiki_dir }
+        Self { wiki_dir, shared: false }
+    }
+
+    /// Open the shared wiki store at `home_dir/shared/wiki/`.
+    pub fn new_shared(home_dir: &Path) -> Self {
+        Self {
+            wiki_dir: home_dir.join("shared").join("wiki"),
+            shared: true,
+        }
+    }
+
+    /// Whether this is the shared wiki.
+    pub fn is_shared(&self) -> bool {
+        self.shared
     }
 
     /// Return the wiki root directory.
@@ -209,12 +244,14 @@ impl WikiStore {
             let updated = extract_datetime_field(&content, "updated")
                 .unwrap_or_else(Utc::now);
             let tags = extract_string_list(&content, "tags");
+            let author = extract_field(&content, "author");
 
             pages.push(PageMeta {
                 path: rel_str,
                 title,
                 updated,
                 tags,
+                author,
             });
         }
 
@@ -771,9 +808,16 @@ impl WikiStore {
     }
 
     fn append_log(&self, action: &str, page_path: &str) -> std::result::Result<(), String> {
+        self.append_log_with_author(action, page_path, None)
+    }
+
+    fn append_log_with_author(&self, action: &str, page_path: &str, author: Option<&str>) -> std::result::Result<(), String> {
         let log_path = self.wiki_dir.join("_log.md");
         let now = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-        let entry = format!("## [{}] {} | {}\n", now, action, page_path);
+        let entry = match author {
+            Some(a) => format!("## [{}] {} | {} | by:{}\n", now, action, page_path, a),
+            None => format!("## [{}] {} | {}\n", now, action, page_path),
+        };
 
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -783,6 +827,60 @@ impl WikiStore {
             .map_err(|e| format!("open log: {e}"))?;
         f.write_all(entry.as_bytes())
             .map_err(|e| format!("write log: {e}"))
+    }
+
+    /// Write a page with author attribution (used by shared wiki).
+    pub fn write_page_with_author(&self, path: &str, content: &str, author: &str) -> Result<()> {
+        self.validate_page_path(path)?;
+
+        if content.len() > MAX_PAGE_SIZE {
+            return Err(DuDuClawError::Memory(format!(
+                "page too large: {} bytes (max {})",
+                content.len(),
+                MAX_PAGE_SIZE
+            )));
+        }
+
+        let full = self.wiki_dir.join(path);
+
+        // Ensure parent directory
+        if let Some(parent) = full.parent()
+            && !parent.exists() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| DuDuClawError::Memory(format!("create dir: {e}")))?;
+            }
+
+        let is_new = !full.exists();
+
+        // Atomic write
+        let tmp = full.with_extension("md.tmp");
+        std::fs::write(&tmp, content)
+            .map_err(|e| DuDuClawError::Memory(format!("write temp: {e}")))?;
+        std::fs::rename(&tmp, &full).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            DuDuClawError::Memory(format!("rename temp: {e}"))
+        })?;
+
+        // Update index
+        let title = extract_title(content).unwrap_or_else(|| path.to_string());
+        if let Err(e) = self.update_index(path, &title) {
+            warn!("Failed to update index for {path}: {e}");
+        }
+
+        // Append log with author
+        let action = if is_new { "create" } else { "update" };
+        if let Err(e) = self.append_log_with_author(action, path, Some(author)) {
+            warn!("Failed to log {action} {path}: {e}");
+        }
+
+        info!(page = path, author, action, "Wiki page written (shared)");
+        Ok(())
+    }
+
+    /// Extract the author of a page by reading its frontmatter.
+    pub fn page_author(&self, path: &str) -> Result<Option<String>> {
+        let content = self.read_raw(path)?;
+        Ok(extract_field(&content, "author"))
     }
 }
 
@@ -798,6 +896,7 @@ fn parse_wiki_page(path: &str, content: &str) -> Result<WikiPage> {
     let tags = extract_string_list(content, "tags");
     let related = extract_string_list(content, "related");
     let sources = extract_string_list(content, "sources");
+    let author = extract_field(content, "author");
     let body = extract_body(content);
 
     Ok(WikiPage {
@@ -808,6 +907,7 @@ fn parse_wiki_page(path: &str, content: &str) -> Result<WikiPage> {
         tags,
         related,
         sources,
+        author,
         body,
     })
 }
@@ -1233,6 +1333,7 @@ This is the body of the page.
                 content: Some(sample_page("Bob")),
                 rationale: "New customer".to_string(),
                 related_pages: vec![],
+                target: WikiTarget::default(),
             },
             WikiProposal {
                 page_path: "concepts/greeting.md".to_string(),
@@ -1240,6 +1341,7 @@ This is the body of the page.
                 content: Some(sample_page("Greeting")),
                 rationale: "Common pattern".to_string(),
                 related_pages: vec!["entities/bob.md".to_string()],
+                target: WikiTarget::default(),
             },
         ];
 

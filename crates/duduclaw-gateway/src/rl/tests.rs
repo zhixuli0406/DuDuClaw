@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod tests {
+mod rl_tests {
     use std::collections::HashMap;
 
     use chrono::Utc;
