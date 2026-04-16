@@ -3,6 +3,7 @@ import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { useLogsStore, selectFilteredEntries } from '@/stores/logs-store';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useConnectionStore } from '@/stores/connection-store';
 import {
   Pause,
   Play,
@@ -40,15 +41,17 @@ export function LogsPage() {
   } = useLogsStore();
   const filteredEntries = useMemo(() => selectFilteredEntries({ entries, filter }), [entries, filter]);
   const { agents, fetchAgents } = useAgentsStore();
+  const connectionState = useConnectionStore((s) => s.state);
   const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    if (connectionState !== 'authenticated') return;
     fetchAgents();
     subscribe();
     return () => {
       unsubscribe();
     };
-  }, [fetchAgents, subscribe, unsubscribe]);
+  }, [connectionState, fetchAgents, subscribe, unsubscribe]);
 
   // Auto-scroll to bottom when new entries arrive (unless paused)
   useEffect(() => {
