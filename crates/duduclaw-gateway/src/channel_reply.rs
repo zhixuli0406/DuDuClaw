@@ -632,10 +632,21 @@ async fn build_reply_with_session_inner(
     let dispatch_start_time = chrono::Utc::now().to_rfc3339();
 
     // 1. Try `claude` CLI with multi-account rotation (OAuth + API keys)
-    let reply = match call_claude_cli_rotated(
+    // Wrap in REPLY_CHANNEL scope so `send_to_agent` MCP tool can register
+    // delegation callbacks for sub-agent response forwarding.
+    // Only set for sessions originating from a real channel (telegram/line/discord).
+    let cli_future = call_claude_cli_rotated(
         &sanitized_text, &model, &full_system_prompt, &ctx.home_dir,
         agent_dir.as_deref(), on_progress.as_ref(), capabilities.as_ref(),
-    ).await {
+    );
+    let is_channel_session = duduclaw_core::SUPPORTED_CHANNEL_TYPES.iter()
+        .any(|t| session_id.starts_with(&format!("{t}:")));
+    let reply = if is_channel_session {
+        crate::claude_runner::REPLY_CHANNEL.scope(session_id.to_string(), cli_future).await
+    } else {
+        cli_future.await
+    };
+    let reply = match reply {
         Ok(reply) => {
             info!("Claude replied via Claude Code SDK ({} chars)", reply.len());
             Some(reply)
@@ -2185,6 +2196,13 @@ async fn spawn_claude_cli_with_env(
     } else {
         None
     };
+
+    // Inject channel reply context for delegation callback forwarding.
+    // The MCP `send_to_agent` tool reads this env var to register a callback
+    // so sub-agent responses are forwarded back to the originating channel.
+    if let Ok(channel) = crate::claude_runner::REPLY_CHANNEL.try_with(|ch| ch.clone()) {
+        cmd.env(duduclaw_core::ENV_REPLY_CHANNEL, &channel);
+    }
 
     // Prevent "nested session" error when gateway was launched from a Claude Code session
     cmd.env_remove("CLAUDECODE");

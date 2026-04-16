@@ -342,8 +342,11 @@ pub fn build_judge_prompt(
 /// Tries JSON first (preferred), falls back to conservative text parsing.
 /// When in doubt, rejects (safe default).
 pub fn parse_judge_response(response: &str) -> JudgeResult {
+    // Strip markdown code fences that LLMs commonly wrap around JSON
+    let stripped = strip_json_fences(response);
+
     // Try JSON parse first (structured output from tool_use or compliant LLM)
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(response) {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(stripped) {
         let approved = parsed.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
         let score = parsed.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0).clamp(0.0, 1.0);
         let feedback = parsed.get("feedback").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -372,6 +375,33 @@ pub fn parse_judge_response(response: &str) -> JudgeResult {
 
 /// Reuse the generator's XML escape function (deduplicated, review #19).
 use super::generator::escape_xml_tag as escape_xml_tag_verifier;
+
+/// Strip markdown code fences (` ```json ... ``` ` or ` ``` ... ``` `)
+/// that LLMs commonly wrap around JSON responses.
+/// Also handles responses with preamble text before the fence (e.g., "Sure:\n```json\n{...}\n```").
+fn strip_json_fences(s: &str) -> &str {
+    let trimmed = s.trim();
+    // Fast path: response starts with fence
+    if let Some(rest) = trimmed.strip_prefix("```json") {
+        return rest.strip_suffix("```").unwrap_or(rest).trim();
+    }
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        return rest.strip_suffix("```").unwrap_or(rest).trim();
+    }
+    // Slow path: preamble text before fence (e.g., "Sure:\n```json\n{...}\n```")
+    // Only match fences at line start (after \n) to avoid matching inside JSON string values.
+    if let Some(fence_start) = trimmed.find("\n```json") {
+        let after_fence = &trimmed[fence_start + 8..]; // skip "\n```json"
+        return after_fence.strip_suffix("```").unwrap_or(after_fence).trim();
+    }
+    if let Some(fence_start) = trimmed.find("\n```") {
+        let after_fence = &trimmed[fence_start + 4..]; // skip "\n```"
+        if let Some(end) = after_fence.rfind("```") {
+            return after_fence[..end].trim();
+        }
+    }
+    trimmed
+}
 
 fn extract_score(text: &str) -> Option<f64> {
     for pattern in &["score:", "score :"] {

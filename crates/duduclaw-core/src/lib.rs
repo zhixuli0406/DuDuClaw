@@ -23,6 +23,21 @@ pub const ENV_DELEGATION_DEPTH: &str = "DUDUCLAW_DELEGATION_DEPTH";
 pub const ENV_DELEGATION_ORIGIN: &str = "DUDUCLAW_DELEGATION_ORIGIN";
 pub const ENV_DELEGATION_SENDER: &str = "DUDUCLAW_DELEGATION_SENDER";
 
+/// Channel context for delegation callback.
+/// Format: `<channel_type>:<channel_id>[:<thread_id>]`
+/// e.g. `telegram:12345` or `discord:thread:98765`
+///
+/// Set by channel handlers before spawning CLI sessions.
+/// Read by `send_to_agent` MCP tool to record a callback so the
+/// dispatcher can forward sub-agent responses back to the originating channel.
+pub const ENV_REPLY_CHANNEL: &str = "DUDUCLAW_REPLY_CHANNEL";
+
+/// Channel types supported for delegation callback forwarding.
+/// Used by both the MCP `send_to_agent` tool and the channel_reply session filter.
+pub const SUPPORTED_CHANNEL_TYPES: &[&str] = &[
+    "telegram", "line", "discord", "slack", "whatsapp", "feishu",
+];
+
 /// Resolve the absolute path to the current DuDuClaw binary.
 ///
 /// Used to populate `.mcp.json` and hook commands so Claude CLI

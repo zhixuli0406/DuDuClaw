@@ -49,6 +49,10 @@ struct BusMessage {
     /// The agent that directly sent this message (updated on each hop).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sender_agent: Option<String>,
+    /// Additional message_ids absorbed during coalescing.
+    /// Used to consume delegation callbacks for all merged messages, not just the first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    coalesced_ids: Vec<String>,
 }
 
 /// Starts the agent dispatcher as a background task.
@@ -102,6 +106,10 @@ pub fn start_agent_dispatcher_with_crypto(
             if tick % 60 == 0 {
                 poll_deferred_gvu(&home_dir, encryption_key.as_ref()).await;
             }
+            // Clean up orphaned delegation callbacks every 720 ticks (~1 hour)
+            if tick % 720 == 0 {
+                cleanup_stale_delegation_callbacks(&home_dir).await;
+            }
             // TaskSpec polling every 2 ticks (~10 seconds)
             if tick % 2 == 0 {
                 poll_pending_taskspecs(&home_dir, &registry).await;
@@ -137,6 +145,8 @@ async fn poll_and_dispatch_sqlite(
         {
             Ok(response) => {
                 queue.complete(&msg.id, &response).await?;
+                // Forward sub-agent response to originating channel if callback exists
+                forward_delegation_response(home_dir, &msg.id, &response, &msg.target).await;
                 info!(
                     msg_id = %msg.id,
                     target = %msg.target,
@@ -345,6 +355,7 @@ async fn poll_and_dispatch(
                         delegation_depth: msg.delegation_depth,
                         origin_agent: msg.origin_agent.clone(),
                         sender_agent: Some(msg.agent_id.clone()),
+                        coalesced_ids: vec![],
                     };
                     if let Ok(json) = serde_json::to_string(&err_response) {
                         if let Err(e) = append_line(&queue_path, &json).await {
@@ -552,6 +563,9 @@ async fn poll_and_dispatch(
                 "Agent dispatch completed"
             );
 
+            // Clone response text before moving into BusMessage (needed for callback forwarding)
+            let response_for_callback = response_text.clone();
+
             // Append response to the queue
             let response_entry = BusMessage {
                 msg_type: "agent_response".to_string(),
@@ -564,6 +578,7 @@ async fn poll_and_dispatch(
                 delegation_depth: msg.delegation_depth,
                 origin_agent: msg.origin_agent.clone(),
                 sender_agent: Some(msg.agent_id.clone()),
+                coalesced_ids: vec![],
             };
 
             if let Ok(json) = serde_json::to_string(&response_entry) {
@@ -575,6 +590,16 @@ async fn poll_and_dispatch(
                         "Failed to write agent response to bus_queue"
                     );
                 }
+            }
+
+            // ── Delegation callback: forward response to originating channel ──
+            // If the original `send_to_agent` was called from a channel context,
+            // a callback was registered linking message_id → channel info.
+            // Forward the sub-agent's response directly to that channel.
+            // Also consume callbacks for coalesced (merged) messages.
+            forward_delegation_response(&home, &msg.message_id, &response_for_callback, &msg.agent_id).await;
+            for extra_id in &msg.coalesced_ids {
+                forward_delegation_response(&home, extra_id, &response_for_callback, &msg.agent_id).await;
             }
 
             drop(permit);
@@ -1067,6 +1092,10 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
             // a low-depth message from masking a deeper one.
             let max_depth = chunk.iter().map(|m| m.delegation_depth).max().unwrap_or(0);
 
+            // Collect message_ids from non-first messages so their delegation
+            // callbacks can also be consumed when the coalesced response arrives.
+            let extra_ids: Vec<String> = chunk.iter().skip(1).map(|m| m.message_id.clone()).collect();
+
             result.push(BusMessage {
                 msg_type: "agent_message".to_string(),
                 message_id: first.message_id.clone(),
@@ -1078,6 +1107,7 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
                 delegation_depth: max_depth,
                 origin_agent: first.origin_agent.clone(),
                 sender_agent: first.sender_agent.clone(),
+                coalesced_ids: extra_ids,
             });
         }
     }
@@ -1108,6 +1138,365 @@ pub async fn append_line(path: &Path, line: &str) -> Result<(), String> {
     })
     .await
     .map_err(|e| format!("spawn_blocking: {e}"))?
+}
+
+// ── Delegation callback forwarding ────────────────────────────
+
+/// Shared HTTP client for channel forwarding (avoids creating a new client per call).
+static FORWARD_HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+fn forward_http() -> &'static reqwest::Client {
+    FORWARD_HTTP.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
+/// Clean up orphaned delegation callbacks older than 24 hours.
+async fn cleanup_stale_delegation_callbacks(home_dir: &Path) {
+    let db_path = home_dir.join("message_queue.db");
+    if !db_path.exists() {
+        return;
+    }
+    let cutoff = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open(&db_path).ok()?;
+        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+        conn.execute(
+            "DELETE FROM delegation_callbacks WHERE created_at < ?1",
+            rusqlite::params![cutoff],
+        ).ok()
+    }).await;
+    if let Ok(Some(count)) = result {
+        if count > 0 {
+            info!(removed = count, "Cleaned up stale delegation callbacks");
+        }
+    }
+}
+
+/// Check if a delegation callback exists for this message and forward
+/// the response to the originating channel.
+async fn forward_delegation_response(
+    home_dir: &Path,
+    original_message_id: &str,
+    response_text: &str,
+    responder_agent: &str,
+) {
+    let db_path = home_dir.join("message_queue.db");
+    if !db_path.exists() {
+        return;
+    }
+
+    // Atomically consume the callback (DELETE RETURNING — SQLite 3.35+)
+    let msg_id = original_message_id.to_string();
+    let callback = tokio::task::spawn_blocking(move || {
+        let conn = match rusqlite::Connection::open(&db_path) {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+
+        conn.query_row(
+            "DELETE FROM delegation_callbacks WHERE message_id = ?1 \
+             RETURNING message_id, agent_id, channel_type, channel_id, thread_id, retry_count",
+            rusqlite::params![msg_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i32>(5)?,
+                ))
+            },
+        ).ok()
+    }).await.ok().flatten();
+
+    let Some((_, callback_agent_id, channel_type, channel_id, thread_id, retry_count)) = callback else {
+        return; // No callback registered — normal non-channel delegation
+    };
+
+    info!(
+        channel = %channel_type,
+        chat_id = %channel_id,
+        thread = ?thread_id,
+        responder = %responder_agent,
+        "Forwarding sub-agent response to originating channel"
+    );
+
+    if let Err(e) = forward_to_channel(
+        home_dir, &channel_type, &channel_id, thread_id.as_deref(),
+        response_text, responder_agent,
+    ).await {
+        let next_retry = retry_count + 1;
+        if next_retry >= 5 {
+            warn!(
+                channel = %channel_type,
+                chat_id = %channel_id,
+                error = %e,
+                retries = retry_count,
+                "Delegation callback forwarding permanently failed after 5 retries — dropping"
+            );
+        } else {
+            warn!(
+                channel = %channel_type,
+                chat_id = %channel_id,
+                error = %e,
+                retry = next_retry,
+                "Failed to forward delegation response — re-inserting callback for retry"
+            );
+            let db_path = home_dir.join("message_queue.db");
+            let msg_id = original_message_id.to_string();
+            let agent = callback_agent_id.clone();
+            let ch_type = channel_type.clone();
+            let ch_id = channel_id.clone();
+            let tid = thread_id.clone();
+            let now = chrono::Utc::now().to_rfc3339();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                    let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+                    let _ = conn.execute(
+                        "INSERT OR IGNORE INTO delegation_callbacks \
+                         (message_id, agent_id, channel_type, channel_id, thread_id, retry_count, created_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        rusqlite::params![msg_id, agent, ch_type, ch_id, tid, next_retry, now],
+                    );
+                }
+            }).await;
+        }
+    }
+}
+
+/// Escape Telegram MarkdownV1 special characters to prevent formatting injection.
+fn escape_markdown_v1(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('*', "\\*")
+        .replace('_', "\\_")
+        .replace('`', "\\`")
+        .replace('[', "\\[")
+}
+
+/// Sanitize agent response text before forwarding to a public channel.
+/// Strips internal paths, DUDUCLAW_SYSTEM markers, and other implementation details.
+fn sanitize_for_channel(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.contains("[DUDUCLAW_SYSTEM:"))
+        .map(|line| {
+            // Redact absolute paths like /Users/xxx/... or /home/xxx/...
+            if line.contains("/Users/") || line.contains("/home/") {
+                let mut result = line.to_string();
+                for prefix in &["/Users/", "/home/"] {
+                    while let Some(start) = result.find(prefix) {
+                        let end = result[start..].find(|c: char| c.is_whitespace() || c == '\'' || c == '"' || c == ')')
+                            .map(|e| start + e)
+                            .unwrap_or(result.len());
+                        result.replace_range(start..end, "[path]");
+                    }
+                }
+                result
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Validate that a channel_id contains only safe characters (alphanumeric, hyphen, underscore).
+/// Prevents path traversal and URL injection attacks when channel_id is used in API URLs.
+fn validate_channel_id(channel_type: &str, id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("channel_id is empty".into());
+    }
+    // All channel IDs should be alphanumeric (with optional hyphens/underscores/dots for Slack timestamps)
+    let valid = id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.');
+    if !valid {
+        return Err(format!("channel_id contains invalid characters for {channel_type}: {id}"));
+    }
+    // Discord snowflakes: 17-20 digit numbers
+    if channel_type == "discord" && !id.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("Discord channel_id must be numeric snowflake, got: {id}"));
+    }
+    // Telegram chat_id: signed integer (can be negative for groups)
+    if channel_type == "telegram" && id.parse::<i64>().is_err() {
+        return Err(format!("Telegram chat_id must be numeric, got: {id}"));
+    }
+    Ok(())
+}
+
+/// Send a message to a specific channel (Telegram/LINE/Discord/Slack).
+/// Reads channel tokens from config.toml.
+async fn forward_to_channel(
+    home_dir: &Path,
+    channel_type: &str,
+    channel_id: &str,
+    thread_id: Option<&str>,
+    text: &str,
+    responder_agent: &str,
+) -> Result<(), String> {
+    // Validate channel_id format to prevent URL injection / SSRF
+    validate_channel_id(channel_type, channel_id)?;
+    if let Some(tid) = thread_id {
+        validate_channel_id(channel_type, tid)?;
+    }
+
+    // Read config for channel token
+    let config_path = home_dir.join("config.toml");
+    let config_str = tokio::fs::read_to_string(&config_path)
+        .await
+        .map_err(|e| format!("read config.toml: {e}"))?;
+    let config: toml::Value = config_str
+        .parse()
+        .map_err(|e| format!("parse config.toml: {e}"))?;
+
+    // Truncate long responses for channel delivery
+    let max_len = match channel_type {
+        "telegram" => 4096,
+        "discord" => 2000,
+        "line" => 5000,
+        _ => 4096,
+    };
+    // Sanitize response text — strip internal paths and system markers before channel delivery
+    let safe_text = sanitize_for_channel(text);
+
+    // Escape agent name for Telegram MarkdownV1 to prevent formatting injection
+    let safe_agent = escape_markdown_v1(responder_agent);
+    let char_count = safe_text.chars().count();
+    let display_text = if char_count > max_len {
+        let truncated: String = safe_text.chars().take(max_len - 100).collect();
+        format!(
+            "📨 **{}** 的回報：\n\n{}…\n\n_(回應過長，已截斷)_",
+            safe_agent, truncated
+        )
+    } else {
+        format!("📨 **{}** 的回報：\n\n{}", safe_agent, safe_text)
+    };
+
+    let http = forward_http();
+
+    match channel_type {
+        "telegram" => {
+            let token = get_config_token(&config, "telegram_bot_token_enc", "telegram_bot_token", home_dir);
+            if token.is_empty() {
+                return Err("telegram_bot_token not configured".into());
+            }
+            let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+            let mut payload = serde_json::json!({
+                "chat_id": channel_id,
+                "text": display_text,
+                "parse_mode": "Markdown",
+            });
+            if let Some(tid) = thread_id {
+                if let Ok(tid_num) = tid.parse::<i64>() {
+                    payload["message_thread_id"] = serde_json::json!(tid_num);
+                }
+            }
+            let resp = http.post(&url).json(&payload).send().await
+                .map_err(|e| format!("telegram send: {e}"))?;
+            if !resp.status().is_success() {
+                // Retry without parse_mode in case Markdown causes issues
+                let fallback_payload = serde_json::json!({
+                    "chat_id": channel_id,
+                    "text": &display_text,
+                });
+                match http.post(&url).json(&fallback_payload).send().await {
+                    Ok(r) if !r.status().is_success() => {
+                        warn!(status = %r.status(), "Telegram fallback retry also failed");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Telegram fallback retry network error");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "line" => {
+            let token = get_config_token(&config, "line_channel_token_enc", "line_channel_token", home_dir);
+            if token.is_empty() {
+                return Err("line_channel_token not configured".into());
+            }
+            let url = "https://api.line.me/v2/bot/message/push";
+            let resp = http.post(url)
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&serde_json::json!({
+                    "to": channel_id,
+                    "messages": [{"type": "text", "text": display_text}]
+                }))
+                .send().await
+                .map_err(|e| format!("line send: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("LINE API returned {}", resp.status()));
+            }
+        }
+        "discord" => {
+            let token = get_config_token(&config, "discord_bot_token_enc", "discord_bot_token", home_dir);
+            if token.is_empty() {
+                return Err("discord_bot_token not configured".into());
+            }
+            let target_channel = thread_id.unwrap_or(channel_id);
+            let url = format!("https://discord.com/api/v10/channels/{}/messages", target_channel);
+            let resp = http.post(&url)
+                .header("Authorization", format!("Bot {}", token))
+                .json(&serde_json::json!({ "content": display_text }))
+                .send().await
+                .map_err(|e| format!("discord send: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("Discord API returned {}", resp.status()));
+            }
+        }
+        "slack" => {
+            let token = get_config_token(&config, "slack_bot_token_enc", "slack_bot_token", home_dir);
+            if token.is_empty() {
+                return Err("slack_bot_token not configured".into());
+            }
+            let url = "https://slack.com/api/chat.postMessage";
+            let resp = http.post(url)
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&serde_json::json!({
+                    "channel": channel_id,
+                    "text": display_text,
+                    "thread_ts": thread_id,
+                }))
+                .send().await
+                .map_err(|e| format!("slack send: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("Slack API returned {}", resp.status()));
+            }
+        }
+        "whatsapp" | "feishu" => {
+            // These channels use webhook-based APIs that require more complex setup.
+            // Log as unsupported for now — the callback is consumed to prevent orphans.
+            warn!(channel = %channel_type, "Delegation callback forwarding not yet implemented for this channel");
+        }
+        other => {
+            return Err(format!("unsupported channel type for forwarding: {other}"));
+        }
+    }
+
+    info!(
+        channel = %channel_type,
+        chat_id = %channel_id,
+        "Delegation response forwarded to channel successfully"
+    );
+    Ok(())
+}
+
+/// Read a channel token from config.toml `[channels]` table,
+/// trying encrypted value first then plaintext fallback.
+fn get_config_token(config: &toml::Value, enc_key: &str, plain_key: &str, home_dir: &Path) -> String {
+    let channels = config.get("channels");
+    // Try encrypted token first
+    if let Some(enc) = channels.and_then(|c| c.get(enc_key)).and_then(|v| v.as_str()) {
+        match crate::config_crypto::decrypt_value(enc, home_dir) {
+            Some(decrypted) => return decrypted,
+            None => warn!(key = enc_key, "Failed to decrypt channel token — falling back to plaintext"),
+        }
+    }
+    // Fallback to plaintext
+    channels.and_then(|c| c.get(plain_key)).and_then(|v| v.as_str()).unwrap_or("").to_string()
 }
 
 #[cfg(test)]
@@ -1146,12 +1535,14 @@ mod tests {
             delegation_depth: 0,
             origin_agent: None,
             sender_agent: None,
+            coalesced_ids: vec![],
         };
         let json = serde_json::to_string(&msg).unwrap();
         // None fields with skip_serializing_if should be absent
         assert!(!json.contains("origin_agent"));
         assert!(!json.contains("sender_agent"));
         assert!(!json.contains("response"));
+        assert!(!json.contains("coalesced_ids"));
         // delegation_depth is always serialized (no skip)
         assert!(json.contains("delegation_depth"));
     }
@@ -1178,6 +1569,7 @@ mod tests {
                 delegation_depth: 2,
                 origin_agent: Some("main".to_string()),
                 sender_agent: Some("researcher".to_string()),
+                coalesced_ids: vec![],
             },
             BusMessage {
                 msg_type: "agent_message".to_string(),
@@ -1190,6 +1582,7 @@ mod tests {
                 delegation_depth: 4,
                 origin_agent: Some("main".to_string()),
                 sender_agent: Some("analyst".to_string()),
+                coalesced_ids: vec![],
             },
         ];
         let coalesced = coalesce_messages(msgs);
@@ -1199,5 +1592,7 @@ mod tests {
         // origin_agent and sender_agent come from first message
         assert_eq!(coalesced[0].origin_agent.as_deref(), Some("main"));
         assert_eq!(coalesced[0].sender_agent.as_deref(), Some("researcher"));
+        // Coalesced should contain the second message's ID
+        assert_eq!(coalesced[0].coalesced_ids, vec!["m2"]);
     }
 }

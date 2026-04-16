@@ -121,7 +121,20 @@ impl MessageQueue {
 
              CREATE INDEX IF NOT EXISTS idx_mq_status ON message_queue(status);
              CREATE INDEX IF NOT EXISTS idx_mq_target ON message_queue(target);
-             CREATE INDEX IF NOT EXISTS idx_mq_created ON message_queue(created_at);",
+             CREATE INDEX IF NOT EXISTS idx_mq_created ON message_queue(created_at);
+
+             -- Delegation callbacks: maps bus message_id → originating channel context
+             -- so the dispatcher can forward sub-agent responses back to the user.
+             CREATE TABLE IF NOT EXISTS delegation_callbacks (
+                 message_id      TEXT PRIMARY KEY,
+                 agent_id        TEXT NOT NULL,
+                 channel_type    TEXT NOT NULL,
+                 channel_id      TEXT NOT NULL,
+                 thread_id       TEXT,
+                 retry_count     INTEGER NOT NULL DEFAULT 0,
+                 created_at      TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_dc_agent ON delegation_callbacks(agent_id);",
         )
         .map_err(|e| format!("init message_queue schema: {e}"))
     }
@@ -345,4 +358,81 @@ impl MessageQueue {
         }
         Ok(result)
     }
+
+    // ── Delegation callbacks ─────────────────────────────────────
+
+    /// Record a delegation callback so the dispatcher can forward
+    /// the sub-agent's response back to the originating channel.
+    pub async fn register_callback(&self, cb: &DelegationCallback) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR IGNORE INTO delegation_callbacks \
+             (message_id, agent_id, channel_type, channel_id, thread_id, retry_count, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                cb.message_id,
+                cb.agent_id,
+                cb.channel_type,
+                cb.channel_id,
+                cb.thread_id,
+                cb.retry_count,
+                cb.created_at,
+            ],
+        )
+        .map_err(|e| format!("register_callback: {e}"))?;
+        Ok(())
+    }
+
+    /// Atomically consume a delegation callback by message_id (DELETE RETURNING).
+    /// Returns `None` if no callback was registered for this message.
+    pub async fn take_callback(&self, message_id: &str) -> Result<Option<DelegationCallback>, String> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "DELETE FROM delegation_callbacks WHERE message_id = ?1 \
+             RETURNING message_id, agent_id, channel_type, channel_id, thread_id, retry_count, created_at",
+            params![message_id],
+            |row| {
+                Ok(DelegationCallback {
+                    message_id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    channel_type: row.get(2)?,
+                    channel_id: row.get(3)?,
+                    thread_id: row.get(4)?,
+                    retry_count: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| format!("take_callback: {e}"))
+    }
+
+    /// Clean up callbacks older than 24 hours (orphans from crashed sessions).
+    pub async fn cleanup_stale_callbacks(&self) -> Result<usize, String> {
+        let cutoff = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM delegation_callbacks WHERE created_at < ?1",
+            params![cutoff],
+        )
+        .map(|n| n)
+        .map_err(|e| format!("cleanup_stale_callbacks: {e}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Delegation callback row type
+// ---------------------------------------------------------------------------
+
+/// A callback record linking a bus message_id to the channel context
+/// that should receive the sub-agent's response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegationCallback {
+    pub message_id: String,
+    pub agent_id: String,
+    pub channel_type: String,
+    pub channel_id: String,
+    pub thread_id: Option<String>,
+    pub retry_count: i32,
+    pub created_at: String,
 }
