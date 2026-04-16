@@ -2,6 +2,7 @@ import { useEffect, useCallback, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { useTasksStore } from '@/stores/tasks-store';
+import { useConnectionStore } from '@/stores/connection-store';
 import type { ActivityEvent, ActivityType } from '@/lib/api';
 import {
   Plus,
@@ -112,12 +113,14 @@ export function ActivityFeed({
 }) {
   const intl = useIntl();
   const { activities, fetchActivities } = useTasksStore();
+  const connectionState = useConnectionStore((s) => s.state);
   const [visibleCount, setVisibleCount] = useState(limit);
   const [filterAgent, setFilterAgent] = useState<string>(agentId ?? '');
 
   useEffect(() => {
+    if (connectionState !== 'authenticated') return;
     fetchActivities({ limit: 50, agent_id: filterAgent || undefined });
-  }, [fetchActivities, filterAgent]);
+  }, [connectionState, fetchActivities, filterAgent]);
 
   const handleLoadMore = useCallback(() => {
     setVisibleCount((prev) => prev + 20);
