@@ -255,7 +255,7 @@ impl WikiStore {
             });
         }
 
-        pages.sort_by(|a, b| b.updated.cmp(&a.updated));
+        pages.sort_by_key(|p| std::cmp::Reverse(p.updated));
         Ok(pages)
     }
 
@@ -382,7 +382,7 @@ impl WikiStore {
             });
         }
 
-        hits.sort_by(|a, b| b.score.cmp(&a.score));
+        hits.sort_by_key(|h| std::cmp::Reverse(h.score));
         hits.truncate(limit);
         Ok(hits)
     }
