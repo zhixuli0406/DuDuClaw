@@ -24,7 +24,8 @@ use super::version_store::{ExperimentLogEntry, SoulVersion, VersionMetrics, Vers
 use crate::prediction::metacognition::MetaCognition;
 
 /// Maximum number of generation attempts per GVU cycle.
-const DEFAULT_MAX_GENERATIONS: u32 = 3;
+/// Adaptive depth: up to 7 rounds for thorough evolution.
+const DEFAULT_MAX_GENERATIONS: u32 = 7;
 
 /// Default wall-clock timeout per GVU cycle (5 minutes).
 ///

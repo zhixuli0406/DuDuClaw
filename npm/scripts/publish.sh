@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Publish DuDuClaw CE to npm
-# Usage: ./publish-ce.sh <version> [--dry-run]
+# Publish DuDuClaw to npm
+# Usage: ./publish.sh <version> [--dry-run]
 #
 # Prerequisites:
 #   - GitHub release artifacts downloaded to ./artifacts/
@@ -13,11 +13,11 @@ set -euo pipefail
 #   mkdir -p artifacts && cd artifacts
 #   gh release download "v${VERSION}" --repo zhixuli0406/DuDuClaw
 #   cd ..
-#   ./npm/scripts/publish-ce.sh "$VERSION"
+#   ./npm/scripts/publish.sh "$VERSION"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NPM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-VERSION="${1:?Usage: publish-ce.sh <version> [--dry-run]}"
+VERSION="${1:?Usage: publish.sh <version> [--dry-run]}"
 DRY_RUN="${2:-}"
 
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-./artifacts}"
@@ -30,7 +30,7 @@ declare -A PLATFORM_MAP=(
   ["duduclaw-linux-arm64"]="linux-arm64"
 )
 
-echo "=== DuDuClaw CE npm publish v${VERSION} ==="
+echo "=== DuDuClaw npm publish v${VERSION} ==="
 
 # Step 1: Update version in all package.json files
 echo "--- Updating versions ---"

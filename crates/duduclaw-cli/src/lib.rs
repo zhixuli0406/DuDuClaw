@@ -3,40 +3,18 @@
 #![allow(clippy::format_in_format_args)]
 #![allow(clippy::ptr_arg)]
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use duduclaw_agent::AgentRunner;
 use duduclaw_core::error::DuDuClawError;
 use duduclaw_core::types::CheckStatus;
-use duduclaw_gateway::GatewayExtension;
-
 mod acp;
 mod mcp;
 mod migrate;
 mod ptc;
 mod service;
 mod wizard;
-
-/// Global extension override — set by Pro binary before calling [`entry_point`].
-/// CE binary leaves this empty, causing [`current_extension`] to return `NullExtension`.
-static EXTENSION_OVERRIDE: OnceLock<Arc<dyn GatewayExtension>> = OnceLock::new();
-
-/// Set the gateway extension for this process.
-///
-/// Must be called before [`entry_point`] if a non-default extension is desired.
-/// Only the first call takes effect (subsequent calls are ignored).
-pub fn set_extension(ext: Arc<dyn GatewayExtension>) {
-    let _ = EXTENSION_OVERRIDE.set(ext);
-}
-
-/// Get the currently registered extension, or `NullExtension` if none was set.
-fn current_extension() -> Arc<dyn GatewayExtension> {
-    EXTENSION_OVERRIDE
-        .get()
-        .cloned()
-        .unwrap_or_else(|| Arc::new(duduclaw_gateway::NullExtension))
-}
 
 // ── Credential helpers (M-4) ────────────────────────────────
 
@@ -279,12 +257,6 @@ enum Commands {
     /// Interactive industry-specific agent setup wizard
     Wizard,
 
-    /// Manage license activation and status
-    License {
-        #[command(subcommand)]
-        command: LicenseCommands,
-    },
-
     /// Red-team test an agent against its behavioral contract
     Test {
         /// Agent name to test
@@ -414,30 +386,6 @@ enum ServiceCommands {
 }
 
 #[derive(Subcommand)]
-enum LicenseCommands {
-    /// Activate a license key
-    Activate {
-        /// License key (base64-encoded JSON)
-        key: String,
-    },
-
-    /// Deactivate the current license
-    Deactivate,
-
-    /// Show current license status
-    Status,
-
-    /// Verify a license key without activating it
-    Verify {
-        /// License key to verify
-        key: String,
-    },
-
-    /// Print this machine's fingerprint (for license binding)
-    Fingerprint,
-}
-
-#[derive(Subcommand)]
 enum RlCommands {
     /// Export agent sessions as RL training trajectories
     Export {
@@ -554,13 +502,6 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Migrate => cmd_migrate().await,
         Commands::McpServer => cmd_mcp_server().await,
         Commands::Wizard => wizard::cmd_wizard(&duduclaw_home()).await,
-        Commands::License { command } => match command {
-            LicenseCommands::Activate { key } => cmd_license_activate(&key).await,
-            LicenseCommands::Deactivate => cmd_license_deactivate().await,
-            LicenseCommands::Status => cmd_license_status().await,
-            LicenseCommands::Verify { key } => cmd_license_verify(&key).await,
-            LicenseCommands::Fingerprint => cmd_license_fingerprint(),
-        },
         Commands::Test { name } => cmd_test_agent(&name).await,
         Commands::Update { yes } => cmd_update(yes).await,
         Commands::Rl(rl_cmd) => {
@@ -587,8 +528,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         }
         Commands::Hook(HookCommands::AgentFileGuard) => cmd_hook_agent_file_guard().await,
         Commands::Version => {
-            let name = if duduclaw_gateway::updater::is_pro_edition() { "duduclaw-pro" } else { "duduclaw" };
-            println!("{name} {}", duduclaw_gateway::updater::current_version());
+            println!("duduclaw {}", duduclaw_gateway::updater::current_version());
             Ok(())
         }
     }
@@ -1468,9 +1408,6 @@ discord_bot_token_enc = "{discord_token_enc}"
     })?;
     println!("  {} {}", style("✓").green(), config_path.display());
 
-    // License public key is embedded at compile time via DUDUCLAW_LICENSE_PUBKEY_HEX.
-    // No runtime file deployment needed — see feature_gate.rs load_public_key().
-
     // inference.toml (only for local / hybrid modes)
     if use_local {
         let inference_toml_path = home.join("inference.toml");
@@ -1742,18 +1679,12 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
         println!("     Set DUDUCLAW_AUTH_TOKEN env var or [gateway].auth_token in config.toml\n");
     }
 
-    let extension = current_extension();
-    let edition = extension.name();
-    if edition != "Community" {
-        println!("   Edition: {edition}");
-    }
-
     let config = duduclaw_gateway::GatewayConfig {
         bind,
         port,
         auth_token,
         home_dir: home,
-        extension,
+        extension: Arc::new(duduclaw_gateway::NullExtension),
     };
 
     duduclaw_gateway::start_gateway(config).await
@@ -2331,213 +2262,6 @@ async fn cmd_mcp_server() -> duduclaw_core::error::Result<()> {
 
     let home = duduclaw_home();
     mcp::run_mcp_server(&home).await
-}
-
-// ── License management ──────────────────────────────────────
-
-/// `duduclaw license status` — Show current license tier, expiry, and machine fingerprint.
-async fn cmd_license_status() -> duduclaw_core::error::Result<()> {
-    use console::style;
-    let home = duduclaw_home();
-    let gate = duduclaw_gateway::feature_gate::FeatureGate::load();
-    let tier = gate.tier();
-    let license_path = home.join("license.key");
-
-    println!("\n  {} License Status\n", style("🔑").bold());
-
-    let tier_display = match tier {
-        duduclaw_gateway::feature_gate::Tier::Community => style("Community (Open Source)").green(),
-        duduclaw_gateway::feature_gate::Tier::Pro => style("Pro").yellow(),
-        duduclaw_gateway::feature_gate::Tier::Enterprise => style("Enterprise").magenta(),
-        duduclaw_gateway::feature_gate::Tier::Oem => style("OEM").cyan(),
-    };
-    println!("  Tier:        {tier_display}");
-
-    if license_path.exists() {
-        if let Ok(content) = tokio::fs::read_to_string(&license_path).await
-            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(customer) = json.get("customer_name").and_then(|v| v.as_str()) {
-                    println!("  Customer:    {customer}");
-                }
-                if let Some(expires) = json.get("expires_at").and_then(|v| v.as_str()) {
-                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(expires) {
-                        let now = chrono::Utc::now();
-                        let days = (dt.signed_duration_since(now)).num_days();
-                        if days < 0 {
-                            println!("  Expires:     {} ({})", expires, style("EXPIRED").red().bold());
-                        } else if days < 30 {
-                            println!("  Expires:     {} ({} days remaining)", expires, style(days).yellow());
-                        } else {
-                            println!("  Expires:     {} ({days} days remaining)", expires);
-                        }
-                    } else {
-                        println!("  Expires:     {expires}");
-                    }
-                }
-                if let Some(fp) = json.get("machine_fingerprint").and_then(|v| v.as_str()) {
-                    println!("  Fingerprint: {fp}");
-                }
-            }
-    } else {
-        println!("  License:     {}", style("Not activated").dim());
-    }
-
-    // Show machine fingerprint
-    let fingerprint = build_machine_fingerprint();
-    println!("  Machine ID:  {fingerprint}");
-
-    println!();
-    Ok(())
-}
-
-/// `duduclaw license activate <key>` — Write a license key to ~/.duduclaw/license.key.
-async fn cmd_license_activate(key: &str) -> duduclaw_core::error::Result<()> {
-    use console::style;
-    let home = duduclaw_home();
-
-    // Validate JSON
-    let json: serde_json::Value = serde_json::from_str(key).map_err(|e| {
-        DuDuClawError::Config(format!("Invalid license key format: {e}"))
-    })?;
-
-    // Verify Ed25519 signature before writing
-    let pubkey = duduclaw_gateway::feature_gate::FeatureGate::load_public_key()
-        .ok_or_else(|| DuDuClawError::Config("License public key not configured".into()))?;
-    let canonical = duduclaw_gateway::feature_gate::build_canonical_payload(&json)
-        .ok_or_else(|| DuDuClawError::Config("License missing required fields".into()))?;
-    let sig_b64 = json.get("signature").and_then(|v| v.as_str())
-        .ok_or_else(|| DuDuClawError::Config("License missing signature".into()))?;
-    let sig_bytes = duduclaw_gateway::feature_gate::base64_decode(sig_b64)
-        .ok_or_else(|| DuDuClawError::Config("Invalid signature encoding".into()))?;
-    if !duduclaw_gateway::feature_gate::verify_ed25519_signature(&pubkey, &canonical, &sig_bytes) {
-        return Err(DuDuClawError::Config("License signature verification failed".into()));
-    }
-
-    // Atomic write with restrictive permissions
-    let license_path = home.join("license.key");
-    let rand_suffix = uuid::Uuid::new_v4().as_simple().to_string();
-    let tmp_path = license_path.with_extension(format!("key.{rand_suffix}.tmp"));
-    tokio::fs::write(&tmp_path, key).await.map_err(|e| {
-        DuDuClawError::Config(format!("Failed to write license: {e}"))
-    })?;
-    duduclaw_core::platform::set_owner_only(&tmp_path).ok();
-    if let Err(e) = tokio::fs::rename(&tmp_path, &license_path).await {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(DuDuClawError::Config(format!("Failed to commit license: {e}")));
-    }
-
-    // Reload and verify
-    let gate = duduclaw_gateway::feature_gate::FeatureGate::load();
-    let tier = gate.tier().as_str();
-    println!("\n  {} License activated — tier: {}\n", style("✓").green().bold(), style(tier).yellow());
-    Ok(())
-}
-
-/// `duduclaw license deactivate` — Remove license.key.
-async fn cmd_license_deactivate() -> duduclaw_core::error::Result<()> {
-    use console::style;
-    let home = duduclaw_home();
-    let license_path = home.join("license.key");
-
-    if license_path.exists() {
-        tokio::fs::remove_file(&license_path).await.map_err(|e| {
-            DuDuClawError::Config(format!("Failed to remove license: {e}"))
-        })?;
-        println!("\n  {} License deactivated — reverted to Community tier\n", style("✓").green().bold());
-    } else {
-        println!("\n  {} No license is currently active\n", style("ℹ").blue());
-    }
-    Ok(())
-}
-
-/// `duduclaw license verify <key>` — Validate a license key without writing it.
-async fn cmd_license_verify(key: &str) -> duduclaw_core::error::Result<()> {
-    use console::style;
-
-    let json: serde_json::Value = match serde_json::from_str(key) {
-        Ok(v) => v,
-        Err(e) => {
-            println!("\n  {} Invalid JSON: {e}\n", style("✗").red().bold());
-            return Ok(());
-        }
-    };
-
-    let tier = json.get("tier").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let customer = json.get("customer_name").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let expires = json.get("expires_at").and_then(|v| v.as_str()).unwrap_or("perpetual");
-    let fp = json.get("machine_fingerprint").and_then(|v| v.as_str()).unwrap_or("");
-
-    println!("\n  {} License Key Details\n", style("🔍").bold());
-    println!("  Tier:        {tier}");
-    println!("  Customer:    {customer}");
-    println!("  Expires:     {expires}");
-    println!("  Fingerprint: {}", if fp.is_empty() { "(none)" } else { fp });
-
-    // Actual Ed25519 signature verification
-    match duduclaw_gateway::feature_gate::FeatureGate::load_public_key() {
-        None => {
-            println!("  Signature:   {}", style("UNVERIFIED (no public key)").yellow());
-        }
-        Some(pubkey) => {
-            let canonical = duduclaw_gateway::feature_gate::build_canonical_payload(&json);
-            let sig_b64 = json.get("signature").and_then(|v| v.as_str()).unwrap_or("");
-            let sig_bytes = duduclaw_gateway::feature_gate::base64_decode(sig_b64);
-            match (canonical, sig_bytes) {
-                (Some(c), Some(s)) if duduclaw_gateway::feature_gate::verify_ed25519_signature(&pubkey, &c, &s) => {
-                    println!("  Signature:   {}", style("VALID").green().bold());
-                }
-                _ => {
-                    println!("  Signature:   {}", style("INVALID").red().bold());
-                }
-            }
-        }
-    }
-
-    // Check expiry
-    if expires != "perpetual"
-        && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(expires) {
-            let days = dt.signed_duration_since(chrono::Utc::now()).num_days();
-            if days < 0 {
-                println!("  Status:      {}", style("EXPIRED").red().bold());
-            } else {
-                println!("  Status:      {} ({days} days remaining)", style("valid").green());
-            }
-        }
-
-    // Check machine fingerprint match
-    let my_fp = build_machine_fingerprint();
-    if !fp.is_empty() {
-        if fp == my_fp {
-            println!("  Machine:     {}", style("MATCH").green().bold());
-        } else {
-            println!("  Machine:     {}", style("MISMATCH").red().bold());
-            println!("               This machine: {my_fp}");
-        }
-    }
-
-    println!();
-    Ok(())
-}
-
-/// `duduclaw license fingerprint` — Print this machine's fingerprint.
-fn cmd_license_fingerprint() -> duduclaw_core::error::Result<()> {
-    let fingerprint = build_machine_fingerprint();
-    println!("{fingerprint}");
-    Ok(())
-}
-
-/// Build machine fingerprint: SHA-256(hostname::primary_mac)[..16] as hex.
-fn build_machine_fingerprint() -> String {
-    let hostname = gethostname::gethostname().to_string_lossy().to_string();
-    let mac = mac_address::get_mac_address()
-        .ok()
-        .flatten()
-        .map(|m| m.to_string())
-        .unwrap_or_else(|| "00:00:00:00:00:00".into());
-    let combined = format!("{hostname}::{mac}");
-    use sha2::Digest;
-    let hash = sha2::Sha256::digest(combined.as_bytes());
-    hex::encode(&hash[..16])
 }
 
 /// `duduclaw test <agent>` - Red-team test an agent against its behavioral contract.

@@ -45,14 +45,11 @@ pub struct MethodHandler {
     channel_handles: tokio::sync::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
     /// [M2] Server-side cached pending update (set by check_update, consumed by apply_update).
     pending_update: RwLock<Option<PendingUpdate>>,
-    /// Cached license tier — avoids re-reading disk + Ed25519 on every RPC call.
-    /// Invalidated by license.activate / license.deactivate.
-    feature_gate_cache: RwLock<Option<(Instant, crate::feature_gate::Tier)>>,
     /// User database for multi-user auth (injected after gateway start).
     user_db: RwLock<Option<Arc<UserDb>>>,
     /// JWT configuration for token issuance (injected after gateway start).
     jwt_config: RwLock<Option<Arc<JwtConfig>>>,
-    /// Extension point for Pro/Enterprise features (NullExtension in CE).
+    /// Plugin extension point (NullExtension by default).
     extension: Arc<dyn GatewayExtension>,
     /// SQLite-backed cron task store. Injected after gateway starts.
     cron_store: RwLock<Option<Arc<CronStore>>>,
@@ -144,7 +141,6 @@ impl MethodHandler {
             reply_ctx: RwLock::new(None),
             channel_handles: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             pending_update: RwLock::new(None),
-            feature_gate_cache: RwLock::new(None),
             user_db: RwLock::new(None),
             jwt_config: RwLock::new(None),
             extension,
@@ -262,51 +258,8 @@ impl MethodHandler {
     }
 
     /// Internal dispatch — returns a WsFrame with placeholder id (overwritten by caller).
-    /// TTL for the cached FeatureGate tier (30 seconds).
-    const FEATURE_GATE_CACHE_TTL_SECS: u64 = 30;
-
-    /// Get the current license tier, using a 30s TTL cache to avoid per-RPC disk I/O.
-    async fn cached_gate(&self) -> crate::feature_gate::FeatureGate {
-        // Fast path: read lock
-        {
-            let cache = self.feature_gate_cache.read().await;
-            if let Some((ts, tier)) = *cache {
-                if ts.elapsed().as_secs() < Self::FEATURE_GATE_CACHE_TTL_SECS {
-                    return crate::feature_gate::FeatureGate::with_tier(tier);
-                }
-            }
-        }
-        // Slow path: write lock with double-check to prevent thundering herd
-        let mut cache = self.feature_gate_cache.write().await;
-        if let Some((ts, tier)) = *cache {
-            if ts.elapsed().as_secs() < Self::FEATURE_GATE_CACHE_TTL_SECS {
-                return crate::feature_gate::FeatureGate::with_tier(tier);
-            }
-        }
-        let gate = crate::feature_gate::FeatureGate::load();
-        *cache = Some((Instant::now(), gate.tier()));
-        gate
-    }
-
-    /// Invalidate the FeatureGate cache (called after activate/deactivate).
-    async fn invalidate_gate_cache(&self) {
-        *self.feature_gate_cache.write().await = None;
-    }
-
-    /// Check if a feature is allowed by the current license tier.
-    /// Returns None if allowed, or a 402 error WsFrame if denied.
-    async fn require_feature(&self, feature: &str) -> Option<WsFrame> {
-        let gate = self.cached_gate().await;
-        if gate.check(feature) {
-            None
-        } else {
-            let msg = gate.upgrade_message(feature);
-            Some(WsFrame::error_response("", &format!("Feature requires upgrade: {msg}")))
-        }
-    }
-
     async fn dispatch(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
-        // ── Extension dispatch (Pro/Enterprise methods) ──────
+        // ── Plugin extension dispatch ──────
         // Try extension first; if it returns Some, the method is handled.
         if let Some(frame) = self.extension.handle_method(method, params.clone(), ctx).await {
             return frame;
@@ -479,11 +432,6 @@ impl MethodHandler {
                 require_manager!();
                 self.handle_evolution_skills().await
             }
-
-            // ── License (admin only, H3 fix) ─────────────────
-            "license.status" => { require_manager!(); self.handle_license_status().await }
-            "license.activate" => { require_admin!(); self.handle_license_activate(params).await }
-            "license.deactivate" => { require_admin!(); self.handle_license_deactivate().await }
 
             // ── Odoo (admin only) ────────────────────────────
             "odoo.status" => { require_admin!(); self.handle_odoo_status().await }
@@ -3082,8 +3030,6 @@ impl MethodHandler {
         drop(channel_map);
         WsFrame::ok_response("", json!({
             "version": crate::updater::current_version(),
-            "edition": self.extension.name(),
-            "tier": self.extension.tier(),
             "uptime_seconds": uptime,
             "agents_count": reg.list().len(),
             "channels_connected": channels_connected,
@@ -3148,7 +3094,6 @@ impl MethodHandler {
         WsFrame::ok_response("", json!({
             "version": crate::updater::current_version(),
             "auto_update": crate::updater::auto_update_enabled(&self.home_dir),
-            "edition": if crate::updater::is_pro_edition() { "pro" } else { "community" },
         }))
     }
 
@@ -3953,164 +3898,6 @@ impl MethodHandler {
         }))
     }
 
-    // ── License ──────────────────────────────────────────────
-
-    async fn handle_license_status(&self) -> WsFrame {
-        let gate = self.cached_gate().await;
-        let tier = gate.tier();
-        let fingerprint = crate::feature_gate::FeatureGate::machine_fingerprint_static();
-
-        // Read license.key for detailed info (customer_name, expires_at, etc.)
-        let license_path = self.home_dir.join("license.key");
-        let (customer_name, expires_at, days_remaining, activated) =
-            if let Ok(content) = tokio::fs::read_to_string(&license_path).await {
-                if let Ok(license) = serde_json::from_str::<serde_json::Value>(&content) {
-                    let customer = license
-                        .get("customer_name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let exp = license
-                        .get("expires_at")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    let days = exp.as_deref().and_then(|s| {
-                        chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| {
-                            let remaining = dt
-                                .with_timezone(&chrono::Utc)
-                                .signed_duration_since(chrono::Utc::now());
-                            remaining.num_days().max(0)
-                        })
-                    });
-                    let is_active = tier > crate::feature_gate::Tier::Community;
-                    (customer, exp, days, is_active)
-                } else {
-                    (String::new(), None, None, false)
-                }
-            } else {
-                (String::new(), None, None, false)
-            };
-
-        let mut info = json!({
-            "tier": tier.as_str(),
-            "activated": activated,
-            "machine_fingerprint": fingerprint,
-            "max_agents": 0,
-            "max_channels": 0,
-        });
-
-        if let Some(obj) = info.as_object_mut() {
-            if !customer_name.is_empty() {
-                obj.insert("customer_name".to_string(), json!(customer_name));
-            }
-            if let Some(exp) = expires_at {
-                obj.insert("expires_at".to_string(), json!(exp));
-            }
-            if let Some(days) = days_remaining {
-                obj.insert("days_remaining".to_string(), json!(days));
-            }
-
-            // Merge extension info (Pro/Enterprise may add extra fields)
-            let ext_info = self.extension.license_info();
-            if let Some(ext_obj) = ext_info.as_object() {
-                for (k, v) in ext_obj {
-                    if k != "tier" && k != "activated" {
-                        obj.entry(k.clone()).or_insert_with(|| v.clone());
-                    }
-                }
-            }
-        }
-
-        WsFrame::ok_response("", info)
-    }
-
-    async fn handle_license_activate(&self, params: Value) -> WsFrame {
-        let key = match params.get("key").and_then(|v| v.as_str()) {
-            Some(k) if !k.is_empty() => k,
-            _ => return WsFrame::error_response("", "Missing 'key' parameter"),
-        };
-
-        // Parse JSON
-        let json_val: Value = match serde_json::from_str(key) {
-            Ok(v) => v,
-            Err(e) => return WsFrame::error_response("", &format!("Invalid JSON: {e}")),
-        };
-
-        // Verify Ed25519 signature BEFORE writing to disk
-        let pubkey = match crate::feature_gate::FeatureGate::load_public_key() {
-            Some(k) => k,
-            None => return WsFrame::error_response("", "License public key not configured"),
-        };
-        let canonical = match crate::feature_gate::build_canonical_payload(&json_val) {
-            Some(c) => c,
-            None => return WsFrame::error_response("", "License missing required fields"),
-        };
-        let sig_b64 = match json_val.get("signature").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => return WsFrame::error_response("", "License missing signature"),
-        };
-        let sig_bytes = match crate::feature_gate::base64_decode(sig_b64) {
-            Some(b) => b,
-            None => return WsFrame::error_response("", "Invalid signature encoding"),
-        };
-        if !crate::feature_gate::verify_ed25519_signature(&pubkey, &canonical, &sig_bytes) {
-            return WsFrame::error_response("", "License signature verification failed");
-        }
-
-        // Check expiry before writing
-        if let Some(exp_str) = json_val.get("expires_at").and_then(|v| v.as_str()) {
-            if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(exp_str) {
-                if exp.with_timezone(&chrono::Utc) < chrono::Utc::now() {
-                    return WsFrame::error_response("", "License has expired");
-                }
-            }
-        }
-
-        // Check machine fingerprint before writing
-        let fp = json_val.get("machine_fingerprint").and_then(|v| v.as_str()).unwrap_or("");
-        if !fp.is_empty() {
-            let local_fp = crate::feature_gate::FeatureGate::machine_fingerprint_static();
-            if fp != local_fp {
-                return WsFrame::error_response("", &format!(
-                    "Machine fingerprint mismatch (license: {}, this machine: {})", fp, local_fp
-                ));
-            }
-        }
-
-        // Atomic write: temp + rename (with restrictive permissions)
-        let license_path = self.home_dir.join("license.key");
-        let rand_suffix = uuid::Uuid::new_v4().as_simple().to_string();
-        let tmp_path = license_path.with_extension(format!("key.{rand_suffix}.tmp"));
-        if let Err(e) = tokio::fs::write(&tmp_path, key).await {
-            return WsFrame::error_response("", &format!("Failed to write license: {e}"));
-        }
-        duduclaw_core::platform::set_owner_only(&tmp_path).ok();
-        if let Err(e) = tokio::fs::rename(&tmp_path, &license_path).await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return WsFrame::error_response("", &format!("Failed to commit license: {e}"));
-        }
-
-        // Invalidate cache and reload
-        self.invalidate_gate_cache().await;
-        let gate = self.cached_gate().await;
-        info!(tier = gate.tier().as_str(), "License activated");
-        WsFrame::ok_response("", json!({
-            "success": true,
-            "tier": gate.tier().as_str(),
-        }))
-    }
-
-    async fn handle_license_deactivate(&self) -> WsFrame {
-        let license_path = self.home_dir.join("license.key");
-        if license_path.exists() {
-            if let Err(e) = tokio::fs::remove_file(&license_path).await {
-                return WsFrame::error_response("", &format!("Failed to remove license: {e}"));
-            }
-        }
-        self.invalidate_gate_cache().await;
-        info!("License deactivated — reverting to Community tier");
-        WsFrame::ok_response("", json!({ "success": true, "tier": "Community" }))
-    }
 
     // ── Helpers ─────────────────────────────────────────────
 

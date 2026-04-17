@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useConnectionStore } from '@/stores/connection-store';
-import { api, type BillingUsage, type BillingInvoice, type LicenseInfo } from '@/lib/api';
+import { api, type BillingUsage, type BillingInvoice } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import {
   CreditCard,
@@ -86,7 +86,6 @@ export function BillingPage() {
   const [usage, setUsage] = useState<BillingUsage | null>(null);
   const [invoices, setInvoices] = useState<readonly BillingInvoice[]>([]);
   const [currentPlan, setCurrentPlan] = useState<string>('community');
-  const [licenseInfo, setLicenseInfo] = useState<LicenseInfo | null>(null);
 
   useEffect(() => {
     if (connectionState !== 'authenticated') return;
@@ -98,16 +97,11 @@ export function BillingPage() {
       .history()
       .then((r) => setInvoices(r.invoices))
       .catch((e) => console.warn("[api]", e));
-    api.license
-      .status()
-      .then((info) => {
-        setLicenseInfo(info);
-        setCurrentPlan(info.tier?.toLowerCase() ?? 'community');
-      })
-      .catch((e) => console.warn("[api]", e));
+    // License API removed — all features are now open
+    setCurrentPlan('community');
   }, [connectionState]);
 
-  const renewalDate = licenseInfo?.expires_at ?? null;
+  const renewalDate = null;
 
   return (
     <div className="space-y-6">

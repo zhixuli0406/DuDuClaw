@@ -22,8 +22,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 
-const GITHUB_REPO_COMMUNITY: &str = "zhixuli0406/DuDuClaw";
-const GITHUB_REPO_PRO: &str = "zhixuli0406/duduclaw-pro-releases";
+const GITHUB_REPO: &str = "zhixuli0406/DuDuClaw";
 /// Current version: prefers build-time `DUDUCLAW_VERSION` env (set by Pro build script),
 /// then runtime `DUDUCLAW_VERSION` env, finally falls back to this crate's `CARGO_PKG_VERSION`.
 pub fn current_version() -> &'static str {
@@ -48,9 +47,8 @@ pub fn set_version_override(version: &str) {
 }
 /// Check whether automatic update is enabled.
 ///
-/// Pro editions default to `true`; CE defaults to `false`.
-/// Overridable via `[gateway].auto_update` in config.toml or
-/// `DUDUCLAW_AUTO_UPDATE` env var (`1`/`true` to enable, `0`/`false` to disable).
+/// Defaults to `false`. Overridable via `[gateway].auto_update` in config.toml
+/// or `DUDUCLAW_AUTO_UPDATE` env var (`1`/`true` to enable, `0`/`false` to disable).
 pub fn auto_update_enabled(home_dir: &std::path::Path) -> bool {
     // 1. Env override takes priority
     if let Ok(val) = std::env::var("DUDUCLAW_AUTO_UPDATE") {
@@ -69,8 +67,7 @@ pub fn auto_update_enabled(home_dir: &std::path::Path) -> bool {
         }
     }
 
-    // 3. Default: Pro = true, CE = false
-    is_pro_edition()
+    false
 }
 
 /// Maximum download + decompressed binary size: 200 MB. [H5][R2:NC2]
@@ -122,31 +119,14 @@ pub struct ApplyResult {
 // Installation method detection (includes linuxbrew [L2])
 // ---------------------------------------------------------------------------
 
-/// Detect whether the running binary is the Pro edition.
-///
-/// Detection order:
-/// 1. `DUDUCLAW_EDITION` env var (set by gateway on startup from extension name)
-/// 2. Binary filename contains "duduclaw-pro" (release builds)
-pub fn is_pro_edition() -> bool {
-    // Env var takes priority — set by gateway startup from GatewayExtension::tier()
-    if let Ok(edition) = std::env::var("DUDUCLAW_EDITION") {
-        return edition.eq_ignore_ascii_case("pro") || edition.eq_ignore_ascii_case("enterprise");
-    }
-    // Fallback: check binary filename (works for renamed release binaries)
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().contains("duduclaw-pro")))
-        .unwrap_or(false)
-}
-
-/// Return the GitHub repo slug for update checking based on edition.
+/// Return the GitHub repo slug for update checking.
 fn github_repo() -> &'static str {
-    if is_pro_edition() { GITHUB_REPO_PRO } else { GITHUB_REPO_COMMUNITY }
+    GITHUB_REPO
 }
 
-/// Return the Homebrew formula name based on edition.
+/// Return the Homebrew formula name.
 pub fn brew_formula_name() -> &'static str {
-    if is_pro_edition() { "duduclaw-pro" } else { "duduclaw" }
+    "duduclaw"
 }
 
 pub fn detect_install_method() -> InstallMethod {
@@ -156,8 +136,7 @@ pub fn detect_install_method() -> InstallMethod {
     };
     let exe_str = exe.to_string_lossy();
 
-    if exe_str.contains("/Cellar/duduclaw-pro/")
-        || exe_str.contains("/Cellar/duduclaw/")
+    if exe_str.contains("/Cellar/duduclaw/")
         || exe_str.contains("/homebrew/")
         || exe_str.contains("/linuxbrew/")
     {
@@ -220,12 +199,6 @@ fn platform_asset_suffix() -> &'static str {
 }
 
 fn binary_name() -> &'static str {
-    if is_pro_edition() {
-        #[cfg(target_os = "windows")]
-        { return "duduclaw-pro.exe"; }
-        #[cfg(not(target_os = "windows"))]
-        { return "duduclaw-pro"; }
-    }
     #[cfg(target_os = "windows")]
     { "duduclaw.exe" }
     #[cfg(not(target_os = "windows"))]
@@ -252,7 +225,7 @@ pub fn is_valid_download_url(url: &str) -> bool {
 pub async fn check_update() -> Result<UpdateInfo, String> {
     // [R3:M2] Redirect policy for check_update — only allow GitHub API/CDN
     let ver = current_version();
-    let ua = format!("{}/{ver}", if is_pro_edition() { "duduclaw-pro" } else { "duduclaw" });
+    let ua = format!("{}/{ver}", "duduclaw");
     let client = reqwest::Client::builder()
         .user_agent(&ua)
         .timeout(std::time::Duration::from_secs(15))
@@ -377,7 +350,7 @@ pub async fn apply_update(download_url: &str, checksum_url: &str) -> Result<Appl
 
     // [R2:NM2] Custom redirect policy — re-validate redirect targets
     let ver = current_version();
-    let ua = format!("{}/{ver}", if is_pro_edition() { "duduclaw-pro" } else { "duduclaw" });
+    let ua = format!("{}/{ver}", "duduclaw");
     let client = reqwest::Client::builder()
         .user_agent(&ua)
         .timeout(std::time::Duration::from_secs(300))
@@ -877,9 +850,8 @@ mod tests {
         // With no env var and no config.toml, CE defaults to false
         let tmp = std::env::temp_dir().join("duduclaw-test-auto-update");
         let _ = std::fs::create_dir_all(&tmp);
-        // No config.toml → falls through to is_pro_edition() which is false in CE tests
+        // No config.toml → defaults to false
         let result = auto_update_enabled(&tmp);
-        // In test environment, is_pro_edition() returns false → auto_update = false
         assert!(!result);
         let _ = std::fs::remove_dir_all(&tmp);
     }

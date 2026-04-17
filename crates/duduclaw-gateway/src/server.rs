@@ -70,8 +70,7 @@ pub struct GatewayConfig {
     pub auth_token: Option<String>,
     /// Path to the DuDuClaw home directory (e.g. `~/.duduclaw`).
     pub home_dir: std::path::PathBuf,
-    /// Extension point for Pro/Enterprise features.
-    /// Defaults to [`NullExtension`] in CE builds.
+    /// Plugin extension point. Defaults to [`NullExtension`].
     pub extension: Arc<dyn GatewayExtension>,
 }
 
@@ -96,11 +95,6 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     let home_dir = config.home_dir.clone();
     let extension = config.extension.clone();
-
-    // Publish edition tier so updater (and child processes) can detect Pro/Enterprise
-    // without relying on binary filename — fixes update page fetching CE versions.
-    // SAFETY: Called once at startup before spawning threads; no concurrent reads yet.
-    unsafe { std::env::set_var("DUDUCLAW_EDITION", extension.tier()) };
 
     let handler = MethodHandler::with_extension(config.home_dir, extension.clone()).await;
 
@@ -525,7 +519,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         app = app.merge(line);
     }
 
-    // Merge extension routes (Pro/Enterprise dashboard, API endpoints)
+    // Merge plugin extension routes (if any)
     if let Some(extra) = extension.extra_routes() {
         app = app.merge(extra);
     }
@@ -1008,6 +1002,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     None => break,
                 };
 
+                #[allow(clippy::collapsible_match)]
                 match msg {
                     Message::Text(text) => {
                         let frame = match serde_json::from_str::<WsFrame>(&text) {
