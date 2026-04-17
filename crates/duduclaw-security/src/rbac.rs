@@ -180,6 +180,10 @@ mod tests {
                 additional_mounts: vec![],
                 sandbox_enabled: false,
                 network_access: false,
+                worktree_enabled: false,
+                worktree_auto_merge: true,
+                worktree_cleanup_on_exit: true,
+                worktree_copy_files: vec![],
             },
             heartbeat: HeartbeatConfig {
                 enabled: false,
