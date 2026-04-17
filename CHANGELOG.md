@@ -1,5 +1,18 @@
 # Changelog
 
+
+## [1.5.0] - 2026-04-17
+
+### Added
+- (describe new features here)
+
+### Changed
+- (describe changes here)
+
+### Fixed
+- (describe bug fixes here)
+
+
 All notable changes to DuDuClaw are documented here. For the authoritative
 version history and per-commit detail, see `git log`.
 
