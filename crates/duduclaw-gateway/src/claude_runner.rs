@@ -717,7 +717,9 @@ async fn call_claude_streaming(
                                         ));
                                     }
                                     if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
-                                        result_text = text.to_string();
+                                        if !text.is_empty() {
+                                            result_text = text.to_string();
+                                        }
                                     }
                                     if let Some(usage_val) = event.get("usage") {
                                         token_usage = crate::cost_telemetry::TokenUsage::from_json(usage_val);

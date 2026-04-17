@@ -784,27 +784,42 @@ async fn build_reply_with_session_inner(
     };
 
     // 3. Fallback: Python wrapper (with account rotator)
+    //
+    // The Python SDK uses the `anthropic` package (Direct API) which requires
+    // an API key — OAuth tokens are not supported. Only attempt this fallback
+    // when an API key is available; skip entirely for OAuth-only setups to
+    // avoid the misleading "未設定任何 API 帳號" error message.
+    let fallback_api_key = get_api_key(&ctx.home_dir).await;
     let reply = match reply {
         Some(r) => Some(r),
-        None => match call_python_sdk_v2(&sanitized_text, &model, &full_system_prompt, &ctx.home_dir).await {
-            Ok(reply) => {
-                info!("Claude replied via Python SDK ({} chars)", reply.len());
-                Some(reply)
-            }
-            Err(e) => {
-                let log_line = format!("[{}] python SDK error: {e}\n", chrono::Utc::now());
-                let _ = tokio::fs::OpenOptions::new()
-                    .create(true).append(true)
-                    .open(ctx.home_dir.join("debug.log")).await
-                    .map(|mut f| { use tokio::io::AsyncWriteExt; tokio::spawn(async move { let _ = f.write_all(log_line.as_bytes()).await; }); });
-                warn!("Python SDK unavailable: {e}");
-                // Only overwrite if we don't already have a more specific CLI error.
-                if last_cli_error.is_none() {
-                    last_cli_error = Some(e);
+        None if fallback_api_key.is_some() => {
+            match call_python_sdk_v2(
+                &sanitized_text, &model, &full_system_prompt, &ctx.home_dir,
+                fallback_api_key.as_deref(),
+            ).await {
+                Ok(reply) => {
+                    info!("Claude replied via Python SDK ({} chars)", reply.len());
+                    Some(reply)
                 }
-                None
+                Err(e) => {
+                    let log_line = format!("[{}] python SDK error: {e}\n", chrono::Utc::now());
+                    let _ = tokio::fs::OpenOptions::new()
+                        .create(true).append(true)
+                        .open(ctx.home_dir.join("debug.log")).await
+                        .map(|mut f| { use tokio::io::AsyncWriteExt; tokio::spawn(async move { let _ = f.write_all(log_line.as_bytes()).await; }); });
+                    warn!("Python SDK unavailable: {e}");
+                    // Only overwrite if we don't already have a more specific CLI error.
+                    if last_cli_error.is_none() {
+                        last_cli_error = Some(e);
+                    }
+                    None
+                }
             }
-        },
+        }
+        None => {
+            info!("Skipping Python SDK fallback — no API key available (OAuth-only setup)");
+            None
+        }
     };
 
     if let Some(mut reply) = reply {
@@ -2524,7 +2539,15 @@ async fn spawn_claude_cli_with_env(
                                         ));
                                     }
                                     if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
-                                        result_text = text.to_string();
+                                        // Only overwrite with the result event's text if it's
+                                        // non-empty. When Claude uses tools, the final `result`
+                                        // event often has `result: ""` because the real answer
+                                        // was emitted in intermediate assistant text blocks.
+                                        // Overwriting with "" would discard those responses and
+                                        // trigger a false "Empty response" error.
+                                        if !text.is_empty() {
+                                            result_text = text.to_string();
+                                        }
                                     }
                                 }
                                 // Assistant message with content blocks
@@ -2746,18 +2769,23 @@ pub async fn call_python_sdk_delegate(
     system_prompt: &str,
     home_dir: &Path,
 ) -> Result<String, String> {
-    call_python_sdk_v2(prompt, model, system_prompt, home_dir).await
+    call_python_sdk_v2(prompt, model, system_prompt, home_dir, None).await
 }
 
 /// Call the Python Claude Code SDK via subprocess.
 ///
 /// The Python SDK uses the `anthropic` package with the `AccountRotator`
 /// for multi-account rotation, budget tracking, and error recovery.
+///
+/// When `api_key` is provided, it is injected as `ANTHROPIC_API_KEY` env var
+/// into the subprocess so the Python SDK can authenticate even when
+/// `config.toml` has no `[[accounts]]` entries.
 async fn call_python_sdk_v2(
     user_message: &str,
     model: &str,
     system_prompt: &str,
     home_dir: &Path,
+    api_key: Option<&str>,
 ) -> Result<String, String> {
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
@@ -2770,8 +2798,8 @@ async fn call_python_sdk_v2(
     let config_path = home_dir.join("config.toml");
     let python_path = find_python_path(home_dir);
 
-    let mut child = Command::new(duduclaw_core::platform::python3_command())
-        .args([
+    let mut cmd = Command::new(duduclaw_core::platform::python3_command());
+    cmd.args([
             "-m",
             "duduclaw.sdk.chat",
             "--model",
@@ -2785,7 +2813,12 @@ async fn call_python_sdk_v2(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    // Inject API key if provided by caller (from rotator or config).
+    if let Some(key) = api_key {
+        cmd.env("ANTHROPIC_API_KEY", key);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("Spawn python3: {e}"))?;
 
