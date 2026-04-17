@@ -45,9 +45,42 @@ pub struct PartitionedSoul {
 }
 
 /// Section header patterns recognized by the parser.
-const IDENTITY_HEADERS: &[&str] = &["## [identity]", "## Identity", "## 身份"];
-const BEHAVIOR_HEADERS: &[&str] = &["## [behaviors]", "## Behaviors", "## 行為"];
-const OBSERVATION_HEADERS: &[&str] = &["## [observations]", "## Observations", "## 觀察"];
+///
+/// Supports both DuDuClaw native format and SoulSpec v0.5 format:
+/// - DuDuClaw: `## [identity]`, `## Identity`, `## 身份`
+/// - SoulSpec v0.5: `## Core Identity`, `## Personality`, `## Purpose`
+const IDENTITY_HEADERS: &[&str] = &[
+    "## [identity]",
+    "## Identity",
+    "## 身份",
+    // SoulSpec v0.5 compatible
+    "## Core Identity",
+    "## Purpose",
+    "## Role",
+    "## 核心身份",
+];
+const BEHAVIOR_HEADERS: &[&str] = &[
+    "## [behaviors]",
+    "## Behaviors",
+    "## 行為",
+    // SoulSpec v0.5 compatible
+    "## Personality",
+    "## Response Style",
+    "## Communication Style",
+    "## Core Responsibilities",
+    "## Escalation Rules",
+    "## 個性",
+    "## 回應風格",
+];
+const OBSERVATION_HEADERS: &[&str] = &[
+    "## [observations]",
+    "## Observations",
+    "## 觀察",
+    // SoulSpec v0.5 compatible
+    "## Learned Patterns",
+    "## Adaptations",
+    "## 學習模式",
+];
 
 impl PartitionedSoul {
     /// Parse a SOUL.md string into partitioned sections.
@@ -218,6 +251,92 @@ impl PartitionedSoul {
         use ring::digest;
         let d = digest::digest(&digest::SHA256, content.as_bytes());
         d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    // ── SoulSpec v0.5 compatibility ────────────────────────────────
+
+    /// Validate SoulSpec v0.5 structural requirements.
+    ///
+    /// Returns a list of issues. Empty list means fully compliant.
+    /// SoulSpec v0.5 requires: Identity (or Core Identity/Role/Purpose),
+    /// Personality (or Behaviors), and Language sections.
+    pub fn validate_soulspec_v05(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+
+        let section_names: Vec<String> = self
+            .sections
+            .iter()
+            .map(|s| s.name.to_lowercase())
+            .collect();
+
+        // Check for identity section (immutable)
+        let has_identity = self
+            .sections
+            .iter()
+            .any(|s| s.mutability == SectionMutability::Immutable);
+        if !has_identity {
+            issues.push(
+                "SoulSpec v0.5: missing identity section (## Identity, ## Core Identity, ## Role, or ## Purpose)"
+                    .to_string(),
+            );
+        }
+
+        // Check for personality/behaviors section
+        let has_personality = section_names.iter().any(|n| {
+            n.contains("personality")
+                || n.contains("behavior")
+                || n.contains("style")
+                || n.contains("responsibilit")
+                || n.contains("個性")
+                || n.contains("行為")
+        });
+        if !has_personality {
+            issues.push(
+                "SoulSpec v0.5: missing personality/behaviors section (## Personality, ## Behaviors, or ## Response Style)"
+                    .to_string(),
+            );
+        }
+
+        // Check for language section (optional but recommended)
+        let has_language = self.preamble.to_lowercase().contains("language")
+            || section_names.iter().any(|n| n.contains("language") || n.contains("語言"));
+        if !has_language {
+            issues.push(
+                "SoulSpec v0.5: recommend adding a ## Language section for multi-language agents"
+                    .to_string(),
+            );
+        }
+
+        issues
+    }
+
+    /// Check if this SOUL.md follows SoulSpec v0.5 format.
+    pub fn is_soulspec_compliant(&self) -> bool {
+        self.validate_soulspec_v05()
+            .iter()
+            .all(|i| i.contains("recommend"))
+    }
+
+    /// Export this SOUL.md in SoulSpec v0.5 canonical format.
+    ///
+    /// Normalizes section headers to SoulSpec v0.5 naming convention.
+    pub fn to_soulspec_format(&self) -> String {
+        let mut parts = Vec::new();
+
+        if !self.preamble.is_empty() {
+            parts.push(self.preamble.clone());
+        }
+
+        for section in &self.sections {
+            let header = match section.mutability {
+                SectionMutability::Immutable => format!("## Identity: {}", section.name),
+                SectionMutability::Evolvable => format!("## {}", section.name),
+                SectionMutability::Observable => format!("## Observations: {}", section.name),
+            };
+            parts.push(format!("{}\n\n{}", header, section.content));
+        }
+
+        parts.join("\n\n")
     }
 }
 

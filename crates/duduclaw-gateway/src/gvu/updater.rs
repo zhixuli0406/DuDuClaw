@@ -82,6 +82,30 @@ impl Updater {
             ));
         }
 
+        // Scan proposal for hidden/malicious Markdown content (Soul-Evil Attack defense).
+        let soul_scan = duduclaw_security::soul_scanner::scan_soul(&proposal.content);
+        if !soul_scan.clean {
+            let max_severity = soul_scan.findings.iter().map(|f| f.severity).max().unwrap_or(0);
+            if max_severity >= 70 {
+                warn!(
+                    agent = %proposal.agent_id,
+                    threat_score = soul_scan.threat_score,
+                    findings = soul_scan.findings.len(),
+                    "GVU proposal blocked by SOUL.md scanner"
+                );
+                return Err(format!(
+                    "GVU proposal contains hidden content (threat score {}/100): {}",
+                    soul_scan.threat_score, soul_scan.summary,
+                ));
+            }
+            // Low-severity findings: log but allow (e.g., short HTML comments)
+            info!(
+                agent = %proposal.agent_id,
+                threat_score = soul_scan.threat_score,
+                "GVU proposal has low-severity SOUL.md scanner findings — allowing"
+            );
+        }
+
         // Verify the proposal does not attempt to override behavioral contracts.
         // NFKC-normalize and strip invisible characters before checking to prevent
         // Unicode fullwidth/homoglyph bypass attacks (R4-H2).
@@ -117,6 +141,34 @@ impl Updater {
         }
         if new_content.len() > 50_000 {
             return Err("Resulting SOUL.md exceeds 50KB limit".to_string());
+        }
+
+        // Compute Agent Stability Index (ASI) — reject if drift is too extreme.
+        let asi = duduclaw_security::stability_index::compute_asi(
+            &current_content,
+            &new_content,
+            &[], // Version distances populated by heartbeat, not available inline
+            &duduclaw_security::stability_index::AsiConfig::default(),
+        );
+        if asi.level == duduclaw_security::stability_index::AsiLevel::Critical {
+            warn!(
+                agent = %proposal.agent_id,
+                asi = asi.index,
+                summary = %asi.summary,
+                "GVU proposal rejected: ASI below critical threshold"
+            );
+            return Err(format!(
+                "GVU proposal would cause critical identity drift (ASI={:.3}): {}",
+                asi.index, asi.summary,
+            ));
+        }
+        if asi.level == duduclaw_security::stability_index::AsiLevel::Warning {
+            warn!(
+                agent = %proposal.agent_id,
+                asi = asi.index,
+                summary = %asi.summary,
+                "GVU proposal triggers ASI warning — proceeding with caution"
+            );
         }
 
         // Atomic write: write to temp file, then rename (prevents truncated SOUL.md on crash)

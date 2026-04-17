@@ -476,7 +476,7 @@ fn extract_tags_from_content(content: &str) -> Vec<String> {
     }
 
     let mut sorted: Vec<_> = word_counts.into_iter().filter(|(_, c)| *c >= 2).collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
     sorted.into_iter().take(5).map(|(w, _)| w).collect()
 }
 

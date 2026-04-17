@@ -572,7 +572,7 @@ pub fn extract_keywords(text: &str, top_k: usize) -> Vec<String> {
 
     // Sort by frequency and return top-k
     let mut entries: Vec<(String, u32)> = freq.into_iter().collect();
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|b| std::cmp::Reverse(b.1));
     entries.into_iter().take(top_k).map(|(k, _)| k).collect()
 }
 

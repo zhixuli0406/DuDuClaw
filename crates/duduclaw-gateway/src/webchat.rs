@@ -188,6 +188,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                     None => break,
                 };
 
+                #[allow(clippy::collapsible_match)]
                 match msg {
                     Message::Text(text) => {
                         let chat_msg: ChatMessage = match serde_json::from_str(&text) {

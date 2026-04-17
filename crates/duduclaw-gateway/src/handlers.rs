@@ -8,7 +8,7 @@ use duduclaw_auth::acl;
 use duduclaw_auth::models::{UserRole, AccessLevel};
 use duduclaw_core::traits::MemoryEngine;
 use duduclaw_memory::SqliteMemoryEngine;
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use rusqlite::params;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
@@ -483,8 +483,9 @@ impl MethodHandler {
             "skills.share" => self.handle_skills_share(params).await,
             "skills.adopt" => self.handle_skills_adopt(params).await,
 
-            // ── Stubs for frontend pages (not yet implemented) ──
-            "billing.usage" | "billing.history" | "billing.plan" =>
+            // ── Billing ──────────────────────────────────────
+            "billing.usage" => self.handle_billing_usage().await,
+            "billing.history" | "billing.plan" =>
                 WsFrame::error_response("", "Billing features are not available in the current edition"),
             "browser.audit_log" | "browser.emergency_stop" | "browser.tool_approve"
             | "browser.browserbase_sessions" | "browser.browserbase_cost" =>
@@ -3476,6 +3477,87 @@ impl MethodHandler {
         };
 
         WsFrame::ok_response("", json!({ "monthly": monthly }))
+    }
+
+    // ── Billing ──────────────────────────────────────────────
+
+    /// Return real usage data for the billing page.
+    ///
+    /// - conversations: session count this month from sessions.db
+    /// - agents: active agent count from registry
+    /// - channels: connected channel count from channel_status
+    /// - inference_hours: estimated from CostTelemetry token usage this month
+    async fn handle_billing_usage(&self) -> WsFrame {
+        let now = chrono::Utc::now();
+        // Start of current month in RFC3339
+        let month_start = now
+            .date_naive()
+            .with_day(1)
+            .unwrap_or(now.date_naive())
+            .and_hms_opt(0, 0, 0)
+            .unwrap_or_default();
+        let month_start_utc = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            month_start,
+            chrono::Utc,
+        );
+        let hours_since_month_start =
+            (now - month_start_utc).num_hours().max(1) as u64;
+
+        // Conversations this month from sessions.db
+        let session_db = self.home_dir.join("sessions.db");
+        let conversations_used: i64 = if session_db.exists() {
+            rusqlite::Connection::open(&session_db)
+                .ok()
+                .and_then(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM sessions WHERE last_active >= ?1",
+                        params![month_start_utc.to_rfc3339()],
+                        |r| r.get(0),
+                    )
+                    .ok()
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Active agents from registry
+        let reg = self.registry.read().await;
+        let agents_used = reg.list().len() as i64;
+        drop(reg);
+
+        // Connected channels
+        let channel_map = self.channel_status.read().await;
+        let channels_used = channel_map.values().filter(|s| s.connected).count() as i64;
+        drop(channel_map);
+
+        // Inference hours estimated from total output tokens this month
+        // Rough heuristic: 1 hour ≈ 50 requests average
+        let inference_hours_used: f64 =
+            if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
+                match telemetry.summary_global(hours_since_month_start).await {
+                    Ok(summary) => summary.total_requests as f64 / 50.0,
+                    Err(_) => 0.0,
+                }
+            } else {
+                0.0
+            };
+
+        // Community edition: unlimited (-1)
+        let reset_at = (month_start_utc + chrono::Duration::days(30)).to_rfc3339();
+
+        WsFrame::ok_response(
+            "",
+            json!({
+                "plan": "community",
+                "tier": "community",
+                "conversations": { "used": conversations_used, "limit": -1 },
+                "agents": { "used": agents_used, "limit": -1 },
+                "channels": { "used": channels_used, "limit": -1 },
+                "inference_hours": { "used": inference_hours_used.round() as i64, "limit": -1 },
+                "reset_at": reset_at,
+            }),
+        )
     }
 
     // ── Heartbeat ────────────────────────────────────────────
