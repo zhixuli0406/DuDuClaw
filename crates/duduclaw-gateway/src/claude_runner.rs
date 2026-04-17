@@ -37,6 +37,21 @@ fn build_system_prompt(agent: &duduclaw_agent::LoadedAgent) -> String {
     parts.join("\n\n---\n\n")
 }
 
+/// Resolve the effective working directory for a Claude CLI subprocess.
+///
+/// If L0 worktree isolation is active (task-local `WORKTREE_PATH` is set),
+/// use the worktree path. Otherwise fall back to the agent's base directory.
+fn effective_work_dir(agent_dir: &Path) -> Option<PathBuf> {
+    // Check worktree task-local first.
+    let wt = WORKTREE_PATH.try_with(|opt| opt.clone()).ok().flatten();
+    if let Some(ref p) = wt {
+        if p.exists() {
+            return Some(p.clone());
+        }
+    }
+    agent_dir.exists().then(|| agent_dir.to_path_buf())
+}
+
 /// Look up an agent from the registry and route to the best model.
 ///
 /// Routing logic per agent:
@@ -118,10 +133,10 @@ pub async fn call_claude_for_agent_with_type(
         "claude" => {
             // Skip local entirely, go straight to Claude API
             info!(agent = %agent_name, model = %claude_model, "Claude-only mode");
-            let wd = agent_dir.exists().then_some(agent_dir.as_path());
+            let wd = effective_work_dir(&agent_dir);
             return call_with_rotation(
                 home_dir, agent_id, prompt, &claude_model, &system_prompt,
-                request_type, Some(&capabilities), wd,
+                request_type, Some(&capabilities), wd.as_deref(),
             ).await;
         }
         _ => {
@@ -180,12 +195,12 @@ pub async fn call_claude_for_agent_with_type(
     // if CLI fails with rate limit (all OAuth accounts exhausted).
     // In "cli" mode: CLI is the only cloud path.
     // In "direct" mode: skip CLI, go straight to Direct API.
-    let wd = agent_dir.exists().then_some(agent_dir.as_path());
+    let wd = effective_work_dir(&agent_dir);
     if api_mode != "direct" {
         info!(agent = %agent_name, model = %claude_model, "Calling Claude CLI (SDK primary)");
         match call_with_rotation(
             home_dir, agent_id, prompt, &claude_model, &system_prompt, request_type,
-            Some(&capabilities), wd,
+            Some(&capabilities), wd.as_deref(),
         ).await {
             Ok(text) => return Ok(text),
             Err(e) => {
@@ -813,6 +828,11 @@ tokio::task_local! {
     /// The MCP `send_to_agent` tool reads this to register a delegation callback
     /// so the dispatcher can forward sub-agent responses back to the originating channel.
     pub static REPLY_CHANNEL: String;
+
+    /// Worktree path override injected by the dispatcher when L0 worktree
+    /// isolation is enabled.  `prepare_claude_cmd` uses this as the working
+    /// directory instead of the agent's base directory.
+    pub static WORKTREE_PATH: Option<std::path::PathBuf>;
 }
 
 /// Prepare a `claude` CLI command with common args and env vars.

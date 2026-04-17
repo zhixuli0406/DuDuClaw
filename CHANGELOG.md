@@ -1,6 +1,37 @@
 # Changelog
 
 
+## [1.6.0] - 2026-04-17
+
+### Added
+- **Git Worktree L0 isolation layer** (`worktree.rs`): lightweight per-task filesystem
+  isolation via git worktrees. Cheaper than container sandbox — creates isolated working
+  directories so concurrent agents don't step on each other's files.
+  - `WorktreeManager`: full lifecycle management (create / remove / list / cleanup_stale)
+  - **Atomic merge** with dry-run pre-check: merge → check → abort → real merge if clean.
+    Protected by global `Mutex` to prevent concurrent merge corruption.
+  - **Snap workflow** (inspired by agent-worktree): create → execute → inspect → merge/cleanup,
+    with pure-function decision logic separated from I/O for testability.
+  - **Friendly branch names**: `wt/{agent_id}/{adjective}-{noun}` from 50×50 word lists.
+  - **copy_env_files**: copies `.env` etc. into worktree with path traversal jail,
+    symlink rejection, and 1MB size limit.
+  - **Structured exit codes**: `AgentExitCode` enum (Success/Error/Retry/KeepAlive).
+  - **Resource limits**: max 5 worktrees per agent, 20 total.
+- `ContainerConfig` extended with `worktree_enabled`, `worktree_auto_merge`,
+  `worktree_cleanup_on_exit`, `worktree_copy_files` fields.
+- Three-tier isolation routing in dispatcher: L0 Worktree → L1 Container → Direct.
+- `WORKTREE_PATH` task-local in `claude_runner` for working directory override.
+
+### Security (3-round deep review)
+- Path traversal defense: canonical jail + absolute path rejection + `..` blocking.
+- Agent ID sanitization: `sanitize_agent_id()` restricts to `[a-z0-9-]`.
+- Branch name validation: `validate_wt_branch()` rejects `..`, leading `-`, non-`wt/` prefixes.
+- Git command hardening: `--` separators on all `git merge` commands.
+- `restore_head` validates branch names and commit hashes before `git checkout`.
+- Symlink checks before `canonicalize()` to prevent TOCTOU bypass.
+- Destination file removal before copy to prevent symlink race.
+- Global merge lock via `OnceLock<Mutex<()>>` (not per-instance).
+
 ## [1.5.0] - 2026-04-17
 
 ### Added

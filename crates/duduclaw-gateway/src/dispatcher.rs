@@ -636,7 +636,7 @@ impl DelegationEnv {
     }
 }
 
-/// Dispatch a task to an agent — using sandbox if enabled, otherwise direct call.
+/// Dispatch a task to an agent — L0 worktree → L1 sandbox → direct call.
 async fn dispatch_to_agent(
     home_dir: &std::path::Path,
     registry: &Arc<RwLock<AgentRegistry>>,
@@ -644,15 +644,27 @@ async fn dispatch_to_agent(
     prompt: &str,
     delegation: &DelegationEnv,
 ) -> Result<String, String> {
-    // Check if agent has sandbox enabled
-    let use_sandbox = {
+    // Read isolation flags from agent config.
+    let (use_sandbox, use_worktree, worktree_cfg) = {
         let reg = registry.read().await;
         let agent = if agent_id == "default" {
             reg.main_agent()
         } else {
             reg.get(agent_id)
         };
-        agent.is_some_and(|a| a.config.container.sandbox_enabled)
+        match agent {
+            Some(a) => (
+                a.config.container.sandbox_enabled,
+                a.config.container.worktree_enabled,
+                WorktreeCfg {
+                    auto_merge: a.config.container.worktree_auto_merge,
+                    cleanup: a.config.container.worktree_cleanup_on_exit,
+                    copy_files: a.config.container.worktree_copy_files.clone(),
+                    agent_dir: a.dir.clone(),
+                },
+            ),
+            None => (false, false, WorktreeCfg::default()),
+        }
     };
 
     // Pass delegation context via task-local so prepare_claude_cmd can
@@ -661,8 +673,11 @@ async fn dispatch_to_agent(
 
     let env_map_clone = env_map.clone();
     crate::claude_runner::DELEGATION_ENV.scope(env_map, async {
-        if use_sandbox && sandbox::is_sandbox_available().await {
-            info!(agent = agent_id, "Dispatching via sandbox");
+        if use_worktree {
+            info!(agent = agent_id, "Dispatching via worktree (L0)");
+            dispatch_in_worktree(home_dir, registry, agent_id, prompt, &worktree_cfg).await
+        } else if use_sandbox && sandbox::is_sandbox_available().await {
+            info!(agent = agent_id, "Dispatching via sandbox (L1)");
             dispatch_sandboxed(home_dir, registry, agent_id, prompt, &env_map_clone).await
         } else {
             call_claude_for_agent_with_type(
@@ -671,6 +686,145 @@ async fn dispatch_to_agent(
             ).await
         }
     }).await
+}
+
+/// Per-agent worktree configuration snapshot (avoids holding registry lock).
+#[derive(Debug, Clone, Default)]
+struct WorktreeCfg {
+    auto_merge: bool,
+    cleanup: bool,
+    copy_files: Vec<String>,
+    agent_dir: PathBuf,
+}
+
+/// Execute a task in an isolated git worktree (L0 isolation).
+///
+/// Flow: create worktree → copy env files → call Claude CLI → inspect result
+///       → snap decision (merge / cleanup / keep) → return response.
+async fn dispatch_in_worktree(
+    home_dir: &Path,
+    registry: &Arc<RwLock<AgentRegistry>>,
+    agent_id: &str,
+    prompt: &str,
+    cfg: &WorktreeCfg,
+) -> Result<String, String> {
+    let manager = crate::worktree::WorktreeManager::new(home_dir);
+
+    // Use the agent directory as repo root (it should be a git repo or
+    // inside one). Fall back to the agent dir itself.
+    let repo_root = find_git_root(&cfg.agent_dir).await.unwrap_or_else(|| cfg.agent_dir.clone());
+
+    // Create worktree.
+    let wt = manager.create(&repo_root, agent_id).await?;
+    info!(
+        agent = agent_id,
+        branch = %wt.branch,
+        path = %wt.path.display(),
+        "Worktree created for task"
+    );
+
+    // Copy environment files.
+    if let Err(e) = manager.copy_env_files(&cfg.agent_dir, &wt.path, &cfg.copy_files).await {
+        warn!(agent = agent_id, err = %e, "Failed to copy env files to worktree");
+    }
+
+    // Call Claude CLI with worktree as working directory.
+    // We use WORKTREE_PATH task-local to communicate the override to claude_runner.
+    let result = crate::claude_runner::WORKTREE_PATH.scope(
+        Some(wt.path.clone()),
+        call_claude_for_agent_with_type(
+            home_dir, registry, agent_id, prompt,
+            crate::cost_telemetry::RequestType::Dispatch,
+        ),
+    ).await;
+
+    // Snap: inspect and decide what to do with the worktree.
+    let response_text = result.unwrap_or_else(|e| format!("Error: {e}"));
+
+    if cfg.auto_merge || cfg.cleanup {
+        let status = manager.inspect_worktree(&wt.path, &repo_root).await;
+        let action = crate::worktree::determine_snap_action(&status);
+
+        let target_branch = get_main_branch(&repo_root).await;
+        match manager.execute_snap(&action, &repo_root, &wt.path, &wt.branch, &target_branch).await {
+            Ok(outcome) => {
+                info!(agent = agent_id, ?outcome, "Worktree snap completed");
+            }
+            Err(e) => {
+                warn!(agent = agent_id, err = %e, "Worktree snap failed — keeping worktree");
+            }
+        }
+    } else {
+        info!(
+            agent = agent_id,
+            path = %wt.path.display(),
+            branch = %wt.branch,
+            "Worktree kept (auto_merge and cleanup both disabled) — run cleanup_stale to reclaim"
+        );
+    }
+
+    Ok(response_text)
+}
+
+/// Find the git repository root using `git rev-parse --show-toplevel`.
+///
+/// Uses git itself instead of manually walking directories, which avoids
+/// TOCTOU races with `.git` existence checks and handles gitdir files.
+async fn find_git_root(start: &Path) -> Option<PathBuf> {
+    let output = tokio::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(start)
+        .output()
+        .await
+        .ok()?;
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    None
+}
+
+/// Detect the main/master/default branch of the repo.
+///
+/// Validates output to only contain safe branch name characters.
+async fn get_main_branch(repo_root: &Path) -> String {
+    let is_safe_branch = |s: &str| -> bool {
+        !s.is_empty()
+            && !s.starts_with('-')
+            && !s.contains("..")
+            && s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '/' || c == '.')
+    };
+
+    // Try symbolic-ref for the default branch.
+    let output = tokio::process::Command::new("git")
+        .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .await;
+    if let Ok(o) = output {
+        if o.status.success() {
+            let s = String::from_utf8_lossy(&o.stdout);
+            if let Some(branch) = s.trim().strip_prefix("refs/remotes/origin/") {
+                if is_safe_branch(branch) {
+                    return branch.to_string();
+                }
+            }
+        }
+    }
+    // Fallback: check if "main" or "master" exists.
+    for candidate in &["main", "master"] {
+        let check = tokio::process::Command::new("git")
+            .args(["rev-parse", "--verify", candidate])
+            .current_dir(repo_root)
+            .output()
+            .await;
+        if check.map(|o| o.status.success()).unwrap_or(false) {
+            return candidate.to_string();
+        }
+    }
+    "main".to_string()
 }
 
 /// Execute a task inside a sandboxed Docker container.

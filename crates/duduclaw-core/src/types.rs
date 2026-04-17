@@ -202,6 +202,20 @@ pub struct ContainerConfig {
     /// Allow network access inside the sandbox (default: false = offline).
     #[serde(default)]
     pub network_access: bool,
+    /// Run agent tasks in an isolated git worktree (L0 lightweight isolation).
+    /// Cheaper than container sandbox — creates a separate working directory
+    /// so concurrent agents don't step on each other's files.
+    #[serde(default)]
+    pub worktree_enabled: bool,
+    /// Automatically merge worktree branch back after successful task completion.
+    #[serde(default = "default_true")]
+    pub worktree_auto_merge: bool,
+    /// Remove worktree after task completion (or after merge).
+    #[serde(default = "default_true")]
+    pub worktree_cleanup_on_exit: bool,
+    /// Non-git-tracked files to copy into the worktree (e.g. `.env`, `.env.local`).
+    #[serde(default)]
+    pub worktree_copy_files: Vec<String>,
 }
 
 /// Heartbeat / scheduled-task configuration.

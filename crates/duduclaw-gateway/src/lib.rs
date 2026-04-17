@@ -74,6 +74,7 @@ pub mod webchat;
 pub mod webhook;
 pub mod reminder_scheduler;
 pub mod wiki_ingest;
+pub mod worktree;
 
 // ── Hermes-learnings modules (Phase 3, 4, 6) ──
 pub mod compression;
