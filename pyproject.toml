@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "duduclaw"
-version = "1.4.31"
+version = "1.5.0"
 description = "DuDuClaw Python SDK — evolution vetter, channel bridges, and Claude Code SDK integration"
 requires-python = ">=3.9"
 license = {text = "Apache-2.0"}

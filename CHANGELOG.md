@@ -4,13 +4,33 @@
 ## [1.5.0] - 2026-04-17
 
 ### Added
-- (describe new features here)
+- **SOUL.md content scanner** (`soul_scanner`): defends against "Soul-Evil Attack" —
+  detects hidden HTML comments, invisible Unicode, zero-width steganography, data URIs,
+  and hidden HTML tags in SOUL.md files.
+- **Agent Stability Index** (`stability_index`): quantifies identity drift between
+  SOUL.md versions with configurable thresholds (Warning / Critical).
+- **Template sanitizer** (`template_sanitizer`): sanitizes prompt templates for
+  injection resistance.
+- **SoulSpec v0.5 compatibility**: soul_partition now recognizes SoulSpec v0.5 headers
+  (Core Identity, Personality, Learned Patterns, etc.), with validation and export.
+- **Audit Logs page**: new History tab showing JSONL audit events with severity icons,
+  agent/channel/user badges, and expandable JSON details. Existing real-time log stream
+  moved to Realtime tab.
+- **Billing usage API** (`billing.usage`): returns live session count, active agents,
+  connected channels, and inference hours from actual data sources.
 
 ### Changed
-- (describe changes here)
+- GVU updater now runs soul_scanner + ASI checks before applying SOUL.md proposals.
+- Soul guard integrity check includes content scan on every run and ASI on drift.
+- BillingPage simplified — removed stub plan card, payment method, invoice history,
+  and upgrade sections (not applicable to community edition).
+- Logs nav icon changed from ScrollText to FileText; label renamed to "Audit Logs".
 
 ### Fixed
-- (describe bug fixes here)
+- Clippy: `sort_by_key` with `Reverse` instead of `sort_by` closure (3 occurrences).
+- Windows sandbox test split with `cfg(not(windows))` / `cfg(windows)`.
+- `clippy::collapsible_match` allow in webchat.
+- CI: ignore RUSTSEC-2026-0098 and RUSTSEC-2026-0099.
 
 
 All notable changes to DuDuClaw are documented here. For the authoritative
