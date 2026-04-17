@@ -201,6 +201,38 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let (event_tx, _) = broadcast::channel::<String>(64);
     handler.set_event_tx(event_tx.clone()).await;
 
+    // ── Initialize MemGPT 3-layer memory managers ──
+    let core_memory_db = home_dir.join("core_memory.db");
+    let core_memory = std::sync::Arc::new(
+        duduclaw_memory::CoreMemoryManager::new(&core_memory_db)
+            .unwrap_or_else(|e| {
+                warn!("Core memory init failed ({e}), using in-memory fallback");
+                duduclaw_memory::CoreMemoryManager::in_memory().expect("in-memory should succeed")
+            }),
+    );
+    let recall_memory_db = home_dir.join("recall_memory.db");
+    let recall_memory = std::sync::Arc::new(
+        duduclaw_memory::RecallMemoryManager::new(&recall_memory_db)
+            .unwrap_or_else(|e| {
+                warn!("Recall memory init failed ({e}), using in-memory fallback");
+                duduclaw_memory::RecallMemoryManager::in_memory().expect("in-memory should succeed")
+            }),
+    );
+    let memory_db_path = home_dir.join("memory.db");
+    let archival_engine = std::sync::Arc::new(
+        duduclaw_memory::SqliteMemoryEngine::new(&memory_db_path)
+            .unwrap_or_else(|e| {
+                warn!("Archival memory init failed ({e}), using in-memory fallback");
+                duduclaw_memory::SqliteMemoryEngine::in_memory().expect("in-memory should succeed")
+            }),
+    );
+    let archival_memory = std::sync::Arc::new(
+        duduclaw_memory::ArchivalMemoryBridge::new(archival_engine),
+    );
+    let memory_budget = duduclaw_memory::MemoryBudgetConfig::default();
+    info!("MemGPT 3-layer memory initialized (core={}, recall={}, archival={} tokens)",
+        memory_budget.core_tokens, memory_budget.recall_tokens, memory_budget.archival_tokens);
+
     // Start channel bots if configured
     let reply_ctx = Arc::new(
         crate::channel_reply::ReplyContext::new(
@@ -212,6 +244,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         )
         .with_prediction_engine(prediction_engine.clone())
         .with_gvu_loop(gvu_loop.clone())
+        .with_memory(core_memory, recall_memory, archival_memory, memory_budget)
     );
     // Inject reply context into handler for channel hot-start/stop
     handler.set_reply_ctx(reply_ctx.clone()).await;
