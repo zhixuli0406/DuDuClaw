@@ -579,7 +579,9 @@ fn handle_stream_event(
                     .unwrap_or("Unknown error");
                 *result_text = format!("[error] {err_msg}");
             } else if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
-                *result_text = text.to_string();
+                if !text.is_empty() {
+                    *result_text = text.to_string();
+                }
             }
             // Extract token usage from result event
             extract_usage(event.get("usage"), input_tokens, output_tokens);

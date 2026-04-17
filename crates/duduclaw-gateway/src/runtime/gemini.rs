@@ -162,9 +162,14 @@ impl AgentRuntime for GeminiRuntime {
                         }
                     }
                     "result" => {
-                        // Final result: extract content and stats
+                        // Final result: extract content and stats.
+                        // Only overwrite if non-empty — when the AI uses tools, the
+                        // result event may have empty content while the real answer
+                        // was accumulated from earlier "message" events.
                         if let Some(text) = event.extra.get("content").and_then(|c| c.as_str()) {
-                            content = text.to_string();
+                            if !text.is_empty() {
+                                content = text.to_string();
+                            }
                         }
                         if let Some(stats) = event.extra.get("stats") {
                             if let Ok(s) = serde_json::from_value::<GeminiStats>(stats.clone()) {
