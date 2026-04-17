@@ -1,6 +1,6 @@
 {
   "name": "duduclaw",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "DuDuClaw \u2014 Multi-Agent AI Assistant Platform (Community Edition)",
   "license": "Apache-2.0",
   "repository": {
@@ -28,10 +28,10 @@
     "postinstall": "node scripts/install.js"
   },
   "optionalDependencies": {
-    "@duduclaw/darwin-arm64": "1.6.0",
-    "@duduclaw/darwin-x64": "1.6.0",
-    "@duduclaw/linux-x64": "1.6.0",
-    "@duduclaw/linux-arm64": "1.6.0",
-    "@duduclaw/win32-x64": "1.6.0"
+    "@duduclaw/darwin-arm64": "1.7.0",
+    "@duduclaw/darwin-x64": "1.7.0",
+    "@duduclaw/linux-x64": "1.7.0",
+    "@duduclaw/linux-arm64": "1.7.0",
+    "@duduclaw/win32-x64": "1.7.0"
   }
 }

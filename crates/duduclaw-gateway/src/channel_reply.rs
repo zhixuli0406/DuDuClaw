@@ -74,6 +74,15 @@ pub struct ReplyContext {
     pub skill_recorder: Arc<tokio::sync::Mutex<TrajectoryRecorder>>,
     /// Persistent skill bank for extracted skills (Phase 3).
     pub skill_bank: Arc<tokio::sync::Mutex<SkillCache>>,
+    // ── MemGPT 3-layer memory (Phase 5) ──
+    /// Core Memory (L1) — always in context window.
+    pub core_memory: Option<Arc<duduclaw_memory::CoreMemoryManager>>,
+    /// Recall Memory (L2) — cross-session conversation log.
+    pub recall_memory: Option<Arc<duduclaw_memory::RecallMemoryManager>>,
+    /// Archival Memory (L3) — long-term semantic knowledge.
+    pub archival_memory: Option<Arc<duduclaw_memory::ArchivalMemoryBridge>>,
+    /// Memory budget configuration.
+    pub memory_budget: duduclaw_memory::MemoryBudgetConfig,
 }
 
 impl ReplyContext {
@@ -128,6 +137,10 @@ impl ReplyContext {
             mistake_notebook: None,
             skill_recorder: Arc::new(tokio::sync::Mutex::new(TrajectoryRecorder::new())),
             skill_bank: Arc::new(tokio::sync::Mutex::new(SkillCache::new())),
+            core_memory: None,
+            recall_memory: None,
+            archival_memory: None,
+            memory_budget: duduclaw_memory::MemoryBudgetConfig::default(),
         }
     }
 
@@ -146,6 +159,21 @@ impl ReplyContext {
     /// Create with MistakeNotebook for grounded GVU evolution.
     pub fn with_mistake_notebook(mut self, nb: Arc<crate::gvu::mistake_notebook::MistakeNotebook>) -> Self {
         self.mistake_notebook = Some(nb);
+        self
+    }
+
+    /// Create with MemGPT 3-layer memory.
+    pub fn with_memory(
+        mut self,
+        core: Arc<duduclaw_memory::CoreMemoryManager>,
+        recall: Arc<duduclaw_memory::RecallMemoryManager>,
+        archival: Arc<duduclaw_memory::ArchivalMemoryBridge>,
+        budget: duduclaw_memory::MemoryBudgetConfig,
+    ) -> Self {
+        self.core_memory = Some(core);
+        self.recall_memory = Some(recall);
+        self.archival_memory = Some(archival);
+        self.memory_budget = budget;
         self
     }
 }
@@ -591,6 +619,26 @@ async fn build_reply_with_session_inner(
         warn!("Failed to save user message to session: {e}");
     }
 
+    // ── Recall Memory (L2): record user inbound message ──
+    if let Some(recall) = &ctx.recall_memory {
+        let (channel, chat_id) = parse_session_id_parts(session_id);
+        let entry = duduclaw_memory::RecallEntry {
+            agent_id: agent_id.clone(),
+            channel: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            session_id: session_id.to_string(),
+            role: "user".to_string(),
+            content: sanitized_text.clone(),
+            source: "interactive".to_string(),
+            source_agent: String::new(),
+            token_count: user_tokens,
+            ..Default::default()
+        };
+        if let Err(e) = recall.record(entry).await {
+            warn!("Failed to record user message to recall log: {e}");
+        }
+    }
+
     // Build conversation history from session
     let history = match session_mgr.get_messages(session_id).await {
         Ok(msgs) => {
@@ -613,10 +661,45 @@ async fn build_reply_with_session_inner(
         }
     };
 
-    let full_system_prompt = if history.is_empty() {
-        system_prompt
+    // ── MemGPT 3-layer memory injection ──
+    let memory_section = if ctx.memory_budget.enabled {
+        if let (Some(core), Some(recall), Some(archival)) =
+            (&ctx.core_memory, &ctx.recall_memory, &ctx.archival_memory)
+        {
+            let budget_mgr = duduclaw_memory::MemoryBudgetManager::new(
+                Arc::clone(core),
+                Arc::clone(recall),
+                Arc::clone(archival),
+            );
+            let (channel, chat_id) = parse_session_id_parts(session_id);
+            match budget_mgr
+                .build_memory_prompt(
+                    &ctx.memory_budget,
+                    &agent_id,
+                    channel,
+                    chat_id,
+                    &sanitized_text,
+                )
+                .await
+            {
+                Ok(section) => section,
+                Err(e) => {
+                    warn!("Failed to build memory prompt: {e}");
+                    String::new()
+                }
+            }
+        } else {
+            String::new()
+        }
     } else {
-        format!("{system_prompt}{history}")
+        String::new()
+    };
+
+    let full_system_prompt = match (memory_section.is_empty(), history.is_empty()) {
+        (true, true) => system_prompt,
+        (true, false) => format!("{system_prompt}{history}"),
+        (false, true) => format!("{system_prompt}\n\n{memory_section}"),
+        (false, false) => format!("{system_prompt}\n\n{memory_section}{history}"),
     };
 
     // Track the last underlying failure so the fallback message can
@@ -810,6 +893,26 @@ async fn build_reply_with_session_inner(
             .await
         {
             warn!("Failed to save assistant message to session: {e}");
+        }
+
+        // ── Recall Memory (L2): record assistant reply ──
+        if let Some(recall) = &ctx.recall_memory {
+            let (channel, chat_id) = parse_session_id_parts(session_id);
+            let entry = duduclaw_memory::RecallEntry {
+                agent_id: agent_id.clone(),
+                channel: channel.to_string(),
+                chat_id: chat_id.to_string(),
+                session_id: session_id.to_string(),
+                role: "assistant".to_string(),
+                content: reply.clone(),
+                source: "interactive".to_string(),
+                source_agent: agent_id.clone(),
+                token_count: reply_tokens,
+                ..Default::default()
+            };
+            if let Err(e) = recall.record(entry).await {
+                warn!("Failed to record assistant reply to recall log: {e}");
+            }
         }
 
         // ── Prediction-driven evolution ──────────────────────────────
@@ -2836,6 +2939,15 @@ fn estimate_tokens(text: &str) -> u32 {
     let cjk_tokens = (cjk_chars as f32 / 1.5).ceil() as u32;
     let other_tokens = (other_chars as f32 / 4.0).ceil() as u32;
     cjk_tokens + other_tokens + 1 // +1 minimum
+}
+
+/// Parse session_id "telegram:12345" or "telegram:12345:thread" into (channel, chat_id).
+fn parse_session_id_parts(session_id: &str) -> (&str, &str) {
+    let parts: Vec<&str> = session_id.splitn(3, ':').collect();
+    match parts.len() {
+        0 | 1 => ("", session_id),
+        _ => (parts[0], parts[1]),
+    }
 }
 
 async fn get_api_key(home_dir: &Path) -> Option<String> {
