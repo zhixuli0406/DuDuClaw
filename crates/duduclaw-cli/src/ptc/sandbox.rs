@@ -433,11 +433,21 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn test_bash_client_stub_is_valid() {
         let stub = bash_client_stub();
         assert!(stub.contains("ptc_call"));
         assert!(stub.contains("DUDUCLAW_PTC_SOCKET"));
         assert!(stub.contains("UNIX-CONNECT"));
+        // Must NOT have a fallback path
+        assert!(!stub.contains("/tmp/ptc.sock"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_bash_client_stub_is_valid() {
+        let stub = bash_client_stub();
+        assert!(stub.contains("DUDUCLAW_PTC_SOCKET"));
         // Must NOT have a fallback path
         assert!(!stub.contains("/tmp/ptc.sock"));
     }
