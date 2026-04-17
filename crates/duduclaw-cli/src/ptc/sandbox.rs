@@ -356,6 +356,10 @@ impl PtcSandbox {
             }],
             sandbox_enabled: true,
             network_access: false, // --network=none
+            worktree_enabled: false,
+            worktree_auto_merge: true,
+            worktree_cleanup_on_exit: true,
+            worktree_copy_files: vec![],
         };
 
         let start = std::time::Instant::now();
