@@ -1,6 +1,21 @@
 # Changelog
 
 
+## [1.7.2] - 2026-04-17
+
+### Fixed
+- **Stream-JSON empty result overwrite**: When Claude uses tools, the final `result`
+  event often has an empty `result` field. The parser unconditionally overwrote
+  accumulated assistant text with this empty string, causing false "Empty response"
+  errors. Fixed in all 4 stream-json parsers (channel_reply, claude_runner, agent
+  runner, gemini runtime).
+- **Python SDK fallback OAuth awareness**: The Python SDK fallback now skips entirely
+  for OAuth-only setups (it requires API keys) instead of producing the misleading
+  "未設定任何 API 帳號" error. When an API key is available, it is explicitly
+  passed to the subprocess.
+
+
+
 ## [1.6.0] - 2026-04-17
 
 ### Added
