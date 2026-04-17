@@ -108,7 +108,7 @@ jobs:
             duduclaw-*.zip
             duduclaw-*.sha256
 
-  # Publish CE to npm
+  # Publish to npm
   npm-publish:
     needs: release
     runs-on: ubuntu-latest
@@ -135,7 +135,7 @@ jobs:
           ARTIFACTS_DIR: ./artifacts
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          ./npm/scripts/publish-ce.sh "$VERSION"
+          ./npm/scripts/publish.sh "$VERSION"
 
   # Publish Python SDK to PyPI
   pypi-publish:
@@ -174,19 +174,3 @@ jobs:
     env:
       HAS_PYPI: ${{ vars.PYPI_TRUSTED_PUBLISHER == 'true' }}
 
-  # Trigger Pro repo rebuild after CE release
-  trigger-pro-rebuild:
-    needs: release
-    runs-on: ubuntu-latest
-    steps:
-      - name: Dispatch to duduclaw-pro
-        if: env.HAS_TOKEN == 'true'
-        env:
-          HAS_TOKEN: ${{ secrets.PRO_REPO_DISPATCH_TOKEN != '' }}
-          PRO_TOKEN: ${{ secrets.PRO_REPO_DISPATCH_TOKEN }}
-        run: |
-          curl -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $PRO_TOKEN" \
-            https://api.github.com/repos/zhixuli0406/duduclaw-pro/dispatches \
-            -d '{"event_type":"ce-release","client_payload":{"ce_version":"${{ github.ref_name }}"}}'

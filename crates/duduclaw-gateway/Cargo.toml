@@ -40,9 +40,7 @@ duduclaw-inference = { workspace = true }
 duduclaw-dashboard = { workspace = true, optional = true }
 async-trait = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
-gethostname = "0.5"
 hex = "0.4"
-mac_address = "1"
 openssl-sys = { version = "0.9", optional = true }
 
 [target.'cfg(windows)'.dependencies]

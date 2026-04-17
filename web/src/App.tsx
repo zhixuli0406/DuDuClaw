@@ -13,7 +13,6 @@ import { SettingsPage } from './pages/SettingsPage';
 import { LogsPage } from './pages/LogsPage';
 import { OrgChartPage } from './pages/OrgChartPage';
 import { SkillMarketPage } from './pages/SkillMarketPage';
-import { LicensePage } from './pages/LicensePage';
 import { WebChatPage } from './pages/WebChatPage';
 import { BillingPage } from './pages/BillingPage';
 import { ReportPage } from './pages/ReportPage';
@@ -74,7 +73,6 @@ export function App() {
             <Route path="accounts" element={<AccountsPage />} />
             <Route path="security" element={<SecurityPage />} />
             <Route path="settings" element={<SettingsPage />} />
-            <Route path="license" element={<LicensePage />} />
             <Route path="mcp" element={<McpPage />} />
             <Route path="odoo" element={<OdooPage />} />
             <Route path="users" element={<UsersPage />} />

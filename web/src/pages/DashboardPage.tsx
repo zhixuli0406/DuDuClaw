@@ -8,7 +8,6 @@ import {
   api,
   type BudgetSummary,
   type DoctorCheck,
-  type LicenseInfo,
   type WikiPageMeta,
   type WikiStats,
 } from '@/lib/api';
@@ -19,8 +18,6 @@ import {
   Radio,
   Wallet,
   HeartPulse,
-  Shield,
-  ArrowUpRight,
   BookOpen,
   FileText,
   Clock,
@@ -68,7 +65,6 @@ export function DashboardPage() {
   const connectionState = useConnectionStore((s) => s.state);
   const [budget, setBudget] = useState<BudgetSummary | null>(null);
   const [doctor, setDoctor] = useState<{ checks: DoctorCheck[]; summary: { pass: number; warn: number; fail: number } } | null>(null);
-  const [license, setLicense] = useState<LicenseInfo | null>(null);
   const [wikiPages, setWikiPages] = useState<ReadonlyArray<WikiPageMeta>>([]);
   const [wikiStats, setWikiStats] = useState<WikiStats | null>(null);
   const [wikiContents, setWikiContents] = useState<Record<string, string>>({});
@@ -82,7 +78,6 @@ export function DashboardPage() {
     fetchStatus();
     api.accounts.budgetSummary().then(setBudget).catch((e) => console.warn("[api]", e));
     api.system.doctor().then(setDoctor).catch((e) => console.warn("[api]", e));
-    api.license.status().then(setLicense).catch((e) => console.warn("[api]", e));
 
     // Fetch wiki data for the default (first) agent
     api.agents.list().then(async (res) => {
@@ -176,30 +171,6 @@ export function DashboardPage() {
           color={summary.fail ? 'bg-rose-500' : summary.warn ? 'bg-amber-500' : 'bg-emerald-500'}
         />
       </div>
-
-      {/* License Tier Banner */}
-      {license && !license.activated && (
-        <div className="flex items-center justify-between rounded-xl border border-amber-200 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-900/20">
-          <div className="flex items-center gap-3">
-            <Shield className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-            <div>
-              <p className="text-sm font-medium text-amber-800 dark:text-amber-200">
-                {intl.formatMessage({ id: 'dashboard.license.community' })}
-              </p>
-              <p className="text-xs text-amber-600 dark:text-amber-400">
-                {intl.formatMessage({ id: 'dashboard.license.upgradeHint' })}
-              </p>
-            </div>
-          </div>
-          <a
-            href="mailto:info@dudustudio.monster"
-            className="inline-flex items-center gap-1 rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-amber-600"
-          >
-            {intl.formatMessage({ id: 'dashboard.license.upgrade' })}
-            <ArrowUpRight className="h-3 w-3" />
-          </a>
-        </div>
-      )}
 
       {/* Doctor Checks */}
       {checks.length > 0 && (

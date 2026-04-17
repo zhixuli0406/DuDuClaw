@@ -894,14 +894,6 @@ export const api = {
     history: () =>
       client.call('billing.history') as Promise<{ invoices: BillingInvoice[] }>,
   },
-  license: {
-    status: () =>
-      client.call('license.status') as Promise<LicenseInfo>,
-    activate: (key: string) =>
-      client.call('license.activate', { key }) as Promise<{ success: boolean }>,
-    deactivate: () =>
-      client.call('license.deactivate') as Promise<{ success: boolean }>,
-  },
   marketplace: {
     install: (serverId: string) =>
       client.call('marketplace.install', { server_id: serverId }) as Promise<{ success: boolean }>,

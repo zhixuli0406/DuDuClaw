@@ -52,7 +52,6 @@ pub mod dispatcher;
 pub mod message_queue;
 pub mod evolution;
 pub mod external_factors;
-pub mod feature_gate;
 pub mod handlers;
 pub mod line;
 pub mod mcp_oauth;

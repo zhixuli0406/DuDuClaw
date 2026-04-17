@@ -17,7 +17,6 @@ import {
   Shield,
   Settings,
   ScrollText,
-  KeyRound,
   MessageCircle,
   BarChart3,
   CreditCard,
@@ -55,7 +54,6 @@ const navItems: NavItem[] = [
   { to: '/odoo', icon: Building2, label: 'nav.odoo', minRole: 'admin' },
   { to: '/users', icon: Users, label: 'nav.users', minRole: 'admin' },
   { to: '/settings', icon: Settings, label: 'nav.settings', minRole: 'admin' },
-  { to: '/license', icon: KeyRound, label: 'nav.license', minRole: 'admin' },
   { to: '/logs', icon: ScrollText, label: 'nav.logs', minRole: 'manager' },
 ];
 
