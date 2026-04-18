@@ -437,9 +437,8 @@ impl ComputerUseOrchestrator {
     }
 
     /// L5b: capture screenshot from the host display via `xcap`.
+    #[cfg(feature = "desktop")]
     async fn capture_screenshot_native(&self) -> Result<String, ComputerUseError> {
-        // xcap must run on the main thread (macOS AppKit requirement),
-        // so we use spawn_blocking.
         let result = tokio::task::spawn_blocking(|| -> Result<String, String> {
             let monitors = xcap::Monitor::all()
                 .map_err(|e| format!("No monitors: {e}"))?;
@@ -468,7 +467,15 @@ impl ComputerUseOrchestrator {
         .await
         .map_err(|e| ComputerUseError::ApiError(format!("spawn_blocking: {e}")))?;
 
-        result.map_err(|e| ComputerUseError::ApiError(e))
+        result.map_err(ComputerUseError::ApiError)
+    }
+
+    /// L5b fallback when `desktop` feature is not enabled.
+    #[cfg(not(feature = "desktop"))]
+    async fn capture_screenshot_native(&self) -> Result<String, ComputerUseError> {
+        Err(ComputerUseError::ApiError(
+            "Native screenshot requires the 'desktop' feature (enigo + xcap)".into(),
+        ))
     }
 
     /// Capture screenshot with sensitive region masking applied.
@@ -562,6 +569,7 @@ impl ComputerUseOrchestrator {
     }
 
     /// L5b: execute on host via `enigo` (mouse/keyboard) through spawn_blocking.
+    #[cfg(feature = "desktop")]
     async fn execute_action_native(
         &self,
         action: &ComputerAction,
@@ -644,6 +652,17 @@ impl ComputerUseOrchestrator {
         })
         .await
         .map_err(|e| ComputerUseError::ApiError(format!("spawn_blocking: {e}")))?
+    }
+
+    /// L5b fallback when `desktop` feature is not enabled.
+    #[cfg(not(feature = "desktop"))]
+    async fn execute_action_native(
+        &self,
+        _action: &ComputerAction,
+    ) -> Result<(), ComputerUseError> {
+        Err(ComputerUseError::ApiError(
+            "Native action execution requires the 'desktop' feature (enigo)".into(),
+        ))
     }
 
     /// Query the active window title (for risk detection).
