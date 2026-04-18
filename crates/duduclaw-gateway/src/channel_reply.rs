@@ -714,6 +714,139 @@ async fn build_reply_with_session_inner(
     // previous turn and must not be credited to this one.
     let dispatch_start_time = chrono::Utc::now().to_rfc3339();
 
+    // ── L5 Computer Use: intercept if agent has computer_use enabled ──
+    // Check for natural-language emergency stop first
+    if crate::risk_detector::is_emergency_stop(text) {
+        info!(session_id, "Emergency stop detected for computer use");
+        // Stop ALL active computer use sessions via the global registry
+        let sessions = crate::computer_use_orchestrator::list_sessions().await;
+        for sid in &sessions {
+            if let Some(ctl) = crate::computer_use_orchestrator::get_session_control(sid).await {
+                ctl.stopped.store(true, std::sync::atomic::Ordering::Release);
+            }
+            crate::computer_use_orchestrator::unregister_session(sid).await;
+        }
+        let count = sessions.len();
+        return if count > 0 {
+            format!("🛑 已停止 {count} 個電腦操作 session")
+        } else {
+            "🛑 已停止電腦操作".to_string()
+        };
+    }
+
+    // Check if this agent has computer_use enabled and the user's intent
+    // suggests a computer use task (e.g., mentions screen, click, open app).
+    let cu_enabled = capabilities
+        .as_ref()
+        .map(|c| c.computer_use)
+        .unwrap_or(false);
+
+    if cu_enabled && looks_like_computer_use_request(text) {
+        // Build a ComputerUseConfig from the agent's capabilities
+        let cap_cfg = capabilities
+            .as_ref()
+            .map(|c| &c.computer_use_config)
+            .cloned()
+            .unwrap_or_default();
+        // Read execution_mode from capabilities
+        let exec_mode = capabilities
+            .as_ref()
+            .map(|c| c.computer_use_mode)
+            .unwrap_or_default();
+
+        // Read CONTRACT.toml must_not rules (if the agent has a contract)
+        let contract_must_not = agent_dir.as_ref().and_then(|d| {
+            let contract_path = d.join("CONTRACT.toml");
+            let content = std::fs::read_to_string(&contract_path).ok()?;
+            let table: toml::Table = content.parse().ok()?;
+            let must_not = table.get("must_not")?.as_table()?;
+            let rules = must_not.get("rules")?.as_array()?;
+            Some(rules.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
+        }).unwrap_or_default();
+
+        let cu_config = crate::computer_use_orchestrator::ComputerUseConfig {
+            max_session_minutes: cap_cfg.max_session_minutes,
+            max_actions: cap_cfg.max_actions,
+            display_width: cap_cfg.display_width,
+            display_height: cap_cfg.display_height,
+            auto_confirm_trusted: cap_cfg.auto_confirm_trusted,
+            allowed_apps: cap_cfg.allowed_apps.clone(),
+            blocked_actions: cap_cfg.blocked_actions.clone(),
+            execution_mode: exec_mode,
+            contract_must_not,
+            ..Default::default()
+        };
+
+        // Resolve API key for the Claude Vision API (computer use needs direct API)
+        if let Some(api_key) = get_api_key(&ctx.home_dir).await {
+            let mut orchestrator = crate::computer_use_orchestrator::ComputerUseOrchestrator::new(
+                agent_id.clone(),
+                ctx.home_dir.clone(),
+                cu_config,
+            );
+
+            // Build a real channel sender from the session_id (e.g., "telegram:12345")
+            // so screenshots and confirmations are delivered to the user's channel.
+            let sender: Box<dyn crate::channel_sender::ChannelSender> = {
+                let (ch_type, ch_id) = parse_session_id_parts(session_id);
+                if ch_type.is_empty() || ch_id.is_empty() {
+                    Box::new(crate::channel_sender::NullSender)
+                } else if ch_type == "webchat" {
+                    // WebChat needs the broadcast tx for WebSocket delivery
+                    crate::channel_sender::create_webchat_sender(
+                        ch_id.to_string(),
+                        ctx.event_tx.clone(),
+                    )
+                } else {
+                    // Look up the channel token from config
+                    let token = crate::config_crypto::read_encrypted_config_field(
+                        &ctx.home_dir, ch_type, &format!("{ch_type}_bot_token"),
+                    ).await.unwrap_or_default();
+
+                    let target = crate::channel_sender::ChannelTarget {
+                        channel_type: ch_type.to_string(),
+                        chat_id: ch_id.to_string(),
+                        token,
+                        extra_id: Some(user_id.to_string()),
+                    };
+                    crate::channel_sender::create_sender(&target, ctx.http.clone())
+                }
+            };
+
+            // Generate a session ID and register in the global registry
+            let cu_session_id = format!("cu-{}", uuid::Uuid::new_v4().as_simple());
+            let control = orchestrator.control_handle();
+
+            match orchestrator.start_session(&api_key, &model).await {
+                Ok(()) => {
+                    // Register session so /stop, emergency stop, and MCP tools can find it
+                    if let Err(e) = crate::computer_use_orchestrator::register_session(
+                        &cu_session_id, control,
+                    ).await {
+                        warn!(error = %e, "Failed to register computer use session");
+                        orchestrator.stop_session().await;
+                        // Fall through to text reply
+                    } else {
+                        let result = orchestrator.run_loop(text, sender.as_ref()).await;
+
+                        // Always unregister on completion
+                        crate::computer_use_orchestrator::unregister_session(&cu_session_id).await;
+
+                        match result {
+                            Ok(reply_text) => return reply_text,
+                            Err(e) => {
+                                warn!(error = %e, "Computer use session failed, falling back to text");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to start computer use container, falling back to text");
+                }
+            }
+        }
+    }
+
     // 1. Try `claude` CLI with multi-account rotation (OAuth + API keys)
     // Wrap in REPLY_CHANNEL scope so `send_to_agent` MCP tool can register
     // delegation callbacks for sub-agent response forwarding.
@@ -2992,4 +3125,29 @@ async fn get_api_key(home_dir: &Path) -> Option<String> {
     }
     // Try encrypted config field, fallback to plaintext
     crate::config_crypto::read_encrypted_config_field(home_dir, "api", "anthropic_api_key").await
+}
+
+/// Heuristic: does the user's message look like a computer use request?
+///
+/// Matches keywords in Chinese, English, and Japanese that indicate the
+/// user wants the agent to interact with the desktop GUI.
+fn looks_like_computer_use_request(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    // Chinese keywords
+    let cn = ["打開", "開啟", "點擊", "截圖", "螢幕", "桌面", "滑鼠",
+              "鍵盤", "操作電腦", "幫我開", "幫我點", "幫我按",
+              "幫我打", "幫我填", "幫我輸入", "幫我關", "視窗",
+              "列印", "下載", "安裝"];
+    // English keywords
+    let en = ["open app", "click on", "take screenshot", "on my screen",
+              "on my desktop", "mouse", "keyboard", "type into",
+              "fill the form", "close the window", "print the",
+              "download the", "install the", "open the browser",
+              "control my computer", "on my computer"];
+    // Japanese keywords
+    let jp = ["画面", "クリック", "開いて", "入力して", "スクリーンショット"];
+
+    cn.iter().any(|kw| lower.contains(&kw.to_lowercase()))
+        || en.iter().any(|kw| lower.contains(kw))
+        || jp.iter().any(|kw| lower.contains(&kw.to_lowercase()))
 }

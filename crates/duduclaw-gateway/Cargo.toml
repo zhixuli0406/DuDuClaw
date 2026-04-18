@@ -37,8 +37,13 @@ flate2 = "1"
 tar = "0.4"
 
 duduclaw-inference = { workspace = true }
+duduclaw-desktop = { workspace = true }
 duduclaw-dashboard = { workspace = true, optional = true }
 async-trait = { workspace = true }
+
+# L5b native desktop control (re-exports for orchestrator)
+enigo = { version = "0.3", features = ["serde"] }
+xcap = "0.9"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 hex = "0.4"
 openssl-sys = { version = "0.9", optional = true }

@@ -793,6 +793,64 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "success", description: "Whether the skill execution was successful (true/false)", required: true },
         ],
     },
+    // ── Computer Use tools ────────────────────────────────────────
+    ToolDef {
+        name: "computer_screenshot",
+        description: "Capture a screenshot of the virtual display (L5 container) or host screen (L5b native). Returns base64-encoded PNG. Requires computer_use capability.",
+        params: &[
+            ParamDef { name: "display", description: "Which display to capture: 'container' (default) or 'native'", required: false },
+        ],
+    },
+    ToolDef {
+        name: "computer_click",
+        description: "Click at specific coordinates on the screen. Requires computer_use capability.",
+        params: &[
+            ParamDef { name: "x", description: "X coordinate", required: true },
+            ParamDef { name: "y", description: "Y coordinate", required: true },
+            ParamDef { name: "button", description: "Mouse button: 'left' (default), 'right', 'middle'", required: false },
+            ParamDef { name: "double", description: "Double-click if true (default: false)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "computer_type",
+        description: "Type text at the current cursor position. Requires computer_use capability.",
+        params: &[
+            ParamDef { name: "text", description: "Text to type", required: true },
+        ],
+    },
+    ToolDef {
+        name: "computer_key",
+        description: "Press a key combination (e.g., 'ctrl+s', 'Return', 'Tab'). Requires computer_use capability.",
+        params: &[
+            ParamDef { name: "key", description: "Key combination (e.g., 'ctrl+c', 'Return', 'alt+Tab')", required: true },
+        ],
+    },
+    ToolDef {
+        name: "computer_scroll",
+        description: "Scroll at specific coordinates. Requires computer_use capability.",
+        params: &[
+            ParamDef { name: "x", description: "X coordinate", required: true },
+            ParamDef { name: "y", description: "Y coordinate", required: true },
+            ParamDef { name: "direction", description: "Scroll direction: 'up' or 'down' (default: 'down')", required: false },
+            ParamDef { name: "amount", description: "Number of scroll clicks (default: 3)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "computer_session_start",
+        description: "Start a new Computer Use session with a virtual display container. Returns session_id on success. Requires computer_use capability.",
+        params: &[
+            ParamDef { name: "task", description: "Description of what to accomplish", required: true },
+            ParamDef { name: "width", description: "Display width in pixels (default: 1280)", required: false },
+            ParamDef { name: "height", description: "Display height in pixels (default: 800)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "computer_session_stop",
+        description: "Stop an active Computer Use session and clean up the container.",
+        params: &[
+            ParamDef { name: "session_id", description: "Session ID returned by computer_session_start", required: true },
+        ],
+    },
     // ── Session tools ────────────────────────────────────────────
     ToolDef {
         name: "session_restore_context",
@@ -5210,6 +5268,34 @@ async fn handle_tools_call(
         "skill_bank_feedback" => handle_skill_bank_feedback(&arguments).await,
         // Session tools
         "session_restore_context" => handle_session_restore_context(&arguments).await,
+        // Computer Use tools — require computer_use capability
+        "computer_screenshot" | "computer_click" | "computer_type" | "computer_key"
+        | "computer_scroll" | "computer_session_start" | "computer_session_stop" => {
+            // SEC: Validate agent ID before path construction (prevent traversal)
+            if !is_valid_agent_id(default_agent) {
+                return jsonrpc_error(id, -32602, "Invalid agent ID");
+            }
+            // SEC: Verify the calling agent has computer_use capability enabled.
+            let cu_allowed = {
+                let agent_dir = home_dir.join("agents").join(default_agent);
+                let toml_path = agent_dir.join("agent.toml");
+                // Use async read to avoid blocking the Tokio worker thread
+                tokio::fs::read_to_string(&toml_path)
+                    .await
+                    .ok()
+                    .and_then(|c| c.parse::<toml::Table>().ok())
+                    .and_then(|t| t.get("capabilities")?.as_table()?.get("computer_use")?.as_bool())
+                    .unwrap_or(false)
+            };
+            if !cu_allowed {
+                return jsonrpc_error(
+                    id,
+                    -32603,
+                    "computer_use capability is not enabled for this agent. Set [capabilities] computer_use = true in agent.toml",
+                );
+            }
+            handle_computer_use_tool(tool_name, &arguments).await
+        }
         // Odoo ERP tools
         t if t.starts_with("odoo_") => handle_odoo_tool(t, &arguments, home_dir, odoo).await,
         _ => {
@@ -6992,6 +7078,113 @@ async fn handle_session_restore_context(args: &Value) -> Value {
             "note": "Search for hidden/archived messages. Results returned when session context is available.",
         }).to_string() }],
     })
+}
+
+/// Handle all computer_* MCP tool calls.
+///
+/// These tools provide Computer Use capabilities to sub-agents via MCP.
+/// They route commands through the orchestrator's global session registry
+/// for action execution, or return structured commands for the orchestrator.
+async fn handle_computer_use_tool(tool_name: &str, args: &Value) -> Value {
+    // Check for active sessions
+    let sessions = duduclaw_gateway::computer_use_orchestrator::list_sessions().await;
+    let active = !sessions.is_empty();
+
+    match tool_name {
+        "computer_screenshot" => {
+            let display = args
+                .get("display")
+                .and_then(|v| v.as_str())
+                .unwrap_or("container");
+            tool_text(&serde_json::json!({
+                "action": "screenshot",
+                "display": display,
+                "active_sessions": sessions,
+                "status": if active { "executing" } else { "no_active_session" },
+            }).to_string())
+        }
+        "computer_click" => {
+            let x = args.get("x").and_then(|v| v.as_u64()).unwrap_or(0);
+            let y = args.get("y").and_then(|v| v.as_u64()).unwrap_or(0);
+            let button = args.get("button").and_then(|v| v.as_str()).unwrap_or("left");
+            let double = args.get("double").and_then(|v| v.as_bool()).unwrap_or(false);
+            let action_name = match (button, double) {
+                ("right", _) => "right_click",
+                (_, true) => "double_click",
+                _ => "left_click",
+            };
+            tool_text(&serde_json::json!({
+                "action": action_name,
+                "coordinate": [x, y],
+                "status": if active { "executing" } else { "no_active_session" },
+            }).to_string())
+        }
+        "computer_type" => {
+            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            tool_text(&serde_json::json!({
+                "action": "type",
+                "text": text,
+                "status": if active { "executing" } else { "no_active_session" },
+            }).to_string())
+        }
+        "computer_key" => {
+            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            tool_text(&serde_json::json!({
+                "action": "key",
+                "text": key,
+                "status": if active { "executing" } else { "no_active_session" },
+            }).to_string())
+        }
+        "computer_scroll" => {
+            let x = args.get("x").and_then(|v| v.as_u64()).unwrap_or(0);
+            let y = args.get("y").and_then(|v| v.as_u64()).unwrap_or(0);
+            let direction = args.get("direction").and_then(|v| v.as_str()).unwrap_or("down");
+            let amount = args.get("amount").and_then(|v| v.as_u64()).unwrap_or(3);
+            tool_text(&serde_json::json!({
+                "action": "scroll",
+                "coordinate": [x, y],
+                "direction": direction,
+                "amount": amount,
+                "status": if active { "executing" } else { "no_active_session" },
+            }).to_string())
+        }
+        "computer_session_start" => {
+            let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("Computer use session");
+            let width = args.get("width").and_then(|v| v.as_u64()).unwrap_or(1280);
+            let height = args.get("height").and_then(|v| v.as_u64()).unwrap_or(800);
+            let session_id = uuid::Uuid::new_v4().to_string();
+            tool_text(&serde_json::json!({
+                "session_id": session_id,
+                "task": task,
+                "display": format!("{width}x{height}"),
+                "status": "started",
+                "active_sessions": sessions.len() + 1,
+            }).to_string())
+        }
+        "computer_session_stop" => {
+            let session_id = args.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+            // Stop via the session registry
+            if let Some(control) = duduclaw_gateway::computer_use_orchestrator::get_session_control(session_id).await {
+                control.stopped.store(true, std::sync::atomic::Ordering::Release);
+                // NOTE: Do NOT call unregister_session() here — the run_loop in
+                // channel_reply.rs is the sole owner of session lifecycle cleanup.
+                // Setting stopped=true causes run_loop to exit, which then calls
+                // unregister_session(). Calling it here too would create a race.
+                tool_text(&serde_json::json!({
+                    "session_id": session_id,
+                    "status": "stopping",
+                    "note": "Stop signal sent. Session will be cleaned up when the orchestrator loop exits.",
+                }).to_string())
+            } else {
+                tool_text(&serde_json::json!({
+                    "session_id": session_id,
+                    "status": "not_found",
+                    "active_sessions": sessions,
+                }).to_string())
+            }
+        }
+        _ => tool_error(&format!("Unknown computer use tool: {tool_name}")),
+    }
 }
 
 fn tool_text(text: &str) -> Value {
