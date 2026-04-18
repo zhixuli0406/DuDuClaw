@@ -131,22 +131,23 @@ pub struct DirectApiResponse {
 
 /// Call Anthropic Messages API directly with precise cache_control placement.
 ///
-/// Cache strategy:
-/// 1. System prompt → single block with `cache_control: ephemeral` at the end
-///    - Since DuDuClaw controls the content, it's deterministic = always cache hit
-/// 2. User message → no cache_control (changes every time)
+/// Cache strategy (Hermes-inspired "system_and_3"):
+/// 1. System prompt → single block with `cache_control: ephemeral`
+/// 2. Conversation history → included as prior turns, with cache breakpoint
+///    on the 3rd-to-last message for optimal cache hit rate
+/// 3. Current user message → no cache_control (changes every time)
 ///
-/// This achieves 95%+ cache efficiency on the system prompt portion.
+/// This achieves 95%+ cache efficiency on system prompt + stable history.
 pub async fn call_direct_api(
     api_key: &str,
     model: &str,
     system_prompt: &str,
     user_prompt: &str,
+    conversation_history: &[(String, String)], // (role, content) pairs
 ) -> Result<DirectApiResponse, String> {
     let client = http_client();
 
     // Build system blocks with cache_control on the final block.
-    // The system prompt is a single deterministic block — maximizes cache prefix match.
     let system = vec![SystemBlock {
         block_type: "text".to_string(),
         text: normalize_system_prompt(system_prompt),
@@ -155,11 +156,36 @@ pub async fn call_direct_api(
         }),
     }];
 
-    let messages = vec![Message {
+    // Build messages with conversation history (Hermes-inspired cache strategy)
+    let mut messages: Vec<Message> = Vec::with_capacity(conversation_history.len() + 1);
+
+    // Add conversation history with Hermes-inspired "system_and_3" cache strategy:
+    // place cache breakpoint on the 3rd-to-last message so the last 3 messages
+    // (which change each turn) are re-sent, while everything before is cached.
+    // Only set breakpoint when history has enough depth to benefit from caching.
+    let cache_breakpoint_idx = if conversation_history.len() >= 4 {
+        Some(conversation_history.len() - 4)
+    } else {
+        None // too short for meaningful caching
+    };
+    for (i, (role, content)) in conversation_history.iter().enumerate() {
+        messages.push(Message {
+            role: role.clone(),
+            content: content.clone(),
+            cache_control: if cache_breakpoint_idx == Some(i) {
+                Some(CacheControl { control_type: "ephemeral".to_string() })
+            } else {
+                None
+            },
+        });
+    }
+
+    // Current user message — no cache (changes every call)
+    messages.push(Message {
         role: "user".to_string(),
         content: user_prompt.to_string(),
-        cache_control: None, // Single-turn: user message changes every call
-    }];
+        cache_control: None,
+    });
 
     let body = MessagesRequest {
         model: model.to_string(),

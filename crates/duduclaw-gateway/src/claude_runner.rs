@@ -268,7 +268,9 @@ async fn try_direct_api(
         return Err("No API key available for Direct API (OAuth accounts require CLI path)".to_string());
     }
 
-    let response = crate::direct_api::call_direct_api(&api_key, model, system_prompt, prompt).await?;
+    // TODO: pass conversation_history from the caller to enable multi-turn
+    // for the Direct API fallback path (currently stateless).
+    let response = crate::direct_api::call_direct_api(&api_key, model, system_prompt, prompt, &[]).await?;
 
     // Record telemetry
     if let Some(ref usage) = response.usage {

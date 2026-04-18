@@ -165,55 +165,6 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "tags", description: "Comma-separated tags", required: false },
         ],
     },
-    // ── MemGPT 3-layer memory tools ───────────────────────────────
-    ToolDef {
-        name: "core_memory_get",
-        description: "Read a core memory block. Core memory is always in your context window. Labels: user_facts, agent_state, pending_actions, conversation_context",
-        params: &[
-            ParamDef { name: "label", description: "Block label to read", required: true },
-        ],
-    },
-    ToolDef {
-        name: "core_memory_append",
-        description: "Append text to a core memory block. Use this to remember important facts about the user, track your state, or record pending actions you promised.",
-        params: &[
-            ParamDef { name: "label", description: "Block label (e.g. user_facts, pending_actions)", required: true },
-            ParamDef { name: "content", description: "Text to append", required: true },
-        ],
-    },
-    ToolDef {
-        name: "core_memory_replace",
-        description: "Replace a substring in a core memory block. Use to update outdated information.",
-        params: &[
-            ParamDef { name: "label", description: "Block label", required: true },
-            ParamDef { name: "old_content", description: "Exact text to find and replace", required: true },
-            ParamDef { name: "new_content", description: "Replacement text", required: true },
-        ],
-    },
-    ToolDef {
-        name: "recall_search",
-        description: "Search past conversation history across all sessions. Returns relevant messages from previous interactions, including cron/reminder/proactive messages.",
-        params: &[
-            ParamDef { name: "query", description: "Search keywords", required: true },
-            ParamDef { name: "limit", description: "Max results (default 10)", required: false },
-        ],
-    },
-    ToolDef {
-        name: "archival_search",
-        description: "Search long-term archival memory for stored knowledge, insights, and past conversation summaries.",
-        params: &[
-            ParamDef { name: "query", description: "Search query", required: true },
-            ParamDef { name: "limit", description: "Max results (default 5)", required: false },
-        ],
-    },
-    ToolDef {
-        name: "archival_insert",
-        description: "Store important information in long-term archival memory for future retrieval.",
-        params: &[
-            ParamDef { name: "content", description: "Knowledge to store", required: true },
-            ParamDef { name: "tags", description: "Comma-separated tags for categorization", required: false },
-        ],
-    },
     // ── Sub-agent management tools ──────────────────────────────
     ToolDef {
         name: "create_agent",
@@ -949,8 +900,7 @@ async fn handle_send_message(
     params: &Value,
     home_dir: &Path,
     http: &reqwest::Client,
-    recall: &duduclaw_memory::RecallMemoryManager,
-    agent_id: &str,
+    _agent_id: &str,
 ) -> Value {
     let channel = params.get("channel").and_then(|v| v.as_str()).unwrap_or("");
     let chat_id = params.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -1043,26 +993,6 @@ async fn handle_send_message(
         }
         _ => format!("Unknown channel: {channel}"),
     };
-
-    // ── Recall Memory (L2): capture outbound message to recall log ──
-    // This is the critical fix for cross-session context: when an agent
-    // sends a message via MCP send_message (cron/proactive/sub-agent),
-    // the message is now recorded so follow-up user replies have context.
-    if result.starts_with("Message sent") {
-        let entry = duduclaw_memory::RecallEntry {
-            agent_id: agent_id.to_string(),
-            channel: channel.to_string(),
-            chat_id: chat_id.to_string(),
-            role: "assistant".to_string(),
-            content: text.to_string(),
-            source: "agent_mcp".to_string(),
-            source_agent: agent_id.to_string(),
-            ..Default::default()
-        };
-        if let Err(e) = recall.record(entry).await {
-            warn!("Failed to record send_message to recall log: {e}");
-        }
-    }
 
     serde_json::json!({
         "content": [{"type": "text", "text": result}]
@@ -1224,247 +1154,6 @@ async fn handle_memory_store(
             "content": [{"type": "text", "text": format!("Error storing memory: {e}")}],
             "isError": true
         }),
-    }
-}
-
-// ── MemGPT 3-layer memory handlers ────────────────────────────
-
-async fn handle_core_memory_get(
-    params: &Value,
-    core: &duduclaw_memory::CoreMemoryManager,
-    agent_id: &str,
-) -> Value {
-    let label = params.get("label").and_then(|v| v.as_str()).unwrap_or("");
-    if label.is_empty() {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": "Error: label is required"}],
-            "isError": true
-        });
-    }
-
-    // Determine scope from reply channel env
-    let scope = std::env::var(duduclaw_core::ENV_REPLY_CHANNEL).unwrap_or_default();
-
-    match core.get_block(agent_id, label, &scope).await {
-        Ok(Some(block)) => serde_json::json!({
-            "content": [{"type": "text", "text": format!(
-                "### {}\n{}\n\n(tokens: {}/{})",
-                block.label, block.content, block.token_count, block.max_tokens
-            )}]
-        }),
-        Ok(None) => serde_json::json!({
-            "content": [{"type": "text", "text": format!("Block '{label}' not found. Available: user_facts, agent_state, pending_actions, conversation_context")}]
-        }),
-        Err(e) => serde_json::json!({
-            "content": [{"type": "text", "text": format!("Error: {e}")}],
-            "isError": true
-        }),
-    }
-}
-
-async fn handle_core_memory_append(
-    params: &Value,
-    core: &duduclaw_memory::CoreMemoryManager,
-    agent_id: &str,
-) -> Value {
-    let label = params.get("label").and_then(|v| v.as_str()).unwrap_or("");
-    let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    if label.is_empty() || content.is_empty() {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": "Error: label and content are required"}],
-            "isError": true
-        });
-    }
-
-    let scope = std::env::var(duduclaw_core::ENV_REPLY_CHANNEL).unwrap_or_default();
-
-    match core.append(agent_id, label, &scope, content).await {
-        Ok(block) => serde_json::json!({
-            "content": [{"type": "text", "text": format!(
-                "Appended to '{}'. Now: {}/{} tokens.",
-                block.label, block.token_count, block.max_tokens
-            )}]
-        }),
-        Err(e) => serde_json::json!({
-            "content": [{"type": "text", "text": format!("Error: {e}")}],
-            "isError": true
-        }),
-    }
-}
-
-async fn handle_core_memory_replace(
-    params: &Value,
-    core: &duduclaw_memory::CoreMemoryManager,
-    agent_id: &str,
-) -> Value {
-    let label = params.get("label").and_then(|v| v.as_str()).unwrap_or("");
-    let old = params.get("old_content").and_then(|v| v.as_str()).unwrap_or("");
-    let new = params.get("new_content").and_then(|v| v.as_str()).unwrap_or("");
-    if label.is_empty() || old.is_empty() {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": "Error: label and old_content are required"}],
-            "isError": true
-        });
-    }
-
-    let scope = std::env::var(duduclaw_core::ENV_REPLY_CHANNEL).unwrap_or_default();
-
-    match core.replace(agent_id, label, &scope, old, new).await {
-        Ok(block) => serde_json::json!({
-            "content": [{"type": "text", "text": format!(
-                "Replaced in '{}'. Now: {}/{} tokens.",
-                block.label, block.token_count, block.max_tokens
-            )}]
-        }),
-        Err(e) => serde_json::json!({
-            "content": [{"type": "text", "text": format!("Error: {e}")}],
-            "isError": true
-        }),
-    }
-}
-
-async fn handle_recall_search(
-    params: &Value,
-    recall: &duduclaw_memory::RecallMemoryManager,
-    agent_id: &str,
-) -> Value {
-    let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
-    if query.is_empty() {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": "Error: query is required"}],
-            "isError": true
-        });
-    }
-    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
-
-    // Determine channel/chat from reply channel env
-    let reply_channel = std::env::var(duduclaw_core::ENV_REPLY_CHANNEL).unwrap_or_default();
-    let (channel, chat_id) = parse_reply_channel(&reply_channel);
-
-    match recall.search(agent_id, channel, chat_id, query, limit).await {
-        Ok(entries) => {
-            if entries.is_empty() {
-                return serde_json::json!({
-                    "content": [{"type": "text", "text": "No matching recall entries found."}]
-                });
-            }
-            let mut text = format!("Found {} recall entries:\n\n", entries.len());
-            for e in &entries {
-                let source_tag = if e.source != "interactive" {
-                    format!(" ({})", e.source)
-                } else {
-                    String::new()
-                };
-                text.push_str(&format!(
-                    "[{}] {}{}: {}\n",
-                    &e.timestamp[..19.min(e.timestamp.len())],
-                    e.role,
-                    source_tag,
-                    e.content
-                ));
-            }
-            serde_json::json!({ "content": [{"type": "text", "text": text}] })
-        }
-        Err(e) => serde_json::json!({
-            "content": [{"type": "text", "text": format!("Error: {e}")}],
-            "isError": true
-        }),
-    }
-}
-
-async fn handle_archival_search(
-    params: &Value,
-    archival: &duduclaw_memory::ArchivalMemoryBridge,
-    agent_id: &str,
-) -> Value {
-    let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
-    if query.is_empty() {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": "Error: query is required"}],
-            "isError": true
-        });
-    }
-    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-
-    match archival.retrieve(agent_id, query, limit).await {
-        Ok(entries) => {
-            if entries.is_empty() {
-                return serde_json::json!({
-                    "content": [{"type": "text", "text": "No matching archival entries found."}]
-                });
-            }
-            let mut text = format!("Found {} archival entries:\n\n", entries.len());
-            for e in &entries {
-                let tags = if e.tags.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [{}]", e.tags.join(", "))
-                };
-                text.push_str(&format!(
-                    "- ({}, imp:{:.1}) {}{}\n",
-                    e.layer.as_str(),
-                    e.importance,
-                    e.content,
-                    tags
-                ));
-            }
-            serde_json::json!({ "content": [{"type": "text", "text": text}] })
-        }
-        Err(e) => serde_json::json!({
-            "content": [{"type": "text", "text": format!("Error: {e}")}],
-            "isError": true
-        }),
-    }
-}
-
-async fn handle_archival_insert(
-    params: &Value,
-    archival: &duduclaw_memory::ArchivalMemoryBridge,
-    agent_id: &str,
-) -> Value {
-    let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    if content.is_empty() {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": "Error: content is required"}],
-            "isError": true
-        });
-    }
-
-    let tags_str = params.get("tags").and_then(|v| v.as_str()).unwrap_or("");
-    let tags: Vec<String> = if tags_str.is_empty() {
-        Vec::new()
-    } else {
-        tags_str.split(',').map(|s| s.trim().to_string()).collect()
-    };
-
-    let classification = duduclaw_memory::classify(content, "user_input");
-    match archival
-        .store(
-            agent_id,
-            content,
-            classification.layer,
-            classification.importance,
-            "mcp_archival_insert",
-            tags,
-        )
-        .await
-    {
-        Ok(id) => serde_json::json!({
-            "content": [{"type": "text", "text": format!("Stored in archival memory (id: {id}).")}]
-        }),
-        Err(e) => serde_json::json!({
-            "content": [{"type": "text", "text": format!("Error: {e}")}],
-            "isError": true
-        }),
-    }
-}
-
-/// Parse "telegram:12345" or "telegram:12345:thread" into (channel, chat_id).
-fn parse_reply_channel(reply_channel: &str) -> (&str, &str) {
-    let parts: Vec<&str> = reply_channel.splitn(3, ':').collect();
-    match parts.len() {
-        0 | 1 => ("", ""),
-        _ => (parts[0], parts[1]),
     }
 }
 
@@ -5012,24 +4701,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     let memory = SqliteMemoryEngine::new(&memory_db_path)
         .map_err(|e| DuDuClawError::Memory(format!("Failed to open memory DB: {e}")))?;
 
-    // Initialize MemGPT 3-layer memory managers
-    let core_memory_db = home_dir.join("core_memory.db");
-    let core_memory = duduclaw_memory::CoreMemoryManager::new(&core_memory_db)
-        .map_err(|e| DuDuClawError::Memory(format!("Failed to open core memory DB: {e}")))?;
-    let recall_memory_db = home_dir.join("recall_memory.db");
-    let recall_memory = duduclaw_memory::RecallMemoryManager::new(&recall_memory_db)
-        .map_err(|e| DuDuClawError::Memory(format!("Failed to open recall memory DB: {e}")))?;
-    let archival_bridge = duduclaw_memory::ArchivalMemoryBridge::new(
-        std::sync::Arc::new(SqliteMemoryEngine::new(&memory_db_path)
-            .map_err(|e| DuDuClawError::Memory(format!("Failed to open archival bridge DB: {e}")))?)
-    );
-
     let default_agent = get_default_agent(home_dir).await;
-
-    // Init default core memory blocks for this agent
-    if let Err(e) = core_memory.init_defaults(&default_agent).await {
-        warn!("Failed to init core memory defaults: {e}");
-    }
 
     // Odoo connector (lazy — connected on first odoo_connect call)
     let odoo: std::sync::Arc<tokio::sync::RwLock<Option<duduclaw_odoo::OdooConnector>>> =
@@ -5078,7 +4750,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
             "tools/list" => handle_tools_list(&id),
             "tools/call" => {
                 let params = request.get("params").cloned().unwrap_or(Value::Null);
-                handle_tools_call(&id, &params, home_dir, &http, &memory, &core_memory, &recall_memory, &archival_bridge, &default_agent, &odoo).await
+                handle_tools_call(&id, &params, home_dir, &http, &memory, &default_agent, &odoo).await
             }
             "notifications/initialized" => {
                 // This is a notification (no id expected in response), skip
@@ -5140,9 +4812,6 @@ async fn handle_tools_call(
     home_dir: &Path,
     http: &reqwest::Client,
     memory: &SqliteMemoryEngine,
-    core_memory: &duduclaw_memory::CoreMemoryManager,
-    recall_memory: &duduclaw_memory::RecallMemoryManager,
-    archival_bridge: &duduclaw_memory::ArchivalMemoryBridge,
     default_agent: &str,
     odoo: &OdooState,
 ) -> Value {
@@ -5174,17 +4843,10 @@ async fn handle_tools_call(
             | "pause_cron_task"
     );
     let result = match tool_name {
-        "send_message" => handle_send_message(&arguments, home_dir, http, recall_memory, default_agent).await,
+        "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
         "web_search" => handle_web_search(&arguments, http).await,
         "memory_search" => handle_memory_search(&arguments, memory, default_agent).await,
         "memory_store" => handle_memory_store(&arguments, memory, default_agent).await,
-        // MemGPT 3-layer memory tools
-        "core_memory_get" => handle_core_memory_get(&arguments, core_memory, default_agent).await,
-        "core_memory_append" => handle_core_memory_append(&arguments, core_memory, default_agent).await,
-        "core_memory_replace" => handle_core_memory_replace(&arguments, core_memory, default_agent).await,
-        "recall_search" => handle_recall_search(&arguments, recall_memory, default_agent).await,
-        "archival_search" => handle_archival_search(&arguments, archival_bridge, default_agent).await,
-        "archival_insert" => handle_archival_insert(&arguments, archival_bridge, default_agent).await,
         "send_to_agent" => handle_send_to_agent(&arguments, home_dir, default_agent).await,
         "send_photo" => handle_send_media(&arguments, home_dir, http, "photo").await,
         "send_sticker" => handle_send_media(&arguments, home_dir, http, "sticker").await,

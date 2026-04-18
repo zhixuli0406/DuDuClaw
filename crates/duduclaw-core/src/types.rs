@@ -776,47 +776,37 @@ pub struct AgentConfig {
     /// Disabled by default — enable per-agent in `agent.toml [sticker]`.
     #[serde(default)]
     pub sticker: StickerConfig,
-    /// MemGPT 3-layer memory configuration.
-    /// Disabled by default — enable per-agent in `agent.toml [memory]`.
+    /// Legacy memory configuration (retained for agent.toml backwards compatibility).
+    /// The MemGPT 3-layer memory system was removed — these fields are no longer consumed.
+    /// Session continuity is now handled by native multi-turn session management.
     #[serde(default)]
     pub memory: MemoryConfig,
 }
 
-/// MemGPT-style 3-layer memory configuration.
+/// Legacy memory configuration — no longer consumed at runtime.
 ///
-/// ```toml
-/// [memory]
-/// enabled = true
-/// core_tokens = 2000
-/// recall_tokens = 3000
-/// archival_tokens = 1500
-/// ```
+/// Retained so existing `agent.toml` files with a `[memory]` section
+/// can still be deserialized without errors. All fields are ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct MemoryConfig {
-    /// Whether the 3-layer memory system is enabled.
     pub enabled: bool,
-    /// Max tokens for Core Memory (L1).
     pub core_tokens: u32,
-    /// Max tokens for Recall Memory (L2).
     pub recall_tokens: u32,
-    /// Max tokens for Archival Memory (L3).
     pub archival_tokens: u32,
-    /// How many recent recall entries to auto-inject.
     pub recall_auto_inject: u32,
-    /// How many archival entries to auto-retrieve.
     pub archival_auto_retrieve: u32,
 }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            core_tokens: 2000,
-            recall_tokens: 3000,
-            archival_tokens: 1500,
-            recall_auto_inject: 10,
-            archival_auto_retrieve: 5,
+            enabled: false,
+            core_tokens: 0,
+            recall_tokens: 0,
+            archival_tokens: 0,
+            recall_auto_inject: 0,
+            archival_auto_retrieve: 0,
         }
     }
 }
