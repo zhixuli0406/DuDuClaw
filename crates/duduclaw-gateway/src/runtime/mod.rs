@@ -28,6 +28,13 @@ pub struct RuntimeResponse {
     pub runtime_name: String,
 }
 
+/// A single turn in conversation history.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationTurn {
+    pub role: String,    // "user" | "assistant"
+    pub content: String,
+}
+
 /// Context passed to a runtime execution.
 #[derive(Debug, Clone)]
 pub struct RuntimeContext {
@@ -46,6 +53,9 @@ pub struct RuntimeContext {
     /// Preferred OpenAI-compatible provider name (e.g. "minimax", "deepseek").
     /// Used by OpenAiCompatRuntime to resolve the correct API key first.
     pub preferred_provider: Option<String>,
+    /// Conversation history for multi-turn context (chronological, newest last).
+    /// Excludes the current user message. Empty on first turn.
+    pub conversation_history: Vec<ConversationTurn>,
 }
 
 /// Streaming chunk from a runtime execution.
@@ -156,6 +166,39 @@ impl RuntimeRegistry {
             .map(|(t, r)| (t, r.name()))
             .collect()
     }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────
+
+/// Format conversation history as an XML-delimited prompt prefix.
+///
+/// Used by CLI-based runtimes (Gemini, Codex) that lack native multi-turn
+/// support, and as a fallback for Claude CLI when `--resume` is unavailable.
+///
+/// NOTE: The canonical implementation with turn trimming lives in
+/// `channel_reply.rs`. This version is for the AgentRuntime trait path.
+pub fn format_history_as_prompt(history: &[ConversationTurn], current_message: &str) -> String {
+    if history.is_empty() {
+        return current_message.to_string();
+    }
+    let mut buf = String::with_capacity(history.len() * 200 + current_message.len() + 64);
+    buf.push_str("<conversation_history>\n");
+    for turn in history {
+        // Escape closing tags in content to prevent XML structure corruption
+        let safe_content = turn.content
+            .replace("</user>", "&lt;/user&gt;")
+            .replace("</assistant>", "&lt;/assistant&gt;");
+        buf.push('<');
+        buf.push_str(&turn.role);
+        buf.push('>');
+        buf.push_str(&safe_content);
+        buf.push_str("</");
+        buf.push_str(&turn.role);
+        buf.push_str(">\n");
+    }
+    buf.push_str("</conversation_history>\n\n");
+    buf.push_str(current_message);
+    buf
 }
 
 // ── Tests ───────────────────────────────────────────────────────

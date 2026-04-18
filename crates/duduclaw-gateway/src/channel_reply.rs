@@ -33,6 +33,71 @@ use crate::skill_lifecycle::sandbox_trial::SandboxStore;
 /// Shared channel status map, accessible by both channel bots and the RPC handler.
 pub type ChannelStatusMap = Arc<RwLock<std::collections::HashMap<String, ChannelState>>>;
 
+// ── Multi-turn conversation types ──────────────────────────
+
+/// A single turn in conversation history, used for native multi-turn support.
+#[derive(Debug, Clone)]
+pub struct ConversationTurn {
+    pub role: String,    // "user" | "assistant"
+    pub content: String,
+}
+
+/// Maximum character count for a single turn before it gets trimmed.
+/// Inspired by Hermes Agent's tool output trimming (Phase 1 compression).
+const TURN_TRIM_THRESHOLD: usize = 800;
+const TURN_HEAD_CHARS: usize = 300;
+const TURN_TAIL_CHARS: usize = 200;
+
+/// Trim a turn's content if it exceeds the threshold (char-level, CJK-safe).
+///
+/// Preserves the first and last portions, replacing the middle with a
+/// "[trimmed N chars]" placeholder. Zero LLM cost — pure text surgery.
+/// Inspired by Hermes Agent's 4-phase compression (Phase 1: tool output trimming).
+fn trim_turn_content(content: &str) -> String {
+    let char_count = content.chars().count();
+    if char_count <= TURN_TRIM_THRESHOLD {
+        return content.to_string();
+    }
+    // char-level slicing to avoid panic on multi-byte UTF-8 (CJK)
+    let head: String = content.chars().take(TURN_HEAD_CHARS).collect();
+    let tail: String = content.chars().skip(char_count - TURN_TAIL_CHARS).collect();
+    let trimmed = char_count - TURN_HEAD_CHARS - TURN_TAIL_CHARS;
+    format!("{}…\n[trimmed {} chars]\n…{}", head, trimmed, tail)
+}
+
+/// Format conversation history as an XML-delimited prompt prefix.
+///
+/// Used by CLI-based runtimes (Gemini, Codex) and as a fallback for Claude CLI
+/// when `--resume` is unavailable (e.g., account rotation changed session store).
+///
+/// Applies Hermes-inspired optimizations:
+/// - Long turns (>800 chars) are trimmed with head/tail preservation
+/// - Keeps conversation structure intact while reducing token usage
+pub(crate) fn format_history_as_prompt(history: &[ConversationTurn], current_message: &str) -> String {
+    if history.is_empty() {
+        return current_message.to_string();
+    }
+    let mut buf = String::with_capacity(history.len() * 200 + current_message.len() + 64);
+    buf.push_str("<conversation_history>\n");
+    for turn in history {
+        let content = trim_turn_content(&turn.content);
+        // Escape closing tags in content to prevent XML structure corruption
+        let safe_content = content
+            .replace("</user>", "&lt;/user&gt;")
+            .replace("</assistant>", "&lt;/assistant&gt;");
+        buf.push('<');
+        buf.push_str(&turn.role);
+        buf.push('>');
+        buf.push_str(&safe_content);
+        buf.push_str("</");
+        buf.push_str(&turn.role);
+        buf.push_str(">\n");
+    }
+    buf.push_str("</conversation_history>\n\n");
+    buf.push_str(current_message);
+    buf
+}
+
 // ── Shared state ────────────────────────────────────────────
 
 /// Shared context for building replies, initialized once at gateway start.
@@ -74,15 +139,6 @@ pub struct ReplyContext {
     pub skill_recorder: Arc<tokio::sync::Mutex<TrajectoryRecorder>>,
     /// Persistent skill bank for extracted skills (Phase 3).
     pub skill_bank: Arc<tokio::sync::Mutex<SkillCache>>,
-    // ── MemGPT 3-layer memory (Phase 5) ──
-    /// Core Memory (L1) — always in context window.
-    pub core_memory: Option<Arc<duduclaw_memory::CoreMemoryManager>>,
-    /// Recall Memory (L2) — cross-session conversation log.
-    pub recall_memory: Option<Arc<duduclaw_memory::RecallMemoryManager>>,
-    /// Archival Memory (L3) — long-term semantic knowledge.
-    pub archival_memory: Option<Arc<duduclaw_memory::ArchivalMemoryBridge>>,
-    /// Memory budget configuration.
-    pub memory_budget: duduclaw_memory::MemoryBudgetConfig,
 }
 
 impl ReplyContext {
@@ -137,10 +193,6 @@ impl ReplyContext {
             mistake_notebook: None,
             skill_recorder: Arc::new(tokio::sync::Mutex::new(TrajectoryRecorder::new())),
             skill_bank: Arc::new(tokio::sync::Mutex::new(SkillCache::new())),
-            core_memory: None,
-            recall_memory: None,
-            archival_memory: None,
-            memory_budget: duduclaw_memory::MemoryBudgetConfig::default(),
         }
     }
 
@@ -162,20 +214,6 @@ impl ReplyContext {
         self
     }
 
-    /// Create with MemGPT 3-layer memory.
-    pub fn with_memory(
-        mut self,
-        core: Arc<duduclaw_memory::CoreMemoryManager>,
-        recall: Arc<duduclaw_memory::RecallMemoryManager>,
-        archival: Arc<duduclaw_memory::ArchivalMemoryBridge>,
-        budget: duduclaw_memory::MemoryBudgetConfig,
-    ) -> Self {
-        self.core_memory = Some(core);
-        self.recall_memory = Some(recall);
-        self.archival_memory = Some(archival);
-        self.memory_budget = budget;
-        self
-    }
 }
 
 /// Helper to update a channel's connection state and broadcast the change to dashboard clients.
@@ -619,87 +657,50 @@ async fn build_reply_with_session_inner(
         warn!("Failed to save user message to session: {e}");
     }
 
-    // ── Recall Memory (L2): record user inbound message ──
-    if let Some(recall) = &ctx.recall_memory {
-        let (channel, chat_id) = parse_session_id_parts(session_id);
-        let entry = duduclaw_memory::RecallEntry {
-            agent_id: agent_id.clone(),
-            channel: channel.to_string(),
-            chat_id: chat_id.to_string(),
-            session_id: session_id.to_string(),
-            role: "user".to_string(),
-            content: sanitized_text.clone(),
-            source: "interactive".to_string(),
-            source_agent: String::new(),
-            token_count: user_tokens,
-            ..Default::default()
-        };
-        if let Err(e) = recall.record(entry).await {
-            warn!("Failed to record user message to recall log: {e}");
-        }
-    }
-
-    // Build conversation history from session
-    let history = match session_mgr.get_messages(session_id).await {
+    // Build structured conversation history from session (for native multi-turn).
+    // Filter out "system" role messages — these are post-compression summaries
+    // stored by SessionManager::compress(). They belong in the system prompt,
+    // not in the conversation turns (Anthropic Messages API rejects them).
+    let max_history_turns = 20;
+    let mut compression_summary = String::new();
+    let conversation_history: Vec<ConversationTurn> = match session_mgr.get_messages(session_id).await {
         Ok(msgs) => {
-            if msgs.len() > 1 {
-                let mut history_text = String::with_capacity(msgs.len() * 200);
-                // All messages except the last one (which we just appended)
-                for m in msgs.iter().take(msgs.len().saturating_sub(1)) {
-                    if !history_text.is_empty() { history_text.push('\n'); }
-                    use std::fmt::Write;
-                    let _ = write!(history_text, "{}: {}", m.role, m.content);
-                }
-                format!("\n\n## Conversation History\n{history_text}")
+            let prior: Vec<_> = msgs.iter()
+                .take(msgs.len().saturating_sub(1))
+                .filter_map(|m| {
+                    if m.role == "system" {
+                        // Capture compression summary for system prompt injection
+                        if !m.content.is_empty() {
+                            compression_summary = m.content.clone();
+                        }
+                        None
+                    } else {
+                        Some(ConversationTurn {
+                            role: m.role.clone(),
+                            content: m.content.clone(),
+                        })
+                    }
+                })
+                .collect();
+            // Keep only the most recent turns to prevent token overflow
+            if prior.len() > max_history_turns {
+                prior[prior.len() - max_history_turns..].to_vec()
             } else {
-                String::new()
+                prior
             }
         }
         Err(e) => {
             warn!("Failed to load session messages: {e}");
-            String::new()
+            vec![]
         }
     };
+    let has_history = !conversation_history.is_empty();
 
-    // ── MemGPT 3-layer memory injection ──
-    let memory_section = if ctx.memory_budget.enabled {
-        if let (Some(core), Some(recall), Some(archival)) =
-            (&ctx.core_memory, &ctx.recall_memory, &ctx.archival_memory)
-        {
-            let budget_mgr = duduclaw_memory::MemoryBudgetManager::new(
-                Arc::clone(core),
-                Arc::clone(recall),
-                Arc::clone(archival),
-            );
-            let (channel, chat_id) = parse_session_id_parts(session_id);
-            match budget_mgr
-                .build_memory_prompt(
-                    &ctx.memory_budget,
-                    &agent_id,
-                    channel,
-                    chat_id,
-                    &sanitized_text,
-                )
-                .await
-            {
-                Ok(section) => section,
-                Err(e) => {
-                    warn!("Failed to build memory prompt: {e}");
-                    String::new()
-                }
-            }
-        } else {
-            String::new()
-        }
+    // Inject compression summary into system prompt (if session was compressed)
+    let full_system_prompt = if compression_summary.is_empty() {
+        system_prompt
     } else {
-        String::new()
-    };
-
-    let full_system_prompt = match (memory_section.is_empty(), history.is_empty()) {
-        (true, true) => system_prompt,
-        (true, false) => format!("{system_prompt}{history}"),
-        (false, true) => format!("{system_prompt}\n\n{memory_section}"),
-        (false, false) => format!("{system_prompt}\n\n{memory_section}{history}"),
+        format!("{system_prompt}\n\n## Prior Conversation Summary\n{compression_summary}")
     };
 
     // Track the last underlying failure so the fallback message can
@@ -854,6 +855,8 @@ async fn build_reply_with_session_inner(
     let cli_future = call_claude_cli_rotated(
         &sanitized_text, &model, &full_system_prompt, &ctx.home_dir,
         agent_dir.as_deref(), on_progress.as_ref(), capabilities.as_ref(),
+        if has_history { Some(session_id) } else { None },
+        &conversation_history,
     );
     let is_channel_session = duduclaw_core::SUPPORTED_CHANNEL_TYPES.iter()
         .any(|t| session_id.starts_with(&format!("{t}:")));
@@ -1041,26 +1044,6 @@ async fn build_reply_with_session_inner(
             .await
         {
             warn!("Failed to save assistant message to session: {e}");
-        }
-
-        // ── Recall Memory (L2): record assistant reply ──
-        if let Some(recall) = &ctx.recall_memory {
-            let (channel, chat_id) = parse_session_id_parts(session_id);
-            let entry = duduclaw_memory::RecallEntry {
-                agent_id: agent_id.clone(),
-                channel: channel.to_string(),
-                chat_id: chat_id.to_string(),
-                session_id: session_id.to_string(),
-                role: "assistant".to_string(),
-                content: reply.clone(),
-                source: "interactive".to_string(),
-                source_agent: agent_id.clone(),
-                token_count: reply_tokens,
-                ..Default::default()
-            };
-            if let Err(e) = recall.record(entry).await {
-                warn!("Failed to record assistant reply to recall log: {e}");
-            }
         }
 
         // ── Prediction-driven evolution ──────────────────────────────
@@ -1790,6 +1773,101 @@ fn classify_cli_error_hint(err: &str) -> &'static str {
 }
 
 #[cfg(test)]
+mod multi_turn_tests {
+    use super::*;
+
+    #[test]
+    fn trim_turn_content_short_passthrough() {
+        let short = "Hello world";
+        assert_eq!(trim_turn_content(short), short);
+    }
+
+    #[test]
+    fn trim_turn_content_at_threshold() {
+        let exactly = "a".repeat(TURN_TRIM_THRESHOLD);
+        assert_eq!(trim_turn_content(&exactly), exactly);
+    }
+
+    #[test]
+    fn trim_turn_content_over_threshold() {
+        let long = "x".repeat(TURN_TRIM_THRESHOLD + 100);
+        let result = trim_turn_content(&long);
+        assert!(result.contains("[trimmed"));
+        assert!(result.len() < long.len());
+    }
+
+    #[test]
+    fn trim_turn_content_cjk_safe() {
+        // 900 CJK chars — each is 3 bytes in UTF-8.
+        // This would panic with byte-level slicing.
+        let cjk = "你好世界".repeat(225); // 4 chars × 225 = 900 chars
+        assert_eq!(cjk.chars().count(), 900);
+        let result = trim_turn_content(&cjk);
+        assert!(result.contains("[trimmed"));
+        // Verify result is valid UTF-8 (would panic if not)
+        let _ = result.as_bytes();
+    }
+
+    #[test]
+    fn format_history_empty() {
+        assert_eq!(
+            format_history_as_prompt(&[], "hello"),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn format_history_single_turn() {
+        let history = vec![ConversationTurn {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let result = format_history_as_prompt(&history, "world");
+        assert!(result.contains("<conversation_history>"));
+        assert!(result.contains("<user>hi</user>"));
+        assert!(result.ends_with("world"));
+    }
+
+    #[test]
+    fn format_history_xml_escaping() {
+        let history = vec![ConversationTurn {
+            role: "assistant".to_string(),
+            content: "Use </assistant> tag carefully".to_string(),
+        }];
+        let result = format_history_as_prompt(&history, "ok");
+        // The closing tag in content should be escaped
+        assert!(!result.contains("Use </assistant> tag"));
+        assert!(result.contains("&lt;/assistant&gt;"));
+    }
+
+    #[test]
+    fn make_session_id_stable() {
+        let id1 = make_claude_session_id("telegram:123", "oauth-token-abc");
+        let id2 = make_claude_session_id("telegram:123", "oauth-token-abc");
+        assert_eq!(id1, id2);
+        assert!(id1.starts_with("dd-"));
+    }
+
+    #[test]
+    fn make_session_id_different_accounts() {
+        let id1 = make_claude_session_id("telegram:123", "account-A");
+        let id2 = make_claude_session_id("telegram:123", "account-B");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn is_session_error_narrow_match() {
+        assert!(is_session_error("session not found: dd-abc123"));
+        assert!(is_session_error("Error: invalid session ID"));
+        assert!(is_session_error("--resume requires a valid session"));
+        // Should NOT match unrelated errors containing "session"
+        assert!(!is_session_error("HTTP session timeout"));
+        assert!(!is_session_error("TLS session negotiation failed"));
+        assert!(!is_session_error("rate limit exceeded"));
+    }
+}
+
+#[cfg(test)]
 mod fallback_tests {
     use super::*;
 
@@ -2252,7 +2330,7 @@ pub(crate) async fn call_claude_cli_public(
     }
     // Use account-rotated path so GVU benefits from multi-account failover
     // instead of failing silently when the ambient account is rate-limited.
-    call_claude_cli_rotated(user_message, model, system_prompt, home_dir, None, None, None).await
+    call_claude_cli_rotated(user_message, model, system_prompt, home_dir, None, None, None, None, &[]).await
 }
 
 /// Call the `claude` CLI (Claude Code SDK) with streaming output.
@@ -2277,7 +2355,7 @@ async fn call_claude_cli(
     let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     spawn_claude_cli_with_env(
         user_message, model, system_prompt, home_dir, work_dir,
-        on_progress, capabilities, &empty,
+        on_progress, capabilities, &empty, None,
     ).await
 }
 
@@ -2296,13 +2374,21 @@ pub(crate) async fn call_claude_cli_rotated(
     work_dir: Option<&Path>,
     on_progress: Option<&ProgressCallback>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    session_id: Option<&str>,
+    conversation_history: &[ConversationTurn],
 ) -> Result<String, String> {
     let rotator = match crate::claude_runner::get_rotator_cached(home_dir).await {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "Rotator unavailable — falling back to non-rotated CLI path");
+            // Fallback: prepend history to prompt for non-rotated path
+            let effective_msg = if conversation_history.is_empty() {
+                user_message.to_string()
+            } else {
+                format_history_as_prompt(conversation_history, user_message)
+            };
             return call_claude_cli(
-                user_message, model, system_prompt, home_dir, work_dir,
+                &effective_msg, model, system_prompt, home_dir, work_dir,
                 on_progress, capabilities,
             ).await;
         }
@@ -2311,14 +2397,21 @@ pub(crate) async fn call_claude_cli_rotated(
     let account_count = rotator.count().await;
     if account_count == 0 {
         // Fresh install — no accounts configured. Use ambient env.
+        let effective_msg = if conversation_history.is_empty() {
+            user_message.to_string()
+        } else {
+            format_history_as_prompt(conversation_history, user_message)
+        };
         return call_claude_cli(
-            user_message, model, system_prompt, home_dir, work_dir,
+            &effective_msg, model, system_prompt, home_dir, work_dir,
             on_progress, capabilities,
         ).await;
     }
 
     // Delegate to the testable primitive with a closure that actually spawns the CLI.
     let input_len = user_message.len();
+    let history_clone = conversation_history.to_vec();
+    let session_id_owned = session_id.map(|s| s.to_string());
     rotate_cli_spawn(&rotator, move |env_vars| {
         let user_message = user_message.to_string();
         let model = model.to_string();
@@ -2327,13 +2420,73 @@ pub(crate) async fn call_claude_cli_rotated(
         let work_dir = work_dir.map(|p| p.to_path_buf());
         let on_progress = on_progress;
         let capabilities = capabilities.cloned();
+        let history = history_clone.clone();
+        let sid = session_id_owned.clone();
         async move {
-            spawn_claude_cli_with_env(
+            // Generate deterministic Claude CLI session ID from DuDuClaw session + account
+            let claude_sid = if !history.is_empty() {
+                sid.as_ref().map(|s| {
+                    let acct = env_vars.get("CLAUDE_CODE_OAUTH_TOKEN")
+                        .or(env_vars.get("ANTHROPIC_API_KEY"))
+                        .cloned()
+                        .unwrap_or_default();
+                    make_claude_session_id(s, &acct)
+                })
+            } else {
+                None
+            };
+
+            // Try with --resume first if we have session history
+            let result = spawn_claude_cli_with_env(
                 &user_message, &model, &system_prompt, &home_dir,
-                work_dir.as_deref(), on_progress, capabilities.as_ref(), &env_vars,
-            ).await
+                work_dir.as_deref(), on_progress, capabilities.as_ref(),
+                &env_vars, claude_sid.as_deref(),
+            ).await;
+
+            // Fallback: if --resume failed (session not found, account rotated),
+            // retry with history prepended to prompt
+            match result {
+                Ok(text) => Ok(text),
+                Err(ref e) if claude_sid.is_some() && is_session_error(e) => {
+                    warn!("Claude --resume failed ({e}), retrying with history-in-prompt fallback");
+                    let augmented = format_history_as_prompt(&history, &user_message);
+                    spawn_claude_cli_with_env(
+                        &augmented, &model, &system_prompt, &home_dir,
+                        work_dir.as_deref(), on_progress, capabilities.as_ref(),
+                        &env_vars, None,
+                    ).await
+                }
+                Err(e) => Err(e),
+            }
         }
     }, input_len).await
+}
+
+/// Generate a deterministic Claude CLI session ID from DuDuClaw session + account.
+///
+/// Uses SHA-256 (first 8 bytes) for stability across process restarts.
+/// `DefaultHasher` is randomized per-process and would break `--resume`.
+fn make_claude_session_id(duduclaw_sid: &str, account_id: &str) -> String {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(duduclaw_sid.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(account_id.as_bytes());
+    let digest = hasher.finalize();
+    format!("dd-{:016x}", u64::from_be_bytes(digest[..8].try_into().unwrap()))
+}
+
+/// Check if an error indicates a session-related failure (not found, expired).
+///
+/// Deliberately narrow matching to avoid false positives from unrelated errors
+/// like "HTTP session timeout" or "TLS session negotiation failed".
+fn is_session_error(e: &str) -> bool {
+    let lower = e.to_lowercase();
+    lower.contains("session not found")
+        || lower.contains("invalid session")
+        || lower.contains("session expired")
+        || lower.contains("no such session")
+        || (lower.contains("--resume") && lower.contains("session"))
 }
 
 /// Rotation-loop primitive, decoupled from the actual subprocess spawn.
@@ -2417,6 +2570,7 @@ async fn spawn_claude_cli_with_env(
     on_progress: Option<&ProgressCallback>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
     env_vars: &std::collections::HashMap<String, String>,
+    claude_session_id: Option<&str>,
 ) -> Result<String, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -2433,6 +2587,14 @@ async fn spawn_claude_cli_with_env(
     };
 
     let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);
+
+    // Resume an existing Claude CLI session for multi-turn continuity.
+    // Placed before `-p` so the CLI establishes session context first.
+    // Session ID is deterministic: SHA-256(duduclaw_session_id + account_id).
+    if let Some(sid) = claude_session_id {
+        cmd.args(["--resume", sid]);
+    }
+
     cmd.args([
         "-p", user_message,
         "--model", model,
