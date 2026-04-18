@@ -37,13 +37,13 @@ flate2 = "1"
 tar = "0.4"
 
 duduclaw-inference = { workspace = true }
-duduclaw-desktop = { workspace = true }
+duduclaw-desktop = { workspace = true, optional = true }
 duduclaw-dashboard = { workspace = true, optional = true }
 async-trait = { workspace = true }
 
 # L5b native desktop control (re-exports for orchestrator)
-enigo = { version = "0.3", features = ["serde"] }
-xcap = "0.9"
+enigo = { version = "0.3", features = ["serde"], optional = true }
+xcap = { version = "0.9", optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 hex = "0.4"
 openssl-sys = { version = "0.9", optional = true }
@@ -55,7 +55,8 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 songbird = { version = "0.5", optional = true, features = ["driver", "rustls", "receive"] }
 
 [features]
-default = ["dashboard"]
+default = ["dashboard", "desktop"]
+desktop = ["dep:duduclaw-desktop", "dep:enigo", "dep:xcap"]
 dashboard = ["dep:duduclaw-dashboard"]
 vendored-openssl = ["openssl-sys/vendored"]
 metal = ["duduclaw-inference/metal"]
