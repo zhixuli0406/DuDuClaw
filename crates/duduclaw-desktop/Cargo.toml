@@ -1,0 +1,29 @@
+[package]
+name = "duduclaw-desktop"
+version.workspace = true
+edition.workspace = true
+description = "Native desktop control (mouse, keyboard, screenshot) for DuDuClaw L5b"
+
+[dependencies]
+async-trait = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+
+# Cross-platform input simulation (mouse + keyboard)
+enigo = { version = "0.3", features = ["serde"] }
+
+# Cross-platform screen capture
+xcap = "0.9"
+
+# Image encoding (PNG)
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Global input event listener (optional — for user activity detection)
+rdev = { version = "0.5", optional = true }
+
+[features]
+default = []
+activity-monitor = ["dep:rdev"]
+
+[dev-dependencies]
+tokio = { workspace = true }

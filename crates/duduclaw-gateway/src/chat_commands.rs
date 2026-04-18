@@ -29,6 +29,20 @@ pub enum ChatCommand {
     Pair(String),
     /// `/voice` — toggle voice reply mode (next response as TTS audio)
     Voice,
+    /// `/screenshot` — capture and send current screen
+    Screenshot,
+    /// `/computer on` — temporarily enable computer use for this session
+    ComputerOn,
+    /// `/computer off` — disable computer use
+    ComputerOff,
+    /// `/pause` — pause the active computer use session
+    ComputerPause,
+    /// `/resume` — resume a paused computer use session
+    ComputerResume,
+    /// `/stop` — stop the active computer use session
+    ComputerStop,
+    /// `/replay [n]` — show the last N screenshots from audit log
+    Replay(u32),
     /// `!STOP` / `!停止` — stop the current agent/scope via failsafe
     SafetyStop,
     /// `!STOP ALL` / `!全部停止` — emergency stop all agents
@@ -135,6 +149,21 @@ pub fn parse_command(
             Some(ChatCommand::Pair(code))
         }
         "voice" | "v" => Some(ChatCommand::Voice),
+        "screenshot" | "ss" => Some(ChatCommand::Screenshot),
+        "computer" => match args.map(|a| a.to_ascii_lowercase()).as_deref() {
+            Some("on") => Some(ChatCommand::ComputerOn),
+            Some("off") => Some(ChatCommand::ComputerOff),
+            _ => Some(ChatCommand::Screenshot), // bare /computer → show status
+        },
+        "pause" => Some(ChatCommand::ComputerPause),
+        "resume" => Some(ChatCommand::ComputerResume),
+        "stop" => Some(ChatCommand::ComputerStop),
+        "replay" => {
+            let n = args
+                .and_then(|a| a.parse::<u32>().ok())
+                .unwrap_or(5);
+            Some(ChatCommand::Replay(n))
+        }
         _ => None,
     }
 }
@@ -173,6 +202,28 @@ pub async fn handle_command(
                 voice_set.insert(key);
                 "🔊 Voice mode ON — next replies will be sent as audio.".to_string()
             }
+        }
+        ChatCommand::Screenshot => {
+            // Handled by the caller — needs access to the orchestrator
+            "📸 截圖指令已接收（需要 active computer use session）".to_string()
+        }
+        ChatCommand::ComputerOn => {
+            "🖥️ Computer Use 已啟用（本次 session）".to_string()
+        }
+        ChatCommand::ComputerOff => {
+            "🖥️ Computer Use 已關閉".to_string()
+        }
+        ChatCommand::ComputerPause => {
+            "⏸ Computer Use session 已暫停。發送 /resume 繼續".to_string()
+        }
+        ChatCommand::ComputerResume => {
+            "▶️ Computer Use session 已恢復".to_string()
+        }
+        ChatCommand::ComputerStop => {
+            "🛑 Computer Use session 已終止".to_string()
+        }
+        ChatCommand::Replay(n) => {
+            handle_replay(ctx, agent_id, *n).await
         }
         ChatCommand::SafetyStop => handle_safety_stop(ctx, session_id, agent_id).await,
         ChatCommand::SafetyStopAll => handle_safety_stop_all(ctx).await,
@@ -393,6 +444,35 @@ async fn handle_safety_status(ctx: &ReplyContext, session_id: &str) -> String {
     }
 }
 
+async fn handle_replay(ctx: &ReplyContext, agent_id: &str, limit: u32) -> String {
+    let audit = crate::screenshot_audit::BrowserAuditLog::new(&ctx.home_dir, 7);
+    match audit.entries_for_agent(agent_id, limit as usize) {
+        Ok(entries) if entries.is_empty() => {
+            "📭 沒有找到截圖記錄".to_string()
+        }
+        Ok(entries) => {
+            let mut lines = vec![format!("📸 最近 {} 筆操作記錄：", entries.len())];
+            for entry in &entries {
+                let ts = entry.timestamp.format("%H:%M:%S");
+                let ss = entry
+                    .screenshot_path
+                    .as_ref()
+                    .map(|p| format!(" [截圖: {}]", p.display()))
+                    .unwrap_or_default();
+                lines.push(format!("• {ts} [{tier}] {action}{ss}",
+                    tier = entry.tier,
+                    action = entry.action,
+                ));
+            }
+            lines.join("\n")
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to read audit log");
+            format!("⚠️ 讀取審計記錄失敗：{e}")
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -459,6 +539,19 @@ mod tests {
     #[test]
     fn test_parse_compact() {
         assert_eq!(parse_command("/compact", None), Some(ChatCommand::Compact));
+    }
+
+    #[test]
+    fn test_parse_computer_commands() {
+        assert_eq!(parse_command("/screenshot", None), Some(ChatCommand::Screenshot));
+        assert_eq!(parse_command("/ss", None), Some(ChatCommand::Screenshot));
+        assert_eq!(parse_command("/computer on", None), Some(ChatCommand::ComputerOn));
+        assert_eq!(parse_command("/computer off", None), Some(ChatCommand::ComputerOff));
+        assert_eq!(parse_command("/pause", None), Some(ChatCommand::ComputerPause));
+        assert_eq!(parse_command("/resume", None), Some(ChatCommand::ComputerResume));
+        assert_eq!(parse_command("/stop", None), Some(ChatCommand::ComputerStop));
+        assert_eq!(parse_command("/replay", None), Some(ChatCommand::Replay(5)));
+        assert_eq!(parse_command("/replay 10", None), Some(ChatCommand::Replay(10)));
     }
 
     #[test]

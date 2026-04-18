@@ -261,6 +261,17 @@ pub struct CapabilitiesConfig {
     #[serde(default)]
     pub computer_use: bool,
 
+    /// Computer use execution mode.
+    /// - `container` (default): L5a — run inside Docker/Apple Container with Xvfb.
+    /// - `native`: L5b — directly control the host desktop (enigo + xcap).
+    /// - `auto`: choose based on agent trust level and task requirements.
+    #[serde(default)]
+    pub computer_use_mode: ComputerUseMode,
+
+    /// Computer use sub-configuration (session limits, app whitelist, etc.).
+    #[serde(default)]
+    pub computer_use_config: ComputerUseCapConfig,
+
     /// Allow running browser automation commands (playwright, puppeteer) via Bash.
     #[serde(default)]
     pub browser_via_bash: bool,
@@ -283,6 +294,62 @@ pub struct CapabilitiesConfig {
     pub wiki_visible_to: Vec<String>,
 }
 
+/// Computer use execution mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerUseMode {
+    /// L5a: run inside an isolated container with Xvfb virtual display.
+    Container,
+    /// L5b: directly control the host desktop (requires explicit trust).
+    Native,
+    /// Auto-select based on agent trust level and task requirements.
+    Auto,
+}
+
+impl Default for ComputerUseMode {
+    fn default() -> Self {
+        Self::Container
+    }
+}
+
+/// Sub-configuration for computer use sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct ComputerUseCapConfig {
+    /// Allowed applications — empty means all allowed.
+    pub allowed_apps: Vec<String>,
+    /// Blocked action types (e.g., "delete_file", "terminal").
+    pub blocked_actions: Vec<String>,
+    /// Maximum session duration in minutes.
+    pub max_session_minutes: u32,
+    /// Maximum actions per session.
+    pub max_actions: u32,
+    /// Virtual display width (container mode).
+    pub display_width: u32,
+    /// Virtual display height (container mode).
+    pub display_height: u32,
+    /// Automatically confirm trusted operations (in allowed_apps whitelist).
+    pub auto_confirm_trusted: bool,
+}
+
+impl Default for ComputerUseCapConfig {
+    fn default() -> Self {
+        Self {
+            allowed_apps: Vec::new(),
+            blocked_actions: vec![
+                "delete_file".to_string(),
+                "terminal".to_string(),
+                "system_preferences".to_string(),
+            ],
+            max_session_minutes: 10,
+            max_actions: 50,
+            display_width: 1280,
+            display_height: 800,
+            auto_confirm_trusted: false,
+        }
+    }
+}
+
 fn default_wiki_visible_to() -> Vec<String> {
     vec!["*".to_string()]
 }
@@ -291,6 +358,8 @@ impl Default for CapabilitiesConfig {
     fn default() -> Self {
         Self {
             computer_use: false,
+            computer_use_mode: ComputerUseMode::default(),
+            computer_use_config: ComputerUseCapConfig::default(),
             browser_via_bash: false,
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
