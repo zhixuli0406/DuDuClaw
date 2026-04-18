@@ -1,6 +1,36 @@
 # Changelog
 
 
+## [1.8.1] - 2026-04-19
+
+### Added
+- **Native multi-turn session management**: Claude CLI `--resume` with SHA-256
+  deterministic session ID mapping. Fallback to XML-delimited history-in-prompt
+  when session not found (e.g., account rotation).
+- **Hermes-inspired turn trimming**: Long conversation turns (>800 chars) are
+  trimmed to head 300 + tail 200 chars with `[trimmed N chars]` placeholder.
+  CJK-safe char-level slicing. Zero LLM cost.
+- **Direct API prompt cache strategy**: "system_and_3" cache breakpoint placement
+  inspired by Hermes Agent for ~75% cache hit rate on multi-turn conversations.
+- **Session compression summary injection**: Post-compression summaries (role=system)
+  are now injected into system prompt instead of conversation turns.
+
+### Removed
+- **MemGPT 3-layer memory system** (-1,985 LOC): Core Memory, Recall Memory,
+  Archival Bridge, Budget Manager, Consolidation Pipeline.
+  The system prompt injection approach caused 6,500 tokens of bloat per prompt
+  and "lost in the middle" attention degradation.
+- **6 MCP tools**: `core_memory_get`, `core_memory_append`, `core_memory_replace`,
+  `recall_search`, `archival_search`, `archival_insert`.
+- 3 SQLite databases (`core_memory.db`, `recall_memory.db`) are no longer populated.
+
+### Fixed
+- **Session chain breakage**: Agnes losing context between consecutive messages
+  ("幫我全部開啟" → "你指的是什麼？"). Root cause: stateless CLI subprocess
+  per message with history in system prompt. Now uses native multi-turn.
+
+
+
 ## [1.7.2] - 2026-04-17
 
 ### Fixed
