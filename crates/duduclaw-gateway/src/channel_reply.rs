@@ -2575,7 +2575,7 @@ async fn call_claude_cli(
 /// Lightweight Claude CLI call for single-turn metadata tasks.
 ///
 /// Optimized for: session compression, instruction extraction, key-fact extraction,
-/// GVU evolution, wiki ingest. Uses `--bare --effort low --max-turns 1
+/// GVU evolution, wiki ingest. Uses `--bare --effort medium --max-turns 1
 /// --no-session-persistence --tools ""` for minimal overhead and cost.
 ///
 /// Estimated 25-40% cost reduction vs the full channel reply path.
@@ -2594,7 +2594,7 @@ async fn call_claude_cli_lightweight(
     let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);
     cmd.args([
         "--bare",                    // Skip hooks, LSP, plugins, CLAUDE.md discovery
-        "--effort", "low",           // No extended thinking for metadata tasks
+        "--effort", "medium",        // Balanced: no full thinking but adequate extraction quality
         "--max-turns", "1",          // Single-turn only (no tool use)
         "--no-session-persistence",  // Throwaway call, don't save session
         "--tools", "",               // Disable all built-in tools (pure text response)
