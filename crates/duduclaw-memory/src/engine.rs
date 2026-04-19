@@ -6,9 +6,27 @@ use rusqlite::{params, Connection};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use serde::Serialize;
+
 use duduclaw_core::error::{DuDuClawError, Result};
 use duduclaw_core::traits::MemoryEngine;
 use duduclaw_core::types::{MemoryEntry, TimeWindow};
+
+/// A lightweight cross-session key fact (P2 Key-Fact Accumulator).
+///
+/// Replaces MemGPT's 6,500-token Core Memory with <200 tokens of key facts.
+/// Stored per-agent in memory.db, retrieved via FTS5 for system prompt injection.
+#[derive(Debug, Clone, Serialize)]
+pub struct KeyFact {
+    pub id: String,
+    pub agent_id: String,
+    pub fact: String,
+    pub channel: String,
+    pub chat_id: String,
+    pub source_session: String,
+    pub timestamp: String,
+    pub access_count: u32,
+}
 
 /// Configurable weights for the Generative Agents 3D retrieval re-ranking.
 ///
@@ -303,6 +321,35 @@ impl SqliteMemoryEngine {
             ",
         )
         .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        // Key-Fact Accumulator (P2): lightweight cross-session memory.
+        // Stores extracted key facts per agent for future session context.
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS key_facts (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                fact TEXT NOT NULL,
+                channel TEXT DEFAULT '',
+                chat_id TEXT DEFAULT '',
+                source_session TEXT DEFAULT '',
+                timestamp TEXT NOT NULL,
+                access_count INTEGER DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_facts_agent
+                ON key_facts(agent_id, timestamp DESC);
+            ",
+        )
+        .map_err(|e| DuDuClawError::Memory(format!("key_facts table: {e}")))?;
+
+        // FTS5 for key facts — separate virtual table for fact search
+        let _ = conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS key_facts_fts USING fts5(
+                fact,
+                tokenize='unicode61'
+            );",
+        );
 
         // Migration: add cognitive memory columns to existing databases (idempotent).
         // Each ALTER is run individually so that "duplicate column" errors on one
@@ -614,6 +661,167 @@ async fn call_claude_summarize(raw_memories: &str) -> String {
     }
 }
 
+
+// ── Key-Fact Accumulator (P2) ──────────────────────────────────
+
+impl SqliteMemoryEngine {
+    /// Store a key fact extracted from a conversation turn.
+    pub async fn store_fact(
+        &self,
+        agent_id: &str,
+        fact: &str,
+        channel: &str,
+        chat_id: &str,
+        source_session: &str,
+    ) -> Result<String> {
+        let conn = self.conn.lock().await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            "INSERT INTO key_facts (id, agent_id, fact, channel, chat_id, source_session, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, agent_id, fact, channel, chat_id, source_session, now],
+        )
+        .map_err(|e| DuDuClawError::Memory(format!("store_fact: {e}")))?;
+
+        // Sync FTS5 index
+        let _ = conn.execute(
+            "INSERT INTO key_facts_fts (rowid, fact) VALUES (last_insert_rowid(), ?1)",
+            params![fact],
+        );
+
+        Ok(id)
+    }
+
+    /// Get the most recent key facts for an agent.
+    pub async fn get_recent_facts(&self, agent_id: &str, limit: u32) -> Result<Vec<KeyFact>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, agent_id, fact, channel, chat_id, source_session, timestamp, access_count
+                 FROM key_facts WHERE agent_id = ?1 ORDER BY timestamp DESC LIMIT ?2",
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![agent_id, limit], |row| {
+                Ok(KeyFact {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    fact: row.get(2)?,
+                    channel: row.get(3)?,
+                    chat_id: row.get(4)?,
+                    source_session: row.get(5)?,
+                    timestamp: row.get(6)?,
+                    access_count: row.get(7)?,
+                })
+            })
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        let mut facts = Vec::new();
+        for row in rows {
+            facts.push(row.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+        }
+        Ok(facts)
+    }
+
+    /// Search key facts by query using FTS5 full-text search.
+    pub async fn search_facts(&self, agent_id: &str, query: &str, limit: u32) -> Result<Vec<KeyFact>> {
+        let conn = self.conn.lock().await;
+
+        // FTS5 search with agent_id filter via JOIN
+        let mut stmt = conn
+            .prepare(
+                "SELECT k.id, k.agent_id, k.fact, k.channel, k.chat_id, k.source_session, k.timestamp, k.access_count
+                 FROM key_facts k
+                 JOIN key_facts_fts f ON f.rowid = k.rowid
+                 WHERE k.agent_id = ?1 AND key_facts_fts MATCH ?2
+                 ORDER BY rank
+                 LIMIT ?3",
+            )
+            .map_err(|e| DuDuClawError::Memory(format!("search_facts prepare: {e}")))?;
+
+        let rows = stmt
+            .query_map(params![agent_id, query, limit], |row| {
+                Ok(KeyFact {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    fact: row.get(2)?,
+                    channel: row.get(3)?,
+                    chat_id: row.get(4)?,
+                    source_session: row.get(5)?,
+                    timestamp: row.get(6)?,
+                    access_count: row.get(7)?,
+                })
+            })
+            .map_err(|e| DuDuClawError::Memory(format!("search_facts query: {e}")))?;
+
+        let mut facts = Vec::new();
+        for row in rows {
+            facts.push(row.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+        }
+
+        // Fallback: if FTS5 returns nothing (query too short, no match), use recency
+        if facts.is_empty() {
+            drop(stmt);
+            return self.get_recent_facts(agent_id, limit).await;
+        }
+
+        Ok(facts)
+    }
+
+    /// Count total key facts for an agent.
+    pub async fn count_facts(&self, agent_id: &str) -> Result<u64> {
+        let conn = self.conn.lock().await;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM key_facts WHERE agent_id = ?1",
+                params![agent_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        Ok(count as u64)
+    }
+
+    /// Bump access count for a fact (used during deduplication).
+    pub async fn bump_fact_access(&self, fact_id: &str) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE key_facts SET access_count = access_count + 1 WHERE id = ?1",
+            params![fact_id],
+        )
+        .map_err(|e| DuDuClawError::Memory(format!("bump_fact_access: {e}")))?;
+        Ok(())
+    }
+
+    /// Purge stale facts older than `max_age_days` with `access_count < min_access`.
+    pub async fn purge_stale_facts(&self, agent_id: &str, max_age_days: u32, min_access: u32) -> Result<u64> {
+        let conn = self.conn.lock().await;
+        let cutoff = (Utc::now() - chrono::Duration::days(max_age_days as i64)).to_rfc3339();
+        let count = conn
+            .execute(
+                "DELETE FROM key_facts WHERE agent_id = ?1 AND timestamp < ?2 AND access_count < ?3",
+                params![agent_id, cutoff, min_access],
+            )
+            .map_err(|e| DuDuClawError::Memory(format!("purge_stale_facts: {e}")))?;
+        Ok(count as u64)
+    }
+}
+
+/// Word-level Jaccard similarity for fact deduplication.
+///
+/// Returns 0.0–1.0. Used to detect near-duplicate facts before storing.
+pub fn word_jaccard(a: &str, b: &str) -> f64 {
+    let words_a: std::collections::HashSet<&str> = a.split_whitespace().collect();
+    let words_b: std::collections::HashSet<&str> = b.split_whitespace().collect();
+    if words_a.is_empty() && words_b.is_empty() {
+        return 1.0;
+    }
+    let intersection = words_a.intersection(&words_b).count();
+    let union = words_a.union(&words_b).count();
+    if union == 0 { 0.0 } else { intersection as f64 / union as f64 }
+}
 
 #[cfg(test)]
 mod tests {
