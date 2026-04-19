@@ -1157,8 +1157,8 @@ async fn build_reply_with_session_inner(
                      and deliverables. Max 200 words. Use the same language as the input.\n\n\
                      {user_text}"
                 );
-                match call_claude_cli(
-                    &prompt, "claude-haiku-4-5", "", &home, None, None, None,
+                match call_claude_cli_lightweight(
+                    &prompt, "claude-haiku-4-5", &home,
                 ).await {
                     Ok(extracted) => {
                         if let Err(e) = sm.set_pinned(&sid, &extracted).await {
@@ -1197,8 +1197,8 @@ async fn build_reply_with_session_inner(
                          User: {user_text_for_facts}\n\
                          Assistant: {reply_snippet}"
                     );
-                    let facts_text = match call_claude_cli(
-                        &prompt, "claude-haiku-4-5", "", &home_for_facts, None, None, None,
+                    let facts_text = match call_claude_cli_lightweight(
+                        &prompt, "claude-haiku-4-5", &home_for_facts,
                     ).await {
                         Ok(t) => t,
                         Err(e) => {
@@ -1764,7 +1764,7 @@ async fn build_reply_with_session_inner(
                     "Summarize the following conversation history concisely for use as context \
                      in future turns. Include key facts, decisions, and outcomes. Max 400 words.\n\n{transcript}"
                 );
-                let summary = match call_claude_cli(&prompt, "claude-haiku-4-5", "", &home_for_compress, None, None, None).await {
+                let summary = match call_claude_cli_lightweight(&prompt, "claude-haiku-4-5", &home_for_compress).await {
                     Ok(s) => s,
                     Err(_) => "[Session compressed — previous conversation summary omitted for brevity]".to_string(),
                 };
@@ -2572,6 +2572,91 @@ async fn call_claude_cli(
     ).await
 }
 
+/// Lightweight Claude CLI call for single-turn metadata tasks.
+///
+/// Optimized for: session compression, instruction extraction, key-fact extraction,
+/// GVU evolution, wiki ingest. Uses `--bare --effort low --max-turns 1
+/// --no-session-persistence --tools ""` for minimal overhead and cost.
+///
+/// Estimated 25-40% cost reduction vs the full channel reply path.
+async fn call_claude_cli_lightweight(
+    prompt: &str,
+    model: &str,
+    home_dir: &Path,
+) -> Result<String, String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let claude_path = duduclaw_core::which_claude()
+        .ok_or_else(|| "claude CLI not found in PATH".to_string())?;
+
+    let api_key = get_api_key(home_dir).await;
+
+    let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);
+    cmd.args([
+        "--bare",                    // Skip hooks, LSP, plugins, CLAUDE.md discovery
+        "--effort", "low",           // No extended thinking for metadata tasks
+        "--max-turns", "1",          // Single-turn only (no tool use)
+        "--no-session-persistence",  // Throwaway call, don't save session
+        "--tools", "",               // Disable all built-in tools (pure text response)
+        "-p", prompt,
+        "--model", model,
+        "--output-format", "stream-json",
+        "--verbose",
+        "--dangerously-skip-permissions",
+    ]);
+
+    if let Some(ref key) = api_key {
+        cmd.env("ANTHROPIC_API_KEY", key);
+    }
+    cmd.env_remove("CLAUDECODE");
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let mut child = cmd.spawn().map_err(|e| format!("claude CLI spawn error: {e}"))?;
+    let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
+    let mut reader = BufReader::new(stdout).lines();
+
+    let mut result_text = String::new();
+    while let Ok(Some(line)) = reader.next_line().await {
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+            if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
+                if !text.is_empty() {
+                    result_text = text.to_string();
+                }
+            }
+            if event.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+                if let Some(content) = event.get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
+                    for block in content {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                                if !t.is_empty() {
+                                    result_text = t.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let status = child.wait().await.map_err(|e| format!("wait error: {e}"))?;
+    if !status.success() && result_text.is_empty() {
+        return Err(format!("claude CLI exited with {status}"));
+    }
+
+    if result_text.is_empty() {
+        Err("Empty response from lightweight CLI call".to_string())
+    } else {
+        Ok(result_text)
+    }
+}
+
 /// Try the `claude` CLI with rotation across configured `AccountRotator` accounts.
 ///
 /// On each attempt the rotator selects an account and yields its env vars
@@ -2809,19 +2894,22 @@ async fn spawn_claude_cli_with_env(
     }
 
     cmd.args([
+        // Minimal mode: skip hooks, LSP, plugin sync, attribution, auto-memory,
+        // CLAUDE.md auto-discovery. DuDuClaw provides its own system prompt via
+        // --system-prompt-file, so Claude's default discovery is wasted overhead.
+        // Estimated 15-25% latency reduction for subprocess calls.
+        "--bare",
+        // Move per-machine sections (cwd, env, git status) from system prompt to
+        // first user message. Keeps system prompt stable across turns → better
+        // prompt cache hit rate (~10-15% token reduction on turn 2+).
+        "--exclude-dynamic-system-prompt-sections",
         "-p", user_message,
         "--model", model,
         "--output-format", "stream-json",
         "--verbose",
         // Channel subprocess has no TTY — bypass all permission prompts.
-        // Agent-level security is enforced by CONTRACT.toml + container sandbox
-        // + duduclaw security hooks, not by Claude Code's interactive prompts.
-        // "auto" mode still pauses for some high-risk ops (mkdir, write) which
-        // causes Claude to tell Discord users "please click Allow in terminal".
         "--dangerously-skip-permissions",
-        // Allow enough agentic turns for complex tasks (read files → think → write).
-        // Default -p max-turns can be too low, causing Claude to stop mid-task
-        // and return a text summary instead of completing the work.
+        // Allow enough agentic turns for complex tasks.
         "--max-turns", "50",
     ]);
 
@@ -2855,6 +2943,14 @@ async fn spawn_claude_cli_with_env(
             );
         }
         cmd.current_dir(dir);
+
+        // --bare disables .mcp.json auto-discovery, so explicitly specify it.
+        // --strict-mcp-config ensures no ambient global MCP leaks into agent context.
+        let mcp_json = dir.join(".mcp.json");
+        if mcp_json.exists() {
+            cmd.args(["--mcp-config", &mcp_json.to_string_lossy()]);
+            cmd.arg("--strict-mcp-config");
+        }
     }
     if let Some(ref key) = api_key {
         cmd.env("ANTHROPIC_API_KEY", key);

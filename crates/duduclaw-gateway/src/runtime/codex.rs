@@ -86,12 +86,23 @@ impl AgentRuntime for CodexRuntime {
             .arg("--json")
             .arg("--full-auto");
 
-        // Pass system prompt (SOUL.md, role definitions) as instructions
+        // Pass system prompt via AGENTS.md in working directory.
+        // Codex exec has no --instructions flag; it reads from AGENTS.md.
         if !system_prompt.is_empty() {
-            cmd.arg("--instructions").arg(system_prompt);
+            if let Some(ref dir) = context.agent_dir {
+                let agents_md = dir.join("AGENTS.md");
+                let _ = std::fs::write(&agents_md, system_prompt);
+            }
         }
 
-        cmd.arg(&safe_prompt);
+        // Prepend conversation history to prompt (Codex exec has no native multi-turn)
+        let augmented_prompt = if context.conversation_history.is_empty() {
+            safe_prompt
+        } else {
+            super::format_history_as_prompt(&context.conversation_history, &safe_prompt)
+        };
+
+        cmd.arg(&augmented_prompt);
 
         // Set model if specified
         if !context.model.is_empty() {

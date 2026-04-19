@@ -87,14 +87,34 @@ impl AgentRuntime for GeminiRuntime {
         let mut cmd = tokio::process::Command::new(&self.gemini_path);
         cmd.arg("-p")
             .arg("--output-format")
-            .arg("stream-json");
+            .arg("stream-json")
+            .arg("--approval-mode").arg("yolo"); // bypass permissions (subprocess has no TTY)
 
-        // Pass system prompt (SOUL.md, role definitions) as system instruction
-        if !system_prompt.is_empty() {
-            cmd.arg("--system-instruction").arg(system_prompt);
-        }
+        // Pass system prompt via GEMINI_SYSTEM_MD env var (temp file).
+        // Gemini CLI has no --system-instruction flag.
+        let _system_prompt_guard: Option<tempfile::TempPath> = if !system_prompt.is_empty() {
+            match tempfile::NamedTempFile::new() {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    let _ = f.write_all(system_prompt.as_bytes());
+                    let path = f.into_temp_path();
+                    cmd.env("GEMINI_SYSTEM_MD", &path);
+                    Some(path)
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
 
-        cmd.arg(&safe_prompt);
+        // Prepend conversation history to prompt (Gemini CLI has no native multi-turn in -p mode)
+        let augmented_prompt = if context.conversation_history.is_empty() {
+            safe_prompt
+        } else {
+            super::format_history_as_prompt(&context.conversation_history, &safe_prompt)
+        };
+
+        cmd.arg(&augmented_prompt);
 
         // Set model if specified
         if !context.model.is_empty() {
