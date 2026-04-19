@@ -1,6 +1,17 @@
 # Changelog
 
 
+## [1.8.5] - 2026-04-19
+
+### Fixed
+- **MCP tools unavailable in channel reply**: Claude CLI in `-p
+  --dangerously-skip-permissions` mode does NOT read global
+  `~/.claude/settings.json` MCP servers — only project-level `.mcp.json`.
+  Reverted v1.8.4's global migration back to per-agent `.mcp.json` with
+  gateway startup auto-creation/fixup for all agents.
+
+
+
 ## [1.8.4] - 2026-04-19
 
 ### Changed
