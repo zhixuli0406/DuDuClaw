@@ -1,6 +1,18 @@
 # Changelog
 
 
+## [1.8.4] - 2026-04-19
+
+### Changed
+- **Global MCP server registration**: DuDuClaw MCP server (platform tools:
+  `send_to_agent`, `list_cron_tasks`, `create_agent`, etc.) is now registered
+  in `~/.claude/settings.json` (global) instead of per-agent `.mcp.json`.
+  Gateway startup auto-migrates existing per-agent entries to global.
+  Agent-specific MCP servers (Playwright, Browserbase) stay per-agent.
+  This eliminates the class of bugs where agents lacked MCP tool access.
+
+
+
 ## [1.8.3] - 2026-04-19
 
 ### Fixed
