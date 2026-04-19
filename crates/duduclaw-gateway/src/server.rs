@@ -295,36 +295,21 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         info!(interval_secs = probe_interval, "Account health probe started");
     }
 
-    // Register duduclaw MCP server in global Claude settings (~/.claude/settings.json).
-    // This makes the platform MCP tools (send_to_agent, list_cron_tasks, etc.)
-    // available to ALL agents without per-agent .mcp.json maintenance.
-    match duduclaw_agent::mcp_template::ensure_global_mcp_server() {
-        Ok(true) => info!("Registered duduclaw MCP server in global Claude settings"),
-        Ok(false) => {}
-        Err(e) => warn!(error = %e, "Failed to register global MCP server — falling back to per-agent"),
-    }
-
-    // Migrate per-agent .mcp.json: remove stale duduclaw entries (now global).
-    // Preserves agent-specific servers (playwright, browserbase, etc.).
+    // Ensure every agent has a `.mcp.json` with the duduclaw MCP server entry.
+    //
+    // Claude CLI in `-p --dangerously-skip-permissions` mode does NOT read
+    // global `~/.claude/settings.json` MCP servers — it only reads project-level
+    // `.mcp.json` from the working directory. So per-agent `.mcp.json` is required.
+    //
+    // `ensure_duduclaw_absolute_path()` handles 3 cases:
+    // 1. No `.mcp.json` → creates one with the resolved duduclaw binary
+    // 2. Relative command → resolves to absolute path
+    // 3. Non-existent binary (e.g., stale `duduclaw-pro`) → fixes it
     {
         let agents_dir = home_dir.join("agents");
-        let mut migrated = 0usize;
-        if let Ok(entries) = std::fs::read_dir(&agents_dir) {
-            for entry in entries.flatten() {
-                let dir = entry.path();
-                if !dir.is_dir() { continue; }
-                if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with('_') || name.starts_with('.') { continue; }
-                }
-                match duduclaw_agent::mcp_template::remove_duduclaw_from_agent_mcp(&dir) {
-                    Ok(true) => migrated += 1,
-                    Ok(false) => {}
-                    Err(e) => warn!(agent_dir = %dir.display(), error = %e, "MCP migration failed"),
-                }
-            }
-        }
-        if migrated > 0 {
-            info!(count = migrated, "Migrated duduclaw MCP from per-agent to global settings");
+        let fixed = duduclaw_agent::mcp_template::ensure_mcp_absolute_paths_all(&agents_dir);
+        if fixed > 0 {
+            info!(count = fixed, "Fixed/created .mcp.json for agent MCP server discovery");
         }
     }
 
