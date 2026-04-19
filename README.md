@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.4.31-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.8.4-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -31,7 +31,7 @@ DuDuClaw (plumbing)
   ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu / WebChat
   ├─ Multi-Runtime — Claude / Codex / Gemini / OpenAI-compat 自動偵測 + per-agent 設定
   ├─ Session Manager — SQLite, 50k token 自動壓縮（CJK-aware）
-  ├─ MCP Server — 80+ 工具（通訊、記憶、Agent、Skill、推論、任務、知識庫、ERP）
+  ├─ MCP Server — 80+ 工具（通訊、記憶、Agent、Skill、推論、任務、知識庫、ERP），全域註冊
   ├─ Evolution Engine — GVU² 雙迴圈進化 + 預測驅動 + MistakeNotebook
   ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / MLX / ONNX
   ├─ Voice Pipeline — ASR (SenseVoice / Whisper) + TTS (Piper / MiniMax) + VAD (Silero)
@@ -60,11 +60,12 @@ DuDuClaw (plumbing)
 
 | 特色 | 說明 |
 |------|------|
-| **MCP Server 架構** | `duduclaw mcp-server` 提供 80+ 工具，涵蓋通訊、記憶、Agent 管理、推論、排程、Skill 市場、任務看板、共享知識庫、Odoo ERP |
+| **MCP Server 架構** | `duduclaw mcp-server` 提供 80+ 工具，涵蓋通訊、記憶、Agent 管理、推論、排程、Skill 市場、任務看板、共享知識庫、Odoo ERP。全域註冊於 `~/.claude/settings.json`，gateway 啟動時自動遷移 |
 | **Multi-Runtime** | `AgentRuntime` trait — Claude / Codex / Gemini / OpenAI-compat 四種後端，`RuntimeRegistry` 自動偵測，per-agent 設定 |
 | **本地推論引擎** | 統一 `InferenceBackend` trait — llama.cpp（Metal/CUDA/Vulkan）/ mistral.rs（ISQ + PagedAttention）/ Exo P2P 叢集 / llamafile / MLX（Apple Silicon）/ OpenAI-compat HTTP |
 | **三層信心路由** | LocalFast → LocalStrong → CloudAPI，基於啟發式信心評分自動分流，CJK-aware token estimation |
 | **InferenceManager** | 多模式自動切換：Exo P2P → llamafile → Direct backend → OpenAI-compat → Cloud API，週期性健康檢查 + 自動 failover |
+| **原生多輪 Session** | Claude CLI `--resume` 搭配 SHA-256 確定性 session ID + fallback；Hermes 風格 turn trimming（>800 chars, CJK-safe）；Direct API "system_and_3" 斷點快取策略 |
 | **Direct API** | 繞過 CLI 直接呼叫 Anthropic Messages API，`cache_control: ephemeral` 達 95%+ 快取命中率 |
 | **Token 壓縮** | Meta-Token（BPE-like 27-47%）、LLMLingua-2（2-5x 有損）、StreamingLLM（無限長對話）|
 | **Cross-Provider Failover** | `FailoverManager` 健康追蹤、冷卻、不可重試錯誤偵測 |
@@ -85,7 +86,7 @@ DuDuClaw (plumbing)
 
 | 特色 | 說明 |
 |------|------|
-| **Sub-Agent 編排** | `create_agent` / `spawn_agent` / `list_agents` MCP 工具 + `reports_to` 組織層級 + D3.js 架構圖 |
+| **Sub-Agent 編排** | `create_agent` / `spawn_agent` / `list_agents` MCP 工具 + `reports_to` 組織層級 + D3.js 架構圖；system prompt 自動注入 "## Your Team" 子 Agent 名冊 |
 | **GVU² 雙迴圈進化** | 外迴圈（Behavioral GVU — SOUL.md 進化）+ 內迴圈（Task GVU — 即時任務重試），MistakeNotebook 跨迴圈記憶 |
 | **預測驅動進化** | Active Inference + Dual Process Theory，~90% 對話零 LLM 成本；MetaCognition 每 100 預測自校準閾值 |
 | **4+2 層驗證** | L1-Format / L2-Metrics / **L2.5-MistakeRegression** / L3-LLMJudge / **L3.5-SandboxCanary** / L4-Safety，前 4 層零成本 |
@@ -185,7 +186,7 @@ DuDuClaw (plumbing)
 ├── dudu/                    # 主 Agent
 │   ├── .claude/             # Claude Code 設定
 │   │   └── settings.local.json
-│   ├── .mcp.json            # MCP Server 設定（指向 duduclaw mcp-server）
+│   ├── .mcp.json            # Agent 專屬 MCP Server 設定（如 Playwright）；DuDuClaw MCP 已移至全域 ~/.claude/settings.json
 │   ├── SOUL.md              # 人格定義（SHA-256 保護）
 │   ├── CLAUDE.md            # Claude Code 指引
 │   ├── CONTRACT.toml        # 行為契約（must_not / must_always）
