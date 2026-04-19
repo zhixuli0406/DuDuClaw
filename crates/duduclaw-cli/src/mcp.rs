@@ -1525,13 +1525,18 @@ async fn handle_schedule_task(params: &Value, home_dir: &Path) -> Value {
 // ── Cron task management handlers ─────────────────────────────
 
 /// List cron tasks, optionally filtered by agent_id and enabled status.
-async fn handle_list_cron_tasks(params: &Value, home_dir: &Path, default_agent: &str) -> Value {
+///
+/// When `agent_id` is omitted, returns ALL tasks (not just the calling agent's).
+/// This matches dashboard behavior and allows the main agent to see sub-agent
+/// cron tasks — cron jobs are system resources, not session-scoped.
+async fn handle_list_cron_tasks(params: &Value, home_dir: &Path, _default_agent: &str) -> Value {
     use duduclaw_gateway::cron_store::CronStore;
 
-    let agent_id = params
+    // Explicit agent_id filter — empty or absent means show all tasks.
+    let agent_id_filter = params
         .get("agent_id")
         .and_then(|v| v.as_str())
-        .unwrap_or(default_agent);
+        .unwrap_or("");
     let enabled_only = params
         .get("enabled_only")
         .and_then(|v| v.as_bool())
@@ -1557,19 +1562,20 @@ async fn handle_list_cron_tasks(params: &Value, home_dir: &Path, default_agent: 
         Err(e) => return tool_error(&format!("list cron tasks: {e}")),
     };
 
-    // Filter by agent_id (empty string means show all).
-    let tasks: Vec<_> = if agent_id.is_empty() {
+    // Filter by agent_id only if explicitly provided.
+    let tasks: Vec<_> = if agent_id_filter.is_empty() {
         all_tasks
     } else {
         all_tasks
             .into_iter()
-            .filter(|t| t.agent_id == agent_id)
+            .filter(|t| t.agent_id == agent_id_filter)
             .collect()
     };
 
     if tasks.is_empty() {
+        let scope = if agent_id_filter.is_empty() { "any agent".to_string() } else { format!("agent '{agent_id_filter}'") };
         return serde_json::json!({
-            "content": [{"type": "text", "text": format!("No cron tasks found for agent '{agent_id}'.")}]
+            "content": [{"type": "text", "text": format!("No cron tasks found for {scope}.")}]
         });
     }
 

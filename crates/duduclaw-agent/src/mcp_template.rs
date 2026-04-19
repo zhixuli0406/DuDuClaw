@@ -149,34 +149,17 @@ pub fn ensure_browserbase_in_config(
     Ok(())
 }
 
-/// Ensure the `duduclaw` MCP server entry in `.mcp.json` uses an absolute path.
+/// Ensure the `duduclaw` MCP server entry in `.mcp.json` exists and points to
+/// a valid, absolute binary path.
 ///
-/// Reads the existing config, checks if the `duduclaw` server's `command` is
-/// a relative name (e.g., `"duduclaw"` or `"duduclaw-pro"`).  If so, replaces
-/// it with the resolved absolute path from [`duduclaw_core::resolve_duduclaw_bin`].
-/// All other servers are preserved untouched.
+/// Handles three scenarios:
+/// 1. `.mcp.json` does not exist → creates it with the resolved duduclaw binary
+/// 2. `duduclaw` server entry has a relative command → resolves to absolute path
+/// 3. `duduclaw` server entry points to a non-existent binary → fixes it
 ///
-/// Returns `Ok(true)` if the file was updated, `Ok(false)` if no change needed.
+/// Returns `Ok(true)` if the file was created or updated, `Ok(false)` if no change needed.
 pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
     let path = agent_dir.join(".mcp.json");
-    if !path.exists() {
-        return Ok(false);
-    }
-
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-    let mut config: McpConfig = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
-
-    // Check if duduclaw server needs updating.
-    let needs_update = config
-        .mcp_servers
-        .get("duduclaw")
-        .is_some_and(|e| !std::path::Path::new(&e.command).is_absolute());
-
-    if !needs_update {
-        return Ok(false);
-    }
 
     let abs_bin = duduclaw_core::resolve_duduclaw_bin();
     let abs_str = abs_bin.to_string_lossy().into_owned();
@@ -186,11 +169,53 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
         return Ok(false);
     }
 
+    // Case 1: No .mcp.json exists → create with duduclaw server entry
+    if !path.exists() {
+        let mut servers = std::collections::HashMap::new();
+        servers.insert("duduclaw".to_string(), McpServerDef {
+            command: abs_str.clone(),
+            args: vec!["mcp-server".to_string()],
+            env: std::collections::HashMap::new(),
+        });
+        let config = McpConfig { mcp_servers: servers };
+        let json = serde_json::to_string_pretty(&config)
+            .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
+        std::fs::write(&path, &json)
+            .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+        duduclaw_core::platform::set_owner_only(&path).ok();
+        info!(path = %path.display(), command = %abs_str, "Created .mcp.json with duduclaw server");
+        return Ok(true);
+    }
+
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let mut config: McpConfig = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+
+    // Case 2 & 3: Check if duduclaw server needs updating.
+    let needs_update = match config.mcp_servers.get("duduclaw") {
+        None => true, // No duduclaw entry at all
+        Some(entry) => {
+            let cmd_path = std::path::Path::new(&entry.command);
+            !cmd_path.is_absolute()             // Case 2: relative path
+                || !cmd_path.exists()            // Case 3: binary doesn't exist
+                || entry.command != abs_str      // Command changed (e.g., duduclaw-pro → duduclaw)
+        }
+    };
+
+    if !needs_update {
+        return Ok(false);
+    }
+
     config
         .mcp_servers
-        .get_mut("duduclaw")
-        .expect("checked above")
-        .command = abs_str.clone();
+        .entry("duduclaw".to_string())
+        .and_modify(|e| e.command = abs_str.clone())
+        .or_insert(McpServerDef {
+            command: abs_str.clone(),
+            args: vec!["mcp-server".to_string()],
+            env: std::collections::HashMap::new(),
+        });
 
     let json = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
