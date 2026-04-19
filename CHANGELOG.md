@@ -1,6 +1,23 @@
 # Changelog
 
 
+## [1.8.6] - 2026-04-19
+
+### Added
+- **Instruction Pinning** (P0): First user message → async Haiku extraction of
+  core task instructions → stored in `sessions.pinned_instructions` → injected
+  at system prompt tail (high-attention position). Survives session compression.
+- **Snowball Recap** (P0): Each turn prepends `<task_recap>` with pinned
+  instructions to user message. Zero LLM cost, utilizes U-shaped attention tail.
+- **Clarification Accumulation**: When agent asks a question and user answers,
+  the answer is appended to pinned instructions (capped at 1000 chars).
+- **P2 Key-Fact Accumulator**: Lightweight cross-session memory replacing
+  MemGPT Core Memory. Extracts 2-4 key facts per substantive turn via Haiku,
+  stores in `key_facts` table with FTS5 search, injects top 3 relevant facts
+  into system prompt. ~100-150 tokens vs MemGPT's 6,500 (87% reduction).
+
+
+
 ## [1.8.5] - 2026-04-19
 
 ### Fixed
