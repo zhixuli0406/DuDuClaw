@@ -98,6 +98,14 @@ pub(crate) fn format_history_as_prompt(history: &[ConversationTurn], current_mes
     buf
 }
 
+/// Lightweight sub-agent descriptor for system prompt injection.
+#[derive(Debug, Clone)]
+pub(crate) struct TeamMember {
+    pub name: String,
+    pub display_name: String,
+    pub role: String,
+}
+
 // ── Shared state ────────────────────────────────────────────
 
 /// Shared context for building replies, initialized once at gateway start.
@@ -412,12 +420,28 @@ async fn build_reply_with_session_inner(
         ctrl.get_active(&agent_id)
     };
 
+    // Build sub-agent team roster for system prompt injection.
+    // Lists agents whose `reports_to` matches the current agent, so the agent
+    // knows its team and can delegate via `spawn_agent` / `send_to_agent`.
+    let team_members: Vec<TeamMember> = {
+        let agents = reg.list();
+        agents.iter()
+            .filter(|a| a.config.agent.reports_to == agent_id && a.config.agent.name != agent_id)
+            .map(|a| TeamMember {
+                name: a.config.agent.name.clone(),
+                display_name: a.config.agent.display_name.clone(),
+                role: format!("{:?}", a.config.agent.role),
+            })
+            .collect()
+    };
+    let team_ref = if team_members.is_empty() { None } else { Some(team_members.as_slice()) };
+
     // Build progressive system prompt
     let system_prompt = {
         let cache = ctx.skill_cache.lock().await;
         let compressed: Vec<_> = cache.all().into_iter().cloned().collect();
         if compressed.is_empty() {
-            build_system_prompt(agent, None, None, None, skill_token_budget)
+            build_system_prompt(agent, None, None, None, skill_token_budget, team_ref)
         } else {
             build_system_prompt(
                 agent,
@@ -425,6 +449,7 @@ async fn build_reply_with_session_inner(
                 Some(&compressed),
                 Some(&active_skills),
                 skill_token_budget,
+                team_ref,
             )
         }
     };
@@ -3164,6 +3189,7 @@ fn build_system_prompt(
     compressed_skills: Option<&[crate::skill_lifecycle::compression::CompressedSkill]>,
     active_skills: Option<&std::collections::HashSet<String>>,
     skill_token_budget: u32,
+    team_members: Option<&[TeamMember]>,
 ) -> String {
     let mut parts = Vec::new();
 
@@ -3216,6 +3242,18 @@ fn build_system_prompt(
             for skill in &a.skills {
                 parts.push(format!("## Skill: {}\n{}", skill.name, skill.content));
             }
+        }
+    }
+
+    // Inject sub-agent team roster so the agent knows its organizational context.
+    // This enables natural delegation: "請團隊檢查" → agent knows which sub-agents to use.
+    if let Some(members) = team_members {
+        if !members.is_empty() {
+            let mut team_section = String::from("## Your Team\nYou have the following sub-agents. Use `spawn_agent` or `send_to_agent` MCP tools to delegate tasks to them.\n");
+            for m in members {
+                team_section.push_str(&format!("- **{}** ({}) — {}\n", m.display_name, m.name, m.role));
+            }
+            parts.push(team_section);
         }
     }
 
