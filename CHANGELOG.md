@@ -1,6 +1,21 @@
 # Changelog
 
 
+## [1.8.2] - 2026-04-19
+
+### Added
+- **Sub-agent team roster injection**: System prompt now automatically includes
+  a "Your Team" section listing sub-agents (by `reports_to` hierarchy), enabling
+  natural delegation like "請團隊檢查" without requiring SOUL.md changes.
+- **Release workflow_dispatch**: Release CI can now be manually re-triggered
+  with `gh workflow run release.yml -f tag=vX.Y.Z` when tag-push CI fails.
+
+### Fixed
+- **Agent team awareness**: Agnes didn't recognize "duduclaw團隊" as her
+  sub-agents because organizational context was missing from system prompt.
+
+
+
 ## [1.8.1] - 2026-04-19
 
 ### Added
