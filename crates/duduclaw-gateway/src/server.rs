@@ -295,13 +295,36 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         info!(interval_secs = probe_interval, "Account health probe started");
     }
 
-    // Fix MCP server paths before starting dispatcher — ensures subprocess-spawned
-    // Claude CLI can discover the duduclaw MCP server without PATH inheritance.
+    // Register duduclaw MCP server in global Claude settings (~/.claude/settings.json).
+    // This makes the platform MCP tools (send_to_agent, list_cron_tasks, etc.)
+    // available to ALL agents without per-agent .mcp.json maintenance.
+    match duduclaw_agent::mcp_template::ensure_global_mcp_server() {
+        Ok(true) => info!("Registered duduclaw MCP server in global Claude settings"),
+        Ok(false) => {}
+        Err(e) => warn!(error = %e, "Failed to register global MCP server — falling back to per-agent"),
+    }
+
+    // Migrate per-agent .mcp.json: remove stale duduclaw entries (now global).
+    // Preserves agent-specific servers (playwright, browserbase, etc.).
     {
         let agents_dir = home_dir.join("agents");
-        let fixed = duduclaw_agent::mcp_template::ensure_mcp_absolute_paths_all(&agents_dir);
-        if fixed > 0 {
-            info!(count = fixed, "Fixed relative MCP paths for agent subprocess discovery");
+        let mut migrated = 0usize;
+        if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                if !dir.is_dir() { continue; }
+                if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with('_') || name.starts_with('.') { continue; }
+                }
+                match duduclaw_agent::mcp_template::remove_duduclaw_from_agent_mcp(&dir) {
+                    Ok(true) => migrated += 1,
+                    Ok(false) => {}
+                    Err(e) => warn!(agent_dir = %dir.display(), error = %e, "MCP migration failed"),
+                }
+            }
+        }
+        if migrated > 0 {
+            info!(count = migrated, "Migrated duduclaw MCP from per-agent to global settings");
         }
     }
 
