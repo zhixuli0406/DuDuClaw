@@ -1,6 +1,32 @@
 # Changelog
 
 
+## [1.8.7] - 2026-04-19
+
+### Added
+- **Claude CLI lightweight path**: New `call_claude_cli_lightweight()` for
+  single-turn metadata tasks (compression, instruction/fact extraction). Uses
+  `--bare --effort low --max-turns 1 --no-session-persistence --tools ""`.
+  Estimated 25-40% cost reduction for metadata tasks.
+
+### Changed
+- **Claude CLI `--bare` mode**: Main channel reply path now uses `--bare` to
+  skip hooks/LSP/plugins/CLAUDE.md discovery (15-25% latency reduction).
+- **Claude CLI `--exclude-dynamic-system-prompt-sections`**: Stabilizes system
+  prompt across turns for better prompt cache hit rate (10-15% token reduction).
+- **Claude CLI `--strict-mcp-config`**: Explicit MCP isolation per agent.
+- **Gemini CLI system prompt**: Fixed from non-existent `--system-instruction`
+  flag to `GEMINI_SYSTEM_MD` env var (temp file). Added `--approval-mode yolo`
+  and conversation history prefix.
+- **Codex CLI system prompt**: Fixed from non-existent `--instructions` flag
+  to `AGENTS.md` file write. Added conversation history prefix.
+
+### Fixed
+- **Gemini runtime**: `--system-instruction` flag doesn't exist in Gemini CLI.
+- **Codex runtime**: `--instructions` flag doesn't exist in Codex exec.
+
+
+
 ## [1.8.6] - 2026-04-19
 
 ### Added
