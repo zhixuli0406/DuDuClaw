@@ -1,15 +1,16 @@
 # DuDuClaw Project Guidelines
 
-## Architecture Overview (v1.4.29)
+## Architecture Overview (v1.8.4)
 
 DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code / Codex / Gemini** CLI as AI backends via a unified `AgentRuntime` trait with auto-detection and per-agent configuration. DuDuClaw provides the plumbing: channel routing, session management, memory, evolution, multi-account rotation, local LLM inference, and browser automation.
 
 Key architectural decisions:
 - **Multi-Runtime** (`AgentRuntime` trait) — Claude / Codex / Gemini / OpenAI-compat four backends, `RuntimeRegistry` auto-detection, per-agent config in `agent.toml [runtime]`
-- **MCP Server** (`duduclaw mcp-server`) exposes channel, memory, agent, skill, task, shared wiki, and autopilot tools to AI Runtime via JSON-RPC 2.0 over stdin/stdout
-- **Agent directories** are Claude Code compatible: each contains `.claude/`, `SOUL.md`, `CLAUDE.md`, `.mcp.json`
-- **Sub-agent orchestration** via `create_agent` / `spawn_agent` / `list_agents` MCP tools with `reports_to` hierarchy
+- **MCP Server** (`duduclaw mcp-server`) exposes channel, memory, agent, skill, task, shared wiki, and autopilot tools to AI Runtime via JSON-RPC 2.0 over stdin/stdout. Registered globally in `~/.claude/settings.json` (auto-migrated from per-agent `.mcp.json` since v1.8.4)
+- **Agent directories** are Claude Code compatible: each contains `.claude/`, `SOUL.md`, `CLAUDE.md`. Agent-specific MCP servers (e.g. Playwright) still use per-agent `.mcp.json`; the DuDuClaw MCP server is registered globally in `~/.claude/settings.json`
+- **Sub-agent orchestration** via `create_agent` / `spawn_agent` / `list_agents` MCP tools with `reports_to` hierarchy. System prompt auto-includes "## Your Team" roster with sub-agents from the `reports_to` hierarchy (v1.8.2)
 - **Session Manager** persists conversations in SQLite with 50k token auto-compression (CJK-aware token estimation)
+- **Native multi-turn session management** (v1.8.1): Claude CLI `--resume <session-id>` with SHA-256 deterministic session ID + fallback to history-in-prompt; Hermes-inspired turn trimming (>800 chars, CJK-safe); Direct API prompt cache with "system_and_3" breakpoint strategy; session compression summaries injected into system prompt (not conversation turns)
 - **File-based IPC** (`bus_queue.jsonl`) for inter-agent delegation; **AgentDispatcher** consumes and spawns Claude CLI subprocesses
 - **Container sandbox** (Docker / Apple Container) for agent task isolation with `--network=none`, tmpfs, read-only rootfs
 - **Python subprocess** bridge for skill vetting
@@ -17,10 +18,10 @@ Key architectural decisions:
 - **BroadcastLayer** tracing layer streams real-time logs to WebSocket subscribers
 - **Ed25519 challenge-response** auth for secure WebSocket connections
 - **Unified heartbeat scheduler** — per-agent cron/interval for bus polling + GVU silence breaker, `max_concurrent_runs` semaphore
-- **CronScheduler** reads `cron_tasks.jsonl`, evaluates cron expressions, fires tasks on schedule
+- **CronScheduler** reads `cron_tasks.jsonl`, evaluates cron expressions, fires tasks on schedule. `list_cron_tasks` returns all tasks (no longer filters by default_agent, v1.8.3)
 - **Prediction-driven evolution engine**: Prediction-error-driven evolution (Active Inference / Dual Process Theory) — zero LLM cost for ~90% of conversations. Dual Process Router: Negligible/Moderate errors → zero cost, Significant → GVU reflection, Critical → emergency GVU loop. MetaCognition self-calibrates error thresholds every 100 predictions.
 - **GVU self-play loop** (Generator→Verifier→Updater): TextGrad feedback, max 3 rounds, 4-layer verification (L1-L2-L4 deterministic zero-cost + L3 LLM judge). SOUL.md versioning with 24h observation period + auto-rollback. Atomic write (temp + rename) with SHA-256 fingerprint.
-- **Cognitive memory** (optional): episodic/semantic separation with Generative Agents 3D-weighted retrieval
+- **Cognitive memory** (optional): `SqliteMemoryEngine` with episodic/semantic separation and Generative Agents 3D-weighted retrieval. MemGPT 3-layer system (Core Memory, Recall Memory, Archival Bridge, Budget Manager, Consolidation Pipeline, 6 MCP tools) was removed in v1.8.1 (−1,985 LOC)
 - **Security layer**: SOUL.md drift detection (SHA-256), prompt injection scanner (6 rule categories), JSONL audit log, per-agent key isolation
 - **Claude Code security hooks** (`.claude/hooks/`): 3-phase progressive defense — Layer 1 deterministic blacklist, Layer 2 obfuscation/exfiltration detection (YELLOW+), Layer 3 Haiku AI judgment (RED only). Threat level state machine (GREEN→YELLOW→RED) with auto-escalation/degradation. Protects Write/Edit/Read of sensitive files, scans for secret leaks, audits all tool calls (async JSONL compatible with Rust `audit.rs`), validates `.env.claude`, detects config tampering. All prompts use XML delimiters for injection resistance. See `docs/TODO-security-hooks.md` and `docs/code-review-security-hooks.md`.
 - **Browser automation & computer use** (5-layer auto-routing): L1 API Fetch → L2 Static Scrape → L3 Headless Browser (Playwright MCP) → L4 Sandbox Browser (container-isolated) → L5 Computer Use (virtual display). Deny-by-default via `CapabilitiesConfig` in `agent.toml [capabilities]` — `computer_use`, `browser_via_bash`, `allowed_tools`, `denied_tools`. `--disallowedTools` passed to Claude CLI. `bash-gate.sh` Layer 1.5 allowlist for Playwright/Puppeteer (requires `DUDUCLAW_BROWSER_VIA_BASH=1` env). See `docs/TODO-browser-automation.md`.
