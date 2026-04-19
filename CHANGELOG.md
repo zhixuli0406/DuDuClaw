@@ -1,6 +1,18 @@
 # Changelog
 
 
+## [1.8.3] - 2026-04-19
+
+### Fixed
+- **Cron jobs invisible to MCP**: `list_cron_tasks` filtered by `default_agent`,
+  hiding sub-agent cron tasks (duduclaw-pm, xianwen-pm, etc.). Dashboard showed
+  them but agents couldn't see or manage them. Now returns all tasks by default.
+- **Missing `.mcp.json` for agents**: Agnes pointed to non-existent `duduclaw-pro`
+  binary; other agents had no `.mcp.json` at all, causing "沒有 MCP 通訊工具".
+  Gateway startup now auto-creates/fixes `.mcp.json` for all agents.
+
+
+
 ## [1.8.2] - 2026-04-19
 
 ### Added
