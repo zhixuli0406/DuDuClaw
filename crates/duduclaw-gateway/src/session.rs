@@ -119,7 +119,14 @@ impl SessionManager {
             "ALTER TABLE session_messages ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
             [],
         );
-        // Ignore error — column already exists on subsequent runs
+
+        // Instruction Pinning: persist extracted task instructions across turns
+        // (arXiv 2505.06120 — combats U-shaped attention degradation in multi-turn)
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN pinned_instructions TEXT DEFAULT ''",
+            [],
+        );
+        // Ignore errors — columns already exist on subsequent runs
 
         Ok(())
     }
@@ -375,6 +382,36 @@ impl SessionManager {
         Ok(deleted as u64)
     }
 
+    // ── Instruction Pinning ────────────────────────────────────
+
+    /// Get pinned task instructions for a session.
+    ///
+    /// Returns empty string if no instructions are pinned.
+    pub async fn get_pinned(&self, session_id: &str) -> Result<String> {
+        let conn = self.acquire().await;
+        let result: std::result::Result<String, _> = conn.query_row(
+            "SELECT COALESCE(pinned_instructions, '') FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(s) => Ok(s),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(String::new()),
+            Err(e) => Err(DuDuClawError::Gateway(format!("get_pinned: {e}"))),
+        }
+    }
+
+    /// Set (or replace) pinned task instructions for a session.
+    pub async fn set_pinned(&self, session_id: &str, instructions: &str) -> Result<()> {
+        let conn = self.acquire().await;
+        conn.execute(
+            "UPDATE sessions SET pinned_instructions = ?1 WHERE id = ?2",
+            params![instructions, session_id],
+        )
+        .map_err(|e| DuDuClawError::Gateway(format!("set_pinned: {e}")))?;
+        Ok(())
+    }
+
     /// Hide a message from the active context (Sculptor hide/restore).
     ///
     /// The message remains in the database and can be restored later.
@@ -528,5 +565,62 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "msg1");
         assert_eq!(msgs[1].content, "msg3");
+    }
+
+    #[tokio::test]
+    async fn test_pinned_instructions_roundtrip() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("pin-test", "agent").await.unwrap();
+
+        // Initially empty
+        let pinned = mgr.get_pinned("pin-test").await.unwrap();
+        assert!(pinned.is_empty());
+
+        // Set pinned
+        mgr.set_pinned("pin-test", "- Goal: build two teams\n- Constraint: use Rust").await.unwrap();
+        let pinned = mgr.get_pinned("pin-test").await.unwrap();
+        assert!(pinned.contains("build two teams"));
+        assert!(pinned.contains("use Rust"));
+
+        // Update pinned (accumulate)
+        let updated = format!("{pinned}\n- 用戶確認：PM 每天 8:00 回報");
+        mgr.set_pinned("pin-test", &updated).await.unwrap();
+        let pinned = mgr.get_pinned("pin-test").await.unwrap();
+        assert!(pinned.contains("PM 每天 8:00 回報"));
+    }
+
+    #[tokio::test]
+    async fn test_pinned_survives_compression() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("compress-pin", "agent").await.unwrap();
+
+        // Set pinned + add messages
+        mgr.set_pinned("compress-pin", "- Goal: deploy v2.0").await.unwrap();
+        mgr.append_message("compress-pin", "user", "hello", 5).await.unwrap();
+        mgr.append_message("compress-pin", "assistant", "world", 5).await.unwrap();
+
+        // Compress — should delete messages but keep pinned
+        mgr.compress("compress-pin", "Summary: user said hello").await.unwrap();
+
+        // Messages gone (replaced with summary)
+        let msgs = mgr.get_messages("compress-pin").await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "system");
+
+        // Pinned survived!
+        let pinned = mgr.get_pinned("compress-pin").await.unwrap();
+        assert_eq!(pinned, "- Goal: deploy v2.0");
+    }
+
+    #[tokio::test]
+    async fn test_pinned_nonexistent_session() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+
+        // Non-existent session returns empty (not error)
+        let pinned = mgr.get_pinned("does-not-exist").await.unwrap();
+        assert!(pinned.is_empty());
     }
 }
