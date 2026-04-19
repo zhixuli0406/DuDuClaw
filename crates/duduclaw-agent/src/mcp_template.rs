@@ -149,15 +149,123 @@ pub fn ensure_browserbase_in_config(
     Ok(())
 }
 
-/// Ensure the `duduclaw` MCP server entry in `.mcp.json` exists and points to
-/// a valid, absolute binary path.
+/// Ensure the `duduclaw` MCP server is registered in Claude Code's **global**
+/// settings (`~/.claude/settings.json`), not per-agent `.mcp.json`.
 ///
-/// Handles three scenarios:
-/// 1. `.mcp.json` does not exist → creates it with the resolved duduclaw binary
-/// 2. `duduclaw` server entry has a relative command → resolves to absolute path
-/// 3. `duduclaw` server entry points to a non-existent binary → fixes it
+/// The DuDuClaw MCP server provides platform-level tools (send_to_agent,
+/// list_cron_tasks, create_agent, etc.) that ALL agents need. Placing it
+/// globally avoids per-agent `.mcp.json` maintenance and the production bugs
+/// caused by missing or stale configs.
 ///
-/// Returns `Ok(true)` if the file was created or updated, `Ok(false)` if no change needed.
+/// Agent-specific MCP servers (Playwright, Browserbase, etc.) stay in
+/// per-agent `.mcp.json` — Claude CLI merges both layers.
+///
+/// Returns `Ok(true)` if settings.json was updated, `Ok(false)` if no change needed.
+pub fn ensure_global_mcp_server() -> Result<bool, String> {
+    let abs_bin = duduclaw_core::resolve_duduclaw_bin();
+    let abs_str = abs_bin.to_string_lossy().into_owned();
+    if !std::path::Path::new(&abs_str).is_absolute() {
+        return Ok(false);
+    }
+
+    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    let settings_path = home.join(".claude").join("settings.json");
+
+    // Read existing settings (or create empty)
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let content = std::fs::read_to_string(&settings_path)
+            .map_err(|e| format!("Failed to read {}: {e}", settings_path.display()))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse {}: {e}", settings_path.display()))?
+    } else {
+        serde_json::json!({})
+    };
+
+    // Check current state
+    let current_cmd = settings
+        .get("mcpServers")
+        .and_then(|s| s.get("duduclaw"))
+        .and_then(|d| d.get("command"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+
+    if current_cmd == abs_str {
+        return Ok(false); // Already correct
+    }
+
+    // Upsert mcpServers.duduclaw
+    let mcp_servers = settings
+        .as_object_mut()
+        .ok_or("settings.json is not a JSON object")?
+        .entry("mcpServers")
+        .or_insert(serde_json::json!({}));
+
+    mcp_servers
+        .as_object_mut()
+        .ok_or("mcpServers is not a JSON object")?
+        .insert("duduclaw".to_string(), serde_json::json!({
+            "command": abs_str,
+            "args": ["mcp-server"]
+        }));
+
+    // Write back atomically
+    let json = serde_json::to_string_pretty(&settings)
+        .map_err(|e| format!("Failed to serialize settings: {e}"))?;
+    let tmp = settings_path.with_extension("json.tmp");
+    std::fs::write(&tmp, &json)
+        .map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &settings_path)
+        .map_err(|e| format!("Failed to rename {}: {e}", tmp.display()))?;
+
+    info!(
+        path = %settings_path.display(),
+        command = %abs_str,
+        "Registered duduclaw MCP server in global Claude settings"
+    );
+    Ok(true)
+}
+
+/// Remove the `duduclaw` entry from a per-agent `.mcp.json` (migrated to global).
+///
+/// Preserves other server entries (playwright, browserbase, etc.).
+/// Deletes the file entirely if no servers remain.
+///
+/// Returns `Ok(true)` if changed, `Ok(false)` if nothing to do.
+pub fn remove_duduclaw_from_agent_mcp(agent_dir: &Path) -> Result<bool, String> {
+    let path = agent_dir.join(".mcp.json");
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let mut config: McpConfig = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+
+    if config.mcp_servers.remove("duduclaw").is_none() {
+        return Ok(false); // No duduclaw entry
+    }
+
+    if config.mcp_servers.is_empty() {
+        // No servers left — remove the file
+        std::fs::remove_file(&path)
+            .map_err(|e| format!("Failed to remove {}: {e}", path.display()))?;
+        info!(path = %path.display(), "Removed empty .mcp.json (duduclaw migrated to global)");
+    } else {
+        // Write back without duduclaw entry
+        let json = serde_json::to_string_pretty(&config)
+            .map_err(|e| format!("Failed to serialize: {e}"))?;
+        std::fs::write(&path, json)
+            .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+        info!(path = %path.display(), "Removed duduclaw from per-agent .mcp.json (migrated to global)");
+    }
+    Ok(true)
+}
+
+/// Legacy per-agent `.mcp.json` fixup — kept for backwards compatibility.
+///
+/// Prefer `ensure_global_mcp_server()` for new installations.
+/// This function is called after global migration to clean up stale entries.
 pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
     let path = agent_dir.join(".mcp.json");
 
