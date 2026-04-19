@@ -6,6 +6,6 @@ pub mod search;
 pub mod wiki;
 
 pub use embedding::VectorIndex;
-pub use engine::SqliteMemoryEngine;
+pub use engine::{KeyFact, SqliteMemoryEngine, word_jaccard};
 pub use router::classify;
 pub use wiki::WikiStore;

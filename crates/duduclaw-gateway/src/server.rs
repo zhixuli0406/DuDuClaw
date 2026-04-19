@@ -212,6 +212,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         )
         .with_prediction_engine(prediction_engine.clone())
         .with_gvu_loop(gvu_loop.clone())
+        .with_memory_db(home_dir.join("memory.db"))
     );
     // Inject reply context into handler for channel hot-start/stop
     handler.set_reply_ctx(reply_ctx.clone()).await;

@@ -147,6 +147,9 @@ pub struct ReplyContext {
     pub skill_recorder: Arc<tokio::sync::Mutex<TrajectoryRecorder>>,
     /// Persistent skill bank for extracted skills (Phase 3).
     pub skill_bank: Arc<tokio::sync::Mutex<SkillCache>>,
+    /// Path to memory.db for key-fact accumulator (P2).
+    /// Engine is created on-demand per operation due to SQLite thread safety.
+    pub memory_db_path: Option<PathBuf>,
 }
 
 impl ReplyContext {
@@ -201,6 +204,7 @@ impl ReplyContext {
             mistake_notebook: None,
             skill_recorder: Arc::new(tokio::sync::Mutex::new(TrajectoryRecorder::new())),
             skill_bank: Arc::new(tokio::sync::Mutex::new(SkillCache::new())),
+            memory_db_path: None,
         }
     }
 
@@ -222,6 +226,11 @@ impl ReplyContext {
         self
     }
 
+    /// Set memory DB path for cross-session key-fact accumulator (P2).
+    pub fn with_memory_db(mut self, path: PathBuf) -> Self {
+        self.memory_db_path = Some(path);
+        self
+    }
 }
 
 /// Helper to update a channel's connection state and broadcast the change to dashboard clients.
@@ -743,10 +752,30 @@ async fn build_reply_with_session_inner(
         }
     }
 
-    // Inject pinned instructions + compression summary into system prompt.
-    // Pinned instructions go at the END (Anthropic best practice: high-attention tail).
+    // Inject key facts + pinned instructions + compression summary into system prompt.
+    // Order: key facts (middle) → compression summary → pinned (tail, highest attention).
     let full_system_prompt = {
         let mut prompt = system_prompt;
+
+        // P2 Key-Fact Accumulator: inject cross-session facts (middle position —
+        // stable reference data that doesn't need U-shaped peak attention).
+        // Uses spawn_blocking because SqliteMemoryEngine is !Send (rusqlite).
+        if let Some(db_path) = ctx.memory_db_path.clone() {
+            let aid = agent_id.clone();
+            let query = sanitized_text.clone();
+            if let Ok(facts_text) = tokio::task::spawn_blocking(move || {
+                let engine = duduclaw_memory::SqliteMemoryEngine::new(&db_path).ok()?;
+                let rt = tokio::runtime::Handle::current();
+                let facts = rt.block_on(engine.search_facts(&aid, &query, 3)).ok()?;
+                if facts.is_empty() { return None; }
+                Some(facts.iter().map(|f| format!("- {}", f.fact)).collect::<Vec<_>>().join("\n"))
+            }).await {
+                if let Some(ft) = facts_text {
+                    prompt = format!("{prompt}\n\n## Key Facts About This User\n{ft}");
+                }
+            }
+        }
+
         if !compression_summary.is_empty() {
             prompt = format!("{prompt}\n\n## Prior Conversation Summary\n{compression_summary}");
         }
@@ -1143,6 +1172,70 @@ async fn build_reply_with_session_inner(
                     }
                 }
             });
+        }
+
+        // ── P2 Key-Fact Accumulator: extract facts from substantive turns ──
+        // Only extracts when reply is long enough to contain useful information.
+        // Async, non-blocking — same pattern as instruction extraction.
+        if reply.len() > 100 {
+            if let Some(db_path) = ctx.memory_db_path.clone() {
+                let agent_id_for_facts = agent_id.clone();
+                let user_text_for_facts = sanitized_text.clone();
+                let reply_snippet = reply[..reply.len().min(500)].to_string();
+                let (ch, cid) = parse_session_id_parts(session_id);
+                let channel_for_facts = ch.to_string();
+                let chat_id_for_facts = cid.to_string();
+                let session_for_facts = session_id.to_string();
+                let home_for_facts = ctx.home_dir.clone();
+                tokio::spawn(async move {
+                    let prompt = format!(
+                        "Extract 2-4 key factual insights from this conversation turn \
+                         that would be useful in FUTURE conversations with this user. \
+                         Focus on: user preferences, confirmed decisions, domain rules, \
+                         technical constraints. Output bullet points only. Max 100 words. \
+                         Same language as input.\n\n\
+                         User: {user_text_for_facts}\n\
+                         Assistant: {reply_snippet}"
+                    );
+                    let facts_text = match call_claude_cli(
+                        &prompt, "claude-haiku-4-5", "", &home_for_facts, None, None, None,
+                    ).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            warn!(agent = %agent_id_for_facts, error = %e, "Key-fact extraction failed (best-effort)");
+                            return;
+                        }
+                    };
+
+                    // Store facts in spawn_blocking (SqliteMemoryEngine is !Send)
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let engine = match duduclaw_memory::SqliteMemoryEngine::new(&db_path) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to open memory engine for fact storage");
+                                return;
+                            }
+                        };
+                        let rt = tokio::runtime::Handle::current();
+                        for line in facts_text.lines() {
+                            let fact = line.trim_start_matches(&['-', '•', '*', ' '][..]).trim();
+                            if fact.len() < 10 { continue; }
+                            // Dedup: check if similar fact already exists
+                            if let Ok(existing) = rt.block_on(engine.search_facts(&agent_id_for_facts, fact, 1)) {
+                                if existing.first().map_or(false, |e| duduclaw_memory::word_jaccard(&e.fact, fact) > 0.8) {
+                                    let _ = rt.block_on(engine.bump_fact_access(&existing[0].id));
+                                    continue;
+                                }
+                            }
+                            let _ = rt.block_on(engine.store_fact(
+                                &agent_id_for_facts, fact,
+                                &channel_for_facts, &chat_id_for_facts,
+                                &session_for_facts,
+                            ));
+                        }
+                    }).await;
+                });
+            }
         }
 
         // ── Prediction-driven evolution ──────────────────────────────
