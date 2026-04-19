@@ -1,6 +1,16 @@
 # Changelog
 
 
+## [1.8.8] - 2026-04-20
+
+### Fixed
+- **Lightweight CLI effort level**: Changed from `--effort low` to
+  `--effort medium` for instruction/fact extraction tasks. Prevents
+  quality degradation in extracted pinned instructions and key facts
+  while maintaining cost savings from other lightweight flags.
+
+
+
 ## [1.8.7] - 2026-04-19
 
 ### Added
