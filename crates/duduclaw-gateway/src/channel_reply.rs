@@ -441,7 +441,7 @@ async fn build_reply_with_session_inner(
         let cache = ctx.skill_cache.lock().await;
         let compressed: Vec<_> = cache.all().into_iter().cloned().collect();
         if compressed.is_empty() {
-            build_system_prompt(agent, None, None, None, skill_token_budget, team_ref)
+            build_system_prompt(agent, None, None, None, skill_token_budget, team_ref, "")
         } else {
             build_system_prompt(
                 agent,
@@ -450,6 +450,7 @@ async fn build_reply_with_session_inner(
                 Some(&active_skills),
                 skill_token_budget,
                 team_ref,
+                "",
             )
         }
     };
@@ -721,11 +722,42 @@ async fn build_reply_with_session_inner(
     };
     let has_history = !conversation_history.is_empty();
 
-    // Inject compression summary into system prompt (if session was compressed)
-    let full_system_prompt = if compression_summary.is_empty() {
-        system_prompt
-    } else {
-        format!("{system_prompt}\n\n## Prior Conversation Summary\n{compression_summary}")
+    // ── Instruction Pinning: load + accumulate ──
+    // Pinned instructions survive session compression (stored on sessions table).
+    let mut pinned = session_mgr.get_pinned(session_id).await.unwrap_or_default();
+
+    // Clarification accumulation: if agent asked a question last turn and user
+    // is now answering, append the answer to pinned instructions.
+    if has_history && !pinned.is_empty() {
+        if let Some(last_assistant) = conversation_history.iter().rev()
+            .find(|t| t.role == "assistant")
+        {
+            if last_assistant.content.contains('？') || last_assistant.content.contains('?') {
+                let answer_snippet = &sanitized_text[..sanitized_text.len().min(200)];
+                // Cap pinned at ~1000 chars to prevent bloat
+                if pinned.len() < 1000 {
+                    pinned = format!("{pinned}\n- 用戶確認：{answer_snippet}");
+                    let _ = session_mgr.set_pinned(session_id, &pinned).await;
+                }
+            }
+        }
+    }
+
+    // Inject pinned instructions + compression summary into system prompt.
+    // Pinned instructions go at the END (Anthropic best practice: high-attention tail).
+    let full_system_prompt = {
+        let mut prompt = system_prompt;
+        if !compression_summary.is_empty() {
+            prompt = format!("{prompt}\n\n## Prior Conversation Summary\n{compression_summary}");
+        }
+        if !pinned.is_empty() {
+            prompt = format!(
+                "{prompt}\n\n## Pinned Task Instructions\n\
+                 The user's core task requirements (ALWAYS follow these throughout the conversation):\n\
+                 {pinned}"
+            );
+        }
+        prompt
     };
 
     // Track the last underlying failure so the fallback message can
@@ -877,8 +909,17 @@ async fn build_reply_with_session_inner(
     // Wrap in REPLY_CHANNEL scope so `send_to_agent` MCP tool can register
     // delegation callbacks for sub-agent response forwarding.
     // Only set for sessions originating from a real channel (telegram/line/discord).
+    // Snowball Recap: prepend pinned instructions as <task_recap> to user message.
+    // Placed in user message (U-shaped attention tail peak) rather than system
+    // prompt to maximize LLM attention on the original task requirements.
+    let effective_message = if pinned.is_empty() || !has_history {
+        sanitized_text.clone()
+    } else {
+        format!("<task_recap>\n{pinned}\n</task_recap>\n\n{sanitized_text}")
+    };
+
     let cli_future = call_claude_cli_rotated(
-        &sanitized_text, &model, &full_system_prompt, &ctx.home_dir,
+        &effective_message, &model, &full_system_prompt, &ctx.home_dir,
         agent_dir.as_deref(), on_progress.as_ref(), capabilities.as_ref(),
         if has_history { Some(session_id) } else { None },
         &conversation_history,
@@ -1069,6 +1110,39 @@ async fn build_reply_with_session_inner(
             .await
         {
             warn!("Failed to save assistant message to session: {e}");
+        }
+
+        // ── Instruction Pinning: extract on first turn ──────────────
+        // Asynchronously extract core task instructions from the first user
+        // message using Haiku (lightweight, same path as session compression).
+        // Pinned instructions persist across turns and survive compression.
+        if !has_history {
+            let sm = ctx.session_manager.clone();
+            let sid = session_id.to_string();
+            let user_text = sanitized_text.clone();
+            let home = ctx.home_dir.clone();
+            tokio::spawn(async move {
+                let prompt = format!(
+                    "Extract the core task instructions from this user message. \
+                     Output a concise bullet list of: goals, constraints, parameters, \
+                     and deliverables. Max 200 words. Use the same language as the input.\n\n\
+                     {user_text}"
+                );
+                match call_claude_cli(
+                    &prompt, "claude-haiku-4-5", "", &home, None, None, None,
+                ).await {
+                    Ok(extracted) => {
+                        if let Err(e) = sm.set_pinned(&sid, &extracted).await {
+                            warn!(session_id = %sid, error = %e, "Failed to save pinned instructions");
+                        } else {
+                            info!(session_id = %sid, "Pinned task instructions extracted ({} chars)", extracted.len());
+                        }
+                    }
+                    Err(e) => {
+                        warn!(session_id = %sid, error = %e, "Instruction extraction failed (best-effort, non-blocking)");
+                    }
+                }
+            });
         }
 
         // ── Prediction-driven evolution ──────────────────────────────
@@ -1889,6 +1963,27 @@ mod multi_turn_tests {
         assert!(!is_session_error("HTTP session timeout"));
         assert!(!is_session_error("TLS session negotiation failed"));
         assert!(!is_session_error("rate limit exceeded"));
+    }
+
+    #[test]
+    fn recap_prefix_with_pinned() {
+        let pinned = "- Goal: build two teams\n- PM: daily 8:00 report";
+        let msg = "開始建立團隊";
+        let result = format!("<task_recap>\n{pinned}\n</task_recap>\n\n{msg}");
+        assert!(result.contains("<task_recap>"));
+        assert!(result.contains("build two teams"));
+        assert!(result.ends_with("開始建立團隊"));
+    }
+
+    #[test]
+    fn recap_skipped_when_no_pinned() {
+        let pinned = "";
+        let msg = "hello";
+        // When pinned is empty, effective_message = sanitized_text (no recap)
+        let effective = if pinned.is_empty() { msg.to_string() } else {
+            format!("<task_recap>\n{pinned}\n</task_recap>\n\n{msg}")
+        };
+        assert_eq!(effective, "hello");
     }
 }
 
@@ -3190,6 +3285,7 @@ fn build_system_prompt(
     active_skills: Option<&std::collections::HashSet<String>>,
     skill_token_budget: u32,
     team_members: Option<&[TeamMember]>,
+    pinned_instructions: &str,
 ) -> String {
     let mut parts = Vec::new();
 
@@ -3255,6 +3351,17 @@ fn build_system_prompt(
             }
             parts.push(team_section);
         }
+    }
+
+    // Instruction Pinning: inject at the END of system prompt (Anthropic best practice:
+    // "put instructions at the bottom for best attention"). This combats U-shaped
+    // attention degradation by placing key task requirements in the high-attention tail.
+    if !pinned_instructions.is_empty() {
+        parts.push(format!(
+            "## Pinned Task Instructions\n\
+             The user's core task requirements (ALWAYS follow these throughout the conversation):\n\
+             {pinned_instructions}"
+        ));
     }
 
     if parts.is_empty() {
