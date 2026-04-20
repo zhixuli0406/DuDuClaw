@@ -17,7 +17,7 @@ use crate::claude_runner::{call_claude_for_agent_with_type};
 use duduclaw_agent::registry::AgentRegistry;
 use duduclaw_container::sandbox;
 
-use duduclaw_core::{MAX_DELEGATION_DEPTH, ENV_DELEGATION_DEPTH, ENV_DELEGATION_ORIGIN, ENV_DELEGATION_SENDER};
+use duduclaw_core::{MAX_DELEGATION_DEPTH, ENV_DELEGATION_DEPTH, ENV_DELEGATION_ORIGIN, ENV_DELEGATION_SENDER, truncate_bytes};
 
 /// Message envelope stored in `bus_queue.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1128,7 +1128,7 @@ async fn handle_step_failure(
                 attempt,
                 delay_secs,
                 "Retrying step after {delay_secs}s backoff (error: {})",
-                &error[..error.len().min(100)],
+                truncate_bytes(&error, 100),
             );
             tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
             // Step is already reset to Pending — next loop iteration will pick it up

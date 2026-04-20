@@ -7,6 +7,7 @@
 //!
 //! Reference: <https://docs.anthropic.com/en/docs/agents-and-tools/computer-use>
 
+use duduclaw_core::truncate_bytes;
 use image::ImageEncoder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -445,7 +446,7 @@ impl ComputerUseSession {
         if !status.is_success() {
             return Err(ComputerUseError::ApiError(format!(
                 "API error ({status}): {}",
-                &response_text[..response_text.len().min(300)]
+                truncate_bytes(&response_text, 300)
             )));
         }
 

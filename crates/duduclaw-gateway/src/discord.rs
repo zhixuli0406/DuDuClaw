@@ -13,6 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use duduclaw_core::truncate_bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -468,7 +469,7 @@ async fn register_slash_commands(http: &reqwest::Client, token: &str, app_id: &s
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            warn!("Discord: slash command registration failed ({status}): {}", &body[..body.len().min(200)]);
+            warn!("Discord: slash command registration failed ({status}): {}", truncate_bytes(&body, 200));
         }
         Err(e) => {
             warn!("Discord: slash command registration error: {e}");
@@ -624,7 +625,7 @@ async fn gateway_loop(
                     let payload: GatewayPayload = match serde_json::from_str(&msg) {
                         Ok(p) => p,
                         Err(e) => {
-                            warn!("Discord Gateway: failed to parse payload: {e} (first 200 chars: {})", &msg[..msg.len().min(200)]);
+                            warn!("Discord Gateway: failed to parse payload: {e} (first 200 chars: {})", truncate_bytes(&msg, 200));
                             continue;
                         }
                     };
@@ -887,7 +888,7 @@ async fn handle_message_create(
         return;
     }
 
-    info!("📩 Discord [{author_name}] (guild:{guild_id}): {}", &clean_content[..clean_content.len().min(80)]);
+    info!("📩 Discord [{author_name}] (guild:{guild_id}): {}", truncate_bytes(&clean_content, 80));
 
     // ── Auto-thread ──
     // Default to true in guilds so conversations are organized into threads
@@ -1192,7 +1193,7 @@ async fn create_thread(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        warn!("Discord: failed to create thread ({status}): {}", &body[..body.len().min(200)]);
+        warn!("Discord: failed to create thread ({status}): {}", truncate_bytes(&body, 200));
         return None;
     }
 
@@ -1260,7 +1261,7 @@ async fn send_raw(http: &reqwest::Client, token: &str, channel_id: &str, payload
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            let detail = body[..body.len().min(200)].to_string();
+            let detail = truncate_bytes(&body, 200).to_string();
 
             // Retry without message_reference when Discord reports a cross-channel
             // reference error.  This can happen when gateway channel metadata is
@@ -1286,7 +1287,7 @@ async fn send_raw(http: &reqwest::Client, token: &str, channel_id: &str, payload
                     Ok(r2) => {
                         let s2 = r2.status();
                         let b2 = r2.text().await.unwrap_or_default();
-                        let d2 = b2[..b2.len().min(200)].to_string();
+                        let d2 = truncate_bytes(&b2, 200).to_string();
                         error!("Discord send failed on retry ({s2}): {d2}");
                         return Err(DiscordSendError {
                             status: Some(s2.as_u16()),
@@ -1620,7 +1621,7 @@ async fn edit_interaction_response(
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            error!("Discord edit interaction failed ({status}): {}", &body[..body.len().min(200)]);
+            error!("Discord edit interaction failed ({status}): {}", truncate_bytes(&body, 200));
         }
         Err(e) => error!("Discord edit interaction error: {e}"),
         _ => {}

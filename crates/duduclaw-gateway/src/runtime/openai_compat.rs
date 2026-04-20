@@ -7,6 +7,7 @@
 //!   - Supports MiniMax-M2.7, MiniMax-M2.5, etc.
 
 use async_trait::async_trait;
+use duduclaw_core::truncate_bytes;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -153,7 +154,7 @@ impl AgentRuntime for OpenAiCompatRuntime {
             }
             return Err(format!(
                 "API error ({status}): {}",
-                &response_text[..response_text.len().min(300)]
+                truncate_bytes(&response_text, 300)
             ));
         }
 

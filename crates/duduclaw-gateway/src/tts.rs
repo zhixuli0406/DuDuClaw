@@ -3,6 +3,7 @@
 //! MiniMax Speech API: POST https://api.minimax.io/v1/t2a_v2
 //! Returns audio bytes (MP3 by default).
 
+use duduclaw_core::truncate_bytes;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use tracing::info;
@@ -126,7 +127,7 @@ impl TtsProvider for MiniMaxTts {
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(format!("MiniMax TTS error ({status}): {}", &text[..text.len().min(300)]));
+            return Err(format!("MiniMax TTS error ({status}): {}", truncate_bytes(&text, 300)));
         }
 
         let resp: T2aResponse = response
@@ -367,7 +368,7 @@ impl TtsProvider for OpenAiTtsProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(format!("OpenAI TTS error ({status}): {}", &text[..text.len().min(200)]));
+            return Err(format!("OpenAI TTS error ({status}): {}", truncate_bytes(&text, 200)));
         }
 
         let audio = resp.bytes().await.map_err(|e| format!("OpenAI TTS read: {e}"))?;

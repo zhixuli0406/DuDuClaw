@@ -6,6 +6,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use duduclaw_core::truncate_bytes;
 use axum::{
     Router,
     body::Bytes,
@@ -306,7 +307,7 @@ async fn line_webhook_handler(
                 continue;
             }
 
-            info!("📩 LINE [{sender}]: {}", &input_text[..input_text.len().min(80)]);
+            info!("📩 LINE [{sender}]: {}", truncate_bytes(&input_text, 80));
 
             // Progress callback via Push API (requires userId).
             // LINE Push API has monthly message quotas — debounce at 60s
@@ -448,7 +449,7 @@ async fn send_reply_rich(
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            error!("LINE reply failed ({status}): {}", &text[..text.len().min(200)]);
+            error!("LINE reply failed ({status}): {}", truncate_bytes(&text, 200));
             false
         }
         Err(e) => {
@@ -480,7 +481,7 @@ async fn push_message_rich(http: &reqwest::Client, token: &str, user_id: &str, m
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            error!("LINE push (rich) failed ({status}): {}", &body[..body.len().min(200)]);
+            error!("LINE push (rich) failed ({status}): {}", truncate_bytes(&body, 200));
         }
         Err(e) => error!("LINE push (rich) error: {e}"),
         _ => info!("LINE: push fallback succeeded for {user_id}"),
@@ -507,7 +508,7 @@ async fn push_message(http: &reqwest::Client, token: &str, user_id: &str, text: 
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            warn!("LINE push failed ({status}): {}", &body[..body.len().min(200)]);
+            warn!("LINE push failed ({status}): {}", truncate_bytes(&body, 200));
         }
         Err(e) => warn!("LINE push error: {e}"),
         _ => {}
