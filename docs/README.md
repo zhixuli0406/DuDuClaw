@@ -1,6 +1,6 @@
 # DuDuClaw Documentation
 
-> Public documentation for the DuDuClaw Claude Code extension layer.
+> Public documentation for the DuDuClaw Multi-Runtime AI Agent Platform (v1.8.14).
 
 ---
 
@@ -23,6 +23,13 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/10-cognitive-memory.md](features/10-cognitive-memory.md) | Cognitive memory — human-inspired memory with forgetting |
 | [features/11-token-compression.md](features/11-token-compression.md) | Token compression triad — lossless, lossy, and streaming |
 | [features/12-industry-templates.md](features/12-industry-templates.md) | Industry templates & Odoo ERP bridge |
+| [features/13-multi-runtime.md](features/13-multi-runtime.md) | Multi-runtime agent execution — Claude / Codex / Gemini / OpenAI |
+| [features/14-voice-pipeline.md](features/14-voice-pipeline.md) | Voice pipeline — ASR / TTS / VAD / LiveKit |
+| [features/15-skill-lifecycle.md](features/15-skill-lifecycle.md) | Skill lifecycle engine — 7-stage automated extraction |
+| [features/16-session-memory-stack.md](features/16-session-memory-stack.md) | Session memory stack — pinned instructions + snowball recap + key facts |
+| [features/17-wiki-knowledge-layer.md](features/17-wiki-knowledge-layer.md) | Wiki knowledge layer — L0-L3 trust-weighted auto-injection |
+| [features/18-worktree-isolation.md](features/18-worktree-isolation.md) | Git worktree L0 isolation — lightweight per-task sandbox |
+| [features/19-agent-client-protocol.md](features/19-agent-client-protocol.md) | ACP/A2A protocol server — Zed / JetBrains / Neovim integration |
 
 ---
 
@@ -40,7 +47,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 
 | Document | Description | Status |
 |----------|-------------|--------|
-| [CLAUDE.md](CLAUDE.md) | Architecture overview (v1.2.0) | Current |
+| [CLAUDE.md](CLAUDE.md) | Architecture overview (v1.8.14) | Current |
 | [evolution-engine.md](evolution-engine.md) | Evolution Engine v2 — Prediction + GVU² + Cognitive Memory | Current |
 
 ## User & Developer Guides
@@ -79,7 +86,14 @@ docs/
 │   ├── 09-behavioral-contracts.md
 │   ├── 10-cognitive-memory.md
 │   ├── 11-token-compression.md
-│   └── 12-industry-templates.md
+│   ├── 12-industry-templates.md
+│   ├── 13-multi-runtime.md
+│   ├── 14-voice-pipeline.md
+│   ├── 15-skill-lifecycle.md
+│   ├── 16-session-memory-stack.md
+│   ├── 17-wiki-knowledge-layer.md
+│   ├── 18-worktree-isolation.md
+│   └── 19-agent-client-protocol.md
 ├── spec/                              # Open format specifications
 │   ├── soul-md-spec.md                #   SOUL.md format v1.0
 │   ├── contract-toml-spec.md          #   CONTRACT.toml format v1.0

@@ -1,6 +1,6 @@
 # DuDuClaw 主要機能紹介
 
-> DuDuClaw v1.4.27 | 最終更新：2026-04-15
+> DuDuClaw v1.8.14 | 最終更新：2026-04-21
 
 本ディレクトリには、DuDuClawの注目機能に関する詳細な紹介記事を収録しています。各記事では設計思想、システム動作、運用フローを解説しており、ソースコードを読まずに「仕組み」を理解したい開発者を対象としています。
 
@@ -25,6 +25,12 @@
 | 13 | [マルチランタイムエージェント実行](13-multi-runtime.md) | Claude / Codex / Gemini / OpenAI互換統一バックエンド |
 | 14 | [音声パイプライン](14-voice-pipeline.md) | ASR / TTS / VAD / LiveKit — ローカル優先音声インテリジェンス |
 | 15 | [スキルライフサイクルエンジン](15-skill-lifecycle.md) | 7段階の自動スキル抽出・管理 |
+| 16 | [セッションメモリスタック](../16-session-memory-stack.md) | Instruction Pinning + Snowball Recap + Key-Fact Accumulator |
+| 17 | [Wiki 知識レイヤー](../17-wiki-knowledge-layer.md) | L0-L3 信頼度加重知識の自動注入 |
+| 18 | [Git Worktree L0 分離](../18-worktree-isolation.md) | タスク毎の軽量ワークスペース + アトミックマージ |
+| 19 | [Agent Client Protocol (ACP/A2A)](../19-agent-client-protocol.md) | stdio JSON-RPC 2.0 — Zed/JetBrains/Neovim 統合 |
+
+> 注：16-19 は現在英語版のみ。翻訳の PR を歓迎します。
 
 ---
 

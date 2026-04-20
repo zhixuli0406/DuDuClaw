@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.8.4-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.8.14-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -30,13 +30,16 @@ AI Runtime (brain) — Claude CLI / Codex CLI / Gemini CLI / OpenAI-compat
 DuDuClaw (plumbing)
   ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu / WebChat
   ├─ Multi-Runtime — Claude / Codex / Gemini / OpenAI-compat 自動偵測 + per-agent 設定
-  ├─ Session Manager — SQLite, 50k token 自動壓縮（CJK-aware）
-  ├─ MCP Server — 80+ 工具（通訊、記憶、Agent、Skill、推論、任務、知識庫、ERP），全域註冊
+  ├─ Session Memory Stack — 原生 --resume + Instruction Pinning + Snowball Recap + Key-Fact Accumulator
+  ├─ MCP Server — 80+ 工具（通訊、記憶、Agent、Skill、推論、任務、知識庫、ERP），per-agent 註冊
   ├─ Evolution Engine — GVU² 雙迴圈進化 + 預測驅動 + MistakeNotebook
   ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / MLX / ONNX
   ├─ Voice Pipeline — ASR (SenseVoice / Whisper) + TTS (Piper / MiniMax) + VAD (Silero)
   ├─ Account Rotator — 多 OAuth + API Key 輪替、預算追蹤、健康檢查、Cross-Provider Failover
   ├─ Browser Automation — 5 層自動路由（API Fetch → Scrape → Headless → Sandbox → Computer Use）
+  ├─ Worktree Isolation — Git worktree L0 沙箱、原子合併、每 Agent 5 個上限
+  ├─ Wiki Knowledge Layer — L0-L3 四層知識架構 + 信任權重 + FTS5 + 自動注入
+  ├─ ACP/A2A Server — `duduclaw acp-server` stdio JSON-RPC 2.0，Zed/JetBrains/Neovim 整合
   └─ Web Dashboard — React 19 SPA（23 頁面），透過 rust-embed 嵌入 binary
 ```
 
@@ -60,12 +63,15 @@ DuDuClaw (plumbing)
 
 | 特色 | 說明 |
 |------|------|
-| **MCP Server 架構** | `duduclaw mcp-server` 提供 80+ 工具，涵蓋通訊、記憶、Agent 管理、推論、排程、Skill 市場、任務看板、共享知識庫、Odoo ERP。全域註冊於 `~/.claude/settings.json`，gateway 啟動時自動遷移 |
+| **MCP Server 架構** | `duduclaw mcp-server` 提供 80+ 工具，涵蓋通訊、記憶、Agent 管理、推論、排程、Skill 市場、任務看板、共享知識庫、Odoo ERP。註冊於每個 agent 目錄的 `.mcp.json`（Claude CLI `-p --dangerously-skip-permissions` 僅讀取專案級設定），gateway 啟動時自動建立/修復 |
 | **Multi-Runtime** | `AgentRuntime` trait — Claude / Codex / Gemini / OpenAI-compat 四種後端，`RuntimeRegistry` 自動偵測，per-agent 設定 |
 | **本地推論引擎** | 統一 `InferenceBackend` trait — llama.cpp（Metal/CUDA/Vulkan）/ mistral.rs（ISQ + PagedAttention）/ Exo P2P 叢集 / llamafile / MLX（Apple Silicon）/ OpenAI-compat HTTP |
 | **三層信心路由** | LocalFast → LocalStrong → CloudAPI，基於啟發式信心評分自動分流，CJK-aware token estimation |
 | **InferenceManager** | 多模式自動切換：Exo P2P → llamafile → Direct backend → OpenAI-compat → Cloud API，週期性健康檢查 + 自動 failover |
-| **原生多輪 Session** | Claude CLI `--resume` 搭配 SHA-256 確定性 session ID + fallback；Hermes 風格 turn trimming（>800 chars, CJK-safe）；Direct API "system_and_3" 斷點快取策略 |
+| **原生多輪 Session** | Claude CLI `--resume` 搭配 SHA-256 確定性 session ID + history-in-prompt fallback（帳號輪替/stale session 自動重試）；Hermes 風格 turn trimming（>800 chars, CJK-safe）；Direct API "system_and_3" 斷點快取策略 |
+| **Session 記憶堆疊** | Instruction Pinning（首訊 Haiku 擷取核心任務 → session prompt 尾端注入）+ Snowball Recap（每輪 `<task_recap>` 前置零成本回顧）+ P2 Key-Fact Accumulator（每輪 2-4 則事實 → FTS5 索引 → 注入 top-3，僅 100-150 tokens vs MemGPT 6,500 tokens，−87%）|
+| **Claude CLI 輕量路徑** | `call_claude_cli_lightweight()` 以 `--effort medium --max-turns 1 --no-session-persistence --tools ""` 處理 metadata 任務（壓縮、instruction/key-fact 擷取），25-40% 成本節省 |
+| **Claude CLI 穩定化旗標** | `--strict-mcp-config`（MCP 隔離）+ `--exclude-dynamic-system-prompt-sections`（跨輪 prompt 穩定，10-15% token 節省），`--bare` 因破壞 OAuth 鑰匙圈於 v1.8.11 移除 |
 | **Direct API** | 繞過 CLI 直接呼叫 Anthropic Messages API，`cache_control: ephemeral` 達 95%+ 快取命中率 |
 | **Token 壓縮** | Meta-Token（BPE-like 27-47%）、LLMLingua-2（2-5x 有損）、StreamingLLM（無限長對話）|
 | **Cross-Provider Failover** | `FailoverManager` 健康追蹤、冷卻、不可重試錯誤偵測 |
@@ -86,7 +92,9 @@ DuDuClaw (plumbing)
 
 | 特色 | 說明 |
 |------|------|
-| **Sub-Agent 編排** | `create_agent` / `spawn_agent` / `list_agents` MCP 工具 + `reports_to` 組織層級 + D3.js 架構圖；system prompt 自動注入 "## Your Team" 子 Agent 名冊 |
+| **Sub-Agent 編排** | `create_agent` / `spawn_agent` / `list_agents` MCP 工具 + `reports_to` 組織層級 + D3.js 架構圖；system prompt 自動注入 "## Your Team" 子 Agent 名冊 + 長回報訊息自動分頁（Discord 1900 / Telegram 4000 / LINE 4900 / Slack 3900 byte budget，標籤 `📨 **agent** 的回報 (1/N)`）|
+| **跨系統 prompt 注入** | CLAUDE.md + CONTRACT.toml（must_not/must_always）+ SOUL.md + Wiki L0+L1 + key_facts top-3 + pinned_instructions 於 CLI/channel/dispatcher 三條路徑一致注入，Claude/Codex/Gemini/OpenAI 四 runtime 行為對齊 |
+| **孤兒回應恢復** | dispatcher 啟動時 `reconcile_orphan_responses` 掃描 `bus_queue.jsonl`，原子重播 crash/Ctrl+C/hotswap 後殘留的 `agent_response` callback |
 | **GVU² 雙迴圈進化** | 外迴圈（Behavioral GVU — SOUL.md 進化）+ 內迴圈（Task GVU — 即時任務重試），MistakeNotebook 跨迴圈記憶 |
 | **預測驅動進化** | Active Inference + Dual Process Theory，~90% 對話零 LLM 成本；MetaCognition 每 100 預測自校準閾值 |
 | **4+2 層驗證** | L1-Format / L2-Metrics / **L2.5-MistakeRegression** / L3-LLMJudge / **L3.5-SandboxCanary** / L4-Safety，前 4 層零成本 |
@@ -102,7 +110,11 @@ DuDuClaw (plumbing)
 | **Skill 自動合成** | 偵測重複領域缺口 → 從情境記憶合成新 Skill → 沙箱試用（TTL 管理）→ 跨 Agent 畢業升級 |
 | **Task Board** | SQLite 任務管理 — 狀態/優先級/指派追蹤 + 即時 Activity Feed（WebSocket 推播）|
 | **Autopilot 規則引擎** | 自動化任務委派、通知、Skill 觸發 — 支援任務建立/狀態變更/頻道訊息/閒置偵測/Cron 排程 |
-| **共享知識庫** | `~/.duduclaw/shared/wiki/` 跨 Agent 共享知識（SOP、政策、產品規格）+ 全文搜尋 + 作者歸屬 |
+| **共享知識庫** | `~/.duduclaw/shared/wiki/` 跨 Agent 共享知識（SOP、政策、產品規格）+ 作者歸屬 |
+| **Wiki 知識分層** | Vault-for-LLM 啟發 — L0 Identity / L1 Core（自動注入每次對話）/ L2 Context（每日更新）/ L3 Deep（按需搜尋），每頁附 `trust` (0.0-1.0) 權重；FTS5 unicode61 tokenizer 支援 CJK 全文搜尋；`wiki_dedup` 偵測重複頁、`wiki_graph` 輸出 Mermaid 知識圖 |
+| **Wiki 自動注入** | `build_system_prompt()` 自動將 L0+L1 頁面注入 WIKI_CONTEXT；涵蓋 CLI 互動、頻道回覆、dispatcher/cron 三條系統 prompt 組裝路徑，Claude/Codex/Gemini/OpenAI 四 runtime 一致 |
+| **Git Worktree L0 隔離** | 每任務獨立 worktree 工作區（比容器沙箱便宜），atomic merge（dry-run pre-check + global `Mutex`），`wt/{agent_id}/{adjective}-{noun}` 友善分支名；每 agent 上限 5 個、全域 20 個；Snap workflow：create → execute → inspect → merge/cleanup |
+| **ACP/A2A Protocol Server** | `duduclaw acp-server` 提供 stdio JSON-RPC 2.0 伺服器（`agent/discover` / `tasks/send` / `tasks/get` / `tasks/cancel`），相容 Agent Client Protocol，支援 Zed / JetBrains / Neovim IDE 整合；輸出 `.well-known/agent.json` AgentCard |
 | **Reminder 排程** | 一次性提醒（相對時間 `5m`/`2h`/`1d` 或 ISO 8601 絕對時間），`direct` 靜態訊息或 `agent_callback` 喚醒模式 |
 
 ### 安全防護
@@ -116,7 +128,9 @@ DuDuClaw (plumbing)
 | **Secret 洩漏掃描** | 20+ 模式（Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/DB URL 等）|
 | **敏感檔案保護** | Read/Write/Edit 三方向保護 `secret.key`、`.env*`、`SOUL.md`、`CONTRACT.toml` |
 | **行為契約** | `CONTRACT.toml` 定義 `must_not` / `must_always` 邊界 + `duduclaw test` 紅隊測試（9 項場景）|
+| **統一多源審計日誌** | `audit.unified_log` 合併 4 條 JSONL（`security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl`）為統一信封（timestamp / source / event_type / agent_id / severity / summary / details），Logs 頁面支援來源篩選、嚴重度下拉、即時與歷史分頁 |
 | **JSONL 審計日誌** | async 寫入，格式相容 Rust `AuditEvent` schema |
+| **CJK-Safe 字串切片** | `truncate_bytes` / `truncate_chars` 新模組取代 31 處 `s[..s.len().min(N)]` byte-index 切片（修復 v1.8.11 多位元組 codepoint panic）|
 | **Per-Agent 密鑰隔離** | AES-256-GCM 加密儲存，agent 間密鑰互不可見 |
 | **容器沙箱** | Docker / Apple Container（`--network=none`、tmpfs、read-only rootfs、512MB limit）|
 | **Browser 自動化** | 5 層路由（API Fetch → Static Scrape → Headless → Sandbox → Computer Use），deny-by-default |
@@ -128,6 +142,8 @@ DuDuClaw (plumbing)
 | **雙模式帳號輪替** | OAuth 訂閱（Pro/Team/Max）+ API Key 混合 — 4 策略（Priority/LeastCost/Failover/RoundRobin）|
 | **健康追蹤** | Rate limit 冷卻（2min）、帳單耗盡冷卻（24h）、Token 過期追蹤（30d/7d 預警）|
 | **成本遙測** | SQLite token 追蹤、快取效率分析、200K 價格懸崖警告、自適應路由（快取效率 <30% 自動切本地）|
+| **Claude CLI 二進位探測** | `which_claude()` / `which_claude_in_home()` 掃描 Homebrew（Intel + Apple Silicon）/ Bun / Volta / npm-global / `.claude/bin` / `.local/bin` / asdf shims / NVM 版本目錄，修復 launchd 啟動時找不到 binary 的問題 |
+| **結構化失敗分類** | `FailureReason` 枚舉（RateLimited / Billing / Timeout / BinaryMissing / SpawnError / EmptyResponse / NoAccounts / Unknown）+ 分類 zh-TW 訊息 + `channel_failures.jsonl` 審計紀錄 |
 
 ### 整合與擴充
 
@@ -139,6 +155,10 @@ DuDuClaw (plumbing)
 | **CronScheduler** | `cron_tasks.jsonl` + cron 表達式，定時任務自動觸發 |
 | **ONNX 嵌入** | BERT WordPiece tokenizer + ONNX Runtime 向量嵌入，語意搜尋支援 |
 | **Experiment Logger** | Trajectory recording，支援 RL/RLHF 離線分析 |
+| **Memory Decay 排程** | 每 24h 背景執行 `run_decay`：低重要度 + 30 天以上歸檔 → 封存 90 天以上永久刪除 |
+| **RL Trajectory Collector** | 頻道互動期間寫入 `~/.duduclaw/rl_trajectories.jsonl`，`duduclaw rl` CLI 提供 export/stats/reward 功能，複合獎勵（outcome×0.7 + efficiency×0.2 + overlong×0.1）|
+| **Marketplace RPC** | `marketplace.list` 服務真實 MCP 目錄（Playwright, Browserbase, Filesystem, GitHub, Slack, Postgres, SQLite, Memory, Fetch, Brave Search），可透過 `~/.duduclaw/marketplace.json` 合併使用者自訂 |
+| **Partner Portal** | SQLite `PartnerStore`（`~/.duduclaw/partner.db`）+ 7 RPCs（profile/stats/customers CRUD）+ 銷售統計 |
 
 ### Web Dashboard
 
@@ -146,7 +166,11 @@ DuDuClaw (plumbing)
 |------|------|
 | **技術棧** | React 19 + TypeScript + Tailwind CSS 4 + shadcn/ui，溫暖 amber 色系 |
 | **23 個頁面** | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / KnowledgeHub / Odoo / Login / Users / Analytics / Export |
-| **即時日誌** | BroadcastLayer tracing → WebSocket 推播 |
+| **即時日誌** | BroadcastLayer tracing → WebSocket 推播，WS 心跳 ping/pong（server 30s / client 25s）+ 60s 空閒關閉 |
+| **Logs 歷史頁重寫** | 來源篩選 chips（全部 / 安全 / 工具呼叫 / 通道失敗 / 回饋）+ 即時人次計數 + 嚴重度下拉 + 嚴重度著色左框（emerald/amber/rose）+ 點擊展開 JSON 細節 |
+| **Memory 頁 Key Insights** | 第四分頁呈現 P2 Key-Fact Accumulator 累積的結構化洞察（`key_facts` 表）+ `access_count` badge + 時間戳 + 來源 metadata |
+| **Memory 頁演化歷史** | SOUL.md 版本歷史 + 前/後度量差異（positive feedback / prediction error / user corrections）+ 狀態徽章（Confirmed / RolledBack / Observing）|
+| **Toast 通知系統** | 模組作用域事件匯流排、max-5 queue、自動關閉、暖色系 stone/amber/emerald/rose 變體、尊重 `prefers-reduced-motion` |
 | **組織架構圖** | D3.js 互動式 Agent 層級視覺化 |
 | **深淺色切換** | 跟隨系統偏好，支援手動切換 |
 | **國際化** | zh-TW / en / ja-JP 三語支援（600+ 翻譯鍵）|
@@ -186,15 +210,17 @@ DuDuClaw (plumbing)
 ├── dudu/                    # 主 Agent
 │   ├── .claude/             # Claude Code 設定
 │   │   └── settings.local.json
-│   ├── .mcp.json            # Agent 專屬 MCP Server 設定（如 Playwright）；DuDuClaw MCP 已移至全域 ~/.claude/settings.json
+│   ├── .mcp.json            # MCP Server 設定（DuDuClaw platform tools + agent 專屬 MCP 如 Playwright）
+│   │                        # gateway 啟動時自動建立/修復；Claude CLI `-p` 模式僅讀此檔
 │   ├── SOUL.md              # 人格定義（SHA-256 保護）
-│   ├── CLAUDE.md            # Claude Code 指引
-│   ├── CONTRACT.toml        # 行為契約（must_not / must_always）
-│   ├── agent.toml           # DuDuClaw 設定（模型、預算、心跳、runtime）
+│   ├── CLAUDE.md            # Claude Code 指引（含 CLAUDE_WIKI 模板）
+│   ├── CONTRACT.toml        # 行為契約（must_not / must_always），自動注入 system prompt
+│   ├── agent.toml           # DuDuClaw 設定（模型、預算、心跳、runtime、capabilities）
 │   ├── SKILLS/              # 技能集（可由進化引擎自動產出）
-│   ├── memory/              # 每日筆記
+│   ├── wiki/                # Wiki 知識庫（L0-L3 分層 + trust 權重 + FTS5）
+│   ├── memory/              # 每日筆記 + memory.db（預測偏差）+ key_facts 表
 │   ├── tasks/               # TaskSpec 工作流持久化（JSON）
-│   └── state/               # 運行時狀態 (SQLite)
+│   └── state/               # 運行時狀態（SQLite：sessions.pinned_instructions 等）
 │
 └── coder/                   # 另一個 Agent
     └── ...
@@ -322,7 +348,8 @@ cargo build --release -p duduclaw-cli -p duduclaw-gateway --features duduclaw-ga
 duduclaw onboard             # 互動式首次設定
 duduclaw run                 # 一鍵啟動（gateway + channels + heartbeat + cron + dispatcher）
 duduclaw migrate             # 將 agent.toml 轉換為 Claude Code 格式
-duduclaw mcp-server          # 啟動 MCP Server（供 Claude Code 使用）
+duduclaw mcp-server          # 啟動 MCP Server（供 AI Runtime 使用，stdio JSON-RPC 2.0）
+duduclaw acp-server          # 啟動 ACP/A2A Server（IDE 整合：Zed/JetBrains/Neovim）
 duduclaw gateway             # 僅啟動 WebSocket gateway server
 
 duduclaw agent               # CLI 互動式對話
@@ -338,6 +365,10 @@ duduclaw test <agent>        # 紅隊安全測試（9 項內建場景 + JSON 報
 duduclaw status              # 系統健康快照
 duduclaw doctor              # 健康診斷
 duduclaw wizard              # 產業模板互動式設定
+
+duduclaw rl export           # 匯出 RL trajectory（~/.duduclaw/rl_trajectories.jsonl）
+duduclaw rl stats            # 每 Agent trajectory 統計
+duduclaw rl reward           # 計算複合獎勵（outcome×0.7 + efficiency×0.2 + overlong×0.1）
 
 duduclaw service install     # 安裝為系統服務
 duduclaw service start/stop  # 啟停系統服務
@@ -457,6 +488,9 @@ cd web && npx tsc --noEmit
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — 完整系統架構設計
 - [CLAUDE.md](CLAUDE.md) — AI 協作設計上下文與原則
+- [CHANGELOG.md](CHANGELOG.md) — 版本變更紀錄
+- [docs/features/README.md](docs/features/README.md) — 特色功能詳解（19 篇，含 zh-TW / ja-JP 翻譯）
+- [docs/features/feature-inventory.md](docs/features/feature-inventory.md) — 完整功能清單
 - [docs/spec/soul-md-spec.md](docs/spec/soul-md-spec.md) — SOUL.md 格式規範 v1.0
 - [docs/spec/contract-toml-spec.md](docs/spec/contract-toml-spec.md) — CONTRACT.toml 格式規範 v1.0
 - [docs/api/README.md](docs/api/README.md) — WebSocket RPC 協議 + JSON-RPC 2.0 介面
