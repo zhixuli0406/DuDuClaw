@@ -1,6 +1,68 @@
 # Changelog
 
 
+## [1.8.10] - 2026-04-20
+
+### Added
+- **`marketplace.list` RPC** serving the real built-in MCP catalog
+  (Playwright, Browserbase, Filesystem, GitHub, Slack, Postgres,
+  SQLite, Memory, Fetch, Brave Search) enriched with `author`,
+  `tags`, and `featured` fields. Merges optional user entries from
+  `~/.duduclaw/marketplace.json` without a rebuild.
+- **Partner data model**: new SQLite-backed `PartnerStore`
+  (`~/.duduclaw/partner.db`) with profile + customer CRUD and
+  computed sales stats. Seven RPCs (`partner.profile`, `partner.stats`,
+  `partner.customers`, `partner.profile.update`,
+  `partner.customer.add`, `partner.customer.update`,
+  `partner.customer.delete`) and 4 unit tests.
+- **Toast notification system** (`web/src/components/Toast.tsx` +
+  `web/src/lib/toast.ts`): module-scoped event bus, max-5 queue,
+  auto-dismiss, warm stone/amber/emerald/rose variants,
+  `prefers-reduced-motion` honored.
+- **`cron.resume`** wired to a Resume button alongside Pause in the
+  Settings cron task list.
+- **SOUL.md evolution history UI** in Memory → Evolution tab with
+  pre/post metric deltas (positive feedback, prediction error, user
+  corrections) and status badges (Confirmed / RolledBack / Observing).
+
+### Changed
+- **`evolution.status`** returns real aggregate data
+  (`enabled`/`mode`/`total_agents`/`gvu_enabled_count`/
+  `total_versions`/`last_applied_at`) instead of hardcoded
+  `{enabled: true, mode: "prediction_driven"}`.
+- **`activity.subscribe`** returns honest metadata
+  (`broadcast_mode: "all_events"` + note) — previously a bare stub.
+  Per-topic filtering is not implemented; all authenticated WS
+  clients receive all activity events.
+- **ChannelsPage setup guides**: 42 hardcoded zh-TW strings extracted
+  to i18n across Telegram / LINE / Discord / Slack / WhatsApp /
+  Feishu in zh-TW / en / ja-JP.
+- **MarketplacePage** loads from the real RPC; fake stars/prices and
+  the 8-item `MOCK_SERVERS` constant removed. Category-based icon
+  mapping (browser / data / communication).
+- **PartnerPortalPage** rewired to real RPCs; mock constants
+  (`PARTNER_STATUS`, `SALES_STATS`, `MOCK_CUSTOMERS`) and the
+  preview banner removed. Added onboarding card (empty-profile
+  state) and Add Customer modal.
+- Inline error feedback added to MarketplacePage install,
+  PartnerPortalPage license generation, and ApprovalModal WS
+  response failures (previously all silently swallowed).
+
+### Removed
+- **`activity.unsubscribe`** RPC (backend dispatch arm and frontend
+  method) — broadcasts cannot be stopped without closing the WS
+  itself, so the RPC was dead.
+- **`evolution.skills`** handler — fully redundant with
+  `skills.list`, which returns richer per-agent + global structure.
+
+### Fixed
+- 23 silent `console.warn("[api]", e)` catches across DashboardPage,
+  ReportPage, BillingPage, SkillMarketPage, SettingsPage, MemoryPage,
+  AgentsPage, ChannelsPage, and KnowledgeHubPage now surface errors
+  to users via toast while preserving devtools visibility.
+
+
+
 ## [1.8.9] - 2026-04-20
 
 ### Added
