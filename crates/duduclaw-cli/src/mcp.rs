@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use duduclaw_core::error::{DuDuClawError, Result};
+use duduclaw_core::truncate_bytes;
 use duduclaw_memory::SqliteMemoryEngine;
 use duduclaw_core::traits::MemoryEngine;
 use duduclaw_core::types::MemoryEntry;
@@ -1777,10 +1778,9 @@ async fn handle_list_cron_tasks(params: &Value, home_dir: &Path, _default_agent:
             agent = t.agent_id,
             runs = t.run_count,
             fail = t.failure_count,
-            task = if t.task.len() > 120 {
-                format!("{}…", &t.task[..120])
-            } else {
-                t.task.clone()
+            task = {
+                let t_task = truncate_bytes(&t.task, 120);
+                if t_task.len() < t.task.len() { format!("{t_task}…") } else { t.task.clone() }
             },
         ));
     }

@@ -6,6 +6,7 @@
 //!
 //! Reference: <https://docs.anthropic.com/en/api/messages>
 
+use duduclaw_core::truncate_bytes;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -220,7 +221,7 @@ pub async fn call_direct_api(
                 status, err.error.error_type, err.error.message
             ));
         }
-        return Err(format!("Anthropic API error ({}): {}", status, &response_text[..response_text.len().min(200)]));
+        return Err(format!("Anthropic API error ({}): {}", status, truncate_bytes(&response_text, 200)));
     }
 
     let resp: MessagesResponse = serde_json::from_str(&response_text)

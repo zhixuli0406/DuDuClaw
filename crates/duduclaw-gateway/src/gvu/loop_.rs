@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use duduclaw_core::truncate_bytes;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -535,7 +536,7 @@ pub fn build_evaluator_request(
              ## Current SOUL.md (excerpt)\n{}\n\n\
              ## Proposed Changes\n{}\n\n\
              ## Rationale\n{}",
-            &current_soul[..current_soul.len().min(2000)],
+            truncate_bytes(&current_soul, 2000),
             proposal.content,
             proposal.rationale,
         ),
@@ -601,7 +602,7 @@ pub fn parse_evaluator_response(response: &str) -> verifier::VerificationResult 
             gradient: TextGradient::blocking(
                 "L-Evaluator",
                 "proposal",
-                &format!("Evaluator response: {}", &response[..response.len().min(200)]),
+                &format!("Evaluator response: {}", truncate_bytes(response, 200)),
                 "Revise proposal based on evaluator feedback",
             ),
         }

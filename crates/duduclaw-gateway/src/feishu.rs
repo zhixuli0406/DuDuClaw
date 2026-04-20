@@ -13,6 +13,7 @@ use axum::{
     http::StatusCode,
     routing::post,
 };
+use duduclaw_core::truncate_bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -247,7 +248,7 @@ async fn handle_message(event: &serde_json::Value, state: &FeishuState) {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
-    info!("📩 Feishu [{sender}]: {}", &text[..text.len().min(80)]);
+    info!("📩 Feishu [{sender}]: {}", truncate_bytes(&text, 80));
 
     // Chat commands
     if crate::chat_commands::is_command(&text) {
@@ -311,7 +312,7 @@ async fn send_message(state: &FeishuState, chat_id: &str, text: &str) {
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            error!("Feishu send failed ({status}): {}", &text[..text.len().min(200)]);
+            error!("Feishu send failed ({status}): {}", truncate_bytes(&text, 200));
         }
         Err(e) => error!("Feishu send error: {e}"),
         _ => {}
@@ -345,7 +346,7 @@ async fn reply_message(state: &FeishuState, message_id: &str, text: &str) {
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            error!("Feishu reply failed ({status}): {}", &text[..text.len().min(200)]);
+            error!("Feishu reply failed ({status}): {}", truncate_bytes(&text, 200));
         }
         Err(e) => error!("Feishu reply error: {e}"),
         _ => {}

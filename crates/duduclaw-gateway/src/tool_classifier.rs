@@ -5,6 +5,8 @@
 //!
 //! Reference: AFM (arXiv 2511.12712), RECOMP (ICLR 2024)
 
+use duduclaw_core::truncate_bytes;
+
 /// Metadata about a tool call result used for classification.
 pub struct ToolCallMeta {
     /// Name of the tool that produced the result (e.g. "bash", "read_file").
@@ -148,7 +150,7 @@ impl ToolResultClassifier {
     fn looks_like_error(text: &str) -> bool {
         let lower = text.to_lowercase();
         // Check first 500 chars for efficiency
-        let prefix = &lower[..lower.len().min(500)];
+        let prefix = truncate_bytes(&lower, 500);
         prefix.contains("error")
             || prefix.contains("traceback")
             || prefix.contains("panic")

@@ -11,6 +11,7 @@ use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     response::IntoResponse,
 };
+use duduclaw_core::truncate_bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -125,7 +126,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
     // Use IP for rate limiting (per-IP connection count), but add random suffix for
     // session isolation so users behind NAT get independent sessions (R3-H6).
     let rate_limit_id = format!("webchat:{peer_ip}");
-    let session_suffix = &uuid::Uuid::new_v4().to_string()[..8];
+    let session_uuid = uuid::Uuid::new_v4().to_string();
+    let session_suffix = truncate_bytes(&session_uuid, 8);
     let user_id = format!("webchat:{peer_ip}:{session_suffix}");
 
     if !state.acquire_connection(&rate_limit_id).await {

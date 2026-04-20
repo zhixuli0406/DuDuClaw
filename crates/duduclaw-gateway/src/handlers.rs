@@ -7,6 +7,7 @@ use duduclaw_auth::{self, UserContext, UserDb, JwtConfig};
 use duduclaw_auth::acl;
 use duduclaw_auth::models::{UserRole, AccessLevel};
 use duduclaw_core::traits::MemoryEngine;
+use duduclaw_core::truncate_bytes;
 use duduclaw_memory::SqliteMemoryEngine;
 use chrono::{Datelike, Utc};
 use rusqlite::params;
@@ -1368,8 +1369,14 @@ impl MethodHandler {
                     "trigger": cfg.agent.trigger,
                     "icon": cfg.agent.icon,
                     "reports_to": cfg.agent.reports_to,
-                    "soul_preview": a.soul.as_ref().map(|s| if s.len() > 500 { format!("{}…", &s[..500]) } else { s.clone() }),
-                    "identity_preview": a.identity.as_ref().map(|s| if s.len() > 500 { format!("{}…", &s[..500]) } else { s.clone() }),
+                    "soul_preview": a.soul.as_ref().map(|s| {
+                        let t = truncate_bytes(s, 500);
+                        if t.len() < s.len() { format!("{t}…") } else { s.clone() }
+                    }),
+                    "identity_preview": a.identity.as_ref().map(|s| {
+                        let t = truncate_bytes(s, 500);
+                        if t.len() < s.len() { format!("{t}…") } else { s.clone() }
+                    }),
                     "memory_summary": a.memory,
                     "skills": a.skills.iter().map(|s| &s.name).collect::<Vec<_>>(),
                     "model": {

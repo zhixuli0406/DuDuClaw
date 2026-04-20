@@ -764,7 +764,7 @@ async fn build_reply_with_session_inner(
             .find(|t| t.role == "assistant")
         {
             if last_assistant.content.contains('？') || last_assistant.content.contains('?') {
-                let answer_snippet = &sanitized_text[..sanitized_text.len().min(200)];
+                let answer_snippet = duduclaw_core::truncate_bytes(&sanitized_text, 200);
                 // Cap pinned at ~1000 chars to prevent bloat
                 if pinned.len() < 1000 {
                     pinned = format!("{pinned}\n- 用戶確認：{answer_snippet}");
@@ -1238,7 +1238,7 @@ async fn build_reply_with_session_inner(
             if let Some(db_path) = ctx.memory_db_path.clone() {
                 let agent_id_for_facts = agent_id.clone();
                 let user_text_for_facts = sanitized_text.clone();
-                let reply_snippet = reply[..reply.len().min(500)].to_string();
+                let reply_snippet = duduclaw_core::truncate_bytes(&reply, 500).to_string();
                 let (ch, cid) = parse_session_id_parts(session_id);
                 let channel_for_facts = ch.to_string();
                 let chat_id_for_facts = cid.to_string();
@@ -2727,7 +2727,10 @@ async fn call_claude_cli_lightweight(
 
     let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);
     cmd.args([
-        "--bare",                    // Skip hooks, LSP, plugins, CLAUDE.md discovery
+        // NOTE: `--bare` removed — Claude CLI 2.1.110 regresses OAuth auth when
+        // the flag is active (kills keychain lookup alongside the hook/LSP skips).
+        // Lightweight path still relies on --max-turns 1 + --no-session-persistence
+        // + --tools "" to keep the call cheap.
         "--effort", "medium",        // Balanced: no full thinking but adequate extraction quality
         "--max-turns", "1",          // Single-turn only (no tool use)
         "--no-session-persistence",  // Throwaway call, don't save session
@@ -3028,11 +3031,14 @@ async fn spawn_claude_cli_with_env(
     }
 
     cmd.args([
-        // Minimal mode: skip hooks, LSP, plugin sync, attribution, auto-memory,
-        // CLAUDE.md auto-discovery. DuDuClaw provides its own system prompt via
-        // --system-prompt-file, so Claude's default discovery is wasted overhead.
-        // Estimated 15-25% latency reduction for subprocess calls.
-        "--bare",
+        // NOTE: `--bare` was previously used here to skip hooks/LSP/plugin-sync
+        // for ~15-25% latency reduction. Removed because Claude CLI 2.1.110
+        // regresses OAuth authentication when `--bare` is active — the flag
+        // cuts the OS-keychain credential lookup alongside the optimizations,
+        // causing every subprocess call to fail with "Not logged in".
+        // We still rely on --system-prompt-file + --exclude-dynamic-system-prompt-sections
+        // to keep the system prompt stable, which preserves most of the cache
+        // benefit that --bare was chasing.
         // Move per-machine sections (cwd, env, git status) from system prompt to
         // first user message. Keeps system prompt stable across turns → better
         // prompt cache hit rate (~10-15% token reduction on turn 2+).

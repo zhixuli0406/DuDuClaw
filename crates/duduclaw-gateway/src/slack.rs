@@ -6,6 +6,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use duduclaw_core::truncate_bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -326,7 +327,7 @@ async fn handle_event(
         return;
     }
 
-    info!("📩 Slack [{user}]: {}", &text[..text.len().min(80)]);
+    info!("📩 Slack [{user}]: {}", truncate_bytes(&text, 80));
 
     // Add thinking emoji reaction
     let _ = http

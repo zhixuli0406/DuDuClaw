@@ -2,6 +2,7 @@
 //!
 //! Future work: wire to AgentRunner for real agent execution.
 
+use duduclaw_core::truncate_bytes;
 use tracing::info;
 
 use super::types::*;
@@ -25,7 +26,7 @@ pub fn handle_prompt_with_agent(
     // Simulate a thinking step
     updates.push(SessionUpdate::TextChunk {
         session_id: session_id.to_string(),
-        content: format!("Processing: {}", &message[..message.len().min(50)]),
+        content: format!("Processing: {}", truncate_bytes(message, 50)),
     });
 
     // Final response

@@ -1,11 +1,13 @@
 pub mod agent_guard;
 pub mod error;
 pub mod platform;
+pub mod text_utils;
 pub mod traits;
 pub mod types;
 
 pub use agent_guard::{check_agent_file_write, check_bash_command, GuardDecision, AGENT_STRUCTURE_FILES};
 pub use error::{DuDuClawError, Result};
+pub use text_utils::{truncate_bytes, truncate_chars};
 pub use traits::{Channel, ContainerRuntime, MemoryEngine};
 pub use types::*;
 

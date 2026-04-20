@@ -7,6 +7,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use duduclaw_core::truncate_bytes;
 use axum::{
     Router,
     body::Bytes,
@@ -302,7 +303,7 @@ async fn receive_webhook(
                         continue;
                     }
 
-                    info!("📩 WhatsApp [{sender}]: {}", &input_text[..input_text.len().min(80)]);
+                    info!("📩 WhatsApp [{sender}]: {}", truncate_bytes(&input_text, 80));
 
                     // Chat commands
                     if crate::chat_commands::is_command(&input_text) {
@@ -369,7 +370,7 @@ async fn send_text(
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            error!("WhatsApp send failed ({status}): {}", &text[..text.len().min(200)]);
+            error!("WhatsApp send failed ({status}): {}", truncate_bytes(&text, 200));
         }
         Err(e) => error!("WhatsApp send error: {e}"),
         _ => {}

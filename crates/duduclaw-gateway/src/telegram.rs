@@ -12,6 +12,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use duduclaw_core::truncate_bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{error, info, warn};
@@ -414,7 +415,7 @@ async fn poll_loop(
                     info!("🎙 Telegram [{sender}]: voice message");
                     match transcribe_voice(&client, &api_base, &voice.file_id).await {
                         Ok(text) => {
-                            info!("🎙 Telegram [{sender}] transcribed: {}", &text[..text.len().min(80)]);
+                            info!("🎙 Telegram [{sender}] transcribed: {}", truncate_bytes(&text, 80));
                             text
                         }
                         Err(e) => {
@@ -536,7 +537,7 @@ async fn poll_loop(
                     continue;
                 }
 
-                info!("📩 Telegram [{sender}]: {}", &input_text[..input_text.len().min(80)]);
+                info!("📩 Telegram [{sender}]: {}", truncate_bytes(&input_text, 80));
 
                 // ── Build session ID (topic-aware) ──
                 let session_id = if let Some(tid) = thread_id {
@@ -594,7 +595,7 @@ async fn poll_loop(
                         Ok(audio_bytes) => {
                             send_voice(&client, &api_base, chat_id, audio_bytes).await;
                             if reply.len() > 200 {
-                                send_reply(&client, &api_base, chat_id, &format!("📝 {}", &reply[..200]), thread_id, msg_id, None).await;
+                                send_reply(&client, &api_base, chat_id, &format!("📝 {}", truncate_bytes(&reply, 200)), thread_id, msg_id, None).await;
                             }
                         }
                         Err(e) => {
