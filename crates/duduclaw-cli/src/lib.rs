@@ -450,8 +450,16 @@ pub async fn entry_point() {
     // Dropping it would flush and close the writer prematurely.
     std::mem::forget(_guard);
 
+    // Default to `warn` when RUST_LOG is unset so the terminal stays clean for
+    // end users. Warnings and errors still surface (stuck forwards, auth
+    // failures, panics), but the diagnostic chatter from every WebSocket
+    // connection / dispatcher tick / heartbeat is hidden until the operator
+    // opts in with `RUST_LOG=info duduclaw run`. Previous default was `info`
+    // which produced noisy startup output clients found alarming.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
         .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(non_blocking))
         .with(duduclaw_gateway::log::BroadcastLayer)

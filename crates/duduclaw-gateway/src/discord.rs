@@ -954,7 +954,17 @@ async fn handle_message_create(
     };
 
     // ── Build session ID ──
-    let session_id = if auto_thread && !is_thread {
+    // Use `discord:thread:...` whenever the conversation lives inside a thread,
+    // either because the incoming message was already in one (`is_thread`) or
+    // because we just created one (`created_thread`). The previous condition
+    // `auto_thread && !is_thread` only returned `thread:` on the first turn
+    // (when we were *about* to create a thread) — on every follow-up turn the
+    // user typed inside the thread, `is_thread` flipped to true so the session
+    // id silently switched from `discord:thread:{id}` to `discord:{id}` and
+    // context was lost. Also handles the edge case where auto_thread=true but
+    // create_thread() failed (then we want `discord:{channel_id}`, not a
+    // misleading `discord:thread:{channel_id}`).
+    let session_id = if is_thread || created_thread {
         format!("discord:thread:{reply_channel_id}")
     } else {
         format!("discord:{reply_channel_id}")

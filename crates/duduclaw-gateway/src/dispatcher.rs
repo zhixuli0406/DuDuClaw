@@ -78,6 +78,16 @@ pub fn start_agent_dispatcher_with_crypto(
     let dispatch_lock = Arc::new(tokio::sync::Mutex::new(()));
     tokio::spawn(async move {
         info!("Agent dispatcher started");
+
+        // One-shot reconcile on startup: any `agent_response` lines left in
+        // bus_queue.jsonl from a previous process whose corresponding
+        // delegation_callbacks row is still pending need to be forwarded.
+        // Without this, a user-visible sub-agent reply stays trapped between
+        // restarts — the live dispatcher only forwards responses it generates
+        // itself (see the `forward_delegation_response` call sites near
+        // `dispatch.rs:600`), not ones it finds on disk.
+        reconcile_orphan_responses(&home_dir).await;
+
         let mut tick: u64 = 0;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -1308,6 +1318,70 @@ fn forward_http() -> &'static reqwest::Client {
     })
 }
 
+/// Scan bus_queue.jsonl for `agent_response` lines whose originating message
+/// still has a pending `delegation_callbacks` row, and forward each one to
+/// the user's channel.
+///
+/// This handles a specific failure mode: a previous DuDuClaw process dispatched
+/// an agent_message, the sub-agent wrote an agent_response back to the queue,
+/// but the process died (user Ctrl+C, crash, OOM) before `forward_delegation_response`
+/// ran. On startup we replay those pending deliveries so the user doesn't
+/// have to re-ask the sub-agent.
+async fn reconcile_orphan_responses(home_dir: &Path) {
+    let queue_path = home_dir.join("bus_queue.jsonl");
+    let db_path = home_dir.join("message_queue.db");
+    if !queue_path.exists() || !db_path.exists() {
+        return;
+    }
+    let content = match tokio::fs::read_to_string(&queue_path).await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // Collect (in_reply_to, payload, sender_agent) for every agent_response line.
+    // We don't modify the JSONL file — forward_delegation_response consumes the
+    // SQLite callback row atomically, and re-running against the same response
+    // after restart is cheap (no callback → no-op).
+    let mut orphans: Vec<(String, String, String)> = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let event: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if event.get("type").and_then(|t| t.as_str()) != Some("agent_response") {
+            continue;
+        }
+        let Some(in_reply_to) = event.get("in_reply_to").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(payload) = event.get("payload").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let sender = event
+            .get("sender_agent")
+            .and_then(|v| v.as_str())
+            .or_else(|| event.get("agent_id").and_then(|v| v.as_str()))
+            .unwrap_or("unknown")
+            .to_string();
+        orphans.push((in_reply_to.to_string(), payload.to_string(), sender));
+    }
+
+    if orphans.is_empty() {
+        return;
+    }
+
+    info!(count = orphans.len(), "Scanning for orphan delegation responses");
+    for (in_reply_to, payload, sender) in orphans {
+        // forward_delegation_response deletes the callback row atomically;
+        // if no row exists we silently skip.
+        forward_delegation_response(home_dir, &in_reply_to, &payload, &sender).await;
+    }
+}
+
 /// Clean up orphaned delegation callbacks older than 24 hours.
 async fn cleanup_stale_delegation_callbacks(home_dir: &Path) {
     let db_path = home_dir.join("message_queue.db");
@@ -1383,7 +1457,7 @@ async fn forward_delegation_response(
 
     if let Err(e) = forward_to_channel(
         home_dir, &channel_type, &channel_id, thread_id.as_deref(),
-        response_text, responder_agent,
+        response_text, responder_agent, &callback_agent_id,
     ).await {
         let next_retry = retry_count + 1;
         if next_retry >= 5 {
@@ -1490,6 +1564,7 @@ async fn forward_to_channel(
     thread_id: Option<&str>,
     text: &str,
     responder_agent: &str,
+    originating_agent: &str,
 ) -> Result<(), String> {
     // Validate channel_id format to prevent URL injection / SSRF
     validate_channel_id(channel_type, channel_id)?;
@@ -1506,118 +1581,157 @@ async fn forward_to_channel(
         .parse()
         .map_err(|e| format!("parse config.toml: {e}"))?;
 
-    // Truncate long responses for channel delivery
+    // Per-channel message byte budgets. A budget of 100 bytes is reserved for
+    // the agent header (📨 **name** 的回報：) and the part indicator ((1/N)),
+    // so each chunk stays safely under the hard channel limit.
     let max_len = match channel_type {
-        "telegram" => 4096,
-        "discord" => 2000,
-        "line" => 5000,
-        _ => 4096,
+        "telegram" => 4000,
+        "discord" => 1900,
+        "line" => 4900,
+        "slack" => 3900,
+        _ => 3900,
     };
     // Sanitize response text — strip internal paths and system markers before channel delivery
     let safe_text = sanitize_for_channel(text);
-
     // Escape agent name for Telegram MarkdownV1 to prevent formatting injection
     let safe_agent = escape_markdown_v1(responder_agent);
-    let char_count = safe_text.chars().count();
-    let display_text = if char_count > max_len {
-        let truncated: String = safe_text.chars().take(max_len - 100).collect();
-        format!(
-            "📨 **{}** 的回報：\n\n{}…\n\n_(回應過長，已截斷)_",
-            safe_agent, truncated
-        )
-    } else {
-        format!("📨 **{}** 的回報：\n\n{}", safe_agent, safe_text)
-    };
+
+    // Split the body into paragraph/line-aligned chunks instead of truncating.
+    // For everything except Telegram/Slack MarkdownV1 escaping, the splitter
+    // prefers `\n\n`, then `\n`, then spaces, and only hard-cuts as a last
+    // resort. Each chunk is prefixed with the agent header (only the first
+    // chunk gets the full "的回報：" banner; follow-ups just re-attribute).
+    let chunks = crate::channel_format::split_text(&safe_text, max_len);
+    let total = chunks.len();
+    let chunks: Vec<String> = chunks
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if total == 1 {
+                format!("📨 **{}** 的回報：\n\n{}", safe_agent, c)
+            } else if i == 0 {
+                format!("📨 **{}** 的回報 (1/{}):\n\n{}", safe_agent, total, c)
+            } else {
+                format!("📨 **{}** (續 {}/{}):\n\n{}", safe_agent, i + 1, total, c)
+            }
+        })
+        .collect();
 
     let http = forward_http();
 
+    // Small gap between chunks so Discord/Telegram don't rate-limit us and the
+    // user sees a logical order. 250ms is well inside both platforms' burst
+    // allowances (Discord 5 msgs/5s, Telegram 30 msgs/s to the same chat).
+    let chunk_gap = std::time::Duration::from_millis(250);
+
     match channel_type {
         "telegram" => {
-            let token = get_config_token(&config, "telegram_bot_token_enc", "telegram_bot_token", home_dir);
+            let token = get_agent_channel_token(home_dir, originating_agent, "telegram")
+                .unwrap_or_else(|| get_config_token(&config, "telegram_bot_token_enc", "telegram_bot_token", home_dir));
             if token.is_empty() {
                 return Err("telegram_bot_token not configured".into());
             }
             let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
-            let mut payload = serde_json::json!({
-                "chat_id": channel_id,
-                "text": display_text,
-                "parse_mode": "Markdown",
-            });
-            if let Some(tid) = thread_id {
-                if let Ok(tid_num) = tid.parse::<i64>() {
-                    payload["message_thread_id"] = serde_json::json!(tid_num);
-                }
-            }
-            let resp = http.post(&url).json(&payload).send().await
-                .map_err(|e| format!("telegram send: {e}"))?;
-            if !resp.status().is_success() {
-                // Retry without parse_mode in case Markdown causes issues
-                let fallback_payload = serde_json::json!({
+            for (i, body) in chunks.iter().enumerate() {
+                let mut payload = serde_json::json!({
                     "chat_id": channel_id,
-                    "text": &display_text,
+                    "text": body,
+                    "parse_mode": "Markdown",
                 });
-                match http.post(&url).json(&fallback_payload).send().await {
-                    Ok(r) if !r.status().is_success() => {
-                        warn!(status = %r.status(), "Telegram fallback retry also failed");
+                if let Some(tid) = thread_id {
+                    if let Ok(tid_num) = tid.parse::<i64>() {
+                        payload["message_thread_id"] = serde_json::json!(tid_num);
                     }
-                    Err(e) => {
-                        warn!(error = %e, "Telegram fallback retry network error");
-                    }
-                    _ => {}
                 }
+                let resp = http.post(&url).json(&payload).send().await
+                    .map_err(|e| format!("telegram send chunk {}/{}: {e}", i + 1, total))?;
+                if !resp.status().is_success() {
+                    // Retry without parse_mode in case Markdown causes issues on this chunk
+                    let fallback_payload = serde_json::json!({
+                        "chat_id": channel_id,
+                        "text": body,
+                    });
+                    match http.post(&url).json(&fallback_payload).send().await {
+                        Ok(r) if !r.status().is_success() => {
+                            warn!(status = %r.status(), chunk = i + 1, total = total, "Telegram fallback retry also failed");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, chunk = i + 1, total = total, "Telegram fallback retry network error");
+                        }
+                        _ => {}
+                    }
+                }
+                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
             }
         }
         "line" => {
-            let token = get_config_token(&config, "line_channel_token_enc", "line_channel_token", home_dir);
+            let token = get_agent_channel_token(home_dir, originating_agent, "line")
+                .unwrap_or_else(|| get_config_token(&config, "line_channel_token_enc", "line_channel_token", home_dir));
             if token.is_empty() {
                 return Err("line_channel_token not configured".into());
             }
             let url = "https://api.line.me/v2/bot/message/push";
-            let resp = http.post(url)
-                .header("Authorization", format!("Bearer {}", token))
-                .json(&serde_json::json!({
-                    "to": channel_id,
-                    "messages": [{"type": "text", "text": display_text}]
-                }))
-                .send().await
-                .map_err(|e| format!("line send: {e}"))?;
-            if !resp.status().is_success() {
-                return Err(format!("LINE API returned {}", resp.status()));
+            for (i, body) in chunks.iter().enumerate() {
+                let resp = http.post(url)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .json(&serde_json::json!({
+                        "to": channel_id,
+                        "messages": [{"type": "text", "text": body}]
+                    }))
+                    .send().await
+                    .map_err(|e| format!("line send chunk {}/{}: {e}", i + 1, total))?;
+                if !resp.status().is_success() {
+                    return Err(format!("LINE API returned {} on chunk {}/{}", resp.status(), i + 1, total));
+                }
+                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
             }
         }
         "discord" => {
-            let token = get_config_token(&config, "discord_bot_token_enc", "discord_bot_token", home_dir);
+            // Prefer the originating agent's own Discord bot token (from
+            // agents/<id>/agent.toml [channels.discord]). Threads in Discord
+            // are scoped to the bot that started the conversation — posting
+            // to them from a different bot returns 401 Unauthorized even if
+            // that other bot sits in the same guild.
+            let token = get_agent_channel_token(home_dir, originating_agent, "discord")
+                .unwrap_or_else(|| get_config_token(&config, "discord_bot_token_enc", "discord_bot_token", home_dir));
             if token.is_empty() {
                 return Err("discord_bot_token not configured".into());
             }
             let target_channel = thread_id.unwrap_or(channel_id);
             let url = format!("https://discord.com/api/v10/channels/{}/messages", target_channel);
-            let resp = http.post(&url)
-                .header("Authorization", format!("Bot {}", token))
-                .json(&serde_json::json!({ "content": display_text }))
-                .send().await
-                .map_err(|e| format!("discord send: {e}"))?;
-            if !resp.status().is_success() {
-                return Err(format!("Discord API returned {}", resp.status()));
+            for (i, body) in chunks.iter().enumerate() {
+                let resp = http.post(&url)
+                    .header("Authorization", format!("Bot {}", token))
+                    .json(&serde_json::json!({ "content": body }))
+                    .send().await
+                    .map_err(|e| format!("discord send chunk {}/{}: {e}", i + 1, total))?;
+                if !resp.status().is_success() {
+                    return Err(format!("Discord API returned {} on chunk {}/{}", resp.status(), i + 1, total));
+                }
+                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
             }
         }
         "slack" => {
-            let token = get_config_token(&config, "slack_bot_token_enc", "slack_bot_token", home_dir);
+            let token = get_agent_channel_token(home_dir, originating_agent, "slack")
+                .unwrap_or_else(|| get_config_token(&config, "slack_bot_token_enc", "slack_bot_token", home_dir));
             if token.is_empty() {
                 return Err("slack_bot_token not configured".into());
             }
             let url = "https://slack.com/api/chat.postMessage";
-            let resp = http.post(url)
-                .header("Authorization", format!("Bearer {}", token))
-                .json(&serde_json::json!({
-                    "channel": channel_id,
-                    "text": display_text,
-                    "thread_ts": thread_id,
-                }))
-                .send().await
-                .map_err(|e| format!("slack send: {e}"))?;
-            if !resp.status().is_success() {
-                return Err(format!("Slack API returned {}", resp.status()));
+            for (i, body) in chunks.iter().enumerate() {
+                let resp = http.post(url)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .json(&serde_json::json!({
+                        "channel": channel_id,
+                        "text": body,
+                        "thread_ts": thread_id,
+                    }))
+                    .send().await
+                    .map_err(|e| format!("slack send chunk {}/{}: {e}", i + 1, total))?;
+                if !resp.status().is_success() {
+                    return Err(format!("Slack API returned {} on chunk {}/{}", resp.status(), i + 1, total));
+                }
+                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
             }
         }
         "whatsapp" | "feishu" => {
@@ -1640,6 +1754,30 @@ async fn forward_to_channel(
 
 /// Read a channel token from config.toml `[channels]` table,
 /// trying encrypted value first then plaintext fallback.
+/// Try to read the originating agent's per-channel bot token from
+/// `agents/<id>/agent.toml [channels.<channel>]` and decrypt it.
+/// Returns `None` (not empty `""`) if the agent has no per-agent token
+/// configured, so the caller can cleanly fall back to the global token.
+fn get_agent_channel_token(home_dir: &Path, agent_id: &str, channel: &str) -> Option<String> {
+    let agent_toml = home_dir.join("agents").join(agent_id).join("agent.toml");
+    let content = std::fs::read_to_string(&agent_toml).ok()?;
+    let table: toml::Value = content.parse().ok()?;
+    let channels = table.get("channels")?.as_table()?;
+    let section = channels.get(channel)?.as_table()?;
+
+    // Encrypted form first (bot_token_enc); then plaintext (bot_token).
+    let enc_key = "bot_token_enc";
+    if let Some(enc) = section.get(enc_key).and_then(|v| v.as_str()) {
+        if !enc.is_empty() {
+            if let Some(plain) = crate::config_crypto::decrypt_value(enc, home_dir) {
+                return Some(plain);
+            }
+        }
+    }
+    let plain = section.get("bot_token").and_then(|v| v.as_str()).unwrap_or("");
+    if plain.is_empty() { None } else { Some(plain.to_string()) }
+}
+
 fn get_config_token(config: &toml::Value, enc_key: &str, plain_key: &str, home_dir: &Path) -> String {
     let channels = config.get("channels");
     // Try encrypted token first
