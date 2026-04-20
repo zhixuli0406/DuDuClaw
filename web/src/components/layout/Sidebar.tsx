@@ -24,6 +24,8 @@ import {
   Users,
   Plug,
   Globe,
+  Store,
+  Handshake,
   LogOut,
 } from 'lucide-react';
 
@@ -42,6 +44,8 @@ const navItems: NavItem[] = [
   { to: '/tasks', icon: KanbanSquare, label: 'nav.tasks' },
   { to: '/org', icon: Network, label: 'nav.org', minRole: 'manager' },
   { to: '/skills', icon: Puzzle, label: 'nav.skills' },
+  { to: '/marketplace', icon: Store, label: 'nav.marketplace' },
+  { to: '/partner', icon: Handshake, label: 'nav.partner', minRole: 'manager' },
   { to: '/channels', icon: Radio, label: 'nav.channels', minRole: 'admin' },
   { to: '/accounts', icon: Wallet, label: 'nav.accounts', minRole: 'admin' },
   { to: '/memory', icon: Brain, label: 'nav.memory' },

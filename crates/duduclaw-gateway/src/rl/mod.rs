@@ -10,6 +10,7 @@
 //! - OpenHands RL SWE (arXiv 2508.03501): soft overlong punishment
 //! - Self-Play SWE-RL (arXiv 2512.18552): self-play zero-annotation training
 
+pub mod collector;
 pub mod reward;
 pub mod trajectory_export;
 pub mod types;

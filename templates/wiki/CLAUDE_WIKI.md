@@ -19,10 +19,22 @@ Read `wiki/_schema.md` for structure conventions.
 Always read `wiki/_index.md` before searching individual pages.
 The index contains one-line summaries of every page.
 
+### Knowledge Layers
+Pages have a `layer` field controlling injection frequency:
+- `identity` (L0) — Agent identity, always in context
+- `core` (L1) — Core facts, always in context
+- `context` (L2) — Recent decisions, daily refresh
+- `deep` (L3) — Deep knowledge, search-only (default)
+
+### Trust Score
+Pages have a `trust` field (0.0-1.0) indicating reliability:
+- `0.9+` verified, `0.7-0.8` reviewed, `0.5` default, `<0.3` needs review
+- Search results are ranked by trust-weighted score
+
 ### Page creation workflow
 1. Determine the correct subdirectory (`entities/`, `concepts/`, `sources/`, `synthesis/`)
 2. Choose a kebab-case filename
-3. Write content with YAML frontmatter (title, created, updated, tags, related, sources)
+3. Write content with YAML frontmatter (title, created, updated, tags, related, sources, layer, trust)
 4. Include cross-references to related pages using relative markdown links
 5. `wiki_write` handles `_index.md` and `_log.md` updates automatically
 

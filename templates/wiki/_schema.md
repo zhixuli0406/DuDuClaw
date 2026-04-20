@@ -16,8 +16,29 @@ updated: <ISO 8601>
 tags: [tag1, tag2]
 related: [path/to/related1.md, path/to/related2.md]
 sources: [source1, source2]
+layer: deep
+trust: 0.5
 ---
 ```
+
+## Knowledge Layers (layer)
+Controls how often this page is injected into LLM context:
+- `identity` (L0) — Agent/user identity. Always injected into every conversation.
+- `core` (L1) — Core facts, environment, active projects. Always injected.
+- `context` (L2) — Recent decisions, debugging context. Refreshed daily.
+- `deep` (L3) — Deep knowledge archive. Retrieved on-demand via search only.
+
+Default: `deep`. Omitting this field treats the page as L3.
+
+## Trust Score (trust)
+Confidence rating from 0.0 to 1.0:
+- `0.9+` — Empirically verified, authoritative
+- `0.7-0.8` — High confidence, reviewed by human
+- `0.5` — Default, unrated
+- `0.3-0.4` — Auto-ingested, unverified
+- `< 0.3` — Needs review, possibly outdated
+
+Search results are ranked by trust-weighted score. Higher trust pages appear first.
 
 ## Naming Convention
 - Filename: kebab-case (e.g. `wang-ming-customer.md`)

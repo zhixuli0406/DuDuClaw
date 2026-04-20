@@ -75,3 +75,106 @@ fn test_agent_card_well_known_structure() {
         assert!(skill.get("tags").is_some());
     }
 }
+
+#[test]
+fn test_a2a_task_manager_lifecycle() {
+    use super::handlers::{A2ATaskManager, A2ATaskState};
+
+    let mut mgr = A2ATaskManager::new();
+
+    // Create a task
+    let task = mgr.create_task("ctx_1", "Summarize document");
+    let task_id = task.id.clone();
+    assert_eq!(task.state, A2ATaskState::Working);
+    assert_eq!(task.context_id, "ctx_1");
+    assert_eq!(task.description, "Summarize document");
+
+    // Get task
+    assert!(mgr.get_task(&task_id).is_some());
+    assert!(mgr.get_task("nonexistent").is_none());
+
+    // Complete task
+    assert!(mgr.complete_task(&task_id, "Summary done".to_string()));
+    let completed = mgr.get_task(&task_id).unwrap();
+    assert_eq!(completed.state, A2ATaskState::Completed);
+    assert_eq!(completed.result.as_deref(), Some("Summary done"));
+
+    // Cancel a new task
+    let task2 = mgr.create_task("ctx_2", "Another task");
+    let task2_id = task2.id.clone();
+    assert!(mgr.cancel_task(&task2_id));
+    let cancelled = mgr.get_task(&task2_id).unwrap();
+    assert_eq!(cancelled.state, A2ATaskState::Canceled);
+
+    // Cancel nonexistent returns false
+    assert!(!mgr.cancel_task("nonexistent"));
+}
+
+#[test]
+fn test_tasks_send_via_handler() {
+    use super::handlers::A2ATaskManager;
+
+    let mut mgr = A2ATaskManager::new();
+    let params = serde_json::json!({
+        "message": "Hello, agent!",
+        "context_id": "test_ctx",
+    });
+    let id = serde_json::json!(1);
+
+    let response = super::server::handle_tasks_send(&id, &params, &mut mgr);
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 1);
+
+    let result = &response["result"];
+    assert!(result.get("task").is_some());
+    assert!(result.get("artifacts").is_some());
+
+    let task = &result["task"];
+    assert_eq!(task["state"], "completed");
+    assert!(task["result"].as_str().is_some());
+
+    let artifacts = result["artifacts"].as_array().unwrap();
+    assert!(!artifacts.is_empty());
+    assert_eq!(artifacts[0]["type"], "text");
+}
+
+#[test]
+fn test_tasks_send_missing_message() {
+    use super::handlers::A2ATaskManager;
+
+    let mut mgr = A2ATaskManager::new();
+    let params = serde_json::json!({});
+    let id = serde_json::json!(2);
+
+    let response = super::server::handle_tasks_send(&id, &params, &mut mgr);
+    assert!(response.get("error").is_some());
+    assert_eq!(response["error"]["code"], -32602);
+}
+
+#[test]
+fn test_tasks_get_via_handler() {
+    use super::handlers::A2ATaskManager;
+
+    let mgr = A2ATaskManager::new();
+    let params = serde_json::json!({ "task_id": "nonexistent" });
+    let id = serde_json::json!(3);
+
+    let response = super::server::handle_tasks_get(&id, &params, &mgr);
+    assert!(response.get("error").is_some());
+    assert_eq!(response["error"]["code"], -32001);
+}
+
+#[test]
+fn test_agent_discover() {
+    let id = serde_json::json!(4);
+    let response = super::server::handle_agent_discover(&id);
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 4);
+
+    let result = &response["result"];
+    assert_eq!(result["name"], "DuDuClaw Agent");
+    assert!(result.get("capabilities").is_some());
+    assert!(result.get("skills").is_some());
+    assert!(result["capabilities"]["streaming"].as_bool().unwrap());
+}

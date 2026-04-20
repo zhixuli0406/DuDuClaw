@@ -201,7 +201,6 @@ mod tests {
             access_count: 0,
             last_accessed: None,
             source_event: "test".to_string(),
-            shareable: false,
         }
     }
 

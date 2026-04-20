@@ -58,6 +58,7 @@ pub mod mcp_oauth;
 pub mod media;
 pub mod tts;
 pub mod log;
+pub mod metrics;
 pub mod gvu;
 pub mod prediction;
 pub mod protocol;

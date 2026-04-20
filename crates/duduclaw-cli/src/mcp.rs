@@ -165,6 +165,35 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "tags", description: "Comma-separated tags", required: false },
         ],
     },
+    ToolDef {
+        name: "memory_search_by_layer",
+        description: "Search agent memory filtered by cognitive layer (episodic or semantic)",
+        params: &[
+            ParamDef { name: "query", description: "Search query", required: true },
+            ParamDef { name: "layer", description: "Cognitive layer: 'episodic' or 'semantic'", required: true },
+            ParamDef { name: "limit", description: "Max results to return (default: 10)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "memory_successful_conversations",
+        description: "Find successful past conversations related to a topic (high-importance episodic memories)",
+        params: &[
+            ParamDef { name: "topic", description: "Topic keywords to search for", required: true },
+            ParamDef { name: "limit", description: "Max results to return (default: 10)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "memory_episodic_pressure",
+        description: "Compute episodic memory pressure score. A value > 10.0 suggests enough observations for a Meso reflection.",
+        params: &[
+            ParamDef { name: "hours_ago", description: "Look back window in hours (default: 24)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "memory_consolidation_status",
+        description: "Count semantic conflicts — high-importance episodic memories not yet consolidated into semantic knowledge",
+        params: &[],
+    },
     // ── Sub-agent management tools ──────────────────────────────
     ToolDef {
         name: "create_agent",
@@ -410,9 +439,10 @@ const TOOLS: &[ToolDef] = &[
     // ── Compression tools ──────────────────────────────────────────
     ToolDef {
         name: "compress_text",
-        description: "Compress text using Meta-Token (lossless) compression. Returns compressed text and compression ratio. Best for JSON, code, and repetitive templates.",
+        description: "Compress text using the specified strategy. Strategies: 'meta_token' (lossless, best for JSON/code/templates), 'llmlingua' (lossy 2-5x, best for natural language), 'streaming_llm' (session window management), 'auto' (auto-select based on content type). Default: 'meta_token'.",
         params: &[
             ParamDef { name: "text", description: "Text to compress", required: true },
+            ParamDef { name: "strategy", description: "Compression strategy: meta_token | llmlingua | streaming_llm | auto (default: meta_token)", required: false },
         ],
     },
     ToolDef {
@@ -630,11 +660,14 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "wiki_search",
-        description: "Full-text search across wiki pages. Searches _index.md first, then drills into matching pages for context.",
+        description: "Full-text search across wiki pages with trust-weighted ranking. Supports layer/trust filtering and 1-hop expand via related pages.",
         params: &[
             ParamDef { name: "query", description: "Search query (keywords)", required: true },
             ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
             ParamDef { name: "limit", description: "Max results (default: 10)", required: false },
+            ParamDef { name: "min_trust", description: "Minimum trust score filter (0.0-1.0)", required: false },
+            ParamDef { name: "layer", description: "Filter by layer: identity/core/context/deep", required: false },
+            ParamDef { name: "expand", description: "1-hop expand via related/backlinks (true/false, default: false)", required: false },
         ],
     },
     ToolDef {
@@ -656,6 +689,29 @@ const TOOLS: &[ToolDef] = &[
         description: "Export the wiki as Obsidian vault (directory of .md files with wikilinks) or a single HTML file. Returns the output path or HTML content.",
         params: &[
             ParamDef { name: "format", description: "Export format: 'obsidian' or 'html' (default: html)", required: false },
+            ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "wiki_dedup",
+        description: "Detect potential duplicate wiki pages using title and tag similarity. Returns candidate pairs with trust scores for merge decisions.",
+        params: &[
+            ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "wiki_graph",
+        description: "Export wiki knowledge graph as Mermaid diagram. Nodes=pages, edges=related links. Supports focused view around a center page.",
+        params: &[
+            ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
+            ParamDef { name: "center", description: "Center page path for focused view (e.g. 'entities/customer.md')", required: false },
+            ParamDef { name: "depth", description: "Max hops from center (default: 2, ignored without center)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "wiki_rebuild_fts",
+        description: "Rebuild the FTS5 full-text search index from all wiki pages on disk. Use if search results seem stale.",
+        params: &[
             ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
         ],
     },
@@ -682,10 +738,12 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "shared_wiki_search",
-        description: "Full-text search across shared wiki pages.",
+        description: "Full-text search across shared wiki pages with trust-weighted ranking. Supports layer/trust filtering.",
         params: &[
             ParamDef { name: "query", description: "Search query (keywords)", required: true },
             ParamDef { name: "limit", description: "Max results (default: 10)", required: false },
+            ParamDef { name: "min_trust", description: "Minimum trust score filter (0.0-1.0)", required: false },
+            ParamDef { name: "layer", description: "Filter by layer: identity/core/context/deep", required: false },
         ],
     },
     ToolDef {
@@ -1155,6 +1213,126 @@ async fn handle_memory_store(
             "isError": true
         }),
     }
+}
+
+async fn handle_memory_search_by_layer(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    agent_id: &str,
+) -> Value {
+    let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    if query.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: query is required"}],
+            "isError": true
+        });
+    }
+    let layer_str = params.get("layer").and_then(|v| v.as_str()).unwrap_or("");
+    if layer_str.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: layer is required (episodic or semantic)"}],
+            "isError": true
+        });
+    }
+    let layer = duduclaw_core::types::MemoryLayer::parse(layer_str);
+    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+
+    match memory.search_layer(agent_id, query, &layer, limit).await {
+        Ok(entries) => {
+            if entries.is_empty() {
+                serde_json::json!({
+                    "content": [{"type": "text", "text": format!("No {layer_str} memories found.")}]
+                })
+            } else {
+                let text = entries
+                    .iter()
+                    .map(|e| format!("[{}] [{}] {}", e.timestamp.format("%Y-%m-%d %H:%M"), e.layer.as_str(), e.content))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                serde_json::json!({
+                    "content": [{"type": "text", "text": text}]
+                })
+            }
+        }
+        Err(e) => serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error searching memory by layer: {e}")}],
+            "isError": true
+        }),
+    }
+}
+
+async fn handle_memory_successful_conversations(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    agent_id: &str,
+) -> Value {
+    let topic = params.get("topic").and_then(|v| v.as_str()).unwrap_or("");
+    if topic.is_empty() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: topic is required"}],
+            "isError": true
+        });
+    }
+    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+
+    match memory.search_successful_conversations(agent_id, topic, limit).await {
+        Ok(contents) => {
+            if contents.is_empty() {
+                serde_json::json!({
+                    "content": [{"type": "text", "text": "No successful conversations found for this topic."}]
+                })
+            } else {
+                let text = contents.join("\n---\n");
+                serde_json::json!({
+                    "content": [{"type": "text", "text": text}]
+                })
+            }
+        }
+        Err(e) => serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error searching conversations: {e}")}],
+            "isError": true
+        }),
+    }
+}
+
+async fn handle_memory_episodic_pressure(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    agent_id: &str,
+) -> Value {
+    let hours_ago = params.get("hours_ago").and_then(|v| v.as_u64()).unwrap_or(24);
+    let since = chrono::Utc::now() - chrono::Duration::hours(hours_ago as i64);
+    let pressure = memory.episodic_pressure(agent_id, since).await;
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": format!(
+            "Episodic pressure (last {hours_ago}h): {pressure:.2}\n\
+             Threshold for Meso reflection: 10.0\n\
+             Status: {}",
+            if pressure > 10.0 { "⚠ Above threshold — reflection recommended" }
+            else { "✓ Below threshold" }
+        )}]
+    })
+}
+
+async fn handle_memory_consolidation_status(
+    memory: &SqliteMemoryEngine,
+    agent_id: &str,
+) -> Value {
+    let conflict_count = memory.semantic_conflict_count(agent_id).await;
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": format!(
+            "Semantic conflict count: {conflict_count}\n\
+             High-importance episodic memories not yet consolidated into semantic knowledge.\n\
+             Status: {}",
+            if conflict_count > 0 {
+                format!("⚠ {conflict_count} unconsolidated observations — consolidation recommended")
+            } else {
+                "✓ No conflicts detected".to_string()
+            }
+        )}]
+    })
 }
 
 /// Send a message to another agent via the bus queue.
@@ -3632,6 +3810,27 @@ async fn handle_compress_text(params: &Value) -> Value {
         });
     }
 
+    let strategy = params
+        .get("strategy")
+        .and_then(|v| v.as_str())
+        .unwrap_or("meta_token");
+
+    match strategy {
+        "meta_token" => compress_with_meta_token(text),
+        "llmlingua" => compress_with_llmlingua(text).await,
+        "streaming_llm" => compress_with_streaming_llm(text),
+        "auto" => compress_auto(text).await,
+        other => serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": format!(
+                "Unknown strategy '{other}'. Valid options: meta_token, llmlingua, streaming_llm, auto"
+            )}]
+        }),
+    }
+}
+
+/// Meta-Token lossless compression (best for JSON, code, templates).
+fn compress_with_meta_token(text: &str) -> Value {
     let (compressed, stats) = duduclaw_inference::compression::meta_token::compress(text);
 
     let result = format!(
@@ -3654,6 +3853,144 @@ async fn handle_compress_text(params: &Value) -> Value {
     serde_json::json!({
         "content": [{"type": "text", "text": result}]
     })
+}
+
+/// LLMLingua-2 lossy compression (best for natural language).
+async fn compress_with_llmlingua(text: &str) -> Value {
+    let config = duduclaw_inference::compression::llmlingua::LlmLinguaConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let compressor = duduclaw_inference::compression::llmlingua::LlmLinguaCompressor::new(config);
+
+    if !compressor.is_available().await {
+        return serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text":
+                "LLMLingua-2 is not available. Install with: pip install llmlingua\n\
+                 Falling back to meta_token is recommended."}]
+        });
+    }
+
+    match compressor.compress(text).await {
+        Ok((compressed, stats)) => {
+            let result = format!(
+                "Compression Result (LLMLingua-2, lossy):\n\
+                 \n  Original: {} chars\
+                 \n  Compressed: {} chars\
+                 \n  Ratio: {:.2}x\
+                 \n  Savings: {:.1}%\n\n\
+                 Compressed text:\n{compressed}",
+                stats.original_len,
+                stats.compressed_len,
+                stats.ratio,
+                (1.0 - 1.0 / stats.ratio) * 100.0,
+            );
+            serde_json::json!({
+                "content": [{"type": "text", "text": result}]
+            })
+        }
+        Err(e) => serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": format!("LLMLingua compression failed: {e}")}]
+        }),
+    }
+}
+
+/// StreamingLLM session window compression (attention sink + sliding window).
+fn compress_with_streaming_llm(text: &str) -> Value {
+    let config = duduclaw_inference::compression::streaming_llm::StreamingLlmConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let mut window = duduclaw_inference::compression::streaming_llm::StreamingWindow::new(config);
+
+    // Split text into lines and push as user messages to simulate session
+    for line in text.lines() {
+        if !line.trim().is_empty() {
+            window.push("user", line);
+        }
+    }
+
+    let stats = window.stats();
+    let retained: Vec<String> = window
+        .formatted_messages()
+        .into_iter()
+        .map(|(_role, content)| content)
+        .collect();
+    let compressed = retained.join("\n");
+
+    let result = format!(
+        "Compression Result (StreamingLLM, window):\n\
+         \n  Original estimate: {} tokens\
+         \n  Window: {} tokens\
+         \n  Messages retained: {}\
+         \n  Messages evicted: {}\
+         \n  Ratio: {:.2}x\n\n\
+         Windowed text:\n{compressed}",
+        stats.original_len,
+        stats.compressed_len,
+        window.message_count(),
+        window.evicted_count(),
+        stats.ratio,
+    );
+
+    serde_json::json!({
+        "content": [{"type": "text", "text": result}]
+    })
+}
+
+/// Auto-select compression strategy based on content type.
+/// - Structured data (JSON, code) → Meta-Token (lossless)
+/// - Natural language → LLMLingua (lossy, higher ratio)
+async fn compress_auto(text: &str) -> Value {
+    let is_structured = detect_structured_content(text);
+
+    if is_structured {
+        compress_with_meta_token(text)
+    } else {
+        // Try LLMLingua for natural language; fall back to Meta-Token if unavailable
+        let config = duduclaw_inference::compression::llmlingua::LlmLinguaConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let compressor =
+            duduclaw_inference::compression::llmlingua::LlmLinguaCompressor::new(config);
+
+        if compressor.is_available().await {
+            compress_with_llmlingua(text).await
+        } else {
+            compress_with_meta_token(text)
+        }
+    }
+}
+
+/// Detect whether text is structured (JSON, code) vs natural language.
+fn detect_structured_content(text: &str) -> bool {
+    let trimmed = text.trim();
+
+    // JSON detection
+    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    {
+        return true;
+    }
+
+    // Code detection heuristics: high density of code-like tokens
+    let code_indicators = [
+        "fn ", "pub ", "let ", "const ", "impl ", "struct ", // Rust
+        "function ", "var ", "import ", "export ", "class ",  // JS/TS
+        "def ", "self.", "elif ", "__init__",                  // Python
+        "func ", "package ", "type ", "interface ",            // Go
+        "<?", "?>", "<%", "%>",                                // Template
+    ];
+    let indicator_count = code_indicators
+        .iter()
+        .filter(|ind| trimmed.contains(**ind))
+        .count();
+
+    // If 3+ code indicators found, treat as structured
+    indicator_count >= 3
 }
 
 async fn handle_decompress_text(params: &Value) -> Value {
@@ -4853,6 +5190,10 @@ async fn handle_tools_call(
         "web_search" => handle_web_search(&arguments, http).await,
         "memory_search" => handle_memory_search(&arguments, memory, default_agent).await,
         "memory_store" => handle_memory_store(&arguments, memory, default_agent).await,
+        "memory_search_by_layer" => handle_memory_search_by_layer(&arguments, memory, default_agent).await,
+        "memory_successful_conversations" => handle_memory_successful_conversations(&arguments, memory, default_agent).await,
+        "memory_episodic_pressure" => handle_memory_episodic_pressure(&arguments, memory, default_agent).await,
+        "memory_consolidation_status" => handle_memory_consolidation_status(memory, default_agent).await,
         "send_to_agent" => handle_send_to_agent(&arguments, home_dir, default_agent).await,
         "send_photo" => handle_send_media(&arguments, home_dir, http, "photo").await,
         "send_sticker" => handle_send_media(&arguments, home_dir, http, "sticker").await,
@@ -4919,6 +5260,9 @@ async fn handle_tools_call(
         "wiki_lint" => handle_wiki_lint(&arguments, home_dir, default_agent).await,
         "wiki_stats" => handle_wiki_stats(&arguments, home_dir, default_agent).await,
         "wiki_export" => handle_wiki_export(&arguments, home_dir, default_agent).await,
+        "wiki_dedup" => handle_wiki_dedup(&arguments, home_dir, default_agent).await,
+        "wiki_graph" => handle_wiki_graph(&arguments, home_dir, default_agent).await,
+        "wiki_rebuild_fts" => handle_wiki_rebuild_fts(&arguments, home_dir, default_agent).await,
         // Shared Wiki tools
         "shared_wiki_ls" => handle_shared_wiki_ls(home_dir).await,
         "shared_wiki_read" => handle_shared_wiki_read(&arguments, home_dir).await,
@@ -5741,6 +6085,19 @@ async fn handle_wiki_search(args: &Value, home_dir: &Path, default_agent: &str) 
         .and_then(|s| s.parse().ok())
         .unwrap_or(10)
         .min(100);
+    let min_trust: Option<f32> = args
+        .get("min_trust")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
+    let layer_filter: Option<duduclaw_memory::WikiLayer> = args
+        .get("layer")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
+    let expand: bool = args
+        .get("expand")
+        .and_then(|v| v.as_str())
+        .map(|s| s == "true")
+        .unwrap_or(false);
 
     let wiki_dir = match resolve_wiki_dir(home_dir, agent_id) {
         Ok(d) => d,
@@ -5751,90 +6108,25 @@ async fn handle_wiki_search(args: &Value, home_dir: &Path, default_agent: &str) 
         return tool_text("No wiki found. Use wiki_write to create the first page.");
     }
 
-    let query_terms: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
-    let pages = collect_md_files(&wiki_dir, &wiki_dir);
+    let store = duduclaw_memory::WikiStore::new(wiki_dir);
+    let hits = match store.search_filtered(query, limit, min_trust, layer_filter, expand) {
+        Ok(h) => h,
+        Err(e) => return tool_error(&format!("Wiki search failed: {e}")),
+    };
 
-    // Score each page by keyword match count in content
-    let mut scored: Vec<(usize, String, String, Vec<String>)> = Vec::new(); // (score, path, title, matching_lines)
-
-    for rel_path in &pages {
-        let full_path = wiki_dir.join(rel_path);
-        let content = match std::fs::read_to_string(&full_path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let content_lower = content.to_lowercase();
-        let score: usize = query_terms.iter().filter(|t| content_lower.contains(t.as_str())).count();
-
-        if score == 0 {
-            continue;
-        }
-
-        let title = extract_frontmatter_title(&content)
-            .unwrap_or_else(|| rel_path.to_string_lossy().to_string());
-
-        // Collect matching lines (up to 3 per page)
-        let matching_lines: Vec<String> = content
-            .lines()
-            .filter(|line| {
-                let ll = line.to_lowercase();
-                query_terms.iter().any(|t| ll.contains(t.as_str()))
-            })
-            .take(3)
-            .map(|l| {
-                let trimmed = l.trim();
-                if trimmed.len() > 120 {
-                    format!("  {}...", &trimmed[..117])
-                } else {
-                    format!("  {}", trimmed)
-                }
-            })
-            .collect();
-
-        scored.push((score, rel_path.to_string_lossy().to_string(), title, matching_lines));
-    }
-
-    // Also search _index.md for additional context
-    let index_path = wiki_dir.join("_index.md");
-    if let Ok(index_content) = std::fs::read_to_string(&index_path) {
-        let index_lower = index_content.to_lowercase();
-        for term in &query_terms {
-            if index_lower.contains(term.as_str()) {
-                // Boost pages mentioned in matching index lines
-                for line in index_content.lines() {
-                    let ll = line.to_lowercase();
-                    if ll.contains(term.as_str()) {
-                        // Extract page path from markdown link [title](path)
-                        if let Some(start) = line.find("](")
-                            && let Some(end) = line[start + 2..].find(')') {
-                                let linked_path = &line[start + 2..start + 2 + end];
-                                // Boost this page's score
-                                for entry in &mut scored {
-                                    if entry.1 == linked_path {
-                                        entry.0 += 1;
-                                    }
-                                }
-                            }
-                    }
-                }
-            }
-        }
-    }
-
-    // Sort by score descending
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-    scored.truncate(limit);
-
-    if scored.is_empty() {
+    if hits.is_empty() {
         return tool_text(&format!("No wiki pages match query: '{}'", query));
     }
 
-    let mut output = format!("Found {} matching pages for '{}':\n\n", scored.len(), query);
-    for (score, path, title, lines) in &scored {
-        output.push_str(&format!("**{}** ({}) — relevance: {}\n", title, path, score));
-        for line in lines {
-            output.push_str(&format!("{}\n", line));
+    let mut output = format!("Found {} matching pages for '{}':\n\n", hits.len(), query);
+    for h in &hits {
+        let expanded_tag = if h.score == 0 { " [expanded]" } else { "" };
+        output.push_str(&format!(
+            "**{}** ({}) — relevance: {} | trust: {:.1} | layer: {}{}\n",
+            h.title, h.path, h.score, h.trust, h.layer, expanded_tag
+        ));
+        for line in &h.context_lines {
+            output.push_str(&format!("  {}\n", line));
         }
         output.push('\n');
     }
@@ -6071,6 +6363,88 @@ fn contains_sensitive_pattern(content: &str) -> Option<&'static str> {
     None
 }
 
+async fn handle_wiki_dedup(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
+    if !is_valid_agent_id(agent_id) {
+        return tool_error("Invalid agent_id format");
+    }
+
+    let wiki_dir = match resolve_wiki_dir(home_dir, agent_id) {
+        Ok(d) => d,
+        Err(e) => return tool_error(&e),
+    };
+    if !wiki_dir.exists() {
+        return tool_text("No wiki found.");
+    }
+
+    let store = duduclaw_memory::WikiStore::new(wiki_dir);
+    match store.detect_duplicates() {
+        Ok(candidates) if candidates.is_empty() => {
+            tool_text("No duplicate candidates found.")
+        }
+        Ok(candidates) => {
+            let mut output = format!("Found {} potential duplicate pairs:\n\n", candidates.len());
+            for c in &candidates {
+                output.push_str(&format!(
+                    "- **{}** (trust: {:.1}) ↔ **{}** (trust: {:.1})\n  Reason: {}\n  Suggestion: keep the page with higher trust\n\n",
+                    c.page_a, c.trust_a, c.page_b, c.trust_b, c.reason
+                ));
+            }
+            tool_text(&output)
+        }
+        Err(e) => tool_error(&format!("Dedup detection failed: {e}")),
+    }
+}
+
+async fn handle_wiki_graph(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
+    if !is_valid_agent_id(agent_id) {
+        return tool_error("Invalid agent_id format");
+    }
+
+    let wiki_dir = match resolve_wiki_dir(home_dir, agent_id) {
+        Ok(d) => d,
+        Err(e) => return tool_error(&e),
+    };
+    if !wiki_dir.exists() {
+        return tool_text("No wiki found.");
+    }
+
+    let center = args.get("center").and_then(|v| v.as_str());
+    let depth: usize = args
+        .get("depth")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+
+    let store = duduclaw_memory::WikiStore::new(wiki_dir);
+    match store.export_mermaid(center, depth) {
+        Ok(mermaid) => tool_text(&format!("```mermaid\n{mermaid}```")),
+        Err(e) => tool_error(&format!("Graph export failed: {e}")),
+    }
+}
+
+async fn handle_wiki_rebuild_fts(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or(default_agent);
+    if !is_valid_agent_id(agent_id) {
+        return tool_error("Invalid agent_id format");
+    }
+
+    let wiki_dir = match resolve_wiki_dir(home_dir, agent_id) {
+        Ok(d) => d,
+        Err(e) => return tool_error(&e),
+    };
+    if !wiki_dir.exists() {
+        return tool_text("No wiki found.");
+    }
+
+    let store = duduclaw_memory::WikiStore::new(wiki_dir);
+    match store.rebuild_fts() {
+        Ok(count) => tool_text(&format!("FTS index rebuilt: {} pages indexed.", count)),
+        Err(e) => tool_error(&format!("FTS rebuild failed: {e}")),
+    }
+}
+
 async fn handle_shared_wiki_ls(home_dir: &Path) -> Value {
     let wiki_dir = resolve_shared_wiki_dir(home_dir);
     if !wiki_dir.exists() {
@@ -6175,68 +6549,38 @@ async fn handle_shared_wiki_search(args: &Value, home_dir: &Path) -> Value {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10)
         .min(100);
+    let min_trust: Option<f32> = args
+        .get("min_trust")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
+    let layer_filter: Option<duduclaw_memory::WikiLayer> = args
+        .get("layer")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
 
     let wiki_dir = resolve_shared_wiki_dir(home_dir);
     if !wiki_dir.exists() {
         return tool_text("No shared wiki found. Use shared_wiki_write to create the first page.");
     }
 
-    let query_terms: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
-    let pages = collect_md_files(&wiki_dir, &wiki_dir);
+    let store = duduclaw_memory::WikiStore::new_shared(home_dir);
+    let hits = match store.search_filtered(query, limit, min_trust, layer_filter, false) {
+        Ok(h) => h,
+        Err(e) => return tool_error(&format!("Shared wiki search failed: {e}")),
+    };
 
-    let mut scored: Vec<(usize, String, String, String, Vec<String>)> = Vec::new(); // (score, path, title, author, lines)
-
-    for rel_path in &pages {
-        let full_path = wiki_dir.join(rel_path);
-        let content = match std::fs::read_to_string(&full_path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let content_lower = content.to_lowercase();
-        let score: usize = query_terms.iter().filter(|t| content_lower.contains(t.as_str())).count();
-        if score == 0 {
-            continue;
-        }
-
-        let title = extract_frontmatter_title(&content)
-            .unwrap_or_else(|| rel_path.to_string_lossy().to_string());
-        let author = extract_frontmatter_field(&content, "author")
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let matching_lines: Vec<String> = content
-            .lines()
-            .filter(|line| {
-                let ll = line.to_lowercase();
-                query_terms.iter().any(|t| ll.contains(t.as_str()))
-            })
-            .take(3)
-            .map(|l| {
-                let trimmed = l.trim();
-                if trimmed.chars().count() > 120 {
-                    let truncated: String = trimmed.chars().take(117).collect();
-                    format!("  {}...", truncated)
-                } else {
-                    format!("  {}", trimmed)
-                }
-            })
-            .collect();
-
-        scored.push((score, rel_path.to_string_lossy().to_string(), title, author, matching_lines));
-    }
-
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-    scored.truncate(limit);
-
-    if scored.is_empty() {
+    if hits.is_empty() {
         return tool_text(&format!("No shared wiki pages match '{}'.", query));
     }
 
-    let mut output = format!("Found {} shared wiki results for '{}':\n\n", scored.len(), query);
-    for (score, path, title, author, lines) in &scored {
-        output.push_str(&format!("📄 {} — {} (by: {}, relevance: {})\n", path, title, author, score));
-        for line in lines {
-            output.push_str(&format!("{}\n", line));
+    let mut output = format!("Found {} shared wiki results for '{}':\n\n", hits.len(), query);
+    for h in &hits {
+        output.push_str(&format!(
+            "📄 {} — {} (trust: {:.1} | layer: {} | relevance: {})\n",
+            h.path, h.title, h.trust, h.layer, h.score
+        ));
+        for line in &h.context_lines {
+            output.push_str(&format!("  {}\n", line));
         }
         output.push('\n');
     }
@@ -6553,6 +6897,9 @@ fn safe_truncate(s: &mut String, max_bytes: usize) -> bool {
 // ── execute_program handler ─────────────────────────────────────
 
 async fn handle_execute_program(args: &Value) -> Value {
+    use crate::ptc::sandbox::{PtcRpcServer, PtcSandbox};
+    use crate::ptc::types::{ScriptLanguage, ScriptRequest};
+
     let code = match args.get("code").and_then(|v| v.as_str()) {
         Some(c) => c.to_string(),
         None => return tool_error("Missing required parameter: code"),
@@ -6569,13 +6916,10 @@ async fn handle_execute_program(args: &Value) -> Value {
 
     tracing::info!(language, timeout_seconds, "execute_program called");
 
-    let (cmd, cmd_args): (&str, Vec<String>) = match language.as_str() {
-        "python" => (duduclaw_core::platform::python3_command(), vec!["-c".to_string(), code.clone()]),
-        #[cfg(not(windows))]
-        "bash" => ("bash", vec!["-c".to_string(), code.clone()]),
-        #[cfg(windows)]
-        "bash" => ("cmd", vec!["/C".to_string(), code.clone()]),
-        "javascript" => ("node", vec!["-e".to_string(), code.clone()]),
+    let script_language = match language.as_str() {
+        "python" => ScriptLanguage::Python,
+        "bash" => ScriptLanguage::Bash,
+        "javascript" => ScriptLanguage::Bash, // node -e via bash wrapper below
         other => {
             return tool_error(&format!(
                 "Unsupported language: '{}'. Supported: python, bash, javascript",
@@ -6584,86 +6928,56 @@ async fn handle_execute_program(args: &Value) -> Value {
         }
     };
 
-    // SECURITY: Clear all inherited env vars (prevents API key leakage),
-    // then whitelist only safe variables.
-    let mut command = tokio::process::Command::new(cmd);
-    command
-        .args(&cmd_args)
-        .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default())
-        .env("USERPROFILE", std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default())
-        .env("LANG", std::env::var("LANG").unwrap_or_default())
-        .env("TERM", std::env::var("TERM").unwrap_or_default())
-        .env("PYTHONUNBUFFERED", "1")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    // Pass PTC socket path if available
-    if let Ok(ptc_socket) = std::env::var("DUDUCLAW_PTC_SOCKET") {
-        command.env("DUDUCLAW_PTC_SOCKET", ptc_socket);
-    }
-
-    let mut child = match command.spawn() {
-        Ok(c) => c,
-        Err(e) => return tool_error(&format!("Failed to execute {language}: {e}")),
+    // For javascript, wrap the code in a bash invocation of node -e
+    let script_code = if language == "javascript" {
+        // Escape single quotes in the JS code for safe embedding in bash
+        let escaped = code.replace('\'', "'\\''");
+        format!("node -e '{escaped}'")
+    } else {
+        code
     };
 
-    // Take stdout/stderr handles before waiting so we retain ownership of `child` for kill()
-    let mut child_stdout = child.stdout.take();
-    let mut child_stderr = child.stderr.take();
+    const MAX_OUTPUT_BYTES: usize = 1_048_576; // 1 MB
 
-    const MAX_STDOUT: usize = 1_048_576; // 1 MB
-    const MAX_STDERR: usize = 4_096; // 4 KB
+    let req = ScriptRequest {
+        script: script_code,
+        language: script_language,
+        timeout_ms: timeout_seconds * 1000,
+        max_output_bytes: MAX_OUTPUT_BYTES,
+    };
 
-    let timeout = std::time::Duration::from_secs(timeout_seconds);
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => {
-            // Read captured output with bounded limits to prevent OOM.
-            // We allow a small overhead beyond MAX so safe_truncate can find
-            // a clean char boundary.
-            let mut raw_stdout = Vec::with_capacity(65536);
-            let mut raw_stderr = Vec::with_capacity(4096);
-            if let Some(ref mut out) = child_stdout {
-                use tokio::io::AsyncReadExt as _;
-                let mut limited = out.take(MAX_STDOUT as u64 + 1024);
-                let _ = limited.read_to_end(&mut raw_stdout).await;
-            }
-            if let Some(ref mut err) = child_stderr {
-                use tokio::io::AsyncReadExt as _;
-                let mut limited = err.take(MAX_STDERR as u64 + 1024);
-                let _ = limited.read_to_end(&mut raw_stderr).await;
-            }
-            let mut stdout = String::from_utf8_lossy(&raw_stdout).to_string();
-            let mut stderr = String::from_utf8_lossy(&raw_stderr).to_string();
-            let exit_code = status.code().unwrap_or(-1);
+    // Create a temporary RPC server for the sandbox execution.
+    // If a PTC socket is already set in the environment, reuse that path;
+    // otherwise create a unique temporary socket path.
+    let socket_path = std::env::var("DUDUCLAW_PTC_SOCKET")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::temp_dir().join(format!(
+                "duduclaw_ptc_exec_{}.sock",
+                std::process::id()
+            ))
+        });
+    let rpc_server = PtcRpcServer::new(socket_path);
 
-            // Truncate string output at char boundary
-            safe_truncate(&mut stdout, MAX_STDOUT);
-            safe_truncate(&mut stderr, MAX_STDERR);
-
-            if status.success() {
+    // Use PtcSandbox::execute_in_container which tries container isolation
+    // first and falls back to direct subprocess execution.
+    match PtcSandbox::execute_in_container(&req, &rpc_server).await {
+        Ok(result) => {
+            if result.exit_code == 0 {
                 serde_json::json!({
-                    "content": [{ "type": "text", "text": stdout }],
+                    "content": [{ "type": "text", "text": result.stdout }],
                 })
             } else {
                 serde_json::json!({
                     "content": [{ "type": "text", "text": format!(
-                        "Program exited with code {exit_code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+                        "Program exited with code {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                        result.exit_code, result.stdout, result.stderr
                     ) }],
                     "isError": true,
                 })
             }
         }
-        Ok(Err(e)) => tool_error(&format!("Failed to execute {language}: {e}")),
-        Err(_) => {
-            // CRITICAL: Kill child process on timeout to prevent orphaned processes
-            let _ = child.kill().await;
-            let _ = child.wait().await; // Reap zombie process
-            tool_error(&format!(
-                "Execution timed out after {timeout_seconds}s"
-            ))
-        }
+        Err(e) => tool_error(&format!("Failed to execute {language}: {e}")),
     }
 }
 

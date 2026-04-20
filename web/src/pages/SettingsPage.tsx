@@ -6,6 +6,9 @@ import { useSystemStore } from '@/stores/system-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { api, type AutopilotRule, type AutopilotHistoryEntry } from '@/lib/api';
 import { Dialog } from '@/components/shared/Dialog';
+import { ToolApprovalPanel } from '@/components/ToolApprovalPanel';
+import { SessionReplayPanel } from '@/components/SessionReplayPanel';
+import { BrowserAuditPanel } from '@/components/BrowserAuditPanel';
 import {
   Settings,
   Container,
@@ -24,9 +27,10 @@ import {
   Mic,
   Zap,
   Workflow,
+  Globe,
 } from 'lucide-react';
 
-type TabId = 'general' | 'container' | 'heartbeat' | 'cron' | 'voice' | 'proactive' | 'autopilot' | 'doctor' | 'update';
+type TabId = 'general' | 'container' | 'heartbeat' | 'cron' | 'voice' | 'proactive' | 'autopilot' | 'doctor' | 'update' | 'browser';
 
 export function SettingsPage() {
   const intl = useIntl();
@@ -44,6 +48,7 @@ export function SettingsPage() {
     { id: 'autopilot', label: intl.formatMessage({ id: 'settings.autopilot' }), icon: Workflow },
     { id: 'doctor', label: intl.formatMessage({ id: 'settings.doctor' }), icon: Stethoscope },
     { id: 'update', label: intl.formatMessage({ id: 'settings.update' }), icon: Download },
+    { id: 'browser', label: intl.formatMessage({ id: 'settings.browser' }), icon: Globe },
   ];
 
   return (
@@ -83,6 +88,7 @@ export function SettingsPage() {
       {activeTab === 'autopilot' && <AutopilotTab />}
       {activeTab === 'doctor' && <DoctorTab />}
       {activeTab === 'update' && <UpdateTab />}
+      {activeTab === 'browser' && <BrowserTab />}
     </div>
   );
 }
@@ -1531,6 +1537,18 @@ function AutopilotHistoryDialog({
         )}
       </div>
     </Dialog>
+  );
+}
+
+// ── Browser Automation Tab ─────────────────────────────────────
+
+function BrowserTab() {
+  return (
+    <div className="space-y-6">
+      <ToolApprovalPanel />
+      <SessionReplayPanel />
+      <BrowserAuditPanel />
+    </div>
   );
 }
 

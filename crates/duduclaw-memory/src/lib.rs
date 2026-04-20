@@ -1,3 +1,4 @@
+pub mod decay;
 pub mod embedding;
 pub mod engine;
 pub mod import;
@@ -8,4 +9,4 @@ pub mod wiki;
 pub use embedding::VectorIndex;
 pub use engine::{KeyFact, SqliteMemoryEngine, word_jaccard};
 pub use router::classify;
-pub use wiki::WikiStore;
+pub use wiki::{WikiFts, WikiLayer, WikiStore};

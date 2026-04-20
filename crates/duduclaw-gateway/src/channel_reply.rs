@@ -8,10 +8,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use duduclaw_agent::registry::AgentRegistry;
+use duduclaw_agent::resolver::AgentResolver;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use duduclaw_core::MemoryEngine;
+use duduclaw_core::types::{Message, MessageType};
 use duduclaw_security::circuit_breaker::CircuitBreakerRegistry;
 use duduclaw_security::failsafe::FailsafeManager;
 use duduclaw_security::killswitch::KillswitchConfig;
@@ -386,12 +388,29 @@ async fn build_reply_with_session_inner(
         // Explicit agent name (per-agent Discord bot)
         reg.get(name).or_else(|| reg.main_agent())
     } else {
-        // Default: config.toml default_agent → main_agent() → fallback
-        let default_agent_name = get_default_agent(&ctx.home_dir).await;
-        if let Some(name) = &default_agent_name {
-            reg.get(name).or_else(|| reg.main_agent())
+        // Resolve via AgentResolver: trigger word → channel binding → default_agent → main_agent
+        let channel = session_id.split(':').next().unwrap_or("unknown").to_string();
+        let msg = Message {
+            id: String::new(),
+            message_type: MessageType::Incoming,
+            channel,
+            chat_id: session_id.to_string(),
+            sender: user_id.to_string(),
+            text: text.to_string(),
+            timestamp: chrono::Utc::now(),
+            agent_id: None,
+        };
+        let resolver = AgentResolver::new(&reg);
+        if let Some(resolved) = resolver.resolve(&msg) {
+            Some(resolved)
         } else {
-            reg.main_agent()
+            // Fallback: config.toml default_agent → main_agent()
+            let default_agent_name = get_default_agent(&ctx.home_dir).await;
+            if let Some(name) = &default_agent_name {
+                reg.get(name).or_else(|| reg.main_agent())
+            } else {
+                reg.main_agent()
+            }
         }
     };
 
@@ -409,6 +428,9 @@ async fn build_reply_with_session_inner(
     let skill_token_budget = agent
         .map(|a| a.config.evolution.skill_token_budget)
         .unwrap_or(2500);
+    let external_factors_config = agent
+        .map(|a| a.config.evolution.external_factors.clone())
+        .unwrap_or_default();
 
     // Refresh compressed skill cache from agent's loaded skills
     {
@@ -1141,6 +1163,41 @@ async fn build_reply_with_session_inner(
             warn!("Failed to save assistant message to session: {e}");
         }
 
+        // ── RL trajectory collection (async, non-blocking) ─────────
+        // Collect session as an RL training trajectory after each reply.
+        // Runs in a background task to avoid adding latency to the hot path.
+        {
+            let home_for_rl = ctx.home_dir.clone();
+            let sid_for_rl = session_id.to_string();
+            let agent_for_rl = agent_id.clone();
+            let model_for_rl = model.clone();
+            let sm_for_rl = ctx.session_manager.clone();
+            tokio::spawn(async move {
+                let msgs = match sm_for_rl.get_messages(&sid_for_rl).await {
+                    Ok(m) if !m.is_empty() => m,
+                    Ok(_) => return,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "RL collector: skip — cannot read session");
+                        return;
+                    }
+                };
+                let message_pairs: Vec<(String, String)> = msgs
+                    .iter()
+                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .collect();
+                // Outcome reward: 1.0 for successful reply (we reached this code path)
+                crate::rl::collector::collect_trajectory(
+                    home_for_rl,
+                    sid_for_rl,
+                    agent_for_rl,
+                    model_for_rl,
+                    message_pairs,
+                    1.0,
+                )
+                .await;
+            });
+        }
+
         // ── Instruction Pinning: extract on first turn ──────────────
         // Asynchronously extract core task instructions from the first user
         // message using Haiku (lightweight, same path as session compression).
@@ -1256,6 +1313,7 @@ async fn build_reply_with_session_inner(
             let gap_acc_for_pred = ctx.gap_accumulator.clone();
             let sandbox_for_pred = ctx.sandbox_store.clone();
             let notebook_for_pred = ctx.mistake_notebook.clone();
+            let ext_factors_cfg = external_factors_config.clone();
 
             tokio::spawn(async move {
                 // 1. Generate prediction (< 1ms, zero LLM)
@@ -1614,6 +1672,19 @@ async fn build_reply_with_session_inner(
                             None, None,
                         );
 
+                        // Enrich trigger context with external factors for Significant/Critical errors
+                        let enriched_context = {
+                            let ext = crate::external_factors::collect_external_factors(
+                                &home_for_pred, &agent_id_for_pred, &ext_factors_cfg,
+                            ).await;
+                            let ext_prompt = ext.to_prompt();
+                            if ext_prompt.is_empty() {
+                                context.clone()
+                            } else {
+                                format!("{context}\n\n{ext_prompt}")
+                            }
+                        };
+
                         // Run GVU loop if available
                         if let (Some(gvu), Some(dir)) = (&gvu, &agent_dir_for_pred) {
                             let contract = duduclaw_agent::contract::load_contract(dir);
@@ -1642,7 +1713,7 @@ async fn build_reply_with_session_inner(
                             let outcome = gvu.run_with_context(
                                 &agent_id_for_pred,
                                 dir,
-                                &context,
+                                &enriched_context,
                                 pre_metrics,
                                 &contract.boundaries.must_not,
                                 &contract.boundaries.must_always,
@@ -1695,6 +1766,69 @@ async fn build_reply_with_session_inner(
                                         "GVU timed out — wall-clock budget exceeded"
                                     );
                                     // Treat as inconclusive — don't record outcome
+                                }
+                            }
+
+                            // ── Proactive rule evaluation (post-GVU) ─────────
+                            {
+                                use duduclaw_agent::proactive::{
+                                    extract_proactive_rules, RuleContext, RuleEvaluator,
+                                };
+
+                                let proactive_rules =
+                                    extract_proactive_rules(&contract.boundaries.must_always);
+
+                                if !proactive_rules.is_empty() {
+                                    // Build context from available data.
+                                    // hours_since_last_interaction: approximate from
+                                    // conversation messages (last turn timestamp).
+                                    let hours_since = {
+                                        let msgs = sm_for_pred
+                                            .get_messages(&session_id_for_pred)
+                                            .await
+                                            .unwrap_or_default();
+                                        msgs.last()
+                                            .and_then(|m| {
+                                                chrono::DateTime::parse_from_rfc3339(&m.timestamp)
+                                                    .ok()
+                                                    .map(|ts| {
+                                                        let elapsed = chrono::Utc::now()
+                                                            - ts.with_timezone(&chrono::Utc);
+                                                        (elapsed.num_seconds().max(0) as f32)
+                                                            / 3600.0
+                                                    })
+                                            })
+                                            .unwrap_or(0.0)
+                                    };
+
+                                    let recent_events: Vec<String> = Vec::new();
+                                    let active_patterns: Vec<String> = Vec::new();
+
+                                    let rule_ctx = RuleContext {
+                                        hours_since_last_interaction: hours_since,
+                                        recent_events,
+                                        active_patterns,
+                                    };
+
+                                    let mut evaluator = RuleEvaluator::new();
+                                    let triggered =
+                                        evaluator.evaluate(&proactive_rules, &rule_ctx);
+
+                                    for (rule, message) in &triggered {
+                                        info!(
+                                            agent = %agent_id_for_pred,
+                                            rule = %rule.source_contract,
+                                            "Proactive rule fired: {message}"
+                                        );
+                                    }
+
+                                    if !triggered.is_empty() {
+                                        debug!(
+                                            agent = %agent_id_for_pred,
+                                            count = triggered.len(),
+                                            "Proactive rules evaluated post-GVU"
+                                        );
+                                    }
                                 }
                             }
                         } else {
@@ -3539,6 +3673,25 @@ fn build_system_prompt(
                 team_section.push_str(&format!("- **{}** ({}) — {}\n", m.display_name, m.name, m.role));
             }
             parts.push(team_section);
+        }
+    }
+
+    // Wiki knowledge injection — L0 (Identity) + L1 (Core) pages are always
+    // injected so the agent can reference accumulated wiki knowledge without
+    // manual wiki_search calls. L2/L3 are search-only.
+    if let Some(a) = agent {
+        let wiki_dir = a.dir.join("wiki");
+        if wiki_dir.exists() {
+            let store = duduclaw_memory::WikiStore::new(wiki_dir);
+            match store.build_injection_context(6000) {
+                Ok(wiki_ctx) if !wiki_ctx.is_empty() => {
+                    parts.push(format!("## Wiki Knowledge\n{}", wiki_ctx.trim_end()));
+                }
+                Ok(_) => {} // no L0/L1 pages
+                Err(e) => {
+                    tracing::warn!("Wiki injection failed: {e}");
+                }
+            }
         }
     }
 

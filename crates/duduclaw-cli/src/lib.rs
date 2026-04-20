@@ -505,26 +505,10 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Test { name } => cmd_test_agent(&name).await,
         Commands::Update { yes } => cmd_update(yes).await,
         Commands::Rl(rl_cmd) => {
-            match rl_cmd {
-                RlCommands::Export { agent, since, format } => {
-                    println!("RL export: agent={agent}, since={since:?}, format={format}");
-                    println!("Use duduclaw-gateway rl module for trajectory export.");
-                }
-                RlCommands::Stats { agent } => {
-                    println!("RL stats: agent={agent}");
-                }
-                RlCommands::Reward { trajectory } => {
-                    println!("RL reward: trajectory={trajectory}");
-                }
-            }
-            Ok(())
+            cmd_rl(rl_cmd, &duduclaw_home()).await
         }
         Commands::AcpServer => {
-            println!("ACP server mode — IDE integration via Agent Client Protocol");
-            println!("Listens on stdin/stdout with JSON-RPC 2.0");
-            println!("Connect from Zed, JetBrains, or Neovim.");
-            // Future: wire to acp::AcpServer
-            Ok(())
+            acp::server::run_acp_server(&duduclaw_home()).await
         }
         Commands::Hook(HookCommands::AgentFileGuard) => cmd_hook_agent_file_guard().await,
         Commands::Version => {
@@ -544,6 +528,124 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
 ///
 /// On allow, exits 0 silently so the Write / Edit proceeds normally.
 ///
+/// Handle `duduclaw rl` subcommands: export, stats, reward.
+async fn cmd_rl(rl_cmd: RlCommands, home_dir: &PathBuf) -> duduclaw_core::error::Result<()> {
+    use duduclaw_gateway::rl::collector::{self, TrajectoryStats};
+
+    match rl_cmd {
+        RlCommands::Export { agent, since, format: _ } => {
+            let export_dir = home_dir.join("rl_trajectories");
+
+            // Read from global JSONL and filter by agent + date
+            let all = collector::read_trajectories(home_dir)
+                .map_err(|e| DuDuClawError::Config(format!("Failed to read trajectories: {e}")))?;
+
+            let filtered: Vec<_> = all
+                .into_iter()
+                .filter(|t| t.agent_id == agent)
+                .filter(|t| {
+                    if let Some(ref since_str) = since {
+                        if let Ok(since_date) = chrono::NaiveDate::parse_from_str(since_str, "%Y-%m-%d") {
+                            return t.created_at.date_naive() >= since_date;
+                        }
+                    }
+                    true
+                })
+                .collect();
+
+            if filtered.is_empty() {
+                println!("No trajectories found for agent '{agent}'.");
+                return Ok(());
+            }
+
+            // Write filtered trajectories to stdout as JSONL
+            println!("Exporting {} trajectories for agent '{agent}':", filtered.len());
+            for traj in &filtered {
+                if let Ok(json) = serde_json::to_string(traj) {
+                    println!("{json}");
+                }
+            }
+            println!("\n--- Export complete ---");
+            println!("Per-agent files: {}", export_dir.join(&agent).display());
+        }
+
+        RlCommands::Stats { agent } => {
+            let all = collector::read_trajectories(home_dir)
+                .map_err(|e| DuDuClawError::Config(format!("Failed to read trajectories: {e}")))?;
+
+            let stats = TrajectoryStats::for_agent(&all, &agent);
+
+            if stats.total_count == 0 {
+                println!("No trajectories found for agent '{agent}'.");
+                println!("Trajectories are collected automatically during channel interactions.");
+                return Ok(());
+            }
+
+            println!("RL Trajectory Statistics for agent '{agent}':");
+            println!("─────────────────────────────────────────");
+            println!("  Trajectories:   {}", stats.total_count);
+            println!("  Total tokens:   {}", stats.total_tokens);
+            println!("  Avg reward:     {:.3}", stats.avg_reward);
+            println!("  Avg turns:      {:.1}", stats.avg_turns);
+            println!("  Avg tokens:     {:.0}", stats.avg_tokens);
+
+            // Also show global stats
+            let global_stats = TrajectoryStats::from_trajectories(&all);
+            if global_stats.agent_counts.len() > 1 {
+                println!("\nGlobal (all agents):");
+                println!("  Trajectories:   {}", global_stats.total_count);
+                println!("  Avg reward:     {:.3}", global_stats.avg_reward);
+                for (aid, count) in &global_stats.agent_counts {
+                    println!("    {aid}: {count} trajectories");
+                }
+            }
+        }
+
+        RlCommands::Reward { trajectory } => {
+            let path = std::path::Path::new(&trajectory);
+            if !path.exists() {
+                // Try relative to home_dir
+                let alt = home_dir.join(&trajectory);
+                if !alt.exists() {
+                    println!("Trajectory file not found: {trajectory}");
+                    return Ok(());
+                }
+                match collector::compute_reward_for_file(&alt) {
+                    Ok(results) => {
+                        print_rewards(&results);
+                    }
+                    Err(e) => {
+                        println!("Failed to compute reward: {e}");
+                    }
+                }
+                return Ok(());
+            }
+            match collector::compute_reward_for_file(path) {
+                Ok(results) => {
+                    print_rewards(&results);
+                }
+                Err(e) => {
+                    println!("Failed to compute reward: {e}");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn print_rewards(results: &[(String, f64)]) {
+    if results.is_empty() {
+        println!("No trajectories found in file.");
+        return;
+    }
+    println!("Reward computation (composite: outcome×0.7 + efficiency×0.2 + overlong×0.1):");
+    println!("─────────────────────────────────────────────────────────");
+    for (id, reward) in results {
+        println!("  {id}: {reward:.4}");
+    }
+}
+
 /// Cross-platform by design: pure Rust, no bash, no shell quoting issues.
 async fn cmd_hook_agent_file_guard() -> duduclaw_core::error::Result<()> {
     use std::io::Read;
@@ -2140,9 +2242,11 @@ skill_security_scan = true
         .map_err(|e| DuDuClawError::Agent(format!("Failed to write SOUL.md: {e}")))?;
 
     // CLAUDE.md — helps Claude Code sessions pick up context
+    let wiki_guide = include_str!("../../../templates/wiki/CLAUDE_WIKI.md");
     let claude_md = format!(
-        "# {display_name}\n\nAgent managed by DuDuClaw v{}.\n",
-        duduclaw_gateway::updater::current_version()
+        "# {display_name}\n\nAgent managed by DuDuClaw v{}.\n\n{}\n",
+        duduclaw_gateway::updater::current_version(),
+        wiki_guide,
     );
     tokio::fs::write(agent_dir.join("CLAUDE.md"), &claude_md)
         .await
