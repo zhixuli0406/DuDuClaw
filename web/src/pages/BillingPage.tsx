@@ -3,6 +3,7 @@ import { useIntl } from 'react-intl';
 import { useConnectionStore } from '@/stores/connection-store';
 import { api, type BillingUsage } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { toast, formatError } from '@/lib/toast';
 import {
   MessageCircle,
   Bot,
@@ -67,8 +68,11 @@ export function BillingPage() {
     api.billing
       .usage()
       .then(setUsage)
-      .catch((e) => console.warn('[api]', e));
-  }, [connectionState]);
+      .catch((e) => {
+        console.warn('[api]', e);
+        toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      });
+  }, [connectionState, intl]);
 
   return (
     <div className="space-y-6">

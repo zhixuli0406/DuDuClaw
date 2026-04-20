@@ -17,6 +17,7 @@ export function ApprovalModal() {
   const intl = useIntl();
   const [request, setRequest] = useState<ApprovalRequest | null>(null);
   const [countdown, setCountdown] = useState(0);
+  const [responseError, setResponseError] = useState<string | null>(null);
   const respondedRef = useRef(false);
 
   // Subscribe to approval_request events from WebSocket
@@ -26,6 +27,7 @@ export function ApprovalModal() {
       respondedRef.current = false;
       setRequest(req);
       setCountdown(req.timeout_seconds || 30);
+      setResponseError(null);
     });
     return unsub;
   }, []);
@@ -39,11 +41,18 @@ export function ApprovalModal() {
         request_id: request.request_id,
         approved,
       });
-    } catch {
-      // Response delivery failed — the timeout will auto-deny on the backend
+      setResponseError(null);
+      setRequest(null);
+    } catch (err) {
+      // Response delivery failed — keep the modal open and surface the error.
+      // The backend will auto-deny on timeout, but the user needs visible feedback.
+      const message = err instanceof Error ? err.message : String(err);
+      setResponseError(
+        intl.formatMessage({ id: 'browser.approvals.responseError' }, { message }),
+      );
+      respondedRef.current = false;
     }
-    setRequest(null);
-  }, [request]);
+  }, [request, intl]);
 
   // Countdown timer — auto-deny when it reaches zero
   useEffect(() => {
@@ -101,6 +110,16 @@ export function ApprovalModal() {
             </pre>
           )}
         </div>
+
+        {/* Response error */}
+        {responseError && (
+          <div
+            role="alert"
+            className="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-300"
+          >
+            {responseError}
+          </div>
+        )}
 
         {/* Actions */}
         <div className="flex gap-3">

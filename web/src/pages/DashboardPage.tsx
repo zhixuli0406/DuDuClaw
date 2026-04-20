@@ -24,6 +24,7 @@ import {
   ExternalLink,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { toast, formatError } from '@/lib/toast';
 
 function StatCard({
   icon: Icon,
@@ -76,8 +77,14 @@ export function DashboardPage() {
 
     fetchAgents();
     fetchStatus();
-    api.accounts.budgetSummary().then(setBudget).catch((e) => console.warn("[api]", e));
-    api.system.doctor().then(setDoctor).catch((e) => console.warn("[api]", e));
+    api.accounts.budgetSummary().then(setBudget).catch((e) => {
+      console.warn("[api]", e);
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    });
+    api.system.doctor().then(setDoctor).catch((e) => {
+      console.warn("[api]", e);
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    });
 
     // Fetch wiki data for the default (first) agent
     api.agents.list().then(async (res) => {
@@ -108,9 +115,15 @@ export function DashboardPage() {
         }
         setWikiContents(contents);
       }
-    }).catch((e) => console.warn("[api]", e));
+    }).catch((e) => {
+      console.warn("[api]", e);
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    });
 
-    // Lightweight budget refresh every 60s
+    // Lightweight budget refresh every 60s.
+    // Silent on failure to avoid spamming toasts from a transient blip — the
+    // initial load already surfaces errors, and the WS "disconnected" indicator
+    // covers the outage case.
     const interval = setInterval(() => {
       api.accounts.budgetSummary().then(setBudget).catch((e) => console.warn("[api]", e));
     }, 60_000);

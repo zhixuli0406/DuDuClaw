@@ -21,6 +21,9 @@ use crate::extension::GatewayExtension;
 use crate::gvu::version_store::VersionStore;
 use crate::protocol::WsFrame;
 use crate::task_store::{TaskStore, TaskRow, ActivityRow};
+use crate::partner_store::{
+    PartnerStore, PartnerProfileInput, PartnerCustomerInput, PartnerCustomerPatch,
+};
 
 /// Validate agent ID is safe for filesystem paths (no traversal).
 fn is_valid_agent_id(id: &str) -> bool {
@@ -429,10 +432,6 @@ impl MethodHandler {
             // ── Evolution (manager+, H3 fix) ─────────────────
             "evolution.status" => { require_manager!(); self.handle_evolution_status().await }
             "evolution.history" => { require_manager!(); self.handle_evolution_history(params).await }
-            "evolution.skills" => {
-                require_manager!();
-                self.handle_evolution_skills().await
-            }
 
             // ── Odoo (admin only) ────────────────────────────
             "odoo.status" => { require_admin!(); self.handle_odoo_status().await }
@@ -469,8 +468,15 @@ impl MethodHandler {
 
             // ── Activity Feed (open to all authenticated) ───
             "activity.list" => self.handle_activity_list(params).await,
-            "activity.subscribe" => WsFrame::ok_response("", json!({ "subscribed": true })),
-            "activity.unsubscribe" => WsFrame::ok_response("", json!({ "unsubscribed": true })),
+            // Per-topic filtering is NOT implemented: BroadcastLayer fans out every
+            // activity event to every authenticated WS client unconditionally. This
+            // RPC exists purely as a client-intent signal and future-compat hook so
+            // callers can declare interest without guessing at server state.
+            "activity.subscribe" => WsFrame::ok_response("", json!({
+                "subscribed": true,
+                "broadcast_mode": "all_events",
+                "note": "All authenticated WS clients receive activity events automatically; no per-client filter is in effect.",
+            })),
 
             // ── Autopilot (admin only) ──────────────────────
             "autopilot.list" => { require_admin!(); self.handle_autopilot_list().await }
@@ -484,6 +490,27 @@ impl MethodHandler {
             "skills.share" => self.handle_skills_share(params).await,
             "skills.adopt" => self.handle_skills_adopt(params).await,
 
+            // ── Partner Portal ──────────────────────────────
+            "partner.profile" => self.handle_partner_profile().await,
+            "partner.stats" => self.handle_partner_stats().await,
+            "partner.customers" => self.handle_partner_customers(params).await,
+            "partner.profile.update" => {
+                require_admin!();
+                self.handle_partner_profile_update(params).await
+            }
+            "partner.customer.add" => {
+                require_admin!();
+                self.handle_partner_customer_add(params).await
+            }
+            "partner.customer.update" => {
+                require_admin!();
+                self.handle_partner_customer_update(params).await
+            }
+            "partner.customer.delete" => {
+                require_admin!();
+                self.handle_partner_customer_delete(params).await
+            }
+
             // ── Billing ──────────────────────────────────────
             "billing.usage" => self.handle_billing_usage().await,
             "billing.history" | "billing.plan" =>
@@ -491,6 +518,7 @@ impl MethodHandler {
             "browser.audit_log" | "browser.emergency_stop" | "browser.tool_approve"
             | "browser.browserbase_sessions" | "browser.browserbase_cost" =>
                 WsFrame::error_response("", "Browser automation features require the Pro edition"),
+            "marketplace.list" => self.handle_marketplace_list().await,
             "marketplace.install" =>
                 WsFrame::error_response("", "Marketplace install is not yet available"),
 
@@ -3028,6 +3056,140 @@ impl MethodHandler {
         }
     }
 
+    // ── Partner Portal ───────────────────────────────────────
+
+    fn partner_store(&self) -> PartnerStore {
+        PartnerStore::new(&self.home_dir.join("partner.db"))
+    }
+
+    async fn handle_partner_profile(&self) -> WsFrame {
+        let store = self.partner_store();
+        let profile = store.get_profile();
+        match serde_json::to_value(&profile) {
+            Ok(v) => WsFrame::ok_response("", v),
+            Err(e) => WsFrame::error_response("", &format!("serialize profile: {e}")),
+        }
+    }
+
+    async fn handle_partner_stats(&self) -> WsFrame {
+        let store = self.partner_store();
+        let stats = store.compute_stats();
+        match serde_json::to_value(&stats) {
+            Ok(v) => WsFrame::ok_response("", v),
+            Err(e) => WsFrame::error_response("", &format!("serialize stats: {e}")),
+        }
+    }
+
+    async fn handle_partner_customers(&self, params: Value) -> WsFrame {
+        let status = params
+            .get("status")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(100)
+            .min(1000) as usize;
+
+        let store = self.partner_store();
+        let customers = store.list_customers(status.as_deref(), limit);
+        match serde_json::to_value(&customers) {
+            Ok(list) => WsFrame::ok_response("", json!({ "customers": list })),
+            Err(e) => WsFrame::error_response("", &format!("serialize customers: {e}")),
+        }
+    }
+
+    async fn handle_partner_profile_update(&self, params: Value) -> WsFrame {
+        let tier = match params.get("tier").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'tier' parameter"),
+        };
+        let input = PartnerProfileInput {
+            company: params
+                .get("company")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            tier,
+            partner_id: params
+                .get("partner_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            certified_at: params
+                .get("certified_at")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+        };
+        let store = self.partner_store();
+        match store.upsert_profile(&input) {
+            Ok(()) => {
+                let profile = store.get_profile();
+                match serde_json::to_value(&profile) {
+                    Ok(v) => WsFrame::ok_response("", v),
+                    Err(e) => WsFrame::error_response("", &format!("serialize profile: {e}")),
+                }
+            }
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    async fn handle_partner_customer_add(&self, params: Value) -> WsFrame {
+        let input: PartnerCustomerInput = match serde_json::from_value(params.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                return WsFrame::error_response(
+                    "",
+                    &format!("Invalid customer payload: {e}"),
+                )
+            }
+        };
+        let store = self.partner_store();
+        match store.add_customer(&input) {
+            Ok(id) => WsFrame::ok_response("", json!({ "id": id })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    async fn handle_partner_customer_update(&self, params: Value) -> WsFrame {
+        let id = match params.get("id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'id' parameter"),
+        };
+        let patch_value = params
+            .get("patch")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let patch: PartnerCustomerPatch = match serde_json::from_value(patch_value) {
+            Ok(v) => v,
+            Err(e) => {
+                return WsFrame::error_response(
+                    "",
+                    &format!("Invalid patch payload: {e}"),
+                )
+            }
+        };
+        let store = self.partner_store();
+        match store.update_customer(&id, &patch) {
+            Ok(()) => WsFrame::ok_response("", json!({ "success": true })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    async fn handle_partner_customer_delete(&self, params: Value) -> WsFrame {
+        let id = match params.get("id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'id' parameter"),
+        };
+        let store = self.partner_store();
+        match store.delete_customer(&id) {
+            Ok(()) => WsFrame::ok_response("", json!({ "success": true })),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
     // ── System ───────────────────────────────────────────────
 
     async fn handle_system_status(&self) -> WsFrame {
@@ -3637,8 +3799,10 @@ impl MethodHandler {
 
     async fn handle_evolution_status(&self) -> WsFrame {
         let reg = self.registry.read().await;
+        let mut gvu_enabled_count = 0usize;
         let agents: Vec<Value> = reg.list().iter().map(|a| {
             let cfg = &a.config;
+            if cfg.evolution.gvu_enabled { gvu_enabled_count += 1; }
             json!({
                 "agent_id": cfg.agent.name,
                 "gvu_enabled": cfg.evolution.gvu_enabled,
@@ -3650,10 +3814,39 @@ impl MethodHandler {
                 "observation_period_hours": cfg.evolution.observation_period_hours,
             })
         }).collect();
+        let total_agents = agents.len();
+        let agent_ids: Vec<String> = reg.list().iter().map(|a| a.config.agent.name.clone()).collect();
+        drop(reg);
 
+        // Aggregate real version stats from evolution.db (if any GVU run has persisted).
+        let db_path = self.home_dir.join("evolution.db");
+        let (total_versions, last_applied_at) = if db_path.exists() {
+            let vs = VersionStore::new(&db_path);
+            let mut total: u64 = 0;
+            let mut latest: Option<chrono::DateTime<chrono::Utc>> = None;
+            for aid in &agent_ids {
+                let history = vs.get_history(aid, 100);
+                total += history.len() as u64;
+                if let Some(v) = history.first() {
+                    latest = Some(match latest {
+                        Some(prev) if prev >= v.applied_at => prev,
+                        _ => v.applied_at,
+                    });
+                }
+            }
+            (total, latest.map(|t| t.to_rfc3339()))
+        } else {
+            (0u64, None)
+        };
+
+        let enabled = gvu_enabled_count > 0;
         WsFrame::ok_response("", json!({
-            "enabled": true,
-            "mode": "prediction_driven",
+            "enabled": enabled,
+            "mode": if enabled { "prediction_driven" } else { "disabled" },
+            "total_agents": total_agents,
+            "gvu_enabled_count": gvu_enabled_count,
+            "total_versions": total_versions,
+            "last_applied_at": last_applied_at,
             "agents": agents,
         }))
     }
@@ -3714,21 +3907,6 @@ impl MethodHandler {
         versions.truncate(limit);
 
         WsFrame::ok_response("", json!({ "versions": versions }))
-    }
-
-    async fn handle_evolution_skills(&self) -> WsFrame {
-        let reg = self.registry.read().await;
-        let mut all_skills = Vec::new();
-        for agent in reg.list() {
-            for skill in &agent.skills {
-                all_skills.push(json!({
-                    "agent_id": agent.config.agent.name,
-                    "name": skill.name,
-                    "size": skill.content.len(),
-                }));
-            }
-        }
-        WsFrame::ok_response("", json!({ "skills": all_skills }))
     }
 
     // ── Models ──────────────────────────────────────────────
@@ -4827,6 +5005,68 @@ impl MethodHandler {
             Ok(entries) => WsFrame::ok_response("", json!({ "entries": entries })),
             Err(e) => WsFrame::error_response("", &format!("failed to query audit log: {e}")),
         }
+    }
+
+    // ── Marketplace ─────────────────────────────────────────────
+
+    /// Build the Marketplace catalog JSON: built-in entries plus
+    /// optional user-contributed entries from `~/.duduclaw/marketplace.json`.
+    ///
+    /// Schema of the optional file:
+    /// ```json
+    /// { "servers": [ { "id": "...", "name": "...", ... } ] }
+    /// ```
+    /// Each entry follows the `McpCatalogItem` JSON shape. Invalid files
+    /// are skipped with a warning so a malformed user file never breaks
+    /// the dashboard.
+    async fn handle_marketplace_list(&self) -> WsFrame {
+        use duduclaw_agent::mcp_template::{marketplace_catalog, McpCatalogItem};
+
+        let mut servers: Vec<McpCatalogItem> = marketplace_catalog();
+
+        // Merge optional user-contributed catalog entries.
+        let user_path = self.home_dir.join("marketplace.json");
+        if user_path.exists() {
+            match tokio::fs::read_to_string(&user_path).await {
+                Ok(content) => {
+                    #[derive(serde::Deserialize)]
+                    struct UserCatalog {
+                        #[serde(default)]
+                        servers: Vec<McpCatalogItem>,
+                    }
+                    match serde_json::from_str::<UserCatalog>(&content) {
+                        Ok(user) => {
+                            info!(
+                                path = %user_path.display(),
+                                count = user.servers.len(),
+                                "Merged user marketplace catalog"
+                            );
+                            servers.extend(user.servers);
+                        }
+                        Err(e) => warn!(
+                            path = %user_path.display(),
+                            error = %e,
+                            "Failed to parse user marketplace.json; skipping"
+                        ),
+                    }
+                }
+                Err(e) => warn!(
+                    path = %user_path.display(),
+                    error = %e,
+                    "Failed to read user marketplace.json; skipping"
+                ),
+            }
+        }
+
+        let servers_json = match serde_json::to_value(&servers) {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response(
+                "",
+                &format!("Failed to serialize marketplace catalog: {e}"),
+            ),
+        };
+
+        WsFrame::ok_response("", json!({ "servers": servers_json }))
     }
 
     // ── MCP Management ──────────────────────────────────────────

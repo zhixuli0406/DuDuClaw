@@ -4,6 +4,7 @@ import { cn } from '@/lib/utils';
 import { api, type SkillIndexEntry, type SharedSkillInfo, type SkillInfo } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
 import { Dialog } from '@/components/shared/Dialog';
+import { toast, formatError } from '@/lib/toast';
 import {
   Search,
   Tag,
@@ -99,7 +100,11 @@ function MarketTab() {
     try {
       const res = await api.skillMarket.search(q);
       setResults(res?.skills ?? []);
-    } catch {
+    } catch (e) {
+      console.warn('[api]', e);
+      // Surface to the user so they don't mistake a network/backend error for
+      // "no results." The empty-results reset still drives the empty-state UI.
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
       setResults([]);
     } finally {
       setLoading(false);
@@ -203,13 +208,15 @@ function SharedSkillsTab() {
       try {
         const result = await api.sharedSkills.list();
         setSharedSkills(result?.skills ?? []);
-      } catch {
+      } catch (e) {
+        console.warn('[api]', e);
+        toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
         setSharedSkills([]);
       } finally {
         setLoading(false);
       }
     })();
-  }, [fetchAgents]);
+  }, [fetchAgents, intl]);
 
   const handleAdopt = useCallback(async () => {
     if (!adoptTarget || !adoptAgent) return;
@@ -224,7 +231,10 @@ function SharedSkillsTab() {
         ),
       );
       setTimeout(() => { setAdoptTarget(null); setAdoptSuccess(null); }, 1500);
-    } catch { /* noop */ }
+    } catch (e) {
+      console.warn('[api]', e);
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+    }
   }, [adoptTarget, adoptAgent, intl]);
 
   return (
@@ -367,13 +377,15 @@ function MySkillsTab() {
       try {
         const result = await api.skills.list(selectedAgent);
         setSkills(result?.skills ?? []);
-      } catch {
+      } catch (e) {
+        console.warn('[api]', e);
+        toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
         setSkills([]);
       } finally {
         setLoading(false);
       }
     })();
-  }, [selectedAgent]);
+  }, [selectedAgent, intl]);
 
   const handleShare = useCallback(async (skillName: string) => {
     if (!selectedAgent) return;
@@ -381,8 +393,11 @@ function MySkillsTab() {
       await api.sharedSkills.share(selectedAgent, skillName);
       setShareSuccess(skillName);
       setTimeout(() => setShareSuccess(null), 2000);
-    } catch { /* noop */ }
-  }, [selectedAgent]);
+    } catch (e) {
+      console.warn('[api]', e);
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+    }
+  }, [selectedAgent, intl]);
 
   return (
     <div className="space-y-6">

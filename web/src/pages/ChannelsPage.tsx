@@ -3,6 +3,7 @@ import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type ChannelStatus, type AgentInfo } from '@/lib/api';
 import { client } from '@/lib/ws-client';
+import { toast, formatError } from '@/lib/toast';
 import { useConnectionStore } from '@/stores/connection-store';
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import {
@@ -340,9 +341,12 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
 
   useEffect(() => {
     if (open) {
-      api.agents.list().then((r) => setAgents(r.agents ?? [])).catch((e) => console.warn("[api]", e));
+      api.agents.list().then((r) => setAgents(r.agents ?? [])).catch((e) => {
+        console.warn("[api]", e);
+        toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      });
     }
-  }, [open]);
+  }, [open, intl]);
 
   const [token, setToken] = useState('');
   const [secret, setSecret] = useState('');
@@ -368,86 +372,86 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
     }
   };
 
-  // TODO: Move channel setup guides to i18n
-  const channelGuide: Record<string, { tokenLabel: string; secretLabel?: string; steps: string[] }> = {
+  const channelGuide: Record<string, { tokenLabel: string; secretLabel?: string; stepKeys: string[] }> = {
     telegram: {
       tokenLabel: 'Bot Token',
-      steps: [
-        '1. 在 Telegram 搜尋 @BotFather 並開始對話',
-        '2. 輸入 /newbot，依提示設定名稱與 username',
-        '3. BotFather 會回傳 Bot Token，複製貼到下方',
-        'Long Polling 模式，無需設定 Webhook',
+      stepKeys: [
+        'channels.setup.telegram.step1',
+        'channels.setup.telegram.step2',
+        'channels.setup.telegram.step3',
+        'channels.setup.telegram.note',
       ],
     },
     line: {
       tokenLabel: 'Channel Access Token',
       secretLabel: 'Channel Secret',
-      steps: [
-        '1. 前往 developers.line.biz/console',
-        '2. 建立 Provider → Messaging API Channel',
-        '3. Basic settings → 複製 Channel Secret',
-        '4. Messaging API → Issue Channel Access Token',
-        '5. Webhook settings → 設定 URL + 開啟 Use webhook',
-        '需要 HTTPS（ngrok / Tailscale Funnel）',
+      stepKeys: [
+        'channels.setup.line.step1',
+        'channels.setup.line.step2',
+        'channels.setup.line.step3',
+        'channels.setup.line.step4',
+        'channels.setup.line.step5',
+        'channels.setup.line.note',
       ],
     },
     discord: {
       tokenLabel: 'Bot Token',
-      steps: [
-        '1. 前往 discord.com/developers/applications',
-        '2. New Application → 左側 Bot → Reset Token → 複製 Token',
-        '3. Bot 頁面往下捲 → Privileged Gateway Intents：',
-        '⚠️ 必須開啟 MESSAGE CONTENT INTENT（否則 Bot 無法收到訊息）',
-        '   建議開啟 SERVER MEMBERS INTENT',
-        '4. 左側 OAuth2 → URL Generator → Scopes 勾選 bot',
-        '5. Bot Permissions 勾選：',
-        '   ☑ Send Messages（傳送訊息）',
-        '   ☑ Read Message History（讀取訊息歷史記錄）',
-        '   ☑ View Channels（檢視頻道）',
-        '6. 複製產生的 URL → 瀏覽器開啟 → 邀請 Bot 加入伺服器',
-        '💡 若先前已邀請但權限不足，需用新 URL 重新邀請',
+      stepKeys: [
+        'channels.setup.discord.step1',
+        'channels.setup.discord.step2',
+        'channels.setup.discord.step3',
+        'channels.setup.discord.intentWarning',
+        'channels.setup.discord.intentRecommend',
+        'channels.setup.discord.step4',
+        'channels.setup.discord.step5',
+        'channels.setup.discord.perm1',
+        'channels.setup.discord.perm2',
+        'channels.setup.discord.perm3',
+        'channels.setup.discord.step6',
+        'channels.setup.discord.reinviteTip',
       ],
     },
     slack: {
       tokenLabel: 'Bot User OAuth Token (xoxb-...)',
       secretLabel: 'App-Level Token (xapp-...)',
-      steps: [
-        '1. 前往 api.slack.com/apps → Create New App',
-        '2. OAuth & Permissions → Install to Workspace',
-        '3. 複製 Bot User OAuth Token (xoxb-...)',
-        '4. Socket Mode → 啟用 → 取得 App-Level Token (xapp-...)',
-        '5. OAuth Scopes: chat:write, channels:read, app_mentions:read',
-        'Socket Mode 模式，無需公開 URL',
+      stepKeys: [
+        'channels.setup.slack.step1',
+        'channels.setup.slack.step2',
+        'channels.setup.slack.step3',
+        'channels.setup.slack.step4',
+        'channels.setup.slack.step5',
+        'channels.setup.slack.note',
       ],
     },
     whatsapp: {
       tokenLabel: 'Access Token',
       secretLabel: 'Phone Number ID',
-      steps: [
-        '1. 前往 developers.facebook.com/apps',
-        '2. 建立 Business App → 加入 WhatsApp 產品',
-        '3. WhatsApp → API Setup → 取得 Access Token',
-        '4. 記下 Phone Number ID',
-        '5. Configuration → 設定 Webhook URL + Verify Token',
-        '6. 訂閱 messages 事件',
-        '需要 Meta Business 驗證才能正式上線',
+      stepKeys: [
+        'channels.setup.whatsapp.step1',
+        'channels.setup.whatsapp.step2',
+        'channels.setup.whatsapp.step3',
+        'channels.setup.whatsapp.step4',
+        'channels.setup.whatsapp.step5',
+        'channels.setup.whatsapp.step6',
+        'channels.setup.whatsapp.note',
       ],
     },
     feishu: {
       tokenLabel: 'App ID',
       secretLabel: 'App Secret',
-      steps: [
-        '1. 前往 open.feishu.cn/app',
-        '2. 建立企業自建應用',
-        '3. 憑證與基礎資訊 → 取得 App ID + App Secret',
-        '4. 事件與回調 → 設定 Request URL',
-        '5. 權限: im:message:send_as_bot, im:message',
-        '6. 提交審核 → 發布上線',
+      stepKeys: [
+        'channels.setup.feishu.step1',
+        'channels.setup.feishu.step2',
+        'channels.setup.feishu.step3',
+        'channels.setup.feishu.step4',
+        'channels.setup.feishu.step5',
+        'channels.setup.feishu.step6',
       ],
     },
   };
 
-  const guide = channelGuide[channelType] ?? { tokenLabel: 'Token', steps: [] };
+  const guide = channelGuide[channelType] ?? { tokenLabel: 'Token', stepKeys: [] };
+  const steps = guide.stepKeys.map((id) => intl.formatMessage({ id }));
 
   return (
     <Dialog open={open} onClose={onClose} title={fixedType ? intl.formatMessage({ id: 'channels.dialog.editTitle' }, { type: fixedType }) : intl.formatMessage({ id: 'channels.dialog.addTitle' })}>
@@ -480,7 +484,7 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
         {/* Setup guide */}
         <div className="rounded-lg bg-amber-50 p-3 text-xs text-amber-800 dark:bg-amber-900/20 dark:text-amber-300">
           <p className="mb-1 font-medium">{intl.formatMessage({ id: 'channels.dialog.setupGuide' })}</p>
-          {guide.steps.map((step, i) => (
+          {steps.map((step, i) => (
             <p key={i} className={step.startsWith('⚠') ? 'font-semibold text-rose-600 dark:text-rose-400' : ''}>
               {step}
             </p>
