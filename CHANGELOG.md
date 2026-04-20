@@ -1,6 +1,39 @@
 # Changelog
 
 
+## [1.8.11] - 2026-04-20
+
+### Fixed
+- **Claude CLI `--bare` broke OAuth authentication** (Claude CLI
+  2.1.110 regression). The flag was added to
+  `spawn_claude_cli_with_env` for ~15-25% latency reduction by
+  skipping hooks / LSP / plugin sync / CLAUDE.md auto-discovery, but
+  also disabled OS-keychain credential lookup, causing every channel
+  subprocess call to fail with "Not logged in · Please run /login"
+  even when `claude auth status` confirmed a valid session. Removed
+  from both `call_claude_cli_rotated` and `call_claude_cli_lightweight`
+  paths.
+- **CJK / emoji byte-index string slicing panicked tokio workers**.
+  `s[..s.len().min(N)]` slices by byte, not by char, so any multi-byte
+  codepoint straddling byte N (e.g. `學` = 3 bytes) triggered "byte
+  index N is not a char boundary" panics that crashed reply dispatch
+  silently. The pattern was copy-pasted across 31 sites in 16 files
+  (Feishu, WhatsApp, LINE, Slack, Telegram, Discord, TTS, direct_api,
+  handlers, dispatcher, tool_classifier, gvu/loop_, cli/mcp,
+  cli/acp/handlers, runtime/openai_compat, computer_use, webchat,
+  channel_reply).
+
+### Added
+- **`duduclaw_core::truncate_bytes` / `truncate_chars`** (new
+  `duduclaw-core/src/text_utils.rs` module). `truncate_bytes` returns
+  a `&str` sliced at the nearest UTF-8 char boundary ≤ the requested
+  byte budget — a panic-safe drop-in for `&s[..N]`. `truncate_chars`
+  counts codepoints. Six unit tests cover ASCII, mid-CJK, zero-budget,
+  and emoji (4-byte) cases. Every unsafe byte-index slice on a
+  user-text / LLM-text / HTTP-body string was migrated.
+
+
+
 ## [1.8.10] - 2026-04-20
 
 ### Added
