@@ -2922,6 +2922,11 @@ fn is_session_error(e: &str) -> bool {
         || lower.contains("session expired")
         || lower.contains("no such session")
         || (lower.contains("--resume") && lower.contains("session"))
+        // Treat generic "unknown stream-json error" (is_error=true with no `result`
+        // text) as a likely session-handle problem when --resume is in use. The
+        // history-in-prompt fallback is safe: worst case we double-spend one turn,
+        // best case we recover a broken --resume without user intervention.
+        || lower.contains("unknown stream-json error")
 }
 
 /// Rotation-loop primitive, decoupled from the actual subprocess spawn.
@@ -3278,8 +3283,23 @@ async fn spawn_claude_cli_with_env(
                                             .and_then(|r| r.as_str())
                                             .unwrap_or("Unknown stream-json error");
                                         let _ = child.kill().await;
+                                        // Include captured stderr tail in the error so we can
+                                        // diagnose cases where Claude CLI sets is_error=true
+                                        // without a meaningful `result` text (e.g. --resume
+                                        // failures, internal CLI errors). Without this the
+                                        // error just says "Unknown stream-json error".
+                                        let stderr_tail = stderr_buf
+                                            .lock()
+                                            .ok()
+                                            .map(|g| g.trim().to_string())
+                                            .filter(|s| !s.is_empty())
+                                            .map(|s| {
+                                                let snippet = duduclaw_core::truncate_bytes(&s, 500);
+                                                format!(" | stderr: {snippet}")
+                                            })
+                                            .unwrap_or_default();
                                         return Err(format!(
-                                            "claude CLI stream error: {err_text}"
+                                            "claude CLI stream error: {err_text}{stderr_tail}"
                                         ));
                                     }
                                     if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
