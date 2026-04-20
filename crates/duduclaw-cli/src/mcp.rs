@@ -81,10 +81,17 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "schedule_task",
-        description: "Schedule a task",
+        description: "Schedule a recurring task in DuDuClaw's persistent CronScheduler. \
+            Tasks survive process restarts, are stored in ~/.duduclaw/cron_tasks.db, \
+            and can target any agent via agent_id. Use this for production scheduling \
+            (daily reports, periodic health checks, recurring agent work). \
+            Prefer this over Claude Code's built-in /schedule slash command, which \
+            is session-bound and expires when the session ends.",
         params: &[
-            ParamDef { name: "cron", description: "Cron expression", required: true },
-            ParamDef { name: "description", description: "Task description", required: true },
+            ParamDef { name: "cron", description: "Cron expression (5 fields '* * * * *' minute-precision, or 6 fields with seconds). Example: '0 8 * * *' = every day at 08:00 (agent's local time).", required: true },
+            ParamDef { name: "task", description: "Task prompt / description sent to the target agent when the cron fires. Write it as an instruction the agent will follow (e.g., 'Run daily competitive research and post findings to @Agnes').", required: true },
+            ParamDef { name: "name", description: "Human-readable task name for listing / pausing / deleting later (e.g., 'xianwen-pm-daily-research').", required: true },
+            ParamDef { name: "agent_id", description: "Target agent that will execute the task (e.g. 'xianwen-pm', 'duduclaw-tl'). Defaults to 'default' if omitted — explicit is strongly recommended.", required: false },
         ],
     },
     ToolDef {
