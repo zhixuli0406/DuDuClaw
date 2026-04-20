@@ -352,6 +352,10 @@ impl MethodHandler {
                 let _ = check_agent!(AccessLevel::Viewer);
                 self.handle_memory_browse(params).await
             }
+            "memory.key_facts" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_memory_key_facts(params).await
+            }
 
             // ── Wiki (open to all authenticated users) ───────
             "wiki.pages" => self.handle_wiki_pages(params).await,
@@ -400,6 +404,10 @@ impl MethodHandler {
             "security.audit_log" => {
                 require_admin!();
                 self.handle_security_audit_log(params).await
+            }
+            "audit.unified_log" => {
+                require_admin!();
+                self.handle_audit_unified_log(params).await
             }
             "security.status" => {
                 require_admin!();
@@ -565,6 +573,7 @@ impl MethodHandler {
                 { "name": "accounts.health", "description": "Account health check" },
                 { "name": "memory.search", "description": "Search agent memory" },
                 { "name": "memory.browse", "description": "Browse recent memory entries" },
+                { "name": "memory.key_facts", "description": "List extracted key insights (P2 Key-Fact Accumulator)" },
                 { "name": "wiki.pages", "description": "List wiki pages for an agent" },
                 { "name": "wiki.read", "description": "Read a wiki page" },
                 { "name": "wiki.search", "description": "Search wiki pages" },
@@ -2065,6 +2074,78 @@ impl MethodHandler {
         }
     }
 
+    /// List P2 Key-Fact Accumulator entries (exposed as "Key Insights" in the UI).
+    ///
+    /// Reads the `key_facts` table directly via raw SQL so that a missing table
+    /// resolves to an empty result set instead of surfacing an error — the table
+    /// is created on demand by `SqliteMemoryEngine::new`, but we want this RPC to
+    /// work even against older databases that were created before P2 landed.
+    async fn handle_memory_key_facts(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50).min(200) as i64;
+
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        }
+
+        let db_path = self.agent_memory_db_path(agent_id);
+        if !db_path.exists() {
+            return WsFrame::ok_response("", json!({ "entries": [] }));
+        }
+
+        let conn = match rusqlite::Connection::open(&db_path) {
+            Ok(c) => c,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+        };
+
+        let mut stmt = match conn.prepare(
+            "SELECT id, agent_id, fact, channel, chat_id, source_session, timestamp, access_count
+             FROM key_facts
+             WHERE agent_id = ?1
+             ORDER BY timestamp DESC
+             LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                // Graceful: if the `key_facts` table doesn't exist yet in this
+                // memory.db (e.g. legacy agent that hasn't triggered P2 bootstrap),
+                // fall back to an empty list rather than surfacing the SQL error.
+                let msg = e.to_string();
+                if msg.contains("no such table") {
+                    return WsFrame::ok_response("", json!({ "entries": [] }));
+                }
+                return WsFrame::error_response("", &format!("Key facts query prepare failed: {e}"));
+            }
+        };
+
+        let rows = match stmt.query_map(params![agent_id, limit], |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "agent_id": row.get::<_, String>(1)?,
+                "fact": row.get::<_, String>(2)?,
+                "channel": row.get::<_, String>(3)?,
+                "chat_id": row.get::<_, String>(4)?,
+                "source_session": row.get::<_, String>(5)?,
+                "timestamp": row.get::<_, String>(6)?,
+                "access_count": row.get::<_, i64>(7)?,
+            }))
+        }) {
+            Ok(r) => r,
+            Err(e) => return WsFrame::error_response("", &format!("Key facts query failed: {e}")),
+        };
+
+        let mut entries: Vec<Value> = Vec::new();
+        for row in rows {
+            match row {
+                Ok(v) => entries.push(v),
+                Err(e) => {
+                    return WsFrame::error_response("", &format!("Key facts row decode failed: {e}"));
+                }
+            }
+        }
+        WsFrame::ok_response("", json!({ "entries": entries }))
+    }
+
     // ── Wiki Knowledge Base ──────────────────────────────────
 
     async fn handle_wiki_pages(&self, params: Value) -> WsFrame {
@@ -3400,6 +3481,308 @@ impl MethodHandler {
             })
         }).collect();
         WsFrame::ok_response("", json!({ "events": events_json }))
+    }
+
+    /// Unified audit log that merges events from four JSONL sources:
+    /// - `security_audit.jsonl` (SOUL drift / injection / quarantine events)
+    /// - `tool_calls.jsonl` (MCP tool invocations)
+    /// - `channel_failures.jsonl` (channel reply failures)
+    /// - `feedback.jsonl` (heterogeneous user / evolution feedback signals)
+    ///
+    /// Each event is normalized into a common envelope with `source`,
+    /// `event_type`, `severity`, `summary`, and `details`. Missing files are
+    /// treated as zero-event sources; malformed lines are skipped silently.
+    async fn handle_audit_unified_log(&self, params: Value) -> WsFrame {
+        const DEFAULT_LIMIT: usize = 200;
+        const MAX_LIMIT: usize = 1000;
+        const SUMMARY_MAX_BYTES: usize = 240;
+
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| (n as usize).min(MAX_LIMIT))
+            .unwrap_or(DEFAULT_LIMIT);
+
+        let all_sources = ["security", "tool_call", "channel_failure", "feedback"];
+        let requested_sources: Vec<String> = params
+            .get("sources")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(|x| x.to_string()))
+                    .filter(|s| all_sources.contains(&s.as_str()))
+                    .collect()
+            })
+            .unwrap_or_else(|| all_sources.iter().map(|s| s.to_string()).collect());
+
+        let severity_filter = params
+            .get("severity_filter")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let agent_id_filter = params
+            .get("agent_id_filter")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // Initialize counts for every source so the frontend always sees the
+        // key even when the caller whitelisted a subset.
+        let mut source_counts: std::collections::HashMap<String, usize> =
+            all_sources.iter().map(|s| ((*s).to_string(), 0usize)).collect();
+
+        let mut events: Vec<Value> = Vec::new();
+
+        // Helper: read jsonl file tolerating missing files + malformed lines.
+        async fn read_jsonl_lines(path: &std::path::Path) -> Vec<Value> {
+            match tokio::fs::read_to_string(path).await {
+                Ok(content) => content
+                    .split('\n')
+                    .filter(|line| !line.trim().is_empty())
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        }
+
+        // ── Source: security_audit.jsonl ────────────────────────────
+        if requested_sources.iter().any(|s| s == "security") {
+            let path = self.home_dir.join("security_audit.jsonl");
+            let rows = read_jsonl_lines(&path).await;
+            *source_counts.entry("security".into()).or_insert(0) += rows.len();
+            for row in &rows {
+                let timestamp = row
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let event_type = row
+                    .get("event_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let agent_id = row
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let severity = row
+                    .get("severity")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("info")
+                    .to_lowercase();
+
+                if let Some(sf) = &severity_filter
+                    && &severity != sf
+                {
+                    continue;
+                }
+                if let Some(af) = &agent_id_filter
+                    && &agent_id != af
+                {
+                    continue;
+                }
+
+                let raw_summary = row
+                    .get("details")
+                    .map(|d| d.to_string())
+                    .unwrap_or_default();
+                let summary = truncate_bytes(&raw_summary, SUMMARY_MAX_BYTES).to_string();
+
+                events.push(json!({
+                    "timestamp": timestamp,
+                    "source": "security",
+                    "event_type": event_type,
+                    "agent_id": agent_id,
+                    "severity": severity,
+                    "summary": summary,
+                    "details": { "security_audit": row },
+                }));
+            }
+        }
+
+        // ── Source: tool_calls.jsonl ────────────────────────────────
+        if requested_sources.iter().any(|s| s == "tool_call") {
+            let path = self.home_dir.join("tool_calls.jsonl");
+            let rows = read_jsonl_lines(&path).await;
+            *source_counts.entry("tool_call".into()).or_insert(0) += rows.len();
+            for row in &rows {
+                let timestamp = row
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let agent_id = row
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let tool_name = row
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let success = row
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let params_summary = row
+                    .get("params_summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let severity = if success { "info" } else { "warning" };
+                let event_type = format!(
+                    "tool.{tool_name}.{}",
+                    if success { "success" } else { "failure" }
+                );
+                let summary = truncate_bytes(params_summary, SUMMARY_MAX_BYTES).to_string();
+
+                // severity_filter only applies to security per spec.
+                if let Some(af) = &agent_id_filter
+                    && &agent_id != af
+                {
+                    continue;
+                }
+
+                events.push(json!({
+                    "timestamp": timestamp,
+                    "source": "tool_call",
+                    "event_type": event_type,
+                    "agent_id": agent_id,
+                    "severity": severity,
+                    "summary": summary,
+                    "details": { "tool_call": row },
+                }));
+            }
+        }
+
+        // ── Source: channel_failures.jsonl ──────────────────────────
+        if requested_sources.iter().any(|s| s == "channel_failure") {
+            let path = self.home_dir.join("channel_failures.jsonl");
+            let rows = read_jsonl_lines(&path).await;
+            *source_counts.entry("channel_failure".into()).or_insert(0) += rows.len();
+            for row in &rows {
+                let timestamp = row
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // Producer uses lowercase "agent" field; fall back to
+                // "agent_id" to be defensive.
+                let agent_id = row
+                    .get("agent")
+                    .or_else(|| row.get("agent_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let reason = row
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown");
+                let error_msg = row
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let event_type = format!("channel.{reason}");
+                let summary = truncate_bytes(error_msg, SUMMARY_MAX_BYTES).to_string();
+
+                if let Some(af) = &agent_id_filter
+                    && &agent_id != af
+                {
+                    continue;
+                }
+
+                events.push(json!({
+                    "timestamp": timestamp,
+                    "source": "channel_failure",
+                    "event_type": event_type,
+                    "agent_id": agent_id,
+                    "severity": "warning",
+                    "summary": summary,
+                    "details": { "channel_failure": row },
+                }));
+            }
+        }
+
+        // ── Source: feedback.jsonl (heterogeneous shape) ────────────
+        if requested_sources.iter().any(|s| s == "feedback") {
+            let path = self.home_dir.join("feedback.jsonl");
+            let rows = read_jsonl_lines(&path).await;
+            *source_counts.entry("feedback".into()).or_insert(0) += rows.len();
+            for row in &rows {
+                let timestamp = row
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let agent_id = row
+                    .get("agent_id")
+                    .or_else(|| row.get("agent"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // `signal_type` is used by evolution feedback; fall back to
+                // `kind` / `type`, else "generic".
+                let kind = row
+                    .get("signal_type")
+                    .or_else(|| row.get("kind"))
+                    .or_else(|| row.get("type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("generic");
+                let event_type = format!("feedback.{kind}");
+
+                // Prefer `detail`, fall back to `message`, else stringified row.
+                let raw_summary = row
+                    .get("detail")
+                    .or_else(|| row.get("message"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| row.to_string());
+                let summary = truncate_bytes(&raw_summary, SUMMARY_MAX_BYTES).to_string();
+
+                if let Some(af) = &agent_id_filter
+                    && &agent_id != af
+                {
+                    continue;
+                }
+
+                events.push(json!({
+                    "timestamp": timestamp,
+                    "source": "feedback",
+                    "event_type": event_type,
+                    "agent_id": agent_id,
+                    "severity": "info",
+                    "summary": summary,
+                    "details": { "feedback": row },
+                }));
+            }
+        }
+
+        // Sort descending by timestamp. Lexicographic compare works for
+        // RFC3339/ISO8601 timestamps with consistent timezone suffix.
+        events.sort_by(|a, b| {
+            let ta = a.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+            let tb = b.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+            tb.cmp(ta)
+        });
+
+        let total = events.len();
+        events.truncate(limit);
+
+        let counts_json = json!({
+            "security": source_counts.get("security").copied().unwrap_or(0),
+            "tool_call": source_counts.get("tool_call").copied().unwrap_or(0),
+            "channel_failure": source_counts.get("channel_failure").copied().unwrap_or(0),
+            "feedback": source_counts.get("feedback").copied().unwrap_or(0),
+        });
+
+        WsFrame::ok_response(
+            "",
+            json!({
+                "events": events,
+                "source_counts": counts_json,
+                "total": total,
+            }),
+        )
     }
 
     /// Live security system status — replaces static placeholder panels.

@@ -130,6 +130,17 @@ export interface MemoryEntry {
   tags: string[];
 }
 
+export interface KeyFactEntry {
+  id: string;
+  agent_id: string;
+  fact: string;
+  channel: string;
+  chat_id: string;
+  source_session: string;
+  timestamp: string;
+  access_count: number;
+}
+
 export interface WikiPageMeta {
   path: string;
   title: string;
@@ -202,6 +213,25 @@ export interface AuditEvent {
   agent_id: string;
   severity: 'info' | 'warning' | 'critical';
   details: Record<string, unknown>;
+}
+
+// ── Unified audit log (merges security, tool_call, channel_failure, feedback) ──
+export type UnifiedAuditSource = 'security' | 'tool_call' | 'channel_failure' | 'feedback';
+
+export interface UnifiedAuditEvent {
+  timestamp: string;
+  source: UnifiedAuditSource;
+  event_type: string;
+  agent_id: string;
+  severity: 'info' | 'warning' | 'critical';
+  summary: string;
+  details: Record<string, unknown>;
+}
+
+export interface UnifiedAuditResponse {
+  events: UnifiedAuditEvent[];
+  source_counts: Record<UnifiedAuditSource, number>;
+  total: number;
 }
 
 export interface SkillIndexEntry {
@@ -739,6 +769,11 @@ export const api = {
         agent_id: agentId,
         limit,
       }) as Promise<{ entries: MemoryEntry[] }>,
+    keyFacts: (agentId: string, limit = 50) =>
+      client.call('memory.key_facts', {
+        agent_id: agentId,
+        limit,
+      }) as Promise<{ entries: KeyFactEntry[] }>,
   },
   wiki: {
     pages: (agentId: string) =>
@@ -878,6 +913,14 @@ export const api = {
         rate_limiter: { requests_per_minute: number; concurrent_requests: number };
         soul_drift: Array<{ agent_id: string; soul_exists: boolean; gvu_enabled: boolean }>;
       }>,
+  },
+  audit: {
+    unifiedLog: (params?: {
+      limit?: number;
+      sources?: UnifiedAuditSource[];
+      severity_filter?: 'info' | 'warning' | 'critical';
+      agent_id_filter?: string;
+    }) => client.call('audit.unified_log', params ?? {}) as Promise<UnifiedAuditResponse>,
   },
   skillMarket: {
     search: (query: string) =>

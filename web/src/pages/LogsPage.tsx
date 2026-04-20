@@ -4,7 +4,12 @@ import { cn } from '@/lib/utils';
 import { useLogsStore, selectFilteredEntries } from '@/stores/logs-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useConnectionStore } from '@/stores/connection-store';
-import { api, type AuditEvent } from '@/lib/api';
+import { toast, formatError } from '@/lib/toast';
+import {
+  api,
+  type UnifiedAuditEvent,
+  type UnifiedAuditSource,
+} from '@/lib/api';
 import {
   Pause,
   Play,
@@ -12,11 +17,6 @@ import {
   Search,
   History,
   Radio,
-  Shield,
-  AlertTriangle,
-  FileWarning,
-  User,
-  Hash,
 } from 'lucide-react';
 
 // ── Shared styles ──────────────────────────────────────────
@@ -101,49 +101,207 @@ function TabButton({
   );
 }
 
-// ── History tab (audit events from JSONL) ──────────────────
+// ── History tab (unified audit events from JSONL sources) ─────
+
+type SeverityFilter = 'all' | 'info' | 'warning' | 'critical';
+
+const ALL_SOURCES: UnifiedAuditSource[] = [
+  'security',
+  'tool_call',
+  'channel_failure',
+  'feedback',
+];
 
 function HistoryTab() {
   const intl = useIntl();
   const connectionState = useConnectionStore((s) => s.state);
-  const [events, setEvents] = useState<AuditEvent[]>([]);
+  const [events, setEvents] = useState<UnifiedAuditEvent[]>([]);
+  const [sourceCounts, setSourceCounts] = useState<Record<UnifiedAuditSource, number>>({
+    security: 0,
+    tool_call: 0,
+    channel_failure: 0,
+    feedback: 0,
+  });
   const [loading, setLoading] = useState(false);
-  const [expandedIdx, setExpandedIdx] = useState<number | null>(null);
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  // null = all sources; otherwise whitelist subset
+  const [selectedSources, setSelectedSources] = useState<UnifiedAuditSource[] | null>(null);
+  const [severityFilter, setSeverityFilter] = useState<SeverityFilter>('all');
 
   useEffect(() => {
     if (connectionState !== 'authenticated') return;
+    let cancelled = false;
     setLoading(true);
-    api.security
-      .auditLog(100)
-      .then((res) => setEvents(res?.events ?? []))
-      .catch(() => setEvents([]))
-      .finally(() => setLoading(false));
-  }, [connectionState]);
+    const params: {
+      limit: number;
+      sources?: UnifiedAuditSource[];
+      severity_filter?: 'info' | 'warning' | 'critical';
+    } = { limit: 300 };
+    if (selectedSources !== null) params.sources = selectedSources;
+    if (severityFilter !== 'all') params.severity_filter = severityFilter;
 
-  if (loading) {
-    return (
-      <div className="flex flex-1 items-center justify-center text-stone-400">
-        {intl.formatMessage({ id: 'common.loading' })}
-      </div>
-    );
-  }
+    api.audit
+      .unifiedLog(params)
+      .then((res) => {
+        if (cancelled) return;
+        setEvents(res?.events ?? []);
+        setSourceCounts(
+          res?.source_counts ?? {
+            security: 0,
+            tool_call: 0,
+            channel_failure: 0,
+            feedback: 0,
+          },
+        );
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setEvents([]);
+        toast.error(
+          intl.formatMessage(
+            { id: 'toast.error.loadFailed' },
+            { message: formatError(e) },
+          ),
+        );
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [connectionState, selectedSources, severityFilter, intl]);
 
-  if (events.length === 0) {
-    return (
-      <div className="flex flex-1 items-center justify-center text-stone-400">
-        {intl.formatMessage({ id: 'logs.history.empty' })}
-      </div>
-    );
-  }
+  const toggleSource = (src: UnifiedAuditSource) => {
+    setSelectedSources((prev) => {
+      if (prev === null) {
+        // Going from "all" to a single selection
+        return [src];
+      }
+      if (prev.includes(src)) {
+        const next = prev.filter((s) => s !== src);
+        return next.length === 0 ? null : next;
+      }
+      const next = [...prev, src];
+      // If all four selected, collapse back to "all" (null)
+      return next.length === ALL_SOURCES.length ? null : next;
+    });
+  };
+
+  const isSourceActive = (src: UnifiedAuditSource) =>
+    selectedSources === null || selectedSources.includes(src);
 
   return (
-    <div className="flex-1 space-y-2 overflow-y-auto">
-      {events.map((evt, i) => (
-        <AuditRow
-          key={`${evt.timestamp}-${i}`}
-          event={evt}
-          expanded={expandedIdx === i}
-          onToggle={() => setExpandedIdx(expandedIdx === i ? null : i)}
+    <div className="flex flex-1 flex-col gap-3 overflow-hidden">
+      {/* Filter bar */}
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <SourceChip
+            active={selectedSources === null}
+            onClick={() => setSelectedSources(null)}
+            label={intl.formatMessage({ id: 'logs.filter.source.all' })}
+            count={
+              sourceCounts.security +
+              sourceCounts.tool_call +
+              sourceCounts.channel_failure +
+              sourceCounts.feedback
+            }
+          />
+          {ALL_SOURCES.map((src) => (
+            <SourceChip
+              key={src}
+              active={selectedSources !== null && isSourceActive(src)}
+              onClick={() => toggleSource(src)}
+              label={intl.formatMessage({ id: `logs.filter.source.${src}` })}
+              count={sourceCounts[src]}
+            />
+          ))}
+        </div>
+
+        <select
+          value={severityFilter}
+          onChange={(e) => setSeverityFilter(e.target.value as SeverityFilter)}
+          className="rounded-lg border border-stone-200 bg-white px-3 py-1.5 text-sm text-stone-700 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-300"
+        >
+          <option value="all">
+            {intl.formatMessage({ id: 'logs.filter.severity.all' })}
+          </option>
+          <option value="info">info</option>
+          <option value="warning">warning</option>
+          <option value="critical">critical</option>
+        </select>
+      </div>
+
+      {/* Body */}
+      {loading ? (
+        <HistoryLoadingSkeleton />
+      ) : events.length === 0 ? (
+        <div className="flex flex-1 items-center justify-center px-4 text-center text-stone-400">
+          <p>{intl.formatMessage({ id: 'logs.empty.noMatch' })}</p>
+        </div>
+      ) : (
+        <div className="flex-1 space-y-2 overflow-y-auto pr-1">
+          {events.map((evt, i) => {
+            const key = `${evt.timestamp}-${evt.source}-${i}`;
+            return (
+              <AuditRow
+                key={key}
+                event={evt}
+                expanded={expandedKey === key}
+                onToggle={() => setExpandedKey(expandedKey === key ? null : key)}
+              />
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SourceChip({
+  active,
+  onClick,
+  label,
+  count,
+}: {
+  readonly active: boolean;
+  readonly onClick: () => void;
+  readonly label: string;
+  readonly count: number;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        'inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors',
+        active
+          ? 'border-amber-400 bg-amber-50 text-amber-800 dark:border-amber-500/50 dark:bg-amber-900/20 dark:text-amber-300'
+          : 'border-stone-200 bg-white text-stone-600 hover:bg-stone-50 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-400 dark:hover:bg-stone-700/60',
+      )}
+    >
+      <span>{label}</span>
+      <span
+        className={cn(
+          'rounded-full px-1.5 py-0.5 text-[10px] font-semibold',
+          active
+            ? 'bg-amber-200 text-amber-900 dark:bg-amber-800/60 dark:text-amber-200'
+            : 'bg-stone-100 text-stone-500 dark:bg-stone-700 dark:text-stone-400',
+        )}
+      >
+        {count}
+      </span>
+    </button>
+  );
+}
+
+function HistoryLoadingSkeleton() {
+  return (
+    <div className="flex-1 space-y-2 overflow-hidden">
+      {Array.from({ length: 6 }).map((_, i) => (
+        <div
+          key={i}
+          className="h-16 animate-pulse rounded-xl border border-stone-200 bg-stone-50 dark:border-stone-800 dark:bg-stone-800/50"
         />
       ))}
     </div>
@@ -152,10 +310,17 @@ function HistoryTab() {
 
 // ── Audit row ──────────────────────────────────────────────
 
-const severityStyles: Record<string, string> = {
-  info: 'text-blue-500',
-  warning: 'text-amber-500',
-  critical: 'text-rose-500',
+const severityBorder: Record<UnifiedAuditEvent['severity'], string> = {
+  info: 'border-l-emerald-400 dark:border-l-emerald-500',
+  warning: 'border-l-amber-400 dark:border-l-amber-500',
+  critical: 'border-l-rose-400 dark:border-l-rose-500',
+};
+
+const sourceBadge: Record<UnifiedAuditSource, string> = {
+  security: 'bg-stone-100 text-stone-700 dark:bg-stone-800 dark:text-stone-300',
+  tool_call: 'bg-stone-100 text-stone-700 dark:bg-stone-800 dark:text-stone-300',
+  channel_failure: 'bg-stone-100 text-stone-700 dark:bg-stone-800 dark:text-stone-300',
+  feedback: 'bg-stone-100 text-stone-700 dark:bg-stone-800 dark:text-stone-300',
 };
 
 function AuditRow({
@@ -163,66 +328,66 @@ function AuditRow({
   expanded,
   onToggle,
 }: {
-  readonly event: AuditEvent;
+  readonly event: UnifiedAuditEvent;
   readonly expanded: boolean;
   readonly onToggle: () => void;
 }) {
-  const SevIcon =
-    event.severity === 'critical'
-      ? AlertTriangle
-      : event.severity === 'warning'
-        ? FileWarning
-        : Shield;
+  const intl = useIntl();
+  const time = (() => {
+    try {
+      return new Date(event.timestamp).toLocaleString('zh-TW', {
+        hour12: false,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
+    } catch {
+      return event.timestamp;
+    }
+  })();
 
-  const time = new Date(event.timestamp).toLocaleString('zh-TW', {
-    hour12: false,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
+  const sourceLabel = intl.formatMessage({
+    id: `logs.filter.source.${event.source}`,
   });
-
-  const userId = (event.details as Record<string, unknown>)?.user_id as string | undefined;
-  const channel = (event.details as Record<string, unknown>)?.channel as string | undefined;
-  const scope = (event.details as Record<string, unknown>)?.scope as string | undefined;
 
   return (
     <div
-      className="cursor-pointer rounded-xl border border-stone-200 bg-white p-4 transition-colors hover:bg-stone-50 dark:border-stone-800 dark:bg-stone-900 dark:hover:bg-stone-800/70"
+      className={cn(
+        'cursor-pointer rounded-xl border border-l-4 border-stone-200 bg-white p-4 transition-colors hover:bg-stone-50 dark:border-stone-800 dark:bg-stone-900 dark:hover:bg-stone-800/70',
+        severityBorder[event.severity],
+      )}
       onClick={onToggle}
     >
-      <div className="flex items-start gap-3">
-        <SevIcon
-          className={`mt-0.5 h-4 w-4 shrink-0 ${severityStyles[event.severity] ?? 'text-stone-400'}`}
-        />
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-sm font-medium text-stone-900 dark:text-stone-100">
-              {event.event_type}
-            </span>
-            {event.agent_id && (
-              <span className="rounded bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
-                {event.agent_id}
-              </span>
-            )}
-            {(channel ?? scope) && (
-              <span className="inline-flex items-center gap-1 rounded bg-blue-100 px-1.5 py-0.5 text-xs text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
-                <Hash className="h-3 w-3" />
-                {channel ?? scope}
-              </span>
-            )}
-            {userId && (
-              <span className="inline-flex items-center gap-1 rounded bg-violet-100 px-1.5 py-0.5 text-xs text-violet-700 dark:bg-violet-900/30 dark:text-violet-400">
-                <User className="h-3 w-3" />
-                {userId}
-              </span>
-            )}
-          </div>
-          <p className="mt-1 text-xs text-stone-500 dark:text-stone-400">{time}</p>
-        </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <span
+          className={cn(
+            'rounded px-1.5 py-0.5 text-[11px] font-medium',
+            sourceBadge[event.source],
+          )}
+        >
+          {sourceLabel}
+        </span>
+        <span className="font-mono text-xs text-stone-500 dark:text-stone-400">
+          {event.event_type}
+        </span>
+        {event.agent_id && (
+          <span className="text-xs font-medium text-amber-600 dark:text-amber-400">
+            {event.agent_id}
+          </span>
+        )}
+        <span className="ml-auto text-xs text-stone-400 dark:text-stone-500">
+          {time}
+        </span>
       </div>
+
+      {event.summary && (
+        <p className="mt-2 whitespace-normal break-words text-sm text-stone-700 dark:text-stone-200">
+          {event.summary}
+        </p>
+      )}
 
       {expanded && event.details && Object.keys(event.details).length > 0 && (
         <pre className="mt-3 overflow-x-auto rounded-lg bg-stone-100 p-3 text-xs text-stone-700 dark:bg-stone-800 dark:text-stone-300">
