@@ -1,6 +1,36 @@
 # Changelog
 
 
+## [1.8.12] - 2026-04-20
+
+### Fixed
+- **Opaque `claude CLI stream error: Unknown stream-json error`** now
+  carries the captured Claude CLI stderr tail (`| stderr: ...`, 500
+  bytes max). When Claude CLI emits `is_error: true` on a `result`
+  event with no `result` string, the caller previously got no
+  actionable detail; now the real reason (stale `--resume` handle,
+  internal CLI error, etc.) is surfaced in both the debug log and
+  the rotator's error history.
+- **Auto-fallback on generic `--resume` failures**. `is_session_error`
+  now also matches "unknown stream-json error", so when Claude CLI
+  can't spell out why `--resume` failed the caller retries once with
+  the session history folded into the prompt. Worst case one extra
+  turn of cost; best case the user gets a reply instead of an opaque
+  error.
+- **`schedule_task` MCP tool schema was missing `agent_id` and `name`**.
+  The handler reads both (plus `task` / `prompt` / `description` as
+  synonyms) but the declared `ParamDef` list exposed only `cron` and
+  `description`. From the agent's point of view the tool looked half-
+  built, so Agnes fell back to Claude Code's session-bound
+  `/schedule` slash command (7-day auto-expiry) instead of DuDuClaw's
+  persistent `CronScheduler`. Schema now lists `cron`, `task`, `name`
+  (all required), and `agent_id` (optional, strongly recommended),
+  and the description explicitly states the tool is persistent
+  (`~/.duduclaw/cron_tasks.db`), survives restarts, and should be
+  preferred over `/schedule`.
+
+
+
 ## [1.8.11] - 2026-04-20
 
 ### Fixed
