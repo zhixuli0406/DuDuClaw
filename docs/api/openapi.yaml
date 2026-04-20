@@ -1806,23 +1806,6 @@ paths:
                     items:
                       type: object
 
-  /rpc/evolution.skills:
-    post:
-      tags: [evolution]
-      summary: Evolution skills status
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/EmptyParams"
-      responses:
-        "200":
-          description: Evolution skills
-          content:
-            application/json:
-              schema:
-                type: object
-
   # ── Browser ──────────────────────────────────────────────────
 
   /rpc/browser.request_approval:

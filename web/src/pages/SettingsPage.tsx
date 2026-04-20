@@ -6,6 +6,7 @@ import { useSystemStore } from '@/stores/system-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { api, type AutopilotRule, type AutopilotHistoryEntry } from '@/lib/api';
 import { Dialog } from '@/components/shared/Dialog';
+import { toast, formatError } from '@/lib/toast';
 import { ToolApprovalPanel } from '@/components/ToolApprovalPanel';
 import { SessionReplayPanel } from '@/components/SessionReplayPanel';
 import { BrowserAuditPanel } from '@/components/BrowserAuditPanel';
@@ -114,8 +115,11 @@ function GeneralTab() {
         const rotMatch = raw.match(/strategy\s*=\s*"(\w+)"/);
         if (rotMatch) setRotationStrategy(rotMatch[1]);
       }
-    }).catch((e) => console.warn("[api]", e));
-  }, []);
+    }).catch((e) => {
+      console.warn("[api]", e);
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    });
+  }, [intl]);
 
   const handleSave = async () => {
     setSaving(true);
@@ -124,8 +128,9 @@ function GeneralTab() {
       await api.system.updateConfig({ log_level: logLevel, rotation_strategy: rotationStrategy });
       setSaved(true);
       savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
-    } catch {
-      // error handled silently
+    } catch (e) {
+      console.warn("[api]", e);
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
     } finally {
       setSaving(false);
     }
@@ -229,7 +234,12 @@ function HeartbeatTab() {
     api.heartbeat
       .status()
       .then((r) => setHeartbeats(r?.heartbeats ?? []))
-      .catch((e) => console.warn("[api]", e));
+      .catch((e) => {
+        console.warn("[api]", e);
+        toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      });
+    // 15s poll stays silent — transient errors would spam the user; the
+    // initial load toast is enough to flag persistent problems.
     const interval = setInterval(() => {
       api.heartbeat
         .status()
@@ -237,7 +247,7 @@ function HeartbeatTab() {
         .catch((e) => console.warn("[api]", e));
     }, 15_000);
     return () => clearInterval(interval);
-  }, []);
+  }, [intl]);
 
   return (
     <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
@@ -281,7 +291,10 @@ function HeartbeatTab() {
                       setHeartbeats((prev) =>
                         prev.map((h) => h.agent_id === hb.agent_id ? { ...h, enabled: !h.enabled } : h)
                       );
-                    }).catch((e) => console.warn("[api]", e));
+                    }).catch((e) => {
+                      console.warn("[api]", e);
+                      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+                    });
                   }}
                   title={intl.formatMessage({ id: 'settings.heartbeat.toggle' })}
                   className={cn(
@@ -290,7 +303,10 @@ function HeartbeatTab() {
                   )}
                 />
                 <button
-                  onClick={() => api.heartbeat.trigger(hb.agent_id).catch((e) => console.warn("[api]", e))}
+                  onClick={() => api.heartbeat.trigger(hb.agent_id).catch((e) => {
+                    console.warn("[api]", e);
+                    toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+                  })}
                   className="rounded px-1.5 py-0.5 text-xs text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-amber-900/20"
                 >
                   <Play className="h-3 w-3" />
@@ -348,6 +364,13 @@ function CronTab() {
   const handlePause = async (name: string) => {
     try {
       await api.cron.pause(name);
+      await fetchTasks();
+    } catch { /* ignore */ }
+  };
+
+  const handleResume = async (name: string) => {
+    try {
+      await api.cron.resume(name);
       await fetchTasks();
     } catch { /* ignore */ }
   };
@@ -455,12 +478,19 @@ function CronTab() {
                     </td>
                     <td className="py-2 text-right">
                       <div className="flex justify-end gap-1">
-                        {task.enabled && (
+                        {task.enabled ? (
                           <button
                             onClick={() => handlePause(taskName)}
                             className="rounded px-2 py-1 text-xs text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-amber-900/20"
                           >
                             {intl.formatMessage({ id: 'settings.cron.pause' })}
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => handleResume(taskName)}
+                            className="rounded px-2 py-1 text-xs text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-900/20"
+                          >
+                            {intl.formatMessage({ id: 'settings.cron.resume' })}
                           </button>
                         )}
                         <button
@@ -594,8 +624,11 @@ function UpdateTab() {
     api.system.version().then((info) => {
       setEdition(info.edition ?? 'community');
       setAutoUpdate(info.auto_update ?? false);
-    }).catch((e) => console.warn("[api]", e));
-  }, []);
+    }).catch((e) => {
+      console.warn("[api]", e);
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    });
+  }, [intl]);
 
   // [H1] useRef guard prevents double-click race — declared before handleCheck
   const installingRef = useRef(false);

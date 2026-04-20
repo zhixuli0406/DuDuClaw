@@ -1,8 +1,9 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
-import { api, type MemoryEntry, type SkillInfo } from '@/lib/api';
+import { api, type MemoryEntry, type SkillInfo, type EvolutionVersion } from '@/lib/api';
 import { Link } from 'react-router';
+import { toast, formatError } from '@/lib/toast';
 import {
   Brain,
   Search,
@@ -77,7 +78,13 @@ function MemoriesTab() {
       if (list.length > 0 && !selectedAgent) {
         setSelectedAgent(list[0].name);
       }
-    }).catch((e) => console.warn("[api]", e));
+    }).catch((e) => {
+      console.warn("[api]", e);
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    });
+    // Run once on mount; `selectedAgent` is only read inside the promise body
+    // to seed a default and shouldn't retrigger this fetch. `intl` is stable
+    // from react-intl context, so omitting it here is safe.
   }, []);
 
   // Auto-browse when agent changes
@@ -86,10 +93,12 @@ function MemoriesTab() {
     setLoading(true);
     api.memory.browse(selectedAgent, 50).then((res) => {
       setEntries(res?.entries ?? []);
-    }).catch(() => {
+    }).catch((e) => {
+      console.warn("[api]", e);
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
       setEntries([]);
     }).finally(() => setLoading(false));
-  }, [selectedAgent]);
+  }, [selectedAgent, intl]);
 
   const handleSearch = useCallback(async () => {
     if (!query.trim() || !selectedAgent) return;
@@ -97,12 +106,14 @@ function MemoriesTab() {
     try {
       const result = await api.memory.search(selectedAgent, query);
       setEntries(result?.entries ?? []);
-    } catch {
+    } catch (e) {
+      console.warn("[api]", e);
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
       setEntries([]);
     } finally {
       setLoading(false);
     }
-  }, [query, selectedAgent]);
+  }, [query, selectedAgent, intl]);
 
   const selectStyle = 'rounded-lg border border-stone-200 bg-white px-3 py-2.5 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-700 dark:bg-stone-800 dark:text-stone-50';
 
@@ -362,25 +373,75 @@ function EvolutionTab() {
   const intl = useIntl();
   const [agents, setAgents] = useState<EvolutionAgent[]>([]);
   const [mode, setMode] = useState('');
+  const [enabled, setEnabled] = useState(false);
+  const [gvuEnabledCount, setGvuEnabledCount] = useState(0);
+  const [totalVersions, setTotalVersions] = useState(0);
+  const [lastAppliedAt, setLastAppliedAt] = useState<string | null>(null);
+  const [versions, setVersions] = useState<ReadonlyArray<EvolutionVersion>>([]);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     setLoading(true);
-    api.evolution.status().then((res) => {
-      setAgents(res?.agents ?? []);
-      setMode(res?.mode ?? '');
-    }).catch((e) => console.warn("[api]", e)).finally(() => setLoading(false));
-  }, []);
+    // Aggregate error surfacing — one toast covers the pair so a double
+    // backend outage doesn't stack two notifications on the user.
+    let notified = false;
+    const onFailure = (e: unknown) => {
+      console.warn("[api]", e);
+      if (notified) return null;
+      notified = true;
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      return null;
+    };
+    Promise.all([
+      api.evolution.status().catch(onFailure),
+      api.evolution.history(undefined, 20).catch(onFailure),
+    ]).then(([status, history]) => {
+      setAgents(status?.agents ?? []);
+      setMode(status?.mode ?? '');
+      setEnabled(status?.enabled ?? false);
+      setGvuEnabledCount(status?.gvu_enabled_count ?? 0);
+      setTotalVersions(status?.total_versions ?? 0);
+      setLastAppliedAt(status?.last_applied_at ?? null);
+      setVersions(history?.versions ?? []);
+    }).finally(() => setLoading(false));
+  }, [intl]);
 
   return (
     <div className="space-y-4">
       {/* Mode banner */}
       {mode && (
-        <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 dark:border-amber-800 dark:bg-amber-900/20">
-          <GitBranch className="h-4 w-4 text-amber-600 dark:text-amber-400" />
-          <span className="text-sm text-amber-700 dark:text-amber-400">
-            {intl.formatMessage({ id: 'evolution.mode' })}: <strong>{mode.replace('_', ' ')}</strong>
+        <div className={cn(
+          'flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border px-4 py-3',
+          enabled
+            ? 'border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-900/20'
+            : 'border-stone-200 bg-stone-50 dark:border-stone-700 dark:bg-stone-800/50',
+        )}>
+          <div className="flex items-center gap-2">
+            <GitBranch className={cn(
+              'h-4 w-4',
+              enabled ? 'text-amber-600 dark:text-amber-400' : 'text-stone-400',
+            )} />
+            <span className={cn(
+              'text-sm',
+              enabled ? 'text-amber-700 dark:text-amber-400' : 'text-stone-500 dark:text-stone-400',
+            )}>
+              {intl.formatMessage({ id: 'evolution.mode' })}: <strong>{mode.replace('_', ' ')}</strong>
+            </span>
+          </div>
+          <span className="text-xs text-stone-500 dark:text-stone-400">
+            {gvuEnabledCount}/{agents.length} {intl.formatMessage({ id: 'evolution.agentsEnabled' })}
           </span>
+          {totalVersions > 0 && (
+            <span className="text-xs text-stone-500 dark:text-stone-400">
+              · {totalVersions} versions
+            </span>
+          )}
+          {lastAppliedAt && (
+            <span className="flex items-center gap-1 text-xs text-stone-500 dark:text-stone-400">
+              <Clock className="h-3 w-3" />
+              {new Date(lastAppliedAt).toLocaleString()}
+            </span>
+          )}
         </div>
       )}
 
@@ -452,6 +513,111 @@ function EvolutionTab() {
           ))}
         </div>
       )}
+
+      {/* SOUL.md evolution history */}
+      {!loading && agents.length > 0 && (
+        <div className="space-y-3">
+          <h3 className="flex items-center gap-2 pt-2 text-sm font-semibold text-stone-700 dark:text-stone-300">
+            <GitBranch className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+            {intl.formatMessage({ id: 'evolution.engine' })}
+          </h3>
+          {versions.length === 0 ? (
+            <div className="flex items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-10 text-sm text-stone-500 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-400">
+              {intl.formatMessage({ id: 'evolution.noHistory' })}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {versions.map((v) => (
+                <EvolutionVersionCard key={v.version_id} version={v} />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EvolutionVersionCard({ version }: { version: EvolutionVersion }) {
+  const intl = useIntl();
+
+  const statusLabel = (() => {
+    switch (version.status) {
+      case 'Confirmed': return intl.formatMessage({ id: 'evolution.status.confirmed' });
+      case 'RolledBack': return intl.formatMessage({ id: 'evolution.status.rolledBack' });
+      case 'Observing': return intl.formatMessage({ id: 'evolution.status.observing' });
+      default: return version.status;
+    }
+  })();
+  const statusColor: Record<string, string> = {
+    Confirmed: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
+    RolledBack: 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400',
+    Observing: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
+  };
+
+  const renderDelta = (pre: number, post: number | undefined, invert = false) => {
+    if (post === undefined || post === null) return (
+      <span className="text-stone-400">{pre.toFixed(2)}</span>
+    );
+    const delta = post - pre;
+    const good = invert ? delta < 0 : delta > 0;
+    const color = Math.abs(delta) < 1e-6
+      ? 'text-stone-500'
+      : good ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400';
+    return (
+      <span>
+        <span className="text-stone-500">{pre.toFixed(2)}</span>
+        <span className="mx-1 text-stone-400">→</span>
+        <span className={color}>{post.toFixed(2)}</span>
+      </span>
+    );
+  };
+
+  return (
+    <div className="rounded-xl border border-stone-200 bg-white p-4 dark:border-stone-800 dark:bg-stone-900">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-medium text-amber-600 dark:text-amber-400">
+            {version.agent_id}
+          </span>
+          <span className={cn(
+            'rounded-full px-2 py-0.5 text-[10px] font-medium',
+            statusColor[version.status] ?? 'bg-stone-100 text-stone-600 dark:bg-stone-800 dark:text-stone-400',
+          )}>
+            {statusLabel}
+          </span>
+          <code className="text-[10px] text-stone-400">{version.soul_hash.slice(0, 8)}</code>
+        </div>
+        <span className="flex items-center gap-1 text-xs text-stone-400">
+          <Clock className="h-3 w-3" />
+          {new Date(version.applied_at).toLocaleString()}
+        </span>
+      </div>
+      {version.soul_summary && (
+        <p className="mt-2 text-sm text-stone-700 dark:text-stone-300 whitespace-pre-wrap">
+          {version.soul_summary}
+        </p>
+      )}
+      <div className="mt-3 grid grid-cols-3 gap-2 border-t border-stone-100 pt-3 text-xs dark:border-stone-800">
+        <div>
+          <p className="text-[10px] text-stone-400">{intl.formatMessage({ id: 'evolution.metric.feedback' })}</p>
+          <p className="font-mono">
+            {renderDelta(version.pre_metrics.positive_feedback_ratio, version.post_metrics?.positive_feedback_ratio)}
+          </p>
+        </div>
+        <div>
+          <p className="text-[10px] text-stone-400">{intl.formatMessage({ id: 'evolution.metric.error' })}</p>
+          <p className="font-mono">
+            {renderDelta(version.pre_metrics.prediction_error, version.post_metrics?.prediction_error, true)}
+          </p>
+        </div>
+        <div>
+          <p className="text-[10px] text-stone-400">{intl.formatMessage({ id: 'evolution.metric.corrections' })}</p>
+          <p className="font-mono">
+            {renderDelta(version.pre_metrics.user_correction_rate, version.post_metrics?.user_correction_rate, true)}
+          </p>
+        </div>
+      </div>
     </div>
   );
 }

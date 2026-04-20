@@ -1,157 +1,53 @@
-import { useState, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
-import { api } from '@/lib/api';
+import { api, type MarketplaceServer } from '@/lib/api';
 import {
   Search,
-  Star,
   Download,
   Check,
-  Calendar,
-  ShoppingCart,
-  FileText,
   MessageSquare,
   Database,
-  Zap,
-  BarChart3,
-  CloudSun,
+  Globe,
+  Package,
   Sparkles,
 } from 'lucide-react';
 
-type Category = 'all' | 'messaging' | 'data' | 'ai' | 'automation' | 'business';
-
-interface MockServer {
-  readonly id: string;
-  readonly name: string;
-  readonly author: string;
-  readonly stars: number;
-  readonly description: string;
-  readonly tags: readonly string[];
-  readonly price_cents: number;
-  readonly icon: React.ComponentType<{ className?: string }>;
-  readonly category: Category;
-  readonly featured: boolean;
-}
-
-const MOCK_SERVERS: ReadonlyArray<MockServer> = [
-  {
-    id: 'google-calendar-sync',
-    name: 'Google Calendar Sync',
-    author: 'duduclaw',
-    stars: 342,
-    description: 'Sync events, create meetings, and manage calendars directly from your agent.',
-    tags: ['calendar', 'google', 'productivity'],
-    price_cents: 0,
-    icon: Calendar,
-    category: 'automation',
-    featured: true,
-  },
-  {
-    id: 'shopify-orders',
-    name: 'Shopify Orders',
-    author: 'ecommerce-tools',
-    stars: 218,
-    description: 'Manage Shopify orders, inventory, and customer data through MCP tools.',
-    tags: ['shopify', 'e-commerce', 'orders'],
-    price_cents: 999,
-    icon: ShoppingCart,
-    category: 'business',
-    featured: true,
-  },
-  {
-    id: 'notion-database',
-    name: 'Notion Database',
-    author: 'notion-labs',
-    stars: 567,
-    description: 'Read, write, and query Notion databases. Create pages and manage properties.',
-    tags: ['notion', 'database', 'wiki'],
-    price_cents: 0,
-    icon: Database,
-    category: 'data',
-    featured: true,
-  },
-  {
-    id: 'slack-advanced',
-    name: 'Slack Advanced',
-    author: 'slack-community',
-    stars: 189,
-    description: 'Advanced Slack integration with thread management, reactions, and workflow triggers.',
-    tags: ['slack', 'messaging', 'workflow'],
-    price_cents: 499,
-    icon: MessageSquare,
-    category: 'messaging',
-    featured: false,
-  },
-  {
-    id: 'weather-api',
-    name: 'Weather API',
-    author: 'open-weather',
-    stars: 423,
-    description: 'Get current weather, forecasts, and historical data for any location worldwide.',
-    tags: ['weather', 'api', 'location'],
-    price_cents: 0,
-    icon: CloudSun,
-    category: 'data',
-    featured: false,
-  },
-  {
-    id: 'pdf-generator',
-    name: 'PDF Generator',
-    author: 'doc-tools',
-    stars: 156,
-    description: 'Generate professional PDF reports, invoices, and documents from templates.',
-    tags: ['pdf', 'document', 'template'],
-    price_cents: 1499,
-    icon: FileText,
-    category: 'automation',
-    featured: false,
-  },
-  {
-    id: 'line-rich-menu',
-    name: 'LINE Rich Menu Builder',
-    author: 'line-tw',
-    stars: 97,
-    description: 'Design and deploy LINE rich menus with visual editor and A/B testing.',
-    tags: ['line', 'menu', 'messaging'],
-    price_cents: 799,
-    icon: Zap,
-    category: 'messaging',
-    featured: false,
-  },
-  {
-    id: 'odoo-advanced-reports',
-    name: 'Odoo Advanced Reports',
-    author: 'erp-studio',
-    stars: 64,
-    description: 'Generate custom Odoo reports with charts, pivot tables, and scheduled exports.',
-    tags: ['odoo', 'erp', 'reports'],
-    price_cents: 1999,
-    icon: BarChart3,
-    category: 'business',
-    featured: false,
-  },
-];
+type Category = 'all' | 'featured' | 'browser' | 'data' | 'communication';
 
 const CATEGORIES: ReadonlyArray<Category> = [
   'all',
-  'messaging',
+  'featured',
+  'browser',
   'data',
-  'ai',
-  'automation',
-  'business',
+  'communication',
 ];
+
+/** Map a backend `category` string to a lucide icon component. */
+function iconForCategory(category: string): React.ComponentType<{ className?: string }> {
+  switch (category) {
+    case 'browser':
+      return Globe;
+    case 'data':
+      return Database;
+    case 'communication':
+      return MessageSquare;
+    default:
+      return Package;
+  }
+}
 
 function ServerCard({
   server,
   installed,
   onInstall,
 }: {
-  readonly server: MockServer;
+  readonly server: MarketplaceServer;
   readonly installed: boolean;
   readonly onInstall: () => void;
 }) {
   const intl = useIntl();
-  const Icon = server.icon;
+  const Icon = iconForCategory(server.category);
 
   return (
     <div className="rounded-xl border border-stone-200 bg-white p-5 transition-shadow hover:shadow-md dark:border-stone-800 dark:bg-stone-900">
@@ -160,16 +56,20 @@ function ServerCard({
           <Icon className="h-5 w-5 text-amber-600 dark:text-amber-400" />
         </div>
         <div className="flex-1 min-w-0">
-          <h4 className="font-medium text-stone-900 dark:text-stone-50 truncate">
-            {server.name}
-          </h4>
+          <div className="flex items-center gap-2">
+            <h4 className="font-medium text-stone-900 dark:text-stone-50 truncate">
+              {server.name}
+            </h4>
+            {server.featured && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">
+                <Sparkles className="h-3 w-3" />
+                {intl.formatMessage({ id: 'marketplace.featured' })}
+              </span>
+            )}
+          </div>
           <div className="flex items-center gap-2 mt-0.5">
             <span className="text-xs text-stone-500 dark:text-stone-400">
               {server.author}
-            </span>
-            <span className="flex items-center gap-0.5 text-xs text-amber-600 dark:text-amber-400">
-              <Star className="h-3 w-3 fill-current" />
-              {server.stars}
             </span>
           </div>
         </div>
@@ -179,23 +79,20 @@ function ServerCard({
         {server.description}
       </p>
 
-      <div className="mt-3 flex flex-wrap gap-1.5">
-        {server.tags.map((tag) => (
-          <span
-            key={tag}
-            className="inline-flex rounded-full bg-stone-100 px-2 py-0.5 text-xs text-stone-600 dark:bg-stone-800 dark:text-stone-400"
-          >
-            {tag}
-          </span>
-        ))}
-      </div>
+      {server.tags.length > 0 && (
+        <div className="mt-3 flex flex-wrap gap-1.5">
+          {server.tags.map((tag) => (
+            <span
+              key={tag}
+              className="inline-flex rounded-full bg-stone-100 px-2 py-0.5 text-xs text-stone-600 dark:bg-stone-800 dark:text-stone-400"
+            >
+              {tag}
+            </span>
+          ))}
+        </div>
+      )}
 
-      <div className="mt-4 flex items-center justify-between">
-        <span className="text-sm font-semibold text-stone-900 dark:text-stone-50">
-          {server.price_cents === 0
-            ? intl.formatMessage({ id: 'marketplace.free' })
-            : `$${(server.price_cents / 100).toFixed(2)}${intl.formatMessage({ id: 'marketplace.perMonth' })}`}
-        </span>
+      <div className="mt-4 flex items-center justify-end">
         <button
           onClick={onInstall}
           disabled={installed}
@@ -228,30 +125,72 @@ export function MarketplacePage() {
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<Category>('all');
   const [installedIds, setInstalledIds] = useState<ReadonlySet<string>>(new Set());
+  const [installError, setInstallError] = useState<string | null>(null);
+  const [servers, setServers] = useState<ReadonlyArray<MarketplaceServer>>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
-  const featured = MOCK_SERVERS.filter((s) => s.featured);
+  useEffect(() => {
+    let cancelled = false;
+
+    const load = async () => {
+      setLoading(true);
+      setLoadError(null);
+      try {
+        const res = await api.marketplace.list();
+        if (!cancelled) {
+          setServers(res.servers ?? []);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message : String(err);
+          setLoadError(message);
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    };
+
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const featuredServers = useMemo(
+    () => servers.filter((s) => s.featured),
+    [servers],
+  );
 
   const filtered = useMemo(() => {
     const q = query.toLowerCase();
-    return MOCK_SERVERS.filter((s) => {
-      if (category !== 'all' && s.category !== category) return false;
+    return servers.filter((s) => {
+      if (category === 'featured' && !s.featured) return false;
+      if (category !== 'all' && category !== 'featured' && s.category !== category) return false;
       if (q) {
         return (
           s.name.toLowerCase().includes(q) ||
           s.description.toLowerCase().includes(q) ||
-          s.tags.some((t) => t.toLowerCase().includes(q))
+          s.tags.some((t) => t.toLowerCase().includes(q)) ||
+          s.author.toLowerCase().includes(q)
         );
       }
       return true;
     });
-  }, [query, category]);
+  }, [query, category, servers]);
 
   const handleInstall = async (serverId: string) => {
+    setInstallError(null);
     try {
       await api.marketplace.install(serverId);
       setInstalledIds((prev) => new Set([...prev, serverId]));
-    } catch {
-      // Installation failed — UI stays unchanged
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setInstallError(
+        intl.formatMessage({ id: 'marketplace.installError' }, { message }),
+      );
     }
   };
 
@@ -260,6 +199,47 @@ export function MarketplacePage() {
       <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
         {intl.formatMessage({ id: 'marketplace.title' })}
       </h2>
+
+      {/* Install Error Alert */}
+      {installError && (
+        <div
+          role="alert"
+          className="flex items-start justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-300"
+        >
+          <span className="flex-1">{installError}</span>
+          <button
+            type="button"
+            onClick={() => setInstallError(null)}
+            className="shrink-0 text-rose-500 hover:text-rose-700 dark:text-rose-400 dark:hover:text-rose-200"
+            aria-label="Dismiss"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+          </button>
+        </div>
+      )}
+
+      {/* Load Error */}
+      {loadError && (
+        <div
+          role="alert"
+          className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-300"
+        >
+          {loadError}
+        </div>
+      )}
 
       {/* Search Bar */}
       <div className="relative">
@@ -291,8 +271,15 @@ export function MarketplacePage() {
         ))}
       </div>
 
-      {/* Featured Section */}
-      {category === 'all' && !query && (
+      {/* Loading */}
+      {loading && (
+        <p className="py-12 text-center text-stone-400 dark:text-stone-500">
+          {intl.formatMessage({ id: 'common.loading' })}
+        </p>
+      )}
+
+      {/* Featured Section (only on `all` tab with no search) */}
+      {!loading && category === 'all' && !query && featuredServers.length > 0 && (
         <div>
           <div className="flex items-center gap-2 mb-4">
             <Sparkles className="h-5 w-5 text-amber-500" />
@@ -301,7 +288,7 @@ export function MarketplacePage() {
             </h3>
           </div>
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {featured.map((server) => (
+            {featuredServers.map((server) => (
               <ServerCard
                 key={server.id}
                 server={server}
@@ -314,28 +301,32 @@ export function MarketplacePage() {
       )}
 
       {/* All Servers Grid */}
-      <div>
-        {(category !== 'all' || query) && (
-          <h3 className="mb-4 text-lg font-medium text-stone-900 dark:text-stone-50">
-            {intl.formatMessage({ id: `marketplace.categories.${category}` })}
-          </h3>
-        )}
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {filtered.map((server) => (
-            <ServerCard
-              key={server.id}
-              server={server}
-              installed={installedIds.has(server.id)}
-              onInstall={() => handleInstall(server.id)}
-            />
-          ))}
+      {!loading && (
+        <div>
+          {(category !== 'all' || query) && (
+            <h3 className="mb-4 text-lg font-medium text-stone-900 dark:text-stone-50">
+              {intl.formatMessage({ id: `marketplace.categories.${category}` })}
+            </h3>
+          )}
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {filtered.map((server) => (
+              <ServerCard
+                key={server.id}
+                server={server}
+                installed={installedIds.has(server.id)}
+                onInstall={() => handleInstall(server.id)}
+              />
+            ))}
+          </div>
+          {filtered.length === 0 && (
+            <p className="py-12 text-center text-stone-400 dark:text-stone-500">
+              {servers.length === 0
+                ? intl.formatMessage({ id: 'marketplace.empty' })
+                : intl.formatMessage({ id: 'common.noData' })}
+            </p>
+          )}
         </div>
-        {filtered.length === 0 && (
-          <p className="py-12 text-center text-stone-400 dark:text-stone-500">
-            {intl.formatMessage({ id: 'common.noData' })}
-          </p>
-        )}
-      </div>
+      )}
     </div>
   );
 }

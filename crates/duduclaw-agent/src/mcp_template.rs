@@ -387,12 +387,22 @@ pub fn ensure_mcp_absolute_paths_all(agents_dir: &Path) -> usize {
 }
 
 /// An entry in the MCP marketplace catalog.
-#[derive(Debug, Clone, Serialize)]
+///
+/// Honest-fields-only: no fake stars, download counts, or prices.
+/// - `author`: who maintains the MCP server package.
+/// - `tags`: keyword tags used for search and filtering.
+/// - `featured`: flag for flagship items highlighted on the Marketplace page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpCatalogItem {
     pub id: String,
     pub name: String,
     pub description: String,
     pub category: String,
+    pub author: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub featured: bool,
     pub requires_oauth: bool,
     pub default_def: McpServerDef,
     pub required_env: Vec<String>,
@@ -406,6 +416,9 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
             name: "Playwright".into(),
             description: "Browser automation".into(),
             category: "browser".into(),
+            author: "Anthropic".into(),
+            tags: vec!["browser".into(), "automation".into(), "testing".into()],
+            featured: true,
             requires_oauth: false,
             default_def: McpServerDef {
                 command: "npx".into(),
@@ -419,6 +432,9 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
             name: "Browserbase".into(),
             description: "Cloud browser".into(),
             category: "browser".into(),
+            author: "community".into(),
+            tags: vec!["browser".into(), "cloud".into(), "automation".into()],
+            featured: false,
             requires_oauth: false,
             default_def: McpServerDef {
                 command: "npx".into(),
@@ -435,6 +451,9 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
             name: "Filesystem".into(),
             description: "File access".into(),
             category: "data".into(),
+            author: "Anthropic".into(),
+            tags: vec!["files".into(), "storage".into(), "local".into()],
+            featured: true,
             requires_oauth: false,
             default_def: McpServerDef {
                 command: "npx".into(),
@@ -448,6 +467,9 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
             name: "GitHub".into(),
             description: "GitHub API".into(),
             category: "data".into(),
+            author: "Anthropic".into(),
+            tags: vec!["github".into(), "git".into(), "api".into(), "code".into()],
+            featured: true,
             requires_oauth: false,
             default_def: McpServerDef {
                 command: "npx".into(),
@@ -461,6 +483,9 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
             name: "Slack".into(),
             description: "Slack".into(),
             category: "communication".into(),
+            author: "Anthropic".into(),
+            tags: vec!["slack".into(), "messaging".into(), "chat".into()],
+            featured: false,
             requires_oauth: false,
             default_def: McpServerDef {
                 command: "npx".into(),
@@ -474,6 +499,9 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
             name: "PostgreSQL".into(),
             description: "PostgreSQL".into(),
             category: "data".into(),
+            author: "Anthropic".into(),
+            tags: vec!["database".into(), "sql".into(), "postgres".into()],
+            featured: true,
             requires_oauth: false,
             default_def: McpServerDef {
                 command: "npx".into(),
@@ -487,6 +515,9 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
             name: "SQLite".into(),
             description: "SQLite".into(),
             category: "data".into(),
+            author: "Anthropic".into(),
+            tags: vec!["database".into(), "sql".into(), "sqlite".into(), "local".into()],
+            featured: false,
             requires_oauth: false,
             default_def: McpServerDef {
                 command: "npx".into(),
@@ -500,6 +531,9 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
             name: "Memory".into(),
             description: "Persistent memory".into(),
             category: "data".into(),
+            author: "Anthropic".into(),
+            tags: vec!["memory".into(), "storage".into(), "knowledge".into()],
+            featured: false,
             requires_oauth: false,
             default_def: McpServerDef {
                 command: "npx".into(),
@@ -513,6 +547,9 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
             name: "Fetch".into(),
             description: "HTTP fetch".into(),
             category: "data".into(),
+            author: "Anthropic".into(),
+            tags: vec!["http".into(), "web".into(), "api".into()],
+            featured: false,
             requires_oauth: false,
             default_def: McpServerDef {
                 command: "npx".into(),
@@ -526,6 +563,9 @@ pub fn marketplace_catalog() -> Vec<McpCatalogItem> {
             name: "Brave Search".into(),
             description: "Brave Search".into(),
             category: "data".into(),
+            author: "Anthropic".into(),
+            tags: vec!["search".into(), "web".into(), "brave".into()],
+            featured: false,
             requires_oauth: false,
             default_def: McpServerDef {
                 command: "npx".into(),

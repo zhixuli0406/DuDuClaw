@@ -4,6 +4,7 @@ import { useAgentsStore } from '@/stores/agents-store';
 import { cn } from '@/lib/utils';
 import { api, type AgentDetail, type AgentUpdateParams } from '@/lib/api';
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { toast, formatError } from '@/lib/toast';
 import { Bot, Pause, Play, Send, Eye, Plus, X, ShieldCheck, Pencil, Trash2 } from 'lucide-react';
 
 function StatusBadge({ status }: { status: string }) {
@@ -425,7 +426,10 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
   useEffect(() => {
     if (agent) {
       // Fetch available models
-      api.models.list().then((res) => setAvailableModels(res?.models ?? [])).catch((e) => console.warn("[api]", e));
+      api.models.list().then((res) => setAvailableModels(res?.models ?? [])).catch((e) => {
+        console.warn("[api]", e);
+        toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      });
 
       // Determine current preferred/fallback as unified IDs
       const localModel = agent.model?.local?.model ?? '';

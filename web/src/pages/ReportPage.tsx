@@ -4,6 +4,7 @@ import { useConnectionStore } from '@/stores/connection-store';
 import { api } from '@/lib/api';
 import { MessageCircle, Zap, Clock, DollarSign } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { toast, formatError } from '@/lib/toast';
 
 type Period = 'day' | 'week' | 'month';
 
@@ -88,11 +89,20 @@ export function ReportPage() {
 
   const fetchData = useCallback(
     (p: Period) => {
-      api.analytics.summary(p).then(setSummary).catch((e) => console.warn("[api]", e));
-      api.analytics.conversations().then((r) => setDaily(r?.daily ?? [])).catch((e) => console.warn("[api]", e));
-      api.analytics.costSavings().then((r) => setCosts(r?.monthly ?? [])).catch((e) => console.warn("[api]", e));
+      // One aggregate toast if anything in the group fails so three parallel
+      // errors don't stack three notifications on the user.
+      let notified = false;
+      const onFailure = (e: unknown) => {
+        console.warn("[api]", e);
+        if (notified) return;
+        notified = true;
+        toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      };
+      api.analytics.summary(p).then(setSummary).catch(onFailure);
+      api.analytics.conversations().then((r) => setDaily(r?.daily ?? [])).catch(onFailure);
+      api.analytics.costSavings().then((r) => setCosts(r?.monthly ?? [])).catch(onFailure);
     },
-    [],
+    [intl],
   );
 
   useEffect(() => {

@@ -25,6 +25,7 @@ import {
   Share2,
 } from 'lucide-react';
 import { WikiGraph } from '@/components/WikiGraph';
+import { toast, formatError } from '@/lib/toast';
 
 type TabId = 'browse' | 'search' | 'graph' | 'health';
 
@@ -41,7 +42,11 @@ export function KnowledgeHubPage() {
       if (list.length > 0 && !selectedAgent) {
         setSelectedAgent(list[0].name);
       }
-    }).catch((e) => console.warn("[api]", e));
+    }).catch((e) => {
+      console.warn("[api]", e);
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    });
+    // Run once on mount; selectedAgent seeding doesn't warrant re-fetching.
   }, []);
 
   const tabs: ReadonlyArray<{ id: TabId; label: string }> = [

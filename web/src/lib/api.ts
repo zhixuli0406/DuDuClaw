@@ -427,6 +427,35 @@ export interface BillingInvoice {
   pdf_url?: string;
 }
 
+// ── Partner Portal types ───────────────────────────────────
+
+export interface PartnerProfile {
+  company: string | null;
+  tier: string;
+  partner_id: string | null;
+  certified_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PartnerStats {
+  total_sold: number;
+  active_customers: number;
+  this_month_commission_cents: number;
+  lifetime_commission_cents: number;
+}
+
+export interface PartnerCustomer {
+  id: string;
+  name: string;
+  tier: string;
+  activated_at: string;
+  status: string;
+  commission_cents: number;
+  notes: string | null;
+  created_at: string;
+}
+
 export interface LicenseInfo {
   tier: string;
   activated: boolean;
@@ -536,8 +565,25 @@ export interface McpCatalogItem {
   name: string;
   description: string;
   category: string;
+  /** Author is always populated by the backend; optional here for
+   *  backward compatibility with any older JSON payloads. */
+  author?: string;
+  tags?: string[];
+  featured?: boolean;
   requires_oauth: boolean;
   default_def: McpServerDef;
+  required_env: string[];
+}
+
+export interface MarketplaceServer {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  author: string;
+  tags: string[];
+  featured: boolean;
+  requires_oauth: boolean;
   required_env: string[];
 }
 
@@ -743,6 +789,10 @@ export const api = {
       client.call('evolution.status') as Promise<{
         enabled: boolean;
         mode: string;
+        total_agents: number;
+        gvu_enabled_count: number;
+        total_versions: number;
+        last_applied_at: string | null;
         agents: Array<{
           agent_id: string;
           gvu_enabled: boolean;
@@ -802,6 +852,8 @@ export const api = {
       client.call('cron.add', { agent_id: agentId, cron, task }),
     pause: (id: string) =>
       client.call('cron.pause', { id }),
+    resume: (id: string) =>
+      client.call('cron.resume', { id }),
     remove: (id: string) =>
       client.call('cron.remove', { id }),
   },
@@ -895,8 +947,10 @@ export const api = {
       client.call('billing.history') as Promise<{ invoices: BillingInvoice[] }>,
   },
   marketplace: {
-    install: (serverId: string) =>
-      client.call('marketplace.install', { server_id: serverId }) as Promise<{ success: boolean }>,
+    list: () =>
+      client.call('marketplace.list') as Promise<{ servers: MarketplaceServer[] }>,
+    install: (id: string) =>
+      client.call('marketplace.install', { id }) as Promise<{ success: boolean }>,
   },
   odoo: {
     status: () =>
@@ -951,8 +1005,9 @@ export const api = {
       client.call('activity.list', params ?? {}) as Promise<{ events: ActivityEvent[]; total: number }>,
     subscribe: () =>
       client.call('activity.subscribe'),
-    unsubscribe: () =>
-      client.call('activity.unsubscribe'),
+    // No unsubscribe: the backend broadcasts activity events to every
+    // authenticated WS client, so disconnecting the WS is the only way to
+    // stop receiving them.
   },
   autopilot: {
     list: () =>
@@ -974,8 +1029,33 @@ export const api = {
     adopt: (skillName: string, targetAgentId: string) =>
       client.call('skills.adopt', { skill_name: skillName, target_agent_id: targetAgentId }) as Promise<{ success: boolean }>,
   },
-  // Partner portal — backend not yet implemented; calls will reject with error
   partner: {
+    profile: () =>
+      client.call('partner.profile') as Promise<PartnerProfile>,
+    stats: () =>
+      client.call('partner.stats') as Promise<PartnerStats>,
+    customers: (status?: string, limit = 100) =>
+      client.call('partner.customers', { status, limit }) as Promise<{
+        customers: PartnerCustomer[];
+      }>,
+    updateProfile: (
+      input: Omit<PartnerProfile, 'created_at' | 'updated_at'>,
+    ) =>
+      client.call('partner.profile.update', input) as Promise<PartnerProfile>,
+    addCustomer: (input: Omit<PartnerCustomer, 'id' | 'created_at'>) =>
+      client.call('partner.customer.add', input) as Promise<{ id: string }>,
+    updateCustomer: (
+      id: string,
+      patch: Partial<Omit<PartnerCustomer, 'id' | 'created_at'>>,
+    ) =>
+      client.call('partner.customer.update', { id, patch }) as Promise<{
+        success: boolean;
+      }>,
+    deleteCustomer: (id: string) =>
+      client.call('partner.customer.delete', { id }) as Promise<{
+        success: boolean;
+      }>,
+    // License generation — backend not yet implemented; calls reject with error.
     generateLicense: (_params: { tier: string; customer: string; months: number }) =>
       Promise.reject(new Error('Partner license generation not yet available')) as Promise<{ key: string }>,
   },
