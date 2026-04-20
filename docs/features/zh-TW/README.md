@@ -1,6 +1,6 @@
 # DuDuClaw 特色功能介紹
 
-> DuDuClaw v1.4.27 | 最後更新：2026-04-15
+> DuDuClaw v1.8.14 | 最後更新：2026-04-21
 
 本目錄收錄 DuDuClaw 各項特色功能的詳細介紹。每篇文章以設計理念、系統行為與運作流程為主軸——面向想深入了解「系統如何運作」的開發者，無需閱讀原始碼。
 
@@ -25,6 +25,12 @@
 | 13 | [Multi-Runtime Agent 執行](13-multi-runtime.md) | Claude / Codex / Gemini / OpenAI-compat 統一後端 |
 | 14 | [語音管線](14-voice-pipeline.md) | ASR / TTS / VAD / LiveKit — 本地優先語音智慧 |
 | 15 | [Skill 生命週期引擎](15-skill-lifecycle.md) | 7 階段自動化技能萃取與管理 |
+| 16 | [Session 記憶堆疊](../16-session-memory-stack.md) | Instruction Pinning + Snowball Recap + Key-Fact Accumulator |
+| 17 | [Wiki 知識分層](../17-wiki-knowledge-layer.md) | L0-L3 四層信任加權知識，自動注入系統 prompt |
+| 18 | [Git Worktree L0 隔離](../18-worktree-isolation.md) | 每任務獨立工作區，原子合併 |
+| 19 | [Agent Client Protocol (ACP/A2A)](../19-agent-client-protocol.md) | stdio JSON-RPC 2.0，Zed/JetBrains/Neovim 整合 |
+
+> 註：16-19 篇目前僅提供英文版，歡迎 PR 翻譯。
 
 ---
 

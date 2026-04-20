@@ -1,6 +1,6 @@
 # DuDuClaw Feature Highlights
 
-> DuDuClaw v1.4.27 | Last updated: 2026-04-15
+> DuDuClaw v1.8.14 | Last updated: 2026-04-21
 
 This directory contains detailed introductions to DuDuClaw's standout features. Each article explains the design rationale, system behavior, and operational flow — aimed at developers who want to understand *how things work* without diving into source code.
 
@@ -25,6 +25,10 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 13 | [Multi-Runtime Agent Execution](13-multi-runtime.md) | Claude / Codex / Gemini / OpenAI-compat unified backend |
 | 14 | [Voice Pipeline](14-voice-pipeline.md) | ASR / TTS / VAD / LiveKit — local-first voice intelligence |
 | 15 | [Skill Lifecycle Engine](15-skill-lifecycle.md) | 7-stage automated skill extraction and management |
+| 16 | [Session Memory Stack](16-session-memory-stack.md) | Pinned instructions + snowball recap + key-fact accumulator |
+| 17 | [Wiki Knowledge Layer](17-wiki-knowledge-layer.md) | L0-L3 trust-weighted knowledge with auto-injection |
+| 18 | [Git Worktree L0 Isolation](18-worktree-isolation.md) | Lightweight per-task sandbox with atomic merge |
+| 19 | [Agent Client Protocol (ACP/A2A)](19-agent-client-protocol.md) | IDE-grade stdio JSON-RPC for Zed/JetBrains/Neovim |
 
 ---
 
