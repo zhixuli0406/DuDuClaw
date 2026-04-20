@@ -1474,7 +1474,17 @@ async fn send_to_agent_with_ctx(
                      );
                      CREATE INDEX IF NOT EXISTS idx_dc_agent ON delegation_callbacks(agent_id);"
                 );
-                // Parse channel context: "telegram:12345" or "telegram:12345:6789"
+                // Parse channel context. Supported formats:
+                //   "telegram:12345"            → chat, no thread
+                //   "telegram:12345:6789"       → chat + topic/thread
+                //   "discord:<channel_id>"      → main channel
+                //   "discord:thread:<thread_id>" → Discord thread (thread IS a
+                //                                  channel to the Discord API;
+                //                                  the literal token "thread"
+                //                                  is a marker, not an ID)
+                //   "line:<user_id>"            → LINE user
+                //   "slack:<channel_id>"        → Slack channel
+                //   "slack:<channel_id>:<ts>"   → Slack thread (ts = parent timestamp)
                 let parts: Vec<&str> = channel_str.splitn(3, ':').collect();
                 if parts.len() >= 2 && duduclaw_core::SUPPORTED_CHANNEL_TYPES.contains(&parts[0]) {
                     // Rate limit: max 100 pending callbacks per agent to prevent DoS
@@ -1487,8 +1497,17 @@ async fn send_to_agent_with_ctx(
                         tracing::warn!(agent = %caller_cb, "delegation_callbacks per-agent limit (100) reached");
                     } else {
                     let ch_type = parts[0];
-                    let ch_id = parts[1];
-                    let thread = parts.get(2).map(|s| s.to_string());
+                    // Special case: `<type>:thread:<id>` — "thread" is a marker
+                    // word, not the channel_id. Collapse to (ch_id=<id>,
+                    // thread_id=None) because Discord's API treats a thread as
+                    // a regular channel endpoint. Storing "thread" as ch_id
+                    // makes validate_channel_id reject the forward as non-
+                    // numeric and the sub-agent's reply never reaches the user.
+                    let (ch_id, thread) = if parts.len() == 3 && parts[1] == "thread" {
+                        (parts[2], None)
+                    } else {
+                        (parts[1], parts.get(2).map(|s| s.to_string()))
+                    };
                     let now = chrono::Utc::now().to_rfc3339();
                     let _ = conn.execute(
                         "INSERT OR IGNORE INTO delegation_callbacks \
