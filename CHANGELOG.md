@@ -1,6 +1,117 @@
 # Changelog
 
 
+## [1.8.9] - 2026-04-20
+
+### Added
+- **Wiki knowledge layer system** (Vault-for-LLM inspired): 4-layer
+  architecture (L0 Identity / L1 Core / L2 Context / L3 Deep) with
+  `layer` and `trust` (0.0-1.0) frontmatter fields. Search results
+  ranked by trust-weighted score. Backward-compatible defaults for
+  existing pages.
+- **Wiki system prompt injection**: `build_system_prompt()` now
+  auto-injects L0+L1 wiki pages into the WIKI_CONTEXT module.
+  Agents automatically reference their accumulated knowledge without
+  manual `wiki_search` calls.
+- **FTS5 full-text index**: `WikiFts` SQLite-backed index with
+  `unicode61` tokenizer for CJK support. Auto-syncs on every
+  `write_page` / `delete_page`. Manual rebuild via `wiki_rebuild_fts`
+  MCP tool.
+- **Wiki dedup detection**: `wiki_dedup` MCP tool detects duplicate
+  pages by title match and tag Jaccard similarity (>= 0.8).
+- **Wiki knowledge graph**: `wiki_graph` MCP tool exports Mermaid
+  diagrams with BFS-limited center+depth focused view. Node shapes
+  vary by knowledge layer.
+- **Wiki search filters**: `wiki_search` / `shared_wiki_search` now
+  support `min_trust`, `layer`, and `expand` (1-hop related/backlink
+  expansion) parameters.
+- **Reverse backlink index**: `build_backlink_index()` scans
+  `related` frontmatter + body markdown links for bidirectional
+  mapping.
+- **Layer-aware context injection**: `build_injection_context()` +
+  `collect_by_layer()` for system prompt budget-aware injection.
+- **CLAUDE_WIKI.md template**: Now included in agent CLAUDE.md on
+  creation, providing wiki MCP tool usage guide to Claude Code.
+- **A2A stdio JSON-RPC server** (`acp::server::run_acp_server`):
+  `duduclaw acp-server` is now functional (previously a stub). Runs a
+  line-delimited JSON-RPC 2.0 loop on stdin/stdout with
+  `agent/discover`, `tasks/send`, `tasks/get`, `tasks/cancel`
+  methods, backed by the `A2ATaskManager`. Enables Zed / JetBrains /
+  Neovim IDE integration via the Agent Client Protocol.
+- **Behavioral contract injection**: `AgentRegistry` now loads
+  `CONTRACT.toml` into `LoadedAgent.contract`. `must_not` /
+  `must_always` rules are rendered as a CONTRACT module in the
+  system prompt, giving every runtime (Claude / Codex / Gemini)
+  consistent behavioral boundaries.
+- **Memory decay daily scheduler**: Gateway spawns a background
+  task that runs `duduclaw_memory::decay::run_decay` every 24h,
+  archiving low-importance entries older than 30 days and
+  permanently deleting archived entries older than 90 days.
+- **Dashboard WebSocket heartbeat**: Server sends a WebSocket
+  `Ping` every 30s and closes idle sockets after 60s without a
+  `Pong`. Client sends an application-level `ping` RPC every 25s
+  (browsers can't issue control frames). New `ping` method on the
+  gateway method handler returns `{pong:true}`.
+- **`/metrics` Prometheus endpoint**: New `duduclaw_gateway::metrics`
+  module exposed as `GET /metrics` on the gateway HTTP server for
+  scraping runtime metrics.
+- **RL trajectory collector + CLI**: New
+  `duduclaw_gateway::rl::collector` module writes per-agent
+  trajectories to `~/.duduclaw/rl_trajectories.jsonl` during
+  channel interactions. `duduclaw rl export|stats|reward` is now
+  functional (previously stub), including composite reward
+  computation (outcome × 0.7 + efficiency × 0.2 + overlong × 0.1).
+- **Cognitive memory MCP tools**: `memory_search_by_layer`
+  (episodic/semantic filter), `memory_successful_conversations`
+  (high-importance episodic recall by topic),
+  `memory_episodic_pressure` (observation-density score for
+  scheduling Meso reflections), `memory_consolidation_status`
+  (count of un-consolidated high-importance episodes).
+- **Streaming ASR providers**: `AsrRouter` now accepts
+  `Box<dyn StreamingAsrProvider>` (e.g. Deepgram WebSocket) via
+  `add_streaming_provider` / `streaming_provider()` for real-time
+  transcription alongside existing batch providers.
+- **Compression strategy selector**: `compress_text` MCP tool gains
+  a `strategy` param — `meta_token` (lossless), `llmlingua` (lossy
+  2-5×), `streaming_llm` (window management), or `auto`.
+- **Marketplace + Partner Portal dashboard pages**: Wired into
+  router and sidebar (manager+ gate for Partner Portal). New
+  Browser Automation tab under Settings with ToolApproval,
+  SessionReplay, and BrowserAudit panels. `ApprovalModal` mounted
+  at app root for synchronous tool approval prompts.
+
+### Changed
+- **Cloud ingest prompt**: Now instructs Claude to include `layer`
+  and `trust` in extracted wiki page frontmatter.
+- **Auto-ingest defaults**: Source pages default to `layer: context,
+  trust: 0.4`; entity pages to `layer: deep, trust: 0.3`.
+- **Backlink logging**: `write_page()` logs info-level suggestions
+  when referenced pages lack reciprocal backlinks.
+- **`wiki_search` / `shared_wiki_search` response**: Hits now
+  include `weighted_score`, `trust`, and `layer` fields alongside
+  the existing `score`.
+- **`duduclaw-agent` crate**: Now depends on `duduclaw-memory` to
+  build the WIKI_CONTEXT injection module at prompt assembly time.
+
+### Fixed
+- **Wiki-to-LLM disconnect (all runtimes)**: Wiki system previously
+  accumulated knowledge via channel ingest and GVU evolution but
+  never fed it back into LLM system prompts. Now L0+L1 pages are
+  auto-injected into ALL three system prompt assembly paths:
+  - CLI interactive (`runner.rs` — `WIKI_CONTEXT` module)
+  - Channel reply (`channel_reply.rs` — `## Wiki Knowledge` section,
+    serves Telegram/LINE/Discord → Claude/Codex/Gemini/OpenAI)
+  - Dispatcher/Cron (`claude_runner.rs` — `# Wiki Knowledge` section,
+    serves agent-to-agent delegation and scheduled tasks)
+- **FTS desync**: FTS index was completely disconnected from write
+  operations. Now auto-syncs on every page write/delete.
+- **CLAUDE_WIKI template unused**: Template existed but was never
+  included in agent CLAUDE.md files.
+- **`duduclaw rl` / `duduclaw acp-server` stubs**: Both commands
+  previously printed a placeholder and returned; they now execute
+  the real collector / JSON-RPC server.
+
+
 ## [1.8.8] - 2026-04-20
 
 ### Fixed

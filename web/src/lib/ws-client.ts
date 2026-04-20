@@ -27,6 +27,7 @@ export class DuDuClawClient {
   private reconnectAttempt = 0;
   private maxReconnectAttempts = 10;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private _state: ConnectionState = 'disconnected';
   private _onStateChange: ((state: ConnectionState) => void) | null = null;
   private url = '';
@@ -76,6 +77,7 @@ export class DuDuClawClient {
       };
 
       this.ws.onclose = () => {
+        this.stopHeartbeat();
         if (this.ws === null) return; // Intentional disconnect — skip
         this.setState('disconnected');
         this.rejectAllPending('Connection closed');
@@ -121,9 +123,30 @@ export class DuDuClawClient {
             return;
           }
         }
+        this.startHeartbeat();
         resolve();
       };
     });
+  }
+
+  private startHeartbeat() {
+    this.stopHeartbeat();
+    // Send a ping every 25s to keep the connection alive
+    // (server expects activity within 60s)
+    this.heartbeatTimer = setInterval(() => {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        // Send an application-level ping since browser WebSocket
+        // does not expose the ping/pong API
+        this.ws.send(JSON.stringify({ type: 'req', id: '_ping', method: 'ping', params: {} }));
+      }
+    }, 25000);
+  }
+
+  private stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
   }
 
   private handleFrame(frame: WsFrame) {
@@ -220,6 +243,7 @@ export class DuDuClawClient {
   }
 
   disconnect() {
+    this.stopHeartbeat();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

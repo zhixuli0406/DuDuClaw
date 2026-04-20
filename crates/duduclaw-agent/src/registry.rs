@@ -25,6 +25,8 @@ pub struct LoadedAgent {
     pub memory: Option<String>,
     /// Skill files loaded from SKILLS/*.md.
     pub skills: Vec<SkillFile>,
+    /// Behavioral contract loaded from CONTRACT.toml.
+    pub contract: crate::contract::Contract,
     /// Directory this agent was loaded from.
     pub dir: PathBuf,
 }
@@ -147,6 +149,7 @@ impl AgentRegistry {
         let identity = Self::load_optional_md(&dir.join("IDENTITY.md")).await;
         let memory = Self::load_optional_md(&dir.join("MEMORY.md")).await;
         let skills = Self::load_skills(&dir.join("SKILLS")).await;
+        let contract = crate::contract::load_contract(dir);
 
         Ok(LoadedAgent {
             config,
@@ -154,6 +157,7 @@ impl AgentRegistry {
             identity,
             memory,
             skills,
+            contract,
             dir: dir.to_path_buf(),
         })
     }

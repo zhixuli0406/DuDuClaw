@@ -34,6 +34,27 @@ fn build_system_prompt(agent: &duduclaw_agent::LoadedAgent) -> String {
         parts.push(format!("# Memory\n{}", memory.trim_end()));
     }
 
+    // Wiki knowledge injection — L0 (Identity) + L1 (Core) pages
+    let wiki_dir = agent.dir.join("wiki");
+    if wiki_dir.exists() {
+        let store = duduclaw_memory::WikiStore::new(wiki_dir);
+        match store.build_injection_context(6000) {
+            Ok(wiki_ctx) if !wiki_ctx.is_empty() => {
+                parts.push(format!("# Wiki Knowledge\n{}", wiki_ctx.trim_end()));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("Wiki injection failed in dispatcher: {e}");
+            }
+        }
+    }
+
+    // Behavioral contract boundaries — must_not / must_always rules.
+    let contract_prompt = duduclaw_agent::contract::contract_to_prompt(&agent.contract);
+    if !contract_prompt.is_empty() {
+        parts.push(contract_prompt);
+    }
+
     parts.join("\n\n---\n\n")
 }
 

@@ -248,6 +248,39 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     handler.set_heartbeat(heartbeat).await;
     info!("Heartbeat scheduler started (per-agent evolution + monitoring)");
 
+    // ── Memory decay: archive old entries daily ───────────────
+    // Archives entries older than 30 days (low-importance) and permanently
+    // deletes archived entries older than 90 days.
+    {
+        let hd = home_dir.clone();
+        tokio::spawn(async move {
+            // Wait 5 minutes after startup before first run
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+            let policy = duduclaw_memory::decay::MemoryDecayPolicy {
+                archive_after_days: 30,
+                delete_after_days: 90,
+                ..duduclaw_memory::decay::MemoryDecayPolicy::default()
+            };
+            loop {
+                interval.tick().await;
+                let db_path = hd.join("memory.db");
+                let p = policy.clone();
+                tokio::task::spawn_blocking(move || {
+                    let engine = match duduclaw_memory::SqliteMemoryEngine::new(&db_path) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::warn!("Memory decay: failed to open memory.db: {e}");
+                            return;
+                        }
+                    };
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(duduclaw_memory::decay::run_decay(&engine, &p));
+                });
+            }
+        });
+    }
+
     // Start cron scheduler (reads from SQLite cron_tasks.db, fires on schedule)
     let cron_store = Arc::new(
         crate::cron_store::CronStore::open(&home_dir)
@@ -513,6 +546,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let mut app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health_handler))
+        .route("/metrics", get(crate::metrics::metrics_handler))
         .route("/api/mcp/oauth/callback", get(handle_mcp_oauth_callback))
         .with_state(state)
         .merge(auth_router)
@@ -1001,8 +1035,22 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut event_rx = state.event_tx.subscribe();
     let mut logs_subscribed = false;
 
+    // Heartbeat: send ping every 30s, close if no pong in 60s
+    let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut last_pong = std::time::Instant::now();
+
     loop {
         tokio::select! {
+            // ── Heartbeat ping ─────────────────────────────
+            _ = heartbeat_interval.tick() => {
+                if last_pong.elapsed().as_secs() > 60 {
+                    warn!("Dashboard WebSocket heartbeat timeout");
+                    break;
+                }
+                if sink.send(Message::Ping(vec![].into())).await.is_err() {
+                    break;
+                }
+            }
             // ── Incoming WebSocket frames ───────────────────
             msg_opt = stream.next() => {
                 let msg = match msg_opt {
@@ -1047,6 +1095,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     Message::Close(_) => { info!("WebSocket connection closed by client"); break; }
                     Message::Ping(data) => {
                         if sink.send(Message::Pong(data)).await.is_err() { break; }
+                    }
+                    Message::Pong(_) => {
+                        last_pong = std::time::Instant::now();
                     }
                     _ => {}
                 }

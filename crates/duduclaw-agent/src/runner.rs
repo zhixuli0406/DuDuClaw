@@ -170,7 +170,7 @@ impl AgentRunner {
 /// Skills are sorted alphabetically by name for deterministic ordering.
 ///
 /// Module order:
-///   SHARED_BASE → IDENTITY (SOUL.md + IDENTITY.md) → SKILLS → MEMORY → DYNAMIC
+///   SHARED_BASE → IDENTITY (SOUL.md + IDENTITY.md) → SKILLS → MEMORY → WIKI_CONTEXT → DYNAMIC
 fn build_system_prompt(agent: &LoadedAgent) -> SystemPromptSnapshot {
     let mut buf = String::new();
     let mut modules = Vec::new();
@@ -233,7 +233,34 @@ fn build_system_prompt(agent: &LoadedAgent) -> SystemPromptSnapshot {
         append_module!("MEMORY", memory.trim_end());
     }
 
-    // 5. Dynamic — timestamp and session-specific metadata.
+    // 5. Wiki knowledge injection — L0 (Identity) + L1 (Core) pages
+    //    are always injected into the system prompt. L2/L3 are retrieved
+    //    on-demand via wiki_search MCP tool.
+    {
+        let wiki_dir = agent.dir.join("wiki");
+        if wiki_dir.exists() {
+            let store = duduclaw_memory::WikiStore::new(wiki_dir);
+            match store.build_injection_context(8000) {
+                Ok(wiki_ctx) if !wiki_ctx.is_empty() => {
+                    append_module!("WIKI_CONTEXT", wiki_ctx.trim_end());
+                }
+                Ok(_) => {} // no L0/L1 pages
+                Err(e) => {
+                    tracing::warn!("Failed to build wiki injection context: {e}");
+                }
+            }
+        }
+    }
+
+    // 6. Behavioral contract boundaries — must_not / must_always rules.
+    {
+        let contract_prompt = crate::contract::contract_to_prompt(&agent.contract);
+        if !contract_prompt.is_empty() {
+            append_module!("CONTRACT", &contract_prompt);
+        }
+    }
+
+    // 7. Dynamic — timestamp and session-specific metadata.
     //    This section is intentionally last so the frozen prefix above
     //    stays byte-identical even if dynamic content varies.
     {

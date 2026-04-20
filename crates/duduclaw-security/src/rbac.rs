@@ -208,6 +208,7 @@ mod tests {
             sticker: Default::default(),
             ptc: Default::default(),
             channels: None,
+            memory: Default::default(),
         }
     }
 

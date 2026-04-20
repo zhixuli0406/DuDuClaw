@@ -294,6 +294,7 @@ impl MethodHandler {
         match method {
             "connect.challenge" => self.handle_connect_challenge(params),
             "connect" => self.handle_connect(params),
+            "ping" => WsFrame::ok_response("", json!({ "pong": true })),
             "hello-ok" => self.handle_hello_ok(params),
             "tools.catalog" => self.handle_tools_catalog(params),
 
@@ -2107,6 +2108,9 @@ impl MethodHandler {
                         "path": h.path,
                         "title": h.title,
                         "score": h.score,
+                        "weighted_score": h.weighted_score,
+                        "trust": h.trust,
+                        "layer": h.layer.to_string(),
                         "context_lines": h.context_lines,
                     })
                 }).collect();
@@ -2247,6 +2251,9 @@ impl MethodHandler {
                         "path": h.path,
                         "title": h.title,
                         "score": h.score,
+                        "weighted_score": h.weighted_score,
+                        "trust": h.trust,
+                        "layer": h.layer.to_string(),
                         "context_lines": h.context_lines,
                     })
                 }).collect();

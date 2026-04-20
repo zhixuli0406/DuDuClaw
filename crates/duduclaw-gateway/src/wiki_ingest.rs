@@ -203,7 +203,7 @@ pub fn generate_local_proposals(
     // (session_id is channel-scoped, so without timestamp all turns overwrite the same file)
     let source_path = format!("sources/{}-{}-{}.md", date, sanitize_filename(session_id), time);
     let source_content = format!(
-        "---\ntitle: Conversation {}\ncreated: {}\nupdated: {}\ntags: [conversation, auto-ingest]\nrelated: []\nsources: [{}]\n---\n\n## User\n{}\n\n## Assistant\n{}\n",
+        "---\ntitle: Conversation {}\ncreated: {}\nupdated: {}\ntags: [conversation, auto-ingest]\nrelated: []\nsources: [{}]\nlayer: context\ntrust: 0.4\n---\n\n## User\n{}\n\n## Assistant\n{}\n",
         &session_id[..8.min(session_id.len())],
         now.to_rfc3339(),
         now.to_rfc3339(),
@@ -228,7 +228,7 @@ pub fn generate_local_proposals(
         let safe_name = sanitize_yaml_value(&entity_name);
         let safe_type = sanitize_yaml_value(&entity_type);
         let entity_content = format!(
-            "---\ntitle: {}\ncreated: {}\nupdated: {}\ntags: [{}, auto-ingest]\nrelated: []\nsources: [{}]\n---\n\nMentioned in conversation on {}.\n",
+            "---\ntitle: {}\ncreated: {}\nupdated: {}\ntags: [{}, auto-ingest]\nrelated: []\nsources: [{}]\nlayer: deep\ntrust: 0.3\n---\n\nMentioned in conversation on {}.\n",
             safe_name,
             now.to_rfc3339(),
             now.to_rfc3339(),
@@ -278,6 +278,12 @@ pub fn build_cloud_ingest_prompt(
          2. Domain concepts or processes → concepts/ pages\n\
          3. If this contradicts existing wiki pages, note the contradiction\n\
          4. Create cross-references to related existing pages\n\n\
+         ## Knowledge Layers & Trust Scores\n\
+         Every page MUST include `layer` and `trust` in frontmatter:\n\
+         - layer: identity (L0, agent identity) | core (L1, env/active projects) | context (L2, recent decisions) | deep (L3, archive)\n\
+         - trust: 0.0-1.0 (0.9+ verified, 0.7 reviewed, 0.5 default, 0.3 auto-ingested)\n\
+         Choose layer based on how often this knowledge should be injected into context.\n\
+         Choose trust based on how confident the extraction is.\n\n\
          Respond with JSON:\n\
          ```json\n\
          {{\n\
@@ -285,7 +291,7 @@ pub fn build_cloud_ingest_prompt(
              {{\n\
                \"page_path\": \"concepts/example.md\",\n\
                \"action\": \"create\",\n\
-               \"content\": \"---\\ntitle: Example\\n...---\\n\\nBody text.\",\n\
+               \"content\": \"---\\ntitle: Example\\nlayer: deep\\ntrust: 0.6\\n...---\\n\\nBody text.\",\n\
                \"rationale\": \"why\",\n\
                \"related_pages\": [\"entities/foo.md\"]\n\
              }}\n\

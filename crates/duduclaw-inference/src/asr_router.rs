@@ -9,6 +9,7 @@ use tracing::{info, warn};
 
 use crate::asr::AsrProvider;
 use crate::error::InferenceError;
+use crate::realtime_voice::StreamingAsrProvider;
 
 /// ASR routing strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +25,8 @@ pub enum AsrStrategy {
 /// ASR Router that dispatches to the best available provider.
 pub struct AsrRouter {
     providers: Vec<Box<dyn AsrProvider>>,
+    /// Streaming ASR providers (e.g. Deepgram WebSocket).
+    streaming_providers: Vec<Box<dyn StreamingAsrProvider>>,
     #[allow(dead_code)]
     strategy: AsrStrategy,
     #[cfg(feature = "onnx")]
@@ -37,6 +40,7 @@ impl AsrRouter {
     pub fn new(strategy: AsrStrategy) -> Self {
         Self {
             providers: Vec::new(),
+            streaming_providers: Vec::new(),
             strategy,
             #[cfg(feature = "onnx")]
             vad: None,
@@ -52,6 +56,18 @@ impl AsrRouter {
         self
     }
 
+    /// Add a streaming ASR provider (e.g. Deepgram WebSocket).
+    pub fn add_streaming_provider(mut self, provider: Box<dyn StreamingAsrProvider>) -> Self {
+        info!(provider = provider.name(), "ASR Router: registered streaming provider");
+        self.streaming_providers.push(provider);
+        self
+    }
+
+    /// Get the first available streaming provider (if any).
+    pub fn streaming_provider(&self) -> Option<&dyn StreamingAsrProvider> {
+        self.streaming_providers.first().map(|p| p.as_ref())
+    }
+
     /// Set the VAD pre-processor (requires `onnx` feature).
     #[cfg(feature = "onnx")]
     pub fn with_vad(mut self, vad: crate::vad::SileroVad) -> Self {
@@ -62,7 +78,8 @@ impl AsrRouter {
     /// Build a router with all available providers auto-detected.
     ///
     /// Checks for local models in `models_dir`, cloud API keys in env.
-    pub fn auto_detect(_models_dir: &std::path::Path, strategy: AsrStrategy) -> Self {
+    pub fn auto_detect(models_dir: &std::path::Path, strategy: AsrStrategy) -> Self {
+        let _ = &models_dir; // used only when onnx/whisper features are enabled
         let mut router = Self::new(strategy);
 
         // Try SenseVoice (local ONNX)
@@ -108,7 +125,20 @@ impl AsrRouter {
                 router.providers.push(Box::new(provider));
             }
 
-        if router.providers.is_empty() {
+        // Try Deepgram streaming ASR (cloud, WebSocket)
+        if strategy != AsrStrategy::LocalOnly {
+            if std::env::var("DEEPGRAM_API_KEY").is_ok() {
+                match crate::deepgram::DeepgramStreamingAsr::from_env() {
+                    Ok(provider) => {
+                        info!("ASR Router: Deepgram streaming ASR available");
+                        router.streaming_providers.push(Box::new(provider));
+                    }
+                    Err(e) => warn!("ASR Router: Deepgram init failed: {e}"),
+                }
+            }
+        }
+
+        if router.providers.is_empty() && router.streaming_providers.is_empty() {
             warn!("ASR Router: no providers available — transcription will fail");
         }
 
