@@ -1,6 +1,63 @@
 # Changelog
 
 
+## [1.8.14] - 2026-04-21
+
+### Fixed
+- **Discord thread session id drifted across turns**. `auto_thread &&
+  !is_thread` in the session-id formatter was only true on the first
+  turn (when a thread was about to be created) — every follow-up turn
+  the user typed inside the thread flipped `is_thread` to true and the
+  session id silently switched from `discord:thread:{id}` to
+  `discord:{id}`, loading a fresh empty session and losing all context.
+  Condition is now `is_thread || created_thread` so a thread-scoped
+  conversation keeps one session id for its entire lifetime. Also
+  handles the edge case where `create_thread()` fails (returns
+  `discord:{channel_id}` instead of a misleading `discord:thread:...`).
+- **Sub-agent replies stuck in bus_queue.jsonl**. Three layered bugs
+  prevented `send_to_agent` → sub-agent → user round-trips from ever
+  completing:
+  1. The `delegation_callbacks` parser split `<channel>:thread:<id>`
+     by `:` and stored the literal string "thread" as `channel_id`;
+     downstream `validate_channel_id` rejected it as non-numeric, so
+     forwarding retry-looped forever. Parser now recognises the
+     `<type>:thread:<id>` marker and stores `channel_id=<id>,
+     thread_id=None`.
+  2. `forward_to_channel` only ran immediately after a live dispatch;
+     orphan `agent_response` entries left on disk after a crash /
+     Ctrl+C / hotswap were never replayed. New
+     `reconcile_orphan_responses` scans `bus_queue.jsonl` on
+     dispatcher startup and atomically replays every callback whose
+     row is still pending.
+  3. Discord / Telegram / LINE / Slack arms read the global
+     `[channels] <type>_bot_token` from config.toml. Discord threads
+     are scoped to the bot that opened them — a different bot returns
+     401 Unauthorized even in the same guild. New
+     `get_agent_channel_token` reads the originating agent's per-agent
+     token from `agents/<id>/agent.toml [channels.<type>] bot_token_enc`
+     first, falling back to the global token only when the agent has
+     none.
+- **Long sub-agent replies silently truncated**. `forward_to_channel`
+  capped responses at the channel byte limit and appended
+  `_(回應過長，已截斷)_`, dropping most TL/PM report content. Rewritten
+  to use the existing `channel_format::split_text` (paragraph/line
+  aligned, UTF-8 safe) emitting chunks labelled
+  `📨 **agent** 的回報 (1/N)` / `(續 2/N)`, each sized under the
+  channel's byte budget (Discord 1900, Telegram 4000, LINE 4900, Slack
+  3900) with a 250ms inter-chunk gap to stay within API rate limits.
+
+### Changed
+- **Default log level is now `warn`** when `RUST_LOG` is unset.
+  Previous default (`EnvFilter::from_default_env()` with no fallback)
+  dropped every log unless the user explicitly set `RUST_LOG`, which
+  made issues like "401 on delegation forward" undiagnosable from the
+  terminal and left `~/.duduclaw/logs/gateway.log` at 0 bytes. `warn`
+  keeps the terminal quiet for end users while still surfacing real
+  problems; run `RUST_LOG=info duduclaw run` for the verbose
+  dispatcher / WebSocket / heartbeat trace when debugging.
+
+
+
 ## [1.8.13] - 2026-04-20
 
 ### Added
