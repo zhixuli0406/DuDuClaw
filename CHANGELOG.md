@@ -1,6 +1,43 @@
 # Changelog
 
 
+## [1.8.13] - 2026-04-20
+
+### Added
+- **Memory page Key Insights tab**. The agent-local `memory.db` →
+  `memories` table is populated by the prediction engine with
+  satisfaction-error deltas ("Prediction deviation: expected 0.70,
+  inferred 0.42 ..."), not conversational content — so the previous
+  Memory tab looked empty / unhelpful on a running system. The real
+  extracted insights live in the `key_facts` table (P2 Key-Fact
+  Accumulator), which had zero dashboard exposure. New RPC
+  `memory.key_facts(agent_id, limit)` queries that table directly
+  and the Memory page now has a 4th tab "關鍵洞察 / Key Insights /
+  主要インサイト" rendering each fact as a card with `access_count`
+  badge, timestamp, and collapsible source metadata.
+- **Unified multi-source audit log on the Logs page**. Previously
+  `security.audit_log` read only `security_audit.jsonl` (rarely
+  written), so the history panel showed "暫無審計事件" on systems
+  with dozens of real tool calls. New RPC `audit.unified_log(params)`
+  merges four JSONL sources (`security_audit.jsonl`,
+  `tool_calls.jsonl`, `channel_failures.jsonl`, `feedback.jsonl`)
+  into a common envelope — `timestamp` / `source` / `event_type` /
+  `agent_id` / `severity` / `summary` / `details` — sorted
+  newest-first, with per-source counts returned alongside. Severity
+  rules: tool_call success=info, failure=warning,
+  channel_failure=warning, feedback=info, security preserves its
+  original severity. Missing files and malformed JSONL lines are
+  tolerated silently. Summary truncation goes through
+  `duduclaw_core::truncate_bytes` (CJK-safe).
+- **Logs page history tab rewrite**. Source filter chips
+  (全部 / 安全 / 工具呼叫 / 通道失敗 / 回饋) with live per-source
+  counts, severity dropdown, severity-colored left borders
+  (emerald / amber / rose), click-to-expand pretty-printed detail
+  JSON. Realtime tab untouched. `handle_security_audit_log` is
+  preserved intact for backward compatibility.
+
+
+
 ## [1.8.12] - 2026-04-20
 
 ### Fixed
