@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
-import { api, type MemoryEntry, type SkillInfo, type EvolutionVersion } from '@/lib/api';
+import { api, type MemoryEntry, type SkillInfo, type EvolutionVersion, type KeyFactEntry } from '@/lib/api';
 import { Link } from 'react-router';
 import { toast, formatError } from '@/lib/toast';
 import {
@@ -17,9 +17,10 @@ import {
   XCircle,
   Eye,
   ArrowRight,
+  Lightbulb,
 } from 'lucide-react';
 
-type TabId = 'memories' | 'skills' | 'evolution';
+type TabId = 'memories' | 'skills' | 'evolution' | 'insights';
 
 export function MemoryPage() {
   const intl = useIntl();
@@ -27,6 +28,7 @@ export function MemoryPage() {
 
   const tabs: ReadonlyArray<{ id: TabId; label: string }> = [
     { id: 'memories', label: intl.formatMessage({ id: 'memory.tab.memories' }) },
+    { id: 'insights', label: intl.formatMessage({ id: 'memory.tab.insights' }) },
     { id: 'skills', label: intl.formatMessage({ id: 'memory.tab.skills' }) },
     { id: 'evolution', label: intl.formatMessage({ id: 'memory.tab.evolution' }) },
   ];
@@ -56,6 +58,7 @@ export function MemoryPage() {
       </div>
 
       {activeTab === 'memories' && <MemoriesTab />}
+      {activeTab === 'insights' && <InsightsTab />}
       {activeTab === 'skills' && <SkillsTab />}
       {activeTab === 'evolution' && <EvolutionTab />}
     </div>
@@ -630,6 +633,120 @@ function EvolutionRow({ label, enabled }: { label: string; enabled: boolean }) {
         <CheckCircle className="h-4 w-4 text-emerald-500" />
       ) : (
         <XCircle className="h-4 w-4 text-stone-300 dark:text-stone-600" />
+      )}
+    </div>
+  );
+}
+
+function InsightsTab() {
+  const intl = useIntl();
+  const [facts, setFacts] = useState<ReadonlyArray<KeyFactEntry>>([]);
+  const [loading, setLoading] = useState(false);
+  const [agents, setAgents] = useState<ReadonlyArray<{ name: string; display_name: string }>>([]);
+  const [selectedAgent, setSelectedAgent] = useState('');
+
+  // Load agent list on mount (mirrors MemoriesTab to keep UX consistent).
+  useEffect(() => {
+    api.agents.list().then((res) => {
+      const list = res?.agents ?? [];
+      setAgents(list);
+      if (list.length > 0 && !selectedAgent) {
+        setSelectedAgent(list[0].name);
+      }
+    }).catch((e) => {
+      console.warn("[api]", e);
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    });
+    // Run once on mount; see MemoriesTab for rationale.
+  }, []);
+
+  useEffect(() => {
+    if (!selectedAgent) return;
+    setLoading(true);
+    api.memory.keyFacts(selectedAgent, 50).then((res) => {
+      setFacts(res?.entries ?? []);
+    }).catch((e) => {
+      console.warn("[api]", e);
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      setFacts([]);
+    }).finally(() => setLoading(false));
+  }, [selectedAgent, intl]);
+
+  const selectStyle = 'rounded-lg border border-stone-200 bg-white px-3 py-2.5 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-700 dark:bg-stone-800 dark:text-stone-50';
+
+  return (
+    <div className="space-y-4">
+      {/* Agent selector */}
+      <div className="flex gap-2">
+        <select
+          value={selectedAgent}
+          onChange={(e) => setSelectedAgent(e.target.value)}
+          className={selectStyle}
+        >
+          {agents.map((a) => (
+            <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
+          ))}
+        </select>
+      </div>
+
+      {/* Insight cards */}
+      {loading ? (
+        <div className="py-12 text-center text-stone-400">
+          {intl.formatMessage({ id: 'common.loading' })}
+        </div>
+      ) : facts.length === 0 ? (
+        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
+          <Lightbulb className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
+          <p className="mb-2 text-stone-500 dark:text-stone-400">
+            {intl.formatMessage({ id: 'memory.empty.insights' })}
+          </p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {facts.map((fact) => (
+            <div
+              key={fact.id}
+              className="rounded-xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900"
+            >
+              <div className="mb-2 flex items-start justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <Lightbulb className="h-4 w-4 text-amber-500 dark:text-amber-400" />
+                  <span className="text-xs font-medium text-amber-600 dark:text-amber-400">
+                    {fact.agent_id}
+                  </span>
+                  {fact.access_count > 0 && (
+                    <span className="inline-flex items-center rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+                      {intl.formatMessage(
+                        { id: 'memory.insights.accessCount' },
+                        { count: fact.access_count },
+                      )}
+                    </span>
+                  )}
+                </div>
+                <span className="flex shrink-0 items-center gap-1 text-xs text-stone-400 dark:text-stone-500">
+                  <Clock className="h-3 w-3" />
+                  {new Date(fact.timestamp).toLocaleString()}
+                </span>
+              </div>
+              <p className="text-sm text-stone-700 dark:text-stone-300 whitespace-pre-wrap">
+                {fact.fact}
+              </p>
+              {(fact.source_session || fact.channel || fact.chat_id) && (
+                <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1 border-t border-stone-100 pt-2 text-[11px] text-stone-400 dark:border-stone-800 dark:text-stone-500">
+                  {fact.source_session && (
+                    <span>session: <code className="text-stone-500 dark:text-stone-400">{fact.source_session}</code></span>
+                  )}
+                  {fact.channel && (
+                    <span>channel: <code className="text-stone-500 dark:text-stone-400">{fact.channel}</code></span>
+                  )}
+                  {fact.chat_id && (
+                    <span>chat: <code className="text-stone-500 dark:text-stone-400">{fact.chat_id}</code></span>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );
