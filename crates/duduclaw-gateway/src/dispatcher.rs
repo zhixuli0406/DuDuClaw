@@ -1477,17 +1477,35 @@ async fn forward_delegation_response(
         return;
     };
 
+    // v1.8.20: look up the chain root (original origin_agent) so
+    // `forward_to_channel` can cascade token resolution from the
+    // callback caller → chain root → global config. Without this hop,
+    // nested sub-agent replies (where the callback was registered by
+    // e.g. `duduclaw-tl` who has no per-agent Discord bot) fell back
+    // to the stale global token and got rejected with 401 by threads
+    // that were opened by the root agent's bot (e.g. agnes).
+    let chain_root = {
+        let home = home_dir.to_path_buf();
+        let msg_id = original_message_id.to_string();
+        tokio::task::spawn_blocking(move || lookup_origin_agent(&home, &msg_id))
+            .await
+            .ok()
+            .flatten()
+    };
+
     info!(
         channel = %channel_type,
         chat_id = %channel_id,
         thread = ?thread_id,
         responder = %responder_agent,
+        chain_root = ?chain_root,
         "Forwarding sub-agent response to originating channel"
     );
 
     match forward_to_channel(
         home_dir, &channel_type, &channel_id, thread_id.as_deref(),
         response_text, responder_agent, &callback_agent_id,
+        chain_root.as_deref(),
     ).await {
         Ok(()) => {
             // v1.8.17 Fix 2 (Option A): forward succeeded — also persist the
@@ -1846,6 +1864,16 @@ fn validate_channel_id(channel_type: &str, id: &str) -> Result<(), String> {
 
 /// Send a message to a specific channel (Telegram/LINE/Discord/Slack).
 /// Reads channel tokens from config.toml.
+///
+/// `originating_agent` is the `callback.agent_id` — the agent that
+/// called `send_to_agent` and registered this delegation callback.
+/// `chain_root_agent` is the message's `origin_agent` (the agent that
+/// started the whole delegation chain from an inbound channel message),
+/// used as the 2nd tier in `resolve_forward_token`'s cascade so nested
+/// sub-agents can inherit the root's per-agent bot token when they have
+/// none of their own. (v1.8.20: closes the 401-Unauthorized loop where
+/// Discord threads opened by agnes's bot reject posts from the global
+/// bot token.)
 async fn forward_to_channel(
     home_dir: &Path,
     channel_type: &str,
@@ -1854,6 +1882,7 @@ async fn forward_to_channel(
     text: &str,
     responder_agent: &str,
     originating_agent: &str,
+    chain_root_agent: Option<&str>,
 ) -> Result<(), String> {
     // Validate channel_id format to prevent URL injection / SSRF
     validate_channel_id(channel_type, channel_id)?;
@@ -1915,8 +1944,10 @@ async fn forward_to_channel(
 
     match channel_type {
         "telegram" => {
-            let token = get_agent_channel_token(home_dir, originating_agent, "telegram")
-                .unwrap_or_else(|| get_config_token(&config, "telegram_bot_token_enc", "telegram_bot_token", home_dir));
+            let token = resolve_forward_token(
+                home_dir, originating_agent, chain_root_agent, "telegram",
+                &config, "telegram_bot_token_enc", "telegram_bot_token",
+            );
             if token.is_empty() {
                 return Err("telegram_bot_token not configured".into());
             }
@@ -1954,8 +1985,10 @@ async fn forward_to_channel(
             }
         }
         "line" => {
-            let token = get_agent_channel_token(home_dir, originating_agent, "line")
-                .unwrap_or_else(|| get_config_token(&config, "line_channel_token_enc", "line_channel_token", home_dir));
+            let token = resolve_forward_token(
+                home_dir, originating_agent, chain_root_agent, "line",
+                &config, "line_channel_token_enc", "line_channel_token",
+            );
             if token.is_empty() {
                 return Err("line_channel_token not configured".into());
             }
@@ -1981,8 +2014,16 @@ async fn forward_to_channel(
             // are scoped to the bot that started the conversation — posting
             // to them from a different bot returns 401 Unauthorized even if
             // that other bot sits in the same guild.
-            let token = get_agent_channel_token(home_dir, originating_agent, "discord")
-                .unwrap_or_else(|| get_config_token(&config, "discord_bot_token_enc", "discord_bot_token", home_dir));
+            //
+            // v1.8.20: cascade to `chain_root_agent`'s token when the
+            // immediate caller (e.g. a sub-agent TL) has no per-agent
+            // Discord bot configured. The Discord thread was opened by
+            // the chain root (e.g. agnes) so only her bot can post into
+            // it; inheriting her token here prevents the 401 loop.
+            let token = resolve_forward_token(
+                home_dir, originating_agent, chain_root_agent, "discord",
+                &config, "discord_bot_token_enc", "discord_bot_token",
+            );
             if token.is_empty() {
                 return Err("discord_bot_token not configured".into());
             }
@@ -2001,8 +2042,10 @@ async fn forward_to_channel(
             }
         }
         "slack" => {
-            let token = get_agent_channel_token(home_dir, originating_agent, "slack")
-                .unwrap_or_else(|| get_config_token(&config, "slack_bot_token_enc", "slack_bot_token", home_dir));
+            let token = resolve_forward_token(
+                home_dir, originating_agent, chain_root_agent, "slack",
+                &config, "slack_bot_token_enc", "slack_bot_token",
+            );
             if token.is_empty() {
                 return Err("slack_bot_token not configured".into());
             }
@@ -2065,6 +2108,66 @@ fn get_agent_channel_token(home_dir: &Path, agent_id: &str, channel: &str) -> Op
     }
     let plain = section.get("bot_token").and_then(|v| v.as_str()).unwrap_or("");
     if plain.is_empty() { None } else { Some(plain.to_string()) }
+}
+
+/// Resolve a channel token for delegation-forwarding, cascading through
+/// the delegation chain so that sub-agents without their own per-agent
+/// token inherit the root agent's token.
+///
+/// Order of preference:
+///   1. `callback_agent_id`'s own `agents/<id>/agent.toml [channels.<ch>]`
+///      (original v1.8.14 behaviour — if the agent configured its own
+///      bot, use it).
+///   2. `origin_agent`'s token (the chain root, e.g. `agnes` for a
+///      delegation originating from her Discord thread). Discord threads
+///      are scoped to the bot that opened them — v1.8.20 adds this hop
+///      to keep nested sub-agent replies working when only the root
+///      agent has a per-agent token.
+///   3. Global `config.toml [channels] <channel>_bot_token[_enc]`.
+///
+/// Empty string from the global fallback is treated the same as "no
+/// token configured" by the caller — `forward_to_channel` emits its
+/// own `<channel>_bot_token not configured` error in that case.
+fn resolve_forward_token(
+    home_dir: &Path,
+    callback_agent_id: &str,
+    origin_agent: Option<&str>,
+    channel: &str,
+    config: &toml::Value,
+    enc_key: &str,
+    plain_key: &str,
+) -> String {
+    if let Some(tok) = get_agent_channel_token(home_dir, callback_agent_id, channel) {
+        return tok;
+    }
+    if let Some(root) = origin_agent.filter(|s| !s.is_empty() && *s != callback_agent_id) {
+        if let Some(tok) = get_agent_channel_token(home_dir, root, channel) {
+            return tok;
+        }
+    }
+    get_config_token(config, enc_key, plain_key, home_dir)
+}
+
+/// Look up the origin_agent for a message_id. Used by
+/// `forward_delegation_response` to feed the token-cascade in
+/// `forward_to_channel` so nested sub-agent replies can inherit the
+/// root agent's per-agent bot token (v1.8.20).
+///
+/// Returns None if the message_queue.db is missing, the query fails,
+/// or the row has no origin_agent — callers then cascade directly to
+/// the global config token (original v1.8.14 behaviour).
+fn lookup_origin_agent(home_dir: &Path, message_id: &str) -> Option<String> {
+    let db_path = home_dir.join("message_queue.db");
+    let conn = rusqlite::Connection::open(&db_path).ok()?;
+    let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+    conn.query_row(
+        "SELECT origin_agent FROM message_queue WHERE id = ?1",
+        rusqlite::params![message_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+    .filter(|s| !s.is_empty())
 }
 
 fn get_config_token(config: &toml::Value, enc_key: &str, plain_key: &str, home_dir: &Path) -> String {
@@ -2379,5 +2482,162 @@ mod tests {
         assert_eq!(coalesced[0].sender_agent.as_deref(), Some("researcher"));
         // Coalesced should contain the second message's ID
         assert_eq!(coalesced[0].coalesced_ids, vec!["m2"]);
+    }
+
+    // ── v1.8.20: chain-root token cascade ─────────────────────────
+
+    /// Writes a minimal `agents/<name>/agent.toml` that sets a plaintext
+    /// `bot_token` for the given channel. `bot_token_enc` is left
+    /// deliberately unset so the test doesn't need to reach into
+    /// `config_crypto` (which requires the keyfile).
+    fn write_agent_with_channel_token(
+        home: &std::path::Path,
+        agent: &str,
+        channel: &str,
+        token: &str,
+    ) {
+        let dir = home.join("agents").join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        let content = format!(
+            r#"[agent]
+name = "{agent}"
+reports_to = ""
+
+[channels.{channel}]
+bot_token = "{token}"
+"#,
+        );
+        std::fs::write(dir.join("agent.toml"), content).unwrap();
+    }
+
+    fn write_global_config(home: &std::path::Path, channel_key: &str, token: &str) {
+        let content = format!(
+            r#"[channels]
+{channel_key} = "{token}"
+"#,
+        );
+        std::fs::write(home.join("config.toml"), content).unwrap();
+    }
+
+    #[test]
+    fn resolve_token_prefers_callback_agent_when_it_has_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent_with_channel_token(tmp.path(), "duduclaw-tl", "discord", "TL_OWN_TOKEN");
+        write_agent_with_channel_token(tmp.path(), "agnes", "discord", "AGNES_TOKEN");
+        write_global_config(tmp.path(), "discord_bot_token", "GLOBAL_STALE");
+        let config: toml::Value =
+            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap().parse().unwrap();
+
+        let token = resolve_forward_token(
+            tmp.path(), "duduclaw-tl", Some("agnes"), "discord",
+            &config, "discord_bot_token_enc", "discord_bot_token",
+        );
+        assert_eq!(token, "TL_OWN_TOKEN");
+    }
+
+    #[test]
+    fn resolve_token_cascades_to_chain_root_when_callback_agent_has_none() {
+        // The production bug: TL has no [channels.discord], only agnes
+        // does, but the thread belongs to agnes. v1.8.19 fell back to
+        // the (stale) global token → 401. v1.8.20 cascades to agnes.
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent_with_channel_token(tmp.path(), "agnes", "discord", "AGNES_TOKEN");
+        // Intentionally no duduclaw-tl/agent.toml at all.
+        write_global_config(tmp.path(), "discord_bot_token", "GLOBAL_STALE_401");
+        let config: toml::Value =
+            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap().parse().unwrap();
+
+        let token = resolve_forward_token(
+            tmp.path(), "duduclaw-tl", Some("agnes"), "discord",
+            &config, "discord_bot_token_enc", "discord_bot_token",
+        );
+        assert_eq!(
+            token, "AGNES_TOKEN",
+            "Nested sub-agent forward should inherit chain-root's per-agent token, \
+             not fall back to stale global"
+        );
+    }
+
+    #[test]
+    fn resolve_token_falls_back_to_global_when_neither_agent_has_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Neither agent has a [channels.discord] block.
+        write_global_config(tmp.path(), "discord_bot_token", "GLOBAL_ONLY");
+        let config: toml::Value =
+            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap().parse().unwrap();
+
+        let token = resolve_forward_token(
+            tmp.path(), "duduclaw-tl", Some("agnes"), "discord",
+            &config, "discord_bot_token_enc", "discord_bot_token",
+        );
+        assert_eq!(token, "GLOBAL_ONLY");
+    }
+
+    #[test]
+    fn resolve_token_no_infinite_self_loop_when_origin_equals_callback() {
+        // Edge case: callback_agent_id == origin_agent (same agent). The
+        // cascade must not double-query or infinite-loop; just skip the
+        // chain-root tier and go straight to global.
+        let tmp = tempfile::tempdir().unwrap();
+        write_global_config(tmp.path(), "discord_bot_token", "GLOBAL_TOKEN");
+        let config: toml::Value =
+            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap().parse().unwrap();
+
+        let token = resolve_forward_token(
+            tmp.path(), "agnes", Some("agnes"), "discord",
+            &config, "discord_bot_token_enc", "discord_bot_token",
+        );
+        assert_eq!(token, "GLOBAL_TOKEN");
+    }
+
+    #[test]
+    fn resolve_token_handles_missing_origin_agent() {
+        // `lookup_origin_agent` can return None (DB missing, row missing,
+        // NULL origin). Cascade must still work: callback_agent_id →
+        // (no root hop) → global.
+        let tmp = tempfile::tempdir().unwrap();
+        write_global_config(tmp.path(), "discord_bot_token", "GLOBAL_TOKEN");
+        let config: toml::Value =
+            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap().parse().unwrap();
+
+        let token = resolve_forward_token(
+            tmp.path(), "duduclaw-tl", None, "discord",
+            &config, "discord_bot_token_enc", "discord_bot_token",
+        );
+        assert_eq!(token, "GLOBAL_TOKEN");
+    }
+
+    #[test]
+    fn lookup_origin_agent_returns_some_when_row_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("message_queue.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message_queue (
+                id TEXT PRIMARY KEY, sender TEXT NOT NULL, target TEXT NOT NULL,
+                payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                delegation_depth INTEGER NOT NULL DEFAULT 0,
+                origin_agent TEXT, sender_agent TEXT,
+                error TEXT, response TEXT,
+                created_at TEXT NOT NULL, acked_at TEXT, completed_at TEXT
+            );
+            INSERT INTO message_queue (id, sender, target, payload, created_at, origin_agent)
+            VALUES ('m1','duduclaw-tl','duduclaw-marketing','hi','2026-04-21T12:34:25','agnes');
+            INSERT INTO message_queue (id, sender, target, payload, created_at)
+            VALUES ('m2','duduclaw-tl','duduclaw-marketing','hi','2026-04-21T12:34:25');",
+        ).unwrap();
+        drop(conn);
+
+        assert_eq!(lookup_origin_agent(tmp.path(), "m1").as_deref(), Some("agnes"));
+        assert_eq!(lookup_origin_agent(tmp.path(), "m2"), None);
+        assert_eq!(lookup_origin_agent(tmp.path(), "nonexistent"), None);
+    }
+
+    #[test]
+    fn lookup_origin_agent_handles_missing_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No message_queue.db created.
+        assert_eq!(lookup_origin_agent(tmp.path(), "anything"), None);
     }
 }
