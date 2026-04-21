@@ -1403,37 +1403,24 @@ async fn send_to_agent_with_ctx(
     let origin = ctx.origin.as_deref().unwrap_or(caller);
 
     let msg_id = uuid::Uuid::new_v4().to_string();
-    let queue_path = home_dir.join("bus_queue.jsonl");
-    let task = serde_json::json!({
-        "type": "agent_message",
-        "message_id": &msg_id,
-        "agent_id": target,
-        "payload": prompt,
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "delegation_depth": outgoing_depth,
-        "origin_agent": origin,
-        "sender_agent": caller,
-    });
 
-    // Write to both JSONL (legacy) and SQLite (new) for dual-rail migration.
-    let queued = tokio::task::spawn_blocking({
-        let path = queue_path.clone();
-        let task_str = task.to_string();
-        move || append_to_jsonl_sync(&path, &task_str)
-    }).await.unwrap_or(false);
-
-    // Also write to SQLite message queue (Phase 3).
-    // Uses raw rusqlite to avoid circular dependency on duduclaw-gateway.
+    // v1.8.18: SQLite `message_queue.db` is the authoritative dispatch rail.
+    // Writing to `bus_queue.jsonl` as well created a dual-rail race: the
+    // legacy `poll_and_dispatch` loop tokio::spawn's its own Claude CLI
+    // task (which DROPS task-local REPLY_CHANNEL), so whichever side won
+    // the race determined whether sub-agents inherited channel context.
+    // When legacy won, the v1.8.16 reply_channel propagation was silently
+    // defeated — nested sub-agent callbacks never registered, replies
+    // were silently dropped. Fix: stop writing to bus_queue.jsonl here.
+    // (Orphan-response recovery / task_created signals / spawn_agent
+    // entries still use bus_queue.jsonl — those are untouched.)
     //
-    // v1.8.16: propagate `DUDUCLAW_REPLY_CHANNEL` into the row so the
-    // dispatcher can scope REPLY_CHANNEL around the target agent's
-    // Claude CLI when it spawns. Without this, only the first delegation
-    // (initiated directly from channel_reply) carried channel context;
-    // every nested sub-agent delegation's callback was never registered
-    // and the reply was silently dropped. Best-effort: if the ALTER TABLE
-    // migration hasn't run yet the fallback INSERT (without reply_channel)
-    // succeeds on the legacy path.
-    {
+    // v1.8.16 behaviour preserved: propagate `DUDUCLAW_REPLY_CHANNEL`
+    // into the row so the dispatcher can scope REPLY_CHANNEL around the
+    // target agent's Claude CLI when it spawns. Best-effort: if the
+    // ALTER TABLE migration hasn't run yet the fallback INSERT (without
+    // reply_channel) succeeds on the legacy schema.
+    let queued = {
         let db_path = home_dir.join("message_queue.db");
         let msg_id_cl = msg_id.clone();
         let caller_cl = caller.to_string();
@@ -1444,38 +1431,44 @@ async fn send_to_agent_with_ctx(
         let reply_channel = std::env::var(duduclaw_core::ENV_REPLY_CHANNEL)
             .ok()
             .filter(|s| !s.is_empty());
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
-                let inserted = conn.execute(
-                    "INSERT OR IGNORE INTO message_queue \
-                     (id, sender, target, payload, status, retry_count, delegation_depth, \
-                      origin_agent, sender_agent, created_at, reply_channel) \
-                     VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9)",
-                    rusqlite::params![
-                        msg_id_cl, caller_cl, target_cl, prompt_cl,
-                        outgoing_depth, origin_cl, caller_cl, ts_now,
-                        reply_channel,
-                    ],
-                );
-                if inserted.is_err() {
-                    // Legacy schema path (pre-v1.8.16 — no reply_channel column).
-                    // The gateway will migrate on next startup; for now fall
-                    // back to the original INSERT so MCP stays functional.
-                    let _ = conn.execute(
-                        "INSERT OR IGNORE INTO message_queue \
-                         (id, sender, target, payload, status, retry_count, delegation_depth, \
-                          origin_agent, sender_agent, created_at) \
-                         VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8)",
-                        rusqlite::params![
-                            msg_id_cl, caller_cl, target_cl, prompt_cl,
-                            outgoing_depth, origin_cl, caller_cl, ts_now,
-                        ],
-                    );
-                }
+        tokio::task::spawn_blocking(move || -> bool {
+            let Ok(conn) = rusqlite::Connection::open(&db_path) else {
+                return false;
+            };
+            let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO message_queue \
+                 (id, sender, target, payload, status, retry_count, delegation_depth, \
+                  origin_agent, sender_agent, created_at, reply_channel) \
+                 VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    msg_id_cl, caller_cl, target_cl, prompt_cl,
+                    outgoing_depth, origin_cl, caller_cl, ts_now,
+                    reply_channel,
+                ],
+            );
+            if let Ok(rows) = inserted {
+                return rows > 0;
             }
-        }).await;
-    }
+            // Legacy schema path (pre-v1.8.16 — no reply_channel column).
+            // The gateway will migrate on next startup; for now fall back
+            // to the original INSERT so MCP stays functional.
+            conn.execute(
+                "INSERT OR IGNORE INTO message_queue \
+                 (id, sender, target, payload, status, retry_count, delegation_depth, \
+                  origin_agent, sender_agent, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    msg_id_cl, caller_cl, target_cl, prompt_cl,
+                    outgoing_depth, origin_cl, caller_cl, ts_now,
+                ],
+            )
+            .map(|rows| rows > 0)
+            .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
+    };
 
     // Register delegation callback if running inside a channel context.
     // The dispatcher will use this to forward the sub-agent's response
@@ -7282,6 +7275,40 @@ mod tests {
     }
 
     /// Create a minimal agent directory for testing.
+    /// Create the `message_queue` schema in `<home>/message_queue.db` for
+    /// tests. Mirrors `duduclaw-gateway::message_queue::MessageQueue::init_schema`
+    /// including the v1.8.16 `reply_channel` column, so `send_to_agent`'s
+    /// INSERT has a table to write into.
+    ///
+    /// In production, the gateway creates this table on startup via
+    /// `MessageQueue::open`. Tests that bypass the gateway need to set it
+    /// up themselves since MCP subprocesses assume the schema already
+    /// exists.
+    fn init_message_queue_schema(home: &std::path::Path) {
+        let db_path = home.join("message_queue.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("open message_queue.db");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS message_queue (
+                 id              TEXT PRIMARY KEY,
+                 sender          TEXT NOT NULL,
+                 target          TEXT NOT NULL,
+                 payload         TEXT NOT NULL,
+                 status          TEXT NOT NULL DEFAULT 'pending',
+                 retry_count     INTEGER NOT NULL DEFAULT 0,
+                 delegation_depth INTEGER NOT NULL DEFAULT 0,
+                 origin_agent    TEXT,
+                 sender_agent    TEXT,
+                 error           TEXT,
+                 response        TEXT,
+                 created_at      TEXT NOT NULL,
+                 acked_at        TEXT,
+                 completed_at    TEXT,
+                 reply_channel   TEXT
+             );",
+        )
+        .expect("init message_queue schema");
+    }
+
     fn create_test_agent(agents_dir: &std::path::Path, name: &str, reports_to: &str) {
         let agent_dir = agents_dir.join(name);
         fs::create_dir_all(&agent_dir).unwrap();
@@ -7578,6 +7605,7 @@ high_context = true
         let home = tmp.path();
         let agents_dir = home.join("agents");
         fs::create_dir_all(&agents_dir).unwrap();
+        init_message_queue_schema(home);
 
         create_test_agent(&agents_dir, "main", "");
         create_test_agent(&agents_dir, "worker", "main");
@@ -7590,13 +7618,33 @@ high_context = true
         assert!(text.contains("status=queued"), "Expected success, got: {text}");
         assert!(text.contains("depth=3"), "Expected depth 3 (2+1), got: {text}");
 
-        let queue_path = home.join("bus_queue.jsonl");
-        let content = fs::read_to_string(&queue_path).unwrap();
-        let msg: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
-        assert_eq!(msg["delegation_depth"], 3);
-        assert_eq!(msg["origin_agent"], "main");
-        assert_eq!(msg["sender_agent"], "main");
-        assert_eq!(msg["agent_id"], "worker");
+        // v1.8.18: bus_queue.jsonl is NO LONGER written by send_to_agent.
+        // This prevents the dual-rail race where the legacy dispatcher
+        // (tokio::spawn'd per-message, drops task-locals) would spawn the
+        // target agent's Claude CLI without the REPLY_CHANNEL scope.
+        let bus_queue_path = home.join("bus_queue.jsonl");
+        assert!(
+            !bus_queue_path.exists(),
+            "send_to_agent must not write to bus_queue.jsonl (v1.8.18 dual-rail race fix)"
+        );
+
+        // The delegation lives in SQLite — verify it's there with the
+        // correct depth / origin / sender / target.
+        let db_path = home.join("message_queue.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("open message_queue.db");
+        let (sender, target, origin_agent, sender_agent, depth): (String, String, String, String, i32) =
+            conn.query_row(
+                "SELECT sender, target, origin_agent, sender_agent, delegation_depth \
+                 FROM message_queue ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("row in message_queue.db");
+        assert_eq!(depth, 3);
+        assert_eq!(origin_agent, "main");
+        assert_eq!(sender_agent, "main");
+        assert_eq!(sender, "main");
+        assert_eq!(target, "worker");
     }
 
     #[tokio::test]
@@ -7620,6 +7668,48 @@ high_context = true
 
         let queue_path = home.join("bus_queue.jsonl");
         assert!(!queue_path.exists(), "Queue should not have been written to");
+    }
+
+    /// v1.8.18 regression test. Prevents re-introduction of the dual-rail
+    /// race fix: `send_to_agent` must NEVER write to `bus_queue.jsonl`.
+    ///
+    /// If this test starts failing, some refactor has re-enabled the
+    /// legacy jsonl write — which in turn re-enables the race where the
+    /// legacy `poll_and_dispatch` loop tokio::spawn's dispatch tasks
+    /// that drop the REPLY_CHANNEL task-local, silently defeating the
+    /// v1.8.16 reply_channel propagation.
+    #[tokio::test]
+    async fn send_to_agent_never_writes_bus_queue_jsonl() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        init_message_queue_schema(home);
+
+        create_test_agent(&agents_dir, "main", "");
+        create_test_agent(&agents_dir, "worker", "main");
+
+        // Happy path at depth 0 → outgoing 1. Succeeds.
+        let ctx = DelegationContext { depth: 0, origin: None, sender: None };
+        let params = serde_json::json!({ "agent_id": "worker", "prompt": "hi" });
+        let result = send_to_agent_with_ctx(&params, home, "main", ctx).await;
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("status=queued"), "Expected success, got: {text}");
+
+        // The SQLite queue must have the row...
+        let db_path = home.join("message_queue.db");
+        let count: i64 = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM message_queue", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "SQLite queue must contain the delegation");
+
+        // ...but bus_queue.jsonl must NOT exist (v1.8.18 fix).
+        let bus_queue_path = home.join("bus_queue.jsonl");
+        assert!(
+            !bus_queue_path.exists(),
+            "v1.8.18 regression: send_to_agent must not write to bus_queue.jsonl"
+        );
     }
 
     #[tokio::test]
@@ -7653,6 +7743,7 @@ high_context = true
         let home = tmp.path();
         let agents_dir = home.join("agents");
         fs::create_dir_all(&agents_dir).unwrap();
+        init_message_queue_schema(home);
 
         create_test_agent(&agents_dir, "main", "");
         create_test_agent(&agents_dir, "worker", "main");
@@ -7665,11 +7756,20 @@ high_context = true
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("depth=1"), "Expected depth 1 (0+1), got: {text}");
 
-        let queue_path = home.join("bus_queue.jsonl");
-        let content = fs::read_to_string(&queue_path).unwrap();
-        let msg: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
-        assert_eq!(msg["delegation_depth"], 1);
-        assert_eq!(msg["origin_agent"], "main", "Should fall back to caller");
+        // v1.8.18: verify via SQLite — bus_queue.jsonl is no longer
+        // written by `send_to_agent` (see `send_to_agent_never_writes_bus_queue_jsonl`).
+        let db_path = home.join("message_queue.db");
+        let (depth, origin_agent): (i32, String) = rusqlite::Connection::open(&db_path)
+            .expect("open message_queue.db")
+            .query_row(
+                "SELECT delegation_depth, origin_agent \
+                 FROM message_queue ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row in message_queue.db");
+        assert_eq!(depth, 1);
+        assert_eq!(origin_agent, "main", "Should fall back to caller");
     }
 }
 
