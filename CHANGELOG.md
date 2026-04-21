@@ -1,6 +1,32 @@
 # Changelog
 
 
+## [1.8.19] - 2026-04-21
+
+### Fixed
+- **`Failed to initialize inference engine: Backend unavailable:
+  llama.cpp` WARN flood**. When an agent's `[model.local]` had
+  `use_router = true` but the gateway binary was built without
+  `--features metal`/`cuda`/`vulkan` (the default for the
+  npm-distributed binary to avoid pulling libclang + cmake into the
+  release build), every single request ran the local-offload path,
+  hit `InferenceEngine::init`, got `BackendUnavailable`, warned, fell
+  back to SDK, and repeated next request. Functionally harmless — the
+  fallback always worked — but drowned real warnings and wasted
+  ~100ms per request on a doomed init attempt. Added a process-
+  lifetime `AtomicBool` negative cache next to the existing
+  `INFERENCE_ENGINE` singleton in `claude_runner.rs`: on the first
+  failed `init` (or first successful init that still reports no
+  available backend), the flag latches to `true` and every subsequent
+  `get_inference_engine` short-circuits to `None` silently. The WARN
+  is now one-shot per gateway process, with an actionable hint on how
+  to enable a backend (rebuild with `--features metal/cuda/vulkan`, or
+  configure `[openai_compat]` in `inference.toml` for a remote
+  backend). A gateway restart resets the cache — which is also when
+  operators would have rebuilt the binary, so the trade-off aligns.
+
+
+
 ## [1.8.18] - 2026-04-21
 
 ### Fixed
