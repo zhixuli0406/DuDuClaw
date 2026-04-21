@@ -1,6 +1,36 @@
 # Changelog
 
 
+## [1.8.21] - 2026-04-21
+
+### Added
+- **`duduclaw reforward <message_id> [--dry-run]`** — manual unstuck
+  lever for completed delegations whose forward failed and got retry-
+  queued. Before v1.8.20, nested sub-agent forwards to Discord threads
+  hit 401 Unauthorized because token lookup didn't cascade to the
+  chain-root agent; v1.8.20 fixes that going forward, but
+  already-completed messages were stuck — the dispatcher only retries
+  when a new `agent_response` arrives for the same message_id, which
+  never happens for a message that's already `done`. The callback row
+  ages out to 24h cleanup and the user loses the reply. New command:
+  reads `message_queue.db` by id (requires `status='done'` and
+  non-empty response), uses the existing `delegation_callbacks` row
+  if present, synthesizes one from the stored `reply_channel` column
+  if missing (`INSERT OR REPLACE` for idempotency across re-runs),
+  then delegates to `forward_delegation_response` which uses the
+  v1.8.20 token cascade and v1.8.17 Fix 2 session append. Reports
+  `Sent` / `DryRun` / `Failed` with friendly output; exit 1 on error.
+  New `pub async fn reforward_message` + `pub enum ReforwardOutcome`
+  in `duduclaw_gateway::dispatcher` for library reuse. 9 new
+  regression tests covering dry-run paths, error cases
+  (pending / missing / empty response / no channel context), and the
+  `parse_reply_channel` grammar incl. the `discord:thread:<id>`
+  collapse rule. Production-verified: recovered message
+  `78fbcfc8-735b-4053-9ee0-a03543fd904f` (a marketing report that had
+  been stuck since 12:35 UTC) delivered to its Discord thread.
+
+
+
 ## [1.8.20] - 2026-04-21
 
 ### Fixed
