@@ -263,6 +263,28 @@ enum Commands {
         name: String,
     },
 
+    /// Manually re-forward a completed delegation response (v1.8.21+).
+    ///
+    /// Use when a sub-agent's reply is stuck in `delegation_callbacks`
+    /// because a previous forward attempt failed (e.g. Discord 401
+    /// pre-v1.8.20 on nested sub-agent chains). The response text is
+    /// already stored in `message_queue.db`; this command reuses the
+    /// dispatcher's forward machinery to actually POST it to the
+    /// originating channel.
+    ///
+    /// Example:
+    ///     duduclaw reforward 78fbcfc8-735b-4053-9ee0-a03543fd904f
+    ///     duduclaw reforward <id> --dry-run    # just show target
+    Reforward {
+        /// The `message_queue.id` (UUID) of the stuck delegation.
+        message_id: String,
+
+        /// Print what would be sent without touching the database or
+        /// making any HTTP calls.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Check for updates and optionally install the latest version
     Update {
         /// Apply the update without confirmation
@@ -511,6 +533,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::McpServer => cmd_mcp_server().await,
         Commands::Wizard => wizard::cmd_wizard(&duduclaw_home()).await,
         Commands::Test { name } => cmd_test_agent(&name).await,
+        Commands::Reforward { message_id, dry_run } => {
+            cmd_reforward(&message_id, dry_run, &duduclaw_home()).await
+        }
         Commands::Update { yes } => cmd_update(yes).await,
         Commands::Rl(rl_cmd) => {
             cmd_rl(rl_cmd, &duduclaw_home()).await
@@ -2541,6 +2566,61 @@ struct TestResult {
     vector: String,
     passed: bool,
     detail: String,
+}
+
+// ── Manual delegation re-forward (v1.8.21) ──────────────────
+
+async fn cmd_reforward(
+    message_id: &str,
+    dry_run: bool,
+    home_dir: &PathBuf,
+) -> duduclaw_core::error::Result<()> {
+    use duduclaw_gateway::dispatcher::{reforward_message, ReforwardOutcome};
+
+    match reforward_message(home_dir, message_id, dry_run).await {
+        Ok(ReforwardOutcome::DryRun { channel_type, channel_id, thread_id, has_existing_callback }) => {
+            println!("[dry-run] Would re-forward message {message_id}");
+            println!("  channel:       {channel_type}");
+            println!("  channel_id:    {channel_id}");
+            if let Some(tid) = thread_id {
+                println!("  thread_id:     {tid}");
+            }
+            println!(
+                "  callback row:  {}",
+                if has_existing_callback {
+                    "present (will be consumed on actual run)"
+                } else {
+                    "missing (will be synthesized from reply_channel)"
+                }
+            );
+            println!("\nRun without --dry-run to actually forward.");
+            Ok(())
+        }
+        Ok(ReforwardOutcome::Sent { channel_type, channel_id, thread_id }) => {
+            println!("✓ Forwarded message {message_id}");
+            println!("  channel:    {channel_type}");
+            println!("  channel_id: {channel_id}");
+            if let Some(tid) = thread_id {
+                println!("  thread_id:  {tid}");
+            }
+            println!("\nCheck the originating channel — the reply should be visible now.");
+            Ok(())
+        }
+        Ok(ReforwardOutcome::Failed) => {
+            eprintln!("✗ Re-forward attempted but failed — callback re-inserted for retry.");
+            eprintln!("  Check the gateway log for the underlying API error:");
+            eprintln!("    tail -30 ~/.duduclaw/logs/gateway.log.* | grep -i 'forward\\|401\\|unauthorized'");
+            eprintln!("\n  Common causes:");
+            eprintln!("    - The gateway is using a stale bot token; verify agents/<root>/agent.toml");
+            eprintln!("    - The Discord thread was archived/deleted");
+            eprintln!("    - Per-channel rate limits — wait and retry");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("✗ {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 // ── Self-update ──────────────────────────────────────────────
