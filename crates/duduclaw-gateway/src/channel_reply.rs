@@ -2167,32 +2167,6 @@ mod multi_turn_tests {
     }
 
     #[test]
-    fn make_session_id_stable() {
-        let id1 = make_claude_session_id("telegram:123", "oauth-token-abc");
-        let id2 = make_claude_session_id("telegram:123", "oauth-token-abc");
-        assert_eq!(id1, id2);
-        assert!(id1.starts_with("dd-"));
-    }
-
-    #[test]
-    fn make_session_id_different_accounts() {
-        let id1 = make_claude_session_id("telegram:123", "account-A");
-        let id2 = make_claude_session_id("telegram:123", "account-B");
-        assert_ne!(id1, id2);
-    }
-
-    #[test]
-    fn is_session_error_narrow_match() {
-        assert!(is_session_error("session not found: dd-abc123"));
-        assert!(is_session_error("Error: invalid session ID"));
-        assert!(is_session_error("--resume requires a valid session"));
-        // Should NOT match unrelated errors containing "session"
-        assert!(!is_session_error("HTTP session timeout"));
-        assert!(!is_session_error("TLS session negotiation failed"));
-        assert!(!is_session_error("rate limit exceeded"));
-    }
-
-    #[test]
     fn recap_prefix_with_pinned() {
         let pinned = "- Goal: build two teams\n- PM: daily 8:00 report";
         let msg = "開始建立團隊";
@@ -2809,7 +2783,11 @@ pub(crate) async fn call_claude_cli_rotated(
     work_dir: Option<&Path>,
     on_progress: Option<&ProgressCallback>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
-    session_id: Option<&str>,
+    // `_session_id` retained in the signature for call-site compatibility;
+    // the Claude CLI `--resume` path was removed (see module note above
+    // `rotate_cli_spawn` invocation). History is folded into the prompt
+    // instead.
+    _session_id: Option<&str>,
     conversation_history: &[ConversationTurn],
 ) -> Result<String, String> {
     let rotator = match crate::claude_runner::get_rotator_cached(home_dir).await {
@@ -2844,11 +2822,17 @@ pub(crate) async fn call_claude_cli_rotated(
     }
 
     // Delegate to the testable primitive with a closure that actually spawns the CLI.
+    //
+    // Claude CLI `-p --resume <id>` only accepts either a canonical UUID (that
+    // already exists in its session store) or an exact session title match, so
+    // DuDuClaw's deterministic `dd-<hash>` IDs were rejected 100% of the time
+    // and every multi-turn wasted one CLI spawn before falling back to
+    // history-in-prompt. We skip `--resume` entirely and always fold the
+    // conversation history into the prompt when there is any — one spawn per
+    // turn, no log noise, no cost duplication.
     let input_len = user_message.len();
     let history_clone = conversation_history.to_vec();
-    let session_id_owned = session_id.map(|s| s.to_string());
     rotate_cli_spawn(&rotator, move |env_vars| {
-        let user_message = user_message.to_string();
         let model = model.to_string();
         let system_prompt = system_prompt.to_string();
         let home_dir = home_dir.to_path_buf();
@@ -2856,77 +2840,20 @@ pub(crate) async fn call_claude_cli_rotated(
         let on_progress = on_progress;
         let capabilities = capabilities.cloned();
         let history = history_clone.clone();
-        let sid = session_id_owned.clone();
+        let user_message_owned = user_message.to_string();
         async move {
-            // Generate deterministic Claude CLI session ID from DuDuClaw session + account
-            let claude_sid = if !history.is_empty() {
-                sid.as_ref().map(|s| {
-                    let acct = env_vars.get("CLAUDE_CODE_OAUTH_TOKEN")
-                        .or(env_vars.get("ANTHROPIC_API_KEY"))
-                        .cloned()
-                        .unwrap_or_default();
-                    make_claude_session_id(s, &acct)
-                })
+            let effective_prompt = if history.is_empty() {
+                user_message_owned
             } else {
-                None
+                format_history_as_prompt(&history, &user_message_owned)
             };
-
-            // Try with --resume first if we have session history
-            let result = spawn_claude_cli_with_env(
-                &user_message, &model, &system_prompt, &home_dir,
+            spawn_claude_cli_with_env(
+                &effective_prompt, &model, &system_prompt, &home_dir,
                 work_dir.as_deref(), on_progress, capabilities.as_ref(),
-                &env_vars, claude_sid.as_deref(),
-            ).await;
-
-            // Fallback: if --resume failed (session not found, account rotated),
-            // retry with history prepended to prompt
-            match result {
-                Ok(text) => Ok(text),
-                Err(ref e) if claude_sid.is_some() && is_session_error(e) => {
-                    warn!("Claude --resume failed ({e}), retrying with history-in-prompt fallback");
-                    let augmented = format_history_as_prompt(&history, &user_message);
-                    spawn_claude_cli_with_env(
-                        &augmented, &model, &system_prompt, &home_dir,
-                        work_dir.as_deref(), on_progress, capabilities.as_ref(),
-                        &env_vars, None,
-                    ).await
-                }
-                Err(e) => Err(e),
-            }
+                &env_vars, None,
+            ).await
         }
     }, input_len).await
-}
-
-/// Generate a deterministic Claude CLI session ID from DuDuClaw session + account.
-///
-/// Uses SHA-256 (first 8 bytes) for stability across process restarts.
-/// `DefaultHasher` is randomized per-process and would break `--resume`.
-fn make_claude_session_id(duduclaw_sid: &str, account_id: &str) -> String {
-    use sha2::{Sha256, Digest};
-    let mut hasher = Sha256::new();
-    hasher.update(duduclaw_sid.as_bytes());
-    hasher.update(b"\x00");
-    hasher.update(account_id.as_bytes());
-    let digest = hasher.finalize();
-    format!("dd-{:016x}", u64::from_be_bytes(digest[..8].try_into().unwrap()))
-}
-
-/// Check if an error indicates a session-related failure (not found, expired).
-///
-/// Deliberately narrow matching to avoid false positives from unrelated errors
-/// like "HTTP session timeout" or "TLS session negotiation failed".
-fn is_session_error(e: &str) -> bool {
-    let lower = e.to_lowercase();
-    lower.contains("session not found")
-        || lower.contains("invalid session")
-        || lower.contains("session expired")
-        || lower.contains("no such session")
-        || (lower.contains("--resume") && lower.contains("session"))
-        // Treat generic "unknown stream-json error" (is_error=true with no `result`
-        // text) as a likely session-handle problem when --resume is in use. The
-        // history-in-prompt fallback is safe: worst case we double-spend one turn,
-        // best case we recover a broken --resume without user intervention.
-        || lower.contains("unknown stream-json error")
 }
 
 /// Rotation-loop primitive, decoupled from the actual subprocess spawn.
