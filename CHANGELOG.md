@@ -1,6 +1,38 @@
 # Changelog
 
 
+## [1.8.20] - 2026-04-21
+
+### Fixed
+- **Nested sub-agent forwards to Discord threads got 401
+  Unauthorized when only the chain-root agent had a per-agent bot
+  token**. Production-observed on v1.8.19 (message
+  `78fbcfc8-735b-4053-9ee0-a03543fd904f`, TL→marketing depth=2 — the
+  marketing agent finished the report, response text in DB, but the
+  HTTP POST to Discord thread `1496095418805780591` returned 401).
+  `forward_to_channel`'s token lookup cascaded from `callback.agent_id`
+  (the `send_to_agent` caller, e.g. `duduclaw-tl` — no per-agent bot
+  configured) straight to the global `config.toml` token, skipping
+  the chain-root agent (agnes) who actually owned the bot that
+  opened the thread. Discord threads are scoped to the bot that
+  opened them (v1.8.14 already documented this), so the 401 loop
+  was inevitable for any nested delegation whose immediate caller
+  lacked its own bot. New `resolve_forward_token` helper cascades
+  three tiers: (1) callback agent's own token → (2) chain-root
+  agent's token (looked up from `message_queue.origin_agent` via
+  new `lookup_origin_agent`) → (3) global config token. The four
+  channel arms (telegram/line/discord/slack) in `forward_to_channel`
+  all route through the helper so the cascade applies uniformly,
+  though only Discord's thread-bot scoping actually triggered the
+  production failure. Handles the `origin_agent == callback_agent`
+  self-loop, missing `message_queue.db`, and NULL
+  `origin_agent` column cleanly. 7 new regression tests in
+  `dispatcher::tests`, including
+  `resolve_token_cascades_to_chain_root_when_callback_agent_has_none`
+  that replays the production scenario.
+
+
+
 ## [1.8.19] - 2026-04-21
 
 ### Fixed
