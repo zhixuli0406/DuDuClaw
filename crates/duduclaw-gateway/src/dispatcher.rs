@@ -1421,6 +1421,263 @@ async fn cleanup_stale_delegation_callbacks(home_dir: &Path) {
     }
 }
 
+/// Outcome of a manual re-forward attempt (`duduclaw reforward <id>`).
+/// Distinct from an automatic dispatcher retry so the CLI can give the
+/// operator a clear exit code and summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReforwardOutcome {
+    /// Forward succeeded — the response reached the originating channel
+    /// and (where applicable) was appended to the parent agent's session.
+    Sent {
+        channel_type: String,
+        channel_id: String,
+        thread_id: Option<String>,
+    },
+    /// `--dry-run` mode: report what would happen without touching
+    /// `delegation_callbacks` or sending anything.
+    DryRun {
+        channel_type: String,
+        channel_id: String,
+        thread_id: Option<String>,
+        has_existing_callback: bool,
+    },
+    /// Forward was attempted but failed (and the retry callback was
+    /// re-inserted by the existing dispatcher machinery). The caller
+    /// can inspect gateway logs for the specific Discord/Telegram/LINE
+    /// API error.
+    Failed,
+}
+
+/// Manually re-forward a completed delegation response.
+///
+/// **Why this exists:** when a sub-agent's response finished but the
+/// HTTP POST to its originating channel failed (e.g. Discord 401 on
+/// the chain-root's thread, pre-v1.8.20), the callback is re-inserted
+/// into `delegation_callbacks` for retry — but the dispatcher only
+/// retries on a *new* `agent_response` for the same message_id, which
+/// never arrives (the delegation is already `done`). The callback
+/// sits stuck until a 24h cleanup drops it, and the user never sees
+/// the reply. This command gives the operator a manual lever.
+///
+/// **What it does:**
+/// 1. Reads the `message_queue` row by id; requires `status='done'`
+///    and a non-empty `response`.
+/// 2. If `delegation_callbacks` has no pending row for this id (the
+///    callback was permanently dropped or never registered),
+///    synthesize one from the row's `reply_channel` column so the
+///    existing `forward_delegation_response` machinery has something
+///    to consume.
+/// 3. Invokes `forward_delegation_response`, which:
+///    - Resolves the forward token via the v1.8.20 cascade
+///      (`callback_agent_id` → `origin_agent` → global config).
+///    - On success: POSTs to the channel + appends the reply to the
+///      parent agent's session (v1.8.17 Fix 2), then deletes the
+///      callback.
+///    - On failure: logs WARN, re-inserts the callback for a future
+///      manual retry.
+/// 4. Returns [`ReforwardOutcome`] telling the caller whether the
+///    send actually landed.
+pub async fn reforward_message(
+    home_dir: &Path,
+    message_id: &str,
+    dry_run: bool,
+) -> Result<ReforwardOutcome, String> {
+    let db_path = home_dir.join("message_queue.db");
+    if !db_path.exists() {
+        return Err(format!(
+            "message_queue.db not found at {}. Has the gateway been started on this home dir?",
+            db_path.display()
+        ));
+    }
+
+    // Fetch the stored response + channel context.
+    let msg_id_owned = message_id.to_string();
+    let db_clone = db_path.clone();
+    let row: Option<(String, String, String, String, Option<String>)> =
+        tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open(&db_clone).ok()?;
+            let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+            conn.query_row(
+                "SELECT status, target, IFNULL(response,''), IFNULL(sender,''), reply_channel \
+                 FROM message_queue WHERE id = ?1",
+                rusqlite::params![msg_id_owned],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .ok()
+        })
+        .await
+        .ok()
+        .flatten();
+
+    let Some((status, target, response, sender, reply_channel)) = row else {
+        return Err(format!(
+            "No message with id={message_id} in message_queue.db. Check the id or list recent messages via `sqlite3 ~/.duduclaw/message_queue.db \"SELECT id,status FROM message_queue ORDER BY rowid DESC LIMIT 10\"`."
+        ));
+    };
+    if status != "done" {
+        return Err(format!(
+            "Message {message_id} has status='{status}', not 'done'. Only completed responses can be re-forwarded."
+        ));
+    }
+    if response.is_empty() {
+        return Err(format!(
+            "Message {message_id} is done but has no response body stored. Nothing to re-send."
+        ));
+    }
+
+    // Determine channel context. Prefer the existing delegation_callbacks
+    // row; fall back to parsing `reply_channel` ourselves so we can
+    // re-forward messages whose callback was already permanently dropped.
+    let (callback_agent_id, ch_type, ch_id, thread_id, has_existing_callback) = {
+        let db_clone = db_path.clone();
+        let msg_id_owned = message_id.to_string();
+        let existing: Option<(String, String, String, Option<String>)> =
+            tokio::task::spawn_blocking(move || {
+                let conn = rusqlite::Connection::open(&db_clone).ok()?;
+                let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+                conn.query_row(
+                    "SELECT agent_id, channel_type, channel_id, thread_id \
+                     FROM delegation_callbacks WHERE message_id = ?1",
+                    rusqlite::params![msg_id_owned],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .ok()
+            })
+            .await
+            .ok()
+            .flatten();
+
+        if let Some((agent, ct, cid, tid)) = existing {
+            (agent, ct, cid, tid, true)
+        } else {
+            // No live callback — synthesize from message_queue.reply_channel.
+            let rc = reply_channel.clone().ok_or_else(|| {
+                format!(
+                    "Message {message_id} has no delegation_callbacks row AND no reply_channel stored. \
+                     Cannot determine where to forward. (Non-channel delegation, e.g. cron?)"
+                )
+            })?;
+            let (ct, cid, tid) = parse_reply_channel(&rc)?;
+            // callback_agent_id = the original sender (`message_queue.sender`
+            // = who called send_to_agent). This is what the live callback
+            // would have stored.
+            (sender, ct, cid, tid, false)
+        }
+    };
+
+    if dry_run {
+        return Ok(ReforwardOutcome::DryRun {
+            channel_type: ch_type,
+            channel_id: ch_id,
+            thread_id,
+            has_existing_callback,
+        });
+    }
+
+    // Synthesize a callback row if one doesn't exist — forward_delegation_response
+    // uses DELETE RETURNING to consume exactly one row, so this is the
+    // cheapest way to reuse its machinery (including v1.8.20 cascade and
+    // v1.8.17 Fix 2 session append).
+    if !has_existing_callback {
+        let db_clone = db_path.clone();
+        let msg_id_owned = message_id.to_string();
+        let agent = callback_agent_id.clone();
+        let ct = ch_type.clone();
+        let cid = ch_id.clone();
+        let tid = thread_id.clone();
+        let now = chrono::Utc::now().to_rfc3339();
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let conn = rusqlite::Connection::open(&db_clone)
+                .map_err(|e| format!("open message_queue.db: {e}"))?;
+            let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+            conn.execute(
+                "INSERT OR REPLACE INTO delegation_callbacks \
+                 (message_id, agent_id, channel_type, channel_id, thread_id, retry_count, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+                rusqlite::params![msg_id_owned, agent, ct, cid, tid, now],
+            )
+            .map_err(|e| format!("insert synthesized callback: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("join blocking task: {e}"))??;
+    }
+
+    // Delegate to the existing forward machinery. It will consume the
+    // callback, resolve the token via v1.8.20 cascade, POST to the
+    // channel, and on success append the reply to the parent session.
+    forward_delegation_response(home_dir, message_id, &response, &target).await;
+
+    // Verify outcome: if the callback is gone, the forward succeeded
+    // (forward_delegation_response deletes on success; re-inserts on
+    // failure).
+    let db_clone = db_path.clone();
+    let msg_id_owned = message_id.to_string();
+    let callback_remains: bool = tokio::task::spawn_blocking(move || {
+        let conn = match rusqlite::Connection::open(&db_clone) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+        conn.query_row(
+            "SELECT 1 FROM delegation_callbacks WHERE message_id = ?1",
+            rusqlite::params![msg_id_owned],
+            |_| Ok(()),
+        )
+        .is_ok()
+    })
+    .await
+    .unwrap_or(false);
+
+    if callback_remains {
+        Ok(ReforwardOutcome::Failed)
+    } else {
+        Ok(ReforwardOutcome::Sent {
+            channel_type: ch_type,
+            channel_id: ch_id,
+            thread_id,
+        })
+    }
+}
+
+/// Parse a `reply_channel` string (same grammar as
+/// [`duduclaw_core::ENV_REPLY_CHANNEL`]) into (channel_type, channel_id,
+/// optional thread_id). Mirrors the parser in
+/// `duduclaw-cli::mcp::send_to_agent_with_ctx` — kept local to avoid
+/// a cross-crate dep on the MCP server module.
+fn parse_reply_channel(rc: &str) -> Result<(String, String, Option<String>), String> {
+    let parts: Vec<&str> = rc.splitn(3, ':').collect();
+    if parts.len() < 2 {
+        return Err(format!("malformed reply_channel '{rc}': expected <type>:<id>[:<thread>]"));
+    }
+    let ch_type = parts[0].to_string();
+    // Special marker `<type>:thread:<id>` (e.g. `discord:thread:123`)
+    // collapses to (ch_id=<id>, thread_id=None) — matches mcp.rs behavior.
+    let (ch_id, thread_id) = if parts.len() == 3 && parts[1] == "thread" {
+        (parts[2].to_string(), None)
+    } else {
+        let cid = parts[1].to_string();
+        let tid = parts.get(2).map(|s| s.to_string());
+        (cid, tid)
+    };
+    Ok((ch_type, ch_id, thread_id))
+}
+
 /// Check if a delegation callback exists for this message and forward
 /// the response to the originating channel.
 async fn forward_delegation_response(
@@ -2639,5 +2896,196 @@ bot_token = "{token}"
         let tmp = tempfile::tempdir().unwrap();
         // No message_queue.db created.
         assert_eq!(lookup_origin_agent(tmp.path(), "anything"), None);
+    }
+
+    // ── v1.8.21: manual re-forward CLI ────────────────────────────
+
+    #[test]
+    fn parse_reply_channel_plain_forms() {
+        assert_eq!(
+            parse_reply_channel("discord:12345").unwrap(),
+            ("discord".into(), "12345".into(), None),
+        );
+        assert_eq!(
+            parse_reply_channel("telegram:67890:thread42").unwrap(),
+            ("telegram".into(), "67890".into(), Some("thread42".into())),
+        );
+    }
+
+    #[test]
+    fn parse_reply_channel_discord_thread_marker_collapses() {
+        // `discord:thread:<id>` — the literal "thread" is a marker, not
+        // the channel_id. Collapses to (ch_id=<id>, thread_id=None) to
+        // match mcp.rs callback insert semantics.
+        assert_eq!(
+            parse_reply_channel("discord:thread:1496095418805780591").unwrap(),
+            ("discord".into(), "1496095418805780591".into(), None),
+        );
+    }
+
+    #[test]
+    fn parse_reply_channel_rejects_malformed() {
+        assert!(parse_reply_channel("no-colon-here").is_err());
+        assert!(parse_reply_channel("").is_err());
+    }
+
+    /// Helper: create `message_queue.db` with a single completed row for
+    /// reforward tests. Schema matches `MessageQueue::init_schema`
+    /// including v1.8.16's `reply_channel` column.
+    fn setup_done_message(
+        home: &std::path::Path,
+        id: &str,
+        sender: &str,
+        target: &str,
+        response: &str,
+        reply_channel: Option<&str>,
+    ) {
+        let db_path = home.join("message_queue.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS message_queue (
+                id TEXT PRIMARY KEY, sender TEXT NOT NULL, target TEXT NOT NULL,
+                payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                delegation_depth INTEGER NOT NULL DEFAULT 0,
+                origin_agent TEXT, sender_agent TEXT,
+                error TEXT, response TEXT,
+                created_at TEXT NOT NULL, acked_at TEXT, completed_at TEXT,
+                reply_channel TEXT
+            );
+            CREATE TABLE IF NOT EXISTS delegation_callbacks (
+                message_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                channel_type TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                thread_id TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );",
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO message_queue (id, sender, target, payload, status, \
+             response, created_at, completed_at, reply_channel, origin_agent) \
+             VALUES (?1, ?2, ?3, 'payload', 'done', ?4, '2026-04-21T12:34:25', \
+             '2026-04-21T12:35:48', ?5, ?2)",
+            rusqlite::params![id, sender, target, response, reply_channel],
+        ).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reforward_dry_run_uses_existing_callback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let mid = "78fbcfc8-735b-4053-9ee0-a03543fd904f";
+        setup_done_message(home, mid, "duduclaw-tl", "duduclaw-marketing", "the report", None);
+
+        // A live callback exists (the dispatcher re-inserted it after the
+        // HTTP POST got 401). Dry-run should surface it without mutating
+        // anything.
+        let conn = rusqlite::Connection::open(home.join("message_queue.db")).unwrap();
+        conn.execute(
+            "INSERT INTO delegation_callbacks (message_id, agent_id, channel_type, channel_id, thread_id, retry_count, created_at) \
+             VALUES (?1, 'duduclaw-tl', 'discord', '1496095418805780591', NULL, 1, '2026-04-21T12:35:48')",
+            rusqlite::params![mid],
+        ).unwrap();
+        drop(conn);
+
+        let outcome = reforward_message(home, mid, true).await.expect("dry-run");
+        match outcome {
+            ReforwardOutcome::DryRun { channel_type, channel_id, thread_id, has_existing_callback } => {
+                assert_eq!(channel_type, "discord");
+                assert_eq!(channel_id, "1496095418805780591");
+                assert_eq!(thread_id, None);
+                assert!(has_existing_callback);
+            }
+            other => panic!("expected DryRun, got {other:?}"),
+        }
+
+        // Dry-run must NOT have consumed the callback.
+        let count: i64 = rusqlite::Connection::open(home.join("message_queue.db")).unwrap()
+            .query_row("SELECT COUNT(*) FROM delegation_callbacks WHERE message_id=?1",
+                rusqlite::params![mid], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1, "dry-run must not touch delegation_callbacks");
+    }
+
+    #[tokio::test]
+    async fn reforward_dry_run_synthesizes_from_reply_channel_when_no_callback() {
+        // The pathological case: callback was already permanently dropped
+        // (5x retries exhausted, or 24h stale cleanup ran), but the row
+        // still has reply_channel stored. Dry-run should parse that and
+        // report what it would do.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let mid = "m1";
+        setup_done_message(
+            home, mid, "duduclaw-tl", "duduclaw-marketing", "the report",
+            Some("discord:thread:1496095418805780591"),
+        );
+
+        let outcome = reforward_message(home, mid, true).await.expect("dry-run");
+        match outcome {
+            ReforwardOutcome::DryRun { channel_type, channel_id, has_existing_callback, .. } => {
+                assert_eq!(channel_type, "discord");
+                assert_eq!(channel_id, "1496095418805780591");
+                assert!(!has_existing_callback);
+            }
+            other => panic!("expected DryRun, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reforward_rejects_pending_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let mid = "m1";
+        // Manually insert a pending row (setup_done_message always sets 'done').
+        let conn = rusqlite::Connection::open(home.join("message_queue.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS message_queue (
+                id TEXT PRIMARY KEY, sender TEXT NOT NULL, target TEXT NOT NULL,
+                payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                delegation_depth INTEGER NOT NULL DEFAULT 0,
+                origin_agent TEXT, sender_agent TEXT,
+                error TEXT, response TEXT,
+                created_at TEXT NOT NULL, acked_at TEXT, completed_at TEXT,
+                reply_channel TEXT
+            );",
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO message_queue (id, sender, target, payload, status, created_at) \
+             VALUES (?1, 'a', 'b', 'p', 'pending', '2026-01-01T00:00:00Z')",
+            rusqlite::params![mid],
+        ).unwrap();
+        drop(conn);
+
+        let err = reforward_message(home, mid, true).await.unwrap_err();
+        assert!(err.contains("status='pending'"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn reforward_rejects_missing_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_done_message(tmp.path(), "exists", "a", "b", "hi", None);
+        let err = reforward_message(tmp.path(), "does-not-exist", true).await.unwrap_err();
+        assert!(err.contains("No message with id"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn reforward_rejects_empty_response() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_done_message(tmp.path(), "m1", "a", "b", "", None);
+        let err = reforward_message(tmp.path(), "m1", true).await.unwrap_err();
+        assert!(err.contains("no response body"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn reforward_without_callback_or_reply_channel_errors() {
+        // No callback row, no reply_channel either — can't determine where
+        // to forward. Must error out rather than silently doing nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        setup_done_message(tmp.path(), "m1", "a", "b", "ok", None);
+        let err = reforward_message(tmp.path(), "m1", true).await.unwrap_err();
+        assert!(err.contains("Cannot determine where to forward"), "got: {err}");
     }
 }
