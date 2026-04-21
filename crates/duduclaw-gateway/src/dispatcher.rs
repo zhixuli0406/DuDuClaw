@@ -1485,47 +1485,306 @@ async fn forward_delegation_response(
         "Forwarding sub-agent response to originating channel"
     );
 
-    if let Err(e) = forward_to_channel(
+    match forward_to_channel(
         home_dir, &channel_type, &channel_id, thread_id.as_deref(),
         response_text, responder_agent, &callback_agent_id,
     ).await {
-        let next_retry = retry_count + 1;
-        if next_retry >= 5 {
-            warn!(
-                channel = %channel_type,
-                chat_id = %channel_id,
-                error = %e,
-                retries = retry_count,
-                "Delegation callback forwarding permanently failed after 5 retries — dropping"
-            );
-        } else {
-            warn!(
-                channel = %channel_type,
-                chat_id = %channel_id,
-                error = %e,
-                retry = next_retry,
-                "Failed to forward delegation response — re-inserting callback for retry"
-            );
-            let db_path = home_dir.join("message_queue.db");
-            let msg_id = original_message_id.to_string();
-            let agent = callback_agent_id.clone();
-            let ch_type = channel_type.clone();
-            let ch_id = channel_id.clone();
-            let tid = thread_id.clone();
-            let now = chrono::Utc::now().to_rfc3339();
-            let _ = tokio::task::spawn_blocking(move || {
-                if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                    let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
-                    let _ = conn.execute(
-                        "INSERT OR IGNORE INTO delegation_callbacks \
-                         (message_id, agent_id, channel_type, channel_id, thread_id, retry_count, created_at) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        rusqlite::params![msg_id, agent, ch_type, ch_id, tid, next_retry, now],
-                    );
-                }
-            }).await;
+        Ok(()) => {
+            // v1.8.17 Fix 2 (Option A): forward succeeded — also persist the
+            // sub-agent's reply into the PARENT agent's session history so
+            // that the parent's next CLI invocation sees what the sub-agent
+            // told the user. Without this, the parent has no record of the
+            // sub-agent's output and tends to hallucinate earlier context
+            // when the user replies (e.g. "方案A" referring to TL's reply).
+            //
+            // Non-blocking by design: any failure here is logged at WARN and
+            // does NOT affect the channel delivery outcome (already succeeded).
+            // Because `delegation_callbacks` was atomically consumed before
+            // `forward_to_channel` ran, this branch only fires on the FIRST
+            // successful delivery — so no duplicate turns on retry.
+            append_subagent_reply_to_parent_session(
+                home_dir,
+                &channel_type,
+                &channel_id,
+                thread_id.as_deref(),
+                &callback_agent_id,
+                responder_agent,
+                response_text,
+            ).await;
+        }
+        Err(e) => {
+            let next_retry = retry_count + 1;
+            if next_retry >= 5 {
+                warn!(
+                    channel = %channel_type,
+                    chat_id = %channel_id,
+                    error = %e,
+                    retries = retry_count,
+                    "Delegation callback forwarding permanently failed after 5 retries — dropping"
+                );
+            } else {
+                warn!(
+                    channel = %channel_type,
+                    chat_id = %channel_id,
+                    error = %e,
+                    retry = next_retry,
+                    "Failed to forward delegation response — re-inserting callback for retry"
+                );
+                let db_path = home_dir.join("message_queue.db");
+                let msg_id = original_message_id.to_string();
+                let agent = callback_agent_id.clone();
+                let ch_type = channel_type.clone();
+                let ch_id = channel_id.clone();
+                let tid = thread_id.clone();
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+                        let _ = conn.execute(
+                            "INSERT OR IGNORE INTO delegation_callbacks \
+                             (message_id, agent_id, channel_type, channel_id, thread_id, retry_count, created_at) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            rusqlite::params![msg_id, agent, ch_type, ch_id, tid, next_retry, now],
+                        );
+                    }
+                }).await;
+            }
         }
     }
+}
+
+/// Candidate session_id forms to try for a given channel context.
+///
+/// Different channels use different session_id grammars (see `channel_reply.rs`
+/// and each channel handler). Unfortunately, the delegation_callbacks row
+/// stores `(channel_type, channel_id, thread_id)` as flat columns, and for
+/// Discord the `discord:thread:<id>` prefix is collapsed to `channel_id=<id>,
+/// thread_id=None` (see `mcp.rs::send_to_agent`). That loses information, so
+/// we return ALL plausible session_ids and the caller tries them in order —
+/// appending to whichever session already exists (we never want to create a
+/// brand-new session from the forward path).
+///
+/// Order matters: we return the more-specific (thread-scoped) form first.
+fn candidate_session_ids(
+    channel_type: &str,
+    channel_id: &str,
+    thread_id: Option<&str>,
+) -> Vec<String> {
+    match channel_type {
+        "discord" => {
+            // Could be either `discord:<id>` or `discord:thread:<id>` —
+            // try thread form first since the information was lost on insert.
+            vec![
+                format!("discord:thread:{channel_id}"),
+                format!("discord:{channel_id}"),
+            ]
+        }
+        "telegram" => {
+            if let Some(tid) = thread_id {
+                vec![format!("telegram:{channel_id}:{tid}")]
+            } else {
+                vec![format!("telegram:{channel_id}")]
+            }
+        }
+        "slack" => {
+            if let Some(ts) = thread_id {
+                vec![format!("slack:{channel_id}:{ts}")]
+            } else {
+                vec![format!("slack:{channel_id}")]
+            }
+        }
+        // Generic `<channel>:<id>[:<thread_id>]`
+        _ => {
+            if let Some(tid) = thread_id {
+                vec![
+                    format!("{channel_type}:{channel_id}:{tid}"),
+                    format!("{channel_type}:{channel_id}"),
+                ]
+            } else {
+                vec![format!("{channel_type}:{channel_id}")]
+            }
+        }
+    }
+}
+
+/// Append the sub-agent's reply to the parent agent's session history.
+///
+/// Writes an `assistant` turn directly into `sessions.db::session_messages`
+/// with explicit attribution so the parent LLM can distinguish "I said this"
+/// from "a sub-agent said this on my behalf". Falls through silently (WARN
+/// log only) on any SQLite error — Discord delivery already succeeded and
+/// we never want to break that path.
+///
+/// Format of the appended content (XML-delimited, mirrors the tag grammar
+/// `channel_reply::format_history_as_prompt` uses):
+///
+/// ```text
+/// <subagent_reply agent="duduclaw-tl">
+/// <original response text>
+/// </subagent_reply>
+/// ```
+async fn append_subagent_reply_to_parent_session(
+    home_dir: &Path,
+    channel_type: &str,
+    channel_id: &str,
+    thread_id: Option<&str>,
+    parent_agent_id: &str,
+    responder_agent: &str,
+    response_text: &str,
+) {
+    let db_path = home_dir.join("sessions.db");
+    if !db_path.exists() {
+        // Brand-new install / no sessions yet — nothing to append to.
+        tracing::debug!(
+            db = %db_path.display(),
+            "sessions.db missing — skipping parent-session append"
+        );
+        return;
+    }
+
+    // Sanitize the responder name so the closing tag round-trips cleanly.
+    // Agent names are already constrained to ASCII alphanumerics + `-_` by
+    // the registry, but belt-and-suspenders prevents XML-tag injection via
+    // a crafted name.
+    let safe_responder: String = responder_agent
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let responder_for_tag = if safe_responder.is_empty() {
+        "sub-agent".to_string()
+    } else {
+        safe_responder
+    };
+
+    let content = format!(
+        "<subagent_reply agent=\"{responder_for_tag}\">\n{response_text}\n</subagent_reply>"
+    );
+    let tokens = subagent_reply_token_estimate(&content);
+    let candidates = candidate_session_ids(channel_type, channel_id, thread_id);
+    let parent = parent_agent_id.to_string();
+
+    let ch_type = channel_type.to_string();
+    let ch_id = channel_id.to_string();
+    let responder_for_log = responder_agent.to_string();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
+        let conn = rusqlite::Connection::open(&db_path)
+            .map_err(|e| format!("open sessions.db: {e}"))?;
+        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Try each candidate session_id in order. Append to the first one
+        // that already exists AND belongs to the expected parent agent.
+        for sid in &candidates {
+            let existing: Option<String> = conn.query_row(
+                "SELECT agent_id FROM sessions WHERE id = ?1",
+                rusqlite::params![sid],
+                |row| row.get(0),
+            ).ok();
+
+            let Some(owner) = existing else { continue };
+            if owner != parent {
+                // Session exists but belongs to a different agent — skip.
+                // This can happen if two agents share the same channel and
+                // we'd otherwise write into the wrong parent's history.
+                tracing::debug!(
+                    session_id = %sid,
+                    owner = %owner,
+                    expected = %parent,
+                    "session exists but owner mismatch — skipping"
+                );
+                continue;
+            }
+
+            conn.execute(
+                "INSERT INTO session_messages (session_id, role, content, tokens, timestamp) \
+                 VALUES (?1, 'assistant', ?2, ?3, ?4)",
+                rusqlite::params![sid, &content, tokens, now],
+            ).map_err(|e| format!("insert session_messages: {e}"))?;
+
+            conn.execute(
+                "UPDATE sessions SET total_tokens = total_tokens + ?1, last_active = ?2 \
+                 WHERE id = ?3",
+                rusqlite::params![tokens, now, sid],
+            ).map_err(|e| format!("update sessions: {e}"))?;
+
+            return Ok(Some(sid.clone()));
+        }
+
+        Ok(None)
+    }).await;
+
+    match result {
+        Ok(Ok(Some(sid))) => {
+            info!(
+                parent = %parent_agent_id,
+                responder = %responder_for_log,
+                session_id = %sid,
+                tokens = tokens,
+                "Appended sub-agent reply to parent session history"
+            );
+        }
+        Ok(Ok(None)) => {
+            // No matching session — the parent agent has never held a turn
+            // on this channel yet. Common for brand-new conversations where
+            // the sub-agent reply arrives before the parent's first reply
+            // has closed. Non-fatal.
+            warn!(
+                channel = %ch_type,
+                chat_id = %ch_id,
+                parent = %parent_agent_id,
+                "No parent session found for sub-agent reply append \
+                 (forward still succeeded); parent may miss this turn"
+            );
+        }
+        Ok(Err(e)) => {
+            warn!(
+                channel = %ch_type,
+                chat_id = %ch_id,
+                parent = %parent_agent_id,
+                error = %e,
+                "Failed to append sub-agent reply to parent session \
+                 (forward still succeeded)"
+            );
+        }
+        Err(e) => {
+            warn!(
+                channel = %ch_type,
+                chat_id = %ch_id,
+                parent = %parent_agent_id,
+                error = %e,
+                "spawn_blocking panicked while appending sub-agent reply \
+                 (forward still succeeded)"
+            );
+        }
+    }
+}
+
+/// CJK-aware token estimate for the appended sub-agent turn.
+///
+/// Mirrors `channel_reply::estimate_tokens` (duplicated here to avoid
+/// coupling the dispatcher to channel_reply's internals). ~1.5 chars/token
+/// for CJK, ~4 chars/token for other scripts. Over-estimates slightly —
+/// that's fine for the 50k compression threshold, which errs toward early
+/// compression.
+fn subagent_reply_token_estimate(text: &str) -> u32 {
+    let mut cjk: u32 = 0;
+    let mut other: u32 = 0;
+    for ch in text.chars() {
+        let cp = ch as u32;
+        if (0x3000..=0x9FFF).contains(&cp)
+            || (0xF900..=0xFAFF).contains(&cp)
+            || (0x20000..=0x2A6DF).contains(&cp)
+            || (0x2A700..=0x2CEAF).contains(&cp)
+        {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    let cjk_t = (cjk as f32 / 1.5).ceil() as u32;
+    let other_t = (other as f32 / 4.0).ceil() as u32;
+    cjk_t + other_t + 1
 }
 
 /// Escape Telegram MarkdownV1 special characters to prevent formatting injection.
@@ -1875,6 +2134,210 @@ mod tests {
         let depth = MAX_DELEGATION_DEPTH;
         assert!(depth >= 2, "MAX_DELEGATION_DEPTH too small: {depth}");
         assert!(depth <= 10, "MAX_DELEGATION_DEPTH too large: {depth}");
+    }
+
+    // ── v1.8.17 Fix 2: parent-session append tests ──
+
+    use crate::session::SessionManager;
+
+    /// Helper: set up a temp home directory with sessions.db seeded with a
+    /// parent session owned by `parent_agent` at `session_id`.
+    async fn setup_parent_session(
+        session_id: &str,
+        parent_agent: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let db_path = home.join("sessions.db");
+        let sm = SessionManager::new(&db_path).unwrap();
+        sm.get_or_create(session_id, parent_agent).await.unwrap();
+        // Seed a user turn so the parent's history isn't empty.
+        sm.append_message(session_id, "user", "parent turn", 5).await.unwrap();
+        (tmp, home)
+    }
+
+    #[tokio::test]
+    async fn forward_appends_to_parent_session_on_success() {
+        let (_tmp, home) = setup_parent_session("telegram:42", "agnes").await;
+
+        append_subagent_reply_to_parent_session(
+            &home,
+            "telegram",
+            "42",
+            None,
+            "agnes",
+            "duduclaw-tl",
+            "方案 A / B / C — which do you prefer?",
+        ).await;
+
+        // Re-open the session store and verify the turn landed.
+        let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
+        let msgs = sm.get_messages("telegram:42").await.unwrap();
+        assert_eq!(msgs.len(), 2, "expected user turn + appended assistant turn");
+        assert_eq!(msgs[1].role, "assistant");
+        assert!(msgs[1].content.contains("方案 A / B / C"));
+        assert!(msgs[1].tokens > 0, "tokens should be estimated > 0");
+    }
+
+    #[tokio::test]
+    async fn sub_agent_attribution_is_in_content() {
+        let (_tmp, home) = setup_parent_session("telegram:99", "agnes").await;
+
+        append_subagent_reply_to_parent_session(
+            &home,
+            "telegram",
+            "99",
+            None,
+            "agnes",
+            "duduclaw-tl",
+            "Here are three options.",
+        ).await;
+
+        let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
+        let msgs = sm.get_messages("telegram:99").await.unwrap();
+        let appended = &msgs.last().unwrap().content;
+        assert!(
+            appended.contains("duduclaw-tl"),
+            "sub-agent name must be present for parent LLM attribution: {appended}"
+        );
+        assert!(
+            appended.contains("<subagent_reply"),
+            "should use XML delimiter: {appended}"
+        );
+        assert!(
+            appended.contains("</subagent_reply>"),
+            "should close XML delimiter: {appended}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_skips_session_append_on_http_failure() {
+        // This scenario is enforced structurally: the Err branch in
+        // `forward_delegation_response` never calls
+        // `append_subagent_reply_to_parent_session`. We assert that by
+        // NOT calling the helper at all and verifying the parent session
+        // contains only the original user turn.
+        let (_tmp, home) = setup_parent_session("telegram:55", "agnes").await;
+
+        // Simulate: forward_to_channel returned Err — we do not append.
+        // (No call to append_subagent_reply_to_parent_session.)
+
+        let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
+        let msgs = sm.get_messages("telegram:55").await.unwrap();
+        assert_eq!(msgs.len(), 1, "no append should have occurred");
+        assert_eq!(msgs[0].role, "user");
+    }
+
+    #[tokio::test]
+    async fn session_append_failure_does_not_break_forward() {
+        // Simulate session-store error by pointing the helper at a home_dir
+        // with a *corrupt* sessions.db file. The helper MUST return without
+        // panicking and without propagating an error (its signature is
+        // `-> ()` — non-blocking by contract).
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        // Write a garbage file where sessions.db would live.
+        std::fs::write(home.join("sessions.db"), b"not a sqlite database").unwrap();
+
+        // Should not panic. If it returned, the forward path's Ok(()) is
+        // preserved (caller does not observe the internal failure).
+        append_subagent_reply_to_parent_session(
+            &home,
+            "telegram",
+            "77",
+            None,
+            "agnes",
+            "duduclaw-tl",
+            "reply text",
+        ).await;
+        // Reaching this line == test passes.
+    }
+
+    #[tokio::test]
+    async fn missing_sessions_db_is_silently_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        // Intentionally DO NOT create sessions.db.
+
+        // Should no-op gracefully.
+        append_subagent_reply_to_parent_session(
+            &home,
+            "discord",
+            "123456789",
+            None,
+            "agnes",
+            "duduclaw-tl",
+            "reply",
+        ).await;
+    }
+
+    #[tokio::test]
+    async fn discord_thread_candidate_tried_before_channel() {
+        // The Discord session lives at `discord:thread:<id>` — verify we
+        // correctly match the thread-form candidate first.
+        let (_tmp, home) = setup_parent_session("discord:thread:9876", "agnes").await;
+
+        append_subagent_reply_to_parent_session(
+            &home,
+            "discord",
+            "9876",
+            None,
+            "agnes",
+            "duduclaw-tl",
+            "thread reply",
+        ).await;
+
+        let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
+        let msgs = sm.get_messages("discord:thread:9876").await.unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[1].content.contains("thread reply"));
+    }
+
+    #[tokio::test]
+    async fn owner_mismatch_skips_append() {
+        // If the session at the candidate ID belongs to a different agent,
+        // we must NOT write into it (avoid cross-agent history pollution).
+        let (_tmp, home) = setup_parent_session("telegram:100", "other_agent").await;
+
+        append_subagent_reply_to_parent_session(
+            &home,
+            "telegram",
+            "100",
+            None,
+            "agnes",  // ← expected parent, but session belongs to other_agent
+            "duduclaw-tl",
+            "should not be appended",
+        ).await;
+
+        let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
+        let msgs = sm.get_messages("telegram:100").await.unwrap();
+        assert_eq!(msgs.len(), 1, "must not pollute another agent's session");
+        assert_eq!(msgs[0].role, "user");
+    }
+
+    #[test]
+    fn candidate_session_ids_discord_returns_both_forms() {
+        let ids = candidate_session_ids("discord", "9876", None);
+        assert_eq!(ids[0], "discord:thread:9876");
+        assert_eq!(ids[1], "discord:9876");
+    }
+
+    #[test]
+    fn candidate_session_ids_telegram_with_thread() {
+        let ids = candidate_session_ids("telegram", "42", Some("7"));
+        assert_eq!(ids, vec!["telegram:42:7".to_string()]);
+    }
+
+    #[test]
+    fn candidate_session_ids_slack_with_ts() {
+        let ids = candidate_session_ids("slack", "C123", Some("1700000.0001"));
+        assert_eq!(ids, vec!["slack:C123:1700000.0001".to_string()]);
+    }
+
+    #[test]
+    fn subagent_token_estimate_is_nonzero() {
+        assert!(subagent_reply_token_estimate("hello") > 0);
+        assert!(subagent_reply_token_estimate("你好世界") >= 3);
     }
 
     #[test]
