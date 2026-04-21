@@ -219,12 +219,21 @@ pub struct ContainerConfig {
 }
 
 /// Heartbeat / scheduled-task configuration.
+///
+/// `cron` expressions are **always evaluated in UTC** — the heartbeat loop
+/// compares `chrono::Utc::now()` against the next scheduled time. To fire at
+/// a local wall-clock time, convert it to UTC first (for Asia/Taipei, UTC+8,
+/// subtract 8 hours). Both 5-field (`min hour dom mon dow`) and 6-field
+/// (`sec min hour dom mon dow`) forms are accepted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct HeartbeatConfig {
     pub enabled: bool,
     pub interval_seconds: u64,
     pub max_concurrent_runs: u32,
+    /// Cron expression evaluated in UTC. Empty string falls back to
+    /// `interval_seconds`. Example: `"0 1 * * *"` fires at 01:00 UTC
+    /// (which is 09:00 in Asia/Taipei).
     pub cron: String,
 }
 
@@ -919,14 +928,15 @@ impl StickerConfig {
 /// ```toml
 /// [proactive]
 /// enabled = true
-/// check_interval = "*/30 * * * *"   # cron: every 30 min
+/// check_interval = "*/30 * * * *"   # cron: every 30 min (UTC — see [heartbeat] cron note)
 /// quiet_hours_start = 23
 /// quiet_hours_end = 8
 /// max_messages_per_hour = 3
 /// token_budget_per_check = 2000
 /// notify_channel = "telegram"
 /// notify_chat_id = "123456789"
-/// timezone = "Asia/Taipei"
+/// timezone = "Asia/Taipei"          # affects quiet_hours only
+/// max_turns = 8                     # Claude CLI --max-turns for proactive runs
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
@@ -948,7 +958,13 @@ pub struct ProactiveConfig {
     /// Chat/group ID to send notifications to.
     pub notify_chat_id: String,
     /// IANA timezone for quiet hours (e.g., "Asia/Taipei").
+    /// NOTE: only affects `quiet_hours_*` evaluation. The `check_interval`
+    /// cron expression is always evaluated in UTC (same as `[heartbeat] cron`).
     pub timezone: String,
+    /// Claude CLI `--max-turns` for a proactive check. Needs enough headroom
+    /// for MCP tool calls (e.g. querying Notion, Gmail) and summarisation.
+    /// Default 8; bump higher for checks that chain many tool calls.
+    pub max_turns: u32,
 }
 
 impl Default for ProactiveConfig {
@@ -963,6 +979,7 @@ impl Default for ProactiveConfig {
             notify_channel: String::new(),
             notify_chat_id: String::new(),
             timezone: "Asia/Taipei".into(),
+            max_turns: 8,
         }
     }
 }
@@ -983,6 +1000,19 @@ impl ProactiveConfig {
                 "quiet_hours_end out of range (0-23), clamping to 23"
             );
             self.quiet_hours_end = 23;
+        }
+        if self.max_turns == 0 {
+            tracing::warn!(
+                "proactive.max_turns is 0, bumping to default (8)"
+            );
+            self.max_turns = 8;
+        }
+        if self.max_turns > 64 {
+            tracing::warn!(
+                value = self.max_turns,
+                "proactive.max_turns unusually high, clamping to 64"
+            );
+            self.max_turns = 64;
         }
     }
 }

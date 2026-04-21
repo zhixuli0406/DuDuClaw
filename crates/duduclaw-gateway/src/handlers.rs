@@ -2943,6 +2943,9 @@ impl MethodHandler {
             "last_error": row.last_error,
             "run_count": row.run_count,
             "failure_count": row.failure_count,
+            "notify_channel": row.notify_channel,
+            "notify_chat_id": row.notify_chat_id,
+            "notify_thread_id": row.notify_thread_id,
         })
     }
 
@@ -3011,13 +3014,38 @@ impl MethodHandler {
             Err(e) => return WsFrame::error_response("", &format!("lookup: {e}")),
         }
 
-        let row = CronTaskRow::new(
+        let notify_channel = params
+            .get("notify_channel")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let notify_chat_id = params
+            .get("notify_chat_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let notify_thread_id = params
+            .get("notify_thread_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        if notify_channel.is_some() != notify_chat_id.is_some() {
+            return WsFrame::error_response(
+                "",
+                "notify_channel and notify_chat_id must be set together",
+            );
+        }
+
+        let mut row = CronTaskRow::new(
             uuid::Uuid::new_v4().to_string(),
             name.clone(),
             agent_id.clone(),
             cron_expr.clone(),
             task_body,
         );
+        row.notify_channel = notify_channel;
+        row.notify_chat_id = notify_chat_id;
+        row.notify_thread_id = notify_thread_id;
         if let Err(e) = store.insert(&row).await {
             return WsFrame::error_response("", &format!("insert: {e}"));
         }
@@ -3083,14 +3111,48 @@ impl MethodHandler {
             .update_fields(&id, &name, &agent_id, &cron_expr, &task_body, enabled)
             .await
         {
-            Ok(true) => {
-                self.notify_cron_reload().await;
-                info!(id = %id, "Cron task updated");
-                WsFrame::ok_response("", json!({ "success": true, "id": id }))
+            Ok(true) => {}
+            Ok(false) => {
+                return WsFrame::error_response("", &format!("Cron task '{id}' not found"));
             }
-            Ok(false) => WsFrame::error_response("", &format!("Cron task '{id}' not found")),
-            Err(e) => WsFrame::error_response("", &format!("update: {e}")),
+            Err(e) => return WsFrame::error_response("", &format!("update: {e}")),
         }
+
+        // Optional: only touch notify_* when any of those keys are present
+        // in the payload. Absence means "leave existing values alone".
+        let has_notify_update = params.get("notify_channel").is_some()
+            || params.get("notify_chat_id").is_some()
+            || params.get("notify_thread_id").is_some();
+        if has_notify_update {
+            let notify_channel = params
+                .get("notify_channel")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let notify_chat_id = params
+                .get("notify_chat_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let notify_thread_id = params
+                .get("notify_thread_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            if notify_channel.is_some() != notify_chat_id.is_some() {
+                return WsFrame::error_response(
+                    "",
+                    "notify_channel and notify_chat_id must be set together",
+                );
+            }
+            if let Err(e) = store
+                .update_notify(&id, notify_channel, notify_chat_id, notify_thread_id)
+                .await
+            {
+                return WsFrame::error_response("", &format!("update_notify: {e}"));
+            }
+        }
+
+        self.notify_cron_reload().await;
+        info!(id = %id, "Cron task updated");
+        WsFrame::ok_response("", json!({ "success": true, "id": id }))
     }
 
     async fn handle_cron_set_enabled(&self, params: Value, enabled: bool) -> WsFrame {

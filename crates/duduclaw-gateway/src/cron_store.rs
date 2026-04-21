@@ -15,6 +15,11 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 /// One row in the `cron_tasks` table.
+///
+/// `notify_channel` / `notify_chat_id` / `notify_thread_id` are optional
+/// routing hints: when present, the scheduler delivers the agent's response
+/// to that channel after a successful run. When absent, the run is recorded
+/// silently (same as pre-v1.8.22 behaviour).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronTaskRow {
     pub id: String,
@@ -30,6 +35,16 @@ pub struct CronTaskRow {
     pub last_error: Option<String>,
     pub run_count: i64,
     pub failure_count: i64,
+    /// Target channel type: "discord" | "telegram" | "line" | "slack" |
+    /// "whatsapp" | "feishu" | "webchat". `None` → no auto-delivery.
+    #[serde(default)]
+    pub notify_channel: Option<String>,
+    /// Target chat / channel / room ID on the notify platform.
+    #[serde(default)]
+    pub notify_chat_id: Option<String>,
+    /// Optional Discord thread ID (only meaningful when notify_channel="discord").
+    #[serde(default)]
+    pub notify_thread_id: Option<String>,
 }
 
 impl CronTaskRow {
@@ -50,7 +65,16 @@ impl CronTaskRow {
             last_error: None,
             run_count: 0,
             failure_count: 0,
+            notify_channel: None,
+            notify_chat_id: None,
+            notify_thread_id: None,
         }
+    }
+
+    /// True iff this row is configured to deliver its response to a channel.
+    pub fn has_notify_target(&self) -> bool {
+        matches!(&self.notify_channel, Some(ch) if !ch.is_empty())
+            && matches!(&self.notify_chat_id, Some(id) if !id.is_empty())
     }
 }
 
@@ -99,6 +123,24 @@ impl CronStore {
              CREATE INDEX IF NOT EXISTS idx_cron_tasks_name    ON cron_tasks(name);",
         )
         .map_err(|e| format!("init cron store schema: {e}"))?;
+
+        // v1.8.22 migration — add notify_* columns for cron-result channel
+        // delivery (issue #15). SQLite does not support IF NOT EXISTS on
+        // ALTER TABLE ADD COLUMN, so we attempt each one and ignore the
+        // "duplicate column name" error. All other errors propagate.
+        for col in [
+            "notify_channel",
+            "notify_chat_id",
+            "notify_thread_id",
+        ] {
+            let sql = format!("ALTER TABLE cron_tasks ADD COLUMN {col} TEXT");
+            if let Err(e) = conn.execute(&sql, []) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(format!("add column {col}: {msg}"));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -110,7 +152,8 @@ impl CronStore {
             .prepare(
                 "SELECT id, name, agent_id, cron, task, enabled,
                         created_at, updated_at, last_run_at, last_status, last_error,
-                        run_count, failure_count
+                        run_count, failure_count,
+                        notify_channel, notify_chat_id, notify_thread_id
                  FROM cron_tasks
                  ORDER BY created_at ASC",
             )
@@ -129,7 +172,8 @@ impl CronStore {
             .prepare(
                 "SELECT id, name, agent_id, cron, task, enabled,
                         created_at, updated_at, last_run_at, last_status, last_error,
-                        run_count, failure_count
+                        run_count, failure_count,
+                        notify_channel, notify_chat_id, notify_thread_id
                  FROM cron_tasks
                  WHERE enabled = 1
                  ORDER BY created_at ASC",
@@ -149,7 +193,8 @@ impl CronStore {
             .query_row(
                 "SELECT id, name, agent_id, cron, task, enabled,
                         created_at, updated_at, last_run_at, last_status, last_error,
-                        run_count, failure_count
+                        run_count, failure_count,
+                        notify_channel, notify_chat_id, notify_thread_id
                  FROM cron_tasks WHERE id = ?1",
                 params![id],
                 row_to_cron_task,
@@ -165,7 +210,8 @@ impl CronStore {
             .query_row(
                 "SELECT id, name, agent_id, cron, task, enabled,
                         created_at, updated_at, last_run_at, last_status, last_error,
-                        run_count, failure_count
+                        run_count, failure_count,
+                        notify_channel, notify_chat_id, notify_thread_id
                  FROM cron_tasks WHERE name = ?1 LIMIT 1",
                 params![name],
                 row_to_cron_task,
@@ -184,8 +230,9 @@ impl CronStore {
             "INSERT INTO cron_tasks
                 (id, name, agent_id, cron, task, enabled,
                  created_at, updated_at, last_run_at, last_status, last_error,
-                 run_count, failure_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 run_count, failure_count,
+                 notify_channel, notify_chat_id, notify_thread_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 row.id,
                 row.name,
@@ -200,6 +247,9 @@ impl CronStore {
                 row.last_error,
                 row.run_count,
                 row.failure_count,
+                row.notify_channel,
+                row.notify_chat_id,
+                row.notify_thread_id,
             ],
         )
         .map_err(|e| format!("insert cron task: {e}"))?;
@@ -207,6 +257,7 @@ impl CronStore {
     }
 
     /// Update the editable fields of a task (name, agent_id, cron, task, enabled).
+    /// `notify_*` fields are preserved — use [`Self::update_notify`] to change them.
     pub async fn update_fields(
         &self,
         id: &str,
@@ -227,6 +278,28 @@ impl CronStore {
                 params![id, name, agent_id, cron, task, if enabled { 1 } else { 0 }, now],
             )
             .map_err(|e| format!("update cron task: {e}"))?;
+        Ok(changed > 0)
+    }
+
+    /// Update the `notify_*` routing fields of a task. Pass `None` to clear a field.
+    pub async fn update_notify(
+        &self,
+        id: &str,
+        notify_channel: Option<&str>,
+        notify_chat_id: Option<&str>,
+        notify_thread_id: Option<&str>,
+    ) -> Result<bool, String> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "UPDATE cron_tasks
+                 SET notify_channel = ?2, notify_chat_id = ?3, notify_thread_id = ?4,
+                     updated_at = ?5
+                 WHERE id = ?1",
+                params![id, notify_channel, notify_chat_id, notify_thread_id, now],
+            )
+            .map_err(|e| format!("update_notify: {e}"))?;
         Ok(changed > 0)
     }
 
@@ -373,6 +446,22 @@ impl CronStore {
                 continue;
             }
 
+            let notify_channel = value
+                .get("notify_channel")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            let notify_chat_id = value
+                .get("notify_chat_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            let notify_thread_id = value
+                .get("notify_thread_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+
             let row = CronTaskRow {
                 id,
                 name,
@@ -387,6 +476,9 @@ impl CronStore {
                 last_error: None,
                 run_count: 0,
                 failure_count: 0,
+                notify_channel,
+                notify_chat_id,
+                notify_thread_id,
             };
             if let Err(e) = self.insert(&row).await {
                 warn!(id = %row.id, "failed to migrate row: {e}");
@@ -423,6 +515,9 @@ fn row_to_cron_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronTaskRow> {
         last_error: row.get(10)?,
         run_count: row.get(11)?,
         failure_count: row.get(12)?,
+        notify_channel: row.get(13)?,
+        notify_chat_id: row.get(14)?,
+        notify_thread_id: row.get(15)?,
     })
 }
 
@@ -472,6 +567,69 @@ mod tests {
 
         assert!(store.delete("t1").await.unwrap());
         assert!(store.list_all().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn notify_fields_roundtrip_and_update() {
+        let dir = tempdir().unwrap();
+        let store = CronStore::open(dir.path()).unwrap();
+
+        // Insert a row with notify fields set
+        let mut row = CronTaskRow::new(
+            "n1".into(),
+            "Notify Task".into(),
+            "agnes".into(),
+            "0 9 * * *".into(),
+            "daily brief".into(),
+        );
+        row.notify_channel = Some("discord".into());
+        row.notify_chat_id = Some("1234567890".into());
+        row.notify_thread_id = Some("9876543210".into());
+        store.insert(&row).await.unwrap();
+
+        // Round-trip through the DB
+        let got = store.get("n1").await.unwrap().unwrap();
+        assert!(got.has_notify_target());
+        assert_eq!(got.notify_channel.as_deref(), Some("discord"));
+        assert_eq!(got.notify_chat_id.as_deref(), Some("1234567890"));
+        assert_eq!(got.notify_thread_id.as_deref(), Some("9876543210"));
+
+        // update_fields preserves notify columns
+        store
+            .update_fields("n1", "Renamed", "agnes", "0 9 * * *", "brief", true)
+            .await
+            .unwrap();
+        let got = store.get("n1").await.unwrap().unwrap();
+        assert_eq!(got.name, "Renamed");
+        assert_eq!(got.notify_channel.as_deref(), Some("discord"));
+
+        // update_notify can clear a field with None
+        store
+            .update_notify("n1", Some("telegram"), Some("555"), None)
+            .await
+            .unwrap();
+        let got = store.get("n1").await.unwrap().unwrap();
+        assert_eq!(got.notify_channel.as_deref(), Some("telegram"));
+        assert_eq!(got.notify_chat_id.as_deref(), Some("555"));
+        assert_eq!(got.notify_thread_id, None);
+
+        // has_notify_target is false when channel is empty
+        store.update_notify("n1", None, None, None).await.unwrap();
+        let got = store.get("n1").await.unwrap().unwrap();
+        assert!(!got.has_notify_target());
+    }
+
+    #[tokio::test]
+    async fn notify_columns_migration_is_idempotent() {
+        // Simulate a pre-v1.8.22 DB by creating it, then re-opening — the
+        // ALTER TABLE calls in init_schema must not fail on the second pass
+        // when the columns already exist.
+        let dir = tempdir().unwrap();
+        let store1 = CronStore::open(dir.path()).unwrap();
+        drop(store1);
+        let store2 = CronStore::open(dir.path()).unwrap();
+        // If open succeeded the ALTER idempotency contract holds.
+        let _ = store2.list_all().await.unwrap();
     }
 
     #[tokio::test]

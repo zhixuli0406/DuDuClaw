@@ -400,24 +400,64 @@ async fn execute_proactive_check(
 
     info!(agent = agent_id, "Proactive check: executing");
 
-    // Build prompt and execute via Claude CLI
+    // Build prompt and execute via Claude CLI.
+    //
+    // Previously used `--print --no-input --system-prompt <inline>` without
+    // `--mcp-config`. Three problems with that form:
+    //   1. `--no-input` was removed in Claude CLI ≥2.1 (causes hard error).
+    //   2. No `--mcp-config` means the agent cannot call Notion / Gmail /
+    //      duduclaw MCP tools during a proactive check, so any check that
+    //      depends on external state silently no-ops.
+    //   3. `--max-turns 3` is too tight for checks that chain tool calls.
+    //
+    // Fix: mirror the channel_reply spawn path — pass system prompt via a
+    // temp file (avoids /proc/PID/cmdline leak), attach the agent's
+    // `.mcp.json` with `--strict-mcp-config`, and make max_turns config-
+    // driven with a sensible default of 8.
     let prompt = proactive::build_proactive_prompt(&proactive_md, agent_id);
     let claude = duduclaw_core::which_claude();
 
     let result = match claude {
         Some(claude_path) => {
-            let output = duduclaw_core::platform::async_command_for(&claude_path)
-                .args([
-                    "--print", "--no-input",
-                    "--system-prompt", &prompt,
-                    "--max-turns", "3",
-                    "-p", "Execute the proactive checks now.",
-                ])
+            // Write system prompt to a temp file — Claude CLI ≥2 supports
+            // --system-prompt-file and this avoids cmdline length / leak issues.
+            let prompt_file = match tempfile::NamedTempFile::new() {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    if let Err(e) = f.write_all(prompt.as_bytes()) {
+                        warn!(agent = agent_id, "Proactive temp-file write failed: {e}");
+                        return;
+                    }
+                    f
+                }
+                Err(e) => {
+                    warn!(agent = agent_id, "Proactive temp-file create failed: {e}");
+                    return;
+                }
+            };
+            let prompt_path = prompt_file.path().to_path_buf();
+
+            let max_turns_str = agent_config.proactive.max_turns.to_string();
+            let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);
+            cmd.arg("--print")
+                .args(["--system-prompt-file", &prompt_path.to_string_lossy()])
+                .args(["--max-turns", &max_turns_str])
+                .args(["-p", "Execute the proactive checks now."])
                 .current_dir(&agent_dir)
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output()
-                .await;
+                .stderr(std::process::Stdio::piped());
+
+            // Attach agent's MCP server definitions so Notion/Gmail/etc tools
+            // are available during the proactive run. `--strict-mcp-config`
+            // prevents ambient global MCP from leaking in.
+            let mcp_json = agent_dir.join(".mcp.json");
+            if mcp_json.exists() {
+                cmd.args(["--mcp-config", &mcp_json.to_string_lossy()]);
+                cmd.arg("--strict-mcp-config");
+            }
+
+            let output = cmd.output().await;
+            drop(prompt_file); // explicit: temp file survives until after spawn exits
             match output {
                 Ok(o) if o.status.success() => {
                     String::from_utf8_lossy(&o.stdout).to_string()

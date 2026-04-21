@@ -1069,7 +1069,7 @@ function ProactiveTab() {
             placeholder="*/30 * * * *"
             className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
           />
-          <p className="text-xs text-stone-400">Cron expression</p>
+          <p className="text-xs text-stone-400">Cron expression (UTC timezone — Asia/Taipei users subtract 8h)</p>
         </div>
 
         <div className="space-y-1.5">
