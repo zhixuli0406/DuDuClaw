@@ -1424,6 +1424,15 @@ async fn send_to_agent_with_ctx(
 
     // Also write to SQLite message queue (Phase 3).
     // Uses raw rusqlite to avoid circular dependency on duduclaw-gateway.
+    //
+    // v1.8.16: propagate `DUDUCLAW_REPLY_CHANNEL` into the row so the
+    // dispatcher can scope REPLY_CHANNEL around the target agent's
+    // Claude CLI when it spawns. Without this, only the first delegation
+    // (initiated directly from channel_reply) carried channel context;
+    // every nested sub-agent delegation's callback was never registered
+    // and the reply was silently dropped. Best-effort: if the ALTER TABLE
+    // migration hasn't run yet the fallback INSERT (without reply_channel)
+    // succeeds on the legacy path.
     {
         let db_path = home_dir.join("message_queue.db");
         let msg_id_cl = msg_id.clone();
@@ -1432,19 +1441,38 @@ async fn send_to_agent_with_ctx(
         let prompt_cl = prompt.to_string();
         let origin_cl = origin.to_string();
         let ts_now = chrono::Utc::now().to_rfc3339();
+        let reply_channel = std::env::var(duduclaw_core::ENV_REPLY_CHANNEL)
+            .ok()
+            .filter(|s| !s.is_empty());
         let _ = tokio::task::spawn_blocking(move || {
             if let Ok(conn) = rusqlite::Connection::open(&db_path) {
                 let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
-                let _ = conn.execute(
+                let inserted = conn.execute(
                     "INSERT OR IGNORE INTO message_queue \
                      (id, sender, target, payload, status, retry_count, delegation_depth, \
-                      origin_agent, sender_agent, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8)",
+                      origin_agent, sender_agent, created_at, reply_channel) \
+                     VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9)",
                     rusqlite::params![
                         msg_id_cl, caller_cl, target_cl, prompt_cl,
                         outgoing_depth, origin_cl, caller_cl, ts_now,
+                        reply_channel,
                     ],
                 );
+                if inserted.is_err() {
+                    // Legacy schema path (pre-v1.8.16 — no reply_channel column).
+                    // The gateway will migrate on next startup; for now fall
+                    // back to the original INSERT so MCP stays functional.
+                    let _ = conn.execute(
+                        "INSERT OR IGNORE INTO message_queue \
+                         (id, sender, target, payload, status, retry_count, delegation_depth, \
+                          origin_agent, sender_agent, created_at) \
+                         VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8)",
+                        rusqlite::params![
+                            msg_id_cl, caller_cl, target_cl, prompt_cl,
+                            outgoing_depth, origin_cl, caller_cl, ts_now,
+                        ],
+                    );
+                }
             }
         }).await;
     }

@@ -151,8 +151,25 @@ async fn poll_and_dispatch_sqlite(
             sender: msg.sender_agent.clone().unwrap_or_default(),
         };
 
-        match dispatch_to_agent(home_dir, registry, &msg.target, &msg.payload, &delegation).await
-        {
+        // v1.8.16: propagate the originating channel context down into the
+        // target agent's Claude CLI spawn. `claude_runner::REPLY_CHANNEL` is
+        // a task-local that `prepare_claude_cmd` reads to set the
+        // `DUDUCLAW_REPLY_CHANNEL` env var — which in turn is what the MCP
+        // `send_to_agent` tool reads when it registers a delegation callback.
+        // Without this scope, sub-agents spawned by the dispatcher (depth ≥ 2)
+        // get no channel context, their `send_to_agent` callbacks never
+        // register, and sub-agent replies are silently dropped at the
+        // `forward_delegation_response` no-callback branch.
+        let dispatch_fut =
+            dispatch_to_agent(home_dir, registry, &msg.target, &msg.payload, &delegation);
+        let result = match msg.reply_channel.clone() {
+            Some(rc) if !rc.is_empty() => {
+                crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut).await
+            }
+            _ => dispatch_fut.await,
+        };
+
+        match result {
             Ok(response) => {
                 queue.complete(&msg.id, &response).await?;
                 // Forward sub-agent response to originating channel if callback exists
@@ -1444,7 +1461,20 @@ async fn forward_delegation_response(
     }).await.ok().flatten();
 
     let Some((_, callback_agent_id, channel_type, channel_id, thread_id, retry_count)) = callback else {
-        return; // No callback registered — normal non-channel delegation
+        // No callback registered — this is the legitimate case for purely
+        // internal delegations (cron/reminder/heartbeat), but it is ALSO
+        // what happened pre-v1.8.16 when a nested sub-agent's reply was
+        // silently dropped because the delegation chain lost channel
+        // context. Debug-log so future silent drops are at least visible
+        // under `RUST_LOG=duduclaw_gateway::dispatcher=debug`.
+        tracing::debug!(
+            message_id = %original_message_id,
+            responder = %responder_agent,
+            "No delegation callback — response not forwarded to any channel \
+             (expected for cron/reminder/non-channel delegations; unexpected \
+             if this was a user-facing sub-agent reply)"
+        );
+        return;
     };
 
     info!(
