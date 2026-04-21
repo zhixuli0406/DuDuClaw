@@ -345,8 +345,29 @@ static INFERENCE_ENGINE: std::sync::OnceLock<tokio::sync::RwLock<Option<std::syn
 /// Prevents concurrent tasks from each loading a full GGUF model (OOM risk).
 static INFERENCE_INIT_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
+/// Process-lifetime negative cache — set to `true` once
+/// `InferenceEngine::init` fails in a way that won't recover this run
+/// (e.g. the binary was built without `--features metal`/`cuda`/`vulkan`,
+/// so llama.cpp has no backend; or the router is disabled and there's
+/// no remote endpoint configured). Every later `get_inference_engine`
+/// call short-circuits silently to `None` instead of retrying init and
+/// re-emitting the same WARN. Reset is by restarting the gateway —
+/// which is also when the operator would have rebuilt with features.
+///
+/// Before this cache, every channel/dispatch call hit the init path and
+/// logged the same "Backend unavailable: llama.cpp — Build with
+/// --features metal, cuda, or vulkan" WARN, flooding the gateway log.
+static INFERENCE_UNAVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Get or create the inference engine singleton.
 async fn get_inference_engine(home_dir: &std::path::Path) -> Option<std::sync::Arc<duduclaw_inference::InferenceEngine>> {
+    // Negative-cache fast path: a previous init attempt already failed
+    // in a way that won't recover without a gateway restart. Skip silently.
+    if INFERENCE_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+
     let cache = INFERENCE_ENGINE.get_or_init(|| tokio::sync::RwLock::new(None));
 
     // Fast path: engine already initialized
@@ -361,7 +382,11 @@ async fn get_inference_engine(home_dir: &std::path::Path) -> Option<std::sync::A
     let init_lock = INFERENCE_INIT_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
     let _init_guard = init_lock.lock().await;
 
-    // Double-check after acquiring lock (another task may have initialized)
+    // Double-check after acquiring lock (another task may have initialized
+    // or marked the engine permanently unavailable).
+    if INFERENCE_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     {
         let guard = cache.read().await;
         if let Some(engine) = guard.as_ref() {
@@ -372,10 +397,20 @@ async fn get_inference_engine(home_dir: &std::path::Path) -> Option<std::sync::A
     // Initialize engine
     let engine = duduclaw_inference::InferenceEngine::new(home_dir).await;
     if let Err(e) = engine.init().await {
-        warn!("Failed to initialize inference engine: {e}");
+        // One-shot WARN: record the failure, latch the negative cache, and
+        // fall through to SDK for the rest of this process's lifetime.
+        warn!(
+            error = %e,
+            "Failed to initialize inference engine — disabling local offload for this process (build with --features metal/cuda/vulkan to enable llama.cpp, or configure [openai_compat] in inference.toml for a remote backend)"
+        );
+        INFERENCE_UNAVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
         return None;
     }
     if !engine.is_available().await {
+        warn!(
+            "Inference engine initialized but reports no available backend — disabling local offload for this process"
+        );
+        INFERENCE_UNAVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
         return None;
     }
     let arc = std::sync::Arc::new(engine);
