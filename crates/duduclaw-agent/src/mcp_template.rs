@@ -266,6 +266,17 @@ pub fn remove_duduclaw_from_agent_mcp(agent_dir: &Path) -> Result<bool, String> 
 ///
 /// Prefer `ensure_global_mcp_server()` for new installations.
 /// This function is called after global migration to clean up stale entries.
+///
+/// In addition to resolving the `duduclaw` server's command to an absolute
+/// path, this function ensures the server's `env` block contains
+/// `DUDUCLAW_AGENT_ID` pointing at the agent directory's name. The MCP
+/// subprocess uses this env var to self-identify — without it, every MCP
+/// call falls back to `config.toml [general] default_agent` and
+/// supervisor-relation authorization breaks for every agent except the
+/// global default.
+///
+/// The `duduclaw` / `duduclaw-pro` server entries are the only ones
+/// touched; other servers (playwright, browserbase, …) are left alone.
 pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
     let path = agent_dir.join(".mcp.json");
 
@@ -277,13 +288,26 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
         return Ok(false);
     }
 
+    // Agent identity = directory name (matches the rest of the codebase,
+    // e.g. `check_supervisor_relation`, `is_valid_agent_id`).
+    let agent_id = agent_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("agent dir has no file_name: {}", agent_dir.display()))?
+        .to_string();
+
     // Case 1: No .mcp.json exists → create with duduclaw server entry
     if !path.exists() {
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            duduclaw_core::ENV_AGENT_ID.to_string(),
+            agent_id.clone(),
+        );
         let mut servers = std::collections::HashMap::new();
         servers.insert("duduclaw".to_string(), McpServerDef {
             command: abs_str.clone(),
             args: vec!["mcp-server".to_string()],
-            env: std::collections::HashMap::new(),
+            env,
         });
         let config = McpConfig { mcp_servers: servers };
         let json = serde_json::to_string_pretty(&config)
@@ -291,7 +315,12 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
         std::fs::write(&path, &json)
             .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
         duduclaw_core::platform::set_owner_only(&path).ok();
-        info!(path = %path.display(), command = %abs_str, "Created .mcp.json with duduclaw server");
+        info!(
+            path = %path.display(),
+            command = %abs_str,
+            agent_id = %agent_id,
+            "Created .mcp.json with duduclaw server + agent identity"
+        );
         return Ok(true);
     }
 
@@ -300,14 +329,30 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
     let mut config: McpConfig = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
 
-    // Case 2 & 3: Check if duduclaw server needs updating.
-    let needs_update = match config.mcp_servers.get("duduclaw") {
-        None => true, // No duduclaw entry at all
+    // Check if duduclaw / duduclaw-pro server needs any update (command
+    // path OR agent-id env var). Both entry names can appear in legacy
+    // installs; we migrate whichever one is present (or create a fresh
+    // `duduclaw` entry if neither is).
+    let legacy_keys = ["duduclaw", "duduclaw-pro"];
+    let target_key: String = legacy_keys
+        .iter()
+        .find(|k| config.mcp_servers.contains_key(**k))
+        .map(|k| (*k).to_string())
+        .unwrap_or_else(|| "duduclaw".to_string());
+
+    let needs_update = match config.mcp_servers.get(&target_key) {
+        None => true, // No duduclaw / duduclaw-pro entry at all — create one
         Some(entry) => {
             let cmd_path = std::path::Path::new(&entry.command);
-            !cmd_path.is_absolute()             // Case 2: relative path
-                || !cmd_path.exists()            // Case 3: binary doesn't exist
-                || entry.command != abs_str      // Command changed (e.g., duduclaw-pro → duduclaw)
+            let wrong_command = !cmd_path.is_absolute()
+                || !cmd_path.exists()
+                || entry.command != abs_str;
+            let missing_agent_id = entry
+                .env
+                .get(duduclaw_core::ENV_AGENT_ID)
+                .map(|v| v != &agent_id)
+                .unwrap_or(true);
+            wrong_command || missing_agent_id
         }
     };
 
@@ -317,12 +362,26 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
 
     config
         .mcp_servers
-        .entry("duduclaw".to_string())
-        .and_modify(|e| e.command = abs_str.clone())
-        .or_insert(McpServerDef {
-            command: abs_str.clone(),
-            args: vec!["mcp-server".to_string()],
-            env: std::collections::HashMap::new(),
+        .entry(target_key.clone())
+        .and_modify(|e| {
+            e.command = abs_str.clone();
+            // Preserve other env vars, only upsert DUDUCLAW_AGENT_ID.
+            e.env.insert(
+                duduclaw_core::ENV_AGENT_ID.to_string(),
+                agent_id.clone(),
+            );
+        })
+        .or_insert_with(|| {
+            let mut env = std::collections::HashMap::new();
+            env.insert(
+                duduclaw_core::ENV_AGENT_ID.to_string(),
+                agent_id.clone(),
+            );
+            McpServerDef {
+                command: abs_str.clone(),
+                args: vec!["mcp-server".to_string()],
+                env,
+            }
         });
 
     let json = serde_json::to_string_pretty(&config)
@@ -333,7 +392,9 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
     info!(
         path = %path.display(),
         command = %abs_str,
-        "Updated duduclaw MCP server to absolute path"
+        agent_id = %agent_id,
+        server = %target_key,
+        "Updated duduclaw MCP server (absolute path + agent identity)"
     );
     Ok(true)
 }
@@ -689,5 +750,197 @@ mod tests {
         let config: McpConfig = serde_json::from_str(&content).expect("config should be valid JSON");
         assert!(config.mcp_servers.contains_key("playwright"));
         assert!(config.mcp_servers.contains_key("memory"));
+    }
+
+    // ── Agent-ID env migration tests ──────────────────────────
+    //
+    // Each test creates an agent directory named so `ensure_duduclaw_absolute_path`
+    // derives the expected `DUDUCLAW_AGENT_ID`. We set `DUDUCLAW_BIN` (via the
+    // env used by `duduclaw_core::resolve_duduclaw_bin`) so the "command must be
+    // absolute AND must exist" invariant is satisfied under test.
+
+    /// Return a usable absolute path to `/bin/sh` (exists on Linux + macOS),
+    /// which we use as a placeholder duduclaw binary in tests — it satisfies
+    /// the `exists()` check inside `ensure_duduclaw_absolute_path`.
+    fn fake_bin_path() -> std::path::PathBuf {
+        std::path::PathBuf::from("/bin/sh")
+    }
+
+    /// Scoped `DUDUCLAW_BIN` override. Sets the env on construction, removes it
+    /// on drop. Tests that use this must hold `BIN_ENV_LOCK` so parallel runs
+    /// don't clobber each other.
+    struct BinEnvOverride;
+    impl BinEnvOverride {
+        fn new(path: &std::path::Path) -> Self {
+            // SAFETY: serialized via `BIN_ENV_LOCK` in each test.
+            unsafe { std::env::set_var("DUDUCLAW_BIN", path); }
+            Self
+        }
+    }
+    impl Drop for BinEnvOverride {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("DUDUCLAW_BIN"); }
+        }
+    }
+
+    static BIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn write_json(path: &std::path::Path, value: &serde_json::Value) {
+        let pretty = serde_json::to_string_pretty(value).unwrap();
+        std::fs::write(path, pretty).unwrap();
+    }
+
+    fn read_mcp_json(path: &std::path::Path) -> serde_json::Value {
+        let content = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str(&content).unwrap()
+    }
+
+    #[test]
+    fn mcp_json_migration_adds_agent_id_env() {
+        let _guard = BIN_ENV_LOCK.lock().unwrap();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+
+        let tmp = TempDir::new().unwrap();
+        let agent_dir = tmp.path().join("duduclaw-tl");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+
+        // Start with empty env block — exactly the broken state we're fixing.
+        let existing = serde_json::json!({
+            "mcpServers": {
+                "duduclaw": {
+                    "command": fake_bin_path().to_string_lossy(),
+                    "args": ["mcp-server"],
+                    "env": {}
+                }
+            }
+        });
+        let path = agent_dir.join(".mcp.json");
+        write_json(&path, &existing);
+
+        let changed = ensure_duduclaw_absolute_path(&agent_dir).unwrap();
+        assert!(changed, "migration must report a change");
+
+        let got = read_mcp_json(&path);
+        let env = &got["mcpServers"]["duduclaw"]["env"];
+        assert_eq!(
+            env["DUDUCLAW_AGENT_ID"].as_str(),
+            Some("duduclaw-tl"),
+            "env block must contain the agent-directory name"
+        );
+    }
+
+    #[test]
+    fn mcp_json_migration_preserves_other_env_vars() {
+        let _guard = BIN_ENV_LOCK.lock().unwrap();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+
+        let tmp = TempDir::new().unwrap();
+        let agent_dir = tmp.path().join("duduclaw-eng-agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+
+        let existing = serde_json::json!({
+            "mcpServers": {
+                "duduclaw": {
+                    "command": fake_bin_path().to_string_lossy(),
+                    "args": ["mcp-server"],
+                    "env": { "FOO": "bar", "BAZ": "qux" }
+                }
+            }
+        });
+        let path = agent_dir.join(".mcp.json");
+        write_json(&path, &existing);
+
+        ensure_duduclaw_absolute_path(&agent_dir).unwrap();
+
+        let got = read_mcp_json(&path);
+        let env = &got["mcpServers"]["duduclaw"]["env"];
+        assert_eq!(env["FOO"].as_str(), Some("bar"), "FOO must survive migration");
+        assert_eq!(env["BAZ"].as_str(), Some("qux"), "BAZ must survive migration");
+        assert_eq!(
+            env["DUDUCLAW_AGENT_ID"].as_str(),
+            Some("duduclaw-eng-agent"),
+        );
+    }
+
+    #[test]
+    fn mcp_json_migration_preserves_other_mcp_servers() {
+        let _guard = BIN_ENV_LOCK.lock().unwrap();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+
+        let tmp = TempDir::new().unwrap();
+        let agent_dir = tmp.path().join("duduclaw-qa");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+
+        // Playwright must remain untouched — only `duduclaw` is migrated.
+        let existing = serde_json::json!({
+            "mcpServers": {
+                "duduclaw": {
+                    "command": fake_bin_path().to_string_lossy(),
+                    "args": ["mcp-server"],
+                    "env": {}
+                },
+                "playwright": {
+                    "command": "npx",
+                    "args": ["@anthropic-ai/mcp-server-playwright", "--headless"],
+                    "env": {}
+                }
+            }
+        });
+        let path = agent_dir.join(".mcp.json");
+        write_json(&path, &existing);
+
+        ensure_duduclaw_absolute_path(&agent_dir).unwrap();
+
+        let got = read_mcp_json(&path);
+        assert_eq!(
+            got["mcpServers"]["duduclaw"]["env"]["DUDUCLAW_AGENT_ID"].as_str(),
+            Some("duduclaw-qa"),
+        );
+        // Playwright entry preserved byte-for-byte.
+        assert_eq!(
+            got["mcpServers"]["playwright"]["command"].as_str(),
+            Some("npx")
+        );
+        assert_eq!(
+            got["mcpServers"]["playwright"]["args"][0].as_str(),
+            Some("@anthropic-ai/mcp-server-playwright")
+        );
+    }
+
+    #[test]
+    fn mcp_json_migration_creates_file_when_absent() {
+        let _guard = BIN_ENV_LOCK.lock().unwrap();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+
+        let tmp = TempDir::new().unwrap();
+        let agent_dir = tmp.path().join("agnes");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+
+        let changed = ensure_duduclaw_absolute_path(&agent_dir).unwrap();
+        assert!(changed, "absent .mcp.json must be created");
+
+        let got = read_mcp_json(&agent_dir.join(".mcp.json"));
+        assert_eq!(
+            got["mcpServers"]["duduclaw"]["env"]["DUDUCLAW_AGENT_ID"].as_str(),
+            Some("agnes"),
+        );
+    }
+
+    #[test]
+    fn mcp_json_migration_is_idempotent_once_migrated() {
+        let _guard = BIN_ENV_LOCK.lock().unwrap();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+
+        let tmp = TempDir::new().unwrap();
+        let agent_dir = tmp.path().join("agnes");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+
+        // First call creates + migrates.
+        assert!(ensure_duduclaw_absolute_path(&agent_dir).unwrap());
+        // Second call must be a no-op.
+        assert!(
+            !ensure_duduclaw_absolute_path(&agent_dir).unwrap(),
+            "second call must not rewrite the file"
+        );
     }
 }

@@ -5070,8 +5070,31 @@ fn decrypt_channel_token(config: &toml::Table, enc_key: &str, plain_key: &str, h
         .to_string()
 }
 
-/// Read the default agent name from config.toml.
+/// Resolve the caller-identity agent name for MCP authorization.
+///
+/// Preference order (highest → lowest):
+/// 1. `DUDUCLAW_AGENT_ID` env var — injected per-agent via `.mcp.json` so
+///    the MCP subprocess knows which agent's Claude CLI spawned it. This
+///    is the authoritative source: `check_supervisor_relation` compares
+///    this identity against the target agent's `reports_to` chain.
+/// 2. `config.toml [general] default_agent` — legacy fallback, kept for
+///    backwards compatibility with installs whose `.mcp.json` hasn't yet
+///    been migrated to include the env var (see
+///    `duduclaw_agent::mcp_template::ensure_duduclaw_absolute_path`).
+/// 3. Hard-coded "dudu" — final fallback for fresh installs with neither
+///    env nor config set.
+///
+/// An empty `DUDUCLAW_AGENT_ID` (e.g. `"env": { "DUDUCLAW_AGENT_ID": "" }`)
+/// is treated as missing and falls through to the config lookup — this
+/// prevents accidental lockout if a stale migration produced an empty
+/// string.
 async fn get_default_agent(home_dir: &Path) -> String {
+    if let Ok(env_id) = std::env::var(duduclaw_core::ENV_AGENT_ID)
+        && !env_id.trim().is_empty()
+    {
+        return env_id;
+    }
+
     let config = read_config(home_dir).await;
     config
         .as_ref()
@@ -7647,5 +7670,114 @@ high_context = true
         let msg: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
         assert_eq!(msg["delegation_depth"], 1);
         assert_eq!(msg["origin_agent"], "main", "Should fall back to caller");
+    }
+}
+
+#[cfg(test)]
+mod agent_identity_tests {
+    //! Verify `get_default_agent`'s preference order:
+    //! `DUDUCLAW_AGENT_ID` env > `config.toml [general] default_agent` > `"dudu"`.
+    //!
+    //! The env var is process-wide, so these tests must run serially.
+    //! A `Mutex` guards the env-mutation scope; we hold the guard across
+    //! the whole test, including the async `get_default_agent` call.
+
+    use super::get_default_agent;
+    use std::fs;
+    use std::sync::Mutex;
+
+    /// Serializes any test that reads/writes `DUDUCLAW_AGENT_ID`.
+    /// Without this, parallel tests corrupt each other's env view.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Minimal `TempDir` copy (the outer `tests` module already has one,
+    /// but it's not accessible from a sibling module).
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "duduclaw-agent-identity-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &std::path::Path { &self.0 }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+
+    fn write_default_agent_config(home: &std::path::Path, default_agent: &str) {
+        let content = format!(
+            "[general]\ndefault_agent = \"{default_agent}\"\n"
+        );
+        fs::write(home.join("config.toml"), content).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_id_env_overrides_config_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new();
+        write_default_agent_config(tmp.path(), "agnes");
+
+        // SAFETY: env mutation serialized via ENV_LOCK for this test module.
+        unsafe {
+            std::env::set_var(duduclaw_core::ENV_AGENT_ID, "duduclaw-tl");
+        }
+        let result = get_default_agent(tmp.path()).await;
+        unsafe {
+            std::env::remove_var(duduclaw_core::ENV_AGENT_ID);
+        }
+
+        assert_eq!(
+            result, "duduclaw-tl",
+            "env var must override config.toml default_agent"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_id_env_missing_falls_back_to_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new();
+        write_default_agent_config(tmp.path(), "agnes");
+
+        // Make sure no stray env from other tests interferes.
+        unsafe { std::env::remove_var(duduclaw_core::ENV_AGENT_ID); }
+
+        let result = get_default_agent(tmp.path()).await;
+        assert_eq!(result, "agnes", "missing env → fall back to config");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_id_env_empty_string_falls_back_to_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new();
+        write_default_agent_config(tmp.path(), "agnes");
+
+        unsafe {
+            std::env::set_var(duduclaw_core::ENV_AGENT_ID, "");
+        }
+        let result = get_default_agent(tmp.path()).await;
+        unsafe {
+            std::env::remove_var(duduclaw_core::ENV_AGENT_ID);
+        }
+
+        assert_eq!(
+            result, "agnes",
+            "empty env var must be treated like missing"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_env_no_config_defaults_to_dudu() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new();
+        // no config.toml at all
+
+        unsafe { std::env::remove_var(duduclaw_core::ENV_AGENT_ID); }
+
+        let result = get_default_agent(tmp.path()).await;
+        assert_eq!(result, "dudu", "final fallback must be 'dudu'");
     }
 }
