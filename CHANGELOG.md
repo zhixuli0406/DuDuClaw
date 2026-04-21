@@ -1,6 +1,50 @@
 # Changelog
 
 
+## [1.8.15] - 2026-04-21
+
+### Fixed
+- **Discord global `[discord]` 401 noise at gateway startup**. The
+  global `config.toml [channels] discord_bot_token_enc` was eagerly
+  validated on startup via `GET /users/@me`, printing a warn-level
+  "token invalid (HTTP 401)" even when per-agent Discord tokens (the
+  authoritative source since v1.8.14) were live and serving traffic.
+  Users who migrated to per-agent tokens saw a scary warning that
+  implied Discord was broken when it wasn't. `start_discord_bots` now
+  collects per-agent tokens first and passes a `quiet_on_auth_failure`
+  flag to `spawn_discord_bot`; a 401/403 on the global token when at
+  least one per-agent token exists is logged at info level with an
+  explicit note. A 401 with no per-agent fallback still warns.
+- **GVU proposals on tiny SOUL.md baselines were always rejected as
+  CRITICAL drift**. With a ~400-char baseline (e.g. the default agnes
+  template), every evolution `append` made `compute_asi`'s 0.40-
+  weighted char-bigram content similarity collapse to ~0.06 and trip
+  the 0.50 critical threshold deterministically. Not a drift problem —
+  a baseline-size problem. Added
+  `duduclaw_security::stability_index::AsiConfig::bootstrap()`
+  (content 0.40 → 0.20, semantic 0.30 → 0.45, critical 0.50 → 0.25)
+  and `AsiConfig::for_baseline_size(bytes)` which dispatches to
+  bootstrap when `bytes < 1024`, default otherwise. The updater now
+  calls `for_baseline_size(current_content.len())` so agents with
+  richer SOUL.md files still face the strict default threshold.
+- **Claude CLI `--resume` was permanently unreachable — wasting 1
+  extra CLI spawn per multi-turn conversation**. v1.8.1 introduced
+  native multi-turn via `--resume <dd-{hex16}>` with a SHA-256 session
+  ID. Claude CLI strictly requires either a canonical UUID or an
+  exact session title match — `dd-5d8a35f9dba3408e` is neither, so
+  the first `--resume` attempt was rejected 100% of the time before
+  the `is_session_error`-guarded fallback retried with history-in-
+  prompt (the only path that actually worked). Every multi-turn
+  reply paid one wasted CLI spawn + startup latency + warn-level log
+  line. `call_claude_cli_rotated` no longer attempts `--resume`:
+  when conversation history exists, it is folded into the prompt via
+  `format_history_as_prompt` and Claude CLI is spawned once. The
+  `session_id` parameter is kept as `_session_id` for call-site
+  compatibility. Removed dead `make_claude_session_id` and
+  `is_session_error` helpers plus their 3 tests.
+
+
+
 ## [1.8.14] - 2026-04-21
 
 ### Fixed
