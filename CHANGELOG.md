@@ -1,6 +1,45 @@
 # Changelog
 
 
+## [1.8.16] - 2026-04-21
+
+### Fixed
+- **Nested sub-agent replies silently dropped at delegation depth ≥ 2**.
+  A user-visible chain like `agnes → duduclaw-tl → [eng-agent +
+  eng-infra] → synthesis` would deliver the first-level "dispatch
+  confirmation" (depth=1, from `channel_reply`), complete all three
+  sub-agent messages in `message_queue.db` with status=`done`, but
+  never forward the status update (depth=2) nor the 16 KB final
+  synthesis (depth=3) to the originating Discord channel — no WARN,
+  no error, just silence. Root cause: MCP `send_to_agent` only
+  registers a `delegation_callbacks` row when `DUDUCLAW_REPLY_CHANNEL`
+  is set in env, which `channel_reply::REPLY_CHANNEL.scope()` does for
+  inbound channel messages but `dispatcher::dispatch_to_agent` did
+  NOT, so nested sub-agent processes had no channel context, their
+  callback rows were never inserted, and `forward_delegation_response`
+  took its no-callback silent-return branch. Fix propagates channel
+  context through the chain: (1) `message_queue` gains a
+  `reply_channel TEXT` column with idempotent `PRAGMA table_info` +
+  `ALTER TABLE ADD COLUMN` migration; (2) MCP `send_to_agent` captures
+  `DUDUCLAW_REPLY_CHANNEL` from env on INSERT, with a schema-downgrade
+  fallback for the cross-process race on first v1.8.16 boot; (3)
+  `dispatcher::dispatch_to_agent` now wraps the dispatch future in
+  `claude_runner::REPLY_CHANNEL.scope(msg.reply_channel, ...)` when
+  the row carries channel context, so the spawned Claude CLI
+  subprocess inherits the env var and its own nested `send_to_agent`
+  calls register callbacks correctly. Chain propagation is automatic:
+  depth-1's row stores discord:..., depth-2 inherits via env during
+  dispatch and writes it back to its own row, depth-3 does the same.
+- **`forward_delegation_response` no-callback path was fully silent**,
+  making the above bug invisible in logs. Added
+  `tracing::debug!` so future drops surface under
+  `RUST_LOG=duduclaw_gateway::dispatcher=debug` with the message-id +
+  responder agent. Still expected-and-benign for cron / reminder /
+  non-channel delegations; unexpected for user-facing sub-agent
+  replies.
+
+
+
 ## [1.8.15] - 2026-04-21
 
 ### Fixed
