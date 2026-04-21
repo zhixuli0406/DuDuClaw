@@ -297,17 +297,9 @@ pub async fn start_discord_bots(
     let mut results: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut seen_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // 1. Global bot from config.toml
-    if let Some(token) = read_discord_token(home_dir).await {
-        if !token.is_empty() {
-            seen_tokens.insert(token.clone());
-            if let Some(handle) = spawn_discord_bot(token, "discord".to_string(), None, ctx.clone(), home_dir).await {
-                results.push(("discord".to_string(), handle));
-            }
-        }
-    }
-
-    // 2. Per-agent bots from agent configs
+    // Collect per-agent tokens first so we know whether the global token is
+    // the only path or a legacy fallback — this lets us demote a 401 on the
+    // global token to info-level when per-agent bots will cover Discord anyway.
     let agent_tokens: Vec<(String, String)> = {
         let reg = ctx.registry.read().await;
         let mut tokens = Vec::new();
@@ -337,7 +329,28 @@ pub async fn start_discord_bots(
         }
         tokens
     };
+    let has_agent_tokens = !agent_tokens.is_empty();
 
+    // 1. Global bot from config.toml (legacy when per-agent tokens exist)
+    if let Some(token) = read_discord_token(home_dir).await {
+        if !token.is_empty() {
+            seen_tokens.insert(token.clone());
+            if let Some(handle) = spawn_discord_bot(
+                token,
+                "discord".to_string(),
+                None,
+                ctx.clone(),
+                home_dir,
+                has_agent_tokens,
+            )
+            .await
+            {
+                results.push(("discord".to_string(), handle));
+            }
+        }
+    }
+
+    // 2. Per-agent bots from agent configs
     for (agent_name, token) in agent_tokens {
         if seen_tokens.contains(&token) {
             info!("Discord bot for agent '{agent_name}' shares global token — skipping duplicate");
@@ -345,7 +358,16 @@ pub async fn start_discord_bots(
         }
         seen_tokens.insert(token.clone());
         let label = format!("discord:{agent_name}");
-        if let Some(handle) = spawn_discord_bot(token, label.clone(), Some(agent_name), ctx.clone(), home_dir).await {
+        if let Some(handle) = spawn_discord_bot(
+            token,
+            label.clone(),
+            Some(agent_name),
+            ctx.clone(),
+            home_dir,
+            false, // per-agent path is authoritative; any 401 here is a real problem
+        )
+        .await
+        {
             results.push((label, handle));
         }
     }
@@ -354,12 +376,18 @@ pub async fn start_discord_bots(
 }
 
 /// Spawn a single Discord bot connection (shared by global and per-agent paths).
+///
+/// `quiet_on_auth_failure`: when true, a 401/403 on token validation is
+/// logged at info level (e.g. the global `config.toml` token is stale but
+/// per-agent tokens will cover Discord connectivity). When false, the same
+/// failure is escalated to warn.
 async fn spawn_discord_bot(
     token: String,
     label: String,
     agent_name: Option<String>,
     ctx: Arc<ReplyContext>,
     home_dir: &Path,
+    quiet_on_auth_failure: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -387,7 +415,17 @@ async fn spawn_discord_bot(
             }
         }
         Ok(resp) => {
-            warn!("Discord bot [{label}] token invalid (HTTP {})", resp.status());
+            let status = resp.status();
+            if quiet_on_auth_failure
+                && (status == reqwest::StatusCode::UNAUTHORIZED
+                    || status == reqwest::StatusCode::FORBIDDEN)
+            {
+                info!(
+                    "Discord bot [{label}] token stale (HTTP {status}) — skipping; per-agent tokens will handle connectivity"
+                );
+            } else {
+                warn!("Discord bot [{label}] token invalid (HTTP {status})");
+            }
             set_channel_connected(&channel_status, &label, false, Some("token invalid".into()), Some(&event_tx)).await;
             return None;
         }

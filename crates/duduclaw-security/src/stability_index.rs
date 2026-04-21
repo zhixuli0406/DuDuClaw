@@ -49,6 +49,45 @@ impl Default for AsiConfig {
     }
 }
 
+impl AsiConfig {
+    /// Bootstrap configuration for agents with a very small SOUL.md baseline
+    /// (< ~1 KB / < 20 lines). With a tiny baseline, any meaningful evolution
+    /// append makes the content bigram overlap collapse, so the strict 0.40
+    /// content weight would permanently block GVU updates.
+    ///
+    /// This config shifts weight from `content` (which is dominated by the
+    /// append-induced dilution) onto `semantic` (keyword overlap, which
+    /// survives an append more gracefully) and relaxes the critical
+    /// threshold so first-generation evolutions can pass.
+    ///
+    /// Call [`Self::for_baseline_size`] to pick the right config based on the
+    /// baseline length.
+    pub fn bootstrap() -> Self {
+        Self {
+            w_structural: 0.20,
+            w_content: 0.20,
+            w_semantic: 0.45,
+            w_velocity: 0.15,
+            warning_threshold: 0.45,
+            critical_threshold: 0.25,
+        }
+    }
+
+    /// Pick an appropriate config based on the SOUL.md baseline size.
+    ///
+    /// Uses [`Self::bootstrap`] for very small baselines, [`Self::default`]
+    /// otherwise. The threshold is deliberately conservative — once a SOUL.md
+    /// has enough content to resist append-induced similarity collapse,
+    /// the stricter default is appropriate.
+    pub fn for_baseline_size(baseline_bytes: usize) -> Self {
+        if baseline_bytes < 1024 {
+            Self::bootstrap()
+        } else {
+            Self::default()
+        }
+    }
+}
+
 /// Result of ASI computation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AsiResult {
@@ -419,5 +458,48 @@ A helpful customer service agent.
         let result = compute_asi(BASELINE, modified, &[], &config);
         // Should be Critical with default content
         assert!(result.index < 0.70);
+    }
+
+    #[test]
+    fn for_baseline_size_picks_bootstrap_for_tiny_baselines() {
+        let tiny = AsiConfig::for_baseline_size(512);
+        let big = AsiConfig::for_baseline_size(8192);
+        assert!(tiny.critical_threshold < big.critical_threshold);
+        assert!(tiny.w_content < big.w_content);
+    }
+
+    #[test]
+    fn bootstrap_accepts_append_on_tiny_soul_that_default_rejects() {
+        // Simulate the agnes case: ~400-char SOUL.md gets a GVU append that
+        // doubles its size. Under the default strict config, content
+        // similarity collapses and the proposal is rejected as CRITICAL.
+        // Under the bootstrap config sized for small baselines, the same
+        // evolution should pass.
+        let baseline = "# Agnes — 你的 AI 助理\n\n我是 Agnes，一個溫暖、可靠的 AI 助理，由 DuDuClaw 驅動。\n\n## 核心價值\n\n- 用心傾聽，真誠回應\n- 撰寫乾淨、可維護的程式碼\n- 清晰解釋我的思考過程\n- 需要時主動詢問釐清\n\n## 個性特質\n\n- 專業但不冰冷\n- 高效但不急躁\n- 精準但有溫度\n";
+        let appended = format!(
+            "{baseline}\n\n<!-- Evolution update (2026-04-21) -->\n## 學習到的原則\n\n- 主動釐清需求比直接動手更有價值\n- 回覆時優先條列重點\n- 技術術語附上中文說明\n"
+        );
+
+        let default = compute_asi(baseline, &appended, &[], &AsiConfig::default());
+        let bootstrap = compute_asi(baseline, &appended, &[], &AsiConfig::bootstrap());
+
+        // Sanity: both configs should see the same component scores —
+        // only the thresholds + weights differ.
+        assert!(bootstrap.index >= default.index || bootstrap.level != AsiLevel::Critical);
+
+        // Via `for_baseline_size` dispatch, small baselines get bootstrap
+        // and bootstrap should NOT classify this as critical.
+        let dispatched = compute_asi(
+            baseline,
+            &appended,
+            &[],
+            &AsiConfig::for_baseline_size(baseline.len()),
+        );
+        assert_ne!(
+            dispatched.level,
+            AsiLevel::Critical,
+            "Bootstrap config should accept plain SOUL.md appends (got {:.3})",
+            dispatched.index,
+        );
     }
 }

@@ -144,11 +144,19 @@ impl Updater {
         }
 
         // Compute Agent Stability Index (ASI) — reject if drift is too extreme.
+        //
+        // Pick a config sized to the baseline: when SOUL.md is tiny (< ~1 KB),
+        // an append is proportionally huge and the default content-weighted
+        // threshold is permanently tripped. `for_baseline_size` falls back to
+        // the strict default once the baseline grows past the bootstrap size.
+        let asi_config = duduclaw_security::stability_index::AsiConfig::for_baseline_size(
+            current_content.len(),
+        );
         let asi = duduclaw_security::stability_index::compute_asi(
             &current_content,
             &new_content,
             &[], // Version distances populated by heartbeat, not available inline
-            &duduclaw_security::stability_index::AsiConfig::default(),
+            &asi_config,
         );
         if asi.level == duduclaw_security::stability_index::AsiLevel::Critical {
             warn!(
