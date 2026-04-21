@@ -1,6 +1,63 @@
 # Changelog
 
 
+## [1.8.17] - 2026-04-21
+
+### Fixed
+- **MCP server used the global `default_agent` as caller identity,
+  silently breaking supervisor-relation authorization for every
+  sub-agent**. `mcp.rs::get_default_agent` read `config.toml [general]
+  default_agent` (typically the top-level `agnes`) regardless of which
+  agent's Claude CLI actually spawned the MCP subprocess. When
+  `duduclaw-tl` called `send_to_agent("duduclaw-eng-agent", …)`, the
+  supervisor check asked "is agnes the parent of duduclaw-eng-agent?",
+  saw `reports_to=duduclaw-tl`, and rejected the call as a pattern
+  violation — even though the delegation was correct. The TL agent's
+  own Discord message diagnosed this accurately ("MCP Server 在驗證
+  委派權限時，仍以發起 Session 的身份（agnes）作為呼叫者") and
+  proposed `方案 B: 由我代替產出` as a workaround — improvising around
+  the bug instead of the system enforcing the correct chain. New
+  `duduclaw_core::ENV_AGENT_ID = "DUDUCLAW_AGENT_ID"`;
+  `mcp.rs::get_default_agent` preference order is now env var → config
+  `default_agent` → `"dudu"`. `duduclaw-agent::mcp_template::
+  ensure_duduclaw_absolute_path` (called from `server.rs:344` on
+  gateway startup) injects `{ "DUDUCLAW_AGENT_ID": "<agent-dir-name>" }`
+  into each agent's `.mcp.json` `env` block — preserving other env
+  vars, preserving other `mcpServers` entries (playwright,
+  browserbase), handling legacy `duduclaw-pro` key, idempotent on
+  repeated calls. Empty string falls through to config to avoid
+  lockout on botched migrations. After this: `agnes → duduclaw-tl`
+  still allowed, `duduclaw-tl → duduclaw-eng-agent` now allowed,
+  `agnes → duduclaw-eng-agent` correctly rejected.
+- **Sub-agent replies never reached the parent agent's session,
+  breaking conversation continuity across delegations**.
+  `forward_delegation_response` delivered a sub-agent's reply to the
+  originating channel (Discord/Telegram/LINE/Slack) and stopped.
+  Parent agents had no record in their SQLite session of what the
+  sub-agent said, so the next user turn replying to the parent
+  referenced content the parent couldn't see. Production-observed
+  symptom (Discord 2026-04-21 07:24): TL replied with "方案 A/B/C",
+  user said "@Agnes 方案A", Agnes's next invocation had no trace of
+  A/B/C and asked the user to disambiguate between Fabric / Besu /
+  PoA (from an earlier unrelated branch). Fix: after
+  `forward_to_channel(...)` returns `Ok(())`,
+  `forward_delegation_response` appends a single assistant-role turn
+  to the parent's session with XML-delimited content
+  `<subagent_reply agent="X">...</subagent_reply>` (same grammar as
+  `channel_reply::format_history_as_prompt`). Agent name sanitised
+  to `[A-Za-z0-9_-]`. Token count uses the CJK-aware estimator.
+  `sessions.total_tokens` + `last_active` updated in the same
+  transaction. New `candidate_session_ids` tries both
+  `discord:thread:<id>` and `discord:<id>` forms (the `thread:`
+  marker was collapsed in `mcp.rs::send_to_agent` callback insert)
+  and matches by `owner_agent` to prevent cross-agent bleed on
+  shared channels. Session store errors are swallowed at warn level —
+  Discord delivery already succeeded, dropping the session append is
+  strictly better than losing the forward. Append happens only on
+  HTTP success, so retry loops don't double-append.
+
+
+
 ## [1.8.16] - 2026-04-21
 
 ### Fixed
