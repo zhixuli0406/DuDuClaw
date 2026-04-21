@@ -70,6 +70,18 @@ pub struct QueueMessage {
     pub created_at: String,
     pub acked_at: Option<String>,
     pub completed_at: Option<String>,
+    /// Originating channel context for delegation callback forwarding.
+    ///
+    /// Format: `<channel_type>:<channel_id>[:<thread_id>]` (same grammar as
+    /// the `DUDUCLAW_REPLY_CHANNEL` env var). When the MCP `send_to_agent`
+    /// tool inserts a row, it captures the caller's reply-channel context
+    /// here so the dispatcher can scope `REPLY_CHANNEL` around the target
+    /// agent's Claude CLI subprocess — otherwise nested sub-agent
+    /// delegations (the ones spawned by the dispatcher, not by
+    /// `channel_reply`) inherit no channel context and their callback
+    /// is never registered, causing sub-agent replies to be silently
+    /// dropped (v1.8.14 — v1.8.15 issue).
+    pub reply_channel: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +148,42 @@ impl MessageQueue {
              );
              CREATE INDEX IF NOT EXISTS idx_dc_agent ON delegation_callbacks(agent_id);",
         )
-        .map_err(|e| format!("init message_queue schema: {e}"))
+        .map_err(|e| format!("init message_queue schema: {e}"))?;
+
+        // v1.8.16 migration: propagate channel context through the delegation
+        // chain so nested sub-agents spawned by the dispatcher inherit the
+        // originating `DUDUCLAW_REPLY_CHANNEL`. Existing rows get NULL and
+        // stay on the legacy (no-forward) path, which is what we want for
+        // cleanup — new rows benefit from the fix.
+        Self::ensure_column(conn, "message_queue", "reply_channel", "TEXT")?;
+        Ok(())
+    }
+
+    /// Idempotent column addition for SQLite — checks PRAGMA table_info
+    /// before running ALTER TABLE ADD COLUMN, so this is safe to call on
+    /// every startup. SQLite doesn't support `ADD COLUMN IF NOT EXISTS`.
+    fn ensure_column(
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        coltype: &str,
+    ) -> Result<(), String> {
+        let pragma = format!("PRAGMA table_info({table})");
+        let mut stmt = conn
+            .prepare(&pragma)
+            .map_err(|e| format!("prepare pragma for {table}: {e}"))?;
+        let existing: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| format!("query pragma for {table}: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+        if existing.iter().any(|c| c == column) {
+            return Ok(());
+        }
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {coltype}"))
+            .map_err(|e| format!("add {column} to {table}: {e}"))?;
+        info!(table, column, "message_queue migration: added column");
+        Ok(())
     }
 
     // ── Write operations ──────────────────────────────────────────
@@ -147,8 +194,8 @@ impl MessageQueue {
         conn.execute(
             "INSERT INTO message_queue \
              (id, sender, target, payload, status, retry_count, delegation_depth, \
-              origin_agent, sender_agent, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              origin_agent, sender_agent, created_at, reply_channel) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 msg.id,
                 msg.sender,
@@ -160,6 +207,7 @@ impl MessageQueue {
                 msg.origin_agent,
                 msg.sender_agent,
                 msg.created_at,
+                msg.reply_channel,
             ],
         )
         .map_err(|e| format!("enqueue: {e}"))?;
@@ -224,33 +272,15 @@ impl MessageQueue {
         let mut stmt = conn
             .prepare(
                 "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
-                 origin_agent, sender_agent, error, response, created_at, acked_at, completed_at \
+                 origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
+                 reply_channel \
                  FROM message_queue WHERE status = 'pending' \
                  ORDER BY created_at ASC LIMIT ?1",
             )
             .map_err(|e| format!("prepare pending: {e}"))?;
 
         let rows = stmt
-            .query_map(params![limit as i64], |row| {
-                Ok(QueueMessage {
-                    id: row.get(0)?,
-                    sender: row.get(1)?,
-                    target: row.get(2)?,
-                    payload: row.get(3)?,
-                    status: MessageStatus::from_str(
-                        &row.get::<_, String>(4).unwrap_or_default(),
-                    ),
-                    retry_count: row.get(5)?,
-                    delegation_depth: row.get(6)?,
-                    origin_agent: row.get(7)?,
-                    sender_agent: row.get(8)?,
-                    error: row.get(9)?,
-                    response: row.get(10)?,
-                    created_at: row.get(11)?,
-                    acked_at: row.get(12)?,
-                    completed_at: row.get(13)?,
-                })
-            })
+            .query_map(params![limit as i64], |row| Self::row_to_message(row))
             .map_err(|e| format!("query pending: {e}"))?;
 
         let mut result = Vec::new();
@@ -270,32 +300,14 @@ impl MessageQueue {
         let mut stmt = conn
             .prepare(
                 "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
-                 origin_agent, sender_agent, error, response, created_at, acked_at, completed_at \
+                 origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
+                 reply_channel \
                  FROM message_queue WHERE status = 'acked' AND acked_at < ?1",
             )
             .map_err(|e| format!("prepare stale: {e}"))?;
 
         let rows = stmt
-            .query_map(params![cutoff], |row| {
-                Ok(QueueMessage {
-                    id: row.get(0)?,
-                    sender: row.get(1)?,
-                    target: row.get(2)?,
-                    payload: row.get(3)?,
-                    status: MessageStatus::from_str(
-                        &row.get::<_, String>(4).unwrap_or_default(),
-                    ),
-                    retry_count: row.get(5)?,
-                    delegation_depth: row.get(6)?,
-                    origin_agent: row.get(7)?,
-                    sender_agent: row.get(8)?,
-                    error: row.get(9)?,
-                    response: row.get(10)?,
-                    created_at: row.get(11)?,
-                    acked_at: row.get(12)?,
-                    completed_at: row.get(13)?,
-                })
-            })
+            .query_map(params![cutoff], |row| Self::row_to_message(row))
             .map_err(|e| format!("query stale: {e}"))?;
 
         let mut result = Vec::new();
@@ -313,32 +325,38 @@ impl MessageQueue {
         let conn = self.conn.lock().await;
         conn.query_row(
             "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
-             origin_agent, sender_agent, error, response, created_at, acked_at, completed_at \
+             origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
+             reply_channel \
              FROM message_queue WHERE id = ?1",
             params![message_id],
-            |row| {
-                Ok(QueueMessage {
-                    id: row.get(0)?,
-                    sender: row.get(1)?,
-                    target: row.get(2)?,
-                    payload: row.get(3)?,
-                    status: MessageStatus::from_str(
-                        &row.get::<_, String>(4).unwrap_or_default(),
-                    ),
-                    retry_count: row.get(5)?,
-                    delegation_depth: row.get(6)?,
-                    origin_agent: row.get(7)?,
-                    sender_agent: row.get(8)?,
-                    error: row.get(9)?,
-                    response: row.get(10)?,
-                    created_at: row.get(11)?,
-                    acked_at: row.get(12)?,
-                    completed_at: row.get(13)?,
-                })
-            },
+            |row| Self::row_to_message(row),
         )
         .optional()
         .map_err(|e| format!("get_by_id: {e}"))
+    }
+
+    /// Single place to decode a `message_queue` row into a `QueueMessage`.
+    /// Column order must match the SELECT statements above.
+    fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueMessage> {
+        Ok(QueueMessage {
+            id: row.get(0)?,
+            sender: row.get(1)?,
+            target: row.get(2)?,
+            payload: row.get(3)?,
+            status: MessageStatus::from_str(
+                &row.get::<_, String>(4).unwrap_or_default(),
+            ),
+            retry_count: row.get(5)?,
+            delegation_depth: row.get(6)?,
+            origin_agent: row.get(7)?,
+            sender_agent: row.get(8)?,
+            error: row.get(9)?,
+            response: row.get(10)?,
+            created_at: row.get(11)?,
+            acked_at: row.get(12)?,
+            completed_at: row.get(13)?,
+            reply_channel: row.get(14)?,
+        })
     }
 
     /// Count messages by status.
@@ -435,4 +453,93 @@ pub struct DelegationCallback {
     pub thread_id: Option<String>,
     pub retry_count: i32,
     pub created_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn sample_msg(id: &str, reply_channel: Option<&str>) -> QueueMessage {
+        QueueMessage {
+            id: id.into(),
+            sender: "agnes".into(),
+            target: "duduclaw-tl".into(),
+            payload: "hello".into(),
+            status: MessageStatus::Pending,
+            retry_count: 0,
+            delegation_depth: 1,
+            origin_agent: Some("agnes".into()),
+            sender_agent: Some("agnes".into()),
+            error: None,
+            response: None,
+            created_at: "2026-04-21T00:00:00Z".into(),
+            acked_at: None,
+            completed_at: None,
+            reply_channel: reply_channel.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn reply_channel_round_trips_through_pending() {
+        let tmp = TempDir::new().unwrap();
+        let queue = MessageQueue::open(tmp.path()).unwrap();
+        queue
+            .enqueue(&sample_msg("m1", Some("discord:1495790276264853625")))
+            .await
+            .unwrap();
+        let pending = queue.pending_messages(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].reply_channel.as_deref(),
+            Some("discord:1495790276264853625"),
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_channel_null_is_preserved() {
+        let tmp = TempDir::new().unwrap();
+        let queue = MessageQueue::open(tmp.path()).unwrap();
+        queue.enqueue(&sample_msg("m2", None)).await.unwrap();
+        let fetched = queue.get_by_id("m2").await.unwrap().unwrap();
+        assert_eq!(fetched.reply_channel, None);
+    }
+
+    #[tokio::test]
+    async fn ensure_column_is_idempotent_on_legacy_db() {
+        // Simulate a pre-v1.8.16 database where the table exists without
+        // the `reply_channel` column. `init_schema` on startup must add
+        // the column without data loss, and subsequent startups must
+        // be no-ops.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("message_queue.db");
+
+        {
+            // Manually create the legacy schema (no reply_channel column).
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE message_queue (
+                     id TEXT PRIMARY KEY, sender TEXT NOT NULL, target TEXT NOT NULL,
+                     payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+                     retry_count INTEGER NOT NULL DEFAULT 0,
+                     delegation_depth INTEGER NOT NULL DEFAULT 0,
+                     origin_agent TEXT, sender_agent TEXT,
+                     error TEXT, response TEXT,
+                     created_at TEXT NOT NULL, acked_at TEXT, completed_at TEXT);
+                 INSERT INTO message_queue (id, sender, target, payload, created_at)
+                     VALUES ('legacy-1','agnes','tl','hi','2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        // First open: column is added.
+        let _ = MessageQueue::open(tmp.path()).unwrap();
+        // Second open: ensure_column is a no-op, no error.
+        let queue = MessageQueue::open(tmp.path()).unwrap();
+
+        // Legacy row is intact and reads back with NULL reply_channel.
+        let legacy = queue.get_by_id("legacy-1").await.unwrap().unwrap();
+        assert_eq!(legacy.reply_channel, None);
+        assert_eq!(legacy.sender, "agnes");
+    }
 }
