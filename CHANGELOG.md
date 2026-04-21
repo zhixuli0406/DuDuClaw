@@ -1,6 +1,66 @@
 # Changelog
 
 
+## [1.8.22] - 2026-04-21
+
+### Fixed
+- **Proactive check could not use the agent's MCP tools (#14)**.
+  `heartbeat.rs`'s proactive spawn hard-coded
+  `--print --no-input --system-prompt --max-turns 3` without
+  `--mcp-config`. Two breakages stacked: Claude CLI ≥2.1 removed
+  `--no-input` (so the spawn hard-errored on the current CLI), and
+  the missing `--mcp-config` meant any PROACTIVE.md that said "query
+  Notion for open tasks" silently no-opped — the sub-agent could not
+  see the tool. Rewritten to mirror `spawn_claude_cli_with_env`:
+  system prompt via `--system-prompt-file` (no `/proc/PID/cmdline`
+  exposure), auto-attach `<agent_dir>/.mcp.json` with
+  `--strict-mcp-config` when present, and `--max-turns` now reads
+  from a new `ProactiveConfig.max_turns` field (default 8, clamped
+  1–64) so checks that chain multiple tool calls have headroom.
+- **Cron task results never reached the chat channel (#15)**.
+  `cron_scheduler::execute_cron_task` only called `record_run` +
+  hallucination audit; the response text lived in the DB only, and
+  any prompt asking the agent to "send to Discord via send_message"
+  silently failed because `call_claude_for_agent_with_type` does not
+  attach MCP. Users were wrapping cron jobs in external shell scripts
+  that called Discord/Notion APIs directly. Fix adds row-level
+  routing: three new columns on `cron_tasks`
+  (`notify_channel` / `notify_chat_id` / `notify_thread_id`, all
+  `TEXT NULL`, idempotent `ALTER TABLE` migration that tolerates
+  "duplicate column name" so reopening a v1.8.21 DB is safe). New
+  `deliver_cron_result` resolves the bot token through the same
+  cascade the dispatcher uses (per-agent `agent.toml [channels.<ch>]`
+  encrypted or plaintext → global `config.toml [channels]`), clamps
+  the response to 3500 chars (Discord's 2000-char cap is the tightest;
+  CJK-safe codepoint count), prefixes with a task-name header, and
+  calls the unified `ChannelSender`. Discord thread routing uses
+  `notify_thread_id` as the effective chat_id. Delivery failures log
+  but never flip `record_run` — the agent did its work, only the
+  postage failed. `CronTaskRow::has_notify_target()` gates delivery
+  so legacy rows without notify columns stay completely silent. MCP
+  `schedule_task` and dashboard `cron_add` / `cron_update` both
+  accept the three new optional params with symmetric validation
+  ("both or neither" for channel + chat_id). Two new tests cover
+  round-trip + `update_notify` clearing, and the reopen-the-DB
+  migration idempotency contract.
+
+### Documented
+- **`[heartbeat] cron` is UTC — was not documented (#16 Level 1)**.
+  `heartbeat.rs:251` and `cron_scheduler.rs:151` both call
+  `chrono::Utc::now()`, and `ProactiveConfig.timezone` only affects
+  `quiet_hours_*` — not the cron evaluation. Taipei (UTC+8) users
+  writing `"0 9 * * *"` expecting 09:00 local actually got 17:00.
+  Added comments to all 5 `templates/*/agent.toml` heartbeat blocks
+  with the Asia/Taipei mapping (`"0 1 * * *"` → local 09:00),
+  expanded the `HeartbeatConfig` doc-comment, clarified on
+  `ProactiveConfig.timezone` that it is quiet-hours-only, added the
+  same UTC caveat to the MCP `schedule_task` tool description and
+  the dashboard `SettingsPage` cron-input hint. Timezone-aware cron
+  evaluation (Level 2 — reading `cron_timezone` on the task row) is
+  planned for a later release; this change is documentation-only so
+  no behaviour change for existing crons.
+
+
 ## [1.8.21] - 2026-04-21
 
 ### Added
