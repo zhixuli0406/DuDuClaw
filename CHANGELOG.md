@@ -1,6 +1,48 @@
 # Changelog
 
 
+## [1.8.18] - 2026-04-21
+
+### Fixed
+- **Dual-rail dispatch race silently defeated v1.8.16's reply_channel
+  propagation**. Production-observed on a live v1.8.17 chain (agnes →
+  TL → [eng-agent + eng-infra]): TL's outgoing delegations to the two
+  eng-agents had `reply_channel=NULL` in `message_queue.db` even
+  though `DUDUCLAW_REPLY_CHANNEL` was scoped correctly in the
+  dispatcher. Effect: when eng-agent replied, no callback was
+  registered, the forward lookup silently skipped, and the engineer's
+  output never reached TL's session. `DUDUCLAW_DELEGATION_DEPTH`
+  still propagated correctly in the same chain — the "half-propagated"
+  pattern (correct depth + NULL reply_channel) was the telltale.
+  Root cause: `mcp.rs::send_to_agent` was dual-writing every
+  delegation to both `bus_queue.jsonl` (legacy) and
+  `message_queue.db` (SQLite, authoritative since v1.8.1).
+  The gateway's dispatcher polled both every 5 seconds:
+  `poll_and_dispatch` (legacy) `tokio::spawn`'s a per-message
+  dispatch task, which drops task-local `REPLY_CHANNEL` at the
+  spawn boundary; `poll_and_dispatch_sqlite` (v1.8.16) scopes
+  `REPLY_CHANNEL` correctly. Whichever side reached
+  `prepare_claude_cmd` first determined whether
+  `DUDUCLAW_REPLY_CHANNEL` was set on the target's Claude CLI
+  subprocess. `DELEGATION_ENV.scope` nested INSIDE `dispatch_to_agent`
+  applies to both paths equally, explaining why depth propagated but
+  reply_channel didn't. Fix: removed the `bus_queue.jsonl` write from
+  `send_to_agent`. SQLite has been the authoritative rail since
+  v1.8.1 — the jsonl write was dead weight kept around for migration
+  safety and, by causing the race, actively defeating the v1.8.16
+  fix. `queued` flag now derives from the SQLite INSERT rowcount
+  (v1.8.16 schema-downgrade fallback preserved). `poll_and_dispatch`
+  (legacy) is left untouched; it still handles `task_created`
+  signals and orphan-response recovery, both of which use separate
+  writers not affected by this change. New
+  `mcp::tests::send_to_agent_never_writes_bus_queue_jsonl`
+  regression guard. Two existing E2E tests
+  (`e2e_send_to_agent_increments_depth`,
+  `e2e_depth_zero_defaults_origin_to_caller`) migrated from reading
+  `bus_queue.jsonl` to `message_queue.db`.
+
+
+
 ## [1.8.17] - 2026-04-21
 
 ### Fixed
