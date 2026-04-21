@@ -35,6 +35,10 @@ network_access = false
 enabled = true
 interval_seconds = 300
 max_concurrent_runs = 1
+# `cron` is evaluated in UTC. Convert from your local time when writing it:
+#   Asia/Taipei (UTC+8):  "0 1 * * *"  fires at local 09:00 daily.
+#   America/New_York (UTC-5/-4): "0 13 * * *" fires around local 08:00/09:00.
+# 5-field syntax (min hour dom mon dow) is normalised to 6-field internally.
 cron = "*/5 * * * *"
 
 [budget]

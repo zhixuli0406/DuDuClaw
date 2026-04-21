@@ -36,6 +36,8 @@ network_access = false
 enabled = true
 interval_seconds = 300   # Check every 5 min for pending tasks
 max_concurrent_runs = 1
+# `cron` is evaluated in UTC (empty string falls back to interval_seconds).
+# Asia/Taipei (UTC+8): "0 1 * * *" fires at local 09:00 daily.
 cron = ""
 
 [budget]

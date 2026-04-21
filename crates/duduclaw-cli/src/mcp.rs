@@ -88,10 +88,13 @@ const TOOLS: &[ToolDef] = &[
             Prefer this over Claude Code's built-in /schedule slash command, which \
             is session-bound and expires when the session ends.",
         params: &[
-            ParamDef { name: "cron", description: "Cron expression (5 fields '* * * * *' minute-precision, or 6 fields with seconds). Example: '0 8 * * *' = every day at 08:00 (agent's local time).", required: true },
+            ParamDef { name: "cron", description: "Cron expression (5 fields '* * * * *' minute-precision, or 6 fields with seconds). EVALUATED IN UTC — for Asia/Taipei (UTC+8), '0 1 * * *' fires at local 09:00.", required: true },
             ParamDef { name: "task", description: "Task prompt / description sent to the target agent when the cron fires. Write it as an instruction the agent will follow (e.g., 'Run daily competitive research and post findings to @Agnes').", required: true },
             ParamDef { name: "name", description: "Human-readable task name for listing / pausing / deleting later (e.g., 'xianwen-pm-daily-research').", required: true },
             ParamDef { name: "agent_id", description: "Target agent that will execute the task (e.g. 'xianwen-pm', 'duduclaw-tl'). Defaults to 'default' if omitted — explicit is strongly recommended.", required: false },
+            ParamDef { name: "notify_channel", description: "Optional: channel type to auto-deliver the task result to ('discord', 'telegram', 'line', 'slack', 'whatsapp', 'feishu', 'webchat'). When set with notify_chat_id, the response is sent to that channel after a successful run.", required: false },
+            ParamDef { name: "notify_chat_id", description: "Optional: chat / channel / room ID on the notify platform. Required when notify_channel is set.", required: false },
+            ParamDef { name: "notify_thread_id", description: "Optional: Discord thread ID. Only used when notify_channel='discord' and the result should land in a specific thread.", required: false },
         ],
     },
     ToolDef {
@@ -1728,14 +1731,42 @@ async fn handle_schedule_task(params: &Value, home_dir: &Path) -> Value {
         }
     };
 
+    let notify_channel = params
+        .get("notify_channel")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let notify_chat_id = params
+        .get("notify_chat_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let notify_thread_id = params
+        .get("notify_thread_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    // If one of notify_channel / notify_chat_id is set, the other must also
+    // be set — a partial target would silently fail at delivery time.
+    if notify_channel.is_some() != notify_chat_id.is_some() {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: notify_channel and notify_chat_id must be set together"}],
+            "isError": true
+        });
+    }
+
     let task_id = uuid::Uuid::new_v4().to_string();
-    let row = CronTaskRow::new(
+    let mut row = CronTaskRow::new(
         task_id.clone(),
         name.to_string(),
         agent_id.to_string(),
         cron.to_string(),
         task.to_string(),
     );
+    row.notify_channel = notify_channel;
+    row.notify_chat_id = notify_chat_id;
+    row.notify_thread_id = notify_thread_id;
 
     match store.insert(&row).await {
         Ok(()) => serde_json::json!({

@@ -4,7 +4,7 @@
 //! so that dashboard/MCP edits take effect immediately instead of waiting
 //! for the next baseline poll.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -247,6 +247,22 @@ async fn execute_cron_task(
                 "cron task completed"
             );
 
+            // ── Channel delivery (v1.8.22, issue #15) ───────────
+            // Previously cron results stayed in the DB and the user had to
+            // poll the dashboard to see them. When the task row carries a
+            // notify_* target, forward the response to that channel so
+            // Discord/Telegram/LINE/Slack users receive it automatically.
+            if task.has_notify_target() {
+                if let Err(e) = deliver_cron_result(home_dir, task, &response).await {
+                    warn!(
+                        id = %task.id,
+                        name = %task.name,
+                        channel = task.notify_channel.as_deref().unwrap_or(""),
+                        "cron notification delivery failed: {e}"
+                    );
+                }
+            }
+
             // ── Action-claim verifier (shadow mode) ─────────────
             // Same logic as channel_reply.rs: scan the response text
             // for factual assertions and cross-reference against the
@@ -309,6 +325,114 @@ async fn execute_cron_task(
             }
         }
     }
+}
+
+/// Deliver a successful cron task's response text to the configured
+/// notification channel. Resolves the bot token via the same cascade used
+/// by channel_reply / dispatcher (per-agent token first, then global
+/// `config.toml [channels]`), then calls the unified `ChannelSender`.
+///
+/// The response is clamped to a safe size per platform before sending —
+/// Discord's 2000-char message cap is the tightest limit, so we truncate
+/// at 3500 *chars* (not bytes) which works on every supported channel and
+/// still fits well inside Telegram's 4096-char cap. Longer responses get
+/// a `\n[…truncated]` suffix so the user knows there's more in the logs.
+async fn deliver_cron_result(
+    home_dir: &Path,
+    task: &CronTaskRow,
+    response: &str,
+) -> Result<(), String> {
+    let channel = task
+        .notify_channel
+        .as_deref()
+        .ok_or_else(|| "notify_channel missing".to_string())?;
+    let chat_id = task
+        .notify_chat_id
+        .as_deref()
+        .ok_or_else(|| "notify_chat_id missing".to_string())?;
+
+    // Discord threads are addressed as the channel_id — forwarding routes
+    // a message to the thread by using the thread id as chat_id.
+    let effective_chat_id = match (channel, task.notify_thread_id.as_deref()) {
+        ("discord", Some(tid)) if !tid.is_empty() => tid.to_string(),
+        _ => chat_id.to_string(),
+    };
+
+    let token = resolve_channel_token(home_dir, &task.agent_id, channel).await;
+    if token.is_empty() {
+        return Err(format!(
+            "no bot token configured for channel {channel} (tried agent {} and global config)",
+            task.agent_id
+        ));
+    }
+
+    // Clamp by chars (not bytes) — CJK-safe because we already count code
+    // points, and it stays under every channel's message size cap.
+    const MAX_CHARS: usize = 3500;
+    let message = if response.chars().count() > MAX_CHARS {
+        let mut s: String = response.chars().take(MAX_CHARS).collect();
+        s.push_str("\n[…truncated]");
+        s
+    } else {
+        response.to_string()
+    };
+
+    // Prefix a one-line header so the user can tell scheduled messages
+    // apart from interactive replies at a glance.
+    let body = format!("⏰ [{}] {}", task.name, message);
+
+    let target = crate::channel_sender::ChannelTarget {
+        channel_type: channel.to_string(),
+        chat_id: effective_chat_id,
+        token,
+        extra_id: None,
+    };
+    // `reqwest::Client` is cheap to construct for a per-task send; the
+    // cron pipeline fires at most once per minute per task so we don't
+    // need a shared pool.
+    let http = reqwest::Client::new();
+    let sender = crate::channel_sender::create_sender(&target, http);
+    sender
+        .send_text(&body)
+        .await
+        .map_err(|e| format!("send_text failed: {e}"))
+}
+
+/// Resolve a channel bot token for cron delivery, mirroring the dispatcher
+/// cascade: per-agent `agent.toml [channels.<ch>]` → global
+/// `config.toml [channels] <ch>_bot_token(_enc)`.
+async fn resolve_channel_token(home_dir: &Path, agent_id: &str, channel: &str) -> String {
+    // Per-agent encrypted / plaintext first.
+    let agent_toml = home_dir.join("agents").join(agent_id).join("agent.toml");
+    if let Ok(content) = tokio::fs::read_to_string(&agent_toml).await {
+        if let Ok(table) = content.parse::<toml::Value>() {
+            if let Some(section) = table
+                .get("channels")
+                .and_then(|c| c.as_table())
+                .and_then(|t| t.get(channel))
+                .and_then(|v| v.as_table())
+            {
+                if let Some(enc) = section.get("bot_token_enc").and_then(|v| v.as_str()) {
+                    if !enc.is_empty() {
+                        if let Some(plain) = crate::config_crypto::decrypt_value(enc, home_dir) {
+                            return plain;
+                        }
+                    }
+                }
+                if let Some(plain) = section.get("bot_token").and_then(|v| v.as_str()) {
+                    if !plain.is_empty() {
+                        return plain.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // Global config fallback.
+    let field_base = format!("{channel}_bot_token");
+    crate::config_crypto::read_encrypted_config_field(home_dir, "channels", &field_base)
+        .await
+        .unwrap_or_default()
 }
 
 /// Normalise a cron expression to 6-field format (with seconds). If the
