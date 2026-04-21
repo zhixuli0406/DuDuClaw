@@ -25,6 +25,20 @@ pub const ENV_DELEGATION_DEPTH: &str = "DUDUCLAW_DELEGATION_DEPTH";
 pub const ENV_DELEGATION_ORIGIN: &str = "DUDUCLAW_DELEGATION_ORIGIN";
 pub const ENV_DELEGATION_SENDER: &str = "DUDUCLAW_DELEGATION_SENDER";
 
+/// Agent identity injected into Claude CLI subprocesses via per-agent
+/// `.mcp.json` so the MCP server knows *which* agent is the current
+/// caller for supervisor-relation authorization.
+///
+/// Without this, the MCP server falls back to
+/// `config.toml [general] default_agent` — which is the global default
+/// and causes cross-agent delegations to be mis-authorized (e.g. a TL
+/// sub-agent spawning its own sub-agent gets rejected because the MCP
+/// thinks the caller is the top-level default agent, not TL).
+///
+/// Populated automatically at gateway startup; see
+/// `duduclaw_agent::mcp_template::ensure_duduclaw_absolute_path`.
+pub const ENV_AGENT_ID: &str = "DUDUCLAW_AGENT_ID";
+
 /// Channel context for delegation callback.
 /// Format: `<channel_type>:<channel_id>[:<thread_id>]`
 /// e.g. `telegram:12345` or `discord:thread:98765`
