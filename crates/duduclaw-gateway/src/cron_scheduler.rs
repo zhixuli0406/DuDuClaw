@@ -223,7 +223,19 @@ async fn execute_cron_task(
     // bound for action-claim verification below.
     let dispatch_start_time = chrono::Utc::now().to_rfc3339();
 
-    let result = crate::claude_runner::DELEGATION_ENV
+    // v1.8.25: when the task has a notify_channel target, scope REPLY_CHANNEL
+    // around the dispatch so that any `send_to_agent` the cron agent makes
+    // inherits the channel context. Without this, nested delegations from
+    // cron (e.g. a daily-report agent calling send_to_agent("agnes", …))
+    // registered no delegation_callback — their replies landed in
+    // message_queue.response and were silently dropped at
+    // `forward_delegation_response`'s no-callback branch. The cron agent's
+    // own top-level response still goes through `deliver_cron_result`
+    // (a direct channel POST) as before — this scope only affects nested
+    // sub-agent replies.
+    let reply_channel_override = cron_reply_channel_string(task);
+
+    let dispatch_fut = crate::claude_runner::DELEGATION_ENV
         .scope(delegation_env, async {
             call_claude_for_agent_with_type(
                 home_dir,
@@ -233,8 +245,11 @@ async fn execute_cron_task(
                 crate::cost_telemetry::RequestType::Cron,
             )
             .await
-        })
-        .await;
+        });
+    let result = match reply_channel_override {
+        Some(rc) => crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut).await,
+        None => dispatch_fut.await,
+    };
 
     match result {
         Ok(response) => {
@@ -433,6 +448,33 @@ async fn resolve_channel_token(home_dir: &Path, agent_id: &str, channel: &str) -
         .unwrap_or_default()
 }
 
+/// Build the `DUDUCLAW_REPLY_CHANNEL` string from a cron task's notify_*
+/// fields, or `None` if the task has no notification target (so the
+/// caller should skip the `REPLY_CHANNEL.scope`).
+///
+/// The grammar matches `mcp.rs::send_to_agent`'s callback parser:
+///
+///   `<channel_type>:<chat_id>[:<thread_id>]`
+///
+/// where trailing `thread_id` is only included when present. For Discord
+/// threads stored as `notify_chat_id=<thread_id>, notify_thread_id=NULL`
+/// (our v1.8.24 UPDATE shape), this emits `discord:<thread_id>` — the
+/// MCP parser treats the id as the channel directly, matching Discord's
+/// "thread IS a channel" API semantics. For `(chat_id=<channel_id>,
+/// thread_id=<thread_id>)` both components are included.
+///
+/// Introduced in v1.8.25 so nested `send_to_agent` calls inside cron
+/// agents register delegation callbacks and their replies get
+/// forwarded + session-appended instead of silently dropped.
+fn cron_reply_channel_string(task: &CronTaskRow) -> Option<String> {
+    let channel = task.notify_channel.as_deref().filter(|s| !s.is_empty())?;
+    let chat = task.notify_chat_id.as_deref().filter(|s| !s.is_empty())?;
+    match task.notify_thread_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(thread) => Some(format!("{channel}:{chat}:{thread}")),
+        None => Some(format!("{channel}:{chat}")),
+    }
+}
+
 /// Parse a task's `cron_timezone` column. Returns `None` for absent /
 /// empty values (UTC / legacy behaviour) and for unknown IANA names —
 /// the latter also emits a warn log once, at load time, so a typo is
@@ -484,4 +526,76 @@ pub fn start_cron_scheduler(
         })
     };
     (handle, scheduler)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task_with_notify(channel: Option<&str>, chat: Option<&str>, thread: Option<&str>) -> CronTaskRow {
+        let mut row = CronTaskRow::new(
+            "test-id".to_string(),
+            "test-name".to_string(),
+            "agnes".to_string(),
+            "0 * * * *".to_string(),
+            "do stuff".to_string(),
+        );
+        row.notify_channel = channel.map(str::to_string);
+        row.notify_chat_id = chat.map(str::to_string);
+        row.notify_thread_id = thread.map(str::to_string);
+        row
+    }
+
+    #[test]
+    fn reply_channel_none_when_notify_unset() {
+        assert_eq!(cron_reply_channel_string(&task_with_notify(None, None, None)), None);
+        // Partial — channel but no chat — also None (deliver_cron_result
+        // would reject this anyway).
+        assert_eq!(cron_reply_channel_string(&task_with_notify(Some("discord"), None, None)), None);
+        // Empty strings treated same as missing.
+        assert_eq!(cron_reply_channel_string(&task_with_notify(Some(""), Some(""), None)), None);
+    }
+
+    #[test]
+    fn reply_channel_discord_thread_as_chat_id() {
+        // Our v1.8.24 UPDATE shape: thread_id baked into chat_id, separate
+        // thread_id column left NULL. Discord's API treats the thread id
+        // as a channel id for POST purposes, so this matches what
+        // deliver_cron_result already does.
+        let task = task_with_notify(Some("discord"), Some("1495935398852038686"), None);
+        assert_eq!(
+            cron_reply_channel_string(&task).as_deref(),
+            Some("discord:1495935398852038686"),
+        );
+    }
+
+    #[test]
+    fn reply_channel_with_separate_thread_id() {
+        // Alternative shape: chat_id is parent channel, thread_id is
+        // separate. Emits the 3-field form mcp.rs knows how to parse.
+        let task = task_with_notify(Some("discord"), Some("parent-channel"), Some("thread-42"));
+        assert_eq!(
+            cron_reply_channel_string(&task).as_deref(),
+            Some("discord:parent-channel:thread-42"),
+        );
+    }
+
+    #[test]
+    fn reply_channel_telegram_without_thread() {
+        let task = task_with_notify(Some("telegram"), Some("12345"), None);
+        assert_eq!(
+            cron_reply_channel_string(&task).as_deref(),
+            Some("telegram:12345"),
+        );
+    }
+
+    #[test]
+    fn reply_channel_telegram_with_topic_thread() {
+        // Telegram forum topics use a numeric thread_id.
+        let task = task_with_notify(Some("telegram"), Some("12345"), Some("6789"));
+        assert_eq!(
+            cron_reply_channel_string(&task).as_deref(),
+            Some("telegram:12345:6789"),
+        );
+    }
 }
