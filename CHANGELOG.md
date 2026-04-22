@@ -1,6 +1,38 @@
 # Changelog
 
 
+## [1.8.23] - 2026-04-22
+
+### Added
+- **Timezone-aware cron evaluation (#16 Level 2)**. Both the heartbeat
+  scheduler and the per-task cron scheduler now honour a new
+  `cron_timezone` field. Setting it to an IANA name
+  (e.g. `"Asia/Taipei"`) lets the user write cron expressions in their
+  wall clock and have the scheduler do the UTC conversion —
+  `"0 9 * * *"` with `cron_timezone = "Asia/Taipei"` now actually fires
+  at 09:00 Taipei every day. Empty / absent `cron_timezone` preserves
+  the pre-v1.8.23 UTC behaviour, so nothing moves for existing
+  deployments. The field lives on `HeartbeatConfig` (agent.toml
+  `[heartbeat]`) and on `cron_tasks` DB rows (accepted by MCP
+  `schedule_task` and dashboard `cron_add` / `cron_update`). A shared
+  `duduclaw_core::should_fire_in_tz` makes both schedulers use
+  identical evaluation semantics. Typos are caught at call time in the
+  MCP tool and dashboard handlers (IANA validation via `chrono-tz`),
+  so a bad zone name surfaces as an error instead of silently firing
+  in UTC. If a bad name does reach the scheduler somehow, it logs a
+  single warn line at load time and falls back to UTC — the cron
+  keeps firing instead of going silent. DB migration is idempotent
+  `ALTER TABLE`: reopening a v1.8.22 database adds the column with all
+  existing rows inheriting `NULL` (= UTC). Documented in all 5
+  `templates/*/agent.toml` and in the dashboard cron-input hint.
+  18 new tests across `duduclaw-core` (8: Taipei, New York EDT, UTC
+  fallback, invalid names, `*/5` tz-invariance, trimming), agent
+  heartbeat (5: tz set / empty / invalid / disabled, next_fire UTC
+  instant), and cron_store (5 including a `cron_timezone` roundtrip
+  + `update_cron_timezone` clearing, and migration idempotency across
+  reopen).
+
+
 ## [1.8.22] - 2026-04-21
 
 ### Fixed
