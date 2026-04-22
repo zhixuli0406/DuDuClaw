@@ -2297,7 +2297,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-agent"
-version = "1.8.23"
+version = "1.8.24"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -2321,7 +2321,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-auth"
-version = "1.8.23"
+version = "1.8.24"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -2341,7 +2341,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-bridge"
-version = "1.8.23"
+version = "1.8.24"
 dependencies = [
  "chrono",
  "duduclaw-core",
@@ -2352,7 +2352,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-bus"
-version = "1.8.23"
+version = "1.8.24"
 dependencies = [
  "duduclaw-core",
  "serde",
@@ -2363,7 +2363,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-cli"
-version = "1.8.23"
+version = "1.8.24"
 dependencies = [
  "base64 0.22.1",
  "bollard",
@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-container"
-version = "1.8.23"
+version = "1.8.24"
 dependencies = [
  "async-trait",
  "bollard",
@@ -2416,7 +2416,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-core"
-version = "1.8.23"
+version = "1.8.24"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2436,7 +2436,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-dashboard"
-version = "1.8.23"
+version = "1.8.24"
 dependencies = [
  "axum",
  "mime_guess",
@@ -2445,7 +2445,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-desktop"
-version = "1.8.23"
+version = "1.8.24"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2459,7 +2459,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-gateway"
-version = "1.8.23"
+version = "1.8.24"
 dependencies = [
  "async-trait",
  "axum",
@@ -2508,7 +2508,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-inference"
-version = "1.8.23"
+version = "1.8.24"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2541,7 +2541,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-memory"
-version = "1.8.23"
+version = "1.8.24"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2558,7 +2558,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-odoo"
-version = "1.8.23"
+version = "1.8.24"
 dependencies = [
  "chrono",
  "duduclaw-core",
@@ -2572,7 +2572,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-security"
-version = "1.8.23"
+version = "1.8.24"
 dependencies = [
  "base64 0.22.1",
  "chrono",
