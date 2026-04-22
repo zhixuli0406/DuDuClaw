@@ -37,20 +37,35 @@ ENV PYTHONPATH=/opt/duduclaw
 # Install Python dependencies
 RUN pip install --no-cache-dir anthropic==0.50.0
 
-# Install Docker CLI and curl for healthcheck
+# Install Docker CLI, Node.js 22, multi-runtime AI CLIs (Claude/Codex/Gemini), and curl for healthcheck
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    docker.io ca-certificates curl && \
+    docker.io ca-certificates curl gnupg && \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    npm install -g \
+        @anthropic-ai/claude-code \
+        @openai/codex \
+        @google/gemini-cli && \
+    apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy entrypoint
 COPY container/server-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-RUN mkdir -p /home/duduclaw/.duduclaw && chown -R duduclaw:duduclaw /home/duduclaw
+RUN mkdir -p \
+        /home/duduclaw/.duduclaw \
+        /home/duduclaw/.claude \
+        /home/duduclaw/.codex \
+        /home/duduclaw/.gemini && \
+    chown -R duduclaw:duduclaw /home/duduclaw
 
 USER duduclaw
 WORKDIR /home/duduclaw
 VOLUME /home/duduclaw/.duduclaw
+VOLUME /home/duduclaw/.claude
+VOLUME /home/duduclaw/.codex
+VOLUME /home/duduclaw/.gemini
 EXPOSE 18789
 
 ENTRYPOINT ["/entrypoint.sh"]

@@ -9,9 +9,18 @@ services:
       - "18789:18789"
     volumes:
       - duduclaw-data:/home/duduclaw/.duduclaw
+      - duduclaw-claude:/home/duduclaw/.claude
+      - duduclaw-codex:/home/duduclaw/.codex
+      - duduclaw-gemini:/home/duduclaw/.gemini
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # Claude: OAuth token (preferred — from `claude setup-token`) or API key fallback
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # Codex (OpenAI): API key fallback — ChatGPT Plus/Pro OAuth lives in duduclaw-codex volume
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      # Gemini (Google): API key fallback — Google OAuth lives in duduclaw-gemini volume
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - DUDUCLAW_BIND=0.0.0.0
       - LINE_CHANNEL_TOKEN=${LINE_CHANNEL_TOKEN:-}
       - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET:-}
@@ -52,4 +61,7 @@ services:
 
 volumes:
   duduclaw-data:
+  duduclaw-claude:
+  duduclaw-codex:
+  duduclaw-gemini:
   tailscale-state:
