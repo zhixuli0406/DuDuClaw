@@ -1,6 +1,45 @@
 # Changelog
 
 
+## [1.8.24] - 2026-04-22
+
+### Fixed
+- **Sub-agent replies disappeared from the root agent's session on
+  nested delegations (chain-root session-append gap)**. v1.8.17 Fix 2
+  wrote an XML-delimited `<subagent_reply agent="X">` turn into the
+  parent agent's session, but only when the session owner matched
+  `callback.agent_id` — a deliberate cross-agent-bleed guard. The
+  unintended side effect: sub-agents spawned by the dispatcher (TL,
+  eng-agent, eng-infra, marketing, …) don't have their own sessions in
+  `sessions.db` — only agnes does. So when eng-agent replied to TL's
+  `send_to_agent` call, the owner-mismatch skip fired:
+  `callback.agent_id=duduclaw-tl` vs `session owner=agnes` → warn +
+  silent drop → agnes's next turn had no record of the engineer's
+  output → root agent couldn't synthesise the chain's total work.
+  Fix: same cascade pattern as v1.8.20 token resolution.
+  `append_subagent_reply_to_parent_session` now takes
+  `chain_root_agent: Option<&str>` and accepts an owner match at
+  either tier. Tier 1 (parent direct) uses the existing
+  `<subagent_reply agent="X">` grammar. Tier 2 (chain root)
+  writes `<subagent_reply agent="X" via="Y">` where Y is the
+  callback agent — the `via=` attribute lets the root LLM tell a
+  direct reply apart from one relayed via a sub-agent. Tier 3
+  (neither match) still skips, so the cross-agent-bleed guard
+  holds. `forward_delegation_response` already computed the
+  chain root for v1.8.20's token cascade; just wires it down.
+  `safe_agent_tag` helper factored out so direct and relayed
+  content share the same `[A-Za-z0-9_-]` sanitisation. 4 new
+  regression tests in `dispatcher::tests`
+  (`append_cascades_to_chain_root_when_parent_has_no_session`,
+  `cascade_appends_via_annotation`,
+  `cascade_does_not_override_direct_parent_match`,
+  `cascade_skipped_when_neither_parent_nor_root_owns_session`).
+  Sub-agents still don't get their own persistent sessions —
+  session-per-agent-per-chain remains a separate, larger design
+  decision.
+
+
+
 ## [1.8.23] - 2026-04-22
 
 ### Added
