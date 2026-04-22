@@ -18,8 +18,13 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 # Copy pre-built frontend assets for dashboard embedding
 COPY --from=frontend-builder /build/crates/duduclaw-dashboard/dist/ crates/duduclaw-dashboard/dist/
-# Build release binary with dashboard enabled
-RUN cargo build --release -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard
+# Build release binary with dashboard only (desktop feature excluded —
+# Computer Use / screen capture lives in the dedicated Dockerfile.computer-use
+# image; pulling xcap/enigo here would drag in wayland/pipewire/gbm on Linux).
+RUN cargo build --release \
+    --no-default-features \
+    --features duduclaw-gateway/dashboard \
+    -p duduclaw-cli -p duduclaw-gateway
 
 # Stage 3: Production image
 FROM python:3.12-slim
