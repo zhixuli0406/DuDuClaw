@@ -95,7 +95,7 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "notify_channel", description: "Optional: channel type to auto-deliver the task result to ('discord', 'telegram', 'line', 'slack', 'whatsapp', 'feishu', 'webchat'). When set with notify_chat_id, the response is sent to that channel after a successful run.", required: false },
             ParamDef { name: "notify_chat_id", description: "Optional: chat / channel / room ID on the notify platform. Required when notify_channel is set.", required: false },
             ParamDef { name: "notify_thread_id", description: "Optional: Discord thread ID. Only used when notify_channel='discord' and the result should land in a specific thread.", required: false },
-            ParamDef { name: "cron_timezone", description: "Optional: IANA timezone name for interpreting the cron expression (e.g. 'Asia/Taipei', 'America/New_York'). Omit or leave empty to evaluate in UTC (legacy behaviour pre-v1.8.23).", required: false },
+            ParamDef { name: "cron_timezone", description: "Optional: IANA timezone name for interpreting the cron expression (e.g. 'Asia/Taipei', 'America/New_York'). Omit to auto-detect the host system's local timezone (v1.8.25+). Pass 'UTC' to force UTC evaluation explicitly.", required: false },
         ],
     },
     ToolDef {
@@ -883,6 +883,32 @@ const TOOLS: &[ToolDef] = &[
 ];
 
 // ── JSON-RPC helpers ─────────────────────────────────────────
+
+/// Detect the host system's IANA timezone name (e.g. `"Asia/Taipei"`,
+/// `"America/New_York"`, `"UTC"`).
+///
+/// Uses `iana_time_zone::get_timezone()` which reads `/etc/localtime` on
+/// Unix / the registry on Windows. Validated against `chrono-tz` so we
+/// never return a name the scheduler would reject — defensive because
+/// `iana-time-zone` is allowed to surface historical aliases that
+/// `chrono-tz`'s database has dropped.
+///
+/// Returns `None` when the host has no discoverable TZ (extremely rare
+/// on real machines — typical in minimal Docker images with no
+/// `/etc/localtime`). Callers should fall back to UTC.
+///
+/// Introduced in v1.8.25 so `schedule_task` stops surprising users by
+/// silently evaluating cron expressions in UTC when they meant local.
+fn detect_local_timezone() -> Option<String> {
+    let name = iana_time_zone::get_timezone().ok()?;
+    // Round-trip through chrono-tz so we only ever hand back names the
+    // scheduler's `duduclaw_core::parse_timezone` will accept.
+    if duduclaw_core::parse_timezone(&name).is_some() {
+        Some(name)
+    } else {
+        None
+    }
+}
 
 fn jsonrpc_response(id: &Value, result: Value) -> Value {
     serde_json::json!({
@@ -1747,12 +1773,30 @@ async fn handle_schedule_task(params: &Value, home_dir: &Path) -> Value {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    // v1.8.25: auto-detect the host's IANA timezone when the caller doesn't
+    // specify one explicitly. Historically schedule_task fell through to UTC
+    // if `cron_timezone` was absent — which surprised every Taipei-based
+    // user whose "0 8 * * *" fired at 16:00 local time. Auto-detecting
+    // matches what a human would expect "8am every day" to mean when
+    // running the scheduler on their own laptop / server.
+    //
+    // Explicit opt-out: pass `cron_timezone = "UTC"` to force UTC
+    // evaluation. Explicit any-other-IANA-name still wins (below).
     let cron_timezone = params
         .get("cron_timezone")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+        .map(|s| s.to_string())
+        .or_else(|| {
+            let detected = detect_local_timezone();
+            if let Some(ref tz) = detected {
+                tracing::info!(detected_tz = %tz, "schedule_task: auto-detected local timezone (no cron_timezone param supplied)");
+            } else {
+                tracing::warn!("schedule_task: could not detect local timezone — falling back to UTC");
+            }
+            detected
+        });
 
     // If one of notify_channel / notify_chat_id is set, the other must also
     // be set — a partial target would silently fail at delivery time.
@@ -1765,7 +1809,9 @@ async fn handle_schedule_task(params: &Value, home_dir: &Path) -> Value {
 
     // Validate cron_timezone against the IANA database at call time so a
     // typo is reported to the scheduler caller instead of silently falling
-    // back to UTC at firing time.
+    // back to UTC at firing time. Auto-detected values always parse (they
+    // come from the host's TZ database), but explicit user input might
+    // have a typo.
     if let Some(ref tz_name) = cron_timezone {
         if duduclaw_core::parse_timezone(tz_name).is_none() {
             return serde_json::json!({
@@ -7823,6 +7869,28 @@ high_context = true
             .expect("row in message_queue.db");
         assert_eq!(depth, 1);
         assert_eq!(origin_agent, "main", "Should fall back to caller");
+    }
+
+    // ── v1.8.25: local timezone auto-detect ─────────────────────────
+
+    #[test]
+    fn detect_local_timezone_returns_valid_iana_name() {
+        // This is a host-system-dependent test. We can't assert the
+        // specific zone (CI may run on UTC / America/Los_Angeles /
+        // Asia/Taipei), but we CAN assert that whatever we get back
+        // parses as a valid chrono-tz IANA name. That's the contract
+        // schedule_task relies on.
+        //
+        // On hosts with no discoverable TZ (extremely minimal Docker
+        // images), the function legitimately returns None — we accept
+        // both outcomes but check parseability of any name returned.
+        if let Some(tz_name) = detect_local_timezone() {
+            assert!(
+                duduclaw_core::parse_timezone(&tz_name).is_some(),
+                "detected TZ '{tz_name}' must round-trip through parse_timezone"
+            );
+            assert!(!tz_name.is_empty(), "detected TZ must not be empty string");
+        }
     }
 }
 
