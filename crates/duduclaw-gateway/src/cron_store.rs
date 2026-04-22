@@ -45,6 +45,11 @@ pub struct CronTaskRow {
     /// Optional Discord thread ID (only meaningful when notify_channel="discord").
     #[serde(default)]
     pub notify_thread_id: Option<String>,
+    /// IANA timezone name (e.g. "Asia/Taipei") for interpreting `cron`.
+    /// `None` → UTC (legacy behaviour pre-v1.8.23). Invalid names fall
+    /// back to UTC at evaluation time.
+    #[serde(default)]
+    pub cron_timezone: Option<String>,
 }
 
 impl CronTaskRow {
@@ -68,6 +73,7 @@ impl CronTaskRow {
             notify_channel: None,
             notify_chat_id: None,
             notify_thread_id: None,
+            cron_timezone: None,
         }
     }
 
@@ -125,13 +131,15 @@ impl CronStore {
         .map_err(|e| format!("init cron store schema: {e}"))?;
 
         // v1.8.22 migration — add notify_* columns for cron-result channel
-        // delivery (issue #15). SQLite does not support IF NOT EXISTS on
-        // ALTER TABLE ADD COLUMN, so we attempt each one and ignore the
-        // "duplicate column name" error. All other errors propagate.
+        // delivery (issue #15). v1.8.23 adds cron_timezone for Level 2 of
+        // issue #16. SQLite does not support IF NOT EXISTS on ALTER TABLE
+        // ADD COLUMN, so we attempt each one and ignore the "duplicate
+        // column name" error. All other errors propagate.
         for col in [
             "notify_channel",
             "notify_chat_id",
             "notify_thread_id",
+            "cron_timezone",
         ] {
             let sql = format!("ALTER TABLE cron_tasks ADD COLUMN {col} TEXT");
             if let Err(e) = conn.execute(&sql, []) {
@@ -153,7 +161,8 @@ impl CronStore {
                 "SELECT id, name, agent_id, cron, task, enabled,
                         created_at, updated_at, last_run_at, last_status, last_error,
                         run_count, failure_count,
-                        notify_channel, notify_chat_id, notify_thread_id
+                        notify_channel, notify_chat_id, notify_thread_id,
+                        cron_timezone
                  FROM cron_tasks
                  ORDER BY created_at ASC",
             )
@@ -173,7 +182,8 @@ impl CronStore {
                 "SELECT id, name, agent_id, cron, task, enabled,
                         created_at, updated_at, last_run_at, last_status, last_error,
                         run_count, failure_count,
-                        notify_channel, notify_chat_id, notify_thread_id
+                        notify_channel, notify_chat_id, notify_thread_id,
+                        cron_timezone
                  FROM cron_tasks
                  WHERE enabled = 1
                  ORDER BY created_at ASC",
@@ -194,7 +204,8 @@ impl CronStore {
                 "SELECT id, name, agent_id, cron, task, enabled,
                         created_at, updated_at, last_run_at, last_status, last_error,
                         run_count, failure_count,
-                        notify_channel, notify_chat_id, notify_thread_id
+                        notify_channel, notify_chat_id, notify_thread_id,
+                        cron_timezone
                  FROM cron_tasks WHERE id = ?1",
                 params![id],
                 row_to_cron_task,
@@ -211,7 +222,8 @@ impl CronStore {
                 "SELECT id, name, agent_id, cron, task, enabled,
                         created_at, updated_at, last_run_at, last_status, last_error,
                         run_count, failure_count,
-                        notify_channel, notify_chat_id, notify_thread_id
+                        notify_channel, notify_chat_id, notify_thread_id,
+                        cron_timezone
                  FROM cron_tasks WHERE name = ?1 LIMIT 1",
                 params![name],
                 row_to_cron_task,
@@ -231,8 +243,10 @@ impl CronStore {
                 (id, name, agent_id, cron, task, enabled,
                  created_at, updated_at, last_run_at, last_status, last_error,
                  run_count, failure_count,
-                 notify_channel, notify_chat_id, notify_thread_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                 notify_channel, notify_chat_id, notify_thread_id,
+                 cron_timezone)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?17)",
             params![
                 row.id,
                 row.name,
@@ -250,6 +264,7 @@ impl CronStore {
                 row.notify_channel,
                 row.notify_chat_id,
                 row.notify_thread_id,
+                row.cron_timezone,
             ],
         )
         .map_err(|e| format!("insert cron task: {e}"))?;
@@ -257,7 +272,8 @@ impl CronStore {
     }
 
     /// Update the editable fields of a task (name, agent_id, cron, task, enabled).
-    /// `notify_*` fields are preserved — use [`Self::update_notify`] to change them.
+    /// `notify_*` and `cron_timezone` are preserved — use [`Self::update_notify`]
+    /// or [`Self::update_cron_timezone`] to change them.
     pub async fn update_fields(
         &self,
         id: &str,
@@ -278,6 +294,26 @@ impl CronStore {
                 params![id, name, agent_id, cron, task, if enabled { 1 } else { 0 }, now],
             )
             .map_err(|e| format!("update cron task: {e}"))?;
+        Ok(changed > 0)
+    }
+
+    /// Update just the `cron_timezone` column. Pass `None` to clear it
+    /// (which reverts the row to UTC / legacy semantics).
+    pub async fn update_cron_timezone(
+        &self,
+        id: &str,
+        cron_timezone: Option<&str>,
+    ) -> Result<bool, String> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let changed = conn
+            .execute(
+                "UPDATE cron_tasks
+                 SET cron_timezone = ?2, updated_at = ?3
+                 WHERE id = ?1",
+                params![id, cron_timezone, now],
+            )
+            .map_err(|e| format!("update_cron_timezone: {e}"))?;
         Ok(changed > 0)
     }
 
@@ -461,6 +497,11 @@ impl CronStore {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(String::from);
+            let cron_timezone = value
+                .get("cron_timezone")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
 
             let row = CronTaskRow {
                 id,
@@ -479,6 +520,7 @@ impl CronStore {
                 notify_channel,
                 notify_chat_id,
                 notify_thread_id,
+                cron_timezone,
             };
             if let Err(e) = self.insert(&row).await {
                 warn!(id = %row.id, "failed to migrate row: {e}");
@@ -518,6 +560,7 @@ fn row_to_cron_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronTaskRow> {
         notify_channel: row.get(13)?,
         notify_chat_id: row.get(14)?,
         notify_thread_id: row.get(15)?,
+        cron_timezone: row.get(16)?,
     })
 }
 
@@ -617,6 +660,46 @@ mod tests {
         store.update_notify("n1", None, None, None).await.unwrap();
         let got = store.get("n1").await.unwrap().unwrap();
         assert!(!got.has_notify_target());
+    }
+
+    #[tokio::test]
+    async fn cron_timezone_roundtrip_and_clear() {
+        let dir = tempdir().unwrap();
+        let store = CronStore::open(dir.path()).unwrap();
+
+        let mut row = CronTaskRow::new(
+            "tz1".into(),
+            "Timezone Task".into(),
+            "agnes".into(),
+            "0 9 * * *".into(),
+            "daily brief".into(),
+        );
+        row.cron_timezone = Some("Asia/Taipei".into());
+        store.insert(&row).await.unwrap();
+
+        let got = store.get("tz1").await.unwrap().unwrap();
+        assert_eq!(got.cron_timezone.as_deref(), Some("Asia/Taipei"));
+
+        // update_fields must preserve cron_timezone
+        store
+            .update_fields("tz1", "Renamed", "agnes", "0 9 * * *", "brief", true)
+            .await
+            .unwrap();
+        let got = store.get("tz1").await.unwrap().unwrap();
+        assert_eq!(got.cron_timezone.as_deref(), Some("Asia/Taipei"));
+
+        // update_cron_timezone can flip to another zone
+        store
+            .update_cron_timezone("tz1", Some("America/New_York"))
+            .await
+            .unwrap();
+        let got = store.get("tz1").await.unwrap().unwrap();
+        assert_eq!(got.cron_timezone.as_deref(), Some("America/New_York"));
+
+        // Passing None clears it (reverts to UTC)
+        store.update_cron_timezone("tz1", None).await.unwrap();
+        let got = store.get("tz1").await.unwrap().unwrap();
+        assert_eq!(got.cron_timezone, None);
     }
 
     #[tokio::test]

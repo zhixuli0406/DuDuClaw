@@ -21,4 +21,4 @@ dirs = "6"
 serde_yaml = "0.9"
 zeroize = "1"
 tempfile = "3"
-chrono-tz = "0.10"
+chrono-tz = { workspace = true }

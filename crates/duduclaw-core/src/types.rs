@@ -220,21 +220,28 @@ pub struct ContainerConfig {
 
 /// Heartbeat / scheduled-task configuration.
 ///
-/// `cron` expressions are **always evaluated in UTC** — the heartbeat loop
-/// compares `chrono::Utc::now()` against the next scheduled time. To fire at
-/// a local wall-clock time, convert it to UTC first (for Asia/Taipei, UTC+8,
-/// subtract 8 hours). Both 5-field (`min hour dom mon dow`) and 6-field
-/// (`sec min hour dom mon dow`) forms are accepted.
+/// `cron` expressions are evaluated in the timezone named by `cron_timezone`.
+/// When `cron_timezone` is empty (the default), cron falls back to UTC —
+/// backward-compatible with pre-v1.8.23 behaviour. Set it to an IANA name
+/// (e.g. `"Asia/Taipei"`) to write cron expressions in your local wall clock
+/// and let the scheduler do the UTC conversion. Both 5-field (`min hour dom
+/// mon dow`) and 6-field (`sec min hour dom mon dow`) forms are accepted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct HeartbeatConfig {
     pub enabled: bool,
     pub interval_seconds: u64,
     pub max_concurrent_runs: u32,
-    /// Cron expression evaluated in UTC. Empty string falls back to
-    /// `interval_seconds`. Example: `"0 1 * * *"` fires at 01:00 UTC
-    /// (which is 09:00 in Asia/Taipei).
+    /// Cron expression evaluated in `cron_timezone` (or UTC if that is empty).
+    /// Empty string disables cron and falls back to `interval_seconds`.
+    /// Example: with `cron_timezone = "Asia/Taipei"`, `"0 9 * * *"` fires
+    /// at 09:00 Taipei time daily.
     pub cron: String,
+    /// IANA timezone name for interpreting `cron` (e.g. `"Asia/Taipei"`,
+    /// `"America/New_York"`). Empty = UTC (legacy behaviour pre-v1.8.23).
+    /// Invalid names log a warning at load time and fall back to UTC.
+    #[serde(default)]
+    pub cron_timezone: String,
 }
 
 /// Budget limits and warnings.

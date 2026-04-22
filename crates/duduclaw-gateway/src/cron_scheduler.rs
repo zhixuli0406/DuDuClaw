@@ -34,6 +34,10 @@ const TICK_INTERVAL_SECS: u64 = 30;
 struct LiveTask {
     task: CronTaskRow,
     schedule: Schedule,
+    /// Parsed `cron_timezone` from the DB row. `None` means UTC (legacy).
+    /// An invalid IANA name becomes `None` with a warn-level log at load
+    /// time — the task continues to fire in UTC instead of going silent.
+    cron_tz: Option<chrono_tz::Tz>,
     last_run: Option<chrono::DateTime<Utc>>,
 }
 
@@ -108,9 +112,11 @@ impl CronScheduler {
                         (Some(mem), None) => Some(mem),
                         (None, db) => db,
                     };
+                    let cron_tz = resolve_task_cron_tz(&task);
                     new_live.push(LiveTask {
                         task,
                         schedule,
+                        cron_tz,
                         last_run,
                     });
                 }
@@ -153,20 +159,12 @@ impl CronScheduler {
             {
                 let mut tasks = self.tasks.write().await;
                 for lt in tasks.iter_mut() {
-                    let should_fire = match lt.last_run {
-                        Some(last) => lt
-                            .schedule
-                            .after(&last)
-                            .next()
-                            .map(|next| next <= now)
-                            .unwrap_or(false),
-                        None => lt
-                            .schedule
-                            .after(&(now - chrono::Duration::hours(1)))
-                            .next()
-                            .map(|next| next <= now)
-                            .unwrap_or(false),
-                    };
+                    let should_fire = duduclaw_core::should_fire_in_tz(
+                        &lt.schedule,
+                        lt.last_run,
+                        now,
+                        lt.cron_tz,
+                    );
 
                     if should_fire {
                         info!(
@@ -433,6 +431,30 @@ async fn resolve_channel_token(home_dir: &Path, agent_id: &str, channel: &str) -
     crate::config_crypto::read_encrypted_config_field(home_dir, "channels", &field_base)
         .await
         .unwrap_or_default()
+}
+
+/// Parse a task's `cron_timezone` column. Returns `None` for absent /
+/// empty values (UTC / legacy behaviour) and for unknown IANA names —
+/// the latter also emits a warn log once, at load time, so a typo is
+/// visible in the scheduler output without spamming the per-tick loop.
+fn resolve_task_cron_tz(task: &CronTaskRow) -> Option<chrono_tz::Tz> {
+    let tz_name = task.cron_timezone.as_deref().unwrap_or("").trim();
+    if tz_name.is_empty() {
+        return None;
+    }
+    match duduclaw_core::parse_timezone(tz_name) {
+        Some(tz) => Some(tz),
+        None => {
+            warn!(
+                id = %task.id,
+                name = %task.name,
+                cron_timezone = tz_name,
+                "Unknown cron_timezone on cron task — falling back to UTC. \
+                 Use an IANA name like \"Asia/Taipei\"."
+            );
+            None
+        }
+    }
 }
 
 /// Normalise a cron expression to 6-field format (with seconds). If the
