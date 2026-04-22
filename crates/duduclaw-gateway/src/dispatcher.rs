@@ -1783,6 +1783,7 @@ async fn forward_delegation_response(
                 &channel_id,
                 thread_id.as_deref(),
                 &callback_agent_id,
+                chain_root.as_deref(),
                 responder_agent,
                 response_text,
             ).await;
@@ -1882,6 +1883,21 @@ fn candidate_session_ids(
     }
 }
 
+/// Sanitize an agent name for inclusion in the XML `<subagent_reply>` tag.
+/// Agent names are already constrained to `[A-Za-z0-9_-]` by the registry,
+/// but belt-and-suspenders prevents XML-tag injection via a crafted name.
+fn safe_agent_tag(name: &str) -> String {
+    let sanitised: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if sanitised.is_empty() {
+        "sub-agent".to_string()
+    } else {
+        sanitised
+    }
+}
+
 /// Append the sub-agent's reply to the parent agent's session history.
 ///
 /// Writes an `assistant` turn directly into `sessions.db::session_messages`
@@ -1890,20 +1906,41 @@ fn candidate_session_ids(
 /// log only) on any SQLite error — Discord delivery already succeeded and
 /// we never want to break that path.
 ///
-/// Format of the appended content (XML-delimited, mirrors the tag grammar
-/// `channel_reply::format_history_as_prompt` uses):
+/// ### Owner cascade (v1.8.22)
 ///
-/// ```text
-/// <subagent_reply agent="duduclaw-tl">
-/// <original response text>
-/// </subagent_reply>
-/// ```
+/// The session is looked up by the channel's [`candidate_session_ids`].
+/// The found session's `agent_id` (= owner) is compared against two
+/// candidate parents:
+///
+/// 1. `parent_agent_id` = the agent that called `send_to_agent` (i.e.
+///    the callback's `agent_id`). **Direct match** — content is
+///    `<subagent_reply agent="X">...</subagent_reply>`.
+///
+/// 2. `chain_root_agent` = the message's `origin_agent` (the agent who
+///    originally received the channel message and started the whole
+///    delegation chain). **Cascade match** — content adds a
+///    `via="<parent_agent_id>"` attribute so the root agent's LLM can
+///    tell the reply wasn't a direct delegation from it but arrived
+///    through an intermediate sub-agent. Format:
+///    `<subagent_reply agent="X" via="Y">...</subagent_reply>`.
+///
+/// Without the cascade, any reply in a nested chain (e.g. TL →
+/// eng-agent, where TL has no persistent session but agnes does)
+/// would be dropped with an owner-mismatch warn, leaving the root
+/// agent with no record of the engineer's output. v1.8.22 closes
+/// that gap.
+///
+/// If neither candidate matches any existing session, the append is
+/// skipped with a debug log. This preserves the cross-agent-bleed
+/// guard (two unrelated agents sharing a channel still cannot leak
+/// content into each other's history).
 async fn append_subagent_reply_to_parent_session(
     home_dir: &Path,
     channel_type: &str,
     channel_id: &str,
     thread_id: Option<&str>,
     parent_agent_id: &str,
+    chain_root_agent: Option<&str>,
     responder_agent: &str,
     response_text: &str,
 ) {
@@ -1917,39 +1954,38 @@ async fn append_subagent_reply_to_parent_session(
         return;
     }
 
-    // Sanitize the responder name so the closing tag round-trips cleanly.
-    // Agent names are already constrained to ASCII alphanumerics + `-_` by
-    // the registry, but belt-and-suspenders prevents XML-tag injection via
-    // a crafted name.
-    let safe_responder: String = responder_agent
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-    let responder_for_tag = if safe_responder.is_empty() {
-        "sub-agent".to_string()
-    } else {
-        safe_responder
-    };
+    let responder_for_tag = safe_agent_tag(responder_agent);
+    let via_for_tag = safe_agent_tag(parent_agent_id);
 
-    let content = format!(
+    // Two variants of the content — direct vs relayed. Both are built
+    // up-front so the spawn_blocking closure doesn't need the
+    // responder/parent strings by reference.
+    let direct_content = format!(
         "<subagent_reply agent=\"{responder_for_tag}\">\n{response_text}\n</subagent_reply>"
     );
-    let tokens = subagent_reply_token_estimate(&content);
+    let relayed_content = format!(
+        "<subagent_reply agent=\"{responder_for_tag}\" via=\"{via_for_tag}\">\n{response_text}\n</subagent_reply>"
+    );
+
     let candidates = candidate_session_ids(channel_type, channel_id, thread_id);
     let parent = parent_agent_id.to_string();
+    let root = chain_root_agent
+        .filter(|s| !s.is_empty() && *s != parent_agent_id)
+        .map(str::to_string);
 
     let ch_type = channel_type.to_string();
     let ch_id = channel_id.to_string();
     let responder_for_log = responder_agent.to_string();
 
-    let result = tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
+    let result = tokio::task::spawn_blocking(move || -> Result<Option<(String, bool)>, String> {
         let conn = rusqlite::Connection::open(&db_path)
             .map_err(|e| format!("open sessions.db: {e}"))?;
         let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
         let now = chrono::Utc::now().to_rfc3339();
 
-        // Try each candidate session_id in order. Append to the first one
-        // that already exists AND belongs to the expected parent agent.
+        // Try each candidate session_id in order. Accept a session whose
+        // owner matches either the direct parent OR the chain root.
+        // Direct match wins if both are available for the same session.
         for sid in &candidates {
             let existing: Option<String> = conn.query_row(
                 "SELECT agent_id FROM sessions WHERE id = ?1",
@@ -1958,23 +1994,27 @@ async fn append_subagent_reply_to_parent_session(
             ).ok();
 
             let Some(owner) = existing else { continue };
-            if owner != parent {
-                // Session exists but belongs to a different agent — skip.
-                // This can happen if two agents share the same channel and
-                // we'd otherwise write into the wrong parent's history.
+
+            let (content, is_relayed) = if owner == parent {
+                (&direct_content, false)
+            } else if root.as_deref() == Some(owner.as_str()) {
+                (&relayed_content, true)
+            } else {
                 tracing::debug!(
                     session_id = %sid,
                     owner = %owner,
-                    expected = %parent,
-                    "session exists but owner mismatch — skipping"
+                    expected_parent = %parent,
+                    expected_root = ?root,
+                    "session exists but owner matches neither parent nor chain-root — skipping"
                 );
                 continue;
-            }
+            };
 
+            let tokens = subagent_reply_token_estimate(content);
             conn.execute(
                 "INSERT INTO session_messages (session_id, role, content, tokens, timestamp) \
                  VALUES (?1, 'assistant', ?2, ?3, ?4)",
-                rusqlite::params![sid, &content, tokens, now],
+                rusqlite::params![sid, content, tokens, now],
             ).map_err(|e| format!("insert session_messages: {e}"))?;
 
             conn.execute(
@@ -1983,32 +2023,33 @@ async fn append_subagent_reply_to_parent_session(
                 rusqlite::params![tokens, now, sid],
             ).map_err(|e| format!("update sessions: {e}"))?;
 
-            return Ok(Some(sid.clone()));
+            return Ok(Some((sid.clone(), is_relayed)));
         }
 
         Ok(None)
     }).await;
 
     match result {
-        Ok(Ok(Some(sid))) => {
+        Ok(Ok(Some((sid, is_relayed)))) => {
             info!(
                 parent = %parent_agent_id,
                 responder = %responder_for_log,
                 session_id = %sid,
-                tokens = tokens,
+                relayed = is_relayed,
                 "Appended sub-agent reply to parent session history"
             );
         }
         Ok(Ok(None)) => {
             // No matching session — the parent agent has never held a turn
-            // on this channel yet. Common for brand-new conversations where
-            // the sub-agent reply arrives before the parent's first reply
-            // has closed. Non-fatal.
+            // on this channel yet, AND (if present) the chain-root agent
+            // also has no session here. Common for brand-new conversations
+            // where the sub-agent reply arrives before the parent's first
+            // reply has closed. Non-fatal.
             warn!(
                 channel = %ch_type,
                 chat_id = %ch_id,
                 parent = %parent_agent_id,
-                "No parent session found for sub-agent reply append \
+                "No parent or chain-root session found for sub-agent reply append \
                  (forward still succeeded); parent may miss this turn"
             );
         }
@@ -2526,6 +2567,7 @@ mod tests {
             "42",
             None,
             "agnes",
+            None,
             "duduclaw-tl",
             "方案 A / B / C — which do you prefer?",
         ).await;
@@ -2549,6 +2591,7 @@ mod tests {
             "99",
             None,
             "agnes",
+            None,
             "duduclaw-tl",
             "Here are three options.",
         ).await;
@@ -2607,6 +2650,7 @@ mod tests {
             "77",
             None,
             "agnes",
+            None,
             "duduclaw-tl",
             "reply text",
         ).await;
@@ -2626,6 +2670,7 @@ mod tests {
             "123456789",
             None,
             "agnes",
+            None,
             "duduclaw-tl",
             "reply",
         ).await;
@@ -2643,6 +2688,7 @@ mod tests {
             "9876",
             None,
             "agnes",
+            None,
             "duduclaw-tl",
             "thread reply",
         ).await;
@@ -2665,6 +2711,7 @@ mod tests {
             "100",
             None,
             "agnes",  // ← expected parent, but session belongs to other_agent
+            None,     // no chain root provided
             "duduclaw-tl",
             "should not be appended",
         ).await;
@@ -2672,6 +2719,132 @@ mod tests {
         let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
         let msgs = sm.get_messages("telegram:100").await.unwrap();
         assert_eq!(msgs.len(), 1, "must not pollute another agent's session");
+        assert_eq!(msgs[0].role, "user");
+    }
+
+    // ── v1.8.22: chain-root cascade tests ─────────────────────────
+
+    #[tokio::test]
+    async fn append_cascades_to_chain_root_when_parent_has_no_session() {
+        // Production scenario that motivated v1.8.22:
+        // - User chats with agnes on Discord → agnes has a session.
+        // - agnes delegates to TL → TL replies → Fix 2 appends to agnes's
+        //   session (parent match, works since v1.8.17).
+        // - TL then delegates to eng-agent → eng-agent replies.
+        //   The callback.agent_id is TL (no session), but the channel
+        //   session belongs to the chain root agnes.
+        //   Pre-v1.8.22: owner-mismatch → skip → agnes never sees the
+        //   engineer's output.
+        //   v1.8.22: cascade to chain_root owner → append with `via="TL"`.
+        let (_tmp, home) = setup_parent_session("discord:thread:555", "agnes").await;
+
+        append_subagent_reply_to_parent_session(
+            &home,
+            "discord",
+            "555",
+            None,
+            "duduclaw-tl",           // parent agent (callback.agent_id) — no session
+            Some("agnes"),           // chain root (message.origin_agent) — has session
+            "duduclaw-eng-agent",
+            "Engineer report: infrastructure ready",
+        ).await;
+
+        let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
+        let msgs = sm.get_messages("discord:thread:555").await.unwrap();
+        assert_eq!(msgs.len(), 2, "engineer reply should land in agnes's session");
+        assert_eq!(msgs[1].role, "assistant");
+        assert!(
+            msgs[1].content.contains("Engineer report"),
+            "content preserved: {}", msgs[1].content
+        );
+    }
+
+    #[tokio::test]
+    async fn cascade_appends_via_annotation() {
+        // The relayed content must include `via="<parent>"` so the
+        // chain-root's LLM can distinguish a direct sub-agent reply
+        // ("TL said X") from an indirect one ("eng-agent said X,
+        // relayed via TL").
+        let (_tmp, home) = setup_parent_session("discord:thread:42", "agnes").await;
+
+        append_subagent_reply_to_parent_session(
+            &home,
+            "discord",
+            "42",
+            None,
+            "duduclaw-tl",
+            Some("agnes"),
+            "duduclaw-eng-infra",
+            "infra topology finalised",
+        ).await;
+
+        let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
+        let content = sm
+            .get_messages("discord:thread:42").await.unwrap()
+            .pop().unwrap().content;
+        assert!(
+            content.contains("agent=\"duduclaw-eng-infra\""),
+            "responder must be in `agent=...`: {content}"
+        );
+        assert!(
+            content.contains("via=\"duduclaw-tl\""),
+            "parent must be in `via=...` for cascade path: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cascade_does_not_override_direct_parent_match() {
+        // If BOTH the parent and the chain root could match (i.e. the
+        // session owner == parent), we take the direct path — no `via=`.
+        // This covers the "top-level chain" case where agnes delegates
+        // to TL directly.
+        let (_tmp, home) = setup_parent_session("discord:thread:1", "agnes").await;
+
+        append_subagent_reply_to_parent_session(
+            &home,
+            "discord",
+            "1",
+            None,
+            "agnes",          // parent_agent_id == session owner → direct path
+            Some("agnes"),    // chain_root == parent (self-loop)
+            "duduclaw-tl",
+            "dispatch ack",
+        ).await;
+
+        let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
+        let content = sm
+            .get_messages("discord:thread:1").await.unwrap()
+            .pop().unwrap().content;
+        assert!(content.contains("<subagent_reply agent=\"duduclaw-tl\">"));
+        assert!(
+            !content.contains("via="),
+            "direct match must NOT add via= attribute: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cascade_skipped_when_neither_parent_nor_root_owns_session() {
+        // Cross-agent bleed guard still holds: if the session belongs to
+        // a third agent (neither parent nor chain root), refuse to write.
+        let (_tmp, home) = setup_parent_session("telegram:200", "third-agent").await;
+
+        append_subagent_reply_to_parent_session(
+            &home,
+            "telegram",
+            "200",
+            None,
+            "duduclaw-tl",       // parent — no session match
+            Some("agnes"),       // chain root — no session match either
+            "duduclaw-eng-agent",
+            "leaked content",
+        ).await;
+
+        let sm = SessionManager::new(&home.join("sessions.db")).unwrap();
+        let msgs = sm.get_messages("telegram:200").await.unwrap();
+        assert_eq!(
+            msgs.len(), 1,
+            "third-agent's session must stay untouched (cross-agent bleed guard)"
+        );
         assert_eq!(msgs[0].role, "user");
     }
 
