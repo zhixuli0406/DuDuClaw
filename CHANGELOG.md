@@ -1,6 +1,114 @@
 # Changelog
 
 
+## [1.8.26] - 2026-04-22
+
+### Added
+- **`shared_wiki_lint` MCP tool** — audits `~/.duduclaw/shared/wiki/`
+  for Karpathy LLM Wiki schema compliance. Reports: pages missing
+  any of the six required frontmatter fields (`title`, `created`,
+  `updated`, `tags`, `layer`, `trust`), pages containing fallback-
+  content markers (e.g. "基於訓練資料", "web_search failed",
+  "無法取得", "查無結果", "based on training data" …) that were not
+  explicitly tagged `fallback-mode`, plus the existing graph-level
+  checks (orphans / broken links / stale pages) delegated to
+  `WikiStore::lint()`. Unlike per-agent `wiki_lint`, this tool
+  takes no `agent_id` — shared wiki is a single global namespace.
+
+### Fixed
+- **Shared wiki accepted pages authored from stale LLM priors,
+  polluting the cross-agent knowledge base.** When
+  `ai-papers-researcher` / `ai-repos-researcher` cron tasks ran
+  while `web_search` was failing, they silently fell back to
+  recalling training data and wrote reports whose frontmatter
+  looked legitimate but whose body was unanchored to any verifiable
+  source (7/7 Hugging Face model URLs returned HTTP 200 + `<title>
+  404` body in one case). These entered `shared/wiki/` unchallenged
+  and drifted there indefinitely. Project rule: 「有 fallback 的資
+  料不應該混入共用 wiki 中產生雜訊」.
+
+  **Fix A** — `handle_shared_wiki_write` now enforces two gates
+  before the write:
+
+  1. **Frontmatter schema gate** (`validate_wiki_frontmatter`):
+     page must open with a `---…---` block declaring *all* of
+     `title, created, updated, tags, layer, trust`. `trust` must
+     parse as a float in `[0.0, 1.0]`. Missing or malformed
+     frontmatter → hard reject with a message pointing at the
+     missing fields.
+  2. **Fallback-content gate** (`detect_fallback_content`): body
+     scanned for any of 14 CJK / English fallback markers. On
+     match, reject unless the page explicitly opts in with
+     `fallback-mode` in its `tags` (for post-mortem archives
+     where a human deliberately wants the record preserved; those
+     pages are still expected to carry `trust: 0.2` or lower).
+
+  Per-agent `wiki_write` is intentionally left permissive — private
+  wikis can hold speculative or fallback material; only the shared
+  bus is strict.
+
+- **Four research-pipeline cron prompts pushed fabricated content
+  into `shared/wiki/` when search tools failed.**
+  `ai-papers-morning`, `ai-papers-evening`, `ai-repos-morning`, and
+  `ai-repos-evening` (rows in `~/.duduclaw/cron_tasks.db`) have been
+  rewritten to:
+
+  - **Abort on search failure** instead of falling through to
+    training-data recall. The new prompts open with a hard
+    precondition: if `web_search` returns 0 results, immediately
+    notify `agnes` that "本日研究暫停：搜尋工具失效" and exit the
+    task. Explicit ban on the 無法取得 / 基於訓練資料 / 查無結果
+    narrative patterns (which now trip the shared-wiki fallback
+    gate anyway).
+  - **Two-layer URL verification** before any wiki write: a HEAD
+    fetch must return HTTP 200 *and* the body must not contain
+    `<title>404` (the Hugging Face gotcha where bad model URLs
+    return 200 with a 404 page body). Items failing either check
+    are dropped — the prompts are explicit that filling with
+    unverified items is prohibited.
+  - **Atomic-entity page layout per Karpathy LLM Wiki**: one
+    entity page per paper/repo under `entities/YYYY-MM-DD-<slug>.
+    md`, plus a daily digest under `research/ai-papers/YYYY-MM-DD-
+    (08|20).md` whose `related:` points back to every entity.
+    Frontmatter is spelled out explicitly inline (all six required
+    fields, `layer: context`, `trust: 0.5` default, `sources:`
+    list), and heading decoration emoji are banned.
+
+  Backup of the pre-rewrite rows saved to
+  `~/.duduclaw/cron_tasks.db.v1.8.25.bak` in case rollback is
+  needed.
+
+- **Two fabricated shared-wiki pages from 2026-04-22** were
+  removed: `research/ai-repos/2026-04-22-08.md` (web_search
+  fallback, 0 real URLs) and `research/ai-repos/2026-04-22-20.md`
+  (7/7 HF model URLs were 404-in-body). `_index.md` cleaned and
+  `_log.md` appended with `delete … by:operator (fabricated: …)`
+  entries. Both surviving `research/ai-papers/*.md` pages were
+  retrofitted with the full nine-field Karpathy frontmatter
+  (`title`, `created`, `updated`, `author`, `tags`, `related`,
+  `sources`, `layer: context`, `trust: 0.5`) so they pass the new
+  `shared_wiki_lint` tool.
+
+### Tests
+
+**12 new** (all passing, all in `mcp::wiki_schema_tests`):
+
+- `frontmatter_validator_accepts_full_schema`
+- `frontmatter_validator_rejects_missing_frontmatter`
+- `frontmatter_validator_rejects_missing_required_fields`
+- `frontmatter_validator_rejects_out_of_range_trust`
+- `frontmatter_validator_rejects_non_numeric_trust`
+- `detect_fallback_catches_cjk_marker`
+- `detect_fallback_catches_english_marker`
+- `detect_fallback_ignores_clean_body`
+- `shared_wiki_write_rejects_fallback_content`
+- `shared_wiki_write_rejects_missing_frontmatter`
+- `shared_wiki_write_allows_fallback_mode_opt_in`
+- `shared_wiki_write_accepts_clean_karpathy_page`
+
+Full workspace lib suite still green.
+
+
 ## [1.8.25] - 2026-04-22
 
 ### Fixed
