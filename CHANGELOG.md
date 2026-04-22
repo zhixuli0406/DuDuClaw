@@ -1,6 +1,58 @@
 # Changelog
 
 
+## [1.8.25] - 2026-04-22
+
+### Fixed
+- **Cron tasks scheduled `0 8 * * *` expecting 8 am local fired 8 am
+  UTC instead**. Creating a task via MCP `schedule_task` without
+  specifying `cron_timezone` fell through to UTC evaluation — so a
+  Taipei user got their "morning" cron at 16:00 local and their
+  "evening" cron at 04:00 the *next morning*. New
+  `detect_local_timezone()` helper reads the host's IANA name
+  (`iana_time_zone::get_timezone()` on Unix / Windows) and
+  round-trips it through `duduclaw_core::parse_timezone` to guarantee
+  `chrono-tz` acceptance. `handle_schedule_task` now auto-populates
+  `cron_timezone` from the detected TZ when absent; explicit
+  `cron_timezone='UTC'` still forces UTC (opt-out), any explicit IANA
+  name still wins. Logs the detected zone at info level for
+  observability. `cron_timezone` tool schema description updated to
+  reflect the new auto-detect default. New direct dep
+  `iana-time-zone = "0.1"` on `duduclaw-cli` (already a transitive
+  dep of `chrono`, no new vendored C). New test
+  `detect_local_timezone_returns_valid_iana_name` asserts
+  parse_timezone round-trip and tolerates None on hosts with no
+  discoverable TZ (minimal Docker images).
+- **Cron agents' nested `send_to_agent` replies silently dropped
+  (same class as v1.8.16 but for cron-initiated chains)**. The cron
+  scheduler dispatched tasks via `call_claude_for_agent_with_type`
+  wrapped only in `DELEGATION_ENV.scope` — never in
+  `REPLY_CHANNEL.scope`. So when a daily-report agent called
+  `send_to_agent("agnes", "here's my report")`, no
+  `delegation_callbacks` row was ever registered (MCP's
+  `send_to_agent` only inserts callbacks when
+  `DUDUCLAW_REPLY_CHANNEL` env is set). Agnes's response landed in
+  `message_queue.response` and was then dropped at
+  `forward_delegation_response`'s no-callback silent-return branch.
+  Fix: `run_task` now wraps the dispatch future in
+  `REPLY_CHANNEL.scope(cron_reply_channel_string(task), …)` when
+  the task has a `notify_channel` target. New helper
+  `cron_reply_channel_string` builds the
+  `<channel_type>:<chat_id>[:<thread_id>]` grammar that
+  `mcp.rs::send_to_agent` parses; Discord threads stored as
+  `chat_id=<thread_id>, thread_id=NULL` emit `discord:<thread_id>`
+  (matching `deliver_cron_result`'s existing API-level "thread is
+  a channel" semantics). Effect: nested cron delegations now
+  register callbacks → forward through v1.8.20 token cascade →
+  session-append via v1.8.24 chain-root cascade. The cron agent's
+  own top-level response still goes through `deliver_cron_result`
+  (direct POST) unchanged; this patch strictly closes the nested
+  path. 5 new tests in `cron_scheduler::tests` covering None /
+  Discord thread-as-chat-id / Discord parent+thread / Telegram
+  without thread / Telegram forum topic thread.
+
+
+
 ## [1.8.24] - 2026-04-22
 
 ### Fixed
