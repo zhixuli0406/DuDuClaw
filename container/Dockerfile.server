@@ -16,6 +16,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+# duduclaw-memory + duduclaw-cli use include_str! against templates/wiki/*.
+# Missing this dir → "No such file or directory" at compile time.
+COPY templates/ templates/
 # Copy pre-built frontend assets for dashboard embedding
 COPY --from=frontend-builder /build/crates/duduclaw-dashboard/dist/ crates/duduclaw-dashboard/dist/
 # Build release binary with dashboard only (desktop feature excluded —
