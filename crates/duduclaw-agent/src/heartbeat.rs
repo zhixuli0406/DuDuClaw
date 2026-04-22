@@ -37,6 +37,9 @@ pub struct HeartbeatStatus {
     pub enabled: bool,
     pub interval_seconds: u64,
     pub cron: String,
+    /// IANA timezone for interpreting `cron` (empty = UTC, the legacy
+    /// behaviour pre-v1.8.23).
+    pub cron_timezone: String,
     pub last_run: Option<String>,
     pub next_run: Option<String>,
     pub total_runs: u64,
@@ -60,6 +63,11 @@ struct LiveAgent {
     /// Max silence hours before forced reflection (from EvolutionConfig).
     max_silence_hours: f64,
     schedule: Option<Schedule>,
+    /// Parsed `cron_timezone`. `None` means UTC (legacy). An invalid name in
+    /// config (e.g. typo) resolves to `None` here and a single warn-level
+    /// log line is emitted at load time — the cron continues to fire in UTC
+    /// instead of going silent.
+    cron_tz: Option<chrono_tz::Tz>,
     last_run: Option<chrono::DateTime<Utc>>,
     /// Timestamp of the last evolution trigger (from any source: prediction engine or silence breaker).
     last_evolution_trigger: Option<chrono::DateTime<Utc>>,
@@ -67,15 +75,41 @@ struct LiveAgent {
     active_runs: Arc<tokio::sync::Semaphore>,
 }
 
+/// Parse the `cron_timezone` field, logging a warning once when an IANA name
+/// is present but invalid. Empty strings are the normal "use UTC" default
+/// and are silent.
+fn resolve_cron_tz(agent_id: &str, tz_name: &str) -> Option<chrono_tz::Tz> {
+    let trimmed = tz_name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match duduclaw_core::parse_timezone(trimmed) {
+        Some(tz) => Some(tz),
+        None => {
+            warn!(
+                agent = agent_id,
+                cron_timezone = trimmed,
+                "Unknown cron_timezone — falling back to UTC. Use an IANA name like \"Asia/Taipei\"."
+            );
+            None
+        }
+    }
+}
+
 impl LiveAgent {
     fn from_loaded(agent: &LoadedAgent) -> Self {
         let schedule = parse_cron(&agent.config.heartbeat.cron);
         let max = agent.config.heartbeat.max_concurrent_runs.max(1);
+        let cron_tz = resolve_cron_tz(
+            &agent.config.agent.name,
+            &agent.config.heartbeat.cron_timezone,
+        );
         Self {
             agent_id: agent.config.agent.name.clone(),
             config: agent.config.heartbeat.clone(),
             max_silence_hours: agent.config.evolution.max_silence_hours,
             schedule,
+            cron_tz,
             last_run: None,
             last_evolution_trigger: Some(Utc::now()), // prevent cold-start immediate trigger
             total_runs: 0,
@@ -83,7 +117,10 @@ impl LiveAgent {
         }
     }
 
-    /// Determine whether this agent should fire now.
+    /// Determine whether this agent should fire now. When `cron_timezone`
+    /// is set on the config, the cron expression is evaluated in that
+    /// timezone's wall clock — so `"0 9 * * *"` with `cron_timezone =
+    /// "Asia/Taipei"` fires at 09:00 Taipei every day, not 09:00 UTC.
     fn should_fire(&self, now: chrono::DateTime<Utc>) -> bool {
         if !self.config.enabled {
             return false;
@@ -91,13 +128,9 @@ impl LiveAgent {
 
         // Cron takes precedence if present
         if let Some(sched) = &self.schedule {
-            return match self.last_run {
-                Some(last) => sched.after(&last).next().is_some_and(|next| next <= now),
-                None => sched
-                    .after(&(now - chrono::Duration::hours(1)))
-                    .next()
-                    .is_some_and(|next| next <= now),
-            };
+            return duduclaw_core::should_fire_in_tz(
+                sched, self.last_run, now, self.cron_tz,
+            );
         }
 
         // Fallback: fixed interval
@@ -114,10 +147,18 @@ impl LiveAgent {
     }
 
     /// Compute the next expected fire time (for monitoring display).
+    /// Returned as a UTC instant regardless of `cron_timezone` — callers
+    /// format it for display.
     fn next_fire(&self) -> Option<chrono::DateTime<Utc>> {
         let anchor = self.last_run.unwrap_or_else(Utc::now);
         if let Some(sched) = &self.schedule {
-            return sched.after(&anchor).next();
+            return match self.cron_tz {
+                Some(tz) => sched
+                    .after(&anchor.with_timezone(&tz))
+                    .next()
+                    .map(|dt| dt.with_timezone(&Utc)),
+                None => sched.after(&anchor).next(),
+            };
         }
         Some(anchor + chrono::Duration::seconds(self.config.interval_seconds as i64))
     }
@@ -179,6 +220,10 @@ impl HeartbeatScheduler {
                 existing.config = la.config.heartbeat.clone();
                 existing.max_silence_hours = la.config.evolution.max_silence_hours;
                 existing.schedule = parse_cron(&la.config.heartbeat.cron);
+                existing.cron_tz = resolve_cron_tz(
+                    &la.config.agent.name,
+                    &la.config.heartbeat.cron_timezone,
+                );
             } else {
                 agents.insert(la.config.agent.name.clone(), LiveAgent::from_loaded(la));
             }
@@ -201,6 +246,7 @@ impl HeartbeatScheduler {
                 enabled: a.config.enabled,
                 interval_seconds: a.config.interval_seconds,
                 cron: a.config.cron.clone(),
+                cron_timezone: a.config.cron_timezone.clone(),
                 last_run: a.last_run.map(|t| t.to_rfc3339()),
                 next_run: a.next_fire().map(|t| t.to_rfc3339()),
                 total_runs: a.total_runs,
@@ -600,4 +646,91 @@ pub fn start_heartbeat_scheduler(
         s.run().await;
     });
     scheduler
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn make_live_agent(
+        cron: &str,
+        cron_timezone: &str,
+    ) -> LiveAgent {
+        LiveAgent {
+            agent_id: "test".into(),
+            config: HeartbeatConfig {
+                enabled: true,
+                interval_seconds: 300,
+                max_concurrent_runs: 1,
+                cron: cron.into(),
+                cron_timezone: cron_timezone.into(),
+            },
+            max_silence_hours: 4.0,
+            schedule: parse_cron(cron),
+            cron_tz: resolve_cron_tz("test", cron_timezone),
+            last_run: None,
+            last_evolution_trigger: None,
+            total_runs: 0,
+            active_runs: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+
+    #[test]
+    fn should_fire_respects_cron_timezone() {
+        // "0 9 * * *" in Asia/Taipei = 01:00 UTC.
+        let agent = make_live_agent("0 9 * * *", "Asia/Taipei");
+
+        // 00:59 UTC (08:59 Taipei) → no fire.
+        let before = Utc.with_ymd_and_hms(2026, 4, 22, 0, 59, 0).unwrap();
+        assert!(!agent.should_fire(before));
+
+        // 01:00 UTC (09:00 Taipei) → fire.
+        let at = Utc.with_ymd_and_hms(2026, 4, 22, 1, 0, 0).unwrap();
+        assert!(agent.should_fire(at));
+    }
+
+    #[test]
+    fn should_fire_utc_fallback_when_tz_empty() {
+        // Same cron expression, no timezone → UTC, so 09:00 UTC is the fire time.
+        let agent = make_live_agent("0 9 * * *", "");
+
+        // 01:00 UTC → NOT fire (Taipei 09:00, but we're in UTC mode).
+        let at_tpe = Utc.with_ymd_and_hms(2026, 4, 22, 1, 0, 0).unwrap();
+        assert!(!agent.should_fire(at_tpe));
+
+        // 09:00 UTC → fire.
+        let at_utc = Utc.with_ymd_and_hms(2026, 4, 22, 9, 0, 0).unwrap();
+        assert!(agent.should_fire(at_utc));
+    }
+
+    #[test]
+    fn should_fire_invalid_tz_falls_back_to_utc() {
+        // Unknown IANA name should resolve to None and behave like UTC.
+        let agent = make_live_agent("0 9 * * *", "Mars/Olympus");
+        assert!(agent.cron_tz.is_none());
+
+        let at_tpe = Utc.with_ymd_and_hms(2026, 4, 22, 1, 0, 0).unwrap();
+        assert!(!agent.should_fire(at_tpe));
+        let at_utc = Utc.with_ymd_and_hms(2026, 4, 22, 9, 0, 0).unwrap();
+        assert!(agent.should_fire(at_utc));
+    }
+
+    #[test]
+    fn should_fire_disabled_never_fires() {
+        let mut agent = make_live_agent("* * * * *", "UTC");
+        agent.config.enabled = false;
+        let now = Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
+        assert!(!agent.should_fire(now));
+    }
+
+    #[test]
+    fn next_fire_returns_utc_instant_regardless_of_tz() {
+        // "0 9 * * *" Asia/Taipei → next fire instant should be 01:00 UTC
+        // on the next day when last_run anchors at 01:05 UTC same day.
+        let mut agent = make_live_agent("0 9 * * *", "Asia/Taipei");
+        agent.last_run = Some(Utc.with_ymd_and_hms(2026, 4, 22, 1, 5, 0).unwrap());
+        let next = agent.next_fire().expect("cron is set so next_fire is Some");
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 4, 23, 1, 0, 0).unwrap());
+    }
 }

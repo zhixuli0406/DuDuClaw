@@ -88,13 +88,14 @@ const TOOLS: &[ToolDef] = &[
             Prefer this over Claude Code's built-in /schedule slash command, which \
             is session-bound and expires when the session ends.",
         params: &[
-            ParamDef { name: "cron", description: "Cron expression (5 fields '* * * * *' minute-precision, or 6 fields with seconds). EVALUATED IN UTC — for Asia/Taipei (UTC+8), '0 1 * * *' fires at local 09:00.", required: true },
+            ParamDef { name: "cron", description: "Cron expression (5 fields '* * * * *' minute-precision, or 6 fields with seconds). Evaluated in `cron_timezone` when set, otherwise UTC. For Asia/Taipei (UTC+8), '0 9 * * *' with cron_timezone='Asia/Taipei' fires at 09:00 Taipei time daily.", required: true },
             ParamDef { name: "task", description: "Task prompt / description sent to the target agent when the cron fires. Write it as an instruction the agent will follow (e.g., 'Run daily competitive research and post findings to @Agnes').", required: true },
             ParamDef { name: "name", description: "Human-readable task name for listing / pausing / deleting later (e.g., 'xianwen-pm-daily-research').", required: true },
             ParamDef { name: "agent_id", description: "Target agent that will execute the task (e.g. 'xianwen-pm', 'duduclaw-tl'). Defaults to 'default' if omitted — explicit is strongly recommended.", required: false },
             ParamDef { name: "notify_channel", description: "Optional: channel type to auto-deliver the task result to ('discord', 'telegram', 'line', 'slack', 'whatsapp', 'feishu', 'webchat'). When set with notify_chat_id, the response is sent to that channel after a successful run.", required: false },
             ParamDef { name: "notify_chat_id", description: "Optional: chat / channel / room ID on the notify platform. Required when notify_channel is set.", required: false },
             ParamDef { name: "notify_thread_id", description: "Optional: Discord thread ID. Only used when notify_channel='discord' and the result should land in a specific thread.", required: false },
+            ParamDef { name: "cron_timezone", description: "Optional: IANA timezone name for interpreting the cron expression (e.g. 'Asia/Taipei', 'America/New_York'). Omit or leave empty to evaluate in UTC (legacy behaviour pre-v1.8.23).", required: false },
         ],
     },
     ToolDef {
@@ -1746,6 +1747,12 @@ async fn handle_schedule_task(params: &Value, home_dir: &Path) -> Value {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    let cron_timezone = params
+        .get("cron_timezone")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
 
     // If one of notify_channel / notify_chat_id is set, the other must also
     // be set — a partial target would silently fail at delivery time.
@@ -1754,6 +1761,20 @@ async fn handle_schedule_task(params: &Value, home_dir: &Path) -> Value {
             "content": [{"type": "text", "text": "Error: notify_channel and notify_chat_id must be set together"}],
             "isError": true
         });
+    }
+
+    // Validate cron_timezone against the IANA database at call time so a
+    // typo is reported to the scheduler caller instead of silently falling
+    // back to UTC at firing time.
+    if let Some(ref tz_name) = cron_timezone {
+        if duduclaw_core::parse_timezone(tz_name).is_none() {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!(
+                    "Error: unknown cron_timezone '{tz_name}'. Use an IANA name like 'Asia/Taipei' or 'America/New_York'."
+                )}],
+                "isError": true
+            });
+        }
     }
 
     let task_id = uuid::Uuid::new_v4().to_string();
@@ -1767,6 +1788,7 @@ async fn handle_schedule_task(params: &Value, home_dir: &Path) -> Value {
     row.notify_channel = notify_channel;
     row.notify_chat_id = notify_chat_id;
     row.notify_thread_id = notify_thread_id;
+    row.cron_timezone = cron_timezone;
 
     match store.insert(&row).await {
         Ok(()) => serde_json::json!({

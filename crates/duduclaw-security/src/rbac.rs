@@ -190,6 +190,7 @@ mod tests {
                 interval_seconds: 60,
                 max_concurrent_runs: 1,
                 cron: "".to_string(),
+                cron_timezone: "".to_string(),
             },
             budget: BudgetConfig {
                 monthly_limit_cents: 1000,

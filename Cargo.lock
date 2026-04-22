@@ -2420,6 +2420,8 @@ version = "1.8.22"
 dependencies = [
  "async-trait",
  "chrono",
+ "chrono-tz",
+ "cron",
  "libc",
  "serde",
  "serde_json",
@@ -2463,6 +2465,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
+ "chrono-tz",
  "cron",
  "duduclaw-agent",
  "duduclaw-auth",

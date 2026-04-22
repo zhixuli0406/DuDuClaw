@@ -2946,6 +2946,7 @@ impl MethodHandler {
             "notify_channel": row.notify_channel,
             "notify_chat_id": row.notify_chat_id,
             "notify_thread_id": row.notify_thread_id,
+            "cron_timezone": row.cron_timezone,
         })
     }
 
@@ -3036,6 +3037,25 @@ impl MethodHandler {
             );
         }
 
+        // Optional cron_timezone — validated against the IANA database so
+        // typos surface at the dashboard instead of at firing time.
+        let cron_timezone = params
+            .get("cron_timezone")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        if let Some(ref tz_name) = cron_timezone {
+            if duduclaw_core::parse_timezone(tz_name).is_none() {
+                return WsFrame::error_response(
+                    "",
+                    &format!(
+                        "Unknown cron_timezone '{tz_name}'. Use an IANA name like 'Asia/Taipei'."
+                    ),
+                );
+            }
+        }
+
         let mut row = CronTaskRow::new(
             uuid::Uuid::new_v4().to_string(),
             name.clone(),
@@ -3046,6 +3066,7 @@ impl MethodHandler {
         row.notify_channel = notify_channel;
         row.notify_chat_id = notify_chat_id;
         row.notify_thread_id = notify_thread_id;
+        row.cron_timezone = cron_timezone;
         if let Err(e) = store.insert(&row).await {
             return WsFrame::error_response("", &format!("insert: {e}"));
         }
@@ -3147,6 +3168,31 @@ impl MethodHandler {
                 .await
             {
                 return WsFrame::error_response("", &format!("update_notify: {e}"));
+            }
+        }
+
+        // Optional cron_timezone update — empty string clears it.
+        if params.get("cron_timezone").is_some() {
+            let tz_input = params
+                .get("cron_timezone")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            let tz_to_store: Option<&str> = if tz_input.is_empty() {
+                None
+            } else {
+                if duduclaw_core::parse_timezone(tz_input).is_none() {
+                    return WsFrame::error_response(
+                        "",
+                        &format!(
+                            "Unknown cron_timezone '{tz_input}'. Use an IANA name like 'Asia/Taipei'."
+                        ),
+                    );
+                }
+                Some(tz_input)
+            };
+            if let Err(e) = store.update_cron_timezone(&id, tz_to_store).await {
+                return WsFrame::error_response("", &format!("update_cron_timezone: {e}"));
             }
         }
 

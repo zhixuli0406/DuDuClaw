@@ -35,9 +35,12 @@ network_access = false
 enabled = false
 interval_seconds = 3600
 max_concurrent_runs = 1
-# `cron` is evaluated in UTC (empty string falls back to interval_seconds).
-# Asia/Taipei (UTC+8): "0 1 * * *" fires at local 09:00 daily.
+# `cron` is evaluated in `cron_timezone` when set, otherwise UTC.
+# Empty cron falls back to interval_seconds.
 cron = ""
+# IANA timezone for `cron`. Empty = UTC (legacy behaviour pre-v1.8.23).
+# Example: cron_timezone = "Asia/Taipei"  →  cron "0 9 * * *" fires at 09:00 Taipei.
+cron_timezone = ""
 
 [budget]
 monthly_limit_cents = 3000

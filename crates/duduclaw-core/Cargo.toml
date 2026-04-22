@@ -10,6 +10,8 @@ toml = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
+cron = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

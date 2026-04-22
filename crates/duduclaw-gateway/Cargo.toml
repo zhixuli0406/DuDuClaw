@@ -12,6 +12,7 @@ duduclaw-security = { workspace = true }
 duduclaw-container = { workspace = true }
 duduclaw-odoo = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 cron = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }

@@ -71,6 +71,7 @@ base64 = "0.22"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 cron = "0.15"
 
 # UUID
