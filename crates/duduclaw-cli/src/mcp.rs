@@ -771,6 +771,11 @@ const TOOLS: &[ToolDef] = &[
         params: &[],
     },
     ToolDef {
+        name: "shared_wiki_lint",
+        description: "Audit shared wiki pages for Karpathy-schema compliance. Reports: missing required frontmatter fields (title/created/updated/tags/layer/trust), fallback-content markers, orphan pages, broken links, stale pages.",
+        params: &[],
+    },
+    ToolDef {
         name: "wiki_share",
         description: "Share a page from your wiki to the shared wiki. Creates a source-attributed copy in shared/wiki/sources/.",
         params: &[
@@ -5439,6 +5444,7 @@ async fn handle_tools_call(
         "shared_wiki_search" => handle_shared_wiki_search(&arguments, home_dir).await,
         "shared_wiki_delete" => handle_shared_wiki_delete(&arguments, home_dir, default_agent).await,
         "shared_wiki_stats" => handle_shared_wiki_stats(home_dir).await,
+        "shared_wiki_lint" => handle_shared_wiki_lint(home_dir).await,
         "wiki_share" => handle_wiki_share(&arguments, home_dir, default_agent).await,
         // Skill Internalization tools
         "skill_extract" => handle_skill_extract(&arguments, home_dir, default_agent).await,
@@ -5921,6 +5927,89 @@ fn ensure_wiki_dir(wiki_dir: &Path) -> std::result::Result<(), String> {
             .map_err(|e| format!("Failed to write _log.md: {e}"))?;
     }
 
+    Ok(())
+}
+
+/// Required frontmatter fields for Karpathy-style LLM wiki pages.
+const WIKI_REQUIRED_FIELDS: &[&str] = &["title", "created", "updated", "tags", "layer", "trust"];
+
+/// Regex-free fallback phrases that indicate a page was authored from a stale
+/// LLM prior (e.g. web_search tool failure) rather than live evidence. These
+/// are noise in the shared wiki per project rule:
+///   「有 fallback 的資料不應該混入共用 wiki 中產生雜訊」
+const WIKI_FALLBACK_MARKERS: &[&str] = &[
+    "無法取得",
+    "web_search 失敗",
+    "web_search failed",
+    "no results found",
+    "基於訓練資料",
+    "基於我的訓練資料",
+    "based on training data",
+    "based on my training data",
+    "fallback 資料",
+    "fallback mode",
+    "查無結果",
+    "搜尋工具失效",
+    "cannot fetch",
+    "unable to fetch",
+];
+
+/// Scan body for fallback markers. Returns the matched marker, if any.
+/// Lowercase comparison for ASCII markers; direct substring for CJK.
+fn detect_fallback_content(body: &str) -> Option<&'static str> {
+    let lower = body.to_lowercase();
+    for marker in WIKI_FALLBACK_MARKERS {
+        let marker_lower = marker.to_lowercase();
+        if lower.contains(&marker_lower) {
+            return Some(marker);
+        }
+    }
+    None
+}
+
+/// Validate Karpathy-style frontmatter. Returns a list of missing fields.
+/// Caller decides whether missing fields are fatal (shared wiki) or warn-only.
+fn validate_wiki_frontmatter(content: &str) -> std::result::Result<(), String> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return Err(
+            "Missing YAML frontmatter. Every page must start with `---` and declare: \
+             title, created, updated, tags, layer, trust."
+                .to_string(),
+        );
+    }
+    let rest = &trimmed[3..];
+    let end = match rest.find("\n---") {
+        Some(e) => e,
+        None => return Err("Frontmatter is not closed with a trailing `---`.".to_string()),
+    };
+    let fm = &rest[..end];
+
+    let mut missing: Vec<&str> = Vec::new();
+    for field in WIKI_REQUIRED_FIELDS {
+        let prefix = format!("{}:", field);
+        let found = fm.lines().any(|line| line.trim_start().starts_with(&prefix));
+        if !found {
+            missing.push(field);
+        }
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "Frontmatter missing required field(s): {}. \
+             See _schema.md; the Karpathy wiki schema requires all of: {}.",
+            missing.join(", "),
+            WIKI_REQUIRED_FIELDS.join(", ")
+        ));
+    }
+
+    // Trust must parse as a number in [0.0, 1.0]
+    if let Some(raw) = extract_frontmatter_field(content, "trust") {
+        match raw.parse::<f32>() {
+            Ok(t) if (0.0..=1.0).contains(&t) => {}
+            Ok(t) => return Err(format!("Frontmatter `trust` must be in [0.0, 1.0], got {t}")),
+            Err(_) => return Err(format!("Frontmatter `trust` must be a number, got `{raw}`")),
+        }
+    }
     Ok(())
 }
 
@@ -6695,6 +6784,32 @@ async fn handle_shared_wiki_write(args: &Value, home_dir: &Path, caller_agent: &
         return tool_error(&format!("Content contains sensitive data ({label}). Remove it before writing to shared wiki."));
     }
 
+    // Karpathy-schema frontmatter guard (shared wiki is strict — violations reject).
+    if let Err(e) = validate_wiki_frontmatter(content) {
+        return tool_error(&format!("Shared wiki schema check failed: {e}"));
+    }
+
+    // Fallback-content guard: shared wiki refuses pages authored from stale
+    // LLM priors (e.g. web_search failure). Callers that must preserve such a
+    // record can write it to their own agent wiki with a low trust score, but
+    // the shared wiki stays clean per design: "有 fallback 的資料不應該混入共
+    // 用 wiki 中產生雜訊".
+    let body = extract_frontmatter_body(content);
+    if let Some(marker) = detect_fallback_content(&body) {
+        // Allow explicit opt-in via `fallback-mode` tag so a human can
+        // deliberately archive a fallback record (e.g. for post-mortem).
+        let tags = extract_frontmatter_field(content, "tags").unwrap_or_default();
+        let opt_in = tags.to_lowercase().contains("fallback-mode");
+        if !opt_in {
+            return tool_error(&format!(
+                "Fallback content detected (marker: '{marker}'). Refusing to \
+                 write to shared wiki. If this record is intentional, add the \
+                 `fallback-mode` tag to frontmatter and set `trust: 0.2` or \
+                 lower. Otherwise, re-run the source fetch before writing."
+            ));
+        }
+    }
+
     let wiki_dir = resolve_shared_wiki_dir(home_dir);
     if let Err(e) = ensure_shared_wiki_dir(&wiki_dir) {
         return tool_error(&e);
@@ -6846,6 +6961,109 @@ async fn handle_shared_wiki_stats(home_dir: &Path) -> Value {
     dirs.sort_by(|a, b| b.1.cmp(&a.1));
     for (dir, count) in &dirs {
         output.push_str(&format!("  {} — {} pages\n", dir, count));
+    }
+
+    tool_text(&output)
+}
+
+/// Audit shared wiki for Karpathy-schema compliance: missing frontmatter
+/// fields, fallback-content markers, orphan pages, broken links, stale pages.
+async fn handle_shared_wiki_lint(home_dir: &Path) -> Value {
+    let wiki_dir = resolve_shared_wiki_dir(home_dir);
+    if !wiki_dir.exists() {
+        return tool_text("No shared wiki found.");
+    }
+
+    let pages = collect_md_files(&wiki_dir, &wiki_dir);
+    if pages.is_empty() {
+        return tool_text("Shared wiki exists but has no pages.");
+    }
+
+    // Schema compliance + fallback scan
+    let mut schema_violations: Vec<(String, String)> = Vec::new();
+    let mut fallback_pages: Vec<(String, &'static str)> = Vec::new();
+    for rel_path in &pages {
+        let full_path = wiki_dir.join(rel_path);
+        let content = std::fs::read_to_string(&full_path).unwrap_or_default();
+        let rel_str = rel_path.to_string_lossy().to_string();
+
+        if let Err(e) = validate_wiki_frontmatter(&content) {
+            schema_violations.push((rel_str.clone(), e));
+        }
+
+        let body = extract_frontmatter_body(&content);
+        if let Some(marker) = detect_fallback_content(&body) {
+            let tags = extract_frontmatter_field(&content, "tags").unwrap_or_default();
+            if !tags.to_lowercase().contains("fallback-mode") {
+                fallback_pages.push((rel_str, marker));
+            }
+        }
+    }
+
+    // Delegate graph-level checks to WikiStore::lint
+    let store = duduclaw_memory::WikiStore::new_shared(home_dir);
+    let graph = store.lint().ok();
+
+    let mut output = format!("Shared Wiki Lint Report\n\nTotal pages: {}\n", pages.len());
+    if let Some(ref r) = graph {
+        output.push_str(&format!("Index entries: {}\n", r.index_entries));
+    }
+    output.push('\n');
+
+    let clean = schema_violations.is_empty()
+        && fallback_pages.is_empty()
+        && graph.as_ref().is_none_or(|r| {
+            r.orphan_pages.is_empty() && r.broken_links.is_empty() && r.stale_pages.is_empty()
+        });
+
+    if clean {
+        output.push_str("All clear — shared wiki is Karpathy-schema compliant.\n");
+        return tool_text(&output);
+    }
+
+    if !schema_violations.is_empty() {
+        output.push_str(&format!(
+            "Schema violations ({}):\n",
+            schema_violations.len()
+        ));
+        for (path, err) in &schema_violations {
+            output.push_str(&format!("  - {}: {}\n", path, err));
+        }
+        output.push('\n');
+    }
+
+    if !fallback_pages.is_empty() {
+        output.push_str(&format!(
+            "Fallback-content pages ({}) — likely authored without live evidence:\n",
+            fallback_pages.len()
+        ));
+        for (path, marker) in &fallback_pages {
+            output.push_str(&format!("  - {} (marker: '{}')\n", path, marker));
+        }
+        output.push_str("  → Remove, re-run source fetch, or add `fallback-mode` tag + `trust: 0.2` to opt in.\n\n");
+    }
+
+    if let Some(r) = graph {
+        if !r.orphan_pages.is_empty() {
+            output.push_str(&format!("Orphan pages ({}) — not in _index.md:\n", r.orphan_pages.len()));
+            for p in &r.orphan_pages {
+                output.push_str(&format!("  - {}\n", p));
+            }
+            output.push('\n');
+        }
+        if !r.broken_links.is_empty() {
+            output.push_str(&format!("Broken links ({}):\n", r.broken_links.len()));
+            for (from, to) in &r.broken_links {
+                output.push_str(&format!("  - {} -> {} (not found)\n", from, to));
+            }
+            output.push('\n');
+        }
+        if !r.stale_pages.is_empty() {
+            output.push_str(&format!("Stale pages (>30 days) ({}):\n", r.stale_pages.len()));
+            for p in &r.stale_pages {
+                output.push_str(&format!("  - {}\n", p));
+            }
+        }
     }
 
     tool_text(&output)
@@ -8000,5 +8218,237 @@ mod agent_identity_tests {
 
         let result = get_default_agent(tmp.path()).await;
         assert_eq!(result, "dudu", "final fallback must be 'dudu'");
+    }
+}
+
+#[cfg(test)]
+mod wiki_schema_tests {
+    //! Karpathy-schema frontmatter guard + fallback-content rejection
+    //! (v1.8.26 shared wiki hygiene).
+    use super::*;
+    use std::fs;
+
+    /// Minimal TempDir — sibling modules can't share `tests::TempDir`.
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let p = std::env::temp_dir()
+                .join(format!("duduclaw-wiki-schema-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &std::path::Path { &self.0 }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_agent_toml(agents_dir: &std::path::Path, name: &str) {
+        let dir = agents_dir.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        // Minimal agent.toml — handle_shared_wiki_write doesn't parse it,
+        // but other helpers invoked during the call might read [agent].role.
+        fs::write(
+            dir.join("agent.toml"),
+            format!("[agent]\nname = \"{name}\"\nrole = \"main\"\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn frontmatter_validator_accepts_full_schema() {
+        let content = "---\n\
+                       title: Test Page\n\
+                       created: 2026-04-22T10:00:00Z\n\
+                       updated: 2026-04-22T10:00:00Z\n\
+                       tags: [a, b]\n\
+                       layer: context\n\
+                       trust: 0.7\n\
+                       ---\n\
+                       body\n";
+        assert!(validate_wiki_frontmatter(content).is_ok());
+    }
+
+    #[test]
+    fn frontmatter_validator_rejects_missing_frontmatter() {
+        let err = validate_wiki_frontmatter("# body only\n").unwrap_err();
+        assert!(err.contains("Missing YAML frontmatter"), "got: {}", err);
+    }
+
+    #[test]
+    fn frontmatter_validator_rejects_missing_required_fields() {
+        // Missing tags, layer, trust
+        let content = "---\n\
+                       title: T\n\
+                       created: 2026-04-22T00:00:00Z\n\
+                       updated: 2026-04-22T00:00:00Z\n\
+                       ---\n\
+                       body\n";
+        let err = validate_wiki_frontmatter(content).unwrap_err();
+        assert!(err.contains("tags"), "err should mention tags: {}", err);
+        assert!(err.contains("layer"), "err should mention layer: {}", err);
+        assert!(err.contains("trust"), "err should mention trust: {}", err);
+    }
+
+    #[test]
+    fn frontmatter_validator_rejects_out_of_range_trust() {
+        let content = "---\n\
+                       title: T\n\
+                       created: 2026-04-22T00:00:00Z\n\
+                       updated: 2026-04-22T00:00:00Z\n\
+                       tags: []\n\
+                       layer: context\n\
+                       trust: 1.5\n\
+                       ---\n";
+        let err = validate_wiki_frontmatter(content).unwrap_err();
+        assert!(err.contains("0.0") || err.contains("[0.0, 1.0]"), "got: {}", err);
+    }
+
+    #[test]
+    fn frontmatter_validator_rejects_non_numeric_trust() {
+        let content = "---\n\
+                       title: T\n\
+                       created: 2026-04-22T00:00:00Z\n\
+                       updated: 2026-04-22T00:00:00Z\n\
+                       tags: []\n\
+                       layer: context\n\
+                       trust: high\n\
+                       ---\n";
+        let err = validate_wiki_frontmatter(content).unwrap_err();
+        assert!(err.contains("trust"), "got: {}", err);
+    }
+
+    #[test]
+    fn detect_fallback_catches_cjk_marker() {
+        let body = "本報告基於訓練資料推測，web_search 工具回傳空結果。";
+        assert!(detect_fallback_content(body).is_some());
+    }
+
+    #[test]
+    fn detect_fallback_catches_english_marker() {
+        let body = "Unable to fetch live data; based on training data up to 2024.";
+        assert!(detect_fallback_content(body).is_some());
+    }
+
+    #[test]
+    fn detect_fallback_ignores_clean_body() {
+        let body = "TEMPO framework alternates policy refinement and critic recalibration.";
+        assert!(detect_fallback_content(body).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_wiki_write_rejects_fallback_content() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml(&agents_dir, "agnes");
+
+        let args = serde_json::json!({
+            "page_path": "research/bad.md",
+            "content": "---\n\
+                        title: Bad Page\n\
+                        created: 2026-04-22T00:00:00Z\n\
+                        updated: 2026-04-22T00:00:00Z\n\
+                        tags: [research]\n\
+                        layer: context\n\
+                        trust: 0.5\n\
+                        ---\n\
+                        查無結果，基於訓練資料整理。\n",
+        });
+
+        let result = handle_shared_wiki_write(&args, tmp.path(), "agnes").await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("Fallback content detected"),
+            "expected fallback rejection, got: {}",
+            text
+        );
+        assert!(
+            result["isError"].as_bool().unwrap_or(false),
+            "should be isError=true"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_wiki_write_rejects_missing_frontmatter() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml(&agents_dir, "agnes");
+
+        let args = serde_json::json!({
+            "page_path": "research/plain.md",
+            "content": "# Just a title\n\nbody without frontmatter\n",
+        });
+
+        let result = handle_shared_wiki_write(&args, tmp.path(), "agnes").await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("schema check failed") && text.contains("Missing YAML frontmatter"),
+            "got: {}",
+            text
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_wiki_write_allows_fallback_mode_opt_in() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml(&agents_dir, "agnes");
+
+        let args = serde_json::json!({
+            "page_path": "research/postmortem.md",
+            "content": "---\n\
+                        title: Postmortem\n\
+                        created: 2026-04-22T00:00:00Z\n\
+                        updated: 2026-04-22T00:00:00Z\n\
+                        tags: [fallback-mode, postmortem]\n\
+                        layer: context\n\
+                        trust: 0.2\n\
+                        ---\n\
+                        web_search failed repeatedly; archiving this record.\n",
+        });
+
+        let result = handle_shared_wiki_write(&args, tmp.path(), "agnes").await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        // Opt-in path should bypass the fallback rejection entirely.
+        assert!(
+            !text.contains("Fallback content detected"),
+            "opt-in should not trigger rejection, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_wiki_write_accepts_clean_karpathy_page() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml(&agents_dir, "agnes");
+
+        let args = serde_json::json!({
+            "page_path": "entities/tempo-framework.md",
+            "content": "---\n\
+                        title: TEMPO Framework\n\
+                        created: 2026-04-22T00:00:00Z\n\
+                        updated: 2026-04-22T00:00:00Z\n\
+                        tags: [reasoning, test-time-training]\n\
+                        layer: context\n\
+                        trust: 0.6\n\
+                        ---\n\
+                        TEMPO alternates policy refinement with critic recalibration.\n",
+        });
+
+        let result = handle_shared_wiki_write(&args, tmp.path(), "agnes").await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("Written shared wiki page"),
+            "clean page should succeed, got: {}",
+            text
+        );
+        assert!(!result["isError"].as_bool().unwrap_or(false));
     }
 }
