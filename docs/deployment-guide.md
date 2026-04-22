@@ -179,6 +179,8 @@ server {
 
 ## 6. Docker Compose
 
+> **→ 詳細版：** [docs/guides/docker.md](./guides/docker.md) — 包含三大 CLI 認證設定、port 詳解、volume 備份、watchtower、疑難排解。
+
 ```bash
 cd /path/to/DuDuClaw
 docker compose up -d
