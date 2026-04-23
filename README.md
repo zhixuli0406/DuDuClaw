@@ -6,9 +6,20 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.8.14-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.8.27-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
+
+---
+
+> 🎉 **v1.8.27 — Multica Agent 整合層上線** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.8.27))
+>
+> - 12 個新 MCP 工具讓 agent 成為任務看板的一等公民（`tasks_*`、`activity_*`、`autopilot_list`、`shared_skill_*`）
+> - Agent 每次對話自動看到待辦任務佇列，system prompt 雙-block cache 保護前綴
+> - Autopilot 觸發引擎 + 三態熔斷器（Closed / Open / HalfOpen）防止規則自循環
+> - `events.db` SQLite 事件匯流排取代 `events.jsonl`，消除檔案匯流排所有已知 hazards
+> - 任務看板修正為永遠渲染四欄 Kanban，Dashboard 新增迷你任務預覽小部件
+> - 47 個新單元測試（條件求值、熔斷器狀態轉換、規則 schema 驗證、事件匯流排）
 
 ---
 
