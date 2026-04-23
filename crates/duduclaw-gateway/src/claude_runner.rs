@@ -3,11 +3,26 @@
 //! Used by both the cron scheduler and the agent dispatcher.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use duduclaw_agent::registry::AgentRegistry;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+/// Shared `Arc<TaskStore>` injected by `server.rs` at startup so
+/// `build_pending_tasks_section` reuses the gateway-owned connection
+/// instead of opening a fresh SQLite connection per agent invocation.
+///
+/// The fallback path (open-per-call) is kept for tests and for graceful
+/// degradation if the store injection somehow fails to run.
+static SHARED_TASK_STORE: OnceLock<Arc<crate::task_store::TaskStore>> = OnceLock::new();
+
+/// Register the shared `TaskStore` for use by `build_pending_tasks_section`.
+/// Idempotent — only the first call takes effect. Called once from `server.rs`
+/// after the store is opened.
+pub fn set_shared_task_store(store: Arc<crate::task_store::TaskStore>) {
+    let _ = SHARED_TASK_STORE.set(store);
+}
 
 /// Build a system prompt from an agent's loaded markdown files.
 ///
@@ -56,6 +71,90 @@ fn build_system_prompt(agent: &duduclaw_agent::LoadedAgent) -> String {
     }
 
     parts.join("\n\n---\n\n")
+}
+
+/// Build a concise "## Your Task Queue" section from the Task Board.
+///
+/// Pulls up to 5 open tasks (in_progress → todo → blocked, ordered by
+/// priority urgent→low) assigned to `agent_id` and renders a bullet list
+/// plus a reminder of the MCP tools available for task management.
+///
+/// Returns `None` when the agent has no pending tasks — callers should
+/// skip appending the section in that case to keep the prompt tight.
+async fn build_pending_tasks_section(home_dir: &Path, agent_id: &str) -> Option<String> {
+    // Prefer the shared store (one SQLite connection for the whole
+    // gateway process — avoids WAL write-lock contention on high-volume
+    // channel replies). Fall back to per-call open only when the
+    // injection hasn't run yet (tests, or a race at startup).
+    let shared = SHARED_TASK_STORE.get().cloned();
+    let fallback_store;
+    let store: &crate::task_store::TaskStore = match shared.as_deref() {
+        Some(s) => s,
+        None => {
+            fallback_store = match crate::task_store::TaskStore::open(home_dir) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %e,
+                        "task queue omitted from system prompt — TaskStore open failed"
+                    );
+                    return None;
+                }
+            };
+            &fallback_store
+        }
+    };
+
+    let mut all: Vec<crate::task_store::TaskRow> = Vec::new();
+    for status in &["in_progress", "todo", "blocked"] {
+        if let Ok(mut rows) = store.list_tasks(Some(status), Some(agent_id), None).await {
+            all.append(&mut rows);
+        }
+    }
+    if all.is_empty() {
+        return None;
+    }
+
+    let priority_rank = |p: &str| match p {
+        "urgent" => 0,
+        "high" => 1,
+        "medium" => 2,
+        "low" => 3,
+        _ => 4,
+    };
+    all.sort_by(|a, b| priority_rank(&a.priority).cmp(&priority_rank(&b.priority)));
+
+    let total = all.len();
+    let shown: Vec<String> = all
+        .iter()
+        .take(5)
+        .enumerate()
+        .map(|(i, t)| {
+            let extra = match t.status.as_str() {
+                "blocked" => t
+                    .blocked_reason
+                    .as_deref()
+                    .map(|r| format!(" — blocked: {r}"))
+                    .unwrap_or_default(),
+                "in_progress" => " [in progress]".to_string(),
+                _ => String::new(),
+            };
+            format!("{}. [{}] {}{}", i + 1, t.priority, t.title, extra)
+        })
+        .collect();
+    let more = if total > 5 {
+        format!("\n+{} more — call tasks_list to see all", total - 5)
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "## Your Task Queue ({total} pending)\n{}{}\n\n\
+         Use `tasks_list`, `tasks_claim`, `tasks_update`, `tasks_complete`, `tasks_block` \
+         to manage these, and `activity_post` to report progress without changing status.",
+        shown.join("\n"),
+        more,
+    ))
 }
 
 /// Resolve the effective working directory for a Claude CLI subprocess.
@@ -122,6 +221,16 @@ pub async fn call_claude_for_agent_with_type(
     let capabilities = agent.config.capabilities.clone();
     drop(reg);
 
+    // Pending Task Queue is computed from the Task Board so the agent
+    // opens each turn aware of its queue. Captured SEPARATELY rather than
+    // appended to `system_prompt` because Direct API uses the prompt cache
+    // on the system block — appending dynamic content would invalidate
+    // the entire cached prefix (Soul/Identity/Skills/Contract) every turn.
+    // Direct API path passes this as an uncached secondary system block;
+    // CLI / local inference paths concatenate when composing their prompt
+    // (those paths manage cache opaquely through the upstream SDK).
+    let tasks_suffix = build_pending_tasks_section(home_dir, agent_id).await;
+
     // Install agent-file-guard PreToolUse hook before any spawn.
     // Blocks the sub-agent from using raw Write/Edit to create
     // agent-structure files outside <home>/agents/<name>/.
@@ -138,13 +247,22 @@ pub async fn call_claude_for_agent_with_type(
         }
     }
 
+    // For CLI / local inference paths, tasks suffix is inlined into the
+    // system prompt — those paths don't use our manual `cache_control`,
+    // so an inline append costs nothing cache-wise. For the Direct API
+    // path we instead pass the suffix as a separate uncached block.
+    let system_prompt_inlined: std::borrow::Cow<str> = match &tasks_suffix {
+        Some(s) => std::borrow::Cow::Owned(format!("{system_prompt}\n\n---\n\n{s}")),
+        None => std::borrow::Cow::Borrowed(system_prompt.as_str()),
+    };
+
     // P0 fix: global mode gate BEFORE per-agent routing
     let inference_mode = get_inference_mode(home_dir).await;
     match inference_mode.as_str() {
         "local" => {
             // Force local inference regardless of per-agent prefer_local
             let model_id = local_config.as_ref().map(|c| c.model.as_str());
-            return call_local_inference(home_dir, prompt, &system_prompt, model_id)
+            return call_local_inference(home_dir, prompt, &system_prompt_inlined, model_id)
                 .await
                 .map_err(|e| format!(
                     "Agent '{agent_name}' is in local-only mode but inference failed: {e}. \
@@ -156,7 +274,7 @@ pub async fn call_claude_for_agent_with_type(
             info!(agent = %agent_name, model = %claude_model, "Claude-only mode");
             let wd = effective_work_dir(&agent_dir);
             return call_with_rotation(
-                home_dir, agent_id, prompt, &claude_model, &system_prompt,
+                home_dir, agent_id, prompt, &claude_model, &system_prompt_inlined,
                 request_type, Some(&capabilities), wd.as_deref(),
             ).await;
         }
@@ -196,7 +314,7 @@ pub async fn call_claude_for_agent_with_type(
                 else if local.use_router { "router-driven" }
                 else { "prefer-local" };
             info!(agent = %agent_name, local_model = %local.model, reason, "Trying local offload");
-            match call_local_inference(home_dir, prompt, &system_prompt, Some(&local.model)).await {
+            match call_local_inference(home_dir, prompt, &system_prompt_inlined, Some(&local.model)).await {
                 Ok(response) => {
                     info!(agent = %agent_name, "Query served by local model (cost saved)");
                     return Ok(response);
@@ -220,7 +338,7 @@ pub async fn call_claude_for_agent_with_type(
     if api_mode != "direct" {
         info!(agent = %agent_name, model = %claude_model, "Calling Claude CLI (SDK primary)");
         match call_with_rotation(
-            home_dir, agent_id, prompt, &claude_model, &system_prompt, request_type,
+            home_dir, agent_id, prompt, &claude_model, &system_prompt_inlined, request_type,
             Some(&capabilities), wd.as_deref(),
         ).await {
             Ok(text) => return Ok(text),
@@ -238,9 +356,14 @@ pub async fn call_claude_for_agent_with_type(
     }
 
     // ── ③ Direct API: fallback with API Key (cache-optimized) ────
-    // Only reached when: api_mode="direct", or api_mode="auto" + all OAuth rate-limited
+    // Only reached when: api_mode="direct", or api_mode="auto" + all OAuth rate-limited.
+    // Pass tasks_suffix as a separate uncached block so the static system
+    // prefix stays cacheable.
     info!(agent = %agent_name, model = %claude_model, "Trying Direct API (API Key fallback)");
-    match try_direct_api(home_dir, agent_id, prompt, &claude_model, &system_prompt, request_type).await {
+    match try_direct_api(
+        home_dir, agent_id, prompt, &claude_model, &system_prompt,
+        tasks_suffix.as_deref(), request_type,
+    ).await {
         Ok(text) => Ok(text),
         Err(e) => Err(e),
     }
@@ -282,6 +405,7 @@ async fn try_direct_api(
     prompt: &str,
     model: &str,
     system_prompt: &str,
+    dynamic_system_suffix: Option<&str>,
     request_type: crate::cost_telemetry::RequestType,
 ) -> Result<String, String> {
     let api_key = get_api_key(home_dir).await;
@@ -291,7 +415,9 @@ async fn try_direct_api(
 
     // TODO: pass conversation_history from the caller to enable multi-turn
     // for the Direct API fallback path (currently stateless).
-    let response = crate::direct_api::call_direct_api(&api_key, model, system_prompt, prompt, &[]).await?;
+    let response = crate::direct_api::call_direct_api_with_dynamic(
+        &api_key, model, system_prompt, dynamic_system_suffix, prompt, &[],
+    ).await?;
 
     // Record telemetry
     if let Some(ref usage) = response.usage {

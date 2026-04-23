@@ -291,22 +291,38 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     handler.set_cron_store(cron_store.clone()).await;
 
     // Initialize task board store (SQLite tasks.db + activity feed)
-    match crate::task_store::TaskStore::open(&home_dir) {
-        Ok(ts) => {
-            handler.set_task_store(Arc::new(ts)).await;
-            info!("Task board store initialized");
-        }
-        Err(e) => warn!("Failed to open task store: {e}"),
-    }
+    let task_store_opt: Option<Arc<crate::task_store::TaskStore>> =
+        match crate::task_store::TaskStore::open(&home_dir) {
+            Ok(ts) => {
+                let arc = Arc::new(ts);
+                handler.set_task_store(arc.clone()).await;
+                // Share the same Arc with claude_runner so system-prompt
+                // task injection reuses this connection rather than
+                // opening a new SQLite handle per agent invocation.
+                crate::claude_runner::set_shared_task_store(arc.clone());
+                info!("Task board store initialized");
+                Some(arc)
+            }
+            Err(e) => {
+                warn!("Failed to open task store: {e}");
+                None
+            }
+        };
 
     // Initialize autopilot rule store (SQLite autopilot.db)
-    match crate::autopilot_store::AutopilotStore::open(&home_dir) {
-        Ok(ap) => {
-            handler.set_autopilot_store(Arc::new(ap)).await;
-            info!("Autopilot store initialized");
-        }
-        Err(e) => warn!("Failed to open autopilot store: {e}"),
-    }
+    let autopilot_store_opt: Option<Arc<crate::autopilot_store::AutopilotStore>> =
+        match crate::autopilot_store::AutopilotStore::open(&home_dir) {
+            Ok(ap) => {
+                let arc = Arc::new(ap);
+                handler.set_autopilot_store(arc.clone()).await;
+                info!("Autopilot store initialized");
+                Some(arc)
+            }
+            Err(e) => {
+                warn!("Failed to open autopilot store: {e}");
+                None
+            }
+        };
 
     let (cron_handle, cron_scheduler) = crate::cron_scheduler::start_cron_scheduler(
         home_dir.clone(),
@@ -359,7 +375,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     };
 
-    // Start agent dispatcher (consumes bus_queue.jsonl + SQLite queue, spawns sub-agents)
+    // Start agent dispatcher (consumes bus_queue.jsonl + SQLite queue, spawns sub-agents).
+    // Clone the Arc so AutopilotEngine can share the same MessageQueue (delegate action).
+    let mq_for_autopilot = message_queue.clone();
     bg_handles.push(crate::dispatcher::start_agent_dispatcher_with_crypto(
         home_dir.clone(),
         handler.registry().clone(),
@@ -367,6 +385,54 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         message_queue,
     ));
     info!("Agent dispatcher started ({} background tasks)", bg_handles.len());
+
+    // ── Autopilot trigger engine (Multica-inspired event-driven automation) ──
+    // Subscribes to a typed broadcast bus. Events come from:
+    //   1) WebSocket handlers (in-process, via `set_autopilot_event_tx`)
+    //   2) MCP subprocess (out-of-process) through the SQLite event bus
+    //      at `events.db` — replaces the legacy `events.jsonl` file bus.
+    if let (Some(ap_store), Some(ts)) = (autopilot_store_opt, task_store_opt.clone()) {
+        // Capacity 8192: covers a burst of ~4000 events/hr without
+        // dropping under a slow DB. Beyond this, `RecvError::Lagged`
+        // surfaces in both the error log and the Activity Feed so the
+        // drop isn't silent.
+        let (ap_tx, ap_rx) =
+            tokio::sync::broadcast::channel::<crate::autopilot_engine::AutopilotEvent>(8192);
+        handler.set_autopilot_event_tx(ap_tx.clone()).await;
+
+        // Poll SQLite event bus for events appended by MCP subprocesses.
+        match crate::events_store::EventBusStore::open(&home_dir) {
+            Ok(bus) => {
+                let bus = Arc::new(bus);
+                bg_handles.push(crate::autopilot_engine::spawn_events_db_poll(
+                    bus,
+                    ap_tx.clone(),
+                ));
+                info!("Event bus (events.db) poll task started");
+            }
+            Err(e) => {
+                warn!("events.db open failed: {e} — MCP-originated events will not reach Autopilot");
+            }
+        }
+
+        // One-shot cleanup of legacy file bus. Any in-flight events
+        // during the upgrade window are lost; this is a one-time cost.
+        let _ = tokio::fs::remove_file(home_dir.join("events.jsonl")).await;
+        let _ = tokio::fs::remove_file(home_dir.join("events.jsonl.1")).await;
+
+        // Spawn the engine loop
+        let engine = crate::autopilot_engine::AutopilotEngine::new(
+            home_dir.clone(),
+            ap_store,
+            ts,
+            mq_for_autopilot,
+            ap_rx,
+        );
+        bg_handles.push(tokio::spawn(async move { engine.run().await }));
+        info!("Autopilot trigger engine started");
+    } else {
+        info!("Autopilot engine disabled (missing task or autopilot store)");
+    }
 
     // ── Periodic update check (every 6 hours) — broadcast to dashboard ──
     // Pro edition: auto-download + install + graceful restart (unless disabled).

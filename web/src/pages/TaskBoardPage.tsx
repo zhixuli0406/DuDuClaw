@@ -689,33 +689,32 @@ export function TaskBoardPage() {
         </select>
       </div>
 
-      {/* Kanban Board */}
-      {tasks.length === 0 && !loading ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-          <Clock className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-          <p className="text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'tasks.empty' })}
-          </p>
-        </div>
-      ) : (
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-          {COLUMNS.map(({ status, icon }) => (
-            <KanbanColumn
-              key={status}
-              status={status}
-              icon={icon}
-              tasks={tasksByStatus(status)}
-              agents={agents}
-              onDrop={handleDrop}
-              onRemove={(id) => {
-                const t = tasks.find((task) => task.id === id);
-                if (t) setRemoveTarget(t);
-              }}
-              onSelect={setDetailTarget}
-            />
-          ))}
+      {/* Empty hint bar (only when truly empty and loaded) */}
+      {tasks.length === 0 && !loading && (
+        <div className="flex items-center gap-3 rounded-lg border border-dashed border-stone-300 bg-white px-4 py-3 text-sm text-stone-500 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-400">
+          <Clock className="h-4 w-4 flex-shrink-0" />
+          <span>{intl.formatMessage({ id: 'tasks.empty' })}</span>
         </div>
       )}
+
+      {/* Kanban Board — always 4 columns, matches original Multica design */}
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
+        {COLUMNS.map(({ status, icon }) => (
+          <KanbanColumn
+            key={status}
+            status={status}
+            icon={icon}
+            tasks={tasksByStatus(status)}
+            agents={agents}
+            onDrop={handleDrop}
+            onRemove={(id) => {
+              const t = tasks.find((task) => task.id === id);
+              if (t) setRemoveTarget(t);
+            }}
+            onSelect={setDetailTarget}
+          />
+        ))}
+      </div>
 
       {/* Create Dialog */}
       <CreateTaskDialog

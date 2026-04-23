@@ -13,6 +13,8 @@ import {
 } from '@/lib/api';
 import { WikiGraph } from '@/components/WikiGraph';
 import { ActivityFeed } from '@/components/ActivityFeed';
+import { useTasksStore } from '@/stores/tasks-store';
+import type { TaskStatus } from '@/lib/api';
 import {
   Bot,
   Radio,
@@ -22,6 +24,10 @@ import {
   FileText,
   Clock,
   ExternalLink,
+  KanbanSquare,
+  AlertCircle,
+  CheckCircle2,
+  Ban,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
@@ -55,6 +61,121 @@ function StatCard({
           </p>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── Task Board mini-preview (4-column Kanban summary) ────────
+
+const PREVIEW_COLUMNS: ReadonlyArray<{
+  status: TaskStatus;
+  icon: React.ComponentType<{ className?: string }>;
+  accent: string;
+}> = [
+  { status: 'todo', icon: Clock, accent: 'border-t-stone-400' },
+  { status: 'in_progress', icon: AlertCircle, accent: 'border-t-amber-500' },
+  { status: 'done', icon: CheckCircle2, accent: 'border-t-emerald-500' },
+  { status: 'blocked', icon: Ban, accent: 'border-t-rose-500' },
+];
+
+function TasksPreviewCard() {
+  const intl = useIntl();
+  const tasks = useTasksStore((s) => s.tasks);
+  const loading = useTasksStore((s) => s.loading);
+  const error = useTasksStore((s) => s.error);
+  const fetchTasks = useTasksStore((s) => s.fetchTasks);
+
+  useEffect(() => {
+    fetchTasks();
+  }, [fetchTasks]);
+
+  const byStatus = (status: TaskStatus) =>
+    tasks.filter((t) => t.status === status);
+  const isEmpty = tasks.length === 0;
+  // Distinguish "never loaded yet" from "loaded empty" to avoid
+  // rendering a confusing empty state before the first fetch returns.
+  const notYetLoaded = loading && isEmpty;
+
+  return (
+    <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+      <div className="mb-4 flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <KanbanSquare className="h-5 w-5 text-amber-500" />
+          <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
+            {intl.formatMessage({ id: 'tasks.preview.title' })}
+          </h3>
+        </div>
+        <Link
+          to="/tasks"
+          className="flex items-center gap-1 text-xs text-stone-500 transition-colors hover:text-amber-600 dark:text-stone-400 dark:hover:text-amber-400"
+        >
+          {intl.formatMessage({ id: 'tasks.preview.viewAll' })}
+          <ExternalLink className="h-3 w-3" />
+        </Link>
+      </div>
+
+      {error && !loading && (
+        <div className="mb-3 rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
+          {error}
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        {PREVIEW_COLUMNS.map(({ status, icon: Icon, accent }) => {
+          const colTasks = byStatus(status).slice(0, 3);
+          return (
+            <div
+              key={status}
+              className={cn(
+                'rounded-lg border-t-2 bg-stone-50 p-3 dark:bg-stone-800/40',
+                accent,
+              )}
+            >
+              <div className="mb-2 flex items-center gap-1.5 text-xs font-medium text-stone-600 dark:text-stone-300">
+                <Icon className="h-3.5 w-3.5" />
+                <span>
+                  {intl.formatMessage({ id: `tasks.column.${status}` })}
+                </span>
+                <span className="ml-auto rounded-full bg-stone-200 px-1.5 py-0.5 text-[10px] text-stone-600 dark:bg-stone-700 dark:text-stone-300">
+                  {byStatus(status).length}
+                </span>
+              </div>
+              <div className="space-y-1.5">
+                {notYetLoaded ? (
+                  // Skeleton cards on first paint (no flash of empty state)
+                  <>
+                    <div className="h-6 animate-pulse rounded bg-stone-200 dark:bg-stone-700" />
+                    <div className="h-6 animate-pulse rounded bg-stone-200 dark:bg-stone-700" />
+                  </>
+                ) : (
+                  <>
+                    {colTasks.map((t) => (
+                      <div
+                        key={t.id}
+                        className="truncate rounded border border-stone-200 bg-white px-2 py-1 text-xs text-stone-700 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-300"
+                        title={t.title}
+                      >
+                        {t.title}
+                      </div>
+                    ))}
+                    {colTasks.length === 0 && (
+                      <div className="py-1 text-center text-[10px] text-stone-400 dark:text-stone-600">
+                        —
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {isEmpty && !loading && !error && (
+        <p className="mt-3 text-center text-xs text-stone-400 dark:text-stone-600">
+          {intl.formatMessage({ id: 'tasks.preview.empty' })}
+        </p>
+      )}
     </div>
   );
 }
@@ -291,6 +412,9 @@ export function DashboardPage() {
           </div>
         </div>
       )}
+
+      {/* Task Board Preview (Multica-style team Kanban overview) */}
+      <TasksPreviewCard />
 
       {/* Activity Feed */}
       <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
