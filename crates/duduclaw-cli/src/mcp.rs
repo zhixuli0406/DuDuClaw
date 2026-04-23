@@ -885,6 +885,115 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "query", description: "Search query to find relevant archived messages", required: true },
         ],
     },
+    // ── Task Board tools (Multica-inspired, Agent-as-teammate) ──
+    ToolDef {
+        name: "tasks_list",
+        description: "List tasks from the shared Kanban board. Defaults to tasks assigned to the calling agent. Pass assigned_to='*' for all agents. Use this to see your task queue.",
+        params: &[
+            ParamDef { name: "status", description: "Filter by status: todo / in_progress / done / blocked", required: false },
+            ParamDef { name: "priority", description: "Filter by priority: low / medium / high / urgent", required: false },
+            ParamDef { name: "assigned_to", description: "Filter by agent ID. Defaults to caller. Pass '*' for all agents.", required: false },
+            ParamDef { name: "limit", description: "Max results (default 20, max 100)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "tasks_create",
+        description: "Create a new task on the Kanban board. created_by is automatically set to the calling agent.",
+        params: &[
+            ParamDef { name: "title", description: "Task title (required, <200 chars)", required: true },
+            ParamDef { name: "description", description: "Markdown description", required: false },
+            ParamDef { name: "assigned_to", description: "Agent ID to assign the task to. Defaults to caller.", required: false },
+            ParamDef { name: "priority", description: "low / medium / high / urgent (default: medium)", required: false },
+            ParamDef { name: "tags", description: "Comma-separated tags", required: false },
+            ParamDef { name: "parent_task_id", description: "Parent task ID for sub-tasks", required: false },
+        ],
+    },
+    ToolDef {
+        name: "tasks_update",
+        description: "Update task fields. For common state transitions use tasks_claim / tasks_complete / tasks_block instead.",
+        params: &[
+            ParamDef { name: "task_id", description: "Task ID", required: true },
+            ParamDef { name: "title", description: "New title", required: false },
+            ParamDef { name: "description", description: "New description", required: false },
+            ParamDef { name: "priority", description: "New priority", required: false },
+            ParamDef { name: "tags", description: "New comma-separated tags", required: false },
+        ],
+    },
+    ToolDef {
+        name: "tasks_claim",
+        description: "Claim a task: reassigns it to the calling agent and transitions status to in_progress. Posts a task_assigned activity event.",
+        params: &[
+            ParamDef { name: "task_id", description: "Task ID to claim", required: true },
+        ],
+    },
+    ToolDef {
+        name: "tasks_complete",
+        description: "Mark a task as done and post a task_completed activity event with the optional summary.",
+        params: &[
+            ParamDef { name: "task_id", description: "Task ID", required: true },
+            ParamDef { name: "summary", description: "Optional completion summary (posted to the activity feed)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "tasks_block",
+        description: "Mark a task as blocked with a reason. Posts a task_blocked activity event.",
+        params: &[
+            ParamDef { name: "task_id", description: "Task ID", required: true },
+            ParamDef { name: "reason", description: "Blocker reason (required, shown on the card)", required: true },
+        ],
+    },
+    // ── Activity Feed tools ─────────────────────────────────────
+    ToolDef {
+        name: "activity_post",
+        description: "Post a progress / comment event to the Activity Feed. Use to report intermediate progress without changing task status.",
+        params: &[
+            ParamDef { name: "summary", description: "One-line human-readable summary (required)", required: true },
+            ParamDef { name: "task_id", description: "Optional task ID to link the activity to", required: false },
+            ParamDef { name: "event_type", description: "Event type (progress, comment, info, etc.). Default: agent_comment", required: false },
+            ParamDef { name: "metadata", description: "Optional JSON metadata blob", required: false },
+        ],
+    },
+    ToolDef {
+        name: "activity_list",
+        description: "List recent Activity Feed events. Filterable by agent / task / type.",
+        params: &[
+            ParamDef { name: "task_id", description: "Filter by task ID", required: false },
+            ParamDef { name: "agent_id", description: "Filter by agent ID (default: caller)", required: false },
+            ParamDef { name: "event_type", description: "Filter by event type", required: false },
+            ParamDef { name: "limit", description: "Max results (default 20, max 100)", required: false },
+        ],
+    },
+    // ── Autopilot tools (read-only from agents) ─────────────────
+    ToolDef {
+        name: "autopilot_list",
+        description: "List automation rules (read-only for agents). Rule creation / edit is restricted to the web dashboard.",
+        params: &[
+            ParamDef { name: "enabled_only", description: "Only show enabled rules (default: true)", required: false },
+        ],
+    },
+    // ── Shared Skills tools (cross-agent skill pool) ────────────
+    ToolDef {
+        name: "shared_skill_list",
+        description: "List skills in the team-shared skill pool (~/.duduclaw/shared/skills/). Skills shared by other agents are available for adoption.",
+        params: &[
+            ParamDef { name: "tag", description: "Filter by tag", required: false },
+        ],
+    },
+    ToolDef {
+        name: "shared_skill_share",
+        description: "Share one of your own skills to the team-shared skill pool. Skill must already exist in your agent's SKILLS/ directory.",
+        params: &[
+            ParamDef { name: "skill_name", description: "Skill name (matches SKILLS/<name>.md)", required: true },
+        ],
+    },
+    ToolDef {
+        name: "shared_skill_adopt",
+        description: "Adopt a shared skill into an agent's SKILLS directory. Bumps usage_count on the shared skill and records the adopter.",
+        params: &[
+            ParamDef { name: "skill_name", description: "Shared skill name", required: true },
+            ParamDef { name: "target_agent", description: "Agent to adopt the skill into (default: caller)", required: false },
+        ],
+    },
 ];
 
 // ── JSON-RPC helpers ─────────────────────────────────────────
@@ -5358,6 +5467,14 @@ async fn handle_tools_call(
             | "update_cron_task"
             | "delete_cron_task"
             | "pause_cron_task"
+            | "tasks_create"
+            | "tasks_update"
+            | "tasks_claim"
+            | "tasks_complete"
+            | "tasks_block"
+            | "activity_post"
+            | "shared_skill_share"
+            | "shared_skill_adopt"
     );
     let result = match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
@@ -5455,6 +5572,22 @@ async fn handle_tools_call(
         "skill_bank_feedback" => handle_skill_bank_feedback(&arguments).await,
         // Session tools
         "session_restore_context" => handle_session_restore_context(&arguments).await,
+        // Task Board tools
+        "tasks_list" => handle_tasks_list(&arguments, home_dir, default_agent).await,
+        "tasks_create" => handle_tasks_create(&arguments, home_dir, default_agent).await,
+        "tasks_update" => handle_tasks_update(&arguments, home_dir).await,
+        "tasks_claim" => handle_tasks_claim(&arguments, home_dir, default_agent).await,
+        "tasks_complete" => handle_tasks_complete(&arguments, home_dir, default_agent).await,
+        "tasks_block" => handle_tasks_block(&arguments, home_dir, default_agent).await,
+        // Activity Feed tools
+        "activity_post" => handle_activity_post(&arguments, home_dir, default_agent).await,
+        "activity_list" => handle_activity_list(&arguments, home_dir, default_agent).await,
+        // Autopilot tools
+        "autopilot_list" => handle_autopilot_list(&arguments, home_dir).await,
+        // Shared Skills tools
+        "shared_skill_list" => handle_shared_skill_list(&arguments, home_dir).await,
+        "shared_skill_share" => handle_shared_skill_share(&arguments, home_dir, default_agent).await,
+        "shared_skill_adopt" => handle_shared_skill_adopt(&arguments, home_dir, default_agent).await,
         // Computer Use tools — require computer_use capability
         "computer_screenshot" | "computer_click" | "computer_type" | "computer_key"
         | "computer_scroll" | "computer_session_start" | "computer_session_stop" => {
@@ -7569,6 +7702,686 @@ fn tool_error(msg: &str) -> Value {
     })
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Task Board / Activity Feed / Autopilot / Shared Skills MCP tools
+// (Multica-inspired "Agent-as-teammate" integration, v1.8.27+)
+// ─────────────────────────────────────────────────────────────────
+
+fn task_row_to_json(row: &duduclaw_gateway::task_store::TaskRow) -> Value {
+    let tags: Vec<&str> = row
+        .tags
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    serde_json::json!({
+        "id": row.id,
+        "title": row.title,
+        "description": row.description,
+        "status": row.status,
+        "priority": row.priority,
+        "assigned_to": row.assigned_to,
+        "created_by": row.created_by,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+        "completed_at": row.completed_at,
+        "blocked_reason": row.blocked_reason,
+        "parent_task_id": row.parent_task_id,
+        "tags": tags,
+        "message_id": row.message_id,
+    })
+}
+
+fn activity_row_to_json(row: &duduclaw_gateway::task_store::ActivityRow) -> Value {
+    serde_json::json!({
+        "id": row.id,
+        "type": row.event_type,
+        "agent_id": row.agent_id,
+        "task_id": row.task_id,
+        "summary": row.summary,
+        "timestamp": row.timestamp,
+        "metadata": row.metadata,
+    })
+}
+
+async fn append_activity(
+    store: &duduclaw_gateway::task_store::TaskStore,
+    event_type: &str,
+    agent_id: &str,
+    task_id: Option<&str>,
+    summary: &str,
+    metadata: Option<String>,
+) {
+    let row = duduclaw_gateway::task_store::ActivityRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        event_type: event_type.to_string(),
+        agent_id: agent_id.to_string(),
+        task_id: task_id.map(|s| s.to_string()),
+        summary: summary.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        metadata,
+    };
+    let _ = store.append_activity(&row).await;
+}
+
+fn clamp_limit(args: &Value, default: i64, max: i64) -> i64 {
+    let n = args
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(default);
+    n.max(1).min(max)
+}
+
+async fn handle_tasks_list(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open task store: {e}")),
+    };
+    let status = args.get("status").and_then(|v| v.as_str());
+    let priority = args.get("priority").and_then(|v| v.as_str());
+    let assigned_to_raw = args.get("assigned_to").and_then(|v| v.as_str());
+    // Default to caller; "*" means all agents
+    let assigned_to: Option<&str> = match assigned_to_raw {
+        Some("*") => None,
+        Some(s) if !s.is_empty() => Some(s),
+        _ => Some(default_agent),
+    };
+
+    let rows = match store.list_tasks(status, assigned_to, priority).await {
+        Ok(r) => r,
+        Err(e) => return tool_error(&format!("list tasks: {e}")),
+    };
+    let limit = clamp_limit(args, 20, 100) as usize;
+    let tasks: Vec<Value> = rows.iter().take(limit).map(task_row_to_json).collect();
+    tool_text(&serde_json::json!({
+        "tasks": tasks,
+        "total": rows.len(),
+        "filtered_by_agent": assigned_to,
+    }).to_string())
+}
+
+async fn handle_tasks_create(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if title.is_empty() {
+        return tool_error("title is required");
+    }
+    if title.len() > 200 {
+        return tool_error("title must be <= 200 chars");
+    }
+    let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let priority = args
+        .get("priority")
+        .and_then(|v| v.as_str())
+        .filter(|p| matches!(*p, "low" | "medium" | "high" | "urgent"))
+        .unwrap_or("medium")
+        .to_string();
+    let assigned_to = args
+        .get("assigned_to")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_agent)
+        .to_string();
+    // Reject malformed / wildcard agent ids — `assigned_to` is stored verbatim
+    // and later used as an equality filter, so an invalid value produces
+    // tasks nobody can query.
+    if !is_valid_agent_id(&assigned_to) {
+        return tool_error(&format!(
+            "assigned_to must be a valid agent id (lowercase alphanumeric + hyphens), got: {assigned_to}"
+        ));
+    }
+    if !is_valid_agent_id(default_agent) {
+        return tool_error("invalid caller agent id");
+    }
+    let tags = args.get("tags").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let parent_task_id = args.get("parent_task_id").and_then(|v| v.as_str()).map(String::from);
+
+    let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open task store: {e}")),
+    };
+
+    let mut row = duduclaw_gateway::task_store::TaskRow::new(
+        uuid::Uuid::new_v4().to_string(),
+        title.to_string(),
+        description,
+        priority,
+        assigned_to.clone(),
+        default_agent.to_string(),
+    );
+    row.tags = tags;
+    row.parent_task_id = parent_task_id;
+
+    if let Err(e) = store.insert_task(&row).await {
+        return tool_error(&format!("insert task: {e}"));
+    }
+
+    // Record activity
+    append_activity(
+        &store,
+        "task_created",
+        default_agent,
+        Some(&row.id),
+        &format!("Created task: {}", row.title),
+        None,
+    )
+    .await;
+    // If the task was assigned to someone else, also record task_assigned
+    if assigned_to != default_agent {
+        append_activity(
+            &store,
+            "task_assigned",
+            default_agent,
+            Some(&row.id),
+            &format!("Assigned to {}: {}", assigned_to, row.title),
+            None,
+        )
+        .await;
+    }
+
+    append_bus_event(home_dir, "task.created", &task_row_to_json(&row)).await;
+
+    tool_text(&serde_json::json!({ "task": task_row_to_json(&row) }).to_string())
+}
+
+async fn handle_tasks_update(args: &Value, home_dir: &Path) -> Value {
+    let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+    if task_id.is_empty() {
+        return tool_error("task_id is required");
+    }
+    let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open task store: {e}")),
+    };
+    // Build fields map — only pass through allowed fields
+    let mut fields = serde_json::Map::new();
+    for k in ["title", "description", "priority", "tags"] {
+        if let Some(v) = args.get(k) {
+            fields.insert(k.into(), v.clone());
+        }
+    }
+    if fields.is_empty() {
+        return tool_error("no fields to update");
+    }
+    let updated = match store
+        .update_task(task_id, &Value::Object(fields))
+        .await
+    {
+        Ok(Some(r)) => r,
+        Ok(None) => return tool_error(&format!("task not found: {task_id}")),
+        Err(e) => return tool_error(&format!("update task: {e}")),
+    };
+    append_bus_event(home_dir, "task.updated", &task_row_to_json(&updated)).await;
+    tool_text(&serde_json::json!({ "task": task_row_to_json(&updated) }).to_string())
+}
+
+async fn handle_tasks_claim(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+    if task_id.is_empty() {
+        return tool_error("task_id is required");
+    }
+    if !is_valid_agent_id(default_agent) {
+        return tool_error("invalid caller agent id");
+    }
+    let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open task store: {e}")),
+    };
+    let fields = serde_json::json!({
+        "assigned_to": default_agent,
+        "status": "in_progress",
+    });
+    let updated = match store.update_task(task_id, &fields).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return tool_error(&format!("task not found: {task_id}")),
+        Err(e) => return tool_error(&format!("claim task: {e}")),
+    };
+    append_activity(
+        &store,
+        "task_assigned",
+        default_agent,
+        Some(task_id),
+        &format!("{} claimed task: {}", default_agent, updated.title),
+        None,
+    )
+    .await;
+    append_bus_event(home_dir, "task.updated", &task_row_to_json(&updated)).await;
+    tool_text(&serde_json::json!({ "task": task_row_to_json(&updated) }).to_string())
+}
+
+async fn handle_tasks_complete(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+    if task_id.is_empty() {
+        return tool_error("task_id is required");
+    }
+    if !is_valid_agent_id(default_agent) {
+        return tool_error("invalid caller agent id");
+    }
+    let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+    let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open task store: {e}")),
+    };
+    let fields = serde_json::json!({ "status": "done" });
+    let updated = match store.update_task(task_id, &fields).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return tool_error(&format!("task not found: {task_id}")),
+        Err(e) => return tool_error(&format!("complete task: {e}")),
+    };
+    let activity_summary = if summary.is_empty() {
+        format!("Completed: {}", updated.title)
+    } else {
+        format!("Completed: {} — {}", updated.title, summary)
+    };
+    append_activity(
+        &store,
+        "task_completed",
+        default_agent,
+        Some(task_id),
+        &activity_summary,
+        None,
+    )
+    .await;
+    append_bus_event(home_dir, "task.updated", &task_row_to_json(&updated)).await;
+    tool_text(&serde_json::json!({ "task": task_row_to_json(&updated) }).to_string())
+}
+
+async fn handle_tasks_block(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let task_id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+    let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if task_id.is_empty() {
+        return tool_error("task_id is required");
+    }
+    if reason.is_empty() {
+        return tool_error("reason is required");
+    }
+    if !is_valid_agent_id(default_agent) {
+        return tool_error("invalid caller agent id");
+    }
+    let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open task store: {e}")),
+    };
+    let fields = serde_json::json!({
+        "status": "blocked",
+        "blocked_reason": reason,
+    });
+    let updated = match store.update_task(task_id, &fields).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return tool_error(&format!("task not found: {task_id}")),
+        Err(e) => return tool_error(&format!("block task: {e}")),
+    };
+    append_activity(
+        &store,
+        "task_blocked",
+        default_agent,
+        Some(task_id),
+        &format!("Blocked: {} — {}", updated.title, reason),
+        None,
+    )
+    .await;
+    append_bus_event(home_dir, "task.updated", &task_row_to_json(&updated)).await;
+    tool_text(&serde_json::json!({ "task": task_row_to_json(&updated) }).to_string())
+}
+
+async fn handle_activity_post(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if summary.is_empty() {
+        return tool_error("summary is required");
+    }
+    if !is_valid_agent_id(default_agent) {
+        return tool_error("invalid caller agent id");
+    }
+    let event_type = args
+        .get("event_type")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("agent_comment")
+        .to_string();
+    let task_id = args.get("task_id").and_then(|v| v.as_str()).map(String::from);
+    let metadata = args.get("metadata").map(|v| v.to_string());
+
+    let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open task store: {e}")),
+    };
+    let row = duduclaw_gateway::task_store::ActivityRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        event_type,
+        agent_id: default_agent.to_string(),
+        task_id,
+        summary: summary.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        metadata,
+    };
+    if let Err(e) = store.append_activity(&row).await {
+        return tool_error(&format!("append activity: {e}"));
+    }
+    append_bus_event(home_dir, "activity.new", &activity_row_to_json(&row)).await;
+    tool_text(&serde_json::json!({ "activity": activity_row_to_json(&row) }).to_string())
+}
+
+async fn handle_activity_list(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open task store: {e}")),
+    };
+    let agent_id_raw = args.get("agent_id").and_then(|v| v.as_str());
+    let agent_id: Option<&str> = match agent_id_raw {
+        Some("*") => None,
+        Some(s) if !s.is_empty() => Some(s),
+        _ => Some(default_agent),
+    };
+    let event_type = args.get("event_type").and_then(|v| v.as_str());
+    let task_id_filter = args.get("task_id").and_then(|v| v.as_str());
+    let limit = clamp_limit(args, 20, 100);
+
+    let (rows, total) = match store
+        .list_activity(agent_id, event_type, limit, 0)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return tool_error(&format!("list activity: {e}")),
+    };
+    let items: Vec<Value> = rows
+        .iter()
+        .filter(|r| match task_id_filter {
+            Some(t) => r.task_id.as_deref() == Some(t),
+            None => true,
+        })
+        .map(activity_row_to_json)
+        .collect();
+    tool_text(&serde_json::json!({
+        "activities": items,
+        "total": total,
+    }).to_string())
+}
+
+async fn handle_autopilot_list(args: &Value, home_dir: &Path) -> Value {
+    let enabled_only = args
+        .get("enabled_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let store = match duduclaw_gateway::autopilot_store::AutopilotStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("open autopilot store: {e}")),
+    };
+    let rules = match store.list_rules().await {
+        Ok(r) => r,
+        Err(e) => return tool_error(&format!("list rules: {e}")),
+    };
+    let items: Vec<Value> = rules
+        .iter()
+        .filter(|r| !enabled_only || r.enabled)
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "name": r.name,
+                "enabled": r.enabled,
+                "trigger_event": r.trigger_event,
+                "conditions": serde_json::from_str::<Value>(&r.conditions).unwrap_or(Value::Null),
+                "action": serde_json::from_str::<Value>(&r.action).unwrap_or(Value::Null),
+                "created_at": r.created_at,
+                "last_triggered_at": r.last_triggered_at,
+                "trigger_count": r.trigger_count,
+            })
+        })
+        .collect();
+    tool_text(&serde_json::json!({ "rules": items }).to_string())
+}
+
+async fn handle_shared_skill_list(args: &Value, home_dir: &Path) -> Value {
+    let tag_filter = args.get("tag").and_then(|v| v.as_str()).map(str::to_lowercase);
+    let shared_dir = home_dir.join("shared").join("skills");
+    if !shared_dir.exists() {
+        return tool_text(&serde_json::json!({ "skills": [] }).to_string());
+    }
+    let mut skills: Vec<Value> = Vec::new();
+    let mut entries = match tokio::fs::read_dir(&shared_dir).await {
+        Ok(e) => e,
+        Err(e) => return tool_error(&format!("read shared skills dir: {e}")),
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        let tags_raw = extract_frontmatter(&content, "tags").unwrap_or_default();
+        let tags: Vec<String> = tags_raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if let Some(ref needle) = tag_filter {
+            if !tags.iter().any(|t| t.to_lowercase().contains(needle)) {
+                continue;
+            }
+        }
+        let description = extract_frontmatter(&content, "description").unwrap_or_default();
+        let shared_by = extract_frontmatter(&content, "shared_by").unwrap_or_default();
+        let shared_at = extract_frontmatter(&content, "shared_at").unwrap_or_default();
+        let usage_count: i64 = extract_frontmatter(&content, "usage_count")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let adopted_by: Vec<String> = extract_frontmatter(&content, "adopted_by")
+            .map(|s| s.split(',').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect())
+            .unwrap_or_default();
+        skills.push(serde_json::json!({
+            "name": name,
+            "description": description,
+            "shared_by": shared_by,
+            "shared_at": shared_at,
+            "tags": tags,
+            "usage_count": usage_count,
+            "adopted_by": adopted_by,
+        }));
+    }
+    tool_text(&serde_json::json!({ "skills": skills }).to_string())
+}
+
+async fn handle_shared_skill_share(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let skill_name = args.get("skill_name").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if skill_name.is_empty() {
+        return tool_error("skill_name is required");
+    }
+    if !is_valid_agent_id(default_agent) {
+        return tool_error("invalid caller agent id");
+    }
+    let skill_path = home_dir
+        .join("agents")
+        .join(default_agent)
+        .join("SKILLS")
+        .join(format!("{skill_name}.md"));
+    if !skill_path.exists() {
+        return tool_error(&format!("skill not found in your SKILLS/: {skill_name}"));
+    }
+    let content = match tokio::fs::read_to_string(&skill_path).await {
+        Ok(c) => c,
+        Err(e) => return tool_error(&format!("read skill: {e}")),
+    };
+    let shared_dir = home_dir.join("shared").join("skills");
+    if let Err(e) = tokio::fs::create_dir_all(&shared_dir).await {
+        return tool_error(&format!("create shared dir: {e}"));
+    }
+    let shared_path = shared_dir.join(format!("{skill_name}.md"));
+    let now = chrono::Utc::now().to_rfc3339();
+    let shared_content = format!(
+        "---\nshared_by: {default_agent}\nshared_at: {now}\ndescription: \ntags: \nadopted_by: \nusage_count: 0\n---\n\n{content}"
+    );
+    if let Err(e) = tokio::fs::write(&shared_path, &shared_content).await {
+        return tool_error(&format!("write shared skill: {e}"));
+    }
+    tool_text(&serde_json::json!({ "success": true, "skill": skill_name }).to_string())
+}
+
+async fn handle_shared_skill_adopt(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let skill_name = args.get("skill_name").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if skill_name.is_empty() {
+        return tool_error("skill_name is required");
+    }
+    let target_agent = args
+        .get("target_agent")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_agent);
+    if !is_valid_agent_id(target_agent) {
+        return tool_error("invalid target_agent id");
+    }
+    let shared_path = home_dir.join("shared").join("skills").join(format!("{skill_name}.md"));
+    if !shared_path.exists() {
+        return tool_error(&format!("shared skill not found: {skill_name}"));
+    }
+    let content = match tokio::fs::read_to_string(&shared_path).await {
+        Ok(c) => c,
+        Err(e) => return tool_error(&format!("read shared skill: {e}")),
+    };
+    // Strip frontmatter (up to second "---")
+    let skill_content = strip_frontmatter(&content);
+
+    let target_dir = home_dir.join("agents").join(target_agent).join("SKILLS");
+    if let Err(e) = tokio::fs::create_dir_all(&target_dir).await {
+        return tool_error(&format!("create agent SKILLS dir: {e}"));
+    }
+    let target_path = target_dir.join(format!("{skill_name}.md"));
+    if let Err(e) = tokio::fs::write(&target_path, &skill_content).await {
+        return tool_error(&format!("write skill to agent: {e}"));
+    }
+
+    // Bump usage_count and adopted_by in shared frontmatter
+    let updated = update_frontmatter_field(&content, "usage_count", |old| {
+        let n: i64 = old.parse().unwrap_or(0);
+        (n + 1).to_string()
+    });
+    let updated = update_frontmatter_field(&updated, "adopted_by", |old| {
+        let mut agents: Vec<String> = old
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !agents.iter().any(|a| a == target_agent) {
+            agents.push(target_agent.to_string());
+        }
+        agents.join(", ")
+    });
+    let _ = tokio::fs::write(&shared_path, &updated).await;
+
+    tool_text(&serde_json::json!({
+        "success": true,
+        "skill": skill_name,
+        "adopted_to": target_agent,
+    }).to_string())
+}
+
+/// Extract a top-level YAML frontmatter field value.
+/// Scans only within the first `---` fenced block.
+fn extract_frontmatter(content: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    let mut in_front = false;
+    for (i, line) in content.lines().enumerate() {
+        if i == 0 && line.trim() == "---" {
+            in_front = true;
+            continue;
+        }
+        if in_front && line.trim() == "---" {
+            break;
+        }
+        if in_front {
+            if let Some(rest) = line.strip_prefix(&prefix) {
+                return Some(rest.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Rewrite a single top-level frontmatter field using `transform`.
+fn update_frontmatter_field(content: &str, key: &str, transform: impl Fn(&str) -> String) -> String {
+    let prefix = format!("{key}:");
+    let mut in_front = false;
+    content
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            if i == 0 && line.trim() == "---" {
+                in_front = true;
+                return line.to_string();
+            }
+            if in_front && line.trim() == "---" {
+                in_front = false;
+                return line.to_string();
+            }
+            if in_front {
+                if let Some(rest) = line.strip_prefix(&prefix) {
+                    return format!("{prefix} {}", transform(rest.trim()));
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Strip the leading `---...---` YAML frontmatter block (if any) and
+/// return the body, trimmed of leading whitespace.
+fn strip_frontmatter(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return trimmed.to_string();
+    }
+    // After the opening ---, find the next line that is exactly "---".
+    // Collect lines after that as the body.
+    let mut saw_open = false;
+    let mut body_lines: Vec<&str> = Vec::new();
+    let mut collecting = false;
+    for line in trimmed.lines() {
+        if collecting {
+            body_lines.push(line);
+            continue;
+        }
+        if !saw_open {
+            if line.trim() == "---" {
+                saw_open = true;
+            }
+            continue;
+        }
+        // saw_open && !collecting
+        if line.trim() == "---" {
+            collecting = true;
+        }
+    }
+    if collecting {
+        body_lines.join("\n").trim_start().to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Append an event to the SQLite event bus (`~/.duduclaw/events.db`).
+///
+/// Replaces the legacy `events.jsonl` file bus (removed in v1.8.28).
+/// Row inserts are atomic under SQLite WAL with a 5-second
+/// `busy_timeout`, so concurrent writers from multiple MCP subprocesses
+/// and the gateway reader stay consistent without file-bus hazards
+/// (rotation races, partial writes, permission concerns, or unbounded
+/// growth — the gateway prunes old rows on a schedule).
+///
+/// Best-effort: failures are logged but never fatal — the caller has
+/// already persisted the authoritative row in `tasks.db` / `activity`.
+async fn append_bus_event(home_dir: &Path, event: &str, payload: &Value) {
+    let bus = match duduclaw_gateway::events_store::EventBusStore::open(home_dir) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "open events.db");
+            return;
+        }
+    };
+    let payload_str = payload.to_string();
+    if let Err(e) = bus.append(event, &payload_str).await {
+        warn!(error = %e, event = %event, "append events.db");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8450,5 +9263,531 @@ mod wiki_schema_tests {
             text
         );
         assert!(!result["isError"].as_bool().unwrap_or(false));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Task Board / Activity Feed / Shared Skills MCP tool tests
+// ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod task_board_tests {
+    use super::*;
+    use std::fs;
+
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("duduclaw-tb-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn parse_ok(value: &Value) -> Value {
+        assert!(
+            !value.get("isError").and_then(|v| v.as_bool()).unwrap_or(false),
+            "tool returned error: {value}"
+        );
+        let text = value["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_create_then_list_returns_task() {
+        let tmp = TempDir::new();
+        let create = handle_tasks_create(
+            &serde_json::json!({
+                "title": "Ship feature X",
+                "priority": "high",
+            }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let created = parse_ok(&create);
+        let task_id = created["task"]["id"].as_str().unwrap().to_string();
+        assert_eq!(created["task"]["assigned_to"], "agnes");
+        assert_eq!(created["task"]["created_by"], "agnes");
+        assert_eq!(created["task"]["status"], "todo");
+
+        let list = handle_tasks_list(
+            &serde_json::json!({}),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let listed = parse_ok(&list);
+        let tasks = listed["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], task_id);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_list_filters_to_caller_by_default() {
+        let tmp = TempDir::new();
+        // agnes creates a task assigned to bruno
+        handle_tasks_create(
+            &serde_json::json!({
+                "title": "For bruno",
+                "assigned_to": "bruno",
+            }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        // agnes creates a task for herself
+        handle_tasks_create(
+            &serde_json::json!({ "title": "For agnes" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+
+        // agnes listing — should only see her own
+        let agnes_list = handle_tasks_list(
+            &serde_json::json!({}),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let agnes_tasks = parse_ok(&agnes_list);
+        let titles: Vec<&str> = agnes_tasks["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(titles, vec!["For agnes"]);
+
+        // '*' sees all
+        let all = handle_tasks_list(
+            &serde_json::json!({ "assigned_to": "*" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let all_tasks = parse_ok(&all);
+        assert_eq!(all_tasks["tasks"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_claim_transitions_to_in_progress_and_reassigns() {
+        let tmp = TempDir::new();
+        let create = handle_tasks_create(
+            &serde_json::json!({
+                "title": "Orphan task",
+                "assigned_to": "bruno",
+            }),
+            tmp.path(),
+            "bruno",
+        )
+        .await;
+        let id = parse_ok(&create)["task"]["id"].as_str().unwrap().to_string();
+
+        // agnes claims it
+        let claim = handle_tasks_claim(
+            &serde_json::json!({ "task_id": id }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let claimed = parse_ok(&claim);
+        assert_eq!(claimed["task"]["assigned_to"], "agnes");
+        assert_eq!(claimed["task"]["status"], "in_progress");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_complete_marks_done_and_sets_completed_at() {
+        let tmp = TempDir::new();
+        let create = handle_tasks_create(
+            &serde_json::json!({ "title": "Finish me" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let id = parse_ok(&create)["task"]["id"].as_str().unwrap().to_string();
+
+        let complete = handle_tasks_complete(
+            &serde_json::json!({
+                "task_id": id,
+                "summary": "Shipped",
+            }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let done = parse_ok(&complete);
+        assert_eq!(done["task"]["status"], "done");
+        assert!(done["task"]["completed_at"].as_str().is_some());
+
+        // Activity log should contain task_completed
+        let activity = handle_activity_list(
+            &serde_json::json!({ "event_type": "task_completed" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let log = parse_ok(&activity);
+        let activities = log["activities"].as_array().unwrap();
+        assert!(activities.iter().any(|a| a["type"] == "task_completed"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_block_requires_reason() {
+        let tmp = TempDir::new();
+        let create = handle_tasks_create(
+            &serde_json::json!({ "title": "Stuck" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let id = parse_ok(&create)["task"]["id"].as_str().unwrap().to_string();
+
+        // Missing reason → error
+        let no_reason = handle_tasks_block(
+            &serde_json::json!({ "task_id": id }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(no_reason["isError"].as_bool().unwrap_or(false));
+
+        // With reason → success
+        let blocked = handle_tasks_block(
+            &serde_json::json!({
+                "task_id": id,
+                "reason": "Waiting for API key",
+            }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let b = parse_ok(&blocked);
+        assert_eq!(b["task"]["status"], "blocked");
+        assert_eq!(b["task"]["blocked_reason"], "Waiting for API key");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_create_rejects_empty_title() {
+        let tmp = TempDir::new();
+        let result = handle_tasks_create(
+            &serde_json::json!({ "title": "   " }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(result["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activity_post_then_list() {
+        let tmp = TempDir::new();
+        let post = handle_activity_post(
+            &serde_json::json!({
+                "summary": "Checked in on research task",
+                "event_type": "progress",
+            }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let posted = parse_ok(&post);
+        assert_eq!(posted["activity"]["type"], "progress");
+        assert_eq!(posted["activity"]["agent_id"], "agnes");
+
+        let list = handle_activity_list(
+            &serde_json::json!({}),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let items = parse_ok(&list)["activities"].as_array().unwrap().clone();
+        assert_eq!(items.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_skill_share_then_list_then_adopt() {
+        let tmp = TempDir::new();
+        // Seed a skill file under agents/agnes/SKILLS/
+        let skills_dir = tmp.path().join("agents").join("agnes").join("SKILLS");
+        fs::create_dir_all(&skills_dir).unwrap();
+        fs::write(
+            skills_dir.join("pricing-audit.md"),
+            "# Pricing Audit\n\nSteps:\n1. Pull price list.\n2. Diff against rules.\n",
+        )
+        .unwrap();
+
+        // Share
+        let share = handle_shared_skill_share(
+            &serde_json::json!({ "skill_name": "pricing-audit" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        parse_ok(&share);
+
+        // List — should appear
+        let list = handle_shared_skill_list(
+            &serde_json::json!({}),
+            tmp.path(),
+        )
+        .await;
+        let skills = parse_ok(&list)["skills"].as_array().unwrap().clone();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0]["name"], "pricing-audit");
+        assert_eq!(skills[0]["shared_by"], "agnes");
+
+        // Adopt into bruno
+        let adopt = handle_shared_skill_adopt(
+            &serde_json::json!({
+                "skill_name": "pricing-audit",
+                "target_agent": "bruno",
+            }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        parse_ok(&adopt);
+        let bruno_path = tmp
+            .path()
+            .join("agents")
+            .join("bruno")
+            .join("SKILLS")
+            .join("pricing-audit.md");
+        assert!(bruno_path.exists());
+
+        // Shared frontmatter should now record usage_count=1 and adopted_by includes bruno
+        let list2 = handle_shared_skill_list(
+            &serde_json::json!({}),
+            tmp.path(),
+        )
+        .await;
+        let skills2 = parse_ok(&list2)["skills"].as_array().unwrap().clone();
+        assert_eq!(skills2[0]["usage_count"], 1);
+        assert!(skills2[0]["adopted_by"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "bruno"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn autopilot_list_respects_enabled_only() {
+        let tmp = TempDir::new();
+        // Seed two rules directly via AutopilotStore
+        let store = duduclaw_gateway::autopilot_store::AutopilotStore::open(tmp.path()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut enabled = duduclaw_gateway::autopilot_store::AutopilotRuleRow {
+            id: "r1".into(),
+            name: "r1".into(),
+            enabled: true,
+            trigger_event: "task_created".into(),
+            conditions: "{}".into(),
+            action: "{}".into(),
+            created_at: now.clone(),
+            last_triggered_at: None,
+            trigger_count: 0,
+        };
+        store.insert_rule(&enabled).await.unwrap();
+        enabled.id = "r2".into();
+        enabled.name = "r2".into();
+        enabled.enabled = false;
+        store.insert_rule(&enabled).await.unwrap();
+
+        let only_enabled = handle_autopilot_list(
+            &serde_json::json!({ "enabled_only": true }),
+            tmp.path(),
+        )
+        .await;
+        let rules = parse_ok(&only_enabled)["rules"].as_array().unwrap().clone();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["id"], "r1");
+
+        let all = handle_autopilot_list(
+            &serde_json::json!({ "enabled_only": false }),
+            tmp.path(),
+        )
+        .await;
+        let all_rules = parse_ok(&all)["rules"].as_array().unwrap().clone();
+        assert_eq!(all_rules.len(), 2);
+    }
+
+    #[test]
+    fn strip_frontmatter_removes_leading_block() {
+        let input = "---\nfoo: bar\n---\n\nBody line 1\nBody line 2\n";
+        let out = strip_frontmatter(input);
+        assert_eq!(out, "Body line 1\nBody line 2");
+    }
+
+    #[test]
+    fn strip_frontmatter_preserves_content_without_fence() {
+        let input = "No frontmatter here\nJust body\n";
+        let out = strip_frontmatter(input);
+        // Only the leading whitespace is trimmed; trailing newline stays
+        assert_eq!(out, "No frontmatter here\nJust body\n");
+    }
+
+    #[test]
+    fn extract_frontmatter_reads_first_match() {
+        let content = "---\nshared_by: agnes\nusage_count: 3\n---\nBody\n";
+        assert_eq!(
+            extract_frontmatter(content, "shared_by"),
+            Some("agnes".into())
+        );
+        assert_eq!(
+            extract_frontmatter(content, "usage_count"),
+            Some("3".into())
+        );
+        assert_eq!(extract_frontmatter(content, "missing"), None);
+    }
+
+    #[test]
+    fn update_frontmatter_field_bumps_counter() {
+        let content = "---\nshared_by: a\nusage_count: 0\n---\nbody";
+        let updated = update_frontmatter_field(content, "usage_count", |old| {
+            let n: i64 = old.parse().unwrap_or(0);
+            (n + 1).to_string()
+        });
+        assert!(updated.contains("usage_count: 1"));
+    }
+
+    // ── Edge-case tests (security + idempotency + error paths) ─────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_create_rejects_invalid_assigned_to() {
+        let tmp = TempDir::new();
+        // Wildcard is nonsensical — equality filter would match nothing
+        let wildcard = handle_tasks_create(
+            &serde_json::json!({ "title": "x", "assigned_to": "*" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(wildcard["isError"].as_bool().unwrap_or(false));
+
+        // Path-traversal style
+        let traversal = handle_tasks_create(
+            &serde_json::json!({ "title": "x", "assigned_to": "../etc/passwd" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(traversal["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_complete_is_idempotent() {
+        let tmp = TempDir::new();
+        let create = handle_tasks_create(
+            &serde_json::json!({ "title": "Already done" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let id = parse_ok(&create)["task"]["id"].as_str().unwrap().to_string();
+
+        handle_tasks_complete(
+            &serde_json::json!({ "task_id": id.clone() }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let second = handle_tasks_complete(
+            &serde_json::json!({ "task_id": id }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let done = parse_ok(&second);
+        assert_eq!(done["task"]["status"], "done");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_update_rejects_unknown_task() {
+        let tmp = TempDir::new();
+        let result = handle_tasks_update(
+            &serde_json::json!({
+                "task_id": "does-not-exist",
+                "title": "Nope",
+            }),
+            tmp.path(),
+        )
+        .await;
+        assert!(result["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_list_filters_by_status() {
+        let tmp = TempDir::new();
+        // Create 3 tasks (sequential — parallel would race the SQLite lock)
+        let a = handle_tasks_create(
+            &serde_json::json!({ "title": "t1" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let b = handle_tasks_create(
+            &serde_json::json!({ "title": "t2" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let _c = handle_tasks_create(
+            &serde_json::json!({ "title": "t3" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let _ = b;
+        let a_id = parse_ok(&a)["task"]["id"].as_str().unwrap().to_string();
+
+        // Mark one as done
+        handle_tasks_complete(
+            &serde_json::json!({ "task_id": a_id }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+
+        let todo = handle_tasks_list(
+            &serde_json::json!({ "status": "todo" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let tlist = parse_ok(&todo)["tasks"].as_array().unwrap().clone();
+        assert_eq!(tlist.len(), 2);
+
+        let done_list = handle_tasks_list(
+            &serde_json::json!({ "status": "done" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let dlist = parse_ok(&done_list)["tasks"].as_array().unwrap().clone();
+        assert_eq!(dlist.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_skill_share_rejects_missing_skill_file() {
+        let tmp = TempDir::new();
+        // agnes has no SKILLS directory yet
+        let result = handle_shared_skill_share(
+            &serde_json::json!({ "skill_name": "nonexistent" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(result["isError"].as_bool().unwrap_or(false));
     }
 }

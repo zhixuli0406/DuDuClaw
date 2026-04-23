@@ -146,16 +146,54 @@ pub async fn call_direct_api(
     user_prompt: &str,
     conversation_history: &[(String, String)], // (role, content) pairs
 ) -> Result<DirectApiResponse, String> {
+    call_direct_api_with_dynamic(
+        api_key,
+        model,
+        system_prompt,
+        None,
+        user_prompt,
+        conversation_history,
+    )
+    .await
+}
+
+/// Variant of [`call_direct_api`] that accepts an optional **dynamic system
+/// suffix** which is appended as a *second* system block **without**
+/// `cache_control`.
+///
+/// Motivation: the agent's pending Task Queue changes every turn, so
+/// appending it to the cached system block would invalidate the entire
+/// static prefix (Soul/Identity/Skills/Contract — usually 5–20k tokens).
+/// Keeping it in a separate uncached block preserves 95%+ cache efficiency
+/// on the static prefix while still letting the agent see the live queue.
+///
+/// Callers that don't need dynamic content should keep using
+/// [`call_direct_api`].
+pub async fn call_direct_api_with_dynamic(
+    api_key: &str,
+    model: &str,
+    system_prompt: &str,
+    dynamic_system_suffix: Option<&str>,
+    user_prompt: &str,
+    conversation_history: &[(String, String)],
+) -> Result<DirectApiResponse, String> {
     let client = http_client();
 
-    // Build system blocks with cache_control on the final block.
-    let system = vec![SystemBlock {
+    // Build system blocks: static prefix is cached, dynamic suffix is not.
+    let mut system = vec![SystemBlock {
         block_type: "text".to_string(),
         text: normalize_system_prompt(system_prompt),
         cache_control: Some(CacheControl {
             control_type: "ephemeral".to_string(),
         }),
     }];
+    if let Some(suffix) = dynamic_system_suffix.filter(|s| !s.trim().is_empty()) {
+        system.push(SystemBlock {
+            block_type: "text".to_string(),
+            text: suffix.to_string(),
+            cache_control: None, // intentionally uncached — changes per-turn
+        });
+    }
 
     // Build messages with conversation history (Hermes-inspired cache strategy)
     let mut messages: Vec<Message> = Vec::with_capacity(conversation_history.len() + 1);

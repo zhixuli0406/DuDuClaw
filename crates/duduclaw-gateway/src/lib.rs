@@ -45,6 +45,8 @@ pub mod cron_store;
 pub mod task_store;
 pub mod partner_store;
 pub mod autopilot_store;
+pub mod autopilot_engine;
+pub mod events_store;
 pub mod direct_api;
 pub mod delegation;
 pub mod discord;

@@ -68,6 +68,10 @@ pub struct MethodHandler {
     autopilot_store: RwLock<Option<Arc<AutopilotStore>>>,
     /// Event broadcast sender for real-time task/activity events.
     event_tx: RwLock<Option<tokio::sync::broadcast::Sender<String>>>,
+    /// Typed event broadcast sender consumed by `AutopilotEngine`.
+    autopilot_event_tx: RwLock<
+        Option<tokio::sync::broadcast::Sender<crate::autopilot_engine::AutopilotEvent>>,
+    >,
 }
 
 /// Cached update info from the last `system.check_update` call. [M2][R2:NM1]
@@ -154,6 +158,7 @@ impl MethodHandler {
             task_store: RwLock::new(None),
             autopilot_store: RwLock::new(None),
             event_tx: RwLock::new(None),
+            autopilot_event_tx: RwLock::new(None),
         }
     }
 
@@ -175,6 +180,21 @@ impl MethodHandler {
     /// Inject the event broadcast sender for task/activity real-time events.
     pub async fn set_event_tx(&self, tx: tokio::sync::broadcast::Sender<String>) {
         *self.event_tx.write().await = Some(tx);
+    }
+
+    /// Inject the typed event broadcast sender consumed by `AutopilotEngine`.
+    pub async fn set_autopilot_event_tx(
+        &self,
+        tx: tokio::sync::broadcast::Sender<crate::autopilot_engine::AutopilotEvent>,
+    ) {
+        *self.autopilot_event_tx.write().await = Some(tx);
+    }
+
+    /// Publish an autopilot event to the engine (best-effort).
+    async fn emit_autopilot_event(&self, event: crate::autopilot_engine::AutopilotEvent) {
+        if let Some(tx) = self.autopilot_event_tx.read().await.as_ref() {
+            let _ = tx.send(event);
+        }
     }
 
     /// Inject the running cron scheduler handle (called once after gateway start).
@@ -5971,6 +5991,10 @@ impl MethodHandler {
         let task_json = task_row_to_json(&row);
         self.broadcast_event("task.created", task_json.clone()).await;
         self.broadcast_event("activity.new", activity_row_to_json(&activity)).await;
+        self.emit_autopilot_event(crate::autopilot_engine::AutopilotEvent::TaskCreated {
+            task: task_json.clone(),
+        })
+        .await;
 
         WsFrame::ok_response("", json!({ "task": task_json }))
     }
@@ -5984,10 +6008,41 @@ impl MethodHandler {
         if task_id.is_empty() {
             return WsFrame::error_response("", "task_id is required");
         }
+        // Capture previous status for TaskStatusChanged event emission.
+        let prev_status = store
+            .get_task(task_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|r| r.status);
         match store.update_task(task_id, &params).await {
             Ok(Some(row)) => {
                 let task_json = task_row_to_json(&row);
                 self.broadcast_event("task.updated", task_json.clone()).await;
+                self.emit_autopilot_event(
+                    crate::autopilot_engine::AutopilotEvent::TaskUpdated {
+                        task: task_json.clone(),
+                    },
+                )
+                .await;
+
+                // Emit TaskStatusChanged when status actually changed.
+                if let (Some(prev), Some(new_status)) = (
+                    prev_status.as_deref(),
+                    params.get("status").and_then(|v| v.as_str()),
+                ) {
+                    if prev != new_status {
+                        self.emit_autopilot_event(
+                            crate::autopilot_engine::AutopilotEvent::TaskStatusChanged {
+                                task_id: task_id.to_string(),
+                                from: prev.to_string(),
+                                to: new_status.to_string(),
+                                task: task_json.clone(),
+                            },
+                        )
+                        .await;
+                    }
+                }
 
                 // If status changed to done/blocked, record activity
                 if let Some(status) = params.get("status").and_then(|v| v.as_str()) {
@@ -6094,8 +6149,17 @@ impl MethodHandler {
             return WsFrame::error_response("", "name is required");
         }
         let trigger_event = params.get("trigger_event").and_then(|v| v.as_str()).unwrap_or("task_created").to_string();
+        if let Err(e) = validate_autopilot_trigger_event(&trigger_event) {
+            return WsFrame::error_response("", &e);
+        }
         let conditions = params.get("conditions").cloned().unwrap_or(json!({}));
         let action = params.get("action").cloned().unwrap_or(json!({}));
+        // Reject malformed rules at write time so the dashboard surfaces
+        // the error immediately rather than silently in autopilot_history
+        // the first time the rule would have fired.
+        if let Err(e) = validate_autopilot_action(&action) {
+            return WsFrame::error_response("", &e);
+        }
 
         let row = AutopilotRuleRow {
             id: uuid::Uuid::new_v4().to_string(),
@@ -6122,6 +6186,17 @@ impl MethodHandler {
         let rule_id = params.get("rule_id").and_then(|v| v.as_str()).unwrap_or("");
         if rule_id.is_empty() {
             return WsFrame::error_response("", "rule_id is required");
+        }
+        // Re-validate any provided trigger_event / action fields.
+        if let Some(t) = params.get("trigger_event").and_then(|v| v.as_str()) {
+            if let Err(e) = validate_autopilot_trigger_event(t) {
+                return WsFrame::error_response("", &e);
+            }
+        }
+        if let Some(a) = params.get("action") {
+            if let Err(e) = validate_autopilot_action(a) {
+                return WsFrame::error_response("", &e);
+            }
         }
         match store.update_rule(rule_id, &params).await {
             Ok(Some(row)) => WsFrame::ok_response("", json!({ "rule": autopilot_rule_to_json(&row) })),
@@ -6362,6 +6437,68 @@ fn autopilot_rule_to_json(r: &AutopilotRuleRow) -> Value {
 }
 
 /// Extract a field value from YAML-style frontmatter (`---` delimited).
+/// Validate a trigger_event string against the set understood by AutopilotEngine.
+/// Rejecting unknown values at write time avoids rules that are stored
+/// successfully but can never fire.
+fn validate_autopilot_trigger_event(ev: &str) -> Result<(), String> {
+    const KNOWN: &[&str] = &[
+        "task_created",
+        "task_updated",
+        "task_status_changed",
+        "activity_new",
+        "channel_message",
+        "agent_idle",
+        "cron_tick",
+    ];
+    if KNOWN.iter().any(|k| *k == ev) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown trigger_event '{ev}'; must be one of: {}",
+            KNOWN.join(", ")
+        ))
+    }
+}
+
+/// Validate an autopilot action JSON object at rule-write time.
+///
+/// Requires `type` ∈ {delegate, notify, run_skill} and the fields the
+/// engine will eventually need. Catches misconfiguration immediately
+/// rather than silently during the first fire.
+fn validate_autopilot_action(action: &Value) -> Result<(), String> {
+    let obj = action
+        .as_object()
+        .ok_or_else(|| "action must be a JSON object".to_string())?;
+    let t = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "action.type is required".to_string())?;
+    let require_str = |key: &str| -> Result<(), String> {
+        obj.get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|_| ())
+            .ok_or_else(|| format!("action.{key} is required for type '{t}'"))
+    };
+    match t {
+        "delegate" => {
+            require_str("target_agent")?;
+            require_str("prompt")?;
+        }
+        "notify" => {
+            require_str("channel")?;
+            require_str("chat_id")?;
+            require_str("text")?;
+        }
+        "run_skill" => {
+            require_str("target_agent")?;
+            require_str("skill_name")?;
+        }
+        other => return Err(format!("unknown action.type '{other}'")),
+    }
+    Ok(())
+}
+
 fn extract_frontmatter(content: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}:");
     for line in content.lines() {
@@ -6389,4 +6526,73 @@ fn update_frontmatter_field(content: &str, key: &str, transform: impl Fn(&str) -
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod autopilot_validation_tests {
+    use super::*;
+
+    #[test]
+    fn trigger_event_known_values_pass() {
+        for ev in [
+            "task_created",
+            "task_updated",
+            "task_status_changed",
+            "activity_new",
+            "channel_message",
+            "agent_idle",
+            "cron_tick",
+        ] {
+            assert!(validate_autopilot_trigger_event(ev).is_ok(), "should accept {ev}");
+        }
+    }
+
+    #[test]
+    fn trigger_event_rejects_typos() {
+        assert!(validate_autopilot_trigger_event("task.created").is_err());
+        assert!(validate_autopilot_trigger_event("").is_err());
+        assert!(validate_autopilot_trigger_event("randomEvent").is_err());
+    }
+
+    #[test]
+    fn action_delegate_requires_target_and_prompt() {
+        let ok = json!({ "type": "delegate", "target_agent": "bruno", "prompt": "go" });
+        assert!(validate_autopilot_action(&ok).is_ok());
+
+        let missing_target = json!({ "type": "delegate", "prompt": "go" });
+        assert!(validate_autopilot_action(&missing_target).is_err());
+
+        let missing_prompt = json!({ "type": "delegate", "target_agent": "bruno" });
+        assert!(validate_autopilot_action(&missing_prompt).is_err());
+    }
+
+    #[test]
+    fn action_notify_requires_channel_chat_text() {
+        let ok = json!({ "type": "notify", "channel": "telegram", "chat_id": "1", "text": "hi" });
+        assert!(validate_autopilot_action(&ok).is_ok());
+
+        let missing = json!({ "type": "notify", "channel": "telegram" });
+        assert!(validate_autopilot_action(&missing).is_err());
+    }
+
+    #[test]
+    fn action_run_skill_requires_target_and_skill() {
+        let ok = json!({ "type": "run_skill", "target_agent": "bruno", "skill_name": "audit" });
+        assert!(validate_autopilot_action(&ok).is_ok());
+
+        let missing = json!({ "type": "run_skill", "target_agent": "bruno" });
+        assert!(validate_autopilot_action(&missing).is_err());
+    }
+
+    #[test]
+    fn action_rejects_unknown_type() {
+        let bad = json!({ "type": "self_destruct" });
+        assert!(validate_autopilot_action(&bad).is_err());
+    }
+
+    #[test]
+    fn action_rejects_non_object() {
+        assert!(validate_autopilot_action(&Value::Null).is_err());
+        assert!(validate_autopilot_action(&json!("delegate")).is_err());
+    }
 }
