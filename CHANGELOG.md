@@ -1,6 +1,123 @@
 # Changelog
 
 
+## [1.8.27] - 2026-04-23
+
+### Added
+- **Multica-inspired Agent integration layer** — agents are now
+  first-class teammates on the task board, not just tools. Ships three
+  coupled pieces:
+
+  1. **12 new MCP tools** (`crates/duduclaw-cli/src/mcp.rs`) —
+     `tasks_list`, `tasks_create`, `tasks_update`, `tasks_claim`,
+     `tasks_complete`, `tasks_block`, `activity_post`, `activity_list`,
+     `autopilot_list`, `shared_skill_list`, `shared_skill_share`,
+     `shared_skill_adopt`. All mutating tools enforce
+     `is_valid_agent_id` on the caller, and `tasks_list` defaults to
+     the calling agent so noise stays low.
+  2. **Pending task queue injection into the agent system prompt**
+     (`crates/duduclaw-gateway/src/claude_runner.rs`) — every call to
+     `call_claude_for_agent*` renders the top-5 open tasks (priority-
+     ordered, `in_progress` → `todo` → `blocked`) into a
+     `## Your Task Queue` block. Uses a shared `Arc<TaskStore>` via
+     `OnceLock` so system-prompt composition doesn't open a fresh
+     SQLite connection per turn. On the Direct API path the block is
+     passed as an uncached second system block via
+     `direct_api::call_direct_api_with_dynamic`, so the static 5–20k
+     token prefix stays cacheable.
+  3. **Autopilot trigger engine** (`autopilot_engine.rs`, new) —
+     `tokio::broadcast::Sender<AutopilotEvent>` (capacity 8192) fed by
+     both WebSocket handlers (in-process) and a SQLite event bus
+     (out-of-process, see below). Typed variants: `TaskCreated`,
+     `TaskUpdated`, `TaskStatusChanged`, `ActivityNew`, `ChannelMessage`,
+     `AgentIdle`, `CronTick`. Condition DSL supports nested `all`/`any`
+     + `eq`/`neq`/`in`/`not_in`/`gt`/`gte`/`lt`/`lte`/`contains`. Three
+     action executors: `delegate` (MessageQueue enqueue), `notify`
+     (Telegram/LINE/Discord/Slack via shared `reqwest::Client` from
+     `OnceLock`), `run_skill` (reads the agent's `SKILLS/<name>.md`
+     and delegates it as a prompt).
+
+- **SQLite event bus** (`events_store.rs`, new) — `events.db` replaces
+  the legacy `events.jsonl` file bus. WAL mode + `busy_timeout=5000` +
+  monotonic auto-increment `id` give the tail reader a simple
+  `WHERE id > ?` watermark; 7-day retention prune runs every 6 hours.
+  Eliminates the file-bus hazard matrix in one swap (rotation race,
+  partial-line reads, 0644 permissions, unbounded growth).
+
+- **Dashboard Task Board preview widget** (`DashboardPage.tsx`) —
+  `TasksPreviewCard` renders a mini 4-column Kanban with per-column
+  task counts and links to `/tasks`. Loading skeleton, error banner,
+  and empty-state tri-state so users can distinguish "never loaded"
+  from "loaded empty".
+
+- **Autopilot rule dashboard schema validation** (`handlers.rs`) —
+  `autopilot.create` / `autopilot.update` reject unknown
+  `trigger_event` values and `action` JSON missing required fields
+  per type, so malformed rules fail immediately on the dashboard
+  instead of silently during the first fire.
+
+- **i18n keys** `tasks.preview.{title,viewAll,empty}` synced across
+  `zh-TW`, `en`, `ja-JP`.
+
+- **47 new unit tests** — 18 in `mcp::task_board_tests`, 18 in
+  `autopilot_engine::tests` (including Closed/Open/HalfOpen state
+  transitions), 7 in `handlers::autopilot_validation_tests`, 4 in
+  `events_store::tests`. Full gateway lib suite: 611 tests passing.
+
+### Changed
+- **Task Board always renders four columns** (`TaskBoardPage.tsx`) —
+  v1.4.29 hid the entire board behind an `tasks.length === 0`
+  early-return, breaking the Kanban design intent that empty columns
+  themselves *are* the affordance. Grid is now
+  `grid-cols-1 md:grid-cols-2 lg:grid-cols-4` with each column keeping
+  its own drop-hint placeholder.
+
+- **Agent-facing MCP caller validation** is now consistent across
+  `tasks_create` / `tasks_claim` / `tasks_complete` / `tasks_block` /
+  `activity_post`. Wildcard (`*`) and path-traversal-like values are
+  rejected at the boundary with a clear error message.
+
+- **Autopilot circuit breaker is now a proper 3-state FSM** (Closed /
+  Open / HalfOpen). 10 fires in 60s trip to Open (60s cooldown),
+  HalfOpen allows one probe; retry within 30s re-trips, quiet window
+  returns to Closed. All transitions are logged to `autopilot_history`
+  and the Activity Feed so operators can see rule loops get contained
+  and recover. Replaces the v1.8.27-dev sliding-window rate limiter.
+
+- **Autopilot broadcast channel** capacity raised from 1024 → 8192 and
+  the `RecvError::Lagged` branch escalated from `warn!` → `error!`
+  with a detached `append_activity` task (so logging the lag no longer
+  amplifies event drops).
+
+### Fixed
+- **Autopilot rule storage silently accepted malformed JSON**, so
+  broken rules would only surface their error when first fired (and
+  only in `autopilot_history`, invisible during rule authoring). Now
+  rejected at write time.
+
+- **`action_run_skill` had no path guard** — a crafted rule with
+  `skill_name: "../../../etc/passwd"` could have escaped the
+  SKILLS directory. Defense in depth: alphanumeric allowlist on both
+  `target_agent` and `skill_name`, plus `canonicalize()` containment
+  check against `<home>/agents/<agent>/SKILLS/`.
+
+- **`events.jsonl` rotation race lost in-flight events** — writers
+  holding an `O_APPEND` fd at the moment of `rename()` would land
+  writes on the orphaned `.jsonl.1`, which the tail task ignored.
+  Made moot by the SQLite event bus swap.
+
+- **`build_pending_tasks_section` silently returned `None` when
+  TaskStore open failed**, hiding a broken task board from operators.
+  Now logs a warning at `warn!` level while still degrading gracefully
+  (the agent just loses its task queue for that turn).
+
+### Security
+- **`events.db` is owned exclusively by the gateway/MCP process
+  writing it** — SQLite handles file permissions (`0600` under default
+  umask). Event payloads containing task descriptions / metadata are
+  no longer world-readable on multi-user systems.
+
+
 ## [1.8.26] - 2026-04-22
 
 ### Added
