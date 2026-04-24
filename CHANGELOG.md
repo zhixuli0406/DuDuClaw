@@ -1,6 +1,46 @@
 # Changelog
 
 
+## [1.8.29] - 2026-04-24
+
+### Fixed
+- **Misleading "No auth token configured" startup banner.** The CLI
+  always printed that message whenever `DUDUCLAW_AUTH_TOKEN` and
+  `[gateway].auth_token` were both unset — but the WebSocket auth gate
+  in `server::handle_socket` *also* requires JWT when `users.db`
+  contains any rows (legacy `auth_token` and JWT are independent gates).
+  Operators saw the message, assumed authentication was off, and then
+  got spammed with `WebSocket auth failed – closing connection` once
+  per second as the dashboard reconnected — with no hint that the real
+  fix was to log in at `/login`.
+
+### Changed
+- [`duduclaw run`](crates/duduclaw-cli/src/lib.rs) now probes
+  `~/.duduclaw/users.db` at startup (via `probe_users_db`). When any
+  user exists the banner switches from "no auth token" to:
+
+  ```
+  🔐 JWT auth required: N user(s) in ~/.duduclaw/users.db
+    Dashboard login: http://localhost:PORT/login
+  ```
+
+  so the correct next action is obvious.
+
+- When `admin@local`'s stored password hash still verifies against the
+  literal `"admin"` seeded by
+  `duduclaw_auth::UserDb::ensure_default_admin`, an additional line
+  warns: `⚠ Default admin still in use: admin@local / admin — change the
+  password at /settings`. The verification uses the `argon2` crate
+  directly (now a direct `duduclaw-cli` dep) rather than the full
+  `duduclaw-auth` crate to keep the CLI's dependency surface narrow.
+
+### Added
+- 6 new unit tests in `startup_probe_tests` covering: missing
+  `users.db`, empty users table, default-admin detection,
+  non-default-password non-detection, admin@local absence, and
+  garbage-PHC input handling.
+
+
 ## [1.8.28] - 2026-04-24
 
 ### Fixed
