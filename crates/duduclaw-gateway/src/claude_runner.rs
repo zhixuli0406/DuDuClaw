@@ -1048,10 +1048,18 @@ fn prepare_claude_cmd(
         // Subprocess has no TTY — auto-accept tool permissions.
         // Security is enforced by DuDuClaw's CONTRACT.toml + container sandbox.
         "--permission-mode", "auto",
-        // Auto-approve all DuDuClaw MCP tools — --permission-mode auto only
-        // covers built-in Claude Code tools (Read/Write/Bash), not MCP tools.
-        // Without this, the sub-agent sees "permission denied" for every MCP call.
-        "--allowedTools", "mcp__duduclaw__*",
+        // Auto-approve all DuDuClaw MCP tools + a curated set of native Claude
+        // Code tools. When `--allowedTools` is specified, Claude Code treats
+        // it as the **only** auto-approved list — anything else would need
+        // interactive confirmation, which is impossible in `-p` subprocess
+        // mode and causes the tool to silently no-op / return empty.
+        //
+        // Prior to v1.8.30 only `mcp__duduclaw__*` was listed, which meant
+        // `WebSearch` / `WebFetch` (Anthropic server-side) silently returned
+        // 0 results for cron researcher agents even though they work fine in
+        // interactive Claude Code. Explicitly listing them here restores
+        // research capability without opening up arbitrary code execution.
+        "--allowedTools", "mcp__duduclaw__*,WebSearch,WebFetch,Read,Write,Edit,Glob,Grep,Bash,TodoWrite",
         // Allow enough agentic turns for complex tasks (read → think → write).
         "--max-turns", "50",
     ]);
