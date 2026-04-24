@@ -2385,43 +2385,23 @@ async fn forward_to_channel(
 /// Read a channel token from config.toml `[channels]` table,
 /// trying encrypted value first then plaintext fallback.
 /// Try to read the originating agent's per-channel bot token from
-/// `agents/<id>/agent.toml [channels.<channel>]` and decrypt it.
-/// Returns `None` (not empty `""`) if the agent has no per-agent token
-/// configured, so the caller can cleanly fall back to the global token.
-fn get_agent_channel_token(home_dir: &Path, agent_id: &str, channel: &str) -> Option<String> {
-    let agent_toml = home_dir.join("agents").join(agent_id).join("agent.toml");
-    let content = std::fs::read_to_string(&agent_toml).ok()?;
-    let table: toml::Value = content.parse().ok()?;
-    let channels = table.get("channels")?.as_table()?;
-    let section = channels.get(channel)?.as_table()?;
-
-    // Encrypted form first (bot_token_enc); then plaintext (bot_token).
-    let enc_key = "bot_token_enc";
-    if let Some(enc) = section.get(enc_key).and_then(|v| v.as_str()) {
-        if !enc.is_empty() {
-            if let Some(plain) = crate::config_crypto::decrypt_value(enc, home_dir) {
-                return Some(plain);
-            }
-        }
-    }
-    let plain = section.get("bot_token").and_then(|v| v.as_str()).unwrap_or("");
-    if plain.is_empty() { None } else { Some(plain.to_string()) }
-}
-
 /// Resolve a channel token for delegation-forwarding, cascading through
-/// the delegation chain so that sub-agents without their own per-agent
-/// token inherit the root agent's token.
+/// both the delegation chain (`origin_agent`) AND the static reports_to
+/// hierarchy so that sub-agents without their own per-agent token
+/// inherit a parent's token.
 ///
-/// Order of preference:
+/// Order of preference (v1.8.28):
 ///   1. `callback_agent_id`'s own `agents/<id>/agent.toml [channels.<ch>]`
 ///      (original v1.8.14 behaviour — if the agent configured its own
 ///      bot, use it).
-///   2. `origin_agent`'s token (the chain root, e.g. `agnes` for a
-///      delegation originating from her Discord thread). Discord threads
-///      are scoped to the bot that opened them — v1.8.20 adds this hop
-///      to keep nested sub-agent replies working when only the root
-///      agent has a per-agent token.
-///   3. Global `config.toml [channels] <channel>_bot_token[_enc]`.
+///   2. **reports_to cascade from `callback_agent_id`** (new in v1.8.28)
+///      — walks up `reports_to` until an ancestor with a token is found.
+///      Handles the common case where sub-agents inherit the team root's
+///      Discord bot without needing explicit `origin_agent` tracking.
+///   3. `origin_agent`'s token and its `reports_to` cascade (v1.8.20
+///      preserved — Discord threads are scoped to the bot that opened
+///      them; the delegation root is the thread opener).
+///   4. Global `config.toml [channels] <channel>_bot_token[_enc]`.
 ///
 /// Empty string from the global fallback is treated the same as "no
 /// token configured" by the caller — `forward_to_channel` emits its
@@ -2435,14 +2415,24 @@ fn resolve_forward_token(
     enc_key: &str,
     plain_key: &str,
 ) -> String {
-    if let Some(tok) = get_agent_channel_token(home_dir, callback_agent_id, channel) {
+    // 1 + 2: callback agent's own token, then reports_to cascade.
+    if let Some(tok) = crate::config_crypto::resolve_agent_channel_token_via_reports_to(
+        home_dir,
+        callback_agent_id,
+        channel,
+    ) {
         return tok;
     }
+    // 3: origin_agent + its reports_to cascade (covers the case where
+    // callback_agent_id's chain doesn't reach the thread opener).
     if let Some(root) = origin_agent.filter(|s| !s.is_empty() && *s != callback_agent_id) {
-        if let Some(tok) = get_agent_channel_token(home_dir, root, channel) {
+        if let Some(tok) = crate::config_crypto::resolve_agent_channel_token_via_reports_to(
+            home_dir, root, channel,
+        ) {
             return tok;
         }
     }
+    // 4: global fallback.
     get_config_token(config, enc_key, plain_key, home_dir)
 }
 
