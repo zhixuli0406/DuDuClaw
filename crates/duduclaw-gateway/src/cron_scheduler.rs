@@ -411,37 +411,30 @@ async fn deliver_cron_result(
         .map_err(|e| format!("send_text failed: {e}"))
 }
 
-/// Resolve a channel bot token for cron delivery, mirroring the dispatcher
-/// cascade: per-agent `agent.toml [channels.<ch>]` → global
-/// `config.toml [channels] <ch>_bot_token(_enc)`.
+/// Resolve a channel bot token for cron delivery with `reports_to` cascade.
+///
+/// Order of preference (v1.8.28):
+///   1. The agent's own `agent.toml [channels.<ch>]`.
+///   2. Walk up the `reports_to` chain until an ancestor with a token is
+///      found (cycle-safe, bounded by `MAX_REPORTS_TO_HOPS`).
+///   3. Global `config.toml [channels] <ch>_bot_token(_enc)` as last resort.
+///
+/// Step 2 is new in v1.8.28. It fixes the cron "Discord 401 Unauthorized"
+/// loop that hit multi-bot setups: when a cron-fired agent (e.g. a
+/// sub-agent under a TL) has no per-agent Discord token, the old cascade
+/// fell straight to the global token. If the global token is a different
+/// bot from the one that opened the notify thread, Discord returned 401
+/// on every chunk. Walking `reports_to` lets the sub-agent inherit the
+/// team root's bot token automatically.
 async fn resolve_channel_token(home_dir: &Path, agent_id: &str, channel: &str) -> String {
-    // Per-agent encrypted / plaintext first.
-    let agent_toml = home_dir.join("agents").join(agent_id).join("agent.toml");
-    if let Ok(content) = tokio::fs::read_to_string(&agent_toml).await {
-        if let Ok(table) = content.parse::<toml::Value>() {
-            if let Some(section) = table
-                .get("channels")
-                .and_then(|c| c.as_table())
-                .and_then(|t| t.get(channel))
-                .and_then(|v| v.as_table())
-            {
-                if let Some(enc) = section.get("bot_token_enc").and_then(|v| v.as_str()) {
-                    if !enc.is_empty() {
-                        if let Some(plain) = crate::config_crypto::decrypt_value(enc, home_dir) {
-                            return plain;
-                        }
-                    }
-                }
-                if let Some(plain) = section.get("bot_token").and_then(|v| v.as_str()) {
-                    if !plain.is_empty() {
-                        return plain.to_string();
-                    }
-                }
-            }
-        }
+    if let Some(tok) = crate::config_crypto::resolve_agent_channel_token_via_reports_to(
+        home_dir, agent_id, channel,
+    ) {
+        return tok;
     }
 
-    // Global config fallback.
+    // Global config fallback — only reached when nobody on the chain has
+    // a per-agent token configured.
     let field_base = format!("{channel}_bot_token");
     crate::config_crypto::read_encrypted_config_field(home_dir, "channels", &field_base)
         .await
