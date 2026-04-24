@@ -1,6 +1,59 @@
 # Changelog
 
 
+## [1.8.28] - 2026-04-24
+
+### Fixed
+- **Cron notifications failed silently with Discord 401 Unauthorized
+  in multi-bot setups.** When a cron-fired agent (e.g. `xianwen-pm`,
+  `ai-papers-researcher`) had no per-agent
+  `[channels.discord] bot_token` set in its `agent.toml`, the token
+  resolver fell straight to the **global** `config.toml [channels]
+  discord_bot_token_enc`. If that global token belongs to a different
+  bot from the one that opened the notify target — and Discord threads
+  are bot-scoped so only the opening bot can post into them — every
+  delivery attempt returned `401 Unauthorized` even though the agent
+  LLM call had already succeeded. User-visible symptom: cron
+  `last_status = success` but nothing arrives in the Discord thread.
+
+  **Fix**: new `resolve_agent_channel_token_via_reports_to` in
+  [`config_crypto.rs`](crates/duduclaw-gateway/src/config_crypto.rs)
+  walks the `reports_to` chain and returns the first ancestor's token.
+  Cycle-safe (tracks visited ids) and bounded (`MAX_REPORTS_TO_HOPS =
+  8`). Wired into both:
+
+  1. [`cron_scheduler::resolve_channel_token`](crates/duduclaw-gateway/src/cron_scheduler.rs) — the cron
+     `deliver_cron_result` path.
+  2. [`dispatcher::resolve_forward_token`](crates/duduclaw-gateway/src/dispatcher.rs) — the
+     `forward_delegation_response` path that relays sub-agent replies
+     back to the originating channel.
+
+  After this change, a cron-fired `xianwen-pm` with no Discord bot of
+  its own inherits `xianwen-tl`'s token, or `agnes`'s if the TL also
+  has none configured — matching the `reports_to` hierarchy the user
+  already declared.
+
+### Changed
+- `resolve_forward_token` now does the `reports_to` cascade on **both**
+  `callback_agent_id` AND `origin_agent` (the thread opener). The
+  v1.8.20 behaviour of falling back to `origin_agent`'s direct token
+  is preserved as step 3 in the cascade; steps 1-2 add the new walk so
+  agents deeper in the hierarchy are covered without needing every TL
+  / PM / researcher to have the same bot token pasted into their
+  `agent.toml`.
+
+- The stale single-purpose `get_agent_channel_token` helper in
+  `dispatcher.rs` is removed — superseded by the shared cascade helper
+  in `config_crypto.rs`.
+
+### Added
+- 8 new unit tests in `config_crypto::tests` covering the cascade:
+  own-token wins, parent-token cascade, `None` when chain is empty,
+  nearest-ancestor-not-farthest preference, cycle detection, missing
+  agent.toml, `reports_to = ""` treated as root, and per-channel
+  independence.
+
+
 ## [1.8.27] - 2026-04-23
 
 ### Added
