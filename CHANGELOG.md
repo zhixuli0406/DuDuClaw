@@ -1,6 +1,45 @@
 # Changelog
 
 
+## [1.8.30] - 2026-04-24
+
+### Fixed
+- **Native Claude Code tools (`WebSearch` / `WebFetch` / `Read` /
+  `Write` / `Edit` / `Glob` / `Grep` / `Bash` / `TodoWrite`) were
+  silently unavailable to `claude -p` subprocesses**, causing
+  researcher cron tasks to receive 0 results and bail out even when
+  the same tools worked in interactive Claude Code sessions.
+
+  **Root cause**: [`claude_runner.rs`](crates/duduclaw-gateway/src/claude_runner.rs)
+  passed `--allowedTools "mcp__duduclaw__*"` to `claude -p`. Claude
+  Code treats `--allowedTools` as an **exclusive** auto-approve list,
+  not an *additive* one: anything not matching would need interactive
+  confirmation, which is impossible in subprocess mode. The built-in
+  tools therefore returned empty / no-oped with no error signal.
+
+  User-visible symptom (from the 2026-04-24 evening cron run): the
+  `ai-papers-researcher` / `ai-repos-researcher` agents correctly
+  followed their updated SOUL.md and cron prompts (which now direct
+  them to use native `WebSearch` instead of the DDG-blocked MCP
+  `web_search`), invoked `WebSearch`, got 0 results, and — per the
+  hard-stop rule — aborted with "搜尋工具失效" inside six seconds.
+  The equivalent query run interactively via Claude Code returned
+  normal results immediately.
+
+  **Fix**: expand the `--allowedTools` list to explicitly include the
+  native tool names researchers actually need:
+
+      mcp__duduclaw__*,WebSearch,WebFetch,Read,Write,Edit,
+      Glob,Grep,Bash,TodoWrite
+
+  This keeps the deny-by-default posture for anything not listed
+  (e.g. no `KillBash` / `NotebookEdit` / etc.) while restoring the
+  research capability that interactive Claude Code has had all along.
+  `disallowed_tools` from `agent.toml [capabilities]` still layers on
+  top via `--disallowedTools`, so explicit per-agent blocks are
+  unchanged.
+
+
 ## [1.8.29] - 2026-04-24
 
 ### Fixed
