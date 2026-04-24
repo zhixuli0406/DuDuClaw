@@ -45,6 +45,7 @@ sha2 = "0.10"
 hex = "0.4"
 rustls = { workspace = true }
 rusqlite = { workspace = true }
+argon2 = { version = "0.5", features = ["std"] }
 
 [features]
 default = []

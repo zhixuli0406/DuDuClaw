@@ -1810,8 +1810,25 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
             .map(|t| t.to_string())
     });
     if auth_token.is_none() {
-        println!("   ⚠ No auth token configured — dashboard is accessible without authentication");
-        println!("     Set DUDUCLAW_AUTH_TOKEN env var or [gateway].auth_token in config.toml\n");
+        // The WS auth gate in `server::handle_socket` also requires JWT
+        // when `users.db` has any rows — independent of `auth_token`. The
+        // old single-line "no auth token — dashboard accessible" message
+        // was misleading in that case (user would see every WS connection
+        // rejected as "auth failed"). Check the real state and report
+        // accurately so the operator knows what to do.
+        let (user_count, has_default_admin) = probe_users_db(&home);
+        if user_count > 0 {
+            println!("   🔐 JWT auth required: {} user(s) in ~/.duduclaw/users.db", user_count);
+            println!("     Dashboard login: http://localhost:{port}/login");
+            if has_default_admin {
+                println!("     ⚠ Default admin still in use: admin@local / admin — change the password at /settings");
+            }
+            println!();
+        } else {
+            println!("   ⚠ No auth configured — dashboard is accessible without authentication");
+            println!("     Set DUDUCLAW_AUTH_TOKEN env var or [gateway].auth_token in config.toml");
+            println!();
+        }
     }
 
     let config = duduclaw_gateway::GatewayConfig {
@@ -1823,6 +1840,67 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
     };
 
     duduclaw_gateway::start_gateway(config).await
+}
+
+/// Read `users.db` and report (user_count, has_default_admin) without
+/// taking a dependency on the full `duduclaw-auth` crate.
+///
+/// `has_default_admin` tries to verify the stored argon2id hash against
+/// the literal string `"admin"` — the password
+/// `duduclaw_auth::UserDb::ensure_default_admin` writes on first boot.
+/// The check uses the `argon2` crate directly (already pulled in
+/// transitively by `duduclaw-auth`) so the startup banner can flag the
+/// default-password risk even when the caller hasn't imported the auth
+/// crate itself.
+///
+/// Any IO / schema error silently returns `(0, false)` — the warning
+/// then degrades to the no-auth-configured fallback rather than crashing
+/// the startup path.
+fn probe_users_db(home_dir: &std::path::Path) -> (i64, bool) {
+    let db_path = home_dir.join("users.db");
+    if !db_path.exists() {
+        return (0, false);
+    }
+    let Ok(conn) = rusqlite::Connection::open(&db_path) else {
+        return (0, false);
+    };
+    let _ = conn.execute_batch("PRAGMA busy_timeout=1000;");
+
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+        .unwrap_or(0);
+    if count == 0 {
+        return (0, false);
+    }
+
+    // Check whether admin@local still has the default password.
+    let default_admin_hash: Option<String> = conn
+        .query_row(
+            "SELECT password_hash FROM users WHERE email = 'admin@local'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok();
+
+    let has_default_admin = default_admin_hash
+        .as_deref()
+        .map(verify_argon2_admin_default)
+        .unwrap_or(false);
+
+    (count, has_default_admin)
+}
+
+/// Verify a stored argon2id PHC string against the literal `"admin"`
+/// default password. Returns `false` on any parse / hash failure so
+/// the banner never falsely claims the default is in use.
+fn verify_argon2_admin_default(hash_phc: &str) -> bool {
+    use argon2::{Argon2, PasswordHash, PasswordVerifier};
+    let Ok(parsed) = PasswordHash::new(hash_phc) else {
+        return false;
+    };
+    Argon2::default()
+        .verify_password(b"admin", &parsed)
+        .is_ok()
 }
 
 /// `duduclaw agent` or `duduclaw agent run <name>` - Interactive session.
@@ -2702,4 +2780,117 @@ async fn cmd_update(auto_yes: bool) -> duduclaw_core::error::Result<()> {
         Err(DuDuClawError::Gateway(format!("Update failed: {}", result.message)))
     }
 }
+
+#[cfg(test)]
+mod startup_probe_tests {
+    use super::*;
+    use argon2::{
+        password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
+        Argon2,
+    };
+
+    struct TempHome(std::path::PathBuf);
+    impl TempHome {
+        fn new() -> Self {
+            let p = std::env::temp_dir()
+                .join(format!("duduclaw-probeusers-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn seed_users_db(home: &std::path::Path, email: &str, password: &str) {
+        let conn = rusqlite::Connection::open(home.join("users.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS users (
+                 id             TEXT PRIMARY KEY,
+                 email          TEXT NOT NULL UNIQUE,
+                 password_hash  TEXT NOT NULL,
+                 role           TEXT NOT NULL DEFAULT 'member',
+                 created_at     TEXT NOT NULL,
+                 last_login_at  TEXT
+             );",
+        )
+        .unwrap();
+        let salt = SaltString::generate(&mut OsRng);
+        let hash = Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .unwrap()
+            .to_string();
+        conn.execute(
+            "INSERT INTO users (id, email, password_hash, role, created_at)
+             VALUES (?1, ?2, ?3, 'admin', '2026-04-24T00:00:00Z')",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), email, hash],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn missing_users_db_returns_zero_and_false() {
+        let home = TempHome::new();
+        let (count, default_admin) = probe_users_db(&home.0);
+        assert_eq!(count, 0);
+        assert!(!default_admin);
+    }
+
+    #[test]
+    fn empty_users_table_returns_zero_and_false() {
+        let home = TempHome::new();
+        // Create an empty users.db with the schema but no rows.
+        let conn = rusqlite::Connection::open(home.0.join("users.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (
+                 id             TEXT PRIMARY KEY,
+                 email          TEXT NOT NULL UNIQUE,
+                 password_hash  TEXT NOT NULL,
+                 role           TEXT NOT NULL DEFAULT 'member',
+                 created_at     TEXT NOT NULL,
+                 last_login_at  TEXT
+             );",
+        )
+        .unwrap();
+        let (count, default_admin) = probe_users_db(&home.0);
+        assert_eq!(count, 0);
+        assert!(!default_admin);
+    }
+
+    #[test]
+    fn default_admin_detected_when_password_is_admin() {
+        let home = TempHome::new();
+        seed_users_db(&home.0, "admin@local", "admin");
+        let (count, default_admin) = probe_users_db(&home.0);
+        assert_eq!(count, 1);
+        assert!(default_admin, "admin@local with password 'admin' should be flagged");
+    }
+
+    #[test]
+    fn default_admin_not_flagged_when_password_changed() {
+        let home = TempHome::new();
+        seed_users_db(&home.0, "admin@local", "a-very-different-password");
+        let (count, default_admin) = probe_users_db(&home.0);
+        assert_eq!(count, 1);
+        assert!(!default_admin, "non-default password must not raise the banner");
+    }
+
+    #[test]
+    fn default_admin_not_flagged_when_only_non_admin_users_exist() {
+        let home = TempHome::new();
+        seed_users_db(&home.0, "alice@example.com", "admin");
+        let (count, default_admin) = probe_users_db(&home.0);
+        assert_eq!(count, 1);
+        assert!(!default_admin, "admin@local absent → no default-admin warning");
+    }
+
+    #[test]
+    fn verify_argon2_admin_default_rejects_garbage_phc() {
+        assert!(!verify_argon2_admin_default("not-a-phc-string"));
+        assert!(!verify_argon2_admin_default(""));
+    }
+}
+
 
