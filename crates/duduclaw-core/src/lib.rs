@@ -89,63 +89,142 @@ pub fn is_valid_agent_id(s: &str) -> bool {
 
 /// Find the `claude` binary in PATH or common locations (BE-L1, BE-M1).
 ///
-/// Search order:
-/// 1. `which claude` (respects current `PATH`)
+/// Discovery sources:
+/// 1. `which claude` (Unix) / `where claude` (Windows) — respects current `PATH`
 /// 2. Fixed absolute candidate paths covering Homebrew (Intel + Apple Silicon),
-///    Bun, Volta, npm-global, user-local installs, and asdf shims
+///    Bun, Volta, npm-global, user-local installs, asdf shims (Unix) and
+///    npm / pnpm / Yarn / Bun / Volta / Scoop / Claude Code native installer
+///    locations (Windows)
 /// 3. NVM glob expansion (`$HOME/.nvm/versions/node/*/bin/claude`)
 ///
-/// This is the single shared implementation — replaces 4+ duplicates.
+/// **Windows precedence (CRITICAL — fixes BatBadBut / CVE-2024-24576):**
+///
+/// Discoveries from sources 1 + 2 are pooled, then ranked **`.exe` ahead of
+/// `.cmd`** regardless of source. Spawning a `.exe` is always safe; spawning
+/// a `.cmd` triggers Rust's BatBadBut rejection when args contain newlines /
+/// quotes / `&` (which user prompts and system prompts routinely do). So a
+/// host with both `~/.local/bin/claude.exe` (clean) and a leftover
+/// `%APPDATA%\npm\claude.cmd` (BatBadBut hazard) MUST resolve to the `.exe`
+/// even when `where.exe claude` returns the `.cmd` first.
+///
+/// On Unix, the order is preserved (PATH first, then HOME).
+///
 /// When gateway is launched from launchd / Finder / Dock, `PATH` frequently
 /// omits Homebrew and Node version-manager paths, so the fixed candidates
 /// are critical for zero-config install discovery.
 pub fn which_claude() -> Option<String> {
-    // 1. Check PATH via `which` (Unix) or `where` (Windows)
+    // ── 1. Discover via PATH ─────────────────────────────────────
+    let mut path_results: Vec<String> = Vec::new();
     let lookup_cmd = if cfg!(windows) { "where" } else { "which" };
     if let Ok(output) = std::process::Command::new(lookup_cmd)
         .arg("claude")
         .output()
-        && output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-
-            if cfg!(windows) {
-                // `where` returns multiple lines. On Windows, prefer .cmd/.exe
-                // over extensionless npm shims (which are shell scripts that
-                // cause os error 193 or argument-passing issues with cmd /C).
-                let lines: Vec<&str> = stdout.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
-
-                // First pass: prefer .exe or .cmd
-                for line in &lines {
-                    let lower = line.to_lowercase();
-                    if (lower.ends_with(".exe") || lower.ends_with(".cmd"))
-                        && std::path::Path::new(line).exists()
-                    {
-                        return Some(line.to_string());
-                    }
-                }
-                // Fallback: take the first result and try appending .cmd
-                if let Some(first) = lines.first() {
-                    let cmd_path = format!("{first}.cmd");
-                    if std::path::Path::new(&cmd_path).exists() {
-                        return Some(cmd_path);
-                    }
-                    if std::path::Path::new(first).exists() {
-                        return Some(first.to_string());
-                    }
-                }
-            } else {
-                let path = stdout.lines().next().unwrap_or("").trim().to_string();
-                if !path.is_empty() && std::path::Path::new(&path).exists() {
-                    return Some(path);
-                }
+        && output.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && std::path::Path::new(trimmed).exists() {
+                path_results.push(trimmed.to_string());
             }
         }
+    }
 
-    // 2-3. Scan fixed + dynamic HOME-rooted candidates
+    // ── 2-3. Discover via HOME-rooted scan ──────────────────────
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_default();
-    which_claude_in_home(std::path::Path::new(&home))
+    let home_result = which_claude_in_home(std::path::Path::new(&home));
+
+    // Combine in source order: PATH first (user's explicit env), then HOME.
+    let mut all: Vec<String> = path_results;
+    if let Some(h) = home_result {
+        if !all.contains(&h) {
+            all.push(h);
+        }
+    }
+
+    if all.is_empty() {
+        log_resolved_claude_path_once(None, &[]);
+        return None;
+    }
+
+    let chosen: Option<String> = if cfg!(windows) {
+        pick_windows_preferred(&all)
+    } else {
+        // Unix: source-order is fine (no BatBadBut hazard).
+        all.first().cloned()
+    };
+
+    log_resolved_claude_path_once(chosen.as_deref(), &all);
+    chosen
+}
+
+/// Windows-only precedence: `.exe` STRICTLY > `.cmd` > extensionless.
+///
+/// Even if PATH discovery returned `.cmd` first, an `.exe` found anywhere in
+/// the pool wins. This is the **BatBadBut mitigation hinge** — losing this
+/// ordering puts every channel reply at risk because Rust 1.77+ rejects
+/// spawning `.bat`/`.cmd` files when args contain newlines / quotes / `&`
+/// (CVE-2024-24576), which user prompts and system prompts routinely do.
+///
+/// Compiled cross-platform under `#[cfg(any(windows, test))]` so the
+/// precedence logic can be exercised by unit tests on macOS / Linux runners.
+#[cfg(any(windows, test))]
+fn pick_windows_preferred(all: &[String]) -> Option<String> {
+    // Pass 1: any .exe wins (safe to spawn, no BatBadBut)
+    all.iter()
+        .find(|c| c.to_lowercase().ends_with(".exe"))
+        .cloned()
+        // Pass 2: .cmd (resolve_cmd_to_node parses to node + cli.js)
+        .or_else(|| {
+            all.iter()
+                .find(|c| c.to_lowercase().ends_with(".cmd"))
+                .cloned()
+        })
+        // Pass 3: extensionless — try appending .exe then .cmd
+        .or_else(|| {
+            all.iter().find_map(|c| {
+                let exe_path = format!("{c}.exe");
+                if std::path::Path::new(&exe_path).exists() {
+                    return Some(exe_path);
+                }
+                let cmd_path = format!("{c}.cmd");
+                if std::path::Path::new(&cmd_path).exists() {
+                    return Some(cmd_path);
+                }
+                None
+            })
+        })
+        // Last resort: first entry as-is
+        .or_else(|| all.first().cloned())
+}
+
+/// Emit one INFO log on the first `which_claude` call so operators can see
+/// which binary the gateway resolved without needing to enable trace-level
+/// logging. Subsequent calls are silent — `which_claude` is invoked many
+/// times per session and noisy logs would drown out real signals.
+///
+/// Logs the chosen path AND the full discovery pool so we can diagnose
+/// "wrong .cmd was picked" reports without round-tripping with the user.
+fn log_resolved_claude_path_once(chosen: Option<&str>, pool: &[String]) {
+    static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    LOGGED.get_or_init(|| {
+        match chosen {
+            Some(path) => {
+                tracing::info!(
+                    path = %path,
+                    candidates = ?pool,
+                    "Resolved claude binary"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "claude binary not found — checked PATH and HOME candidates"
+                );
+            }
+        }
+    });
 }
 
 /// Scan fixed absolute paths and HOME-rooted candidates for the `claude` binary.
@@ -270,9 +349,93 @@ pub fn which_claude_in_home(home: &std::path::Path) -> Option<String> {
 
 #[cfg(test)]
 mod which_claude_tests {
-    use super::which_claude_in_home;
+    use super::{pick_windows_preferred, which_claude_in_home};
     use std::fs;
     use std::path::Path;
+
+    // ── pick_windows_preferred precedence (BatBadBut hinge) ──────
+    //
+    // These tests verify the v1.8.32 fix: even when PATH discovery
+    // returns a `.cmd` first (e.g. `where.exe claude` finds an npm
+    // shim), an `.exe` discovered anywhere in the candidate pool
+    // MUST win. Losing this ordering = every channel reply on
+    // Windows fails with "batch file arguments are invalid".
+
+    #[test]
+    fn windows_pref_exe_beats_cmd_even_when_cmd_listed_first() {
+        let pool = vec![
+            "C:\\Users\\X\\AppData\\Roaming\\npm\\claude.cmd".to_string(),
+            "C:\\Users\\X\\.local\\bin\\claude.exe".to_string(),
+        ];
+        assert_eq!(
+            pick_windows_preferred(&pool).as_deref(),
+            Some("C:\\Users\\X\\.local\\bin\\claude.exe"),
+        );
+    }
+
+    #[test]
+    fn windows_pref_picks_cmd_when_no_exe_exists() {
+        let pool = vec!["C:\\Users\\X\\AppData\\Roaming\\npm\\claude.cmd".to_string()];
+        assert_eq!(
+            pick_windows_preferred(&pool).as_deref(),
+            Some("C:\\Users\\X\\AppData\\Roaming\\npm\\claude.cmd"),
+        );
+    }
+
+    #[test]
+    fn windows_pref_returns_none_for_empty_pool() {
+        assert!(pick_windows_preferred(&[]).is_none());
+    }
+
+    #[test]
+    fn windows_pref_first_exe_wins_among_multiple_exes() {
+        let pool = vec![
+            "C:\\a\\claude.exe".to_string(),
+            "C:\\b\\claude.exe".to_string(),
+        ];
+        assert_eq!(
+            pick_windows_preferred(&pool).as_deref(),
+            Some("C:\\a\\claude.exe"),
+        );
+    }
+
+    #[test]
+    fn windows_pref_first_cmd_wins_among_multiple_cmds_when_no_exe() {
+        let pool = vec![
+            "C:\\a\\claude.cmd".to_string(),
+            "C:\\b\\claude.cmd".to_string(),
+        ];
+        assert_eq!(
+            pick_windows_preferred(&pool).as_deref(),
+            Some("C:\\a\\claude.cmd"),
+        );
+    }
+
+    #[test]
+    fn windows_pref_extension_check_is_case_insensitive() {
+        // Some installers / users have uppercase extensions in PATHEXT order.
+        let pool = vec![
+            "C:\\a\\claude.CMD".to_string(),
+            "C:\\b\\claude.EXE".to_string(),
+        ];
+        assert_eq!(
+            pick_windows_preferred(&pool).as_deref(),
+            Some("C:\\b\\claude.EXE"),
+        );
+    }
+
+    #[test]
+    fn windows_pref_falls_back_to_first_for_extensionless_when_no_fs_match() {
+        // Pass 3 (FS append) misses; Pass 4 returns first entry as-is.
+        let pool = vec![
+            "/nonexistent/claude".to_string(),
+            "/another/claude".to_string(),
+        ];
+        assert_eq!(
+            pick_windows_preferred(&pool).as_deref(),
+            Some("/nonexistent/claude"),
+        );
+    }
 
     /// Create an executable shim at `path` so `.exists()` returns true.
     fn write_shim(path: &Path) {
