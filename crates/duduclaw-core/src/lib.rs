@@ -149,12 +149,12 @@ pub fn which_claude() -> Option<String> {
         return None;
     }
 
-    let chosen: Option<String> = if cfg!(windows) {
-        pick_windows_preferred(&all)
-    } else {
-        // Unix: source-order is fine (no BatBadBut hazard).
-        all.first().cloned()
-    };
+    // Unix: source-order is fine (no BatBadBut hazard).
+    // Windows: pick by .exe > .cmd > extensionless precedence.
+    #[cfg(not(windows))]
+    let chosen: Option<String> = all.first().cloned();
+    #[cfg(windows)]
+    let chosen: Option<String> = pick_windows_preferred(&all);
 
     log_resolved_claude_path_once(chosen.as_deref(), &all);
     chosen
