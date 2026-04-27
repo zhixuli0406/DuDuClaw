@@ -1,6 +1,75 @@
 # Changelog
 
 
+## [1.8.32] - 2026-04-27
+
+### Fixed
+- **Windows: BatBadBut spawn error persisted after v1.8.31 because
+  `which_claude` short-circuited on `where.exe` results before
+  HOME-rooted candidates were consulted.** v1.8.31 reordered the HOME
+  candidate list so `.exe` came before `.cmd`, but missed the more
+  fundamental bug: [`which_claude`](crates/duduclaw-core/src/lib.rs)
+  ran `where.exe claude` first and **returned the first matching
+  `.exe` OR `.cmd` line**, never reaching the HOME scan. On hosts
+  with both a clean `~/.local/bin/claude.exe` install AND a leftover
+  `%APPDATA%\npm\claude.cmd`, `where.exe` typically returned the
+  `.cmd` first when PATH included `%APPDATA%\Roaming\npm` (which it
+  often does for service / launchd / Explorer-launched processes
+  even though the user's interactive shell shows it empty). The
+  `.cmd` then triggered Rust 1.77+'s
+  [BatBadBut][batbadbut] rejection (CVE-2024-24576) for any prompt
+  containing newlines / quotes / `&` — i.e. essentially every prompt.
+
+  [batbadbut]: https://blog.rust-lang.org/2024/04/09/cve-2024-24576/
+
+  **Fix**: `which_claude` now **pools** results from PATH discovery
+  AND the HOME-rooted scan (deduped), then applies a strict
+  precedence regardless of source:
+
+  1. any `.exe` in the pool wins (always safe to spawn)
+  2. then any `.cmd` (parsed by `resolve_cmd_to_node` into
+     `node.exe + cli.js` to avoid handing args to `cmd.exe`)
+  3. then extensionless paths with `.exe`/`.cmd` appended via FS check
+  4. last resort: first existing entry as-is
+
+  On the customer machine that was failing in v1.8.31, this means
+  `where.exe claude` returning `%APPDATA%\Roaming\npm\claude.cmd`
+  AND the HOME scan finding `~/.local/bin/claude.exe` now resolves
+  to the `.exe` — bypassing the BatBadBut hazard entirely.
+
+### Added
+- **One-shot `INFO` log of the resolved `claude` binary path on the
+  first `which_claude` call.** The log line includes both the chosen
+  path and the full discovery pool. This means future Windows /
+  multi-installer issue reports arrive with the resolved path
+  already in the logs:
+
+      INFO duduclaw_core: Resolved claude binary
+        path="C:\\Users\\X\\.local\\bin\\claude.exe"
+        candidates=["C:\\Users\\X\\AppData\\Roaming\\npm\\claude.cmd",
+                    "C:\\Users\\X\\.local\\bin\\claude.exe"]
+
+  Subsequent `which_claude` calls (there are 11 call sites — channel
+  reply, account rotation, heartbeat, etc.) are silent so this never
+  becomes log spam.
+
+### Tests
+- 7 new cross-platform unit tests in `which_claude_tests` exercise
+  the new precedence rules:
+  `windows_pref_exe_beats_cmd_even_when_cmd_listed_first`,
+  `windows_pref_picks_cmd_when_no_exe_exists`,
+  `windows_pref_returns_none_for_empty_pool`,
+  `windows_pref_first_exe_wins_among_multiple_exes`,
+  `windows_pref_first_cmd_wins_among_multiple_cmds_when_no_exe`,
+  `windows_pref_extension_check_is_case_insensitive` (handles
+  uppercase `.EXE` / `.CMD` from PATHEXT-style discovery), and
+  `windows_pref_falls_back_to_first_for_extensionless_when_no_fs_match`.
+
+  Compile-gated with `#[cfg(any(windows, test))]` on the helper
+  `pick_windows_preferred` so macOS / Linux CI runners can validate
+  the Windows-only logic without needing a Windows host.
+
+
 ## [1.8.31] - 2026-04-27
 
 ### Fixed
