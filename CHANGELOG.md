@@ -1,6 +1,53 @@
 # Changelog
 
 
+## [1.8.34] - 2026-04-27
+
+### Fixed
+- **Local-fallback path silently failed for users running a remote
+  OpenAI-compatible inference server (vLLM / SGLang / llamafile).**
+  Reproducer: Linux gateway with no Claude CLI installed,
+  `inference_mode = "local"` in `config.toml`, and `[openai_compat]`
+  pointing at `http://192.168.168.244:8000/v1` in `inference.toml`.
+  Sending a message via the dashboard webchat returned
+  `DuDu 暫時無法回應：系統找不到 Claude Code CLI` even though the
+  remote vLLM endpoint was reachable and the model id matched.
+
+  Root cause: `InferenceEngine::load_model` unconditionally called
+  `ModelManager::resolve_path`, which only finds GGUF files under
+  `~/.duduclaw/models/`. For remote backends the model lives on a
+  server, so `resolve_path` returned `ModelNotFound` and the engine
+  errored before `OpenAiCompatBackend` ever saw the request — making
+  the `channel_reply` local-fallback path silently fail with the
+  misleading "Claude Code CLI not found" final message.
+
+  Gateway log evidence:
+  ```
+  WARN duduclaw_inference::engine: Failed to auto-load model
+    model="qwen3.6-35b-a3b" error=Model not found: qwen3.6-35b-a3b
+  WARN duduclaw_gateway::channel_reply: Local inference unavailable:
+    Local inference error: Model not found: qwen3.6-35b-a3b
+  WARN duduclaw_gateway::channel_reply: Channel reply fallback —
+    all providers failed agent=DuDu reason=BinaryMissing
+    last_error=claude CLI not found in PATH
+  ```
+
+  Fix: add `InferenceBackend::requires_local_file` (default `true`,
+  override `false` in `OpenAiCompatBackend`) and gate `resolve_path`
+  on it. Remote backends now receive the raw model id, which matches
+  what `OpenAiCompatBackend::load_model` already does (ignores the
+  path arg and uses `[openai_compat].base_url + .model` from
+  `inference.toml`).
+
+  Adds two regression tests in `engine::tests` using a stub backend:
+  - `load_model_skips_path_resolution_for_remote_backends`
+  - `load_model_still_resolves_path_for_local_backends`
+
+  Workaround for users on ≤ 1.8.33: `touch
+  ~/.duduclaw/models/<model-id>.gguf` to satisfy the path check.
+  Safe to delete after upgrading to 1.8.34.
+
+
 ## [1.8.33] - 2026-04-27
 
 ### Fixed
