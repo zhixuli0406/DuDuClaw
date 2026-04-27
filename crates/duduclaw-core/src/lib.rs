@@ -182,19 +182,50 @@ pub fn which_claude_in_home(home: &std::path::Path) -> Option<String> {
         let appdata = std::env::var("APPDATA").unwrap_or_default();
         let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
         vec![
-            // npm global (default Windows npm install location)
-            format!("{appdata}\\npm\\claude.cmd"),
-            format!("{appdata}\\npm\\claude"),
+            // ── .exe candidates first ────────────────────────────
+            // .exe spawns cleanly via std::process::Command — no
+            // BatBadBut (CVE-2024-24576) hazard. When a host has both
+            // a clean .exe install AND a leftover npm .cmd shim, we
+            // MUST prefer the .exe to avoid Rust 1.77+'s rejection of
+            // .cmd args containing newlines / quotes / `&` etc.
+            //
+            // Claude Code native installer (XDG-style on Windows):
+            //   ~/.local/bin/claude.exe — the most common location
+            //   on machines installed via the official installer.
+            format!("{home_str}\\.local\\bin\\claude.exe"),
+            // Claude Code legacy / desktop-installer locations
+            format!("{home_str}\\.claude\\bin\\claude.exe"),
+            format!("{localappdata}\\Programs\\claude\\claude.exe"),
             // Bun on Windows
             format!("{home_str}\\.bun\\bin\\claude.exe"),
             // Volta on Windows
             format!("{home_str}\\.volta\\bin\\claude.exe"),
-            // Claude Code native installer
-            format!("{localappdata}\\Programs\\claude\\claude.exe"),
-            format!("{home_str}\\.claude\\bin\\claude.exe"),
             // Scoop
             format!("{home_str}\\scoop\\shims\\claude.exe"),
+            // pnpm global (modern default)
+            format!("{localappdata}\\pnpm\\claude.exe"),
+            // Yarn classic global
+            format!("{localappdata}\\Yarn\\bin\\claude.exe"),
+
+            // ── .cmd candidates (rely on resolve_cmd_to_node) ────
+            // Each .cmd is parsed into (node.exe, cli.js) at spawn
+            // time so we never hand args directly to cmd.exe.
+            // npm global (default Windows npm install location)
+            format!("{appdata}\\npm\\claude.cmd"),
+            format!("{appdata}\\npm\\claude"),
+            // pnpm global .cmd shim
+            format!("{localappdata}\\pnpm\\claude.cmd"),
+            // Yarn classic global .cmd shim
+            format!("{localappdata}\\Yarn\\bin\\claude.cmd"),
+            // Bun on Windows (older versions ship .cmd shims)
+            format!("{home_str}\\.bun\\bin\\claude.cmd"),
+            // Volta .cmd (older releases)
+            format!("{home_str}\\.volta\\bin\\claude.cmd"),
+            // Scoop
             format!("{home_str}\\scoop\\shims\\claude.cmd"),
+            // ~/.local/bin extensionless / .cmd fallback
+            format!("{home_str}\\.local\\bin\\claude.cmd"),
+            format!("{home_str}\\.local\\bin\\claude"),
         ]
     };
 
