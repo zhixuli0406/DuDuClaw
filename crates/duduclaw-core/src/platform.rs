@@ -59,23 +59,32 @@ pub fn async_command_for(program: &str) -> tokio::process::Command {
     tokio::process::Command::new(program)
 }
 
-/// On Windows, resolve an npm `.cmd` shim to its underlying (node, script) pair.
+/// On Windows, resolve a `.cmd`/`.bat` shim (npm, Bun, pnpm, yarn …) to its
+/// underlying `(node, script)` pair so we can spawn `node.exe script.mjs`
+/// directly — avoiding `cmd /C` (mangles arguments) and Rust 1.77+'s
+/// `BatBadBut` rejection (CVE-2024-24576) which surfaces as the IO error
+/// `"batch file arguments are invalid"` when args contain `"`, `&`, newlines,
+/// etc. — a common case here since user prompts and system prompts often do.
 ///
-/// npm `.cmd` shims have a standard format ending with:
-/// ```text
-/// "%_prog%" "%dp0%\node_modules\...\cli.mjs" %*
-/// ```
+/// Two strategies, in order:
 ///
-/// We parse this to extract the script path and find `node.exe`, then
-/// call `node.exe script.mjs args...` directly — avoiding `cmd /C`
-/// which mangles arguments containing quotes, `&`, `|`, `>`, newlines, etc.
+/// 1. **Parse the shim file** — search every line of the shim for a quoted
+///    or whitespace-separated token ending in `.js`/`.mjs`/`.cjs`, expand
+///    common shim variables (`%~dp0`, `%dp0%`, `%~dpn0`, `%CD%`), and join
+///    the relative result with the shim's directory.
 ///
-/// Returns `None` if the file is not a parseable npm shim (falls back to
-/// direct execution or `cmd /C`).
+/// 2. **Probe known package layouts** — if the shim doesn't parse (Bun
+///    binary wrappers, custom shims), check the well-known relative paths
+///    where `@anthropic-ai/claude-code/cli.js` lives for npm / Bun / yarn /
+///    pnpm global installs.
+///
+/// Returns `None` only if neither strategy resolves a real `.js`. In that
+/// case the caller falls back to spawning the `.cmd` directly, which may
+/// then trigger the BatBadBut error — but at least we tried both clean paths.
 #[cfg(windows)]
 fn resolve_cmd_to_node(program: &str) -> Option<(String, String)> {
     let lower = program.to_lowercase();
-    // Only attempt for .cmd files or extensionless files
+    // Direct .exe is fine — Rust spawns it cleanly without cmd.exe.
     if lower.ends_with(".exe") {
         return None;
     }
@@ -92,39 +101,134 @@ fn resolve_cmd_to_node(program: &str) -> Option<(String, String)> {
         program.to_string()
     };
 
-    let content = std::fs::read_to_string(&cmd_path).ok()?;
+    if !std::path::Path::new(&cmd_path).exists() {
+        return None;
+    }
+
     let dir = std::path::Path::new(&cmd_path).parent()?;
 
-    // Find the script path: look for node_modules\...\*.mjs or *.js in the last lines
-    // npm shims end with: "%_prog%" "%dp0%\node_modules\...\cli.mjs" %*
-    for line in content.lines().rev() {
-        // Look for a quoted path containing node_modules
-        if !line.contains("node_modules") {
-            continue;
+    // Strategy A: parse the shim's invocation line.
+    if let Ok(content) = std::fs::read_to_string(&cmd_path)
+        && let Some(rel) = parse_shim_script_path(&content)
+    {
+        let candidate = dir.join(&rel);
+        if candidate.exists() {
+            return Some((locate_node(dir), candidate.to_string_lossy().to_string()));
         }
-        // Extract path between quotes: "%dp0%\node_modules\...\cli.mjs"
-        for segment in line.split('"') {
-            if segment.contains("node_modules") && (segment.ends_with(".mjs") || segment.ends_with(".js")) {
-                // Resolve %dp0% → the directory of the .cmd file
-                let resolved = segment
-                    .replace("%dp0%", "")
-                    .replace("%~dp0", "");
-                let script = dir.join(resolved.trim_start_matches(['\\', '/']));
-                if script.exists() {
-                    // Find node.exe: check alongside the .cmd, then PATH
-                    let node = dir.join("node.exe");
-                    let node_path = if node.exists() {
-                        node.to_string_lossy().to_string()
-                    } else {
-                        "node".to_string() // rely on PATH
-                    };
-                    return Some((node_path, script.to_string_lossy().to_string()));
-                }
-            }
+    }
+
+    // Strategy B: probe well-known cli.js layouts relative to the shim dir.
+    for parts in known_cli_subpaths() {
+        let mut p = dir.to_path_buf();
+        for seg in *parts {
+            p.push(seg);
+        }
+        if p.exists() {
+            return Some((locate_node(dir), p.to_string_lossy().to_string()));
         }
     }
 
     None
+}
+
+/// Parse the invocation line of a Windows shim and return the relative path
+/// to the `.js`/`.mjs`/`.cjs` script it invokes, with shim variables expanded
+/// to empty strings (so the path is relative to the shim's directory).
+///
+/// Cross-platform-compiled so unit tests can exercise it on any host.
+#[cfg(any(windows, test))]
+fn parse_shim_script_path(content: &str) -> Option<String> {
+    // Walk lines in reverse — the actual invocation is at the bottom of the
+    // shim (after all the `IF EXIST` / `SETLOCAL` boilerplate).
+    for line in content.lines().rev() {
+        let mut last_match: Option<String> = None;
+
+        // Pass 1: every double-quoted segment (odd indices when split by `"`).
+        for (i, segment) in line.split('"').enumerate() {
+            if i % 2 == 1
+                && let Some(p) = clean_shim_token(segment)
+            {
+                last_match = Some(p);
+            }
+        }
+        // Pass 2: whitespace tokens (handles unquoted shims like Bun's).
+        for token in line.split_whitespace() {
+            let unquoted = token.trim_matches(['"', '\'']);
+            if let Some(p) = clean_shim_token(unquoted) {
+                last_match = Some(p);
+            }
+        }
+
+        if last_match.is_some() {
+            return last_match;
+        }
+    }
+    None
+}
+
+/// Return `Some(relative_path)` if `raw` looks like a JS script reference in a
+/// shim (ends in `.js`/`.mjs`/`.cjs` after expanding common shim variables),
+/// otherwise `None`. Path separators are normalized to `/` so that
+/// `Path::join` works on both Windows and Unix.
+#[cfg(any(windows, test))]
+fn clean_shim_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_lowercase();
+    if !(lower.ends_with(".mjs") || lower.ends_with(".js") || lower.ends_with(".cjs")) {
+        return None;
+    }
+    // %~dp0 / %dp0% / %~dpn0 / %~f0 / %CD% all expand to "the shim's dir";
+    // by replacing them with empty we get a path relative to that dir.
+    let expanded = trimmed
+        .replace("%~dp0", "")
+        .replace("%dp0%", "")
+        .replace("%~dpn0", "")
+        .replace("%~f0", "")
+        .replace("%CD%", "");
+    let normalized = expanded.replace('\\', "/");
+    let cleaned = normalized.trim_start_matches('/').to_string();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Well-known relative paths from a shim directory to
+/// `@anthropic-ai/claude-code/cli.js`. Used as a fallback when shim parsing
+/// fails (e.g. binary wrappers, custom installers).
+#[cfg(any(windows, test))]
+fn known_cli_subpaths() -> &'static [&'static [&'static str]] {
+    &[
+        // npm global: %APPDATA%\npm\claude.cmd → ./node_modules/...
+        &["node_modules", "@anthropic-ai", "claude-code", "cli.js"],
+        &["node_modules", "@anthropic-ai", "claude-code", "cli.mjs"],
+        // npm prefix (Node native installer): <prefix>/bin/claude.cmd → <prefix>/lib/node_modules/...
+        &["..", "lib", "node_modules", "@anthropic-ai", "claude-code", "cli.js"],
+        // yarn global / generic ../node_modules
+        &["..", "node_modules", "@anthropic-ai", "claude-code", "cli.js"],
+        // Bun global: <bun>/bin/claude.cmd → <bun>/install/global/node_modules/...
+        &["..", "install", "global", "node_modules", "@anthropic-ai", "claude-code", "cli.js"],
+        // Bun packages layout
+        &["..", "packages", "@anthropic-ai", "claude-code", "cli.js"],
+    ]
+}
+
+/// Find a usable `node.exe` near a shim. Falls back to bare `"node"` (relying
+/// on `PATH`) so the spawn still succeeds when Node isn't co-located.
+#[cfg(windows)]
+fn locate_node(dir: &std::path::Path) -> String {
+    let alongside = dir.join("node.exe");
+    if alongside.exists() {
+        return alongside.to_string_lossy().to_string();
+    }
+    if let Some(parent) = dir.parent() {
+        let up = parent.join("node.exe");
+        if up.exists() {
+            return up.to_string_lossy().to_string();
+        }
+    }
+    "node".to_string()
 }
 
 // ── File locking ─────────────────────────────────────────────
@@ -371,5 +475,140 @@ mod sys {
         use windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent;
         // CTRL_C_EVENT = 0
         unsafe { GenerateConsoleCtrlEvent(0, 0); }
+    }
+}
+
+// ── Shim parser tests ─────────────────────────────────────────
+//
+// These tests are cross-platform-compiled — they exercise pure string
+// parsing (`parse_shim_script_path`) and static data (`known_cli_subpaths`)
+// without touching the filesystem or invoking any Windows APIs, so the
+// host can be macOS or Linux.
+#[cfg(test)]
+mod shim_parser_tests {
+    use super::{known_cli_subpaths, parse_shim_script_path};
+
+    #[test]
+    fn parses_npm_v9_shim() {
+        // Real npm@9 shim format (slightly trimmed for brevity).
+        let content = r#"@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+
+IF EXIST "%dp0%\node.exe" (
+  SET "_prog=%dp0%\node.exe"
+) ELSE (
+  SET "_prog=node"
+  SET PATHEXT=%PATHEXT:;.JS;=;%
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_modules\@anthropic-ai\claude-code\cli.mjs" %*
+"#;
+        assert_eq!(
+            parse_shim_script_path(content).as_deref(),
+            Some("node_modules/@anthropic-ai/claude-code/cli.mjs"),
+        );
+    }
+
+    #[test]
+    fn parses_bun_shim_with_relative_packages_path() {
+        // Bun's `bun install -g` shim format.
+        let content = r#"@"%~dp0\..\bun.exe" "%~dp0\..\packages\@anthropic-ai\claude-code\cli.js" %*"#;
+        assert_eq!(
+            parse_shim_script_path(content).as_deref(),
+            Some("../packages/@anthropic-ai/claude-code/cli.js"),
+        );
+    }
+
+    #[test]
+    fn parses_pnpm_global_shim() {
+        let content = r#"@"%~dp0\node.exe" "%~dp0\..\global\5\node_modules\@anthropic-ai\claude-code\cli.js" %*"#;
+        assert_eq!(
+            parse_shim_script_path(content).as_deref(),
+            Some("../global/5/node_modules/@anthropic-ai/claude-code/cli.js"),
+        );
+    }
+
+    #[test]
+    fn parses_yarn_classic_global_shim() {
+        let content = r#"@node "%~dp0..\lib\node_modules\@anthropic-ai\claude-code\cli.js" %*"#;
+        assert_eq!(
+            parse_shim_script_path(content).as_deref(),
+            Some("../lib/node_modules/@anthropic-ai/claude-code/cli.js"),
+        );
+    }
+
+    #[test]
+    fn picks_js_target_when_node_exe_also_in_line() {
+        // The "node.exe" token must NOT win — only `.js`/`.mjs`/`.cjs`.
+        let content = r#"@"%~dp0\node.exe" "%~dp0\node_modules\foo\cli.js" %*"#;
+        assert_eq!(
+            parse_shim_script_path(content).as_deref(),
+            Some("node_modules/foo/cli.js"),
+        );
+    }
+
+    #[test]
+    fn returns_none_for_pure_exe_wrapper() {
+        // Scoop / Volta shims that just call a `.exe` directly — not a Node script.
+        let content = r#"@"%~dp0\..\apps\claude\current\bin\claude.exe" %*"#;
+        assert!(parse_shim_script_path(content).is_none());
+    }
+
+    #[test]
+    fn returns_none_for_empty_shim() {
+        assert!(parse_shim_script_path("").is_none());
+    }
+
+    #[test]
+    fn handles_unquoted_token() {
+        // Some hand-written shims omit quotes. Whitespace fallback should still match.
+        let content = "@node %~dp0\\cli.mjs %*";
+        assert_eq!(
+            parse_shim_script_path(content).as_deref(),
+            Some("cli.mjs"),
+        );
+    }
+
+    #[test]
+    fn handles_cjs_extension() {
+        let content = r#"@node "%~dp0\node_modules\foo\bar.cjs" %*"#;
+        assert_eq!(
+            parse_shim_script_path(content).as_deref(),
+            Some("node_modules/foo/bar.cjs"),
+        );
+    }
+
+    #[test]
+    fn picks_last_js_when_multiple_in_line() {
+        // If a shim mentions multiple JS paths on one line (e.g. wrapper +
+        // delegate), the last one is the actual invocation target.
+        let content = r#"@node "%~dp0\wrapper.js" "%~dp0\real-cli.js" %*"#;
+        assert_eq!(
+            parse_shim_script_path(content).as_deref(),
+            Some("real-cli.js"),
+        );
+    }
+
+    #[test]
+    fn known_cli_subpaths_cover_major_package_managers() {
+        // Light sanity check — make sure none of the entries are accidentally
+        // empty and that we cover at least npm + Bun (different parent depths).
+        let paths = known_cli_subpaths();
+        assert!(paths.len() >= 4, "expected coverage for npm/yarn/pnpm/Bun");
+        assert!(paths.iter().all(|p| !p.is_empty()));
+        assert!(
+            paths.iter().any(|p| p.first() == Some(&"node_modules")),
+            "missing direct node_modules entry (npm global)",
+        );
+        assert!(
+            paths.iter().any(|p| p.first() == Some(&"..")),
+            "missing parent-relative entry (Bun/yarn/pnpm)",
+        );
     }
 }
