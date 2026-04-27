@@ -1,6 +1,67 @@
 # Changelog
 
 
+## [1.8.31] - 2026-04-27
+
+### Fixed
+- **Windows: `claude CLI spawn error: batch file arguments are
+  invalid` blocking every channel reply.** Rust 1.77+ rejects spawning
+  `.bat`/`.cmd` files when argv contains characters that could be
+  reinterpreted by `cmd.exe` (newlines, quotes, `&`, `|`, …) — the
+  [BatBadBut][batbadbut] mitigation for CVE-2024-24576. User prompts
+  and system prompts routinely contain those characters, so `claude
+  -p` subprocess calls failed at spawn time on every Windows host
+  whose `which_claude` resolved to `%APPDATA%\npm\claude.cmd` (or any
+  other npm/Bun/pnpm/yarn `.cmd` shim). The rotator interpreted the
+  spawn failure as an account error, retried each account in turn, and
+  surfaced the misleading `All accounts exhausted` to the user.
+
+  [batbadbut]: https://blog.rust-lang.org/2024/04/09/cve-2024-24576/
+
+  **Two-layer fix in `duduclaw-core`:**
+
+  1. [`which_claude_in_home`](crates/duduclaw-core/src/lib.rs) on
+     Windows now **prefers `.exe` over `.cmd`** in candidate ordering.
+     A host with both a real `.exe` install (e.g. Claude Code native
+     installer at `~/.local/bin/claude.exe`) and a leftover npm
+     `.cmd` shim previously matched the `.cmd` first and tripped
+     BatBadBut. Reordered so every `.exe` location is checked before
+     any `.cmd`. Also added the **`~/.local/bin/claude.exe`** path
+     (the official native installer's XDG-style location on Windows,
+     previously missing) plus pnpm / Yarn-classic / Bun-`.cmd` /
+     Volta-`.cmd` fallbacks.
+
+  2. [`platform::resolve_cmd_to_node`](crates/duduclaw-core/src/platform.rs)
+     — the npm-shim parser that converts a `.cmd` shim into a
+     `node.exe + cli.js` invocation (so we never hand args to
+     `cmd.exe`) — previously only matched paths containing
+     `node_modules` ending in `.mjs`/`.js`. Bun (`..\packages\…`),
+     pnpm (`..\global\5\node_modules\…`), and Yarn classic
+     (`..\lib\node_modules\…`) all parsed as `None` and fell through
+     to the BatBadBut path. New parser scans every quoted segment +
+     every whitespace token, expands `%~dp0` / `%dp0%` / `%~dpn0` /
+     `%~f0` / `%CD%` to empty, normalizes `\` to `/` for
+     cross-platform path joining, accepts `.cjs`, and picks the
+     *last* JS token per line so wrapper scripts don't shadow the
+     real `cli.js`. When parsing still fails (binary wrappers, custom
+     shims), a known-layout probe checks 6 well-known relative paths
+     from the shim directory to `@anthropic-ai/claude-code/cli.js`
+     for npm / Bun / yarn / pnpm.
+
+  **Diagnostic note**: `where claude` returning empty on the customer
+  machine was a red herring — `which_claude`'s HOME-rooted candidate
+  scan still found `~/.local/bin/claude.exe`. The actual root cause
+  was the `.cmd`-before-`.exe` ordering shadowing it.
+
+### Tests
+- 11 new cross-platform unit tests in `platform::shim_parser_tests`
+  exercise npm v9 / Bun / pnpm / Yarn-classic shim formats, the
+  pure-`.exe`-wrapper case, multi-`.js`-per-line ordering, `.cjs`
+  extension handling, and unquoted-token fallback. Compile-gated with
+  `#[cfg(any(windows, test))]` so they run on macOS/Linux CI hosts
+  and validate the parser without needing a Windows runner.
+
+
 ## [1.8.30] - 2026-04-24
 
 ### Fixed
