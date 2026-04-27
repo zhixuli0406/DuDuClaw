@@ -215,10 +215,24 @@ impl InferenceEngine {
     }
 
     /// Load a model by id or path.
+    ///
+    /// For local backends (llama.cpp, mistral.rs) the id is resolved against
+    /// `models_dir` and the resulting filesystem path is passed to the backend.
+    /// For remote backends (OpenAI-compatible HTTP) the id is passed through
+    /// unchanged because the model lives on a server — without this branch the
+    /// engine would error with `ModelNotFound` before the backend ever sees
+    /// the request, breaking remote-only setups (vLLM, SGLang, llamafile).
     pub async fn load_model(&self, model_id: &str) -> Result<ModelInfo> {
         let backend = self.get_backend().await?;
-        let model_path = self.model_manager.resolve_path(model_id).await?;
-        let path_str = model_path.to_string_lossy().to_string();
+        let path_str = if backend.requires_local_file() {
+            self.model_manager
+                .resolve_path(model_id)
+                .await?
+                .to_string_lossy()
+                .to_string()
+        } else {
+            model_id.to_string()
+        };
 
         let info = backend.load_model(&path_str, &self.config.generation).await?;
         self.model_manager.set_loaded(&info.id, info.context_length).await;
@@ -358,5 +372,124 @@ impl InferenceEngine {
             Some(m) => m.is_available().await,
             None => false,
         }
+    }
+
+    #[cfg(test)]
+    async fn set_backend_for_test(&self, backend: Arc<dyn InferenceBackend>) {
+        *self.backend.write().await = Some(backend);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tempfile::TempDir;
+
+    /// Stub backend used by tests to verify engine behavior without needing
+    /// a real model file or network endpoint.
+    struct StubBackend {
+        requires_local: bool,
+        load_called: AtomicBool,
+        last_path: RwLock<Option<String>>,
+    }
+
+    impl StubBackend {
+        fn new(requires_local: bool) -> Self {
+            Self {
+                requires_local,
+                load_called: AtomicBool::new(false),
+                last_path: RwLock::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl InferenceBackend for StubBackend {
+        fn name(&self) -> &str {
+            "stub"
+        }
+
+        fn requires_local_file(&self) -> bool {
+            self.requires_local
+        }
+
+        async fn load_model(
+            &self,
+            model_path: &str,
+            _params: &GenerationParams,
+        ) -> Result<ModelInfo> {
+            self.load_called.store(true, Ordering::SeqCst);
+            *self.last_path.write().await = Some(model_path.to_string());
+            Ok(ModelInfo {
+                id: "stub-model".to_string(),
+                path: model_path.to_string(),
+                architecture: "stub".to_string(),
+                parameter_count: "0".to_string(),
+                quantization: "none".to_string(),
+                file_size_bytes: 0,
+                estimated_memory_mb: 0,
+                kv_cache_mb: 0,
+                is_loaded: true,
+                context_length: 4096,
+            })
+        }
+
+        async fn unload_model(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn loaded_model(&self) -> Option<ModelInfo> {
+            None
+        }
+
+        async fn generate(&self, _request: &InferenceRequest) -> Result<InferenceResponse> {
+            unreachable!("generate should not be called by load_model tests")
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    /// Regression test for v1.8.34: remote backends (OpenAI-compat) must skip
+    /// `ModelManager::resolve_path` because the model lives on a server and
+    /// there is no local GGUF file.
+    #[tokio::test]
+    async fn load_model_skips_path_resolution_for_remote_backends() {
+        let tmp = TempDir::new().expect("tempdir");
+        let engine = InferenceEngine::new(tmp.path()).await;
+        let backend = Arc::new(StubBackend::new(false));
+        engine.set_backend_for_test(backend.clone()).await;
+
+        let info = engine
+            .load_model("qwen3.6-35b-a3b")
+            .await
+            .expect("remote backend load should not require a local file");
+
+        assert!(backend.load_called.load(Ordering::SeqCst));
+        assert_eq!(info.id, "stub-model");
+        // Remote backends receive the raw model id, not a filesystem path.
+        let last = backend.last_path.read().await.clone();
+        assert_eq!(last.as_deref(), Some("qwen3.6-35b-a3b"));
+    }
+
+    /// Local backends must still go through `resolve_path` so missing files
+    /// surface as `ModelNotFound` (preserves pre-v1.8.34 llama.cpp behavior).
+    #[tokio::test]
+    async fn load_model_still_resolves_path_for_local_backends() {
+        let tmp = TempDir::new().expect("tempdir");
+        let engine = InferenceEngine::new(tmp.path()).await;
+        let backend = Arc::new(StubBackend::new(true));
+        engine.set_backend_for_test(backend.clone()).await;
+
+        let err = engine
+            .load_model("nonexistent-model")
+            .await
+            .expect_err("local backend with missing file should fail");
+
+        assert!(matches!(err, InferenceError::ModelNotFound { .. }));
+        assert!(!backend.load_called.load(Ordering::SeqCst));
     }
 }
