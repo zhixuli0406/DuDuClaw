@@ -1,6 +1,92 @@
 # Changelog
 
 
+## [1.8.33] - 2026-04-27
+
+### Fixed
+- **Windows: BatBadBut spawn error persisted on hosts where the
+  `@anthropic-ai/claude-code` npm package ships a native `.exe`
+  instead of a JS CLI.** The customer reproducer on 2026-04-27
+  (after v1.8.32 still failed) revealed the `claude.cmd` shim
+  contents:
+
+  ```bat
+  @ECHO off
+  GOTO start
+  :find_dp0
+  SET dp0=%~dp0
+  EXIT /b
+  :start
+  SETLOCAL
+  CALL :find_dp0
+  "%dp0%\node_modules\@anthropic-ai\claude-code\bin\claude.exe"   %*
+  ```
+
+  `@anthropic-ai/claude-code` ≥ 2.x ships a real `claude.exe` inside
+  the npm package and the cmd shim is just a transfer wrapper. The
+  v1.8.32 shim parser only matched `.js`/`.mjs`/`.cjs` references,
+  returned `None` for the `.exe` line, fell through to known-layout
+  probes (which also only checked for `cli.js` / `cli.mjs`), returned
+  `None` there too, and the caller spawned the `.cmd` directly →
+  BatBadBut. The diagnostic log added in v1.8.32 confirmed it:
+
+  ```
+  INFO Resolved claude binary
+    path=C:\Users\USER\AppData\Roaming\npm\claude.cmd
+    candidates=[..., "...\\claude.cmd"]   ← no .exe in pool
+  WARN claude CLI spawn error: batch file arguments are invalid
+  ```
+
+  **Fix**: extend the shim parser and probe table to follow shims
+  that point to a real `.exe` (not just JavaScript scripts). Three
+  rule changes in [`platform::resolve_cmd_shim`](crates/duduclaw-core/src/platform.rs):
+
+  1. `clean_shim_token` now matches `.exe` in addition to
+     `.js`/`.mjs`/`.cjs`. The result is typed:
+     `ShimTarget { kind: Exe | Script, rel: String }`.
+
+  2. **Per-line target selection rule**:
+     - Line has BOTH `.exe` AND a script → **Script wins** (the
+       `.exe` is the runtime — `node.exe` / `bun.exe` — and the
+       script is the actual target). Handles Bun / pnpm / yarn
+       JS shims.
+     - Line has ONLY `.exe` → **Exe wins** (new-style native shim;
+       the `.exe` IS the target). Handles the customer's case.
+     - Line has ONLY a script → **Script wins** (legacy npm shims).
+
+  3. `known_cli_subpaths` → `known_target_subpaths` now contains 5
+     native-`.exe` probes covering npm / yarn / Bun / pnpm globals —
+     each terminating at `node_modules/@anthropic-ai/claude-code/bin/claude.exe`.
+     Legacy `cli.js` / `cli.mjs` probes are retained for older
+     installs.
+
+  After this change, the customer's spawn path becomes:
+  `Command::new("C:\\Users\\USER\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe")` —
+  a direct `.exe` invocation with zero `cmd.exe` involvement and
+  zero BatBadBut hazard, regardless of prompt content.
+
+### Changed
+- `resolve_cmd_to_node` (private) renamed to `resolve_cmd_shim` and
+  now returns `Option<(String, Vec<String>)>` — a real executable
+  plus prefix args — so callers can spawn either a direct `.exe`
+  (`vec![]`) or `node + cli.js` (`vec![cli.js]`) uniformly.
+  `command_for` / `async_command_for` updated accordingly.
+
+### Tests
+- Shim parser tests overhauled around the new `parse_shim_target`
+  API. 14 cross-platform unit tests now cover:
+  - the new-style native-`.exe` shim (the customer's exact
+    `claude.cmd` content reproduced verbatim),
+  - legacy JS shims for npm v9 / Bun / pnpm / yarn classic,
+  - the **Script-wins-over-Exe-when-both-present** priority rule,
+  - the multi-token-per-line ordering for both `.exe` and `.js`,
+  - the empty-shim, unquoted-hand-written, and `.cjs` extension
+    edge cases,
+  - a `known_target_subpaths_cover_native_and_legacy` assertion
+    that the probe table contains ≥4 native-`.exe` probes and ≥4
+    JS probes, all targeting `@anthropic-ai/claude-code`.
+
+
 ## [1.8.32] - 2026-04-27
 
 ### Fixed
