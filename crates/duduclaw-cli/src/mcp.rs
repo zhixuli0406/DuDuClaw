@@ -357,11 +357,21 @@ const TOOLS: &[ToolDef] = &[
     // ── Evolution controls ──────────────────────────────────────
     ToolDef {
         name: "evolution_toggle",
-        description: "Toggle evolution engine flags for an agent (gvu_enabled, cognitive_memory, etc.). Changes take effect within seconds.",
+        description: "Toggle evolution engine flags for an agent. Changes take effect within seconds. \
+                       Supports standard flags and stagnation-detection sub-fields \
+                       (stagnation_enabled, stagnation_window_seconds, stagnation_trigger_threshold, stagnation_action).",
         params: &[
             ParamDef { name: "agent_id", description: "Target agent name", required: true },
-            ParamDef { name: "field", description: "Config field to toggle: gvu_enabled, cognitive_memory, skill_auto_activate, skill_security_scan", required: true },
-            ParamDef { name: "value", description: "New value: true/false (for booleans), or a number (for max_silence_hours, skill_token_budget, etc.)", required: true },
+            ParamDef {
+                name: "field",
+                description: "Config field to toggle: gvu_enabled, cognitive_memory, skill_auto_activate, \
+                               skill_security_scan (booleans); max_silence_hours, max_gvu_generations, \
+                               observation_period_hours, skill_token_budget, max_active_skills (numbers); \
+                               stagnation_enabled (bool), stagnation_window_seconds (int, 60–604800), \
+                               stagnation_trigger_threshold (int, 1–1000), stagnation_action (log_only|suppress)",
+                required: true,
+            },
+            ParamDef { name: "value", description: "New value: true/false (for booleans), a number (for numeric fields), or a string (for stagnation_action)", required: true },
         ],
     },
     ToolDef {
@@ -3582,7 +3592,7 @@ async fn handle_evolution_toggle(params: &Value, home_dir: &Path) -> Value {
     }
     let evo = doc.get_mut("evolution").unwrap().as_table_mut().unwrap();
 
-    // Validate field name
+    // Validate field name and apply to the correct TOML section.
     let boolean_fields = [
         "gvu_enabled", "cognitive_memory",
         "skill_auto_activate", "skill_security_scan",
@@ -3591,17 +3601,28 @@ async fn handle_evolution_toggle(params: &Value, home_dir: &Path) -> Value {
         "max_silence_hours", "max_gvu_generations", "observation_period_hours",
         "skill_token_budget", "max_active_skills",
     ];
+    // Stagnation-detection sub-section fields (prefix: stagnation_*).
+    // These map into [evolution.stagnation_detection] in the TOML.
+    let stagnation_bool_fields = ["stagnation_enabled"];
+    let stagnation_int_fields  = ["stagnation_window_seconds", "stagnation_trigger_threshold"];
+    let stagnation_str_fields  = ["stagnation_action"];
+
+    let parse_bool = |s: &str| -> std::result::Result<bool, String> {
+        match s {
+            "true" | "1" | "yes" | "on"  => Ok(true),
+            "false" | "0" | "no" | "off" => Ok(false),
+            _ => Err(format!("invalid boolean value '{s}' — use true/false")),
+        }
+    };
 
     if boolean_fields.contains(&field) {
-        let bool_val = match value_str {
-            "true" | "1" | "yes" | "on" => true,
-            "false" | "0" | "no" | "off" => false,
-            _ => return serde_json::json!({
-                "content": [{"type": "text", "text": format!("Error: invalid boolean value '{value_str}' — use true/false")}],
+        match parse_bool(value_str) {
+            Ok(v) => { evo.insert(field.to_string(), toml::Value::Boolean(v)); }
+            Err(e) => return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: {e}")}],
                 "isError": true
             }),
-        };
-        evo.insert(field.to_string(), toml::Value::Boolean(bool_val));
+        }
     } else if numeric_fields.contains(&field) {
         if let Ok(int_val) = value_str.parse::<i64>() {
             evo.insert(field.to_string(), toml::Value::Integer(int_val));
@@ -3613,11 +3634,83 @@ async fn handle_evolution_toggle(params: &Value, home_dir: &Path) -> Value {
                 "isError": true
             });
         }
+    } else if stagnation_bool_fields.contains(&field)
+           || stagnation_int_fields.contains(&field)
+           || stagnation_str_fields.contains(&field)
+    {
+        // Write into the [evolution.stagnation_detection] sub-table.
+        let sd_key = field.trim_start_matches("stagnation_");
+
+        // Ensure [evolution.stagnation_detection] sub-table exists.
+        if !evo.contains_key("stagnation_detection") {
+            evo.insert(
+                "stagnation_detection".to_string(),
+                toml::Value::Table(toml::Table::new()),
+            );
+        }
+        let sd = evo
+            .get_mut("stagnation_detection")
+            .unwrap()
+            .as_table_mut()
+            .unwrap();
+
+        if stagnation_bool_fields.contains(&field) {
+            match parse_bool(value_str) {
+                Ok(v) => { sd.insert(sd_key.to_string(), toml::Value::Boolean(v)); }
+                Err(e) => return serde_json::json!({
+                    "content": [{"type": "text", "text": format!("Error: {e}")}],
+                    "isError": true
+                }),
+            }
+        } else if stagnation_int_fields.contains(&field) {
+            let int_val: i64 = match value_str.parse() {
+                Ok(v) => v,
+                Err(_) => return serde_json::json!({
+                    "content": [{"type": "text", "text": format!("Error: '{field}' requires an integer value, got '{value_str}'")}],
+                    "isError": true
+                }),
+            };
+            // Range validation matching StagnationDetectionConfig::validate()
+            let range_err = match sd_key {
+                "window_seconds" if !(60..=604_800).contains(&int_val) =>
+                    Some(format!("stagnation_window_seconds must be 60–604800, got {int_val}")),
+                "trigger_threshold" if !(1..=1000).contains(&int_val) =>
+                    Some(format!("stagnation_trigger_threshold must be 1–1000, got {int_val}")),
+                _ => None,
+            };
+            if let Some(e) = range_err {
+                return serde_json::json!({
+                    "content": [{"type": "text", "text": format!("Error: {e}")}],
+                    "isError": true
+                });
+            }
+            sd.insert(sd_key.to_string(), toml::Value::Integer(int_val));
+        } else {
+            // stagnation_action: "log_only" | "suppress" (P1 reserved)
+            match value_str {
+                "log_only" | "suppress" => {
+                    sd.insert(sd_key.to_string(), toml::Value::String(value_str.to_owned()));
+                }
+                other => return serde_json::json!({
+                    "content": [{"type": "text", "text": format!(
+                        "Error: stagnation_action must be 'log_only' or 'suppress', got '{other}'"
+                    )}],
+                    "isError": true
+                }),
+            }
+        }
     } else {
+        let all_fields: Vec<&str> = boolean_fields.iter()
+            .chain(numeric_fields.iter())
+            .chain(stagnation_bool_fields.iter())
+            .chain(stagnation_int_fields.iter())
+            .chain(stagnation_str_fields.iter())
+            .copied()
+            .collect();
         return serde_json::json!({
             "content": [{"type": "text", "text": format!(
                 "Error: unknown field '{field}'. Valid fields: {}",
-                boolean_fields.iter().chain(numeric_fields.iter()).cloned().collect::<Vec<_>>().join(", ")
+                all_fields.join(", ")
             )}],
             "isError": true
         });
@@ -3664,6 +3757,7 @@ async fn handle_evolution_status_tool(params: &Value, home_dir: &Path, default_a
     };
 
     let evo = &config.evolution;
+    let sd = &evo.stagnation_detection;
     let status = format!(
         "Evolution status for agent '{agent_id}':\n\
          \n\
@@ -3677,11 +3771,21 @@ async fn handle_evolution_status_tool(params: &Value, home_dir: &Path, default_a
          \n\
          Max silence hours:         {:.1}\n\
          Max GVU generations:       {}\n\
-         Observation period hours:  {:.1}",
+         Observation period hours:  {:.1}\n\
+         \n\
+         Stagnation detection:\n\
+           enabled:           {}\n\
+           window_seconds:    {} ({:.1}h)\n\
+           trigger_threshold: {}\n\
+           action:            {}",
         evo.gvu_enabled, evo.cognitive_memory,
         evo.skill_auto_activate, evo.skill_security_scan,
         evo.skill_token_budget, evo.max_active_skills,
         evo.max_silence_hours, evo.max_gvu_generations, evo.observation_period_hours,
+        sd.enabled,
+        sd.window_seconds, sd.window_seconds as f64 / 3600.0,
+        sd.trigger_threshold,
+        sd.action,
     );
 
     serde_json::json!({
@@ -4878,6 +4982,20 @@ async fn handle_skill_security_scan(params: &Value, home_dir: &Path) -> Value {
 
     use duduclaw_gateway::skill_lifecycle::security_scanner;
     let result = security_scanner::scan_skill(&content, must_not.as_deref());
+
+    // Sprint N P0: emit security_scan audit event (non-blocking, global singleton)
+    {
+        use duduclaw_gateway::evolution_events::emitter::EvolutionEventEmitter;
+        EvolutionEventEmitter::global().emit_security_scan(
+            agent_id,
+            skill_name,
+            result.passed,
+            serde_json::json!({
+                "risk_level": format!("{:?}", result.risk_level),
+                "findings_count": result.findings.len(),
+            }),
+        );
+    }
 
     let findings_text: Vec<String> = result.findings.iter().map(|f| {
         format!(

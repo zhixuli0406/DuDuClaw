@@ -25,6 +25,7 @@ use crate::task_store::{TaskStore, TaskRow, ActivityRow};
 use crate::partner_store::{
     PartnerStore, PartnerProfileInput, PartnerCustomerInput, PartnerCustomerPatch,
 };
+use crate::evolution_events::schema::StagnationDetectionConfig;
 
 /// Validate agent ID is safe for filesystem paths (no traversal).
 fn is_valid_agent_id(id: &str) -> bool {
@@ -1172,6 +1173,70 @@ impl MethodHandler {
                     if let Some(v) = params_clone.get(*key).and_then(|v| v.as_f64()) {
                         evo.insert((*key).into(), toml::Value::Float(v));
                         changes.push(format!("evolution.{key} = {v}"));
+                    }
+                }
+
+                // ── Stagnation detection sub-section ──────────────────────────
+                // Keys accepted: stagnation_enabled, stagnation_window_seconds,
+                //                stagnation_trigger_threshold, stagnation_action
+                {
+                    // SECURITY-2: validate stagnation params before writing to TOML.
+                    // Illegal values (window_seconds=0, trigger_threshold=0) must never
+                    // reach agent.toml as P1 stagnation-detection logic depends on them.
+                    let sd_validation = StagnationDetectionConfig {
+                        enabled: params_clone.get("stagnation_enabled").and_then(|v| v.as_bool()),
+                        window_seconds: params_clone.get("stagnation_window_seconds").and_then(|v| v.as_u64()),
+                        trigger_threshold: params_clone.get("stagnation_trigger_threshold").and_then(|v| v.as_u64()),
+                        action: params_clone.get("stagnation_action").and_then(|v| v.as_str()).map(|s| s.to_owned()),
+                    };
+                    if let Err(e) = sd_validation.validate() {
+                        return Err(format!("evolution_toggle: invalid stagnation config: {e}"));
+                    }
+
+                    let sd = evo
+                        .entry("stagnation_detection")
+                        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                        .as_table_mut();
+                    if let Some(sd) = sd {
+                        let mut sd_changed = false;
+
+                        if let Some(v) = params_clone.get("stagnation_enabled").and_then(|v| v.as_bool()) {
+                            sd.insert("enabled".into(), toml::Value::Boolean(v));
+                            changes.push(format!("evolution.stagnation_detection.enabled = {v}"));
+                            sd_changed = true;
+                        }
+                        if let Some(v) = params_clone.get("stagnation_window_seconds").and_then(|v| v.as_u64()) {
+                            sd.insert("window_seconds".into(), toml::Value::Integer(v as i64));
+                            changes.push(format!("evolution.stagnation_detection.window_seconds = {v}"));
+                            sd_changed = true;
+                        }
+                        if let Some(v) = params_clone.get("stagnation_trigger_threshold").and_then(|v| v.as_u64()) {
+                            sd.insert("trigger_threshold".into(), toml::Value::Integer(v as i64));
+                            changes.push(format!("evolution.stagnation_detection.trigger_threshold = {v}"));
+                            sd_changed = true;
+                        }
+                        // stagnation_action: "log_only" | "suppress" (P1)
+                        if let Some(v) = params_clone.get("stagnation_action").and_then(|v| v.as_str()) {
+                            match v {
+                                "log_only" | "suppress" => {
+                                    sd.insert("action".into(), toml::Value::String(v.to_owned()));
+                                    changes.push(format!("evolution.stagnation_detection.action = {v}"));
+                                    sd_changed = true;
+                                }
+                                other => {
+                                    tracing::warn!(
+                                        "evolution_toggle: unknown stagnation_action '{}', ignored",
+                                        other
+                                    );
+                                }
+                            }
+                        }
+
+                        // If no stagnation sub-keys were touched, remove the empty
+                        // sub-table so we don't dirty the TOML needlessly.
+                        if !sd_changed {
+                            evo.remove("stagnation_detection");
+                        }
                     }
                 }
             }

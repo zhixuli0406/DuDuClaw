@@ -92,5 +92,9 @@ pub mod rl;
 pub mod skill_extraction;
 pub mod tool_classifier;
 
+// ── Sprint N P0: EvolutionEvents JSONL audit log ──
+pub mod evolution_events;
+pub mod skill_synthesis_pipeline;
+
 pub use extension::{GatewayExtension, NullExtension};
 pub use server::{start_gateway, GatewayConfig};
