@@ -212,11 +212,75 @@ mod activation_tests {
         for _ in 0..5 {
             ctrl.record_conversation("agent1", 0.4);
         }
-        // Adding a third should evict skill_a (highest post error)
-        ctrl.activate("agent1", "skill_c", 0.3);
+        // Adding a third should evict one skill (capacity exceeded).
+        // Return value signals which skill was evicted.
+        let evicted = ctrl.activate("agent1", "skill_c", 0.3);
         let active = ctrl.get_active("agent1");
         assert!(active.contains("skill_c"));
         assert_eq!(active.len(), 2);
+        // evicted must be Some (capacity was full) and must NOT be skill_c itself.
+        let evicted_name = evicted.expect("activate must return the evicted skill when at capacity");
+        assert_ne!(evicted_name, "skill_c", "the newly activated skill must not report itself as evicted");
+    }
+
+    /// Verify activate() returns Some(evicted_skill) carrying the correct name,
+    /// using a controlled setup where skill_a is guaranteed the worst performer.
+    #[test]
+    fn activate_returns_evicted_skill_name() {
+        let mut ctrl = SkillActivationController::new(2);
+        ctrl.activate("agent1", "skill_a", 0.3);
+        ctrl.activate("agent1", "skill_b", 0.3);
+
+        // Deactivate skill_b, re-activate with fresh record; then build skill_a's
+        // stats up to 5 conversations with a high error so it is worst performer.
+        ctrl.deactivate("agent1", "skill_b");
+        ctrl.activate("agent1", "skill_b", 0.3);
+
+        // Give skill_a high post-error (bad), skill_b low post-error (good).
+        // record_conversation affects ALL active skills, so we alternate:
+        // Build skill_a's record first while it's alone, then add skill_b.
+        // Simpler approach: give skill_a 5 conversations with error 0.9,
+        // then give skill_b 5 conversations with error 0.1, using separate
+        // single-skill sessions.
+        //
+        // Reset to a clean single-skill context for skill_a:
+        let mut ctrl = SkillActivationController::new(2);
+        ctrl.activate("agent2", "skill_a", 0.3);
+        for _ in 0..5 {
+            ctrl.record_conversation("agent2", 0.9); // skill_a: high error → worst
+        }
+        ctrl.activate("agent2", "skill_b", 0.3);
+        // skill_b has 0 conversations recorded → not eligible as worst (< 5 required).
+        // Adding skill_c forces eviction of skill_a (only candidate with ≥ 5 conversations).
+        let evicted = ctrl.activate("agent2", "skill_c", 0.3);
+        assert_eq!(
+            evicted.as_deref(),
+            Some("skill_a"),
+            "skill_a must be identified as worst performer and returned as evicted"
+        );
+        // After eviction, skill_a must no longer be active.
+        let active = ctrl.get_active("agent2");
+        assert!(!active.contains("skill_a"), "evicted skill must be deactivated");
+        assert!(active.contains("skill_b"), "skill_b must remain active");
+        assert!(active.contains("skill_c"), "skill_c must be newly active");
+    }
+
+    /// Verify activate() returns None when there is still room (no eviction needed).
+    #[test]
+    fn activate_returns_none_when_no_eviction() {
+        let mut ctrl = SkillActivationController::new(5);
+        let evicted = ctrl.activate("agent1", "skill_a", 0.5);
+        assert!(evicted.is_none(), "no eviction needed when under max_active");
+    }
+
+    /// Verify activate() returns None for a skill that is already active.
+    #[test]
+    fn activate_already_active_returns_none() {
+        let mut ctrl = SkillActivationController::new(1);
+        ctrl.activate("agent1", "skill_a", 0.5);
+        // Activating the same skill again must not trigger eviction.
+        let evicted = ctrl.activate("agent1", "skill_a", 0.4);
+        assert!(evicted.is_none(), "re-activating an already active skill must not evict");
     }
 }
 

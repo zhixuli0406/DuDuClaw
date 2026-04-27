@@ -540,6 +540,15 @@ pub struct EvolutionConfig {
     /// Drift magnitude threshold for flagging anomalous behavior (0.0–1.0).
     #[serde(default = "default_skill_behavior_drift_threshold")]
     pub skill_behavior_drift_threshold: f64,
+
+    // ── Stagnation detection (P0 config, P1 suppress action) ──
+
+    /// Configuration for the signal-stagnation detector.
+    ///
+    /// P0: only `log_only` action is active.
+    /// P1: `suppress` action will be wired up here without schema changes.
+    #[serde(default)]
+    pub stagnation_detection: StagnationDetectionConfig,
 }
 
 impl Default for EvolutionConfig {
@@ -572,6 +581,8 @@ impl Default for EvolutionConfig {
             // Behavior monitoring
             skill_behavior_monitor_enabled: false,
             skill_behavior_drift_threshold: 0.3,
+            // Stagnation detection
+            stagnation_detection: StagnationDetectionConfig::default(),
         }
     }
 }
@@ -630,6 +641,230 @@ fn default_curiosity_max_daily() -> u32 {
 
 fn default_skill_behavior_drift_threshold() -> f64 {
     0.3
+}
+
+// ── Stagnation detection defaults ─────────────────────────────────────────────
+
+fn default_stagnation_window_seconds() -> u64 {
+    21600 // 6 hours
+}
+
+fn default_stagnation_trigger_threshold() -> u32 {
+    3
+}
+
+fn default_stagnation_action() -> StagnationAction {
+    StagnationAction::LogOnly
+}
+
+// ── StagnationDetectionConfig ─────────────────────────────────────────────────
+
+/// Which action to take when stagnation is detected.
+///
+/// P0 supports only `log_only`.
+/// P1 will add `suppress` — the variant is defined here so the config schema
+/// is stable and no TOML migration is needed when P1 ships.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StagnationAction {
+    /// Record the stagnation event in the audit log but take no further action.
+    /// This is the only active mode in P0.
+    LogOnly,
+    /// Suppress the triggering signal (P1 reserved — not yet wired up).
+    ///
+    /// ⚠️ Setting this in P0 has no effect; the runtime will treat it as
+    /// `log_only` until P1 is merged.
+    Suppress,
+}
+
+impl Default for StagnationAction {
+    fn default() -> Self {
+        Self::LogOnly
+    }
+}
+
+impl std::fmt::Display for StagnationAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LogOnly => f.write_str("log_only"),
+            Self::Suppress => f.write_str("suppress"),
+        }
+    }
+}
+
+/// Stagnation-detection configuration for the evolution engine.
+///
+/// Detects when the same type of signal fires too often within a short window,
+/// which typically indicates a feedback loop or misconfigured threshold.
+///
+/// Agnes-approved defaults (Sprint N P0):
+/// - `window_seconds = 21600` (6 h)
+/// - `trigger_threshold = 3`
+/// - `action = log_only`
+///
+/// ## TOML example
+/// ```toml
+/// [evolution.stagnation_detection]
+/// enabled = true
+/// window_seconds = 21600
+/// trigger_threshold = 3
+/// action = "log_only"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StagnationDetectionConfig {
+    /// Master switch. When `false` the detector is fully disabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Sliding-window length in seconds (default 21600 = 6 h).
+    ///
+    /// Valid range: 60 – 604800 (1 min – 7 days).
+    #[serde(default = "default_stagnation_window_seconds")]
+    pub window_seconds: u64,
+
+    /// Number of signal firings within `window_seconds` that constitutes
+    /// stagnation (default 3).
+    ///
+    /// Valid range: 1 – 1000.
+    #[serde(default = "default_stagnation_trigger_threshold")]
+    pub trigger_threshold: u32,
+
+    /// What to do when stagnation is detected.
+    ///
+    /// P0: only `log_only` has effect. `suppress` is accepted by the parser
+    /// for forward-compatibility but behaves as `log_only` until P1.
+    #[serde(default = "default_stagnation_action")]
+    pub action: StagnationAction,
+}
+
+impl Default for StagnationDetectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_seconds: default_stagnation_window_seconds(),
+            trigger_threshold: default_stagnation_trigger_threshold(),
+            action: default_stagnation_action(),
+        }
+    }
+}
+
+impl StagnationDetectionConfig {
+    /// Validate field ranges and return a descriptive error if invalid.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.window_seconds < 60 || self.window_seconds > 604_800 {
+            return Err(format!(
+                "stagnation_detection.window_seconds must be 60–604800, got {}",
+                self.window_seconds
+            ));
+        }
+        if self.trigger_threshold == 0 || self.trigger_threshold > 1000 {
+            return Err(format!(
+                "stagnation_detection.trigger_threshold must be 1–1000, got {}",
+                self.trigger_threshold
+            ));
+        }
+        Ok(())
+    }
+}
+
+// ── Tests — StagnationDetectionConfig ────────────────────────────────────────
+
+#[cfg(test)]
+mod stagnation_tests {
+    use super::*;
+
+    #[test]
+    fn test_default_values() {
+        let cfg = StagnationDetectionConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.window_seconds, 21600);
+        assert_eq!(cfg.trigger_threshold, 3);
+        assert_eq!(cfg.action, StagnationAction::LogOnly);
+    }
+
+    #[test]
+    fn test_default_validates() {
+        assert!(StagnationDetectionConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_window_too_small_fails() {
+        let mut cfg = StagnationDetectionConfig::default();
+        cfg.window_seconds = 30;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("window_seconds"), "got: {err}");
+    }
+
+    #[test]
+    fn test_window_too_large_fails() {
+        let mut cfg = StagnationDetectionConfig::default();
+        cfg.window_seconds = 700_000;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_threshold_zero_fails() {
+        let mut cfg = StagnationDetectionConfig::default();
+        cfg.trigger_threshold = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("trigger_threshold"), "got: {err}");
+    }
+
+    #[test]
+    fn test_suppress_action_deserialises() {
+        // P1-reserved value must parse without error.
+        let toml_str = r#"
+            enabled = true
+            window_seconds = 21600
+            trigger_threshold = 3
+            action = "suppress"
+        "#;
+        let cfg: StagnationDetectionConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(cfg.action, StagnationAction::Suppress);
+        // Validation passes regardless of action.
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_deserialise_from_toml_with_defaults() {
+        // Minimal TOML — all optional fields should fall back to defaults.
+        let cfg: StagnationDetectionConfig = toml::from_str("").expect("empty TOML");
+        assert_eq!(cfg.window_seconds, 21600);
+        assert_eq!(cfg.trigger_threshold, 3);
+        assert_eq!(cfg.action, StagnationAction::LogOnly);
+    }
+
+    #[test]
+    fn test_stagnation_action_display() {
+        assert_eq!(StagnationAction::LogOnly.to_string(), "log_only");
+        assert_eq!(StagnationAction::Suppress.to_string(), "suppress");
+    }
+
+    #[test]
+    fn test_evolution_config_has_stagnation_detection() {
+        let cfg = EvolutionConfig::default();
+        // stagnation_detection field must be present with defaults.
+        assert!(cfg.stagnation_detection.enabled);
+        assert_eq!(cfg.stagnation_detection.window_seconds, 21600);
+    }
+
+    #[test]
+    fn test_evolution_config_stagnation_overridable_via_toml() {
+        let toml_str = r#"
+            skill_auto_activate = false
+            skill_security_scan = true
+            [stagnation_detection]
+            enabled = false
+            window_seconds = 3600
+            trigger_threshold = 5
+            action = "log_only"
+        "#;
+        let cfg: EvolutionConfig = toml::from_str(toml_str).expect("parse");
+        assert!(!cfg.stagnation_detection.enabled);
+        assert_eq!(cfg.stagnation_detection.window_seconds, 3600);
+        assert_eq!(cfg.stagnation_detection.trigger_threshold, 5);
+    }
 }
 
 /// Configuration for external factors that feed into the evolution engine.

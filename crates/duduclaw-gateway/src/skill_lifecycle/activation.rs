@@ -44,17 +44,26 @@ impl SkillActivationController {
     }
 
     /// Activate a skill for an agent.
-    pub fn activate(&mut self, agent_id: &str, skill_name: &str, trigger_error: f64) {
+    ///
+    /// Returns the name of the skill that was evicted to make room (if any).
+    /// The caller is responsible for emitting the `skill_deactivate` audit event
+    /// for the evicted skill using trigger_signal `"capacity_eviction"`.
+    pub fn activate(&mut self, agent_id: &str, skill_name: &str, trigger_error: f64) -> Option<String> {
         // Check capacity and evict if needed (before borrowing active set)
         let current_count = self.active.get(agent_id).map(|s| s.len()).unwrap_or(0);
         let already_active = self.active.get(agent_id).map(|s| s.contains(skill_name)).unwrap_or(false);
 
-        if current_count >= self.max_active && !already_active {
+        let evicted = if current_count >= self.max_active && !already_active {
             if let Some(worst) = self.find_worst_performer(agent_id) {
                 info!(agent = agent_id, skill = %worst, "Evicting lowest-performing skill to make room");
                 self.deactivate(agent_id, &worst);
+                Some(worst)
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
         let active = self.active.entry(agent_id.to_string()).or_default();
         if active.insert(skill_name.to_string()) {
@@ -70,6 +79,8 @@ impl SkillActivationController {
             });
             info!(agent = agent_id, skill = skill_name, "Skill activated");
         }
+
+        evicted
     }
 
     /// Deactivate a skill.

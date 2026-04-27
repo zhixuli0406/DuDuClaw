@@ -54,3 +54,17 @@ format = "pretty"  # pretty | json
 # ── Behavior Monitoring ────────────────────────────────────
 # skill_behavior_monitor_enabled = false    # Detect behavioral drift after skill activation
 # skill_behavior_drift_threshold = 0.3      # Drift magnitude (0.0–1.0) to flag anomaly
+
+# ── Stagnation Detection (Sprint N P0) ─────────────────────────
+# Detects when the same evolution signal fires too often within a sliding
+# window — typically indicating a feedback loop or misconfigured threshold.
+#
+# [evolution.stagnation_detection]
+# enabled = true               # Master switch (default: true)
+# window_seconds = 21600       # Observation window (default: 21600 = 6 h; range: 60–604800)
+# trigger_threshold = 3        # Firings before stagnation flagged (default: 3; range: 1–1000)
+# action = "log_only"          # "log_only" (P0 active) | "suppress" (P1 reserved)
+#
+# evolution_toggle MCP params:
+#   stagnation_enabled, stagnation_window_seconds,
+#   stagnation_trigger_threshold, stagnation_action

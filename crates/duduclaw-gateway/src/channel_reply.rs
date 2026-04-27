@@ -19,6 +19,7 @@ use duduclaw_security::failsafe::FailsafeManager;
 use duduclaw_security::killswitch::KillswitchConfig;
 
 use crate::channel_settings::ChannelSettingsManager;
+use crate::evolution_events::emitter::EvolutionEventEmitter;
 use crate::handlers::ChannelState;
 use crate::gvu::loop_::GvuLoop;
 use crate::prediction::engine::PredictionEngine;
@@ -152,6 +153,10 @@ pub struct ReplyContext {
     /// Path to memory.db for key-fact accumulator (P2).
     /// Engine is created on-demand per operation due to SQLite thread safety.
     pub memory_db_path: Option<PathBuf>,
+    /// EvolutionEvents audit-log emitter (Sprint N P0).
+    ///
+    /// Non-blocking: all emit calls fire-and-forget via tokio::spawn.
+    pub evolution_emitter: Arc<EvolutionEventEmitter>,
 }
 
 impl ReplyContext {
@@ -207,6 +212,7 @@ impl ReplyContext {
             skill_recorder: Arc::new(tokio::sync::Mutex::new(TrajectoryRecorder::new())),
             skill_bank: Arc::new(tokio::sync::Mutex::new(SkillCache::new())),
             memory_db_path: None,
+            evolution_emitter: Arc::new(EvolutionEventEmitter::from_env()),
         }
     }
 
@@ -1314,6 +1320,7 @@ async fn build_reply_with_session_inner(
             let sandbox_for_pred = ctx.sandbox_store.clone();
             let notebook_for_pred = ctx.mistake_notebook.clone();
             let ext_factors_cfg = external_factors_config.clone();
+            let evolution_emitter_for_pred = ctx.evolution_emitter.clone();
 
             tokio::spawn(async move {
                 // 1. Generate prediction (< 1ms, zero LLM)
@@ -1407,7 +1414,26 @@ async fn build_reply_with_session_inner(
                         if !diagnosis.suggested_skills.is_empty() {
                             let mut ctrl = skill_activation_for_pred.lock().await;
                             for skill_name in &diagnosis.suggested_skills {
-                                ctrl.activate(&agent_id_for_pred, skill_name, error.composite_error);
+                                let evicted = ctrl.activate(&agent_id_for_pred, skill_name, error.composite_error);
+                                // Sprint N P0: emit skill_deactivate for capacity eviction (non-blocking)
+                                // activate() returns the evicted skill name when max_active is reached.
+                                if let Some(ref evicted_skill) = evicted {
+                                    evolution_emitter_for_pred.emit_skill_deactivate(
+                                        &agent_id_for_pred,
+                                        evicted_skill,
+                                        "capacity_eviction",
+                                        serde_json::json!({
+                                            "reason": "max_active_capacity_exceeded",
+                                            "new_skill": skill_name,
+                                        }),
+                                    );
+                                }
+                                // Sprint N P0: emit skill_activate audit event (non-blocking)
+                                evolution_emitter_for_pred.emit_skill_activate(
+                                    &agent_id_for_pred,
+                                    skill_name,
+                                    "prediction_error_diagnosis",
+                                );
                             }
                         }
                         // Report skill gap to evolution engine + accumulate for synthesis
@@ -1504,6 +1530,13 @@ async fn build_reply_with_session_inner(
                         };
                         for name in &deactivated {
                             info!(agent = %agent_id_for_pred, skill = %name, "Skill deactivated by effectiveness evaluation");
+                            // Sprint N P0: emit skill_deactivate audit event (non-blocking)
+                            evolution_emitter_for_pred.emit_skill_deactivate(
+                                &agent_id_for_pred,
+                                name,
+                                "effectiveness_evaluation",
+                                serde_json::json!({"reason": "prediction_error_not_improved"}),
+                            );
                         }
 
                         // Scan for distillation candidates
@@ -1580,6 +1613,13 @@ async fn build_reply_with_session_inner(
                                             store.discard(&agent_id_for_pred, name);
                                             let mut ctrl = skill_activation_for_pred.lock().await;
                                             ctrl.deactivate(&agent_id_for_pred, name);
+                                            // Sprint N P0: emit skill_deactivate audit event (non-blocking)
+                                            evolution_emitter_for_pred.emit_skill_deactivate(
+                                                &agent_id_for_pred,
+                                                name,
+                                                "sandbox_trial_discard",
+                                                serde_json::json!({"reason": outcome.reason}),
+                                            );
                                         }
                                         crate::skill_lifecycle::sandbox_trial::TrialDecision::ExtendTrial(extra) => {
                                             if extra > 0 {
@@ -1685,6 +1725,24 @@ async fn build_reply_with_session_inner(
                             }
                         };
 
+                        // Sprint N P0 stub — signal suppression point for stagnation detection.
+                        // TODO P1: replace `false` with real stagnation_detection threshold check.
+                        //   P0 canonical stub metadata (Spec §1.1 — Option C, null placeholders):
+                        //     { "suppressed_signal": null, "trigger_count": null, "window_seconds": null }
+                        //   P1 example with real data (fill in actual values from stagnation config):
+                        //   e.g.: if consecutive >= stagnation_cfg.trigger_threshold {
+                        //       evolution_emitter_for_pred.emit_signal_suppressed_stub(
+                        //           &agent_id_for_pred,
+                        //           serde_json::json!({
+                        //               "suppressed_signal": "prediction_error_diagnosis",
+                        //               "trigger_count": consecutive,
+                        //               "window_seconds": stagnation_cfg.window_seconds,
+                        //           }),
+                        //       );
+                        //       // skip GVU trigger
+                        //   }
+                        let _signal_should_suppress = false; // always false in P0
+
                         // Run GVU loop if available
                         if let (Some(gvu), Some(dir)) = (&gvu, &agent_dir_for_pred) {
                             let contract = duduclaw_agent::contract::load_contract(dir);
@@ -1730,6 +1788,13 @@ async fn build_reply_with_session_inner(
                                         version = %version.version_id,
                                         "GVU applied SOUL.md change"
                                     );
+                                    // Sprint N P0: emit gvu_generation audit event (non-blocking)
+                                    evolution_emitter_for_pred.emit_gvu_generation(
+                                        &agent_id_for_pred,
+                                        crate::evolution_events::schema::Outcome::Success,
+                                        &etype,
+                                        serde_json::json!({"gvu_outcome": "applied", "version_id": version.version_id}),
+                                    );
                                     let mut meta = pe.metacognition.lock().await;
                                     meta.record_outcome(error.category, true);
                                 }
@@ -1739,11 +1804,25 @@ async fn build_reply_with_session_inner(
                                         critique = %last_gradient.critique,
                                         "GVU abandoned all attempts"
                                     );
+                                    // Sprint N P0: emit gvu_generation audit event (non-blocking)
+                                    evolution_emitter_for_pred.emit_gvu_generation(
+                                        &agent_id_for_pred,
+                                        crate::evolution_events::schema::Outcome::Failure,
+                                        &etype,
+                                        serde_json::json!({"gvu_outcome": "abandoned", "critique": last_gradient.critique}),
+                                    );
                                     let mut meta = pe.metacognition.lock().await;
                                     meta.record_outcome(error.category, false);
                                 }
                                 crate::gvu::loop_::GvuOutcome::Skipped { ref reason } => {
                                     debug!(agent = %agent_id_for_pred, reason, "GVU skipped");
+                                    // Sprint N P0: emit gvu_generation audit event (non-blocking)
+                                    evolution_emitter_for_pred.emit_gvu_generation(
+                                        &agent_id_for_pred,
+                                        crate::evolution_events::schema::Outcome::Failure,
+                                        &etype,
+                                        serde_json::json!({"gvu_outcome": "skipped", "reason": reason}),
+                                    );
                                     if !reason.contains("observation") {
                                         let mut meta = pe.metacognition.lock().await;
                                         meta.record_outcome(error.category, false);
@@ -1756,6 +1835,13 @@ async fn build_reply_with_session_inner(
                                         retry_after_hours,
                                         "GVU deferred — will retry with accumulated gradients"
                                     );
+                                    // Sprint N P0: emit gvu_generation audit event (non-blocking)
+                                    evolution_emitter_for_pred.emit_gvu_generation(
+                                        &agent_id_for_pred,
+                                        crate::evolution_events::schema::Outcome::Failure,
+                                        &etype,
+                                        serde_json::json!({"gvu_outcome": "deferred", "retry_count": retry_count, "retry_after_hours": retry_after_hours}),
+                                    );
                                     // Don't record as outcome yet — will be evaluated on retry
                                 }
                                 crate::gvu::loop_::GvuOutcome::TimedOut { elapsed, generations_completed, .. } => {
@@ -1764,6 +1850,13 @@ async fn build_reply_with_session_inner(
                                         elapsed_secs = elapsed.as_secs(),
                                         generations_completed,
                                         "GVU timed out — wall-clock budget exceeded"
+                                    );
+                                    // Sprint N P0: emit gvu_generation audit event (non-blocking)
+                                    evolution_emitter_for_pred.emit_gvu_generation(
+                                        &agent_id_for_pred,
+                                        crate::evolution_events::schema::Outcome::Failure,
+                                        &etype,
+                                        serde_json::json!({"gvu_outcome": "timed_out", "elapsed_secs": elapsed.as_secs(), "generations_completed": generations_completed}),
                                     );
                                     // Treat as inconclusive — don't record outcome
                                 }
