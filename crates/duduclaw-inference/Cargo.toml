@@ -64,3 +64,6 @@ mistralrs = ["dep:mistralrs-core", "dep:indexmap", "dep:either"]
 mistralrs-metal = ["mistralrs", "mistralrs-core/metal"]
 mistralrs-cuda = ["mistralrs", "mistralrs-core/cuda"]
 mistralrs-flash-attn = ["mistralrs-cuda", "mistralrs-core/flash-attn"]
+
+[dev-dependencies]
+tempfile = "3"

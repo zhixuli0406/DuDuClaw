@@ -114,6 +114,10 @@ impl InferenceBackend for OpenAiCompatBackend {
         "openai-compat"
     }
 
+    fn requires_local_file(&self) -> bool {
+        false
+    }
+
     async fn load_model(&self, _model_path: &str, _params: &GenerationParams) -> Result<ModelInfo> {
         // HTTP backends manage their own models — just verify connectivity
         let info = ModelInfo {
