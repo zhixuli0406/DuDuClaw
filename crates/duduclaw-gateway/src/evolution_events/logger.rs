@@ -36,8 +36,31 @@ const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
 /// Environment variable that overrides the default base directory.
 const ENV_VAR_DIR: &str = "EVOLUTION_EVENTS_DIR";
 
-/// Default base directory relative to the current working directory.
-const DEFAULT_BASE_DIR: &str = "data/evolution/events";
+/// Environment variable pointing to the DuDuClaw home directory.
+const ENV_VAR_DUDUCLAW_HOME: &str = "DUDUCLAW_HOME";
+
+/// Last-resort fallback (relative to cwd) — only used if no home can be resolved.
+const LEGACY_FALLBACK_DIR: &str = "data/evolution/events";
+
+/// Resolve the audit-log base directory using a layered fallback strategy.
+///
+/// Priority (highest first):
+/// 1. `$EVOLUTION_EVENTS_DIR` — explicit override
+/// 2. `$DUDUCLAW_HOME/evolution/events` — gateway-provided home
+/// 3. `$HOME/.duduclaw/evolution/events` — standard install layout
+/// 4. `data/evolution/events` — legacy cwd-relative fallback (compat only)
+pub fn resolve_default_dir() -> PathBuf {
+    if let Ok(explicit) = std::env::var(ENV_VAR_DIR) {
+        return PathBuf::from(explicit);
+    }
+    if let Ok(dudu_home) = std::env::var(ENV_VAR_DUDUCLAW_HOME) {
+        return PathBuf::from(dudu_home).join("evolution").join("events");
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        return PathBuf::from(home).join(".duduclaw").join("evolution").join("events");
+    }
+    PathBuf::from(LEGACY_FALLBACK_DIR)
+}
 
 // ── Internal file state ───────────────────────────────────────────────────────
 
@@ -75,12 +98,44 @@ impl EvolutionEventLogger {
         }
     }
 
-    /// Create a logger using the effective base directory:
-    /// `$EVOLUTION_EVENTS_DIR` if set, otherwise `data/evolution/events/`.
+    /// Create a logger using the resolved base directory.
+    ///
+    /// See [`resolve_default_dir`] for the precedence rules.
     pub fn from_env() -> Self {
-        let dir = std::env::var(ENV_VAR_DIR)
-            .unwrap_or_else(|_| DEFAULT_BASE_DIR.to_owned());
-        Self::new(dir)
+        Self::new(resolve_default_dir())
+    }
+
+    /// Return the effective base directory this logger writes to.
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
+    /// Probe that the configured `base_dir` is writable.
+    ///
+    /// Creates the directory (if missing) and writes a small `.healthcheck`
+    /// marker file so we surface IO permission / path issues at boot time
+    /// instead of silently dropping audit events for hours.
+    ///
+    /// Intentionally does **not** write a real `AuditEvent` so the JSONL
+    /// schema stays free of `meta`-style records.
+    pub async fn self_test(&self) -> std::io::Result<()> {
+        tokio::fs::create_dir_all(&self.base_dir).await?;
+        let marker = self.base_dir.join(".healthcheck");
+        let payload = format!("ok {}\n", chrono::Utc::now().to_rfc3339());
+        tokio::fs::write(&marker, payload.as_bytes()).await.map_err(|e| {
+            tracing::error!(
+                target: "evolution_events",
+                base_dir = %self.base_dir.display(),
+                "Audit log self-test FAILED: {e}"
+            );
+            e
+        })?;
+        tracing::info!(
+            target: "evolution_events",
+            base_dir = %self.base_dir.display(),
+            "Audit log self-test passed"
+        );
+        Ok(())
     }
 
     /// Append an [`AuditEvent`] to the current log file.
@@ -110,7 +165,10 @@ impl EvolutionEventLogger {
         let line = match serde_json::to_string(&event) {
             Ok(s) => format!("{s}\n"),
             Err(e) => {
-                eprintln!("[evolution_events] serialise error: {e}");
+                tracing::error!(
+                    target: "evolution_events",
+                    "AuditEvent serialise error: {e}"
+                );
                 return;
             }
         };
@@ -144,7 +202,13 @@ impl EvolutionEventLogger {
                     });
                 }
                 Err(e) => {
-                    eprintln!("[evolution_events] failed to open log file for {today} (seq={next_seq}): {e}");
+                    tracing::error!(
+                        target: "evolution_events",
+                        base_dir = %self.base_dir.display(),
+                        date = %today,
+                        seq = next_seq,
+                        "Failed to open audit log file: {e}"
+                    );
                     return;
                 }
             }
@@ -157,7 +221,11 @@ impl EvolutionEventLogger {
                 state.bytes_written += bytes.len() as u64;
             }
             Err(e) => {
-                eprintln!("[evolution_events] write error: {e}");
+                tracing::error!(
+                    target: "evolution_events",
+                    base_dir = %self.base_dir.display(),
+                    "Audit log write error: {e}"
+                );
                 // Invalidate cached handle so next call retries open.
                 *guard = None;
             }
@@ -602,5 +670,107 @@ mod tests {
         assert!(v.get("generation").is_some());
         assert!(v.get("trigger_signal").is_some());
         assert_eq!(v["skill_id"], serde_json::Value::Null);
+    }
+
+    // ── BUG-2: default-dir resolution ──
+
+    /// Helper that runs `f` with the given env vars set/cleared, restoring
+    /// previous values on drop. Tests must be `#[serial]` because env is
+    /// process-global; we keep the helper minimal and serialise via Mutex.
+    fn with_envs<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        // Tests touching shared process env are serialised to avoid races.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        let saved: Vec<(String, Option<String>)> = vars
+            .iter()
+            .map(|(k, _)| ((*k).to_owned(), std::env::var(k).ok()))
+            .collect();
+        // SAFETY: tests are serialised via LOCK; no other thread reads/writes
+        // these vars while we hold the guard.
+        for (k, v) in vars {
+            match v {
+                Some(val) => unsafe { std::env::set_var(k, val); },
+                None => unsafe { std::env::remove_var(k); },
+            }
+        }
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        for (k, v) in saved {
+            match v {
+                Some(val) => unsafe { std::env::set_var(&k, val); },
+                None => unsafe { std::env::remove_var(&k); },
+            }
+        }
+        if let Err(p) = unwind {
+            std::panic::resume_unwind(p);
+        }
+    }
+
+    #[test]
+    fn test_resolve_default_dir_uses_env_override() {
+        with_envs(
+            &[
+                ("EVOLUTION_EVENTS_DIR", Some("/tmp/explicit-override")),
+                ("DUDUCLAW_HOME", Some("/tmp/should-not-win")),
+                ("HOME", Some("/tmp/also-should-not-win")),
+            ],
+            || {
+                let p = resolve_default_dir();
+                assert_eq!(p, PathBuf::from("/tmp/explicit-override"));
+            },
+        );
+    }
+
+    #[test]
+    fn test_resolve_default_dir_uses_dudu_home_when_set() {
+        with_envs(
+            &[
+                ("EVOLUTION_EVENTS_DIR", None),
+                ("DUDUCLAW_HOME", Some("/tmp/dudu")),
+                ("HOME", Some("/tmp/home")),
+            ],
+            || {
+                let p = resolve_default_dir();
+                assert_eq!(p, PathBuf::from("/tmp/dudu/evolution/events"));
+            },
+        );
+    }
+
+    #[test]
+    fn test_resolve_default_dir_falls_back_to_home_duduclaw() {
+        with_envs(
+            &[
+                ("EVOLUTION_EVENTS_DIR", None),
+                ("DUDUCLAW_HOME", None),
+                ("HOME", Some("/tmp/userhome")),
+            ],
+            || {
+                let p = resolve_default_dir();
+                assert_eq!(p, PathBuf::from("/tmp/userhome/.duduclaw/evolution/events"));
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn test_self_test_creates_dir_and_marker() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("nested/audit");
+        let logger = make_logger(&target);
+        logger.self_test().await.expect("self_test must succeed");
+        let marker = target.join(".healthcheck");
+        assert!(marker.exists(), "healthcheck marker must exist at {marker:?}");
+        let body = tokio::fs::read_to_string(&marker).await.unwrap();
+        assert!(body.starts_with("ok "), "marker should start with 'ok ', got: {body}");
+    }
+
+    #[tokio::test]
+    async fn test_self_test_surfaces_io_error_on_unwritable_path() {
+        // A path under a regular file (not a dir) cannot be created.
+        let tmp = TempDir::new().unwrap();
+        let blocking_file = tmp.path().join("blocker");
+        tokio::fs::write(&blocking_file, b"x").await.unwrap();
+        let bad = blocking_file.join("audit");
+        let logger = make_logger(&bad);
+        let result = logger.self_test().await;
+        assert!(result.is_err(), "self_test should fail when path is unwritable");
     }
 }

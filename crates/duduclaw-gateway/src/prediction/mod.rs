@@ -9,10 +9,12 @@
 //! Only genuine prediction errors trigger expensive LLM reflections.
 
 pub mod engine;
+pub mod forced_reflection;
 pub mod metacognition;
 pub mod metrics;
 pub mod outcome;
 pub mod router;
+pub mod subagent_prediction;
 pub mod user_model;
 
 #[cfg(test)]

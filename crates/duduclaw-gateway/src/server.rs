@@ -96,6 +96,40 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let home_dir = config.home_dir.clone();
     let extension = config.extension.clone();
 
+    // ── BUG-2 fix: anchor EvolutionEvents audit log to home_dir, not cwd ──
+    //
+    // EvolutionEventLogger::from_env() falls back to cwd-relative
+    // "data/evolution/events" if neither EVOLUTION_EVENTS_DIR nor DUDUCLAW_HOME
+    // is set. When the gateway runs with cwd=$HOME, audit events are silently
+    // dropped because the path doesn't exist. We pin both env vars before any
+    // emitter is constructed so every component sees the same target.
+    {
+        let events_dir = home_dir.join("evolution").join("events");
+        // SAFETY: process is single-threaded at this point in start_gateway
+        // (no other tasks have been spawned yet). Setting env vars here is
+        // safe; later threads only read.
+        if std::env::var_os("EVOLUTION_EVENTS_DIR").is_none() {
+            unsafe { std::env::set_var("EVOLUTION_EVENTS_DIR", &events_dir); }
+            info!(
+                "EVOLUTION_EVENTS_DIR defaulted to {}",
+                events_dir.display()
+            );
+        }
+        if std::env::var_os("DUDUCLAW_HOME").is_none() {
+            unsafe { std::env::set_var("DUDUCLAW_HOME", &home_dir); }
+        }
+        // Run a synchronous-ish self-test so a misconfigured path surfaces at
+        // boot rather than after the first prediction error.
+        let logger = crate::evolution_events::logger::EvolutionEventLogger::from_env();
+        if let Err(e) = logger.self_test().await {
+            warn!(
+                "EvolutionEvents audit log path {} is not writable: {e} — \
+                 audit events will be silently dropped until this is fixed",
+                events_dir.display()
+            );
+        }
+    }
+
     let handler = MethodHandler::with_extension(config.home_dir, extension.clone()).await;
 
     // Initialize cost telemetry (must happen before any Claude CLI calls)
@@ -197,6 +231,27 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     ));
     info!("GVU evolution loop initialized (encryption: {})", if gvu_encryption_key.is_some() { "enabled" } else { "disabled" });
 
+    // ── BUG-1 fix: schedule ObservationFinalizer (30 min ticks) ───────────
+    // Closes expired SOUL.md observation windows (confirmed / rolled_back /
+    // extended). Without this, the very first applied SOUL change blocks all
+    // subsequent GVU proposals indefinitely.
+    {
+        let finalizer = Arc::new(
+            crate::gvu::observation_finalizer::ObservationFinalizer::new(
+                crate::gvu::version_store::VersionStore::with_crypto(
+                    &gvu_db_path,
+                    gvu_encryption_key.as_ref(),
+                ),
+                home_dir.join("prediction.db"),
+                home_dir.join("feedback.jsonl"),
+                home_dir.join("agents"),
+                gvu_encryption_key,
+            ),
+        );
+        tokio::spawn(finalizer.run(std::time::Duration::from_secs(1800)));
+        info!("ObservationFinalizer scheduled — 30 min interval");
+    }
+
     // Event broadcast channel for pushing real-time updates (e.g. channel status) to dashboard
     let (event_tx, _) = broadcast::channel::<String>(64);
     handler.set_event_tx(event_tx.clone()).await;
@@ -241,12 +296,31 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Start unified heartbeat scheduler (per-agent: evolution + cron + monitoring)
     // Replaces the old start_evolution_timers — each agent's HeartbeatConfig
     // now drives meso/macro reflections at its own interval or cron schedule.
-    let heartbeat = duduclaw_agent::heartbeat::start_heartbeat_scheduler(
+    //
+    // BUG-3 fix: wire a SilenceBreakerEvent channel so silence detection in
+    // the scheduler turns into a real `silence_breaker` evolution event in
+    // prediction.db (gated by a 4h per-agent cool-down).
+    let (silence_tx, silence_rx) =
+        tokio::sync::mpsc::unbounded_channel::<duduclaw_agent::SilenceBreakerEvent>();
+    let heartbeat = duduclaw_agent::heartbeat::start_heartbeat_scheduler_with(
         home_dir.clone(),
         handler.registry().clone(),
+        Some(silence_tx),
     );
     handler.set_heartbeat(heartbeat).await;
     info!("Heartbeat scheduler started (per-agent evolution + monitoring)");
+
+    // Consume SilenceBreakerEvent → forced reflection event
+    {
+        let cooldown = Arc::new(
+            crate::prediction::forced_reflection::SilenceBreakerCooldown::default_4h(),
+        );
+        crate::prediction::forced_reflection::spawn_silence_event_consumer(
+            silence_rx,
+            prediction_engine.clone(),
+            cooldown,
+        );
+    }
 
     // ── Memory decay: archive old entries daily ───────────────
     // Archives entries older than 30 days (low-importance) and permanently
@@ -383,6 +457,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         handler.registry().clone(),
         None,
         message_queue,
+        Some(prediction_engine.clone()),
     ));
     info!("Agent dispatcher started ({} background tasks)", bg_handles.len());
 

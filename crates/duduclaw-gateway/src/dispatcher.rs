@@ -63,16 +63,21 @@ pub fn start_agent_dispatcher(
     home_dir: PathBuf,
     registry: Arc<RwLock<AgentRegistry>>,
 ) -> tokio::task::JoinHandle<()> {
-    start_agent_dispatcher_with_crypto(home_dir, registry, None, None)
+    start_agent_dispatcher_with_crypto(home_dir, registry, None, None, None)
 }
 
 /// Start the dispatcher with optional encryption key for deferred GVU (review #30)
 /// and optional SQLite message queue (Phase 3 Hybrid TaskPipeline).
+///
+/// `prediction_engine` (BUG-5 fix): when supplied, every successful sub-agent
+/// dispatch records a synthetic prediction cycle so sub-agents accumulate
+/// `prediction_log` rows the same way channel-facing agents do.
 pub fn start_agent_dispatcher_with_crypto(
     home_dir: PathBuf,
     registry: Arc<RwLock<AgentRegistry>>,
     encryption_key: Option<[u8; 32]>,
     message_queue: Option<Arc<crate::message_queue::MessageQueue>>,
+    prediction_engine: Option<Arc<crate::prediction::engine::PredictionEngine>>,
 ) -> tokio::task::JoinHandle<()> {
     // Mutex protects the read-modify-write cycle on bus_queue.jsonl
     let dispatch_lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -95,13 +100,22 @@ pub fn start_agent_dispatcher_with_crypto(
             let _guard = dispatch_lock.lock().await;
 
             // Poll JSONL bus queue (legacy path — kept for backward compat)
-            if let Err(e) = poll_and_dispatch(&home_dir, &registry).await {
+            if let Err(e) =
+                poll_and_dispatch(&home_dir, &registry, prediction_engine.as_ref()).await
+            {
                 warn!("Dispatcher poll error: {e}");
             }
 
             // Poll SQLite message queue (new path)
             if let Some(ref mq) = message_queue {
-                if let Err(e) = poll_and_dispatch_sqlite(mq, &home_dir, &registry).await {
+                if let Err(e) = poll_and_dispatch_sqlite(
+                    mq,
+                    &home_dir,
+                    &registry,
+                    prediction_engine.as_ref(),
+                )
+                .await
+                {
                     warn!("SQLite dispatcher poll error: {e}");
                 }
                 // Sweep stale messages every 12 ticks (~60 seconds)
@@ -133,6 +147,7 @@ async fn poll_and_dispatch_sqlite(
     queue: &Arc<crate::message_queue::MessageQueue>,
     home_dir: &Path,
     registry: &Arc<RwLock<AgentRegistry>>,
+    prediction_engine: Option<&Arc<crate::prediction::engine::PredictionEngine>>,
 ) -> Result<(), String> {
     let messages = queue.pending_messages(10).await?;
     if messages.is_empty() {
@@ -174,6 +189,17 @@ async fn poll_and_dispatch_sqlite(
                 queue.complete(&msg.id, &response).await?;
                 // Forward sub-agent response to originating channel if callback exists
                 forward_delegation_response(home_dir, &msg.id, &response, &msg.target).await;
+                // BUG-5 fix: record a prediction cycle for the sub-agent
+                // so user_models / prediction_log accumulate the same way
+                // they do for the channel-facing root agent.
+                crate::prediction::subagent_prediction::spawn_record(
+                    prediction_engine.cloned(),
+                    msg.target.clone(),
+                    msg.sender_agent.clone(),
+                    msg.origin_agent.clone(),
+                    msg.payload.clone(),
+                    response.clone(),
+                );
                 info!(
                     msg_id = %msg.id,
                     target = %msg.target,
@@ -325,6 +351,7 @@ async fn poll_deferred_gvu(home_dir: &Path, encryption_key: Option<&[u8; 32]>) {
 async fn poll_and_dispatch(
     home_dir: &Path,
     registry: &Arc<RwLock<AgentRegistry>>,
+    prediction_engine: Option<&Arc<crate::prediction::engine::PredictionEngine>>,
 ) -> Result<(), String> {
     let queue_path = home_dir.join("bus_queue.jsonl");
 
@@ -453,6 +480,7 @@ async fn poll_and_dispatch(
         let reg = reg.clone();
         let queue = queue.clone();
         let notebook = notebook.clone();
+        let pe_for_task = prediction_engine.cloned();
 
         handles.push(tokio::spawn(async move {
             let dispatch_start = Utc::now().to_rfc3339();
@@ -627,6 +655,20 @@ async fn poll_and_dispatch(
             forward_delegation_response(&home, &msg.message_id, &response_for_callback, &msg.agent_id).await;
             for extra_id in &msg.coalesced_ids {
                 forward_delegation_response(&home, extra_id, &response_for_callback, &msg.agent_id).await;
+            }
+
+            // BUG-5 fix: record a sub-agent prediction cycle so user_models
+            // and prediction_log accumulate even for agents that never see a
+            // direct channel message.
+            if result.is_ok() {
+                crate::prediction::subagent_prediction::spawn_record(
+                    pe_for_task.clone(),
+                    msg.agent_id.clone(),
+                    msg.sender_agent.clone(),
+                    msg.origin_agent.clone(),
+                    msg.payload.clone(),
+                    response_for_callback.clone(),
+                );
             }
 
             drop(permit);

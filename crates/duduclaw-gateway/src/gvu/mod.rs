@@ -27,6 +27,7 @@ pub mod diversity;
 pub mod generator;
 pub mod loop_;
 pub mod mistake_notebook;
+pub mod observation_finalizer;
 pub mod proposal;
 pub mod shadow_mode;
 pub mod soul_partition;

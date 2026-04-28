@@ -13,7 +13,13 @@ pub mod skill_loader;
 pub mod skill_registry;
 
 pub use budget::{BudgetManager, BudgetStatus};
-pub use heartbeat::{HeartbeatScheduler, HeartbeatStatus, start_heartbeat_scheduler};
+pub use heartbeat::{
+    HeartbeatScheduler,
+    HeartbeatStatus,
+    SilenceBreakerEvent,
+    start_heartbeat_scheduler,
+    start_heartbeat_scheduler_with,
+};
 pub use ipc::{IpcBroker, IpcMessage, IpcMessageStatus, IpcMessageType};
 pub use registry::{AgentRegistry, LoadedAgent};
 pub use runner::AgentRunner;

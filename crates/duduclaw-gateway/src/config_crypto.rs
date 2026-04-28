@@ -7,8 +7,9 @@
 use std::path::Path;
 
 /// Load the AES-256 keyfile from `~/.duduclaw/.keyfile`.
-/// Public variant for GVU encryption and other internal consumers.
-pub(crate) fn load_keyfile_public(home_dir: &Path) -> Option<[u8; 32]> {
+/// Used by GVU encryption, the ObservationFinalizer CLI, and other internal
+/// consumers that need to talk to the same VersionStore as the gateway.
+pub fn load_keyfile_public(home_dir: &Path) -> Option<[u8; 32]> {
     load_keyfile(home_dir)
 }
 
