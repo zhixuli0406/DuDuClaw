@@ -208,7 +208,30 @@ async fn run_socket_mode(
 
     let (mut sink, mut stream) = ws_stream.split();
 
-    while let Some(msg_result) = stream.next().await {
+    // Stall watchdog: Slack Socket Mode normally produces a ping/disconnect
+    // every ~30s. If the stream goes silent for >120s the TCP is half-closed
+    // and we'll never see a Close frame — break out so the outer reconnect
+    // loop can re-issue `apps.connections.open` and grab a fresh URL.
+    const STALL_TIMEOUT_SECS: u64 = 120;
+
+    loop {
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(STALL_TIMEOUT_SECS),
+            stream.next(),
+        )
+        .await;
+
+        let msg_result = match next {
+            Ok(Some(r)) => r,
+            Ok(None) => break, // stream closed cleanly
+            Err(_) => {
+                warn!(
+                    "Slack [{label}] Socket Mode stalled ({STALL_TIMEOUT_SECS}s no traffic), reconnecting"
+                );
+                break;
+            }
+        };
+
         let msg = match msg_result {
             Ok(m) => m,
             Err(e) => {

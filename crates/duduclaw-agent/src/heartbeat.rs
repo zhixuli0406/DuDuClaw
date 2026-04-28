@@ -21,6 +21,7 @@ use std::time::Duration;
 use chrono::{self, Utc};
 use cron::Schedule;
 use duduclaw_core::types::{AgentStatus, HeartbeatConfig};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio::time;
@@ -421,7 +422,11 @@ impl HeartbeatScheduler {
 /// Execute a single heartbeat cycle for one agent.
 ///
 /// 1. Bus polling (existing): check for pending inter-agent messages
-/// 2. Proactive check (new): if PROACTIVE.md exists, execute checks and route results
+/// 2. Task board pull (new): scan tasks.db for `todo`/stalled `in_progress`
+///    rows assigned to this agent and enqueue a wake-up message — closes the
+///    "Multica task board exists but agents never claim from it" gap where
+///    agents only ever ran when a channel message arrived.
+/// 3. Proactive check: if PROACTIVE.md exists, execute checks and route results
 async fn execute_heartbeat(
     home_dir: &Path,
     agent_id: &str,
@@ -444,10 +449,192 @@ async fn execute_heartbeat(
         info!(agent = agent_id, pending, "Agent has pending bus messages");
     }
 
+    // ── Task board pull (new) ──
+    if let Err(e) = poll_assigned_tasks(home_dir, agent_id).await {
+        debug!(agent = agent_id, error = %e, "Task board poll skipped");
+    }
+
     // ── Proactive check (new) ──
     execute_proactive_check(home_dir, agent_id, proactive_states).await;
 
     info!(agent = agent_id, "Heartbeat cycle complete");
+}
+
+/// Poll `tasks.db` for work assigned to this agent and enqueue a wake-up
+/// message into `message_queue.db`. The dispatcher's existing 5-second poll
+/// loop will then route the message to the agent through the same code path
+/// channel messages use.
+///
+/// Two trigger conditions:
+///   1. **Highest-priority `todo`** task assigned to this agent — pulls one
+///      per heartbeat to avoid stampedes. The agent is told to use
+///      `tasks_claim` to formally take ownership.
+///   2. **Stalled `in_progress`** task — `updated_at` older than 30 min.
+///      The agent is asked to either resume work or surface a blocker.
+///
+/// We track which (task_id, kind) pairs have been nudged in `tasks.db`'s
+/// `metadata` field of an injected `activity` row, so a single backlog item
+/// doesn't generate one wake-up per heartbeat tick. Cooldown: 1 hour.
+async fn poll_assigned_tasks(home_dir: &Path, agent_id: &str) -> Result<(), String> {
+    let tasks_db = home_dir.join("tasks.db");
+    let queue_db = home_dir.join("message_queue.db");
+    if !tasks_db.exists() || !queue_db.exists() {
+        return Ok(());
+    }
+
+    // Validate agent_id (defense in depth — same checks as proactive).
+    if agent_id.contains("..")
+        || agent_id.contains('/')
+        || agent_id.contains('\\')
+        || agent_id.contains('\0')
+    {
+        return Err("invalid agent_id".into());
+    }
+
+    let agent = agent_id.to_string();
+    let tasks_path = tasks_db.clone();
+    let queue_path = queue_db.clone();
+
+    // All sqlite I/O on a blocking thread — rusqlite is sync.
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let tdb = rusqlite::Connection::open(&tasks_path)
+            .map_err(|e| format!("open tasks.db: {e}"))?;
+        tdb.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| format!("set busy_timeout: {e}"))?;
+
+        // Highest-priority todo for this agent.
+        let todo: Option<(String, String, String)> = tdb
+            .query_row(
+                "SELECT id, title, priority FROM tasks
+                 WHERE assigned_to = ?1 AND status = 'todo'
+                 ORDER BY CASE priority
+                     WHEN 'critical' THEN 0
+                     WHEN 'urgent'   THEN 1
+                     WHEN 'high'     THEN 2
+                     WHEN 'medium'   THEN 3
+                     ELSE 4
+                   END, created_at ASC
+                 LIMIT 1",
+                rusqlite::params![&agent],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("query todo: {e}"))?;
+
+        // Stalled in_progress: updated_at > 30 minutes ago.
+        let stall_cutoff = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
+        let stalled: Option<(String, String)> = tdb
+            .query_row(
+                "SELECT id, title FROM tasks
+                 WHERE assigned_to = ?1 AND status = 'in_progress'
+                   AND updated_at < ?2
+                 ORDER BY updated_at ASC
+                 LIMIT 1",
+                rusqlite::params![&agent, stall_cutoff],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("query stalled: {e}"))?;
+        drop(tdb);
+
+        if todo.is_none() && stalled.is_none() {
+            return Ok(());
+        }
+
+        let qdb = rusqlite::Connection::open(&queue_path)
+            .map_err(|e| format!("open message_queue.db: {e}"))?;
+        qdb.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| format!("set busy_timeout: {e}"))?;
+
+        // Cooldown gate: skip if the same kind of nudge was sent to this
+        // agent within the last hour. We use the `payload` LIKE marker on
+        // existing pending/acked rows so there's no extra schema.
+        let cooldown_cutoff = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+
+        if let Some((task_id, title, priority)) = todo {
+            let marker = format!("[heartbeat-pull task_id={task_id}]");
+            let already: i64 = qdb
+                .query_row(
+                    "SELECT COUNT(*) FROM message_queue
+                     WHERE target = ?1 AND payload LIKE ?2 AND created_at > ?3",
+                    rusqlite::params![&agent, format!("%{marker}%"), &cooldown_cutoff],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if already == 0 {
+                let id = uuid::Uuid::new_v4().to_string();
+                let now = chrono::Utc::now().to_rfc3339();
+                let payload = format!(
+                    "{marker} 任務看板有一筆指派給你的待辦任務尚未開始：\n\
+                     • Task ID: {task_id}\n\
+                     • 標題: {title}\n\
+                     • 優先級: {priority}\n\n\
+                     請使用 MCP 工具 `tasks_claim` 接手這項任務並開始執行；\
+                     若無法立即處理，使用 `tasks_block` 並說明阻塞原因。"
+                );
+                qdb.execute(
+                    "INSERT INTO message_queue \
+                     (id, sender, target, payload, status, retry_count, delegation_depth, \
+                      created_at) \
+                     VALUES (?1, 'heartbeat-scheduler', ?2, ?3, 'pending', 0, 0, ?4)",
+                    rusqlite::params![&id, &agent, &payload, &now],
+                )
+                .map_err(|e| format!("enqueue todo wake-up: {e}"))?;
+                info!(
+                    agent = %agent,
+                    task_id = %task_id,
+                    priority = %priority,
+                    "Heartbeat: enqueued todo wake-up"
+                );
+            }
+        }
+
+        if let Some((task_id, title)) = stalled {
+            let marker = format!("[heartbeat-stall task_id={task_id}]");
+            let already: i64 = qdb
+                .query_row(
+                    "SELECT COUNT(*) FROM message_queue
+                     WHERE target = ?1 AND payload LIKE ?2 AND created_at > ?3",
+                    rusqlite::params![&agent, format!("%{marker}%"), &cooldown_cutoff],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if already == 0 {
+                let id = uuid::Uuid::new_v4().to_string();
+                let now = chrono::Utc::now().to_rfc3339();
+                let payload = format!(
+                    "{marker} 你 claim 的任務已停滯超過 30 分鐘無進度：\n\
+                     • Task ID: {task_id}\n\
+                     • 標題: {title}\n\n\
+                     請使用 MCP 工具 `activity_post` 回報目前進度，或在受阻時 \
+                     `tasks_block` 標記並說明原因。"
+                );
+                qdb.execute(
+                    "INSERT INTO message_queue \
+                     (id, sender, target, payload, status, retry_count, delegation_depth, \
+                      created_at) \
+                     VALUES (?1, 'heartbeat-scheduler', ?2, ?3, 'pending', 0, 0, ?4)",
+                    rusqlite::params![&id, &agent, &payload, &now],
+                )
+                .map_err(|e| format!("enqueue stall wake-up: {e}"))?;
+                info!(
+                    agent = %agent,
+                    task_id = %task_id,
+                    "Heartbeat: enqueued stalled-task wake-up"
+                );
+            }
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {e}"))?
 }
 
 /// Execute proactive checks for an agent if PROACTIVE.md exists and conditions allow.
