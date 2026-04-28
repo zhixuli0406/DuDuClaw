@@ -294,6 +294,8 @@ export type ActivityType =
   | 'agent_reply'
   | 'skill_learned'
   | 'evolution_triggered'
+  | 'autopilot_triggered'
+  | 'autopilot_lag'
   | 'error';
 
 export interface ActivityEvent {
