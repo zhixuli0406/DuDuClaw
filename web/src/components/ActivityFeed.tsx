@@ -14,13 +14,22 @@ import {
   Zap,
   AlertTriangle,
   ChevronDown,
+  Activity,
 } from 'lucide-react';
 
-const TYPE_CONFIG: Record<ActivityType, {
+type TypeConfig = {
   icon: React.ComponentType<{ className?: string }>;
   color: string;
   bgColor: string;
-}> = {
+};
+
+const FALLBACK_CONFIG: TypeConfig = {
+  icon: Activity,
+  color: 'text-stone-500',
+  bgColor: 'bg-stone-100 dark:bg-stone-800',
+};
+
+const TYPE_CONFIG: Record<ActivityType, TypeConfig> = {
   task_created: {
     icon: Plus,
     color: 'text-blue-500',
@@ -56,6 +65,16 @@ const TYPE_CONFIG: Record<ActivityType, {
     color: 'text-amber-500',
     bgColor: 'bg-amber-100 dark:bg-amber-900/30',
   },
+  autopilot_triggered: {
+    icon: Zap,
+    color: 'text-amber-500',
+    bgColor: 'bg-amber-100 dark:bg-amber-900/30',
+  },
+  autopilot_lag: {
+    icon: AlertTriangle,
+    color: 'text-amber-500',
+    bgColor: 'bg-amber-100 dark:bg-amber-900/30',
+  },
   error: {
     icon: AlertTriangle,
     color: 'text-rose-500',
@@ -64,7 +83,7 @@ const TYPE_CONFIG: Record<ActivityType, {
 };
 
 function ActivityItem({ event }: { event: ActivityEvent }) {
-  const config = TYPE_CONFIG[event.type];
+  const config = TYPE_CONFIG[event.type] ?? FALLBACK_CONFIG;
   const Icon = config.icon;
 
   const timeAgo = formatTimeAgo(event.timestamp);
