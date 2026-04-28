@@ -68,6 +68,19 @@ struct IdentifyProperties {
     device: String,
 }
 
+#[derive(Debug, Serialize)]
+struct GatewayResume {
+    op: u8,
+    d: ResumeData,
+}
+
+#[derive(Debug, Serialize)]
+struct ResumeData {
+    token: String,
+    session_id: String,
+    seq: u64,
+}
+
 // Discord Gateway intents
 const INTENT_GUILDS: u64 = 1 << 0;
 const INTENT_GUILD_MESSAGES: u64 = 1 << 9;
@@ -536,10 +549,20 @@ async fn gateway_loop(
     let mut consecutive_failures: u32 = 0;
     const MAX_FAILURES: u32 = 10;
 
+    // Persistent session state across reconnects — required for Gateway RESUME (op 6).
+    // Without these, every reconnect IDENTIFYs anew and Discord drops every event
+    // buffered during the disconnect window. See Discord Gateway docs §"Resuming".
+    let session_seq = Arc::new(AtomicU64::new(u64::MAX));
+    let mut session_id: Option<String> = None;
+    let mut resume_gateway_url: Option<String> = None;
+
     loop {
-        // Exponential backoff: 5s, 10s, 20s, 40s, ... capped at 300s (5min)
+        // Exponential backoff: 5s, 10s, 20s, ... capped at 60s.
+        // Cap was 300s — too long for an interactive bot; if we genuinely
+        // can't reconnect after 60s the underlying issue won't fix itself
+        // by waiting longer.
         if consecutive_failures > 0 {
-            let backoff = std::cmp::min(5u64 << consecutive_failures.min(6), 300);
+            let backoff = std::cmp::min(5u64 << consecutive_failures.min(4), 60);
             warn!("Discord [{label}] reconnecting in {backoff}s (attempt {consecutive_failures}/{MAX_FAILURES})");
             tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
         }
@@ -571,12 +594,22 @@ async fn gateway_loop(
             return;
         }
 
-        info!("Discord [{label}] Gateway connecting...");
+        // Use resume_gateway_url if available — Discord requires reconnects to
+        // hit the URL provided in the original READY event for RESUME to work.
+        let connect_url = match (&session_id, &resume_gateway_url) {
+            (Some(_), Some(rurl)) => rurl.clone(),
+            _ => gateway_url.clone(),
+        };
+        let attempting_resume = session_id.is_some();
+        info!(
+            "Discord [{label}] Gateway connecting (mode={})...",
+            if attempting_resume { "RESUME" } else { "IDENTIFY" }
+        );
         set_channel_connected(&channel_status, &label, false, Some("connecting".into()), Some(&event_tx)).await;
 
         let ws = match tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            tokio_tungstenite::connect_async(&gateway_url),
+            tokio_tungstenite::connect_async(&connect_url),
         ).await {
             Ok(Ok((ws, resp))) => {
                 info!("Discord Gateway WebSocket connected (HTTP {})", resp.status());
@@ -597,22 +630,37 @@ async fn gateway_loop(
         };
 
         let (mut write, mut read) = ws.split();
-        let sequence = Arc::new(AtomicU64::new(u64::MAX));
         let mut heartbeat_interval_ms: u64 = 41250;
-        let mut _identified = false;
         // Track last heartbeat ACK to detect zombied connections.
         // Discord requires: if no ACK received within heartbeat_interval,
         // the client MUST close and reconnect.
         let mut last_heartbeat_ack = std::time::Instant::now();
         let mut awaiting_heartbeat_ack = false;
+        let mut last_message_at = std::time::Instant::now();
 
-        let (heartbeat_tx, mut heartbeat_rx) = tokio::sync::mpsc::channel::<()>(1);
+        // Capacity 16 + try_send so heartbeat task can never block on a busy
+        // receiver. Capacity 1 + send().await caused permanent deadlock when
+        // select! consumed slowly: heartbeat task stuck awaiting send → no
+        // future ticks → zombie detection never fires → silent stall.
+        let (heartbeat_tx, mut heartbeat_rx) = tokio::sync::mpsc::channel::<()>(16);
         let heartbeat_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
             Arc::new(tokio::sync::Mutex::new(None));
+        // Tracks whether the current connection has been promoted to a usable
+        // session (READY for new sessions, RESUMED for resumes). Used by the
+        // outer `consecutive_failures += 1` to distinguish "broke before
+        // session was ever live" from "broke after working for a while".
+        let mut session_live = false;
 
-        loop {
+        // Inner loop break signals.
+        enum BreakReason {
+            Recoverable,
+            SessionInvalid, // clear session_id and reconnect
+            Fatal,          // exit gateway_loop entirely
+        }
+        let break_reason: BreakReason = loop {
             tokio::select! {
                 msg_opt = read.next() => {
+                    last_message_at = std::time::Instant::now();
                     let msg = match msg_opt {
                         Some(Ok(Message::Text(text))) => text.to_string(),
                         Some(Ok(Message::Binary(bin))) => {
@@ -627,7 +675,7 @@ async fn gateway_loop(
                         Some(Ok(Message::Ping(data))) => {
                             if let Err(e) = write.send(Message::Pong(data)).await {
                                 warn!("Discord Gateway: failed to send pong: {e}");
-                                break;
+                                break BreakReason::Recoverable;
                             }
                             continue;
                         }
@@ -635,28 +683,33 @@ async fn gateway_loop(
                             let raw_code = frame.as_ref().map(|f| u16::from(f.code));
                             let reason = frame.as_ref().map(|f| f.reason.to_string()).unwrap_or_default();
                             warn!("Discord [{label}] Gateway closed (code: {raw_code:?}, reason: {reason})");
-                            // Fatal Discord close codes — do not retry
                             match raw_code {
+                                // Fatal — do not retry
                                 Some(4004) => {
                                     error!("Discord [{label}] authentication failed (4004), stopping");
                                     set_channel_connected(&channel_status, &label, false, Some("authentication failed — update token via Dashboard".into()), Some(&event_tx)).await;
-                                    return;
+                                    break BreakReason::Fatal;
                                 }
                                 Some(4014) => {
                                     error!("Discord [{label}] disallowed intents (4014), stopping");
                                     set_channel_connected(&channel_status, &label, false, Some("disallowed intents — enable MESSAGE CONTENT INTENT in Discord Developer Portal".into()), Some(&event_tx)).await;
-                                    return;
+                                    break BreakReason::Fatal;
                                 }
                                 Some(4013) => {
                                     error!("Discord [{label}] invalid intents (4013), stopping");
                                     set_channel_connected(&channel_status, &label, false, Some("invalid intents".into()), Some(&event_tx)).await;
-                                    return;
+                                    break BreakReason::Fatal;
                                 }
-                                _ => break, // recoverable, will retry with backoff
+                                // Session is no longer resumable — must IDENTIFY fresh.
+                                // 4007 invalid seq, 4009 session timed out, 4003 not authenticated.
+                                Some(4007) | Some(4009) | Some(4003) => {
+                                    break BreakReason::SessionInvalid;
+                                }
+                                _ => break BreakReason::Recoverable,
                             }
                         }
-                        Some(Err(e)) => { warn!("Discord Gateway error: {e}"); break; }
-                        None => break,
+                        Some(Err(e)) => { warn!("Discord Gateway error: {e}"); break BreakReason::Recoverable; }
+                        None => break BreakReason::Recoverable,
                         _ => continue,
                     };
 
@@ -669,11 +722,11 @@ async fn gateway_loop(
                     };
 
                     if let Some(s) = payload.s {
-                        sequence.store(s, Ordering::Relaxed);
+                        session_seq.store(s, Ordering::Relaxed);
                     }
 
                     match payload.op {
-                        // Hello — start heartbeating
+                        // Hello — start heartbeating, then either RESUME or IDENTIFY
                         10 => {
                             if let Some(d) = &payload.d {
                                 heartbeat_interval_ms = d
@@ -687,7 +740,8 @@ async fn gateway_loop(
                             let hb_handle = tokio::spawn(async move {
                                 loop {
                                     tokio::time::sleep(interval).await;
-                                    if tx.send(()).await.is_err() {
+                                    // try_send: drop ticks rather than block when receiver is slow.
+                                    if tx.try_send(()).is_err() && tx.is_closed() {
                                         break;
                                     }
                                 }
@@ -699,25 +753,44 @@ async fn gateway_loop(
                                 old.abort();
                             }
                             *guard = Some(hb_handle);
+                            drop(guard);
 
-                            let identify = GatewayIdentify {
-                                op: 2,
-                                d: IdentifyData {
-                                    token: token.clone(),
-                                    intents: BOT_INTENTS,
-                                    properties: IdentifyProperties {
-                                        os: "linux".to_string(),
-                                        browser: "duduclaw".to_string(),
-                                        device: "duduclaw".to_string(),
-                                    },
-                                },
+                            // Send RESUME if we have a valid session, otherwise IDENTIFY.
+                            let send_res = match (&session_id, session_seq.load(Ordering::Relaxed)) {
+                                (Some(sid), seq) if seq != u64::MAX => {
+                                    let resume = GatewayResume {
+                                        op: 6,
+                                        d: ResumeData {
+                                            token: token.clone(),
+                                            session_id: sid.clone(),
+                                            seq,
+                                        },
+                                    };
+                                    info!("Discord [{label}] sending RESUME (seq={seq})");
+                                    let json_str = serde_json::to_string(&resume).unwrap_or_default();
+                                    write.send(Message::Text(json_str.into())).await
+                                }
+                                _ => {
+                                    let identify = GatewayIdentify {
+                                        op: 2,
+                                        d: IdentifyData {
+                                            token: token.clone(),
+                                            intents: BOT_INTENTS,
+                                            properties: IdentifyProperties {
+                                                os: "linux".to_string(),
+                                                browser: "duduclaw".to_string(),
+                                                device: "duduclaw".to_string(),
+                                            },
+                                        },
+                                    };
+                                    let json_str = serde_json::to_string(&identify).unwrap_or_default();
+                                    write.send(Message::Text(json_str.into())).await
+                                }
                             };
-                            let json_str = serde_json::to_string(&identify).unwrap_or_default();
-                            if write.send(Message::Text(json_str.into())).await.is_err() {
-                                break;
+                            if send_res.is_err() {
+                                break BreakReason::Recoverable;
                             }
-                            _identified = true;
-                            info!("Discord Gateway identified (heartbeat: {heartbeat_interval_ms}ms)");
+                            info!("Discord Gateway handshake sent (heartbeat: {heartbeat_interval_ms}ms)");
                         }
 
                         // Heartbeat ACK — record timestamp for zombie detection
@@ -758,8 +831,28 @@ async fn gateway_loop(
                                         }
                                     }
                                     "READY" => {
-                                        info!("Discord [{label}] Gateway READY");
+                                        // Capture session_id + resume_gateway_url for future RESUMEs.
+                                        if let Some(d) = &payload.d {
+                                            session_id = d.get("session_id")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string());
+                                            resume_gateway_url = d.get("resume_gateway_url")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string());
+                                        }
+                                        info!(
+                                            "Discord [{label}] Gateway READY (session_id={}, resume_url={})",
+                                            session_id.as_deref().unwrap_or("?"),
+                                            resume_gateway_url.is_some()
+                                        );
                                         consecutive_failures = 0;
+                                        session_live = true;
+                                        set_channel_connected(&channel_status, &label, true, None, Some(&event_tx)).await;
+                                    }
+                                    "RESUMED" => {
+                                        info!("Discord [{label}] Gateway RESUMED");
+                                        consecutive_failures = 0;
+                                        session_live = true;
                                         set_channel_connected(&channel_status, &label, true, None, Some(&event_tx)).await;
                                     }
                                     "GUILD_CREATE" => {
@@ -776,16 +869,29 @@ async fn gateway_loop(
                             }
                         }
 
-                        // Reconnect
-                        7 => { info!("Discord Gateway requested reconnect"); break; }
+                        // Reconnect — Discord asks us to disconnect & RESUME on a new socket.
+                        7 => {
+                            info!("Discord [{label}] Gateway requested reconnect (op 7)");
+                            break BreakReason::Recoverable;
+                        }
 
-                        // Invalid Session
+                        // Invalid Session — d is a boolean: true = resumable, false = must re-IDENTIFY.
+                        // Per Discord docs, wait 1-5s before reconnecting.
                         9 => {
-                            warn!("Discord [{label}] Gateway invalid session");
+                            let resumable = payload.d
+                                .as_ref()
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            warn!("Discord [{label}] Gateway invalid session (resumable={resumable})");
                             set_channel_connected(&channel_status, &label, false, Some("invalid session".to_string()), Some(&event_tx)).await;
-                            _identified = false;
-                            consecutive_failures += 1;
-                            break;
+                            // Discord requires a 1-5s random delay before reconnecting.
+                            let jitter_ms = 1000 + (std::time::Instant::now().elapsed().subsec_nanos() % 4000);
+                            tokio::time::sleep(std::time::Duration::from_millis(jitter_ms as u64)).await;
+                            if resumable {
+                                break BreakReason::Recoverable;
+                            } else {
+                                break BreakReason::SessionInvalid;
+                            }
                         }
 
                         _ => {}
@@ -802,11 +908,10 @@ async fn gateway_loop(
                             "Discord [{label}] no heartbeat ACK received in {:.1}s — zombied connection, reconnecting",
                             elapsed.as_secs_f64()
                         );
-                        consecutive_failures += 1;
-                        break;
+                        break BreakReason::Recoverable;
                     }
 
-                    let seq_val = sequence.load(Ordering::Relaxed);
+                    let seq_val = session_seq.load(Ordering::Relaxed);
                     let seq_json: Value = if seq_val == u64::MAX {
                         Value::Null
                     } else {
@@ -814,12 +919,29 @@ async fn gateway_loop(
                     };
                     let hb = json!({ "op": 1, "d": seq_json });
                     if write.send(Message::Text(hb.to_string().into())).await.is_err() {
-                        break;
+                        break BreakReason::Recoverable;
                     }
                     awaiting_heartbeat_ack = true;
                 }
+
+                // Stall watchdog: if neither read nor heartbeat fires for
+                // 2× heartbeat_interval, the select! is stalled. Without this,
+                // a half-closed TCP (FIN never seen) + a frozen heartbeat task
+                // would hang forever silently — the exact symptom seen in
+                // production at 11:17Z 2026-04-28 where 18 minutes passed
+                // with no log output.
+                _ = tokio::time::sleep(std::time::Duration::from_secs(
+                    (heartbeat_interval_ms / 1000).saturating_mul(2).max(60)
+                )) => {
+                    let idle = last_message_at.elapsed();
+                    warn!(
+                        "Discord [{label}] gateway stall watchdog fired (no traffic for {:.0}s), reconnecting",
+                        idle.as_secs_f64()
+                    );
+                    break BreakReason::Recoverable;
+                }
             }
-        }
+        };
 
         // Cleanup heartbeat
         let mut guard = heartbeat_handle.lock().await;
@@ -828,8 +950,24 @@ async fn gateway_loop(
         }
         drop(guard);
 
-        let _ = _identified;
-        consecutive_failures += 1;
+        match break_reason {
+            BreakReason::Fatal => return,
+            BreakReason::SessionInvalid => {
+                session_id = None;
+                resume_gateway_url = None;
+                session_seq.store(u64::MAX, Ordering::Relaxed);
+            }
+            BreakReason::Recoverable => {}
+        }
+
+        // Only escalate failure count if the session never went live this round.
+        // A session that worked for hours and then closed cleanly should reconnect
+        // at backoff=0, not get penalised.
+        if session_live {
+            consecutive_failures = 0;
+        } else {
+            consecutive_failures += 1;
+        }
         set_channel_connected(&channel_status, &label, false, Some("reconnecting".to_string()), Some(&event_tx)).await;
     }
 }
