@@ -328,6 +328,33 @@ impl HeartbeatScheduler {
 
             let now = Utc::now();
 
+            // ── Task board pull (runs for ALL agents regardless of heartbeat.enabled) ──
+            //
+            // The task board is a scheduler-level concern, not a per-agent
+            // evolution concern: even agents with `heartbeat.enabled = false`
+            // (the default for most agents) still need to be woken up when
+            // work is assigned to them on the board. Without this, the
+            // Multica "Agent-as-teammate" design degenerates to "agents only
+            // act when a channel message arrives" — exactly the failure
+            // mode observed at 12:27 2026-04-28 with 26 unrouted tasks.
+            //
+            // Throttled per agent to 1 pull per 60s so a 30s scheduler tick
+            // doesn't double-fire.
+            let pull_targets: Vec<(PathBuf, String)> = {
+                let agents = self.agents.read().await;
+                agents
+                    .values()
+                    .map(|a| (self.home_dir.clone(), a.agent_id.clone()))
+                    .collect()
+            };
+            for (home, aid) in pull_targets {
+                tokio::spawn(async move {
+                    if let Err(e) = poll_assigned_tasks(&home, &aid).await {
+                        debug!(agent = %aid, error = %e, "Task board poll skipped");
+                    }
+                });
+            }
+
             // Collect tasks to spawn while holding the lock, then release before spawning
             let mut to_spawn: Vec<(PathBuf, String, Arc<tokio::sync::Semaphore>)> = Vec::new();
             {
@@ -449,10 +476,9 @@ async fn execute_heartbeat(
         info!(agent = agent_id, pending, "Agent has pending bus messages");
     }
 
-    // ── Task board pull (new) ──
-    if let Err(e) = poll_assigned_tasks(home_dir, agent_id).await {
-        debug!(agent = agent_id, error = %e, "Task board poll skipped");
-    }
+    // Note: Task board pull (`poll_assigned_tasks`) is invoked from
+    // `HeartbeatScheduler::run` directly so it covers agents with
+    // `heartbeat.enabled = false` too — see the comment block there.
 
     // ── Proactive check (new) ──
     execute_proactive_check(home_dir, agent_id, proactive_states).await;
