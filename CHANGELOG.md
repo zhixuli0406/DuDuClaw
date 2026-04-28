@@ -1,6 +1,73 @@
 # Changelog
 
 
+## [1.9.1] - 2026-04-28
+
+### Added
+- **`duduclaw evolution finalize` CLI subcommand** with `--dry-run` and
+  `--agent <id>` filters. One-shot recovery for SOUL.md observation
+  windows that should already have transitioned but never did.
+
+### Fixed (self-evolution pipeline — 5 audit gaps from 2026-04-28 health check)
+- **SOUL.md observation windows now actually close.**
+  `VersionStore::get_expired_observations` and `Updater::execute_confirm /
+  execute_rollback` had no callers, so the very first applied SOUL change
+  blocked all subsequent GVU proposals indefinitely. agnes was stuck for
+  6 days locally. Adds a 30-min `ObservationFinalizer` background task
+  that computes post-metrics from `prediction.db` + `feedback.jsonl`,
+  runs the existing `judge_outcome` tolerance logic, and confirms /
+  rolls back / extends accordingly.
+- **EvolutionEvents audit log now writes to a stable absolute path.**
+  Default base directory was `data/evolution/events` — relative to cwd.
+  Gateway boot from `cwd=$HOME` silently dropped every audit event. Now
+  resolves via layered fallback: `$EVOLUTION_EVENTS_DIR` →
+  `$DUDUCLAW_HOME/evolution/events` → `$HOME/.duduclaw/evolution/events`
+  → legacy. Boot also injects the env var before any emitter is
+  constructed and runs a `.healthcheck` self-test that surfaces IO
+  failures via `tracing::error!` instead of silent `eprintln!`.
+- **Silence breaker now actually triggers a forced reflection.**
+  `heartbeat.rs` previously only emitted `warn!` and reset its own timer
+  — the system advertised "self-reflection on long silence" but never
+  did anything. Adds a `SilenceBreakerEvent` mpsc channel; the gateway
+  consumes it and writes a typed `silence_breaker` row to
+  `prediction.db.evolution_events`, with a 4-hour per-agent cooldown to
+  prevent loops.
+- **MetaCognition rehydrates counters from `prediction.db` on startup.**
+  `total_predictions` and `predictions_since_last_eval` were stuck at 0
+  across restarts because `metacognition.json` only persisted at
+  evaluation time. With `evaluation_interval=100` the threshold became
+  unreachable and adaptive thresholds never recalibrated. Now takes
+  `max(disk, in-memory)` and runs a one-shot `evaluate_and_adjust` if
+  the in-memory counter is overdue. Also anchors
+  `original_sig_improvement_rate` baseline on the first eval that has
+  ≥5 Significant samples (was previously stuck at `null`).
+- **Sub-agent dispatches now record prediction samples.**
+  `prediction.db.user_models` had only the channel-facing root agent
+  (1/19 in our deployment); 18 sub-agents accumulated nothing because
+  the prediction hook only ran in `channel_reply`, not in
+  `dispatcher.rs`. Adds a fire-and-forget `subagent_prediction` module
+  that synthesises `user_id = "agent:<sender_or_origin>"`, builds a
+  2-message `ConversationMetrics` snapshot from the dispatched payload
+  + response, and runs the same `predict → calculate_error →
+  log_evolution_event → update_model` cycle as the channel path. Hooks
+  both the JSONL and SQLite dispatch loops; deliberately does NOT
+  trigger the GVU loop from this path (preserves the channel-only
+  invariant for SOUL evolution).
+
+### Tests
+- 23 new unit tests across `observation_finalizer`, `evolution_events::logger`,
+  `prediction::forced_reflection`, `prediction::metacognition` (BUG-4 group),
+  and `prediction::subagent_prediction`.
+- Workspace tests after the change:
+  duduclaw-gateway 730 ✓, duduclaw-agent 31 ✓, duduclaw-cli 80 ✓.
+
+### Dashboard
+- ActivityFeed no longer crashes when the gateway emits an unknown
+  `ActivityType`. Adds explicit entries for `autopilot_triggered` and
+  `autopilot_lag`, plus a neutral `FALLBACK_CONFIG` so future unknown
+  types render as a generic row instead of throwing on `config.icon`.
+
+
 ## [1.8.34] - 2026-04-27
 
 ### Fixed
