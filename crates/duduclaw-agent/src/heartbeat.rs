@@ -55,6 +55,23 @@ pub struct HeartbeatEvent {
     pub actions: Vec<String>,
 }
 
+/// Emitted when an agent has gone `max_silence_hours` without any evolution
+/// trigger.  The gateway subscribes to this channel and turns the event into
+/// an actual forced reflection (writing to `prediction.db.evolution_events`
+/// and optionally invoking the GVU loop).
+///
+/// The heartbeat scheduler used to handle silence detection by simply
+/// resetting a timer and emitting a `warn!` — no evolution actually
+/// happened. This event is the bridge from "we noticed silence" to "we did
+/// something about it".
+#[derive(Debug, Clone)]
+pub struct SilenceBreakerEvent {
+    pub agent_id: String,
+    /// How long (in hours) the agent had been silent when this event fired.
+    pub hours: f64,
+    pub timestamp: chrono::DateTime<Utc>,
+}
+
 // ── Internal per-agent state ──────────────────────────────────
 
 struct LiveAgent {
@@ -181,6 +198,9 @@ pub struct HeartbeatScheduler {
     global_semaphore: Arc<tokio::sync::Semaphore>,
     /// Per-agent proactive rate limiting state (shared across heartbeat cycles).
     proactive_states: Arc<tokio::sync::Mutex<HashMap<String, crate::proactive::ProactiveState>>>,
+    /// Optional channel for forwarding [`SilenceBreakerEvent`]s to the gateway.
+    /// `None` means silence-breaker events stay informational (warn-only).
+    silence_tx: Option<tokio::sync::mpsc::UnboundedSender<SilenceBreakerEvent>>,
 }
 
 impl HeartbeatScheduler {
@@ -192,7 +212,18 @@ impl HeartbeatScheduler {
             running: Arc::new(AtomicBool::new(false)),
             global_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_GLOBAL_CONCURRENT)),
             proactive_states: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            silence_tx: None,
         }
+    }
+
+    /// Builder: install a channel that receives [`SilenceBreakerEvent`]s. Gateway
+    /// uses this to wire silence breaker → forced reflection.
+    pub fn with_silence_tx(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<SilenceBreakerEvent>,
+    ) -> Self {
+        self.silence_tx = Some(tx);
+        self
     }
 
     /// Sync internal state with the registry (picks up new/removed/changed agents).
@@ -319,7 +350,25 @@ impl HeartbeatScheduler {
                             hours = format!("{hours_since_last:.1}"),
                             "Silence breaker: no evolution trigger for too long"
                         );
+                        // Reset the timer first so a slow downstream consumer
+                        // can't cause us to fire repeatedly.
                         agent.last_evolution_trigger = Some(now);
+                        // Forward to the gateway if a channel is wired up. Use
+                        // `try_send`-style fail-fast: if the receiver is gone
+                        // we don't want to block the scheduler.
+                        if let Some(tx) = self.silence_tx.as_ref() {
+                            let event = SilenceBreakerEvent {
+                                agent_id: agent.agent_id.clone(),
+                                hours: hours_since_last,
+                                timestamp: now,
+                            };
+                            if let Err(e) = tx.send(event) {
+                                debug!(
+                                    agent = %agent.agent_id,
+                                    "Silence breaker channel closed: {e}"
+                                );
+                            }
+                        }
                     }
 
                     // ── Normal heartbeat: bus polling ──
@@ -640,7 +689,22 @@ pub fn start_heartbeat_scheduler(
     home_dir: PathBuf,
     registry: Arc<RwLock<AgentRegistry>>,
 ) -> Arc<HeartbeatScheduler> {
-    let scheduler = Arc::new(HeartbeatScheduler::new(home_dir, registry));
+    start_heartbeat_scheduler_with(home_dir, registry, None)
+}
+
+/// Same as [`start_heartbeat_scheduler`] but allows the caller to install a
+/// channel for [`SilenceBreakerEvent`]s. Used by the gateway to convert
+/// silence detection into a real forced-reflection trigger.
+pub fn start_heartbeat_scheduler_with(
+    home_dir: PathBuf,
+    registry: Arc<RwLock<AgentRegistry>>,
+    silence_tx: Option<tokio::sync::mpsc::UnboundedSender<SilenceBreakerEvent>>,
+) -> Arc<HeartbeatScheduler> {
+    let mut sched = HeartbeatScheduler::new(home_dir, registry);
+    if let Some(tx) = silence_tx {
+        sched = sched.with_silence_tx(tx);
+    }
+    let scheduler = Arc::new(sched);
     let s = scheduler.clone();
     tokio::spawn(async move {
         s.run().await;

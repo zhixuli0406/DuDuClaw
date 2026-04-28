@@ -307,11 +307,19 @@ impl PredictionEngine {
             }
         }
 
-        // Load metacognition state
-        let metacognition = meta_path
+        // Load metacognition state, then BUG-4 fix: rehydrate counters
+        // from prediction.db so a restart can't make total_predictions
+        // permanently lag behind the SQLite log (which would prevent
+        // evaluate_and_adjust from ever firing).
+        let mut metacognition = meta_path
             .as_ref()
             .and_then(|p| MetaCognition::load(p))
             .unwrap_or_default();
+        if let Err(e) = metacognition.rehydrate_from_db(&db_path) {
+            warn!("MetaCognition rehydrate skipped: {e}");
+        } else {
+            metacognition.force_evaluation_if_overdue();
+        }
 
         let engine = Self {
             models: Arc::new(Mutex::new(HashMap::new())),

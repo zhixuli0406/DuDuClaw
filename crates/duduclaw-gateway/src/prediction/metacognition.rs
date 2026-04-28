@@ -652,6 +652,93 @@ impl MetaCognition {
         serde_json::from_str(&content).ok()
     }
 
+    /// Re-anchor in-memory counters to the authoritative SQLite tables in
+    /// `prediction.db`.
+    ///
+    /// **Why this exists.** `MetaCognition` is normally written to
+    /// `metacognition.json` in-process and only persists when an evaluation
+    /// happens. If the gateway is killed before that fires (or the JSON file
+    /// is wiped), the next process boots with `total_predictions=0` while the
+    /// SQLite `prediction_log` already has hundreds of rows — adaptive
+    /// thresholds never recalibrate because `evaluation_interval=100` is now
+    /// unreachable.
+    ///
+    /// This method walks the DB once and **takes the maximum** of the on-disk
+    /// counts vs the in-memory counts so we never erase ongoing state.
+    /// Returns `Ok(rows_seen)` for telemetry.
+    pub fn rehydrate_from_db(&mut self, prediction_db: &Path) -> Result<u64, String> {
+        if !prediction_db.exists() {
+            return Ok(0);
+        }
+        let conn = rusqlite::Connection::open(prediction_db)
+            .map_err(|e| format!("open prediction.db: {e}"))?;
+        let total: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM prediction_log",
+                [],
+                |r| r.get::<_, i64>(0).map(|v| v as u64),
+            )
+            .unwrap_or(0);
+        if total > self.total_predictions {
+            self.total_predictions = total;
+        }
+        // Predictions accumulated since last evaluation can only be inferred
+        // approximately — clamp to <= total. We use the same DB count as a
+        // conservative upper bound so `should_evaluate` becomes true if the
+        // interval has been exceeded.
+        if self.predictions_since_last_eval < total
+            && total >= self.evaluation_interval
+        {
+            self.predictions_since_last_eval = total;
+        }
+
+        // Re-populate `layer_stats.total_triggers` per category. We do not
+        // touch `recent_outcomes` because outcome attribution requires the
+        // pairing between triggers and downstream `gvu_trigger` events,
+        // which the rehydrate path can't reconstruct safely.
+        let mut stmt = conn
+            .prepare("SELECT category, COUNT(*) FROM prediction_log GROUP BY category")
+            .map_err(|e| format!("prepare layer_stats: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })
+            .map_err(|e| format!("query layer_stats: {e}"))?;
+        for row in rows.flatten() {
+            let stats = self.layer_stats.entry(row.0).or_default();
+            if stats.total_triggers < row.1 {
+                stats.total_triggers = row.1;
+            }
+        }
+
+        info!(
+            target: "metacognition",
+            total_predictions = self.total_predictions,
+            "Rehydrated counters from prediction.db"
+        );
+        Ok(total)
+    }
+
+    /// If accumulated predictions exceed the evaluation interval but the
+    /// `predictions_since_last_eval` has been reset (e.g. after a restart
+    /// without rehydrate), force one evaluation pass so adaptive thresholds
+    /// catch up.
+    ///
+    /// Returns `true` if an evaluation was forced.
+    pub fn force_evaluation_if_overdue(&mut self) -> bool {
+        if self.total_predictions >= self.evaluation_interval
+            && self.predictions_since_last_eval < self.evaluation_interval
+            && !self.layer_stats.is_empty()
+        {
+            // Bring the counter past the threshold so should_evaluate() agrees.
+            self.predictions_since_last_eval = self.evaluation_interval;
+            self.evaluate_and_adjust();
+            true
+        } else {
+            false
+        }
+    }
+
     // ── Proactive self-calibration (Phase D3) ───────────────────
 
     /// Record that a proactive message was sent.
@@ -721,4 +808,144 @@ impl MetaCognition {
 
 fn default_proactive_threshold() -> f64 {
     0.5
+}
+
+// ── BUG-4 tests: rehydrate / force-evaluation / baseline anchoring ──
+
+#[cfg(test)]
+mod bug4_tests {
+    use super::*;
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    fn seed_prediction_db(path: &Path, rows: &[(&str, &str, f64)]) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS prediction_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                composite_error REAL NOT NULL,
+                category TEXT NOT NULL,
+                timestamp TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        for (agent, cat, err) in rows {
+            conn.execute(
+                "INSERT INTO prediction_log (agent_id, user_id, composite_error, category, timestamp)
+                 VALUES (?1, 'u', ?2, ?3, datetime('now'))",
+                rusqlite::params![agent, err, cat],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_rehydrate_from_db_overrides_lower_in_memory() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("prediction.db");
+        // 50 rows in DB.
+        let rows: Vec<_> = (0..50)
+            .map(|_| ("a", "Negligible", 0.05))
+            .collect();
+        seed_prediction_db(&db, &rows);
+
+        let mut meta = MetaCognition::default();
+        // In-memory says 5 — should bump up to 50.
+        meta.total_predictions = 5;
+        let n = meta.rehydrate_from_db(&db).unwrap();
+        assert_eq!(n, 50);
+        assert_eq!(meta.total_predictions, 50);
+        // layer_stats should reflect the per-category counts.
+        assert_eq!(
+            meta.layer_stats
+                .get("Negligible")
+                .map(|s| s.total_triggers),
+            Some(50)
+        );
+    }
+
+    #[test]
+    fn test_rehydrate_does_not_lower_existing_counts() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("prediction.db");
+        seed_prediction_db(&db, &[("a", "Negligible", 0.05)]);
+
+        let mut meta = MetaCognition::default();
+        // In-memory has more (100) than DB (1) — must not be reduced.
+        meta.total_predictions = 100;
+        meta.rehydrate_from_db(&db).unwrap();
+        assert_eq!(
+            meta.total_predictions, 100,
+            "rehydrate must take max(disk, in-memory)"
+        );
+    }
+
+    #[test]
+    fn test_rehydrate_missing_db_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let mut meta = MetaCognition::default();
+        let n = meta.rehydrate_from_db(&tmp.path().join("nope.db")).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(meta.total_predictions, 0);
+    }
+
+    #[test]
+    fn test_force_evaluation_if_overdue_triggers_recalibrate() {
+        let mut meta = MetaCognition::default();
+        // Simulate "I've seen 200 predictions but counter says 0 since last eval".
+        meta.total_predictions = 200;
+        meta.predictions_since_last_eval = 0;
+        // Need at least one layer_stats entry so the evaluator has data.
+        meta.layer_stats.insert(
+            "Significant".into(),
+            LayerEffectiveness {
+                recent_outcomes: vec![true, true, false, true, true].into(),
+                window_size: 50,
+                total_triggers: 10,
+            },
+        );
+        let fired = meta.force_evaluation_if_overdue();
+        assert!(fired, "overdue evaluation must run");
+        assert_eq!(
+            meta.predictions_since_last_eval, 0,
+            "evaluate_and_adjust resets the counter"
+        );
+    }
+
+    #[test]
+    fn test_force_evaluation_skips_when_under_threshold() {
+        let mut meta = MetaCognition::default();
+        meta.total_predictions = 5;
+        meta.predictions_since_last_eval = 0;
+        meta.layer_stats.insert(
+            "Negligible".into(),
+            LayerEffectiveness::default(),
+        );
+        let fired = meta.force_evaluation_if_overdue();
+        assert!(!fired, "below interval — no forced eval");
+    }
+
+    #[test]
+    fn test_first_recalibrate_sets_baseline() {
+        let mut meta = MetaCognition::default();
+        meta.layer_stats.insert(
+            "Significant".into(),
+            LayerEffectiveness {
+                recent_outcomes: vec![true, false, true, true, false].into(),
+                window_size: 50,
+                total_triggers: 5,
+            },
+        );
+        assert!(meta.original_sig_improvement_rate.is_none());
+        meta.evaluate_and_adjust();
+        assert!(
+            meta.original_sig_improvement_rate.is_some(),
+            "first eval with >=5 sig samples must anchor baseline"
+        );
+        let v = meta.original_sig_improvement_rate.unwrap();
+        // 3 of 5 improved.
+        assert!((v - 0.6).abs() < 1e-9, "baseline = 3/5 = 0.6 (got {v})");
+    }
 }

@@ -296,6 +296,10 @@ enum Commands {
     #[command(subcommand)]
     Rl(RlCommands),
 
+    /// Evolution / GVU lifecycle utilities
+    #[command(subcommand)]
+    Evolution(EvolutionCommands),
+
     /// ACP (Agent Client Protocol) server for IDE integration
     AcpServer,
 
@@ -405,6 +409,25 @@ enum ServiceCommands {
 
     /// Uninstall the system service
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum EvolutionCommands {
+    /// Finalise expired SOUL.md observation windows
+    /// (`observing` → `confirmed` / `rolled_back`).
+    ///
+    /// Without this, the very first SOUL change is stuck in `observing`
+    /// and blocks every subsequent GVU proposal. Run once after upgrading
+    /// to the bug-1 fix to clear backlog; the gateway also runs this on a
+    /// 30-min tick.
+    Finalize {
+        /// Limit finalisation to a single agent.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Print decisions without modifying the database.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -540,6 +563,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Rl(rl_cmd) => {
             cmd_rl(rl_cmd, &duduclaw_home()).await
         }
+        Commands::Evolution(ev_cmd) => {
+            cmd_evolution(ev_cmd, &duduclaw_home()).await
+        }
         Commands::AcpServer => {
             acp::server::run_acp_server(&duduclaw_home()).await
         }
@@ -562,6 +588,102 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
 /// On allow, exits 0 silently so the Write / Edit proceeds normally.
 ///
 /// Handle `duduclaw rl` subcommands: export, stats, reward.
+/// Handle `duduclaw evolution finalize`.
+async fn cmd_evolution(
+    cmd: EvolutionCommands,
+    home_dir: &PathBuf,
+) -> duduclaw_core::error::Result<()> {
+    use duduclaw_gateway::config_crypto;
+    use duduclaw_gateway::gvu::observation_finalizer::{
+        Decision, ObservationFinalizer,
+    };
+    use duduclaw_gateway::gvu::version_store::VersionStore;
+
+    match cmd {
+        EvolutionCommands::Finalize { agent, dry_run } => {
+            let key = config_crypto::load_keyfile_public(home_dir);
+            let evo_db = home_dir.join("evolution.db");
+            let pred_db = home_dir.join("prediction.db");
+            let feedback = home_dir.join("feedback.jsonl");
+            let agents = home_dir.join("agents");
+
+            let vs = VersionStore::with_crypto(&evo_db, key.as_ref());
+
+            if dry_run {
+                // Read expired observations and just print them.
+                let expired = vs.get_expired_observations();
+                let total = expired.len();
+                let filtered: Vec<_> = match agent.as_deref() {
+                    Some(name) => {
+                        expired.into_iter().filter(|v| v.agent_id == name).collect()
+                    }
+                    None => expired,
+                };
+                println!("Found {} expired observation(s){}",
+                    filtered.len(),
+                    if total != filtered.len() {
+                        format!(" (filtered from {total})")
+                    } else {
+                        String::new()
+                    },
+                );
+                for v in filtered {
+                    println!(
+                        "  agent={} version={} applied={} observation_end={} pre_err={:.3} pre_pos={:.2}",
+                        v.agent_id,
+                        v.version_id,
+                        v.applied_at.to_rfc3339(),
+                        v.observation_end.to_rfc3339(),
+                        v.pre_metrics.avg_prediction_error,
+                        v.pre_metrics.positive_feedback_ratio,
+                    );
+                }
+                println!("(dry run — no changes written)");
+                return Ok(());
+            }
+
+            let finalizer = ObservationFinalizer::new(
+                vs, pred_db, feedback, agents, key,
+            );
+            let report = finalizer.tick().await;
+
+            if report.decisions.is_empty() {
+                println!("No expired observations.");
+                return Ok(());
+            }
+
+            for d in &report.decisions {
+                if let Some(filter) = agent.as_deref() {
+                    if d.agent_id != filter {
+                        continue;
+                    }
+                }
+                let label = match &d.decision {
+                    Decision::Confirmed => "CONFIRMED".to_string(),
+                    Decision::RolledBack { reason } => {
+                        format!("ROLLED_BACK ({reason})")
+                    }
+                    Decision::Extended { extra_hours } => {
+                        format!("EXTENDED (+{extra_hours:.1}h)")
+                    }
+                    Decision::Failed { error } => format!("FAILED ({error})"),
+                };
+                println!(
+                    "{}  agent={} version={}  pre_err={:.3} → post_err={:.3}  pre_pos={:.2} → post_pos={:.2}",
+                    label,
+                    d.agent_id,
+                    d.version_id,
+                    d.pre.avg_prediction_error,
+                    d.post.avg_prediction_error,
+                    d.pre.positive_feedback_ratio,
+                    d.post.positive_feedback_ratio,
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 async fn cmd_rl(rl_cmd: RlCommands, home_dir: &PathBuf) -> duduclaw_core::error::Result<()> {
     use duduclaw_gateway::rl::collector::{self, TrajectoryStats};
 
