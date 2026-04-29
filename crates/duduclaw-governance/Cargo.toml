@@ -1,0 +1,36 @@
+[package]
+name = "duduclaw-governance"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+duduclaw-core = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# UUID
+uuid = { workspace = true }
+
+# File watching (hot-reload)
+notify = { version = "6", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["full", "test-util"] }
