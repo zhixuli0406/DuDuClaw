@@ -1,0 +1,79 @@
+# DuDuClaw Governance — 全域預設政策集
+# 依據：SDD v0.2 §1.6
+#
+# 優先序：Agent 專屬政策（policies/{agent_id}.yaml）> 此檔案 > 系統程式碼內建
+#
+# 注意：所有限制值均從此檔案讀取，禁止 magic number。
+
+policies:
+
+  # ── 速率政策（Rate Policies）──────────────────────────────────────
+
+  # MCP 呼叫限制：每分鐘最多 200 次
+  - policy_type: rate
+    policy_id: default-rate-mcp
+    agent_id: "*"
+    resource: mcp_calls
+    limit: 200
+    window_seconds: 60
+    action_on_violation: reject
+
+  # 記憶體寫入限制：每分鐘最多 50 次
+  - policy_type: rate
+    policy_id: default-rate-memory-write
+    agent_id: "*"
+    resource: memory_writes
+    limit: 50
+    window_seconds: 60
+    action_on_violation: reject
+
+  # Wiki 寫入限制：每分鐘最多 20 次
+  - policy_type: rate
+    policy_id: default-rate-wiki-write
+    agent_id: "*"
+    resource: wiki_writes
+    limit: 20
+    window_seconds: 60
+    action_on_violation: reject
+
+  # ── 配額政策（Quota Policies）─────────────────────────────────────
+
+  # 每日 token 使用配額：最多 500,000 tokens
+  - policy_type: quota
+    policy_id: default-quota-daily
+    agent_id: "*"
+    daily_token_budget: 500000
+    max_concurrent_tasks: 5
+    max_memory_entries: 10000
+    reset_cron: "0 0 * * *"
+
+  # ── 權限政策（Permission Policies）──────────────────────────────
+
+  # 預設權限：禁止 admin scope，部分操作需核准
+  - policy_type: permission
+    policy_id: default-permission
+    agent_id: "*"
+    allowed_scopes:
+      - memory:read
+      - memory:write
+      - wiki:read
+      - wiki:write
+      - messaging:send
+      - mcp:call
+    denied_scopes:
+      - admin
+      - governance:write
+    requires_approval:
+      - agent:create
+      - agent:modify
+      - agent:remove
+
+  # ── 生命週期政策（Lifecycle Policies）────────────────────────────
+
+  # 閒置超過 48 小時自動暫停
+  - policy_type: lifecycle
+    policy_id: default-lifecycle
+    agent_id: "*"
+    max_idle_hours: 48
+    health_check_interval_seconds: 300
+    auto_suspend_on_violation_count: 10
