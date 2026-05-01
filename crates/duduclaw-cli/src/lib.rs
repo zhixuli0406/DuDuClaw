@@ -11,6 +11,19 @@ use duduclaw_core::error::DuDuClawError;
 use duduclaw_core::types::CheckStatus;
 mod acp;
 mod mcp;
+pub mod mcp_auth;
+pub mod mcp_auth_strategy;
+pub(crate) mod mcp_dispatch;   // W20-P1 Phase 2A: transport-agnostic dispatcher
+pub(crate) mod mcp_http_auth;  // W20-P1 Phase 2B: HTTP Bearer auth extractor
+pub(crate) mod mcp_http_errors; // W20-P1 Phase 2B: JSON-RPC ↔ HTTP status mapping
+pub(crate) mod mcp_http_server; // W20-P1 Phase 2B: Axum HTTP/SSE server
+pub mod mcp_memory_handlers;
+pub mod mcp_memory_quota;
+pub mod mcp_namespace;
+pub mod mcp_rate_limit;
+pub mod mcp_redact;
+pub(crate) mod mcp_sse_store;  // W20-P1 Phase 2C: SSE event ring buffer
+pub mod mcp_wiki;
 mod migrate;
 mod ptc;
 mod service;
@@ -1721,7 +1734,7 @@ context_size = 4096
                             p.display_speed(),
                             p.display_eta(),
                         );
-                    }) as Box<dyn Fn(duduclaw_inference::model_registry::downloader::DownloadProgress) + Send>)
+                    }) as Box<dyn Fn(duduclaw_inference::model_registry::downloader::DownloadProgress) + Send + Sync>)
                 };
 
                 let result = if entry.is_split() {

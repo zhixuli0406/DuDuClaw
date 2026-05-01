@@ -19,6 +19,8 @@ members = [
     "crates/duduclaw-odoo",
     "crates/duduclaw-inference",
     "crates/duduclaw-desktop",
+    "crates/duduclaw-governance",
+    "crates/duduclaw-durability",
 ]
 
 [workspace.package]

@@ -32,11 +32,13 @@
 //! interrupted by synthesis pipeline failures.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::Utc;
 use tracing::{info, warn};
 
 use super::quality_scorer::{parse_events_from_dir, score_and_filter, ScoredTrajectory, ScorerConfig};
+use crate::evolution_events::emitter::EvolutionEventEmitter;
 use crate::evolution_events::schema::{AuditEvent, AuditEventType, Outcome};
 
 // ── Config ─────────────────────────────────────────────────────────────────────
@@ -60,6 +62,25 @@ pub struct PipelineConfig {
     /// When `true` (Week 1 default): compute and log quality scores but do NOT
     /// graduate skills into the Skill Bank.
     pub dry_run: bool,
+
+    // ── Phase 2 fields (required when dry_run = false) ────────────────────────
+
+    /// Anthropic API key for Haiku 4.5 skill synthesis calls.
+    ///
+    /// Required when `dry_run = false`. When `None` in full mode, the pipeline
+    /// captures a non-fatal error and skips graduation for all trajectories.
+    pub api_key: Option<String>,
+
+    /// DuDuClaw home directory (typically `~/.duduclaw`).
+    ///
+    /// Used to locate agent SKILLS directories and the global skill bank.
+    /// Defaults to `~/.duduclaw` if not set.
+    pub home_dir: PathBuf,
+
+    /// Agent ID that will own synthesized skills before graduation.
+    ///
+    /// Defaults to `"duduclaw-eng-agent"`.
+    pub target_agent_id: String,
 }
 
 impl Default for PipelineConfig {
@@ -69,11 +90,18 @@ impl Default for PipelineConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("data/evolution/events"));
 
+        let home_dir = std::env::var("HOME")
+            .map(|h: String| PathBuf::from(&h).join(".duduclaw"))
+            .unwrap_or_else(|_| PathBuf::from("~/.duduclaw"));
+
         Self {
             events_dir,
             lookback_days: 1,
             scorer_config: ScorerConfig::default(),
             dry_run: true, // Safe default: dry-run until explicitly enabled
+            api_key: None,
+            home_dir,
+            target_agent_id: "duduclaw-eng-agent".to_string(),
         }
     }
 }
@@ -86,6 +114,9 @@ impl PipelineConfig {
         self.scorer_config.validate()?;
         if self.lookback_days == 0 {
             return Err("lookback_days must be >= 1".to_string());
+        }
+        if self.target_agent_id.is_empty() {
+            return Err("target_agent_id must not be empty".to_string());
         }
         Ok(())
     }
@@ -225,7 +256,7 @@ pub async fn run(config: &PipelineConfig) -> PipelineRun {
         );
     }
 
-    // ── Phase 3: Graduation (stub in dry-run mode) ───────────────────────────
+    // ── Phase 3: Graduation ───────────────────────────────────────────────────
 
     let skills_graduated = if config.dry_run {
         info!(
@@ -235,14 +266,10 @@ pub async fn run(config: &PipelineConfig) -> PipelineRun {
         );
         0
     } else {
-        // Phase 2 implementation (W19 Week 2+).
-        // Full flow: memory_search → skill_extract → security_scan → skill_graduate
-        // → emit skill_graduate EvolutionEvent.
-        //
-        // This is a planned stub — graduate_trajectories() will be implemented
-        // after Week-1 dry-run score distribution is validated.
-        warn!("Full graduation mode is not yet implemented — treating as dry-run");
-        0
+        let (graduated, grad_errors) =
+            graduate_trajectories(&top_trajectories, config).await;
+        errors.extend(grad_errors);
+        graduated
     };
 
     let run = PipelineRun {
@@ -258,6 +285,268 @@ pub async fn run(config: &PipelineConfig) -> PipelineRun {
 
     info!(summary = %run.summary(), "Rollout-to-Skill pipeline run complete");
     run
+}
+
+// ── Phase 2: Graduation implementation ───────────────────────────────────────
+
+/// Graduate high-quality trajectories into reusable skills via Haiku 4.5.
+///
+/// For each [`ScoredTrajectory`]:
+/// 1. Build a [`SynthesisInput`] from trajectory metadata + agent context.
+/// 2. Call Haiku 4.5 via [`call_direct_api`] to generate a SKILL.md.
+/// 3. Parse and validate the synthesized skill.
+/// 4. Run [`security_scanner::scan_skill`] (security gate).
+/// 5. Write to agent SKILLS directory.
+/// 6. Call [`graduation::graduate_to_global`] → Skill Bank.
+/// 7. Emit `skill_graduate` [`EvolutionEvent`] (non-blocking).
+///
+/// Returns `(graduated_count, non_fatal_errors)`.
+///
+/// All failures are **non-blocking**: errors are collected and the pipeline
+/// continues processing the next trajectory.
+async fn graduate_trajectories(
+    top_trajectories: &[ScoredTrajectory],
+    config: &PipelineConfig,
+) -> (usize, Vec<String>) {
+    use crate::direct_api::call_direct_api;
+    use crate::evolution_events::emitter::EvolutionEventEmitter;
+    use crate::skill_lifecycle::{graduation, security_scanner, synthesizer};
+
+    let api_key = match &config.api_key {
+        Some(k) if !k.is_empty() => k.clone(),
+        _ => {
+            warn!("No API key configured — skipping Phase 2 graduation");
+            return (0, vec!["Phase 2 skipped: api_key not configured".to_string()]);
+        }
+    };
+
+    let agent_skills_dir = config
+        .home_dir
+        .join("agents")
+        .join(&config.target_agent_id)
+        .join("SKILLS");
+    let global_skills_dir = config.home_dir.join("skills");
+
+    // Collect existing skill names to prevent naming conflicts.
+    let existing_skill_names: Vec<String> = std::fs::read_dir(&agent_skills_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .strip_suffix(".md")
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Load agent SOUL.md for context (prevents duplicate content).
+    let agent_soul = std::fs::read_to_string(
+        config
+            .home_dir
+            .join("agents")
+            .join(&config.target_agent_id)
+            .join("SOUL.md"),
+    )
+    .unwrap_or_default();
+
+    let emitter = EvolutionEventEmitter::global();
+    let mut graduated = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+
+    // Track already-used names within this pipeline run to avoid collisions
+    // between trajectories processed in the same batch.
+    let mut used_names: Vec<String> = existing_skill_names.clone();
+
+    for (idx, traj) in top_trajectories.iter().enumerate() {
+        let span_prefix = format!(
+            "[{}/{}] agent={} score={:.3}",
+            idx + 1,
+            top_trajectories.len(),
+            traj.agent_id,
+            traj.quality_score
+        );
+
+        // ── Step 1: Build SynthesisInput ─────────────────────────────────────
+
+        // Derive a topic label from the agent_id + time window for evidence.
+        let topic = format!(
+            "{}-trajectory-{}",
+            traj.agent_id,
+            traj.window_start.format("%Y%m%d-%H%M")
+        );
+
+        let evidence: Vec<String> = traj
+            .events
+            .iter()
+            .map(|e| {
+                format!(
+                    "agent={} success={} effectiveness_delta={:.2} complexity={:.2}",
+                    e.agent_id, e.is_success, e.effectiveness_score_delta, e.task_complexity
+                )
+            })
+            .collect();
+
+        let synthesis_input = synthesizer::SynthesisInput {
+            trigger: crate::skill_lifecycle::gap_accumulator::SynthesisTrigger {
+                agent_id: traj.agent_id.clone(),
+                topic: topic.clone(),
+                gap_count: traj.event_count,
+                evidence,
+                avg_composite_error: 1.0 - traj.quality_score, // inverse of quality
+            },
+            successful_conversations: Vec::new(), // episodic lookup deferred to P1
+            agent_soul: agent_soul.clone(),
+            existing_skill_names: used_names.clone(),
+        };
+
+        // ── Step 2: Call Haiku 4.5 to synthesize skill ───────────────────────
+
+        let prompt = synthesizer::build_synthesis_prompt(&synthesis_input);
+        let system = "You are a skill designer for an AI agent system. Generate concise, \
+            reusable SKILL.md files based on task execution patterns. \
+            Output ONLY valid SKILL.md with YAML frontmatter.";
+
+        let llm_result = call_direct_api(
+            &api_key,
+            "claude-haiku-4-5", // Cost-efficient model per W19 spec
+            system,
+            &prompt,
+            &[],
+        )
+        .await;
+
+        let llm_response = match llm_result {
+            Ok(resp) => resp.text,
+            Err(e) => {
+                let msg = format!("{span_prefix} LLM call failed: {e}");
+                warn!("{}", msg);
+                errors.push(msg);
+                continue;
+            }
+        };
+
+        // ── Step 3: Parse and validate synthesized skill ─────────────────────
+
+        let synthesized = match synthesizer::parse_synthesis_response(
+            &llm_response,
+            &synthesis_input.trigger,
+            &used_names,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!("{span_prefix} Synthesis parse failed: {e}");
+                warn!("{}", msg);
+                errors.push(msg);
+                continue;
+            }
+        };
+
+        // ── Step 4: Security scan (gate — must pass) ──────────────────────────
+
+        let scan = security_scanner::scan_skill(&synthesized.full_markdown, None);
+        if !scan.passed {
+            let msg = format!(
+                "{span_prefix} Security scan FAILED for '{}' (risk={:?}, {} findings)",
+                synthesized.name,
+                scan.risk_level,
+                scan.findings.len()
+            );
+            warn!("{}", msg);
+            errors.push(msg);
+            continue;
+        }
+
+        info!(
+            "{span_prefix} Security scan passed for '{}'",
+            synthesized.name
+        );
+
+        // ── Step 5: Write skill to agent SKILLS directory ─────────────────────
+
+        if let Err(e) = tokio::fs::create_dir_all(&agent_skills_dir).await {
+            let msg = format!("{span_prefix} Failed to create SKILLS dir: {e}");
+            warn!("{}", msg);
+            errors.push(msg);
+            continue;
+        }
+
+        let skill_path = agent_skills_dir.join(format!("{}.md", synthesized.name));
+        if let Err(e) = tokio::fs::write(&skill_path, &synthesized.full_markdown).await {
+            let msg = format!("{span_prefix} Failed to write skill file: {e}");
+            warn!("{}", msg);
+            errors.push(msg);
+            continue;
+        }
+
+        // ── Step 6: Graduate to global Skill Bank ─────────────────────────────
+
+        let candidate = graduation::GraduationCandidate {
+            skill_name: synthesized.name.clone(),
+            source_agent_id: config.target_agent_id.clone(),
+            lift: traj.quality_score, // use quality score as proxy for lift
+            load_count: u64::from(traj.event_count),
+            is_stable: true,
+            first_activated: traj.window_start,
+        };
+
+        match graduation::graduate_to_global(&candidate, &agent_skills_dir, &global_skills_dir)
+            .await
+        {
+            Ok(record) => {
+                let home_clone = config.home_dir.clone();
+                let record_clone = record.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    graduation::append_graduation_log(&record_clone, &home_clone);
+                })
+                .await;
+
+                info!(
+                    skill = %synthesized.name,
+                    score = %format!("{:.3}", traj.quality_score),
+                    "{span_prefix} Graduated '{}' to global Skill Bank",
+                    synthesized.name
+                );
+
+                // ── Step 7: Emit SkillGraduate EvolutionEvent ─────────────────
+
+                emitter.emit_skill_graduate(
+                    &config.target_agent_id,
+                    &synthesized.name,
+                    serde_json::json!({
+                        "quality_score": traj.quality_score,
+                        "source_trajectories": traj.event_count,
+                        "pipeline_version": "W19-P0",
+                        "source_agent": traj.agent_id,
+                        "window_start": traj.window_start.to_rfc3339(),
+                    }),
+                );
+
+                used_names.push(synthesized.name.clone());
+                graduated += 1;
+            }
+            Err(e) => {
+                // Clean up the skill file we wrote but failed to graduate.
+                let _ = tokio::fs::remove_file(&skill_path).await;
+                let msg = format!(
+                    "{span_prefix} Graduation to global scope failed for '{}': {e}",
+                    synthesized.name
+                );
+                warn!("{}", msg);
+                errors.push(msg);
+            }
+        }
+    }
+
+    info!(
+        graduated = graduated,
+        errors = errors.len(),
+        "Phase 2 graduation complete"
+    );
+
+    (graduated, errors)
 }
 
 // ── EvolutionEvent emitter ────────────────────────────────────────────────────
@@ -315,6 +604,31 @@ mod tests {
             PipelineConfig::default().dry_run,
             "Default config must be dry_run=true for safety"
         );
+    }
+
+    #[test]
+    fn test_pipeline_config_empty_agent_id_invalid() {
+        let cfg = PipelineConfig {
+            target_agent_id: "".to_string(),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("target_agent_id"), "got: {err}");
+    }
+
+    #[test]
+    fn test_pipeline_config_default_has_no_api_key() {
+        // Default config has no API key — safe for dry-run
+        assert!(
+            PipelineConfig::default().api_key.is_none(),
+            "Default config must not have an API key set"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_config_default_target_agent() {
+        let cfg = PipelineConfig::default();
+        assert_eq!(cfg.target_agent_id, "duduclaw-eng-agent");
     }
 
     // ── run() — dry-run mode ──────────────────────────────────────────────────
