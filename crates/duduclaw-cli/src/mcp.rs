@@ -178,6 +178,13 @@ const TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
+        name: "memory_read",
+        description: "Read a single memory entry by ID",
+        params: &[
+            ParamDef { name: "memory_id", description: "Memory entry UUID from memory_store", required: true },
+        ],
+    },
+    ToolDef {
         name: "memory_search_by_layer",
         description: "Search agent memory filtered by cognitive layer (episodic or semantic)",
         params: &[
@@ -344,6 +351,17 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "agent_id", description: "Agent name (default: main agent)", required: false },
         ],
     },
+    ToolDef {
+        name: "skill_synthesis_run",
+        description: "Manually trigger the Rollout-to-Skill synthesis pipeline (W19-P0). \
+                       Parses EvolutionEvents JSONL, scores trajectories, and (when dry_run=false) \
+                       synthesises + graduates high-quality skills into the Skill Bank via Haiku 4.5.",
+        params: &[
+            ParamDef { name: "agent_id", description: "Target agent that will own synthesised skills (default: main agent)", required: false },
+            ParamDef { name: "dry_run", description: "true = score only, no Skill Bank writes (default: true)", required: false },
+            ParamDef { name: "lookback_days", description: "Days of EvolutionEvents history to scan (default: 1)", required: false },
+        ],
+    },
     // ── Feedback tool ────────────────────────────────────────────
     ToolDef {
         name: "submit_feedback",
@@ -379,6 +397,46 @@ const TOOLS: &[ToolDef] = &[
         description: "Get the current evolution engine configuration and status for an agent",
         params: &[
             ParamDef { name: "agent_id", description: "Target agent name (default: main agent)", required: false },
+        ],
+    },
+    // ── Audit Trail Query (W19-P1 M4) ────────────────────────────
+    ToolDef {
+        name: "audit_trail_query",
+        description: "Query the EvolutionEvent audit trail log (Governance + Durability events). \
+                      Syncs the SQLite index cache from JSONL files then executes a filtered, paginated query. \
+                      Supports filtering by agent, event type, outcome, skill, and time range.",
+        params: &[
+            ParamDef { name: "agent_id",   description: "Filter by agent ID (optional)", required: false },
+            ParamDef { name: "event_type", description: "Filter by event type, e.g. governance_violation, durability_circuit_opened (optional)", required: false },
+            ParamDef { name: "outcome",    description: "Filter by outcome, e.g. blocked, warned, triggered, recovered (optional)", required: false },
+            ParamDef { name: "skill_id",   description: "Filter by skill ID (optional)", required: false },
+            ParamDef { name: "since",      description: "Inclusive lower bound RFC3339 timestamp, e.g. 2026-04-29T00:00:00Z (optional)", required: false },
+            ParamDef { name: "until",      description: "Exclusive upper bound RFC3339 timestamp (optional)", required: false },
+            ParamDef { name: "limit",      description: "Page size 1–1000 (default 100)", required: false },
+            ParamDef { name: "offset",     description: "Pagination offset (default 0)", required: false },
+        ],
+    },
+    // ── Reliability Dashboard (W20-P0) ────────────────────────────
+    ToolDef {
+        name: "reliability_summary",
+        description: "Compute Agent Reliability Dashboard summary from the EvolutionEvent audit trail. \
+                      Returns four metrics over a configurable time window: \
+                      consistency_score (per-task-type success rate), \
+                      task_success_rate (overall success fraction), \
+                      skill_adoption_rate (skill_activate / total events), \
+                      fallback_trigger_rate (llm_fallback_triggered / total events). \
+                      Requires Admin scope.",
+        params: &[
+            ParamDef {
+                name: "agent_id",
+                description: "Target agent ID to analyse (required)",
+                required: true,
+            },
+            ParamDef {
+                name: "window_days",
+                description: "Look-back window in days (default 7, max 365)",
+                required: false,
+            },
         ],
     },
     // ── Channel settings tools ────────────────────────────────────
@@ -1006,6 +1064,19 @@ const TOOLS: &[ToolDef] = &[
     },
 ];
 
+// ── External tool whitelist (W19-P0 BUG-QA-001) ─────────────
+/// Tools visible to external MCP clients (`principal.is_external = true`).
+/// Exactly 7 tools are exposed; all others are hidden to reduce attack surface.
+const EXTERNAL_TOOLS_WHITELIST: &[&str] = &[
+    "memory_search",
+    "memory_store",
+    "memory_read",
+    "wiki_read",
+    "wiki_write",
+    "wiki_search",
+    "send_message",
+];
+
 // ── JSON-RPC helpers ─────────────────────────────────────────
 
 /// Detect the host system's IANA timezone name (e.g. `"Asia/Taipei"`,
@@ -1051,6 +1122,10 @@ fn is_valid_agent_id(id: &str) -> bool {
 
 /// Maximum JSONL queue file size (10 MB).
 const MAX_QUEUE_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Maximum allowed byte length for an `agent_id` parameter in MCP handlers.
+/// Prevents excessively long inputs that could cause DoS or log-flooding.
+const MAX_AGENT_ID_LEN: usize = 128;
 
 /// Append a line to a JSONL file with size limit check.
 ///
@@ -1352,8 +1427,9 @@ async fn handle_memory_store(
     };
 
     let classification = duduclaw_memory::classify(content, "user_input");
+    let entry_id = uuid::Uuid::new_v4().to_string();
     let entry = MemoryEntry {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: entry_id.clone(),
         agent_id: agent_id.to_string(),
         content: content.to_string(),
         timestamp: chrono::Utc::now(),
@@ -1367,13 +1443,53 @@ async fn handle_memory_store(
     };
 
     match memory.store(agent_id, entry).await {
+        // BUG-MCP-001 fix: include memory_id so callers can retrieve the entry
+        // via memory_read without needing a secondary search.
         Ok(()) => serde_json::json!({
-            "content": [{"type": "text", "text": "Memory stored successfully."}]
+            "content": [{"type": "text", "text": format!("Memory stored successfully. memory_id: {entry_id}")}],
+            "memory_id": entry_id
         }),
         Err(e) => serde_json::json!({
             "content": [{"type": "text", "text": format!("Error storing memory: {e}")}],
             "isError": true
         }),
+    }
+}
+
+// ── memory_read ───────────────────────────────────────────────────────────────
+// W19-P0 M1: Read a single memory entry by its UUID.
+// Uses get_by_id for O(1) point lookup (agent ownership enforced in SQL).
+// Namespace isolation: get_by_id filters by agent_id, so cross-agent reads
+// are rejected at the DB layer — callers outside the owning namespace always
+// receive isError.
+async fn handle_memory_read(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    agent_id: &str,
+) -> Value {
+    let memory_id = match params.get("memory_id").and_then(|v| v.as_str()) {
+        Some(id) if !id.is_empty() => id,
+        _ => return tool_error("Missing required parameter: memory_id"),
+    };
+
+    match memory.get_by_id(agent_id, memory_id).await {
+        Ok(Some(entry)) => {
+            let payload = serde_json::json!({
+                "memory_id": entry.id,
+                "content": entry.content,
+                "layer": format!("{:?}", entry.layer),
+                "tags": entry.tags,
+                "created_at": entry.timestamp.to_rfc3339(),
+            });
+            serde_json::json!({
+                "content": [{ "type": "text", "text": payload.to_string() }]
+            })
+        }
+        Ok(None) => serde_json::json!({
+            "content": [{ "type": "text", "text": format!("Memory not found or access denied: {memory_id}") }],
+            "isError": true
+        }),
+        Err(e) => tool_error(&format!("Error reading memory: {e}")),
     }
 }
 
@@ -3793,6 +3909,241 @@ async fn handle_evolution_status_tool(params: &Value, home_dir: &Path, default_a
     })
 }
 
+// ── Audit Trail Query handler (W19-P1 M4) ────────────────────
+
+/// MCP handler for `audit_trail_query`.
+///
+/// Forwards to the gateway `audit.evolution_query` WebSocket endpoint
+/// by delegating to [`AuditEventIndex`] directly (no gateway round-trip
+/// needed from the CLI side since we share the same `home_dir`).
+///
+/// # Authorization
+/// `caller_is_admin` must be `true`; if `false` the call is rejected immediately
+/// (defence-in-depth: the MCP dispatch layer enforces `Scope::Admin` before
+/// routing here, but this guard prevents privilege escalation from any future
+/// call-path that skips the dispatch-level check — OWASP A01).
+async fn handle_audit_trail_query(
+    params: &Value,
+    home_dir: &Path,
+    caller_client_id: &str,
+    caller_is_admin: bool,
+) -> Value {
+    // ── Defence-in-depth authorization guard (H1 / OWASP A01) ────────────────
+    if !caller_is_admin {
+        tracing::warn!(
+            caller_client_id = %caller_client_id,
+            "audit_trail_query: access denied — caller lacks Admin scope"
+        );
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: audit_trail_query requires Admin scope"}],
+            "isError": true
+        });
+    }
+    tracing::info!(caller_client_id = %caller_client_id, "audit_trail_query invoked");
+
+    use duduclaw_gateway::evolution_events::query::{AuditEventIndex, AuditQueryFilter};
+
+    let filter = AuditQueryFilter {
+        agent_id:   params.get("agent_id").and_then(|v| v.as_str()).map(|s| s.to_owned()),
+        event_type: params.get("event_type").and_then(|v| v.as_str()).map(|s| s.to_owned()),
+        outcome:    params.get("outcome").and_then(|v| v.as_str()).map(|s| s.to_owned()),
+        skill_id:   params.get("skill_id").and_then(|v| v.as_str()).map(|s| s.to_owned()),
+        since:      params.get("since").and_then(|v| v.as_str()).map(|s| s.to_owned()),
+        until:      params.get("until").and_then(|v| v.as_str()).map(|s| s.to_owned()),
+        limit:      params.get("limit").and_then(|v| v.as_i64()),
+        offset:     params.get("offset").and_then(|v| v.as_i64()),
+    };
+
+    let idx = match AuditEventIndex::open(home_dir) {
+        Ok(i) => i,
+        Err(e) => {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: cannot open audit index: {e}")}],
+                "isError": true
+            })
+        }
+    };
+
+    if let Err(e) = idx.sync_from_files().await {
+        // Non-fatal: log and continue with potentially stale index.
+        tracing::warn!("audit_trail_query: sync warning (stale index): {e}");
+    }
+
+    match idx.query(filter).await {
+        Ok(result) => {
+            let events_json: Vec<serde_json::Value> = result
+                .events
+                .iter()
+                .map(|ev| {
+                    serde_json::json!({
+                        "timestamp":      ev.timestamp,
+                        "event_type":     ev.event_type.to_string(),
+                        "agent_id":       ev.agent_id,
+                        "skill_id":       ev.skill_id,
+                        "generation":     ev.generation,
+                        "outcome":        ev.outcome.to_string(),
+                        "trigger_signal": ev.trigger_signal,
+                        "metadata":       ev.metadata,
+                    })
+                })
+                .collect();
+
+            let summary = format!(
+                "Audit Trail Query Results\n\
+                 ─────────────────────────\n\
+                 Total matching events: {}\n\
+                 Showing: {} events (offset {}, limit {})\n\
+                 \n\
+                 {}",
+                result.total,
+                result.events.len(),
+                result.offset,
+                result.limit,
+                serde_json::to_string_pretty(&events_json).unwrap_or_default(),
+            );
+
+            serde_json::json!({
+                "content": [{"type": "text", "text": summary}],
+                "audit_result": {
+                    "events": events_json,
+                    "total":  result.total,
+                    "limit":  result.limit,
+                    "offset": result.offset,
+                }
+            })
+        }
+        Err(e) => serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: audit query failed: {e}")}],
+            "isError": true
+        }),
+    }
+}
+
+// ── Reliability Dashboard handler (W20-P0) ──────────────────
+
+/// MCP handler for `reliability_summary`.
+///
+/// Computes the four-metric Agent Reliability Summary from the evolution-event
+/// audit trail SQLite index.  Requires Admin scope (same as `audit_trail_query`).
+///
+/// # Authorization
+/// Defence-in-depth: `caller_is_admin` must be `true`.  The dispatch-layer
+/// scope check handles the primary guard; this check prevents privilege
+/// escalation from any future call-path that bypasses dispatch (OWASP A01).
+async fn handle_reliability_summary(
+    params: &Value,
+    home_dir: &Path,
+    caller_client_id: &str,
+    caller_is_admin: bool,
+) -> Value {
+    // ── Authorization guard ───────────────────────────────────────────────────
+    if !caller_is_admin {
+        tracing::warn!(
+            caller_client_id = %caller_client_id,
+            "reliability_summary: access denied — caller lacks Admin scope"
+        );
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: reliability_summary requires Admin scope"}],
+            "isError": true
+        });
+    }
+
+    // ── Parse parameters ──────────────────────────────────────────────────────
+    let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+        Some(id) if !id.trim().is_empty() => {
+            if id.len() > MAX_AGENT_ID_LEN {
+                return serde_json::json!({
+                    "content": [{"type": "text", "text": format!("Error: agent_id must not exceed {MAX_AGENT_ID_LEN} characters")}],
+                    "isError": true
+                });
+            }
+            id.to_owned()
+        }
+        _ => {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": "Error: reliability_summary requires agent_id"}],
+                "isError": true
+            })
+        }
+    };
+
+    let window_days: u32 = params
+        .get("window_days")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.clamp(1, 365) as u32)
+        .unwrap_or(7);
+
+    tracing::info!(
+        caller_client_id = %caller_client_id,
+        agent_id = %agent_id,
+        window_days = window_days,
+        "reliability_summary invoked"
+    );
+
+    use duduclaw_gateway::evolution_events::query::AuditEventIndex;
+
+    // ── Open and sync the audit index ────────────────────────────────────────
+    let idx = match AuditEventIndex::open(home_dir) {
+        Ok(i) => i,
+        Err(e) => {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error: cannot open audit index: {e}")}],
+                "isError": true
+            })
+        }
+    };
+
+    if let Err(e) = idx.sync_from_files().await {
+        tracing::warn!("reliability_summary: sync warning (stale index): {e}");
+    }
+
+    // ── Compute summary ───────────────────────────────────────────────────────
+    match idx.compute_reliability_summary(&agent_id, window_days).await {
+        Ok(s) => {
+            let report = format!(
+                "Agent Reliability Summary\n\
+                 ─────────────────────────\n\
+                 Agent:                  {agent_id}\n\
+                 Window:                 {window_days} days\n\
+                 Total events:           {total}\n\
+                 \n\
+                 Consistency Score:      {consistency:.4}  (per-task-type avg success rate)\n\
+                 Task Success Rate:      {success:.4}  (outcome=success / total)\n\
+                 Skill Adoption Rate:    {adoption:.4}  (skill_activate / total)\n\
+                 Fallback Trigger Rate:  {fallback:.4}  (llm_fallback_triggered / total)\n\
+                 \n\
+                 Generated:              {generated_at}",
+                agent_id = s.agent_id,
+                window_days = s.window_days,
+                total = s.total_events,
+                consistency = s.consistency_score,
+                success = s.task_success_rate,
+                adoption = s.skill_adoption_rate,
+                fallback = s.fallback_trigger_rate,
+                generated_at = s.generated_at,
+            );
+
+            serde_json::json!({
+                "content": [{"type": "text", "text": report}],
+                "reliability_summary": {
+                    "agent_id":             s.agent_id,
+                    "window_days":          s.window_days,
+                    "consistency_score":    s.consistency_score,
+                    "task_success_rate":    s.task_success_rate,
+                    "skill_adoption_rate":  s.skill_adoption_rate,
+                    "fallback_trigger_rate": s.fallback_trigger_rate,
+                    "total_events":         s.total_events,
+                    "generated_at":         s.generated_at,
+                }
+            })
+        }
+        Err(e) => serde_json::json!({
+            "content": [{"type": "text", "text": format!("Error: reliability computation failed: {e}")}],
+            "isError": true
+        }),
+    }
+}
+
 // ── Local inference handlers ────────────────────────────────
 
 async fn handle_inference_status(home_dir: &Path) -> Value {
@@ -5174,6 +5525,105 @@ async fn handle_skill_synthesis_status(params: &Value, home_dir: &Path) -> Value
     })
 }
 
+/// Trigger the Rollout-to-Skill synthesis pipeline (W19-P0).
+///
+/// Reads `agent_id`, `dry_run`, and `lookback_days` from params.
+/// Resolves the Anthropic API key from `ANTHROPIC_API_KEY` env var or
+/// the `~/.duduclaw/config.toml` `[api] anthropic_api_key` field.
+/// Non-blocking: all errors are captured and returned in the summary.
+async fn handle_skill_synthesis_run(params: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    use duduclaw_gateway::skill_synthesis_pipeline::pipeline::{PipelineConfig, run as run_pipeline};
+
+    let agent_id_param = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+    let target_agent = if agent_id_param.is_empty() { default_agent } else { agent_id_param };
+
+    let dry_run = params
+        .get("dry_run")
+        .and_then(|v| match v {
+            Value::Bool(b) => Some(*b),
+            Value::String(s) => s.parse::<bool>().ok(),
+            _ => None,
+        })
+        .unwrap_or(true); // Safe default: dry-run
+
+    let lookback_days = params
+        .get("lookback_days")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.min(30) as u32)
+        .unwrap_or(1);
+
+    // Resolve API key: env var takes precedence over config file.
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .or_else(|| {
+            // Fallback: read from config.toml [api] anthropic_api_key
+            let config_path = home_dir.join("config.toml");
+            std::fs::read_to_string(config_path)
+                .ok()
+                .and_then(|content| {
+                    content
+                        .lines()
+                        .skip_while(|l| !l.trim().starts_with("[api]"))
+                        .find(|l| l.trim().starts_with("anthropic_api_key"))
+                        .and_then(|l| l.splitn(2, '=').nth(1))
+                        .map(|v| v.trim().trim_matches('"').to_string())
+                        .filter(|s| !s.is_empty())
+                })
+        });
+
+    // Point pipeline at real EvolutionEvents location.
+    let events_dir = std::env::var("EVOLUTION_EVENTS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| home_dir.join("evolution").join("events"));
+
+    let config = PipelineConfig {
+        events_dir,
+        lookback_days,
+        dry_run,
+        api_key,
+        home_dir: home_dir.to_path_buf(),
+        target_agent_id: target_agent.to_string(),
+        ..Default::default()
+    };
+
+    let result = run_pipeline(&config).await;
+
+    let mode = if result.dry_run { "DRY RUN" } else { "FULL" };
+    let summary = result.summary();
+
+    let detail = format!(
+        "## Rollout-to-Skill Pipeline — {mode}\n\n\
+         {summary}\n\n\
+         **Events scanned:** {events}\n\
+         **Trajectory windows:** {traj}\n\
+         **Top-20% candidates:** {top}\n\
+         **Skills graduated:** {grad}\n\
+         **Non-fatal errors:** {errs}",
+        events = result.total_events_parsed,
+        traj = result.total_trajectories,
+        top = result.top_trajectories.len(),
+        grad = result.skills_graduated,
+        errs = result.errors.len(),
+    );
+
+    let error_section = if result.errors.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n**Errors:**\n{}",
+            result.errors.iter().map(|e| format!("- {e}")).collect::<Vec<_>>().join("\n")
+        )
+    };
+
+    serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": format!("{detail}{error_section}")
+        }]
+    })
+}
+
 /// Resolve the main agent name from the agents directory.
 // ── Delegation safety helpers ────────────────────────────────
 
@@ -5447,9 +5897,32 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
 
     let default_agent = get_default_agent(home_dir).await;
 
-    // Odoo connector (lazy — connected on first odoo_connect call)
-    let odoo: std::sync::Arc<tokio::sync::RwLock<Option<duduclaw_odoo::OdooConnector>>> =
-        std::sync::Arc::new(tokio::sync::RwLock::new(None));
+    // ── MCP Auth 初始化（W19-P0）──────────────────────────────────
+    let principal = crate::mcp_auth::authenticate_from_env(home_dir)
+        .map_err(|e| DuDuClawError::Gateway(format!("MCP authentication failed: {e}")))?;
+    let ns_ctx = crate::mcp_namespace::resolve(&principal)
+        .map_err(|e| DuDuClawError::Gateway(format!("MCP namespace resolution failed: {e}")))?;
+
+    tracing::info!(
+        client_id = %principal.client_id,
+        namespace = %ns_ctx.write_namespace,
+        is_external = principal.is_external,
+        "MCP server authenticated"
+    );
+
+    // ── McpDispatcher 初始化（W20-P1 Phase 2A）───────────────────
+    // Wraps rate limiter, daily quota, odoo, memory and all tool handlers.
+    // All three transports (stdio, HTTP, SSE) share this dispatcher.
+    let dispatcher = crate::mcp_dispatch::McpDispatcher::new(
+        home_dir.to_path_buf(),
+        http.clone(),
+        std::sync::Arc::new(memory),
+        default_agent.clone(),
+        // Odoo connector (lazy — connected on first odoo_connect call)
+        std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+        crate::mcp_rate_limit::RateLimiter::new(),
+        crate::mcp_memory_quota::DailyQuota::new(),
+    );
 
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -5473,10 +5946,12 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
             continue;
         }
 
+        // Redact any API keys from the raw line before it touches any log output.
+        let redacted_line = crate::mcp_redact::redact(trimmed);
         let request: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
-                warn!("MCP server: invalid JSON: {e}");
+                warn!(line = %redacted_line, "MCP server: invalid JSON: {e}");
                 let err = jsonrpc_error(&Value::Null, -32700, "Parse error");
                 write_response(&mut stdout, &err).await?;
                 continue;
@@ -5491,10 +5966,11 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
 
         let response = match method {
             "initialize" => handle_initialize(&id, &request),
-            "tools/list" => handle_tools_list(&id),
+            "tools/list" => handle_tools_list(&id, principal.is_external),
             "tools/call" => {
+                // W20-P1 Phase 2A: delegate to McpDispatcher (scope → rate-limit → ns-inject → dispatch)
                 let params = request.get("params").cloned().unwrap_or(Value::Null);
-                handle_tools_call(&id, &params, home_dir, &http, &memory, &default_agent, &odoo).await
+                dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await
             }
             "notifications/initialized" => {
                 // This is a notification (no id expected in response), skip
@@ -5513,8 +5989,12 @@ async fn write_response(
     stdout: &mut tokio::io::Stdout,
     response: &Value,
 ) -> Result<()> {
-    let mut output = serde_json::to_string(response)
+    let serialized = serde_json::to_string(response)
         .map_err(|e| DuDuClawError::Gateway(format!("Failed to serialize response: {e}")))?;
+    // Redact any API keys that may have leaked into the response payload
+    // (e.g. via error messages that echo back tool arguments).
+    let redacted = crate::mcp_redact::redact(&serialized);
+    let mut output = redacted.into_owned();
     output.push('\n');
     stdout.write_all(output.as_bytes()).await.map_err(|e| {
         DuDuClawError::Gateway(format!("Failed to write to stdout: {e}"))
@@ -5543,14 +6023,40 @@ fn handle_initialize(id: &Value, _request: &Value) -> Value {
     )
 }
 
-fn handle_tools_list(id: &Value) -> Value {
-    let tools: Vec<Value> = TOOLS.iter().map(build_tool_schema).collect();
+fn handle_tools_list(id: &Value, is_external: bool) -> Value {
+    let tools: Vec<Value> = TOOLS
+        .iter()
+        .filter(|t| {
+            !is_external || EXTERNAL_TOOLS_WHITELIST.contains(&t.name)
+        })
+        .map(build_tool_schema)
+        .collect();
     jsonrpc_response(id, serde_json::json!({ "tools": tools }))
 }
 
-type OdooState = std::sync::Arc<tokio::sync::RwLock<Option<duduclaw_odoo::OdooConnector>>>;
+pub(crate) type OdooState = std::sync::Arc<tokio::sync::RwLock<Option<duduclaw_odoo::OdooConnector>>>;
 
-async fn handle_tools_call(
+// ── Namespace-aware wiki agent resolver (W19-P0 M2) ──────────────────────────
+/// Resolve the effective wiki agent for this principal from the namespace context.
+///
+/// Rules:
+/// - External clients (`write_namespace = "external/{client_id}"`): wiki
+///   operations are scoped to `{client_id}`.  The dispatcher has already
+///   stripped any user-supplied `agent_id` argument, so the fallback in every
+///   wiki handler lands here instead of on `default_agent`.
+/// - Internal clients: preserve existing behaviour — fall back to
+///   `default_agent`, which is the agent configured in config.toml.
+fn wiki_agent_from_ns<'a>(
+    ns_ctx: &'a crate::mcp_namespace::NamespaceContext,
+    default_agent: &'a str,
+) -> &'a str {
+    ns_ctx
+        .write_namespace
+        .strip_prefix("external/")
+        .unwrap_or(default_agent)
+}
+
+pub(crate) async fn handle_tools_call(
     id: &Value,
     params: &Value,
     home_dir: &Path,
@@ -5558,6 +6064,10 @@ async fn handle_tools_call(
     memory: &SqliteMemoryEngine,
     default_agent: &str,
     odoo: &OdooState,
+    ns_ctx: &crate::mcp_namespace::NamespaceContext,
+    daily_quota: &crate::mcp_memory_quota::DailyQuota,
+    caller_client_id: &str,
+    caller_is_admin: bool,
 ) -> Value {
     let tool_name = params
         .get("name")
@@ -5567,6 +6077,24 @@ async fn handle_tools_call(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+
+    // ── Namespace-aware wiki agent (W19-P0 M2) ──────────────────────────────
+    // For external clients, any agent_id was stripped upstream; use the
+    // namespace-derived client_id as the fallback wiki agent so their wiki
+    // operations stay isolated in "external/{client_id}" rather than leaking
+    // into the default internal agent's wiki directory.
+    let wiki_agent = wiki_agent_from_ns(ns_ctx, default_agent);
+
+    // ── Namespace hijacking prevention (W19-P0) ────────────────────────────
+    // If the caller supplied an explicit `namespace` or `agent_id` in the
+    // arguments, verify it falls within their permitted read namespaces.
+    // This prevents an external client from reading another client's data by
+    // passing `"namespace": "internal/other-agent"` in the tool arguments.
+    if let Some(requested_ns) = arguments.get("namespace").and_then(|v| v.as_str()) {
+        if let Err(e) = crate::mcp_namespace::assert_can_access(ns_ctx, requested_ns) {
+            return jsonrpc_error(id, -32003, &format!("Namespace access denied: {e}"));
+        }
+    }
 
     info!(tool = %tool_name, "MCP tools/call");
 
@@ -5597,8 +6125,10 @@ async fn handle_tools_call(
     let result = match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
         "web_search" => handle_web_search(&arguments, http).await,
-        "memory_search" => handle_memory_search(&arguments, memory, default_agent).await,
-        "memory_store" => handle_memory_store(&arguments, memory, default_agent).await,
+        // ── W19-P0 M1: namespace-aware memory endpoints ────────────────────
+        "memory_search" => crate::mcp_memory_handlers::handle_memory_search(&arguments, memory, ns_ctx).await,
+        "memory_store"  => crate::mcp_memory_handlers::handle_memory_store(&arguments, memory, ns_ctx, daily_quota).await,
+        "memory_read"   => crate::mcp_memory_handlers::handle_memory_read(&arguments, memory, ns_ctx).await,
         "memory_search_by_layer" => handle_memory_search_by_layer(&arguments, memory, default_agent).await,
         "memory_successful_conversations" => handle_memory_successful_conversations(&arguments, memory, default_agent).await,
         "memory_episodic_pressure" => handle_memory_episodic_pressure(&arguments, memory, default_agent).await,
@@ -5630,9 +6160,12 @@ async fn handle_tools_call(
         "skill_security_scan" => handle_skill_security_scan(&arguments, home_dir).await,
         "skill_graduate" => handle_skill_graduate(&arguments, home_dir).await,
         "skill_synthesis_status" => handle_skill_synthesis_status(&arguments, home_dir).await,
+        "skill_synthesis_run" => handle_skill_synthesis_run(&arguments, home_dir, default_agent).await,
         "submit_feedback" => handle_submit_feedback(&arguments, home_dir, default_agent).await,
         "evolution_toggle" => handle_evolution_toggle(&arguments, home_dir).await,
         "evolution_status" => handle_evolution_status_tool(&arguments, home_dir, default_agent).await,
+        "audit_trail_query" => handle_audit_trail_query(&arguments, home_dir, caller_client_id, caller_is_admin).await,
+        "reliability_summary" => handle_reliability_summary(&arguments, home_dir, caller_client_id, caller_is_admin).await,
         // Channel settings tools
         "channel_config" => handle_channel_config(&arguments, home_dir).await,
         "channel_config_list" => handle_channel_config_list(&arguments, home_dir).await,
@@ -5661,17 +6194,18 @@ async fn handle_tools_call(
         // Voice / ASR / TTS tools
         "transcribe_audio" => handle_transcribe_audio(&arguments).await,
         "synthesize_speech" => handle_synthesize_speech(&arguments).await,
-        // Wiki Knowledge Base tools
-        "wiki_ls" => handle_wiki_ls(&arguments, home_dir, default_agent).await,
-        "wiki_read" => handle_wiki_read(&arguments, home_dir, default_agent).await,
-        "wiki_write" => handle_wiki_write(&arguments, home_dir, default_agent).await,
-        "wiki_search" => handle_wiki_search(&arguments, home_dir, default_agent).await,
-        "wiki_lint" => handle_wiki_lint(&arguments, home_dir, default_agent).await,
-        "wiki_stats" => handle_wiki_stats(&arguments, home_dir, default_agent).await,
-        "wiki_export" => handle_wiki_export(&arguments, home_dir, default_agent).await,
-        "wiki_dedup" => handle_wiki_dedup(&arguments, home_dir, default_agent).await,
-        "wiki_graph" => handle_wiki_graph(&arguments, home_dir, default_agent).await,
-        "wiki_rebuild_fts" => handle_wiki_rebuild_fts(&arguments, home_dir, default_agent).await,
+        // Wiki Knowledge Base tools — use wiki_agent (namespace-aware) instead of
+        // default_agent so external clients stay isolated in their own namespace.
+        "wiki_ls" => handle_wiki_ls(&arguments, home_dir, wiki_agent).await,
+        "wiki_read" => handle_wiki_read(&arguments, home_dir, wiki_agent).await,
+        "wiki_write" => handle_wiki_write(&arguments, home_dir, wiki_agent).await,
+        "wiki_search" => handle_wiki_search(&arguments, home_dir, wiki_agent).await,
+        "wiki_lint" => handle_wiki_lint(&arguments, home_dir, wiki_agent).await,
+        "wiki_stats" => handle_wiki_stats(&arguments, home_dir, wiki_agent).await,
+        "wiki_export" => handle_wiki_export(&arguments, home_dir, wiki_agent).await,
+        "wiki_dedup" => handle_wiki_dedup(&arguments, home_dir, wiki_agent).await,
+        "wiki_graph" => handle_wiki_graph(&arguments, home_dir, wiki_agent).await,
+        "wiki_rebuild_fts" => handle_wiki_rebuild_fts(&arguments, home_dir, wiki_agent).await,
         // Shared Wiki tools
         "shared_wiki_ls" => handle_shared_wiki_ls(home_dir).await,
         "shared_wiki_read" => handle_shared_wiki_read(&arguments, home_dir).await,
@@ -5680,7 +6214,7 @@ async fn handle_tools_call(
         "shared_wiki_delete" => handle_shared_wiki_delete(&arguments, home_dir, default_agent).await,
         "shared_wiki_stats" => handle_shared_wiki_stats(home_dir).await,
         "shared_wiki_lint" => handle_shared_wiki_lint(home_dir).await,
-        "wiki_share" => handle_wiki_share(&arguments, home_dir, default_agent).await,
+        "wiki_share" => handle_wiki_share(&arguments, home_dir, wiki_agent).await,
         // Skill Internalization tools
         "skill_extract" => handle_skill_extract(&arguments, home_dir, default_agent).await,
         // Program execution
@@ -6068,13 +6602,18 @@ Use relative markdown links: `[Display Text](../concepts/topic.md)`
 
 /// Resolve the wiki directory for an agent, creating it if needed.
 /// Returns `Err` on invalid agent_id or filesystem failures.
+///
+/// BUG-QA-003: External MCP clients (e.g. claude-desktop) may not have an agent
+/// directory on first connect. Auto-create it so wiki operations work immediately
+/// without requiring manual provisioning.
 fn resolve_wiki_dir(home_dir: &Path, agent_id: &str) -> std::result::Result<std::path::PathBuf, String> {
     if !is_valid_agent_id(agent_id) {
         return Err("Invalid agent_id".to_string());
     }
     let agent_dir = home_dir.join("agents").join(agent_id);
     if !agent_dir.exists() {
-        return Err(format!("Agent '{}' does not exist", agent_id));
+        std::fs::create_dir_all(&agent_dir)
+            .map_err(|e| format!("Failed to create agent dir for '{}': {}", agent_id, e))?;
     }
     Ok(agent_dir.join("wiki"))
 }
@@ -9907,5 +10446,772 @@ mod task_board_tests {
         )
         .await;
         assert!(result["isError"].as_bool().unwrap_or(false));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Scope dispatch tests (W19-P0 M2)
+// ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod mcp_scope_dispatch_tests {
+    //! Validates that the scope enforcement logic in `run_mcp_server` correctly
+    //! blocks tool calls that require a scope the caller does not hold, and
+    //! that `admin` is treated as an unconditional pass.
+    //!
+    //! Because `run_mcp_server` is an integration boundary (reads stdin), these
+    //! tests exercise the same building blocks: `tool_requires_scope` from
+    //! `mcp_auth` and a local `check_scope` helper that mirrors the dispatcher.
+
+    use crate::mcp_auth::{Principal, Scope};
+    use chrono::Utc;
+    use std::collections::HashSet;
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    fn make_principal(scopes: &[Scope]) -> Principal {
+        Principal {
+            client_id: "test-ext".to_string(),
+            scopes: scopes.iter().cloned().collect::<HashSet<_>>(),
+            is_external: true,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// Mirror of the scope check in `run_mcp_server`:
+    ///   if required_scope present AND principal lacks it AND lacks admin → deny.
+    fn check_scope(principal: &Principal, tool_name: &str) -> bool {
+        if let Some(required) = crate::mcp_auth::tool_requires_scope(tool_name) {
+            principal.scopes.contains(&required)
+                || principal.scopes.contains(&Scope::Admin)
+        } else {
+            // No scope required → always allow
+            true
+        }
+    }
+
+    // ── Test 1: memory_store blocked without memory:write ────────────────────
+    #[test]
+    fn memory_store_blocked_without_memory_write_scope() {
+        let p = make_principal(&[Scope::MemoryRead, Scope::WikiRead]);
+        assert!(
+            !check_scope(&p, "memory_store"),
+            "memory_store must be blocked when memory:write is absent"
+        );
+    }
+
+    // ── Test 2: wiki_write blocked without wiki:write ─────────────────────────
+    #[test]
+    fn wiki_write_blocked_without_wiki_write_scope() {
+        let p = make_principal(&[Scope::MemoryRead, Scope::WikiRead]);
+        assert!(
+            !check_scope(&p, "wiki_write"),
+            "wiki_write must be blocked when wiki:write is absent"
+        );
+    }
+
+    // ── Test 3: admin scope bypasses all restrictions ────────────────────────
+    #[test]
+    fn admin_scope_allows_all_restricted_tools() {
+        let p = make_principal(&[Scope::Admin]);
+        for tool in &["memory_store", "wiki_write", "send_message"] {
+            assert!(
+                check_scope(&p, tool),
+                "admin scope must allow '{tool}'"
+            );
+        }
+    }
+
+    // ── Test 4: unrestricted tool needs no scope ──────────────────────────────
+    #[test]
+    fn unrestricted_tool_allowed_with_empty_scopes() {
+        let p = make_principal(&[]); // no scopes at all
+        assert!(
+            check_scope(&p, "web_search"),
+            "web_search must be unrestricted regardless of scopes"
+        );
+    }
+
+    // ── Test 5: memory_store allowed when memory:write present ───────────────
+    #[test]
+    fn memory_store_allowed_with_memory_write_scope() {
+        let p = make_principal(&[Scope::MemoryWrite]);
+        assert!(
+            check_scope(&p, "memory_store"),
+            "memory_store must succeed when memory:write is present"
+        );
+    }
+
+    // ── Test 6: wiki_write allowed when wiki:write present ───────────────────
+    #[test]
+    fn wiki_write_allowed_with_wiki_write_scope() {
+        let p = make_principal(&[Scope::WikiWrite]);
+        assert!(
+            check_scope(&p, "wiki_write"),
+            "wiki_write must succeed when wiki:write is present"
+        );
+    }
+
+    // ── Test 7: tool_requires_scope returns correct scopes ───────────────────
+    #[test]
+    fn tool_requires_scope_table_is_correct() {
+        use crate::mcp_auth::tool_requires_scope;
+        assert_eq!(tool_requires_scope("memory_store"), Some(Scope::MemoryWrite));
+        assert_eq!(tool_requires_scope("wiki_write"),   Some(Scope::WikiWrite));
+        assert_eq!(tool_requires_scope("send_message"), Some(Scope::MessagingSend));
+        assert_eq!(tool_requires_scope("memory_search"),Some(Scope::MemoryRead));
+        assert_eq!(tool_requires_scope("wiki_read"),    Some(Scope::WikiRead));
+        assert_eq!(tool_requires_scope("totally_unknown"), None);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Wiki namespace isolation tests (W19-P0 M2)
+// ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod wiki_namespace_tests {
+    //! Validates that `wiki_agent_from_ns` resolves the correct agent directory
+    //! for external vs. internal principals, and that wiki handlers respect
+    //! namespace isolation end-to-end.
+
+    use super::*;
+    use crate::mcp_namespace::NamespaceContext;
+    use std::fs;
+
+    // ── Local TempDir ─────────────────────────────────────────────────────────
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let p = std::env::temp_dir()
+                .join(format!("duduclaw-wns-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &std::path::Path { &self.0 }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+
+    // ── Fixtures ──────────────────────────────────────────────────────────────
+
+    fn external_ns(client_id: &str) -> NamespaceContext {
+        NamespaceContext {
+            write_namespace: format!("external/{client_id}"),
+            read_namespaces: vec![
+                format!("external/{client_id}"),
+                "shared/public".to_string(),
+            ],
+        }
+    }
+
+    fn internal_ns(client_id: &str) -> NamespaceContext {
+        NamespaceContext {
+            write_namespace: format!("internal/{client_id}"),
+            read_namespaces: vec![
+                format!("internal/{client_id}"),
+                "shared/public".to_string(),
+            ],
+        }
+    }
+
+    fn create_agent_dir(home: &std::path::Path, name: &str) {
+        let dir = home.join("agents").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("agent.toml"),
+            format!("[agent]\nname = \"{name}\"\nrole = \"main\"\n"),
+        )
+        .unwrap();
+    }
+
+    // ── Test 1: external ns → client_id is wiki agent ─────────────────────────
+    #[test]
+    fn external_ns_resolves_to_client_id() {
+        let ctx = external_ns("claude-desktop");
+        assert_eq!(wiki_agent_from_ns(&ctx, "dudu"), "claude-desktop");
+    }
+
+    // ── Test 2: internal ns → falls back to default_agent ─────────────────────
+    #[test]
+    fn internal_ns_falls_back_to_default_agent() {
+        let ctx = internal_ns("duduclaw-tl");
+        assert_eq!(wiki_agent_from_ns(&ctx, "dudu"), "dudu");
+    }
+
+    // ── Test 3: default principal ns → falls back to default_agent ───────────
+    #[test]
+    fn default_internal_ns_falls_back() {
+        let ctx = NamespaceContext {
+            write_namespace: "internal/default".to_string(),
+            read_namespaces: vec![
+                "internal/default".to_string(),
+                "shared/public".to_string(),
+            ],
+        };
+        assert_eq!(wiki_agent_from_ns(&ctx, "dudu"), "dudu");
+    }
+
+    // ── Test 4: wiki_write external client uses client's namespace ────────────
+    #[tokio::test(flavor = "current_thread")]
+    async fn wiki_write_external_scoped_to_client_namespace() {
+        let tmp = TempDir::new();
+        let client_id = "claude-desktop";
+        let ctx = external_ns(client_id);
+        let wiki_agent = wiki_agent_from_ns(&ctx, "dudu");
+
+        // Create the external client's agent directory (simulates provisioning)
+        create_agent_dir(tmp.path(), client_id);
+
+        // Args have NO agent_id — simulates the dispatcher stripping it
+        let args = serde_json::json!({
+            "page_path": "notes/hello.md",
+            "content": "---\ntitle: Hello\ncreated: 2026-04-29T00:00:00Z\nupdated: 2026-04-29T00:00:00Z\ntags: [test]\nlayer: context\ntrust: 0.5\n---\nBody.",
+        });
+
+        let result = handle_wiki_write(&args, tmp.path(), wiki_agent).await;
+        let is_err = result["isError"].as_bool().unwrap_or(false);
+        assert!(!is_err, "wiki_write should succeed for external client: {:?}", result);
+
+        // Page must be under the client's namespace, NOT under "dudu"
+        assert!(
+            tmp.path().join("agents").join(client_id).join("wiki").join("notes").join("hello.md").exists(),
+            "wiki page must be written inside the client's namespace"
+        );
+        assert!(
+            !tmp.path().join("agents").join("dudu").join("wiki").join("notes").join("hello.md").exists(),
+            "wiki page must NOT be written to the default internal agent's wiki"
+        );
+    }
+
+    // ── Test 5: external client's agent_id ignored, namespace resolver used ───
+    // Verifies the full contract: even if an args map originally contained
+    // agent_id (before dispatcher strips it), the namespace resolver wins.
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_client_agent_id_stripped_uses_namespace() {
+        let tmp = TempDir::new();
+        let client_id = "trusted-bot";
+        let ctx = external_ns(client_id);
+        let wiki_agent = wiki_agent_from_ns(&ctx, "dudu");
+
+        create_agent_dir(tmp.path(), client_id);
+
+        // After dispatcher strips agent_id, only page_path + content remain
+        let stripped_args = serde_json::json!({
+            "page_path": "secure/record.md",
+            "content": "---\ntitle: Record\ncreated: 2026-04-29T00:00:00Z\nupdated: 2026-04-29T00:00:00Z\ntags: [secure]\nlayer: context\ntrust: 0.8\n---\nData.",
+        });
+
+        let result = handle_wiki_write(&stripped_args, tmp.path(), wiki_agent).await;
+        assert!(
+            !result["isError"].as_bool().unwrap_or(false),
+            "wiki_write after agent_id strip should succeed: {:?}", result
+        );
+
+        let expected = tmp.path()
+            .join("agents")
+            .join(client_id)
+            .join("wiki")
+            .join("secure")
+            .join("record.md");
+        assert!(expected.exists(), "page must be in client's namespace: {:?}", expected);
+    }
+
+    // ── TC-INT-外部工具過濾: external tools/list returns exactly 7 tools ────────
+    #[test]
+    fn external_tools_list_returns_exactly_7_tools() {
+        use serde_json::json;
+        let id = json!(1);
+
+        // External principal → should see exactly 7 whitelisted tools
+        let response = super::handle_tools_list(&id, true);
+        let tools = response["result"]["tools"].as_array().expect("tools must be array");
+        assert_eq!(
+            tools.len(),
+            7,
+            "External principal must see exactly 7 tools, got {}: {:?}",
+            tools.len(),
+            tools.iter().map(|t| t["name"].as_str().unwrap_or("?")).collect::<Vec<_>>()
+        );
+
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or(""))
+            .collect();
+        for expected in &[
+            "memory_search", "memory_store", "memory_read",
+            "wiki_read", "wiki_write", "wiki_search",
+            "send_message",
+        ] {
+            assert!(
+                names.contains(expected),
+                "External tool list must contain '{}'; got: {:?}", expected, names
+            );
+        }
+    }
+
+    // ── TC-INT-內部工具完整: internal tools/list returns full tool list ─────────
+    #[test]
+    fn internal_tools_list_returns_full_list() {
+        use serde_json::json;
+        let id = json!(1);
+
+        // Internal principal → should see all tools (more than 7)
+        let response = super::handle_tools_list(&id, false);
+        let tools = response["result"]["tools"].as_array().expect("tools must be array");
+        assert!(
+            tools.len() > 7,
+            "Internal principal must see more than 7 tools, got {}", tools.len()
+        );
+    }
+
+    // ── Test 7: wiki_write succeeds for external client WITHOUT pre-created dir ──
+    // BUG-QA-003: Reproduces the exact failure scenario — external MCP client
+    // (e.g. claude-desktop) connects for the first time with NO agent directory.
+    // Before the fix: resolve_wiki_dir returned "Agent does not exist".
+    // After the fix: agent dir is auto-created and wiki_write succeeds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wiki_write_external_client_auto_creates_dir_on_first_connect() {
+        let tmp = TempDir::new();
+        let client_id = "claude-desktop";
+        let ctx = external_ns(client_id);
+        let wiki_agent = wiki_agent_from_ns(&ctx, "dudu");
+
+        // Deliberately do NOT call create_agent_dir — this is the BUG-QA-003 scenario
+        assert!(
+            !tmp.path().join("agents").join(client_id).exists(),
+            "pre-condition: agent dir must NOT exist before first connect"
+        );
+
+        let args = serde_json::json!({
+            "page_path": "notes/first-page.md",
+            "content": "---\ntitle: First Page\ncreated: 2026-04-29T00:00:00Z\nupdated: 2026-04-29T00:00:00Z\ntags: [test]\nlayer: context\ntrust: 0.5\n---\nAuto-created on first connect.",
+        });
+
+        let result = handle_wiki_write(&args, tmp.path(), wiki_agent).await;
+        assert!(
+            !result["isError"].as_bool().unwrap_or(false),
+            "wiki_write must succeed for external client on first connect (BUG-QA-003): {:?}", result
+        );
+
+        // Agent dir and wiki page must now exist
+        assert!(
+            tmp.path().join("agents").join(client_id).exists(),
+            "agent dir must be auto-created after first wiki_write"
+        );
+        assert!(
+            tmp.path()
+                .join("agents").join(client_id)
+                .join("wiki").join("notes").join("first-page.md")
+                .exists(),
+            "wiki page must be written after auto-create"
+        );
+    }
+
+    // ── Test 8: resolve_wiki_dir auto-creates agent dir ──────────────────────
+    #[test]
+    fn resolve_wiki_dir_auto_creates_missing_agent_dir() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agent_id = "new-external-bot";
+
+        // Pre-condition: directory does not exist
+        assert!(!home.join("agents").join(agent_id).exists());
+
+        let result = resolve_wiki_dir(home, agent_id);
+        assert!(result.is_ok(), "resolve_wiki_dir must succeed even when agent dir is absent: {:?}", result);
+
+        let wiki_path = result.unwrap();
+        assert_eq!(wiki_path, home.join("agents").join(agent_id).join("wiki"));
+        assert!(
+            home.join("agents").join(agent_id).exists(),
+            "agent dir must be created by resolve_wiki_dir"
+        );
+    }
+
+    // ── Test 9: resolve_wiki_dir leaves existing dir untouched ───────────────
+    #[test]
+    fn resolve_wiki_dir_existing_dir_unchanged() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agent_id = "existing-agent";
+
+        // Pre-condition: agent dir already exists with a marker file
+        let agent_dir = home.join("agents").join(agent_id);
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(agent_dir.join("agent.toml"), "[agent]\nname = \"existing-agent\"\n").unwrap();
+
+        let result = resolve_wiki_dir(home, agent_id);
+        assert!(result.is_ok(), "resolve_wiki_dir must succeed for existing dir: {:?}", result);
+        assert_eq!(result.unwrap(), agent_dir.join("wiki"));
+
+        // Marker file must still be present (existing contents untouched)
+        assert!(
+            agent_dir.join("agent.toml").exists(),
+            "existing agent.toml must not be removed"
+        );
+    }
+
+    // ── Test 10: resolve_wiki_dir rejects invalid agent_id ──────────────────
+    #[test]
+    fn resolve_wiki_dir_invalid_agent_id_rejected() {
+        let tmp = TempDir::new();
+        // Vector 1: Path traversal attempt (relative path traversal: "../")
+        assert!(resolve_wiki_dir(tmp.path(), "../evil").is_err(), "../evil must be rejected");
+        assert!(resolve_wiki_dir(tmp.path(), "../../etc/passwd").is_err(), "../../etc/passwd must be rejected");
+        // Vector 2: Absolute path injection ("/absolute")
+        assert!(resolve_wiki_dir(tmp.path(), "/absolute").is_err(), "/absolute must be rejected");
+        assert!(resolve_wiki_dir(tmp.path(), "/etc/passwd").is_err(), "/etc/passwd must be rejected");
+        // Vector 3: Empty string
+        assert!(resolve_wiki_dir(tmp.path(), "").is_err(), "empty string must be rejected");
+        // Additional: Uppercase not allowed
+        assert!(resolve_wiki_dir(tmp.path(), "Agent-Name").is_err(), "uppercase must be rejected");
+        // Additional: Null byte injection
+        assert!(resolve_wiki_dir(tmp.path(), "agent\0id").is_err(), "null byte must be rejected");
+    }
+
+    // ── Test: audit_trail_query requires Admin scope (H1 fix / OWASP A01) ──────
+    /// Verify that `handle_audit_trail_query` rejects callers who lack Admin scope,
+    /// providing a defence-in-depth guard independent of the dispatch-layer scope check.
+    #[tokio::test(flavor = "current_thread")]
+    async fn audit_trail_query_denied_without_admin_scope() {
+        let tmp = TempDir::new();
+        let result = handle_audit_trail_query(
+            &serde_json::json!({}),
+            tmp.path(),
+            "non-admin-client",
+            false, // caller_is_admin = false
+        )
+        .await;
+        assert_eq!(
+            result["isError"],
+            serde_json::json!(true),
+            "non-admin call must be rejected with isError=true"
+        );
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("Admin scope"),
+            "error message must reference the required scope; got: {text}"
+        );
+    }
+
+    /// Verify that an admin-scoped caller is NOT rejected for authorization reasons.
+    /// (Index may not exist in temp dir, so we accept any non-auth error response.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn audit_trail_query_proceeds_with_admin_scope() {
+        let tmp = TempDir::new();
+        let result = handle_audit_trail_query(
+            &serde_json::json!({}),
+            tmp.path(),
+            "admin-client",
+            true, // caller_is_admin = true
+        )
+        .await;
+        // An admin call must NOT be rejected due to authorization.
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            !text.contains("Admin scope"),
+            "admin call must not fail with auth scope error; got: {text}"
+        );
+    }
+
+    // ── Test 6: wiki_search scoped to client namespace ────────────────────────
+    // External client has no wiki yet → response mentions "No wiki found"
+    // (rather than falling through to the internal default agent's wiki).
+    #[tokio::test(flavor = "current_thread")]
+    async fn wiki_search_scoped_to_client_namespace() {
+        let tmp = TempDir::new();
+        let client_id = "search-bot";
+        let ctx = external_ns(client_id);
+        let wiki_agent = wiki_agent_from_ns(&ctx, "dudu");
+
+        // Create client agent dir but NO wiki inside it
+        create_agent_dir(tmp.path(), client_id);
+        // Also create dudu's wiki with a page — must NOT appear in search result
+        create_agent_dir(tmp.path(), "dudu");
+        let dudu_wiki = tmp.path().join("agents").join("dudu").join("wiki");
+        fs::create_dir_all(&dudu_wiki).unwrap();
+        fs::write(
+            dudu_wiki.join("secret.md"),
+            "---\ntitle: Secret\ncreated: 2026-04-29T00:00:00Z\nupdated: 2026-04-29T00:00:00Z\ntags: [internal]\nlayer: context\ntrust: 0.9\n---\nsecret internal content",
+        )
+        .unwrap();
+
+        let args = serde_json::json!({ "query": "secret" });
+        let result = handle_wiki_search(&args, tmp.path(), wiki_agent).await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+
+        assert!(
+            text.contains("No wiki found") || text.contains("No wiki pages match"),
+            "wiki_search must be scoped to client namespace; got: {text}"
+        );
+        assert!(
+            !text.contains("secret internal content"),
+            "internal agent content must not leak to external client search"
+        );
+    }
+
+    // ── reliability_summary handler tests (W20-P0) ────────────────────────────
+
+    /// Non-admin caller must be rejected with isError=true.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reliability_summary_denied_without_admin_scope() {
+        let tmp = TempDir::new();
+        let result = handle_reliability_summary(
+            &serde_json::json!({"agent_id": "some-agent"}),
+            tmp.path(),
+            "non-admin-client",
+            false,
+        )
+        .await;
+        assert_eq!(result["isError"], serde_json::json!(true));
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("Admin scope"),
+            "error must reference Admin scope; got: {text}"
+        );
+    }
+
+    /// Missing agent_id parameter must return isError=true.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reliability_summary_missing_agent_id() {
+        let tmp = TempDir::new();
+        let result = handle_reliability_summary(
+            &serde_json::json!({}),
+            tmp.path(),
+            "admin-client",
+            true,
+        )
+        .await;
+        assert_eq!(result["isError"], serde_json::json!(true));
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("agent_id"),
+            "error must mention agent_id; got: {text}"
+        );
+    }
+
+    /// Admin caller with valid params must NOT be rejected for auth reasons.
+    /// (Index may not exist in temp dir — we accept any non-auth response.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn reliability_summary_proceeds_with_admin_scope() {
+        let tmp = TempDir::new();
+        let result = handle_reliability_summary(
+            &serde_json::json!({"agent_id": "my-agent"}),
+            tmp.path(),
+            "admin-client",
+            true,
+        )
+        .await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            !text.contains("Admin scope"),
+            "admin call must not fail auth check; got: {text}"
+        );
+    }
+
+    /// window_days defaults to 7 when not provided.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reliability_summary_default_window_days() {
+        let tmp = TempDir::new();
+        let result = handle_reliability_summary(
+            &serde_json::json!({"agent_id": "my-agent"}),
+            tmp.path(),
+            "admin-client",
+            true,
+        )
+        .await;
+        assert!(
+            !result["isError"].as_bool().unwrap_or(false),
+            "DB open must succeed: {:?}",
+            result
+        );
+        let wd = result["reliability_summary"]["window_days"].as_u64().unwrap_or(0);
+        assert_eq!(wd, 7, "default window_days must be 7");
+    }
+
+    /// window_days > 365 must be clamped to 365.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reliability_summary_window_days_clamped() {
+        let tmp = TempDir::new();
+        let result = handle_reliability_summary(
+            &serde_json::json!({"agent_id": "my-agent", "window_days": 9999}),
+            tmp.path(),
+            "admin-client",
+            true,
+        )
+        .await;
+        assert!(
+            !result["isError"].as_bool().unwrap_or(false),
+            "DB open must succeed: {:?}",
+            result
+        );
+        let wd = result["reliability_summary"]["window_days"].as_u64().unwrap_or(0);
+        assert_eq!(wd, 365, "window_days must be clamped to 365");
+    }
+
+    /// window_days=1 must pass through without being clamped (lower bound is 1).
+    #[tokio::test(flavor = "current_thread")]
+    async fn reliability_summary_window_days_min_boundary() {
+        let tmp = TempDir::new();
+        let result = handle_reliability_summary(
+            &serde_json::json!({"agent_id": "my-agent", "window_days": 1}),
+            tmp.path(),
+            "admin-client",
+            true,
+        )
+        .await;
+        assert!(
+            !result["isError"].as_bool().unwrap_or(false),
+            "DB open must succeed: {:?}",
+            result
+        );
+        let wd = result["reliability_summary"]["window_days"].as_u64().unwrap_or(0);
+        assert_eq!(wd, 1, "window_days=1 must not be clamped");
+    }
+
+    /// agent_id consisting only of whitespace must be rejected (not accepted as non-empty).
+    #[tokio::test(flavor = "current_thread")]
+    async fn reliability_summary_whitespace_agent_id_rejected() {
+        let tmp = TempDir::new();
+        let result = handle_reliability_summary(
+            &serde_json::json!({"agent_id": "   "}),
+            tmp.path(),
+            "admin-client",
+            true,
+        )
+        .await;
+        assert!(
+            result["isError"].as_bool().unwrap_or(false),
+            "whitespace-only agent_id must be rejected as missing"
+        );
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("agent_id"),
+            "error message must mention agent_id; got: {text}"
+        );
+    }
+
+    /// agent_id exceeding MAX_AGENT_ID_LEN must be rejected.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reliability_summary_agent_id_too_long_rejected() {
+        let tmp = TempDir::new();
+        let long_id = "a".repeat(129);
+        let result = handle_reliability_summary(
+            &serde_json::json!({"agent_id": long_id}),
+            tmp.path(),
+            "admin-client",
+            true,
+        )
+        .await;
+        assert!(
+            result["isError"].as_bool().unwrap_or(false),
+            "agent_id longer than 128 chars must be rejected"
+        );
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("128"),
+            "error message must mention the 128-char limit; got: {text}"
+        );
+    }
+
+    /// tool_requires_scope must map reliability_summary → Admin.
+    #[test]
+    fn reliability_summary_scope_is_admin() {
+        use crate::mcp_auth::{tool_requires_scope, Scope};
+        assert_eq!(
+            tool_requires_scope("reliability_summary"),
+            Some(Scope::Admin),
+            "reliability_summary must require Admin scope"
+        );
+    }
+
+    // ── TC-SKILL-RUN-01: skill_synthesis_run visible to internal principal ──────
+    // TDD 驗收：W20-P0 修復 — skill_synthesis_run 工具缺失
+    // 保證 internal agents（Cron pipeline、ENG-AGENT）可以看到此工具。
+    #[test]
+    fn skill_synthesis_run_visible_to_internal_principal() {
+        use serde_json::json;
+        let id = json!(1);
+
+        let response = super::handle_tools_list(&id, /* is_external= */ false);
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools must be array");
+
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or(""))
+            .collect();
+
+        assert!(
+            names.contains(&"skill_synthesis_run"),
+            "skill_synthesis_run must appear in internal tools list; got: {:?}",
+            names
+        );
+    }
+
+    // ── TC-SKILL-RUN-02: skill_synthesis_run NOT visible to external principal ──
+    // 安全性驗收：外部 client（Claude Desktop 等）不應能觸發 pipeline。
+    #[test]
+    fn skill_synthesis_run_hidden_from_external_principal() {
+        use serde_json::json;
+        let id = json!(1);
+
+        let response = super::handle_tools_list(&id, /* is_external= */ true);
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools must be array");
+
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or(""))
+            .collect();
+
+        assert!(
+            !names.contains(&"skill_synthesis_run"),
+            "skill_synthesis_run must NOT appear in external tools list (security); got: {:?}",
+            names
+        );
+    }
+
+    // ── TC-SKILL-RUN-03: skill_synthesis_run schema is well-formed ───────────
+    // 驗收：工具定義包含正確的 name、description 和 parameters。
+    #[test]
+    fn skill_synthesis_run_schema_is_well_formed() {
+        use serde_json::json;
+        let id = json!(1);
+
+        let response = super::handle_tools_list(&id, /* is_external= */ false);
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools must be array");
+
+        let tool = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some("skill_synthesis_run"))
+            .expect("skill_synthesis_run must be present in internal tools list");
+
+        // name
+        assert_eq!(tool["name"].as_str(), Some("skill_synthesis_run"));
+
+        // description must be non-empty
+        let desc = tool["description"].as_str().unwrap_or("");
+        assert!(
+            !desc.is_empty(),
+            "skill_synthesis_run must have a non-empty description"
+        );
+
+        // inputSchema must have properties: agent_id, dry_run, lookback_days
+        let props = &tool["inputSchema"]["properties"];
+        for param in &["agent_id", "dry_run", "lookback_days"] {
+            assert!(
+                props.get(param).is_some(),
+                "skill_synthesis_run inputSchema must have property '{}'; schema: {}",
+                param,
+                tool["inputSchema"]
+            );
+        }
     }
 }

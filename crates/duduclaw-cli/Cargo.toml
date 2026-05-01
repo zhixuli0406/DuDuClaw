@@ -46,6 +46,17 @@ hex = "0.4"
 rustls = { workspace = true }
 rusqlite = { workspace = true }
 argon2 = { version = "0.5", features = ["std"] }
+regex = "1"
+subtle = "2"
+# W20-P1: HTTP/SSE transport
+axum = { workspace = true }
+futures-util = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
 
 [features]
 default = []
