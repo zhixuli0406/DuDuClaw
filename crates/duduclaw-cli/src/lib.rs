@@ -13,10 +13,10 @@ mod acp;
 mod mcp;
 pub mod mcp_auth;
 pub mod mcp_auth_strategy;
-pub(crate) mod mcp_dispatch;   // W20-P1 Phase 2A: transport-agnostic dispatcher
+pub mod mcp_dispatch;          // W20-P1 Phase 2A: transport-agnostic dispatcher
 pub(crate) mod mcp_http_auth;  // W20-P1 Phase 2B: HTTP Bearer auth extractor
 pub(crate) mod mcp_http_errors; // W20-P1 Phase 2B: JSON-RPC ↔ HTTP status mapping
-pub(crate) mod mcp_http_server; // W20-P1 Phase 2B: Axum HTTP/SSE server
+pub mod mcp_http_server;       // W20-P1 Phase 2B: Axum HTTP/SSE server
 pub mod mcp_memory_handlers;
 pub mod mcp_memory_quota;
 pub mod mcp_namespace;
@@ -316,6 +316,33 @@ enum Commands {
     /// ACP (Agent Client Protocol) server for IDE integration
     AcpServer,
 
+    /// Start DuDuClaw MCP server over HTTP/SSE transport (W20-P1 Phase 2)
+    ///
+    /// Exposes all MCP tools via:
+    ///   POST /mcp/v1/call         — single JSON-RPC 2.0 tool call
+    ///   GET  /mcp/v1/stream       — SSE event stream
+    ///   POST /mcp/v1/stream/call  — async tool call with SSE result push
+    ///   GET  /healthz             — health check
+    ///
+    /// Authentication: Bearer token via `Authorization: Bearer <api_key>` header.
+    /// API keys are stored in ~/.duduclaw/mcp_keys.toml.
+    ///
+    /// Example:
+    ///     duduclaw http-server --bind 127.0.0.1:8765
+    HttpServer {
+        /// Address to bind (host:port)
+        #[arg(long, default_value = "127.0.0.1:8765")]
+        bind: String,
+
+        /// Disable SSE endpoints (only POST /mcp/v1/call and GET /healthz)
+        #[arg(long)]
+        no_sse: bool,
+
+        /// Tool call timeout in seconds
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
+    },
+
     /// Internal hook entry points (called by Claude Code PreToolUse hooks).
     ///
     /// Reads hook JSON from stdin and exits 0 (allow) or 2 (block).
@@ -581,6 +608,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         }
         Commands::AcpServer => {
             acp::server::run_acp_server(&duduclaw_home()).await
+        }
+        Commands::HttpServer { bind, no_sse, timeout_secs } => {
+            cmd_http_server(&bind, no_sse, timeout_secs).await
         }
         Commands::Hook(HookCommands::AgentFileGuard) => cmd_hook_agent_file_guard().await,
         Commands::Version => {
@@ -2597,6 +2627,67 @@ async fn cmd_migrate() -> duduclaw_core::error::Result<()> {
     println!("Migrating agents to Claude Code format...");
     println!("Home: {}\n", home.display());
     migrate::migrate(&home).await
+}
+
+/// `duduclaw http-server` — Start MCP HTTP/SSE transport server (W20-P1 Phase 2).
+///
+/// Bootstraps the same McpDispatcher used by the stdio MCP server and hands it
+/// to `mcp_http_server::run()` which binds an Axum listener.
+async fn cmd_http_server(
+    bind: &str,
+    no_sse: bool,
+    timeout_secs: u64,
+) -> duduclaw_core::error::Result<()> {
+    use std::sync::Arc;
+    use duduclaw_core::error::DuDuClawError;
+    use duduclaw_memory::SqliteMemoryEngine;
+
+    let home = duduclaw_home();
+
+    let bind_addr: std::net::SocketAddr = bind.parse().map_err(|e| {
+        DuDuClawError::Gateway(format!("Invalid bind address '{bind}': {e}"))
+    })?;
+
+    // Initialize HTTP client
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| DuDuClawError::Gateway(format!("Failed to create HTTP client: {e}")))?;
+
+    // Initialize memory engine
+    let memory_db_path = home.join("memory.db");
+    let memory = SqliteMemoryEngine::new(&memory_db_path)
+        .map_err(|e| DuDuClawError::Memory(format!("Failed to open memory DB: {e}")))?;
+
+    let default_agent = mcp::get_default_agent(&home).await;
+
+    let dispatcher = crate::mcp_dispatch::McpDispatcher::new(
+        home.clone(),
+        http,
+        Arc::new(memory),
+        default_agent,
+        Arc::new(tokio::sync::RwLock::new(None)),
+        crate::mcp_rate_limit::RateLimiter::new(),
+        crate::mcp_memory_quota::DailyQuota::new(),
+    );
+
+    let cfg = crate::mcp_http_server::HttpServerConfig {
+        bind: bind_addr,
+        home_dir: home,
+        enable_sse: !no_sse,
+        call_timeout: std::time::Duration::from_secs(timeout_secs),
+    };
+
+    println!("DuDuClaw MCP HTTP server starting on http://{bind_addr}");
+    if !no_sse {
+        println!("  SSE stream: GET  http://{bind_addr}/mcp/v1/stream");
+        println!("  Tool call:  POST http://{bind_addr}/mcp/v1/call");
+        println!("  Health:     GET  http://{bind_addr}/healthz");
+    }
+
+    crate::mcp_http_server::run(cfg, dispatcher)
+        .await
+        .map_err(|e| DuDuClawError::Gateway(e))
 }
 
 /// `duduclaw mcp-server` - Start the MCP server for Claude Code integration.

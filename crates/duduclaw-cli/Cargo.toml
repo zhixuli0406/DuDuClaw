@@ -57,6 +57,11 @@ async-trait = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }
+# W20-P1: HTTP integration test support
+tower = { version = "0.5", features = ["util"] }
+http = "1"
+http-body-util = "0.1"
+axum = { workspace = true }
 
 [features]
 default = []

@@ -5862,7 +5862,7 @@ fn decrypt_channel_token(config: &toml::Table, enc_key: &str, plain_key: &str, h
 /// is treated as missing and falls through to the config lookup — this
 /// prevents accidental lockout if a stale migration produced an empty
 /// string.
-async fn get_default_agent(home_dir: &Path) -> String {
+pub async fn get_default_agent(home_dir: &Path) -> String {
     if let Ok(env_id) = std::env::var(duduclaw_core::ENV_AGENT_ID)
         && !env_id.trim().is_empty()
     {
