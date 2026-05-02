@@ -125,6 +125,35 @@ impl SqliteMemoryEngine {
         Ok(entries)
     }
 
+    /// Fetch a single memory entry by its UUID and owning agent.
+    ///
+    /// Returns `Ok(Some(entry))` when found, `Ok(None)` when the ID does not
+    /// exist **or** belongs to a different agent (ownership enforcement).
+    /// This is more efficient than `list_recent` + linear scan for point lookups.
+    pub async fn get_by_id(
+        &self,
+        agent_id: &str,
+        memory_id: &str,
+    ) -> Result<Option<MemoryEntry>> {
+        let conn = self.conn.lock().await;
+        let sql = format!(
+            "SELECT {} FROM memories AS m WHERE m.id = ?1 AND m.agent_id = ?2 LIMIT 1",
+            Self::SELECT_COLS
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        let mut rows = stmt
+            .query_map(params![memory_id, agent_id], Self::row_to_entry)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        match rows.next() {
+            Some(row) => Ok(Some(row.map_err(|e| DuDuClawError::Memory(e.to_string()))?)),
+            None => Ok(None),
+        }
+    }
+
     /// Search memories filtered by cognitive layer.
     ///
     /// Same as `search()` but restricted to a specific layer (episodic/semantic).
@@ -914,5 +943,48 @@ mod tests {
         };
         let summary = engine.summarize("nobody", window).await.unwrap();
         assert!(summary.contains("No memories found"));
+    }
+
+    // ── get_by_id tests ────────────────────────────────────────────────────────
+
+    /// Storing an entry and retrieving it by ID returns the correct content.
+    #[tokio::test]
+    async fn get_by_id_returns_stored_entry() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agent-a";
+        let entry = make_entry(agent, "unique memory content", vec!["tag1".to_string()]);
+        let stored_id = entry.id.clone();
+
+        engine.store(agent, entry).await.unwrap();
+
+        let result = engine.get_by_id(agent, &stored_id).await.unwrap();
+        let found = result.expect("entry should be found by ID");
+        assert_eq!(found.id, stored_id);
+        assert_eq!(found.content, "unique memory content");
+        assert_eq!(found.agent_id, agent);
+    }
+
+    /// Unknown ID returns None (not an error).
+    #[tokio::test]
+    async fn get_by_id_unknown_id_returns_none() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let result = engine.get_by_id("agent-a", "nonexistent-uuid").await.unwrap();
+        assert!(result.is_none(), "unknown ID should return None");
+    }
+
+    /// Cross-agent lookup: agent-b cannot read agent-a's entry by ID.
+    #[tokio::test]
+    async fn get_by_id_cross_agent_returns_none() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let entry = make_entry("agent-a", "secret of agent-a", vec![]);
+        let stored_id = entry.id.clone();
+        engine.store("agent-a", entry).await.unwrap();
+
+        // agent-b queries the same ID — must not see agent-a's data.
+        let result = engine.get_by_id("agent-b", &stored_id).await.unwrap();
+        assert!(
+            result.is_none(),
+            "cross-agent get_by_id must return None (ownership enforcement)"
+        );
     }
 }
