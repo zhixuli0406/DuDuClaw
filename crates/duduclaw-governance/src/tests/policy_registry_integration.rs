@@ -14,7 +14,6 @@ mod policy_registry_integration_tests {
     use crate::{
         policy::{ActionOnViolation, PolicyType, RatePolicy, Resource},
         registry::PolicyRegistry,
-        PermissionPolicy,
     };
     use std::sync::Arc;
     use tempfile::TempDir;

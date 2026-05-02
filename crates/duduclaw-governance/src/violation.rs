@@ -109,6 +109,7 @@ impl ViolationDetector {
                 ViolationType::PermissionDenied => "blocked",
                 ViolationType::QuotaExceeded => "blocked",
                 ViolationType::ApprovalRequired => "pending",
+                ViolationType::LifecycleViolation => "blocked",
             }
         };
 

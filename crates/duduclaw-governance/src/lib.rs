@@ -31,8 +31,10 @@
 
 pub mod approval;
 pub mod audit;
+pub mod error_codes;
 pub mod evaluator;
 pub mod policy;
+pub mod quota_manager;
 pub mod registry;
 pub mod violation;
 
@@ -40,13 +42,15 @@ pub mod violation;
 pub mod tests;
 
 // Re-export commonly used types
-pub use approval::{ApprovalDecision, ApprovalRequest, ApprovalResponse, ApprovalWorkflow};
-pub use audit::AuditEventSink;
+pub use approval::{ApprovalDecision, ApprovalDecisionType, ApprovalRequest, ApprovalResponse, ApprovalWorkflow};
+pub use audit::{AuditEventSink, GovernanceQuotaResetEvent};
+pub use error_codes::{PolicyApiError, PolicyErrorCode};
 pub use evaluator::{EvaluationResult, PolicyEvaluator, ViolationType};
 pub use policy::{
     ActionOnViolation, LifecyclePolicy, PermissionPolicy, Policy, PolicyId, PolicyType,
     QuotaPolicy, RatePolicy, Resource,
 };
+pub use quota_manager::{QuotaError, QuotaManager, QuotaUsageSnapshot};
 pub use registry::PolicyRegistry;
 pub use violation::ViolationDetector;
 

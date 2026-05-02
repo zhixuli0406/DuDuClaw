@@ -119,6 +119,15 @@ impl PolicyRegistry {
                     if stem == "global" {
                         continue;
                     }
+                    // 安全性驗證：agent_id 只允許 [a-zA-Z0-9\-_] 字元集
+                    // 防止惡意命名的 YAML 透過 stem 引入邏輯錯誤或注入攻擊
+                    if !Self::is_valid_agent_id(&stem) {
+                        warn!(
+                            "Skipping policy file {:?}: agent_id '{stem}' contains invalid characters (only [a-zA-Z0-9\\-_] allowed)",
+                            path
+                        );
+                        continue;
+                    }
                     // stem = agent_id
                     match Self::load_file(&path) {
                         Ok(file_policies) => {
@@ -255,6 +264,69 @@ impl PolicyRegistry {
         Ok(())
     }
 
+    /// 帶有 scope 權限驗證的 upsert。
+    ///
+    /// 需要 `admin` 或 `governance:write` scope，否則回傳 `PolicyError::PermissionDenied`。
+    ///
+    /// 同時進行衝突偵測：若已存在同 policy_id 但**不同 policy_type**，回傳 `PolicyError::Conflict`。
+    pub async fn upsert_policy_with_scope(
+        &self,
+        policy: PolicyType,
+        caller_scopes: &[String],
+    ) -> Result<(), PolicyError> {
+        // 1. 權限檢查：需要 admin 或 governance:write
+        let has_permission = caller_scopes.iter().any(|s| {
+            s == "admin" || s == "governance:write"
+        });
+        if !has_permission {
+            return Err(PolicyError::PermissionDenied(format!(
+                "upsert_policy requires 'admin' or 'governance:write' scope; caller has: {:?}",
+                caller_scopes
+            )));
+        }
+
+        // 2. 政策 schema 驗證
+        policy.validate()?;
+
+        // 3. 衝突偵測：同 policy_id 但不同 policy_type → Conflict
+        let agent_id = policy.agent_id().to_string();
+        {
+            let lock = self.policies.read().await;
+            if let Some(existing_policies) = lock.get(&agent_id) {
+                if let Some(existing) = existing_policies
+                    .iter()
+                    .find(|p| p.policy_id() == policy.policy_id())
+                {
+                    // 只有在 type_name 不同時才是衝突（type 相同則為 upsert 更新）
+                    if existing.type_name() != policy.type_name() {
+                        return Err(PolicyError::Conflict(format!(
+                            "policy '{}' already exists with type '{}', cannot change to '{}'",
+                            policy.policy_id(),
+                            existing.type_name(),
+                            policy.type_name(),
+                        )));
+                    }
+                }
+            }
+        }
+
+        // 4. 執行 upsert
+        let mut lock = self.policies.write().await;
+        let entry = lock.entry(agent_id).or_default();
+        if let Some(pos) = entry.iter().position(|p| p.policy_id() == policy.policy_id()) {
+            entry[pos] = policy;
+        } else {
+            entry.push(policy);
+        }
+
+        info!("Policy '{}' upserted with scope authorization", {
+            // Note: policy moved above, read from entry
+            entry.last().map(|p| p.policy_id()).unwrap_or("?")
+        });
+
+        Ok(())
+    }
+
     /// 刪除政策（用於測試或動態管理）。
     pub async fn remove_policy(&self, agent_id: &str, policy_id: &str) -> bool {
         let mut lock = self.policies.write().await;
@@ -274,6 +346,15 @@ impl PolicyRegistry {
         })?;
         let file: PolicyFile = serde_yaml::from_str(&content)?;
         Ok(file.policies)
+    }
+
+    /// 驗證 agent_id 字元格式。
+    ///
+    /// 只允許 `[a-zA-Z0-9\-_]` 字元集，防止惡意命名的政策 YAML 透過
+    /// `file_stem` 引入含有路徑分隔符、空白或其他特殊字元的 agent_id，
+    /// 避免後續查詢邏輯錯誤或潛在注入問題。
+    fn is_valid_agent_id(id: &str) -> bool {
+        !id.is_empty() && id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
     }
 }
 
@@ -499,5 +580,61 @@ policies:
 
         let policies = registry.get_policies_for_agent("any-agent").await;
         assert!(policies.is_empty());
+    }
+
+    // ── M3 Security: agent_id 字元集驗證 ──────────────────────────────────────
+
+    #[test]
+    fn test_is_valid_agent_id_accepts_valid_chars() {
+        assert!(PolicyRegistry::is_valid_agent_id("my-agent"));
+        assert!(PolicyRegistry::is_valid_agent_id("agent_123"));
+        assert!(PolicyRegistry::is_valid_agent_id("AgentABC"));
+        assert!(PolicyRegistry::is_valid_agent_id("a"));
+        assert!(PolicyRegistry::is_valid_agent_id("abc-def_GHI-123"));
+    }
+
+    #[test]
+    fn test_is_valid_agent_id_rejects_invalid_chars() {
+        assert!(!PolicyRegistry::is_valid_agent_id(""));          // 空字串
+        assert!(!PolicyRegistry::is_valid_agent_id("../evil"));   // 路徑穿越
+        assert!(!PolicyRegistry::is_valid_agent_id("agent id"));  // 空白
+        assert!(!PolicyRegistry::is_valid_agent_id("agent.name")); // 點號
+        assert!(!PolicyRegistry::is_valid_agent_id("agent/sub")); // 斜線
+        assert!(!PolicyRegistry::is_valid_agent_id("agent\0null")); // null byte
+        assert!(!PolicyRegistry::is_valid_agent_id("$(cmd)")); // Shell 注入
+    }
+
+    #[tokio::test]
+    async fn test_malicious_yaml_filename_is_skipped() {
+        let dir = TempDir::new().unwrap();
+
+        // 建立含有非法字元的 YAML 檔名（路徑穿越嘗試）
+        // 在檔案系統上允許但 agent_id 驗證應拒絕
+        let malicious_stem = "evil..agent"; // 包含點號，應被拒絕
+        let malicious_path = dir.path().join(format!("{malicious_stem}.yaml"));
+        let valid_yaml = make_agent_yaml("evil..agent");
+        std::fs::write(&malicious_path, valid_yaml).unwrap();
+
+        // 建立合法的 agent YAML
+        let valid_path = dir.path().join("valid-agent.yaml");
+        std::fs::write(&valid_path, make_agent_yaml("valid-agent")).unwrap();
+
+        let registry = PolicyRegistry::new(dir.path());
+        registry.load().await.unwrap();
+
+        // 合法 agent 應載入
+        let valid_policies = registry.get_policies_for_agent("valid-agent").await;
+        assert!(!valid_policies.is_empty(), "valid-agent should have policies");
+
+        // 惡意命名的 YAML 應被跳過（policies 中不應有該 stem 的 entry）
+        // 注意：get_policies_for_agent 對不存在的 agent 回傳全域政策
+        // 所以用內部 policies 長度確認：只有 valid-agent（無 global.yaml）
+        // 透過 upsert 驗證：evil..agent 的 policies 不存在
+        let evil_policies = registry.get_policies_for_agent("evil..agent").await;
+        // 沒有 global.yaml，evil..agent 的專屬政策應為空
+        assert!(
+            evil_policies.is_empty(),
+            "maliciously named yaml should not be loaded as agent policies"
+        );
     }
 }

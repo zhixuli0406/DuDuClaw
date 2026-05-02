@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
-    policy::{ActionOnViolation, PermissionPolicy, PolicyType, QuotaPolicy, RatePolicy, Resource},
+    policy::{
+        ActionOnViolation, LifecyclePolicy, PermissionPolicy, PolicyType, QuotaPolicy, RatePolicy,
+        Resource,
+    },
     registry::PolicyRegistry,
     Operation, OperationType,
 };
@@ -31,6 +34,8 @@ pub enum ViolationType {
     PermissionDenied,
     QuotaExceeded,
     ApprovalRequired,
+    /// Agent 違反生命週期政策（idle 超時等）。
+    LifecycleViolation,
 }
 
 impl std::fmt::Display for ViolationType {
@@ -40,6 +45,7 @@ impl std::fmt::Display for ViolationType {
             Self::PermissionDenied => write!(f, "permission_denied"),
             Self::QuotaExceeded => write!(f, "quota_exceeded"),
             Self::ApprovalRequired => write!(f, "approval_required"),
+            Self::LifecycleViolation => write!(f, "lifecycle_violation"),
         }
     }
 }
@@ -120,7 +126,7 @@ impl EvaluationResult {
 
 /// 滑動視窗速率計數器，精確追蹤單位時間內的操作次數。
 #[derive(Debug, Default)]
-struct SlidingWindow {
+pub struct SlidingWindow {
     /// 操作時間戳記佇列（Instant）。
     timestamps: VecDeque<Instant>,
 }
@@ -129,7 +135,7 @@ impl SlidingWindow {
     /// 在視窗 `window` 內記錄一次操作，並檢查是否超過 `limit`。
     ///
     /// 回傳 `true` 表示允許（未超限），`false` 表示超限。
-    fn record_and_check(&mut self, window: Duration, limit: u32) -> bool {
+    pub fn record_and_check(&mut self, window: Duration, limit: u32) -> bool {
         let now = Instant::now();
         let cutoff = now - window;
 
@@ -153,7 +159,7 @@ impl SlidingWindow {
     }
 
     /// 查詢目前視窗內的操作次數（不記錄新操作）。
-    fn current_count(&mut self, window: Duration) -> u32 {
+    pub fn current_count(&mut self, window: Duration) -> u32 {
         let cutoff = Instant::now() - window;
         while let Some(&front) = self.timestamps.front() {
             if front < cutoff {
@@ -172,7 +178,13 @@ impl SlidingWindow {
 #[derive(Debug)]
 struct QuotaState {
     token_used: u64,
+    /// 原子性預留：每次 evaluate_quota 通過後遞增 1，
+    /// record_tokens_used 呼叫後遞減 1。防止 TOCTOU 競爭超過 daily_token_budget。
+    token_reserved: u64,
     concurrent_tasks: u32,
+    /// 原子性預留：每次 evaluate_quota 通過 concurrent_tasks 檢查後遞增 1，
+    /// increment_concurrent_tasks 確認後遞減 1。防止 TOCTOU 競爭超過 max_concurrent_tasks。
+    pending_tasks: u32,
     memory_entries: u64,
     reset_at: Instant,
 }
@@ -181,7 +193,9 @@ impl QuotaState {
     fn new() -> Self {
         Self {
             token_used: 0,
+            token_reserved: 0,
             concurrent_tasks: 0,
+            pending_tasks: 0,
             memory_entries: 0,
             reset_at: Instant::now() + Duration::from_secs(86400), // 24h default
         }
@@ -190,7 +204,9 @@ impl QuotaState {
     fn reset_if_needed(&mut self) {
         if Instant::now() >= self.reset_at {
             self.token_used = 0;
+            self.token_reserved = 0;
             self.concurrent_tasks = 0;
+            self.pending_tasks = 0;
             self.memory_entries = 0;
             self.reset_at = Instant::now() + Duration::from_secs(86400);
         }
@@ -212,6 +228,8 @@ pub struct PolicyEvaluator {
     rate_counters: RwLock<HashMap<RateCounterKey, SlidingWindow>>,
     /// Quota state: agent_id → QuotaState
     quota_states: RwLock<HashMap<QuotaKey, QuotaState>>,
+    /// Last activity time: agent_id → Instant（用於 LifecyclePolicy idle 計算）
+    last_activity_times: RwLock<HashMap<String, Instant>>,
     /// Policy cache TTL（預設 60s）。
     _cache_ttl: Duration,
 }
@@ -223,6 +241,7 @@ impl PolicyEvaluator {
             registry,
             rate_counters: RwLock::new(HashMap::new()),
             quota_states: RwLock::new(HashMap::new()),
+            last_activity_times: RwLock::new(HashMap::new()),
             _cache_ttl: Duration::from_secs(60),
         }
     }
@@ -233,6 +252,7 @@ impl PolicyEvaluator {
             registry,
             rate_counters: RwLock::new(HashMap::new()),
             quota_states: RwLock::new(HashMap::new()),
+            last_activity_times: RwLock::new(HashMap::new()),
             _cache_ttl: ttl,
         }
     }
@@ -267,7 +287,19 @@ impl PolicyEvaluator {
             }
         }
 
-        // 3. Rate check (last because it records the attempt)
+        // 3. Lifecycle check
+        for policy in &policies {
+            if let PolicyType::Lifecycle(lp) = policy {
+                if Self::applies_to(&lp.agent_id, agent_id) {
+                    let result = self.evaluate_lifecycle(agent_id, lp).await;
+                    if result.is_some() {
+                        return result.unwrap();
+                    }
+                }
+            }
+        }
+
+        // 4. Rate check (last because it records the attempt)
         let resource = Self::operation_to_resource(operation);
         for policy in &policies {
             if let PolicyType::Rate(r) = policy {
@@ -343,7 +375,16 @@ impl PolicyEvaluator {
         None // no conclusion from this policy
     }
 
-    /// 評估 QuotaPolicy（目前只檢查，不修改計數器 — 計數器在實際執行後更新）。
+    /// 評估 QuotaPolicy，並在通過檢查後原子性地預留配額資源。
+    ///
+    /// ## TOCTOU 防護
+    /// 所有讀取-檢查-寫入操作在同一寫鎖內完成：
+    /// - 通過 `max_concurrent_tasks` 檢查後立即遞增 `pending_tasks`
+    /// - 通過 `daily_token_budget` 檢查後立即遞增 `token_reserved`
+    ///
+    /// 呼叫者在實際執行後必須：
+    /// - 呼叫 `increment_concurrent_tasks()` 確認並轉為正式計數（同時釋放 `pending_tasks`）
+    /// - 呼叫 `record_tokens_used()` 記錄實際用量（同時釋放 `token_reserved`）
     async fn evaluate_quota(
         &self,
         agent_id: &str,
@@ -357,8 +398,9 @@ impl PolicyEvaluator {
 
         state.reset_if_needed();
 
-        // Check concurrent tasks
-        if state.concurrent_tasks >= policy.max_concurrent_tasks {
+        // Check concurrent tasks（含 pending 預留，防 TOCTOU）
+        if state.concurrent_tasks.saturating_add(state.pending_tasks) >= policy.max_concurrent_tasks
+        {
             return Some(EvaluationResult::deny(
                 &policy.policy_id,
                 ViolationType::QuotaExceeded,
@@ -369,8 +411,8 @@ impl PolicyEvaluator {
             ));
         }
 
-        // Check token budget
-        if state.token_used >= policy.daily_token_budget {
+        // Check token budget（含 reserved 預留，防 TOCTOU）
+        if state.token_used.saturating_add(state.token_reserved) >= policy.daily_token_budget {
             return Some(EvaluationResult::deny(
                 &policy.policy_id,
                 ViolationType::QuotaExceeded,
@@ -393,7 +435,47 @@ impl PolicyEvaluator {
             ));
         }
 
+        // 原子性預留：在同一寫鎖內標記資源已被預定，防止並發請求競爭同一配額
+        state.pending_tasks = state.pending_tasks.saturating_add(1);
+        state.token_reserved = state.token_reserved.saturating_add(1);
+
         None
+    }
+
+    /// 評估 LifecyclePolicy（idle 時間計算）。
+    ///
+    /// 若 Agent 最後活躍時間超過 `max_idle_hours`，回傳 `LifecycleViolation`。
+    /// 若 Agent 無活動記錄（新 Agent），視為合法（預設允許）。
+    async fn evaluate_lifecycle(
+        &self,
+        agent_id: &str,
+        policy: &LifecyclePolicy,
+    ) -> Option<EvaluationResult> {
+        let times = self.last_activity_times.read().await;
+        let last_active = match times.get(agent_id) {
+            Some(t) => *t,
+            None => return None, // 新 Agent，無活動記錄 → 允許
+        };
+        drop(times);
+
+        let idle_duration = Instant::now().saturating_duration_since(last_active);
+        let max_idle = Duration::from_secs(policy.max_idle_hours as u64 * 3600);
+
+        if idle_duration > max_idle {
+            Some(EvaluationResult::deny(
+                &policy.policy_id,
+                ViolationType::LifecycleViolation,
+                format!(
+                    "agent '{}' has been idle for {}s, exceeds max_idle_hours={} (policy '{}')",
+                    agent_id,
+                    idle_duration.as_secs(),
+                    policy.max_idle_hours,
+                    policy.policy_id,
+                ),
+            ))
+        } else {
+            None
+        }
     }
 
     /// 評估 RatePolicy（使用滑動視窗計數器）。
@@ -443,6 +525,9 @@ impl PolicyEvaluator {
     }
 
     /// 更新配額使用量（成功執行操作後呼叫）。
+    ///
+    /// 同時釋放 `evaluate_quota()` 預留的 `token_reserved` slot，
+    /// 確保後續請求可以使用真實的剩餘配額。
     pub async fn record_tokens_used(&self, agent_id: &str, tokens: u64) {
         let mut quota_map = self.quota_states.write().await;
         let state = quota_map
@@ -450,9 +535,14 @@ impl PolicyEvaluator {
             .or_insert_with(QuotaState::new);
         state.reset_if_needed();
         state.token_used = state.token_used.saturating_add(tokens);
+        // 釋放 evaluate_quota 預留的 1 個 token slot
+        state.token_reserved = state.token_reserved.saturating_sub(1);
     }
 
-    /// 增加並發任務計數。
+    /// 確認並發任務計數（evaluate_quota 通過後由呼叫者確認）。
+    ///
+    /// 同時釋放 `evaluate_quota()` 預留的 `pending_tasks` slot，
+    /// 將預留轉換為正式的 `concurrent_tasks` 計數。
     pub async fn increment_concurrent_tasks(&self, agent_id: &str) {
         let mut quota_map = self.quota_states.write().await;
         let state = quota_map
@@ -460,6 +550,8 @@ impl PolicyEvaluator {
             .or_insert_with(QuotaState::new);
         state.reset_if_needed();
         state.concurrent_tasks = state.concurrent_tasks.saturating_add(1);
+        // 釋放 evaluate_quota 預留的 1 個 pending slot
+        state.pending_tasks = state.pending_tasks.saturating_sub(1);
     }
 
     /// 減少並發任務計數。
@@ -469,6 +561,23 @@ impl PolicyEvaluator {
             .entry(agent_id.to_string())
             .or_insert_with(QuotaState::new);
         state.concurrent_tasks = state.concurrent_tasks.saturating_sub(1);
+    }
+
+    /// 記錄 Agent 的活動時間（更新 last_activity_time）。
+    ///
+    /// 每次 Agent 執行操作後應呼叫此方法，確保 LifecyclePolicy 正確評估 idle 時間。
+    pub async fn record_activity(&self, agent_id: &str) {
+        let mut times = self.last_activity_times.write().await;
+        times.insert(agent_id.to_string(), Instant::now());
+    }
+
+    /// 強制設定 Agent 的最後活動時間（僅供測試使用）。
+    ///
+    /// 允許測試模擬 idle 超時情境，不應在生產程式碼中呼叫。
+    #[cfg(test)]
+    pub async fn set_last_activity_for_test(&self, agent_id: &str, t: Instant) {
+        let mut times = self.last_activity_times.write().await;
+        times.insert(agent_id.to_string(), t);
     }
 
     /// 取得目前 Rate 計數（用於測試/監控）。
