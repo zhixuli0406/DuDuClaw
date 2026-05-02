@@ -24,3 +24,17 @@ tools/license-keygen/
 
 # Commercial closed-source modules (not pushed to public repo)
 commercial/
+
+# Python test coverage databases
+.coverage
+**/.coverage
+
+# Release artifacts (built by CI, not committed to source)
+artifacts/
+
+# Platform-specific pre-built binaries (published via npm, not git)
+npm/darwin-x64/bin/
+npm/darwin-arm64/bin/
+npm/linux-x64/bin/
+npm/linux-arm64/bin/
+npm/win32-x64/bin/
