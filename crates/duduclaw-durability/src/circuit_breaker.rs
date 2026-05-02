@@ -309,6 +309,7 @@ impl CircuitBreakerRegistry {
                         let prev = state.state;
                         state.state = BreakerState::HalfOpen;
                         state.consecutive_successes = 0;
+                        state.probe_inflight = state.probe_inflight.saturating_add(1);
                         drop(states);
                         info!(dependency, "circuit breaker: OPEN → HALF_OPEN");
                         self.fire_transition(StateTransition {

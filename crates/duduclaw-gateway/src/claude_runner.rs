@@ -1031,11 +1031,10 @@ async fn call_claude_streaming(
             _ = &mut hard_deadline => {
                 warn!("claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s) — killing process");
                 let _ = child.kill().await;
-                if result_text.is_empty() {
-                    return Err(format!("claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s, no output)"));
-                }
-                warn!("claude CLI hard timeout — returning partial result ({} chars)", result_text.len());
-                break;
+                return Err(format!(
+                    "claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s, partial output: {} chars)",
+                    result_text.len()
+                ));
             }
         }
     }

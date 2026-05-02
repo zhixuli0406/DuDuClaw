@@ -23,7 +23,7 @@ import logging
 from typing import Any, Callable, Coroutine, Optional
 
 from ...auth.types import APIKeyContext
-from ...errors import NotFoundError
+from ...errors import ForbiddenError, NotFoundError
 from ...logging_utils import APIKeyMaskingFilter
 from .namespace import NamespaceInjectionMiddleware
 from .validation import validate_memory_read_params
@@ -95,6 +95,10 @@ class MemoryReadTool:
             :exc:`~...errors.NotFoundError`:   If memory is not found OR belongs
                                                to a different namespace (404 in all cases).
         """
+        # Scope enforcement
+        if not ctx.has_scope("memory:read"):
+            raise ForbiddenError("scope 'memory:read' is required")
+
         # Step 1: Validate memory_id format
         params = validate_memory_read_params(raw_params)
         memory_id = params["memory_id"]

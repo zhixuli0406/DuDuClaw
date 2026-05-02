@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from abc import ABC, abstractmethod
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -189,6 +190,10 @@ def build_client(config: EvalConfig) -> MemoryClient:
             "DUDUCLAW_API_KEY is not set. "
             "Set it to a valid DuDuClaw API key."
         )
+
+    parsed = urlparse(api_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"DUDUCLAW_API_URL invalid format: {api_url!r}")
 
     return HttpMemoryClient(
         base_url=api_url,
