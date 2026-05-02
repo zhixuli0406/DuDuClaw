@@ -133,8 +133,12 @@ pub struct ApprovalDecisionResponse {
 #[derive(Debug, Clone)]
 struct PendingApproval {
     pub agent_id: String,
+    /// 原始申請（保留供稽核歷史記錄使用）。
+    #[allow(dead_code)]
     pub request: ApprovalRequest,
     pub status: ApprovalStatus,
+    /// 申請建立時間（保留供稽核歷史記錄使用）。
+    #[allow(dead_code)]
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub decided_at: Option<DateTime<Utc>>,
@@ -253,6 +257,16 @@ impl ApprovalWorkflow {
             return Err(ApprovalError::AlreadyDecided(format!(
                 "{} (status: {})",
                 request_id, entry.status
+            )));
+        }
+
+        // Check approver authorization: if approvers list is non-empty, the approver must be in it
+        if !self.default_approvers.is_empty()
+            && !self.default_approvers.contains(&decision.approver_id)
+        {
+            return Err(ApprovalError::Unauthorized(format!(
+                "'{}' is not in the authorized approvers list",
+                decision.approver_id
             )));
         }
 

@@ -27,6 +27,9 @@ pub enum PolicyError {
     #[error("Policy conflict: {0}")]
     Conflict(String),
 
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+
     #[error("YAML parse error: {0}")]
     YamlParse(#[from] serde_yaml::Error),
 }

@@ -145,6 +145,36 @@ impl GovernancePolicyChangedEvent {
     }
 }
 
+/// governance_quota_reset 事件的詳細資料。
+///
+/// 每日 cron 重置或手動重置配額時發射。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceQuotaResetEvent {
+    pub event_id: String,
+    pub timestamp: String,
+    /// 被重置的 Agent ID，`"*"` 表示全部 Agent。
+    pub agent_id: String,
+    /// 重置類型："daily" | "manual"
+    pub reset_type: String,
+    /// "success"
+    pub outcome: String,
+}
+
+impl GovernanceQuotaResetEvent {
+    pub fn new(
+        agent_id: impl Into<String>,
+        reset_type: impl Into<String>,
+    ) -> Self {
+        Self {
+            event_id: Uuid::new_v4().to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+            agent_id: agent_id.into(),
+            reset_type: reset_type.into(),
+            outcome: "success".into(),
+        }
+    }
+}
+
 // ── AuditEventSink trait ──────────────────────────────────────────────────────
 
 /// Governance 稽核事件發射介面。
@@ -164,6 +194,9 @@ pub trait AuditEventSink: Send + Sync {
 
     /// 發射 governance_policy_changed 事件。
     async fn emit_policy_changed(&self, event: GovernancePolicyChangedEvent);
+
+    /// 發射 governance_quota_reset 事件。
+    async fn emit_quota_reset(&self, event: GovernanceQuotaResetEvent);
 }
 
 // ── Noop implementation ───────────────────────────────────────────────────────
@@ -178,6 +211,7 @@ impl AuditEventSink for NoopAuditSink {
     async fn emit_approval_requested(&self, _event: GovernanceApprovalRequestedEvent) {}
     async fn emit_approval_decided(&self, _event: GovernanceApprovalDecidedEvent) {}
     async fn emit_policy_changed(&self, _event: GovernancePolicyChangedEvent) {}
+    async fn emit_quota_reset(&self, _event: GovernanceQuotaResetEvent) {}
 }
 
 /// Noop sink 的 Arc 包裝，方便測試使用。
@@ -194,6 +228,7 @@ pub struct RecordingAuditSink {
     pub approval_requests: tokio::sync::Mutex<Vec<GovernanceApprovalRequestedEvent>>,
     pub approval_decisions: tokio::sync::Mutex<Vec<GovernanceApprovalDecidedEvent>>,
     pub policy_changes: tokio::sync::Mutex<Vec<GovernancePolicyChangedEvent>>,
+    pub quota_resets: tokio::sync::Mutex<Vec<GovernanceQuotaResetEvent>>,
 }
 
 #[async_trait::async_trait]
@@ -212,5 +247,9 @@ impl AuditEventSink for RecordingAuditSink {
 
     async fn emit_policy_changed(&self, event: GovernancePolicyChangedEvent) {
         self.policy_changes.lock().await.push(event);
+    }
+
+    async fn emit_quota_reset(&self, event: GovernanceQuotaResetEvent) {
+        self.quota_resets.lock().await.push(event);
     }
 }
