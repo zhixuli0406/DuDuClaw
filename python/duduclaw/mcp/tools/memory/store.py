@@ -27,6 +27,7 @@ import logging
 from typing import Any, Callable, Coroutine
 
 from ...auth.types import APIKeyContext
+from ...errors import ForbiddenError
 from ...logging_utils import APIKeyMaskingFilter
 from .namespace import NamespaceInjectionMiddleware
 from .quota import QuotaEnforcer
@@ -103,6 +104,10 @@ class MemoryStoreTool:
             :exc:`~...errors.ValidationError`:    If any parameter is invalid.
             :exc:`~...errors.QuotaExceededError`: If daily write quota is exceeded.
         """
+        # Scope enforcement
+        if not ctx.has_scope("memory:write"):
+            raise ForbiddenError("scope 'memory:write' is required")
+
         # Step 1: Validate and sanitise parameters
         params = validate_memory_store_params(raw_params)
 

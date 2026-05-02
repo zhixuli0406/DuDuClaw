@@ -145,10 +145,20 @@ pub async fn emit_llm_fallback_audit(
     let primary = primary_model.to_string();
     let fallback = fallback_model.to_string();
     // Truncate to prevent unbounded log growth from adversarial API responses.
-    let error = if trigger_error.len() > MAX_TRIGGER_ERROR_LOG_BYTES {
-        format!("{}…[truncated]", &trigger_error[..MAX_TRIGGER_ERROR_LOG_BYTES])
-    } else {
-        trigger_error.to_string()
+    let error = {
+        let bytes = MAX_TRIGGER_ERROR_LOG_BYTES;
+        if trigger_error.len() > bytes {
+            // Find safe UTF-8 char boundary
+            let safe_end = trigger_error
+                .char_indices()
+                .map(|(i, _)| i)
+                .take_while(|&i| i <= bytes)
+                .last()
+                .unwrap_or(0);
+            format!("{}…[truncated]", &trigger_error[..safe_end])
+        } else {
+            trigger_error.to_string()
+        }
     };
 
     if let Err(e) = tokio::task::spawn_blocking(move || {

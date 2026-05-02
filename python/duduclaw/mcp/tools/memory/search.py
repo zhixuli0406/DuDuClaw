@@ -23,6 +23,7 @@ import time
 from typing import Any, Callable, Coroutine
 
 from ...auth.types import APIKeyContext
+from ...errors import ForbiddenError
 from ...logging_utils import APIKeyMaskingFilter
 from .namespace import NamespaceInjectionMiddleware
 from .validation import validate_memory_search_params
@@ -93,6 +94,10 @@ class MemorySearchTool:
         Raises:
             :exc:`~...errors.ValidationError`: If any parameter is invalid.
         """
+        # Scope enforcement
+        if not ctx.has_scope("memory:read"):
+            raise ForbiddenError("scope 'memory:read' is required")
+
         # Step 1: Validate and sanitise parameters
         params = validate_memory_search_params(raw_params)
 

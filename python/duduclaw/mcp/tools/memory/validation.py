@@ -173,7 +173,7 @@ def validate_memory_store_params(params: dict[str, Any]) -> dict[str, Any]:
                 f"tags[{i}] must not exceed {MAX_TAG_LENGTH} characters "
                 f"(got {len(tag)})"
             )
-        validated_tags.append(tag)
+        validated_tags.append(_sanitize(tag))
 
     # ── ttl_days ───────────────────────────────────────────────────────────────
     ttl_days: Optional[int] = params.get("ttl_days")
