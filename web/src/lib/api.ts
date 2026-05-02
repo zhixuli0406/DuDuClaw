@@ -243,6 +243,27 @@ export interface SkillIndexEntry {
   compatible: string[];
 }
 
+// ── Agent Reliability Dashboard (W20-P0) ─────────────────────────────────────
+
+export interface ReliabilitySummary {
+  /** Agent identifier. */
+  agent_id: string;
+  /** Measurement window in days (default 7). */
+  window_days: number;
+  /** Mean per-event-type success rate (0.0–1.0). */
+  consistency_score: number;
+  /** Overall success rate (0.0–1.0). */
+  task_success_rate: number;
+  /** Fraction of skill_activate events (0.0–1.0). */
+  skill_adoption_rate: number;
+  /** Fraction of llm_fallback_triggered events (0.0–1.0). */
+  fallback_trigger_rate: number;
+  /** Total events counted in the window. */
+  total_events: number;
+  /** RFC3339 timestamp when the summary was generated. */
+  generated_at: string;
+}
+
 // ── Task Board types ────────────────────────────────────────
 
 export type TaskStatus = 'todo' | 'in_progress' | 'done' | 'blocked';
@@ -923,6 +944,11 @@ export const api = {
       severity_filter?: 'info' | 'warning' | 'critical';
       agent_id_filter?: string;
     }) => client.call('audit.unified_log', params ?? {}) as Promise<UnifiedAuditResponse>,
+    reliabilitySummary: (agentId: string, windowDays = 7) =>
+      client.call('audit.reliability_summary', {
+        agent_id: agentId,
+        window_days: windowDays,
+      }) as Promise<ReliabilitySummary>,
   },
   skillMarket: {
     search: (query: string) =>
