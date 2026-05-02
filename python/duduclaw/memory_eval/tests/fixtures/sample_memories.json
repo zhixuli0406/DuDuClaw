@@ -1,0 +1,62 @@
+[
+  {
+    "memory_id": "mem-001",
+    "content": "用戶最愛的食物是拉麵，尤其是豚骨湯底",
+    "summary": "用戶最愛豚骨拉麵",
+    "importance_score": 0.9,
+    "layer": "semantic",
+    "entity_type": "preference",
+    "entity_id": "user-001",
+    "attribute": "favorite_food",
+    "valid_until": null,
+    "created_at": "2026-04-01T10:00:00Z"
+  },
+  {
+    "memory_id": "mem-002",
+    "content": "用戶在台北工作，每週二會去健身房",
+    "summary": "用戶在台北工作，週二健身",
+    "importance_score": 0.85,
+    "layer": "episodic",
+    "entity_type": "routine",
+    "entity_id": "user-001",
+    "attribute": "weekly_schedule",
+    "valid_until": null,
+    "created_at": "2026-04-05T14:30:00Z"
+  },
+  {
+    "memory_id": "mem-003",
+    "content": "用戶的生日是 5 月 15 日，今年想要去日本旅行",
+    "summary": "用戶生日 5/15，計畫赴日旅遊",
+    "importance_score": 0.8,
+    "layer": "episodic",
+    "entity_type": "personal_info",
+    "entity_id": "user-001",
+    "attribute": "birthday",
+    "valid_until": null,
+    "created_at": "2026-04-10T09:00:00Z"
+  },
+  {
+    "memory_id": "mem-004",
+    "content": "用戶是軟體工程師，主要使用 Python 和 TypeScript",
+    "summary": "用戶為軟體工程師，擅長 Python/TypeScript",
+    "importance_score": 0.95,
+    "layer": "semantic",
+    "entity_type": "occupation",
+    "entity_id": "user-001",
+    "attribute": "profession",
+    "valid_until": null,
+    "created_at": "2026-03-20T08:00:00Z"
+  },
+  {
+    "memory_id": "mem-005",
+    "content": "用戶有一隻柴犬，名字叫小橘，2 歲",
+    "summary": "用戶養一隻 2 歲柴犬叫小橘",
+    "importance_score": 0.75,
+    "layer": "episodic",
+    "entity_type": "personal_info",
+    "entity_id": "user-001",
+    "attribute": "pet",
+    "valid_until": null,
+    "created_at": "2026-04-15T16:00:00Z"
+  }
+]

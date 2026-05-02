@@ -1,0 +1,200 @@
+{"id": "gqa-sh-001", "query": "用戶最喜歡的食物是什麼？", "relevant_memory_ids": ["mem-food-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-002", "query": "用戶喜歡吃什麼口味的料理？", "relevant_memory_ids": ["mem-food-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-003", "query": "用戶平時早餐吃什麼？", "relevant_memory_ids": ["mem-food-003"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-004", "query": "用戶最常點的外賣是什麼？", "relevant_memory_ids": ["mem-food-004"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-005", "query": "用戶有食物過敏嗎？", "relevant_memory_ids": ["mem-food-005"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-006", "query": "用戶喜歡喝什麼飲料？", "relevant_memory_ids": ["mem-food-006"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-007", "query": "用戶最喜歡的甜點是什麼？", "relevant_memory_ids": ["mem-food-007"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-008", "query": "用戶吃素嗎？", "relevant_memory_ids": ["mem-food-008"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-009", "query": "用戶最常去哪家餐廳吃飯？", "relevant_memory_ids": ["mem-food-009"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-010", "query": "用戶喜歡辣的食物嗎？", "relevant_memory_ids": ["mem-food-010"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-011", "query": "用戶喜歡什麼口味的咖啡？", "relevant_memory_ids": ["mem-food-011"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-012", "query": "用戶最討厭吃什麼？", "relevant_memory_ids": ["mem-food-012"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-013", "query": "用戶週末通常吃什麼？", "relevant_memory_ids": ["mem-food-013"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-014", "query": "用戶有沒有特定的飲食計畫？", "relevant_memory_ids": ["mem-food-014"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-015", "query": "用戶最近嘗試了什麼新食物？", "relevant_memory_ids": ["mem-food-015"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-016", "query": "用戶在哪裡工作？", "relevant_memory_ids": ["mem-work-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-017", "query": "用戶的職業是什麼？", "relevant_memory_ids": ["mem-work-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-018", "query": "用戶的工作職稱是什麼？", "relevant_memory_ids": ["mem-work-003"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-019", "query": "用戶在哪個城市上班？", "relevant_memory_ids": ["mem-work-004"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-020", "query": "用戶的工作時間是幾點到幾點？", "relevant_memory_ids": ["mem-work-005"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-021", "query": "用戶是遠端工作還是去辦公室？", "relevant_memory_ids": ["mem-work-006"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-022", "query": "用戶的同事叫什麼名字？", "relevant_memory_ids": ["mem-work-007"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-023", "query": "用戶的主管是誰？", "relevant_memory_ids": ["mem-work-008"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-024", "query": "用戶最近在負責什麼專案？", "relevant_memory_ids": ["mem-work-009"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-025", "query": "用戶的工作壓力大嗎？", "relevant_memory_ids": ["mem-work-010"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-026", "query": "用戶做這份工作幾年了？", "relevant_memory_ids": ["mem-work-011"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-027", "query": "用戶的工作需要出差嗎？", "relevant_memory_ids": ["mem-work-012"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-028", "query": "用戶有在考慮換工作嗎？", "relevant_memory_ids": ["mem-work-013"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-029", "query": "用戶的薪資水準大概是多少？", "relevant_memory_ids": ["mem-work-014"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-030", "query": "用戶最享受工作的哪個部分？", "relevant_memory_ids": ["mem-work-015"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-031", "query": "用戶平時喜歡做什麼休閒活動？", "relevant_memory_ids": ["mem-hobby-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-032", "query": "用戶喜歡看什麼類型的電影？", "relevant_memory_ids": ["mem-hobby-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-033", "query": "用戶最近在玩什麼遊戲？", "relevant_memory_ids": ["mem-hobby-003"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-034", "query": "用戶喜歡讀什麼書？", "relevant_memory_ids": ["mem-hobby-004"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-035", "query": "用戶有運動習慣嗎？", "relevant_memory_ids": ["mem-hobby-005"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-036", "query": "用戶週末通常怎麼度過？", "relevant_memory_ids": ["mem-hobby-006"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-037", "query": "用戶喜歡聽什麼音樂？", "relevant_memory_ids": ["mem-hobby-007"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-038", "query": "用戶有在學習任何新技能嗎？", "relevant_memory_ids": ["mem-hobby-008"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-039", "query": "用戶喜歡旅行嗎？", "relevant_memory_ids": ["mem-hobby-009"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-040", "query": "用戶最近看了什麼電視劇？", "relevant_memory_ids": ["mem-hobby-010"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-041", "query": "用戶有什麼創意愛好嗎？", "relevant_memory_ids": ["mem-hobby-011"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-042", "query": "用戶喜歡戶外活動還是室內活動？", "relevant_memory_ids": ["mem-hobby-012"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-043", "query": "用戶最喜歡的運動是什麼？", "relevant_memory_ids": ["mem-hobby-013"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-044", "query": "用戶有在學習語言嗎？", "relevant_memory_ids": ["mem-hobby-014"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-045", "query": "用戶最近參加了什麼活動？", "relevant_memory_ids": ["mem-hobby-015"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-046", "query": "用戶有養寵物嗎？", "relevant_memory_ids": ["mem-pet-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-047", "query": "用戶的寵物叫什麼名字？", "relevant_memory_ids": ["mem-pet-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-048", "query": "用戶有幾個兄弟姐妹？", "relevant_memory_ids": ["mem-fam-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-049", "query": "用戶的家人住在哪裡？", "relevant_memory_ids": ["mem-fam-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-050", "query": "用戶有小孩嗎？", "relevant_memory_ids": ["mem-fam-003"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-051", "query": "用戶的父母還在一起嗎？", "relevant_memory_ids": ["mem-fam-004"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-052", "query": "用戶的伴侶是誰？", "relevant_memory_ids": ["mem-fam-005"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-053", "query": "用戶最近跟家人做了什麼活動？", "relevant_memory_ids": ["mem-fam-006"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-054", "query": "用戶有特別照顧的家人嗎？", "relevant_memory_ids": ["mem-fam-007"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-055", "query": "用戶家裡有幾個人？", "relevant_memory_ids": ["mem-fam-008"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-056", "query": "用戶的寵物最喜歡什麼食物？", "relevant_memory_ids": ["mem-pet-003"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-057", "query": "用戶多久遛狗一次？", "relevant_memory_ids": ["mem-pet-004"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-058", "query": "用戶的貓有什麼特別習慣？", "relevant_memory_ids": ["mem-pet-005"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-059", "query": "用戶寵物最近有看獸醫嗎？", "relevant_memory_ids": ["mem-pet-006"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-060", "query": "用戶計畫養新寵物嗎？", "relevant_memory_ids": ["mem-pet-007"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-061", "query": "用戶的生日是什麼時候？", "relevant_memory_ids": ["mem-profile-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-062", "query": "用戶住在哪個城市？", "relevant_memory_ids": ["mem-profile-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-063", "query": "用戶的名字叫什麼？", "relevant_memory_ids": ["mem-profile-003"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-064", "query": "用戶是哪國人？", "relevant_memory_ids": ["mem-profile-004"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-065", "query": "用戶的年齡是多少？", "relevant_memory_ids": ["mem-profile-005"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-066", "query": "用戶說什麼語言？", "relevant_memory_ids": ["mem-profile-006"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-067", "query": "用戶的身高體重大概是多少？", "relevant_memory_ids": ["mem-profile-007"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-068", "query": "用戶受什麼教育程度？", "relevant_memory_ids": ["mem-profile-008"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-069", "query": "用戶畢業於哪間學校？", "relevant_memory_ids": ["mem-profile-009"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-070", "query": "用戶的電子郵件是什麼？", "relevant_memory_ids": ["mem-profile-010"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-071", "query": "用戶使用什麼手機品牌？", "relevant_memory_ids": ["mem-profile-011"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-072", "query": "用戶有駕照嗎？", "relevant_memory_ids": ["mem-profile-012"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-073", "query": "用戶的血型是什麼？", "relevant_memory_ids": ["mem-profile-013"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-074", "query": "用戶的星座是什麼？", "relevant_memory_ids": ["mem-profile-014"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-075", "query": "用戶住公寓還是獨棟房子？", "relevant_memory_ids": ["mem-profile-015"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-076", "query": "用戶最常使用什麼程式語言？", "relevant_memory_ids": ["mem-tech-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-077", "query": "用戶偏好哪個作業系統？", "relevant_memory_ids": ["mem-tech-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-078", "query": "用戶使用什麼程式碼編輯器？", "relevant_memory_ids": ["mem-tech-003"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-079", "query": "用戶熟悉哪些框架？", "relevant_memory_ids": ["mem-tech-004"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-080", "query": "用戶有個人專案嗎？", "relevant_memory_ids": ["mem-tech-005"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-081", "query": "用戶最近學了什麼新技術？", "relevant_memory_ids": ["mem-tech-006"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-082", "query": "用戶有開源貢獻嗎？", "relevant_memory_ids": ["mem-tech-007"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-083", "query": "用戶用什麼版本控制工具？", "relevant_memory_ids": ["mem-tech-008"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-084", "query": "用戶喜歡前端還是後端開發？", "relevant_memory_ids": ["mem-tech-009"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-085", "query": "用戶使用什麼資料庫？", "relevant_memory_ids": ["mem-tech-010"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-086", "query": "用戶最近遇到什麼技術挑戰？", "relevant_memory_ids": ["mem-tech-011"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-087", "query": "用戶平時如何學習新技術？", "relevant_memory_ids": ["mem-tech-012"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-088", "query": "用戶有 GitHub 帳號嗎？", "relevant_memory_ids": ["mem-tech-013"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-089", "query": "用戶使用哪些 CI/CD 工具？", "relevant_memory_ids": ["mem-tech-014"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-090", "query": "用戶對 AI 技術有什麼看法？", "relevant_memory_ids": ["mem-tech-015"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-091", "query": "用戶最喜歡的程式語言特性是什麼？", "relevant_memory_ids": ["mem-tech-016"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-092", "query": "用戶用過哪些雲端服務？", "relevant_memory_ids": ["mem-tech-017"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-093", "query": "用戶有考取什麼技術證照嗎？", "relevant_memory_ids": ["mem-tech-018"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-094", "query": "用戶最近在研究什麼技術主題？", "relevant_memory_ids": ["mem-tech-019"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-095", "query": "用戶的程式設計風格如何？", "relevant_memory_ids": ["mem-tech-020"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-mh-001", "query": "用戶作為工程師，平常使用什麼工具開發？", "relevant_memory_ids": ["mem-work-002", "mem-tech-003"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-002", "query": "用戶的工作需要用到哪些程式語言？", "relevant_memory_ids": ["mem-work-002", "mem-tech-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-003", "query": "身為後端工程師的用戶，最喜歡哪個資料庫？", "relevant_memory_ids": ["mem-work-003", "mem-tech-010"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-004", "query": "用戶在公司負責的專案用了什麼技術棧？", "relevant_memory_ids": ["mem-work-009", "mem-tech-004"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-005", "query": "用戶是遠端工作的開發者，他的工作環境是什麼？", "relevant_memory_ids": ["mem-work-006", "mem-tech-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-006", "query": "用戶最近在工作上學到了什麼新技術？", "relevant_memory_ids": ["mem-work-009", "mem-tech-006"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-007", "query": "用戶離職後打算做什麼個人技術專案？", "relevant_memory_ids": ["mem-work-013", "mem-tech-005"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-008", "query": "這個喜歡 Python 的工程師在哪裡上班？", "relevant_memory_ids": ["mem-tech-001", "mem-work-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-009", "query": "用戶的工作專案需要什麼雲端服務？", "relevant_memory_ids": ["mem-work-009", "mem-tech-017"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-010", "query": "用戶的 side project 跟正職工作有什麼關係？", "relevant_memory_ids": ["mem-tech-005", "mem-work-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-011", "query": "這位住在台北的用戶喜歡吃什麼？", "relevant_memory_ids": ["mem-profile-002", "mem-food-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-012", "query": "用戶的飲食計畫跟他的體重目標有什麼關係？", "relevant_memory_ids": ["mem-food-014", "mem-profile-007"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-013", "query": "用戶的生日和他最喜歡的生日蛋糕口味是什麼？", "relevant_memory_ids": ["mem-profile-001", "mem-food-007"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-014", "query": "用戶早餐吃什麼，他的身高體重大概如何？", "relevant_memory_ids": ["mem-food-003", "mem-profile-007"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-015", "query": "這個素食者用戶住在哪個城市？", "relevant_memory_ids": ["mem-food-008", "mem-profile-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-016", "query": "用戶最愛的食物和他的血型有什麼有趣的關聯？", "relevant_memory_ids": ["mem-food-001", "mem-profile-013"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-017", "query": "喝美式咖啡的用戶，他的工作開始時間是幾點？", "relevant_memory_ids": ["mem-food-011", "mem-work-005"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-018", "query": "用戶外賣習慣與他的工作時間的關係？", "relevant_memory_ids": ["mem-food-004", "mem-work-005"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-019", "query": "用戶吃辣的習慣和他的旅遊目的地有關係嗎？", "relevant_memory_ids": ["mem-food-010", "mem-hobby-009"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-020", "query": "這個在台北工作的用戶，週末外食習慣是什麼？", "relevant_memory_ids": ["mem-work-004", "mem-food-013"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-021", "query": "用戶每週固定做的運動是什麼？他養了什麼寵物？", "relevant_memory_ids": ["mem-hobby-005", "mem-pet-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-022", "query": "用戶遛狗和看書的時間安排是怎麼樣的？", "relevant_memory_ids": ["mem-pet-004", "mem-hobby-004"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-023", "query": "喜歡戶外活動的用戶和他的寵物一起做什麼？", "relevant_memory_ids": ["mem-hobby-012", "mem-pet-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-024", "query": "用戶最近學習的技能和他的業餘愛好有關嗎？", "relevant_memory_ids": ["mem-hobby-008", "mem-hobby-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-025", "query": "用戶喜歡的音樂類型和他看電影的偏好有什麼共同點？", "relevant_memory_ids": ["mem-hobby-007", "mem-hobby-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-026", "query": "用戶週末的休閒活動和他的寵物習慣？", "relevant_memory_ids": ["mem-hobby-006", "mem-pet-004"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-027", "query": "這位養貓的用戶，他最喜歡什麼遊戲類型？", "relevant_memory_ids": ["mem-pet-001", "mem-hobby-003"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-028", "query": "用戶學習語言的動機和他的旅遊計畫有關嗎？", "relevant_memory_ids": ["mem-hobby-014", "mem-hobby-009"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-029", "query": "用戶跑步習慣和他的飲食計畫的關係？", "relevant_memory_ids": ["mem-hobby-005", "mem-food-014"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-030", "query": "用戶最喜歡的創意愛好和他的職業有沒有連結？", "relevant_memory_ids": ["mem-hobby-011", "mem-work-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-031", "query": "用戶的家人住哪裡，他多久回家一次？", "relevant_memory_ids": ["mem-fam-002", "mem-fam-006"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-032", "query": "用戶的伴侶和他的飲食習慣有關嗎？", "relevant_memory_ids": ["mem-fam-005", "mem-food-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-033", "query": "養了小孩的用戶，他的週末活動是什麼？", "relevant_memory_ids": ["mem-fam-003", "mem-hobby-006"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-034", "query": "用戶家中寵物的名字和品種是什麼？", "relevant_memory_ids": ["mem-pet-002", "mem-pet-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-035", "query": "用戶需要照顧哪位家人，這對他的工作有影響嗎？", "relevant_memory_ids": ["mem-fam-007", "mem-work-006"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-036", "query": "用戶家庭人口數和他住的房子大小有關係嗎？", "relevant_memory_ids": ["mem-fam-008", "mem-profile-015"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-037", "query": "用戶的孩子多大了，他通常帶孩子做什麼活動？", "relevant_memory_ids": ["mem-fam-003", "mem-hobby-006"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-038", "query": "用戶的兄弟姐妹住在哪裡，他們關係好嗎？", "relevant_memory_ids": ["mem-fam-001", "mem-fam-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-039", "query": "用戶的寵物和孩子的關係怎麼樣？", "relevant_memory_ids": ["mem-pet-001", "mem-fam-003"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-mh-040", "query": "用戶父母的狀況和他的家庭活動安排有關嗎？", "relevant_memory_ids": ["mem-fam-004", "mem-fam-006"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "multi_hop"}
+{"id": "gqa-tp-001", "query": "用戶上週做了什麼？", "relevant_memory_ids": ["mem-temporal-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-002", "query": "用戶最近一個月的學習進展如何？", "relevant_memory_ids": ["mem-temporal-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-003", "query": "用戶昨天吃了什麼？", "relevant_memory_ids": ["mem-temporal-003"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-004", "query": "用戶上個月完成了什麼專案？", "relevant_memory_ids": ["mem-temporal-004"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-005", "query": "用戶三個月前換了什麼工作？", "relevant_memory_ids": ["mem-temporal-005"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-006", "query": "用戶最近一週的運動記錄如何？", "relevant_memory_ids": ["mem-temporal-006"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-007", "query": "用戶去年有什麼重要事件？", "relevant_memory_ids": ["mem-temporal-007"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-008", "query": "用戶今年最大的改變是什麼？", "relevant_memory_ids": ["mem-temporal-008"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-009", "query": "用戶上次旅行是什麼時候？", "relevant_memory_ids": ["mem-temporal-009"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-010", "query": "用戶最近新養的寵物是什麼時候來的？", "relevant_memory_ids": ["mem-temporal-010"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-011", "query": "用戶六個月前的工作跟現在有什麼不同？", "relevant_memory_ids": ["mem-temporal-011"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-012", "query": "用戶最近一次看醫生是什麼時候？", "relevant_memory_ids": ["mem-temporal-012"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-013", "query": "用戶何時開始學習目前的程式語言？", "relevant_memory_ids": ["mem-temporal-013"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-014", "query": "用戶最近兩週讀了哪些書？", "relevant_memory_ids": ["mem-temporal-014"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-015", "query": "用戶上次和家人見面是什麼時候？", "relevant_memory_ids": ["mem-temporal-015"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-016", "query": "用戶這個月的主要目標是什麼？", "relevant_memory_ids": ["mem-temporal-016"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-017", "query": "用戶最近一次換手機是什麼時候？", "relevant_memory_ids": ["mem-temporal-017"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-018", "query": "用戶三年前住在哪裡？", "relevant_memory_ids": ["mem-temporal-018"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-019", "query": "用戶最近一季有沒有升職？", "relevant_memory_ids": ["mem-temporal-019"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-020", "query": "用戶上週末做了什麼休閒活動？", "relevant_memory_ids": ["mem-temporal-020"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-021", "query": "用戶今年有完成什麼個人目標嗎？", "relevant_memory_ids": ["mem-temporal-021"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-022", "query": "用戶最近一個月花了多少時間在學習上？", "relevant_memory_ids": ["mem-temporal-022"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-023", "query": "用戶去年的年度回顧說了什麼？", "relevant_memory_ids": ["mem-temporal-023"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-024", "query": "用戶在過去半年內換了幾個工作？", "relevant_memory_ids": ["mem-temporal-024"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-tp-025", "query": "用戶最近一週的心情狀況如何？", "relevant_memory_ids": ["mem-temporal-025"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "temporal"}
+{"id": "gqa-ng-001", "query": "用戶不喜歡吃什麼食物？", "relevant_memory_ids": ["mem-food-012"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "negation"}
+{"id": "gqa-ng-002", "query": "用戶不擅長哪些技術？", "relevant_memory_ids": ["mem-tech-020"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "negation"}
+{"id": "gqa-ng-003", "query": "用戶不喜歡做什麼運動？", "relevant_memory_ids": ["mem-hobby-013"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "negation"}
+{"id": "gqa-ng-004", "query": "用戶沒有養什麼寵物？", "relevant_memory_ids": ["mem-pet-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "negation"}
+{"id": "gqa-ng-005", "query": "用戶從來不看什麼類型的電影？", "relevant_memory_ids": ["mem-hobby-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "negation"}
+{"id": "gqa-ng-006", "query": "用戶不使用哪個程式語言？", "relevant_memory_ids": ["mem-tech-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "negation"}
+{"id": "gqa-ng-007", "query": "用戶不想去哪些地方旅行？", "relevant_memory_ids": ["mem-hobby-009"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "negation"}
+{"id": "gqa-ng-008", "query": "用戶不接受哪些工作條件？", "relevant_memory_ids": ["mem-work-006"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "negation"}
+{"id": "gqa-ng-009", "query": "用戶對哪些食材過敏？", "relevant_memory_ids": ["mem-food-005"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "negation"}
+{"id": "gqa-ng-010", "query": "用戶不信任哪些品牌？", "relevant_memory_ids": ["mem-profile-011"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "negation"}
+{"id": "gqa-ng-011", "query": "用戶沒有完成哪個個人目標？", "relevant_memory_ids": ["mem-temporal-021"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "negation"}
+{"id": "gqa-ng-012", "query": "用戶不想換工作的原因是什麼？", "relevant_memory_ids": ["mem-work-013"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "negation"}
+{"id": "gqa-ng-013", "query": "用戶最不享受工作的哪個部分？", "relevant_memory_ids": ["mem-work-015"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "negation"}
+{"id": "gqa-ng-014", "query": "用戶不喜歡哪種程式碼風格？", "relevant_memory_ids": ["mem-tech-020"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "negation"}
+{"id": "gqa-ng-015", "query": "用戶沒有考慮養哪種寵物？", "relevant_memory_ids": ["mem-pet-007"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "negation"}
+{"id": "gqa-er-001", "query": "用戶的寵物和用戶的工作時間有什麼衝突？", "relevant_memory_ids": ["mem-pet-004", "mem-work-005"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-002", "query": "用戶的伴侶對用戶的技術興趣有什麼看法？", "relevant_memory_ids": ["mem-fam-005", "mem-tech-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-003", "query": "用戶的主管對用戶的遠端工作態度如何？", "relevant_memory_ids": ["mem-work-008", "mem-work-006"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-004", "query": "用戶的興趣愛好和他的技能之間有什麼關聯？", "relevant_memory_ids": ["mem-hobby-001", "mem-tech-005"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-005", "query": "用戶的飲食習慣跟他的健身目標有關係嗎？", "relevant_memory_ids": ["mem-food-014", "mem-hobby-005"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-006", "query": "用戶的教育背景和他目前工作的關聯是什麼？", "relevant_memory_ids": ["mem-profile-008", "mem-work-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-007", "query": "用戶的家庭背景對他選擇工作城市有影響嗎？", "relevant_memory_ids": ["mem-fam-002", "mem-work-004"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-008", "query": "用戶的寵物名字和他的個人風格有關聯嗎？", "relevant_memory_ids": ["mem-pet-002", "mem-hobby-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-009", "query": "用戶的同事和他的技術興趣有交集嗎？", "relevant_memory_ids": ["mem-work-007", "mem-tech-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-010", "query": "用戶的語言學習目標和他的旅遊計畫有連結嗎？", "relevant_memory_ids": ["mem-hobby-014", "mem-hobby-009"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-011", "query": "用戶的技術選擇和他的工作公司的技術棧有關係嗎？", "relevant_memory_ids": ["mem-tech-004", "mem-work-009"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-012", "query": "用戶的生日和他寵物的生日差多少時間？", "relevant_memory_ids": ["mem-profile-001", "mem-pet-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-013", "query": "用戶的運動習慣和他的飲食習慣互補嗎？", "relevant_memory_ids": ["mem-hobby-005", "mem-food-014"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-014", "query": "用戶的讀書偏好和他的工作性質有什麼關聯？", "relevant_memory_ids": ["mem-hobby-004", "mem-work-002"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-015", "query": "用戶的音樂品味和他的程式設計風格有關嗎？", "relevant_memory_ids": ["mem-hobby-007", "mem-tech-020"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-016", "query": "用戶的家人對他的職涯決策有影響嗎？", "relevant_memory_ids": ["mem-fam-004", "mem-work-013"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-017", "query": "用戶的城市選擇和他的工作性質的關係？", "relevant_memory_ids": ["mem-profile-002", "mem-work-001"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-018", "query": "用戶的技術能力和他的個人專案的規模有關嗎？", "relevant_memory_ids": ["mem-tech-001", "mem-tech-005"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-019", "query": "用戶的週末活動和他的職場人際關係有關係嗎？", "relevant_memory_ids": ["mem-hobby-006", "mem-work-007"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-er-020", "query": "用戶的飲食和他的體能狀況影響工作效率嗎？", "relevant_memory_ids": ["mem-food-014", "mem-work-005"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "entity_relation"}
+{"id": "gqa-sh-101", "query": "用戶目前住的地方離工作地點多遠？", "relevant_memory_ids": ["mem-profile-002", "mem-work-004"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-102", "query": "用戶有沒有固定的午餐習慣？", "relevant_memory_ids": ["mem-food-013"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-103", "query": "用戶最近在讀什麼書？", "relevant_memory_ids": ["mem-hobby-004"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-104", "query": "用戶平時睡幾點？", "relevant_memory_ids": ["mem-profile-016"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
+{"id": "gqa-sh-105", "query": "用戶最常使用哪個社群媒體平台？", "relevant_memory_ids": ["mem-profile-017"], "source": "manual", "created": "2026-05-01T00:00:00Z", "category": "single_hop"}
