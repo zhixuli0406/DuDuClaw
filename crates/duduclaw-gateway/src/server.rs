@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::ConnectInfo,
     response::IntoResponse,
@@ -689,6 +689,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/health", get(health_handler))
         .route("/metrics", get(crate::metrics::metrics_handler))
         .route("/api/mcp/oauth/callback", get(handle_mcp_oauth_callback))
+        .route("/api/reliability/summary", get(handle_reliability_summary_http))
         .with_state(state)
         .merge(auth_router)
         .merge(webchat_router);
@@ -1307,6 +1308,94 @@ fn has_users(user_db: &UserDb) -> bool {
 /// Simple health-check endpoint.
 async fn health_handler() -> &'static str {
     "ok"
+}
+
+// ── Reliability Dashboard HTTP endpoint (W20-P0) ─────────────
+
+/// Query parameters for `GET /api/reliability/summary`.
+#[derive(serde::Deserialize, Debug)]
+struct ReliabilitySummaryParams {
+    /// Agent ID to compute the summary for (required).
+    agent_id: Option<String>,
+    /// Measurement window in days (1–365, default 7).
+    window_days: Option<u32>,
+}
+
+/// GET /api/reliability/summary — Agent Reliability Dashboard Phase 1.
+///
+/// Returns a JSON object with four reliability metrics for the requested agent
+/// over a configurable time window backed by the EvolutionEvent audit trail.
+///
+/// **Authorization**: Not guarded at the HTTP layer (read-only, no sensitive
+/// mutation). Sensitive audit queries require the MCP `reliability_summary`
+/// tool which enforces Admin scope.
+///
+/// ## Query parameters
+/// - `agent_id` (required) — Agent to query.
+/// - `window_days` (optional, 1–365, default 7) — Measurement window.
+///
+/// ## Example
+/// ```text
+/// curl "http://localhost:8080/api/reliability/summary?agent_id=my-agent&window_days=7"
+/// ```
+async fn handle_reliability_summary_http(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ReliabilitySummaryParams>,
+) -> impl IntoResponse {
+    use crate::evolution_events::query::AuditEventIndex;
+
+    let agent_id = match params.agent_id.as_deref() {
+        Some(id) if !id.is_empty() => id.to_owned(),
+        _ => {
+            return Json(serde_json::json!({
+                "error": "agent_id query parameter is required"
+            }))
+            .into_response();
+        }
+    };
+
+    let window_days = params
+        .window_days
+        .unwrap_or(7)
+        .clamp(1, 365);
+
+    let home_dir = state.handler.home_dir().to_owned();
+
+    let idx = match AuditEventIndex::open(&home_dir) {
+        Ok(i) => i,
+        Err(e) => {
+            warn!("GET /api/reliability/summary: index open failed: {e}");
+            return Json(serde_json::json!({
+                "error": format!("audit index unavailable: {e}")
+            }))
+            .into_response();
+        }
+    };
+
+    if let Err(e) = idx.sync_from_files().await {
+        warn!("GET /api/reliability/summary: sync warning (stale index): {e}");
+    }
+
+    match idx.compute_reliability_summary(&agent_id, window_days).await {
+        Ok(s) => Json(serde_json::json!({
+            "agent_id":              s.agent_id,
+            "window_days":           s.window_days,
+            "consistency_score":     s.consistency_score,
+            "task_success_rate":     s.task_success_rate,
+            "skill_adoption_rate":   s.skill_adoption_rate,
+            "fallback_trigger_rate": s.fallback_trigger_rate,
+            "total_events":          s.total_events,
+            "generated_at":          s.generated_at,
+        }))
+        .into_response(),
+        Err(e) => {
+            warn!("GET /api/reliability/summary: compute failed: {e}");
+            Json(serde_json::json!({
+                "error": format!("reliability computation failed: {e}")
+            }))
+            .into_response()
+        }
+    }
 }
 
 // ── MCP OAuth callback endpoint ─────────────────────────────

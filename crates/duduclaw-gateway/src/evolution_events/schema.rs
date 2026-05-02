@@ -1,8 +1,22 @@
-//! EvolutionEvent audit-log schema — Sprint N P0.
+//! EvolutionEvent audit-log schema — W19-P1 extended.
 //!
-//! Agnes-confirmed 8-field schema with 5 event types.
-//! This schema is the authoritative source of truth for the JSONL audit log
-//! written by [`super::logger::EvolutionEventLogger`].
+//! Agnes-confirmed 8-field schema. W19-P1 extends `AuditEventType` (11 new
+//! variants) and `Outcome` (8 new variants) for Governance and Durability
+//! domains. Existing P0 schema is **unchanged** — all additions are purely
+//! additive and backward-compatible.
+//!
+//! ## P0 event types (unchanged)
+//! `skill_activate`, `skill_deactivate`, `security_scan`, `gvu_generation`,
+//! `signal_suppressed`, `skill_graduate`
+//!
+//! ## W19-P1 new event types
+//! **Governance**: `governance_violation`, `governance_approval_requested`,
+//! `governance_approval_decided`, `governance_policy_changed`,
+//! `governance_quota_reset`
+//!
+//! **Durability**: `durability_retry_attempt`, `durability_retry_exhausted`,
+//! `durability_circuit_opened`, `durability_circuit_recovered`,
+//! `durability_checkpoint_saved`, `durability_dlq_replayed`
 //!
 //! ## Reserved / future fields
 //! - `intent_category` (`repair | optimize | innovate`) — P2 extension.
@@ -13,13 +27,15 @@ use serde::{Deserialize, Serialize};
 
 // ── Event type ────────────────────────────────────────────────────────────────
 
-/// The type of evolution event being recorded.
+/// The type of evolution / governance / durability event being recorded.
 ///
-/// All five variants are defined here even though `signal_suppressed` is only
-/// triggered in P1 — the schema must be stable before runtime code catches up.
+/// ## Backward compatibility guarantee
+/// All P0 variants (`skill_activate` … `skill_graduate`) are **never renamed
+/// or removed**. W19-P1 variants are purely additive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditEventType {
+    // ── P0 variants (UNCHANGED) ───────────────────────────────────────────────
     /// A skill was activated for an agent.
     SkillActivate,
     /// A skill was deactivated for an agent.
@@ -39,18 +55,91 @@ pub enum AuditEventType {
     /// Emitted after: quality_score passes top-20% threshold →
     /// security scan passes → `skill_graduate` MCP write succeeds.
     SkillGraduate,
+
+    // ── W19-P1: Governance domain (5 new variants) ────────────────────────────
+    /// PolicyEvaluator detected a policy violation.
+    ///
+    /// `outcome`: `blocked` | `warned` | `throttled`
+    /// `metadata`: `{"policy_id", "policy_type", "violation_detail", "operation_type"}`
+    GovernanceViolation,
+    /// An agent requested approval for a high-privilege operation.
+    ///
+    /// `outcome`: `pending`
+    /// `metadata`: `{"approval_request_id", "operation_type", "justification"}`
+    GovernanceApprovalRequested,
+    /// An approver made a decision on an approval request.
+    ///
+    /// `outcome`: `approved` | `rejected`
+    /// `metadata`: `{"approval_request_id", "approver_id", "reason"}`
+    GovernanceApprovalDecided,
+    /// A policy was created, updated, or deleted.
+    ///
+    /// `outcome`: `success` | `failure`
+    /// `metadata`: `{"policy_id", "policy_type", "change_type": "create|update|delete"}`
+    GovernancePolicyChanged,
+    /// Daily quota was reset for one or more agents.
+    ///
+    /// `outcome`: `success`
+    /// `metadata`: `{"policy_id", "agents_affected": N}`
+    GovernanceQuotaReset,
+
+    // ── W19-P1: Durability domain (6 new variants) ────────────────────────────
+    /// The retry engine executed one retry attempt.
+    ///
+    /// `outcome`: `success` | `failure`
+    /// `metadata`: `{"attempt_number", "max_attempts", "delay_ms", "error_code"}`
+    DurabilityRetryAttempt,
+    /// All retry attempts were exhausted; operation sent to DLQ.
+    ///
+    /// `outcome`: `failure`
+    /// `metadata`: `{"operation_type", "max_attempts", "dlq_id", "last_error"}`
+    DurabilityRetryExhausted,
+    /// A circuit breaker transitioned to OPEN state.
+    ///
+    /// `outcome`: `triggered`
+    /// `metadata`: `{"dependency", "failure_rate", "request_count", "reset_timeout_seconds"}`
+    DurabilityCircuitOpened,
+    /// A circuit breaker recovered from OPEN back to CLOSED.
+    ///
+    /// `outcome`: `recovered`
+    /// `metadata`: `{"dependency", "probe_success_count"}`
+    DurabilityCircuitRecovered,
+    /// A task state checkpoint was saved.
+    ///
+    /// `outcome`: `success` | `failure`
+    /// `metadata`: `{"checkpoint_id", "phase", "ttl_seconds"}`
+    DurabilityCheckpointSaved,
+    /// A DLQ record was manually replayed.
+    ///
+    /// `outcome`: `success` | `failure`
+    /// `metadata`: `{"dlq_id", "operation_type", "replayed_by"}`
+    DurabilityDlqReplayed,
 }
 
 impl std::fmt::Display for AuditEventType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Matches the snake_case serde serialisation.
         let s = match self {
+            // P0
             Self::SkillActivate => "skill_activate",
             Self::SkillDeactivate => "skill_deactivate",
             Self::SecurityScan => "security_scan",
             Self::GvuGeneration => "gvu_generation",
             Self::SignalSuppressed => "signal_suppressed",
             Self::SkillGraduate => "skill_graduate",
+            // W19-P1 Governance
+            Self::GovernanceViolation => "governance_violation",
+            Self::GovernanceApprovalRequested => "governance_approval_requested",
+            Self::GovernanceApprovalDecided => "governance_approval_decided",
+            Self::GovernancePolicyChanged => "governance_policy_changed",
+            Self::GovernanceQuotaReset => "governance_quota_reset",
+            // W19-P1 Durability
+            Self::DurabilityRetryAttempt => "durability_retry_attempt",
+            Self::DurabilityRetryExhausted => "durability_retry_exhausted",
+            Self::DurabilityCircuitOpened => "durability_circuit_opened",
+            Self::DurabilityCircuitRecovered => "durability_circuit_recovered",
+            Self::DurabilityCheckpointSaved => "durability_checkpoint_saved",
+            Self::DurabilityDlqReplayed => "durability_dlq_replayed",
         };
         f.write_str(s)
     }
@@ -58,24 +147,57 @@ impl std::fmt::Display for AuditEventType {
 
 // ── Outcome ───────────────────────────────────────────────────────────────────
 
-/// The result of the evolution action.
+/// The result of the evolution / governance / durability action.
+///
+/// ## Backward compatibility guarantee
+/// P0 variants (`success`, `failure`, `suppressed`) are **never renamed or
+/// removed**. W19-P1 variants are purely additive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
+    // ── P0 variants (UNCHANGED) ───────────────────────────────────────────────
     /// The action completed successfully.
     Success,
     /// The action failed (see `metadata` for details).
     Failure,
     /// The action was intentionally suppressed (e.g. stagnation detection).
     Suppressed,
+
+    // ── W19-P1 new variants ───────────────────────────────────────────────────
+    /// Operation was blocked by a policy (`governance_violation`).
+    Blocked,
+    /// Operation triggered a policy warning but was allowed through (`governance_violation`).
+    Warned,
+    /// Operation was rate-limited / throttled (`governance_violation`).
+    Throttled,
+    /// Approval request is waiting for a decision (`governance_approval_requested`).
+    Pending,
+    /// Approval was granted (`governance_approval_decided`).
+    Approved,
+    /// Approval was rejected (`governance_approval_decided`).
+    Rejected,
+    /// Circuit breaker tripped to OPEN (`durability_circuit_opened`).
+    Triggered,
+    /// Circuit breaker recovered to CLOSED (`durability_circuit_recovered`).
+    Recovered,
 }
 
 impl std::fmt::Display for Outcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
+            // P0
             Self::Success => "success",
             Self::Failure => "failure",
             Self::Suppressed => "suppressed",
+            // W19-P1
+            Self::Blocked => "blocked",
+            Self::Warned => "warned",
+            Self::Throttled => "throttled",
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Triggered => "triggered",
+            Self::Recovered => "recovered",
         };
         f.write_str(s)
     }
@@ -506,5 +628,350 @@ mod tests {
     fn test_outcome_display() {
         assert_eq!(Outcome::Success.to_string(), "success");
         assert_eq!(Outcome::Suppressed.to_string(), "suppressed");
+    }
+
+    // ── W19-P1: New EventTypes — backward compatibility (additive) ────────────
+
+    #[test]
+    fn test_all_p0_event_types_still_serialise_correctly() {
+        // Ensure no P0 variant was renamed or removed.
+        let cases = [
+            (AuditEventType::SkillActivate, "skill_activate"),
+            (AuditEventType::SkillDeactivate, "skill_deactivate"),
+            (AuditEventType::SecurityScan, "security_scan"),
+            (AuditEventType::GvuGeneration, "gvu_generation"),
+            (AuditEventType::SignalSuppressed, "signal_suppressed"),
+            (AuditEventType::SkillGraduate, "skill_graduate"),
+        ];
+        for (t, expected) in cases {
+            let ev = AuditEvent::now(t, "a", Outcome::Success);
+            let json = serde_json::to_string(&ev).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                v["event_type"], expected,
+                "P0 event type serialisation must not change"
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_p0_outcomes_still_serialise_correctly() {
+        // Ensure no P0 Outcome was renamed or removed.
+        let cases = [
+            (Outcome::Success, "success"),
+            (Outcome::Failure, "failure"),
+            (Outcome::Suppressed, "suppressed"),
+        ];
+        for (outcome, expected) in cases {
+            let ev = AuditEvent::now(AuditEventType::SecurityScan, "a", outcome);
+            let json = serde_json::to_string(&ev).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(v["outcome"], expected, "P0 outcome serialisation must not change");
+        }
+    }
+
+    // ── W19-P1 Governance EventTypes ──────────────────────────────────────────
+
+    #[test]
+    fn test_governance_violation_serialises() {
+        let ev = AuditEvent::now(
+            AuditEventType::GovernanceViolation,
+            "agent-tl",
+            Outcome::Blocked,
+        )
+        .with_metadata(serde_json::json!({
+            "policy_id": "default-rate-mcp",
+            "policy_type": "rate",
+            "violation_detail": "200 mcp_calls per 60s exceeded",
+            "operation_type": "mcp_call"
+        }));
+        let json = serde_json::to_string(&ev).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event_type"], "governance_violation");
+        assert_eq!(v["outcome"], "blocked");
+        assert_eq!(v["metadata"]["policy_id"], "default-rate-mcp");
+    }
+
+    #[test]
+    fn test_governance_approval_requested_serialises() {
+        let ev = AuditEvent::now(
+            AuditEventType::GovernanceApprovalRequested,
+            "agent-1",
+            Outcome::Pending,
+        )
+        .with_metadata(serde_json::json!({
+            "approval_request_id": "req-123",
+            "operation_type": "agent:create",
+            "justification": "need new agent"
+        }));
+        let json = serde_json::to_string(&ev).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event_type"], "governance_approval_requested");
+        assert_eq!(v["outcome"], "pending");
+    }
+
+    #[test]
+    fn test_governance_approval_decided_approved_serialises() {
+        let ev = AuditEvent::now(
+            AuditEventType::GovernanceApprovalDecided,
+            "duduclaw-tl",
+            Outcome::Approved,
+        )
+        .with_metadata(serde_json::json!({
+            "approval_request_id": "req-123",
+            "approver_id": "duduclaw-tl",
+            "reason": "valid use case"
+        }));
+        let json = serde_json::to_string(&ev).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event_type"], "governance_approval_decided");
+        assert_eq!(v["outcome"], "approved");
+    }
+
+    #[test]
+    fn test_governance_approval_decided_rejected_serialises() {
+        let ev = AuditEvent::now(
+            AuditEventType::GovernanceApprovalDecided,
+            "duduclaw-tl",
+            Outcome::Rejected,
+        );
+        let json = serde_json::to_string(&ev).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["outcome"], "rejected");
+    }
+
+    #[test]
+    fn test_governance_policy_changed_serialises() {
+        let ev = AuditEvent::now(
+            AuditEventType::GovernancePolicyChanged,
+            "duduclaw-tl",
+            Outcome::Success,
+        )
+        .with_metadata(serde_json::json!({
+            "policy_id": "custom-rate-policy",
+            "policy_type": "rate",
+            "change_type": "create"
+        }));
+        let json = serde_json::to_string(&ev).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event_type"], "governance_policy_changed");
+        assert_eq!(v["metadata"]["change_type"], "create");
+    }
+
+    #[test]
+    fn test_governance_quota_reset_serialises() {
+        let ev = AuditEvent::now(
+            AuditEventType::GovernanceQuotaReset,
+            "system",
+            Outcome::Success,
+        )
+        .with_metadata(serde_json::json!({
+            "policy_id": "default-quota-daily",
+            "agents_affected": 5
+        }));
+        let json = serde_json::to_string(&ev).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event_type"], "governance_quota_reset");
+        assert_eq!(v["metadata"]["agents_affected"], 5);
+    }
+
+    // ── W19-P1 Durability EventTypes ──────────────────────────────────────────
+
+    #[test]
+    fn test_durability_retry_attempt_serialises() {
+        let ev = AuditEvent::now(
+            AuditEventType::DurabilityRetryAttempt,
+            "agent-infra",
+            Outcome::Failure,
+        )
+        .with_metadata(serde_json::json!({
+            "attempt_number": 2,
+            "max_attempts": 3,
+            "delay_ms": 1000,
+            "error_code": "NETWORK_TIMEOUT"
+        }));
+        let json = serde_json::to_string(&ev).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event_type"], "durability_retry_attempt");
+        assert_eq!(v["metadata"]["attempt_number"], 2);
+        assert_eq!(v["metadata"]["error_code"], "NETWORK_TIMEOUT");
+    }
+
+    #[test]
+    fn test_durability_retry_exhausted_serialises() {
+        let ev = AuditEvent::now(
+            AuditEventType::DurabilityRetryExhausted,
+            "agent-infra",
+            Outcome::Failure,
+        )
+        .with_metadata(serde_json::json!({
+            "operation_type": "mcp_call",
+            "max_attempts": 3,
+            "dlq_id": "dlq-xyz",
+            "last_error": "[NETWORK_TIMEOUT]: connection refused"
+        }));
+        let json = serde_json::to_string(&ev).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event_type"], "durability_retry_exhausted");
+        assert_eq!(v["outcome"], "failure");
+        assert_eq!(v["metadata"]["dlq_id"], "dlq-xyz");
+    }
+
+    #[test]
+    fn test_durability_circuit_opened_serialises() {
+        let ev = AuditEvent::now(
+            AuditEventType::DurabilityCircuitOpened,
+            "system",
+            Outcome::Triggered,
+        )
+        .with_metadata(serde_json::json!({
+            "dependency": "memory_service",
+            "failure_rate": 0.65,
+            "request_count": 20,
+            "reset_timeout_seconds": 30
+        }));
+        let json = serde_json::to_string(&ev).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event_type"], "durability_circuit_opened");
+        assert_eq!(v["outcome"], "triggered");
+        assert_eq!(v["metadata"]["dependency"], "memory_service");
+    }
+
+    #[test]
+    fn test_durability_circuit_recovered_serialises() {
+        let ev = AuditEvent::now(
+            AuditEventType::DurabilityCircuitRecovered,
+            "system",
+            Outcome::Recovered,
+        )
+        .with_metadata(serde_json::json!({
+            "dependency": "external_mcp_client",
+            "probe_success_count": 1
+        }));
+        let json = serde_json::to_string(&ev).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event_type"], "durability_circuit_recovered");
+        assert_eq!(v["outcome"], "recovered");
+    }
+
+    #[test]
+    fn test_durability_checkpoint_saved_serialises() {
+        let ev = AuditEvent::now(
+            AuditEventType::DurabilityCheckpointSaved,
+            "agent-memory",
+            Outcome::Success,
+        )
+        .with_metadata(serde_json::json!({
+            "checkpoint_id": "ckpt-abc",
+            "phase": "phase-2",
+            "ttl_seconds": 3600
+        }));
+        let json = serde_json::to_string(&ev).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event_type"], "durability_checkpoint_saved");
+        assert_eq!(v["metadata"]["phase"], "phase-2");
+    }
+
+    #[test]
+    fn test_durability_dlq_replayed_serialises() {
+        let ev = AuditEvent::now(
+            AuditEventType::DurabilityDlqReplayed,
+            "agent-infra",
+            Outcome::Success,
+        )
+        .with_metadata(serde_json::json!({
+            "dlq_id": "dlq-001",
+            "operation_type": "wiki_write",
+            "replayed_by": "duduclaw-tl"
+        }));
+        let json = serde_json::to_string(&ev).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event_type"], "durability_dlq_replayed");
+        assert_eq!(v["metadata"]["replayed_by"], "duduclaw-tl");
+    }
+
+    // ── W19-P1 Outcome enum ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_w19_p1_outcomes_serialise() {
+        let cases = [
+            (Outcome::Blocked, "blocked"),
+            (Outcome::Warned, "warned"),
+            (Outcome::Throttled, "throttled"),
+            (Outcome::Pending, "pending"),
+            (Outcome::Approved, "approved"),
+            (Outcome::Rejected, "rejected"),
+            (Outcome::Triggered, "triggered"),
+            (Outcome::Recovered, "recovered"),
+        ];
+        for (outcome, expected) in cases {
+            assert_eq!(outcome.to_string(), expected, "Outcome display mismatch");
+            let ev = AuditEvent::now(AuditEventType::GovernanceViolation, "a", outcome);
+            let json = serde_json::to_string(&ev).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(v["outcome"], expected, "serialised outcome mismatch");
+        }
+    }
+
+    #[test]
+    fn test_w19_p1_event_types_display() {
+        let cases = [
+            (AuditEventType::GovernanceViolation, "governance_violation"),
+            (AuditEventType::GovernanceApprovalRequested, "governance_approval_requested"),
+            (AuditEventType::GovernanceApprovalDecided, "governance_approval_decided"),
+            (AuditEventType::GovernancePolicyChanged, "governance_policy_changed"),
+            (AuditEventType::GovernanceQuotaReset, "governance_quota_reset"),
+            (AuditEventType::DurabilityRetryAttempt, "durability_retry_attempt"),
+            (AuditEventType::DurabilityRetryExhausted, "durability_retry_exhausted"),
+            (AuditEventType::DurabilityCircuitOpened, "durability_circuit_opened"),
+            (AuditEventType::DurabilityCircuitRecovered, "durability_circuit_recovered"),
+            (AuditEventType::DurabilityCheckpointSaved, "durability_checkpoint_saved"),
+            (AuditEventType::DurabilityDlqReplayed, "durability_dlq_replayed"),
+        ];
+        for (t, expected) in cases {
+            assert_eq!(t.to_string(), expected, "Display mismatch for {expected}");
+        }
+    }
+
+    #[test]
+    fn test_all_w19_p1_events_validate_pass() {
+        let events = [
+            AuditEvent::now(AuditEventType::GovernanceViolation, "a", Outcome::Blocked),
+            AuditEvent::now(AuditEventType::GovernanceApprovalRequested, "a", Outcome::Pending),
+            AuditEvent::now(AuditEventType::GovernanceApprovalDecided, "a", Outcome::Approved),
+            AuditEvent::now(AuditEventType::GovernancePolicyChanged, "a", Outcome::Success),
+            AuditEvent::now(AuditEventType::GovernanceQuotaReset, "a", Outcome::Success),
+            AuditEvent::now(AuditEventType::DurabilityRetryAttempt, "a", Outcome::Failure),
+            AuditEvent::now(AuditEventType::DurabilityRetryExhausted, "a", Outcome::Failure),
+            AuditEvent::now(AuditEventType::DurabilityCircuitOpened, "a", Outcome::Triggered),
+            AuditEvent::now(AuditEventType::DurabilityCircuitRecovered, "a", Outcome::Recovered),
+            AuditEvent::now(AuditEventType::DurabilityCheckpointSaved, "a", Outcome::Success),
+            AuditEvent::now(AuditEventType::DurabilityDlqReplayed, "a", Outcome::Success),
+        ];
+        for ev in events {
+            assert!(
+                validate(&ev).is_ok(),
+                "W19-P1 event {:?} should pass validation",
+                ev.event_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_w19_p1_events_deserialise() {
+        // Ensure the new event types can round-trip through JSON
+        let json = r#"{
+            "timestamp": "2026-04-29T00:00:00Z",
+            "event_type": "governance_violation",
+            "agent_id": "duduclaw-tl",
+            "skill_id": null,
+            "generation": null,
+            "outcome": "blocked",
+            "trigger_signal": "policy_evaluator",
+            "metadata": {"policy_id": "default-rate-mcp"}
+        }"#;
+        let ev: AuditEvent = serde_json::from_str(json).expect("deserialise");
+        assert_eq!(ev.event_type, AuditEventType::GovernanceViolation);
+        assert_eq!(ev.outcome, Outcome::Blocked);
     }
 }
