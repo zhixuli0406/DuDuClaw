@@ -8,7 +8,7 @@ use tracing::{info, warn};
 use crate::error::{InferenceError, Result};
 
 /// Download progress callback.
-pub type ProgressCallback = Box<dyn Fn(DownloadProgress) + Send>;
+pub type ProgressCallback = Box<dyn Fn(DownloadProgress) + Send + Sync>;
 
 /// Download progress information.
 #[derive(Debug, Clone)]

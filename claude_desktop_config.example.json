@@ -1,0 +1,17 @@
+{
+  "_comment": "DuDuClaw MCP Server — Claude Desktop 整合設定範例",
+  "_doc": "將此設定加入 ~/Library/Application Support/Claude/claude_desktop_config.json（macOS）或 %APPDATA%\\Claude\\claude_desktop_config.json（Windows）",
+  "mcpServers": {
+    "duduclaw": {
+      "command": "duduclaw",
+      "args": ["mcp-server"],
+      "env": {
+        "_comment_key": "API Key 格式: ddc_<env>_<32個hex字元>。使用 'duduclaw mcp-keygen' 生成。",
+        "DUDUCLAW_MCP_API_KEY": "ddc_dev_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+
+        "_comment_scopes": "逗號分隔的 scope 清單（此欄位為備用，實際 scope 從 config.toml [mcp_keys] 讀取）",
+        "DUDUCLAW_MCP_SCOPES": "memory:read,memory:write,wiki:read,wiki:write,messaging:send"
+      }
+    }
+  }
+}
