@@ -6,20 +6,26 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.8.27-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.9.4-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
 ---
 
-> 🎉 **v1.8.27 — Multica Agent 整合層上線** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.8.27))
+> 🎉 **v1.9.4 — W21 Sprint 封版**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.9.4)）
 >
-> - 12 個新 MCP 工具讓 agent 成為任務看板的一等公民（`tasks_*`、`activity_*`、`autopilot_list`、`shared_skill_*`）
-> - Agent 每次對話自動看到待辦任務佇列，system prompt 雙-block cache 保護前綴
-> - Autopilot 觸發引擎 + 三態熔斷器（Closed / Open / HalfOpen）防止規則自循環
-> - `events.db` SQLite 事件匯流排取代 `events.jsonl`，消除檔案匯流排所有已知 hazards
-> - 任務看板修正為永遠渲染四欄 Kanban，Dashboard 新增迷你任務預覽小部件
-> - 47 個新單元測試（條件求值、熔斷器狀態轉換、規則 schema 驗證、事件匯流排）
+> - 新增 `duduclaw-durability` crate — 五大持久性機制（idempotency / retry / circuit breaker / checkpoint / DLQ）
+> - 新增 `duduclaw-governance` crate — PolicyRegistry + quota_manager + error_codes，YAML 政策載入 + 熱重載
+> - **MCP HTTP/SSE Transport**（W20-P1/P2）— `duduclaw http-server` 提供 Bearer 認證的 REST + SSE 端點，補齊純 stdio 之外的存取路徑
+> - **LOCOMO 記憶評測系統**（W21）— `python/duduclaw/memory_eval/`：retrieval_accuracy / retention_rate / cron_runner（每日 03:00 UTC 評測）+ 200 筆 golden QA
+> - **LLM Fallback** — 主模型 timeout/503/429/overloaded 時自動切換 fallback 模型，UTF-8 安全 truncation
+> - **Discord RESUME** + stall watchdog — 真正的 op 6 RESUME 取代每次重連 IDENTIFY，防止 18 分鐘 zombie 狀態
+> - **Heartbeat 修正** — task-board pull 升至 scheduler 層級，掃描所有 agent 而非僅 enabled=true
+> - **Web ReliabilityPage** — circuit breaker / retry / DLQ 即時儀表板，新增 `/reliability` 路由
+> - **MCP `skill_synthesis_run`** — 完成 graduate_trajectories() 落地（取代 Phase 2 stub），internal principal 可見、external 隱藏
+> - **Python agents routing 模組** — capability-based 路由 + memory_resolver + 7 項 memory MCP tools（含 scope 強制驗證）
+> - **W21 QA 4 輪審查 CRITICAL/HIGH 全清** — memory scope 認證、XSS、SSRF、circuit breaker 幽靈探測、UTF-8 truncation panic 全部修補
+> - 549+ tests, 0 failures
 
 ---
 
@@ -62,7 +68,7 @@ DuDuClaw (plumbing)
 
 | 特色 | 說明 |
 |------|------|
-| **七通道支援** | Telegram（long polling）、LINE（webhook）、Discord（Gateway WebSocket）、Slack（Socket Mode）、WhatsApp（Cloud API）、Feishu（Open Platform v2）、WebChat（WebSocket）|
+| **七通道支援** | Telegram（long polling）、LINE（webhook）、Discord（Gateway WebSocket，op 6 RESUME + stall watchdog + 1-5s jitter）、Slack（Socket Mode）、WhatsApp（Cloud API）、Feishu（Open Platform v2）、WebChat（WebSocket）|
 | **Per-Agent Bot** | 每個 Agent 可擁有獨立的 Bot Token，同平台多 Agent 並行 |
 | **通道熱啟停** | Dashboard 新增/移除通道即時生效，無需重啟 gateway |
 | **WebChat** | 內建 `/ws/chat` WebSocket 端點，React 前端即時對話 |
@@ -128,6 +134,18 @@ DuDuClaw (plumbing)
 | **ACP/A2A Protocol Server** | `duduclaw acp-server` 提供 stdio JSON-RPC 2.0 伺服器（`agent/discover` / `tasks/send` / `tasks/get` / `tasks/cancel`），相容 Agent Client Protocol，支援 Zed / JetBrains / Neovim IDE 整合；輸出 `.well-known/agent.json` AgentCard |
 | **Reminder 排程** | 一次性提醒（相對時間 `5m`/`2h`/`1d` 或 ISO 8601 絕對時間），`direct` 靜態訊息或 `agent_callback` 喚醒模式 |
 
+### 可靠性與治理（v1.9.x 新增）
+
+| 特色 | 說明 |
+|------|------|
+| **`duduclaw-durability` crate** | 五大持久性機制 — idempotency key 管理、指數退避重試（jitter）、三態斷路器（Closed/Open/HalfOpen）、checkpoint 斷點續傳、Dead Letter Queue 終態失敗訊息處理 |
+| **`duduclaw-governance` crate** | PolicyRegistry + 4 種 PolicyType（Rate/Permission/Quota/Lifecycle）+ quota_manager（soft/hard 配額）+ error_codes（QUOTA_EXCEEDED / POLICY_DENIED 標準化）+ YAML 熱重載 + audit log |
+| **LLM Fallback** | 主模型 timeout/503/429/overloaded 時自動切換 fallback 模型，`is_llm_fallback_error` / `should_attempt_model_fallback` 純函式，hard deadline 統一回傳 hard timeout 錯誤觸發 fallback |
+| **Evolution Events 系統** | 30+ event schema、async emitter（batch + retry）、query 介面、reliability 機制；HTTP endpoint 暴露於 gateway，Web ReliabilityPage 視覺化 |
+| **MCP HTTP/SSE Transport**（W20-P1/P2）| `duduclaw http-server --bind 127.0.0.1:8765` — `POST /mcp/v1/call`（單次 JSON-RPC 工具呼叫）+ `GET /mcp/v1/stream`（SSE 長連接事件流）+ `POST /mcp/v1/stream/call`（async + SSE push）+ Bearer 認證 + token bucket rate limit |
+| **記憶 MCP scope 強制驗證** | `memory:read` / `memory:write` scope 在 `store/read/search` execute() 進入點檢查，修補 v1.9.3 之前任意有效 API Key 可繞過 scope 的認證缺口 |
+| **LOCOMO 記憶評測** | `memory_eval/` — retrieval_accuracy / retention_rate / locomo_integrity_check + cron_runner（每日 03:00 UTC）+ 5 分鐘 smoke_test P0 + 200 筆 golden QA 黃金集 |
+
 ### 安全防護
 
 | 特色 | 說明 |
@@ -176,7 +194,8 @@ DuDuClaw (plumbing)
 | 特色 | 說明 |
 |------|------|
 | **技術棧** | React 19 + TypeScript + Tailwind CSS 4 + shadcn/ui，溫暖 amber 色系 |
-| **23 個頁面** | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / KnowledgeHub / Odoo / Login / Users / Analytics / Export |
+| **24 個頁面** | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / KnowledgeHub / Odoo / Login / Users / Analytics / Export / **Reliability**（v1.9.4 新增）|
+| **Reliability 儀表板** | circuit breaker 狀態 / retry 統計 / DLQ 佇列深度 / evolution events 即時資料；`/reliability` 路由，整合 `getEvolutionEvents` / `getReliabilityStats` / `getDlqItems` API |
 | **即時日誌** | BroadcastLayer tracing → WebSocket 推播，WS 心跳 ping/pong（server 30s / client 25s）+ 60s 空閒關閉 |
 | **Logs 歷史頁重寫** | 來源篩選 chips（全部 / 安全 / 工具呼叫 / 通道失敗 / 回饋）+ 即時人次計數 + 嚴重度下拉 + 嚴重度著色左框（emerald/amber/rose）+ 點擊展開 JSON 細節 |
 | **Memory 頁 Key Insights** | 第四分頁呈現 P2 Key-Fact Accumulator 累積的結構化洞察（`key_facts` 表）+ `access_count` badge + 時間戳 + 來源 metadata |
@@ -360,6 +379,7 @@ duduclaw onboard             # 互動式首次設定
 duduclaw run                 # 一鍵啟動（gateway + channels + heartbeat + cron + dispatcher）
 duduclaw migrate             # 將 agent.toml 轉換為 Claude Code 格式
 duduclaw mcp-server          # 啟動 MCP Server（供 AI Runtime 使用，stdio JSON-RPC 2.0）
+duduclaw http-server         # 啟動 MCP HTTP/SSE Transport（Bearer 認證，預設 127.0.0.1:8765）
 duduclaw acp-server          # 啟動 ACP/A2A Server（IDE 整合：Zed/JetBrains/Neovim）
 duduclaw gateway             # 僅啟動 WebSocket gateway server
 
@@ -376,6 +396,7 @@ duduclaw test <agent>        # 紅隊安全測試（9 項內建場景 + JSON 報
 duduclaw status              # 系統健康快照
 duduclaw doctor              # 健康診斷
 duduclaw wizard              # 產業模板互動式設定
+duduclaw evolution finalize  # 一次性回收逾期 SOUL.md 觀察視窗（--dry-run / --agent <id>）
 
 duduclaw rl export           # 匯出 RL trajectory（~/.duduclaw/rl_trajectories.jsonl）
 duduclaw rl stats            # 每 Agent trajectory 統計
@@ -400,26 +421,32 @@ duduclaw version             # 版本資訊
 
 ```
 DuDuClaw/
-├── crates/                         # Rust crates (13 個)
+├── crates/                         # Rust crates (16 個)
 │   ├── duduclaw-core/              # 共用型別、traits (Channel, MemoryEngine)、錯誤定義
 │   ├── duduclaw-agent/             # Agent 註冊、心跳、預算、契約、skill loader/registry
 │   ├── duduclaw-auth/              # 多用戶認證（Argon2 密碼、JWT、ACL 角色權限）
 │   ├── duduclaw-security/          # AES-256-GCM、SOUL guard、input guard、audit、key vault
 │   ├── duduclaw-container/         # Docker / Apple Container / WSL2 沙箱執行
-│   ├── duduclaw-memory/            # SQLite + FTS5 全文搜尋 + 向量嵌入
+│   ├── duduclaw-memory/            # SQLite + FTS5 全文搜尋 + 向量嵌入 + 評測 batch query API
 │   ├── duduclaw-inference/         # 本地推論引擎（llama.cpp / mistral.rs / ONNX / Exo / llamafile）
-│   ├── duduclaw-gateway/           # Axum 伺服器、6 通道、session、GVU²、prediction、cron、dispatcher
+│   ├── duduclaw-gateway/           # Axum 伺服器、7 通道、session、GVU²、prediction、cron、dispatcher、LLM fallback、evolution events
 │   ├── duduclaw-bus/               # tokio broadcast + mpsc 訊息路由
 │   ├── duduclaw-bridge/            # PyO3 Rust↔Python 橋接層
 │   ├── duduclaw-odoo/              # Odoo ERP 中間層 (JSON-RPC, CE/EE, 15 MCP tools)
-│   ├── duduclaw-cli/               # clap CLI 入口 + MCP server + migrate + test
-│   └── duduclaw-dashboard/         # rust-embed 嵌入 React SPA
+│   ├── duduclaw-cli/               # clap CLI 入口 + MCP server (stdio + HTTP/SSE) + migrate + test
+│   ├── duduclaw-dashboard/         # rust-embed 嵌入 React SPA
+│   ├── duduclaw-desktop/           # 桌面端 wrapper（macOS/Windows/Linux）
+│   ├── duduclaw-durability/        # 持久性框架（idempotency / retry / circuit breaker / checkpoint / DLQ）— v1.9.4 新增
+│   └── duduclaw-governance/        # PolicyRegistry / quota_manager / error_codes / audit / approval — v1.9.4 新增
 │
 ├── python/duduclaw/                # Python 擴充層
 │   ├── channels/                   # LINE / Telegram / Discord 通道插件
 │   ├── sdk/                        # Claude Code SDK chat + 多帳號輪替
 │   ├── evolution/                  # Skill Vetter 安全掃描
-│   └── tools/                      # Agent 動態管理工具
+│   ├── tools/                      # Agent 動態管理工具
+│   ├── agents/                     # capability manifest + capability-based router + memory_resolver（v1.9.4）
+│   ├── mcp/                        # MCP API Key auth（含 key masking）+ memory tools（store/read/search/namespace/quota）
+│   └── memory_eval/                # LOCOMO 記憶評測（retrieval/retention + cron + 200 筆 golden QA）— v1.9.4 新增
 │
 ├── npm/                            # npm 發布套件
 │   ├── duduclaw/                   # 主套件（平台無關 wrapper + postinstall binary 下載）
@@ -432,9 +459,9 @@ DuDuClaw/
 ├── web/                            # React Dashboard
 │   └── src/
 │       ├── components/             # UI 元件 (OrgChart, ApprovalModal, SessionReplay)
-│       ├── pages/                  # 23 個頁面
+│       ├── pages/                  # 24 個頁面（含 ReliabilityPage v1.9.4 新增）
 │       ├── stores/                 # Zustand 狀態管理 (8 stores)
-│       ├── lib/                    # API client (WebSocket JSON-RPC)
+│       ├── lib/                    # API client (WebSocket JSON-RPC + evolution events / reliability HTTP)
 │       └── i18n/                   # zh-TW / en / ja-JP
 │
 ├── templates/                      # 產業模板 + Agent 角色模板

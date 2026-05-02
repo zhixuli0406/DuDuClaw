@@ -1,6 +1,6 @@
 # DuDuClaw Documentation
 
-> Public documentation for the DuDuClaw Multi-Runtime AI Agent Platform (v1.8.14).
+> Public documentation for the DuDuClaw Multi-Runtime AI Agent Platform (v1.9.4).
 
 ---
 
@@ -47,7 +47,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 
 | Document | Description | Status |
 |----------|-------------|--------|
-| [CLAUDE.md](CLAUDE.md) | Architecture overview (v1.8.14) | Current |
+| [CLAUDE.md](CLAUDE.md) | Architecture overview (v1.9.4) | Current |
 | [evolution-engine.md](evolution-engine.md) | Evolution Engine v2 — Prediction + GVU² + Cognitive Memory | Current |
 
 ## User & Developer Guides

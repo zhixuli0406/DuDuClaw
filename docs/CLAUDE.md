@@ -1,6 +1,6 @@
 # DuDuClaw Architecture Overview
 
-## Architecture Overview (v1.8.14)
+## Architecture Overview (v1.9.4)
 
 DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code / Codex / Gemini** CLI as AI backends via a unified `AgentRuntime` trait with auto-detection and per-agent configuration. DuDuClaw is not a standalone LLM product; it is the plumbing layer that turns one (or many) AI CLIs into long-running agents with channel routing, session memory, self-evolution, multi-account rotation, local LLM inference, browser automation, and IDE integration.
 
@@ -8,14 +8,15 @@ DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code /
 
 ### Runtime & Transport
 - **Multi-Runtime** (`AgentRuntime` trait) — Claude / Codex / Gemini / OpenAI-compat four backends, `RuntimeRegistry` auto-detection, per-agent config in `agent.toml [runtime]`.
-- **MCP Server** (`duduclaw mcp-server`) exposes channel, memory, agent, skill, task, shared wiki, and autopilot tools to AI Runtime via JSON-RPC 2.0 over stdin/stdout. Registered at the agent level in `<agent>/.mcp.json` (v1.8.5 reverted v1.8.4's global registration because Claude CLI `-p --dangerously-skip-permissions` only reads project-level `.mcp.json`). Gateway startup auto-creates/repairs `.mcp.json` for all agents.
+- **MCP Server (stdio)** (`duduclaw mcp-server`) exposes channel, memory, agent, skill, task, shared wiki, and autopilot tools to AI Runtime via JSON-RPC 2.0 over stdin/stdout. Registered at the agent level in `<agent>/.mcp.json` (v1.8.5 reverted v1.8.4's global registration because Claude CLI `-p --dangerously-skip-permissions` only reads project-level `.mcp.json`). Gateway startup auto-creates/repairs `.mcp.json` for all agents.
+- **MCP Server (HTTP/SSE)** (`duduclaw http-server --bind 127.0.0.1:8765`, v1.9.4) — Bearer-authenticated `POST /mcp/v1/call` (single JSON-RPC tool call), `GET /mcp/v1/stream` (SSE long-lived event stream, Bearer / `?api_key=`), `POST /mcp/v1/stream/call` (async + SSE result push), `GET /healthz` (no auth). Token bucket rate limit (60 req/min). `mcp_sse_store.rs` manages SSE connections with broadcast channels. Complements stdio for external HTTP clients.
 - **ACP/A2A Server** (`duduclaw acp-server`) — stdio JSON-RPC 2.0 loop with `agent/discover`, `tasks/send`, `tasks/get`, `tasks/cancel` methods plus `.well-known/agent.json` AgentCard output. Enables Zed / JetBrains / Neovim IDE integration via Agent Client Protocol.
 - **Agent directories** are Claude Code compatible: each contains `.claude/`, `.mcp.json`, `SOUL.md`, `CLAUDE.md`, `CONTRACT.toml`, `agent.toml`, `wiki/`, `SKILLS/`, `memory/`, `tasks/`, `state/`.
 
 ### Channels (7 + Generic Webhook)
 - **Telegram** (long polling) — file/photo/sticker/voice, forums/topics, mention-only, Whisper transcription.
 - **LINE** (webhook) — HMAC-SHA256 signature, sticker catalog, per-chat settings.
-- **Discord** (Gateway WebSocket) — `tokio::select!` heartbeat, slash commands, auto-thread, voice channels (Songbird).
+- **Discord** (Gateway WebSocket) — `tokio::select!` heartbeat, slash commands, auto-thread, voice channels (Songbird). v1.9.2 hardened: real op 6 RESUME (persists `session_id` + `resume_gateway_url` + sequence), stall watchdog (break if no traffic for 2× heartbeat interval), heartbeat capacity 1→16 with `try_send`, op 9 jitter 1-5s, RESUMED dispatch handling, backoff cap 60s.
 - **Slack** (Socket Mode), **WhatsApp** (Cloud API), **Feishu** (Open Platform v2), **WebChat** (`/ws/chat` + React frontend).
 - **Generic Webhook**: `POST /webhook/{agent_id}` + HMAC-SHA256.
 - **Channel hot-start/stop**: Dashboard `channels.add` / `channels.remove` launches/aborts the channel task without gateway restart.
@@ -146,7 +147,22 @@ DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code /
 - **BroadcastLayer** tracing layer streams real-time logs to WebSocket subscribers.
 - **Dashboard WebSocket heartbeat**: server Ping every 30s, close idle sockets after 60s without Pong. Client `ping` application-level RPC every 25s (browsers can't issue control frames).
 
-### Web Dashboard (23 pages)
+### Reliability & Governance (v1.9.4)
+- **`duduclaw-durability` crate** — five-pillar durability:
+  - `idempotency.rs`: key-based dedup preventing duplicate execution.
+  - `retry.rs`: exponential backoff with jitter strategy.
+  - `circuit_breaker.rs`: three-state Closed / Open / HalfOpen with `probe_inflight` accounting (v1.9.4 fix: OPEN→HALF_OPEN transition increments `probe_inflight` to prevent ghost-probe overage).
+  - `checkpoint.rs`: resumable task progress.
+  - `dlq.rs`: Dead Letter Queue for terminally failed messages.
+- **`duduclaw-governance` crate** (W19-P1 M1-A) — `PolicyRegistry` (YAML + hot reload + agent-priority merge + fail-safe + concurrent upsert safety), four `PolicyType`s (Rate / Permission / Quota / Lifecycle), `quota_manager.rs` (per-agent / per-policy soft + hard quotas), `error_codes.rs` (QUOTA_EXCEEDED / POLICY_DENIED / ...), approval workflow + audit log. Default policy set in `policies/global.yaml`.
+- **LLM fallback chain** (`gateway/llm_fallback.rs`) — primary timeout / 503 / 429 / overloaded auto-switches to fallback model. `is_llm_fallback_error` / `should_attempt_model_fallback` are pure functions with unit tests. UTF-8-safe truncation via `char_indices`.
+- **Evolution Events system** (`gateway/evolution_events/`) — 30+ event schema, async batch+retry emitter, query interface, reliability guarantees. HTTP endpoints exposed on gateway and surfaced in Web `ReliabilityPage`.
+
+### Memory Evaluation (v1.9.4 / W21)
+- **LOCOMO evaluation** (`python/duduclaw/memory_eval/`) — `retrieval_accuracy`, `retention_rate`, `locomo_integrity_check`. `cron_runner` triggered daily at 03:00 UTC. 5-minute `smoke_test` P0 verifies basic memory functions. `build_golden_qa.py` builds the gold QA set; `data/golden_qa_set.jsonl` carries the first 200 entries. `duduclaw-memory` engine adds batch query API for evaluation.
+- **Python `agents/` + `mcp/` modules** — `agents/capabilities/` (manifest + matcher), `agents/routing/` (router + resolution + memory_resolver). `mcp/auth/` (API Key with key masking), `mcp/tools/memory/` (store / read / search / namespace / quota with strict scope enforcement at `execute()` entry — patches a v1.9.3 auth gap where any valid API key bypassed scope limits).
+
+### Web Dashboard (24 pages)
 - Tech stack: React 19 + TypeScript + Tailwind CSS 4 + shadcn/ui, warm amber theme.
 - Real-time log streaming (BroadcastLayer → WebSocket).
 - OrgChart (D3.js interactive agent hierarchy).
@@ -155,5 +171,6 @@ DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code /
 - Toast notification system (module-scoped event bus, max-5 queue, warm variants).
 - Skill Market 3-tab (Marketplace / Shared Skills / My Skills).
 - Autopilot settings + Session Replay + WikiGraph.
+- **ReliabilityPage** (v1.9.4, `/reliability` route) — circuit breaker state, retry stats, DLQ depth dashboard. Fetches `getEvolutionEvents` / `getReliabilityStats` / `getDlqItems`.
 - i18n: zh-TW / en / ja-JP (600+ translation keys).
 - Dark/Light theme (system + manual toggle).

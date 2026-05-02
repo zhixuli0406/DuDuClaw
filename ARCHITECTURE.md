@@ -1,7 +1,12 @@
 # DuDuClaw 系統架構設計
 
-> 版本：1.4.29
-> 日期：2026-04-16
+> 版本：1.9.4
+> 日期：2026-05-02
+>
+> 本文件涵蓋 v1.4.29 之後的核心架構基線。v1.9.x 新增的可靠性 / 治理層、
+> 記憶評測子系統、MCP HTTP/SSE Transport 等請參閱 [CHANGELOG.md](CHANGELOG.md)
+> 與 [docs/CLAUDE.md](docs/CLAUDE.md)；後者已同步至 v1.9.4 並作為本文件的
+> 增量補充，避免本文件所述的詳細流程被新功能蓋掉。
 
 ---
 
@@ -136,16 +141,23 @@ Agent B runner (subprocess) 讀取並執行
 ### 4.1 Crate 架構
 
 ```
-crates/
-├── duduclaw-core/      # 共用型別、traits、錯誤定義
-├── duduclaw-agent/     # Agent 掃描、agent.toml 解析、心跳、預算
-├── duduclaw-security/  # AES-256-GCM 加密、Ed25519 驗證
-├── duduclaw-memory/    # SQLite + FTS5 全文搜尋記憶引擎
-├── duduclaw-gateway/   # Axum 伺服器、通道整合、WebSocket、MCP tools
-├── duduclaw-bus/       # tokio broadcast + mpsc 訊息路由
-├── duduclaw-bridge/    # PyO3 Rust↔Python 橋接（bus_queue 寫入）
-├── duduclaw-cli/       # clap CLI 入口、mcp-server、migrate 指令
-└── duduclaw-dashboard/ # rust-embed 嵌入 React SPA
+crates/                            # v1.9.4 共 16 個 crate
+├── duduclaw-core/                 # 共用型別、traits、錯誤定義
+├── duduclaw-agent/                # Agent 掃描、agent.toml 解析、心跳、預算
+├── duduclaw-auth/                 # 多用戶認證（Argon2、JWT、ACL）
+├── duduclaw-security/             # AES-256-GCM 加密、Ed25519 驗證、SOUL guard、audit
+├── duduclaw-container/            # Docker / Apple Container / WSL2 沙箱
+├── duduclaw-memory/               # SQLite + FTS5 全文搜尋 + 評測 batch query API
+├── duduclaw-inference/            # 本地推論引擎（llama.cpp / mistral.rs / Exo / llamafile）
+├── duduclaw-gateway/              # Axum 伺服器、通道整合、WebSocket、MCP tools、LLM fallback、evolution events
+├── duduclaw-bus/                  # tokio broadcast + mpsc 訊息路由
+├── duduclaw-bridge/               # PyO3 Rust↔Python 橋接（bus_queue 寫入）
+├── duduclaw-odoo/                 # Odoo ERP 中間層（JSON-RPC, 15 MCP tools）
+├── duduclaw-cli/                  # clap CLI 入口、mcp-server (stdio/HTTP/SSE)、migrate
+├── duduclaw-dashboard/            # rust-embed 嵌入 React SPA
+├── duduclaw-desktop/              # 桌面端 wrapper（macOS/Windows/Linux）
+├── duduclaw-durability/  ← v1.9.4 # 持久性框架（idempotency / retry / circuit breaker / checkpoint / DLQ）
+└── duduclaw-governance/  ← v1.9.4 # PolicyRegistry / quota_manager / error_codes / audit / approval
 ```
 
 ### 4.2 Gateway（`duduclaw-gateway`）

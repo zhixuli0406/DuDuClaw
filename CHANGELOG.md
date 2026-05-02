@@ -1,6 +1,142 @@
 # Changelog
 
 
+## [1.9.4] - 2026-05-02
+
+### Added
+- **`duduclaw-durability` crate** — five-pillar durability framework:
+  `idempotency` (key 管理防止重複執行)、`retry`（指數退避 + jitter）、
+  `circuit_breaker`（三態 Closed/Open/HalfOpen）、`checkpoint`（任務進度
+  斷點續傳）、`dlq`（Dead Letter Queue 終態失敗訊息）。完整 unit +
+  integration tests 涵蓋高並發場景。
+- **`duduclaw-governance` crate**（W19-P1 M1-A）— PolicyRegistry +
+  4 種 PolicyType（Rate / Permission / Quota / Lifecycle）+ YAML 載入 +
+  熱重載 + Agent 優先序合併 + fail-safe（非法政策跳過、非法 YAML 不
+  panic）+ 並發 upsert 安全。新增 `quota_manager.rs`（每 agent / 每
+  policy 配額 soft/hard 強制）+ `error_codes.rs`（QUOTA_EXCEEDED /
+  POLICY_DENIED 等標準化錯誤碼）+ `evaluator` / `violation` /
+  `approval` / `audit` 完整 PolicyEngine。預設政策集 `policies/global.yaml`
+  含 default-rate-mcp（200/min MCP 呼叫限制）等六項。
+- **MCP HTTP/SSE Transport**（W20-P1/P2）— 新增 `duduclaw http-server
+  --bind 127.0.0.1:8765` 子命令。`mcp_http_server.rs` 提供
+  `POST /mcp/v1/call`（單次 JSON-RPC 2.0 工具呼叫）、
+  `GET /mcp/v1/stream`（SSE 長連接事件流，Bearer / `?api_key=`）、
+  `POST /mcp/v1/stream/call`（async + SSE 結果推送）、`GET /healthz`
+  （無需認證）。`mcp_rate_limit.rs` 新增 `OpType::HttpRequest`（60
+  req/min token bucket），`mcp_sse_store.rs` 連線管理與 broadcast
+  channel 事件推送，`mcp_http_auth.rs` / `mcp_http_errors.rs` 處理
+  認證 + JSON-RPC↔HTTP 錯誤映射。
+- **`skill_synthesis_run` MCP tool**（W20-P0）— Internal principal 可見、
+  external 隱藏。`pipeline.rs::graduate_trajectories()` 取代 Phase 2
+  stub，串起 memory_search → skill_extract → security_scan →
+  skill_graduate 完整流程。
+- **`duduclaw-memory` 評測 batch query API** — 新增 `MemoryEngine`
+  方法支援評測批次查詢，配合 LOCOMO 評測系統。
+- **LOCOMO 記憶評測系統**（W21）— `python/duduclaw/memory_eval/`：
+  `retrieval_accuracy` / `retention_rate` / `locomo_integrity_check`
+  + `cron_runner`（每日 03:00 UTC 排程）+ 5 分鐘 `smoke_test` P0 +
+  `build_golden_qa`（從 LOCOMO 資料集建構黃金 QA）+
+  `data/golden_qa_set.jsonl`（首批 200 筆 golden QA）+ `client.py` /
+  `config.py` / `db/consolidation.py`。
+- **Python `agents/` + `mcp/` 模組** — `agents/capabilities/`
+  （manifest 載入 + matcher）、`agents/routing/`（capability-based
+  router + resolution + memory_resolver）；`mcp/auth/`（API Key 驗證
+  含 key masking 防洩漏）、`mcp/tools/memory/`（store / read / search
+  / namespace / quota 含 scope 強制驗證）。
+- **LLM Fallback** — `claude_runner.rs` + `llm_fallback.rs`：主模型
+  逾時 / 503 / 429 / overloaded 時自動切換 fallback 模型。新增
+  `is_llm_fallback_error` / `should_attempt_model_fallback` 純函式
+  + 完整 unit tests。
+- **Evolution Events 系統擴充** — `schema.rs` 新增 30+ event schema
+  定義（+483 行）、`emitter.rs` 非同步發送支援 batch + retry（+190
+  行）、新增 `query.rs`（EvolutionEvent 查詢介面，1685 行）+
+  `reliability.rs`（事件可靠性保證機制，324 行）。Gateway HTTP
+  endpoints 暴露於 `handlers.rs`（+154 行）。
+- **Web `ReliabilityPage`**（+328 行，`/reliability` 路由）— circuit
+  breaker 狀態、retry 統計、DLQ 佇列深度即時儀表板。`api.ts` 新增
+  `getEvolutionEvents` / `getReliabilityStats` / `getDlqItems`。
+- **`duduclaw evolution finalize` CLI 子命令**（v1.9.1 引入，v1.9.4
+  封版穩定）— `--dry-run` / `--agent <id>`，一次性回收逾期 SOUL.md
+  觀察視窗。
+- **`claude_desktop_config.example.json`** — Claude Desktop MCP Server
+  整合設定範例。
+
+### Fixed (W21 QA 4-round CRITICAL/HIGH 全清)
+- **CRITICAL — 記憶 MCP scope 認證缺口**：`mcp/tools/memory/store.py`、
+  `read.py`、`search.py` 在 `execute()` 進入點補上 `memory:write` /
+  `memory:read` scope 強制檢查。修補先前任意有效 API Key 都能繞過
+  scope 限制的認證缺口。
+- **HIGH — XSS 儲存型注入**：`validation.py::validated_tags` 改用
+  `_sanitize(tag)` 處理使用者輸入的 tag。
+- **HIGH — SSRF 防護**：`client.py::build_client()` 新增 URL
+  scheme/netloc 驗證，拒絕指向內網或私有位址的 URL。
+- **HIGH — circuit breaker 幽靈探測**：`circuit_breaker.rs`
+  OPEN→HALF_OPEN 轉換時補上 `probe_inflight.saturating_add(1)`。修復
+  並發探測數比設計上限多 1 的 bug。
+- **HIGH — `claude_runner.rs` hard deadline 邏輯**：移除 partial
+  output 時 `break` 的分支，統一回傳含 "hard timeout" 字串的 `Err`，
+  確保 `is_llm_fallback_error` 正確觸發 fallback。
+- **HIGH — UTF-8 truncation panic**：`llm_fallback.rs` truncation 改用
+  `char_indices` 安全 UTF-8 char boundary 切片。修復多位元組字元在
+  byte 512 邊界處切割時的 runtime panic。
+- **Web 高危依賴**：`vite` 8.0.0-8.0.4 → 8.0.5+（GHSA-4w7w-66w2-5vf9
+  + GHSA-v2wj-q39q-566r + GHSA-p9ff-h696-f583：Path Traversal in
+  Optimized Deps、`server.fs.deny` bypass、Arbitrary File Read via
+  WebSocket）；`postcss` <8.5.10 → 8.5.10+（GHSA-qx2v-qp2m-jg93：XSS
+  via Unescaped `</style>` in CSS Stringify Output）。npm audit 0
+  vulnerabilities。
+- **Inference 編譯**：`ProgressCallback` 補上 `Sync` trait bound，修復
+  多執行緒共享場景編譯錯誤。
+
+### Tests
+- 549+ tests, 0 failures（包含 `duduclaw-durability`、
+  `duduclaw-governance` 73 tests + integration 22 個 W19-P1 M1-A
+  驗收項、MCP HTTP transport tests、LLM fallback unit tests、Python
+  agents routing + memory MCP tools 含 api_key_masking 安全測試）。
+
+### Build/Repo
+- `.gitignore` 排除 Python coverage db (`.coverage` /
+  `**/.coverage`)、`release artifacts/`、各平台 `npm/*/bin/` 預建
+  binary（應透過 npm publish）。
+- `pyproject.toml` 更新 Python 依賴版本（memory_eval / agents / mcp
+  相關套件）。
+
+
+## [1.9.3] - 2026-04-28
+
+### Fixed
+- **Heartbeat: task-board pull 對所有 agent 生效，無視 enabled flag**。
+  `poll_assigned_tasks` 之前在 `execute_heartbeat` 內，僅當 agent 心跳
+  config `enabled=true` 才會跑。生產環境 17 個 agent 中有 16 個預設
+  `enabled=false`，於是新加的 task board pull 對最需要它的 agent 從
+  未觸發 — 包括 2026-04-28 12:27 觀察到的 26 個未路由 backlog 任務。
+  修正：將 pull 上移到 `HeartbeatScheduler::run` 的 tick body，每 30s
+  掃描整個 agent registry。`poll_assigned_tasks` 原有的 1-hour LIKE
+  marker cooldown 已防止 stampede。task board pull 概念上屬 scheduler
+  層級而非 per-agent evolution，agent 不該為了被指派工作時被叫醒而
+  opt-in。
+
+
+## [1.9.2] - 2026-04-28
+
+### Fixed
+- **Discord Gateway: 真正實作 RESUME (op 6) + stall watchdog**
+  （`discord.rs`）。
+  - 持久化 `session_id` + `resume_gateway_url` + sequence 跨重連。
+    先前每次重連都發新的 IDENTIFY，丟掉 Discord 在斷線期間緩衝的所有
+    事件。
+  - 第三個 `select!` arm 加入 stall watchdog：超過 2× heartbeat
+    interval 沒有任何流量就 break。修復 2026-04-28 11:17Z 觀察到的
+    silent zombie 狀態，gateway loop 卡住 18 分鐘無任何 log 輸出。
+  - heartbeat channel capacity `1 → 16` + `try_send` 防止 `select!`
+    消費慢時反向阻塞。
+  - Op 9 Invalid Session 讀 `d.bool` 決定 RESUME vs IDENTIFY，依
+    Discord docs 加 1-5s jitter。
+  - close codes 4007/4009/4003 清掉 session state 觸發新 IDENTIFY。
+  - backoff cap 300s → 60s；不要懲罰已經跑了好幾小時的 session。
+  - 處理 `RESUMED` dispatch event。
+
+
 ## [1.9.1] - 2026-04-28
 
 ### Added
