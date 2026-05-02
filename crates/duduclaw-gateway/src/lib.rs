@@ -96,5 +96,8 @@ pub mod tool_classifier;
 pub mod evolution_events;
 pub mod skill_synthesis_pipeline;
 
+// ── LLM fallback helpers (timeout / rate-limit → lighter model) ──
+pub mod llm_fallback;
+
 pub use extension::{GatewayExtension, NullExtension};
 pub use server::{start_gateway, GatewayConfig};

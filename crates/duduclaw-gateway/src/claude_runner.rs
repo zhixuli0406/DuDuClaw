@@ -9,6 +9,11 @@ use duduclaw_agent::registry::AgentRegistry;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::llm_fallback::{
+    emit_llm_fallback_audit, format_fallback_error_message, is_llm_fallback_error,
+    should_attempt_model_fallback,
+};
+
 /// Shared `Arc<TaskStore>` injected by `server.rs` at startup so
 /// `build_pending_tasks_section` reuses the gateway-owned connection
 /// instead of opening a fresh SQLite connection per agent invocation.
@@ -216,6 +221,7 @@ pub async fn call_claude_for_agent_with_type(
     let system_prompt = build_system_prompt(agent);
     let agent_name = agent.config.agent.name.clone();
     let claude_model = agent.config.model.preferred.clone();
+    let fallback_model = agent.config.model.fallback.clone();
     let local_config = agent.config.model.local.clone();
     let api_mode = agent.config.model.api_mode.clone();
     let capabilities = agent.config.capabilities.clone();
@@ -273,10 +279,27 @@ pub async fn call_claude_for_agent_with_type(
             // Skip local entirely, go straight to Claude API
             info!(agent = %agent_name, model = %claude_model, "Claude-only mode");
             let wd = effective_work_dir(&agent_dir);
-            return call_with_rotation(
+            let primary_result = call_with_rotation(
                 home_dir, agent_id, prompt, &claude_model, &system_prompt_inlined,
                 request_type, Some(&capabilities), wd.as_deref(),
             ).await;
+            return match primary_result {
+                Ok(text) => Ok(text),
+                Err(ref e) if is_llm_fallback_error(e) && should_attempt_model_fallback(&claude_model, &fallback_model) => {
+                    warn!(
+                        primary = %claude_model,
+                        fallback = %fallback_model,
+                        error = %e,
+                        "LLM timeout/overloaded — attempting model fallback (claude mode)"
+                    );
+                    emit_llm_fallback_audit(home_dir, agent_id, &claude_model, &fallback_model, e).await;
+                    call_with_rotation(
+                        home_dir, agent_id, prompt, &fallback_model, &system_prompt_inlined,
+                        request_type, Some(&capabilities), wd.as_deref(),
+                    ).await.map_err(|fe| format_fallback_error_message(&claude_model, e, &fallback_model, &fe))
+                }
+                Err(e) => Err(e),
+            };
         }
         _ => {
             // "hybrid" — SDK-first design (see routing logic below)
@@ -344,11 +367,34 @@ pub async fn call_claude_for_agent_with_type(
             Ok(text) => return Ok(text),
             Err(e) => {
                 let is_rate = is_rate_limit_error(&e);
-                if api_mode == "auto" && is_rate {
-                    // All OAuth accounts rate-limited → fall through to Direct API
+                let is_fallback_trigger = is_llm_fallback_error(&e);
+                let can_model_fallback = is_fallback_trigger
+                    && should_attempt_model_fallback(&claude_model, &fallback_model);
+
+                if can_model_fallback {
+                    // Model-level fallback takes priority over account-level
+                    // Direct API fallback: switching to a lighter model reuses
+                    // existing OAuth accounts and avoids consuming API Key quota.
+                    // Even if the error was also a rate-limit, haiku is less
+                    // likely to be overloaded and shares the same account pool.
+                    warn!(
+                        primary = %claude_model,
+                        fallback = %fallback_model,
+                        error = %e,
+                        "LLM timeout/overloaded — attempting model fallback via CLI (hybrid mode)"
+                    );
+                    emit_llm_fallback_audit(home_dir, agent_id, &claude_model, &fallback_model, &e).await;
+                    return call_with_rotation(
+                        home_dir, agent_id, prompt, &fallback_model, &system_prompt_inlined,
+                        request_type, Some(&capabilities), wd.as_deref(),
+                    ).await.map_err(|fe| format_fallback_error_message(&claude_model, &e, &fallback_model, &fe));
+                } else if api_mode == "auto" && is_rate {
+                    // No model fallback available: all OAuth accounts rate-limited
+                    // and the two models are the same (or fallback is unset).
+                    // Fall through to Direct API (account-level fallback).
                     warn!(agent = %agent_name, "All CLI accounts rate-limited → trying Direct API fallback");
                 } else {
-                    // "cli" mode or non-rate error → report error
+                    // "cli" mode or non-retriable error → report error
                     return Err(e);
                 }
             }
@@ -365,6 +411,20 @@ pub async fn call_claude_for_agent_with_type(
         tasks_suffix.as_deref(), request_type,
     ).await {
         Ok(text) => Ok(text),
+        Err(ref e) if is_llm_fallback_error(e) && should_attempt_model_fallback(&claude_model, &fallback_model) => {
+            warn!(
+                primary = %claude_model,
+                fallback = %fallback_model,
+                error = %e,
+                "LLM Direct API timeout/overloaded — attempting model fallback"
+            );
+            emit_llm_fallback_audit(home_dir, agent_id, &claude_model, &fallback_model, e).await;
+            try_direct_api(
+                home_dir, agent_id, prompt, &fallback_model, &system_prompt,
+                tasks_suffix.as_deref(), request_type,
+            ).await
+            .map_err(|fe| format_fallback_error_message(&claude_model, e, &fallback_model, &fe))
+        }
         Err(e) => Err(e),
     }
 }

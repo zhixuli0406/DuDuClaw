@@ -430,6 +430,14 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_audit_unified_log(params).await
             }
+            "audit.evolution_query" => {
+                require_admin!();
+                self.handle_audit_evolution_query(params).await
+            }
+            "audit.reliability_summary" => {
+                require_admin!();
+                self.handle_audit_reliability_summary(params).await
+            }
             "security.status" => {
                 require_admin!();
                 self.handle_security_status().await
@@ -3976,6 +3984,152 @@ impl MethodHandler {
                 "total": total,
             }),
         )
+    }
+
+    /// Audit Trail Evolution Query — W19-P1 M4.
+    ///
+    /// Queries the SQLite-backed index cache of EvolutionEvent JSONL audit logs.
+    /// Runs `sync_from_files()` first to pick up any new events written since
+    /// the last query, then executes a filtered, paginated query.
+    ///
+    /// ## Parameters
+    /// | Field        | Type   | Description                                    |
+    /// |--------------|--------|------------------------------------------------|
+    /// | `agent_id`   | string | Filter by agent (optional)                     |
+    /// | `event_type` | string | Filter by event type, e.g. `governance_violation` |
+    /// | `outcome`    | string | Filter by outcome, e.g. `blocked`              |
+    /// | `skill_id`   | string | Filter by skill                                |
+    /// | `since`      | string | RFC3339 lower bound (inclusive)                |
+    /// | `until`      | string | RFC3339 upper bound (exclusive)                |
+    /// | `limit`      | int    | Page size (default 100, max 1000)              |
+    /// | `offset`     | int    | Pagination offset (default 0)                  |
+    ///
+    /// ## Response
+    /// ```json
+    /// { "events": [...], "total": N, "limit": L, "offset": O }
+    /// ```
+    async fn handle_audit_evolution_query(&self, params: Value) -> WsFrame {
+        use crate::evolution_events::query::{AuditEventIndex, AuditQueryFilter};
+
+        let filter = AuditQueryFilter {
+            agent_id:   params.get("agent_id").and_then(|v| v.as_str()).map(|s| s.to_owned()),
+            event_type: params.get("event_type").and_then(|v| v.as_str()).map(|s| s.to_owned()),
+            outcome:    params.get("outcome").and_then(|v| v.as_str()).map(|s| s.to_owned()),
+            skill_id:   params.get("skill_id").and_then(|v| v.as_str()).map(|s| s.to_owned()),
+            since:      params.get("since").and_then(|v| v.as_str()).map(|s| s.to_owned()),
+            until:      params.get("until").and_then(|v| v.as_str()).map(|s| s.to_owned()),
+            limit:      params.get("limit").and_then(|v| v.as_i64()),
+            offset:     params.get("offset").and_then(|v| v.as_i64()),
+        };
+
+        let idx = match AuditEventIndex::open(&self.home_dir) {
+            Ok(i) => i,
+            Err(e) => {
+                warn!("audit.evolution_query: cannot open index: {e}");
+                return WsFrame::error_response("", &format!("index open failed: {e}"));
+            }
+        };
+
+        // Sync new events from JSONL files before querying.
+        if let Err(e) = idx.sync_from_files().await {
+            warn!("audit.evolution_query: sync error (proceeding with stale index): {e}");
+        }
+
+        match idx.query(filter).await {
+            Ok(result) => {
+                let events_json: Vec<Value> = result
+                    .events
+                    .iter()
+                    .map(|ev| {
+                        json!({
+                            "timestamp":      ev.timestamp,
+                            "event_type":     ev.event_type.to_string(),
+                            "agent_id":       ev.agent_id,
+                            "skill_id":       ev.skill_id,
+                            "generation":     ev.generation,
+                            "outcome":        ev.outcome.to_string(),
+                            "trigger_signal": ev.trigger_signal,
+                            "metadata":       ev.metadata,
+                        })
+                    })
+                    .collect();
+
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "events": events_json,
+                        "total":  result.total,
+                        "limit":  result.limit,
+                        "offset": result.offset,
+                    }),
+                )
+            }
+            Err(e) => {
+                warn!("audit.evolution_query: query error: {e}");
+                WsFrame::error_response("", &format!("query failed: {e}"))
+            }
+        }
+    }
+
+    /// WebSocket RPC handler for `audit.reliability_summary` (W20-P0).
+    ///
+    /// Computes the four-metric Agent Reliability Summary from the evolution-event
+    /// audit trail SQLite index.  Requires Admin scope.
+    ///
+    /// ## Request params
+    /// - `agent_id` (required) — Agent identifier to query
+    /// - `window_days` (optional, default 7, clamped to 1–365)
+    ///
+    /// ## Response
+    /// ```json
+    /// { "agent_id": "...", "window_days": 7, "consistency_score": 0.87, ... }
+    /// ```
+    async fn handle_audit_reliability_summary(&self, params: Value) -> WsFrame {
+        use crate::evolution_events::query::AuditEventIndex;
+
+        let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id.to_owned(),
+            _ => return WsFrame::error_response("", "agent_id is required"),
+        };
+
+        let window_days = params
+            .get("window_days")
+            .and_then(|v| v.as_u64())
+            .map(|d| d.clamp(1, 365) as u32)
+            .unwrap_or(7);
+
+        let idx = match AuditEventIndex::open(&self.home_dir) {
+            Ok(i) => i,
+            Err(e) => {
+                warn!("audit.reliability_summary: cannot open index: {e}");
+                return WsFrame::error_response("", &format!("index open failed: {e}"));
+            }
+        };
+
+        // Sync new events from JSONL files before querying.
+        if let Err(e) = idx.sync_from_files().await {
+            warn!("audit.reliability_summary: sync warning (proceeding with stale index): {e}");
+        }
+
+        match idx.compute_reliability_summary(&agent_id, window_days).await {
+            Ok(s) => WsFrame::ok_response(
+                "",
+                json!({
+                    "agent_id":            s.agent_id,
+                    "window_days":         s.window_days,
+                    "consistency_score":   s.consistency_score,
+                    "task_success_rate":   s.task_success_rate,
+                    "skill_adoption_rate": s.skill_adoption_rate,
+                    "fallback_trigger_rate": s.fallback_trigger_rate,
+                    "total_events":        s.total_events,
+                    "generated_at":        s.generated_at,
+                }),
+            ),
+            Err(e) => {
+                warn!("audit.reliability_summary: compute error: {e}");
+                WsFrame::error_response("", &format!("compute failed: {e}"))
+            }
+        }
     }
 
     /// Live security system status — replaces static placeholder panels.

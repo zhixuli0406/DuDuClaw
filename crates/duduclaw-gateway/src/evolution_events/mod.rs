@@ -25,4 +25,6 @@
 
 pub mod emitter;
 pub mod logger;
+pub mod query;
+pub mod reliability;
 pub mod schema;

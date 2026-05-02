@@ -200,6 +200,194 @@ impl EvolutionEventEmitter {
         );
     }
 
+    // ── W19-P1: Governance domain helpers ────────────────────────────────────
+
+    /// Emit a `governance_violation` event (non-blocking).
+    ///
+    /// Call from `PolicyEvaluator` after a violation is detected and recorded.
+    ///
+    /// ## metadata fields
+    /// `{"policy_id", "policy_type", "violation_detail", "operation_type"}`
+    pub fn emit_governance_violation(
+        &self,
+        agent_id: &str,
+        outcome: Outcome, // Blocked | Warned | Throttled
+        metadata: Json,
+    ) {
+        self.spawn(
+            AuditEvent::now(AuditEventType::GovernanceViolation, agent_id, outcome)
+                .with_trigger_signal("policy_evaluator")
+                .with_metadata(metadata),
+        );
+    }
+
+    /// Emit a `governance_approval_requested` event (non-blocking).
+    ///
+    /// ## metadata fields
+    /// `{"approval_request_id", "operation_type", "justification"}`
+    pub fn emit_governance_approval_requested(
+        &self,
+        agent_id: &str,
+        metadata: Json,
+    ) {
+        self.spawn(
+            AuditEvent::now(
+                AuditEventType::GovernanceApprovalRequested,
+                agent_id,
+                Outcome::Pending,
+            )
+            .with_trigger_signal("approval_workflow")
+            .with_metadata(metadata),
+        );
+    }
+
+    /// Emit a `governance_approval_decided` event (non-blocking).
+    ///
+    /// ## metadata fields
+    /// `{"approval_request_id", "approver_id", "reason"}`
+    pub fn emit_governance_approval_decided(
+        &self,
+        agent_id: &str,
+        outcome: Outcome, // Approved | Rejected
+        metadata: Json,
+    ) {
+        self.spawn(
+            AuditEvent::now(AuditEventType::GovernanceApprovalDecided, agent_id, outcome)
+                .with_trigger_signal("approval_workflow")
+                .with_metadata(metadata),
+        );
+    }
+
+    /// Emit a `governance_policy_changed` event (non-blocking).
+    ///
+    /// ## metadata fields
+    /// `{"policy_id", "policy_type", "change_type": "create|update|delete"}`
+    pub fn emit_governance_policy_changed(
+        &self,
+        agent_id: &str,
+        success: bool,
+        metadata: Json,
+    ) {
+        let outcome = if success { Outcome::Success } else { Outcome::Failure };
+        self.spawn(
+            AuditEvent::now(AuditEventType::GovernancePolicyChanged, agent_id, outcome)
+                .with_trigger_signal("policy_registry")
+                .with_metadata(metadata),
+        );
+    }
+
+    /// Emit a `governance_quota_reset` event (non-blocking).
+    ///
+    /// ## metadata fields
+    /// `{"policy_id", "agents_affected": N}`
+    pub fn emit_governance_quota_reset(&self, agent_id: &str, metadata: Json) {
+        self.spawn(
+            AuditEvent::now(AuditEventType::GovernanceQuotaReset, agent_id, Outcome::Success)
+                .with_trigger_signal("quota_manager")
+                .with_metadata(metadata),
+        );
+    }
+
+    // ── W19-P1: Durability domain helpers ────────────────────────────────────
+
+    /// Emit a `durability_retry_attempt` event (non-blocking).
+    ///
+    /// ## metadata fields
+    /// `{"attempt_number", "max_attempts", "delay_ms", "error_code"}`
+    pub fn emit_durability_retry_attempt(
+        &self,
+        agent_id: &str,
+        success: bool,
+        metadata: Json,
+    ) {
+        let outcome = if success { Outcome::Success } else { Outcome::Failure };
+        self.spawn(
+            AuditEvent::now(AuditEventType::DurabilityRetryAttempt, agent_id, outcome)
+                .with_trigger_signal("retry_engine")
+                .with_metadata(metadata),
+        );
+    }
+
+    /// Emit a `durability_retry_exhausted` event (non-blocking).
+    ///
+    /// ## metadata fields
+    /// `{"operation_type", "max_attempts", "dlq_id", "last_error"}`
+    pub fn emit_durability_retry_exhausted(&self, agent_id: &str, metadata: Json) {
+        self.spawn(
+            AuditEvent::now(AuditEventType::DurabilityRetryExhausted, agent_id, Outcome::Failure)
+                .with_trigger_signal("retry_engine")
+                .with_metadata(metadata),
+        );
+    }
+
+    /// Emit a `durability_circuit_opened` event (non-blocking).
+    ///
+    /// ## metadata fields
+    /// `{"dependency", "failure_rate", "request_count", "reset_timeout_seconds"}`
+    pub fn emit_durability_circuit_opened(&self, agent_id: &str, metadata: Json) {
+        self.spawn(
+            AuditEvent::now(
+                AuditEventType::DurabilityCircuitOpened,
+                agent_id,
+                Outcome::Triggered,
+            )
+            .with_trigger_signal("circuit_breaker")
+            .with_metadata(metadata),
+        );
+    }
+
+    /// Emit a `durability_circuit_recovered` event (non-blocking).
+    ///
+    /// ## metadata fields
+    /// `{"dependency", "probe_success_count"}`
+    pub fn emit_durability_circuit_recovered(&self, agent_id: &str, metadata: Json) {
+        self.spawn(
+            AuditEvent::now(
+                AuditEventType::DurabilityCircuitRecovered,
+                agent_id,
+                Outcome::Recovered,
+            )
+            .with_trigger_signal("circuit_breaker")
+            .with_metadata(metadata),
+        );
+    }
+
+    /// Emit a `durability_checkpoint_saved` event (non-blocking).
+    ///
+    /// ## metadata fields
+    /// `{"checkpoint_id", "phase", "ttl_seconds"}`
+    pub fn emit_durability_checkpoint_saved(
+        &self,
+        agent_id: &str,
+        success: bool,
+        metadata: Json,
+    ) {
+        let outcome = if success { Outcome::Success } else { Outcome::Failure };
+        self.spawn(
+            AuditEvent::now(AuditEventType::DurabilityCheckpointSaved, agent_id, outcome)
+                .with_trigger_signal("checkpoint_manager")
+                .with_metadata(metadata),
+        );
+    }
+
+    /// Emit a `durability_dlq_replayed` event (non-blocking).
+    ///
+    /// ## metadata fields
+    /// `{"dlq_id", "operation_type", "replayed_by"}`
+    pub fn emit_durability_dlq_replayed(
+        &self,
+        agent_id: &str,
+        success: bool,
+        metadata: Json,
+    ) {
+        let outcome = if success { Outcome::Success } else { Outcome::Failure };
+        self.spawn(
+            AuditEvent::now(AuditEventType::DurabilityDlqReplayed, agent_id, outcome)
+                .with_trigger_signal("dead_letter_queue")
+                .with_metadata(metadata),
+        );
+    }
+
     // ── Internal ──────────────────────────────────────────────────────────────
 
     /// Fire-and-forget: log `event` via [`tokio::spawn`].
@@ -555,6 +743,8 @@ mod tests {
                     emitter.emit_signal_suppressed_stub("a", serde_json::json!({"suppressed_signal": null, "trigger_count": null, "window_seconds": null})),
                 AuditEventType::SkillGraduate =>
                     emitter.emit_skill_graduate("a", "test-skill", serde_json::json!({"quality_score": 0.8, "source_trajectories": 1, "pipeline_version": "W19-P0"})),
+                // W19-P1 variants — not tested here (generation=null is a P0 guarantee only)
+                _ => {}
             }
         }
         sleep(Duration::from_millis(100)).await;
