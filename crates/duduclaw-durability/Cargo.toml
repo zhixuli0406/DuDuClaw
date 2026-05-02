@@ -1,0 +1,38 @@
+[package]
+name = "duduclaw-durability"
+version.workspace = true
+edition.workspace = true
+description = "W19-P1 Durability pillar: idempotency, retry engine, circuit breaker, checkpoint manager, DLQ"
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# UUID
+uuid = { workspace = true }
+
+# SHA-256 for idempotency key content hash
+sha2 = "0.10"
+hex = "0.4"
+
+# True random number generation for production-grade jitter (INFRA-SEC-03)
+rand = "0.8"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
