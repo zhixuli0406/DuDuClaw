@@ -1,0 +1,285 @@
+# AgentCapabilityRegistry — Static YAML (W18)
+# Schema version: 1.0
+#
+# Required per agent: agent_id, capabilities[], max_concurrent_tasks
+# Optional per agent: description, tags[]
+#
+# Capabilities use snake_case identifiers.
+# This file is loaded at startup and supports hot reload.
+
+schema_version: "1.0"
+
+agents:
+  # ── Root ──────────────────────────────────────────────────────────────────
+  - agent_id: "agnes"
+    description: "Root orchestrator — top-level task coordination and delegation"
+    capabilities:
+      - orchestration
+      - task_delegation
+      - root_management
+      - cross_team_coordination
+    max_concurrent_tasks: 10
+    tags:
+      - root
+      - main
+      - orchestrator
+
+  # ── DuDuClaw Team ─────────────────────────────────────────────────────────
+  - agent_id: "duduclaw-tl"
+    description: "DuDuClaw Team Leader — strategic planning and team coordination"
+    capabilities:
+      - team_leadership
+      - task_management
+      - agent_coordination
+      - strategic_planning
+      - sprint_planning
+      - technical_review
+    max_concurrent_tasks: 5
+    tags:
+      - leadership
+      - management
+      - duduclaw
+
+  - agent_id: "duduclaw-pm"
+    description: "DuDuClaw Product Manager — product roadmap and requirements"
+    capabilities:
+      - product_management
+      - requirements_analysis
+      - sprint_planning
+      - stakeholder_communication
+      - market_research
+      - user_story_writing
+      - competitive_analysis
+    max_concurrent_tasks: 3
+    tags:
+      - product
+      - planning
+      - duduclaw
+
+  - agent_id: "duduclaw-eng-agent"
+    description: "Agent System Engineer — MCP tools, agent lifecycle, Claude SDK"
+    capabilities:
+      - agent_system_design
+      - mcp_tool_development
+      - agent_lifecycle_management
+      - agent_communication_protocol
+      - claude_sdk_integration
+      - multi_agent_orchestration
+      - tool_use_design
+      - handoff_protocol
+    max_concurrent_tasks: 2
+    tags:
+      - engineering
+      - agents
+      - mcp
+      - duduclaw
+
+  - agent_id: "duduclaw-eng-memory"
+    description: "Memory System Engineer — episodic/semantic memory and retrieval"
+    capabilities:
+      - memory_system_design
+      - memory_retrieval
+      - memory_consolidation
+      - knowledge_graph
+      - vector_search
+      - context_management
+    max_concurrent_tasks: 2
+    tags:
+      - engineering
+      - memory
+      - duduclaw
+
+  - agent_id: "duduclaw-eng-infra"
+    description: "Infrastructure Engineer — deployment, CI/CD, server management"
+    capabilities:
+      - infrastructure_design
+      - deployment
+      - ci_cd
+      - server_management
+      - mcp_server_management
+      - docker
+      - monitoring
+    max_concurrent_tasks: 2
+    tags:
+      - engineering
+      - infrastructure
+      - duduclaw
+
+  - agent_id: "duduclaw-marketing"
+    description: "Marketing Agent — content creation and brand strategy"
+    capabilities:
+      - content_creation
+      - social_media_marketing
+      - brand_strategy
+      - market_analysis
+      - copywriting
+      - campaign_planning
+    max_concurrent_tasks: 3
+    tags:
+      - marketing
+      - content
+      - duduclaw
+
+  - agent_id: "duduclaw-qa-1"
+    description: "QA Reviewer A — code review, functional testing"
+    capabilities:
+      - code_review
+      - testing
+      - quality_assurance
+      - bug_detection
+      - test_case_design
+      - regression_testing
+    max_concurrent_tasks: 2
+    tags:
+      - qa
+      - testing
+      - duduclaw
+
+  - agent_id: "duduclaw-qa-2"
+    description: "QA Reviewer B — security testing and integration testing"
+    capabilities:
+      - code_review
+      - testing
+      - quality_assurance
+      - security_testing
+      - integration_testing
+      - performance_testing
+    max_concurrent_tasks: 2
+    tags:
+      - qa
+      - testing
+      - duduclaw
+
+  # ── Xianwen Team ──────────────────────────────────────────────────────────
+  - agent_id: "xianwen-tl"
+    description: "Xianwen Team Leader — xianwen project coordination"
+    capabilities:
+      - team_leadership
+      - task_management
+      - agent_coordination
+      - strategic_planning
+      - technical_review
+    max_concurrent_tasks: 5
+    tags:
+      - leadership
+      - management
+      - xianwen
+
+  - agent_id: "xianwen-eng-ai"
+    description: "Xianwen AI Engineer — ML pipelines, LLM optimization"
+    capabilities:
+      - ai_model_integration
+      - ml_pipeline
+      - llm_optimization
+      - prompt_engineering
+      - fine_tuning
+      - model_evaluation
+    max_concurrent_tasks: 2
+    tags:
+      - engineering
+      - ai
+      - ml
+      - xianwen
+
+  - agent_id: "xianwen-eng-backend"
+    description: "Xianwen Backend Engineer — API design, database, server logic"
+    capabilities:
+      - backend_development
+      - api_design
+      - database_design
+      - server_side_logic
+      - rest_api
+      - authentication
+    max_concurrent_tasks: 2
+    tags:
+      - engineering
+      - backend
+      - xianwen
+
+  - agent_id: "xianwen-eng-frontend"
+    description: "Xianwen Frontend Engineer — UI/UX, React, web development"
+    capabilities:
+      - frontend_development
+      - ui_design
+      - react
+      - web_development
+      - ux_design
+      - accessibility
+    max_concurrent_tasks: 2
+    tags:
+      - engineering
+      - frontend
+      - xianwen
+
+  - agent_id: "xianwen-pm"
+    description: "Xianwen Product Manager — product planning and user research"
+    capabilities:
+      - product_management
+      - requirements_analysis
+      - user_research
+      - sprint_planning
+      - stakeholder_communication
+    max_concurrent_tasks: 3
+    tags:
+      - product
+      - planning
+      - xianwen
+
+  - agent_id: "xianwen-qa-1"
+    description: "Xianwen QA Reviewer A — functional and regression testing"
+    capabilities:
+      - code_review
+      - testing
+      - quality_assurance
+      - bug_detection
+      - regression_testing
+    max_concurrent_tasks: 2
+    tags:
+      - qa
+      - testing
+      - xianwen
+
+  - agent_id: "xianwen-qa-2"
+    description: "Xianwen QA Reviewer B — end-to-end and exploratory testing"
+    capabilities:
+      - code_review
+      - testing
+      - quality_assurance
+      - integration_testing
+      - exploratory_testing
+    max_concurrent_tasks: 2
+    tags:
+      - qa
+      - testing
+      - xianwen
+
+  # ── Research Agents ───────────────────────────────────────────────────────
+  - agent_id: "ai-papers-researcher"
+    description: "AI Papers Researcher — academic literature and paper analysis"
+    capabilities:
+      - research
+      - paper_analysis
+      - literature_review
+      - academic_search
+      - summarization
+      - citation_analysis
+    max_concurrent_tasks: 3
+    tags:
+      - research
+      - academic
+      - papers
+
+  - agent_id: "ai-repos-researcher"
+    description: "AI Repositories Researcher — open-source code and tech evaluation"
+    capabilities:
+      - research
+      - code_analysis
+      - repository_exploration
+      - technology_evaluation
+      - competitive_analysis
+      - summarization
+    max_concurrent_tasks: 3
+    tags:
+      - research
+      - codebase
+      - repos
