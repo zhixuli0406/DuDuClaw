@@ -36,6 +36,8 @@ zeroize = "1"
 unicode-normalization = "0.1"
 flate2 = "1"
 tar = "0.4"
+dirs = "5"
+hostname = "0.4"
 
 duduclaw-inference = { workspace = true }
 duduclaw-desktop = { workspace = true, optional = true }

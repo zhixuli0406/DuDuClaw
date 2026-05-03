@@ -1,6 +1,6 @@
 # DuDuClaw Project Guidelines
 
-## Architecture Overview (v1.9.4)
+## Architecture Overview (v1.10.0)
 
 DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code / Codex / Gemini** CLI as AI backends via a unified `AgentRuntime` trait with auto-detection and per-agent configuration. DuDuClaw provides the plumbing: channel routing, session management, memory, evolution, multi-account rotation, local LLM inference, and browser automation.
 

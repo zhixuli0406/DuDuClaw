@@ -33,7 +33,17 @@ pub fn set_shared_task_store(store: Arc<crate::task_store::TaskStore>) {
 ///
 /// Skills are sorted alphabetically by name to ensure deterministic byte
 /// sequences across calls — this maximizes prompt cache hit rates.
-fn build_system_prompt(agent: &duduclaw_agent::LoadedAgent) -> String {
+///
+/// `citation_ctx`: when present, wiki pages injected here are recorded into
+/// the global `CitationTracker` keyed by `(agent_id, turn_id, session_id)`.
+/// `session_id` is None when the dispatcher chain doesn't carry session
+/// context (e.g. cron-triggered tasks); the per-conversation cap then
+/// degrades to a per-turn cap, which is conservative.
+/// (review B2 — sub-agent dispatch was previously bypassing trust feedback.)
+fn build_system_prompt(
+    agent: &duduclaw_agent::LoadedAgent,
+    citation_ctx: Option<(&str, &str, Option<&str>)>,
+) -> String {
     let mut parts = Vec::new();
 
     if let Some(soul) = &agent.soul {
@@ -58,7 +68,16 @@ fn build_system_prompt(agent: &duduclaw_agent::LoadedAgent) -> String {
     let wiki_dir = agent.dir.join("wiki");
     if wiki_dir.exists() {
         let store = duduclaw_memory::WikiStore::new(wiki_dir);
-        match store.build_injection_context(6000) {
+        let result = match citation_ctx {
+            Some((agent_id, turn_id, session_id)) => {
+                let tracker = duduclaw_memory::feedback::global_tracker();
+                store.build_injection_context_with_citations(
+                    6000, agent_id, turn_id, session_id, &tracker,
+                )
+            }
+            None => store.build_injection_context(6000),
+        };
+        match result {
             Ok(wiki_ctx) if !wiki_ctx.is_empty() => {
                 parts.push(format!("# Wiki Knowledge\n{}", wiki_ctx.trim_end()));
             }
@@ -218,7 +237,26 @@ pub async fn call_claude_for_agent_with_type(
 
     let agent = agent.ok_or_else(|| format!("Agent '{agent_id}' not found in registry"))?;
 
-    let system_prompt = build_system_prompt(agent);
+    // Sub-agents inherit a turn id from the dispatch chain via tokio
+    // task_local — set by `channel_reply` before invoking the dispatcher.
+    // When None (top-level callers, tests), skip citation tracking; we can't
+    // pair the citation with a downstream prediction error otherwise.
+    //
+    // Session id is also propagated so the per-conversation 0.10 cap stays
+    // session-scoped across all sub-agent calls within the same channel
+    // session (review BLOCKER R2-1).
+    let turn_owned = duduclaw_memory::feedback::CURRENT_TURN_ID
+        .try_with(|tid| tid.clone())
+        .ok()
+        .flatten();
+    let session_owned = duduclaw_memory::feedback::CURRENT_SESSION_ID
+        .try_with(|sid| sid.clone())
+        .ok()
+        .flatten();
+    let citation_ref = turn_owned.as_deref().map(|tid| {
+        (agent_id, tid, session_owned.as_deref())
+    });
+    let system_prompt = build_system_prompt(agent, citation_ref);
     let agent_name = agent.config.agent.name.clone();
     let claude_model = agent.config.model.preferred.clone();
     let fallback_model = agent.config.model.fallback.clone();
@@ -1185,6 +1223,21 @@ fn prepare_claude_cmd(
     // delegation callbacks for sub-agent response forwarding.
     if let Ok(channel) = REPLY_CHANNEL.try_with(|ch| ch.clone()) {
         cmd.env(duduclaw_core::ENV_REPLY_CHANNEL, &channel);
+    }
+
+    // v1.10: Inject wiki RL trust feedback context so the MCP server can
+    // attach turn_id / session_id to sub-agent dispatch BusMessages.
+    // Same pattern as REPLY_CHANNEL — task_local set in channel_reply path,
+    // read here, propagated to subprocess via env var.
+    if let Ok(Some(turn_id)) =
+        duduclaw_memory::feedback::CURRENT_TURN_ID.try_with(|t| t.clone())
+    {
+        cmd.env(duduclaw_core::ENV_TRUST_TURN_ID, &turn_id);
+    }
+    if let Ok(Some(session_id)) =
+        duduclaw_memory::feedback::CURRENT_SESSION_ID.try_with(|s| s.clone())
+    {
+        cmd.env(duduclaw_core::ENV_TRUST_SESSION_ID, &session_id);
     }
 
     (cmd, prompt_guard)

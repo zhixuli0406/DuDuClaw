@@ -85,10 +85,11 @@ impl McpDispatcher {
     ///
     /// # Pipeline
     ///
-    /// 1. **Scope check** — verifies the principal has the required scope.
-    /// 2. **Rate-limit check** — enforces per-client Read / Write limits.
-    /// 3. **Namespace injection** — strips `agent_id` / `namespace` from external clients.
-    /// 4. **Tool dispatch** — delegates to `crate::mcp::handle_tools_call`.
+    /// 1. **External whitelist** — external clients may only call whitelisted tools.
+    /// 2. **Scope check** — verifies the principal has the required scope.
+    /// 3. **Rate-limit check** — enforces per-client Read / Write limits.
+    /// 4. **Namespace injection** — strips `agent_id` / `namespace` from external clients.
+    /// 5. **Tool dispatch** — delegates to `crate::mcp::handle_tools_call`.
     ///
     /// Returns a JSON-RPC `result` or `error` Value.
     pub async fn dispatch_tool_call(
@@ -99,6 +100,26 @@ impl McpDispatcher {
         id: &Value,
     ) -> Value {
         let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+
+        // ── 0. External whitelist enforcement ────────────────────────────────
+        // (review BLOCKER R2 / security N-1) `tools/list` already filters
+        // hidden tools out of discovery, but a malicious external client can
+        // still call any tool by name via `tools/call`. Mirror the filter
+        // here so non-discoverable tools are also non-callable.
+        if principal.is_external
+            && !crate::mcp::EXTERNAL_TOOLS_WHITELIST.contains(&tool_name)
+        {
+            warn!(
+                client_id = %principal.client_id,
+                tool = %tool_name,
+                "External client attempted to call non-whitelisted tool"
+            );
+            return jsonrpc_error(
+                id,
+                -32601,
+                &format!("Method '{tool_name}' not available to external clients"),
+            );
+        }
 
         // ── 1. Scope check ───────────────────────────────────────────────────
         if let Some(required) = crate::mcp_auth::tool_requires_scope(tool_name) {

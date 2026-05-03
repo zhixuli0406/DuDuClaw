@@ -388,6 +388,13 @@ async fn build_reply_with_session_inner(
     user_id: &str,
     on_progress: Option<ProgressCallback>,
 ) -> String {
+    // BLOCKER fix (review B1): use a fresh per-turn ID for citation tracking
+    // and prediction-error feedback. `session_id` spans many turns; sharing
+    // it as the citation key meant prior turns' citations were attributed
+    // to the next turn's prediction error. The session id is still used for
+    // session manager / metrics; only the trust feedback path switches.
+    let turn_id = format!("{session_id}#{}", uuid::Uuid::new_v4());
+
     // Determine which agent to use
     let reg = ctx.registry.read().await;
     let agent = if let Some(name) = agent_override {
@@ -477,8 +484,15 @@ async fn build_reply_with_session_inner(
     let system_prompt = {
         let cache = ctx.skill_cache.lock().await;
         let compressed: Vec<_> = cache.all().into_iter().cloned().collect();
+        // turn_id keys this turn's citations (drain unit); session_id is the
+        // budget unit for the per-conversation 0.10 cap. Both are needed —
+        // see review BLOCKER R2-1 (cap was silently broken when conv_cap PK
+        // followed turn_id and reset every turn).
+        let citation_ctx = Some((agent_id.as_str(), turn_id.as_str(), Some(session_id)));
         if compressed.is_empty() {
-            build_system_prompt(agent, None, None, None, skill_token_budget, team_ref, "")
+            build_system_prompt(
+                agent, None, None, None, skill_token_budget, team_ref, "", citation_ctx,
+            )
         } else {
             build_system_prompt(
                 agent,
@@ -488,6 +502,7 @@ async fn build_reply_with_session_inner(
                 skill_token_budget,
                 team_ref,
                 "",
+                citation_ctx,
             )
         }
     };
@@ -983,6 +998,14 @@ async fn build_reply_with_session_inner(
     );
     let is_channel_session = duduclaw_core::SUPPORTED_CHANNEL_TYPES.iter()
         .any(|t| session_id.starts_with(&format!("{t}:")));
+    // (review B2) Make `turn_id` and `session_id` available to sub-agent
+    // dispatchers via tokio task-locals. Any wiki RAG triggered by the
+    // dispatcher inherits these so citations land in the right tracker
+    // bucket AND respect the session-scoped per-conv cap.
+    let cli_future = duduclaw_memory::feedback::CURRENT_SESSION_ID
+        .scope(Some(session_id.to_string()), cli_future);
+    let cli_future = duduclaw_memory::feedback::CURRENT_TURN_ID
+        .scope(Some(turn_id.clone()), cli_future);
     let reply = if is_channel_session {
         crate::claude_runner::REPLY_CHANNEL.scope(session_id.to_string(), cli_future).await
     } else {
@@ -1302,12 +1325,21 @@ async fn build_reply_with_session_inner(
         }
 
         // ── Prediction-driven evolution ──────────────────────────────
+        // (BLOCKER R2-2) When the prediction engine is unconfigured the
+        // spawned trust-feedback path below never runs, so citations
+        // accumulate in the global `CitationTracker` until the 1-hour GC
+        // reaps them — a slow memory leak under sustained traffic. Drain
+        // the bucket synchronously here before deciding whether to proceed.
+        if ctx.prediction_engine.is_none() {
+            let _ = duduclaw_memory::feedback::global_tracker().drain(&turn_id);
+        }
         if let Some(pe) = ctx.prediction_engine.as_ref() {
             let pe = pe.clone();
             let gvu = ctx.gvu_loop.clone();
             let user_id_for_pred = user_id.to_string();
             let agent_id_for_pred = agent_id.clone();
             let session_id_for_pred = session_id.to_string();
+            let turn_id_for_pred = turn_id.clone();
             let text_clone = text.to_string();
             let reply_clone_for_pred = reply.clone();
             let home_for_pred = ctx.home_dir.clone();
@@ -1323,6 +1355,13 @@ async fn build_reply_with_session_inner(
             let evolution_emitter_for_pred = ctx.evolution_emitter.clone();
 
             tokio::spawn(async move {
+                // RAII drain guard — if anything below panics or returns
+                // early, the citation tracker bucket for this turn is still
+                // freed. (review HIGH R3-3.) The bus drains explicitly on
+                // happy path; we disarm before that to avoid double-drain.
+                let mut drain_guard = duduclaw_memory::feedback::DrainOnDrop::new(
+                    turn_id_for_pred.clone(),
+                );
                 // 1. Generate prediction (< 1ms, zero LLM)
                 let prediction = pe.predict(&user_id_for_pred, &agent_id_for_pred, &text_clone).await;
                 debug!(
@@ -1372,6 +1411,29 @@ async fn build_reply_with_session_inner(
                     let meta = pe.metacognition.lock().await;
                     error.apply_outcome(outcome, &meta.thresholds);
                 }
+
+                // ── Wiki RL trust feedback (Phase 2) ───────────────────
+                // After the error is fully adjusted, dispatch to the trust
+                // feedback bus so wiki pages cited during this turn get
+                // their trust nudged up/down. Drains the citation tracker
+                // for `turn_id_for_pred` (not session_id) so each turn's
+                // citations are attributed only to its own prediction error.
+                // (review B1)
+                if let Some(bus) = crate::prediction::feedback_bus::TrustFeedbackBus::from_globals() {
+                    let _ = bus.on_prediction_error(
+                        &turn_id_for_pred,
+                        &agent_id_for_pred,
+                        &error,
+                    );
+                } else {
+                    // Trust store not initialised — drain tracker manually
+                    // to keep memory bounded.
+                    let _ = duduclaw_memory::feedback::global_tracker()
+                        .drain(&turn_id_for_pred);
+                }
+                // Bus / fallback path drained the bucket — disarm the RAII
+                // guard so it doesn't double-drain on scope exit.
+                drain_guard.disarm();
                 // Record failure to MistakeNotebook for grounded GVU
                 if let Some(ref outcome) = conv_outcome {
                     if outcome.is_failure() {
@@ -3158,6 +3220,21 @@ async fn spawn_claude_cli_with_env(
         cmd.env(duduclaw_core::ENV_REPLY_CHANNEL, &channel);
     }
 
+    // v1.10: Inject wiki RL trust feedback context so the MCP server can
+    // forward turn_id / session_id into BusMessage when enqueueing
+    // sub-agent dispatch. Without this, sub-agent RAG citations are not
+    // attributed back to the originating turn's prediction error.
+    if let Ok(Some(turn_id)) =
+        duduclaw_memory::feedback::CURRENT_TURN_ID.try_with(|t| t.clone())
+    {
+        cmd.env(duduclaw_core::ENV_TRUST_TURN_ID, &turn_id);
+    }
+    if let Ok(Some(session_id)) =
+        duduclaw_memory::feedback::CURRENT_SESSION_ID.try_with(|s| s.clone())
+    {
+        cmd.env(duduclaw_core::ENV_TRUST_SESSION_ID, &session_id);
+    }
+
     // Prevent "nested session" error when gateway was launched from a Claude Code session
     cmd.env_remove("CLAUDECODE");
     cmd.stdin(std::process::Stdio::null());
@@ -3647,6 +3724,13 @@ async fn call_python_sdk_v2(
 /// When `compressed_skills` and `active_skills` are available, uses three-layer
 /// progressive loading instead of full injection. Otherwise falls back to legacy
 /// full injection.
+// `citation_ctx` carries `(agent_id, turn_id, session_id)` — when present,
+// wiki pages injected into the prompt are recorded into the global
+// `CitationTracker` so the prediction-error feedback bus can later attribute
+// trust deltas back to the exact pages that influenced this turn.
+// `session_id` is the SESSION-scoped budget id used for the per-conversation
+// cap (review BLOCKER R2-1). Distinct from `turn_id` which is the per-turn
+// drain key.
 fn build_system_prompt(
     agent: Option<&duduclaw_agent::registry::LoadedAgent>,
     user_message: Option<&str>,
@@ -3655,6 +3739,7 @@ fn build_system_prompt(
     skill_token_budget: u32,
     team_members: Option<&[TeamMember]>,
     pinned_instructions: &str,
+    citation_ctx: Option<(&str, &str, Option<&str>)>,
 ) -> String {
     let mut parts = Vec::new();
 
@@ -3729,7 +3814,16 @@ fn build_system_prompt(
         let wiki_dir = a.dir.join("wiki");
         if wiki_dir.exists() {
             let store = duduclaw_memory::WikiStore::new(wiki_dir);
-            match store.build_injection_context(6000) {
+            let result = match citation_ctx {
+                Some((agent_id, conv_id, session_id)) => {
+                    let tracker = duduclaw_memory::feedback::global_tracker();
+                    store.build_injection_context_with_citations(
+                        6000, agent_id, conv_id, session_id, &tracker,
+                    )
+                }
+                None => store.build_injection_context(6000),
+            };
+            match result {
                 Ok(wiki_ctx) if !wiki_ctx.is_empty() => {
                     parts.push(format!("## Wiki Knowledge\n{}", wiki_ctx.trim_end()));
                 }

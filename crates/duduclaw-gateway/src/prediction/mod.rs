@@ -9,6 +9,7 @@
 //! Only genuine prediction errors trigger expensive LLM reflections.
 
 pub mod engine;
+pub mod feedback_bus;
 pub mod forced_reflection;
 pub mod metacognition;
 pub mod metrics;

@@ -97,6 +97,14 @@ impl AgentRegistry {
                 continue;
             }
 
+            // Skip directories without agent.toml — these are not agent dirs
+            // (e.g. legacy wiki-only directories). Without this guard the load
+            // attempt below would log a WARN on every scan tick.
+            if !fs::try_exists(path.join("agent.toml")).await.unwrap_or(false) {
+                info!(dir = %dir_name, "skipping non-agent directory (no agent.toml)");
+                continue;
+            }
+
             // Attempt to load the agent
             match Self::load_agent(&path).await {
                 Ok(mut agent) => {

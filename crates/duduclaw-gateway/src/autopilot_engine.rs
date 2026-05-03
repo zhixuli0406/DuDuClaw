@@ -632,6 +632,8 @@ impl AutopilotEngine {
             acked_at: None,
             completed_at: None,
             reply_channel: None,
+            turn_id: None,
+            session_id: None,
         };
         mq.enqueue(&msg).await
     }

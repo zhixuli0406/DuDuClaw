@@ -51,6 +51,7 @@ const navItems: NavItem[] = [
   { to: '/memory', icon: Brain, label: 'nav.memory' },
   { to: '/wiki', icon: BookOpen, label: 'nav.wiki' },
   { to: '/shared-wiki', icon: Globe, label: 'nav.sharedWiki' },
+  { to: '/wiki-trust', icon: Shield, label: 'nav.wikiTrust', minRole: 'admin' },
   { to: '/security', icon: Shield, label: 'nav.security', minRole: 'admin' },
   { to: '/reports', icon: BarChart3, label: 'nav.reports', minRole: 'manager' },
   { to: '/billing', icon: CreditCard, label: 'nav.billing', minRole: 'manager' },

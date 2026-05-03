@@ -325,6 +325,12 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         "audit_trail_query" => Some(Scope::Admin),
         // W20-P0: Reliability Dashboard — admin-only，敏感指標資料。
         "reliability_summary" => Some(Scope::Admin),
+        // R4 review: WebSocket dashboard requires manager+ for these via
+        // `require_manager!()`; mirror as Admin scope at the MCP boundary
+        // since MCP scopes lack a Manager tier. `wiki_trust_audit` exposes
+        // page-level trust trends; `wiki_trust_history` exposes
+        // `conversation_id` correlatable with user activity.
+        "wiki_trust_audit" | "wiki_trust_history" => Some(Scope::Admin),
         _ => None,
     }
 }
