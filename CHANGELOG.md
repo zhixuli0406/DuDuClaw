@@ -1,6 +1,16 @@
 # Changelog
 
 
+## [1.10.1] - 2026-05-04
+
+### Fixed — Release pipeline
+- **PyPI publish 失敗修正**：`pyproject.toml` 仍停留在 `1.8.0`（自 v1.8.0 release 後未隨 workspace 同步），導致 v1.10.0 release workflow 嘗試重複上傳已存在的 `duduclaw-1.8.0-py3-none-any.whl`，被 PyPI 拒以 `400 File already exists`。本版同步將 Python SDK 版本提升至 `1.10.1`，與 Cargo workspace 對齊。
+- **`pypa/gh-action-pypi-publish` 加上 `skip-existing: true`**：未來若同一版本被重新觸發（workflow_dispatch 重跑、tag 重推），PyPI 步驟會跳過而非整個 release job 失敗。Trusted Publisher 與 token fallback 兩條路徑都套用。
+
+### 內容差異
+- v1.10.0 的 GitHub Release 二進位、npm 套件已成功發佈；本 patch 主要是把 PyPI 的 `duduclaw` 套件補上來，並順帶 bump 一個 Cargo workspace patch 版本以走完整 release pipeline。Rust / web 程式碼相對 v1.10.0 無新增功能。
+
+
 ## [1.10.0] - 2026-05-03
 
 ### Added — Wiki RL Trust Feedback（核心新功能）
