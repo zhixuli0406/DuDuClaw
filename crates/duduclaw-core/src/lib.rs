@@ -50,6 +50,17 @@ pub const ENV_AGENT_ID: &str = "DUDUCLAW_AGENT_ID";
 /// dispatcher can forward sub-agent responses back to the originating channel.
 pub const ENV_REPLY_CHANNEL: &str = "DUDUCLAW_REPLY_CHANNEL";
 
+/// Wiki RL Trust Feedback context for sub-agent dispatch (v1.10).
+///
+/// `DUDUCLAW_TURN_ID` carries the per-turn ULID used as the
+/// `CitationTracker` drain key. `DUDUCLAW_SESSION_ID` carries the channel
+/// session id used as the per-conversation cap budget key. Set by the
+/// gateway when spawning Claude CLI; read by the MCP server when enqueueing
+/// `send_to_agent` bus messages so sub-agent RAG citations attribute back
+/// to the originating turn.
+pub const ENV_TRUST_TURN_ID: &str = "DUDUCLAW_TURN_ID";
+pub const ENV_TRUST_SESSION_ID: &str = "DUDUCLAW_SESSION_ID";
+
 /// Channel types supported for delegation callback forwarding.
 /// Used by both the MCP `send_to_agent` tool and the channel_reply session filter.
 pub const SUPPORTED_CHANNEL_TYPES: &[&str] = &[

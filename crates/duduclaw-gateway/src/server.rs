@@ -137,6 +137,120 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         tracing::warn!(error = %e, "Failed to initialize cost telemetry — continuing without it");
     }
 
+    // Initialize wiki trust store (Phase 2 of wiki RL trust feedback).
+    // Best-effort: if open fails, the rest of the system still works — RAG
+    // simply falls back to frontmatter trust and trust feedback is skipped.
+    {
+        let trust_db = home_dir.join("wiki_trust.db");
+        let pre_existing = trust_db.exists();
+
+        // Phase 7: read [wiki.trust_feedback] + [wiki.trust_feedback.janitor]
+        // from config.toml. Missing/malformed → safe defaults.
+        let (trust_cfg, janitor_cfg, federation_cfg) = {
+            let raw = std::fs::read_to_string(home_dir.join("config.toml")).unwrap_or_default();
+            let table: toml::Table = raw.parse().unwrap_or_default();
+            (
+                duduclaw_memory::trust_store::TrustStoreConfig::from_toml(&table),
+                duduclaw_memory::JanitorConfig::from_toml(&table),
+                crate::wiki_trust_federation::FederationConfig::from_toml(&table),
+            )
+        };
+
+        // R4 DEBT-3: propagate the configured tracker cap to the
+        // process-global feedback module before any traffic arrives.
+        duduclaw_memory::feedback::set_max_active_conversations(
+            trust_cfg.max_active_conversations,
+        );
+        match duduclaw_memory::trust_store::init_global_trust_store_with_config(
+            &trust_db, trust_cfg,
+        ) {
+            Ok(store) => {
+                info!(
+                    path = %trust_db.display(),
+                    cap = trust_cfg.per_conversation_cap,
+                    archive_threshold = trust_cfg.archive_threshold,
+                    daily_limit = trust_cfg.daily_signal_limit,
+                    "Wiki trust store initialized"
+                );
+
+                // Phase 7 migration: on first creation of the trust DB, seed
+                // rows from existing wiki frontmatter so `trust_audit` shows
+                // a meaningful baseline immediately. Idempotent for re-runs.
+                if !pre_existing {
+                    let agents_dir = home_dir.join("agents");
+                    if agents_dir.exists() {
+                        match store.bootstrap_from_wiki(&agents_dir) {
+                            Ok((inserted, skipped)) => info!(
+                                inserted, skipped,
+                                "Wiki trust store bootstrapped from frontmatter"
+                            ),
+                            Err(e) => warn!(error = %e, "Wiki trust bootstrap failed"),
+                        }
+                    }
+                }
+
+                // Phase 3 / R2-4: restart-aware daily janitor.
+                // Reads `last_janitor_run_at` from the trust DB on boot;
+                // fires immediately if more than a full interval has elapsed
+                // since the last run, otherwise sleeps until the next 24-h
+                // boundary. Persists the timestamp after every successful
+                // pass so a crash-then-restart cycle never skips retention.
+                let agents_dir = home_dir.join("agents");
+                let janitor_store = store.clone();
+                tokio::spawn(async move {
+                    const INTERVAL: std::time::Duration =
+                        std::time::Duration::from_secs(24 * 3600);
+
+                    let last_run = janitor_store
+                        .meta_get("last_janitor_run_at")
+                        .ok()
+                        .flatten()
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|d| d.with_timezone(&chrono::Utc));
+
+                    // If we've never run OR more than one interval has passed,
+                    // run immediately.
+                    let initial_delay = match last_run {
+                        Some(t) => {
+                            let elapsed = chrono::Utc::now()
+                                .signed_duration_since(t)
+                                .to_std()
+                                .unwrap_or(INTERVAL);
+                            INTERVAL.saturating_sub(elapsed)
+                        }
+                        None => std::time::Duration::ZERO,
+                    };
+                    if !initial_delay.is_zero() {
+                        tokio::time::sleep(initial_delay).await;
+                    }
+
+                    loop {
+                        run_wiki_janitor_pass(&agents_dir, &janitor_store, &janitor_cfg);
+                        let now_str = chrono::Utc::now().to_rfc3339();
+                        if let Err(e) = janitor_store.meta_set("last_janitor_run_at", &now_str) {
+                            warn!(error = %e, "failed to persist janitor last-run timestamp");
+                        }
+                        tokio::time::sleep(INTERVAL).await;
+                    }
+                });
+
+                // Phase 7: federation transport — periodic export to peers.
+                // Skipped silently when no peers configured.
+                if !federation_cfg.peers.is_empty() {
+                    crate::wiki_trust_federation::spawn_federation_pusher(
+                        store.clone(),
+                        federation_cfg,
+                    );
+                }
+            }
+            Err(e) => warn!(
+                path = %trust_db.display(),
+                error = %e,
+                "Wiki trust store init failed — trust feedback disabled"
+            ),
+        }
+    }
+
     // ── Initialize user database & JWT ───────────────────────
     let user_db_path = home_dir.join("users.db");
     let user_db = Arc::new(
@@ -694,6 +808,34 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .merge(auth_router)
         .merge(webchat_router);
 
+    // Wiki trust federation inbound endpoint — only mounted when the trust
+    // store is initialised. Fails closed by returning 503 from a stub when
+    // not initialised, so peers get a clear error instead of a 404.
+    //
+    // CRITICAL (review C2): the federation route lives outside auth_router
+    // (peers don't have user JWTs), so it must enforce its own body size
+    // limit. 1 MiB caps the JSON body well before any reasonable batch
+    // bumps against MAX_FEDERATION_UPDATES_PER_PUSH (5k × ~150 bytes).
+    if let Some(store) = duduclaw_memory::trust_store::global_trust_store() {
+        let federation_state = crate::wiki_trust_federation::FederationServerState {
+            store,
+            shared_secret: {
+                let raw = std::fs::read_to_string(home_dir.join("config.toml")).unwrap_or_default();
+                let table: toml::Table = raw.parse().unwrap_or_default();
+                crate::wiki_trust_federation::FederationConfig::from_toml(&table).shared_secret
+            },
+        };
+        app = app.merge(
+            Router::new()
+                .route(
+                    "/api/v1/wiki_trust/federation",
+                    post(crate::wiki_trust_federation::handle_federation_push)
+                        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)),
+                )
+                .with_state(federation_state),
+        );
+    }
+
     // ── .well-known endpoints for protocol discovery ──────────────
     app = app
         .route("/.well-known/mcp-server.json", get(well_known_mcp_server_card))
@@ -842,6 +984,65 @@ async fn handle_login(
         "refresh_token": refresh_token,
         "user": user,
     })).into_response()
+}
+
+/// Iterate every agent's wiki under `agents_dir` and run the Phase 3
+/// janitor (auto-correct, archive, snapshot sync). Best-effort — failures
+/// are logged and the loop continues.
+fn run_wiki_janitor_pass(
+    agents_dir: &std::path::Path,
+    store: &Arc<duduclaw_memory::WikiTrustStore>,
+    janitor_cfg: &duduclaw_memory::JanitorConfig,
+) {
+    let entries = match std::fs::read_dir(agents_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(path = %agents_dir.display(), error = %e, "wiki janitor: agents dir unreadable");
+            return;
+        }
+    };
+    let janitor = duduclaw_memory::WikiJanitor::with_config(store.clone(), *janitor_cfg);
+
+    // (review HIGH-DB N3) Run global retention pruning ONCE per cycle, not
+    // per agent. Doing it per agent meant the pruning budget was multiplied
+    // by agent count, and rate / conv_cap deletes did the same work N times.
+    match janitor.run_global_retention() {
+        Ok((h, r, c)) => info!(
+            history_pruned = h,
+            rate_pruned = r,
+            conv_cap_pruned = c,
+            "wiki trust retention pruned"
+        ),
+        Err(e) => warn!(error = %e, "wiki trust retention pruning failed"),
+    }
+
+    for entry in entries.flatten() {
+        let agent_dir = entry.path();
+        if !agent_dir.is_dir() {
+            continue;
+        }
+        let agent_id = match agent_dir.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+        let wiki_dir = agent_dir.join("wiki");
+        if !wiki_dir.exists() {
+            continue;
+        }
+        let report = janitor.run_once(&wiki_dir, &agent_id);
+        if !report.corrected_pages.is_empty()
+            || !report.archived_pages.is_empty()
+            || report.snapshot_synced > 0
+        {
+            info!(
+                agent = %agent_id,
+                corrected = report.corrected_pages.len(),
+                archived = report.archived_pages.len(),
+                snapshots = report.snapshot_synced,
+                "wiki janitor pass produced changes"
+            );
+        }
+    }
 }
 
 /// Refresh endpoint rate limiter: max 10 per IP per 5 minutes (H9 fix).

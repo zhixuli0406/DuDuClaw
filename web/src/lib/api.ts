@@ -175,6 +175,31 @@ export interface WikiStats {
   };
 }
 
+export interface WikiTrustRow {
+  page_path: string;
+  agent_id: string;
+  trust: number;
+  citation_count: number;
+  error_signal_count: number;
+  success_signal_count: number;
+  last_signal_at: string | null;
+  last_verified: string | null;
+  do_not_inject: boolean;
+  locked: boolean;
+  updated_at: string;
+}
+
+export interface WikiTrustHistoryRow {
+  ts: string;
+  old_trust: number;
+  new_trust: number;
+  applied_delta: number;
+  trigger: string;
+  conversation_id: string | null;
+  composite_error: number | null;
+  signal_kind: string;
+}
+
 export interface SharedWikiStats {
   exists: boolean;
   total_pages: number;
@@ -809,6 +834,35 @@ export const api = {
       client.call('wiki.lint', { agent_id: agentId }) as Promise<WikiLintReport>,
     stats: (agentId: string) =>
       client.call('wiki.stats', { agent_id: agentId }) as Promise<WikiStats>,
+    trustAudit: (agentId: string, maxTrust = 0.3, limit = 50) =>
+      client.call('wiki.trust_audit', { agent_id: agentId, max_trust: maxTrust, limit }) as Promise<{
+        rows: WikiTrustRow[];
+        available: boolean;
+        note?: string;
+      }>,
+    trustHistory: (agentId: string, pagePath: string, limit = 50) =>
+      client.call('wiki.trust_history', { agent_id: agentId, page_path: pagePath, limit }) as Promise<{
+        rows: WikiTrustHistoryRow[];
+        available: boolean;
+      }>,
+    trustOverride: (params: {
+      agent_id: string;
+      page_path: string;
+      trust: number;
+      lock?: boolean;
+      do_not_inject?: boolean;
+      reason?: string;
+    }) =>
+      client.call('wiki.trust_override', params) as Promise<{
+        page_path: string;
+        agent_id: string;
+        old_trust: number;
+        new_trust: number;
+        applied_delta: number;
+        locked: boolean;
+        became_archived: boolean;
+        became_recovered: boolean;
+      }>,
   },
   sharedWiki: {
     pages: () =>

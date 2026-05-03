@@ -37,6 +37,23 @@ fn is_valid_agent_id(id: &str) -> bool {
         && !id.contains("..")
 }
 
+/// Validate wiki page path: relative, .md suffix, no traversal, no NUL.
+/// Mirrors `WikiStore::validate_page_path` for use at the WS RPC boundary
+/// (review H2/M6 — page_path enters audit log + downstream file ops).
+fn is_safe_wiki_page_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 512
+        && !path.contains("..")
+        && !path.starts_with('/')
+        && !path.starts_with('\\')
+        && !path.contains('\0')
+        && !path.contains("%2e")
+        && !path.contains("%2E")
+        && !path.contains("%2f")
+        && !path.contains("%2F")
+        && path.ends_with(".md")
+}
+
 /// Dispatches incoming RPC methods to the appropriate handler.
 pub struct MethodHandler {
     registry: Arc<RwLock<AgentRegistry>>,
@@ -384,6 +401,12 @@ impl MethodHandler {
             "wiki.search" => self.handle_wiki_search(params).await,
             "wiki.lint" => self.handle_wiki_lint(params).await,
             "wiki.stats" => self.handle_wiki_stats(params).await,
+            // Phase 4: trust feedback inspection + manual override.
+            // Trust state exposes per-conversation citation history that
+            // can correlate with user activity → manager+ only (review H1).
+            "wiki.trust_audit" => { require_manager!(); self.handle_wiki_trust_audit(params).await }
+            "wiki.trust_override" => { require_admin!(); self.handle_wiki_trust_override(params).await }
+            "wiki.trust_history" => { require_manager!(); self.handle_wiki_trust_history(params).await }
 
             // ── Shared Wiki ─────────────────────────────────
             "shared_wiki.pages" => self.handle_shared_wiki_pages().await,
@@ -2296,6 +2319,13 @@ impl MethodHandler {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
         let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
         let limit = (params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize).min(100);
+        // Optional conversation_id — when supplied, every returned hit is
+        // recorded into the global CitationTracker so the prediction-error
+        // feedback bus can later attribute trust deltas to the cited pages.
+        let conversation_id = params
+            .get("conversation_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
 
         if agent_id.is_empty() || query.is_empty() {
             return WsFrame::error_response("", "Missing 'agent_id' or 'query' parameter");
@@ -2310,7 +2340,14 @@ impl MethodHandler {
         }
 
         let store = duduclaw_memory::WikiStore::new(wiki_dir);
-        match store.search(query, limit) {
+        let result = match conversation_id {
+            Some(conv_id) => {
+                let tracker = duduclaw_memory::feedback::global_tracker();
+                store.search_with_citation(query, limit, agent_id, conv_id, None, &tracker)
+            }
+            None => store.search(query, limit),
+        };
+        match result {
             Ok(hits) => {
                 let items: Vec<Value> = hits.iter().map(|h| {
                     json!({
@@ -2320,6 +2357,7 @@ impl MethodHandler {
                         "weighted_score": h.weighted_score,
                         "trust": h.trust,
                         "layer": h.layer.to_string(),
+                        "source_type": h.source_type.to_string(),
                         "context_lines": h.context_lines,
                     })
                 }).collect();
@@ -2401,6 +2439,160 @@ impl MethodHandler {
         }))
     }
 
+    // ── Phase 4: Wiki RL Trust inspection / override ────────
+
+    /// `wiki.trust_audit` — list low-trust pages for an agent, with citation
+    /// + signal counters. Read-only; safe for any authenticated user.
+    async fn handle_wiki_trust_audit(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let max_trust = params.get("max_trust").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
+        let limit = (params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize).min(500);
+
+        if agent_id.is_empty() {
+            return WsFrame::error_response("", "Missing 'agent_id' parameter");
+        }
+        if !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+
+        let store = match duduclaw_memory::trust_store::global_trust_store() {
+            Some(s) => s,
+            None => return WsFrame::ok_response("", json!({
+                "rows": [],
+                "available": false,
+                "note": "Trust store not initialized — wiki trust feedback disabled",
+            })),
+        };
+
+        match store.list_low_trust(agent_id, max_trust, limit) {
+            Ok(rows) => {
+                let items: Vec<Value> = rows.iter().map(|s| {
+                    json!({
+                        "page_path": s.page_path,
+                        "agent_id": s.agent_id,
+                        "trust": s.trust,
+                        "citation_count": s.citation_count,
+                        "error_signal_count": s.error_signal_count,
+                        "success_signal_count": s.success_signal_count,
+                        "last_signal_at": s.last_signal_at.map(|d| d.to_rfc3339()),
+                        "last_verified": s.last_verified.map(|d| d.to_rfc3339()),
+                        "do_not_inject": s.do_not_inject,
+                        "locked": s.locked,
+                        "updated_at": s.updated_at.to_rfc3339(),
+                    })
+                }).collect();
+                WsFrame::ok_response("", json!({ "rows": items, "available": true }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("trust audit failed: {e}")),
+        }
+    }
+
+    /// `wiki.trust_override` — manually set trust for a page; optional `lock`
+    /// makes the page immune to subsequent automatic adjustments.
+    /// Admin-only because it can mask drift the feedback loop is trying to
+    /// communicate.
+    async fn handle_wiki_trust_override(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let page_path = params.get("page_path").and_then(|v| v.as_str()).unwrap_or("");
+        let trust = params
+            .get("trust")
+            .and_then(|v| v.as_f64())
+            .map(|f| f as f32);
+        let lock = params.get("lock").and_then(|v| v.as_bool()).unwrap_or(false);
+        let do_not_inject = params.get("do_not_inject").and_then(|v| v.as_bool());
+        let reason = params.get("reason").and_then(|v| v.as_str());
+
+        if agent_id.is_empty() || page_path.is_empty() || trust.is_none() {
+            return WsFrame::error_response(
+                "",
+                "Missing 'agent_id', 'page_path', or 'trust' parameter",
+            );
+        }
+        if !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+        // page_path is admin-controlled but still belongs in audit log; reject
+        // path traversal and other shapes that won't survive janitor file ops
+        // (review H2/M6).
+        if !is_safe_wiki_page_path(page_path) {
+            return WsFrame::error_response("", "Invalid page_path");
+        }
+        let trust = trust.unwrap();
+        if !(0.0..=1.0).contains(&trust) {
+            return WsFrame::error_response("", "trust must be in [0.0, 1.0]");
+        }
+        // Cap audit-log strings to bound history table growth and block CR/LF
+        // injection into log lines (review M3).
+        let reason_clean: Option<String> = reason.map(|r| {
+            r.chars()
+                .filter(|c| *c != '\r' && *c != '\n' && *c != '\0')
+                .take(512)
+                .collect::<String>()
+        });
+        let reason_ref = reason_clean.as_deref();
+
+        let store = match duduclaw_memory::trust_store::global_trust_store() {
+            Some(s) => s,
+            None => return WsFrame::error_response("", "Trust store not initialized"),
+        };
+
+        match store.manual_set(page_path, agent_id, trust, lock, do_not_inject, reason_ref) {
+            Ok(outcome) => WsFrame::ok_response("", json!({
+                "page_path": outcome.page_path,
+                "agent_id": outcome.agent_id,
+                "old_trust": outcome.old_trust,
+                "new_trust": outcome.new_trust,
+                "applied_delta": outcome.applied_delta,
+                "locked": outcome.locked,
+                "became_archived": outcome.became_archived,
+                "became_recovered": outcome.became_recovered,
+            })),
+            Err(e) => WsFrame::error_response("", &format!("trust override failed: {e}")),
+        }
+    }
+
+    /// `wiki.trust_history` — recent audit log rows for a page, useful for
+    /// dashboards or post-mortem analysis.
+    async fn handle_wiki_trust_history(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let page_path = params.get("page_path").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = (params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize).min(500);
+
+        if agent_id.is_empty() || page_path.is_empty() {
+            return WsFrame::error_response("", "Missing 'agent_id' or 'page_path' parameter");
+        }
+        if !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+        if !is_safe_wiki_page_path(page_path) {
+            return WsFrame::error_response("", "Invalid page_path");
+        }
+
+        let store = match duduclaw_memory::trust_store::global_trust_store() {
+            Some(s) => s,
+            None => return WsFrame::ok_response("", json!({ "rows": [], "available": false })),
+        };
+
+        match store.history(agent_id, page_path, limit) {
+            Ok(rows) => {
+                let items: Vec<Value> = rows.iter().map(|h| {
+                    json!({
+                        "ts": h.ts.to_rfc3339(),
+                        "old_trust": h.old_trust,
+                        "new_trust": h.new_trust,
+                        "applied_delta": h.applied_delta,
+                        "trigger": h.trigger,
+                        "conversation_id": h.conversation_id,
+                        "composite_error": h.composite_error,
+                        "signal_kind": h.signal_kind,
+                    })
+                }).collect();
+                WsFrame::ok_response("", json!({ "rows": items, "available": true }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("trust history failed: {e}")),
+        }
+    }
+
     // ── Shared Wiki ─────────────────────────────────────────
 
     async fn handle_shared_wiki_pages(&self) -> WsFrame {
@@ -2442,6 +2634,11 @@ impl MethodHandler {
     async fn handle_shared_wiki_search(&self, params: Value) -> WsFrame {
         let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
         let limit = (params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize).min(100);
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let conversation_id = params
+            .get("conversation_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
 
         if query.is_empty() {
             return WsFrame::error_response("", "Missing 'query' parameter");
@@ -2453,7 +2650,14 @@ impl MethodHandler {
         }
 
         let store = duduclaw_memory::WikiStore::new_shared(&self.home_dir);
-        match store.search(query, limit) {
+        let result = match (conversation_id, !agent_id.is_empty()) {
+            (Some(conv_id), true) => {
+                let tracker = duduclaw_memory::feedback::global_tracker();
+                store.search_with_citation(query, limit, agent_id, conv_id, None, &tracker)
+            }
+            _ => store.search(query, limit),
+        };
+        match result {
             Ok(hits) => {
                 let items: Vec<Value> = hits.iter().map(|h| {
                     json!({
@@ -2463,6 +2667,7 @@ impl MethodHandler {
                         "weighted_score": h.weighted_score,
                         "trust": h.trust,
                         "layer": h.layer.to_string(),
+                        "source_type": h.source_type.to_string(),
                         "context_lines": h.context_lines,
                     })
                 }).collect();

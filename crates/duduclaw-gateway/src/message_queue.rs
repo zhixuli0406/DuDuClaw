@@ -82,6 +82,14 @@ pub struct QueueMessage {
     /// is never registered, causing sub-agent replies to be silently
     /// dropped (v1.8.14 — v1.8.15 issue).
     pub reply_channel: Option<String>,
+    /// Wiki RL trust feedback turn id (v1.10). Originating per-turn ULID
+    /// so sub-agent RAG citations attribute back to the right prediction
+    /// error. `None` for messages enqueued by callers that don't have
+    /// trust-tracking context (cron, webhook, programmatic).
+    pub turn_id: Option<String>,
+    /// Wiki RL trust feedback session id (v1.10). Channel session id used
+    /// as the per-conversation cap budget key.
+    pub session_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +164,13 @@ impl MessageQueue {
         // stay on the legacy (no-forward) path, which is what we want for
         // cleanup — new rows benefit from the fix.
         Self::ensure_column(conn, "message_queue", "reply_channel", "TEXT")?;
+
+        // v1.10 migration: wiki RL trust feedback context. New rows
+        // populated by `send_to_agent` MCP tool from `DUDUCLAW_TURN_ID` /
+        // `DUDUCLAW_SESSION_ID` env vars; legacy rows stay NULL and skip
+        // citation tracking (correct fallback — no signal to apply).
+        Self::ensure_column(conn, "message_queue", "turn_id", "TEXT")?;
+        Self::ensure_column(conn, "message_queue", "session_id", "TEXT")?;
         Ok(())
     }
 
@@ -194,8 +209,8 @@ impl MessageQueue {
         conn.execute(
             "INSERT INTO message_queue \
              (id, sender, target, payload, status, retry_count, delegation_depth, \
-              origin_agent, sender_agent, created_at, reply_channel) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              origin_agent, sender_agent, created_at, reply_channel, turn_id, session_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 msg.id,
                 msg.sender,
@@ -208,6 +223,8 @@ impl MessageQueue {
                 msg.sender_agent,
                 msg.created_at,
                 msg.reply_channel,
+                msg.turn_id,
+                msg.session_id,
             ],
         )
         .map_err(|e| format!("enqueue: {e}"))?;
@@ -273,7 +290,7 @@ impl MessageQueue {
             .prepare(
                 "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
                  origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
-                 reply_channel \
+                 reply_channel, turn_id, session_id \
                  FROM message_queue WHERE status = 'pending' \
                  ORDER BY created_at ASC LIMIT ?1",
             )
@@ -301,7 +318,7 @@ impl MessageQueue {
             .prepare(
                 "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
                  origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
-                 reply_channel \
+                 reply_channel, turn_id, session_id \
                  FROM message_queue WHERE status = 'acked' AND acked_at < ?1",
             )
             .map_err(|e| format!("prepare stale: {e}"))?;
@@ -326,7 +343,7 @@ impl MessageQueue {
         conn.query_row(
             "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
              origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
-             reply_channel \
+             reply_channel, turn_id, session_id \
              FROM message_queue WHERE id = ?1",
             params![message_id],
             |row| Self::row_to_message(row),
@@ -356,6 +373,8 @@ impl MessageQueue {
             acked_at: row.get(12)?,
             completed_at: row.get(13)?,
             reply_channel: row.get(14)?,
+            turn_id: row.get(15)?,
+            session_id: row.get(16)?,
         })
     }
 
@@ -477,6 +496,8 @@ mod tests {
             acked_at: None,
             completed_at: None,
             reply_channel: reply_channel.map(str::to_string),
+            turn_id: None,
+            session_id: None,
         }
     }
 

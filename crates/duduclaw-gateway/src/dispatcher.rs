@@ -53,6 +53,17 @@ struct BusMessage {
     /// Used to consume delegation callbacks for all merged messages, not just the first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     coalesced_ids: Vec<String>,
+
+    // ── Wiki trust feedback context (review BLOCKER R4 sub-agent) ─
+    /// Originating turn id — scoped on the dispatcher's spawn so any wiki
+    /// RAG performed by the sub-agent inherits it via the
+    /// `feedback::CURRENT_TURN_ID` task_local. `None` for messages enqueued
+    /// before this field existed (legacy compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_id: Option<String>,
+    /// Originating channel session id — used by the per-conversation cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
 }
 
 /// Starts the agent dispatcher as a background task.
@@ -177,6 +188,14 @@ async fn poll_and_dispatch_sqlite(
         // `forward_delegation_response` no-callback branch.
         let dispatch_fut =
             dispatch_to_agent(home_dir, registry, &msg.target, &msg.payload, &delegation);
+        // v1.10: scope wiki RL trust feedback context so the sub-agent's
+        // wiki RAG citations land in the same tracker bucket as the
+        // originating turn. Pulled from `message_queue.{turn_id, session_id}`
+        // — populated by the MCP `send_to_agent` tool from env vars.
+        let dispatch_fut = duduclaw_memory::feedback::CURRENT_SESSION_ID
+            .scope(msg.session_id.clone(), dispatch_fut);
+        let dispatch_fut = duduclaw_memory::feedback::CURRENT_TURN_ID
+            .scope(msg.turn_id.clone(), dispatch_fut);
         let result = match msg.reply_channel.clone() {
             Some(rc) if !rc.is_empty() => {
                 crate::claude_runner::REPLY_CHANNEL.scope(rc, dispatch_fut).await
@@ -410,6 +429,8 @@ async fn poll_and_dispatch(
                         origin_agent: msg.origin_agent.clone(),
                         sender_agent: Some(msg.agent_id.clone()),
                         coalesced_ids: vec![],
+                        turn_id: msg.turn_id.clone(),
+                        session_id: msg.session_id.clone(),
                     };
                     if let Ok(json) = serde_json::to_string(&err_response) {
                         if let Err(e) = append_line(&queue_path, &json).await {
@@ -482,6 +503,13 @@ async fn poll_and_dispatch(
         let notebook = notebook.clone();
         let pe_for_task = prediction_engine.cloned();
 
+        // (review BLOCKER R4) Forward turn_id / session_id so the sub-agent
+        // chain re-establishes the citation tracking context. Without this,
+        // sub-agent RAG hits a fresh task with no task_locals → trust
+        // feedback for sub-agents is silently no-op.
+        let turn_id_for_scope = msg.turn_id.clone();
+        let session_id_for_scope = msg.session_id.clone();
+
         handles.push(tokio::spawn(async move {
             let dispatch_start = Utc::now().to_rfc3339();
             let delegation_env = DelegationEnv {
@@ -489,7 +517,12 @@ async fn poll_and_dispatch(
                 origin: msg.origin_agent.clone().unwrap_or_default(),
                 sender: msg.sender_agent.clone().unwrap_or_default(),
             };
-            let result = dispatch_to_agent(&home, &reg, &msg.agent_id, &msg.payload, &delegation_env).await;
+            let dispatch_fut = dispatch_to_agent(&home, &reg, &msg.agent_id, &msg.payload, &delegation_env);
+            let dispatch_fut = duduclaw_memory::feedback::CURRENT_SESSION_ID
+                .scope(session_id_for_scope, dispatch_fut);
+            let dispatch_fut = duduclaw_memory::feedback::CURRENT_TURN_ID
+                .scope(turn_id_for_scope, dispatch_fut);
+            let result = dispatch_fut.await;
 
             let mut response_text = match &result {
                 Ok(text) => text.clone(),
@@ -634,6 +667,8 @@ async fn poll_and_dispatch(
                 origin_agent: msg.origin_agent.clone(),
                 sender_agent: Some(msg.agent_id.clone()),
                 coalesced_ids: vec![],
+                turn_id: msg.turn_id.clone(),
+                session_id: msg.session_id.clone(),
             };
 
             if let Ok(json) = serde_json::to_string(&response_entry) {
@@ -1331,6 +1366,8 @@ fn coalesce_messages(messages: Vec<BusMessage>) -> Vec<BusMessage> {
                 origin_agent: first.origin_agent.clone(),
                 sender_agent: first.sender_agent.clone(),
                 coalesced_ids: extra_ids,
+                turn_id: first.turn_id.clone(),
+                session_id: first.session_id.clone(),
             });
         }
     }
@@ -2550,6 +2587,8 @@ mod tests {
             origin_agent: None,
             sender_agent: None,
             coalesced_ids: vec![],
+            turn_id: None,
+            session_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         // None fields with skip_serializing_if should be absent
@@ -2920,6 +2959,8 @@ mod tests {
                 origin_agent: Some("main".to_string()),
                 sender_agent: Some("researcher".to_string()),
                 coalesced_ids: vec![],
+                turn_id: None,
+                session_id: None,
             },
             BusMessage {
                 msg_type: "agent_message".to_string(),
@@ -2933,6 +2974,8 @@ mod tests {
                 origin_agent: Some("main".to_string()),
                 sender_agent: Some("analyst".to_string()),
                 coalesced_ids: vec![],
+                turn_id: None,
+                session_id: None,
             },
         ];
         let coalesced = coalesce_messages(msgs);

@@ -81,6 +81,72 @@ impl FromStr for WikiLayer {
     }
 }
 
+/// Provenance of a wiki page — distinguishes raw dialogue captures
+/// from human/GVU-verified knowledge so RAG retrieval can weight them differently.
+///
+/// Auto-derived in `parse_wiki_page` when not explicitly set in frontmatter:
+/// - `sources/*` → `RawDialogue`
+/// - `concepts/*` or `entities/*` with trust ≥ 0.7 → `VerifiedFact`
+/// - everything else → `Unknown`
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceType {
+    /// Default — pre-existing pages, no provenance signal yet.
+    #[default]
+    Unknown,
+    /// Auto-ingested dialogue (`sources/*.md` from Discord/Telegram/etc).
+    /// Treated cautiously — RAG penalises this in ranking.
+    RawDialogue,
+    /// Tool / system output snapshot (logs, command output).
+    ToolOutput,
+    /// User-stated fact (explicit assertion in conversation).
+    UserStatement,
+    /// Promoted concept that has passed audit / GVU verification.
+    /// RAG boosts these in ranking.
+    VerifiedFact,
+}
+
+impl SourceType {
+    /// Multiplier applied to search score during ranking.
+    /// Together with `(0.5 + trust)`, this discourages raw dialogue from
+    /// shadowing verified facts even when keyword match counts are equal.
+    pub fn ranking_factor(self) -> f64 {
+        match self {
+            Self::VerifiedFact => 1.2,
+            Self::UserStatement => 1.0,
+            Self::ToolOutput => 0.9,
+            Self::Unknown => 0.8,
+            Self::RawDialogue => 0.6,
+        }
+    }
+}
+
+impl fmt::Display for SourceType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown => write!(f, "unknown"),
+            Self::RawDialogue => write!(f, "raw_dialogue"),
+            Self::ToolOutput => write!(f, "tool_output"),
+            Self::UserStatement => write!(f, "user_statement"),
+            Self::VerifiedFact => write!(f, "verified_fact"),
+        }
+    }
+}
+
+impl FromStr for SourceType {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "unknown" | "" => Ok(Self::Unknown),
+            "raw_dialogue" | "dialogue" | "raw" => Ok(Self::RawDialogue),
+            "tool_output" | "tool" => Ok(Self::ToolOutput),
+            "user_statement" | "user" | "statement" => Ok(Self::UserStatement),
+            "verified_fact" | "verified" | "fact" => Ok(Self::VerifiedFact),
+            _ => Err(format!("unknown source_type: '{s}'")),
+        }
+    }
+}
+
 /// A parsed wiki page with frontmatter and body separated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WikiPage {
@@ -103,8 +169,40 @@ pub struct WikiPage {
     /// Default 0.5 for unrated pages.
     #[serde(default = "default_trust")]
     pub trust: f32,
+    /// Provenance — distinguishes raw dialogue from verified facts.
+    /// Auto-derived from path + trust when frontmatter omits it.
+    #[serde(default)]
+    pub source_type: SourceType,
+    /// Last time this page's facts were re-verified by audit / human / GVU.
+    /// `None` for pre-existing pages — treated as never-verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verified: Option<DateTime<Utc>>,
+    /// Cumulative citation count (incremented when RAG returns this page).
+    /// Authoritative source is `WikiTrustStore`; this field mirrors a snapshot.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub citation_count: u32,
+    /// Cumulative high-error feedback count (negative TrustSignals).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub error_signal_count: u32,
+    /// Cumulative low-error feedback count (positive TrustSignals).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub success_signal_count: u32,
+    /// If true, RAG will exclude this page from search results.
+    /// Set automatically when trust < 0.1, or manually via `wiki_trust_override`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub do_not_inject: bool,
     /// Markdown body (without frontmatter).
     pub body: String,
+}
+
+#[inline]
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+#[inline]
+fn is_false(v: &bool) -> bool {
+    !v
 }
 
 /// Minimal metadata extracted from a page's frontmatter.
@@ -122,6 +220,12 @@ pub struct PageMeta {
     /// Trust score (0.0-1.0).
     #[serde(default = "default_trust")]
     pub trust: f32,
+    /// Provenance — see `SourceType`.
+    #[serde(default)]
+    pub source_type: SourceType,
+    /// Whether RAG should skip this page.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub do_not_inject: bool,
 }
 
 /// A search hit with relevance score.
@@ -130,12 +234,16 @@ pub struct SearchHit {
     pub path: String,
     pub title: String,
     pub score: usize,
-    /// Trust-weighted score for ranking: `score * (0.5 + trust)`.
+    /// Final ranking score: `score * (0.5 + trust) * source_type.ranking_factor()`.
+    /// Higher = ranked first.
     pub weighted_score: f64,
     /// Trust score of the matched page.
     pub trust: f32,
     /// Knowledge layer of the matched page.
     pub layer: WikiLayer,
+    /// Provenance of the matched page (used for ranking + downstream
+    /// trust-feedback decisions).
+    pub source_type: SourceType,
     /// Up to 3 matching lines for context.
     pub context_lines: Vec<String>,
 }
@@ -250,6 +358,21 @@ impl WikiStore {
         &self.wiki_dir
     }
 
+    /// Derive `agent_id` from the wiki directory path.
+    ///
+    /// Layout: `<home>/agents/<agent_id>/wiki/` → `Some("<agent_id>")`.
+    /// Shared wiki and unrecognised layouts return `None`; callers using
+    /// trust_store should treat that as "live trust unavailable" and fall
+    /// back to frontmatter trust.
+    pub fn derived_agent_id(&self) -> Option<String> {
+        if self.shared {
+            return None;
+        }
+        let parent = self.wiki_dir.parent()?;
+        let last = parent.file_name()?.to_string_lossy().to_string();
+        if last.is_empty() { None } else { Some(last) }
+    }
+
     /// Create the wiki directory scaffold (subdirs + reserved files) if missing.
     pub fn ensure_scaffold(&self) -> Result<()> {
         // create_dir_all is idempotent — safe for concurrent callers
@@ -338,6 +461,12 @@ impl WikiStore {
             let trust = extract_field(&content, "trust")
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(default_trust());
+            let source_type = extract_field(&content, "source_type")
+                .and_then(|v| SourceType::from_str(&v).ok())
+                .unwrap_or_else(|| derive_source_type(&rel_str, trust));
+            let do_not_inject = extract_field(&content, "do_not_inject")
+                .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
+                .unwrap_or(false);
 
             pages.push(PageMeta {
                 path: rel_str,
@@ -347,6 +476,8 @@ impl WikiStore {
                 author,
                 layer,
                 trust,
+                source_type,
+                do_not_inject,
             });
         }
 
@@ -427,6 +558,111 @@ impl WikiStore {
         Ok(())
     }
 
+    /// Move a quarantined page into `_archive/<original_path>`.
+    ///
+    /// Used by the Phase 3 janitor when a page has been `do_not_inject`
+    /// long enough to merit physical removal from the live tree. The file
+    /// remains restorable via `restore_archived`. Returns `true` if a move
+    /// happened, `false` if the source path didn't exist (e.g. already archived).
+    ///
+    /// Refuses to operate when `_archive/` is a symlink — otherwise an
+    /// attacker who can write inside `wiki_dir` could redirect archived
+    /// pages outside the wiki tree (review H4).
+    pub fn archive_page(&self, path: &str) -> Result<bool> {
+        self.validate_page_path(path)?;
+        let src = self.wiki_dir.join(path);
+        if !src.exists() {
+            return Ok(false);
+        }
+        let archive_root = self.wiki_dir.join("_archive");
+        if let Ok(meta) = std::fs::symlink_metadata(&archive_root) {
+            if meta.file_type().is_symlink() {
+                return Err(DuDuClawError::Memory(
+                    "_archive/ is a symlink — refusing to archive (would escape wiki dir)".into(),
+                ));
+            }
+        }
+        let dest = archive_root.join(path);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| DuDuClawError::Memory(format!("create archive dir: {e}")))?;
+        }
+        // Confirm the resolved destination still lives under wiki_dir/_archive
+        // (defence in depth — `path` is validate_page_path'd, but a future
+        // attacker who plants symlinks deeper in the tree shouldn't escape).
+        if let (Ok(canon_root), Ok(canon_dest)) = (
+            archive_root.canonicalize(),
+            dest.parent()
+                .map(|p| p.canonicalize())
+                .unwrap_or_else(|| Err(std::io::Error::other("no parent"))),
+        ) {
+            if !canon_dest.starts_with(&canon_root) {
+                return Err(DuDuClawError::Memory(
+                    "archive destination escapes _archive/ (symlink detected)".into(),
+                ));
+            }
+        }
+        std::fs::rename(&src, &dest)
+            .map_err(|e| DuDuClawError::Memory(format!("archive {path}: {e}")))?;
+
+        if let Err(e) = self.remove_from_index(path) {
+            warn!("Failed to remove archived {path} from index: {e}");
+        }
+        if let Err(e) = self.append_log("archive", path) {
+            warn!("Failed to log archive {path}: {e}");
+        }
+        self.fts_sync_remove(path);
+
+        info!(page = path, "Wiki page archived");
+        Ok(true)
+    }
+
+    /// Move an archived page back to its original location.
+    pub fn restore_archived(&self, path: &str) -> Result<bool> {
+        self.validate_page_path(path)?;
+        let archived = self.wiki_dir.join("_archive").join(path);
+        if !archived.exists() {
+            return Ok(false);
+        }
+        let dest = self.wiki_dir.join(path);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| DuDuClawError::Memory(format!("create restore dir: {e}")))?;
+        }
+        std::fs::rename(&archived, &dest)
+            .map_err(|e| DuDuClawError::Memory(format!("restore {path}: {e}")))?;
+
+        if let Ok(content) = std::fs::read_to_string(&dest) {
+            let title = extract_title(&content).unwrap_or_else(|| path.to_string());
+            if let Err(e) = self.update_index(path, &title) {
+                warn!("Failed to update index for restored {path}: {e}");
+            }
+            self.fts_sync_upsert(path, &content);
+        }
+        if let Err(e) = self.append_log("restore", path) {
+            warn!("Failed to log restore {path}: {e}");
+        }
+        info!(page = path, "Wiki page restored from archive");
+        Ok(true)
+    }
+
+    /// Re-write the page's frontmatter so on-disk `trust` and `do_not_inject`
+    /// reflect the current `WikiTrustStore` snapshot. Used by the Phase 3
+    /// janitor's snapshot-sync pass.
+    pub fn update_frontmatter_trust(
+        &self,
+        path: &str,
+        new_trust: f32,
+        new_do_not_inject: bool,
+    ) -> Result<()> {
+        let mut page = self.read_page(path)?;
+        page.trust = new_trust;
+        page.do_not_inject = new_do_not_inject;
+        page.updated = Utc::now();
+        let content = serialize_page(&page);
+        self.write_page(path, &content)
+    }
+
     /// Delete a page from disk.
     pub fn delete_page(&self, path: &str) -> Result<()> {
         self.validate_page_path(path)?;
@@ -451,8 +687,10 @@ impl WikiStore {
 
     /// Full-text keyword search across all wiki pages.
     ///
-    /// Results are ranked by trust-weighted score: `score * (0.5 + trust)`.
-    /// Pages with higher trust scores are ranked higher when keyword matches are equal.
+    /// Ranking: `score * (0.5 + trust) * source_type.ranking_factor()`.
+    /// `trust` is sourced from `WikiTrustStore` when available (live RL state),
+    /// otherwise falls back to the frontmatter snapshot.
+    /// Pages whose live state has `do_not_inject = true` are silently dropped.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         let terms: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
         if terms.is_empty() {
@@ -461,6 +699,23 @@ impl WikiStore {
 
         let md_files = collect_md_files_recursive(&self.wiki_dir, &self.wiki_dir);
         let mut hits: Vec<SearchHit> = Vec::new();
+
+        // Live trust state from WikiTrustStore (when initialised). Bulk-loaded
+        // up-front so each hit only does an in-memory HashMap lookup.
+        let live_state: Option<std::collections::HashMap<String, crate::trust_store::WikiTrustSnapshot>> = {
+            let agent_id = self.derived_agent_id();
+            let store = crate::trust_store::global_trust_store();
+            match (agent_id.as_ref(), store) {
+                (Some(aid), Some(s)) => {
+                    let all_paths: Vec<String> = md_files
+                        .iter()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect();
+                    s.get_many(aid, &all_paths).ok()
+                }
+                _ => None,
+            }
+        };
 
         for rel in &md_files {
             let full = self.wiki_dir.join(rel);
@@ -476,13 +731,35 @@ impl WikiStore {
 
             let title = extract_title(&content)
                 .unwrap_or_else(|| rel.to_string_lossy().to_string());
-            let trust = extract_field(&content, "trust")
+            let rel_str = rel.to_string_lossy().to_string();
+            let frontmatter_trust = extract_field(&content, "trust")
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(default_trust());
             let layer = extract_field(&content, "layer")
                 .and_then(|v| WikiLayer::from_str(&v).ok())
                 .unwrap_or_default();
-            let weighted_score = score as f64 * (0.5 + trust as f64);
+            let mut do_not_inject = extract_field(&content, "do_not_inject")
+                .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
+                .unwrap_or(false);
+
+            // Live state overrides frontmatter snapshot when available.
+            let trust = if let Some(snap) = live_state.as_ref().and_then(|m| m.get(&rel_str)) {
+                if snap.do_not_inject {
+                    do_not_inject = true;
+                }
+                snap.trust
+            } else {
+                frontmatter_trust
+            };
+
+            if do_not_inject {
+                continue;
+            }
+            let source_type = extract_field(&content, "source_type")
+                .and_then(|v| SourceType::from_str(&v).ok())
+                .unwrap_or_else(|| derive_source_type(&rel_str, trust));
+            let weighted_score =
+                score as f64 * (0.5 + trust as f64) * source_type.ranking_factor();
 
             let context_lines: Vec<String> = content
                 .lines()
@@ -504,19 +781,56 @@ impl WikiStore {
                 .collect();
 
             hits.push(SearchHit {
-                path: rel.to_string_lossy().to_string(),
+                path: rel_str,
                 title,
                 score,
                 weighted_score,
                 trust,
                 layer,
+                source_type,
                 context_lines,
             });
         }
 
-        // Sort by weighted_score descending (trust-aware ranking)
+        // Sort by weighted_score descending (trust + source_type aware ranking)
         hits.sort_by(|a, b| b.weighted_score.partial_cmp(&a.weighted_score).unwrap_or(std::cmp::Ordering::Equal));
         hits.truncate(limit);
+        Ok(hits)
+    }
+
+    /// `search` variant that records each hit into a `CitationTracker`.
+    ///
+    /// Behaviour identical to `search` apart from the side-effect: every
+    /// returned `SearchHit` is recorded as a `WikiCitation` keyed by the
+    /// supplied `conversation_id`. Use this whenever the caller is part of
+    /// the live RAG pipeline — the tracker entries are later drained by the
+    /// prediction-error feedback bus to update trust scores.
+    pub fn search_with_citation(
+        &self,
+        query: &str,
+        limit: usize,
+        agent_id: &str,
+        conversation_id: &str,
+        session_id: Option<&str>,
+        tracker: &crate::feedback::CitationTracker,
+    ) -> Result<Vec<SearchHit>> {
+        let hits = self.search(query, limit)?;
+        let now = Utc::now();
+        let citations: Vec<crate::feedback::WikiCitation> = hits
+            .iter()
+            .map(|h| crate::feedback::WikiCitation {
+                page_path: h.path.clone(),
+                agent_id: agent_id.to_string(),
+                conversation_id: conversation_id.to_string(),
+                retrieved_at: now,
+                trust_at_cite: h.trust,
+                source_type: h.source_type,
+                session_id: session_id.map(|s| s.to_string()),
+            })
+            .collect();
+        if !citations.is_empty() {
+            tracker.record_many(citations);
+        }
         Ok(hits)
     }
 
@@ -579,6 +893,15 @@ impl WikiStore {
                 let layer = extract_field(&content, "layer")
                     .and_then(|v| WikiLayer::from_str(&v).ok())
                     .unwrap_or_default();
+                let do_not_inject = extract_field(&content, "do_not_inject")
+                    .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
+                    .unwrap_or(false);
+                if do_not_inject {
+                    continue;
+                }
+                let source_type = extract_field(&content, "source_type")
+                    .and_then(|v| SourceType::from_str(&v).ok())
+                    .unwrap_or_else(|| derive_source_type(&exp_path, trust));
 
                 // Apply same filters to expanded results
                 if let Some(mt) = min_trust {
@@ -595,6 +918,7 @@ impl WikiStore {
                     weighted_score: 0.0,
                     trust,
                     layer,
+                    source_type,
                     context_lines: vec!["(expanded via related/backlink)".to_string()],
                 });
             }
@@ -911,29 +1235,18 @@ impl WikiStore {
     /// Collect all pages belonging to a specific knowledge layer.
     ///
     /// Returns (path, body) pairs sorted by title.
+    ///
+    /// Pages with `do_not_inject: true` (frontmatter or live trust state)
+    /// are excluded so trust feedback can quarantine misleading pages
+    /// without deleting them. Delegates to the meta-aware helper to ensure
+    /// both code paths share the same filtering rules (review HIGH-code:
+    /// previously this version skipped live trust overrides).
     pub fn collect_by_layer(&self, layer: WikiLayer) -> Result<Vec<(String, String)>> {
-        let md_files = collect_md_files_recursive(&self.wiki_dir, &self.wiki_dir);
-        let mut results = Vec::new();
-
-        for rel in &md_files {
-            let full = self.wiki_dir.join(rel);
-            let content = match std::fs::read_to_string(&full) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let page_layer = extract_field(&content, "layer")
-                .and_then(|v| WikiLayer::from_str(&v).ok())
-                .unwrap_or_default();
-            if page_layer == layer {
-                let body = extract_body(&content);
-                let title = extract_title(&content)
-                    .unwrap_or_else(|| rel.to_string_lossy().to_string());
-                results.push((rel.to_string_lossy().to_string(), format!("## {title}\n\n{body}")));
-            }
-        }
-
-        results.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(results)
+        let with_meta = self.collect_by_layer_with_meta(layer)?;
+        Ok(with_meta
+            .into_iter()
+            .map(|(path, body, _trust)| (path, body))
+            .collect())
     }
 
     /// Build injection context from L0 (Identity) + L1 (Core) pages,
@@ -943,11 +1256,58 @@ impl WikiStore {
     /// L0 pages are injected first (highest priority), then L1.
     /// L2/L3 are excluded — they are retrieved on-demand via search.
     pub fn build_injection_context(&self, max_chars: usize) -> Result<String> {
+        let (text, _injected) = self.build_injection_context_inner(max_chars)?;
+        Ok(text)
+    }
+
+    /// Variant of `build_injection_context` that also records which pages
+    /// landed in the prompt as wiki citations.
+    ///
+    /// Use this from the live runner so the feedback bus can later attribute
+    /// prediction error to the exact pages we surfaced.
+    pub fn build_injection_context_with_citations(
+        &self,
+        max_chars: usize,
+        agent_id: &str,
+        conversation_id: &str,
+        session_id: Option<&str>,
+        tracker: &crate::feedback::CitationTracker,
+    ) -> Result<String> {
+        let (text, injected) = self.build_injection_context_inner(max_chars)?;
+        if !injected.is_empty() {
+            let now = Utc::now();
+            let citations: Vec<crate::feedback::WikiCitation> = injected
+                .into_iter()
+                .map(|(path, trust)| {
+                    let st = derive_source_type(&path, trust);
+                    crate::feedback::WikiCitation {
+                        page_path: path,
+                        agent_id: agent_id.to_string(),
+                        conversation_id: conversation_id.to_string(),
+                        retrieved_at: now,
+                        trust_at_cite: trust,
+                        source_type: st,
+                        session_id: session_id.map(|s| s.to_string()),
+                    }
+                })
+                .collect();
+            tracker.record_many(citations);
+        }
+        Ok(text)
+    }
+
+    /// Shared implementation — returns the combined prompt text *and* the list
+    /// of `(page_path, trust)` pairs actually included (after the byte budget).
+    fn build_injection_context_inner(
+        &self,
+        max_chars: usize,
+    ) -> Result<(String, Vec<(String, f32)>)> {
         let mut output = String::new();
         let mut remaining = max_chars;
+        let mut injected: Vec<(String, f32)> = Vec::new();
 
         for layer in [WikiLayer::Identity, WikiLayer::Core] {
-            let pages = self.collect_by_layer(layer)?;
+            let pages = self.collect_by_layer_with_meta(layer)?;
             if pages.is_empty() {
                 continue;
             }
@@ -959,7 +1319,7 @@ impl WikiStore {
             output.push_str(&header);
             remaining -= header.len();
 
-            for (_path, body) in &pages {
+            for (path, body, trust) in &pages {
                 let needed = body.len() + 2; // +2 for trailing newlines
                 if needed > remaining {
                     break;
@@ -967,10 +1327,77 @@ impl WikiStore {
                 output.push_str(body);
                 output.push_str("\n\n");
                 remaining -= needed;
+                injected.push((path.clone(), *trust));
             }
         }
 
-        Ok(output)
+        Ok((output, injected))
+    }
+
+    /// Internal — like `collect_by_layer` but also yields the trust score
+    /// so we can record it in the citation log. Honours `WikiTrustStore`
+    /// live `do_not_inject` overrides when initialised.
+    fn collect_by_layer_with_meta(
+        &self,
+        layer: WikiLayer,
+    ) -> Result<Vec<(String, String, f32)>> {
+        let md_files = collect_md_files_recursive(&self.wiki_dir, &self.wiki_dir);
+        let mut results = Vec::new();
+
+        let live_state: Option<std::collections::HashMap<String, crate::trust_store::WikiTrustSnapshot>> = {
+            let agent_id = self.derived_agent_id();
+            let store = crate::trust_store::global_trust_store();
+            match (agent_id.as_ref(), store) {
+                (Some(aid), Some(s)) => {
+                    let all_paths: Vec<String> = md_files
+                        .iter()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect();
+                    s.get_many(aid, &all_paths).ok()
+                }
+                _ => None,
+            }
+        };
+
+        for rel in &md_files {
+            let full = self.wiki_dir.join(rel);
+            let content = match std::fs::read_to_string(&full) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let page_layer = extract_field(&content, "layer")
+                .and_then(|v| WikiLayer::from_str(&v).ok())
+                .unwrap_or_default();
+            let frontmatter_no_inject = extract_field(&content, "do_not_inject")
+                .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
+                .unwrap_or(false);
+            let rel_str = rel.to_string_lossy().to_string();
+            let live_no_inject = live_state
+                .as_ref()
+                .and_then(|m| m.get(&rel_str))
+                .map(|s| s.do_not_inject)
+                .unwrap_or(false);
+            if page_layer == layer && !frontmatter_no_inject && !live_no_inject {
+                let body = extract_body(&content);
+                let title = extract_title(&content)
+                    .unwrap_or_else(|| rel_str.clone());
+                let frontmatter_trust = extract_field(&content, "trust")
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(default_trust());
+                let trust = live_state
+                    .as_ref()
+                    .and_then(|m| m.get(&rel_str))
+                    .map(|s| s.trust)
+                    .unwrap_or(frontmatter_trust);
+                results.push((
+                    rel_str,
+                    format!("## {title}\n\n{body}"),
+                    trust,
+                ));
+            }
+        }
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(results)
     }
 
     // ── Apply proposals (for GVU integration) ──────────────────
@@ -1259,6 +1686,22 @@ fn parse_wiki_page(path: &str, content: &str) -> Result<WikiPage> {
     let trust = extract_field(content, "trust")
         .and_then(|v| v.parse::<f32>().ok())
         .unwrap_or(default_trust());
+    let explicit_source_type = extract_field(content, "source_type")
+        .and_then(|v| SourceType::from_str(&v).ok());
+    let source_type = explicit_source_type.unwrap_or_else(|| derive_source_type(path, trust));
+    let last_verified = extract_datetime_field(content, "last_verified");
+    let citation_count = extract_field(content, "citation_count")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
+    let error_signal_count = extract_field(content, "error_signal_count")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
+    let success_signal_count = extract_field(content, "success_signal_count")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
+    let do_not_inject = extract_field(content, "do_not_inject")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false);
     let body = extract_body(content);
 
     Ok(WikiPage {
@@ -1272,11 +1715,180 @@ fn parse_wiki_page(path: &str, content: &str) -> Result<WikiPage> {
         author,
         layer,
         trust,
+        source_type,
+        last_verified,
+        citation_count,
+        error_signal_count,
+        success_signal_count,
+        do_not_inject,
         body,
     })
 }
 
+/// Re-serialise a `WikiPage` back to markdown — preserves all frontmatter
+/// fields including the Phase 0/1/2 additions.
+pub fn serialize_page(page: &WikiPage) -> String {
+    let mut fm = String::new();
+    fm.push_str("---\n");
+    // Strings that may contain user-controlled newlines / quotes are wrapped
+    // in JSON-style quoted scalars so they cannot break out of frontmatter
+    // and inject extra YAML keys (CRITICAL — security review C1/H3).
+    fm.push_str(&format!("title: {}\n", yaml_quote(&page.title)));
+    fm.push_str(&format!("created: {}\n", page.created.to_rfc3339()));
+    fm.push_str(&format!("updated: {}\n", page.updated.to_rfc3339()));
+    fm.push_str(&format!("tags: [{}]\n", yaml_quoted_list(&page.tags)));
+    if !page.related.is_empty() {
+        fm.push_str(&format!("related: [{}]\n", yaml_quoted_list(&page.related)));
+    }
+    if !page.sources.is_empty() {
+        fm.push_str(&format!("sources: [{}]\n", yaml_quoted_list(&page.sources)));
+    }
+    if let Some(author) = &page.author {
+        fm.push_str(&format!("author: {}\n", yaml_quote(author)));
+    }
+    fm.push_str(&format!("layer: {}\n", page.layer));
+    fm.push_str(&format!("trust: {:.3}\n", page.trust));
+    if page.source_type != SourceType::Unknown {
+        fm.push_str(&format!("source_type: {}\n", page.source_type));
+    }
+    if let Some(lv) = page.last_verified {
+        fm.push_str(&format!("last_verified: {}\n", lv.to_rfc3339()));
+    }
+    // Phase 0/2: preserve trust-feedback counters across round-trips.
+    // Skipping zero values keeps legacy pages clean (CRITICAL — code review C1).
+    if page.citation_count != 0 {
+        fm.push_str(&format!("citation_count: {}\n", page.citation_count));
+    }
+    if page.error_signal_count != 0 {
+        fm.push_str(&format!("error_signal_count: {}\n", page.error_signal_count));
+    }
+    if page.success_signal_count != 0 {
+        fm.push_str(&format!(
+            "success_signal_count: {}\n",
+            page.success_signal_count
+        ));
+    }
+    if page.do_not_inject {
+        fm.push_str("do_not_inject: true\n");
+    }
+    fm.push_str("---\n\n");
+    fm.push_str(&page.body);
+    fm
+}
+
+/// JSON-style quoted YAML scalar — escapes `"`, `\`, line/paragraph
+/// separators, and any control char so user-controlled strings cannot
+/// break out of frontmatter and inject extra YAML keys.
+///
+/// Escape format is intentionally a strict subset of YAML 1.2 double-quoted
+/// scalars (and JSON), so `extract_field` + `yaml_unescape` below can
+/// faithfully round-trip any value.
+fn yaml_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\u0000"),
+            // YAML 1.2 treats U+2028 / U+2029 as line breaks inside
+            // double-quoted scalars (review security 1) — escape them.
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if c.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Reverse of `yaml_quote` for round-trip parsing of frontmatter scalars.
+/// Operates on a string that has had its outer `"..."` already stripped.
+/// Unknown escape sequences pass through verbatim — never panics.
+fn yaml_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('0') => out.push('\0'),
+            Some('u') => {
+                // Read up to 4 hex digits — `\uXXXX`. Anything malformed
+                // falls through to literal.
+                let mut hex = String::with_capacity(4);
+                for _ in 0..4 {
+                    match chars.clone().next() {
+                        Some(h) if h.is_ascii_hexdigit() => {
+                            hex.push(h);
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                    if let Some(decoded) = char::from_u32(code) {
+                        out.push(decoded);
+                    }
+                } else {
+                    out.push_str("\\u");
+                    out.push_str(&hex);
+                }
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+fn yaml_quoted_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|t| yaml_quote(t))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Auto-derive `SourceType` from path heuristics when frontmatter omits it.
+///
+/// - `sources/*` → `RawDialogue` (Discord/Telegram auto-ingest)
+/// - `concepts/*` or `entities/*` with trust ≥ 0.7 → `VerifiedFact`
+/// - everything else → `Unknown`
+pub fn derive_source_type(path: &str, trust: f32) -> SourceType {
+    let normalised = path.trim_start_matches('/');
+    if normalised.starts_with("sources/") {
+        SourceType::RawDialogue
+    } else if (normalised.starts_with("concepts/") || normalised.starts_with("entities/"))
+        && trust >= 0.7
+    {
+        SourceType::VerifiedFact
+    } else {
+        SourceType::Unknown
+    }
+}
+
 /// Extract a string field from YAML frontmatter (best-effort, no YAML parser).
+///
+/// Round-trips with `yaml_quote`: a value written as `"hello\nworld"`
+/// returns as `hello\nworld` with a real newline (review HIGH R2-1).
 fn extract_field(content: &str, field: &str) -> Option<String> {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
@@ -1289,13 +1901,96 @@ fn extract_field(content: &str, field: &str) -> Option<String> {
     for line in fm.lines() {
         let line = line.trim();
         if let Some(after) = line.strip_prefix(&prefix) {
-            let val = after.trim().trim_matches('"').trim_matches('\'');
+            let raw = after.trim();
+            let val = unquote_scalar(raw);
             if !val.is_empty() {
-                return Some(val.to_string());
+                return Some(val);
             }
         }
     }
     None
+}
+
+/// Read the raw contents inside `[...]` for an inline list field.
+/// Returns the substring between the outermost brackets, or None if the
+/// field is missing / not in inline form. Does not interpret escapes.
+fn extract_inline_list_raw(content: &str, field: &str) -> Option<String> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return None;
+    }
+    let rest = &trimmed[3..];
+    let end = rest.find("\n---")?;
+    let fm = &rest[..end];
+    let prefix = format!("{}:", field);
+    for line in fm.lines() {
+        let line = line.trim();
+        if let Some(after) = line.strip_prefix(&prefix) {
+            let after = after.trim();
+            if let Some(stripped) = after.strip_prefix('[') {
+                if let Some(inner) = stripped.strip_suffix(']') {
+                    return Some(inner.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Split an inline YAML list body into individual scalars.
+///
+/// Respects double-quoted runs so commas inside `"a, b"` stay together.
+/// (review HIGH R2: previous naive `.split(',')` mangled tags with commas.)
+fn split_yaml_inline_list(s: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escape = false;
+    for ch in s.chars() {
+        if escape {
+            current.push(ch);
+            escape = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => {
+                current.push('\\');
+                escape = true;
+            }
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push('"');
+            }
+            ',' if !in_quotes => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    items.push(unquote_scalar(&trimmed));
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        items.push(unquote_scalar(&trimmed));
+    }
+    items
+}
+
+/// Strip outer YAML quotes (single or double) from a scalar and apply
+/// `yaml_unescape` when double-quoted. Single-quoted YAML doesn't process
+/// `\` escapes — the only escape is `''` for a literal apostrophe — so we
+/// preserve the inner string verbatim.
+fn unquote_scalar(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+        yaml_unescape(&raw[1..raw.len() - 1])
+    } else if bytes.len() >= 2 && bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'' {
+        raw[1..raw.len() - 1].replace("''", "'")
+    } else {
+        raw.to_string()
+    }
 }
 
 /// Extract title from frontmatter.
@@ -1325,15 +2020,13 @@ fn extract_datetime_field(content: &str, field: &str) -> Option<DateTime<Utc>> {
 ///   - b
 /// ```
 fn extract_string_list(content: &str, field: &str) -> Vec<String> {
-    // Try inline format first via extract_field
-    if let Some(val) = extract_field(content, field) {
-        let inner = val.trim_start_matches('[').trim_end_matches(']');
-        if !inner.is_empty() {
-            return inner
-                .split(',')
-                .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+    // Try inline format first. Cannot use `extract_field` because that path
+    // already unescapes the WHOLE quoted value — for inline lists like
+    // `tags: ["a, b", "c"]` we need to split BEFORE unescaping per-item.
+    if let Some(raw_inline) = extract_inline_list_raw(content, field) {
+        let parsed = split_yaml_inline_list(&raw_inline);
+        if !parsed.is_empty() {
+            return parsed;
         }
     }
 
@@ -1357,9 +2050,9 @@ fn extract_string_list(content: &str, field: &str) -> Vec<String> {
         if found_key {
             // Block list items are indented lines starting with "- "
             if let Some(item) = trimmed_line.strip_prefix("- ") {
-                let val = item.trim().trim_matches('"').trim_matches('\'');
+                let val = unquote_scalar(item.trim());
                 if !val.is_empty() {
-                    items.push(val.to_string());
+                    items.push(val);
                 }
             } else if !trimmed_line.is_empty() {
                 // Hit a non-list-item, non-empty line — end of block list
@@ -1445,6 +2138,14 @@ fn collect_md_files_inner(base: &Path, dir: &Path, depth: usize) -> Vec<PathBuf>
         };
         let path = entry.path();
         if ftype.is_dir() {
+            // Phase 3 archive directory: skip — pages here are quarantined,
+            // RAG and listings should not surface them (review M6).
+            // We compare by name only (depth-1 from wiki root) so that any
+            // legitimate user content in `concepts/_archive_notes/` etc.
+            // stays visible.
+            if depth == 0 && path.file_name().and_then(|n| n.to_str()) == Some("_archive") {
+                continue;
+            }
             result.extend(collect_md_files_inner(base, &path, depth + 1));
         } else if ftype.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
             let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
@@ -1598,9 +2299,12 @@ impl WikiFts {
                 let snippet: String = row.get(5)?;
 
                 let layer = WikiLayer::from_str(&layer_str).unwrap_or_default();
+                // FTS table doesn't store source_type yet — derive from path + trust.
+                let source_type = derive_source_type(&path, trust);
                 // FTS5 rank is negative (lower = better), convert to positive score
                 let score = (-fts_rank * 10.0).max(1.0) as usize;
-                let weighted_score = score as f64 * (0.5 + trust as f64);
+                let weighted_score =
+                    score as f64 * (0.5 + trust as f64) * source_type.ranking_factor();
 
                 Ok(SearchHit {
                     path,
@@ -1609,6 +2313,7 @@ impl WikiFts {
                     weighted_score,
                     trust,
                     layer,
+                    source_type,
                     context_lines: if snippet.is_empty() { vec![] } else { vec![snippet] },
                 })
             },
@@ -2551,5 +3256,254 @@ This is the body of the page.
         assert_eq!(fts5_escape_query("hello world"), "\"hello\" \"world\"");
         assert_eq!(fts5_escape_query("rust*"), "\"rust*\"");
         assert_eq!(fts5_escape_query(""), "");
+    }
+
+    // ── Phase 0/1: SourceType + citation tracking ──────────────
+
+    #[test]
+    fn source_type_inferred_from_path() {
+        assert_eq!(derive_source_type("sources/2026-05-03.md", 0.4), SourceType::RawDialogue);
+        assert_eq!(derive_source_type("concepts/cron.md", 0.9), SourceType::VerifiedFact);
+        assert_eq!(derive_source_type("concepts/cron.md", 0.4), SourceType::Unknown);
+        assert_eq!(derive_source_type("entities/me.md", 0.8), SourceType::VerifiedFact);
+        assert_eq!(derive_source_type("research/paper.md", 0.9), SourceType::Unknown);
+    }
+
+    #[test]
+    fn legacy_page_loads_with_default_provenance() {
+        let content = page_with_layer_trust("Old Page", "deep", 0.4);
+        let page = parse_wiki_page("research/old.md", &content).unwrap();
+        assert_eq!(page.source_type, SourceType::Unknown);
+        assert_eq!(page.citation_count, 0);
+        assert_eq!(page.error_signal_count, 0);
+        assert!(!page.do_not_inject);
+        assert!(page.last_verified.is_none());
+    }
+
+    #[test]
+    fn explicit_source_type_overrides_path_inference() {
+        let content = "---\ntitle: Tagged\ncreated: 2026-04-20\nupdated: 2026-04-20\nlayer: deep\ntrust: 0.4\nsource_type: verified_fact\n---\nBody.";
+        let page = parse_wiki_page("sources/x.md", content).unwrap();
+        assert_eq!(page.source_type, SourceType::VerifiedFact);
+    }
+
+    #[test]
+    fn search_records_citations_in_tracker() {
+        let tmp = TempDir::new().unwrap();
+        let wiki_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&wiki_dir).unwrap();
+        let store = WikiStore::new(wiki_dir);
+        store.ensure_scaffold().unwrap();
+
+        store
+            .write_page("concepts/a.md", &page_with_layer_trust("Alpha rust", "core", 0.8))
+            .unwrap();
+        store
+            .write_page("concepts/b.md", &page_with_layer_trust("Beta rust", "core", 0.6))
+            .unwrap();
+
+        let tracker = crate::feedback::CitationTracker::new();
+        let hits = store
+            .search_with_citation("rust", 10, "agnes", "conv-1", None, &tracker)
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+
+        let drained = tracker.drain("conv-1");
+        assert_eq!(drained.len(), 2);
+        assert!(drained.iter().all(|c| c.agent_id == "agnes"));
+        assert!(drained.iter().any(|c| c.page_path == "concepts/a.md"));
+        assert!(drained.iter().any(|c| c.page_path == "concepts/b.md"));
+    }
+
+    #[test]
+    fn injection_records_citations() {
+        let tmp = TempDir::new().unwrap();
+        let wiki_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&wiki_dir).unwrap();
+        let store = WikiStore::new(wiki_dir);
+        store.ensure_scaffold().unwrap();
+
+        store
+            .write_page("entities/me.md", &page_with_layer_trust("Identity", "identity", 0.9))
+            .unwrap();
+        store
+            .write_page("concepts/env.md", &page_with_layer_trust("Env", "core", 0.8))
+            .unwrap();
+        // Deep page should not appear in injection or citations
+        store
+            .write_page("concepts/deep.md", &page_with_layer_trust("Deep", "deep", 0.5))
+            .unwrap();
+
+        let tracker = crate::feedback::CitationTracker::new();
+        let ctx = store
+            .build_injection_context_with_citations(10000, "agnes", "conv-2", None, &tracker)
+            .unwrap();
+        assert!(ctx.contains("Identity"));
+        assert!(ctx.contains("Env"));
+
+        let drained = tracker.drain("conv-2");
+        let paths: Vec<_> = drained.iter().map(|c| c.page_path.as_str()).collect();
+        assert!(paths.contains(&"entities/me.md"));
+        assert!(paths.contains(&"concepts/env.md"));
+        assert!(!paths.contains(&"concepts/deep.md")); // L3 excluded
+    }
+
+    #[test]
+    fn do_not_inject_excludes_page_from_search_and_injection() {
+        let tmp = TempDir::new().unwrap();
+        let wiki_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&wiki_dir).unwrap();
+        let store = WikiStore::new(wiki_dir);
+        store.ensure_scaffold().unwrap();
+
+        let banished = "---\ntitle: Banished\ncreated: 2026-04-20\nupdated: 2026-04-20\nlayer: core\ntrust: 0.05\ndo_not_inject: true\n---\nrust details.\n";
+        let kept = page_with_layer_trust("Kept rust page", "core", 0.8);
+        store.write_page("concepts/banished.md", banished).unwrap();
+        store.write_page("concepts/kept.md", &kept).unwrap();
+
+        let hits = store.search("rust", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "concepts/kept.md");
+
+        let ctx = store.build_injection_context(10000).unwrap();
+        assert!(ctx.contains("Kept rust page"));
+        assert!(!ctx.contains("Banished"));
+    }
+
+    #[test]
+    fn yaml_quote_round_trip_preserves_special_chars() {
+        // Regression for review HIGH R2-1: yaml_quote was lossy on read.
+        let cases = [
+            "simple",
+            "with \"double\" quotes",
+            "with \\ backslash",
+            "with\nnewline",
+            "with\ttab",
+            "with\rCR",
+            "with\u{2028}line-sep\u{2029}para-sep",
+            "C:\\path\\to\\file",
+            "control \u{0001}\u{007f}",
+        ];
+        for original in cases {
+            let quoted = yaml_quote(original);
+            // Quoted form must start and end with `"`.
+            assert!(quoted.starts_with('"') && quoted.ends_with('"'));
+            // Round-trip via unquote_scalar.
+            let back = unquote_scalar(&quoted);
+            assert_eq!(back, original, "round-trip lost data for: {original:?}");
+            // Quoted form must contain no raw newline / U+2028 / U+2029,
+            // otherwise frontmatter scanners that split on lines could be
+            // tricked into reading injected keys.
+            assert!(!quoted.contains('\n'));
+            assert!(!quoted.contains('\u{2028}'));
+            assert!(!quoted.contains('\u{2029}'));
+        }
+    }
+
+    #[test]
+    fn yaml_inline_list_split_handles_quoted_commas() {
+        // Regression for review HIGH R2-2: tags with commas got mangled.
+        let raw = "\"alpha, beta\", \"gamma\", \"delta\\\\back\"";
+        let items = split_yaml_inline_list(raw);
+        assert_eq!(items, vec![
+            "alpha, beta".to_string(),
+            "gamma".to_string(),
+            "delta\\back".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn serialize_page_round_trip_preserves_counters_and_special_chars() {
+        let tmp = TempDir::new().unwrap();
+        let wiki_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&wiki_dir).unwrap();
+        let store = WikiStore::new(wiki_dir);
+        store.ensure_scaffold().unwrap();
+
+        // Seed via plain frontmatter, then read into WikiPage and rewrite.
+        store
+            .write_page(
+                "concepts/round-trip.md",
+                &page_with_layer_trust("Hello\nworld", "core", 0.85),
+            )
+            .unwrap();
+
+        let mut page = store.read_page("concepts/round-trip.md").unwrap();
+        // Mutate counters that previously got dropped on rewrite.
+        page.citation_count = 7;
+        page.error_signal_count = 2;
+        page.success_signal_count = 5;
+        page.do_not_inject = false;
+        let new_content = serialize_page(&page);
+        store
+            .write_page("concepts/round-trip.md", &new_content)
+            .unwrap();
+
+        let parsed = store.read_page("concepts/round-trip.md").unwrap();
+        assert_eq!(parsed.citation_count, 7);
+        assert_eq!(parsed.error_signal_count, 2);
+        assert_eq!(parsed.success_signal_count, 5);
+    }
+
+    #[test]
+    fn search_uses_live_trust_when_store_initialised() {
+        // Build wiki under a fake "agnes" path so derived_agent_id() returns Some("agnes").
+        let tmp = TempDir::new().unwrap();
+        let agents_dir = tmp.path().join("agents").join("agnes");
+        let wiki_dir = agents_dir.join("wiki");
+        std::fs::create_dir_all(&wiki_dir).unwrap();
+        let store = WikiStore::new(wiki_dir);
+        store.ensure_scaffold().unwrap();
+
+        store
+            .write_page(
+                "concepts/page.md",
+                &page_with_layer_trust("Page rust", "core", 0.9),
+            )
+            .unwrap();
+
+        // No trust store yet → frontmatter trust used.
+        let hits = store.search("rust", 10).unwrap();
+        assert!((hits[0].trust - 0.9).abs() < 1e-3);
+
+        // Initialise per-test trust store with a low live trust + do_not_inject.
+        let trust_store = std::sync::Arc::new(crate::trust_store::WikiTrustStore::in_memory().unwrap());
+        trust_store
+            .manual_set("concepts/page.md", "agnes", 0.05, false, Some(true), None)
+            .unwrap();
+        crate::trust_store::_set_global_trust_store_for_test(trust_store);
+
+        // Now search should drop the page entirely (live do_not_inject).
+        let hits = store.search("rust", 10).unwrap();
+        assert!(hits.is_empty(), "live do_not_inject should hide page from search");
+    }
+
+    #[test]
+    fn search_ranks_verified_fact_over_raw_dialogue() {
+        let tmp = TempDir::new().unwrap();
+        let wiki_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&wiki_dir).unwrap();
+        let store = WikiStore::new(wiki_dir);
+        store.ensure_scaffold().unwrap();
+
+        // Both pages match "cron"; the dialogue has trust 0.4, the verified
+        // concept has trust 0.9. With type-factor multiplier the gap widens.
+        store.write_page(
+            "sources/discord-cron.md",
+            "---\ntitle: Old discord cron talk\ncreated: 2026-04-20\nupdated: 2026-04-20\nlayer: context\ntrust: 0.4\n---\ncron session-only.\n",
+        ).unwrap();
+        store.write_page(
+            "concepts/cron-facts.md",
+            "---\ntitle: Cron facts\ncreated: 2026-04-20\nupdated: 2026-04-20\nlayer: core\ntrust: 0.9\n---\ncron persistent.\n",
+        ).unwrap();
+
+        let hits = store.search("cron", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].path, "concepts/cron-facts.md");
+        assert_eq!(hits[0].source_type, SourceType::VerifiedFact);
+        assert_eq!(hits[1].source_type, SourceType::RawDialogue);
+        // Concept score should be at least 2× dialogue (verified 1.2 × trust 1.4
+        // vs raw 0.6 × trust 0.9 → 1.68 vs 0.54 — > 3× separation).
+        assert!(hits[0].weighted_score > hits[1].weighted_score * 2.0);
     }
 }

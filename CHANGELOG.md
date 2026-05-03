@@ -1,6 +1,37 @@
 # Changelog
 
 
+## [1.10.0] - 2026-05-03
+
+### Added — Wiki RL Trust Feedback（核心新功能）
+- **`duduclaw-memory` 新增** `trust_store.rs` / `feedback.rs` / `janitor.rs` — 預測誤差驅動的 wiki 信任反饋系統。
+  - `WikiTrustStore`（SQLite，PK `(page_path, agent_id)` 每 agent 獨立 trust）
+  - `CitationTracker` 用 turn_id 為 drain key、session_id 為 cap budget key（兩級 id），LRU + bounded-time 雙條件 eviction 防 keep-alive DoS
+  - `WikiJanitor` 每日 pass：3 negatives in 30d 加 `corrected` tag、隔離 30d 後 archive 至 `wiki/_archive/`、frontmatter ↔ live trust 同步
+  - 防禦：per-page daily cap (10/day)、per-conv Δ cap (0.10)、`VerifiedFact` ×0.5 抗性、`lock=true` 人工 override、0.10/0.20 archive hysteresis
+- **`duduclaw-gateway` 新增** `prediction/feedback_bus.rs` / `wiki_trust_federation.rs` — `TrustFeedbackBus` 在每次 `PredictionError` 後 drain `CitationTracker` 並 dispatch 簽名 deltas（error < 0.20 → positive、≥ 0.55 → negative）；GVU 結果以 2× magnitude 經 `on_gvu_outcome` 進信任反饋。
+- **Federation 同步**（Q3）：trust 信號可跨機 export/import，衝突取均值、`do_not_inject` 取 OR、`schema_version` 拒絕未來版本、5000 updates/push + 1 MiB body 上限 + `constant_time_eq` bearer。
+- **MCP 工具**：`wiki_trust_audit` / `wiki_trust_history`；RPC `wiki.trust_audit / trust_history / trust_override`。
+- **Search ranking** 改為 `score × (0.5 + live_trust) × source_type_factor`（verified_fact ×1.2，raw_dialogue ×0.6）。
+- **Web** 新增 `WikiTrustPage.tsx` 儀表板（trust 列表、history、override、archive 操作）。
+- 文件：[docs/wiki-trust-feedback.md](docs/wiki-trust-feedback.md) runbook + 架構說明。
+
+### Added — v1.10 收尾
+- **Sub-agent enqueue turn_id 完整貫通**：`DUDUCLAW_TURN_ID` / `DUDUCLAW_SESSION_ID` 兩個 env var 常數，gateway spawn Claude CLI 時 set，MCP `send_to_agent` 讀 env 並寫入 `message_queue.{turn_id, session_id}`，dispatcher 從 queue 讀回後重新 scope。channel → 頂層 agent → MCP send_to_agent → SQLite queue → dispatcher → 子 agent CLI 全鏈 turn_id/session_id 正確傳遞。
+- **`flock` for `wiki_trust.db`**：advisory file lock 防多 process 共用 home_dir 造成 archive race / frontmatter 競爭，第二個 process fail-fast 並回明確錯誤。
+- **Atomic batch upsert（真正單 Tx）**：`WikiTrustStore::upsert_signal_batch` 一次 `BEGIN IMMEDIATE` 處理整批；32 citations / 1 prediction error 從 32 fsync 收斂為 **1 fsync**；任何中途錯誤自動 rollback。原本延後到 v1.11 的計畫**提前在 v1.10 完成**。
+- **ABS migration once-only**：`wiki_trust_meta` 標記 conv_cap ABS migration 已完成，避免每次 boot 全表掃描。
+
+### Schema migration
+- `message_queue.turn_id` / `message_queue.session_id` columns 自動新增（既有資料庫升級時 NULL，新訊息會帶值）
+- `wiki_trust_meta(key, value)` 新表 + `conv_cap_abs_migration_done` 標記
+- `wiki_trust_state` / `wiki_trust_history` / `wiki_trust_rate` / `wiki_trust_conv_cap`（PK rename `conversation_id` → `cap_budget_id`）/ `idx_wiki_trust_history_agent_kind_ts` / `idx_wiki_trust_history_ts`
+
+### Tests
+- Backend **126 tests pass**（duduclaw-memory），包含 5 個 v1.10 regression test：flock、batch order、batch cap-budget shared、batch single-Tx、migration once-only
+- 5 輪深度審查（code / security / database / architecture）+ Round 5 SHIP-BLOCK 修復全數收斂
+
+
 ## [1.9.4] - 2026-05-02
 
 ### Added

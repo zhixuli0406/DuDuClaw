@@ -26,6 +26,7 @@ import { TaskBoardPage } from './pages/TaskBoardPage';
 import { MarketplacePage } from './pages/MarketplacePage';
 import { PartnerPortalPage } from './pages/PartnerPortalPage';
 import { ReliabilityPage } from './pages/ReliabilityPage';
+import { WikiTrustPage } from './pages/WikiTrustPage';
 import { useConnectionStore } from './stores/connection-store';
 import { useAuthStore } from './stores/auth-store';
 import { ApprovalModal } from './components/ApprovalModal';
@@ -81,6 +82,7 @@ export function App() {
             <Route path="accounts" element={<AccountsPage />} />
             <Route path="security" element={<SecurityPage />} />
             <Route path="reliability" element={<ReliabilityPage />} />
+            <Route path="wiki-trust" element={<WikiTrustPage />} />
             <Route path="settings" element={<SettingsPage />} />
             <Route path="mcp" element={<McpPage />} />
             <Route path="odoo" element={<OdooPage />} />

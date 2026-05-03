@@ -33,6 +33,17 @@ pub struct MetricsRegistry {
     // Histogram bins for request duration (ms buckets)
     pub duration_buckets: [AtomicU64; 8], // <100, <250, <500, <1000, <2500, <5000, <10000, +Inf
     pub duration_sum_ms: AtomicU64,
+
+    // Wiki RL Trust Feedback (review BLOCKER R4 m12 + R5 MUST-1).
+    // `eviction_total` and `active_conversations` are read live from the
+    // tracker at render time — no atomic needed in the registry.
+    pub wiki_trust_signals_applied_total: AtomicU64,
+    pub wiki_trust_signals_dropped_capped_total: AtomicU64,
+    pub wiki_trust_signals_dropped_locked_total: AtomicU64,
+    pub wiki_trust_signals_dropped_daily_limit_total: AtomicU64,
+    pub wiki_trust_archive_total: AtomicU64,
+    pub wiki_trust_recovery_total: AtomicU64,
+    pub wiki_trust_federation_partial_total: AtomicU64,
 }
 
 const DURATION_BOUNDS_MS: [u64; 7] = [100, 250, 500, 1000, 2500, 5000, 10000];
@@ -50,7 +61,38 @@ impl MetricsRegistry {
             budgets: RwLock::new(Vec::new()),
             duration_buckets: Default::default(),
             duration_sum_ms: AtomicU64::new(0),
+            wiki_trust_signals_applied_total: AtomicU64::new(0),
+            wiki_trust_signals_dropped_capped_total: AtomicU64::new(0),
+            wiki_trust_signals_dropped_locked_total: AtomicU64::new(0),
+            wiki_trust_signals_dropped_daily_limit_total: AtomicU64::new(0),
+            wiki_trust_archive_total: AtomicU64::new(0),
+            wiki_trust_recovery_total: AtomicU64::new(0),
+            wiki_trust_federation_partial_total: AtomicU64::new(0),
         }
+    }
+
+    // ── Wiki RL Trust Feedback (review BLOCKER R4 m12) ──────────────
+
+    pub fn wiki_trust_signal_applied(&self) {
+        self.wiki_trust_signals_applied_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn wiki_trust_signal_dropped_capped(&self) {
+        self.wiki_trust_signals_dropped_capped_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn wiki_trust_signal_dropped_locked(&self) {
+        self.wiki_trust_signals_dropped_locked_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn wiki_trust_signal_dropped_daily_limit(&self) {
+        self.wiki_trust_signals_dropped_daily_limit_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn wiki_trust_archive(&self) {
+        self.wiki_trust_archive_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn wiki_trust_recovery(&self) {
+        self.wiki_trust_recovery_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn wiki_trust_federation_partial(&self) {
+        self.wiki_trust_federation_partial_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a completed request with duration and token counts.
@@ -145,6 +187,61 @@ impl MetricsRegistry {
         for (account, cents) in self.budgets.read().await.iter() {
             out.push_str(&format!("duduclaw_budget_remaining_cents{{account=\"{account}\"}} {cents}\n"));
         }
+
+        // ── Wiki RL Trust Feedback (review BLOCKER R4 m12) ──────
+        out.push_str("# HELP wiki_trust_signals_applied_total Trust signals successfully applied.\n");
+        out.push_str("# TYPE wiki_trust_signals_applied_total counter\n");
+        out.push_str(&format!(
+            "wiki_trust_signals_applied_total {}\n",
+            self.wiki_trust_signals_applied_total.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP wiki_trust_signals_dropped_total Trust signals dropped, by reason.\n");
+        out.push_str("# TYPE wiki_trust_signals_dropped_total counter\n");
+        out.push_str(&format!(
+            "wiki_trust_signals_dropped_total{{reason=\"per_conv_cap\"}} {}\n",
+            self.wiki_trust_signals_dropped_capped_total.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "wiki_trust_signals_dropped_total{{reason=\"locked\"}} {}\n",
+            self.wiki_trust_signals_dropped_locked_total.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "wiki_trust_signals_dropped_total{{reason=\"daily_limit\"}} {}\n",
+            self.wiki_trust_signals_dropped_daily_limit_total.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP wiki_trust_eviction_total CitationTracker LRU + age evictions.\n");
+        out.push_str("# TYPE wiki_trust_eviction_total counter\n");
+        // Read live from the tracker (review R5 MUST-1b: previously this
+        // was a dead atomic that never incremented).
+        out.push_str(&format!(
+            "wiki_trust_eviction_total {}\n",
+            duduclaw_memory::feedback::global_tracker().eviction_count()
+        ));
+        out.push_str("# HELP wiki_trust_archive_total Wiki pages auto-archived (do_not_inject crossed threshold).\n");
+        out.push_str("# TYPE wiki_trust_archive_total counter\n");
+        out.push_str(&format!(
+            "wiki_trust_archive_total {}\n",
+            self.wiki_trust_archive_total.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP wiki_trust_recovery_total Wiki pages recovered from quarantine.\n");
+        out.push_str("# TYPE wiki_trust_recovery_total counter\n");
+        out.push_str(&format!(
+            "wiki_trust_recovery_total {}\n",
+            self.wiki_trust_recovery_total.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP wiki_trust_federation_partial_total Federation pushes where receiver applied < sent.\n");
+        out.push_str("# TYPE wiki_trust_federation_partial_total counter\n");
+        out.push_str(&format!(
+            "wiki_trust_federation_partial_total {}\n",
+            self.wiki_trust_federation_partial_total.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP wiki_trust_active_conversations CitationTracker bucket count.\n");
+        out.push_str("# TYPE wiki_trust_active_conversations gauge\n");
+        // Read live (review R5 MUST-1c: previously a dead atomic gauge).
+        out.push_str(&format!(
+            "wiki_trust_active_conversations {}\n",
+            duduclaw_memory::feedback::global_tracker().conv_count()
+        ));
 
         out
     }
