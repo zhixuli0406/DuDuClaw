@@ -480,6 +480,13 @@ async fn build_reply_with_session_inner(
     };
     let team_ref = if team_members.is_empty() { None } else { Some(team_members.as_slice()) };
 
+    // RFC-21 §1 step 4: resolve the sender's canonical identity *once* per
+    // turn from the WikiCacheIdentityProvider (which becomes a Chained
+    // provider once Notion / LDAP land in step 3). The formatted block is
+    // injected into the system prompt — agents no longer need to grep
+    // `shared_wiki_read("identity/discord-users.md")` mid-reasoning.
+    let sender_block = build_sender_block(&ctx.home_dir, session_id, user_id).await;
+
     // Build progressive system prompt
     let system_prompt = {
         let cache = ctx.skill_cache.lock().await;
@@ -491,7 +498,7 @@ async fn build_reply_with_session_inner(
         let citation_ctx = Some((agent_id.as_str(), turn_id.as_str(), Some(session_id)));
         if compressed.is_empty() {
             build_system_prompt(
-                agent, None, None, None, skill_token_budget, team_ref, "", citation_ctx,
+                agent, None, None, None, skill_token_budget, team_ref, "", citation_ctx, &sender_block,
             )
         } else {
             build_system_prompt(
@@ -503,6 +510,7 @@ async fn build_reply_with_session_inner(
                 team_ref,
                 "",
                 citation_ctx,
+                &sender_block,
             )
         }
     };
@@ -3731,6 +3739,90 @@ async fn call_python_sdk_v2(
 // `session_id` is the SESSION-scoped budget id used for the per-conversation
 // cap (review BLOCKER R2-1). Distinct from `turn_id` which is the per-turn
 // drain key.
+/// RFC-21 §1 step 4: resolve the sender's identity through the configured
+/// [`duduclaw_identity::IdentityProvider`] and format the result as an
+/// XML-delimited `<sender>` block ready for prompt injection.
+///
+/// `session_id` carries the channel as its colon-prefix (`"discord:1234"`,
+/// `"line:U..."`, `"telegram:..."`, ...). Unknown channels degrade to
+/// [`duduclaw_identity::ChannelKind::Other`] — the resolver still works.
+///
+/// Returns an empty string when the sender is unknown or any provider error
+/// occurs. That matches v1.10.1 behaviour exactly, so this change is safe to
+/// land before any concrete upstream provider (Notion / LDAP) is configured.
+async fn build_sender_block(
+    home_dir: &std::path::Path,
+    session_id: &str,
+    user_id: &str,
+) -> String {
+    use duduclaw_identity::IdentityProvider;
+    use duduclaw_identity::providers::WikiCacheIdentityProvider;
+
+    if user_id.is_empty() {
+        return String::new();
+    }
+
+    let channel_str = session_id.split(':').next().unwrap_or("unknown");
+    let channel = duduclaw_identity::ChannelKind::parse_wire(channel_str);
+
+    let provider = WikiCacheIdentityProvider::for_home(home_dir.to_path_buf());
+    match provider.resolve_by_channel(channel.clone(), user_id).await {
+        Ok(Some(person)) => {
+            // Format as a tightly-bounded XML block; agents are trained to
+            // treat XML tags as ground-truth context the user cannot
+            // override (matches the security-hooks injection-resistance
+            // convention used elsewhere in DuDuClaw).
+            let mut block = String::with_capacity(256);
+            block.push_str("<sender>\n");
+            block.push_str(&format!("  <person_id>{}</person_id>\n", xml_escape(&person.person_id)));
+            block.push_str(&format!("  <display_name>{}</display_name>\n", xml_escape(&person.display_name)));
+            if !person.roles.is_empty() {
+                block.push_str(&format!(
+                    "  <roles>{}</roles>\n",
+                    xml_escape(&person.roles.join(", "))
+                ));
+            }
+            if !person.project_ids.is_empty() {
+                block.push_str(&format!(
+                    "  <project_ids>{}</project_ids>\n",
+                    xml_escape(&person.project_ids.join(", "))
+                ));
+            }
+            block.push_str(&format!("  <channel>{}</channel>\n", xml_escape(&channel.as_wire())));
+            block.push_str(&format!("  <source>{}</source>\n", xml_escape(provider.name())));
+            block.push_str("</sender>");
+            block
+        }
+        Ok(None) => String::new(),
+        Err(e) => {
+            tracing::warn!(
+                provider = provider.name(),
+                channel = %channel.as_wire(),
+                "build_sender_block: identity provider error: {}",
+                e,
+            );
+            String::new()
+        }
+    }
+}
+
+/// XML escape — keeps `<sender>` block well-formed even if a person record
+/// contains `<`, `&`, or quote characters.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn build_system_prompt(
     agent: Option<&duduclaw_agent::registry::LoadedAgent>,
     user_message: Option<&str>,
@@ -3740,6 +3832,11 @@ fn build_system_prompt(
     team_members: Option<&[TeamMember]>,
     pinned_instructions: &str,
     citation_ctx: Option<(&str, &str, Option<&str>)>,
+    // RFC-21 §1: when the IdentityProvider resolved the message sender, the
+    // formatted `<sender>...</sender>` XML block is passed in here. Empty
+    // string means "no resolution" — agents fall back to treating the sender
+    // as a stranger, which matches v1.10.1 behaviour exactly.
+    sender_block: &str,
 ) -> String {
     let mut parts = Vec::new();
 
@@ -3793,6 +3890,16 @@ fn build_system_prompt(
                 parts.push(format!("## Skill: {}\n{}", skill.name, skill.content));
             }
         }
+    }
+
+    // RFC-21 §1: inject the `<sender>` block so SOUL.md rules like
+    // "reject non-project members" become evaluable from data the agent
+    // already has, instead of requiring a mid-reasoning shared_wiki_read
+    // lookup. XML-delimited per the security-hooks injection-resistance
+    // convention — the block is placed before team / wiki context so the
+    // agent reads "who am I talking to" before "what do I know".
+    if !sender_block.is_empty() {
+        parts.push(sender_block.to_string());
     }
 
     // Inject sub-agent team roster so the agent knows its organizational context.
@@ -3940,3 +4047,129 @@ fn looks_like_computer_use_request(text: &str) -> bool {
         || en.iter().any(|kw| lower.contains(kw))
         || jp.iter().any(|kw| lower.contains(&kw.to_lowercase()))
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// RFC-21 §1 step 4 — sender block construction
+// ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod sender_block_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_identity_record(home: &std::path::Path, filename: &str, frontmatter: &str) {
+        let dir = home
+            .join("shared")
+            .join("wiki")
+            .join("identity")
+            .join("people");
+        fs::create_dir_all(&dir).unwrap();
+        let body = format!("---\n{frontmatter}---\n");
+        fs::write(dir.join(filename), body).unwrap();
+    }
+
+    #[test]
+    fn xml_escape_handles_metacharacters() {
+        assert_eq!(xml_escape("plain"), "plain");
+        assert_eq!(xml_escape("<tag>"), "&lt;tag&gt;");
+        assert_eq!(xml_escape("a & b"), "a &amp; b");
+        assert_eq!(xml_escape("she said \"hi\""), "she said &quot;hi&quot;");
+        assert_eq!(xml_escape("it's"), "it&apos;s");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_user_id_returns_empty_block() {
+        let tmp = TempDir::new().unwrap();
+        let block = build_sender_block(tmp.path(), "discord:chat-1", "").await;
+        assert!(block.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unknown_sender_returns_empty_block_no_regression() {
+        // No identity records present → resolver returns Ok(None) →
+        // build_sender_block must return "" so v1.10.1 behaviour is preserved.
+        let tmp = TempDir::new().unwrap();
+        let block = build_sender_block(tmp.path(), "discord:chat-1", "9999999").await;
+        assert!(block.is_empty(), "got: {block}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn known_sender_renders_xml_block_with_full_record() {
+        let tmp = TempDir::new().unwrap();
+        write_identity_record(
+            tmp.path(),
+            "ruby.md",
+            "person_id: person_2f9\n\
+             display_name: Ruby Lin\n\
+             roles: [customer-pm, project-lead]\n\
+             project_ids: [proj-alpha]\n\
+             channel_handles:\n  discord: \"1234567890\"\n",
+        );
+
+        let block = build_sender_block(tmp.path(), "discord:chat-1", "1234567890").await;
+        assert!(block.starts_with("<sender>"), "got: {block}");
+        assert!(block.ends_with("</sender>"), "got: {block}");
+        assert!(block.contains("<person_id>person_2f9</person_id>"), "got: {block}");
+        assert!(block.contains("<display_name>Ruby Lin</display_name>"), "got: {block}");
+        assert!(block.contains("<roles>customer-pm, project-lead</roles>"), "got: {block}");
+        assert!(block.contains("<project_ids>proj-alpha</project_ids>"), "got: {block}");
+        assert!(block.contains("<channel>discord</channel>"), "got: {block}");
+        assert!(block.contains("<source>wiki-cache</source>"), "got: {block}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn xml_metacharacters_in_record_are_escaped() {
+        let tmp = TempDir::new().unwrap();
+        // Display name contains characters that would break XML if unescaped.
+        write_identity_record(
+            tmp.path(),
+            "weird.md",
+            "person_id: person_w\n\
+             display_name: \"<weird & co>\"\n\
+             channel_handles:\n  discord: \"42\"\n",
+        );
+
+        let block = build_sender_block(tmp.path(), "discord:c", "42").await;
+        assert!(block.contains("&lt;weird &amp; co&gt;"), "got: {block}");
+        // Sanity: must still be a single, well-formed `<sender>` envelope.
+        assert_eq!(block.matches("<sender>").count(), 1);
+        assert_eq!(block.matches("</sender>").count(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unknown_channel_falls_through_to_other_variant() {
+        let tmp = TempDir::new().unwrap();
+        write_identity_record(
+            tmp.path(),
+            "matrix-user.md",
+            "person_id: person_mx\n\
+             display_name: Matrix User\n\
+             channel_handles:\n  matrix: \"@user:example.org\"\n",
+        );
+
+        // 'matrix:' prefix isn't a built-in channel kind — must still resolve.
+        let block = build_sender_block(tmp.path(), "matrix:room-1", "@user:example.org").await;
+        assert!(block.contains("<person_id>person_mx</person_id>"), "got: {block}");
+        assert!(block.contains("<channel>matrix</channel>"), "got: {block}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn omits_optional_blocks_when_record_lacks_them() {
+        let tmp = TempDir::new().unwrap();
+        // Minimal record — no roles, no projects.
+        write_identity_record(
+            tmp.path(),
+            "minimal.md",
+            "person_id: person_bare\n\
+             display_name: Bare Bones\n\
+             channel_handles:\n  discord: \"77\"\n",
+        );
+
+        let block = build_sender_block(tmp.path(), "discord:c", "77").await;
+        assert!(block.contains("<person_id>person_bare</person_id>"));
+        assert!(!block.contains("<roles>"), "should omit empty roles, got: {block}");
+        assert!(!block.contains("<project_ids>"), "should omit empty project_ids, got: {block}");
+    }
+}
+

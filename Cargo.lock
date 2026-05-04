@@ -2529,6 +2529,7 @@ dependencies = [
  "duduclaw-core",
  "duduclaw-dashboard",
  "duduclaw-desktop",
+ "duduclaw-identity",
  "duduclaw-inference",
  "duduclaw-memory",
  "duduclaw-odoo",
