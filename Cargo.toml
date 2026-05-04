@@ -21,6 +21,7 @@ members = [
     "crates/duduclaw-desktop",
     "crates/duduclaw-governance",
     "crates/duduclaw-durability",
+    "crates/duduclaw-identity",
 ]
 
 [workspace.package]
@@ -99,3 +100,4 @@ duduclaw-dashboard = { path = "crates/duduclaw-dashboard" }
 duduclaw-auth = { path = "crates/duduclaw-auth" }
 duduclaw-odoo = { path = "crates/duduclaw-odoo" }
 duduclaw-desktop = { path = "crates/duduclaw-desktop" }
+duduclaw-identity = { path = "crates/duduclaw-identity" }
