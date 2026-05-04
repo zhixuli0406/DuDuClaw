@@ -1,10 +1,29 @@
 # RFC-21 — Identity Resolution & Per-Agent Credential Isolation
 
 **Owner:** —
-**Status:** Draft (architecture review)
+**Status:** **Implemented** (2026-05-04) — see `docs/RFC-21-operator-guide.md` for deployment.
 **Tracking issue:** [#21](https://github.com/zhixuli0406/DuDuClaw/issues/21)
 **Reporter:** Ruby-11235813
 **Last updated:** 2026-05-04
+
+---
+
+## Implementation status
+
+| Section | Status | Commits |
+|---|---|---|
+| **§3** Shared wiki SoT boundary (`.scope.toml`, `wiki_namespace_status`) | ✅ Landed | `1a967f5` |
+| **§1 step 1** Crate skeleton + `WikiCacheIdentityProvider` | ✅ Landed | `53e19a8` |
+| **§1 step 2** `identity_resolve` MCP tool + `IdentityRead` scope | ✅ Landed | `53e19a8` |
+| **§1 step 3** `NotionIdentityProvider` + `ChainedProvider` | ✅ Landed | (this branch) |
+| **§1 step 4** `<sender>` block auto-injection into channel reply | ✅ Landed | `5c0b116` |
+| **§1 step 5** SOUL.md template generator update | ⚠️ Recharacterised — no template generator exists in the codebase (the `create_agent` MCP tool writes the operator-supplied `soul:` parameter verbatim). Operator guidance is now in `docs/RFC-21-operator-guide.md`. |
+| **§2** Per-agent Odoo isolation (`OdooConnectorPool`, `agent.toml [odoo]`, `Scope::Odoo*`, `allowed_models`/`actions`, audit attribution) | ✅ Landed | (this branch) |
+
+The original migration plan's "step 6" for §2 (require explicit
+`odoo:*` scope in every key) is intentionally **not** auto-applied —
+operators opt in by tightening their `[mcp_keys]` registry per the
+operator guide.
 
 ---
 
