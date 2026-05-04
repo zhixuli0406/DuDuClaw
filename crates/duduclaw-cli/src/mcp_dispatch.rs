@@ -25,8 +25,11 @@ use duduclaw_memory::SqliteMemoryEngine;
 
 // Re-export OdooState so HTTP/SSE layers can reference it without depending on
 // the private type alias in mcp.rs.
-pub type OdooState =
-    Arc<tokio::sync::RwLock<Option<duduclaw_odoo::OdooConnector>>>;
+//
+// RFC-21 §2: replaced the legacy `Arc<RwLock<Option<OdooConnector>>>` global
+// singleton with the per-agent `OdooConnectorPool`. The new type is `Arc`-
+// wrapped for cheap cloning across MCP dispatcher / HTTP / SSE layers.
+pub type OdooState = Arc<crate::odoo_pool::OdooConnectorPool>;
 
 // ── JSON-RPC helpers ──────────────────────────────────────────────────────────
 // Mirror of the private helpers in mcp.rs; kept here so other modules don't
@@ -240,7 +243,7 @@ mod tests {
             duduclaw_memory::SqliteMemoryEngine::new(&memory_path)
                 .expect("test memory db"),
         );
-        let odoo: OdooState = Arc::new(tokio::sync::RwLock::new(None));
+        let odoo: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
         McpDispatcher::new(
             home_dir,
             http,

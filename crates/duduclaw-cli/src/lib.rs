@@ -25,6 +25,7 @@ pub mod mcp_redact;
 pub(crate) mod mcp_sse_store;  // W20-P1 Phase 2C: SSE event ring buffer
 pub mod mcp_wiki;
 mod migrate;
+pub mod odoo_pool;             // RFC-21 §2: per-agent Odoo connector pool
 mod ptc;
 mod service;
 pub mod wiki_scope;            // RFC-21 §3: shared-wiki SoT namespace policy
@@ -2667,7 +2668,7 @@ async fn cmd_http_server(
         http,
         Arc::new(memory),
         default_agent,
-        Arc::new(tokio::sync::RwLock::new(None)),
+        Arc::new(crate::odoo_pool::OdooConnectorPool::default()),
         crate::mcp_rate_limit::RateLimiter::new(),
         crate::mcp_memory_quota::DailyQuota::new(),
     );

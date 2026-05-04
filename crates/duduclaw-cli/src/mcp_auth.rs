@@ -22,6 +22,16 @@ pub enum Scope {
     /// `WikiRead` because operators may want to grant agents read access to
     /// the shared wiki *without* exposing the canonical person registry.
     IdentityRead,
+    /// RFC-21 §2: gates Odoo `search_read` / list / status — read-class
+    /// `odoo_*` MCP tools that don't mutate Odoo state.
+    OdooRead,
+    /// RFC-21 §2: gates Odoo `create` / `write` — mutating `odoo_*` tools
+    /// that change record state but don't fire workflows.
+    OdooWrite,
+    /// RFC-21 §2: gates Odoo `execute_kw` workflow buttons (e.g.
+    /// `action_confirm`) and the generic `odoo_execute` / `odoo_report`
+    /// surfaces, which can fire side-effects beyond simple writes.
+    OdooExecute,
     Admin,
 }
 
@@ -34,6 +44,9 @@ impl std::fmt::Display for Scope {
             Scope::WikiWrite => "wiki:write",
             Scope::MessagingSend => "messaging:send",
             Scope::IdentityRead => "identity:read",
+            Scope::OdooRead => "odoo:read",
+            Scope::OdooWrite => "odoo:write",
+            Scope::OdooExecute => "odoo:execute",
             Scope::Admin => "admin",
         };
         write!(f, "{s}")
@@ -310,6 +323,15 @@ pub fn parse_scopes(s: &str) -> Result<HashSet<Scope>, AuthError> {
             "identity:read" => {
                 result.insert(Scope::IdentityRead);
             }
+            "odoo:read" => {
+                result.insert(Scope::OdooRead);
+            }
+            "odoo:write" => {
+                result.insert(Scope::OdooWrite);
+            }
+            "odoo:execute" => {
+                result.insert(Scope::OdooExecute);
+            }
             "admin" => {
                 result.insert(Scope::Admin);
             }
@@ -331,6 +353,32 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // RFC-21 §1: identity resolution requires its own scope so operators
         // can grant wiki access without exposing the person registry.
         "identity_resolve" => Some(Scope::IdentityRead),
+        // RFC-21 §2: Odoo tool surface — three-tier scope split so an agent
+        // granted only `odoo:read` cannot accidentally (or via prompt
+        // injection) call mutating tools. These checks are defence-in-depth
+        // *in addition to* the per-agent connector pool's `allowed_actions`
+        // filter — both must pass.
+        //
+        // Read class: pure search_read / list / status.
+        "odoo_status"
+        | "odoo_crm_leads"
+        | "odoo_sale_orders"
+        | "odoo_inventory_products"
+        | "odoo_inventory_check"
+        | "odoo_invoice_list"
+        | "odoo_payment_status"
+        | "odoo_search" => Some(Scope::OdooRead),
+        // Connect is read-class — it acquires/refreshes the connection but
+        // doesn't mutate Odoo state. Without it, no read can happen either.
+        "odoo_connect" => Some(Scope::OdooRead),
+        // Write class: create / write that mutate records but don't fire
+        // workflow side-effects.
+        "odoo_crm_create_lead"
+        | "odoo_crm_update_stage"
+        | "odoo_sale_create_quotation" => Some(Scope::OdooWrite),
+        // Execute class: workflow buttons + generic execute_kw + report
+        // generation. These can fire arbitrary Odoo-side actions.
+        "odoo_sale_confirm" | "odoo_execute" | "odoo_report" => Some(Scope::OdooExecute),
         // W19-P1 M4: Audit Trail 查詢 API — admin-only，與 WebSocket 路徑
         // `require_admin!()` 保持對等訪問控制。
         "audit_trail_query" => Some(Scope::Admin),
