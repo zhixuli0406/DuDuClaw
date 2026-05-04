@@ -4867,45 +4867,94 @@ async fn handle_cost_recent(params: &Value) -> Value {
 
 // ── Odoo ERP handlers ───────────────────────────────────────
 
-async fn handle_odoo_tool(tool: &str, params: &Value, home_dir: &Path, odoo: &OdooState) -> Value {
+async fn handle_odoo_tool(
+    tool: &str,
+    params: &Value,
+    home_dir: &Path,
+    odoo: &OdooState,
+    caller_agent: &str,
+) -> Value {
     use duduclaw_odoo::connector::OdooConnector;
     use duduclaw_odoo::models::{crm, sale, inventory, accounting};
 
     // odoo_connect doesn't require an existing connection
     if tool == "odoo_connect" {
-        return handle_odoo_connect(home_dir, odoo).await;
+        return handle_odoo_connect(home_dir, odoo, caller_agent).await;
     }
 
     if tool == "odoo_status" {
-        let guard = odoo.read().await;
-        return match guard.as_ref() {
-            Some(conn) => {
-                let s = conn.status();
-                serde_json::json!({ "content": [{"type": "text", "text": format!(
-                    "Odoo connected: {} ({})\nEdition: {}\nVersion: {}\nUser ID: {}\nEE modules: {}",
-                    s.url, s.db, s.edition, s.version,
-                    s.uid.map(|u| u.to_string()).unwrap_or("-".into()),
-                    if s.ee_modules.is_empty() { "none".to_string() } else { s.ee_modules.join(", ") },
-                )}]})
+        return match odoo.is_connected(caller_agent).await {
+            true => {
+                // Probe the connector by triggering get_or_connect; it's
+                // already cached so this is a hashmap lookup, not an HTTP
+                // call. The decrypt closure is a never-called fallback.
+                match odoo.get_or_connect(caller_agent, |_| Err::<String, String>("unreachable".into())).await {
+                    Ok(conn) => {
+                        let s = conn.status();
+                        let key = odoo.pool_key(caller_agent).await;
+                        serde_json::json!({ "content": [{"type": "text", "text": format!(
+                            "Odoo connected (agent={}, profile={}): {} ({})\nEdition: {}\nVersion: {}\nUser ID: {}\nEE modules: {}",
+                            key.0, key.1, s.url, s.db, s.edition, s.version,
+                            s.uid.map(|u| u.to_string()).unwrap_or("-".into()),
+                            if s.ee_modules.is_empty() { "none".to_string() } else { s.ee_modules.join(", ") },
+                        )}]})
+                    }
+                    Err(e) => mcp_error(&format!("Odoo status: connector slot lost: {e}")),
+                }
             }
-            None => serde_json::json!({
-                "content": [{"type": "text", "text": "Odoo not connected. Call odoo_connect first."}],
+            false => serde_json::json!({
+                "content": [{"type": "text", "text": format!(
+                    "Odoo not connected for agent '{caller_agent}'. Call odoo_connect first."
+                )}],
                 "isError": true
             }),
         };
     }
 
-    // All other tools require an active connection
-    let guard = odoo.read().await;
-    let conn = match guard.as_ref() {
-        Some(c) => c,
-        None => {
+    // RFC-21 §2 acceptance: defence-in-depth. Reject the call before any
+    // HTTP round-trip leaves the process when `agent.toml [odoo]
+    // .allowed_models` / `.allowed_actions` doesn't cover it.
+    if let Some((verb, model)) = classify_odoo_call(tool, params) {
+        let cfg = odoo.agent_override(caller_agent).await;
+        if let Err(reason) = crate::odoo_pool::check_action_permission(cfg.as_ref(), verb, &model) {
+            // Audit the policy denial so operators can spot misconfigured
+            // agents without having to grep MCP logs.
+            duduclaw_security::audit::append_tool_call(
+                home_dir,
+                caller_agent,
+                tool,
+                &format!("DENIED: {model}/{verb} — {reason}"),
+                false,
+            );
+            return mcp_error(&format!("Odoo permission denied: {reason}"));
+        }
+    }
+
+    // All other tools require an active per-agent connection. Use the
+    // pool's cache fast-path; the decrypt closure is unreachable here
+    // because cold-connect is owned by `handle_odoo_connect`.
+    let conn_arc = match odoo
+        .get_or_connect(caller_agent, |_| Err::<String, String>(
+            "Odoo connector not initialised — call odoo_connect first".into(),
+        ))
+        .await
+    {
+        Ok(c) => c,
+        Err(_) => {
             return serde_json::json!({
-                "content": [{"type": "text", "text": "Odoo not connected. Call odoo_connect first."}],
+                "content": [{"type": "text", "text": format!(
+                    "Odoo not connected for agent '{caller_agent}'. Call odoo_connect first."
+                )}],
                 "isError": true
             });
         }
     };
+    let conn: &OdooConnector = conn_arc.as_ref();
+    // ── per-call audit attribution (RFC-21 §2 acceptance) ────────────────
+    // Surface caller_agent + profile + tool + params summary to
+    // tool_calls.jsonl so the audit trail attributes Odoo activity to a
+    // specific agent rather than to the global admin user.
+    let _audit_profile = odoo.pool_key(caller_agent).await.1;
 
     let result: std::result::Result<String, String> = match tool {
         "odoo_crm_leads" => {
@@ -5096,50 +5145,129 @@ async fn handle_odoo_tool(tool: &str, params: &Value, home_dir: &Path, odoo: &Od
         _ => Err(format!("Unknown Odoo tool: {tool}")),
     };
 
+    // RFC-21 §2 acceptance: per-call audit attribution. tool_calls.jsonl
+    // now carries the originating agent + profile + outcome so Odoo
+    // activity can be traced to the agent that triggered it (and not the
+    // shared admin user inside Odoo's own audit log).
+    let params_summary = format!(
+        "profile={}; tool={}; ok={}",
+        _audit_profile,
+        tool,
+        result.is_ok(),
+    );
+    duduclaw_security::audit::append_tool_call(
+        home_dir,
+        caller_agent,
+        tool,
+        &params_summary,
+        result.is_ok(),
+    );
+
     match result {
         Ok(text) => serde_json::json!({ "content": [{"type": "text", "text": text}] }),
         Err(e) => serde_json::json!({ "content": [{"type": "text", "text": format!("Odoo error: {e}")}], "isError": true }),
     }
 }
 
-/// Connect to Odoo using config.toml [odoo] settings.
-async fn handle_odoo_connect(home_dir: &Path, odoo: &OdooState) -> Value {
+/// Heuristic mapping of `(tool, params)` to `(verb, model)` so the per-agent
+/// `allowed_actions` / `allowed_models` filter can run before any HTTP call
+/// reaches Odoo. Returns `None` for `odoo_status` / `odoo_connect` (those
+/// need no model permission).
+fn classify_odoo_call(tool: &str, params: &Value) -> Option<(&'static str, String)> {
+    match tool {
+        "odoo_crm_leads" => Some(("search", "crm.lead".into())),
+        "odoo_crm_create_lead" => Some(("create", "crm.lead".into())),
+        "odoo_crm_update_stage" => Some(("write", "crm.lead".into())),
+        "odoo_sale_orders" => Some(("search", "sale.order".into())),
+        "odoo_sale_create_quotation" => Some(("create", "sale.order".into())),
+        "odoo_sale_confirm" => Some(("execute", "sale.order".into())),
+        "odoo_inventory_products" => Some(("search", "product.product".into())),
+        "odoo_inventory_check" => Some(("search", "stock.quant".into())),
+        "odoo_invoice_list" | "odoo_payment_status" => Some(("search", "account.move".into())),
+        "odoo_search" => {
+            let model = params.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            if model.is_empty() { None } else { Some(("search", model.to_string())) }
+        }
+        "odoo_execute" => {
+            let model = params.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            if model.is_empty() { None } else { Some(("execute", model.to_string())) }
+        }
+        "odoo_report" => {
+            let name = params.get("report_name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() { None } else { Some(("execute", name.to_string())) }
+        }
+        _ => None,
+    }
+}
+
+/// Connect to Odoo using `config.toml [odoo]` overlaid with the caller's
+/// `agent.toml [odoo]` block (when present). RFC-21 §2: each agent ends up
+/// with its own per-pool slot so cross-project credential leakage and
+/// audit-log mis-attribution are eliminated at the system layer.
+async fn handle_odoo_connect(home_dir: &Path, odoo: &OdooState, caller_agent: &str) -> Value {
+    use duduclaw_odoo::AgentOdooConfig;
+
+    // ── 1. Reload global config from disk so operator edits land on next connect ─
     let config_path = home_dir.join("config.toml");
     let content = match tokio::fs::read_to_string(&config_path).await {
         Ok(c) => c,
         Err(e) => return mcp_error(&format!("Cannot read config.toml: {e}")),
     };
-    let table: toml::Table = match content.parse() {
+    let global_table: toml::Table = match content.parse() {
         Ok(t) => t,
         Err(e) => return mcp_error(&format!("Invalid config.toml: {e}")),
     };
-    let odoo_config = duduclaw_odoo::OdooConfig::from_toml(&table);
-    if !odoo_config.is_configured() {
+    let global_cfg = duduclaw_odoo::OdooConfig::from_toml(&global_table);
+    if !global_cfg.is_configured() {
         return mcp_error("Odoo not configured. Add [odoo] section to config.toml with url and db.");
     }
+    odoo.set_global(global_cfg.clone()).await;
 
-    // Resolve credential (try api_key_enc first, then password_enc)
-    let credential = decrypt_encrypted_value(&odoo_config.api_key_enc, home_dir)
-        .or_else(|| decrypt_encrypted_value(&odoo_config.password_enc, home_dir))
-        .unwrap_or_default();
-
-    if credential.is_empty() {
-        return mcp_error("Odoo credential not found. Set api_key_enc or password_enc in [odoo] config.");
+    // ── 2. Reload caller agent's [odoo] override if their agent.toml has one ──
+    let agent_toml_path = home_dir
+        .join("agents")
+        .join(caller_agent)
+        .join("agent.toml");
+    let override_cfg: Option<AgentOdooConfig> =
+        match tokio::fs::read_to_string(&agent_toml_path).await {
+            Ok(raw) => raw
+                .parse::<toml::Table>()
+                .ok()
+                .and_then(|t| AgentOdooConfig::from_agent_toml(&t)),
+            Err(_) => None,
+        };
+    if let Some(cfg) = &override_cfg {
+        odoo.register_agent(caller_agent, cfg.clone()).await;
     }
 
-    match duduclaw_odoo::OdooConnector::connect(&odoo_config, &credential).await {
-        Ok(conn) => {
-            let status = conn.status();
-            *odoo.write().await = Some(conn);
-            serde_json::json!({
-                "content": [{"type": "text", "text": format!(
-                    "Connected to Odoo {} ({}) — {} v{}",
-                    status.url, status.db, status.edition, status.version,
-                )}]
-            })
-        }
-        Err(e) => mcp_error(&format!("Odoo connection failed: {e}")),
-    }
+    // ── 3. Force a fresh handshake — the previous slot, if any, may have ───
+    //       been authed against a stale config.
+    odoo.disconnect(caller_agent).await;
+
+    // ── 4. Cold connect via the pool — credential merge + decrypt happen ──
+    //       inside `OdooConnectorPool::get_or_connect` using the resolver
+    //       state we just registered.
+    let home_dir_owned = home_dir.to_path_buf();
+    let connector = match odoo
+        .get_or_connect(caller_agent, move |enc: &str| {
+            decrypt_encrypted_value(enc, &home_dir_owned)
+                .ok_or_else(|| "Odoo credential not found or could not be decrypted".to_string())
+        })
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => return mcp_error(&format!("Odoo connection failed: {e}")),
+    };
+
+    let status = connector.status();
+    let key = odoo.pool_key(caller_agent).await;
+    serde_json::json!({
+        "content": [{"type": "text", "text": format!(
+            "Connected to Odoo {} ({}) — {} v{}\n  agent={}, profile={}",
+            status.url, status.db, status.edition, status.version,
+            key.0, key.1,
+        )}]
+    })
 }
 
 fn mcp_error(msg: &str) -> Value {
@@ -5958,8 +6086,9 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
         http.clone(),
         std::sync::Arc::new(memory),
         default_agent.clone(),
-        // Odoo connector (lazy — connected on first odoo_connect call)
-        std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+        // RFC-21 §2: per-agent Odoo connector pool (lazy — slot populated on
+        // first odoo_connect call for the calling agent).
+        std::sync::Arc::new(crate::odoo_pool::OdooConnectorPool::default()),
         crate::mcp_rate_limit::RateLimiter::new(),
         crate::mcp_memory_quota::DailyQuota::new(),
     );
@@ -6074,7 +6203,9 @@ fn handle_tools_list(id: &Value, is_external: bool) -> Value {
     jsonrpc_response(id, serde_json::json!({ "tools": tools }))
 }
 
-pub(crate) type OdooState = std::sync::Arc<tokio::sync::RwLock<Option<duduclaw_odoo::OdooConnector>>>;
+// RFC-21 §2: per-agent connector pool replaces the v1.10.1 global singleton.
+// Defined in `crate::odoo_pool::OdooConnectorPool`.
+pub(crate) type OdooState = std::sync::Arc<crate::odoo_pool::OdooConnectorPool>;
 
 // ── Namespace-aware wiki agent resolver (W19-P0 M2) ──────────────────────────
 /// Resolve the effective wiki agent for this principal from the namespace context.
@@ -6313,7 +6444,9 @@ pub(crate) async fn handle_tools_call(
             handle_computer_use_tool(tool_name, &arguments).await
         }
         // Odoo ERP tools
-        t if t.starts_with("odoo_") => handle_odoo_tool(t, &arguments, home_dir, odoo).await,
+        t if t.starts_with("odoo_") => {
+            handle_odoo_tool(t, &arguments, home_dir, odoo, default_agent).await
+        }
         _ => {
             return jsonrpc_error(
                 id,
@@ -11797,5 +11930,226 @@ mod wiki_namespace_tests {
                 tool["inputSchema"]
             );
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// RFC-21 §2 — Odoo per-agent connector pool integration tests
+// ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod odoo_pool_dispatch_tests {
+    //! Validates the routing seam between MCP dispatch and the
+    //! [`crate::odoo_pool::OdooConnectorPool`]: classification, permission
+    //! checks, and pool-key isolation. Actual HTTP round-trips to Odoo are
+    //! not exercised here — that is covered by `duduclaw-odoo` connector
+    //! tests against a live or mocked server.
+
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn classify_maps_search_class_tools() {
+        for (tool, expected_model) in &[
+            ("odoo_crm_leads", "crm.lead"),
+            ("odoo_sale_orders", "sale.order"),
+            ("odoo_inventory_products", "product.product"),
+            ("odoo_inventory_check", "stock.quant"),
+            ("odoo_invoice_list", "account.move"),
+            ("odoo_payment_status", "account.move"),
+        ] {
+            let (verb, model) = classify_odoo_call(tool, &serde_json::json!({})).unwrap();
+            assert_eq!(verb, "search", "tool={tool}");
+            assert_eq!(model, *expected_model, "tool={tool}");
+        }
+    }
+
+    #[test]
+    fn classify_maps_create_class_tools() {
+        for (tool, expected_model) in &[
+            ("odoo_crm_create_lead", "crm.lead"),
+            ("odoo_sale_create_quotation", "sale.order"),
+        ] {
+            let (verb, model) = classify_odoo_call(tool, &serde_json::json!({})).unwrap();
+            assert_eq!(verb, "create", "tool={tool}");
+            assert_eq!(model, *expected_model);
+        }
+    }
+
+    #[test]
+    fn classify_maps_write_class_tools() {
+        let (verb, model) =
+            classify_odoo_call("odoo_crm_update_stage", &serde_json::json!({})).unwrap();
+        assert_eq!(verb, "write");
+        assert_eq!(model, "crm.lead");
+    }
+
+    #[test]
+    fn classify_maps_execute_class_tools() {
+        let (verb, model) =
+            classify_odoo_call("odoo_sale_confirm", &serde_json::json!({})).unwrap();
+        assert_eq!(verb, "execute");
+        assert_eq!(model, "sale.order");
+    }
+
+    #[test]
+    fn classify_extracts_model_from_params_for_generic_search() {
+        let (verb, model) = classify_odoo_call(
+            "odoo_search",
+            &serde_json::json!({ "model": "res.partner" }),
+        )
+        .unwrap();
+        assert_eq!(verb, "search");
+        assert_eq!(model, "res.partner");
+    }
+
+    #[test]
+    fn classify_returns_none_for_generic_search_without_model() {
+        // No model arg → can't classify. The downstream handler will reject
+        // with "model is required" — same v1.10.1 behaviour.
+        assert!(classify_odoo_call("odoo_search", &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn classify_extracts_model_from_params_for_generic_execute() {
+        let (verb, model) = classify_odoo_call(
+            "odoo_execute",
+            &serde_json::json!({ "model": "res.partner", "method": "search" }),
+        )
+        .unwrap();
+        assert_eq!(verb, "execute");
+        assert_eq!(model, "res.partner");
+    }
+
+    #[test]
+    fn classify_returns_none_for_status_and_connect() {
+        // These tools intentionally bypass model-permission gating —
+        // odoo_status reports state, odoo_connect bootstraps the slot.
+        assert!(classify_odoo_call("odoo_status", &serde_json::json!({})).is_none());
+        assert!(classify_odoo_call("odoo_connect", &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn classify_returns_none_for_unknown_tool() {
+        assert!(classify_odoo_call("odoo_blarg", &serde_json::json!({})).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn odoo_status_reports_not_connected_for_fresh_agent() {
+        let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+        let result =
+            handle_odoo_tool("odoo_status", &serde_json::json!({}), std::path::Path::new("/tmp"), &pool, "agnes")
+                .await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("Odoo not connected"), "got: {text}");
+        assert!(text.contains("agnes"), "should name the caller, got: {text}");
+        assert!(result["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn odoo_tool_blocks_disallowed_model_before_any_network_call() {
+        // Register an agent override that whitelists only crm.lead.
+        let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+        pool.register_agent(
+            "agnes",
+            duduclaw_odoo::AgentOdooConfig {
+                profile: Some("test".into()),
+                allowed_models: vec!["crm.lead".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Attempt a sale.order search — must be rejected at the gate, no
+        // get_or_connect HTTP call attempted.
+        let result = handle_odoo_tool(
+            "odoo_sale_orders",
+            &serde_json::json!({}),
+            std::path::Path::new("/tmp"),
+            &pool,
+            "agnes",
+        )
+        .await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(result["isError"].as_bool().unwrap_or(false));
+        assert!(text.contains("permission denied"), "got: {text}");
+        assert!(text.contains("allowed_models"), "got: {text}");
+        // No connector slot should have been touched.
+        assert!(!pool.is_connected("agnes").await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn odoo_tool_blocks_disallowed_action_verb() {
+        let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+        pool.register_agent(
+            "agnes",
+            duduclaw_odoo::AgentOdooConfig {
+                profile: Some("readonly".into()),
+                allowed_actions: vec!["read".into(), "search".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Attempt a write — must be denied even though crm.lead is permitted
+        // (no model whitelist set).
+        let result = handle_odoo_tool(
+            "odoo_crm_create_lead",
+            &serde_json::json!({ "name": "test lead" }),
+            std::path::Path::new("/tmp"),
+            &pool,
+            "agnes",
+        )
+        .await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(result["isError"].as_bool().unwrap_or(false));
+        assert!(text.contains("permission denied"), "got: {text}");
+        assert!(text.contains("allowed_actions"), "got: {text}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn odoo_tool_without_override_falls_through_to_connection_check() {
+        // No override → permission gate is permissive → handler proceeds to
+        // get_or_connect, which fails with the "not connected" message
+        // because no connect was issued.
+        let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+        let result = handle_odoo_tool(
+            "odoo_crm_leads",
+            &serde_json::json!({}),
+            std::path::Path::new("/tmp"),
+            &pool,
+            "agnes",
+        )
+        .await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(result["isError"].as_bool().unwrap_or(false));
+        assert!(text.contains("not connected"), "got: {text}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_agents_get_isolated_pool_slots() {
+        let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+        pool.register_agent(
+            "alpha-pm",
+            duduclaw_odoo::AgentOdooConfig {
+                profile: Some("alpha".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        pool.register_agent(
+            "beta-pm",
+            duduclaw_odoo::AgentOdooConfig {
+                profile: Some("beta".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let alpha_key = pool.pool_key("alpha-pm").await;
+        let beta_key = pool.pool_key("beta-pm").await;
+        assert_ne!(alpha_key, beta_key);
+        assert_eq!(alpha_key.1, "alpha");
+        assert_eq!(beta_key.1, "beta");
     }
 }
