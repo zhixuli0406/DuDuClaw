@@ -863,6 +863,11 @@ const TOOLS: &[ToolDef] = &[
         params: &[],
     },
     ToolDef {
+        name: "wiki_namespace_status",
+        description: "Inspect the shared-wiki namespace SoT policy (~/.duduclaw/shared/wiki/.scope.toml). Returns each configured namespace's mode (agent_writable / read_only / operator_only) and synced_from capability. Unlisted namespaces are agent_writable. Use this before shared_wiki_write to know whether a target namespace is writable.",
+        params: &[],
+    },
+    ToolDef {
         name: "wiki_share",
         description: "Share a page from your wiki to the shared wiki. Creates a source-attributed copy in shared/wiki/sources/.",
         params: &[
@@ -6243,6 +6248,7 @@ pub(crate) async fn handle_tools_call(
         "shared_wiki_delete" => handle_shared_wiki_delete(&arguments, home_dir, default_agent).await,
         "shared_wiki_stats" => handle_shared_wiki_stats(home_dir).await,
         "shared_wiki_lint" => handle_shared_wiki_lint(home_dir).await,
+        "wiki_namespace_status" => handle_wiki_namespace_status(home_dir).await,
         "wiki_share" => handle_wiki_share(&arguments, home_dir, wiki_agent).await,
         // Skill Internalization tools
         "skill_extract" => handle_skill_extract(&arguments, home_dir, default_agent).await,
@@ -7712,6 +7718,16 @@ async fn handle_shared_wiki_write(args: &Value, home_dir: &Path, caller_agent: &
         return tool_error(&e);
     }
 
+    // RFC-21 §3: shared-wiki SoT namespace policy. Loaded fresh on every
+    // call (≤ a few KB on disk) so operator edits to .scope.toml take
+    // effect immediately. Absent / malformed file ⇒ empty policy ⇒ all
+    // namespaces writable (no regression vs. v1.10.1).
+    let scope_policy = crate::wiki_scope::WikiScopePolicy::load_for(home_dir);
+    let caller_capability = crate::wiki_scope::WriterCapability::for_agent(caller_agent);
+    if let Err(deny) = scope_policy.check_write(page_path, &caller_capability) {
+        return tool_error(&format!("Shared wiki write denied: {deny}"));
+    }
+
     if content.len() > WIKI_MAX_PAGE_SIZE {
         return tool_error(&format!("Content too large: {} bytes (max {})", content.len(), WIKI_MAX_PAGE_SIZE));
     }
@@ -7819,6 +7835,15 @@ async fn handle_shared_wiki_delete(args: &Value, home_dir: &Path, caller_agent: 
         return tool_error(&e);
     }
 
+    // RFC-21 §3: deletes on read_only / operator_only namespaces are denied
+    // even for the original page author — the namespace policy is the
+    // authority, not the per-page ACL.
+    let scope_policy = crate::wiki_scope::WikiScopePolicy::load_for(home_dir);
+    let caller_capability = crate::wiki_scope::WriterCapability::for_agent(caller_agent);
+    if let Err(deny) = scope_policy.check_write(page_path, &caller_capability) {
+        return tool_error(&format!("Shared wiki delete denied: {deny}"));
+    }
+
     let wiki_dir = resolve_shared_wiki_dir(home_dir);
     let full_path = wiki_dir.join(page_path);
 
@@ -7901,6 +7926,32 @@ async fn handle_shared_wiki_stats(home_dir: &Path) -> Value {
     }
 
     tool_text(&output)
+}
+
+/// RFC-21 §3: Inspect the shared-wiki namespace policy (`.scope.toml`).
+/// Returns the configured namespaces and their modes plus a hint about the
+/// fallback ("agent_writable") behaviour for namespaces not listed.
+async fn handle_wiki_namespace_status(home_dir: &Path) -> Value {
+    let policy = crate::wiki_scope::WikiScopePolicy::load_for(home_dir);
+    let snapshot = policy.snapshot();
+
+    let payload = serde_json::json!({
+        "policy_file": policy.loaded_from()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| crate::wiki_scope::scope_file_path(home_dir).display().to_string()),
+        "policy_loaded": policy.loaded_from().is_some(),
+        "default_mode": "agent_writable",
+        "namespaces": snapshot,
+    });
+
+    let pretty = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+
+    let header = if policy.is_empty() {
+        "Shared wiki namespace policy: none configured (every namespace is agent_writable).\n\n"
+    } else {
+        "Shared wiki namespace policy:\n\n"
+    };
+    tool_text(&format!("{header}{pretty}"))
 }
 
 /// Audit shared wiki for Karpathy-schema compliance: missing frontmatter
@@ -10067,6 +10118,204 @@ mod wiki_schema_tests {
             text
         );
         assert!(!result["isError"].as_bool().unwrap_or(false));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // RFC-21 §3 — Shared-wiki SoT namespace policy integration
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn write_scope_policy(home: &std::path::Path, body: &str) {
+        let path = home.join("shared").join("wiki").join(".scope.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, body).unwrap();
+    }
+
+    fn clean_karpathy_page(title: &str) -> String {
+        format!(
+            "---\n\
+             title: {title}\n\
+             created: 2026-05-04T00:00:00Z\n\
+             updated: 2026-05-04T00:00:00Z\n\
+             tags: [test]\n\
+             layer: context\n\
+             trust: 0.5\n\
+             ---\n\
+             body content\n",
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_wiki_write_denied_when_namespace_is_read_only() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml(&agents_dir, "agnes");
+
+        write_scope_policy(
+            tmp.path(),
+            r#"
+                [namespaces."identity"]
+                mode = "read_only"
+                synced_from = "identity-provider"
+            "#,
+        );
+
+        let args = serde_json::json!({
+            "page_path": "identity/discord-users.md",
+            "content": clean_karpathy_page("Identity Roster"),
+        });
+        let result = handle_shared_wiki_write(&args, tmp.path(), "agnes").await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            result["isError"].as_bool().unwrap_or(false),
+            "expected isError=true, got payload: {result}"
+        );
+        assert!(text.contains("Shared wiki write denied"), "got: {text}");
+        assert!(text.contains("identity"), "should name the namespace, got: {text}");
+        assert!(text.contains("identity-provider"), "should name the synced_from capability, got: {text}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_wiki_write_allowed_when_namespace_is_unlisted() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml(&agents_dir, "agnes");
+
+        write_scope_policy(
+            tmp.path(),
+            r#"
+                [namespaces."identity"]
+                mode = "read_only"
+                synced_from = "identity-provider"
+            "#,
+        );
+
+        // 'concepts' is not listed — must remain writable.
+        let args = serde_json::json!({
+            "page_path": "concepts/return-policy.md",
+            "content": clean_karpathy_page("Return Policy"),
+        });
+        let result = handle_shared_wiki_write(&args, tmp.path(), "agnes").await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("Written shared wiki page"),
+            "unlisted namespace should be writable, got: {text}"
+        );
+        assert!(!result["isError"].as_bool().unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_wiki_write_unaffected_when_no_scope_policy_present() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml(&agents_dir, "agnes");
+
+        // No .scope.toml written — behaviour must match v1.10.1 exactly.
+        let args = serde_json::json!({
+            "page_path": "identity/should-still-work.md",
+            "content": clean_karpathy_page("Pre-RFC behaviour"),
+        });
+        let result = handle_shared_wiki_write(&args, tmp.path(), "agnes").await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("Written shared wiki page"),
+            "absent policy must not regress writes, got: {text}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_wiki_write_unaffected_when_scope_toml_is_malformed() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml(&agents_dir, "agnes");
+
+        // Fail-safe path: malformed file must never block legitimate writes.
+        write_scope_policy(tmp.path(), "this is :: not = valid = toml ===");
+
+        let args = serde_json::json!({
+            "page_path": "identity/discord-users.md",
+            "content": clean_karpathy_page("Identity Roster"),
+        });
+        let result = handle_shared_wiki_write(&args, tmp.path(), "agnes").await;
+        assert!(
+            !result["isError"].as_bool().unwrap_or(false),
+            "malformed policy must fail-safe to writable, got: {result}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_wiki_delete_denied_when_namespace_is_operator_only() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml(&agents_dir, "agnes");
+
+        // First write a page (no policy yet so the write succeeds).
+        let write_args = serde_json::json!({
+            "page_path": "policies/security.md",
+            "content": clean_karpathy_page("Security Policy"),
+        });
+        let write_res = handle_shared_wiki_write(&write_args, tmp.path(), "agnes").await;
+        assert!(!write_res["isError"].as_bool().unwrap_or(false));
+
+        // Now lock down the policies/ namespace.
+        write_scope_policy(
+            tmp.path(),
+            r#"
+                [namespaces."policies"]
+                mode = "operator_only"
+            "#,
+        );
+
+        let del_args = serde_json::json!({ "page_path": "policies/security.md" });
+        let del_res = handle_shared_wiki_delete(&del_args, tmp.path(), "agnes").await;
+        let text = del_res["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            del_res["isError"].as_bool().unwrap_or(false),
+            "operator_only delete should be denied even for the original author, got: {del_res}"
+        );
+        assert!(text.contains("Shared wiki delete denied"), "got: {text}");
+        assert!(text.contains("operator_only"), "should name the mode, got: {text}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wiki_namespace_status_reports_loaded_policy() {
+        let tmp = TempDir::new();
+        write_scope_policy(
+            tmp.path(),
+            r#"
+                [namespaces."identity"]
+                mode = "read_only"
+                synced_from = "identity-provider"
+
+                [namespaces."policies"]
+                mode = "operator_only"
+            "#,
+        );
+
+        let result = handle_wiki_namespace_status(tmp.path()).await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("\"namespace\": \"identity\""), "got: {text}");
+        assert!(text.contains("\"mode\": \"read_only\""), "got: {text}");
+        assert!(text.contains("\"synced_from\": \"identity-provider\""), "got: {text}");
+        assert!(text.contains("\"namespace\": \"policies\""), "got: {text}");
+        assert!(text.contains("\"mode\": \"operator_only\""), "got: {text}");
+        assert!(text.contains("\"policy_loaded\": true"), "got: {text}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wiki_namespace_status_reports_empty_policy_when_file_absent() {
+        let tmp = TempDir::new();
+        let result = handle_wiki_namespace_status(tmp.path()).await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("none configured") && text.contains("agent_writable"),
+            "got: {text}"
+        );
+        assert!(text.contains("\"policy_loaded\": false"), "got: {text}");
     }
 }
 

@@ -27,6 +27,7 @@ pub mod mcp_wiki;
 mod migrate;
 mod ptc;
 mod service;
+pub mod wiki_scope;            // RFC-21 §3: shared-wiki SoT namespace policy
 mod wizard;
 
 // ── Credential helpers (M-4) ────────────────────────────────

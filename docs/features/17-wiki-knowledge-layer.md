@@ -203,6 +203,46 @@ Beyond per-agent wikis, there's a shared wiki at `~/.duduclaw/shared/wiki/` for 
 
 Visibility is controlled via the `wiki_visible_to` capability on each page — default is agent-private, but pages can be promoted to shared or restricted to a team. MCP tools: `shared_wiki_ls`, `shared_wiki_read`, `shared_wiki_write`, `shared_wiki_search`, `shared_wiki_delete`, `shared_wiki_stats`, `wiki_share`.
 
+### Namespace SoT Policy (`.scope.toml`)
+
+Operators can declare which top-level namespaces inside the shared wiki are **authoritative copies of an external system** (Notion, LDAP, governance policy bundles) and must not be silently overwritten by an evolving agent. Drop a `~/.duduclaw/shared/wiki/.scope.toml`:
+
+```toml
+# Identity is owned by the IdentityProvider sync — no agent may write here
+[namespaces."identity"]
+mode         = "read_only"
+synced_from  = "identity-provider"
+
+# Access control list is owned by the governance policy bundle
+[namespaces."access"]
+mode         = "read_only"
+synced_from  = "policy-registry"
+
+# SOPs continue to be agent-writable (also the default for unlisted namespaces)
+[namespaces."SOP"]
+mode         = "agent_writable"
+
+# Production policies are operator-only — never writable via MCP
+[namespaces."policies"]
+mode         = "operator_only"
+```
+
+Three modes:
+
+| Mode | Agents (MCP path) | Internal capability that matches `synced_from` | Operator CLI |
+|---|---|---|---|
+| `agent_writable` | ✅ allowed | ✅ allowed | ✅ allowed |
+| `read_only` | ❌ denied | ✅ allowed | ✅ allowed |
+| `operator_only` | ❌ denied | ❌ denied | ✅ allowed |
+
+Both `shared_wiki_write` and `shared_wiki_delete` honour the policy. Unlisted namespaces are `agent_writable` by default — the policy *only tightens*, never relaxes.
+
+**Fail-safe:** absent file ⇒ no policy ⇒ existing behaviour. Malformed TOML ⇒ logged warning + treated as no policy. The gateway is never blocked by a broken policy file.
+
+**Hot-reload:** the policy is re-read on every write/delete (the file is small; performance impact negligible). Operator edits take effect immediately.
+
+Use `wiki_namespace_status` MCP tool to inspect the active policy before writing.
+
 ---
 
 ## Cloud Ingest Integration
