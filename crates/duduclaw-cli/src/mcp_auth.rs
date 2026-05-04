@@ -18,6 +18,10 @@ pub enum Scope {
     WikiRead,
     WikiWrite,
     MessagingSend,
+    /// RFC-21 §1: gates `identity_resolve` and friends. Distinct from
+    /// `WikiRead` because operators may want to grant agents read access to
+    /// the shared wiki *without* exposing the canonical person registry.
+    IdentityRead,
     Admin,
 }
 
@@ -29,6 +33,7 @@ impl std::fmt::Display for Scope {
             Scope::WikiRead => "wiki:read",
             Scope::WikiWrite => "wiki:write",
             Scope::MessagingSend => "messaging:send",
+            Scope::IdentityRead => "identity:read",
             Scope::Admin => "admin",
         };
         write!(f, "{s}")
@@ -302,6 +307,9 @@ pub fn parse_scopes(s: &str) -> Result<HashSet<Scope>, AuthError> {
             "messaging:send" => {
                 result.insert(Scope::MessagingSend);
             }
+            "identity:read" => {
+                result.insert(Scope::IdentityRead);
+            }
             "admin" => {
                 result.insert(Scope::Admin);
             }
@@ -320,6 +328,9 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         "wiki_read" | "wiki_search" => Some(Scope::WikiRead),
         "wiki_write" => Some(Scope::WikiWrite),
         "send_message" => Some(Scope::MessagingSend),
+        // RFC-21 §1: identity resolution requires its own scope so operators
+        // can grant wiki access without exposing the person registry.
+        "identity_resolve" => Some(Scope::IdentityRead),
         // W19-P1 M4: Audit Trail 查詢 API — admin-only，與 WebSocket 路徑
         // `require_admin!()` 保持對等訪問控制。
         "audit_trail_query" => Some(Scope::Admin),

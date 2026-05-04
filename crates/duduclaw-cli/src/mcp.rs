@@ -868,6 +868,14 @@ const TOOLS: &[ToolDef] = &[
         params: &[],
     },
     ToolDef {
+        name: "identity_resolve",
+        description: "RFC-21 §1: Resolve a (channel, external_id) pair to the canonical person it represents — name, roles, project memberships, all known channel handles. Returns null when the person is unknown. Reads from the WikiCacheIdentityProvider (~/.duduclaw/shared/wiki/identity/people/*.md). Use this *before* deciding whether the sender is a project member, instead of grepping shared_wiki_read.",
+        params: &[
+            ParamDef { name: "channel", description: "Channel kind: discord / line / telegram / slack / whatsapp / feishu / webchat / email", required: true },
+            ParamDef { name: "external_id", description: "Channel-side identifier — Discord user_id, LINE user_id, email address, etc.", required: true },
+        ],
+    },
+    ToolDef {
         name: "wiki_share",
         description: "Share a page from your wiki to the shared wiki. Creates a source-attributed copy in shared/wiki/sources/.",
         params: &[
@@ -6249,6 +6257,7 @@ pub(crate) async fn handle_tools_call(
         "shared_wiki_stats" => handle_shared_wiki_stats(home_dir).await,
         "shared_wiki_lint" => handle_shared_wiki_lint(home_dir).await,
         "wiki_namespace_status" => handle_wiki_namespace_status(home_dir).await,
+        "identity_resolve" => handle_identity_resolve(&arguments, home_dir, default_agent).await,
         "wiki_share" => handle_wiki_share(&arguments, home_dir, wiki_agent).await,
         // Skill Internalization tools
         "skill_extract" => handle_skill_extract(&arguments, home_dir, default_agent).await,
@@ -7952,6 +7961,81 @@ async fn handle_wiki_namespace_status(home_dir: &Path) -> Value {
         "Shared wiki namespace policy:\n\n"
     };
     tool_text(&format!("{header}{pretty}"))
+}
+
+/// RFC-21 §1: Resolve a `(channel, external_id)` pair to the canonical person
+/// behind it via the [`duduclaw_identity::IdentityProvider`] trait. Step 2 of
+/// the migration plan: only [`duduclaw_identity::providers::WikiCacheIdentityProvider`]
+/// is available; richer providers (Notion, LDAP) plug in at the same trait
+/// surface in later steps.
+async fn handle_identity_resolve(args: &Value, home_dir: &Path, caller_agent: &str) -> Value {
+    use duduclaw_identity::IdentityProvider;
+    use duduclaw_identity::providers::WikiCacheIdentityProvider;
+
+    let channel_str = match args.get("channel").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => return tool_error("Missing required parameter: channel"),
+    };
+    let external_id = match args.get("external_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => return tool_error("Missing required parameter: external_id"),
+    };
+
+    let channel = duduclaw_identity::ChannelKind::parse_wire(channel_str);
+    let provider = WikiCacheIdentityProvider::for_home(home_dir.to_path_buf());
+
+    match provider.resolve_by_channel(channel.clone(), external_id).await {
+        Ok(Some(person)) => {
+            // Surface the structured result as JSON. Agents that need a
+            // narrative can render it themselves; downstream code can
+            // serde_json::from_value back into ResolvedPerson.
+            tracing::info!(
+                provider = provider.name(),
+                channel = %channel.as_wire(),
+                caller_agent = caller_agent,
+                hit = true,
+                "identity_resolve: matched person_id={}",
+                person.person_id,
+            );
+            match serde_json::to_value(&person) {
+                Ok(payload) => {
+                    let pretty = serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| payload.to_string());
+                    tool_text(&format!(
+                        "Resolved person via {} provider:\n\n{pretty}",
+                        provider.name()
+                    ))
+                }
+                Err(e) => tool_error(&format!("Failed to serialize ResolvedPerson: {e}")),
+            }
+        }
+        Ok(None) => {
+            tracing::info!(
+                provider = provider.name(),
+                channel = %channel.as_wire(),
+                caller_agent = caller_agent,
+                hit = false,
+                "identity_resolve: no match",
+            );
+            tool_text(&format!(
+                "No identity record matched (channel={}, external_id={}). \
+                 The person is not in the wiki cache; treat as a stranger \
+                 unless you can resolve them by other means.",
+                channel.as_wire(),
+                external_id,
+            ))
+        }
+        Err(e) => {
+            tracing::warn!(
+                provider = provider.name(),
+                channel = %channel.as_wire(),
+                caller_agent = caller_agent,
+                "identity_resolve: provider error: {}",
+                e,
+            );
+            tool_error(&format!("Identity provider error: {e}"))
+        }
+    }
 }
 
 /// Audit shared wiki for Karpathy-schema compliance: missing frontmatter
@@ -10316,6 +10400,110 @@ mod wiki_schema_tests {
             "got: {text}"
         );
         assert!(text.contains("\"policy_loaded\": false"), "got: {text}");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // RFC-21 §1 — Identity Resolution MCP tool integration
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn write_identity_record(home: &std::path::Path, filename: &str, frontmatter: &str) {
+        let dir = home
+            .join("shared")
+            .join("wiki")
+            .join("identity")
+            .join("people");
+        fs::create_dir_all(&dir).unwrap();
+        let body = format!("---\n{frontmatter}---\n");
+        fs::write(dir.join(filename), body).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn identity_resolve_returns_payload_for_known_handle() {
+        let tmp = TempDir::new();
+        write_identity_record(
+            tmp.path(),
+            "ruby.md",
+            "person_id: person_2f9\n\
+             display_name: Ruby Lin\n\
+             roles: [customer-pm]\n\
+             project_ids: [proj-alpha]\n\
+             channel_handles:\n  discord: \"1234567890\"\n",
+        );
+
+        let args = serde_json::json!({
+            "channel": "discord",
+            "external_id": "1234567890",
+        });
+        let result = handle_identity_resolve(&args, tmp.path(), "agnes").await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+
+        assert!(!result["isError"].as_bool().unwrap_or(false));
+        assert!(text.contains("\"person_id\": \"person_2f9\""), "got: {text}");
+        assert!(text.contains("\"display_name\": \"Ruby Lin\""), "got: {text}");
+        assert!(text.contains("\"source\": \"wiki-cache\""), "got: {text}");
+        assert!(text.contains("Resolved person via wiki-cache"), "got: {text}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn identity_resolve_returns_polite_miss_for_unknown_handle() {
+        let tmp = TempDir::new();
+        // No identity records at all → must report "no match", not error.
+        let args = serde_json::json!({
+            "channel": "discord",
+            "external_id": "9999999",
+        });
+        let result = handle_identity_resolve(&args, tmp.path(), "agnes").await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            !result["isError"].as_bool().unwrap_or(false),
+            "unknown person is not an error, got: {result}"
+        );
+        assert!(text.contains("No identity record matched"), "got: {text}");
+        assert!(text.contains("treat as a stranger"), "got: {text}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn identity_resolve_rejects_missing_channel_or_external_id() {
+        let tmp = TempDir::new();
+        let r1 = handle_identity_resolve(
+            &serde_json::json!({ "external_id": "1234" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(r1["isError"].as_bool().unwrap_or(false));
+        assert!(r1["content"][0]["text"].as_str().unwrap_or("").contains("channel"));
+
+        let r2 = handle_identity_resolve(
+            &serde_json::json!({ "channel": "discord" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(r2["isError"].as_bool().unwrap_or(false));
+        assert!(r2["content"][0]["text"].as_str().unwrap_or("").contains("external_id"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn identity_resolve_accepts_unknown_channel_kind_via_other_variant() {
+        let tmp = TempDir::new();
+        write_identity_record(
+            tmp.path(),
+            "matrix-user.md",
+            "person_id: person_mx\n\
+             display_name: Matrix User\n\
+             channel_handles:\n  matrix: \"@user:example.org\"\n",
+        );
+
+        // 'matrix' isn't a built-in ChannelKind variant — must still resolve
+        // via the Other(_) catch-all.
+        let args = serde_json::json!({
+            "channel": "matrix",
+            "external_id": "@user:example.org",
+        });
+        let result = handle_identity_resolve(&args, tmp.path(), "agnes").await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("\"person_id\": \"person_mx\""), "got: {text}");
     }
 }
 

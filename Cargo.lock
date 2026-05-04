@@ -2403,6 +2403,7 @@ dependencies = [
  "duduclaw-container",
  "duduclaw-core",
  "duduclaw-gateway",
+ "duduclaw-identity",
  "duduclaw-inference",
  "duduclaw-memory",
  "duduclaw-odoo",
@@ -2579,6 +2580,20 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid 1.23.1",
+]
+
+[[package]]
+name = "duduclaw-identity"
+version = "1.10.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

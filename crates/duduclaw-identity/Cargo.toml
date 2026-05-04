@@ -1,0 +1,33 @@
+[package]
+name = "duduclaw-identity"
+version.workspace = true
+edition.workspace = true
+
+# RFC-21 §1 — Identity Resolution provider abstraction.
+#
+# Resolves a (channel, external_id) pair (e.g. a Discord user_id) to the
+# canonical person it represents, behind an `IdentityProvider` trait so
+# operators can plug in Notion / LDAP / a custom HTTP source as the
+# authoritative identity store.
+
+[dependencies]
+# Async trait + runtime
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_yaml = "0.9"
+
+# Error handling
+thiserror = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["full", "test-util"] }
