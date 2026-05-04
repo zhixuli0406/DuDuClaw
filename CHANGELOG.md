@@ -1,6 +1,153 @@
 # Changelog
 
 
+## [1.11.0] - 2026-05-04
+
+RFC-21 — Identity Resolution & Per-Agent Credential Isolation. Closes
+[#21](https://github.com/zhixuli0406/DuDuClaw/issues/21) by addressing all
+three architectural gaps the reporter identified: identity resolution
+walked the shared wiki instead of an authoritative external source, Odoo
+MCP credentials shared one global admin slot across every agent, and the
+shared wiki had no source-of-truth boundary so an evolving agent could
+silently overwrite externally-synced data. All three are now enforced at
+the system layer (dispatcher / pool / namespace policy) instead of relying
+on SOUL.md prompt-layer self-restraint.
+
+### Added — `duduclaw-identity` crate (§1)
+
+- **`IdentityProvider` async trait** + `ResolvedPerson` (`person_id`,
+  `display_name`, `roles`, `project_ids`, `emails`, `channel_handles`,
+  `source`, `fetched_at`) + `ChannelKind` enum (Discord / Line / Telegram
+  / Slack / WhatsApp / Feishu / WebChat / Email + `Other(_)` catch-all
+  with stable wire format) + `IdentityError` (Unreachable / Malformed /
+  Unsupported / Io / Internal).
+- **`WikiCacheIdentityProvider`** reads `<home>/shared/wiki/identity/people/*.md`
+  per-person YAML frontmatter records; tolerates malformed files and
+  missing optional fields; mtime-driven `fetched_at`.
+- **`NotionIdentityProvider`** queries Notion `databases/query` with
+  configurable `NotionFieldMap` (property names + `ProjectsKind`
+  multi_select / relation). HTTP errors classify cleanly: 5xx /
+  network ⇒ Unreachable (chained provider degrades), 4xx ⇒ Malformed.
+- **`ChainedProvider`** combines cache + upstream — cache hit
+  short-circuits; cache miss falls through; upstream unreachable
+  degrades to `Ok(None)` rather than hard-erroring; project membership
+  prefers upstream then falls back to cache.
+- **`identity_resolve` MCP tool** + new `Scope::IdentityRead`
+  ("identity:read") gates the tool. Audit row emitted per call.
+- **`<sender>` XML block auto-injection** into channel reply system
+  prompt (`crates/duduclaw-gateway/src/channel_reply.rs`). Sender is
+  resolved once per turn; XML-escaped to keep the envelope intact;
+  optional fields omitted when empty. Empty result ⇒ block omitted ⇒
+  v1.10.1 behaviour preserved.
+
+### Added — Per-agent Odoo credential isolation (§2)
+
+- **`agent.toml [odoo]` override block** parsed via new
+  `duduclaw-odoo::AgentOdooConfig`: `profile` / `username` /
+  `api_key_enc` / `password_enc` / `allowed_models` /
+  `allowed_actions` / `company_ids`. Empty / malformed block returns
+  None; agent without override falls back to global config.
+- **`OdooConfigResolver`** layers global + per-agent; `pool_key_for`
+  produces stable `(agent_id, profile)` pool keys.
+- **`OdooConnectorPool`** (new `crates/duduclaw-cli/src/odoo_pool.rs`)
+  replaces the v1.10.1 global `Arc<RwLock<Option<OdooConnector>>>` with
+  a `(agent_id, profile)`-keyed pool. Outer `RwLock<HashMap>` for
+  membership reads + per-slot `tokio::sync::Mutex` for first-use
+  connect serialisation. `get_or_connect(decrypt)` → cached
+  `Arc<OdooConnector>` or cold-connect via merged credentials.
+  `set_global` preserves per-agent overrides on hot-reload;
+  `disconnect`/`disconnect_all`/`is_connected` complete the lifecycle.
+- **`Scope::OdooRead` / `OdooWrite` / `OdooExecute`** added to
+  `mcp_auth.rs`. All 14 `odoo_*` tools registered into
+  `tool_requires_scope` — read class (status / connect / search /
+  CRM leads / sale orders / inventory / invoice / payment), write
+  class (create lead / update stage / create quotation), execute class
+  (sale confirm / generic execute / report).
+- **`allowed_models` / `allowed_actions` defence-in-depth filter** —
+  `check_action_permission(verb, model)` runs before any HTTP request
+  leaves the process; supports bare verbs (`"read"` → all models) and
+  qualified verbs (`"write:crm.lead"` → only crm.lead). Policy denials
+  audited as DENIED rows.
+- **Audit attribution**: `tool_calls.jsonl` rows for Odoo calls now
+  carry `params_summary = "profile=<profile>; tool=<name>; ok=<bool>"`
+  so Odoo activity is traceable to the originating agent rather than
+  the shared admin user inside Odoo's own audit log.
+- **`handle_odoo_connect`** now reload-and-reconnect: re-reads
+  `config.toml [odoo]` (set as global), re-reads
+  `agents/<caller>/agent.toml [odoo]` (registers as override),
+  forces `disconnect(caller)`, then `get_or_connect`. The connection
+  report includes the resolved `(agent, profile)`.
+
+### Added — Shared wiki SoT namespace policy (§3)
+
+- **`~/.duduclaw/shared/wiki/.scope.toml`** declares which top-level
+  namespaces are read-only / operator-only. Three modes:
+  `agent_writable` (default — same as v1.10.1, no regression),
+  `read_only { synced_from = "<capability>" }` (only the named internal
+  capability or operator may write), `operator_only` (never writable
+  via MCP).
+- **Enforcement** in both `handle_shared_wiki_write` and
+  `handle_shared_wiki_delete` — the namespace policy is the authority,
+  not the per-page ACL. Read-only namespaces deny even the original
+  page author from deleting.
+- **`wiki_namespace_status` MCP tool** lets agents introspect the
+  active policy before attempting a write.
+- **Fail-safe**: absent file ⇒ empty policy ⇒ everything writable.
+  Malformed TOML ⇒ logged warning + treated as no policy. Hot-reload
+  is automatic — every write/delete re-reads the file (KB-sized; not
+  on the hot path).
+- **Reserved policy filename**: `.scope.toml` is implicitly rejected by
+  the existing `.md` extension check in `validate_wiki_page_path`; no
+  separate reserved-list entry needed.
+
+### Added — Documentation
+
+- **`docs/RFC-21-identity-credential-isolation.md`** — original design
+  doc with three-section migration plan, acceptance criteria, risks,
+  and rollout strategy.
+- **`docs/RFC-21-operator-guide.md`** — step-by-step deployment
+  playbook for all three sections, with verify commands, common
+  pitfalls, and migration sequence from the v1.10.1 single-tenant
+  deployment.
+- **`docs/features/17-wiki-knowledge-layer.md`** updated with the
+  namespace SoT policy section.
+- **`CLAUDE.md`** Architecture Overview header bumped to v1.11.0; new
+  bullets summarising RFC-21 §1 / §2 / §3 in the relevant sections.
+
+### Tests
+
+Cross four crates, **1193 unit + integration tests pass** with no
+regression:
+
+- `duduclaw-identity` 31/31 (15 wiki_cache + 7 chained + 9 notion) +
+  1 doctest
+- `duduclaw-odoo` 27/27 (15 new agent_config tests on top of existing
+  12)
+- `duduclaw-cli` 301/301 — 15 wiki_scope unit + 12 odoo_pool unit + 14
+  odoo_pool_dispatch integration + 4 identity_resolve integration + 7
+  new wiki_schema_tests for namespace policy enforcement
+- `duduclaw-gateway` 834/834 (7 new sender_block tests)
+
+### Backwards compat
+
+Every section preserves v1.10.1 behaviour for deployments that don't
+opt in:
+
+- Absent `.scope.toml` ⇒ no namespace restrictions.
+- Absent `[identity]` ⇒ no `<sender>` block; `shared_wiki_read` for
+  identity continues to work.
+- Absent `agent.toml [odoo]` ⇒ pool collapses to `(agent_id,
+  "default")` slot using global config exactly as before.
+
+No flag-day migration required.
+
+### Commits
+
+`867e719` (RFC) → `1a967f5` (§3) → `53e19a8` (§1 step 1-2) → `5c0b116`
+(§1 step 4) → `a17ba5a` (§2) → `9a40c18` (§1 step 3) → `3269ca0`
+(operator guide + status reflection) → `<this commit>` (v1.11.0 release).
+
+
 ## [1.10.1] - 2026-05-04
 
 ### Fixed — Release pipeline
