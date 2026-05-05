@@ -1,6 +1,36 @@
 # Changelog
 
 
+## [Unreleased] — W22-P0 x-duduclaw Capability Negotiation
+
+ADR-002 — `x-duduclaw` header versioning + capability negotiation. Every HTTP response from the
+MCP HTTP server now carries machine-readable capability metadata, and clients can declare capability
+requirements that trigger an early 422 rather than silent partial failures.
+
+### Added
+
+- **`mcp_headers.rs`** — `CAPABILITY_REGISTRY` static table (9 capabilities: `memory/3`, `mcp/2`,
+  `audit/2`, `governance/1`, `skill/1`, `wiki/1` enabled; `a2a/1`, `secret-manager/1`,
+  `signed-card/1` disabled/pending). `API_VERSION = "1.2"`. Builder/parser/negotiation functions:
+  `build_capabilities_header()`, `build_capabilities_header_from()`, `parse_capabilities()`,
+  `validate_client_capabilities()`, `build_missing_capabilities_header()`. 23 unit tests.
+- **`mcp_capability.rs`** — Two Axum middleware functions:
+  - `inject_capability_headers` — appends `x-duduclaw-version` + `x-duduclaw-capabilities` to
+    every response (including 422s).
+  - `negotiate_capabilities` — validates optional `x-duduclaw-capabilities` request header; returns
+    422 Unprocessable Entity with structured JSON body and `x-duduclaw-missing-capabilities` header
+    if any stated requirement cannot be met. Permissive when header absent/empty/malformed.
+    11 Axum integration tests (via `tower::ServiceExt::oneshot`).
+- **`mcp_http_server.rs`** — Both middleware layers wired into `build_router()` with correct
+  outer/inner ordering (inject outer, negotiate inner).
+- **`docs/ADR-002-x-duduclaw-capability-negotiation.md`** — Full architecture decision record.
+
+### Changed
+
+- `x-duduclaw-version` bumped to `1.2` (second backward-compatible HTTP API change).
+
+---
+
 ## [1.11.0] - 2026-05-04
 
 RFC-21 — Identity Resolution & Per-Agent Credential Isolation. Closes

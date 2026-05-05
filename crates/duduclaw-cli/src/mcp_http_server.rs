@@ -5,6 +5,9 @@
 //   GET  /mcp/v1/stream             — SSE long-lived event stream (Bearer or ?api_key=)
 //   POST /mcp/v1/stream/call        — inject tool call into a named SSE stream
 //   GET  /healthz                   — health check (no auth)
+//
+// W22-P0 ADR-002: All responses carry x-duduclaw-version + x-duduclaw-capabilities headers
+// via the inject_capability_headers + negotiate_capabilities middleware stack.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,6 +15,7 @@ use std::time::Duration;
 
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -23,6 +27,7 @@ use tokio_stream::StreamExt;
 use tracing::info;
 
 use crate::mcp_auth::{authenticate_with_key, Principal};
+use crate::mcp_capability::{inject_capability_headers, negotiate_capabilities};
 use crate::mcp_dispatch::McpDispatcher;
 use crate::mcp_http_errors::into_axum_response;
 use crate::mcp_namespace::{resolve, NamespaceContext};
@@ -207,7 +212,14 @@ pub fn build_router(cfg: &HttpServerConfig, dispatcher: McpDispatcher) -> Router
             .route("/mcp/v1/stream/call", post(stream_call_handler));
     }
 
-    router.with_state(state)
+    // W22-P0 ADR-002: inject x-duduclaw-version + x-duduclaw-capabilities into all responses.
+    // Layer order (axum: last .layer() = outermost = runs first on request, last on response):
+    //   outer: inject_capability_headers — adds standard headers to ALL responses (incl. 422)
+    //   inner: negotiate_capabilities   — validates client's x-duduclaw-capabilities header
+    router
+        .with_state(state)
+        .layer(middleware::from_fn(negotiate_capabilities))   // inner
+        .layer(middleware::from_fn(inject_capability_headers)) // outer
 }
 
 // ── Server entry point ────────────────────────────────────────────────────────

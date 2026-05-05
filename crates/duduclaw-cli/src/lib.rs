@@ -17,6 +17,8 @@ pub mod mcp_dispatch;          // W20-P1 Phase 2A: transport-agnostic dispatcher
 pub(crate) mod mcp_http_auth;  // W20-P1 Phase 2B: HTTP Bearer auth extractor
 pub(crate) mod mcp_http_errors; // W20-P1 Phase 2B: JSON-RPC ↔ HTTP status mapping
 pub mod mcp_http_server;       // W20-P1 Phase 2B: Axum HTTP/SSE server
+pub mod mcp_headers;           // W22-P0 ADR-002: capability registry + x-duduclaw header builder
+pub mod mcp_capability;        // W22-P0 ADR-002: inject_capability_headers + negotiate_capabilities
 pub mod mcp_memory_handlers;
 pub mod mcp_memory_quota;
 pub mod mcp_namespace;
