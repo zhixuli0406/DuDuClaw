@@ -358,6 +358,36 @@ mod tests {
         assert!(result.is_err(), "non-numeric version must return Err");
     }
 
+    /// Direct unit coverage for the `version_str.is_empty()` branch inside parse_capabilities.
+    /// Without a `/`, splitn(2, '/') yields only one part, so version_str is empty → Err.
+    #[test]
+    fn parse_entry_missing_slash_returns_error() {
+        let hv = HeaderValue::from_static("badformat");
+        let result = parse_capabilities(&hv);
+        assert!(
+            result.is_err(),
+            "entry without '/' separator must return Err (empty version_str branch)"
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("badformat"),
+            "error message must include the offending entry: {err_msg}"
+        );
+    }
+
+    /// Validates the semantic rule: client requiring a LOWER version than server has → OK.
+    /// Covers the `_ => {}` arm in validate_client_capabilities (satisfied but not exact match).
+    #[test]
+    fn validate_lower_version_requirement_is_satisfied() {
+        // Server has mcp/2; client only needs mcp/1 → should pass (backward-compatible)
+        let hv = HeaderValue::from_static("mcp/1");
+        let result = validate_client_capabilities(Some(&hv));
+        assert!(
+            result.is_ok(),
+            "client requiring mcp/1 when server has mcp/2 must succeed (backward-compat)"
+        );
+    }
+
     // ── validate_client_capabilities tests (≥ 8 required by ADR-002) ──────────
 
     #[test]
@@ -479,5 +509,45 @@ mod tests {
         let display = err.to_string();
         assert!(display.contains("a2a"), "display must mention missing capability name");
         assert!(display.contains("not available"), "must describe absent capability");
+    }
+
+    /// Covers Display impl's `Some(sv)` branch: "required vX, server vY" format
+    #[test]
+    fn mismatch_display_with_version_info() {
+        let err = CapabilityMismatchError {
+            missing: vec![MissingCapability {
+                capability: "mcp".to_string(),
+                required_version: 99,
+                server_version: Some(2),
+            }],
+        };
+        let display = err.to_string();
+        assert!(display.contains("mcp"), "display must mention capability name");
+        assert!(display.contains("required v99"), "must show required version");
+        assert!(display.contains("server v2"), "must show server version");
+    }
+
+    /// Covers Display impl's `if i > 0 { write!(f, ", ") }` separator branch
+    #[test]
+    fn mismatch_display_with_multiple_entries_uses_comma_separator() {
+        let err = CapabilityMismatchError {
+            missing: vec![
+                MissingCapability {
+                    capability: "a2a".to_string(),
+                    required_version: 1,
+                    server_version: None,
+                },
+                MissingCapability {
+                    capability: "secret-manager".to_string(),
+                    required_version: 1,
+                    server_version: None,
+                },
+            ],
+        };
+        let display = err.to_string();
+        assert!(display.contains("a2a"), "first capability must appear");
+        assert!(display.contains("secret-manager"), "second capability must appear");
+        // The comma separator between multiple entries
+        assert!(display.contains(", "), "multiple entries must be comma-separated");
     }
 }

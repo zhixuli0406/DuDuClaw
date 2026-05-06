@@ -49,7 +49,7 @@ const HDR_MISSING_CAPABILITIES: &str = "x-duduclaw-missing-capabilities";
 /// use axum::{Router, middleware};
 /// use duduclaw_cli::mcp_capability::inject_capability_headers;
 ///
-/// let router = Router::new()
+/// let router: Router = Router::new()
 ///     /* ... routes ... */
 ///     .layer(middleware::from_fn(inject_capability_headers));
 /// ```
