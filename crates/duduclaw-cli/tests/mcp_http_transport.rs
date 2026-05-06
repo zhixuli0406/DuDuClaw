@@ -27,6 +27,7 @@ use duduclaw_cli::mcp_dispatch::McpDispatcher;
 use duduclaw_cli::mcp_http_server::{build_router, HttpServerConfig};
 use duduclaw_cli::mcp_memory_quota::DailyQuota;
 use duduclaw_cli::mcp_rate_limit::RateLimiter;
+use duduclaw_cli::odoo_pool::OdooConnectorPool;
 use duduclaw_memory::SqliteMemoryEngine;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -66,7 +67,7 @@ fn make_dispatcher(home_dir: &std::path::Path) -> McpDispatcher {
         http,
         Arc::new(memory),
         "test-agent".to_string(),
-        Arc::new(tokio::sync::RwLock::new(None)),
+        Arc::new(OdooConnectorPool::default()),
         RateLimiter::new(),
         DailyQuota::new(),
     )
@@ -380,6 +381,174 @@ async fn tc_http_09_stream_accepts_api_key_query_param() {
     assert!(
         ct.contains("text/event-stream"),
         "SSE 端點應回傳 text/event-stream content-type，實際：{ct}"
+    );
+}
+
+// ── TC-HTTP-11: ADR-002 — healthz 回應攜帶 x-duduclaw-* 標頭 ────────────────────
+//
+// 驗證 inject_capability_headers middleware 已正確掛載到 build_router。
+// 即使是無需認證的 /healthz 端點，每個回應都必須攜帶 ADR-002 標準標頭。
+
+#[tokio::test]
+async fn tc_http_11_adr002_headers_present_on_healthz() {
+    let dir = TempDir::new().unwrap();
+    let dispatcher = make_dispatcher(dir.path());
+    let cfg = make_cfg(dir.path());
+    let app = build_router(&cfg, dispatcher);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // ADR-002 §3.1: 每個回應（成功 or 錯誤）都必須帶 x-duduclaw-version
+    let version = resp
+        .headers()
+        .get("x-duduclaw-version")
+        .expect("TC-HTTP-11: x-duduclaw-version 必須出現在 healthz 回應中");
+    assert_eq!(
+        version.to_str().unwrap(),
+        "1.2",
+        "TC-HTTP-11: x-duduclaw-version 必須是 1.2"
+    );
+
+    // ADR-002 §3.1: 每個回應都必須帶 x-duduclaw-capabilities
+    let caps = resp
+        .headers()
+        .get("x-duduclaw-capabilities")
+        .expect("TC-HTTP-11: x-duduclaw-capabilities 必須出現在 healthz 回應中");
+    let caps_str = caps.to_str().unwrap();
+    assert!(
+        caps_str.starts_with("memory/"),
+        "TC-HTTP-11: capabilities 必須以 memory 開頭，實際：{caps_str}"
+    );
+    assert!(
+        caps_str.contains("mcp/2"),
+        "TC-HTTP-11: capabilities 必須包含 mcp/2，實際：{caps_str}"
+    );
+    assert!(
+        !caps_str.contains("a2a/"),
+        "TC-HTTP-11: 停用的 a2a 不應出現在 capabilities，實際：{caps_str}"
+    );
+}
+
+// ── TC-HTTP-12: ADR-002 — 401 錯誤回應也攜帶 x-duduclaw-* 標頭 ──────────────────
+//
+// ADR-002 §3.3.3 規定：即使是認證失敗的 4xx 回應，也必須攜帶標準 DuDuClaw 標頭。
+// inject_capability_headers 作為最外層 middleware，確保所有回應路徑都有標頭。
+
+#[tokio::test]
+async fn tc_http_12_adr002_headers_present_on_401_error() {
+    let dir = TempDir::new().unwrap();
+    let dispatcher = make_dispatcher(dir.path());
+    let cfg = make_cfg(dir.path());
+    let app = build_router(&cfg, dispatcher);
+
+    // 不帶 Authorization header → 401
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp/v1/call")
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}"#))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "TC-HTTP-12: 應回傳 401");
+
+    // 即使是 401，也必須攜帶 ADR-002 標頭
+    assert!(
+        resp.headers().contains_key("x-duduclaw-version"),
+        "TC-HTTP-12: 401 回應必須攜帶 x-duduclaw-version (ADR-002 §3.1)"
+    );
+    assert!(
+        resp.headers().contains_key("x-duduclaw-capabilities"),
+        "TC-HTTP-12: 401 回應必須攜帶 x-duduclaw-capabilities (ADR-002 §3.1)"
+    );
+    let version = resp.headers()["x-duduclaw-version"].to_str().unwrap();
+    assert_eq!(version, "1.2", "TC-HTTP-12: x-duduclaw-version 必須是 1.2");
+}
+
+// ── TC-HTTP-13: ADR-002 — 能力協商 422 via build_router ─────────────────────────
+//
+// 端到端驗證：請求攜帶 x-duduclaw-capabilities: a2a/1（停用能力），
+// negotiate_capabilities middleware 應回傳 422，
+// inject_capability_headers middleware 應為 422 回應加上標準標頭，
+// 422 body 應符合 ADR-002 §3.3.3 JSON 格式。
+
+#[tokio::test]
+async fn tc_http_13_adr002_capability_negotiation_422_via_build_router() {
+    let dir = TempDir::new().unwrap();
+    let dispatcher = make_dispatcher(dir.path());
+    let cfg = make_cfg(dir.path());
+    let app = build_router(&cfg, dispatcher);
+
+    // a2a/1 是停用能力 → negotiate_capabilities 應拒絕並回傳 422
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/healthz")
+        .header("x-duduclaw-capabilities", "a2a/1")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "TC-HTTP-13: 停用能力請求應回傳 422"
+    );
+
+    // 422 回應也必須攜帶標準 ADR-002 標頭（由外層 inject_capability_headers 注入）
+    assert!(
+        resp.headers().contains_key("x-duduclaw-version"),
+        "TC-HTTP-13: 422 回應必須攜帶 x-duduclaw-version"
+    );
+    assert!(
+        resp.headers().contains_key("x-duduclaw-capabilities"),
+        "TC-HTTP-13: 422 回應必須攜帶 x-duduclaw-capabilities"
+    );
+
+    // 422 回應必須攜帶 x-duduclaw-missing-capabilities
+    let missing_hdr = resp
+        .headers()
+        .get("x-duduclaw-missing-capabilities")
+        .expect("TC-HTTP-13: 422 必須攜帶 x-duduclaw-missing-capabilities");
+    let missing_str = missing_hdr.to_str().unwrap();
+    assert!(
+        missing_str.contains("a2a/1"),
+        "TC-HTTP-13: missing-capabilities 必須包含 a2a/1，實際：{missing_str}"
+    );
+
+    // 驗證 422 body 格式 (ADR-002 §3.3.3)
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(
+        json["error"],
+        "capability_mismatch",
+        "TC-HTTP-13: body.error 必須是 capability_mismatch"
+    );
+    assert!(
+        json["missing"].is_array(),
+        "TC-HTTP-13: body.missing 必須是陣列"
+    );
+    let missing_arr = json["missing"].as_array().unwrap();
+    assert_eq!(missing_arr.len(), 1, "TC-HTTP-13: 應有 1 個缺失能力");
+    assert_eq!(
+        missing_arr[0]["capability"],
+        "a2a",
+        "TC-HTTP-13: 缺失能力名稱應為 a2a"
+    );
+    assert_eq!(
+        missing_arr[0]["required_version"],
+        1,
+        "TC-HTTP-13: 要求版本應為 1"
+    );
+    assert!(
+        missing_arr[0]["server_version"].is_null(),
+        "TC-HTTP-13: 停用能力的 server_version 應為 null"
     );
 }
 

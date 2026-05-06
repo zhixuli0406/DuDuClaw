@@ -434,17 +434,369 @@ async fn stream_call_handler(
 #[cfg(test)]
 pub mod tests {
     use std::net::TcpListener;
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt; // provides Router::oneshot
 
     use super::*;
+    use crate::mcp_dispatch::McpDispatcher;
+    use crate::mcp_memory_quota::DailyQuota;
+    use crate::mcp_rate_limit::RateLimiter;
+
+    // ── Header name constants (mirrors mcp_capability.rs) ─────────────────────
+
+    const HDR_VERSION: &str = "x-duduclaw-version";
+    const HDR_CAPABILITIES: &str = "x-duduclaw-capabilities";
+    const HDR_MISSING_CAPABILITIES: &str = "x-duduclaw-missing-capabilities";
+
+    // ── Helpers ────────────────────────────────────────────────────────────────
 
     pub fn ephemeral_addr() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap()
     }
 
+    /// Build a McpDispatcher backed by an in-memory SQLite database.
+    /// No real tools are called in these tests; we only need the router to be valid.
+    fn make_test_dispatcher() -> McpDispatcher {
+        let home_dir = std::env::temp_dir().join("duduclaw_http_server_test");
+        let _ = std::fs::create_dir_all(&home_dir);
+        let http = reqwest::Client::new();
+        let memory = Arc::new(
+            duduclaw_memory::SqliteMemoryEngine::in_memory().expect("in-memory db"),
+        );
+        let odoo = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+        McpDispatcher::new(
+            home_dir,
+            http,
+            memory,
+            "dudu".to_string(),
+            odoo,
+            RateLimiter::new(),
+            DailyQuota::new(),
+        )
+    }
+
+    /// Build a default HttpServerConfig pointing at a temp dir.
+    fn test_config() -> HttpServerConfig {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        HttpServerConfig::new(addr, std::env::temp_dir())
+    }
+
+    /// Shorthand: GET /healthz with no extra headers.
+    fn healthz_request() -> Request<Body> {
+        Request::builder().uri("/healthz").body(Body::empty()).unwrap()
+    }
+
+    /// Shorthand: GET /healthz with x-duduclaw-capabilities header.
+    fn healthz_with_caps(caps: &str) -> Request<Body> {
+        Request::builder()
+            .uri("/healthz")
+            .header(HDR_CAPABILITIES, caps)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    // ── HttpServerConfig tests ─────────────────────────────────────────────────
+
     #[test]
     fn ephemeral_port_binds_successfully() {
         let addr = ephemeral_addr();
         assert!(addr.port() > 0);
+    }
+
+    #[test]
+    fn config_new_has_correct_defaults() {
+        let cfg = test_config();
+        assert!(cfg.enable_sse, "SSE should be enabled by default");
+        assert_eq!(
+            cfg.call_timeout,
+            Duration::from_secs(30),
+            "default call timeout should be 30s"
+        );
+    }
+
+    #[test]
+    fn config_stores_bind_addr_and_home_dir() {
+        let bind: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let home = std::path::PathBuf::from("/tmp/test-home");
+        let cfg = HttpServerConfig::new(bind, home.clone());
+        assert_eq!(cfg.bind, bind);
+        assert_eq!(cfg.home_dir, home);
+    }
+
+    // ── build_router smoke tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn healthz_returns_200_ok() {
+        let cfg = test_config();
+        let router = build_router(&cfg, make_test_dispatcher());
+        let resp = router.oneshot(healthz_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn healthz_response_body_contains_ok_status() {
+        let cfg = test_config();
+        let router = build_router(&cfg, make_test_dispatcher());
+        let resp = router.oneshot(healthz_request()).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["status"], "ok", "healthz body must contain status: ok");
+    }
+
+    // ── ADR-002 header injection via build_router ─────────────────────────────
+
+    #[tokio::test]
+    async fn healthz_always_has_version_header() {
+        let cfg = test_config();
+        let router = build_router(&cfg, make_test_dispatcher());
+        let resp = router.oneshot(healthz_request()).await.unwrap();
+        let version = resp
+            .headers()
+            .get(HDR_VERSION)
+            .expect("x-duduclaw-version must be injected by middleware");
+        assert_eq!(version.to_str().unwrap(), "1.2");
+    }
+
+    #[tokio::test]
+    async fn healthz_always_has_capabilities_header() {
+        let cfg = test_config();
+        let router = build_router(&cfg, make_test_dispatcher());
+        let resp = router.oneshot(healthz_request()).await.unwrap();
+        let caps = resp
+            .headers()
+            .get(HDR_CAPABILITIES)
+            .expect("x-duduclaw-capabilities must be injected by middleware");
+        let caps_str = caps.to_str().unwrap();
+        assert!(caps_str.starts_with("memory/"), "memory must be first cap: {caps_str}");
+    }
+
+    #[tokio::test]
+    async fn healthz_capabilities_header_lists_enabled_caps_only() {
+        let cfg = test_config();
+        let router = build_router(&cfg, make_test_dispatcher());
+        let resp = router.oneshot(healthz_request()).await.unwrap();
+        let caps_str = resp.headers()[HDR_CAPABILITIES].to_str().unwrap();
+        assert!(caps_str.contains("mcp/2"),    "mcp/2 must be listed: {caps_str}");
+        assert!(caps_str.contains("audit/2"),  "audit/2 must be listed: {caps_str}");
+        assert!(!caps_str.contains("a2a/"),    "disabled a2a must be absent: {caps_str}");
+    }
+
+    // ── Capability negotiation through the full router ────────────────────────
+
+    #[tokio::test]
+    async fn healthz_with_satisfied_capability_returns_200() {
+        let cfg = test_config();
+        let router = build_router(&cfg, make_test_dispatcher());
+        let resp = router.oneshot(healthz_with_caps("memory/3,mcp/2")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn healthz_with_disabled_capability_returns_422() {
+        let cfg = test_config();
+        let router = build_router(&cfg, make_test_dispatcher());
+        // a2a is disabled in the registry → 422
+        let resp = router.oneshot(healthz_with_caps("a2a/1")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn healthz_422_includes_missing_capabilities_header() {
+        let cfg = test_config();
+        let router = build_router(&cfg, make_test_dispatcher());
+        let resp = router.oneshot(healthz_with_caps("a2a/1,secret-manager/1")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let missing = resp
+            .headers()
+            .get(HDR_MISSING_CAPABILITIES)
+            .expect("422 must include x-duduclaw-missing-capabilities");
+        let missing_str = missing.to_str().unwrap();
+        assert!(missing_str.contains("a2a/1"), "a2a must be listed as missing: {missing_str}");
+    }
+
+    #[tokio::test]
+    async fn healthz_422_still_has_standard_duduclaw_headers() {
+        // Even a 422 from negotiate_capabilities must carry the standard headers
+        // (inject_capability_headers is the outer layer — runs on ALL responses)
+        let cfg = test_config();
+        let router = build_router(&cfg, make_test_dispatcher());
+        let resp = router.oneshot(healthz_with_caps("a2a/1")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            resp.headers().contains_key(HDR_VERSION),
+            "422 must carry x-duduclaw-version"
+        );
+        assert!(
+            resp.headers().contains_key(HDR_CAPABILITIES),
+            "422 must carry x-duduclaw-capabilities"
+        );
+    }
+
+    // ── Authentication guard on protected endpoints ───────────────────────────
+
+    #[tokio::test]
+    async fn call_endpoint_returns_401_without_auth() {
+        let cfg = test_config();
+        let router = build_router(&cfg, make_test_dispatcher());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp/v1/call")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn sse_stream_endpoint_returns_401_without_auth() {
+        let cfg = test_config(); // enable_sse: true by default
+        let router = build_router(&cfg, make_test_dispatcher());
+        let req = Request::builder()
+            .uri("/mcp/v1/stream")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── SSE routing configuration ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sse_stream_returns_404_when_sse_disabled() {
+        let mut cfg = test_config();
+        cfg.enable_sse = false;
+        let router = build_router(&cfg, make_test_dispatcher());
+        let req = Request::builder()
+            .uri("/mcp/v1/stream")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "SSE endpoint must be absent when enable_sse = false"
+        );
+    }
+
+    // ── Authentication header format error paths ──────────────────────────────
+
+    #[tokio::test]
+    async fn call_endpoint_returns_401_with_non_bearer_auth() {
+        // Authorization header exists but doesn't start with "Bearer "
+        let cfg = test_config();
+        let router = build_router(&cfg, make_test_dispatcher());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp/v1/call")
+            .header("Authorization", "Basic dXNlcjpwYXNz")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "Non-Bearer auth scheme must return 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_endpoint_returns_401_with_empty_bearer_token() {
+        // "Bearer " prefix present but token is empty
+        let cfg = test_config();
+        let router = build_router(&cfg, make_test_dispatcher());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp/v1/call")
+            .header("Authorization", "Bearer ")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "Empty Bearer token must return 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_endpoint_returns_401_with_invalid_bearer_token() {
+        // Valid format but unknown key → authenticate_with_key fails
+        let cfg = test_config();
+        let router = build_router(&cfg, make_test_dispatcher());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp/v1/call")
+            .header("Authorization", "Bearer invalid-key-that-does-not-exist")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "Invalid Bearer token must return 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_stream_returns_401_with_invalid_query_api_key() {
+        // SSE: no Bearer header, but ?api_key= is invalid
+        let cfg = test_config();
+        let router = build_router(&cfg, make_test_dispatcher());
+        let req = Request::builder()
+            .uri("/mcp/v1/stream?api_key=invalid-key")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "Invalid query api_key must return 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_call_endpoint_returns_401_without_auth() {
+        // POST /mcp/v1/stream/call requires Bearer auth
+        let cfg = test_config();
+        let router = build_router(&cfg, make_test_dispatcher());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp/v1/stream/call?conn_id=test-conn")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "stream/call without auth must return 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_call_returns_404_when_sse_disabled() {
+        let mut cfg = test_config();
+        cfg.enable_sse = false;
+        let router = build_router(&cfg, make_test_dispatcher());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp/v1/stream/call?conn_id=test-conn")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","method":"tools/call","id":1}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "stream/call endpoint must be absent when SSE disabled"
+        );
     }
 }

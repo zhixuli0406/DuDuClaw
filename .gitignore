@@ -33,6 +33,19 @@ commercial/
 *.profraw
 **/*.profraw
 
+# Agent-generated daily reports (per-agent operational logs, not for repo)
+docs/tl/daily-report-*.md
+docs/pm/daily-report-*.md
+
+# Researcher agent local notes (auto-generated, mirrored to shared wiki)
+/research/
+
+# Active spike workspaces — promoted to production code on completion
+/python/spikes/
+
+# Python uv lock — only tracked once Python deliverables are first-class
+/uv.lock
+
 # Release artifacts (built by CI, not committed to source)
 artifacts/
 

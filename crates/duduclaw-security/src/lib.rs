@@ -12,6 +12,7 @@ pub mod mount_guard;
 pub mod rate_limiter;
 pub mod rbac;
 pub mod safety_word;
+pub mod secret_manager;
 pub mod soul_guard;
 pub mod soul_scanner;
 pub mod stability_index;
