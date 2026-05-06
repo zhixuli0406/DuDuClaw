@@ -29,6 +29,10 @@ commercial/
 .coverage
 **/.coverage
 
+# Rust llvm-cov instrumentation profiles (created during cargo test --no-fail-fast)
+*.profraw
+**/*.profraw
+
 # Release artifacts (built by CI, not committed to source)
 artifacts/
 

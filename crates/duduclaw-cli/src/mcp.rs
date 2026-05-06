@@ -3286,29 +3286,46 @@ async fn spawn_agent_with_ctx(
         "sender_agent": caller,
     });
 
-    let queued = tokio::task::spawn_blocking({
-        let path = queue_path;
+    // RFC-22 Decision 2-C (Phase 3 W1): on bus_queue write failure, surface
+    // the underlying I/O error to the caller. Previously we returned an
+    // opaque "Failed to queue agent task" which left the LLM (e.g. agnes
+    // 5/5 trace) unable to distinguish "bus full" from "permission denied"
+    // from "disk full" — and prone to hallucinating sub-agent replies as a
+    // fallback.  Concrete error → caller can inform the user / stop early.
+    // Use std::result::Result explicitly — the crate-level `Result<T>` alias
+    // is single-arg (DuDuClawError default), incompatible with our String error.
+    let queued: std::result::Result<(), String> = tokio::task::spawn_blocking({
+        let path = queue_path.clone();
         let entry_str = entry.to_string();
-        move || -> bool {
+        move || -> std::result::Result<(), String> {
             use std::io::Write;
             // Enforce bus_queue.jsonl size limit (CLI-H4)
             const MAX_QUEUE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
             if let Ok(meta) = std::fs::metadata(&path)
-                && meta.len() > MAX_QUEUE_SIZE {
-                    return false;
-                }
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                writeln!(f, "{entry_str}").is_ok()
-            } else {
-                false
+                && meta.len() > MAX_QUEUE_SIZE
+            {
+                return Err(format!(
+                    "bus_queue.jsonl exceeds {}MB size limit (current: {} bytes). \
+                     Run `duduclaw bus rotate` or wait for dispatcher to drain.",
+                    MAX_QUEUE_SIZE / (1024 * 1024),
+                    meta.len()
+                ));
             }
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|e| format!("open {}: {e}", path.display()))?;
+            writeln!(f, "{entry_str}")
+                .map_err(|e| format!("write to {}: {e}", path.display()))?;
+            Ok(())
         }
     })
     .await
-    .unwrap_or(false);
+    .unwrap_or_else(|join_err| Err(format!("spawn_blocking panicked: {join_err}")));
 
-    if queued {
-        serde_json::json!({
+    match queued {
+        Ok(()) => serde_json::json!({
             "content": [{"type": "text", "text": format!(
                 "Sub-agent '{agent_id}' task spawned successfully.\n\
                  Task ID: {task_id}\n\
@@ -3318,12 +3335,17 @@ async fn spawn_agent_with_ctx(
                  Use agent_status to check progress, or check bus_queue.jsonl for the response.",
                 if session_key.is_empty() { &task_id } else { session_key }
             )}]
-        })
-    } else {
-        serde_json::json!({
-            "content": [{"type": "text", "text": "Error: Failed to queue agent task"}],
+        }),
+        Err(reason) => serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "Error: Failed to queue agent task for '{agent_id}'. Reason: {reason}\n\
+                 \n\
+                 Per RFC-22, do NOT fabricate a reply on behalf of '{agent_id}'. \
+                 Inform the user that '{agent_id}' is unreachable and surface \
+                 the reason verbatim."
+            )}],
             "isError": true
-        })
+        }),
     }
 }
 
@@ -6071,8 +6093,15 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     let ns_ctx = crate::mcp_namespace::resolve(&principal)
         .map_err(|e| DuDuClawError::Gateway(format!("MCP namespace resolution failed: {e}")))?;
 
+    // RFC-22 P1-10: Distinguish API key owner (`client_id`, used for namespace
+    // isolation) from the actual calling agent (`caller_agent`, taken from
+    // DUDUCLAW_AGENT_ID injected by per-agent .mcp.json). Without showing both,
+    // observers reading the boot log mistakenly conclude all sub-agents act as
+    // `claude-desktop` (the API key owner). Audit log (tool_calls.jsonl) was
+    // already correct; only the boot log was misleading.
     tracing::info!(
         client_id = %principal.client_id,
+        caller_agent = %default_agent,
         namespace = %ns_ctx.write_namespace,
         is_external = principal.is_external,
         "MCP server authenticated"
@@ -7911,10 +7940,142 @@ async fn handle_shared_wiki_write(args: &Value, home_dir: &Path, caller_agent: &
     }
 
     let store = duduclaw_memory::WikiStore::new_shared(home_dir);
-    match store.write_page_with_author(page_path, content, caller_agent) {
+    let write_result = store.write_page_with_author(page_path, content, caller_agent);
+
+    // RFC-22 Decision 4-D (Phase 3 W2): record an authorship audit alongside
+    // the standard tool_call entry so post-hoc analysis can detect cases
+    // where a single caller wrote a multi-agent page.  The 5/5 trace had
+    // agnes write a "## DuDuClaw PM 觀點" section after pm spawn failed —
+    // wiki content claims pm authored part of it but the only caller was
+    // agnes.  Surfacing this as `matches_caller=false` lets the dashboard
+    // (or future reviewers) flag the page even when the LLM ignores
+    // the CONTRACT.toml `must_not` rule.
+    let claimed_authors = detect_claimed_authors_in_wiki(content);
+    let matches_caller =
+        claimed_authors.is_empty() || claimed_authors.iter().any(|a| a == caller_agent);
+    duduclaw_security::audit::append_tool_call_with_extras(
+        home_dir,
+        caller_agent,
+        "shared_wiki_write",
+        &format!("path={page_path} size={}", content.len()),
+        write_result.is_ok(),
+        &[
+            (
+                "claimed_authors_in_content",
+                serde_json::Value::Array(
+                    claimed_authors.iter().map(|a| a.clone().into()).collect(),
+                ),
+            ),
+            ("matches_caller", matches_caller.into()),
+            ("actual_caller", caller_agent.into()),
+        ],
+    );
+
+    match write_result {
         Ok(()) => tool_text(&format!("Written shared wiki page: {} (by: {})", page_path, caller_agent)),
         Err(e) => tool_error(&format!("Failed to write shared wiki page: {e}")),
     }
+}
+
+/// Detect agent names claimed as authors within a markdown wiki page.
+///
+/// RFC-22 Decision 4-D (Phase 3 W2): callers (typically agnes) sometimes
+/// produce wiki pages structured as multi-agent meeting notes, with sections
+/// like `## DuDuClaw PM 的觀點` followed by content that claims to be
+/// authored by `duduclaw-pm`.  We extract those claimed names so the audit
+/// trail can flag the page when the actual MCP caller does NOT match.
+///
+/// Patterns recognized (case-sensitive on the agent token; any of these
+/// signal a claimed author):
+///
+/// - Markdown heading: `## <agent> 的觀點` / `## <agent> 觀點`
+/// - Bold reply attribution: `**回覆人**：<agent>` / `**Author**: <agent>`
+/// - Trailing signature: `*<agent> | <date>*` (loose match — last segment
+///   before the pipe is treated as the agent name).
+/// - Frontmatter `claimed_authors: [a, b]` (explicit declaration).
+///
+/// Names are filtered to look like duduclaw agent ids (lowercase
+/// alphanumeric + hyphens, length 2..=64). Returns deduplicated list.
+fn detect_claimed_authors_in_wiki(content: &str) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut found = BTreeSet::new();
+
+    // Frontmatter explicit declaration.
+    if let Some(claimed) = extract_frontmatter_field(content, "claimed_authors") {
+        // Tolerate `[a, b]` or `a,b` styles.
+        for raw in claimed
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(',')
+        {
+            let name = raw.trim().trim_matches('"').trim_matches('\'').to_string();
+            if is_agent_id_shape(&name) {
+                found.insert(name);
+            }
+        }
+    }
+
+    // Heading: ## <agent> 的觀點  /  ## <agent> 觀點
+    // We don't use the `regex` crate here to keep dependencies lean for the
+    // mcp.rs module — substring scanning is sufficient given the bounded
+    // input size (already capped by WIKI_MAX_PAGE_SIZE).
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            // Try patterns "<name> 的觀點", "<name> 觀點"
+            for suffix in [" 的觀點", " 觀點", " 的觀點：", " 觀點："] {
+                if let Some(name_part) = rest.strip_suffix(suffix) {
+                    let name = name_part.trim().to_string();
+                    if is_agent_id_shape(&name) {
+                        found.insert(name);
+                    }
+                }
+            }
+        }
+    }
+
+    // Bold attribution: **回覆人**：<agent>  or  **Author**: <agent>
+    for marker in ["**回覆人**：", "**回覆人**:", "**Author**:", "**author**:"] {
+        for chunk in content.split(marker).skip(1) {
+            // Take everything until newline / end / next markdown control
+            let candidate: String = chunk
+                .chars()
+                .take_while(|c| !matches!(c, '\n' | '<' | '|' | '\r'))
+                .collect();
+            let name = candidate.trim().to_string();
+            if is_agent_id_shape(&name) {
+                found.insert(name);
+            }
+        }
+    }
+
+    // Trailing signature: *<agent> | <date>*
+    for line in content.lines() {
+        let t = line.trim();
+        if let Some(inner) = t.strip_prefix('*').and_then(|s| s.strip_suffix('*')) {
+            if let Some((name_raw, _)) = inner.split_once('|') {
+                let name = name_raw.trim().to_string();
+                if is_agent_id_shape(&name) {
+                    found.insert(name);
+                }
+            }
+        }
+    }
+
+    found.into_iter().collect()
+}
+
+/// True when the string looks like a duduclaw agent id (per
+/// `is_valid_agent_id`-equivalent shape: lowercase alphanumeric + `-`,
+/// 2..=64 chars).  Used as a filter before treating a markdown token as
+/// a claimed author.
+fn is_agent_id_shape(s: &str) -> bool {
+    let len = s.len();
+    if !(2..=64).contains(&len) {
+        return false;
+    }
+    s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && s.chars().any(|c| c.is_ascii_alphabetic())
 }
 
 async fn handle_shared_wiki_search(args: &Value, home_dir: &Path) -> Value {
@@ -9994,6 +10155,107 @@ high_context = true
             );
             assert!(!tz_name.is_empty(), "detected TZ must not be empty string");
         }
+    }
+
+    // ── RFC-22 Phase 3 W2: claimed-author detection tests ───────────────
+
+    #[test]
+    fn detect_authors_extracts_zh_observation_heading() {
+        // Replicates the 5/5 wiki shape that triggered hallucinated PM section.
+        let content = r#"---
+title: "test"
+---
+
+# Discussion
+
+## duduclaw-tl 的觀點
+
+Some content...
+
+## duduclaw-pm 的觀點
+
+PM-style content (potentially hallucinated).
+"#;
+        let authors = detect_claimed_authors_in_wiki(content);
+        assert_eq!(
+            authors,
+            vec!["duduclaw-pm".to_string(), "duduclaw-tl".to_string()],
+            "should extract both ## <agent> 的觀點 sections"
+        );
+    }
+
+    #[test]
+    fn detect_authors_handles_bold_attribution() {
+        let content = "**回覆人**：duduclaw-tl\n\n some content";
+        let authors = detect_claimed_authors_in_wiki(content);
+        assert_eq!(authors, vec!["duduclaw-tl".to_string()]);
+    }
+
+    #[test]
+    fn detect_authors_filters_non_agent_shapes() {
+        // Heading that looks like the pattern but agent name is not valid
+        // (uppercase, special chars) — must not be reported.
+        let content = "## DuDuClaw 的觀點\n\n## hello.world 的觀點\n";
+        let authors = detect_claimed_authors_in_wiki(content);
+        assert!(
+            authors.is_empty(),
+            "uppercase / dotted names must not be matched: got {authors:?}"
+        );
+    }
+
+    #[test]
+    fn detect_authors_picks_up_frontmatter_claimed_authors() {
+        let content = r#"---
+title: "x"
+claimed_authors: [agnes, duduclaw-tl, duduclaw-pm]
+---
+
+# Body
+"#;
+        let mut authors = detect_claimed_authors_in_wiki(content);
+        authors.sort();
+        assert_eq!(
+            authors,
+            vec![
+                "agnes".to_string(),
+                "duduclaw-pm".to_string(),
+                "duduclaw-tl".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn detect_authors_empty_for_solo_author_doc() {
+        // Single-author doc with only a frontmatter `author: agnes` — no
+        // ## <agent> 觀點 sections, no `**回覆人**` attribution. Must NOT
+        // pick up `agnes` from the regular `author:` field, because that's
+        // the canonical authorship (different from "claimed_authors").
+        let content = r#"---
+title: "x"
+author: agnes
+---
+
+# Body
+just a normal note
+"#;
+        let authors = detect_claimed_authors_in_wiki(content);
+        assert!(
+            authors.is_empty(),
+            "regular author frontmatter is NOT a claimed-authorship signal; got {authors:?}"
+        );
+    }
+
+    #[test]
+    fn is_agent_id_shape_rejects_obvious_bad() {
+        assert!(is_agent_id_shape("agnes"));
+        assert!(is_agent_id_shape("duduclaw-tl"));
+        assert!(is_agent_id_shape("xianwen-eng-ai"));
+        assert!(!is_agent_id_shape("Agnes"));     // uppercase
+        assert!(!is_agent_id_shape("a"));         // too short
+        assert!(!is_agent_id_shape(""));          // empty
+        assert!(!is_agent_id_shape("with space"));
+        assert!(!is_agent_id_shape("../etc/passwd"));
+        assert!(!is_agent_id_shape("123"));       // no alphabetic
     }
 }
 

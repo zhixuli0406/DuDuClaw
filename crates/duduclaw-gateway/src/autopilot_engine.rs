@@ -134,24 +134,46 @@ pub fn evaluate(conditions: &Value, fields: &serde_json::Map<String, Value>) -> 
         .unwrap_or("");
     let op = conditions.get("op").and_then(|v| v.as_str()).unwrap_or("eq");
     let expected = conditions.get("value").cloned().unwrap_or(Value::Null);
-    let actual = lookup_path(fields, field);
-    apply_op(op, &actual, &expected)
+    let actual = lookup_path_opt(fields, field);
+    apply_op(op, actual.as_ref(), &expected)
 }
 
-fn lookup_path(fields: &serde_json::Map<String, Value>, path: &str) -> Value {
+/// Walk a dotted path and return `Some(value)` only when every segment
+/// exists. Returns `None` when any segment is missing — callers MUST
+/// distinguish "field absent" from "field set to null", because allowing
+/// `eq null` to match an absent field caused 5/5 autopilot mass-fire bug
+/// (RFC-22 P1-9b).
+fn lookup_path_opt(
+    fields: &serde_json::Map<String, Value>,
+    path: &str,
+) -> Option<Value> {
     if path.is_empty() {
-        return Value::Null;
+        return None;
     }
     let mut parts = path.split('.');
-    let head = parts.next().unwrap_or("");
-    let mut current = fields.get(head).cloned().unwrap_or(Value::Null);
+    let head = parts.next()?;
+    let mut current = fields.get(head).cloned()?;
     for part in parts {
-        current = current.get(part).cloned().unwrap_or(Value::Null);
+        current = current.get(part).cloned()?;
     }
-    current
+    Some(current)
 }
 
-fn apply_op(op: &str, actual: &Value, expected: &Value) -> bool {
+/// Backward-compatible wrapper used by `render_template`. Missing fields
+/// render to empty string (existing behavior covered by `render_unknown_key_is_empty`),
+/// but condition evaluation uses `lookup_path_opt` directly so a missing
+/// field never spuriously matches `eq null` / `eq ""`.
+fn lookup_path(fields: &serde_json::Map<String, Value>, path: &str) -> Value {
+    lookup_path_opt(fields, path).unwrap_or(Value::Null)
+}
+
+fn apply_op(op: &str, actual: Option<&Value>, expected: &Value) -> bool {
+    // Missing fields never satisfy any comparison — including `eq null`.
+    // Callers wanting "field is absent" semantics should use a dedicated
+    // op (none currently defined). See RFC-22 P1-9b for the original bug.
+    let Some(actual) = actual else {
+        return false;
+    };
     match op {
         "eq" => actual == expected,
         "neq" => actual != expected,
@@ -909,6 +931,84 @@ mod tests {
         let fields = fields_from(serde_json::json!({ "msg": "hello world" }));
         let cond = serde_json::json!({ "field": "msg", "op": "contains", "value": "world" });
         assert!(evaluate(&cond, &fields));
+    }
+
+    // ── RFC-22 P1-9b regression tests: missing-field never matches ──
+
+    #[test]
+    fn missing_field_does_not_match_eq_null() {
+        // 5/5 root cause: hand-inserted events.db payload was wrapped
+        // in {"task":{...}} so to_fields produced task = {"task":{...}},
+        // making `task.assigned_to` lookup miss → eq null matched →
+        // autopilot fired for all 5 tasks instead of 1 unassigned.
+        let fields = fields_from(serde_json::json!({
+            "task": { "task": { "assigned_to": "duduclaw-eng-infra" } }
+        }));
+        let cond = serde_json::json!({
+            "field": "task.assigned_to",
+            "op": "eq",
+            "value": null
+        });
+        assert!(
+            !evaluate(&cond, &fields),
+            "missing field must NOT match eq null"
+        );
+    }
+
+    #[test]
+    fn missing_field_does_not_match_eq_empty_string() {
+        let fields = fields_from(serde_json::json!({"x": 1}));
+        let cond = serde_json::json!({
+            "field": "task.assigned_to",
+            "op": "eq",
+            "value": ""
+        });
+        assert!(
+            !evaluate(&cond, &fields),
+            "missing field must NOT match eq empty string"
+        );
+    }
+
+    #[test]
+    fn explicit_null_value_still_matches_eq_null() {
+        // The fix must not regress: a payload that explicitly sets
+        // `assigned_to: null` should still match `eq null`.
+        let fields = fields_from(serde_json::json!({
+            "task": { "assigned_to": null }
+        }));
+        let cond = serde_json::json!({
+            "field": "task.assigned_to",
+            "op": "eq",
+            "value": null
+        });
+        assert!(
+            evaluate(&cond, &fields),
+            "explicit null value should match eq null"
+        );
+    }
+
+    #[test]
+    fn missing_field_fails_all_ops() {
+        // Defense in depth: missing field must short-circuit every op
+        // to false (no spurious in/contains/gt match either).
+        let fields = fields_from(serde_json::json!({}));
+        for (op, value) in [
+            ("eq", serde_json::json!(null)),
+            ("neq", serde_json::json!("anything")),
+            ("in", serde_json::json!(["a", "b"])),
+            ("not_in", serde_json::json!(["a", "b"])),
+            ("contains", serde_json::json!("x")),
+            ("gt", serde_json::json!(0)),
+            ("lt", serde_json::json!(100)),
+        ] {
+            let cond = serde_json::json!({
+                "field": "missing.path", "op": op, "value": value
+            });
+            assert!(
+                !evaluate(&cond, &fields),
+                "op {op} must return false when field is missing"
+            );
+        }
     }
 
     #[test]
