@@ -1,0 +1,371 @@
+// wiki_files_cache.rs — Rust 整合設計草稿
+// =========================================
+// [W22-Spike-P1] PoC 成果 → W23 正式整合的設計藍圖
+//
+// 最終位置: crates/duduclaw-gateway/src/wiki_files_cache.rs
+//
+// 整合點:
+//   direct_api.rs::call_direct_api_with_dynamic()
+//     └─ 呼叫前先 WikiFilesCache::ensure_current_file_id()
+//     └─ 若有 file_id → 改用 document block 而非 system prompt text
+//
+// 注意: Files API 目前為 beta，需在 reqwest 請求加入
+//   anthropic-beta: files-api-2025-04-14
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+pub struct WikiFilesCacheConfig {
+    /// TTL for uploaded files (default: 24 hours)
+    pub ttl: Duration,
+    /// Path to persist file_id cache (default: ~/.duduclaw/files_api_cache.json)
+    pub cache_path: PathBuf,
+    /// Anthropic Files API beta header value
+    pub beta_header: &'static str,
+}
+
+impl Default for WikiFilesCacheConfig {
+    fn default() -> Self {
+        Self {
+            ttl: Duration::from_secs(24 * 60 * 60),
+            cache_path: dirs::home_dir()
+                .unwrap_or_default()
+                .join(".duduclaw")
+                .join("files_api_cache.json"),
+            beta_header: "files-api-2025-04-14",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cache entry
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilesApiCacheEntry {
+    pub file_id: String,
+    pub content_hash: String,   // SHA-256 hex of bundle content
+    pub uploaded_at: u64,       // UNIX timestamp (seconds)
+    pub size_bytes: usize,
+    pub page_count: usize,
+    pub filename: String,
+}
+
+impl FilesApiCacheEntry {
+    pub fn is_fresh(&self, ttl: Duration) -> bool {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        (now - self.uploaded_at) < ttl.as_secs()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WikiFilesCache
+// ---------------------------------------------------------------------------
+
+/// Manages the wiki L0/L1 bundle → Anthropic Files API lifecycle.
+///
+/// Thread-safe (Arc<RwLock<_>>) — can be shared across:
+/// - channel_reply.rs (telegram/LINE/Discord handler)
+/// - claude_runner.rs (cron dispatcher)
+/// - direct_api.rs (direct API calls)
+///
+/// All three paths call `ensure_current()` which returns a cached file_id
+/// or triggers an upload if stale/missing.
+pub struct WikiFilesCache {
+    config: WikiFilesCacheConfig,
+    state: Arc<RwLock<Option<FilesApiCacheEntry>>>,
+    http_client: reqwest::Client,
+}
+
+impl WikiFilesCache {
+    pub fn new(config: WikiFilesCacheConfig, http_client: reqwest::Client) -> Self {
+        Self {
+            config,
+            state: Arc::new(RwLock::new(None)),
+            http_client,
+        }
+    }
+
+    /// Return a valid file_id, uploading if necessary.
+    ///
+    /// Returns None if Files API is unavailable (falls back to text injection).
+    pub async fn ensure_current(
+        &self,
+        api_key: &str,
+        wiki_pages: &[(String, String)], // (filename, content)
+    ) -> Option<String> {
+        let bundle = self.make_bundle(wiki_pages);
+        let current_hash = self.sha256(&bundle);
+
+        // Fast path: check in-memory state
+        {
+            let guard = self.state.read().await;
+            if let Some(entry) = guard.as_ref() {
+                if entry.content_hash == current_hash && entry.is_fresh(self.config.ttl) {
+                    debug!("Files API cache hit: file_id={}", entry.file_id);
+                    return Some(entry.file_id.clone());
+                }
+            }
+        }
+
+        // Try persistent cache
+        if let Some(entry) = self.load_persistent_cache().await {
+            if entry.content_hash == current_hash && entry.is_fresh(self.config.ttl) {
+                let mut guard = self.state.write().await;
+                *guard = Some(entry.clone());
+                debug!("Files API persistent cache hit: file_id={}", entry.file_id);
+                return Some(entry.file_id);
+            }
+            // Delete stale file (best-effort)
+            self.delete_file(api_key, &entry.file_id).await;
+        }
+
+        // Upload new bundle
+        match self.upload_bundle(api_key, &bundle, &current_hash, wiki_pages.len()).await {
+            Ok(entry) => {
+                let file_id = entry.file_id.clone();
+                let mut guard = self.state.write().await;
+                *guard = Some(entry.clone());
+                self.save_persistent_cache(&entry).await;
+                info!("Files API upload complete: file_id={}", file_id);
+                Some(file_id)
+            }
+            Err(e) => {
+                warn!("Files API upload failed: {} — falling back to text injection", e);
+                None
+            }
+        }
+    }
+
+    /// Force re-upload on next call.
+    pub async fn invalidate(&self) {
+        let mut guard = self.state.write().await;
+        *guard = None;
+        if self.config.cache_path.exists() {
+            let _ = tokio::fs::remove_file(&self.config.cache_path).await;
+        }
+        info!("Files API cache invalidated");
+    }
+
+    // ------------------------------------------------------------------
+    // Internals
+    // ------------------------------------------------------------------
+
+    fn make_bundle(&self, pages: &[(String, String)]) -> String {
+        let mut sorted: Vec<_> = pages.iter().collect();
+        sorted.sort_by_key(|(name, _)| name.as_str());
+        sorted
+            .iter()
+            .map(|(name, content)| format!("<!-- FILE: {} -->\n{}", name, content))
+            .collect::<Vec<_>>()
+            .join("\n---\n")
+    }
+
+    fn sha256(&self, content: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    async fn upload_bundle(
+        &self,
+        api_key: &str,
+        bundle: &str,
+        hash: &str,
+        page_count: usize,
+    ) -> Result<FilesApiCacheEntry, String> {
+        let bytes = bundle.as_bytes().to_vec();
+        let size = bytes.len();
+
+        // Build multipart form
+        let form = reqwest::multipart::Form::new()
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(bytes)
+                    .file_name("wiki-knowledge-bundle.md")
+                    .mime_str("text/markdown")
+                    .map_err(|e| e.to_string())?,
+            );
+
+        let response = self
+            .http_client
+            .post("https://api.anthropic.com/v1/files")
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", self.config.beta_header)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP error: {e}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("Files API error {}: {}", status, &body[..body.len().min(200)]));
+        }
+
+        #[derive(Deserialize)]
+        struct UploadResponse {
+            id: String,
+        }
+        let resp: UploadResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Parse error: {e}"))?;
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        Ok(FilesApiCacheEntry {
+            file_id: resp.id,
+            content_hash: hash.to_string(),
+            uploaded_at: now,
+            size_bytes: size,
+            page_count,
+            filename: "wiki-knowledge-bundle.md".to_string(),
+        })
+    }
+
+    async fn delete_file(&self, api_key: &str, file_id: &str) {
+        let url = format!("https://api.anthropic.com/v1/files/{}", file_id);
+        let result = self
+            .http_client
+            .delete(&url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", self.config.beta_header)
+            .send()
+            .await;
+        match result {
+            Ok(r) if r.status().is_success() => {
+                debug!("Deleted old Files API file: {}", file_id);
+            }
+            Ok(r) => {
+                warn!("Delete file {} returned {}", file_id, r.status());
+            }
+            Err(e) => {
+                warn!("Delete file {} failed: {}", file_id, e);
+            }
+        }
+    }
+
+    async fn load_persistent_cache(&self) -> Option<FilesApiCacheEntry> {
+        let text = tokio::fs::read_to_string(&self.config.cache_path).await.ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    async fn save_persistent_cache(&self, entry: &FilesApiCacheEntry) {
+        let text = match serde_json::to_string_pretty(entry) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Failed to serialize Files API cache entry: {}", e);
+                return;
+            }
+        };
+        if let Some(parent) = self.config.cache_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        if let Err(e) = tokio::fs::write(&self.config.cache_path, text).await {
+            warn!("Failed to write Files API cache: {}", e);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// direct_api.rs 整合範例
+// ---------------------------------------------------------------------------
+//
+// 在 call_direct_api_with_dynamic() 中，替換 system prompt text injection：
+//
+// // Old (text injection):
+// let mut system = vec![SystemBlock {
+//     block_type: "text".to_string(),
+//     text: wiki_content,
+//     cache_control: Some(CacheControl { control_type: "ephemeral".to_string() }),
+// }];
+//
+// // New (Files API injection, with fallback):
+// let messages = if let Some(file_id) = wiki_files_cache.ensure_current(api_key, &wiki_pages).await {
+//     // Files API path: inject wiki as document block in user message
+//     vec![
+//         Message {
+//             role: "user".to_string(),
+//             content: MessageContent::Blocks(vec![
+//                 ContentBlock::Document {
+//                     source: DocumentSource::File { file_id },
+//                     title: Some("Wiki Knowledge Base".to_string()),
+//                     cache_control: Some(CacheControl { control_type: "ephemeral".to_string() }),
+//                 },
+//                 ContentBlock::Text { text: user_prompt.to_string() },
+//             ]),
+//             cache_control: None,
+//         },
+//     ]
+// } else {
+//     // Fallback: traditional text injection
+//     build_messages_with_text_injection(&wiki_content, user_prompt, conversation_history)
+// };
+//
+// // Beta headers:
+// client
+//     .post(API_BASE)
+//     .header("anthropic-beta", "files-api-2025-04-14,prompt-caching-2024-07-31")
+//     ...
+//
+// ---------------------------------------------------------------------------
+// 測試大綱
+// ---------------------------------------------------------------------------
+//
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//
+//     #[test]
+//     fn make_bundle_is_deterministic() {
+//         // Given pages in different order, bundle should be identical
+//     }
+//
+//     #[test]
+//     fn sha256_stable() {
+//         // Same content → same hash
+//     }
+//
+//     #[tokio::test]
+//     async fn cache_entry_freshness() {
+//         // entry just uploaded → is_fresh() == true
+//         // entry older than TTL → is_fresh() == false
+//     }
+//
+//     #[tokio::test]
+//     async fn ensure_current_uses_cache_when_fresh() {
+//         // Mock HTTP client, assert upload called once on first call,
+//         // and not called on second call within TTL
+//     }
+//
+//     #[tokio::test]
+//     async fn ensure_current_reuploads_on_content_change() {
+//         // First call with content A → upload
+//         // Second call with content B → re-upload + delete old file
+//     }
+//
+//     #[tokio::test]
+//     async fn ensure_current_returns_none_on_upload_failure() {
+//         // Mock HTTP client returning 500 → ensure_current returns None
+//         // → caller should fall back to text injection
+//     }
+// }
