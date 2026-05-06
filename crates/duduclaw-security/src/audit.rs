@@ -212,15 +212,53 @@ pub fn append_tool_call(
     params_summary: &str,
     success: bool,
 ) {
+    append_tool_call_with_extras(home_dir, agent_id, tool_name, params_summary, success, &[])
+}
+
+/// Variant of [`append_tool_call`] that attaches additional fields to the
+/// audit record. Used by `shared_wiki_write` to record `claimed_authors_in_content`
+/// and `matches_caller` (RFC-22 Decision 4-D, Phase 3 W2) so post-hoc audit
+/// can detect when an agent wrote a wiki page that *claims* multi-agent
+/// authorship but only one caller actually invoked the tool — e.g. the
+/// 5/5 trace where agnes wrote a "## DuDuClaw PM 觀點" section after the
+/// pm spawn failed.
+///
+/// Extras are attached as top-level JSON fields. They MUST NOT collide with
+/// the canonical fields (`timestamp`, `agent_id`, `tool_name`, `params_summary`,
+/// `success`); when collision occurs the canonical field wins.
+pub fn append_tool_call_with_extras(
+    home_dir: &Path,
+    agent_id: &str,
+    tool_name: &str,
+    params_summary: &str,
+    success: bool,
+    extras: &[(&str, serde_json::Value)],
+) {
+    const RESERVED: &[&str] = &[
+        "timestamp",
+        "agent_id",
+        "tool_name",
+        "params_summary",
+        "success",
+    ];
     let path = home_dir.join("tool_calls.jsonl");
     maybe_rotate_tool_calls(&path);
-    let record = serde_json::json!({
-        "timestamp": Utc::now().to_rfc3339(),
-        "agent_id": agent_id,
-        "tool_name": tool_name,
-        "params_summary": params_summary,
-        "success": success,
-    });
+    let mut map = serde_json::Map::new();
+    map.insert("timestamp".into(), Utc::now().to_rfc3339().into());
+    map.insert("agent_id".into(), agent_id.into());
+    map.insert("tool_name".into(), tool_name.into());
+    map.insert("params_summary".into(), params_summary.into());
+    map.insert("success".into(), success.into());
+    for (key, value) in extras {
+        if RESERVED.contains(key) {
+            warn!(
+                "tool_call extra field '{key}' collides with canonical name; ignored"
+            );
+            continue;
+        }
+        map.insert((*key).to_string(), value.clone());
+    }
+    let record = serde_json::Value::Object(map);
     let json = match serde_json::to_string(&record) {
         Ok(j) => j,
         Err(e) => {

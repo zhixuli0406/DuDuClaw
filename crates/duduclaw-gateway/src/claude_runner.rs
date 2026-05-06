@@ -1112,6 +1112,13 @@ tokio::task_local! {
     /// so the dispatcher can forward sub-agent responses back to the originating channel.
     pub static REPLY_CHANNEL: String;
 
+    /// RFC-22 P1-7: caller agent_id for cost_telemetry attribution along the
+    /// channel_reply path. Without this, `spawn_claude_cli_with_env` cannot
+    /// record per-agent token usage and `cost_telemetry.db` shows 0 entries
+    /// for whichever agent owned the channel reply (5/5 trace had agnes
+    /// running 23 minutes with no telemetry row).
+    pub static CHANNEL_REPLY_AGENT_ID: String;
+
     /// Worktree path override injected by the dispatcher when L0 worktree
     /// isolation is enabled.  `prepare_claude_cmd` uses this as the working
     /// directory instead of the agent's base directory.

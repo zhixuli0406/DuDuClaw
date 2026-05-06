@@ -1014,6 +1014,12 @@ async fn build_reply_with_session_inner(
         .scope(Some(session_id.to_string()), cli_future);
     let cli_future = duduclaw_memory::feedback::CURRENT_TURN_ID
         .scope(Some(turn_id.clone()), cli_future);
+    // RFC-22 P1-7: scope CHANNEL_REPLY_AGENT_ID so spawn_claude_cli_with_env
+    // can record cost_telemetry against the correct agent. agent_id is empty
+    // when no agent resolved — scope an empty string in that case; the spawn
+    // path checks for non-empty before calling cost_telemetry.
+    let cli_future = crate::claude_runner::CHANNEL_REPLY_AGENT_ID
+        .scope(agent_id.clone(), cli_future);
     let reply = if is_channel_session {
         crate::claude_runner::REPLY_CHANNEL.scope(session_id.to_string(), cli_future).await
     } else {
@@ -3294,6 +3300,10 @@ async fn spawn_claude_cli_with_env(
     };
 
     let mut result_text = String::new();
+    // RFC-22 P1-7: capture token usage from `result` event so cost_telemetry
+    // can be recorded for channel-path replies (previously: 0 entries for
+    // agnes despite 23-min runs because rotate_cli_spawn discarded usage).
+    let mut token_usage: Option<crate::cost_telemetry::TokenUsage> = None;
     // Track last tool type to suppress duplicate progress messages
     let mut last_tool_reported: Option<String> = None;
 
@@ -3417,6 +3427,16 @@ async fn spawn_claude_cli_with_env(
                                         if !text.is_empty() {
                                             result_text = text.to_string();
                                         }
+                                    }
+                                    // RFC-22 P1-7: extract token usage from the result
+                                    // event. Mirrors claude_runner.rs:1006 (dispatch path)
+                                    // so channel and dispatch paths use identical
+                                    // accounting. result event is the canonical source
+                                    // — fall back to /message/usage on assistant events
+                                    // is left for future work if needed.
+                                    if let Some(usage_val) = event.get("usage") {
+                                        token_usage =
+                                            crate::cost_telemetry::TokenUsage::from_json(usage_val);
                                     }
                                 }
                                 // Assistant message with content blocks
@@ -3562,6 +3582,27 @@ async fn spawn_claude_cli_with_env(
     let result_text = result_text.trim().to_string();
     if result_text.is_empty() {
         return Err(format!("Empty response from claude CLI ({diag})"));
+    }
+
+    // RFC-22 P1-7: record cost_telemetry for the channel reply. Skipped when
+    // the task_local agent_id is unset (e.g. invoked outside channel_reply,
+    // such as the dispatch path which already records via claude_runner).
+    if let (Some(usage), Ok(agent_id)) = (
+        token_usage.as_ref(),
+        crate::claude_runner::CHANNEL_REPLY_AGENT_ID.try_with(|id| id.clone()),
+    ) {
+        if !agent_id.is_empty()
+            && let Some(telemetry) = crate::cost_telemetry::get_telemetry()
+        {
+            telemetry
+                .record(
+                    &agent_id,
+                    crate::cost_telemetry::RequestType::Chat,
+                    model,
+                    usage,
+                )
+                .await;
+        }
     }
 
     Ok(result_text)
@@ -3846,6 +3887,17 @@ fn build_system_prompt(
         }
         if let Some(identity) = &a.identity {
             parts.push(identity.clone());
+        }
+
+        // RFC-22 P1-9a / P1-8: inject CONTRACT.toml boundaries (must_not /
+        // must_always) into the channel system prompt. runner.rs already
+        // injects this for sub-agent dispatch but channel_reply did not,
+        // which is why 5/5 agnes hallucinated a PM section after pm spawn
+        // failed — there was no rule visible to LLM forbidding proxy authoring.
+        let contract_prompt =
+            duduclaw_agent::contract::contract_to_prompt(&a.contract);
+        if !contract_prompt.is_empty() {
+            parts.push(contract_prompt);
         }
 
         // Progressive skill injection (when available)

@@ -909,6 +909,36 @@ pub struct DiscordChannelConfig {
     pub bot_token: String,
     /// AES-256-GCM encrypted bot token (base64).
     pub bot_token_enc: Option<String>,
+    /// RFC-22 Decision 3-D (Phase 3 W3): bind specific Discord
+    /// thread/channel/guild IDs to this agent so messages routed there
+    /// flow directly to the bound agent (rather than always landing on
+    /// the root agent and then being delegated).  Empty list means
+    /// "no binding — fall back to default routing" (backwards-compat).
+    pub bindings: Vec<ChannelBinding>,
+}
+
+/// RFC-22 Decision 3-D: a single channel/thread/guild → agent binding.
+///
+/// Stored under `[[channels.discord.bindings]]` (or future telegram/line)
+/// in `agent.toml`.  At resolution time the agent registry walks all agents
+/// and matches the incoming Discord `session_id` shape:
+///
+/// - `discord:thread:<thread_id>`   matches `kind = "thread"`, `id = thread_id`
+/// - `discord:<channel_id>`         matches `kind = "channel"`, `id = channel_id`
+/// - matching guild requires looking up parent guild from Discord context
+///   (not yet implemented in this pass — `kind = "guild"` is reserved)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ChannelBinding {
+    /// One of `"thread"`, `"channel"`, `"guild"`.  Unknown kinds are
+    /// treated as no-match (fail-closed).
+    pub kind: String,
+    /// The Discord snowflake ID for the bound entity.
+    pub id: String,
+    /// Operator-facing description (purely informational; surfaces in
+    /// dashboard / CLI listings).
+    #[serde(default)]
+    pub description: String,
 }
 
 
