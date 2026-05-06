@@ -1,33 +1,114 @@
 # Changelog
 
 
-## [Unreleased] — W22-P0 x-duduclaw Capability Negotiation
+## [1.12.0] - 2026-05-06
 
-ADR-002 — `x-duduclaw` header versioning + capability negotiation. Every HTTP response from the
-MCP HTTP server now carries machine-readable capability metadata, and clients can declare capability
-requirements that trigger an early 422 rather than silent partial failures.
+W22 Sprint deliverables — two W22-P0 ADRs ship together with a multi-agent
+coordination overhaul (RFC-22) driven by a 2026-05-04 → 2026-05-06 端到端
+incident that exposed agnes silently fabricating sub-agent replies, autopilot
+mass-firing on malformed events, and channel-path token usage going entirely
+unrecorded.
 
 ### Added
 
-- **`mcp_headers.rs`** — `CAPABILITY_REGISTRY` static table (9 capabilities: `memory/3`, `mcp/2`,
-  `audit/2`, `governance/1`, `skill/1`, `wiki/1` enabled; `a2a/1`, `secret-manager/1`,
-  `signed-card/1` disabled/pending). `API_VERSION = "1.2"`. Builder/parser/negotiation functions:
-  `build_capabilities_header()`, `build_capabilities_header_from()`, `parse_capabilities()`,
-  `validate_client_capabilities()`, `build_missing_capabilities_header()`. 23 unit tests.
-- **`mcp_capability.rs`** — Two Axum middleware functions:
-  - `inject_capability_headers` — appends `x-duduclaw-version` + `x-duduclaw-capabilities` to
-    every response (including 422s).
-  - `negotiate_capabilities` — validates optional `x-duduclaw-capabilities` request header; returns
-    422 Unprocessable Entity with structured JSON body and `x-duduclaw-missing-capabilities` header
-    if any stated requirement cannot be met. Permissive when header absent/empty/malformed.
-    11 Axum integration tests (via `tower::ServiceExt::oneshot`).
-- **`mcp_http_server.rs`** — Both middleware layers wired into `build_router()` with correct
-  outer/inner ordering (inject outer, negotiate inner).
-- **`docs/ADR-002-x-duduclaw-capability-negotiation.md`** — Full architecture decision record.
+#### W22-P0 ADR-002 — `x-duduclaw` capability negotiation
+
+Every HTTP response from the MCP HTTP server now carries machine-readable
+capability metadata, and clients can declare capability requirements that
+trigger an early 422 rather than silent partial failures.
+
+- **`mcp_headers.rs`** — `CAPABILITY_REGISTRY` static table (9 capabilities:
+  `memory/3`, `mcp/2`, `audit/2`, `governance/1`, `skill/1`, `wiki/1` enabled;
+  `a2a/1`, `secret-manager/1`, `signed-card/1` disabled/pending).
+  `API_VERSION = "1.2"`. Builder/parser/negotiation functions. 23+ unit tests.
+- **`mcp_capability.rs`** — `inject_capability_headers` outer middleware
+  (appends `x-duduclaw-version` + `x-duduclaw-capabilities` to every
+  response) and `negotiate_capabilities` inner middleware (returns 422
+  Unprocessable Entity when client requirements unmet, with structured
+  JSON body + `x-duduclaw-missing-capabilities` header). Permissive when
+  header absent/empty/malformed. 11 Axum integration tests.
+- **`mcp_http_server.rs`** — Both layers wired into `build_router()` with
+  correct outer/inner ordering. Adds 11 integration tests for healthz,
+  unauthorized 401, malformed JSON-RPC, and capability negotiation 422.
+- **`docs/ADR-002-x-duduclaw-capability-negotiation.md`** — Full ADR.
+
+#### W22-P0 ADR-004 — Secret Manager
+
+Unified abstraction over three backends behind a `secret://<backend>/<name>`
+URI scheme so MCP clients (Brave Search, Figma, Notion) can reference
+credentials without embedding them in code or env vars.
+
+- **`crates/duduclaw-security/src/secret_manager/`** — new module:
+  - `mod.rs` — `SecretAdapter` async trait, `SecretUri` parser, config
+    loader (`[secret_manager]` in `config.toml`), `Backend::Local|Vault|Env`.
+  - `local.rs` — In-process AES-256-GCM encrypted store (dev/testing).
+  - `vault.rs` — HashiCorp Vault KV v2 HTTP client (production), reads
+    `vault_addr`, `vault_token`/`vault_token_enc`, `vault_mount`.
+  - `env.rs` — Reads from process environment (CI/override).
+- 26 unit tests covering URI parsing, config parsing, encrypted at-rest
+  verification, error variants, cross-backend round-trips.
+
+#### RFC-22 — Multi-agent coordination principles
+
+- **`docs/RFC-22-multi-agent-coordination-principles.md`** — Four design
+  decisions: (1-C) Two-tier Task/Wiki, (2-C) Hybrid spawn+bus fallback,
+  (3-D) Channel mapping, (4-D) Hallucination forbidden + audit trail.
+- **`crates/duduclaw-core/src/types.rs`** — `ChannelBinding { kind, id,
+  description }` + `DiscordChannelConfig.bindings: Vec<ChannelBinding>` so
+  per-thread routing can target sub-agents directly.
+- **`crates/duduclaw-agent/src/resolver.rs`** — `AgentResolver` step-2
+  channel/thread binding match between trigger word and coarse permission
+  grant. 8 new unit tests.
+- **`crates/duduclaw-security/src/audit.rs`** — `append_tool_call_with_extras`
+  helper for attaching wiki authorship audit fields
+  (`claimed_authors_in_content`, `matches_caller`, `actual_caller`).
+- **`crates/duduclaw-cli/src/mcp.rs`** — `detect_claimed_authors_in_wiki`
+  parses `## <agent> 的觀點`, `**回覆人**：<agent>`, signature, and
+  frontmatter `claimed_authors:` patterns. Recorded on every
+  `shared_wiki_write`. 6 new unit tests.
 
 ### Changed
 
 - `x-duduclaw-version` bumped to `1.2` (second backward-compatible HTTP API change).
+- **`crates/duduclaw-gateway/src/autopilot_engine.rs`** — `lookup_path_opt`
+  returns `Option<Value>` so missing fields no longer match `eq null`,
+  fixing the 5/5 mass-fire bug where 5 task_created events all triggered
+  Rule A. `apply_op` short-circuits `None` to `false`. 4 regression tests
+  (P1-9b).
+- **`crates/duduclaw-gateway/src/channel_reply.rs`** — `build_system_prompt`
+  now injects `CONTRACT.toml` boundaries via `contract_to_prompt`
+  (P1-8 / P1-9a). `spawn_claude_cli_with_env` parses the result event's
+  `usage` field and records via `cost_telemetry` against a
+  `CHANNEL_REPLY_AGENT_ID` task_local set in `build_reply_with_session_inner`
+  — channel replies now produce token usage rows (P1-7).
+- **`crates/duduclaw-gateway/src/claude_runner.rs`** — adds
+  `CHANNEL_REPLY_AGENT_ID` task_local for per-agent cost attribution.
+- **`crates/duduclaw-cli/src/mcp.rs`** — MCP server boot log now logs
+  `caller_agent` alongside `client_id` so observers can distinguish API
+  key owner from actual sub-agent (P1-10). `handle_spawn_agent` surfaces
+  underlying I/O error when `bus_queue.jsonl` write fails, with RFC-22
+  reminder not to fabricate a reply (W1).
+- **`crates/duduclaw-cli/Cargo.toml`** — `default = ["dashboard"]` so
+  `cargo build -p duduclaw-cli --release` produces a binary whose
+  dashboard SPA fallback is mounted (without this every HTTP path except
+  `/health` and `/ws` returned 404).
+
+### Tests
+
+  duduclaw-gateway: 838 passed (incl. 4 new autopilot regression tests)
+  duduclaw-agent:    39 passed (incl. 8 new resolver binding tests)
+  duduclaw-cli:     365 passed (incl. 6 new wiki author + 13 HTTP transport)
+  duduclaw-core:     80 passed
+  duduclaw-security: 179 passed (incl. 26 new secret_manager tests)
+
+  Total **1501 / 1501 green** across all crates.
+
+### Hygiene
+
+- **`.gitignore`** — adds `*.profraw` (cargo test residue),
+  `docs/{tl,pm}/daily-report-*.md` (agent operational logs belong on
+  shared wiki), `/research/` (researcher agent local notes), `/python/spikes/`
+  (active spike workspaces, promoted to production on completion), `/uv.lock`.
 
 ---
 
