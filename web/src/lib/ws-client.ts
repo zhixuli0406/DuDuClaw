@@ -19,6 +19,11 @@ type EventHandler = (payload: unknown) => void;
 // H7 fix: token getter type — called on each connect/reconnect for fresh value
 type TokenGetter = () => string | undefined;
 
+// Called before a reconnect when the previous handshake looked like an auth
+// failure (e.g., expired JWT). Implementations should refresh the token so
+// `getToken()` returns a valid one on the next doConnect.
+type AuthRefreshHook = () => Promise<void>;
+
 export class DuDuClawClient {
   private ws: WebSocket | null = null;
   private pendingRequests = new Map<string, PendingRequest>();
@@ -32,6 +37,8 @@ export class DuDuClawClient {
   private _onStateChange: ((state: ConnectionState) => void) | null = null;
   private url = '';
   private getToken?: TokenGetter;
+  private authRefreshHook?: AuthRefreshHook;
+  private needsAuthRefresh = false;
 
   get state(): ConnectionState {
     return this._state;
@@ -47,14 +54,22 @@ export class DuDuClawClient {
   }
 
   // H7 fix: accept a getter function instead of a static token
-  connect(url: string, getToken?: TokenGetter): Promise<void> {
+  connect(url: string, getToken?: TokenGetter, authRefreshHook?: AuthRefreshHook): Promise<void> {
     this.url = url;
     this.getToken = getToken;
+    this.authRefreshHook = authRefreshHook;
     this.maxReconnectAttempts = 10;
     return this.doConnect();
   }
 
-  private doConnect(): Promise<void> {
+  private async doConnect(): Promise<void> {
+    // If the previous handshake failed with an auth error, refresh the
+    // token before re-opening the socket so getToken() returns a fresh JWT.
+    if (this.needsAuthRefresh && this.authRefreshHook) {
+      this.needsAuthRefresh = false;
+      try { await this.authRefreshHook(); } catch { /* refresh failure → use whatever getToken returns */ }
+    }
+
     return new Promise((resolve, reject) => {
       this.setState('connecting');
 
@@ -105,6 +120,12 @@ export class DuDuClawClient {
             this.setState('authenticated');
           } catch (e) {
             // H10 fix: do NOT set authenticated on failure
+            // If the failure looks like an auth error, flag for token refresh
+            // before the next reconnect attempt.
+            const msg = String(e).toLowerCase();
+            if (msg.includes('jwt') || msg.includes('auth')) {
+              this.needsAuthRefresh = true;
+            }
             this.ws?.close();
             reject(e);
             return;

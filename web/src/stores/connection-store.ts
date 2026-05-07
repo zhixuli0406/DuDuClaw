@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { client, type ConnectionState } from '@/lib/ws-client';
+import { useAuthStore } from '@/stores/auth-store';
 
 type TokenGetter = () => string | undefined;
 
@@ -22,7 +23,11 @@ export const useConnectionStore = create<ConnectionStore>((set) => {
       try {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const url = `${protocol}//${window.location.host}/ws`;
-        await client.connect(url, getToken);
+        // authRefreshHook: when WS handshake fails with an auth-shaped error,
+        // ws-client triggers this before reconnecting so getToken() returns
+        // a fresh JWT. Defends against the JWT-expiry death loop.
+        const authRefreshHook = () => useAuthStore.getState().refresh();
+        await client.connect(url, getToken, authRefreshHook);
       } catch (e) {
         const msg = String(e);
         set({ error: msg });

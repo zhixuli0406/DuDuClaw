@@ -36,6 +36,50 @@ interface AuthStore {
 
 const STORAGE_KEY_REFRESH = 'duduclaw-refresh-token';
 
+// Auto-refresh interval — JWT access token TTL is 30min server-side,
+// refresh at 25min so we never serve a request with an expired token.
+const REFRESH_INTERVAL_MS = 25 * 60 * 1000;
+
+let refreshTimer: ReturnType<typeof setInterval> | null = null;
+let visibilityHandler: (() => void) | null = null;
+let lastRefreshAt = 0;
+
+function stopRefreshTimer() {
+  if (refreshTimer) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
+  if (visibilityHandler && typeof document !== 'undefined') {
+    document.removeEventListener('visibilitychange', visibilityHandler);
+    visibilityHandler = null;
+  }
+}
+
+function startRefreshTimer(refresh: () => Promise<void>) {
+  stopRefreshTimer();
+  lastRefreshAt = Date.now();
+
+  const tick = () => {
+    void refresh()
+      .then(() => { lastRefreshAt = Date.now(); })
+      .catch(() => { /* refresh handles its own logout */ });
+  };
+
+  refreshTimer = setInterval(tick, REFRESH_INTERVAL_MS);
+
+  // Background tabs throttle setInterval to ~1/min; when the user returns,
+  // proactively refresh if more than the interval has elapsed since last refresh.
+  if (typeof document !== 'undefined') {
+    visibilityHandler = () => {
+      if (document.visibilityState === 'visible'
+          && Date.now() - lastRefreshAt >= REFRESH_INTERVAL_MS) {
+        tick();
+      }
+    };
+    document.addEventListener('visibilitychange', visibilityHandler);
+  }
+}
+
 async function apiPost<T>(path: string, body: Record<string, unknown>): Promise<T> {
   const res = await fetch(path, {
     method: 'POST',
@@ -99,6 +143,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         bindings: me.bindings,
         loading: false,
       });
+      startRefreshTimer(get().refresh);
     } catch (e) {
       set({ loading: false });
       throw e;
@@ -107,6 +152,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
 
   // R2 fix: disconnect WebSocket on logout (via client singleton, avoids circular dep)
   logout: () => {
+    stopRefreshTimer();
     client.disconnect();
     localStorage.removeItem(STORAGE_KEY_REFRESH);
     set({
@@ -147,6 +193,8 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
           isAuthenticated: true,
           initialized: true,
         });
+        // Re-arm in case timer was lost (e.g., first refresh after loadFromStorage)
+        startRefreshTimer(get().refresh);
       } catch {
         get().logout();
       } finally {
@@ -189,6 +237,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         initialized: true,
         bindings: me.bindings,
       });
+      startRefreshTimer(get().refresh);
       return true;
     } catch {
       localStorage.removeItem(STORAGE_KEY_REFRESH);
