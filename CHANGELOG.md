@@ -1,6 +1,58 @@
 # Changelog
 
 
+## [1.12.2] - 2026-05-07
+
+Dashboard 死局與假性「設定無反應」修復。使用者回報 Dashboard 設定幾乎無法
+操作、任務無法操作；Telegram 與 Odoo 路徑正常。深入追查後發現 4 個獨立
+問題交互疊加，本版一次解決。
+
+### Fixed
+
+- **JWT auto-refresh 缺失導致 WebSocket 死循環**（CRITICAL）
+  - Symptom: gateway log 連續 4000+ 次 `WebSocket auth failed – closing connection`，
+    最後一次成功認證 2026-05-06T02:17:52，之後 dashboard 全面失效
+  - Root cause: access token TTL 30 分鐘，前端只在 `loadFromStorage` 啟動時
+    呼叫一次 `/api/refresh`，過期後 WS 持續用過期 token 重連被拒
+  - Fix: `auth-store` 加 25 分鐘 setInterval + `visibilitychange` listener；
+    `ws-client` 加 `authRefreshHook`，handshake 失敗訊息含 `jwt`/`auth` 時
+    下次 `doConnect` 前先 await refresh
+
+- **重整頁面看不到資料、需切走再切回**（HIGH）
+  - Symptom: 頁面 reload 後資料空白；切換頁面再切回才正常
+  - Root cause: React effects 由葉子向根 commit，page useEffect 比 App
+    `connectWithAuth` 早跑；`waitForReady` 在 state=disconnected & 無
+    reconnectTimer 時 fast-reject `"Not connected"`
+  - Fix: `AuthGuard` 多 gate 一層 `wsState === 'authenticated'`，protected
+    route 在 WS 就緒後才 mount
+
+- **agents.update 寫入後 registry 沒立刻 reload**（MEDIUM）
+  - Symptom: 修改 agent 設定後使用者誤以為沒生效
+  - Root cause: `update_agent_toml` 拿 registry write lock 用 500ms timeout
+    但 timeout 後 silent fail，agent.toml 已寫入但記憶體 registry 沒重載
+  - Fix: 改回傳 `Result<bool, String>`（bool = hot_reloaded），timeout / scan
+    失敗時 `warn!` 一行；`agents.update` response 加 `"hot_reloaded": bool`
+    與對應 message
+
+- **per-agent channel token 變更不會 hot-restart bot**（MEDIUM）
+  - Symptom: 修改 Discord/Telegram per-agent token 後，下次發訊息仍走舊
+    token，需重啟 gateway
+  - Root cause: bot 啟動時 capture token，registry rescan 不會觸發 bot 重啟；
+    只有 `channels.add` / `channels.remove` RPC 走 hot-restart 路徑
+  - Fix: 新增 `hot_restart_agent_channels(channel_types, agent_name)` helper；
+    `handle_agents_update` 偵測到 `discord_bot_token` / `telegram_bot_token`
+    入參時，寫檔成功後自動 hot-restart 對應 bot；response 加
+    `"channels_restarted": [...]`。LINE 是 webhook 不需處理；Slack / WhatsApp
+    / Feishu 仍需 gateway 重啟（缺 hot-restart helper）
+
+### Notes
+
+- 升版後第一次開啟 dashboard 仍需清除瀏覽器 localStorage 的
+  `duduclaw-refresh-token` 重新登入，才能拿到走新 auth flow 的 fresh JWT。
+- Telegram / Odoo / channel_reply 路徑本來就 OK，不受本版影響。
+
+
+
 ## [1.12.0] - 2026-05-06
 
 W22 Sprint deliverables — two W22-P0 ADRs ship together with a multi-agent
