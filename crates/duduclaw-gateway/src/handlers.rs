@@ -891,8 +891,15 @@ impl MethodHandler {
     /// Read-modify-write an agent's `agent.toml` using the provided mutation closure.
     ///
     /// Uses atomic write (temp + rename) to prevent corruption on concurrent access.
-    /// After a successful write, triggers a registry re-scan for hot-reload.
-    async fn update_agent_toml<F>(&self, agent_id: &str, mutate: F) -> Result<(), String>
+    /// After a successful write, attempts to trigger a registry re-scan for hot-reload.
+    ///
+    /// Returns `Ok(true)` if the registry was re-scanned in time (changes visible
+    /// immediately), `Ok(false)` if the re-scan was skipped due to lock contention
+    /// or scan error (changes will land on the next periodic sync, ≤ 5 min for
+    /// heartbeat-driven consumers; channel_reply / dispatcher always read fresh
+    /// from the lock-protected registry so they see the previous version until the
+    /// next scan).
+    async fn update_agent_toml<F>(&self, agent_id: &str, mutate: F) -> Result<bool, String>
     where
         F: FnOnce(&mut toml::Table) -> Result<(), String>,
     {
@@ -927,15 +934,29 @@ impl MethodHandler {
                 format!("Failed to commit agent.toml: {e}")
             })?;
 
-        // Trigger registry re-scan for hot-reload
-        if let Ok(mut reg) = tokio::time::timeout(
+        // Trigger registry re-scan for hot-reload. Track success so the caller
+        // can surface `hot_reloaded: false` to the user instead of pretending
+        // the change took effect immediately.
+        let hot_reloaded = match tokio::time::timeout(
             std::time::Duration::from_millis(500),
             self.registry.write(),
         ).await {
-            let _ = reg.scan().await;
-        }
+            Ok(mut reg) => {
+                match reg.scan().await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(agent_id, error = %e, "registry rescan failed after agent.toml write — change persisted but not yet visible to in-memory consumers");
+                        false
+                    }
+                }
+            }
+            Err(_) => {
+                warn!(agent_id, "registry write lock timeout (500ms) after agent.toml write — hot reload deferred to next periodic sync");
+                false
+            }
+        };
 
-        Ok(())
+        Ok(hot_reloaded)
     }
 
     /// Convenience: update only the `status` field in an agent's `agent.toml`.
@@ -989,6 +1010,17 @@ impl MethodHandler {
             if let Err(e) = self.demote_current_main(&agent_id).await {
                 return WsFrame::error_response("", &e);
             }
+        }
+
+        // Detect per-agent channel token changes BEFORE the closure consumes
+        // params — so we know what to hot-restart after the write succeeds.
+        // Only Discord/Telegram have working hot-restart helpers today.
+        let mut channels_to_restart: Vec<&'static str> = Vec::new();
+        if params.get("discord_bot_token").and_then(|v| v.as_str()).is_some() {
+            channels_to_restart.push("discord");
+        }
+        if params.get("telegram_bot_token").and_then(|v| v.as_str()).is_some() {
+            channels_to_restart.push("telegram");
         }
 
         let params_clone = params.clone();
@@ -1413,12 +1445,33 @@ impl MethodHandler {
         }).await;
 
         match result {
-            Ok(()) => {
-                info!(agent_id = agent_id.as_str(), "agents.update completed");
+            Ok(hot_reloaded) => {
+                // Hot-restart channel bots whose tokens just changed. Without
+                // this, the running bot loop keeps the previous captured token
+                // until gateway restart, so user-visible behavior diverges
+                // from agent.toml on disk.
+                let restarted = if !channels_to_restart.is_empty() {
+                    self.hot_restart_agent_channels(&channels_to_restart, &agent_id).await
+                } else {
+                    Vec::new()
+                };
+
+                info!(
+                    agent_id = agent_id.as_str(),
+                    hot_reloaded,
+                    channels_restarted = ?restarted,
+                    "agents.update completed"
+                );
                 WsFrame::ok_response("", json!({
                     "success": true,
                     "agent_id": agent_id,
-                    "message": "Agent updated successfully",
+                    "hot_reloaded": hot_reloaded,
+                    "channels_restarted": restarted,
+                    "message": if hot_reloaded {
+                        "Agent updated successfully"
+                    } else {
+                        "Agent updated successfully — registry hot reload deferred to next periodic sync (≤5min)"
+                    },
                 }))
             }
             Err(e) => WsFrame::error_response("", &e),
@@ -1992,6 +2045,39 @@ impl MethodHandler {
         // Always clear runtime status (handle may already be gone if bot crashed)
         let mut status = self.channel_status.write().await;
         status.remove(channel_type);
+    }
+
+    /// Hot-restart per-agent channel bots (Telegram / Discord) after a token
+    /// change persisted to agent.toml. Returns the labels that were re-armed
+    /// (e.g. `["telegram:agnes"]`).
+    ///
+    /// Without this, `agents.update` would write the new token but the running
+    /// bot loop keeps using the old captured token until gateway restart.
+    /// LINE / Slack / WhatsApp / Feishu are not handled here — LINE is webhook-
+    /// based (no background task), the others lack hot-restart helpers and
+    /// still require gateway restart for token changes.
+    async fn hot_restart_agent_channels(&self, channel_types: &[&str], agent_name: &str) -> Vec<String> {
+        let ctx = match self.reply_ctx.read().await.clone() {
+            Some(ctx) => ctx,
+            None => return Vec::new(),
+        };
+
+        let mut restarted = Vec::new();
+        for ch in channel_types {
+            let label = format!("{ch}:{agent_name}");
+            self.hot_stop_channel(&label).await;
+
+            let handles: Vec<(String, tokio::task::JoinHandle<()>)> = match *ch {
+                "discord" => crate::discord::start_discord_bots(&self.home_dir, ctx.clone()).await,
+                "telegram" => crate::telegram::start_telegram_bots(&self.home_dir, ctx.clone()).await,
+                _ => Vec::new(),
+            };
+            for (l, h) in handles {
+                if l == label { restarted.push(l.clone()); }
+                self.register_channel_handle(&l, h).await;
+            }
+        }
+        restarted
     }
 
     // ── Accounts ─────────────────────────────────────────────
