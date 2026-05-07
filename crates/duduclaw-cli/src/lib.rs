@@ -30,6 +30,7 @@ mod migrate;
 pub mod odoo_pool;             // RFC-21 §2: per-agent Odoo connector pool
 mod ptc;
 mod service;
+pub mod weekly_report;         // Per-agent weekly usage report
 pub mod wiki_scope;            // RFC-21 §3: shared-wiki SoT namespace policy
 mod wizard;
 
@@ -354,6 +355,35 @@ enum Commands {
     #[command(subcommand)]
     Hook(HookCommands),
 
+    /// Generate a per-agent usage report (default: last 7 days, Markdown).
+    ///
+    /// Aggregates data from three local stores under `~/.duduclaw/`:
+    ///   - `cost_telemetry.db` — API call count, token usage, estimated cost
+    ///   - `tasks.db`          — activity log grouped by event type
+    ///   - `audit_index.db`    — Evolution-Events reliability metrics
+    ///
+    /// Examples:
+    ///     duduclaw weekly-report
+    ///     duduclaw weekly-report --days 14 --output report.md
+    ///     duduclaw weekly-report --agent agnes --format json
+    WeeklyReport {
+        /// Reporting window in days (1-365).
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+
+        /// Restrict the report to a single agent (by `agent.name`).
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Write the rendered report to this file. Default: stdout.
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+
+        /// Output format. Defaults to Markdown.
+        #[arg(long, default_value = "markdown", value_parser = ["markdown", "json"])]
+        format: String,
+    },
+
     /// Print version information
     Version,
 }
@@ -617,6 +647,21 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             cmd_http_server(&bind, no_sse, timeout_secs).await
         }
         Commands::Hook(HookCommands::AgentFileGuard) => cmd_hook_agent_file_guard().await,
+        Commands::WeeklyReport {
+            days,
+            agent,
+            output,
+            format,
+        } => {
+            weekly_report::run(
+                &duduclaw_home(),
+                days,
+                agent.as_deref(),
+                output.as_deref(),
+                &format,
+            )
+            .await
+        }
         Commands::Version => {
             println!("duduclaw {}", duduclaw_gateway::updater::current_version());
             Ok(())
