@@ -1,6 +1,32 @@
 # Changelog
 
 
+## [1.12.3] - 2026-05-08
+
+Hot-fix on top of v1.12.2 — Dashboard 編輯 agent 時 evolution 與 sticker
+欄位顯示為預設值而非 agent.toml 真實值。
+
+### Fixed
+
+- **`agents.list` response 漏 `evolution` / `sticker` 區段**
+  - Symptom: 在 Dashboard 把 agent 的 `skill_auto_activate` 從 false 改 true
+    並儲存，response 回 `success: true` / `hot_reloaded: true`，`agent.toml`
+    也確實寫入 `skill_auto_activate = true`；但重新打開 agent 編輯框仍
+    顯示 false
+  - Root cause: `handle_agents_list_filtered` 回傳 JSON 沒有 `evolution`
+    與 `sticker` 兩個區段（只有 `agents.inspect` 有）。前端
+    `EditAgentDialog` 從 list response 初始化表單，
+    `agent.evolution?.skill_auto_activate ?? false` 因 `agent.evolution`
+    為 `undefined` 永遠 fallback 到 `false`
+  - 其他 3 個 evolution 欄位（`gvu_enabled` / `cognitive_memory` /
+    `skill_security_scan`）剛好預設 `?? true` 對齊大多 agent.toml 真實值，
+    使用者沒察覺；只有 `skill_auto_activate` 預設 `?? false` 與真實值衝突，
+    才把這個顯示 bug 暴露出來。Sticker 區段也有同樣問題
+  - Fix: 把 `evolution` + `sticker` 區段補進 `agents.list` response，與
+    `agents.inspect` 對齊
+
+
+
 ## [1.12.2] - 2026-05-07
 
 Dashboard 死局與假性「設定無反應」修復。使用者回報 Dashboard 設定幾乎無法
