@@ -32,6 +32,7 @@ pub mod proposal;
 pub mod shadow_mode;
 pub mod soul_partition;
 pub mod text_gradient;
+pub mod trigger;
 pub mod updater;
 pub mod verifier;
 pub mod version_store;

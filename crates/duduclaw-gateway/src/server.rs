@@ -375,7 +375,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         crate::channel_reply::ReplyContext::new(
             handler.registry().clone(),
             home_dir.clone(),
-            session_manager,
+            session_manager.clone(),
             handler.channel_status().clone(),
             event_tx.clone(),
         )
@@ -424,7 +424,23 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     handler.set_heartbeat(heartbeat).await;
     info!("Heartbeat scheduler started (per-agent evolution + monitoring)");
 
-    // Consume SilenceBreakerEvent → forced reflection event
+    // P1 (2026-05-09): build the GvuTriggerCtx once and share it across the
+    // silence-event consumer and the dispatcher so both code paths fire GVU
+    // through the same plumbing (loop / notebook / home dir). Constructed
+    // before the silence consumer spawn — see #3.3 in
+    // commercial/docs/TODO-runtime-health-fixes-202605.md for context.
+    let shared_gvu_ctx =
+        Arc::new(crate::prediction::subagent_prediction::GvuTriggerCtx {
+            gvu_loop: gvu_loop.clone(),
+            notebook: Some(Arc::new(
+                crate::gvu::mistake_notebook::MistakeNotebook::new(
+                    &home_dir.join("evolution.db"),
+                ),
+            )),
+            home_dir: home_dir.clone(),
+        });
+
+    // Consume SilenceBreakerEvent → forced reflection event → optional GVU
     {
         let cooldown = Arc::new(
             crate::prediction::forced_reflection::SilenceBreakerCooldown::default_4h(),
@@ -433,6 +449,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             silence_rx,
             prediction_engine.clone(),
             cooldown,
+            Some(shared_gvu_ctx.clone()),
         );
     }
 
@@ -566,12 +583,16 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Start agent dispatcher (consumes bus_queue.jsonl + SQLite queue, spawns sub-agents).
     // Clone the Arc so AutopilotEngine can share the same MessageQueue (delegate action).
     let mq_for_autopilot = message_queue.clone();
+    // P1 fix (2026-05-09): reuse the shared GvuTriggerCtx built earlier so
+    // dispatcher + silence consumer share the same GvuLoop / MistakeNotebook
+    // — keeps post-GVU bookkeeping consistent across the two trigger paths.
     bg_handles.push(crate::dispatcher::start_agent_dispatcher_with_crypto(
         home_dir.clone(),
         handler.registry().clone(),
         None,
         message_queue,
         Some(prediction_engine.clone()),
+        Some(shared_gvu_ctx.clone()),
     ));
     info!("Agent dispatcher started ({} background tasks)", bg_handles.len());
 
@@ -772,6 +793,18 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         handler.registry().clone(),
     ));
     info!("Reminder scheduler started");
+
+    // #13 (2026-05-12): async session summarizer task.
+    // Every 10 min, scan sessions that have ≥ 10 new turns since their
+    // last summary (or never summarized) and run Haiku to fold the older
+    // turns into a bullet summary. channel_reply reads this summary in
+    // lieu of the verbatim slice, keeping the hot conversation context tight.
+    bg_handles.push(crate::session_summarizer_task::spawn_summarizer(
+        session_manager.clone(),
+        home_dir.clone(),
+        crate::session_summarizer::SummarizeParams::default(),
+    ));
+    info!("Session summarizer task started (10-min cadence)");
 
     // Inject user_db into handler for user management RPC methods
     handler.set_user_db(user_db.clone(), jwt_config.clone()).await;

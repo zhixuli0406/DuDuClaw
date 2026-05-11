@@ -318,6 +318,15 @@ enum Commands {
     #[command(subcommand)]
     Evolution(EvolutionCommands),
 
+    /// Long-term context lifecycle management (#16: quarterly flush).
+    ///
+    /// Periodic cold/hot separation of wiki pages so the system prompt
+    /// index doesn't grow monotonically over months. Cold pages stay
+    /// searchable via MCP `wiki_search` but are excluded from the upfront
+    /// injection budget.
+    #[command(subcommand)]
+    Lifecycle(LifecycleCommands),
+
     /// ACP (Agent Client Protocol) server for IDE integration
     AcpServer,
 
@@ -505,6 +514,41 @@ enum EvolutionCommands {
 }
 
 #[derive(Subcommand)]
+enum LifecycleCommands {
+    /// Rank wiki pages by access recency and propose archiving the
+    /// coldest tail. Until a proper access counter lands (TODO #16.2),
+    /// this uses file `mtime` as a proxy for `last accessed`. Always
+    /// safe — output is informational unless `--apply` is passed.
+    ///
+    /// Example:
+    ///     duduclaw lifecycle flush --dry-run
+    ///     duduclaw lifecycle flush --agent agnes --archive-pct 0.2
+    Flush {
+        /// Limit to a single agent's wiki. Omit to flush global +
+        /// every agent.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Fraction of the coldest tail to archive (0.0..1.0).
+        /// Default 0.30. See [`duduclaw_gateway::lifecycle_flush`].
+        #[arg(long, default_value_t = 0.30)]
+        archive_pct: f64,
+        /// Pages touched in the last N days are protected from archive
+        /// regardless of count. Default 14.
+        #[arg(long, default_value_t = 14)]
+        min_days_since_access: u32,
+        /// Show the plan but make no filesystem changes. Default.
+        /// Pass `--apply` to actually move files.
+        #[arg(long, default_value_t = true)]
+        dry_run: bool,
+        /// Actually move cold pages to `wiki/.archive/`. Inverse of
+        /// `--dry-run`; explicit so accidental flushes need affirmative
+        /// intent.
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum RlCommands {
     /// Export agent sessions as RL training trajectories
     Export {
@@ -545,6 +589,30 @@ fn duduclaw_home() -> PathBuf {
         .join(".duduclaw")
 }
 
+/// Parse `[general] log_level` out of a TOML file at `path`.
+///
+/// Returns `None` on missing file, malformed TOML, or absent key — the caller
+/// falls through to a hard-coded default. Errors are silent because this runs
+/// before the tracing subscriber is initialised, so a `tracing::warn!` here
+/// would be lost. Operators who set the value but see it ignored should look
+/// at the `eprintln!` that `entry_point()` emits with the effective level.
+///
+/// Split from the env-coupled wrapper so tests can pass arbitrary paths
+/// without racing on `DUDUCLAW_HOME` under cargo's parallel test runner.
+fn read_log_level_from_config(path: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: toml::Value = raw.parse().ok()?;
+    value
+        .get("general")
+        .and_then(|g| g.get("log_level"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn read_config_log_level() -> Option<String> {
+    read_log_level_from_config(&duduclaw_home().join("config.toml"))
+}
+
 /// Entry point for the `duduclaw` / `duduclaw-pro` binaries.
 ///
 /// Installs rustls provider, tracing subscriber, parses CLI args, and dispatches.
@@ -569,14 +637,35 @@ pub async fn entry_point() {
     // Dropping it would flush and close the writer prematurely.
     std::mem::forget(_guard);
 
-    // Default to `warn` when RUST_LOG is unset so the terminal stays clean for
-    // end users. Warnings and errors still surface (stuck forwards, auth
-    // failures, panics), but the diagnostic chatter from every WebSocket
-    // connection / dispatcher tick / heartbeat is hidden until the operator
-    // opts in with `RUST_LOG=info duduclaw run`. Previous default was `info`
-    // which produced noisy startup output clients found alarming.
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    // Three-tier resolution for the effective log level:
+    //   1. `RUST_LOG` env var (highest precedence — operator override)
+    //   2. `[general] log_level` in ~/.duduclaw/config.toml (persisted preference)
+    //   3. hard-coded `"warn"` (quiet default for end users)
+    //
+    // Without tier 2, INFO-level signals like `forced_reflection: Forced
+    // reflection event emitted` and `GVU loop generation N` were silently
+    // dropped, making GVU debugging impossible. The `eprintln!` below
+    // surfaces the effective level on stderr at startup so operators can
+    // confirm the resolution chose what they expected.
+    let (env_filter, level_source) = match std::env::var("RUST_LOG") {
+        Ok(spec) => (
+            tracing_subscriber::EnvFilter::try_new(&spec)
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            format!("RUST_LOG={spec}"),
+        ),
+        Err(_) => match read_config_log_level() {
+            Some(level) => (
+                tracing_subscriber::EnvFilter::try_new(&level)
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                format!("config.toml [general] log_level={level}"),
+            ),
+            None => (
+                tracing_subscriber::EnvFilter::new("warn"),
+                "default=warn".to_string(),
+            ),
+        },
+    };
+    eprintln!("[duduclaw] effective log level: {level_source}");
     tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
@@ -639,6 +728,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         }
         Commands::Evolution(ev_cmd) => {
             cmd_evolution(ev_cmd, &duduclaw_home()).await
+        }
+        Commands::Lifecycle(lc_cmd) => {
+            cmd_lifecycle(lc_cmd, &duduclaw_home()).await
         }
         Commands::AcpServer => {
             acp::server::run_acp_server(&duduclaw_home()).await
@@ -772,6 +864,185 @@ async fn cmd_evolution(
                 );
             }
             Ok(())
+        }
+    }
+}
+
+/// `duduclaw lifecycle flush` handler (#16 glue, 2026-05-12).
+///
+/// MVP uses file `mtime` as a proxy for "last accessed" — until the
+/// proper access counter lands in `wiki_trust.db` (deferred #16.2),
+/// this is the best signal we have. Operators are expected to read the
+/// dry-run output before passing `--apply`.
+async fn cmd_lifecycle(
+    cmd: LifecycleCommands,
+    home_dir: &PathBuf,
+) -> duduclaw_core::error::Result<()> {
+    use duduclaw_gateway::lifecycle_flush::{
+        decide_flush, summarize_plan, FlushParams,
+    };
+    use std::path::PathBuf as P;
+
+    match cmd {
+        LifecycleCommands::Flush {
+            agent,
+            archive_pct,
+            min_days_since_access,
+            dry_run,
+            apply,
+        } => {
+            let params = FlushParams {
+                archive_pct,
+                min_days_since_access,
+            };
+            // Collect wiki roots to scan. When `--agent` is given, only
+            // that one; otherwise enumerate every agent + global wiki.
+            let mut roots: Vec<(String, P)> = Vec::new();
+            if let Some(name) = agent.as_deref() {
+                let p = home_dir.join("agents").join(name).join("wiki");
+                if p.exists() {
+                    roots.push((format!("agent:{name}"), p));
+                }
+            } else {
+                let agents_dir = home_dir.join("agents");
+                if let Ok(rd) = std::fs::read_dir(&agents_dir) {
+                    for ent in rd.flatten() {
+                        let p = ent.path().join("wiki");
+                        if p.exists() {
+                            let name = ent.file_name().to_string_lossy().to_string();
+                            roots.push((format!("agent:{name}"), p));
+                        }
+                    }
+                }
+                let shared = home_dir.join("shared").join("wiki");
+                if shared.exists() {
+                    roots.push(("shared".to_string(), shared));
+                }
+            }
+
+            if roots.is_empty() {
+                println!("No wiki roots found under {}", home_dir.display());
+                return Ok(());
+            }
+
+            let effective_dry_run = !apply || dry_run;
+            let mut total_archive = 0usize;
+            let mut total_keep = 0usize;
+            for (label, wiki_root) in &roots {
+                let candidates = scan_wiki_candidates(wiki_root);
+                if candidates.is_empty() {
+                    continue;
+                }
+                let plan = decide_flush(&candidates, &params);
+                total_archive += plan.archive.len();
+                total_keep += plan.keep.len();
+
+                println!("\n## {label}  (wiki: {})", wiki_root.display());
+                println!("{}", summarize_plan(&plan));
+                for c in &plan.archive {
+                    let age = c
+                        .days_since_access
+                        .map(|d| format!("{d}d"))
+                        .unwrap_or_else(|| "?".to_string());
+                    println!(
+                        "  archive  {} (access={}, mtime={})",
+                        c.id, c.access_count, age
+                    );
+                }
+
+                if !effective_dry_run {
+                    // Actually move files into <wiki>/.archive/<original-path>
+                    let archive_root = wiki_root.join(".archive");
+                    let _ = std::fs::create_dir_all(&archive_root);
+                    let mut moved = 0usize;
+                    for c in &plan.archive {
+                        let src = wiki_root.join(&c.id);
+                        if !src.is_file() {
+                            continue;
+                        }
+                        let dst = archive_root.join(&c.id);
+                        if let Some(parent) = dst.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        if std::fs::rename(&src, &dst).is_ok() {
+                            moved += 1;
+                        }
+                    }
+                    println!("  applied: moved {moved} file(s) to .archive/");
+                }
+            }
+
+            println!(
+                "\n=== TOTAL: would archive {total_archive}, keep {total_keep} ({}) ===",
+                if effective_dry_run {
+                    "dry-run; pass --apply to commit"
+                } else {
+                    "applied"
+                }
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Walk a wiki directory and emit one `FlushCandidate` per `.md` file
+/// at any depth. Uses file `mtime` as the access-recency proxy (best
+/// signal until a real access counter lands).
+///
+/// Skips `.archive/` so re-running the command is idempotent.
+fn scan_wiki_candidates(
+    wiki_root: &std::path::Path,
+) -> Vec<duduclaw_gateway::lifecycle_flush::FlushCandidate> {
+    use duduclaw_gateway::lifecycle_flush::FlushCandidate;
+    use std::time::SystemTime;
+
+    let mut out: Vec<FlushCandidate> = Vec::new();
+    let now = SystemTime::now();
+    walk_md_files(wiki_root, &mut |path| {
+        // Skip already-archived pages.
+        if path
+            .components()
+            .any(|c| c.as_os_str() == ".archive")
+        {
+            return;
+        }
+        let rel = match path.strip_prefix(wiki_root) {
+            Ok(p) => p.to_string_lossy().to_string(),
+            Err(_) => return,
+        };
+        let mtime = path
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok();
+        let days = mtime
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|d| (d.as_secs() / 86_400) as u32);
+        out.push(FlushCandidate {
+            id: rel,
+            // No real access counter yet — use 0 so ranking falls back to
+            // mtime tiebreaker (older = more eligible). When the counter
+            // is wired up via #16.2 this becomes the real signal.
+            access_count: 0,
+            days_since_access: days,
+        });
+    });
+    out
+}
+
+fn walk_md_files(root: &std::path::Path, sink: &mut dyn FnMut(&std::path::Path)) {
+    let mut stack: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("md") {
+                sink(&p);
+            }
         }
     }
 }
@@ -3165,6 +3436,78 @@ mod startup_probe_tests {
     fn verify_argon2_admin_default_rejects_garbage_phc() {
         assert!(!verify_argon2_admin_default("not-a-phc-string"));
         assert!(!verify_argon2_admin_default(""));
+    }
+}
+
+#[cfg(test)]
+mod log_level_config_tests {
+    use super::*;
+
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let p = std::env::temp_dir()
+                .join(format!("duduclaw-loglevel-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn config_path(&self) -> std::path::PathBuf {
+            self.0.join("config.toml")
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn returns_none_when_config_missing() {
+        let dir = TempDir::new();
+        assert_eq!(read_log_level_from_config(&dir.config_path()), None);
+    }
+
+    #[test]
+    fn reads_log_level_from_general_section() {
+        let dir = TempDir::new();
+        std::fs::write(
+            dir.config_path(),
+            "[general]\nlog_level = \"debug\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_log_level_from_config(&dir.config_path()),
+            Some("debug".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_when_general_section_missing() {
+        let dir = TempDir::new();
+        std::fs::write(
+            dir.config_path(),
+            "[api]\nanthropic_api_key = \"\"\n",
+        )
+        .unwrap();
+        assert_eq!(read_log_level_from_config(&dir.config_path()), None);
+    }
+
+    #[test]
+    fn returns_none_on_malformed_toml() {
+        let dir = TempDir::new();
+        std::fs::write(dir.config_path(), "this is not = valid [toml").unwrap();
+        assert_eq!(read_log_level_from_config(&dir.config_path()), None);
+    }
+
+    #[test]
+    fn returns_none_when_log_level_is_not_a_string() {
+        let dir = TempDir::new();
+        std::fs::write(
+            dir.config_path(),
+            "[general]\nlog_level = 42\n",
+        )
+        .unwrap();
+        assert_eq!(read_log_level_from_config(&dir.config_path()), None);
     }
 }
 

@@ -253,14 +253,65 @@ impl Updater {
         Ok(version)
     }
 
+    /// After this much wall-clock time since `applied_at`, an observation
+    /// with `< 5` conversations is auto-confirmed instead of extended.
+    ///
+    /// #10 (2026-05-11) — prevents the infinite-extend loop that would
+    /// otherwise pin a SOUL version in `observing` forever. Sub-agents
+    /// without their own channel (e.g. `duduclaw-tl`) only get traffic when
+    /// another agent spawns them. If nobody spawns one for a week, the
+    /// `< 5 conversations → extend` rule would keep cycling every 12 h
+    /// without progress — and crucially, every extend keeps the
+    /// `already_observing` guard active, blocking the *next* GVU proposal
+    /// for that agent. Empirical evidence (5/11 12:33Z): duduclaw-tl
+    /// reached its 2nd extend with 0 conversations — without this cap it
+    /// was on track for an infinite loop.
+    ///
+    /// 72 h is the chosen ceiling because:
+    /// - 24 h initial window + 2× 12 h extends = 48 h, comfortably under cap
+    /// - 72 h still gives a slow-burn cron task three nightly fires
+    /// - Auto-confirm is safe: the new version was already L1+L3 verified
+    ///   before applying, and "nobody used it" is not a signal it's bad.
+    pub(crate) const MAX_OBSERVATION_HOURS_WITHOUT_DATA: i64 = 72;
+
     /// Judge whether an observation period passed or failed.
+    ///
+    /// Pure wrapper around [`Self::judge_outcome_at`] using `Utc::now()`.
+    /// Production code path; tests use the clock-injecting variant below.
     pub fn judge_outcome(
         &self,
         version: &SoulVersion,
         post_metrics: &VersionMetrics,
     ) -> OutcomeVerdict {
-        // Not enough data → extend
+        self.judge_outcome_at(version, post_metrics, Utc::now())
+    }
+
+    /// Clock-injecting variant of [`Self::judge_outcome`]. The `now`
+    /// parameter exists so tests can drive the time-based cap (#10)
+    /// without sleeping or freezing the system clock.
+    pub fn judge_outcome_at(
+        &self,
+        version: &SoulVersion,
+        post_metrics: &VersionMetrics,
+        now: chrono::DateTime<Utc>,
+    ) -> OutcomeVerdict {
+        // Not enough data → extend, UNLESS we've been waiting too long.
         if post_metrics.conversations_count < 5 {
+            // #10 cap: a SOUL.md observation cannot stay in observing
+            // forever just because no traffic arrived. After
+            // MAX_OBSERVATION_HOURS_WITHOUT_DATA, auto-confirm so the
+            // GVU loop can run again on the next silence breaker.
+            let elapsed_hours = (now - version.applied_at).num_hours();
+            if elapsed_hours >= Self::MAX_OBSERVATION_HOURS_WITHOUT_DATA {
+                info!(
+                    agent = %version.agent_id,
+                    version = %version.version_id,
+                    elapsed_hours,
+                    conversations = post_metrics.conversations_count,
+                    "Observation auto-confirmed: no-traffic timeout exceeded (#10)"
+                );
+                return OutcomeVerdict::Confirm;
+            }
             return OutcomeVerdict::ExtendObservation { extra_hours: 12.0 };
         }
 

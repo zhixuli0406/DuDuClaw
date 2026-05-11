@@ -534,6 +534,57 @@ async fn register_slash_commands(http: &reqwest::Client, token: &str, app_id: &s
 static HANDLER_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(10));
 
+/// Compute the wait time for a token-check 429 fallback (when Discord doesn't
+/// send a `Retry-After` header). Streak `0` is treated as `1` so the first
+/// backoff is 60s rather than 0s. Sequence is 60 → 120 → 240 → 480 → 900,
+/// capped at 15 min to avoid pathological waits.
+///
+/// Extracted as a pure function so the table-driven test below can lock the
+/// progression in place — the previous flat 60s loop went unnoticed for so
+/// long because there was no test pinning the backoff schedule.
+fn token_check_backoff_secs(streak: u32) -> u64 {
+    const CAP: u64 = 900;
+    let n = streak.max(1) - 1; // streak 1 → 60·2^0 = 60
+    let base = 60u64.checked_shl(n).unwrap_or(CAP);
+    base.min(CAP)
+}
+
+/// 24h sliding-window threshold for invalid-session storms (#4.2).
+///
+/// Five op-9 invalid sessions inside one day usually indicates a
+/// non-transient problem — Discord-side outage, repeated session resets
+/// from a guild-level issue, or a token quietly invalidated. Once we hit
+/// this many, we emit a `discord_invalid_session_storm` security audit
+/// event so it surfaces in the dashboard's reliability page.
+pub(crate) const INVALID_SESSION_WINDOW_HOURS: i64 = 24;
+pub(crate) const INVALID_SESSION_ALERT_THRESHOLD: usize = 5;
+
+/// Count how many timestamps in `history` fall within `window` of `now`.
+///
+/// Pure helper so the threshold semantics are unit-testable without
+/// reaching into the Discord gateway loop. Out-of-order entries are
+/// tolerated; callers should still trim old entries on the hot path to
+/// keep the slice small.
+pub(crate) fn count_within_window(
+    history: &[chrono::DateTime<chrono::Utc>],
+    now: chrono::DateTime<chrono::Utc>,
+    window: chrono::Duration,
+) -> usize {
+    let cutoff = now - window;
+    history.iter().filter(|t| **t >= cutoff).count()
+}
+
+/// Compute the reconnect delay for an invalid-session event with jitter.
+///
+/// Discord docs require 1–5 s, with jitter encouraged so a million bots
+/// reconnecting at once don't synchronise. Extracted as a pure function
+/// so we can unit-test the bounds without booting a websocket; the
+/// `nanos_seed` argument lets the test pin the deterministic output.
+pub(crate) fn invalid_session_jitter_ms(nanos_seed: u32) -> u64 {
+    // 1000-5000 ms range — Discord's spec.
+    1000 + ((nanos_seed % 4000) as u64)
+}
+
 async fn gateway_loop(
     token: String,
     bot_id: String,
@@ -548,6 +599,23 @@ async fn gateway_loop(
     let event_tx = ctx.event_tx.clone();
     let mut consecutive_failures: u32 = 0;
     const MAX_FAILURES: u32 = 10;
+
+    // Token-check 429 retry tracking — separate from `consecutive_failures`,
+    // which counts gateway connection attempts. Without an independent counter,
+    // the rate-limit branch did `continue` without incrementing anything, so
+    // 22 consecutive 60s waits could accumulate (observed 2026-05-08 20:27).
+    // Cap retries before giving up; back off exponentially with a sane ceiling.
+    let mut token_check_rate_limited_streak: u32 = 0;
+    const MAX_TOKEN_CHECK_RETRIES: u32 = 5;
+
+    // 24-hour sliding window of op-9 "invalid session" timestamps (#4.2).
+    // 4 invalid sessions in 24h was observed on 2026-05-09 — borderline
+    // tolerable but a 5+ count means something upstream is broken. We
+    // keep the timestamps locally (no DB write per event) and emit a
+    // single security audit alert when the threshold trips, then reset
+    // the window so we don't spam alerts every subsequent event.
+    let mut invalid_session_history: std::collections::VecDeque<chrono::DateTime<chrono::Utc>> =
+        std::collections::VecDeque::new();
 
     // Persistent session state across reconnects — required for Gateway RESUME (op 6).
     // Without these, every reconnect IDENTIFYs anew and Discord drops every event
@@ -579,12 +647,51 @@ async fn gateway_loop(
                     return;
                 }
                 Ok(resp) if resp.status().as_u16() == 429 => {
-                    warn!("Discord [{label}] rate limited during token check, waiting 60s");
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    // Honor Retry-After (header value is seconds, optionally float
+                    // per Discord; round up to whole seconds). Fall back to
+                    // exponential 60→120→240→480→900 keyed on the streak length.
+                    let header_secs = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .map(|f| f.ceil() as u64);
+
+                    token_check_rate_limited_streak += 1;
+                    if token_check_rate_limited_streak >= MAX_TOKEN_CHECK_RETRIES {
+                        error!(
+                            "Discord [{label}] token-check rate-limited {token_check_rate_limited_streak}x — \
+                             abandoning bot to avoid hammering Discord",
+                        );
+                        set_channel_connected(
+                            &channel_status,
+                            &label,
+                            false,
+                            Some("rate-limited; bot stopped — try again later".into()),
+                            Some(&event_tx),
+                        )
+                        .await;
+                        return;
+                    }
+
+                    let backoff = header_secs
+                        .unwrap_or_else(|| token_check_backoff_secs(token_check_rate_limited_streak));
+                    warn!(
+                        "Discord [{label}] rate limited during token check (streak \
+                         {token_check_rate_limited_streak}/{MAX_TOKEN_CHECK_RETRIES}), \
+                         waiting {backoff}s (retry-after header: {header_secs:?})",
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
                     continue;
                 }
-                Err(_) => {} // network error, proceed to try gateway anyway
-                _ => {} // token ok
+                Err(_) => {
+                    // network error, proceed to try gateway anyway
+                    token_check_rate_limited_streak = 0;
+                }
+                _ => {
+                    // token ok
+                    token_check_rate_limited_streak = 0;
+                }
             }
         }
 
@@ -882,11 +989,59 @@ async fn gateway_loop(
                                 .as_ref()
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false);
-                            warn!("Discord [{label}] Gateway invalid session (resumable={resumable})");
+
+                            // #4.2: track invalid sessions in a 24h sliding window;
+                            // emit one consolidated security_audit event when the
+                            // storm threshold trips so the dashboard surfaces it.
+                            let now = chrono::Utc::now();
+                            invalid_session_history.push_back(now);
+                            // Trim entries outside the observation window so the
+                            // VecDeque stays bounded under steady-state churn.
+                            let cutoff = now - chrono::Duration::hours(INVALID_SESSION_WINDOW_HOURS);
+                            while invalid_session_history
+                                .front()
+                                .is_some_and(|t| *t < cutoff)
+                            {
+                                invalid_session_history.pop_front();
+                            }
+                            let count_24h = invalid_session_history.len();
+
+                            warn!(
+                                count_24h,
+                                "Discord [{label}] Gateway invalid session (resumable={resumable})"
+                            );
                             set_channel_connected(&channel_status, &label, false, Some("invalid session".to_string()), Some(&event_tx)).await;
+
+                            if count_24h >= INVALID_SESSION_ALERT_THRESHOLD {
+                                let home = ctx.home_dir.clone();
+                                let label_for_audit = label.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    duduclaw_security::audit::append_audit_event(
+                                        &home,
+                                        &duduclaw_security::audit::AuditEvent::new(
+                                            "discord_invalid_session_storm",
+                                            label_for_audit,
+                                            duduclaw_security::audit::Severity::Warning,
+                                            serde_json::json!({
+                                                "count_24h": count_24h,
+                                                "threshold": INVALID_SESSION_ALERT_THRESHOLD,
+                                                "window_hours": INVALID_SESSION_WINDOW_HOURS,
+                                                "guidance": "Repeated op-9 within 24h usually means a non-transient Discord-side or token-side problem. Check `gh status discord` and re-validate the bot token in the dashboard."
+                                            }),
+                                        ),
+                                    );
+                                });
+                                // Reset so we don't re-fire on every subsequent
+                                // event. New storms must accumulate THRESHOLD
+                                // events again before alerting.
+                                invalid_session_history.clear();
+                            }
+
                             // Discord requires a 1-5s random delay before reconnecting.
-                            let jitter_ms = 1000 + (std::time::Instant::now().elapsed().subsec_nanos() % 4000);
-                            tokio::time::sleep(std::time::Duration::from_millis(jitter_ms as u64)).await;
+                            let jitter_ms = invalid_session_jitter_ms(
+                                std::time::Instant::now().elapsed().subsec_nanos(),
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
                             if resumable {
                                 break BreakReason::Recoverable;
                             } else {
@@ -1818,4 +1973,98 @@ async fn edit_interaction_response(
 
 async fn read_discord_token(home_dir: &Path) -> Option<String> {
     crate::config_crypto::read_encrypted_config_field(home_dir, "channels", "discord_bot_token").await
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::token_check_backoff_secs;
+
+    #[test]
+    fn schedule_grows_exponentially_and_caps_at_15min() {
+        // Lock down the published progression. If anyone touches the
+        // formula, this test should force them to update the schedule
+        // intentionally.
+        assert_eq!(token_check_backoff_secs(1), 60);
+        assert_eq!(token_check_backoff_secs(2), 120);
+        assert_eq!(token_check_backoff_secs(3), 240);
+        assert_eq!(token_check_backoff_secs(4), 480);
+        assert_eq!(token_check_backoff_secs(5), 900); // capped
+        assert_eq!(token_check_backoff_secs(6), 900); // still capped
+    }
+
+    #[test]
+    fn streak_zero_does_not_underflow_or_return_zero() {
+        // streak=0 shouldn't ever happen in the call site (we increment
+        // before computing), but guard against the regression where
+        // `n.saturating_sub(1)` of an underflow returned 0s sleeps.
+        assert_eq!(token_check_backoff_secs(0), 60);
+    }
+
+    #[test]
+    fn extreme_streak_is_clamped_not_overflowed() {
+        // Catch the bug where `60u64 << streak` would overflow at streak=58.
+        // checked_shl returning None should fall through to CAP.
+        assert_eq!(token_check_backoff_secs(100), 900);
+        assert_eq!(token_check_backoff_secs(u32::MAX), 900);
+    }
+}
+
+#[cfg(test)]
+mod invalid_session_tests {
+    use super::{count_within_window, invalid_session_jitter_ms};
+    use chrono::{Duration, TimeZone, Utc};
+
+    #[test]
+    fn count_only_includes_entries_within_window() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 9, 12, 0, 0).unwrap();
+        let history = vec![
+            now - Duration::hours(25), // outside window
+            now - Duration::hours(23), // inside
+            now - Duration::hours(1),  // inside
+            now,                       // inside (boundary)
+        ];
+        assert_eq!(count_within_window(&history, now, Duration::hours(24)), 3);
+    }
+
+    #[test]
+    fn count_zero_when_history_empty() {
+        let now = Utc::now();
+        assert_eq!(count_within_window(&[], now, Duration::hours(24)), 0);
+    }
+
+    #[test]
+    fn count_zero_when_all_entries_expired() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 9, 12, 0, 0).unwrap();
+        let history = vec![
+            now - Duration::hours(48),
+            now - Duration::hours(36),
+        ];
+        assert_eq!(count_within_window(&history, now, Duration::hours(24)), 0);
+    }
+
+    #[test]
+    fn jitter_stays_within_discord_spec_1_to_5s() {
+        // Discord spec is 1000-5000ms. Sample a few values across the
+        // nanos space and prove they all fall in the band.
+        for nanos in [0u32, 1, 999, 1000, 3999, 4000, 7777, u32::MAX] {
+            let ms = invalid_session_jitter_ms(nanos);
+            assert!(
+                (1000..=5000).contains(&ms),
+                "jitter for nanos={nanos} = {ms} ms, expected [1000, 5000]"
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_distributes_across_band_not_clipped_to_one_value() {
+        // Sweep input, ensure the output set has more than one value.
+        // Catches the "always 1000" regression that would silently break
+        // jitter without breaking the bounds test above.
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for nanos in 0..50_000u32 {
+            seen.insert(invalid_session_jitter_ms(nanos));
+        }
+        assert!(seen.len() > 100, "jitter looks clipped: only {} values", seen.len());
+    }
 }

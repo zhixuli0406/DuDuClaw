@@ -18,9 +18,17 @@
 //! 3. Logs a `prediction_error` row in `evolution_events` so silence
 //!    detection / metacognition see the activity.
 //!
-//! It deliberately stops short of triggering the GVU loop — that requires
-//! the full conversation context and SOUL contract that only the channel
-//! path has wired up. P1 work can extend this if needed.
+//! ## GVU triggering (P1, 2026-05-09)
+//!
+//! When `record_subagent_prediction` is called with a `gvu_loop` AND the
+//! synthetic prediction error lands in Significant / Critical AND the agent
+//! has `gvu_enabled = true` in `agent.toml`, the same evolution loop that
+//! channel agents use is invoked here through [`crate::gvu::trigger`].
+//!
+//! Before this hook, 16 of 17 production agents accumulated `prediction_error`
+//! rows but never produced a single `gvu_experiment_log` entry. The gating
+//! rules below match channel_reply (Significant/Critical only) so cost
+//! profile stays the same.
 //!
 //! ## User-id convention
 //!
@@ -30,10 +38,14 @@
 //! with real channel `user_id`s (which are numeric for Discord/Telegram).
 //! Empty senders fall back to `agent:_bus`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tracing::{debug, warn};
 
+use crate::gvu::loop_::GvuLoop;
+use crate::gvu::mistake_notebook::MistakeNotebook;
+use crate::gvu::trigger::{maybe_run_gvu, TriggerSource};
 use crate::prediction::engine::PredictionEngine;
 use crate::prediction::metrics::ConversationMetrics;
 use crate::session::SessionMessage;
@@ -86,11 +98,23 @@ pub fn build_synthetic_messages(payload: &str, response: &str) -> Vec<SessionMes
     ]
 }
 
+/// Optional GVU machinery — when supplied, sub-agent predictions whose
+/// composite error lands in Significant / Critical fire the same evolution
+/// loop the channel path uses.
+pub struct GvuTriggerCtx {
+    pub gvu_loop: Arc<GvuLoop>,
+    pub notebook: Option<Arc<MistakeNotebook>>,
+    pub home_dir: PathBuf,
+}
+
 /// Run a single prediction cycle for a completed sub-agent dispatch.
 ///
 /// Designed for `tokio::spawn` — every error is logged at `warn!` and
 /// swallowed so a flaky prediction path can never break the dispatcher's
 /// happy path.
+///
+/// `gvu_ctx`: when `Some`, an eligible Significant/Critical error also
+/// triggers the GVU loop. Eligibility is decided by [`crate::gvu::trigger`].
 pub async fn record_subagent_prediction(
     prediction_engine: Arc<PredictionEngine>,
     agent_id: String,
@@ -98,6 +122,7 @@ pub async fn record_subagent_prediction(
     origin_agent: String,
     payload: String,
     response_text: String,
+    gvu_ctx: Option<Arc<GvuTriggerCtx>>,
 ) {
     if response_text.is_empty() || payload.is_empty() {
         debug!(
@@ -155,6 +180,47 @@ pub async fn record_subagent_prediction(
         category = ?error.category,
         "Sub-agent prediction recorded"
     );
+
+    // 6. Optionally fire GVU (P1, 2026-05-09). The trigger helper enforces
+    //    its own eligibility rules — we just hand it the context.
+    if let Some(ctx) = gvu_ctx {
+        let agent_dir = ctx.home_dir.join("agents").join(&agent_id);
+        let home_for_llm = ctx.home_dir.clone();
+        let payload_preview: String = payload.chars().take(400).collect();
+        let extra = format!(
+            "Sub-agent dispatch payload preview:\n{payload_preview}"
+        );
+
+        // LLM caller mirrors channel_reply's setup so the GVU loop has a
+        // working Generator/Judge backend.
+        let call_llm = move |prompt: String| {
+            let h = home_for_llm.clone();
+            async move {
+                crate::channel_reply::call_claude_cli_public(
+                    &prompt,
+                    "claude-haiku-4-5",
+                    "",
+                    &h,
+                )
+                .await
+            }
+        };
+
+        let _decision = maybe_run_gvu(
+            Some(ctx.gvu_loop.clone()),
+            prediction_engine.clone(),
+            ctx.notebook.clone(),
+            &agent_id,
+            &agent_dir,
+            error.composite_error,
+            error.category,
+            TriggerSource::SubAgentDispatch,
+            Some(&extra),
+            call_llm,
+        )
+        .await;
+        // Outcome is logged inside maybe_run_gvu — nothing else to do here.
+    }
 }
 
 /// Convenience wrapper that swallows panics and detaches as a background
@@ -167,6 +233,7 @@ pub fn spawn_record(
     origin_agent: Option<String>,
     payload: String,
     response_text: String,
+    gvu_ctx: Option<Arc<GvuTriggerCtx>>,
 ) {
     let Some(pe) = prediction_engine else {
         return;
@@ -175,7 +242,7 @@ pub fn spawn_record(
     let origin = origin_agent.unwrap_or_default();
     tokio::spawn(async move {
         if let Err(e) = std::panic::AssertUnwindSafe(record_subagent_prediction(
-            pe, agent_id, sender, origin, payload, response_text,
+            pe, agent_id, sender, origin, payload, response_text, gvu_ctx,
         ))
         .catch_unwind()
         .await
@@ -255,6 +322,7 @@ mod tests {
             "agnes".to_string(),
             "請更新版本".to_string(),
             "已完成 v1.8.36".to_string(),
+            None,
         )
         .await;
 
@@ -282,6 +350,7 @@ mod tests {
                 "agnes".to_string(),
                 "繼續".to_string(),
                 "好的".to_string(),
+                None,
             )
             .await;
         }
@@ -307,6 +376,7 @@ mod tests {
             "z".to_string(),
             "".to_string(),
             "non-empty".to_string(),
+            None,
         )
         .await;
 

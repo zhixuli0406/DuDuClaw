@@ -51,6 +51,102 @@ const TURN_TRIM_THRESHOLD: usize = 800;
 const TURN_HEAD_CHARS: usize = 300;
 const TURN_TAIL_CHARS: usize = 200;
 
+/// #12 glue (2026-05-12) — apply the prompt-compression pipeline when an
+/// agent's `[budget] max_input_tokens` is set AND the request is over
+/// budget. Returns either the compressed history (success) or the
+/// original history (no budget configured / not over / pipeline failed).
+///
+/// Why not propagate errors: the 200K cliff doubles input price but
+/// doesn't break the call. Silent fallback preserves availability;
+/// the `cost_pressure` event surfaces the regression for auditing.
+fn maybe_compress_history(
+    system_prompt: &str,
+    history: Vec<ConversationTurn>,
+    user_message: &str,
+    agent_id: &str,
+) -> Vec<ConversationTurn> {
+    // Look up the budget from cost_telemetry's cached agent config. We
+    // can't get the LoadedAgent at this point without re-acquiring the
+    // registry lock — instead let the per-agent budget read happen via
+    // a small helper. Default 0 (= disabled) preserves prior behaviour.
+    let budget = read_agent_budget_tokens(agent_id);
+    if budget == 0 {
+        return history;
+    }
+
+    // Snapshot of the cost_pressure flag so the pipeline can pick a
+    // more aggressive trim threshold for hot agents.
+    let cost_pressure = crate::cost_telemetry::get_telemetry()
+        .map(|t| t.is_under_cost_pressure(agent_id))
+        .unwrap_or(false);
+
+    // Convert ConversationTurn → OwnedChatMessage. Pipeline returns
+    // OwnedChatMessage, which we map back below.
+    let owned: Vec<crate::prompt_compression::OwnedChatMessage> = history
+        .iter()
+        .map(|t| crate::prompt_compression::OwnedChatMessage {
+            role: t.role.clone(),
+            content: t.content.clone(),
+        })
+        .collect();
+
+    match crate::prompt_compression::enforce_budget(
+        system_prompt,
+        owned,
+        user_message,
+        budget,
+        crate::prompt_compression::default_pipeline(),
+        cost_pressure,
+    ) {
+        Ok(compressed) => {
+            // If the pipeline didn't need to do anything (under budget),
+            // it returns the input unchanged — caller doesn't care.
+            compressed
+                .into_iter()
+                .map(|m| ConversationTurn {
+                    role: m.role,
+                    content: m.content,
+                })
+                .collect()
+        }
+        Err(exceeded) => {
+            // Non-fatal degradation: log, emit a cost-pressure-like
+            // signal, fall through with original history. This keeps
+            // the call working at higher cost rather than mysteriously
+            // failing.
+            tracing::warn!(
+                agent_id,
+                estimated = exceeded.estimated_tokens,
+                budget = exceeded.budget_tokens,
+                stages = ?exceeded.stages_tried,
+                "budget enforcement: compression pipeline insufficient; \
+                 proceeding with full history (request will be expensive)"
+            );
+            history
+        }
+    }
+}
+
+/// Helper for [`maybe_compress_history`]. Reads
+/// `agent.toml [budget] max_input_tokens` for the given agent. Returns
+/// 0 (= disabled) on any failure, preserving v1.12.x behaviour for
+/// agents that haven't opted in.
+fn read_agent_budget_tokens(agent_id: &str) -> u64 {
+    // Resolve the agent dir from the gateway's home dir at runtime.
+    // We avoid threading `home_dir` through this hot path by going via
+    // the well-known DUDUCLAW_HOME / ~/.duduclaw convention used
+    // everywhere else in the codebase.
+    let home = std::env::var("DUDUCLAW_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".duduclaw")
+        });
+    let agent_dir = home.join("agents").join(agent_id);
+    crate::prompt_audit::read_max_input_tokens(&agent_dir).unwrap_or(0)
+}
+
 /// Trim a turn's content if it exceeds the threshold (char-level, CJK-safe).
 ///
 /// Preserves the first and last portions, replacing the middle with a
@@ -747,11 +843,40 @@ async fn build_reply_with_session_inner(
     // Filter out "system" role messages — these are post-compression summaries
     // stored by SessionManager::compress(). They belong in the system prompt,
     // not in the conversation turns (Anthropic Messages API rejects them).
+    //
+    // #13 glue (2026-05-12): when the async summarizer task has folded
+    // older turns into `summary_of_prior`, prepend the summary as a
+    // synthetic `assistant` recap turn and skip the verbatim slice it
+    // covers. Falls through to verbatim history when no summary exists
+    // (summarizer hasn't run yet, or session is below the threshold).
     let max_history_turns = 20;
     let mut compression_summary = String::new();
+    let (async_summary, summarized_through) = session_mgr
+        .get_summary(session_id)
+        .await
+        .unwrap_or_default();
     let conversation_history: Vec<ConversationTurn> = match session_mgr.get_messages(session_id).await {
         Ok(msgs) => {
-            let prior: Vec<_> = msgs.iter()
+            // Optional prefix when the summarizer task has run for this
+            // session. Encoded as a single assistant-role turn so the
+            // Messages API doesn't reject it (no `system` role in turns).
+            let mut out: Vec<ConversationTurn> = Vec::new();
+            if !async_summary.trim().is_empty() {
+                out.push(ConversationTurn {
+                    role: "assistant".to_string(),
+                    content: format!(
+                        "[summary of earlier turns 1..={summarized_through}]\n{async_summary}"
+                    ),
+                });
+            }
+
+            // Verbatim slice: skip the first `summarized_through` turns
+            // (already captured in the prefix) and the LAST turn (which
+            // is the user message about to be re-sent below). The +1
+            // index skip is intentional — we want messages.len() - 1
+            // minus the summarized prefix.
+            let summarized_through_usize = summarized_through as usize;
+            let prior_full: Vec<_> = msgs.iter()
                 .take(msgs.len().saturating_sub(1))
                 .filter_map(|m| {
                     if m.role == "system" {
@@ -768,12 +893,29 @@ async fn build_reply_with_session_inner(
                     }
                 })
                 .collect();
+            // Trim already-summarized turns (best-effort: the count we
+            // skip is approximate because the summarizer indexes raw
+            // messages, including potential hidden ones — but trimming
+            // a bit conservatively is fine, the model sees the summary
+            // either way).
+            let prior: Vec<_> = if summarized_through_usize > 0
+                && prior_full.len() > summarized_through_usize
+            {
+                prior_full[summarized_through_usize..].to_vec()
+            } else if summarized_through_usize >= prior_full.len() {
+                Vec::new()
+            } else {
+                prior_full
+            };
+
             // Keep only the most recent turns to prevent token overflow
-            if prior.len() > max_history_turns {
+            let trimmed = if prior.len() > max_history_turns {
                 prior[prior.len() - max_history_turns..].to_vec()
             } else {
                 prior
-            }
+            };
+            out.extend(trimmed);
+            out
         }
         Err(e) => {
             warn!("Failed to load session messages: {e}");
@@ -997,6 +1139,26 @@ async fn build_reply_with_session_inner(
     } else {
         format!("<task_recap>\n{pinned}\n</task_recap>\n\n{sanitized_text}")
     };
+
+    // #12 glue (2026-05-12) — request-boundary budget enforcement.
+    //
+    // Read the agent's `[budget] max_input_tokens` (0 = disabled,
+    // back-compat). If the total estimated prompt is over budget, run
+    // the compression pipeline on `conversation_history`. The
+    // `cost_pressure` flag from #6.3 makes early stages more aggressive.
+    //
+    // Failure mode is intentionally NON-fatal: if the pipeline can't
+    // bring us under budget, we log a warn + emit an evolution event
+    // and proceed with the full history. Rejecting the request would
+    // surprise the user with a silent failure mid-conversation; the
+    // 200 K cliff merely doubles input price, it doesn't break the
+    // call. Future work can flip this to hard-reject behind a flag.
+    let conversation_history = maybe_compress_history(
+        &full_system_prompt,
+        conversation_history,
+        &effective_message,
+        &agent_id,
+    );
 
     let cli_future = call_claude_cli_rotated(
         &effective_message, &model, &full_system_prompt, &ctx.home_dir,
@@ -3879,13 +4041,33 @@ fn build_system_prompt(
     // as a stranger, which matches v1.10.1 behaviour exactly.
     sender_block: &str,
 ) -> String {
+    // #11 (2026-05-12) — Minimal mode: short-circuit to the lean assembler.
+    // Agents opt in via `agent.toml [prompt] mode = "minimal"`. See
+    // commercial/docs/TODO-runtime-health-fixes-202605.md #11.
+    if let Some(a) = agent {
+        if a.config.prompt.mode == duduclaw_core::types::PromptMode::Minimal {
+            return crate::prompt_minimal::build_minimal_system_prompt(
+                a,
+                sender_block,
+                pinned_instructions,
+            );
+        }
+    }
+
     let mut parts = Vec::new();
+    // Mirror parts with labelled byte counts for the prompt-size audit log.
+    // See `crate::prompt_audit` — emitted only when total exceeds the
+    // 50KB threshold so it stays silent on normal traffic but lights up
+    // exactly the requests that risk hitting the 200K cliff.
+    let mut audit: Vec<crate::prompt_audit::PromptSection> = Vec::new();
 
     if let Some(a) = agent {
         if let Some(soul) = &a.soul {
+            audit.push(crate::prompt_audit::PromptSection::new("soul", soul));
             parts.push(soul.clone());
         }
         if let Some(identity) = &a.identity {
+            audit.push(crate::prompt_audit::PromptSection::new("identity", identity));
             parts.push(identity.clone());
         }
 
@@ -3897,17 +4079,24 @@ fn build_system_prompt(
         let contract_prompt =
             duduclaw_agent::contract::contract_to_prompt(&a.contract);
         if !contract_prompt.is_empty() {
+            audit.push(crate::prompt_audit::PromptSection::new(
+                "contract",
+                &contract_prompt,
+            ));
             parts.push(contract_prompt);
         }
 
         // Progressive skill injection (when available)
+        let mut skills_total_bytes: usize = 0;
         if let (Some(skills), Some(msg)) = (compressed_skills, user_message) {
             if !skills.is_empty() {
                 let active = active_skills.cloned().unwrap_or_default();
 
                 // Layer 0: all skill names
                 let index: Vec<&str> = skills.iter().map(|s| s.tag.as_str()).collect();
-                parts.push(format!("Available skills: {}", index.join(", ")));
+                let s = format!("Available skills: {}", index.join(", "));
+                skills_total_bytes += s.len();
+                parts.push(s);
 
                 // Rank and select layers
                 let ranked = crate::skill_lifecycle::relevance::rank_skills(msg, skills);
@@ -3922,7 +4111,9 @@ fn build_system_prompt(
                 for &idx in &selection.layer2 {
                     let skill = &skills[idx];
                     if remaining_budget >= skill.tokens_layer2 {
-                        parts.push(format!("## Skill: {}\n{}", skill.name, skill.full_content));
+                        let s = format!("## Skill: {}\n{}", skill.name, skill.full_content);
+                        skills_total_bytes += s.len();
+                        parts.push(s);
                         remaining_budget = remaining_budget.saturating_sub(skill.tokens_layer2);
                     }
                 }
@@ -3931,16 +4122,43 @@ fn build_system_prompt(
                 for &idx in &selection.layer1 {
                     let skill = &skills[idx];
                     if remaining_budget >= skill.tokens_layer1 {
-                        parts.push(format!("## {}: {}", skill.name, skill.summary));
+                        let s = format!("## {}: {}", skill.name, skill.summary);
+                        skills_total_bytes += s.len();
+                        parts.push(s);
                         remaining_budget = remaining_budget.saturating_sub(skill.tokens_layer1);
                     }
                 }
             }
         } else {
-            // Legacy: inject all skills fully (backward compat when progressive not enabled)
-            for skill in &a.skills {
-                parts.push(format!("## Skill: {}\n{}", skill.name, skill.content));
+            // Legacy: inject all skills fully (backward compat when
+            // progressive not enabled). #6.2b: cap at
+            // DEFAULT_LEGACY_SKILL_BYTE_CAP so an unbounded SKILLS/ dir
+            // can't push the prompt past the 200K cliff. Truncation
+            // footer (when triggered) explains what was dropped and
+            // points operators at progressive injection.
+            let pairs: Vec<(String, String)> = a
+                .skills
+                .iter()
+                .map(|s| (s.name.clone(), s.content.clone()))
+                .collect();
+            let (rendered, footer) = crate::prompt_audit::budgeted_legacy_skills(
+                &pairs,
+                crate::prompt_audit::DEFAULT_LEGACY_SKILL_BYTE_CAP,
+            );
+            for s in rendered {
+                skills_total_bytes += s.len();
+                parts.push(s);
             }
+            if let Some(note) = footer {
+                skills_total_bytes += note.len();
+                parts.push(note);
+            }
+        }
+        if skills_total_bytes > 0 {
+            audit.push(crate::prompt_audit::PromptSection {
+                label: "skills",
+                bytes: skills_total_bytes,
+            });
         }
     }
 
@@ -3951,6 +4169,10 @@ fn build_system_prompt(
     // convention — the block is placed before team / wiki context so the
     // agent reads "who am I talking to" before "what do I know".
     if !sender_block.is_empty() {
+        audit.push(crate::prompt_audit::PromptSection::new(
+            "sender",
+            sender_block,
+        ));
         parts.push(sender_block.to_string());
     }
 
@@ -3962,6 +4184,10 @@ fn build_system_prompt(
             for m in members {
                 team_section.push_str(&format!("- **{}** ({}) — {}\n", m.display_name, m.name, m.role));
             }
+            audit.push(crate::prompt_audit::PromptSection::new(
+                "team",
+                &team_section,
+            ));
             parts.push(team_section);
         }
     }
@@ -3969,22 +4195,46 @@ fn build_system_prompt(
     // Wiki knowledge injection — L0 (Identity) + L1 (Core) pages are always
     // injected so the agent can reference accumulated wiki knowledge without
     // manual wiki_search calls. L2/L3 are search-only.
+    //
+    // #14 glue (2026-05-12): when we have the user_message, rank pages by
+    // TF-IDF relevance and keep top-K under the 6 KB budget instead of
+    // dumping in file order. The empty-query path falls back to file
+    // order via `relevance_ranker`'s fast path, matching prior behaviour.
     if let Some(a) = agent {
         let wiki_dir = a.dir.join("wiki");
         if wiki_dir.exists() {
             let store = duduclaw_memory::WikiStore::new(wiki_dir);
-            let result = match citation_ctx {
-                Some((agent_id, conv_id, session_id)) => {
-                    let tracker = duduclaw_memory::feedback::global_tracker();
-                    store.build_injection_context_with_citations(
-                        6000, agent_id, conv_id, session_id, &tracker,
-                    )
-                }
-                None => store.build_injection_context(6000),
-            };
+            let query = user_message.unwrap_or("");
+            // Hoist the Arc<CitationTracker> binding so the borrow lives
+            // long enough for the CitationContext. The tracker itself is
+            // a global singleton — cheap to clone the Arc.
+            let tracker_arc = citation_ctx.map(|_| duduclaw_memory::feedback::global_tracker());
+            let citation_context =
+                citation_ctx.zip(tracker_arc.as_ref()).map(
+                    |((agent_id, conv_id, session_id), tracker)| {
+                        crate::ranked_wiki_injection::CitationContext {
+                            agent_id,
+                            conversation_id: conv_id,
+                            session_id,
+                            tracker: tracker.as_ref(),
+                        }
+                    },
+                );
+            let wiki_ctx = crate::ranked_wiki_injection::ranked_wiki_injection(
+                &store,
+                query,
+                6000,
+                citation_context,
+            );
+            // The helper returns "" on error or no pages — wrap the
+            // non-empty case identically to before so prompt shape
+            // stays stable for prompt-cache hits.
+            let result: Result<String, duduclaw_core::error::DuDuClawError> = Ok(wiki_ctx);
             match result {
                 Ok(wiki_ctx) if !wiki_ctx.is_empty() => {
-                    parts.push(format!("## Wiki Knowledge\n{}", wiki_ctx.trim_end()));
+                    let s = format!("## Wiki Knowledge\n{}", wiki_ctx.trim_end());
+                    audit.push(crate::prompt_audit::PromptSection::new("wiki", &s));
+                    parts.push(s);
                 }
                 Ok(_) => {} // no L0/L1 pages
                 Err(e) => {
@@ -3998,12 +4248,24 @@ fn build_system_prompt(
     // "put instructions at the bottom for best attention"). This combats U-shaped
     // attention degradation by placing key task requirements in the high-attention tail.
     if !pinned_instructions.is_empty() {
-        parts.push(format!(
+        let s = format!(
             "## Pinned Task Instructions\n\
              The user's core task requirements (ALWAYS follow these throughout the conversation):\n\
              {pinned_instructions}"
-        ));
+        );
+        audit.push(crate::prompt_audit::PromptSection::new("pinned", &s));
+        parts.push(s);
     }
+
+    let agent_label = agent
+        .map(|a| a.config.agent.name.as_str())
+        .unwrap_or("unknown");
+    crate::prompt_audit::maybe_log_breakdown(
+        agent_label,
+        "channel_reply",
+        &audit,
+        crate::prompt_audit::DEFAULT_EMIT_THRESHOLD_BYTES,
+    );
 
     if parts.is_empty() {
         "You are DuDuClaw, a helpful AI assistant. Reply concisely in the user's language."

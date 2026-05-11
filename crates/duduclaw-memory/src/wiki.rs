@@ -1337,7 +1337,13 @@ impl WikiStore {
     /// Internal — like `collect_by_layer` but also yields the trust score
     /// so we can record it in the citation log. Honours `WikiTrustStore`
     /// live `do_not_inject` overrides when initialised.
-    fn collect_by_layer_with_meta(
+    ///
+    /// Made `pub` for #14 (2026-05-12) so the gateway can apply
+    /// query-driven relevance ranking on top before injection. The
+    /// existing `build_injection_context_*` paths still call this
+    /// internally and apply no ranking — only the new gateway-side
+    /// `ranked_wiki_injection` helper consumes it for ranking.
+    pub fn collect_by_layer_with_meta(
         &self,
         layer: WikiLayer,
     ) -> Result<Vec<(String, String, f32)>> {

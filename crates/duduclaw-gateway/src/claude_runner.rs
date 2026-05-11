@@ -44,24 +44,71 @@ fn build_system_prompt(
     agent: &duduclaw_agent::LoadedAgent,
     citation_ctx: Option<(&str, &str, Option<&str>)>,
 ) -> String {
+    // #11 (2026-05-12) — Minimal mode shortcut. Same opt-in flag as the
+    // channel_reply path so an agent's mode choice is global. Cron path
+    // routes through here, so flipping the flag also covers cron.
+    if agent.config.prompt.mode == duduclaw_core::types::PromptMode::Minimal {
+        let sender_block = ""; // citation_ctx doesn't carry a sender — minimal omits.
+        let pinned = "";
+        return crate::prompt_minimal::build_minimal_system_prompt(
+            agent,
+            sender_block,
+            pinned,
+        );
+    }
+
     let mut parts = Vec::new();
+    // Mirror `parts` with labelled byte counts for the prompt-size audit
+    // log. Cheap (one usize per push) and gives operators per-section
+    // visibility when the 200K cliff fires.
+    let mut audit: Vec<crate::prompt_audit::PromptSection> = Vec::new();
 
     if let Some(soul) = &agent.soul {
-        parts.push(format!("# Soul\n{}", soul.trim_end()));
+        let s = format!("# Soul\n{}", soul.trim_end());
+        audit.push(crate::prompt_audit::PromptSection::new("soul", &s));
+        parts.push(s);
     }
     if let Some(identity) = &agent.identity {
-        parts.push(format!("# Identity\n{}", identity.trim_end()));
+        let s = format!("# Identity\n{}", identity.trim_end());
+        audit.push(crate::prompt_audit::PromptSection::new("identity", &s));
+        parts.push(s);
     }
 
-    // Sort skills by name for deterministic ordering (cache-friendly)
+    // Sort skills by name for deterministic ordering (cache-friendly).
+    // #6.2b: cap the unbounded loop at DEFAULT_LEGACY_SKILL_BYTE_CAP so
+    // an over-stuffed `SKILLS/` directory can't single-handedly push the
+    // system prompt past the 200K cliff. Truncation footer surfaces the
+    // omitted skills so it's debuggable rather than mysterious.
     let mut skills: Vec<_> = agent.skills.iter().collect();
     skills.sort_by(|a, b| a.name.cmp(&b.name));
-    for skill in skills {
-        parts.push(format!("# Skill: {}\n{}", skill.name, skill.content.trim_end()));
+    let pairs: Vec<(String, String)> = skills
+        .iter()
+        .map(|s| (s.name.clone(), s.content.trim_end().to_string()))
+        .collect();
+    let (rendered, footer) = crate::prompt_audit::budgeted_legacy_skills(
+        &pairs,
+        crate::prompt_audit::DEFAULT_LEGACY_SKILL_BYTE_CAP,
+    );
+    let mut skills_total_bytes: usize = 0;
+    for s in rendered {
+        skills_total_bytes += s.len();
+        parts.push(s);
+    }
+    if let Some(note) = footer {
+        skills_total_bytes += note.len();
+        parts.push(note);
+    }
+    if skills_total_bytes > 0 {
+        audit.push(crate::prompt_audit::PromptSection {
+            label: "skills",
+            bytes: skills_total_bytes,
+        });
     }
 
     if let Some(memory) = &agent.memory {
-        parts.push(format!("# Memory\n{}", memory.trim_end()));
+        let s = format!("# Memory\n{}", memory.trim_end());
+        audit.push(crate::prompt_audit::PromptSection::new("memory", &s));
+        parts.push(s);
     }
 
     // Wiki knowledge injection — L0 (Identity) + L1 (Core) pages
@@ -79,7 +126,9 @@ fn build_system_prompt(
         };
         match result {
             Ok(wiki_ctx) if !wiki_ctx.is_empty() => {
-                parts.push(format!("# Wiki Knowledge\n{}", wiki_ctx.trim_end()));
+                let s = format!("# Wiki Knowledge\n{}", wiki_ctx.trim_end());
+                audit.push(crate::prompt_audit::PromptSection::new("wiki", &s));
+                parts.push(s);
             }
             Ok(_) => {}
             Err(e) => {
@@ -91,8 +140,19 @@ fn build_system_prompt(
     // Behavioral contract boundaries — must_not / must_always rules.
     let contract_prompt = duduclaw_agent::contract::contract_to_prompt(&agent.contract);
     if !contract_prompt.is_empty() {
+        audit.push(crate::prompt_audit::PromptSection::new(
+            "contract",
+            &contract_prompt,
+        ));
         parts.push(contract_prompt);
     }
+
+    crate::prompt_audit::maybe_log_breakdown(
+        &agent.config.agent.name,
+        "claude_runner",
+        &audit,
+        crate::prompt_audit::DEFAULT_EMIT_THRESHOLD_BYTES,
+    );
 
     parts.join("\n\n---\n\n")
 }
@@ -263,6 +323,11 @@ pub async fn call_claude_for_agent_with_type(
     let local_config = agent.config.model.local.clone();
     let api_mode = agent.config.model.api_mode.clone();
     let capabilities = agent.config.capabilities.clone();
+    // #15 (2026-05-12) — agent's opt-in to Claude CLI `--bare` mode.
+    // Read here so the rest of this function (and the rotator path)
+    // can wrap subprocess invocations in a `BARE_MODE` scope and
+    // know to filter the rotator to API-key accounts.
+    let cli_bare_mode = agent.config.prompt.cli_bare_mode;
     drop(reg);
 
     // Pending Task Queue is computed from the Task Board so the agent
@@ -319,7 +384,7 @@ pub async fn call_claude_for_agent_with_type(
             let wd = effective_work_dir(&agent_dir);
             let primary_result = call_with_rotation(
                 home_dir, agent_id, prompt, &claude_model, &system_prompt_inlined,
-                request_type, Some(&capabilities), wd.as_deref(),
+                request_type, Some(&capabilities), wd.as_deref(), cli_bare_mode,
             ).await;
             return match primary_result {
                 Ok(text) => Ok(text),
@@ -333,7 +398,7 @@ pub async fn call_claude_for_agent_with_type(
                     emit_llm_fallback_audit(home_dir, agent_id, &claude_model, &fallback_model, e).await;
                     call_with_rotation(
                         home_dir, agent_id, prompt, &fallback_model, &system_prompt_inlined,
-                        request_type, Some(&capabilities), wd.as_deref(),
+                        request_type, Some(&capabilities), wd.as_deref(), cli_bare_mode,
                     ).await.map_err(|fe| format_fallback_error_message(&claude_model, e, &fallback_model, &fe))
                 }
                 Err(e) => Err(e),
@@ -400,7 +465,7 @@ pub async fn call_claude_for_agent_with_type(
         info!(agent = %agent_name, model = %claude_model, "Calling Claude CLI (SDK primary)");
         match call_with_rotation(
             home_dir, agent_id, prompt, &claude_model, &system_prompt_inlined, request_type,
-            Some(&capabilities), wd.as_deref(),
+            Some(&capabilities), wd.as_deref(), cli_bare_mode,
         ).await {
             Ok(text) => return Ok(text),
             Err(e) => {
@@ -424,7 +489,7 @@ pub async fn call_claude_for_agent_with_type(
                     emit_llm_fallback_audit(home_dir, agent_id, &claude_model, &fallback_model, &e).await;
                     return call_with_rotation(
                         home_dir, agent_id, prompt, &fallback_model, &system_prompt_inlined,
-                        request_type, Some(&capabilities), wd.as_deref(),
+                        request_type, Some(&capabilities), wd.as_deref(), cli_bare_mode,
                     ).await.map_err(|fe| format_fallback_error_message(&claude_model, &e, &fallback_model, &fe));
                 } else if api_mode == "auto" && is_rate {
                     // No model fallback available: all OAuth accounts rate-limited
@@ -802,6 +867,7 @@ async fn call_with_rotation(
     request_type: crate::cost_telemetry::RequestType,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
     work_dir: Option<&Path>,
+    bare_mode: bool,
 ) -> Result<String, String> {
     // Pre-flight: check 200K price cliff
     if let Some(estimated) = crate::cost_telemetry::check_price_cliff(system_prompt, prompt) {
@@ -818,6 +884,17 @@ async fn call_with_rotation(
     // env (user's default `claude auth login` session). Matches the same guard
     // in `call_claude_cli_rotated` so both paths behave identically.
     if rotator.count().await == 0 {
+        if bare_mode {
+            // `--bare` strips ambient OAuth, so a fresh install with no
+            // rotator accounts and bare_mode opted-in can't possibly work.
+            // Fail loud here rather than producing a "Not logged in"
+            // error from the subprocess.
+            return Err(format!(
+                "agent {agent_id} has `[prompt] cli_bare_mode = true` but no \
+                 accounts are configured in the rotator. Add an API-key \
+                 account or remove the bare_mode flag."
+            ));
+        }
         info!(agent_id, "No rotator accounts — using ambient env fallback");
         let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let resp = call_claude_with_env(prompt, model, system_prompt, &empty, capabilities, work_dir).await?;
@@ -839,9 +916,29 @@ async fn call_with_rotation(
             None => break,
         };
 
-        info!(account = %selected.id, method = ?selected.auth_method, attempt, "Trying account");
+        // #15 (2026-05-12): bare_mode requires ANTHROPIC_API_KEY auth.
+        // OAuth accounts can't supply that, so skip them with a hint
+        // rather than waste a subprocess on a guaranteed "Not logged in"
+        // failure. Falls through to the next account.
+        if bare_mode
+            && selected.auth_method
+                == duduclaw_agent::account_rotator::AuthMethod::OAuth
+        {
+            warn!(
+                account = %selected.id,
+                "skipping OAuth account — agent requested cli_bare_mode \
+                 which requires ANTHROPIC_API_KEY auth"
+            );
+            continue;
+        }
 
-        match call_claude_with_env(prompt, model, system_prompt, &selected.env_vars, capabilities, work_dir).await {
+        info!(account = %selected.id, method = ?selected.auth_method, attempt, bare_mode, "Trying account");
+
+        let bare_scope = BARE_MODE.scope(
+            bare_mode,
+            call_claude_with_env(prompt, model, system_prompt, &selected.env_vars, capabilities, work_dir),
+        );
+        match bare_scope.await {
             Ok(response) => {
                 // Use telemetry-based cost if usage available, else rough estimate
                 let cost = if let Some(ref usage) = response.usage {
@@ -1123,6 +1220,21 @@ tokio::task_local! {
     /// isolation is enabled.  `prepare_claude_cmd` uses this as the working
     /// directory instead of the agent's base directory.
     pub static WORKTREE_PATH: Option<std::path::PathBuf>;
+
+    /// **#15 (2026-05-12)** — when set to `true`, `prepare_claude_cmd`
+    /// adds `--bare` to the spawned `claude` subprocess. This disables
+    /// CLAUDE.md auto-discovery (the leak documented in #15's spike)
+    /// at the cost of OAuth/keychain auth — the caller must arrange
+    /// for `ANTHROPIC_API_KEY` to be present in env_vars.
+    ///
+    /// Callers should only set this scope when:
+    ///   (a) the agent opted in via `[prompt] cli_bare_mode = true`, AND
+    ///   (b) an `AuthMethod::ApiKey` account is available in the rotator
+    ///       (or the call site otherwise provides an API key).
+    ///
+    /// Default value is `false`. Out-of-scope reads (i.e. no
+    /// `BARE_MODE.scope(...)` wrapping) safely return `false`.
+    pub static BARE_MODE: bool;
 }
 
 /// Prepare a `claude` CLI command with common args and env vars.
@@ -1144,6 +1256,16 @@ fn prepare_claude_cmd(
     if let Some(dir) = work_dir {
         cmd.current_dir(dir);
     }
+    // #15 (2026-05-12) — opt in to `--bare` when the calling site has
+    // wrapped this invocation in a `BARE_MODE.scope(true, ...)`. The
+    // flag disables CLAUDE.md auto-discovery (the leak from #15's
+    // spike) at the cost of OAuth — caller is responsible for setting
+    // `ANTHROPIC_API_KEY` in env_vars.
+    let bare_mode = BARE_MODE.try_with(|b| *b).unwrap_or(false);
+    if bare_mode {
+        cmd.arg("--bare");
+    }
+
     cmd.args([
         "-p", prompt,
         "--model", model,

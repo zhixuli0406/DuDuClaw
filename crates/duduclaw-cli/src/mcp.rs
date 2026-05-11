@@ -5302,6 +5302,45 @@ fn mcp_text(msg: &str) -> Value {
 
 // ── Skill management handlers ───────────────────────────────
 
+/// Pull the `description` field out of a skill's YAML frontmatter without
+/// touching the filesystem. Used by `handle_skill_list` after the skill
+/// content has already been loaded by `AgentRegistry::load_skills`.
+///
+/// Tolerant of: missing frontmatter, unterminated frontmatter, missing
+/// `description` key, quoted vs. unquoted values. Returns an empty
+/// string in any failure mode — UI just shows a blank description rather
+/// than skipping the skill.
+fn parse_skill_description_from_content(content: &str) -> String {
+    let trimmed = content.trim_start();
+    let after = match trimmed.strip_prefix("---") {
+        Some(rest) => rest.trim_start_matches(['\r', '\n']),
+        None => return String::new(),
+    };
+    let yaml_end = match after.find("\n---") {
+        Some(idx) => idx,
+        None => return String::new(),
+    };
+    let yaml_block = &after[..yaml_end];
+
+    // Find the `description:` line. Manual parse instead of yaml-rs to
+    // stay zero-cost on the hot path and tolerate slightly malformed
+    // frontmatter (which yaml-rs would reject outright).
+    for raw_line in yaml_block.lines() {
+        let line = raw_line.trim_start();
+        if let Some(rest) = line.strip_prefix("description:") {
+            let value = rest.trim();
+            // Strip surrounding quotes if present.
+            let value = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                .unwrap_or(value);
+            return value.to_string();
+        }
+    }
+    String::new()
+}
+
 /// Search the local skill registry.
 async fn handle_skill_search(params: &Value, home_dir: &Path) -> Value {
     let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
@@ -5349,58 +5388,34 @@ async fn handle_skill_list(params: &Value, home_dir: &Path) -> Value {
         agent_id.to_string()
     };
 
-    // Collect global skills from ~/.duduclaw/skills/
+    // Collect global skills from ~/.duduclaw/skills/.
+    //
+    // 2026-05-11: switched from flat `read_dir` to the recursive
+    // `AgentRegistry::load_skills` so the Anthropic Skills spec
+    // (`<skill-name>/SKILL.md`) is honoured alongside the legacy flat
+    // `<skill>.md` layout. The only thing we need on top of `load_skills`
+    // is the per-skill `description` for display — re-parse it from the
+    // already-loaded content, no second `read_dir` round-trip.
     let global_skills_dir = home_dir.join("skills");
     let mut global_skills = Vec::new();
     let mut global_names = std::collections::HashSet::new();
 
-    if let Ok(mut entries) = tokio::fs::read_dir(&global_skills_dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                let name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("?")
-                    .to_string();
-
-                let meta = duduclaw_agent::skill_loader::parse_skill_file(&path).ok();
-                let desc = meta
-                    .as_ref()
-                    .map(|m| m.meta.description.clone())
-                    .unwrap_or_default();
-
-                global_names.insert(name.clone());
-                global_skills.push(format!("- {name}: {desc} (global)"));
-            }
-        }
+    for sk in
+        duduclaw_agent::registry::AgentRegistry::load_skills(&global_skills_dir).await
+    {
+        let desc = parse_skill_description_from_content(&sk.content);
+        global_names.insert(sk.name.clone());
+        global_skills.push(format!("- {}: {} (global)", sk.name, desc));
     }
 
     // Collect agent-local skills from ~/.duduclaw/agents/<agent>/SKILLS/
     let skills_dir = home_dir.join("agents").join(&agent_name).join("SKILLS");
     let mut agent_skills = Vec::new();
 
-    if let Ok(mut entries) = tokio::fs::read_dir(&skills_dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                let name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("?")
-                    .to_string();
-
-                let meta = duduclaw_agent::skill_loader::parse_skill_file(&path).ok();
-                let desc = meta
-                    .as_ref()
-                    .map(|m| m.meta.description.clone())
-                    .unwrap_or_default();
-
-                // If agent-local overrides a global skill, mark it
-                let suffix = if global_names.contains(&name) { " (override)" } else { "" };
-                agent_skills.push(format!("- {name}: {desc}{suffix}"));
-            }
-        }
+    for sk in duduclaw_agent::registry::AgentRegistry::load_skills(&skills_dir).await {
+        let desc = parse_skill_description_from_content(&sk.content);
+        let suffix = if global_names.contains(&sk.name) { " (override)" } else { "" };
+        agent_skills.push(format!("- {}: {}{}", sk.name, desc, suffix));
     }
 
     // Remove global skills that are overridden by agent-local
@@ -8572,22 +8587,30 @@ async fn handle_skill_extract(args: &Value, home_dir: &Path, default_agent: &str
         return tool_text(&format!("Skill '{}' has already been extracted to wiki.", skill_name));
     }
 
-    // Find the skill file
+    // Find the skill file. Try both layouts (Anthropic spec preferred):
+    //   1. <skills>/<skill_name>/SKILL.md   (Anthropic Skills spec)
+    //   2. <skills>/<skill_name>.md         (legacy DuDuClaw flat layout)
+    //   3. <skills>/<skill_name>            (raw stem already containing .md)
     let agent_dir = home_dir.join("agents").join(agent_id);
     let skills_dir = agent_dir.join("skills");
-    let skill_path = skills_dir.join(format!("{}.md", skill_name));
-
-    let skill_content = if skill_path.exists() {
-        std::fs::read_to_string(&skill_path).unwrap_or_default()
-    } else {
-        // Try without .md extension (might already include it)
-        let alt_path = skills_dir.join(skill_name);
-        if alt_path.exists() {
-            std::fs::read_to_string(&alt_path).unwrap_or_default()
-        } else {
-            return tool_error(&format!("Skill file not found: {}", skill_path.display()));
-        }
-    };
+    let candidates = [
+        skills_dir.join(skill_name).join("SKILL.md"),
+        skills_dir.join(format!("{}.md", skill_name)),
+        skills_dir.join(skill_name),
+    ];
+    let skill_content = candidates
+        .iter()
+        .find(|p| p.exists())
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    if skill_content.is_empty() {
+        return tool_error(&format!(
+            "Skill '{}' not found under {} (looked for SKILL.md and {}.md forms)",
+            skill_name,
+            skills_dir.display(),
+            skill_name
+        ));
+    }
 
     if skill_content.trim().is_empty() {
         return tool_error("Skill file is empty");
@@ -12155,6 +12178,101 @@ mod wiki_namespace_tests {
         );
     }
 
+    // ── TC-PIPELINE-MCP-01: rollout-to-skill-v2 pipeline tools all registered ───
+    // Regression guard for the 2026-05-07 incident: a stale gateway binary
+    // pre-dating commit 4bf65cb (W20-P0) reported "tool_not_in_mcp_registry"
+    // for the four tools listed below, even though the pipeline expected
+    // them. Pin every tool the pipeline touches so any future move that
+    // hides one of them under `is_external=true` (or removes it) breaks the
+    // build instead of silently breaking the pipeline.
+    #[test]
+    fn rollout_to_skill_pipeline_tools_visible_to_internal_principal() {
+        use serde_json::json;
+
+        let response = super::handle_tools_list(&json!(1), /* is_external= */ false);
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools must be array");
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or(""))
+            .collect();
+
+        for required in &[
+            "memory_episodic_pressure",
+            "skill_synthesis_status",
+            "skill_synthesis_run",
+            "activity_post",
+        ] {
+            assert!(
+                names.contains(required),
+                "internal principal must see {required}; got: {names:?}"
+            );
+        }
+    }
+
+    // ── TC-MCP-EXTERNAL-WHITELIST-01: pipeline tools NOT exposed to external ────
+    // Companion to the regression test above — security guard. External MCP
+    // clients (Claude Desktop, third-party connectors) must NEVER see the
+    // pipeline orchestration tools, regardless of how the registry is
+    // refactored. Hard-pinned to the W19-P0 BUG-QA-001 whitelist.
+    #[test]
+    fn rollout_to_skill_pipeline_tools_hidden_from_external_principal() {
+        use serde_json::json;
+
+        let response = super::handle_tools_list(&json!(1), /* is_external= */ true);
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools must be array");
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or(""))
+            .collect();
+
+        for forbidden in &[
+            "memory_episodic_pressure",
+            "skill_synthesis_status",
+            "skill_synthesis_run",
+            "activity_post",
+        ] {
+            assert!(
+                !names.contains(forbidden),
+                "external principal must NOT see {forbidden}; got: {names:?}"
+            );
+        }
+    }
+
+    // ── TC-MCP-SCHEMA-01: pipeline tool schemas are non-empty ────────────────
+    // Each pipeline tool must declare a non-empty description so generated
+    // tool catalogues remain self-documenting. Catches the failure mode
+    // where a refactor accidentally drops the description string.
+    #[test]
+    fn pipeline_tool_descriptions_are_non_empty() {
+        use serde_json::json;
+
+        let response = super::handle_tools_list(&json!(1), /* is_external= */ false);
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools must be array");
+
+        for required in &[
+            "memory_episodic_pressure",
+            "skill_synthesis_status",
+            "skill_synthesis_run",
+            "activity_post",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|t| t["name"].as_str() == Some(*required))
+                .unwrap_or_else(|| panic!("{required} must be present"));
+            let desc = tool["description"].as_str().unwrap_or("");
+            assert!(
+                !desc.is_empty(),
+                "{required} description must not be empty"
+            );
+        }
+    }
+
     // ── TC-SKILL-RUN-03: skill_synthesis_run schema is well-formed ───────────
     // 驗收：工具定義包含正確的 name、description 和 parameters。
     #[test]
@@ -12413,5 +12531,85 @@ mod odoo_pool_dispatch_tests {
         assert_ne!(alpha_key, beta_key);
         assert_eq!(alpha_key.1, "alpha");
         assert_eq!(beta_key.1, "beta");
+    }
+}
+
+#[cfg(test)]
+mod skill_description_parser_tests {
+    use super::parse_skill_description_from_content;
+
+    #[test]
+    fn extracts_description_from_well_formed_frontmatter() {
+        let content = "---\nname: foo\ndescription: Does the foo thing\n---\n\n# Body";
+        assert_eq!(
+            parse_skill_description_from_content(content),
+            "Does the foo thing"
+        );
+    }
+
+    #[test]
+    fn handles_quoted_description_double_quotes() {
+        let content = "---\ndescription: \"Quoted description with: colons\"\n---";
+        assert_eq!(
+            parse_skill_description_from_content(content),
+            "Quoted description with: colons"
+        );
+    }
+
+    #[test]
+    fn handles_quoted_description_single_quotes() {
+        let content = "---\ndescription: 'single-quoted'\n---";
+        assert_eq!(parse_skill_description_from_content(content), "single-quoted");
+    }
+
+    #[test]
+    fn returns_empty_when_no_frontmatter() {
+        assert_eq!(parse_skill_description_from_content("just body text"), "");
+    }
+
+    #[test]
+    fn returns_empty_when_frontmatter_unterminated() {
+        // No closing `---` — guard against panics.
+        let content = "---\ndescription: orphan\nname: foo\n";
+        assert_eq!(parse_skill_description_from_content(content), "");
+    }
+
+    #[test]
+    fn returns_empty_when_description_key_missing() {
+        let content = "---\nname: foo\nversion: 1\n---\n\nbody";
+        assert_eq!(parse_skill_description_from_content(content), "");
+    }
+
+    #[test]
+    fn ignores_description_inside_body_only_reads_frontmatter() {
+        // Body-side mention shouldn't be picked up.
+        let content =
+            "---\nname: foo\n---\n\nA `description: in body` should be ignored.";
+        assert_eq!(parse_skill_description_from_content(content), "");
+    }
+
+    #[test]
+    fn handles_crlf_line_endings() {
+        // Windows-style line endings shouldn't break parsing.
+        let content = "---\r\ndescription: windows skill\r\n---\r\n\r\nbody";
+        assert_eq!(
+            parse_skill_description_from_content(content),
+            "windows skill"
+        );
+    }
+
+    #[test]
+    fn handles_extra_whitespace_around_value() {
+        let content = "---\ndescription:   spaced out value   \n---";
+        assert_eq!(
+            parse_skill_description_from_content(content),
+            "spaced out value"
+        );
+    }
+
+    #[test]
+    fn handles_empty_frontmatter() {
+        let content = "---\n---\nbody";
+        assert_eq!(parse_skill_description_from_content(content), "");
     }
 }

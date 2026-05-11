@@ -313,6 +313,8 @@ impl GvuLoop {
                 generation: attempt,
                 relevant_mistakes: relevant_mistakes.clone(),
                 wiki_index,
+                must_always: must_always.to_vec(),
+                must_not: must_not.to_vec(),
             };
 
             let prompt = self.generator.generate(&input, &mut proposal);

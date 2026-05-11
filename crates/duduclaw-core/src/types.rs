@@ -1062,6 +1062,72 @@ pub struct AgentConfig {
     /// Session continuity is now handled by native multi-turn session management.
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// System prompt assembly mode (#11 Active Retrieval, 2026-05-12).
+    /// Default `Full` preserves v1.12.x behaviour; opt-in `Minimal` switches
+    /// to Anthropic Skills-style "index + MCP on demand" — wiki/skill
+    /// content is fetched at tool-call time instead of injected upfront.
+    /// See `commercial/docs/TODO-runtime-health-fixes-202605.md #11`.
+    #[serde(default)]
+    pub prompt: PromptConfig,
+}
+
+/// How the system prompt is assembled.
+///
+/// `Full` (default) — v1.12.x behaviour: inject SOUL/IDENTITY/CONTRACT,
+/// pre-load wiki L0+L1, all skills, team roster, pinned tasks. Caches well
+/// when nothing changes but the prefix gets large for knowledge-rich agents.
+///
+/// `Minimal` — Anthropic Skills-style: only stable core (SOUL/IDENTITY/
+/// CONTRACT) + a short MCP tool index. Agents fetch wiki / skill bodies
+/// on demand via `wiki_search` / `wiki_read` / `skill_lookup`. Designed
+/// for agents that hit the 200 K cliff because conversation history +
+/// inlined wiki together overflow the cache window.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptMode {
+    #[default]
+    Full,
+    Minimal,
+}
+
+/// System prompt assembly knobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct PromptConfig {
+    /// Assembly mode — see [`PromptMode`].
+    pub mode: PromptMode,
+    /// Soft budget for the SOUL core slice in Minimal mode, in kilobytes.
+    /// The trimmer keeps the first `minimal_core_kb` × 1024 bytes of SOUL.md
+    /// (no smarter slicing yet — first N bytes is usually persona +
+    /// principles, which is what we want). Default 5 KB ≈ 1.5 K tokens.
+    pub minimal_core_kb: u32,
+    /// **#15 (2026-05-12)** — opt in to Claude CLI's `--bare` mode for
+    /// the agent's subprocess invocations.
+    ///
+    /// When `true`:
+    /// - Cron / dispatcher Claude CLI calls add `--bare --system-prompt
+    ///   <gateway-built>` to the spawn args, preventing CLAUDE.md
+    ///   auto-discovery from leaking into the prompt.
+    /// - Auth switches from OAuth/keychain to `ANTHROPIC_API_KEY` env;
+    ///   the AccountRotator must surface an API key for this agent, or
+    ///   the spawn fails fast with an actionable error.
+    ///
+    /// The default is `false` because `--bare` is a behavioural shift
+    /// (loses OAuth, skips hooks). Operators opt in per-agent after
+    /// verifying their AccountRotator has an API key fallback.
+    ///
+    /// See [#15 in commercial/docs/TODO-runtime-health-fixes-202605.md].
+    pub cli_bare_mode: bool,
+}
+
+impl Default for PromptConfig {
+    fn default() -> Self {
+        Self {
+            mode: PromptMode::Full,
+            minimal_core_kb: 5,
+            cli_bare_mode: false,
+        }
+    }
 }
 
 /// Legacy memory configuration — no longer consumed at runtime.
