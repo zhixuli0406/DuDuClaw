@@ -132,5 +132,10 @@ pub fn build_distillation_input(
         generation: 1,
         relevant_mistakes: vec![],
         wiki_index: wiki_index.map(String::from),
+        // Distillation runs after a skill graduates and is independent of
+        // CONTRACT.toml; pass empty constraints — the GVU loop callsite is
+        // where contract enforcement is wired in.
+        must_always: vec![],
+        must_not: vec![],
     }
 }

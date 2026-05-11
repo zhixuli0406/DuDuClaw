@@ -126,6 +126,26 @@ impl SessionManager {
             "ALTER TABLE sessions ADD COLUMN pinned_instructions TEXT DEFAULT ''",
             [],
         );
+
+        // #13 (2026-05-12): async summarization columns. The background
+        // task in `session_summarizer_task::tick` writes Haiku-generated
+        // bullet summaries of older turns; channel_reply reads them to
+        // substitute for the verbatim history slice. All three columns
+        // start NULL — pre-13 sessions keep their existing behaviour
+        // because the consumer falls back to verbatim assembly when
+        // `summary_of_prior` is NULL/empty.
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN summary_of_prior TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN summarized_through_turn INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN last_summarized_at TEXT",
+            [],
+        );
         // Ignore errors — columns already exist on subsequent runs
 
         Ok(())
@@ -410,6 +430,136 @@ impl SessionManager {
         )
         .map_err(|e| DuDuClawError::Gateway(format!("set_pinned: {e}")))?;
         Ok(())
+    }
+
+    /// Read the cached summary of older turns for this session (#13).
+    ///
+    /// Returns `(summary_text, summarized_through_turn)`. When no
+    /// summary has been generated yet, summary_text is empty and
+    /// summarized_through_turn is 0 — caller falls back to verbatim
+    /// history.
+    pub async fn get_summary(&self, session_id: &str) -> Result<(String, u32)> {
+        let conn = self.acquire().await;
+        let result: std::result::Result<(Option<String>, i64), _> = conn.query_row(
+            "SELECT summary_of_prior, summarized_through_turn \
+             FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+        match result {
+            Ok((s, t)) => Ok((s.unwrap_or_default(), t.max(0) as u32)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok((String::new(), 0)),
+            Err(e) => Err(DuDuClawError::Gateway(format!("get_summary: {e}"))),
+        }
+    }
+
+    /// Write (or overwrite) the summary for a session (#13).
+    ///
+    /// Caller has the responsibility to set `through_turn` to the
+    /// inclusive turn index covered by `summary`. The background
+    /// summarizer task is the only writer in production; tests can
+    /// invoke this directly.
+    pub async fn set_summary(
+        &self,
+        session_id: &str,
+        summary: &str,
+        through_turn: u32,
+    ) -> Result<()> {
+        let conn = self.acquire().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE sessions
+             SET summary_of_prior = ?1,
+                 summarized_through_turn = ?2,
+                 last_summarized_at = ?3
+             WHERE id = ?4",
+            params![summary, through_turn as i64, now, session_id],
+        )
+        .map_err(|e| DuDuClawError::Gateway(format!("set_summary: {e}")))?;
+        Ok(())
+    }
+
+    /// Scan all sessions and emit summarization candidates (#13).
+    ///
+    /// One row per session — the background task then runs
+    /// `session_summarizer::decide_summarization` to filter / order /
+    /// quota-limit them. We intentionally don't filter at the SQL
+    /// level: the policy lives in the pure module and is easier to
+    /// test there.
+    pub async fn list_summary_candidates(
+        &self,
+    ) -> Result<Vec<crate::session_summarizer::SummaryCandidate>> {
+        let conn = self.acquire().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id, s.agent_id,
+                        (SELECT COUNT(*) FROM session_messages m WHERE m.session_id = s.id) AS turn_count,
+                        COALESCE(s.summarized_through_turn, 0) AS summarized_through_turn,
+                        s.last_summarized_at
+                 FROM sessions s",
+            )
+            .map_err(|e| DuDuClawError::Gateway(format!("list_summary_candidates prepare: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let agent_id: String = row.get(1)?;
+                let turn_count: i64 = row.get(2)?;
+                let summarized_through_turn: i64 = row.get(3)?;
+                let last: Option<String> = row.get(4)?;
+                Ok((id, agent_id, turn_count, summarized_through_turn, last))
+            })
+            .map_err(|e| DuDuClawError::Gateway(format!("list_summary_candidates query: {e}")))?;
+
+        let now = chrono::Utc::now();
+        let mut out = Vec::new();
+        for row in rows.flatten() {
+            let (id, agent_id, turn_count, summarized_through_turn, last) = row;
+            let seconds_since_last_summary = last
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds().max(0) as u64);
+            out.push(crate::session_summarizer::SummaryCandidate {
+                session_id: id,
+                agent_id,
+                turn_count: turn_count.max(0) as u32,
+                summarized_through_turn: summarized_through_turn.max(0) as u32,
+                seconds_since_last_summary,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Fetch the first N turns of a session for summarization, in order
+    /// (#13). Returns the rendered transcript ready for the prompt.
+    pub async fn read_first_n_turns_text(
+        &self,
+        session_id: &str,
+        n: u32,
+    ) -> Result<String> {
+        let conn = self.acquire().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT role, content FROM session_messages
+                 WHERE session_id = ?1 AND hidden = 0
+                 ORDER BY id ASC
+                 LIMIT ?2",
+            )
+            .map_err(|e| DuDuClawError::Gateway(format!("read_first_n prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![session_id, n as i64], |row| {
+                let role: String = row.get(0)?;
+                let content: String = row.get(1)?;
+                Ok((role, content))
+            })
+            .map_err(|e| DuDuClawError::Gateway(format!("read_first_n query: {e}")))?;
+        let mut out = String::new();
+        for (role, content) in rows.flatten() {
+            out.push_str(&role);
+            out.push_str(": ");
+            out.push_str(&content);
+            out.push('\n');
+        }
+        Ok(out)
     }
 
     /// Hide a message from the active context (Sculptor hide/restore).

@@ -74,7 +74,7 @@ pub fn start_agent_dispatcher(
     home_dir: PathBuf,
     registry: Arc<RwLock<AgentRegistry>>,
 ) -> tokio::task::JoinHandle<()> {
-    start_agent_dispatcher_with_crypto(home_dir, registry, None, None, None)
+    start_agent_dispatcher_with_crypto(home_dir, registry, None, None, None, None)
 }
 
 /// Start the dispatcher with optional encryption key for deferred GVU (review #30)
@@ -83,12 +83,18 @@ pub fn start_agent_dispatcher(
 /// `prediction_engine` (BUG-5 fix): when supplied, every successful sub-agent
 /// dispatch records a synthetic prediction cycle so sub-agents accumulate
 /// `prediction_log` rows the same way channel-facing agents do.
+///
+/// `gvu_ctx` (P1 2026-05-09): when supplied, sub-agent predictions whose
+/// composite error lands in Significant / Critical also fire the GVU loop
+/// — closing the gap that left 16/17 production agents without any
+/// `gvu_experiment_log` entries.
 pub fn start_agent_dispatcher_with_crypto(
     home_dir: PathBuf,
     registry: Arc<RwLock<AgentRegistry>>,
     encryption_key: Option<[u8; 32]>,
     message_queue: Option<Arc<crate::message_queue::MessageQueue>>,
     prediction_engine: Option<Arc<crate::prediction::engine::PredictionEngine>>,
+    gvu_ctx: Option<Arc<crate::prediction::subagent_prediction::GvuTriggerCtx>>,
 ) -> tokio::task::JoinHandle<()> {
     // Mutex protects the read-modify-write cycle on bus_queue.jsonl
     let dispatch_lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -111,8 +117,13 @@ pub fn start_agent_dispatcher_with_crypto(
             let _guard = dispatch_lock.lock().await;
 
             // Poll JSONL bus queue (legacy path — kept for backward compat)
-            if let Err(e) =
-                poll_and_dispatch(&home_dir, &registry, prediction_engine.as_ref()).await
+            if let Err(e) = poll_and_dispatch(
+                &home_dir,
+                &registry,
+                prediction_engine.as_ref(),
+                gvu_ctx.as_ref(),
+            )
+            .await
             {
                 warn!("Dispatcher poll error: {e}");
             }
@@ -124,6 +135,7 @@ pub fn start_agent_dispatcher_with_crypto(
                     &home_dir,
                     &registry,
                     prediction_engine.as_ref(),
+                    gvu_ctx.as_ref(),
                 )
                 .await
                 {
@@ -159,6 +171,7 @@ async fn poll_and_dispatch_sqlite(
     home_dir: &Path,
     registry: &Arc<RwLock<AgentRegistry>>,
     prediction_engine: Option<&Arc<crate::prediction::engine::PredictionEngine>>,
+    gvu_ctx: Option<&Arc<crate::prediction::subagent_prediction::GvuTriggerCtx>>,
 ) -> Result<(), String> {
     let messages = queue.pending_messages(10).await?;
     if messages.is_empty() {
@@ -218,6 +231,7 @@ async fn poll_and_dispatch_sqlite(
                     msg.origin_agent.clone(),
                     msg.payload.clone(),
                     response.clone(),
+                    gvu_ctx.cloned(),
                 );
                 info!(
                     msg_id = %msg.id,
@@ -371,6 +385,7 @@ async fn poll_and_dispatch(
     home_dir: &Path,
     registry: &Arc<RwLock<AgentRegistry>>,
     prediction_engine: Option<&Arc<crate::prediction::engine::PredictionEngine>>,
+    gvu_ctx: Option<&Arc<crate::prediction::subagent_prediction::GvuTriggerCtx>>,
 ) -> Result<(), String> {
     let queue_path = home_dir.join("bus_queue.jsonl");
 
@@ -502,6 +517,7 @@ async fn poll_and_dispatch(
         let queue = queue.clone();
         let notebook = notebook.clone();
         let pe_for_task = prediction_engine.cloned();
+        let gvu_ctx_for_task = gvu_ctx.cloned();
 
         // (review BLOCKER R4) Forward turn_id / session_id so the sub-agent
         // chain re-establishes the citation tracking context. Without this,
@@ -703,6 +719,7 @@ async fn poll_and_dispatch(
                     msg.origin_agent.clone(),
                     msg.payload.clone(),
                     response_for_callback.clone(),
+                    gvu_ctx_for_task.clone(),
                 );
             }
 

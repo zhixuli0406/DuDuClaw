@@ -65,21 +65,42 @@ pub fn verify_deterministic(
         ));
     }
 
-    // Check: no must_not patterns in the final SOUL.md (simulated)
-    let lower_final = simulated_final.to_lowercase();
+    // Check: no must_not patterns *newly introduced* by the proposal.
+    //
+    // Catch-22 fix (#7, 2026-05-10): we used to check `simulated_final` here,
+    // but agents commonly mirror their must_not rules verbatim into SOUL.md
+    // as a self-reminder ("don't do X"). Once that happens the rule statement
+    // itself lives in `current_soul`, so `simulated_final` always contains it
+    // and L1 rejects every proposal — observed on agnes 2026-05-10 where
+    // 3 generations ran and all failed for "Final SOUL.md would contain
+    // forbidden pattern: '代理其他 agent 撰寫意見...'".
+    //
+    // Semantic alignment: must_not should mean "the proposal must not
+    // introduce this pattern", parallel to the sensitive-pattern check
+    // below (which already runs on `proposed_content`). If operators want
+    // to force-strip an existing pattern from SOUL.md they should hand-edit
+    // — GVU isn't in the business of unwinding human-authored content.
+    let lower_proposed = proposed_content.to_lowercase();
     for pattern in must_not {
         let lower_pattern = pattern.to_lowercase();
-        if lower_final.contains(&lower_pattern) {
+        if lower_proposed.contains(&lower_pattern) {
             return Err(TextGradient::blocking(
                 "L1-Deterministic",
-                "simulated_final",
-                &format!("Final SOUL.md would contain forbidden pattern: '{pattern}'"),
+                "proposal.content",
+                &format!("Proposed content introduces forbidden pattern: '{pattern}'"),
                 &format!("Remove or rephrase the section containing '{pattern}'"),
             ));
         }
     }
 
-    // Check: must_always patterns must be present in the final SOUL.md
+    // Check: must_always patterns must be present in the final SOUL.md.
+    //
+    // This still checks `simulated_final` because the semantics differ
+    // from must_not: must_always is a STATE invariant ("the rule must
+    // remain visible to the agent"), not an INCREMENT check. P0 #2 fixed
+    // the symmetric issue on the Generator side — it now proactively
+    // re-introduces missing must_always patterns into the proposal.
+    let lower_final = simulated_final.to_lowercase();
     for pattern in must_always {
         let lower_pattern = pattern.to_lowercase();
         if !lower_final.contains(&lower_pattern) {

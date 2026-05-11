@@ -9,13 +9,14 @@
 //!    so the absence of organic triggers is itself observable.
 //! 2. Apply a per-agent **4-hour cooldown** so the heartbeat scheduler can't
 //!    cause the same agent to fire repeatedly during e.g. a long downtime.
-//!
-//! Triggering an actual GVU loop here would require ferrying a great deal of
-//! per-agent state (SOUL.md path, contract, mistake notebook, LLM caller…)
-//! out of `channel_reply` and into a free-standing helper. The P0 scope is
-//! "make silence visible and stop it pretending"; the deeper hook into GVU
-//! is left to the natural next-conversation path, where all the dependencies
-//! are already wired.
+//! 3. (P1, 2026-05-09) When a `GvuTriggerCtx` is wired in, also invoke the
+//!    GVU loop directly via [`crate::gvu::trigger::maybe_run_gvu`] with
+//!    [`TriggerSource::ForcedReflection`]. Before this hook, sub-agents
+//!    that never see a channel message could only ever record the
+//!    `silence_breaker` event — the actual reflection it asked for never
+//!    materialized because there was no "next conversation" to piggy-back
+//!    on. The trigger helper enforces its own eligibility gate so agents
+//!    with `gvu_enabled = false` short-circuit safely.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,7 +26,9 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::prediction::engine::PredictionEngine;
+use crate::gvu::trigger::{maybe_run_gvu, TriggerSource};
+use crate::prediction::engine::{ErrorCategory, PredictionEngine};
+use crate::prediction::subagent_prediction::GvuTriggerCtx;
 
 /// In-process cooldown table keyed by agent_id.
 ///
@@ -119,10 +122,16 @@ pub async fn fire_forced_reflection(
 ///
 /// `cooldown` is shared so all fires through the same gateway use the same
 /// per-agent cool-down state.
+///
+/// `gvu_ctx` (P1, 2026-05-09): when supplied, a fired silence-breaker also
+/// invokes the GVU loop via [`maybe_run_gvu`]. The helper enforces its own
+/// eligibility (gvu_enabled, contract presence, …) — passing `None` falls
+/// back to the v1.12.3 behaviour where the silence event is only logged.
 pub fn spawn_silence_event_consumer(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<duduclaw_agent::SilenceBreakerEvent>,
     prediction_engine: Arc<PredictionEngine>,
     cooldown: Arc<SilenceBreakerCooldown>,
+    gvu_ctx: Option<Arc<GvuTriggerCtx>>,
 ) {
     tokio::spawn(async move {
         info!("SilenceBreaker consumer started");
@@ -141,6 +150,55 @@ pub fn spawn_silence_event_consumer(
                     agent = %event.agent_id,
                     "Silence breaker event ignored (cool-down active)"
                 );
+                continue;
+            }
+
+            // The cooldown has cleared and we recorded the silence event.
+            // If a GVU context is wired in, also fire the loop so silent
+            // sub-agents actually evolve instead of just accumulating
+            // silence_breaker rows. We synthesise a Critical-category
+            // outcome because the event itself signals "12h+ of nothing
+            // happened" which is meaningful enough to warrant the full
+            // self-play pass; the trigger helper still gates by
+            // `[evolution] gvu_enabled` so agents that opted out remain
+            // a no-op.
+            if let Some(ctx) = gvu_ctx.clone() {
+                let agent_dir = ctx.home_dir.join("agents").join(&event.agent_id);
+                let home_for_llm = ctx.home_dir.clone();
+                let extra = format!(
+                    "Silence breaker fired after {hours:.1}h without an organic \
+                     evolution trigger. Treating this as a Critical reflection \
+                     opportunity so SOUL.md can be re-tuned even when no recent \
+                     conversation produced a prediction error.",
+                    hours = event.hours,
+                );
+                let call_llm = move |prompt: String| {
+                    let h = home_for_llm.clone();
+                    async move {
+                        crate::channel_reply::call_claude_cli_public(
+                            &prompt,
+                            "claude-haiku-4-5",
+                            "",
+                            &h,
+                        )
+                        .await
+                    }
+                };
+                let _ = maybe_run_gvu(
+                    Some(ctx.gvu_loop.clone()),
+                    prediction_engine.clone(),
+                    ctx.notebook.clone(),
+                    &event.agent_id,
+                    &agent_dir,
+                    // composite_error: Critical-band synthetic value — only
+                    // the magnitude matters because category is forced below.
+                    1.0,
+                    ErrorCategory::Critical,
+                    TriggerSource::ForcedReflection,
+                    Some(&extra),
+                    call_llm,
+                )
+                .await;
             }
         }
         warn!("SilenceBreaker consumer channel closed — exiting");
@@ -226,5 +284,37 @@ mod tests {
         assert!(cooldown.try_acquire("b", now).await);
         // Re-fire on `a` — blocked.
         assert!(!cooldown.try_acquire("a", now).await);
+    }
+
+    /// Ensure the v1.12.3 behaviour is preserved when no GvuTriggerCtx is
+    /// supplied: the consumer still records silence_breaker events and
+    /// honours cooldown, without ever attempting to fire GVU. This is the
+    /// regression guard for the #3.3 wiring — if a future refactor makes
+    /// `gvu_ctx = None` accidentally hit a code path that requires a
+    /// non-None ctx, this test will panic instead of silently regressing.
+    #[tokio::test]
+    async fn consumer_without_gvu_ctx_still_records_silence_event() {
+        let tmp = TempDir::new().unwrap();
+        let engine = make_engine(&tmp);
+        let cooldown = Arc::new(SilenceBreakerCooldown::default_4h());
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        spawn_silence_event_consumer(rx, engine.clone(), cooldown, None);
+
+        tx.send(duduclaw_agent::SilenceBreakerEvent {
+            agent_id: "ghost-agent".to_string(),
+            hours: 13.0,
+            timestamp: Utc::now(),
+        })
+        .unwrap();
+
+        // Wait for the spawned task to consume + persist.
+        for _ in 0..50 {
+            if count_silence_events(&tmp.path().join("prediction.db"), "ghost-agent") > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("silence_breaker event never persisted (None gvu_ctx path)");
     }
 }

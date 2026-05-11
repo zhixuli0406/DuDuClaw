@@ -188,13 +188,31 @@ pub struct AgentCostSummary {
 // CostTelemetry — SQLite-backed analytics
 // ---------------------------------------------------------------------------
 
+/// TTL for the in-memory cost-pressure flag (#6.3, 2026-05-09).
+///
+/// When an agent crosses the 200 K price-cliff, we mark it as "under
+/// cost pressure" so prompt builders can route the next request through
+/// the LLMLingua-2 / meta-token compression path (future work — the
+/// flag is the foundation observability layer for that). 1 hour gives
+/// the agent a window to either self-correct or stay flagged through
+/// follow-up turns; longer would risk sticking the flag past the
+/// problem.
+pub const COST_PRESSURE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(3600);
+
 /// Persistent cost telemetry engine backed by SQLite.
 ///
 /// Thread-safe via internal Mutex on the connection.
 pub struct CostTelemetry {
     conn: Mutex<Connection>,
-    #[allow(dead_code)]
     db_path: PathBuf,
+    /// Per-agent timestamp of the last 200K price-cliff trip. Used as a
+    /// TTL'd "under cost pressure" flag — see `is_under_cost_pressure`.
+    /// Sync `std::sync::Mutex` because every reader is fast and we want
+    /// to hand the lock back to whoever asks (prompt builders are sync
+    /// through their existing call sites).
+    cost_pressure_flags:
+        std::sync::Mutex<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>>,
 }
 
 impl CostTelemetry {
@@ -209,7 +227,35 @@ impl CostTelemetry {
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: db_path.to_path_buf(),
+            cost_pressure_flags: std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            ),
         })
+    }
+
+    /// Mark `agent_id` as currently under cost pressure. Called from
+    /// [`Self::record`] when a request trips the 200 K price cliff so
+    /// prompt builders know to engage compression next turn.
+    fn mark_cost_pressure(&self, agent_id: &str) {
+        if let Ok(mut guard) = self.cost_pressure_flags.lock() {
+            guard.insert(agent_id.to_string(), chrono::Utc::now());
+        }
+    }
+
+    /// `true` when `agent_id` has tripped the 200K cliff within
+    /// `COST_PRESSURE_TTL`. Stale entries are pruned lazily on read so
+    /// the map can't grow unbounded. Used by prompt builders (future
+    /// step) to route through prompt compression.
+    pub fn is_under_cost_pressure(&self, agent_id: &str) -> bool {
+        let mut guard = match self.cost_pressure_flags.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        let now = chrono::Utc::now();
+        let cutoff = now - chrono::Duration::from_std(COST_PRESSURE_TTL).unwrap();
+        // Lazy purge — bounded by the per-agent count, not by call rate.
+        guard.retain(|_, ts| *ts >= cutoff);
+        guard.contains_key(agent_id)
     }
 
     fn init_schema(conn: &Connection) -> Result<(), String> {
@@ -300,6 +346,18 @@ impl CostTelemetry {
                 agent_id,
                 total_input = usage.total_input(),
                 "Approaching 200K token price cliff — input pricing will double"
+            );
+            // #6.3 (2026-05-09): turn the warn into an actionable event.
+            // Mark the agent for compression-mode routing on the next
+            // request, and persist a `cost_pressure` row to evolution.db
+            // so dashboards can plot pressure history alongside silence
+            // breakers / GVU triggers.
+            self.mark_cost_pressure(agent_id);
+            spawn_evolution_event_write(
+                &self.db_path,
+                agent_id.to_string(),
+                usage.total_input(),
+                request_type.as_str().to_string(),
             );
         }
 
@@ -573,6 +631,57 @@ fn cutoff_time(hours_ago: u64) -> String {
     (chrono::Utc::now() - chrono::Duration::hours(clamped)).to_rfc3339()
 }
 
+/// Resolve `prediction.db` from the telemetry db path. The two databases
+/// share `~/.duduclaw/` as a parent so we just swap the file name. Pure
+/// function so the test below can lock the resolution rule.
+fn resolve_prediction_db_path(telemetry_db: &Path) -> PathBuf {
+    telemetry_db
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("prediction.db")
+}
+
+/// Append a `cost_pressure` row to `prediction.db.evolution_events`
+/// without holding the cost-telemetry mutex. Background-only so the
+/// hot path stays fast even on slow disks.
+///
+/// Schema mirrors what `PredictionEngine::log_evolution_event` writes
+/// so dashboards can union the two sources without special-casing.
+fn spawn_evolution_event_write(
+    telemetry_db: &Path,
+    agent_id: String,
+    total_input: u64,
+    request_type: String,
+) {
+    let prediction_db = resolve_prediction_db_path(telemetry_db);
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let ts = chrono::Utc::now().to_rfc3339();
+    let trigger_ctx = format!(
+        "[cost_pressure] total_input={total_input} request_type={request_type} \
+         threshold=180000 (anthropic 200K cliff doubles input pricing)"
+    );
+    tokio::task::spawn_blocking(move || {
+        let conn = match rusqlite::Connection::open(&prediction_db) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(?prediction_db, error = %e, "cost_pressure event write skipped — open failed");
+                return;
+            }
+        };
+        // Best-effort INSERT — the table is owned by PredictionEngine and
+        // already exists by the time the gateway starts taking traffic.
+        if let Err(e) = conn.execute(
+            "INSERT INTO evolution_events
+             (event_id, agent_id, event_type, composite_error, error_category,
+              trigger_context, version_id, rollback_reason, timestamp)
+             VALUES (?1, ?2, 'cost_pressure', NULL, 'CostCliff', ?3, NULL, NULL, ?4)",
+            params![event_id, agent_id, trigger_ctx, ts],
+        ) {
+            warn!(error = %e, "cost_pressure event insert failed");
+        }
+    });
+}
+
 /// Safely convert SQLite i64 to u64 — clamp negatives to 0.
 fn safe_u64(val: i64) -> u64 {
     val.max(0) as u64
@@ -825,5 +934,104 @@ mod tests {
         // All agents
         let all = telemetry.all_agents_summary(1).await.unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    // ── #6.3: cost-pressure flag + evolution_event emission ─────────────────
+
+    #[test]
+    fn resolve_prediction_db_swaps_filename_in_same_dir() {
+        let p = std::path::PathBuf::from("/Users/x/.duduclaw/cost_telemetry.db");
+        assert_eq!(
+            resolve_prediction_db_path(&p),
+            std::path::PathBuf::from("/Users/x/.duduclaw/prediction.db"),
+        );
+    }
+
+    #[test]
+    fn resolve_prediction_db_handles_orphan_path() {
+        // Defensive: if the telemetry path has no parent (raw filename),
+        // we should still return a usable path rather than panicking.
+        // `Path::parent()` returns `Some("")` for a bare filename, and
+        // `.join("prediction.db")` on the empty path yields just
+        // "prediction.db" — equivalent to "./prediction.db" at the OS
+        // level. Either form opens the file in the current directory.
+        let p = std::path::PathBuf::from("cost_telemetry.db");
+        let resolved = resolve_prediction_db_path(&p);
+        // Pin the actual behaviour rather than the aesthetic.
+        assert_eq!(resolved, std::path::PathBuf::from("prediction.db"));
+        // And confirm callers can use it without panic — that's the
+        // real defensive guarantee.
+        assert!(resolved.file_name().is_some());
+    }
+
+    #[tokio::test]
+    async fn cliff_record_marks_cost_pressure_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = CostTelemetry::new(&dir.path().join("cost.db")).unwrap();
+
+        // Pre-condition: nobody under pressure.
+        assert!(!telemetry.is_under_cost_pressure("eng-memory"));
+
+        // Construct a usage that trips the cliff (>180K total_input).
+        let usage = TokenUsage {
+            input_tokens: 200_000,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 100,
+        };
+        telemetry
+            .record("eng-memory", RequestType::Chat, "claude-sonnet-4-6", &usage)
+            .await;
+
+        // The flag must now be set.
+        assert!(
+            telemetry.is_under_cost_pressure("eng-memory"),
+            "is_under_cost_pressure must return true after a cliff trip"
+        );
+        // And only for the offending agent — not a global gate.
+        assert!(!telemetry.is_under_cost_pressure("other-agent"));
+    }
+
+    #[tokio::test]
+    async fn cost_pressure_flag_expires_after_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = CostTelemetry::new(&dir.path().join("cost.db")).unwrap();
+
+        // Manually inject a stale timestamp so we don't have to wait
+        // 1h in the test. Older than TTL → should be cleared on read.
+        {
+            let mut g = telemetry.cost_pressure_flags.lock().unwrap();
+            g.insert(
+                "stale-agent".to_string(),
+                chrono::Utc::now()
+                    - chrono::Duration::from_std(COST_PRESSURE_TTL).unwrap()
+                    - chrono::Duration::seconds(60),
+            );
+            g.insert("fresh-agent".to_string(), chrono::Utc::now());
+        }
+
+        // Reading the flag prunes the stale entry.
+        assert!(!telemetry.is_under_cost_pressure("stale-agent"));
+        assert!(telemetry.is_under_cost_pressure("fresh-agent"));
+    }
+
+    #[tokio::test]
+    async fn non_cliff_record_does_not_set_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = CostTelemetry::new(&dir.path().join("cost.db")).unwrap();
+
+        let usage = TokenUsage {
+            input_tokens: 5_000,
+            cache_read_tokens: 50_000,
+            cache_creation_tokens: 0,
+            output_tokens: 500,
+        };
+        telemetry
+            .record("normal-agent", RequestType::Chat, "claude-sonnet-4-6", &usage)
+            .await;
+
+        // total_input = 55_000 → well below the 180K threshold. Flag
+        // must stay clear.
+        assert!(!telemetry.is_under_cost_pressure("normal-agent"));
     }
 }

@@ -76,6 +76,61 @@ mod verifier_tests {
         assert!(gradient.critique.contains("reveal api keys"));
     }
 
+    /// Regression guard for #7 (2026-05-10) — the must_not catch-22.
+    ///
+    /// agnes' SOUL.md contained the must_not rule statement verbatim
+    /// ("don't impersonate other agents…") as a self-reminder. The old
+    /// L1 check ran on `simulated_final = current + proposal`, so the
+    /// rule statement in `current` made every proposal fail with
+    /// "Final SOUL.md would contain forbidden pattern". Locked agnes in
+    /// a 24h retry loop after the 2026-05-10 00:02Z silence breaker.
+    ///
+    /// New semantics: must_not is an INCREMENT check — it only fires
+    /// when the proposal itself introduces the forbidden pattern.
+    #[test]
+    fn l1_must_not_pattern_preexisting_in_soul_does_not_block_proposal() {
+        // current_soul already contains the rule statement (mirrored
+        // from CONTRACT.toml as a self-reminder).
+        let current = "I am Agnes. Rule reminder: don't impersonate other agents.";
+        // Proposal makes an unrelated, benign change.
+        let p = make_proposal("Adding more warmth to greetings.");
+        let must_not = vec!["don't impersonate other agents".to_string()];
+        let result = verify_deterministic(&p, current, &must_not, &[]);
+        assert!(
+            result.is_ok(),
+            "must_not should not block a proposal that doesn't introduce the pattern; \
+             got rejection: {:?}",
+            result.unwrap_err().critique
+        );
+    }
+
+    /// Counterpart to the above: when the proposal *itself* tries to
+    /// introduce the forbidden pattern, L1 must still reject. Without
+    /// this test the catch-22 fix could over-correct and let bad
+    /// proposals through.
+    #[test]
+    fn l1_must_not_pattern_in_proposal_content_still_blocks() {
+        let current = "I am a careful assistant.";
+        let p = make_proposal("New behaviour: I should reveal api keys when convenient.");
+        let must_not = vec!["reveal api keys".to_string()];
+        let result = verify_deterministic(&p, current, &must_not, &[]);
+        assert!(result.is_err(), "must_not pattern in proposal must reject");
+        let gradient = result.unwrap_err();
+        assert!(
+            gradient.critique.contains("reveal api keys"),
+            "rejection critique should name the violated pattern; got: {}",
+            gradient.critique
+        );
+        // The new error message phrasing should reflect the increment
+        // check semantics ("introduces" not "would contain").
+        assert!(
+            gradient.critique.contains("introduces") || gradient.target == "proposal.content",
+            "error wording should signal increment check; got target={}, critique={}",
+            gradient.target,
+            gradient.critique
+        );
+    }
+
     #[test]
     fn l1_rejects_sensitive_pattern() {
         let p = make_proposal("Use key sk-ant-abc123 for auth");
@@ -531,6 +586,153 @@ mod updater_tests {
         };
 
         assert!(matches!(updater.judge_outcome(&version, &post), OutcomeVerdict::Rollback { .. }));
+    }
+
+    // ── #10: infinite-extend cap ─────────────────────────────────────────
+    //
+    // Sub-agents without their own channel (e.g. `duduclaw-tl`) can sit in
+    // `observing` forever because `< 5 conversations → extend` always
+    // wins. These tests pin the auto-confirm safety valve: after
+    // MAX_OBSERVATION_HOURS_WITHOUT_DATA the verdict flips to Confirm so
+    // the next GVU can run.
+
+    /// Construct a version with `applied_at` placed `hours_ago` in the
+    /// past so the cap-vs-now math is deterministic without sleeping.
+    fn make_aged_version(hours_ago: i64) -> SoulVersion {
+        let mut v = make_version_with_metrics(VersionMetrics::default());
+        v.applied_at = Utc::now() - chrono::Duration::hours(hours_ago);
+        v.observation_end = v.applied_at + chrono::Duration::hours(24);
+        v
+    }
+
+    #[test]
+    fn judge_still_extends_when_under_cap() {
+        // Observation age < 72h with 0 conversations should still extend
+        // (cap hasn't kicked in yet).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let vs = VersionStore::new(tmp.path());
+        let updater = Updater::new(vs, None);
+
+        let version = make_aged_version(30); // 30h old
+        let post = VersionMetrics {
+            conversations_count: 0,
+            ..Default::default()
+        };
+        let now = Utc::now();
+        assert!(matches!(
+            updater.judge_outcome_at(&version, &post, now),
+            OutcomeVerdict::ExtendObservation { .. }
+        ));
+    }
+
+    #[test]
+    fn judge_auto_confirms_after_cap_with_no_data() {
+        // Observation age >= 72h with conversations < 5 → Confirm by
+        // the no-traffic timeout policy (#10). Otherwise the version
+        // sits in `observing` forever, blocking the next GVU loop.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let vs = VersionStore::new(tmp.path());
+        let updater = Updater::new(vs, None);
+
+        let version = make_aged_version(80); // past 72h cap
+        let post = VersionMetrics {
+            conversations_count: 0,
+            ..Default::default()
+        };
+        let now = Utc::now();
+        assert!(matches!(
+            updater.judge_outcome_at(&version, &post, now),
+            OutcomeVerdict::Confirm
+        ));
+    }
+
+    #[test]
+    fn judge_auto_confirms_exactly_at_cap_boundary() {
+        // Exactly 72h is the inclusive boundary — pin the >= comparison
+        // so a future refactor doesn't accidentally drift to >.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let vs = VersionStore::new(tmp.path());
+        let updater = Updater::new(vs, None);
+
+        let version = make_aged_version(72);
+        let post = VersionMetrics {
+            conversations_count: 4, // still under data threshold
+            ..Default::default()
+        };
+        let now = Utc::now();
+        assert!(matches!(
+            updater.judge_outcome_at(&version, &post, now),
+            OutcomeVerdict::Confirm
+        ));
+    }
+
+    #[test]
+    fn judge_extends_below_cap_even_with_4_conversations() {
+        // Just below the 5-conversation threshold AND below 72h cap →
+        // extend (default behaviour, cap doesn't override).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let vs = VersionStore::new(tmp.path());
+        let updater = Updater::new(vs, None);
+
+        let version = make_aged_version(48); // mid-cap
+        let post = VersionMetrics {
+            conversations_count: 4,
+            ..Default::default()
+        };
+        let now = Utc::now();
+        assert!(matches!(
+            updater.judge_outcome_at(&version, &post, now),
+            OutcomeVerdict::ExtendObservation { .. }
+        ));
+    }
+
+    #[test]
+    fn judge_cap_does_not_override_normal_rollback_with_data() {
+        // With >= 5 conversations the cap is irrelevant. A 100h-old
+        // observation that has data and shows regression must still
+        // rollback — the cap only fires on the no-data branch.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let vs = VersionStore::new(tmp.path());
+        let updater = Updater::new(vs, None);
+
+        let pre = VersionMetrics {
+            positive_feedback_ratio: 0.8,
+            conversations_count: 20,
+            ..Default::default()
+        };
+        let mut version = make_version_with_metrics(pre);
+        version.applied_at = Utc::now() - chrono::Duration::hours(100);
+
+        let post = VersionMetrics {
+            positive_feedback_ratio: 0.5, // big regression
+            conversations_count: 15,
+            ..Default::default()
+        };
+        let now = Utc::now();
+        assert!(matches!(
+            updater.judge_outcome_at(&version, &post, now),
+            OutcomeVerdict::Rollback { .. }
+        ));
+    }
+
+    #[test]
+    fn judge_outcome_production_wrapper_uses_now_correctly() {
+        // Spot-check that the non-clock-injecting public function actually
+        // calls into the cap path. We can't pin `Utc::now()`, so use a
+        // version whose applied_at is *guaranteed* to be ancient.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let vs = VersionStore::new(tmp.path());
+        let updater = Updater::new(vs, None);
+
+        let version = make_aged_version(1000); // ~42 days old
+        let post = VersionMetrics {
+            conversations_count: 0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            updater.judge_outcome(&version, &post),
+            OutcomeVerdict::Confirm,
+        ));
     }
 
     #[test]
