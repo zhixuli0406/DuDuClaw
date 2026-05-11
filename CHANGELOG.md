@@ -1,6 +1,105 @@
 # Changelog
 
 
+## [1.13.0] - 2026-05-12
+
+Runtime-health overhaul covering 16 issues across two rounds. Round 1
+restores GVU/SOUL self-evolution (was effectively dead since 5/3); Round 2
+introduces architectural fixes for the cron-driven 200 K token cliff.
+
+See `commercial/docs/TODO-runtime-health-fixes-202605.md` for the
+issue-by-issue audit log with verification evidence.
+
+### Added
+
+- **`[prompt] mode = "minimal"` agent config** — opt-in Anthropic
+  Skills-style system prompt: SOUL core (≤ 5 KB) + identity + contract +
+  MCP tool index. Wiki / skill content fetched on demand instead of
+  inlined upfront. Stable prefix → near-perfect prompt-cache hit.
+  Expected cliff reduction: 75% on knowledge-rich agents.
+  (`crates/duduclaw-gateway/src/prompt_minimal.rs`)
+- **`[budget] max_input_tokens` enforcement** — when set, an agent's
+  request goes through a compression pipeline (Hermes trim → drop oldest
+  tool echoes → bisect-and-summarize) before send. `cost_pressure` flag
+  from §6.3 tightens thresholds automatically. Non-fatal: falls back to
+  full history on pipeline failure.
+  (`crates/duduclaw-gateway/src/prompt_compression.rs`)
+- **`[prompt] cli_bare_mode = true` agent config** — when set, the agent's
+  Claude CLI subprocesses launch with `--bare`, suppressing the
+  CLAUDE.md auto-discovery leak documented in the spike (see
+  TODO #15). Requires an API-key account in the rotator; OAuth accounts
+  are skipped with a warn.
+  (`crates/duduclaw-gateway/src/claude_runner.rs` `BARE_MODE` task-local)
+- **Async session summarizer** — background task (10-min cadence) folds
+  older session turns into Haiku-generated bullet summaries. Stored in
+  three new columns on `sessions` (`summary_of_prior`,
+  `summarized_through_turn`, `last_summarized_at`). `channel_reply`
+  prepends the summary as a synthetic assistant recap turn.
+  (`crates/duduclaw-gateway/src/session_summarizer*.rs`)
+- **TF-IDF wiki relevance ranking** — wiki injection now ranks L0/L1
+  pages by user-message relevance (char-bigram TF-IDF, CJK-safe) before
+  hitting the 6 KB cap. Auto-enabled, no config required; empty query
+  preserves file order for back-compat.
+  (`crates/duduclaw-gateway/src/relevance_ranker.rs`,
+   `crates/duduclaw-gateway/src/ranked_wiki_injection.rs`)
+- **`duduclaw lifecycle flush` CLI** — quarterly cold/hot separation of
+  wiki pages. Uses file mtime as access proxy (real counter deferred).
+  `--dry-run` by default; pass `--apply` to commit moves to
+  `wiki/.archive/`.
+  (`crates/duduclaw-gateway/src/lifecycle_flush.rs`)
+- **GVU trigger module** — sub-agent dispatches now fire GVU via the
+  same path as channel-facing root agents. Previously only `agnes` ever
+  evolved; now `duduclaw-tl` etc. can too.
+  (`crates/duduclaw-gateway/src/gvu/trigger.rs`)
+- **`prompt_audit` observability** — per-section byte-count breakdown
+  emitted as `INFO target=prompt_section_audit` when total exceeds 50 KB.
+  Surfaces *which* section bloated, not just that total was high.
+
+### Fixed
+
+- **`log_level` config now resolves correctly** — three-tier
+  `RUST_LOG → config.toml [general] log_level → "warn"` instead of the
+  previous hard-coded `"warn"` fallback. Restores visibility of
+  `Heartbeat firing`, `forced_reflection`, `SilenceBreaker consumer
+  started`, and other INFO-level diagnostics that were silently dropped.
+- **L1 generator `must_always` injection** — Generator now receives the
+  contract's `must_always` patterns and emits a `<must_include>` block
+  flagging any pattern absent from current SOUL. Unblocks the
+  5/3-onwards deferred loop on agnes where every generation failed the
+  same L1 check.
+- **L1 `must_not` catch-22** — now checks `proposal.content` instead of
+  `simulated_final`. Previously, agents that mirrored a `must_not` rule
+  into SOUL.md as a self-reminder would have every subsequent proposal
+  rejected because the rule statement was in `current_soul`.
+- **Discord token-check backoff** — exponential 60 → 120 → 240 → 480 → 900
+  seconds (capped 15 min) instead of flat 60 s; respects `Retry-After`
+  header. Adds 24 h sliding-window storm detector that emits a
+  `discord_invalid_session_storm` security audit event after 5 events.
+- **GVU `Skipped` log level** — `debug!` → `info!` so trigger-fired-then-silent
+  scenarios (e.g. agent in observation window) are debuggable without
+  enabling debug logging.
+- **`ObservationFinalizer` 72 h no-traffic cap** — sub-agents without
+  channel traffic no longer sit in `observing` forever. After 72 h with
+  conversations < 5, auto-confirm so the next GVU can proceed.
+- **`skill_loader` recursive scan** — supports the official Anthropic
+  Skills `<skill>/SKILL.md` layout (case-insensitive) alongside the
+  legacy flat `<name>.md` form. Nested `references/*.md` correctly
+  treated as supporting material, not separate skills. Symlink
+  containment, hidden-entry skip, 8-level depth cap.
+- **`skill_synthesis` pipeline tools** — added regression-guard tests
+  ensuring all four pipeline tools (`memory_episodic_pressure`,
+  `skill_synthesis_status`, `skill_synthesis_run`, `activity_post`) are
+  visible to internal principals. Root cause of the 5/7 incident was a
+  stale gateway binary, not missing implementation.
+
+### Stats
+
+- 1264 → 1390 tests green (+126 new unit tests)
+- 9 new modules in `duduclaw-gateway`
+- 31 files changed, +5790 / −164
+
+
+
 ## [1.12.3] - 2026-05-08
 
 Hot-fix on top of v1.12.2 — Dashboard 編輯 agent 時 evolution 與 sticker
