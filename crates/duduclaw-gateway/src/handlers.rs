@@ -5486,7 +5486,7 @@ impl MethodHandler {
         if let Some(api_key) = params.get("api_key").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
             match crate::config_crypto::encrypt_value(api_key, &self.home_dir) {
                 Some(enc) => { odoo.insert("api_key_enc".into(), toml::Value::String(enc)); }
-                None => return WsFrame::error_response("", "Encryption unavailable — cannot store API key securely. Ensure keyfile exists."),
+                None => return WsFrame::error_response("", "Could not encrypt API key — keyfile write failed (disk full or permission denied). See gateway log."),
             }
         } else {
             // Preserve existing encrypted key if not provided
@@ -5502,7 +5502,7 @@ impl MethodHandler {
         if let Some(password) = params.get("password").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
             match crate::config_crypto::encrypt_value(password, &self.home_dir) {
                 Some(enc) => { odoo.insert("password_enc".into(), toml::Value::String(enc)); }
-                None => return WsFrame::error_response("", "Encryption unavailable — cannot store password securely. Ensure keyfile exists."),
+                None => return WsFrame::error_response("", "Could not encrypt password — keyfile write failed (disk full or permission denied). See gateway log."),
             }
         } else {
             // Preserve existing encrypted password if not provided
@@ -5548,7 +5548,7 @@ impl MethodHandler {
         if let Some(secret) = params.get("webhook_secret").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
             match crate::config_crypto::encrypt_value(secret, &self.home_dir) {
                 Some(enc) => { odoo.insert("webhook_secret_enc".into(), toml::Value::String(enc)); }
-                None => return WsFrame::error_response("", "Encryption unavailable — cannot store webhook secret securely."),
+                None => return WsFrame::error_response("", "Could not encrypt webhook secret — keyfile write failed (disk full or permission denied). See gateway log."),
             }
         } else {
             // Preserve existing webhook secret
