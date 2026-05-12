@@ -30,6 +30,60 @@ fn load_keyfile(home_dir: &Path) -> Option<[u8; 32]> {
     }
 }
 
+/// Load the keyfile, **generating a fresh one if absent**. Used on the
+/// encrypt-write path — a brand-new client that has never run the CLI
+/// init flow may not have `.keyfile` yet, and a write of a new credential
+/// should not fail merely because of that. Decrypt paths intentionally
+/// stay read-only via [`load_keyfile`] so a missing keyfile never silently
+/// destroys an existing ciphertext.
+///
+/// Returns `None` only when keyfile creation itself fails (RNG failure,
+/// disk full, permission denied) — those cases are logged at `error!`.
+fn load_or_create_keyfile(home_dir: &Path) -> Option<[u8; 32]> {
+    if let Some(key) = load_keyfile(home_dir) {
+        return Some(key);
+    }
+
+    // Ensure home_dir exists so the write below can succeed on a fresh install.
+    if !home_dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(home_dir) {
+            tracing::error!(
+                path = %home_dir.display(),
+                "Failed to create DuDuClaw home dir for keyfile: {e}"
+            );
+            return None;
+        }
+    }
+
+    let key = match duduclaw_security::crypto::CryptoEngine::generate_key() {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!("Failed to generate AES-256 keyfile (RNG failure): {e}");
+            return None;
+        }
+    };
+
+    let keyfile = home_dir.join(".keyfile");
+    if let Err(e) = std::fs::write(&keyfile, key) {
+        tracing::error!(
+            path = %keyfile.display(),
+            "Failed to write new keyfile: {e}"
+        );
+        return None;
+    }
+
+    // Tighten permissions to owner-only — best-effort, don't fail the write.
+    if let Err(e) = duduclaw_core::platform::set_owner_only(&keyfile) {
+        tracing::warn!(
+            path = %keyfile.display(),
+            "Could not tighten keyfile permissions to owner-only: {e}"
+        );
+    }
+
+    tracing::info!(path = %keyfile.display(), "Generated new AES-256 keyfile");
+    Some(key)
+}
+
 /// Decrypt a base64-encoded encrypted value using the per-machine keyfile.
 pub(crate) fn decrypt_value(encrypted: &str, home_dir: &Path) -> Option<String> {
     let key = load_keyfile(home_dir).or_else(|| {
@@ -49,10 +103,20 @@ pub(crate) fn decrypt_value(encrypted: &str, home_dir: &Path) -> Option<String> 
 
 /// Encrypt a plaintext value using the per-machine keyfile.
 ///
-/// Returns `None` if encryption fails (keyfile missing, etc.).
+/// **Auto-generates the keyfile on first use**: a fresh client install may
+/// not yet have `~/.duduclaw/.keyfile`. The first credential write
+/// triggers `load_or_create_keyfile`, so the dashboard "Save" flow works
+/// even before the user ever invoked the CLI init path.
+///
+/// Returns `None` only when:
+/// - `plaintext` is empty,
+/// - the OS RNG cannot produce a key (extremely rare), or
+/// - the keyfile cannot be written (disk full / permission denied).
+///
+/// Decrypt-side helpers stay read-only by design — see [`load_keyfile`].
 pub fn encrypt_value(plaintext: &str, home_dir: &Path) -> Option<String> {
     if plaintext.is_empty() { return None; }
-    let key = load_keyfile(home_dir)?;
+    let key = load_or_create_keyfile(home_dir)?;
     let engine = duduclaw_security::crypto::CryptoEngine::new(&key).ok()?;
     engine.encrypt_string(plaintext).ok()
 }
@@ -355,5 +419,83 @@ mod tests {
             Some("tg-tok")
         );
         assert!(resolve_agent_channel_token_via_reports_to(home.path(), "x", "discord").is_none());
+    }
+
+    // ─── encrypt_value auto-generates keyfile on fresh install ─────
+
+    #[test]
+    fn encrypt_value_generates_keyfile_when_missing() {
+        // Fresh home with no .keyfile — encrypt_value should succeed and
+        // create the keyfile rather than fail the dashboard save flow.
+        let home = TempHome::new();
+        assert!(!home.path().join(".keyfile").exists());
+
+        let enc = encrypt_value("hello-world", home.path());
+        assert!(enc.is_some(), "encrypt_value should auto-create keyfile");
+
+        let keyfile = home.path().join(".keyfile");
+        assert!(keyfile.exists(), "keyfile should now exist on disk");
+        let bytes = std::fs::read(&keyfile).unwrap();
+        assert_eq!(bytes.len(), 32, "keyfile must be a 32-byte AES-256 key");
+    }
+
+    #[test]
+    fn encrypt_then_decrypt_round_trips_after_auto_create() {
+        let home = TempHome::new();
+        let plain = "round-trip-secret";
+        let enc = encrypt_value(plain, home.path()).expect("encrypt");
+        let dec = decrypt_value(&enc, home.path()).expect("decrypt");
+        assert_eq!(dec, plain);
+    }
+
+    #[test]
+    fn encrypt_value_rejects_empty_plaintext() {
+        let home = TempHome::new();
+        assert!(encrypt_value("", home.path()).is_none());
+        // And no keyfile should be created for an empty input — there is
+        // nothing to encrypt, so we should not pollute the home dir.
+        assert!(!home.path().join(".keyfile").exists());
+    }
+
+    #[test]
+    fn second_encrypt_reuses_existing_keyfile() {
+        // Two encrypts in a row must share the same key — otherwise an
+        // earlier ciphertext stored in config.toml could no longer be
+        // decrypted by a subsequent gateway start.
+        let home = TempHome::new();
+        let _ = encrypt_value("first", home.path()).expect("first encrypt");
+        let key1 = std::fs::read(home.path().join(".keyfile")).unwrap();
+        let _ = encrypt_value("second", home.path()).expect("second encrypt");
+        let key2 = std::fs::read(home.path().join(".keyfile")).unwrap();
+        assert_eq!(key1, key2, "keyfile must be stable across encrypts");
+    }
+
+    #[test]
+    fn decrypt_value_does_not_create_keyfile() {
+        // Decrypt is intentionally read-only: a missing keyfile means the
+        // ciphertext cannot be recovered, and silently minting a fresh key
+        // would permanently lose the data. The function must return None
+        // and leave the home dir untouched.
+        let home = TempHome::new();
+        let result = decrypt_value("Zm9v", home.path()); // any base64 input
+        assert!(result.is_none());
+        assert!(!home.path().join(".keyfile").exists());
+    }
+
+    #[test]
+    fn load_or_create_creates_missing_parent_dir() {
+        // If the entire DuDuClaw home dir is absent (very fresh install),
+        // the helper must mkdir -p before writing the keyfile.
+        let parent = std::env::temp_dir()
+            .join(format!("duduclaw-keytest-{}", uuid::Uuid::new_v4()));
+        // parent does NOT yet exist.
+        assert!(!parent.exists());
+
+        let key = load_or_create_keyfile(&parent);
+        assert!(key.is_some());
+        assert!(parent.join(".keyfile").exists());
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&parent);
     }
 }
