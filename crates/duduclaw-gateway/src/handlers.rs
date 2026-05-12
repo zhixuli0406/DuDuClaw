@@ -498,7 +498,7 @@ impl MethodHandler {
             "odoo.status" => { require_admin!(); self.handle_odoo_status().await }
             "odoo.config" => { require_admin!(); self.handle_odoo_config().await }
             "odoo.configure" => { require_admin!(); self.handle_odoo_configure(params).await }
-            "odoo.test" => { require_admin!(); self.handle_odoo_test().await }
+            "odoo.test" => { require_admin!(); self.handle_odoo_test(params).await }
 
             // ── User management (admin only) ─────────────────
             "users.list" => { require_admin!(); self.handle_users_list().await }
@@ -5584,25 +5584,72 @@ impl MethodHandler {
         WsFrame::ok_response("", json!({ "success": true }))
     }
 
-    /// Test the Odoo connection using stored config.
-    async fn handle_odoo_test(&self) -> WsFrame {
+    /// Test the Odoo connection.
+    ///
+    /// Two modes:
+    /// - **Inline (recommended for the dashboard "Test connection" button):** when
+    ///   `params.url` is non-empty, build a transient config from `params`
+    ///   (url / db / protocol / auth_method / username + api_key|password).
+    ///   The config is **never written to disk** — this lets the user verify
+    ///   credentials before persisting them.
+    /// - **Stored:** when no `url` in params, fall back to `config.toml`
+    ///   (original behaviour).
+    ///
+    /// Hybrid: in inline mode without an explicit credential, the saved
+    /// credential is used so you can re-test after a small URL tweak without
+    /// retyping the API key.
+    async fn handle_odoo_test(&self, params: Value) -> WsFrame {
+        let inline_url = params
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        // Always read config.toml once — needed for stored-credential fallback in inline mode.
         let config_path = self.home_dir.join("config.toml");
         let table = self.read_config_table(&config_path).await;
-        let odoo_cfg = duduclaw_odoo::OdooConfig::from_toml(&table);
 
-        if !odoo_cfg.is_configured() {
-            return WsFrame::ok_response("", json!({
-                "success": false,
-                "message": "Odoo not configured — set URL and database first",
-            }));
-        }
-
-        let credential = match self.resolve_odoo_credential(&table) {
-            Some(c) if !c.is_empty() => c,
-            _ => return WsFrame::ok_response("", json!({
-                "success": false,
-                "message": "No API key or password configured",
-            })),
+        let (odoo_cfg, credential) = if inline_url.is_some() {
+            match Self::build_test_config_from_params(&params) {
+                Ok((cfg, Some(cred))) => (cfg, cred),
+                Ok((cfg, None)) => {
+                    // No credential in params — fall back to saved one so the user
+                    // can re-test a tweaked URL without retyping the API key.
+                    match self.resolve_odoo_credential(&table) {
+                        Some(c) if !c.is_empty() => (cfg, c),
+                        _ => {
+                            return WsFrame::ok_response("", json!({
+                                "success": false,
+                                "message": "No credential — enter API key/password, or save once first",
+                            }))
+                        }
+                    }
+                }
+                Err(msg) => {
+                    return WsFrame::ok_response("", json!({
+                        "success": false,
+                        "message": msg,
+                    }))
+                }
+            }
+        } else {
+            let cfg = duduclaw_odoo::OdooConfig::from_toml(&table);
+            if !cfg.is_configured() {
+                return WsFrame::ok_response("", json!({
+                    "success": false,
+                    "message": "Odoo not configured — fill URL and database, or save first",
+                }));
+            }
+            let credential = match self.resolve_odoo_credential(&table) {
+                Some(c) if !c.is_empty() => c,
+                _ => {
+                    return WsFrame::ok_response("", json!({
+                        "success": false,
+                        "message": "No API key or password configured",
+                    }))
+                }
+            };
+            (cfg, credential)
         };
 
         match duduclaw_odoo::OdooConnector::connect(&odoo_cfg, &credential).await {
@@ -5617,10 +5664,104 @@ impl MethodHandler {
                 warn!("Odoo test connection failed: {e}");
                 WsFrame::ok_response("", json!({
                     "success": false,
-                    "message": "Connection failed — check URL, credentials, and network",
+                    "message": format!("Connection failed: {}", Self::scrub_odoo_error(&e)),
                 }))
             }
         }
+    }
+
+    /// Build a transient `OdooConfig` + credential from RPC params for the
+    /// "test before save" flow. Applies the same validation rules as
+    /// `handle_odoo_configure` so the test path can't be used to bypass them.
+    ///
+    /// Returns `(config, Some(credential))` when params include an api_key /
+    /// password, or `(config, None)` when the caller wants the handler to fall
+    /// back to the stored credential.
+    fn build_test_config_from_params(
+        params: &Value,
+    ) -> Result<(duduclaw_odoo::OdooConfig, Option<String>), String> {
+        // URL — reuse the same SSRF-safe validator as `configure`.
+        let url = match params.get("url").and_then(|v| v.as_str()).map(str::trim) {
+            Some(u) if Self::is_safe_odoo_url(u) => u,
+            Some(_) => {
+                return Err(
+                    "Odoo URL must use HTTPS (http:// only allowed for localhost/127.0.0.1)"
+                        .into(),
+                )
+            }
+            _ => return Err("Missing 'url' parameter".into()),
+        };
+
+        // Database — alphanumeric + `_` + `-`, max 63 chars.
+        let db = match params.get("db").and_then(|v| v.as_str()).map(str::trim) {
+            Some(d)
+                if !d.is_empty()
+                    && d.len() < 64
+                    && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
+            {
+                d
+            }
+            Some(_) => {
+                return Err("Invalid database name (alphanumeric, _, - only, max 63 chars)".into())
+            }
+            _ => return Err("Missing 'db' parameter".into()),
+        };
+
+        let protocol = match params.get("protocol").and_then(|v| v.as_str()) {
+            Some("xmlrpc") => "xmlrpc",
+            Some("jsonrpc") | None => "jsonrpc",
+            _ => return Err("Invalid protocol: must be 'jsonrpc' or 'xmlrpc'".into()),
+        };
+
+        let auth_method = match params.get("auth_method").and_then(|v| v.as_str()) {
+            Some("password") => "password",
+            Some("api_key") | None => "api_key",
+            _ => return Err("Invalid auth_method: must be 'api_key' or 'password'".into()),
+        };
+
+        let username = params
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if username.len() > 256 {
+            return Err("Username too long (max 256 chars)".into());
+        }
+
+        let credential_field = if auth_method == "password" { "password" } else { "api_key" };
+        let credential = params
+            .get(credential_field)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty());
+
+        let cfg = duduclaw_odoo::OdooConfig {
+            url: url.into(),
+            db: db.into(),
+            protocol: protocol.into(),
+            auth_method: auth_method.into(),
+            username: username.into(),
+            ..Default::default()
+        };
+        Ok((cfg, credential))
+    }
+
+    /// Strip identifiers that an attacker could weaponize from a connector
+    /// error before forwarding it to the dashboard.
+    ///
+    /// The reqwest error includes the full URL (with any query string) on
+    /// failure. We keep the high-level reason so the user can act on it.
+    fn scrub_odoo_error(raw: &str) -> String {
+        // Cap to avoid pushing megabyte HTML error pages back to the client.
+        const MAX_LEN: usize = 240;
+        let mut out = String::with_capacity(raw.len().min(MAX_LEN));
+        for ch in raw.chars().take(MAX_LEN) {
+            out.push(ch);
+        }
+        if raw.chars().count() > MAX_LEN {
+            out.push_str("…");
+        }
+        out
     }
 
     /// Resolve the Odoo credential from config.toml (encrypted or plaintext).
@@ -7129,5 +7270,175 @@ mod autopilot_validation_tests {
     fn action_rejects_non_object() {
         assert!(validate_autopilot_action(&Value::Null).is_err());
         assert!(validate_autopilot_action(&json!("delegate")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod odoo_test_params_tests {
+    use super::*;
+
+    fn full_params() -> Value {
+        json!({
+            "url": "https://fc00.example.com/odoo",
+            "db": "odoo_demo",
+            "protocol": "jsonrpc",
+            "auth_method": "api_key",
+            "username": "admin",
+            "api_key": "secret-key",
+        })
+    }
+
+    #[test]
+    fn happy_path_returns_config_and_credential() {
+        let (cfg, cred) = MethodHandler::build_test_config_from_params(&full_params()).unwrap();
+        assert_eq!(cfg.url, "https://fc00.example.com/odoo");
+        assert_eq!(cfg.db, "odoo_demo");
+        assert_eq!(cfg.protocol, "jsonrpc");
+        assert_eq!(cfg.auth_method, "api_key");
+        assert_eq!(cfg.username, "admin");
+        assert!(cfg.is_configured());
+        assert_eq!(cred.as_deref(), Some("secret-key"));
+    }
+
+    #[test]
+    fn missing_url_is_rejected() {
+        let p = json!({ "db": "x" });
+        let err = MethodHandler::build_test_config_from_params(&p).unwrap_err();
+        assert!(err.contains("url"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_db_is_rejected() {
+        let p = json!({ "url": "https://x.example.com" });
+        let err = MethodHandler::build_test_config_from_params(&p).unwrap_err();
+        assert!(err.contains("db"), "got: {err}");
+    }
+
+    #[test]
+    fn http_non_localhost_url_is_rejected() {
+        // SSRF guard: only HTTPS, except for strict localhost.
+        let p = json!({ "url": "http://evil.example.com", "db": "x" });
+        let err = MethodHandler::build_test_config_from_params(&p).unwrap_err();
+        assert!(err.contains("HTTPS"), "got: {err}");
+    }
+
+    #[test]
+    fn private_ip_is_rejected() {
+        let p = json!({ "url": "https://10.0.0.1", "db": "x" });
+        let err = MethodHandler::build_test_config_from_params(&p).unwrap_err();
+        assert!(err.contains("HTTPS") || err.contains("localhost"), "got: {err}");
+    }
+
+    #[test]
+    fn fc00_dotted_hostname_is_not_misclassified_as_ipv6_ula() {
+        // Regression: `fc00.example.com` shares the IPv6 ULA prefix label but is
+        // a domain — must not be rejected as a private IP.
+        let p = json!({
+            "url": "https://fc00.example.com",
+            "db": "test",
+        });
+        let res = MethodHandler::build_test_config_from_params(&p);
+        assert!(res.is_ok(), "got: {res:?}");
+    }
+
+    #[test]
+    fn invalid_db_name_is_rejected() {
+        let p = json!({ "url": "https://x.example.com", "db": "bad name!" });
+        let err = MethodHandler::build_test_config_from_params(&p).unwrap_err();
+        assert!(err.contains("database name"), "got: {err}");
+    }
+
+    #[test]
+    fn invalid_protocol_is_rejected() {
+        let p = json!({
+            "url": "https://x.example.com",
+            "db": "x",
+            "protocol": "soap",
+        });
+        let err = MethodHandler::build_test_config_from_params(&p).unwrap_err();
+        assert!(err.contains("protocol"), "got: {err}");
+    }
+
+    #[test]
+    fn invalid_auth_method_is_rejected() {
+        let p = json!({
+            "url": "https://x.example.com",
+            "db": "x",
+            "auth_method": "oauth",
+        });
+        let err = MethodHandler::build_test_config_from_params(&p).unwrap_err();
+        assert!(err.contains("auth_method"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_credential_returns_none_for_fallback() {
+        // Caller intentionally omits the credential field → handler should
+        // fall back to stored credential. Helper returns Ok with `None`.
+        let p = json!({
+            "url": "https://x.example.com",
+            "db": "x",
+            "auth_method": "api_key",
+        });
+        let (_cfg, cred) = MethodHandler::build_test_config_from_params(&p).unwrap();
+        assert!(cred.is_none());
+    }
+
+    #[test]
+    fn empty_credential_string_treated_as_missing() {
+        let p = json!({
+            "url": "https://x.example.com",
+            "db": "x",
+            "api_key": "",
+        });
+        let (_cfg, cred) = MethodHandler::build_test_config_from_params(&p).unwrap();
+        assert!(cred.is_none());
+    }
+
+    #[test]
+    fn password_auth_method_picks_password_field() {
+        let p = json!({
+            "url": "https://x.example.com",
+            "db": "x",
+            "auth_method": "password",
+            "password": "pw",
+            "api_key": "should-be-ignored",
+        });
+        let (cfg, cred) = MethodHandler::build_test_config_from_params(&p).unwrap();
+        assert_eq!(cfg.auth_method, "password");
+        assert_eq!(cred.as_deref(), Some("pw"));
+    }
+
+    #[test]
+    fn username_over_256_chars_is_rejected() {
+        let long = "a".repeat(257);
+        let p = json!({
+            "url": "https://x.example.com",
+            "db": "x",
+            "username": long,
+        });
+        let err = MethodHandler::build_test_config_from_params(&p).unwrap_err();
+        assert!(err.contains("Username"), "got: {err}");
+    }
+
+    #[test]
+    fn localhost_http_is_allowed_for_dev() {
+        let p = json!({ "url": "http://127.0.0.1:8069", "db": "dev" });
+        let res = MethodHandler::build_test_config_from_params(&p);
+        assert!(res.is_ok(), "got: {res:?}");
+    }
+
+    #[test]
+    fn scrub_long_error_truncates_with_ellipsis() {
+        let long_err = "x".repeat(300);
+        let out = MethodHandler::scrub_odoo_error(&long_err);
+        assert!(out.chars().count() <= 241, "got len {}", out.chars().count());
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn scrub_short_error_unchanged() {
+        let short = "401 Unauthorized";
+        let out = MethodHandler::scrub_odoo_error(short);
+        assert_eq!(out, short);
     }
 }

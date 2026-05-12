@@ -583,7 +583,7 @@
   "odoo.disconnected": "未連線",
   "odoo.testConnection": "測試連線",
   "odoo.testFailed": "連線測試失敗",
-  "odoo.testHint": "測試將使用已儲存的設定，請先儲存再測試",
+  "odoo.testHint": "測試會直接用表單上的值（未填入金鑰時退回已儲存的）",
   "odoo.saveFailed": "儲存設定失敗，請稍後再試",
   "odoo.features": "功能模組",
   "odoo.featuresDesc": "選擇要啟用的 Odoo 模組，Agent 將能存取對應的資料",

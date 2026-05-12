@@ -583,7 +583,7 @@
   "odoo.disconnected": "Disconnected",
   "odoo.testConnection": "Test Connection",
   "odoo.testFailed": "Connection test failed",
-  "odoo.testHint": "Tests the saved config — save your changes first",
+  "odoo.testHint": "Tests with the values currently in the form (falls back to saved credential when blank)",
   "odoo.saveFailed": "Failed to save settings. Please try again.",
   "odoo.features": "Feature Modules",
   "odoo.featuresDesc": "Select which Odoo modules to enable. Agents will be able to access data from enabled modules.",
