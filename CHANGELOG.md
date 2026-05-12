@@ -1,6 +1,45 @@
 # Changelog
 
 
+## [1.13.1] - 2026-05-12
+
+Dashboard UX fix for the Odoo connection page.
+
+### Changed
+
+- **`odoo.test` RPC now accepts inline params** — when the dashboard
+  sends `{ url, db, protocol, auth_method, username, api_key?, password? }`,
+  the connector is built from those values without writing to
+  `config.toml`, so users can verify credentials before persisting. When
+  the credential field is empty in inline mode, the handler falls back
+  to the stored encrypted secret so a small URL tweak does not require
+  retyping the API key. Calling `odoo.test` with no params preserves the
+  original "test the saved config" behaviour.
+  (`crates/duduclaw-gateway/src/handlers.rs`)
+- The Test Connection button on the Odoo page now uses the form's live
+  values instead of requiring a prior save. The button is gated on
+  url + db being present.
+  (`web/src/pages/OdooPage.tsx`)
+- `handleSave` / `handleTest` surface the real backend error string
+  instead of swallowing it — the previous generic "save failed" /
+  "Odoo not configured" messages were undiagnosable from the UI alone.
+
+### Security
+
+- Inline-mode params go through the same SSRF / HTTPS / db-name
+  validators as `odoo.configure`. The test path cannot be used to
+  bypass safety rules.
+- New `scrub_odoo_error()` caps connector failure text at 240 chars
+  before forwarding to the dashboard so HTML error pages or full URLs
+  with query strings are not leaked.
+
+### Tests
+
+- 16 new unit tests covering happy path, every validation branch, the
+  `fc00.*` hostname regression (not an IPv6 ULA), credential fallback,
+  and the error-scrubber.
+
+
 ## [1.13.0] - 2026-05-12
 
 Runtime-health overhaul covering 16 issues across two rounds. Round 1
