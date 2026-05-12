@@ -627,6 +627,19 @@ export interface OdooConfigUpdate {
   features_hr: boolean;
 }
 
+/** Optional inline params for `odoo.test` — when provided, the backend
+ *  tests with these values instead of the saved config.toml.
+ *  Omit credentials to fall back to the stored API key / password. */
+export interface OdooTestParams {
+  url: string;
+  db: string;
+  protocol: string;
+  auth_method: string;
+  username: string;
+  api_key?: string;
+  password?: string;
+}
+
 export interface McpServerDef {
   command: string;
   args: string[];
@@ -1084,8 +1097,11 @@ export const api = {
       client.call('odoo.config') as Promise<OdooConfig | null>,
     configure: (config: OdooConfigUpdate) =>
       client.call('odoo.configure', { ...config }) as Promise<{ success: boolean }>,
-    test: () =>
-      client.call('odoo.test') as Promise<{ success: boolean; message: string }>,
+    test: (params?: OdooTestParams) =>
+      client.call('odoo.test', params ? { ...params } : {}) as Promise<{
+        success: boolean;
+        message: string;
+      }>,
   },
   mcp: {
     list: () =>

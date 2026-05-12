@@ -562,7 +562,7 @@
   "odoo.disconnected": "未接続",
   "odoo.testConnection": "接続テスト",
   "odoo.testFailed": "接続テストに失敗しました",
-  "odoo.testHint": "保存済みの設定でテストします — 先に保存してください",
+  "odoo.testHint": "フォームの現在値でテストします（認証情報未入力時は保存済みを使用）",
   "odoo.saveFailed": "設定の保存に失敗しました。もう一度お試しください",
   "odoo.features": "機能モジュール",
   "odoo.featuresDesc": "有効にする Odoo モジュールを選択します。Agent は有効なモジュールのデータにアクセスできます。",

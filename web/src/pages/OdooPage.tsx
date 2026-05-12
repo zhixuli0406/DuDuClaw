@@ -149,8 +149,9 @@ export function OdooPage() {
       setPassword('');
       setWebhookSecret('');
       await loadConfig();
-    } catch {
-      setError(t('odoo.saveFailed'));
+    } catch (e) {
+      const detail = typeof e === 'string' ? e : e instanceof Error ? e.message : '';
+      setError(detail ? `${t('odoo.saveFailed')}: ${detail}` : t('odoo.saveFailed'));
     } finally {
       setSaving(false);
     }
@@ -160,10 +161,26 @@ export function OdooPage() {
     setTesting(true);
     setTestResult(null);
     try {
-      const res = await api.odoo.test();
+      // Test with the **current form values** — backend treats this as a
+      // transient test (nothing written to disk). If the credential field is
+      // empty (e.g. after a save where the masked input was cleared), the
+      // backend falls back to the stored credential.
+      const res = await api.odoo.test({
+        url: url.trim(),
+        db: db.trim(),
+        protocol,
+        auth_method: authMethod,
+        username: username.trim(),
+        api_key: authMethod === 'api_key' && apiKey ? apiKey : undefined,
+        password: authMethod === 'password' && password ? password : undefined,
+      });
       setTestResult({ ok: res.success, message: res.message });
-    } catch {
-      setTestResult({ ok: false, message: t('odoo.testFailed') });
+    } catch (e) {
+      const detail = typeof e === 'string' ? e : e instanceof Error ? e.message : '';
+      setTestResult({
+        ok: false,
+        message: detail ? `${t('odoo.testFailed')}: ${detail}` : t('odoo.testFailed'),
+      });
     } finally {
       setTesting(false);
     }
@@ -321,7 +338,7 @@ export function OdooPage() {
         <div className="mt-5 flex items-center gap-3">
           <button
             onClick={handleTest}
-            disabled={testing || !url.trim() || saving}
+            disabled={testing || !url.trim() || !db.trim() || saving}
             title={!status?.connected ? t('odoo.testHint') : undefined}
             className={cn(buttonSecondary, 'gap-2')}
           >
