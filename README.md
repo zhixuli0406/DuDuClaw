@@ -6,26 +6,30 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.9.4-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.13.1-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
 ---
 
-> 🎉 **v1.9.4 — W21 Sprint 封版**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.9.4)）
+> 🎉 **v1.13.1 — Odoo Test-Before-Save**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.13.1)）
 >
-> - 新增 `duduclaw-durability` crate — 五大持久性機制（idempotency / retry / circuit breaker / checkpoint / DLQ）
-> - 新增 `duduclaw-governance` crate — PolicyRegistry + quota_manager + error_codes，YAML 政策載入 + 熱重載
-> - **MCP HTTP/SSE Transport**（W20-P1/P2）— `duduclaw http-server` 提供 Bearer 認證的 REST + SSE 端點，補齊純 stdio 之外的存取路徑
-> - **LOCOMO 記憶評測系統**（W21）— `python/duduclaw/memory_eval/`：retrieval_accuracy / retention_rate / cron_runner（每日 03:00 UTC 評測）+ 200 筆 golden QA
-> - **LLM Fallback** — 主模型 timeout/503/429/overloaded 時自動切換 fallback 模型，UTF-8 安全 truncation
-> - **Discord RESUME** + stall watchdog — 真正的 op 6 RESUME 取代每次重連 IDENTIFY，防止 18 分鐘 zombie 狀態
-> - **Heartbeat 修正** — task-board pull 升至 scheduler 層級，掃描所有 agent 而非僅 enabled=true
-> - **Web ReliabilityPage** — circuit breaker / retry / DLQ 即時儀表板，新增 `/reliability` 路由
-> - **MCP `skill_synthesis_run`** — 完成 graduate_trajectories() 落地（取代 Phase 2 stub），internal principal 可見、external 隱藏
-> - **Python agents routing 模組** — capability-based 路由 + memory_resolver + 7 項 memory MCP tools（含 scope 強制驗證）
-> - **W21 QA 4 輪審查 CRITICAL/HIGH 全清** — memory scope 認證、XSS、SSRF、circuit breaker 幽靈探測、UTF-8 truncation panic 全部修補
-> - 549+ tests, 0 failures
+> - **`odoo.test` RPC 接受 inline params** — Dashboard「測試連線」按鈕直接用表單目前的值打 Odoo，**不必先儲存**。Inline mode 下 credential 留空會 fallback 到已儲存的金鑰（改 URL 不必重輸 API Key）
+> - 同樣的 SSRF / HTTPS / db-name 驗證鏈，**test 路徑不能繞過 `odoo.configure` 安全規則**
+> - `scrub_odoo_error()` 把後端 reqwest 錯誤截到 240 字、避免 HTML 錯誤頁 / 帶 query 的 URL 外洩
+> - 前端 `handleSave` / `handleTest` 改丟出真實錯誤訊息，不再吞成通用 toast
+> - 16 個新單元測試（含 `fc00.*` hostname 不被誤判為 IPv6 ULA 的 regression）
+
+<details>
+<summary><strong>v1.10.0 → v1.13.0 累積亮點</strong></summary>
+
+- **v1.13.0** — Runtime-health overhaul（16 個 issue / 兩輪修補）：恢復 GVU/SOUL 自我演化、新增 `[prompt] mode = "minimal"` Anthropic Skills 風格系統提示、`[budget] max_input_tokens` 壓縮管線、async session summarizer、TF-IDF wiki 相關性排序、`duduclaw lifecycle flush` 季度冷熱分離 CLI
+- **v1.12.x** — W22-P0 ADR-002 `x-duduclaw` capability negotiation（HTTP 422 早期失敗）+ ADR-004 Secret Manager + RFC-22 多 agent 協調修補（agnes 偽造子 agent 回應 / autopilot 大量誤觸發 / channel 路徑 token 未紀錄）+ `duduclaw weekly-report` 子命令
+- **v1.11.0** — RFC-21（[Issue #21](https://github.com/zhixuli0406/DuDuClaw/issues/21)）：`duduclaw-identity` crate（IdentityProvider trait + Wiki/Notion/Chained 三實作）+ Odoo per-agent 認證隔離（`OdooConnectorPool` 取代全域 admin 單例）+ shared wiki `.scope.toml` SoT 命名空間政策
+- **v1.10.0** — Wiki RL Trust Feedback：`WikiTrustStore` per-agent SQLite trust、`CitationTracker` 雙級 LRU + bounded-time eviction 防 DoS、`WikiJanitor` 每日 pass（自動標 corrected / archive / frontmatter 同步）+ sub-agent turn_id 貫通 + multi-process flock + atomic batch upsert
+- **v1.9.4** — `duduclaw-durability` 五大持久性機制（idempotency / retry / circuit breaker / checkpoint / DLQ）+ `duduclaw-governance` PolicyRegistry + MCP HTTP/SSE Transport + LOCOMO 記憶評測系統（每日 03:00 UTC 評測 + 200 筆 golden QA）+ LLM Fallback + Discord RESUME + Web ReliabilityPage
+
+</details>
 
 ---
 
@@ -178,7 +182,7 @@ DuDuClaw (plumbing)
 
 | 特色 | 說明 |
 |------|------|
-| **Odoo ERP 整合** | `duduclaw-odoo` 中間層 — 15 個 MCP 工具（CRM/銷售/庫存/會計/通用搜尋報表），支援 CE/EE，EditionGate 自動偵測 |
+| **Odoo ERP 整合** | `duduclaw-odoo` 中間層 — 15 個 MCP 工具（CRM/銷售/庫存/會計/通用搜尋報表），支援 CE/EE，EditionGate 自動偵測。Dashboard 設定頁支援**測試後再儲存**（v1.13.1，credential 留空時 fallback 已儲存金鑰）+ **per-agent 認證隔離**（v1.11.0，`OdooConnectorPool` 取代全域 admin 單例）|
 | **Skill 市場** | GitHub Search API 即時索引 + 24h 本地快取 + 安全掃描 + Dashboard 市場頁面 |
 | **Prometheus 指標** | `GET /metrics` — requests、tokens、duration histogram、channel status |
 | **CronScheduler** | `cron_tasks.jsonl` + cron 表達式，定時任務自動觸發 |

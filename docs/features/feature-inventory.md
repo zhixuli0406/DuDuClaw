@@ -228,6 +228,8 @@
 | Odoo Bridge | 15 MCP tools (CRM/Sales/Inventory/Accounting), JSON-RPC middleware |
 | Edition Gate | CE/EE auto-detection, feature gating |
 | Event Polling | Proactive agent notifications on Odoo state changes |
+| Per-Agent Credential Isolation | `OdooConnectorPool` keyed by `(agent_id, profile)`; audit log carries `profile` + `ok=bool` (v1.11.0 / RFC-21 §2) |
+| Dashboard Test-Before-Save | `odoo.test` accepts inline params; missing credential falls back to stored secret; inline mode reuses the same SSRF / HTTPS / db-name validators (v1.13.1) |
 
 ## RL & Observability
 

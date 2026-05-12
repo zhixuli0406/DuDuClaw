@@ -1,6 +1,6 @@
 # DuDuClaw Architecture Overview
 
-## Architecture Overview (v1.9.4)
+## Architecture Overview (v1.13.1)
 
 DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code / Codex / Gemini** CLI as AI backends via a unified `AgentRuntime` trait with auto-detection and per-agent configuration. DuDuClaw is not a standalone LLM product; it is the plumbing layer that turns one (or many) AI CLIs into long-running agents with channel routing, session memory, self-evolution, multi-account rotation, local LLM inference, browser automation, and IDE integration.
 
@@ -141,7 +141,7 @@ DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code /
 - **Autopilot rule engine**: automated delegation/notifications/skill execution. Triggers: task creation, status change, channel message, idle detection, cron schedule.
 
 ### Integrations
-- **Odoo ERP bridge** (`duduclaw-odoo` crate): JSON-RPC middleware supporting CE/EE, 15 MCP tools (CRM/Sales/Inventory/Accounting), EditionGate auto-detection, event polling + webhook.
+- **Odoo ERP bridge** (`duduclaw-odoo` crate): JSON-RPC middleware supporting CE/EE, 15 MCP tools (CRM/Sales/Inventory/Accounting), EditionGate auto-detection, event polling + webhook. Per-agent credential isolation via `OdooConnectorPool` (RFC-21 §2, v1.11.0). Dashboard test-before-save: `odoo.test` RPC accepts inline params (v1.13.1) — credential omitted falls back to stored secret; same SSRF/HTTPS/db-name validators as `odoo.configure`; `scrub_odoo_error()` caps connector errors at 240 chars to prevent HTML / URL leakage.
 - **Prometheus metrics**: `GET /metrics` on gateway HTTP — requests, tokens, duration histogram, channel status.
 - **RL trajectory collector**: writes per-agent trajectories to `~/.duduclaw/rl_trajectories.jsonl` during channel interactions. `duduclaw rl export|stats|reward` CLI (composite reward: outcome × 0.7 + efficiency × 0.2 + overlong × 0.1).
 - **BroadcastLayer** tracing layer streams real-time logs to WebSocket subscribers.

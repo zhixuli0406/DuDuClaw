@@ -228,6 +228,8 @@
 | Odoo Bridge | 15 MCP ツール（CRM/販売/在庫/会計）、JSON-RPC ミドルウェア |
 | Edition Gate | CE/EE 自動検出、機能ゲート |
 | イベントポーリング | Odoo 状態変化をエージェントに能動通知 |
+| エージェント別認証分離 | `OdooConnectorPool` を `(agent_id, profile)` でキー化、監査ログに `profile` + `ok=bool` を付与（v1.11.0 / RFC-21 §2）|
+| ダッシュボード保存前テスト | `odoo.test` が inline params を受理。認証情報を省略すると保存済みの値にフォールバック。inline モードでも同じ SSRF / HTTPS / db-name バリデータを適用（v1.13.1）|
 
 ## RL と可観測性
 
