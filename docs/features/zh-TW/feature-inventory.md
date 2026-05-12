@@ -228,6 +228,8 @@
 | Odoo Bridge | 15 個 MCP 工具（CRM/銷售/庫存/會計）、JSON-RPC 中間層 |
 | Edition Gate | CE/EE 自動偵測、功能閘門 |
 | 事件輪詢 | Odoo 狀態變化主動通知 Agent |
+| Per-agent 認證隔離 | `OdooConnectorPool` keyed by `(agent_id, profile)`，audit 紀錄帶 `profile` + `ok=bool`（v1.11.0 / RFC-21 §2）|
+| Dashboard 測試後再儲存 | `odoo.test` 接受 inline params；credential 留空 fallback 到已儲存金鑰；inline 模式同樣套用 SSRF / HTTPS / db-name 驗證鏈（v1.13.1）|
 
 ## RL 與可觀測性
 
