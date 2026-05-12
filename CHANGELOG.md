@@ -1,6 +1,40 @@
 # Changelog
 
 
+## [1.13.2] - 2026-05-12
+
+Bug fix for fresh-install clients that have never run the CLI keyfile
+init flow.
+
+### Fixed
+
+- **Dashboard credential save no longer fails with "Encryption
+  unavailable" on a fresh install.** `encrypt_value()` now calls a new
+  `load_or_create_keyfile()` helper that auto-generates the 32-byte
+  AES-256 keyfile (`~/.duduclaw/.keyfile`, owner-only permissions) the
+  first time the gateway is asked to encrypt a credential. Previously
+  the helper was read-only and any client that hit the dashboard
+  without first running `duduclaw init` would see the Odoo / channel
+  token / API key save fail with a misleading "Ensure keyfile exists"
+  message. The decrypt path stays read-only by design so a missing
+  keyfile never silently destroys an existing ciphertext.
+  (`crates/duduclaw-gateway/src/config_crypto.rs`)
+- **Better error messages on the rare encryption failures that remain.**
+  The Odoo configure handler now distinguishes the new failure modes
+  (RNG / disk write) from the old "keyfile missing" case and points
+  operators at the gateway log instead of telling them to fix a file
+  the gateway is now able to create itself.
+  (`crates/duduclaw-gateway/src/handlers.rs`)
+
+### Tests
+
+- 7 new unit tests covering: keyfile auto-creation, encrypt→decrypt
+  round trip after auto-create, rejection of empty plaintext (does not
+  pollute the home dir), keyfile stability across successive encrypts,
+  decrypt-side read-only invariant, and `mkdir -p` of a fully absent
+  home directory.
+
+
 ## [1.13.1] - 2026-05-12
 
 Dashboard UX fix for the Odoo connection page.
