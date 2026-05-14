@@ -1,0 +1,52 @@
+[package]
+name = "duduclaw-redaction"
+version.workspace = true
+edition.workspace = true
+
+# RFC-23 — Sensitive Data Redaction Pipeline.
+#
+# Source-aware redaction of internal/PII data before it reaches the online LLM,
+# with reversible restoration at trusted boundaries (user channel, whitelisted
+# tool egress). All token ↔ original mappings are persisted in an encrypted
+# SQLite vault (AES-256-GCM, per-agent key, TTL 7d default, fail-closed).
+
+[dependencies]
+# Internal
+duduclaw-core = { workspace = true }
+duduclaw-security = { workspace = true }
+duduclaw-identity = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Persistence
+rusqlite = { workspace = true }
+
+# Crypto (HMAC + key generation; AES-256-GCM is reused from duduclaw-security)
+ring = { workspace = true }
+base64 = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Rule matching
+regex = "1"
+
+# UUID — for vault entry uniqueness
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["full", "test-util", "macros"] }

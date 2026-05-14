@@ -24,6 +24,7 @@ pub mod mcp_memory_quota;
 pub mod mcp_namespace;
 pub mod mcp_rate_limit;
 pub mod mcp_redact;
+pub mod mcp_redaction;         // RFC-23 redaction pipeline integration
 pub(crate) mod mcp_sse_store;  // W20-P1 Phase 2C: SSE event ring buffer
 pub mod mcp_wiki;
 mod migrate;
@@ -225,8 +226,32 @@ pub fn decrypt_api_key_from_config(home: &PathBuf) -> Option<String> {
 #[command(name = "duduclaw", about = "DuDuClaw - Multi-Agent Orchestration CLI")]
 #[command(version)]
 struct Cli {
+    /// RFC-23 redaction pipeline opt-in/out at the CLI layer. Overrides
+    /// `agent.toml` but is overridden by `DUDUCLAW_REDACTION` env and by
+    /// a channel's `force_on` policy.
+    #[arg(long = "redact", value_name = "MODE", global = true)]
+    redact: Option<String>,
+
+    /// **Dangerous**: combined with `DUDUCLAW_REDACTION=off`, breaks a
+    /// channel's `force_on` redaction lock for emergency operations.
+    /// Writes a CRITICAL audit and a persistent override-flag file that
+    /// the dashboard surfaces with a red banner.
+    #[arg(long = "force-disable-redaction", global = true)]
+    force_disable_redaction: bool,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+impl Cli {
+    /// Parse `--redact` into the typed `CliFlag` enum from the redaction crate.
+    fn redact_flag(&self) -> duduclaw_redaction::CliFlag {
+        match self.redact.as_deref() {
+            Some("on" | "true" | "1") => duduclaw_redaction::CliFlag::On,
+            Some("off" | "false" | "0") => duduclaw_redaction::CliFlag::Off,
+            _ => duduclaw_redaction::CliFlag::Unset,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -674,6 +699,57 @@ pub async fn entry_point() {
         .init();
 
     let cli = Cli::parse();
+
+    // RFC-23: apply force-disable override BEFORE dispatching to any
+    // subcommand. The dual-key check (env=off + flag=true) prevents an
+    // accidental break-glass; we log loudly and write the persistent
+    // banner state so dashboard operators see what happened.
+    if cli.force_disable_redaction {
+        let env_off = std::env::var("DUDUCLAW_REDACTION")
+            .map(|v| matches!(v.to_lowercase().as_str(), "off" | "0" | "false"))
+            .unwrap_or(false);
+        if !env_off {
+            eprintln!(
+                "[redaction] --force-disable-redaction requires DUDUCLAW_REDACTION=off in the environment. Refusing."
+            );
+            std::process::exit(2);
+        }
+        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let duduclaw_home = home.join(".duduclaw");
+        let override_path = duduclaw_home
+            .join("redaction")
+            .join("override.flag");
+        let audit_path = duduclaw_home
+            .join("redaction")
+            .join("audit.jsonl");
+        let flag = duduclaw_redaction::ForceOverrideFlag::new(override_path);
+        let audit: std::sync::Arc<dyn duduclaw_redaction::AuditSink> =
+            std::sync::Arc::new(duduclaw_redaction::JsonlAuditSink::new(audit_path));
+        let operator = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "unknown".to_string());
+        if let Err(e) = flag.activate(
+            operator,
+            vec!["*".to_string()],
+            "CLI --force-disable-redaction invoked",
+            &*audit,
+        ) {
+            eprintln!("[redaction] failed to write override flag: {e}");
+        } else {
+            eprintln!(
+                "⚠️  [redaction] CHANNEL FORCE_ON OVERRIDDEN. Banner active until \
+                 the override flag is removed by hand."
+            );
+        }
+    }
+
+    // Persist the CLI flag for callers (gateway / channel) to read via
+    // an env var (they don't see the Cli struct directly). Using env is
+    // safe because we're still single-threaded at this point.
+    if let Some(mode) = cli.redact.as_deref() {
+        // SAFETY: process is single-threaded before run() spawns tasks.
+        unsafe { std::env::set_var("DUDUCLAW_REDACT_CLI_FLAG", mode); }
+    }
 
     let result = run(cli).await;
     if let Err(e) = result {

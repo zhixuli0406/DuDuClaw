@@ -253,6 +253,8 @@ pub struct ReplyContext {
     ///
     /// Non-blocking: all emit calls fire-and-forget via tokio::spawn.
     pub evolution_emitter: Arc<EvolutionEventEmitter>,
+    /// RFC-23 redaction pipeline. `None` ⇒ disabled (existing behaviour).
+    pub redaction_manager: Option<Arc<duduclaw_redaction::RedactionManager>>,
 }
 
 impl ReplyContext {
@@ -309,7 +311,17 @@ impl ReplyContext {
             skill_bank: Arc::new(tokio::sync::Mutex::new(SkillCache::new())),
             memory_db_path: None,
             evolution_emitter: Arc::new(EvolutionEventEmitter::from_env()),
+            redaction_manager: None,
         }
+    }
+
+    /// Inject the redaction manager. `None` (default) ⇒ no redaction.
+    pub fn with_redaction_manager(
+        mut self,
+        manager: Option<Arc<duduclaw_redaction::RedactionManager>>,
+    ) -> Self {
+        self.redaction_manager = manager;
+        self
     }
 
     /// Create with prediction engine enabled.
@@ -430,6 +442,61 @@ pub async fn build_reply(text: &str, ctx: &ReplyContext) -> String {
     build_reply_with_session(text, ctx, "default", "anonymous", None).await
 }
 
+/// RFC-23: restore any `<REDACT:...>` tokens in the reply text using the
+/// agent's per-session vault. Caller is always `owner` since the text is
+/// destined for the channel's end-user. Errors are swallowed (return the
+/// raw text — tokens stay verbatim, which is safe).
+async fn restore_for_channel(
+    text: String,
+    ctx: &ReplyContext,
+    agent_id: &str,
+    session_id: &str,
+) -> String {
+    let Some(manager) = ctx.redaction_manager.as_ref() else {
+        return text;
+    };
+    // Quick scan: if there's no `<REDACT:` substring at all, skip the
+    // pipeline construction entirely (hot path).
+    if !text.contains(duduclaw_redaction::token::TOKEN_PREFIX) {
+        return text;
+    }
+    let pipeline = match manager.pipeline(agent_id, Some(session_id.to_string())) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, agent = %agent_id, "redaction: pipeline build failed; returning raw text");
+            return text;
+        }
+    };
+    let caller = duduclaw_redaction::Caller::owner(agent_id);
+    pipeline
+        .restore(&text, &caller, duduclaw_redaction::RestoreTarget::UserChannel)
+        .unwrap_or_else(|e| {
+            warn!(error = %e, "redaction: restore failed; returning raw text");
+            text
+        })
+}
+
+/// Best-effort agent-id resolution for outer restore wrappers — mirrors
+/// the order used by `build_reply_with_session_inner` but without the
+/// trigger-word matcher (the wrapper only needs *some* agent id to pick
+/// the per-agent key; if it's wrong, restore yields a miss and the
+/// raw token stays in place — that's safe-by-default).
+async fn resolve_agent_for_restore(ctx: &ReplyContext, session_id: &str) -> String {
+    if let Some(name) = get_default_agent(&ctx.home_dir).await {
+        return name;
+    }
+    let reg = ctx.registry.read().await;
+    if let Some(a) = reg.main_agent() {
+        return a.config.agent.name.clone();
+    }
+    // Last-ditch: session_id prefix.
+    session_id
+        .split(':')
+        .next()
+        .unwrap_or("default")
+        .to_string()
+}
+
 /// Build a reply with progress streaming.
 ///
 /// `on_progress` callback receives real-time progress events (keepalive,
@@ -454,7 +521,9 @@ pub async fn build_reply_for_agent(
     user_id: &str,
     on_progress: Option<ProgressCallback>,
 ) -> String {
-    build_reply_with_session_inner(text, ctx, Some(agent_name), session_id, user_id, on_progress).await
+    let raw =
+        build_reply_with_session_inner(text, ctx, Some(agent_name), session_id, user_id, on_progress).await;
+    restore_for_channel(raw, ctx, agent_name, session_id).await
 }
 
 /// Build a reply with session tracking and optional progress streaming.
@@ -469,7 +538,10 @@ pub async fn build_reply_with_session(
     user_id: &str,
     on_progress: Option<ProgressCallback>,
 ) -> String {
-    build_reply_with_session_inner(text, ctx, None, session_id, user_id, on_progress).await
+    let raw =
+        build_reply_with_session_inner(text, ctx, None, session_id, user_id, on_progress).await;
+    let agent_id = resolve_agent_for_restore(ctx, session_id).await;
+    restore_for_channel(raw, ctx, &agent_id, session_id).await
 }
 
 /// Inner implementation shared by both default-agent and explicit-agent paths.

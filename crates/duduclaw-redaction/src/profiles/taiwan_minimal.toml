@@ -1,0 +1,16 @@
+[meta]
+name = "Taiwan Minimal"
+description = "Minimum Taiwan-context PII: national ID and credit card only."
+version = "1.0.0"
+
+[rules.tw_national_id]
+type = "regex"
+pattern = '''[A-Z][12]\d{8}'''
+category = "TW_ID"
+priority = 100
+
+[rules.credit_card]
+type = "regex"
+pattern = '''\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b'''
+category = "CREDIT_CARD"
+priority = 95

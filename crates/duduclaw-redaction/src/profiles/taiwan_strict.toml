@@ -1,0 +1,46 @@
+[meta]
+name = "Taiwan Strict"
+description = "Strict Taiwan-context PII: national ID, NHI card, business ID, mobile, credit card, email."
+version = "1.0.0"
+
+[rules.tw_national_id]
+type = "regex"
+pattern = '''[A-Z][12]\d{8}'''
+category = "TW_ID"
+priority = 100
+
+[rules.tw_nhi_card]
+type = "regex"
+pattern = '''\b\d{12}\b'''
+category = "TW_NHI"
+priority = 60
+
+[rules.tw_company_id]
+type = "regex"
+pattern = '''(?:^|[^0-9])(\d{8})(?:[^0-9]|$)'''
+category = "TW_BIZ_ID"
+priority = 55
+
+[rules.tw_mobile]
+type = "regex"
+pattern = '''09\d{2}[-\s]?\d{3}[-\s]?\d{3}'''
+category = "TW_MOBILE"
+priority = 80
+
+[rules.tw_landline]
+type = "regex"
+pattern = '''0[2-8][-\s]?\d{3,4}[-\s]?\d{4}'''
+category = "TW_LANDLINE"
+priority = 70
+
+[rules.credit_card]
+type = "regex"
+pattern = '''\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b'''
+category = "CREDIT_CARD"
+priority = 95
+
+[rules.email]
+type = "regex"
+pattern = '''[\w.+-]+@[\w-]+\.[\w.-]+'''
+category = "EMAIL"
+priority = 50

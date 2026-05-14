@@ -1,6 +1,93 @@
 # Changelog
 
 
+## [1.14.0] - 2026-05-14 — RFC-23 Redaction Pipeline
+
+新增獨立 crate `duduclaw-redaction` 與 gateway 整合層，預設**未啟用**。
+
+### Added
+
+- **New crate `duduclaw-redaction`** — source-aware redaction +
+  reversible restoration. Internal data (Odoo / shared wiki / file tools)
+  is replaced with `<REDACT:CATEGORY:hash8>` tokens before the LLM sees
+  it; tokens are restored at trusted boundaries (user channel reply,
+  whitelisted tool egress).
+- **Encrypted SQLite vault** at `~/.duduclaw/redaction/vault.db` using
+  AES-256-GCM (reused from `duduclaw-security`), with per-agent 32-byte
+  keys (`0o600` permission), TTL 7d default, two-stage GC (mark expired
+  → purge after 30d).
+- **Five built-in profiles** embedded in the binary: `general`,
+  `taiwan_strict`, `taiwan_minimal`, `financial`, `developer`. Selected
+  via `[redaction] profiles = [...]`.
+- **Five-layer enable/disable resolver** (`compute_effective_enabled`):
+  channel `force_on` (banked) → env + CLI flag emergency override → env
+  alone → CLI flag → agent.toml → config.toml. Full truth-table coverage.
+- **Channel `force_on` lock** with audited `--force-disable-redaction`
+  emergency break-glass; persistent override-flag file
+  (`~/.duduclaw/redaction/override.flag`) and CRITICAL audit per affected
+  channel.
+- **Tool egress whitelist** with default deny. Whitelisted tools can
+  `restore_args = true` (real values), `passthrough` (keep tokens), or
+  `deny`. Hallucinated tokens always result in deny.
+- **JSONL audit sink** at `~/.duduclaw/redaction/audit.jsonl` with 10MB
+  rotation; events: `redact / restore_ok / restore_denied / restore_miss
+  / egress_allow / egress_deny / vault_gc / force_on_override`.
+- **Background GC tokio task** running `mark_expired` every 6h and
+  `purge_expired` every 24h, with graceful cancel.
+- **Dashboard read-only RPCs**: `redaction.stats`,
+  `redaction.recent_audit`, `redaction.override_status`,
+  `redaction.policy_status`.
+- **Gateway integration shim** at `crates/duduclaw-gateway/src/redaction_integration.rs`
+  providing `build_manager_from_home()`,
+  `compute_effective_for_channel()`, `cli_flag_from_env()`, and
+  `force_disable_active()`.
+- **Full gateway wiring**:
+  - `MethodHandler` carries `Option<Arc<RedactionManager>>` + setter +
+    4 `redaction.*` Dashboard RPC handlers (`stats`, `recent_audit`,
+    `override_status`, `policy_status`).
+  - `start_gateway()` parses `[redaction]` from `config.toml`, builds the
+    manager, spawns the 6h-mark/24h-purge GC task, and injects the
+    manager into `MethodHandler` and `ReplyContext`.
+  - `build_reply_with_session` / `build_reply_for_agent` apply
+    `restore` at the public-API exit so the user channel sees real
+    values while LLM-bound text retains tokens.
+- **MCP-layer integration** (`crates/duduclaw-cli/src/mcp_redaction.rs`):
+  - `McpRedactionLayer` reads `DUDUCLAW_AGENT_ID` + `DUDUCLAW_SESSION_ID`
+    env vars (set by gateway when spawning the Claude CLI subprocess).
+  - On every `tools/call`: pre-check tool args for `<REDACT:...>` tokens
+    and run the egress evaluator (whitelisted → restore; otherwise →
+    JSON-RPC error). Post-process the tool result Value by walking every
+    string leaf through `RedactionPipeline.redact` so the LLM never sees
+    raw internal data.
+- **CLI flags**: global `--redact=on/off` (overrides agent/global config
+  but not channel `force_on`) and `--force-disable-redaction` (requires
+  `DUDUCLAW_REDACTION=off`, writes a persistent override flag + CRITICAL
+  audit + dashboard red banner).
+- **RFC-23** at `commercial/docs/RFC-23-redaction-pipeline.md` + detailed
+  per-phase TODO at `commercial/docs/TODO-redaction-pipeline.md` +
+  operator guide at `commercial/docs/redaction-operator-guide.md`.
+
+### Tests
+
+- 98 unit tests + 11 end-to-end integration tests in
+  `crates/duduclaw-redaction/`, covering: token format & HMAC salt
+  derivation; rule compile + ReDoS-surface limits; vault round trip
+  (encrypt blob never contains plaintext); cross-session and cross-agent
+  isolation; per-rule cross-session-stable override; TTL → expired
+  marker → 30-day purge; reveal counter bookkeeping; egress decisions
+  (allow/passthrough/deny + nested JSON + hallucinated tokens); profile
+  merge with id collision; five-layer toggle truth table with channel
+  force_on priority; force-override flag persistence + banner; GC task
+  mark+stop cycle.
+
+### Default behaviour
+
+`config.toml [redaction] enabled = false` — existing deployments are
+unaffected unless operators explicitly opt in. See
+[`commercial/docs/redaction-operator-guide.md`](commercial/docs/redaction-operator-guide.md)
+for the five-step adoption recipe.
+
+
 ## [1.13.2] - 2026-05-12
 
 Bug fix for fresh-install clients that have never run the CLI keyfile
