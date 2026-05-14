@@ -22,10 +22,11 @@ members = [
     "crates/duduclaw-governance",
     "crates/duduclaw-durability",
     "crates/duduclaw-identity",
+    "crates/duduclaw-redaction",
 ]
 
 [workspace.package]
-version = "1.13.2"
+version = "1.14.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["DuDuClaw Contributors"]
@@ -101,3 +102,4 @@ duduclaw-auth = { path = "crates/duduclaw-auth" }
 duduclaw-odoo = { path = "crates/duduclaw-odoo" }
 duduclaw-desktop = { path = "crates/duduclaw-desktop" }
 duduclaw-identity = { path = "crates/duduclaw-identity" }
+duduclaw-redaction = { path = "crates/duduclaw-redaction" }

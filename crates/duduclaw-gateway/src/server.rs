@@ -137,6 +137,69 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         tracing::warn!(error = %e, "Failed to initialize cost telemetry — continuing without it");
     }
 
+    // ── RFC-23: redaction pipeline bootstrap ────────────────────
+    // Reads `[redaction]` from config.toml. When `enabled = false`
+    // (default) the manager is never built; existing behaviour is
+    // unchanged. When enabled, the manager + GC task start now.
+    let redaction_gc_handle: Option<duduclaw_redaction::GcTask> = {
+        let cfg_path = home_dir.join("config.toml");
+        let parsed: Option<duduclaw_redaction::RedactionConfig> = std::fs::read_to_string(&cfg_path)
+            .ok()
+            .and_then(|s| {
+                #[derive(serde::Deserialize)]
+                struct Wrap {
+                    #[serde(default)]
+                    redaction: duduclaw_redaction::RedactionConfig,
+                }
+                toml::from_str::<Wrap>(&s).ok().map(|w| w.redaction)
+            });
+
+        match parsed {
+            Some(rcfg) if rcfg.enabled => {
+                match crate::redaction_integration::build_manager_from_home(&home_dir, rcfg.clone()) {
+                    Ok(manager) => {
+                        info!(
+                            rules = manager.engine().rule_count(),
+                            ttl_h = manager.vault_ttl_hours(),
+                            "RFC-23 redaction pipeline enabled"
+                        );
+                        // Inject into handler so dashboard RPCs can see it.
+                        handler.set_redaction_manager(manager.clone()).await;
+
+                        // Spawn GC task — 6h mark / 24h purge defaults.
+                        let gc = duduclaw_redaction::spawn_gc(
+                            manager.vault().clone(),
+                            manager.audit_sink().clone(),
+                            duduclaw_redaction::GcConfig::default(),
+                        );
+                        Some(gc)
+                    }
+                    Err(e) => {
+                        // Fail-closed at startup: if redaction was requested
+                        // but cannot be initialised, we surface the failure
+                        // loudly. We still continue (no redaction) — operator
+                        // must observe and act.
+                        warn!(
+                            error = %e,
+                            "RFC-23 redaction pipeline FAILED to initialise — \
+                             gateway continues WITHOUT redaction. Check \
+                             config.toml [redaction] and ~/.duduclaw/redaction/."
+                        );
+                        None
+                    }
+                }
+            }
+            _ => {
+                tracing::debug!("Redaction pipeline not enabled in config.toml");
+                None
+            }
+        }
+    };
+    // Bind to a name so the GC task lives for the lifetime of
+    // `start_gateway`. When the gateway returns (shutdown), the handle
+    // drops and the GC task receives its cancel signal — clean shutdown.
+    let _redaction_gc = redaction_gc_handle;
+
     // Initialize wiki trust store (Phase 2 of wiki RL trust feedback).
     // Best-effort: if open fails, the rest of the system still works — RAG
     // simply falls back to frontmatter trust and trust feedback is skipped.
@@ -382,6 +445,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .with_prediction_engine(prediction_engine.clone())
         .with_gvu_loop(gvu_loop.clone())
         .with_memory_db(home_dir.join("memory.db"))
+        .with_redaction_manager(handler.get_redaction_manager().await)
     );
     // Inject reply context into handler for channel hot-start/stop
     handler.set_reply_ctx(reply_ctx.clone()).await;

@@ -1,0 +1,46 @@
+[meta]
+name = "Developer Secrets"
+description = "Common developer-machine secrets: API keys, tokens, PEM headers, .env values."
+version = "1.0.0"
+
+[rules.openai_key]
+type = "regex"
+pattern = '''sk-[A-Za-z0-9]{20,}'''
+category = "OPENAI_KEY"
+priority = 100
+
+[rules.anthropic_key]
+type = "regex"
+pattern = '''sk-ant-[A-Za-z0-9_-]{20,}'''
+category = "ANTHROPIC_KEY"
+priority = 100
+
+[rules.github_token]
+type = "regex"
+pattern = '''gh[pousr]_[A-Za-z0-9]{20,}'''
+category = "GITHUB_TOKEN"
+priority = 100
+
+[rules.aws_access_key]
+type = "regex"
+pattern = '''AKIA[0-9A-Z]{16}'''
+category = "AWS_ACCESS_KEY"
+priority = 100
+
+[rules.gitlab_pat]
+type = "regex"
+pattern = '''glpat-[A-Za-z0-9_-]{20,}'''
+category = "GITLAB_PAT"
+priority = 100
+
+[rules.slack_bot_token]
+type = "regex"
+pattern = '''xox[abprs]-[A-Za-z0-9-]{20,}'''
+category = "SLACK_TOKEN"
+priority = 100
+
+[rules.pem_header]
+type = "regex"
+pattern = '''-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----'''
+category = "PEM_PRIVATE_KEY"
+priority = 100

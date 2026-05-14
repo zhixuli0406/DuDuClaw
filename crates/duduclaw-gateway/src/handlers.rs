@@ -90,6 +90,8 @@ pub struct MethodHandler {
     autopilot_event_tx: RwLock<
         Option<tokio::sync::broadcast::Sender<crate::autopilot_engine::AutopilotEvent>>,
     >,
+    /// RFC-23 redaction manager. `None` ⇒ pipeline disabled at this layer.
+    redaction_manager: RwLock<Option<Arc<duduclaw_redaction::RedactionManager>>>,
 }
 
 /// Cached update info from the last `system.check_update` call. [M2][R2:NM1]
@@ -177,7 +179,24 @@ impl MethodHandler {
             autopilot_store: RwLock::new(None),
             event_tx: RwLock::new(None),
             autopilot_event_tx: RwLock::new(None),
+            redaction_manager: RwLock::new(None),
         }
+    }
+
+    /// Inject the redaction manager (called once after gateway start when
+    /// `[redaction] enabled` is true). `None` ⇒ redaction disabled.
+    pub async fn set_redaction_manager(
+        &self,
+        manager: Arc<duduclaw_redaction::RedactionManager>,
+    ) {
+        *self.redaction_manager.write().await = Some(manager);
+    }
+
+    /// Read the redaction manager handle.
+    pub async fn get_redaction_manager(
+        &self,
+    ) -> Option<Arc<duduclaw_redaction::RedactionManager>> {
+        self.redaction_manager.read().await.clone()
     }
 
     /// Inject the SQLite-backed cron task store (called once after gateway start).
@@ -545,6 +564,12 @@ impl MethodHandler {
             "autopilot.update" => { require_admin!(); self.handle_autopilot_update(params).await }
             "autopilot.remove" => { require_admin!(); self.handle_autopilot_remove(params).await }
             "autopilot.history" => { require_admin!(); self.handle_autopilot_history(params).await }
+
+            // ── Redaction (RFC-23, manager-only) ──────────────
+            "redaction.stats" => { require_manager!(); self.handle_redaction_stats().await }
+            "redaction.recent_audit" => { require_manager!(); self.handle_redaction_recent_audit(params).await }
+            "redaction.override_status" => { require_manager!(); self.handle_redaction_override_status().await }
+            "redaction.policy_status" => { require_manager!(); self.handle_redaction_policy_status().await }
 
             // ── Shared Skills (open to all authenticated) ───
             "skills.shared" => self.handle_skills_shared_list().await,
@@ -6922,6 +6947,79 @@ impl MethodHandler {
                 WsFrame::ok_response("", json!({ "entries": result }))
             }
             Err(e) => WsFrame::error_response("", &format!("autopilot history: {e}")),
+        }
+    }
+
+    // ── RFC-23 Redaction read-only RPCs ─────────────────────
+
+    async fn handle_redaction_stats(&self) -> WsFrame {
+        let Some(manager) = self.get_redaction_manager().await else {
+            return WsFrame::ok_response("", json!({
+                "enabled": false,
+                "vault": { "total": 0, "active": 0, "expired": 0, "by_category": [] },
+                "rule_count": 0,
+            }));
+        };
+        match duduclaw_redaction::dashboard::handle_stats(&manager) {
+            Ok(s) => match serde_json::to_value(&s) {
+                Ok(v) => WsFrame::ok_response("", v),
+                Err(e) => WsFrame::error_response("", &format!("serialize stats: {e}")),
+            },
+            Err(e) => WsFrame::error_response("", &format!("redaction stats: {e}")),
+        }
+    }
+
+    async fn handle_redaction_recent_audit(&self, params: Value) -> WsFrame {
+        let Some(manager) = self.get_redaction_manager().await else {
+            return WsFrame::ok_response("", json!({ "entries": [] }));
+        };
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50) as usize;
+        let req = duduclaw_redaction::dashboard::RecentAuditRequest { limit };
+        match duduclaw_redaction::dashboard::handle_recent_audit(&manager, req) {
+            Ok(r) => match serde_json::to_value(&r) {
+                Ok(v) => WsFrame::ok_response("", v),
+                Err(e) => WsFrame::error_response("", &format!("serialize audit: {e}")),
+            },
+            Err(e) => WsFrame::error_response("", &format!("redaction audit: {e}")),
+        }
+    }
+
+    async fn handle_redaction_override_status(&self) -> WsFrame {
+        let Some(manager) = self.get_redaction_manager().await else {
+            return WsFrame::ok_response("", json!({
+                "active": false,
+                "banner": null,
+                "record": null,
+            }));
+        };
+        match duduclaw_redaction::dashboard::handle_override_status(&manager) {
+            Ok(s) => match serde_json::to_value(&s) {
+                Ok(v) => WsFrame::ok_response("", v),
+                Err(e) => WsFrame::error_response("", &format!("serialize override: {e}")),
+            },
+            Err(e) => WsFrame::error_response("", &format!("redaction override: {e}")),
+        }
+    }
+
+    async fn handle_redaction_policy_status(&self) -> WsFrame {
+        let Some(manager) = self.get_redaction_manager().await else {
+            return WsFrame::ok_response("", json!({
+                "config_enabled": false,
+                "vault_ttl_hours": 0,
+                "purge_after_expire_days": 0,
+                "rule_count": 0,
+                "override_active": false,
+            }));
+        };
+        match duduclaw_redaction::dashboard::handle_policy_status(&manager) {
+            Ok(s) => match serde_json::to_value(&s) {
+                Ok(v) => WsFrame::ok_response("", v),
+                Err(e) => WsFrame::error_response("", &format!("serialize policy: {e}")),
+            },
+            Err(e) => WsFrame::error_response("", &format!("redaction policy: {e}")),
         }
     }
 

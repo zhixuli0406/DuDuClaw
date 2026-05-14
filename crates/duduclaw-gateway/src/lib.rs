@@ -108,5 +108,8 @@ pub mod skill_synthesis_pipeline;
 // ── LLM fallback helpers (timeout / rate-limit → lighter model) ──
 pub mod llm_fallback;
 
+// ── RFC-23 redaction-pipeline integration shim ──
+pub mod redaction_integration;
+
 pub use extension::{GatewayExtension, NullExtension};
 pub use server::{start_gateway, GatewayConfig};

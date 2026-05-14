@@ -1,0 +1,41 @@
+[meta]
+name = "General"
+description = "Generic PII: email, phone, IP, URL, JWT, common API keys."
+version = "1.0.0"
+
+[rules.email]
+type = "regex"
+pattern = '''[\w.+-]+@[\w-]+\.[\w.-]+'''
+category = "EMAIL"
+priority = 50
+
+[rules.ipv4]
+type = "regex"
+pattern = '''\b(?:\d{1,3}\.){3}\d{1,3}\b'''
+category = "IPV4"
+priority = 40
+
+[rules.jwt]
+type = "regex"
+pattern = '''eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'''
+category = "JWT"
+priority = 90
+restore_scope = { kind = "owner" }
+
+[rules.openai_key]
+type = "regex"
+pattern = '''sk-[A-Za-z0-9]{20,}'''
+category = "OPENAI_KEY"
+priority = 95
+
+[rules.github_token]
+type = "regex"
+pattern = '''gh[pousr]_[A-Za-z0-9]{20,}'''
+category = "GITHUB_TOKEN"
+priority = 95
+
+[rules.aws_access_key]
+type = "regex"
+pattern = '''AKIA[0-9A-Z]{16}'''
+category = "AWS_ACCESS_KEY"
+priority = 95
