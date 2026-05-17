@@ -1232,12 +1232,58 @@ async fn build_reply_with_session_inner(
         &agent_id,
     );
 
-    let cli_future = call_claude_cli_rotated(
-        &effective_message, &model, &full_system_prompt, &ctx.home_dir,
-        agent_dir.as_deref(), on_progress.as_ref(), capabilities.as_ref(),
-        if has_history { Some(session_id) } else { None },
-        &conversation_history,
-    );
+    // Phase 3.C.4 (2026-05-14) — interactive PTY routing for OAuth.
+    //
+    // When `agent.toml [runtime] pty_pool_enabled = true`, route through
+    // the PTY-backed pipeline:
+    //   - OAuth accounts → interactive REPL via `PtySession`
+    //     (Phase 3.C.2 implementation; works after Anthropic's `claude -p`
+    //      OAuth block).
+    //   - API-key accounts → PTY-wrapped `claude -p` (Phase 3.B fallback).
+    //   - Auth-method branching happens inside `call_claude_cli_pty_rotated`
+    //     based on the rotator's `env_vars` shape (Phase 3.C.4).
+    //
+    // Default (`pty_pool_enabled = false`) keeps the legacy
+    // `tokio::process::Command + claude -p` path. Toggle is per-agent
+    // for safe gradual rollout.
+    let runtime_mode = agent_dir
+        .as_deref()
+        .map(crate::pty_runtime::runtime_mode_for_agent)
+        .unwrap_or(crate::pty_runtime::RuntimeMode::FreshSpawn);
+    if runtime_mode == crate::pty_runtime::RuntimeMode::PtyPool {
+        info!(
+            agent_id = %agent_id,
+            mode = runtime_mode.as_str(),
+            "channel_reply: routing through PTY pool (OAuth → interactive, API-key → -p)"
+        );
+    }
+
+    let cli_future: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>,
+    > = match runtime_mode {
+        crate::pty_runtime::RuntimeMode::PtyPool => Box::pin(call_claude_cli_pty_rotated(
+            &effective_message,
+            &model,
+            &full_system_prompt,
+            &ctx.home_dir,
+            agent_dir.as_deref(),
+            on_progress.as_ref(),
+            capabilities.as_ref(),
+            if has_history { Some(session_id) } else { None },
+            &conversation_history,
+        )),
+        crate::pty_runtime::RuntimeMode::FreshSpawn => Box::pin(call_claude_cli_rotated(
+            &effective_message,
+            &model,
+            &full_system_prompt,
+            &ctx.home_dir,
+            agent_dir.as_deref(),
+            on_progress.as_ref(),
+            capabilities.as_ref(),
+            if has_history { Some(session_id) } else { None },
+            &conversation_history,
+        )),
+    };
     let is_channel_session = duduclaw_core::SUPPORTED_CHANNEL_TYPES.iter()
         .any(|t| session_id.starts_with(&format!("{t}:")));
     // (review B2) Make `turn_id` and `session_id` available to sub-agent
@@ -3857,6 +3903,721 @@ pub(crate) fn extract_tool_detail(block: &serde_json::Value) -> Option<String> {
     None
 }
 
+// ── Phase 3.B: PTY-routed Claude CLI invocation ──────────────────────────────
+//
+// Mirror of `spawn_claude_cli_with_env` / `call_claude_cli_rotated`, but
+// routes the subprocess through [`crate::pty_runtime::invoke_oneshot`] so
+// the child sees a real PTY on every platform (ConPTY on Win 10 1809+,
+// openpty on Unix). Compared to the streaming variant this loses live
+// progress callbacks + keepalive heartbeats — those land in Phase 3.C
+// alongside long-lived session reuse. What we keep:
+//
+// - Identical command-line args (so account rotation env injection works the
+//   same way).
+// - `result` / `assistant` stream-json event handling (final answer + token
+//   usage extraction + `is_error` short-circuit).
+// - `cost_telemetry` recording on success.
+// - Same `Result<String, String>` shape so the call sites are drop-in
+//   replaceable when the wedge switches.
+
+/// Diagnostic counters extracted while parsing stream-json output. Embedded in
+/// error messages so post-mortem from `channel_failures.jsonl` is actionable.
+#[derive(Debug, Default)]
+pub(crate) struct StreamDiagnostics {
+    pub lines_seen: u32,
+    pub events_parsed: u32,
+    pub assistant_events: u32,
+    pub text_blocks: u32,
+    pub thinking_blocks: u32,
+    pub tool_use_blocks: u32,
+    pub result_events: u32,
+    pub last_raw_line: String,
+    pub last_result_subtype: Option<String>,
+    pub last_stop_reason: Option<String>,
+}
+
+impl StreamDiagnostics {
+    fn render(&self, exit_code: i32, stderr_tail: &str) -> String {
+        format!(
+            "exit={} lines={} events={} assistant={} text_blocks={} \
+             thinking={} tool_use={} result_events={} \
+             result_subtype={:?} stop_reason={:?} \
+             last_line={:?} stderr_tail={:?}",
+            exit_code,
+            self.lines_seen,
+            self.events_parsed,
+            self.assistant_events,
+            self.text_blocks,
+            self.thinking_blocks,
+            self.tool_use_blocks,
+            self.result_events,
+            self.last_result_subtype,
+            self.last_stop_reason,
+            self.last_raw_line,
+            stderr_tail,
+        )
+    }
+}
+
+/// Outcome of parsing a complete stream-json stdout dump.
+pub(crate) struct StreamParseResult {
+    /// The final answer text. May be empty on parser-level success (e.g. CLI
+    /// only emitted thinking blocks); caller decides whether that's an error.
+    pub text: String,
+    /// Token usage from the `result` event when present.
+    pub usage: Option<crate::cost_telemetry::TokenUsage>,
+    pub diagnostics: StreamDiagnostics,
+}
+
+/// Parse a complete stream-json stdout buffer (newline-delimited JSON events)
+/// in one shot. Mirrors the streaming loop in `spawn_claude_cli_with_env` but
+/// over a finished `&str` rather than an `AsyncBufRead`.
+///
+/// On a `result` event with `is_error: true`, returns `Err(...)` — same
+/// semantics as the streaming variant's mid-stream short-circuit. Same for
+/// assistant-level `error` field.
+pub(crate) fn parse_claude_stream_json_complete(
+    stdout: &str,
+) -> Result<StreamParseResult, String> {
+    let mut text = String::new();
+    let mut usage: Option<crate::cost_telemetry::TokenUsage> = None;
+    let mut diag = StreamDiagnostics::default();
+
+    for raw_line in stdout.split('\n') {
+        let line = raw_line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        diag.lines_seen += 1;
+        diag.last_raw_line = line.chars().take(400).collect();
+
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        diag.events_parsed += 1;
+
+        match event.get("type").and_then(|t| t.as_str()) {
+            Some("result") => {
+                diag.result_events += 1;
+                diag.last_result_subtype = event
+                    .get("subtype")
+                    .and_then(|s| s.as_str())
+                    .map(String::from);
+                if event
+                    .get("is_error")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    let err_text = event
+                        .get("result")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("Unknown stream-json error");
+                    return Err(format!("claude CLI stream error: {err_text}"));
+                }
+                if let Some(t) = event.get("result").and_then(|r| r.as_str()) {
+                    // Only overwrite with the result event's text when non-empty;
+                    // tool-use turns often have empty `result` because the real
+                    // answer landed in intermediate assistant text blocks.
+                    if !t.is_empty() {
+                        text = t.to_string();
+                    }
+                }
+                if let Some(usage_val) = event.get("usage") {
+                    usage = crate::cost_telemetry::TokenUsage::from_json(usage_val);
+                }
+            }
+            Some("assistant") => {
+                diag.assistant_events += 1;
+                if let Some(err) = event.get("error").and_then(|e| e.as_str()) {
+                    return Err(format!("claude CLI assistant error: {err}"));
+                }
+                if let Some(sr) = event
+                    .pointer("/message/stop_reason")
+                    .and_then(|v| v.as_str())
+                {
+                    diag.last_stop_reason = Some(sr.to_string());
+                }
+                if let Some(content) = event
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                {
+                    for block in content {
+                        match block.get("type").and_then(|t| t.as_str()) {
+                            Some("text") => {
+                                diag.text_blocks += 1;
+                                if let Some(t) =
+                                    block.get("text").and_then(|t| t.as_str())
+                                {
+                                    text = t.to_string();
+                                }
+                            }
+                            Some("thinking") => {
+                                diag.thinking_blocks += 1;
+                            }
+                            Some("tool_use") => {
+                                diag.tool_use_blocks += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(StreamParseResult {
+        text,
+        usage,
+        diagnostics: diag,
+    })
+}
+
+/// Compose the args + env that the legacy `spawn_claude_cli_with_env`
+/// passes to `tokio::process::Command`. Extracted so the PTY variant can
+/// drive an identical CLI invocation.
+fn build_claude_cli_args(
+    user_message: &str,
+    model: &str,
+    claude_session_id: Option<&str>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    work_dir: Option<&Path>,
+    system_prompt_file: Option<&Path>,
+) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+
+    if let Some(sid) = claude_session_id {
+        args.push("--resume".to_string());
+        args.push(sid.to_string());
+    }
+
+    args.extend([
+        "--exclude-dynamic-system-prompt-sections".to_string(),
+        "-p".to_string(),
+        user_message.to_string(),
+        "--model".to_string(),
+        model.to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--dangerously-skip-permissions".to_string(),
+        "--max-turns".to_string(),
+        "50".to_string(),
+    ]);
+
+    let caps = capabilities.cloned().unwrap_or_default();
+    let denied = caps.disallowed_tools();
+    if !denied.is_empty() {
+        args.push("--disallowedTools".to_string());
+        args.push(denied.join(","));
+    }
+
+    if let Some(dir) = work_dir {
+        let mcp_json = dir.join(".mcp.json");
+        if mcp_json.exists() {
+            args.push("--mcp-config".to_string());
+            args.push(mcp_json.to_string_lossy().to_string());
+            args.push("--strict-mcp-config".to_string());
+        }
+    }
+
+    if let Some(sys_file) = system_prompt_file {
+        args.push("--system-prompt-file".to_string());
+        args.push(sys_file.to_string_lossy().to_string());
+    }
+
+    args
+}
+
+/// PTY-routed sibling of [`spawn_claude_cli_with_env`]. Spawns the `claude`
+/// CLI under a real PTY (ConPTY on Win, openpty on Unix), waits for the
+/// child to exit, then parses the captured stream-json stdout in one shot.
+///
+/// **Used by Phase 3.C.4 as the API-key fallback path.** OAuth accounts
+/// route through interactive `PtySession` (which works around Anthropic's
+/// `claude -p` OAuth block); API-key accounts still use this `-p` PTY
+/// wrapper, since the OAuth block doesn't affect API-key auth.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_claude_cli_pty_with_env(
+    user_message: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+    work_dir: Option<&Path>,
+    _on_progress: Option<&ProgressCallback>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    env_vars: &std::collections::HashMap<String, String>,
+    claude_session_id: Option<&str>,
+) -> Result<String, String> {
+    let claude_path = duduclaw_core::which_claude()
+        .ok_or_else(|| "claude CLI not found in PATH".to_string())?;
+
+    // Install agent-file-guard hook (parity with the streaming variant). When
+    // work_dir is set, this is a per-agent dir; otherwise skip.
+    if let Some(dir) = work_dir {
+        let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
+        if let Err(e) =
+            crate::agent_hook_installer::ensure_agent_hook_settings(dir, &bin).await
+        {
+            warn!(
+                agent_dir = %dir.display(),
+                error = %e,
+                "spawn_claude_cli_pty_with_env: agent-file-guard install failed — continuing"
+            );
+        }
+    }
+
+    // Pass system prompt via temp file (matches legacy path; cmdline-safe).
+    let prompt_guard: Option<tempfile::TempPath> = if !system_prompt.is_empty() {
+        match tempfile::NamedTempFile::new() {
+            Ok(mut f) => {
+                use std::io::Write;
+                let _ = f.write_all(system_prompt.as_bytes());
+                Some(f.into_temp_path())
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let system_prompt_path = prompt_guard.as_deref();
+
+    let args = build_claude_cli_args(
+        user_message,
+        model,
+        claude_session_id,
+        capabilities,
+        work_dir,
+        system_prompt_path,
+    );
+
+    // Assemble env: API key fallback → caps env vars → caller-provided
+    // rotator env → context propagation (REPLY_CHANNEL, turn/session ids,
+    // DELEGATION_ENV are task-local; mirror the legacy path).
+    let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let api_key = if env_vars.is_empty() {
+        get_api_key(home_dir).await
+    } else {
+        None
+    };
+    if let Some(ref key) = api_key {
+        env.insert("ANTHROPIC_API_KEY".to_string(), key.clone());
+    }
+
+    {
+        let caps = capabilities.cloned().unwrap_or_default();
+        if caps.browser_via_bash {
+            env.insert("DUDUCLAW_BROWSER_VIA_BASH".to_string(), "1".to_string());
+        }
+    }
+
+    // Caller-provided env wins. Empty value means "force-remove" — for
+    // portable-pty there's no env_remove primitive, but starting from an
+    // empty map (we only seed the keys we care about) means an empty value
+    // never gets inherited from the parent, so this is automatic.
+    for (k, v) in env_vars {
+        if v.is_empty() {
+            env.remove(k);
+        } else {
+            env.insert(k.clone(), v.clone());
+        }
+    }
+
+    // Same context-propagation env vars the legacy path sets.
+    if let Ok(channel) = crate::claude_runner::REPLY_CHANNEL.try_with(|ch| ch.clone()) {
+        env.insert(
+            duduclaw_core::ENV_REPLY_CHANNEL.to_string(),
+            channel,
+        );
+    }
+    if let Ok(Some(turn_id)) =
+        duduclaw_memory::feedback::CURRENT_TURN_ID.try_with(|t| t.clone())
+    {
+        env.insert(duduclaw_core::ENV_TRUST_TURN_ID.to_string(), turn_id);
+    }
+    if let Ok(Some(session_id)) =
+        duduclaw_memory::feedback::CURRENT_SESSION_ID.try_with(|s| s.clone())
+    {
+        env.insert(duduclaw_core::ENV_TRUST_SESSION_ID.to_string(), session_id);
+    }
+    // CLAUDECODE removal: portable-pty inherits the parent env, but we
+    // explicitly add an empty marker so any downstream code sees it as
+    // unset. We can't env_remove with portable-pty's CommandBuilder, so
+    // set to empty string — claude CLI treats empty as unset.
+    env.insert("CLAUDECODE".to_string(), String::new());
+
+    let work_dir_owned = work_dir.map(|p| p.to_path_buf());
+    let deadline = std::time::Duration::from_secs(HARD_MAX_TIMEOUT_SECS);
+    let output = match crate::pty_runtime::invoke_oneshot(
+        claude_path,
+        args,
+        env,
+        work_dir_owned,
+        deadline,
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            return Err(format!("claude CLI PTY spawn error: {e}"));
+        }
+    };
+    drop(prompt_guard); // tempfile lives until here
+
+    let parsed = parse_claude_stream_json_complete(&output.stdout)?;
+    let text = parsed.text.trim().to_string();
+    if text.is_empty() {
+        let diag = parsed.diagnostics.render(0, "");
+        return Err(format!("Empty response from claude CLI PTY ({diag})"));
+    }
+
+    // Record cost telemetry — same pattern as the streaming variant.
+    if let (Some(usage), Ok(agent_id)) = (
+        parsed.usage.as_ref(),
+        crate::claude_runner::CHANNEL_REPLY_AGENT_ID.try_with(|id| id.clone()),
+    ) {
+        if !agent_id.is_empty()
+            && let Some(telemetry) = crate::cost_telemetry::get_telemetry()
+        {
+            telemetry
+                .record(
+                    &agent_id,
+                    crate::cost_telemetry::RequestType::Chat,
+                    model,
+                    usage,
+                )
+                .await;
+        }
+    }
+
+    Ok(text)
+}
+
+/// PTY-routed sibling of [`call_claude_cli_rotated`]. Walks the same account
+/// rotation primitive, with the spawn closure branched on auth method
+/// (Phase 3.C.4):
+///
+/// - **OAuth accounts** → [`crate::pty_runtime::acquire_and_invoke`] —
+///   the cross-platform interactive REPL driver. The whole point of
+///   3.C.4 is to keep OAuth users working after Anthropic blocked
+///   `claude -p` for OAuth subscriptions.
+/// - **API-key accounts** → [`spawn_claude_cli_pty_with_env`] — the
+///   Phase 3.B PTY-wrapped `claude -p` path, which still works fine
+///   for API keys.
+///
+/// Auth-method detection from `env_vars`:
+/// - The rotator emits `ANTHROPIC_API_KEY = ""` (empty) for OAuth
+///   accounts (forces OAuth keychain path, prevents stale API key
+///   leak). API-key accounts emit `ANTHROPIC_API_KEY = <hex secret>`.
+/// - `CLAUDE_CODE_OAUTH_TOKEN` presence is an additional positive
+///   signal for OAuth-via-setup-token accounts.
+pub(crate) async fn call_claude_cli_pty_rotated(
+    user_message: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+    work_dir: Option<&Path>,
+    on_progress: Option<&ProgressCallback>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    _session_id: Option<&str>,
+    conversation_history: &[ConversationTurn],
+) -> Result<String, String> {
+    let rotator = match crate::claude_runner::get_rotator_cached(home_dir).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "PTY: rotator unavailable — falling back to PTY direct (no rotation)");
+            let effective_msg = if conversation_history.is_empty() {
+                user_message.to_string()
+            } else {
+                format_history_as_prompt(conversation_history, user_message)
+            };
+            return invoke_pty_branch(
+                &effective_msg,
+                model,
+                system_prompt,
+                home_dir,
+                work_dir,
+                on_progress,
+                capabilities,
+                &std::collections::HashMap::new(),
+            )
+            .await;
+        }
+    };
+
+    let account_count = rotator.count().await;
+    if account_count == 0 {
+        let effective_msg = if conversation_history.is_empty() {
+            user_message.to_string()
+        } else {
+            format_history_as_prompt(conversation_history, user_message)
+        };
+        return invoke_pty_branch(
+            &effective_msg,
+            model,
+            system_prompt,
+            home_dir,
+            work_dir,
+            on_progress,
+            capabilities,
+            &std::collections::HashMap::new(),
+        )
+        .await;
+    }
+
+    let input_len = user_message.len();
+    let history_clone = conversation_history.to_vec();
+    rotate_cli_spawn(
+        &rotator,
+        move |env_vars| {
+            let model = model.to_string();
+            let system_prompt = system_prompt.to_string();
+            let home_dir = home_dir.to_path_buf();
+            let work_dir = work_dir.map(|p| p.to_path_buf());
+            let on_progress = on_progress;
+            let capabilities = capabilities.cloned();
+            let history = history_clone.clone();
+            let user_message_owned = user_message.to_string();
+            async move {
+                let effective_prompt = if history.is_empty() {
+                    user_message_owned
+                } else {
+                    format_history_as_prompt(&history, &user_message_owned)
+                };
+                invoke_pty_branch(
+                    &effective_prompt,
+                    &model,
+                    &system_prompt,
+                    &home_dir,
+                    work_dir.as_deref(),
+                    on_progress,
+                    capabilities.as_ref(),
+                    &env_vars,
+                )
+                .await
+            }
+        },
+        input_len,
+    )
+    .await
+}
+
+/// Dispatch a single PTY-routed claude invocation, branching on the
+/// auth method gleaned from `env_vars`. See
+/// [`call_claude_cli_pty_rotated`] for the routing rationale.
+#[allow(clippy::too_many_arguments)]
+async fn invoke_pty_branch(
+    user_message: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+    work_dir: Option<&Path>,
+    on_progress: Option<&ProgressCallback>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Result<String, String> {
+    if env_vars_indicate_oauth(env_vars) {
+        // OAuth → interactive REPL. The bootstrap protocol + sentinel
+        // pairing is owned by `PtySession`; we feed it the user message
+        // and let the pool reuse / respawn as needed.
+        let agent_id = agent_id_from_work_dir(work_dir);
+        let deadline = std::time::Duration::from_secs(HARD_MAX_TIMEOUT_SECS);
+        // Phase 3.D.2 — segregate pool sessions per OAuth account so
+        // multi-account rotation produces distinct sessions instead of
+        // sharing one (which silently pinned all accounts to whichever
+        // spawned first).
+        let account_id = account_id_from_env_vars(env_vars);
+        // **Review fix**: never log the OAuth token prefix — even 12
+        // hex chars is token-derived material. Log a hash-style tag
+        // for diagnostics (stable per account, no reverse-mapping).
+        let account_log_tag = account_id
+            .as_deref()
+            .map(account_log_tag)
+            .unwrap_or_else(|| "default".to_string());
+        info!(
+            agent_id = %agent_id,
+            account_tag = %account_log_tag,
+            model = %model,
+            "channel_reply: routing OAuth invoke through interactive PTY pool"
+        );
+        let _ = (system_prompt, home_dir, on_progress, capabilities);
+        // Round 4 deferred-cleanup (LOW F-3): use canonical options
+        // entry point instead of the 7-positional-arg legacy variant.
+        let acquire = crate::pty_runtime::AcquireOptions::new(
+            agent_id,
+            duduclaw_cli_runtime::CliKind::Claude,
+            false, // bare_mode
+        )
+        .account_id(account_id.as_deref())
+        .model(Some(model));
+        crate::pty_runtime::acquire_and_invoke_with(
+            crate::pty_runtime::InvokeOptions::new(acquire, user_message, deadline),
+        )
+        .await
+    } else {
+        // API key → legacy `-p` PTY-wrapped path (Phase 3.B).
+        info!("channel_reply: routing API-key invoke through `-p` PTY one-shot");
+        spawn_claude_cli_pty_with_env(
+            user_message,
+            model,
+            system_prompt,
+            home_dir,
+            work_dir,
+            on_progress,
+            capabilities,
+            env_vars,
+            None,
+        )
+        .await
+    }
+}
+
+/// Phase 3.D.2 — derive a stable PtyPool-keying identifier from the
+/// rotator-supplied `env_vars`.
+///
+/// We don't pass the full `AccountEnv.id` through `rotate_cli_spawn`'s
+/// closure (the closure signature is `Fn(HashMap)` for back-compat with
+/// the legacy `call_claude_cli_rotated`). Instead we derive a key from
+/// the env vars the rotator wrote — they're stable per account by
+/// construction:
+///
+/// - `CLAUDE_CODE_OAUTH_TOKEN` is account-specific → first 12 chars hex
+///   form a non-secret-leaking identifier.
+/// - `CLAUDE_CONFIG_DIR` (set when the account uses a non-default
+///   profile directory) maps 1-1 to the OAuth account.
+/// - Otherwise return `None` so the pool falls back to the default
+///   "shared session" behaviour.
+///
+/// **Security note**: returning the OAuth token prefix is intentional —
+/// it's hex characters, included in pool cache keys + diagnostic logs.
+/// A 12-char hex prefix has ~48 bits of entropy, far short of being a
+/// useful secret (the rotator stores the full token; only the gateway
+/// sees this prefix in its memory). It's NEVER logged to disk.
+fn account_id_from_env_vars(
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if let Some(token) = env_vars.get("CLAUDE_CODE_OAUTH_TOKEN")
+        && !token.is_empty()
+    {
+        return Some(format!("oauth-{}", &token[..token.len().min(12)]));
+    }
+    if let Some(dir) = env_vars.get("CLAUDE_CONFIG_DIR")
+        && !dir.is_empty()
+    {
+        return Some(format!("dir-{dir}"));
+    }
+    None
+}
+
+/// **Review fix (security)**: derive a non-secret-revealing tag for
+/// tracing / log lines from an account_id that may itself be token-
+/// derived (`oauth-<prefix>` form). We hash the input and emit a short
+/// hex digest so two log entries for the same account share a tag
+/// (operational debuggability) without leaking any prefix of the
+/// underlying token. SHA-256 truncated to 8 hex chars is sufficient for
+/// operational correlation without collision in a fleet of < 100
+/// accounts.
+fn account_log_tag(account_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(account_id.as_bytes());
+    let bytes = &digest[..4];
+    hex::encode(bytes)
+}
+
+/// True when `env_vars` was emitted for an OAuth account by the rotator
+/// (empty `ANTHROPIC_API_KEY` sentinel, or explicit
+/// `CLAUDE_CODE_OAUTH_TOKEN` presence).
+fn env_vars_indicate_oauth(env_vars: &std::collections::HashMap<String, String>) -> bool {
+    if env_vars.contains_key("CLAUDE_CODE_OAUTH_TOKEN") {
+        return true;
+    }
+    match env_vars.get("ANTHROPIC_API_KEY") {
+        Some(v) if v.is_empty() => true, // rotator's "force OAuth" sentinel
+        _ => false,
+    }
+}
+
+/// Extract the agent id from the last path component of `work_dir`. The
+/// PtyPool keys sessions by `(agent_id, cli_kind, bare_mode)`, so two
+/// agents with the same OAuth account still get their own session.
+fn agent_id_from_work_dir(work_dir: Option<&Path>) -> &'static str {
+    // We need a stable agent identifier that lives long enough for the
+    // PtyPool's cache_key. For simplicity, the pool key gets a 'static
+    // string identifier; we leak a small string per unique agent id
+    // (bounded by the number of agents, typically < 50).
+    //
+    // NOTE: this leak is acceptable because:
+    // 1. Agent ids are finite (< 50 typically),
+    // 2. They're stable across the gateway's lifetime,
+    // 3. The cost is ~50 × ~40 bytes = ~2 KB total.
+    //
+    // **Round 2 review fix (MED-7)**: warn ONCE per unique non-UTF8
+    // path, not on every call. The previous code emitted `warn!` on
+    // every channel_reply that hit a non-UTF8 work_dir, which would
+    // flood the log when one such agent runs hot. Now we maintain a
+    // small `seen_non_utf8` set; a path that's been warned about
+    // returns "default" silently afterwards.
+    static SEEN_NON_UTF8: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<std::ffi::OsString>>,
+    > = std::sync::OnceLock::new();
+    let raw = match work_dir.and_then(|p| p.file_name()).map(|n| (n, n.to_str())) {
+        Some((_, Some(s))) => s,
+        Some((non_utf8, None)) => {
+            let already_warned = {
+                let seen = SEEN_NON_UTF8.get_or_init(|| {
+                    std::sync::Mutex::new(std::collections::HashSet::new())
+                });
+                let mut guard = seen.lock().unwrap_or_else(|p| p.into_inner());
+                !guard.insert(non_utf8.to_os_string())
+            };
+            if !already_warned {
+                warn!(
+                    file_name = %non_utf8.to_string_lossy(),
+                    "channel_reply: work_dir file_name is not valid UTF-8 — falling back to shared 'default' agent id (sessions will be pooled across these agents). This warning is one-shot per unique path."
+                );
+            }
+            "default"
+        }
+        None => "default",
+    };
+
+    static AGENT_ID_CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, &'static str>>,
+    > = std::sync::OnceLock::new();
+    // Round 4 deferred-cleanup (LOW F-4): cap the cache size so a
+    // pathological flood of distinct `work_dir` file_names (e.g. an
+    // attacker who can create directories with timestamped names)
+    // cannot grow the leaked-string set without bound. Past the cap
+    // we return the sentinel "default" and emit a one-shot warning
+    // — at that point session pooling degrades to shared-by-default,
+    // which is the same behaviour the function falls back to for
+    // non-UTF-8 file names today.
+    const AGENT_ID_CACHE_CAP: usize = 1024;
+    let cache = AGENT_ID_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = cache.lock().expect("agent_id cache poisoned");
+    if let Some(s) = guard.get(raw) {
+        return s;
+    }
+    if guard.len() >= AGENT_ID_CACHE_CAP {
+        // One-shot warning per process lifetime — the cap should
+        // never legitimately fire in production (< 50 agents in
+        // realistic deployments).
+        static SATURATED_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if SATURATED_WARNED.set(()).is_ok() {
+            warn!(
+                cap = AGENT_ID_CACHE_CAP,
+                "channel_reply: AGENT_ID_CACHE reached its cap; further unique work_dir names will collapse onto a shared 'default' agent id. \
+This likely indicates an attacker-controlled name flood or a config bug producing per-call random directories."
+            );
+        }
+        return "default";
+    }
+    let leaked: &'static str = Box::leak(raw.to_string().into_boxed_str());
+    guard.insert(raw.to_string(), leaked);
+    leaked
+}
+
 // ── Python SDK subprocess (fallback) ────────────────────────
 
 /// Find the Python source path for `duduclaw.sdk.chat`.
@@ -4556,6 +5317,274 @@ mod sender_block_tests {
         assert!(block.contains("<person_id>person_bare</person_id>"));
         assert!(!block.contains("<roles>"), "should omit empty roles, got: {block}");
         assert!(!block.contains("<project_ids>"), "should omit empty project_ids, got: {block}");
+    }
+}
+
+// Phase 3.B parser tests ──────────────────────────────────────────────────
+#[cfg(test)]
+mod stream_json_parser_tests {
+    use super::parse_claude_stream_json_complete;
+
+    fn line_event(json: &str) -> String {
+        format!("{json}\n")
+    }
+
+    #[test]
+    fn parses_result_event_text() {
+        let stdout = line_event(
+            r#"{"type":"result","subtype":"success","result":"the final answer"}"#,
+        );
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        assert_eq!(parsed.text, "the final answer");
+        assert_eq!(parsed.diagnostics.result_events, 1);
+        assert_eq!(parsed.diagnostics.events_parsed, 1);
+        assert_eq!(parsed.diagnostics.last_result_subtype.as_deref(), Some("success"));
+    }
+
+    #[test]
+    fn falls_back_to_assistant_text_when_result_empty() {
+        let stdout = String::new()
+            + &line_event(
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"intermediate"}]}}"#,
+            )
+            + &line_event(r#"{"type":"result","subtype":"success","result":""}"#);
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        // Empty result event must not overwrite assistant text — same
+        // behaviour as the streaming variant in spawn_claude_cli_with_env.
+        assert_eq!(parsed.text, "intermediate");
+        assert_eq!(parsed.diagnostics.text_blocks, 1);
+        assert_eq!(parsed.diagnostics.assistant_events, 1);
+    }
+
+    #[test]
+    fn extracts_token_usage_from_result_event() {
+        let stdout = line_event(
+            r#"{"type":"result","subtype":"success","result":"hi","usage":{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":5,"cache_read_input_tokens":3}}"#,
+        );
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        let usage = parsed.usage.expect("usage must be present");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 20);
+    }
+
+    #[test]
+    fn short_circuits_on_is_error_result_event() {
+        let stdout = line_event(
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":"Not logged in"}"#,
+        );
+        let err = parse_claude_stream_json_complete(&stdout)
+            .err()
+            .expect("must error");
+        assert!(err.contains("Not logged in"), "got: {err}");
+    }
+
+    #[test]
+    fn short_circuits_on_assistant_error_field() {
+        let stdout = line_event(
+            r#"{"type":"assistant","error":"oauth token expired","message":{"content":[]}}"#,
+        );
+        let err = parse_claude_stream_json_complete(&stdout)
+            .err()
+            .expect("must error");
+        assert!(err.contains("oauth token expired"), "got: {err}");
+    }
+
+    #[test]
+    fn handles_crlf_line_endings() {
+        let stdout = format!(
+            "{evt}\r\n",
+            evt = r#"{"type":"result","subtype":"success","result":"crlf-payload"}"#
+        );
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        assert_eq!(parsed.text, "crlf-payload");
+    }
+
+    #[test]
+    fn ignores_blank_lines_and_invalid_json() {
+        let stdout = String::new()
+            + "\n"
+            + "not-json-at-all\n"
+            + &line_event(r#"{"type":"result","subtype":"success","result":"valid"}"#)
+            + "  \n"
+            + "{ truncated json...\n";
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        assert_eq!(parsed.text, "valid");
+        assert!(parsed.diagnostics.events_parsed >= 1);
+    }
+
+    #[test]
+    fn counts_block_types_for_diagnostics() {
+        let stdout = String::new()
+            + &line_event(
+                r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"thinking","thinking":"..."},{"type":"tool_use","name":"Bash","input":{"command":"ls"}},{"type":"text","text":"answer"}]}}"#,
+            )
+            + &line_event(r#"{"type":"result","subtype":"success","result":"answer"}"#);
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        assert_eq!(parsed.diagnostics.thinking_blocks, 1);
+        assert_eq!(parsed.diagnostics.tool_use_blocks, 1);
+        assert_eq!(parsed.diagnostics.text_blocks, 1);
+        assert_eq!(parsed.diagnostics.last_stop_reason.as_deref(), Some("tool_use"));
+    }
+
+    #[test]
+    fn handles_cjk_payload_safely() {
+        let stdout = line_event(
+            r#"{"type":"result","subtype":"success","result":"你好世界 🐾"}"#,
+        );
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        assert_eq!(parsed.text, "你好世界 🐾");
+    }
+
+    #[test]
+    fn returns_empty_text_when_no_events_present() {
+        let parsed = parse_claude_stream_json_complete("").unwrap();
+        assert_eq!(parsed.text, "");
+        assert_eq!(parsed.diagnostics.events_parsed, 0);
+    }
+}
+
+// Phase 3.C.4 routing-helper tests ────────────────────────────────────────
+//
+// These unit tests replace the manual "gray rollout" validation step by
+// pinning the two pure functions that decide which spawn path a CLI call
+// takes (`env_vars_indicate_oauth`, `agent_id_from_work_dir`). The
+// remaining production glue (`acquire_and_invoke` + `invoke_pty_branch`)
+// is exercised end-to-end by the `claude_interactive_spike` example
+// binary against a real `claude` binary — that's the operator-facing
+// smoke harness.
+#[cfg(test)]
+mod routing_helper_tests {
+    use super::{account_id_from_env_vars, agent_id_from_work_dir, env_vars_indicate_oauth};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn env_vars_indicate_oauth_detects_setup_token_account() {
+        let mut env = HashMap::new();
+        env.insert(
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            "sk-oauth-fake".to_string(),
+        );
+        // Rotator still emits empty API_KEY alongside the token to force
+        // the keychain off; presence of CLAUDE_CODE_OAUTH_TOKEN is the
+        // dominant positive signal.
+        env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+        assert!(env_vars_indicate_oauth(&env));
+    }
+
+    #[test]
+    fn env_vars_indicate_oauth_detects_keychain_account_via_empty_api_key() {
+        // Default OAuth account: rotator sets ANTHROPIC_API_KEY = ""
+        // (the "force keychain" sentinel) and no CLAUDE_CODE_OAUTH_TOKEN.
+        let mut env = HashMap::new();
+        env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+        assert!(env_vars_indicate_oauth(&env));
+    }
+
+    #[test]
+    fn env_vars_indicate_oauth_rejects_api_key_account() {
+        let mut env = HashMap::new();
+        env.insert(
+            "ANTHROPIC_API_KEY".to_string(),
+            "sk-ant-real-key-value".to_string(),
+        );
+        assert!(!env_vars_indicate_oauth(&env));
+    }
+
+    #[test]
+    fn env_vars_indicate_oauth_rejects_empty_env() {
+        // Empty env_vars (no rotator / fresh-install path) is treated as
+        // "not OAuth" so the call falls through to the `-p` PTY path,
+        // which uses ambient auth (API key from config or env).
+        let env: HashMap<String, String> = HashMap::new();
+        assert!(!env_vars_indicate_oauth(&env));
+    }
+
+    #[test]
+    fn agent_id_from_work_dir_extracts_last_segment() {
+        let p = PathBuf::from("/home/user/.duduclaw/agents/agnes");
+        let id = agent_id_from_work_dir(Some(&p));
+        assert_eq!(id, "agnes");
+    }
+
+    #[test]
+    fn agent_id_from_work_dir_returns_default_when_none() {
+        let id = agent_id_from_work_dir(None);
+        assert_eq!(id, "default");
+    }
+
+    // Phase 3.D.2 — account-id derivation tests.
+
+    #[test]
+    fn account_id_from_env_vars_uses_oauth_token_prefix() {
+        let mut env = HashMap::new();
+        env.insert(
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            "abcdef0123456789babababa".to_string(),
+        );
+        let id = account_id_from_env_vars(&env).expect("must derive");
+        assert_eq!(id, "oauth-abcdef012345");
+        assert!(id.starts_with("oauth-"));
+        // Confirm we don't leak the full token through the cache key.
+        assert!(!id.contains("babababa"));
+    }
+
+    #[test]
+    fn account_id_from_env_vars_uses_config_dir_when_token_absent() {
+        let mut env = HashMap::new();
+        env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+        env.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/home/user/.claude/profiles/work".to_string(),
+        );
+        let id = account_id_from_env_vars(&env).expect("must derive");
+        assert!(id.starts_with("dir-"));
+        assert!(id.contains("profiles/work"));
+    }
+
+    #[test]
+    fn account_id_from_env_vars_returns_none_for_default_keychain() {
+        // Default OAuth keychain account: rotator emits empty
+        // ANTHROPIC_API_KEY but no token + no profile dir.
+        let mut env = HashMap::new();
+        env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+        assert!(account_id_from_env_vars(&env).is_none());
+    }
+
+    #[test]
+    fn account_id_from_env_vars_returns_none_for_empty_env() {
+        let env: HashMap<String, String> = HashMap::new();
+        assert!(account_id_from_env_vars(&env).is_none());
+    }
+
+    #[test]
+    fn account_id_from_env_vars_token_prefix_is_stable() {
+        // The same token → same derived id. Different tokens → different ids.
+        let mut env_a = HashMap::new();
+        env_a.insert(
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            "tokenA1234567xyz".to_string(),
+        );
+        let mut env_b = HashMap::new();
+        env_b.insert(
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            "tokenB1234567xyz".to_string(),
+        );
+        let id_a1 = account_id_from_env_vars(&env_a).unwrap();
+        let id_a2 = account_id_from_env_vars(&env_a).unwrap();
+        let id_b = account_id_from_env_vars(&env_b).unwrap();
+        assert_eq!(id_a1, id_a2);
+        assert_ne!(id_a1, id_b);
+    }
+
+    #[test]
+    fn agent_id_from_work_dir_caches_static_strings_per_id() {
+        let p = PathBuf::from("/home/user/.duduclaw/agents/duduclaw-tl");
+        let id1 = agent_id_from_work_dir(Some(&p));
+        let id2 = agent_id_from_work_dir(Some(&p));
+        // Cached &'static — the two references must point to the same
+        // memory so the PtyPool's HashMap key is stable across calls.
+        assert!(std::ptr::eq(id1.as_ptr(), id2.as_ptr()));
     }
 }
 

@@ -870,6 +870,56 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     ));
     info!("Session summarizer task started (10-min cadence)");
 
+    // Phase 3 (2026-05-14): cross-platform PTY pool runtime.
+    //
+    // Initialises the global `duduclaw-cli-runtime` PtyPool used by agents
+    // that opt in via `agent.toml [runtime] pty_pool_enabled = true`. The
+    // init is unconditional so the routing decision in claude_runner /
+    // channel_reply can short-circuit cheaply; agents that don't opt in
+    // never trigger a spawn. See
+    // `commercial/docs/TODO-cli-pty-pool-worker.md` for the full design.
+    crate::pty_runtime::init(home_dir.clone());
+    info!("PTY runtime initialised (Phase 3 adapter — opt-in via agent.toml)");
+
+    // Phase 7 (2026-05-15): optionally promote PTY pool to out-of-process
+    // worker subprocess. Gated by `[runtime] worker_managed = true` in
+    // <home>/config.toml. When the flag is on, `pty_runtime`'s
+    // `acquire_and_invoke` switches transports to HTTP+JSON-RPC against
+    // the spawned `duduclaw-cli-worker` instead of the in-process pool.
+    //
+    // Failure here is non-fatal: a startup error keeps the gateway in
+    // in-process mode (the existing behaviour) + emits a warn log so
+    // operators can see why the subprocess didn't come up.
+    // **Round 2 review fix (HIGH-4)**: instead of detaching a
+    // separate `tokio::spawn` that races with `axum::serve`'s own
+    // ctrl_c, store the supervisor handle so the axum graceful
+    // shutdown closure can call `handle.shutdown().await` AFTER
+    // prediction-engine flush, BEFORE returning. This sequences
+    // SIGTERM → 3s grace → SIGKILL into the main shutdown path
+    // instead of racing it.
+    let worker_supervisor: Option<crate::worker_supervisor::WorkerSupervisorHandle> =
+        match crate::worker_supervisor::spawn_if_enabled(&home_dir).await {
+            Ok(Some(handle)) => {
+                crate::pty_runtime::set_managed_worker(handle.client());
+                info!(
+                    bind = %handle.bind(),
+                    "Worker supervisor spawned — PTY pool routed through subprocess"
+                );
+                Some(handle)
+            }
+            Ok(None) => {
+                info!("Worker supervisor disabled ([runtime] worker_managed = false)");
+                None
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Worker supervisor spawn failed — PTY pool stays in-process"
+                );
+                None
+            }
+        };
+
     // Inject user_db into handler for user management RPC methods
     handler.set_user_db(user_db.clone(), jwt_config.clone()).await;
 
@@ -899,6 +949,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/ws", get(ws_handler))
         .route("/health", get(health_handler))
         .route("/metrics", get(crate::metrics::metrics_handler))
+        .route(
+            "/api/runtime/status",
+            get(crate::runtime_status::handler),
+        )
         .route("/api/mcp/oauth/callback", get(handle_mcp_oauth_callback))
         .route("/api/reliability/summary", get(handle_reliability_summary_http))
         .with_state(state)
@@ -962,9 +1016,16 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .await
         .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(e.to_string()))?;
 
-    // Serve with graceful shutdown on Ctrl+C
+    // Serve with graceful shutdown on Ctrl+C.
+    //
+    // **Round 2 review fix (HIGH-4)**: the worker supervisor's
+    // SIGTERM/SIGKILL chain is sequenced INSIDE the shutdown future
+    // rather than racing it from a detached task. Order:
+    //   ctrl_c → prediction engine flush → supervisor shutdown
+    //   (SIGTERM → 3s grace → SIGKILL) → axum drains → main exits.
     let pe_for_shutdown = prediction_engine.clone();
     let meta_path_for_shutdown = metacognition_path.clone();
+    let supervisor_for_shutdown = worker_supervisor;
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
@@ -972,6 +1033,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             pe_for_shutdown.flush_all().await;
             pe_for_shutdown.persist_metacognition(&meta_path_for_shutdown).await;
             info!("Prediction engine state flushed");
+            if let Some(supervisor) = supervisor_for_shutdown {
+                info!("Shutting down worker supervisor...");
+                supervisor.shutdown().await;
+                info!("Worker supervisor shut down");
+            }
         })
         .await
         .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(e.to_string()))?;
