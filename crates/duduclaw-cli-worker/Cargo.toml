@@ -1,0 +1,38 @@
+[package]
+name = "duduclaw-cli-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Standalone PTY-pool worker for DuDuClaw — exposes the cli-runtime PtyPool over a localhost JSON-RPC API"
+
+[[bin]]
+name = "duduclaw-cli-worker"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+duduclaw-cli-runtime = { workspace = true }
+duduclaw-core = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+hex = "0.4"
+ring = { workspace = true } # used by TokenStore for SecureRandom
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+dirs = "5"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

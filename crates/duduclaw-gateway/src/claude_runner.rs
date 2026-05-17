@@ -354,6 +354,42 @@ pub async fn call_claude_for_agent_with_type(
                 "Failed to install agent-file-guard hook — continuing without enforcement"
             );
         }
+
+        // Phase 3.C.5 (2026-05-14): dispatcher PTY short-circuit.
+        //
+        // When the agent opts in to `[runtime] pty_pool_enabled = true`,
+        // dispatcher-side invocations short-circuit local offload + hybrid
+        // routing and go straight to the PTY pool. The semantic is "I've
+        // chosen PTY-as-runtime; respect that across all entry points
+        // (channel reply + sub-agent dispatch)".
+        //
+        // Cost gates (local offload, model fallback) are intentionally
+        // bypassed because:
+        // 1. The operator's intent is clear from the flag.
+        // 2. PTY interactive mode reuses sessions across turns, so the
+        //    cost saving from local offload is less material.
+        // 3. Mixing PTY-with-local-offload would create surprising
+        //    behaviour — the in-session conversation context would get
+        //    truncated by occasional local-offload diversions.
+        let runtime_mode = crate::pty_runtime::runtime_mode_for_agent(&agent_dir);
+        if runtime_mode == crate::pty_runtime::RuntimeMode::PtyPool {
+            info!(
+                agent = %agent_name,
+                mode = runtime_mode.as_str(),
+                "dispatcher: short-circuit through PTY pool (skipping local offload + hybrid routing)"
+            );
+            let deadline = std::time::Duration::from_secs(180);
+            // Round 4 deferred-cleanup (LOW F-3): canonical options entry.
+            let acquire = crate::pty_runtime::AcquireOptions::new(
+                agent_id,
+                duduclaw_cli_runtime::CliKind::Claude,
+                cli_bare_mode,
+            );
+            return crate::pty_runtime::acquire_and_invoke_with(
+                crate::pty_runtime::InvokeOptions::new(acquire, prompt, deadline),
+            )
+            .await;
+        }
     }
 
     // For CLI / local inference paths, tasks suffix is inlined into the
