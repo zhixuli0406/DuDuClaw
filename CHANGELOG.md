@@ -1,6 +1,113 @@
 # Changelog
 
 
+## [1.15.0] - 2026-05-17 — Cross-Platform PTY Pool + Worker
+
+Anthropic blocked `claude -p` for OAuth-subscription accounts in mid-2026 and
+recommended driving the real interactive `claude` REPL instead. v1.15.0 ships
+the runtime to do exactly that: long-lived `claude` sessions driven through a
+real PTY (ConPTY on Win 10 1809+, openpty on Unix) with a sentinel-framed
+in-band response protocol — no scrollback scraping, no sidecar.
+
+Default **OFF**; per-agent opt-in via `agent.toml [runtime] pty_pool_enabled =
+true`. The existing fresh-spawn `claude -p` path is preserved for API-key
+accounts and remains the global default. Every PTY path falls back to legacy
+`tokio::process::Command + claude -p` on error, so a missing worker /
+unhealthy pool / spawn failure is recoverable, not fatal.
+
+### Added
+
+- **New crate `duduclaw-cli-runtime`** — cross-platform PTY runtime built on
+  [`portable-pty`](https://crates.io/crates/portable-pty).
+  - `PtySession` lifecycle + `SpawnOpts` per-CLI configuration
+    (`CliKind::Claude / Codex / Gemini`).
+  - `PtyPool` with per-agent semaphore, idle eviction, supervisor + restart
+    policy. Cache-hit / spawn / 3 eviction-reason counters surface to gateway.
+  - `Envelope` / `Frame` / sentinel constants + ANSI-stripping
+    `extract_payload_with_chrome_filter`.
+  - `oneshot_pty_invoke` for the `claude -p` PTY-wrapped fallback (API-key
+    accounts).
+- **New crate `duduclaw-cli-worker`** — standalone worker binary wrapping the
+  pool over a localhost HTTP+JSON-RPC API.
+  - Bearer-token auth via `DUDUCLAW_WORKER_TOKEN` env var + on-disk
+    `TokenStore` (`ring::SecureRandom`).
+  - Endpoints: `POST /rpc` (`invoke` / `shutdown_session` / `stats`),
+    `GET /healthz` (no auth).
+  - Library re-export so the gateway shares the protocol types directly.
+- **Gateway integration**:
+  - `crates/duduclaw-gateway/src/pty_runtime.rs` — adapter owning the global
+    `PtyPool`, `RuntimeMode::{FreshSpawn, PtyPool}` per-agent routing,
+    `acquire_and_invoke` + `acquire_and_invoke_with` public surface,
+    optional `MANAGED_WORKER` `WorkerClient` for Phase 7.
+  - `crates/duduclaw-gateway/src/worker_supervisor.rs` — Phase 7 supervisor
+    for the out-of-process worker. Resolves binary, spawns with loopback
+    bind + token + `--home-dir`, polls `/healthz` until ready, runs a 30s
+    health-check loop with N-strike restart, and **sequences
+    SIGTERM/SIGKILL into the gateway graceful-shutdown future** (after
+    prediction-engine flush, before axum drains) instead of racing it from
+    a detached task (Round 2 review HIGH-4).
+  - `crates/duduclaw-gateway/src/runtime_status.rs` — Phase 8.5 JSON status
+    endpoint `GET /api/runtime/status` (loopback-only, no auth) with
+    transport + kill-switch + session / invoke / worker stats.
+  - `crates/duduclaw-gateway/src/channel_reply.rs` —
+    `call_claude_cli_pty_rotated` PTY-routed mirror of
+    `call_claude_cli_rotated`; OAuth → interactive REPL, API-key →
+    `oneshot_pty_invoke + claude -p`. `parse_claude_stream_json_complete`
+    is a buffer-based mirror of the streaming parser;
+    `StreamDiagnostics` is embedded in error messages so
+    `channel_failures.jsonl` post-mortem identifies what went wrong inside
+    the PTY response (`exit / lines / events / assistant / text_blocks /
+    thinking / tool_use / result_subtype / stop_reason / last_line /
+    stderr_tail`).
+  - `crates/duduclaw-gateway/src/claude_runner.rs` — dispatcher-side
+    short-circuit: when `pty_pool_enabled = true`, sub-agent invocations
+    skip local-offload + hybrid routing and go straight through the pool
+    (channel reply + dispatcher consistent).
+- **Phase 8 production observability** (`crates/duduclaw-gateway/src/metrics.rs`):
+  - `pty_pool_acquires_total` + `pty_pool_acquires_cache_hit_total` +
+    `pty_pool_acquires_spawn_total`.
+  - `pty_pool_evicted_idle_total` + `pty_pool_evicted_unhealthy_total` +
+    `pty_pool_evicted_shutdown_total`.
+  - `pty_pool_invokes_ok_total` + `pty_pool_invokes_empty_total` +
+    `pty_pool_invokes_error_total` + `pty_pool_invokes_timeout_total`.
+  - `pty_pool_invoke_duration_buckets[8]` (shared bounds with the main
+    request histogram) + `pty_pool_invoke_duration_sum_ms`.
+  - `worker_health_misses_total` + `worker_restarts_total`.
+  - `pty_pool_managed_worker_active` gauge (0 = in-process, 1 = managed).
+- **Smoke harness**:
+  - `scripts/smoke-pty-pool.sh` (Unix/macOS) — build cli-runtime + spike
+    example + run cli-runtime / gateway `pty_runtime::` /
+    `channel_reply::routing_helper_tests` / `stream_json_parser_tests`.
+    `CLAUDE_SPIKE=1` runs the live interactive spike (consumes OAuth quota).
+  - `scripts/smoke-pty-pool.ps1` — Windows equivalent.
+
+### Operational notes
+
+- **Kill switches**:
+  - Per-agent: `agent.toml [runtime] pty_pool_enabled = false` (default).
+  - Global: env-var kill switch disables PTY routing without rolling back.
+- **Out-of-process mode** (`[runtime] worker_managed = true` in
+  `<home>/config.toml`) promotes the in-process pool to the
+  `duduclaw-cli-worker` subprocess. The supervisor is best-effort: spawn
+  failure leaves the gateway in in-process mode with a warn log.
+- **Cross-platform**:
+  - Windows: `windows` crate Job Objects for child-process containment
+    (Win10 1809+).
+  - Unix: `nix` for signal + process-group control.
+- **References**: [`dorkitude/maude`](https://github.com/dorkitude/maude)
+  (Unix-only tmux shim that inspired the interactive driving idea) and
+  [`runtorque/torque`](https://github.com/runtorque/torque) (Unix-only
+  PTY + UDS frame protocol). `portable-pty` is what makes one code path
+  span mac/Linux/Windows.
+
+### Design docs
+
+- `commercial/docs/runtime-pty-pool-design.md` — full architecture, kill
+  switches, security stance.
+- `commercial/docs/TODO-cli-pty-pool-worker.md` — phase-by-phase TODO with
+  verify steps.
+
+
 ## [1.14.0] - 2026-05-14 — RFC-23 Redaction Pipeline
 
 新增獨立 crate `duduclaw-redaction` 與 gateway 整合層，預設**未啟用**。
