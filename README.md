@@ -6,23 +6,29 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.13.1-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.15.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
 ---
 
-> 🎉 **v1.13.1 — Odoo Test-Before-Save**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.13.1)）
+> 🎉 **v1.15.0 — Cross-Platform PTY Pool + Worker**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.15.0)）
 >
-> - **`odoo.test` RPC 接受 inline params** — Dashboard「測試連線」按鈕直接用表單目前的值打 Odoo，**不必先儲存**。Inline mode 下 credential 留空會 fallback 到已儲存的金鑰（改 URL 不必重輸 API Key）
-> - 同樣的 SSRF / HTTPS / db-name 驗證鏈，**test 路徑不能繞過 `odoo.configure` 安全規則**
-> - `scrub_odoo_error()` 把後端 reqwest 錯誤截到 240 字、避免 HTML 錯誤頁 / 帶 query 的 URL 外洩
-> - 前端 `handleSave` / `handleTest` 改丟出真實錯誤訊息，不再吞成通用 toast
-> - 16 個新單元測試（含 `fc00.*` hostname 不被誤判為 IPv6 ULA 的 regression）
+> Anthropic 已封鎖 OAuth 訂閱帳號的 `claude -p`（推用戶用真互動式 TUI）；v1.15.0 上了一條跨平台 PTY 通道作為 OAuth 帳號的官方替代路徑，**預設關閉**，per-agent 透過 `agent.toml [runtime] pty_pool_enabled = true` 開啟。
+>
+> - **新 crate `duduclaw-cli-runtime`** — `portable-pty` 跨平台抽象（ConPTY on Win 10 1809+、openpty on Unix），sentinel-framed in-band 回應協定（不用 scrollback scraping 也不用 sidecar），`PtySession` lifecycle、`PtyPool` per-agent semaphore + idle eviction + 健康檢查 + supervisor + restart policy
+> - **新 crate `duduclaw-cli-worker`** — 把 PTY pool 包成 localhost JSON-RPC 子進程（Bearer token + `/healthz`），gateway 可選 in-process 或 out-of-process 兩種模式，後者透過 `[runtime] worker_managed = true` 啟用
+> - **Gateway 整合**：`pty_runtime` adapter（`RuntimeMode::{FreshSpawn, PtyPool}` per-agent 路由）、`worker_supervisor` 把 SIGTERM/SIGKILL 順序排進 graceful shutdown future、`runtime_status` 暴露 `GET /api/runtime/status` JSON 端點（loopback-only）
+> - **`channel_reply` PTY 分支** — OAuth 帳號走互動式 REPL、API-key 帳號走 `oneshot_pty_invoke + claude -p`，新增 `parse_claude_stream_json_complete` + `StreamDiagnostics` 讓 `channel_failures.jsonl` 有可診斷的 stream-json 統計
+> - **Phase 8 Production Observability**：`pty_pool_*` Prometheus counters（acquires / cache-hit / spawn / 三種驅逐原因）、invoke outcome（ok/empty/error/timeout）+ duration histogram、worker health misses + restarts、`pty_pool_managed_worker_active` 模式 gauge
+> - **降級安全**：所有 PTY 路徑錯誤都會 fallback 回 legacy `tokio::process::Command + claude -p`；missing worker / 不健康 pool / spawn 失敗都可恢復
+> - **跨平台煙霧驗證**：`scripts/smoke-pty-pool.sh`（Unix/macOS）+ `.ps1`（Windows）build runtime + 跑 cli-runtime / gateway routing helper / stream-json parser 單元測試，`CLAUDE_SPIKE=1` 跑活的互動式 spike（消耗 OAuth 配額）
 
 <details>
-<summary><strong>v1.10.0 → v1.13.0 累積亮點</strong></summary>
+<summary><strong>v1.10.0 → v1.14.0 累積亮點</strong></summary>
 
+- **v1.14.0** — RFC-23 Sensitive Data Redaction：新 crate `duduclaw-redaction`，內部資料（Odoo / shared wiki / file tools）以 `<REDACT:CATEGORY:hash8>` token 取代後才送 LLM，受信邊界（user channel reply、whitelist 工具 egress）自動還原；AES-256-GCM 加密 SQLite vault（per-agent 32-byte key，0o600 權限）+ TTL 7d 兩階段 GC（mark→30 天 purge）+ 5 個內建 profile + 五層 enable/disable resolver + JSONL audit 10MB rotation
+- **v1.13.1** — Odoo Test-Before-Save：`odoo.test` RPC 接受 inline params，Dashboard「測試連線」直接用表單目前的值打 Odoo 不必先儲存；inline credential 留空 fallback 已儲存的金鑰；同樣的 SSRF / HTTPS / db-name 驗證鏈、`scrub_odoo_error()` 截 240 字防 HTML 錯誤頁外洩
 - **v1.13.0** — Runtime-health overhaul（16 個 issue / 兩輪修補）：恢復 GVU/SOUL 自我演化、新增 `[prompt] mode = "minimal"` Anthropic Skills 風格系統提示、`[budget] max_input_tokens` 壓縮管線、async session summarizer、TF-IDF wiki 相關性排序、`duduclaw lifecycle flush` 季度冷熱分離 CLI
 - **v1.12.x** — W22-P0 ADR-002 `x-duduclaw` capability negotiation（HTTP 422 早期失敗）+ ADR-004 Secret Manager + RFC-22 多 agent 協調修補（agnes 偽造子 agent 回應 / autopilot 大量誤觸發 / channel 路徑 token 未紀錄）+ `duduclaw weekly-report` 子命令
 - **v1.11.0** — RFC-21（[Issue #21](https://github.com/zhixuli0406/DuDuClaw/issues/21)）：`duduclaw-identity` crate（IdentityProvider trait + Wiki/Notion/Chained 三實作）+ Odoo per-agent 認證隔離（`OdooConnectorPool` 取代全域 admin 單例）+ shared wiki `.scope.toml` SoT 命名空間政策
@@ -96,6 +102,8 @@ DuDuClaw (plumbing)
 | **Direct API** | 繞過 CLI 直接呼叫 Anthropic Messages API，`cache_control: ephemeral` 達 95%+ 快取命中率 |
 | **Token 壓縮** | Meta-Token（BPE-like 27-47%）、LLMLingua-2（2-5x 有損）、StreamingLLM（無限長對話）|
 | **Cross-Provider Failover** | `FailoverManager` 健康追蹤、冷卻、不可重試錯誤偵測 |
+| **Cross-Platform PTY Pool**（v1.15.0）| OAuth 帳號專用互動式 REPL 通道 — 跨平台 `portable-pty`（ConPTY on Win 10 1809+、openpty on Unix）+ sentinel-framed in-band 回應協定（無 scrollback scraping / 無 sidecar）+ per-agent semaphore + idle eviction + health-check supervisor + restart policy。預設關閉，per-agent `agent.toml [runtime] pty_pool_enabled = true` 開啟；可選 out-of-process 模式（`worker_managed = true`）把 pool 移到 `duduclaw-cli-worker` 子進程透過 localhost JSON-RPC 通訊 |
+| **PTY Pool Observability** | Phase 8 production-rollout 指標 — `pty_pool_*` Prometheus counters（acquires / cache-hit / spawn / 三種驅逐原因 / 4 種 invoke outcome / duration histogram）+ `worker_health_misses_total` + `worker_restarts_total` + `pty_pool_managed_worker_active` 模式 gauge + `GET /api/runtime/status` JSON 端點（loopback-only） |
 | **Browser 自動化** | 5 層路由（API Fetch → Static Scrape → Headless Playwright → Sandbox Container → Computer Use），deny-by-default |
 
 ### 語音與多媒體
@@ -425,7 +433,7 @@ duduclaw version             # 版本資訊
 
 ```
 DuDuClaw/
-├── crates/                         # Rust crates (16 個)
+├── crates/                         # Rust crates (20 個)
 │   ├── duduclaw-core/              # 共用型別、traits (Channel, MemoryEngine)、錯誤定義
 │   ├── duduclaw-agent/             # Agent 註冊、心跳、預算、契約、skill loader/registry
 │   ├── duduclaw-auth/              # 多用戶認證（Argon2 密碼、JWT、ACL 角色權限）
@@ -433,7 +441,7 @@ DuDuClaw/
 │   ├── duduclaw-container/         # Docker / Apple Container / WSL2 沙箱執行
 │   ├── duduclaw-memory/            # SQLite + FTS5 全文搜尋 + 向量嵌入 + 評測 batch query API
 │   ├── duduclaw-inference/         # 本地推論引擎（llama.cpp / mistral.rs / ONNX / Exo / llamafile）
-│   ├── duduclaw-gateway/           # Axum 伺服器、7 通道、session、GVU²、prediction、cron、dispatcher、LLM fallback、evolution events
+│   ├── duduclaw-gateway/           # Axum 伺服器、7 通道、session、GVU²、prediction、cron、dispatcher、LLM fallback、evolution events、PTY pool 整合
 │   ├── duduclaw-bus/               # tokio broadcast + mpsc 訊息路由
 │   ├── duduclaw-bridge/            # PyO3 Rust↔Python 橋接層
 │   ├── duduclaw-odoo/              # Odoo ERP 中間層 (JSON-RPC, CE/EE, 15 MCP tools)
@@ -441,7 +449,11 @@ DuDuClaw/
 │   ├── duduclaw-dashboard/         # rust-embed 嵌入 React SPA
 │   ├── duduclaw-desktop/           # 桌面端 wrapper（macOS/Windows/Linux）
 │   ├── duduclaw-durability/        # 持久性框架（idempotency / retry / circuit breaker / checkpoint / DLQ）— v1.9.4 新增
-│   └── duduclaw-governance/        # PolicyRegistry / quota_manager / error_codes / audit / approval — v1.9.4 新增
+│   ├── duduclaw-governance/        # PolicyRegistry / quota_manager / error_codes / audit / approval — v1.9.4 新增
+│   ├── duduclaw-identity/          # IdentityProvider trait + Wiki/Notion/Chained 三實作 — v1.11.0 新增
+│   ├── duduclaw-redaction/         # 來源感知 redaction + 可還原 vault（AES-256-GCM）+ 5 profile + JSONL audit — v1.14.0 新增
+│   ├── duduclaw-cli-runtime/       # 跨平台 PTY pool runtime（portable-pty / sentinel-framed）— v1.15.0 新增
+│   └── duduclaw-cli-worker/        # standalone PTY pool worker subprocess（localhost JSON-RPC + Bearer token）— v1.15.0 新增
 │
 ├── python/duduclaw/                # Python 擴充層
 │   ├── channels/                   # LINE / Telegram / Discord 通道插件
