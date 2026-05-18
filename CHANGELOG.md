@@ -1,6 +1,119 @@
 # Changelog
 
 
+## [1.15.1] - 2026-05-18 — SOUL.md Bloat Containment + Structured Patch Path
+
+Customer-reported regression: a production COO bot (`agnes`) had its
+`SOUL.md` balloon from 61 to 592 lines over 5 GVU cycles, with 88% of the
+file being accumulated proposal-meta narrative (`## 診斷` / `## rationale` /
+`## expected_improvement` / `## wiki_proposals`). Each subsequent cycle saw
+the bloated file, generated another correction, and the updater appended it
+verbatim — an infinite feedback loop that bypassed every safety check by
+progressively expanding the baseline so ASI's content-weighted threshold
+stayed permanently satisfied.
+
+This release fixes the failure mode in three layers and ships an unrelated
+MCP server stdout-pollution bug fix.
+
+### Fixed
+
+- **`Updater::apply` no longer appends LLM proposal-meta narrative.**
+  - New `strip_proposal_meta()` drops `## 診斷` / `## Analysis` /
+    `## rationale` / `## expected_improvement` / `## wiki_proposals` /
+    `## proposed_changes` headers and their bodies before the legacy append.
+  - New `SOUL_MAX_LINES = 150` and `SOUL_MAX_BYTES = 8 KB` hard caps reject
+    any proposal that would push SOUL.md beyond either limit, independent of
+    ASI (which becomes permissive on a growing baseline because
+    `for_baseline_size` weakens the threshold proportionally).
+  - The legacy "always append, never replace" safety justification is
+    preserved — the strip+cap layer makes append bounded instead of unbounded.
+
+- **L1 verifier now simulates the real apply path.** When
+  `proposal.patch.is_some()`, `verify_deterministic` calls
+  `apply_patch_to_soul` to compute the true post-apply SOUL.md and runs
+  must_always / must_not / size / sensitive-pattern checks against it,
+  instead of the legacy `current + content` fake append. Without this fix
+  the structured-patch path was DOA: `proposal.content` becomes a human
+  summary like "Add refusal rule" and the must_always pattern (a chunk of
+  contract text) was never found inside it — observed on agnes 2026-05-18
+  where 3 generations rejected for the same phantom must_always failure
+  despite the LLM's `soul_patch` JSON containing exactly the required text.
+
+- **`Generator::parse_response` extracts JSON from markdown code fences.**
+  LLMs commonly wrap structured output in ` ```json ... ``` ` fences with
+  surrounding narrative (e.g. "根據分析... ```json\n{...}\n``` ...核心邏輯...").
+  The parser previously failed pure-JSON parsing on the fence, fell back to
+  section extraction, dropped the `soul_patch` field, and silently
+  downgraded to the legacy strip+cap append. Reuses `verifier::strip_json_fences`
+  for consistency with `parse_judge_response`.
+
+- **MCP server stdout pollution.** `tracing_subscriber::fmt::layer()` now
+  routes to stderr instead of stdout. Claude Desktop's MCP stdio transport
+  parses stdout as JSON-RPC 2.0; the previous default tracing destination
+  corrupted every session with `Unexpected token '', "[2m2026-0..." is not
+  valid JSON` errors. The downstream `cmd_mcp_server` re-init via
+  `try_init` silently no-opped once the global subscriber was already
+  installed. Independent of GVU — affects every MCP client.
+
+### Added
+
+- **`SoulPatch { section, op, content }` structured edit type** with four
+  ops — `Replace`, `AppendWithin`, `PrependWithin`, `AddSection`. Located in
+  `crates/duduclaw-gateway/src/gvu/proposal.rs`. Optional `patch:
+  Option<SoulPatch>` field on `EvolutionProposal` so on-disk proposals
+  deserialize unchanged.
+
+- **`apply_patch_to_soul(current, patch) -> Result<String, String>`** in
+  `gvu/updater.rs` — locates the target `## <title>` header, edits the
+  section body in place per the op, reassembles SOUL.md. Section names
+  containing newlines or `##` tokens are rejected (prompt-injection
+  defence); patch.content is capped at 4 KB per edit.
+
+- **Generator prompt asks LLM to emit a `soul_patch` field.** Schema with
+  op semantics, hard rules forbidding `[保留現有內容]` placeholders and
+  whole-file rewrites, plus a concrete example. Prompt length grew from
+  ~22 KB to ~24.5 KB (≈11% per GVU run).
+
+### Production validation
+
+Run on `agnes` 2026-05-18 09:53Z → 10:42Z, four iterations against the same
+Round 1-4 conversation script (boundary probe → off-scope medical question
+→ negative feedback). Final state: SOUL.md grew 61 → 85 lines with one
+cleanly-added new section, zero meta-narrative residue, zero duplicate
+headers, zero embedded JSON. GVU `outcome=applied`, generation 1, 60.2s
+duration, ASI=0.679 (warning, not critical), L1+L3 verifier approved.
+
+### Test coverage
+
+106 GVU unit tests, +22 new:
+- `proposal_meta_stripper_tests` — Chinese + English meta sections, blank-line
+  collapsing, case-insensitive headers, cap sanity.
+- `updater_apply_caps_tests` — meta-only rejection, line-cap overshoot
+  rejection, clean-proposal application.
+- `soul_patch_tests` — all four ops, section-not-found, prompt-injection
+  guards, oversized content rejection, replace-then-replace idempotence.
+- `soul_patch_apply_e2e_tests` — end-to-end through `Updater::apply` with
+  `proposal.patch = Some(...)`.
+- `generator_tests` — fence-stripped JSON parse, missing-patch fallback,
+  prompt-includes-schema regression guard.
+- Patch-aware L1 verifier — append-patch satisfies must_always check,
+  rejection when pattern truly missing, invalid-section gives clear error,
+  must_not check uses patch content not human summary.
+
+### Backward compatibility
+
+- `proposal.patch` is `Option`, `#[serde(default, skip_serializing_if =
+  "Option::is_none")]` — proposals serialized before this release
+  deserialize unchanged.
+- `Updater::apply` falls back to strip+cap legacy append when `patch` is
+  `None`. LLMs that haven't adopted the new schema continue to work, just
+  with the bounded-growth safety net instead of unbounded append.
+- No `CONTRACT.toml` or `agent.toml` schema changes.
+- No migration required. Existing SOUL.md files already polluted by prior
+  bloat are not auto-cleaned — operators should hand-truncate or wait for
+  ObservationFinalizer's rollback path to fire on metric regression.
+
+
 ## [1.15.0] - 2026-05-17 — Cross-Platform PTY Pool + Worker
 
 Anthropic blocked `claude -p` for OAuth-subscription accounts in mid-2026 and
