@@ -691,9 +691,18 @@ pub async fn entry_point() {
         },
     };
     eprintln!("[duduclaw] effective log level: {level_source}");
+    // Route the terminal fmt layer to stderr — stdout must stay clean for any
+    // subcommand that uses it as a protocol channel. `mcp-server` is the
+    // critical case: Claude Desktop spawns it and parses stdout as JSON-RPC
+    // 2.0, so a single tracing line on stdout corrupts the entire session
+    // with "Unexpected token, [2m2026-...] is not valid JSON" errors.
+    // The downstream `cmd_mcp_server` previously tried to re-init tracing to
+    // stderr via `try_init`, but that silently no-ops once the global
+    // subscriber is already installed (here). Routing to stderr from the
+    // start is the only reliable fix. CLI-H7.
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(non_blocking))
         .with(duduclaw_gateway::log::BroadcastLayer)
         .init();

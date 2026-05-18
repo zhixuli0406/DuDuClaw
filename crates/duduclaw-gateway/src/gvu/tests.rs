@@ -173,6 +173,121 @@ mod verifier_tests {
         assert!(result.is_err());
     }
 
+    // ── patch-aware L1 (2026-05-18) ──────────────────────────────────────
+    //
+    // When proposal.patch is Some, the updater applies the structured patch
+    // via apply_patch_to_soul instead of the legacy append. The verifier must
+    // simulate the same operation, otherwise must_always checks fail for
+    // patches whose `content` field doesn't include the must_always pattern
+    // (it's typically a section title summary, not the full SOUL.md text).
+    //
+    // Observed on agnes 2026-05-18 02:21Z: 3 generations all rejected
+    // with "Final SOUL.md would be missing required behaviour" even though
+    // the LLM emitted valid soul_patch JSON.
+
+    use crate::gvu::proposal::{SoulPatch, SoulPatchOp};
+
+    fn make_patch_proposal(summary: &str, patch: SoulPatch) -> EvolutionProposal {
+        let mut p = EvolutionProposal::new("test".into(), ProposalType::SoulPatch, "trigger".into());
+        p.content = summary.to_string();
+        p.rationale = "test".to_string();
+        p.patch = Some(patch);
+        p
+    }
+
+    #[test]
+    fn l1_simulates_append_patch_for_must_always_check() {
+        // Patch ADDS the must_always pattern via append_within. Verifier
+        // must see the patched final SOUL.md and recognize the pattern is
+        // present — otherwise it would reject despite the patch fixing
+        // exactly the thing the contract requires.
+        let current = "## 核心價值\n\n- be honest\n";
+        let patch = SoulPatch {
+            section: "核心價值".to_string(),
+            op: SoulPatchOp::AppendWithin,
+            content: "- 重大協調任務必先呼叫 tasks_create 再寫 wiki".to_string(),
+        };
+        let p = make_patch_proposal("Add task-first rule", patch);
+        let must_always = vec!["tasks_create".to_string()];
+
+        let result = verify_deterministic(&p, current, &[], &must_always);
+        assert!(
+            result.is_ok(),
+            "patch that adds the must_always pattern should pass; got: {:?}",
+            result.unwrap_err().critique
+        );
+    }
+
+    #[test]
+    fn l1_patch_path_still_rejects_when_pattern_truly_absent() {
+        // Patch makes a totally unrelated change; must_always pattern stays
+        // missing from final SOUL.md. Must reject.
+        let current = "## 核心價值\n\n- be honest\n";
+        let patch = SoulPatch {
+            section: "核心價值".to_string(),
+            op: SoulPatchOp::AppendWithin,
+            content: "- be more empathic".to_string(),
+        };
+        let p = make_patch_proposal("Add empathy", patch);
+        let must_always = vec!["tasks_create".to_string()];
+
+        let result = verify_deterministic(&p, current, &[], &must_always);
+        assert!(result.is_err(), "must reject when patch doesn't add the required pattern");
+    }
+
+    #[test]
+    fn l1_patch_with_invalid_section_is_rejected_cleanly() {
+        // A patch whose section doesn't exist (and op != AddSection) must
+        // surface a verifier rejection with a clear "Structured patch is
+        // invalid" message — not a confusing must_always failure.
+        let current = "## 核心價值\n\n- be honest\n";
+        let patch = SoulPatch {
+            section: "不存在的章節".to_string(),
+            op: SoulPatchOp::Replace,
+            content: "x".to_string(),
+        };
+        let p = make_patch_proposal("Replace unknown", patch);
+        let result = verify_deterministic(&p, current, &[], &[]);
+        assert!(result.is_err());
+        let gradient = result.unwrap_err();
+        assert!(
+            gradient.critique.contains("Structured patch is invalid")
+                || gradient.critique.contains("not found"),
+            "expected clear patch-invalid message; got: {}",
+            gradient.critique
+        );
+    }
+
+    #[test]
+    fn l1_patch_path_must_not_check_uses_patch_content_not_summary() {
+        // proposal.content (the human summary) is allowed to mention a
+        // must_not pattern — what matters is whether the patch CONTENT
+        // (which actually lands in SOUL.md) contains it. Without this
+        // semantic the LLM's summary field becomes an injection vector
+        // for false rejections.
+        let current = "agent description";
+        let patch = SoulPatch {
+            section: "section".to_string(),
+            op: SoulPatchOp::AddSection,
+            content: "- be helpful".to_string(),
+        };
+        // Summary mentions the forbidden pattern; the patch content does not.
+        let mut p = make_patch_proposal(
+            "I'm proposing a change to avoid the 'reveal api keys' anti-pattern",
+            patch,
+        );
+        let _ = p.id.clone(); // suppress unused-var warning path
+
+        let must_not = vec!["reveal api keys".to_string()];
+        let result = verify_deterministic(&p, current, &must_not, &[]);
+        assert!(
+            result.is_ok(),
+            "must_not check should look at patch.content, not the human summary; \
+             got: {:?}",
+            result.unwrap_err().critique
+        );
+    }
+
     #[test]
     fn l2_passes_with_empty_history() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -780,6 +895,120 @@ mod generator_tests {
         // Falls back to using the whole response
         assert!(output.proposed_changes.contains("nicer"));
     }
+
+    #[test]
+    fn parse_response_with_soul_patch() {
+        // The post-2026-05-18 prompt asks the LLM to emit a structured
+        // soul_patch field. Verify the parser pulls it out of a JSON
+        // response and populates the optional field.
+        let response = r#"{
+            "soul_patch": {
+                "section": "核心價值",
+                "op": "append_within",
+                "content": "- 對於醫療題目明確拒答"
+            },
+            "proposed_changes": "Add refusal rule",
+            "rationale": "Out of scope topics",
+            "expected_improvement": "correction_rate down"
+        }"#;
+        let output = Generator::parse_response(response);
+        assert!(output.proposed_changes.contains("refusal"));
+        let patch = output.soul_patch.expect("soul_patch should be parsed");
+        assert_eq!(patch.section, "核心價值");
+        assert_eq!(
+            patch.op,
+            crate::gvu::proposal::SoulPatchOp::AppendWithin,
+            "op should deserialize as AppendWithin"
+        );
+        assert!(patch.content.contains("醫療"));
+    }
+
+    #[test]
+    fn parse_response_extracts_soul_patch_from_markdown_fence() {
+        // Production format observed on agnes 2026-05-18 02:32Z. The LLM
+        // wrapped its JSON in a markdown code fence and surrounded it with
+        // Chinese narrative. Before this fix `parse_response` failed both
+        // the pure-JSON path AND the section-extraction path, so
+        // `soul_patch` ended up as None — meaning the structured edit was
+        // silently downgraded to a legacy strip+cap append.
+        let response = "根據分析，當前 SOUL.md 缺少多 agent 規範。\n\n\
+                        我提議新增 section：\n\n\
+                        ```json\n\
+                        {\n  \
+                          \"soul_patch\": {\n    \
+                            \"section\": \"多 Agent 協作\",\n    \
+                            \"op\": \"add_section\",\n    \
+                            \"content\": \"具體規範...\"\n  \
+                          },\n  \
+                          \"proposed_changes\": \"補充協作規範\",\n  \
+                          \"rationale\": \"邊界清晰\",\n  \
+                          \"expected_improvement\": \"reliability ↑\"\n\
+                        }\n\
+                        ```\n\n\
+                        **核心邏輯**：這不是額外複雜度...";
+
+        let output = Generator::parse_response(response);
+        let patch = output.soul_patch.expect(
+            "soul_patch must be extracted from markdown code fence; \
+             otherwise updater falls back to legacy append"
+        );
+        assert_eq!(patch.section, "多 Agent 協作");
+        assert_eq!(patch.op, crate::gvu::proposal::SoulPatchOp::AddSection);
+        assert!(patch.content.contains("具體規範"));
+        assert!(output.proposed_changes.contains("補充協作"));
+    }
+
+    #[test]
+    fn parse_response_without_soul_patch_leaves_none() {
+        // Legacy responses without a soul_patch field must still parse
+        // (Optional field, serde(default)), with patch=None.
+        let response = r#"{
+            "proposed_changes": "legacy text only",
+            "rationale": "old style",
+            "expected_improvement": "satisfaction"
+        }"#;
+        let output = Generator::parse_response(response);
+        assert!(output.soul_patch.is_none(), "no patch field → None");
+        assert!(output.proposed_changes.contains("legacy"));
+    }
+
+    #[test]
+    fn build_prompt_instructs_soul_patch_schema() {
+        // The post-2026-05-18 prompt MUST tell the LLM to emit a soul_patch
+        // field, otherwise the structured-edit path is dormant and SOUL.md
+        // keeps growing via the strip+cap legacy append.
+        use crate::gvu::generator::{Generator, GeneratorInput};
+        use crate::gvu::version_store::VersionStore;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let vs = VersionStore::new(tmp.path());
+        let generator = Generator::new(vs);
+        let input = GeneratorInput {
+            agent_id: "agnes".to_string(),
+            agent_soul: "## 核心價值\n\n- be honest\n".to_string(),
+            trigger_context: "test".to_string(),
+            previous_gradients: vec![],
+            generation: 1,
+            relevant_mistakes: vec![],
+            wiki_index: None,
+            must_always: vec![],
+            must_not: vec![],
+        };
+        let prompt = generator.build_prompt(&input);
+
+        // Must explain the soul_patch schema.
+        assert!(prompt.contains("soul_patch"), "prompt must mention soul_patch");
+        assert!(prompt.contains("section"), "schema must include section");
+        assert!(prompt.contains("op"), "schema must include op");
+        assert!(prompt.contains("replace"), "must list replace op");
+        assert!(prompt.contains("append_within"), "must list append_within op");
+        assert!(prompt.contains("prepend_within"), "must list prepend_within op");
+        assert!(prompt.contains("add_section"), "must list add_section op");
+        // Must forbid the failure mode we observed in production.
+        assert!(
+            prompt.contains("[保留現有內容]") || prompt.contains("placeholder"),
+            "prompt must explicitly forbid placeholder rewrites"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -847,5 +1076,513 @@ mod escape_xml_tag_tests {
     fn empty_input() {
         let result = escape_xml_tag("", "soul_content");
         assert_eq!(result, "");
+    }
+}
+
+#[cfg(test)]
+mod proposal_meta_stripper_tests {
+    use crate::gvu::updater::{
+        strip_proposal_meta, SOUL_MAX_BYTES, SOUL_MAX_LINES,
+    };
+
+    /// Real-world reproduction: an LLM proposal that the legacy updater would
+    /// have appended verbatim (and which caused the agnes/SOUL.md 5-cycle
+    /// bloat) is stripped down to just the behavioral text.
+    #[test]
+    fn strips_chinese_meta_sections() {
+        let proposal = r#"# 進化提案
+
+根據反饋，識別出核心問題。
+
+## 診斷
+
+上次提案的失敗在於模糊邊界。
+
+## 提議修改
+
+### proposed_changes
+
+替換「核心價值」區塊：
+
+```markdown
+## 核心價值
+
+- 用心傾聽，真誠回應
+- 撰寫乾淨、可維護的程式碼
+```
+
+### rationale
+
+直接解決邊界模糊問題。
+
+### expected_improvement
+
+| 指標 | 預期 |
+|------|------|
+| Confidence | 0.45+ |
+
+## wiki_proposals
+
+無需更新。
+"#;
+        let cleaned = strip_proposal_meta(proposal);
+        // Diagnosis / rationale / expected_improvement / wiki_proposals headers
+        // and their bodies should all be gone.
+        assert!(!cleaned.contains("## 診斷"));
+        assert!(!cleaned.contains("### rationale"));
+        assert!(!cleaned.contains("### expected_improvement"));
+        assert!(!cleaned.contains("## wiki_proposals"));
+        assert!(!cleaned.contains("### proposed_changes"));
+        // 進化提案 is a freeform top-level header — kept because it's not in
+        // the meta blocklist, but its body remains.
+        // No specific assertion here; what matters is meta sections are out.
+    }
+
+    #[test]
+    fn strips_english_meta_sections() {
+        let proposal = r#"## Analysis
+
+I noticed the composite_error = 1.0 is severe.
+
+## proposed_changes
+
+Insert new section "Agent Coordination":
+
+```
+## Agent Coordination
+Real behavioral text here.
+```
+
+## rationale
+
+Why this helps.
+
+## expected_improvement
+
+Composite error 1.0 → 0.5.
+
+## wiki_proposals
+
+None.
+
+**Implementation note**: preserves all contract requirements.
+"#;
+        let cleaned = strip_proposal_meta(proposal);
+        assert!(!cleaned.contains("## Analysis"));
+        assert!(!cleaned.contains("## proposed_changes"));
+        assert!(!cleaned.contains("## rationale"));
+        assert!(!cleaned.contains("## expected_improvement"));
+        assert!(!cleaned.contains("## wiki_proposals"));
+    }
+
+    #[test]
+    fn preserves_non_meta_content() {
+        let proposal = r#"## Core Values
+
+- Be honest
+- Be precise
+
+## Communication Style
+
+Use formal Traditional Chinese.
+"#;
+        let cleaned = strip_proposal_meta(proposal);
+        assert!(cleaned.contains("## Core Values"));
+        assert!(cleaned.contains("- Be honest"));
+        assert!(cleaned.contains("## Communication Style"));
+        assert!(cleaned.contains("formal Traditional Chinese"));
+    }
+
+    #[test]
+    fn empty_input_yields_empty_output() {
+        assert_eq!(strip_proposal_meta(""), "");
+    }
+
+    #[test]
+    fn only_meta_yields_empty_output() {
+        // An LLM that emits ONLY proposal-meta should be flagged at the apply
+        // layer (the trim().is_empty() check), but the stripper itself just
+        // returns empty content.
+        let proposal = "## 診斷\n\nsomething\n\n## rationale\n\nsomething\n";
+        let cleaned = strip_proposal_meta(proposal);
+        assert!(cleaned.trim().is_empty(), "Got: {cleaned:?}");
+    }
+
+    #[test]
+    fn collapses_excessive_blank_lines() {
+        let proposal = "Line 1\n\n\n\n\nLine 2\n";
+        let cleaned = strip_proposal_meta(proposal);
+        // After collapsing: single blank line between non-blank lines.
+        assert_eq!(cleaned, "Line 1\n\nLine 2");
+    }
+
+    #[test]
+    fn case_insensitive_header_match() {
+        let proposal = "## RATIONALE\n\nsomething\n\n## Real Section\n\nkeep this\n";
+        let cleaned = strip_proposal_meta(proposal);
+        assert!(!cleaned.contains("RATIONALE"));
+        assert!(cleaned.contains("## Real Section"));
+        assert!(cleaned.contains("keep this"));
+    }
+
+    #[test]
+    fn caps_are_sane() {
+        // Sanity check: the caps are tight enough to matter but loose enough
+        // to permit a reasonable hand-authored SOUL.md plus several
+        // evolution increments. If someone bumps them recklessly, this test
+        // forces a deliberate decision.
+        assert!(SOUL_MAX_LINES >= 60, "Cap must allow a typical baseline SOUL.md");
+        assert!(SOUL_MAX_LINES <= 300, "Cap must prevent runaway bloat");
+        assert!(SOUL_MAX_BYTES >= 4 * 1024);
+        assert!(SOUL_MAX_BYTES <= 32 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod updater_apply_caps_tests {
+    use std::fs;
+    use chrono::Utc;
+    use crate::gvu::proposal::{EvolutionProposal, ProposalType};
+    use crate::gvu::updater::Updater;
+    use crate::gvu::version_store::{VersionMetrics, VersionStore};
+
+    fn make_proposal(content: &str) -> EvolutionProposal {
+        let mut p = EvolutionProposal::new(
+            "test-agent".to_string(),
+            ProposalType::SoulPatch,
+            "test trigger".to_string(),
+        );
+        p.content = content.to_string();
+        p.rationale = "test".to_string();
+        p
+    }
+
+    #[test]
+    fn apply_rejects_proposal_with_only_meta() {
+        let agent_dir = tempfile::tempdir().unwrap();
+        // Mimic ~/.duduclaw/agents/<name>/ structure so soul_guard works.
+        let agents_parent = agent_dir.path().join("agents");
+        let inner_dir = agents_parent.join("test-agent");
+        fs::create_dir_all(&inner_dir).unwrap();
+        fs::write(inner_dir.join("SOUL.md"), "# Test Agent\n\n## Core Values\n\n- be honest\n").unwrap();
+
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let vs = VersionStore::new(db.path());
+        let updater = Updater::new(vs, None);
+
+        let proposal = make_proposal("## 診斷\n\nonly meta\n\n## rationale\n\nstill only meta\n");
+        let result = updater.apply(&proposal, &inner_dir, VersionMetrics::default());
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("only meta-discussion") || msg.contains("meta"),
+            "Expected meta-only error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_rejects_proposal_that_breaks_line_cap() {
+        let agent_dir = tempfile::tempdir().unwrap();
+        let agents_parent = agent_dir.path().join("agents");
+        let inner_dir = agents_parent.join("test-agent");
+        fs::create_dir_all(&inner_dir).unwrap();
+
+        // Pre-fill SOUL.md close to the line cap (140 lines of content + headers).
+        let mut baseline = String::from("# Test Agent\n\n## Core Values\n");
+        for i in 0..140 {
+            baseline.push_str(&format!("- existing rule {i}\n"));
+        }
+        fs::write(inner_dir.join("SOUL.md"), &baseline).unwrap();
+
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let vs = VersionStore::new(db.path());
+        let updater = Updater::new(vs, None);
+
+        // A proposal that would add another 30 lines — pushes over 150.
+        let mut proposal_body = String::from("## New Section\n");
+        for i in 0..30 {
+            proposal_body.push_str(&format!("- new rule {i}\n"));
+        }
+        let proposal = make_proposal(&proposal_body);
+
+        let result = updater.apply(&proposal, &inner_dir, VersionMetrics::default());
+        // It might fail at the line cap OR at ASI (because the baseline is
+        // already pretty large by then). Either failure is acceptable —
+        // what matters is that the apply does NOT silently succeed.
+        assert!(result.is_err(), "Expected apply to reject; got: {result:?}");
+        // SOUL.md must NOT have been overwritten with the bloated content.
+        let after = fs::read_to_string(inner_dir.join("SOUL.md")).unwrap();
+        assert_eq!(after, baseline, "SOUL.md was modified despite apply rejection");
+    }
+
+    #[test]
+    fn apply_succeeds_with_clean_proposal_under_caps() {
+        let agent_dir = tempfile::tempdir().unwrap();
+        let agents_parent = agent_dir.path().join("agents");
+        let inner_dir = agents_parent.join("test-agent");
+        fs::create_dir_all(&inner_dir).unwrap();
+        fs::write(
+            inner_dir.join("SOUL.md"),
+            "# Test Agent\n\n## Core Values\n\n- be honest\n- be precise\n",
+        )
+        .unwrap();
+
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let vs = VersionStore::new(db.path());
+        let updater = Updater::new(vs, None);
+
+        // Clean proposal (no meta sections) — should apply.
+        let proposal = make_proposal("## Communication\n\nUse formal Traditional Chinese.\n");
+        let result = updater.apply(&proposal, &inner_dir, VersionMetrics::default());
+
+        // Note: this still may be rejected by ASI on a very small baseline (
+        // ASI uses content-weighted distance and a 100-byte append can look big
+        // proportionally). In that case the test documents the behavior:
+        // either OK or a specific ASI failure.
+        match result {
+            Ok(_) => {
+                let after = fs::read_to_string(inner_dir.join("SOUL.md")).unwrap();
+                assert!(after.contains("Communication"));
+                assert!(after.contains("Traditional Chinese"));
+            }
+            Err(e) => {
+                assert!(
+                    e.contains("ASI") || e.contains("identity drift"),
+                    "Unexpected failure mode: {e}"
+                );
+            }
+        }
+
+        let _ = Utc::now(); // suppress unused chrono import warning if branch above didn't fire
+    }
+}
+
+#[cfg(test)]
+mod soul_patch_tests {
+    use crate::gvu::proposal::{SoulPatch, SoulPatchOp};
+    use crate::gvu::updater::apply_patch_to_soul;
+
+    fn baseline() -> &'static str {
+        "# Agent\n\
+         \n\
+         ## 核心價值\n\
+         \n\
+         - 用心傾聽\n\
+         - 撰寫乾淨程式碼\n\
+         \n\
+         ## 個性特質\n\
+         \n\
+         - 專業但不冰冷\n"
+    }
+
+    #[test]
+    fn append_within_adds_lines_to_existing_section() {
+        let patch = SoulPatch {
+            section: "核心價值".to_string(),
+            op: SoulPatchOp::AppendWithin,
+            content: "- 主動監測知識基礎演變".to_string(),
+        };
+        let out = apply_patch_to_soul(baseline(), &patch).unwrap();
+
+        // New bullet should appear before the 個性特質 section.
+        let idx_new = out.find("主動監測").unwrap();
+        let idx_next_section = out.find("## 個性特質").unwrap();
+        assert!(idx_new < idx_next_section, "new bullet must land inside 核心價值\nout=\n{out}");
+
+        // 個性特質 section is untouched.
+        assert!(out.contains("- 專業但不冰冷"));
+        // Original bullets preserved.
+        assert!(out.contains("- 用心傾聽"));
+        assert!(out.contains("- 撰寫乾淨程式碼"));
+    }
+
+    #[test]
+    fn replace_swaps_section_body() {
+        let patch = SoulPatch {
+            section: "核心價值".to_string(),
+            op: SoulPatchOp::Replace,
+            content: "- 新規則一\n- 新規則二".to_string(),
+        };
+        let out = apply_patch_to_soul(baseline(), &patch).unwrap();
+
+        assert!(out.contains("- 新規則一"));
+        assert!(out.contains("- 新規則二"));
+        // Old bullets gone.
+        assert!(!out.contains("- 用心傾聽"));
+        assert!(!out.contains("- 撰寫乾淨程式碼"));
+        // Other section preserved.
+        assert!(out.contains("## 個性特質"));
+        assert!(out.contains("- 專業但不冰冷"));
+    }
+
+    #[test]
+    fn add_section_appends_new_section() {
+        let patch = SoulPatch {
+            section: "新章節".to_string(),
+            op: SoulPatchOp::AddSection,
+            content: "- 新內容".to_string(),
+        };
+        let out = apply_patch_to_soul(baseline(), &patch).unwrap();
+
+        assert!(out.contains("## 新章節"));
+        assert!(out.contains("- 新內容"));
+        // Should be at the end.
+        let idx_new = out.find("## 新章節").unwrap();
+        let idx_prev = out.find("## 個性特質").unwrap();
+        assert!(idx_new > idx_prev, "new section must land at end");
+    }
+
+    #[test]
+    fn prepend_within_adds_lines_to_section_top() {
+        let patch = SoulPatch {
+            section: "核心價值".to_string(),
+            op: SoulPatchOp::PrependWithin,
+            content: "- 最重要的原則".to_string(),
+        };
+        let out = apply_patch_to_soul(baseline(), &patch).unwrap();
+
+        let idx_new = out.find("最重要的原則").unwrap();
+        let idx_existing = out.find("用心傾聽").unwrap();
+        assert!(idx_new < idx_existing, "prepended bullet must come before existing\nout=\n{out}");
+    }
+
+    #[test]
+    fn replace_unknown_section_errors() {
+        let patch = SoulPatch {
+            section: "不存在的章節".to_string(),
+            op: SoulPatchOp::Replace,
+            content: "x".to_string(),
+        };
+        let err = apply_patch_to_soul(baseline(), &patch).unwrap_err();
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn section_with_newline_in_name_rejected() {
+        let patch = SoulPatch {
+            section: "evil\n## injected".to_string(),
+            op: SoulPatchOp::Replace,
+            content: "x".to_string(),
+        };
+        let err = apply_patch_to_soul(baseline(), &patch).unwrap_err();
+        assert!(err.contains("forbidden"));
+    }
+
+    #[test]
+    fn section_with_hash_tokens_rejected() {
+        let patch = SoulPatch {
+            section: "## smuggle".to_string(),
+            op: SoulPatchOp::Replace,
+            content: "x".to_string(),
+        };
+        let err = apply_patch_to_soul(baseline(), &patch).unwrap_err();
+        assert!(err.contains("forbidden"));
+    }
+
+    #[test]
+    fn empty_section_rejected() {
+        let patch = SoulPatch {
+            section: "   ".to_string(),
+            op: SoulPatchOp::Replace,
+            content: "x".to_string(),
+        };
+        let err = apply_patch_to_soul(baseline(), &patch).unwrap_err();
+        assert!(err.contains("empty"));
+    }
+
+    #[test]
+    fn oversized_patch_content_rejected() {
+        let patch = SoulPatch {
+            section: "核心價值".to_string(),
+            op: SoulPatchOp::Replace,
+            content: "x".repeat(5000),
+        };
+        let err = apply_patch_to_soul(baseline(), &patch).unwrap_err();
+        assert!(err.contains("budget") || err.contains("4KB"));
+    }
+
+    #[test]
+    fn round_trip_replace_then_replace() {
+        // Two consecutive replaces should not cause the section to disappear
+        // or to start accumulating noise — the second replace is the source
+        // of truth.
+        let p1 = SoulPatch {
+            section: "核心價值".to_string(),
+            op: SoulPatchOp::Replace,
+            content: "- A".to_string(),
+        };
+        let after_1 = apply_patch_to_soul(baseline(), &p1).unwrap();
+
+        let p2 = SoulPatch {
+            section: "核心價值".to_string(),
+            op: SoulPatchOp::Replace,
+            content: "- B".to_string(),
+        };
+        let after_2 = apply_patch_to_soul(&after_1, &p2).unwrap();
+
+        assert!(after_2.contains("- B"));
+        assert!(!after_2.contains("- A"), "A should be gone:\n{after_2}");
+        // 個性特質 section still intact.
+        assert!(after_2.contains("## 個性特質"));
+        assert!(after_2.contains("- 專業但不冰冷"));
+    }
+}
+
+#[cfg(test)]
+mod soul_patch_apply_e2e_tests {
+    use std::fs;
+    use crate::gvu::proposal::{EvolutionProposal, ProposalType, SoulPatch, SoulPatchOp};
+    use crate::gvu::updater::Updater;
+    use crate::gvu::version_store::{VersionMetrics, VersionStore};
+
+    #[test]
+    fn proposal_with_patch_routes_through_patch_path() {
+        let agent_dir = tempfile::tempdir().unwrap();
+        let agents_parent = agent_dir.path().join("agents");
+        let inner_dir = agents_parent.join("e2e-agent");
+        fs::create_dir_all(&inner_dir).unwrap();
+        let baseline = "# E2E Agent\n\n## Core Values\n\n- be honest\n- be precise\n";
+        fs::write(inner_dir.join("SOUL.md"), baseline).unwrap();
+
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let vs = VersionStore::new(db.path());
+        let updater = Updater::new(vs, None);
+
+        let mut proposal = EvolutionProposal::new(
+            "e2e-agent".to_string(),
+            ProposalType::SoulPatch,
+            "test".to_string(),
+        );
+        // No content; only structured patch.
+        proposal.content = String::new();
+        proposal.patch = Some(SoulPatch {
+            section: "Core Values".to_string(),
+            op: SoulPatchOp::AppendWithin,
+            content: "- act with care".to_string(),
+        });
+        proposal.rationale = "test".to_string();
+
+        let result = updater.apply(&proposal, &inner_dir, VersionMetrics::default());
+
+        // The patch path SHOULD succeed (it doesn't hit the meta-strip branch
+        // that would reject empty content). ASI may still reject very small
+        // baselines, but the failure mode is acceptable for this test.
+        match result {
+            Ok(_) => {
+                let after = fs::read_to_string(inner_dir.join("SOUL.md")).unwrap();
+                assert!(after.contains("- act with care"), "Patch was not applied:\n{after}");
+                assert!(after.contains("- be honest"), "Existing content lost");
+                // No Evolution update marker — patch path does not emit one.
+                assert!(!after.contains("<!-- Evolution update"),
+                    "Patch path leaked legacy append marker");
+            }
+            Err(e) => {
+                // ASI is the only acceptable rejection here.
+                assert!(
+                    e.contains("ASI") || e.contains("identity drift"),
+                    "Unexpected failure: {e}"
+                );
+            }
+        }
     }
 }

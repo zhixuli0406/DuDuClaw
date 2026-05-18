@@ -5,6 +5,39 @@ use serde::{Deserialize, Serialize};
 
 use super::text_gradient::TextGradient;
 
+/// Structured edit operation for a SOUL.md patch.
+///
+/// Replaces the legacy "LLM emits Markdown narrative → updater blindly appends"
+/// flow with a typed instruction the updater can execute deterministically.
+/// See [`crate::gvu::updater::apply_patch_to_soul`] for the application logic.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SoulPatchOp {
+    /// Replace the entire body of the named section (header line preserved).
+    Replace,
+    /// Insert lines at the END of the named section.
+    AppendWithin,
+    /// Insert lines at the START of the named section (just after the header).
+    PrependWithin,
+    /// Create a NEW section at the end of SOUL.md with this title.
+    AddSection,
+}
+
+/// A typed instruction for editing SOUL.md.
+///
+/// Example: `SoulPatch { section: "核心價值", op: SoulPatchOp::AppendWithin,
+/// content: "- 主動監測知識基礎的演變" }` adds one bullet to the existing
+/// `## 核心價值` section without touching anything else.
+///
+/// `section` matches the text after the leading `##` (h2) of the target
+/// section. Case-sensitive, leading/trailing whitespace stripped.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SoulPatch {
+    pub section: String,
+    pub op: SoulPatchOp,
+    pub content: String,
+}
+
 /// What kind of evolution change is being proposed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -71,6 +104,12 @@ pub struct EvolutionProposal {
     /// What kind of change.
     pub proposal_type: ProposalType,
     /// The proposed change content (diff, full text, or filename).
+    ///
+    /// LEGACY field: free-form Markdown narrative from the LLM. The updater
+    /// strips meta sections from this (see [`crate::gvu::updater::strip_proposal_meta`])
+    /// before appending. New proposals SHOULD prefer the structured [`Self::patch`]
+    /// field instead, which describes a typed edit operation the updater can
+    /// apply deterministically without LLM-side narrative cleanup.
     pub content: String,
     /// Why this change was proposed (human-readable).
     pub rationale: String,
@@ -84,6 +123,11 @@ pub struct EvolutionProposal {
     pub created_at: DateTime<Utc>,
     /// When the proposal reached a terminal state.
     pub resolved_at: Option<DateTime<Utc>>,
+    /// Structured edit operation. When present, the updater applies this
+    /// instead of the free-form [`Self::content`] append. Optional and
+    /// `serde(default)` so existing on-disk proposals deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<SoulPatch>,
 }
 
 impl EvolutionProposal {
@@ -100,6 +144,7 @@ impl EvolutionProposal {
             trigger_context,
             created_at: Utc::now(),
             resolved_at: None,
+            patch: None,
         }
     }
 }

@@ -11,6 +11,7 @@ use tracing::info;
 use super::mistake_notebook::{MistakeEntry, MistakeNotebook};
 use super::proposal::EvolutionProposal;
 use super::text_gradient::TextGradient;
+use super::updater::apply_patch_to_soul;
 use super::version_store::{SoulVersion, VersionStatus, VersionStore};
 
 /// Result of verification.
@@ -42,11 +43,43 @@ pub fn verify_deterministic(
 ) -> Result<(), TextGradient> {
     let proposed_content = &proposal.content;
 
-    // Simulate the final SOUL.md content after applying the change (append mode)
-    let simulated_final = format!("{}\n\n{}", current_soul, proposed_content);
+    // Simulate the final SOUL.md content after applying the change.
+    //
+    // When the proposal carries a structured `patch`, the updater will route
+    // through `apply_patch_to_soul` instead of the legacy append. The L1 must_always
+    // check therefore needs to match what the updater will actually write, not
+    // a fake append simulation. Without this branch, `proposal.content` (which
+    // becomes the human-readable summary like "Add refusal rule") gets appended
+    // to current_soul, and the must_always pattern search inevitably fails —
+    // observed on agnes 2026-05-18 where 3 generations all rejected with
+    // "Final SOUL.md would be missing required behaviour" despite the LLM
+    // emitting a valid soul_patch JSON.
+    let simulated_final = if let Some(patch) = &proposal.patch {
+        match apply_patch_to_soul(current_soul, patch) {
+            Ok(final_soul) => final_soul,
+            Err(e) => {
+                return Err(TextGradient::blocking(
+                    "L1-Deterministic",
+                    "proposal.patch",
+                    &format!("Structured patch is invalid: {e}"),
+                    "Emit a soul_patch whose section matches an existing ## header (or use op=add_section for a new one), with content under 4KB",
+                ));
+            }
+        }
+    } else {
+        format!("{}\n\n{}", current_soul, proposed_content)
+    };
 
     // Check: proposed content is not empty
-    if proposed_content.trim().is_empty() {
+    //
+    // For the structured-patch path, this guards the patch content; for the
+    // legacy path it guards the freeform Markdown narrative.
+    let payload = proposal
+        .patch
+        .as_ref()
+        .map(|p| p.content.as_str())
+        .unwrap_or(proposed_content.as_str());
+    if payload.trim().is_empty() {
         return Err(TextGradient::blocking(
             "L1-Deterministic",
             "proposal.content",
@@ -56,11 +89,11 @@ pub fn verify_deterministic(
     }
 
     // Check: proposed content is not too long (likely garbage)
-    if proposed_content.len() > 10_000 {
+    if payload.len() > 10_000 {
         return Err(TextGradient::blocking(
             "L1-Deterministic",
             "proposal.content",
-            &format!("Proposed content is {} bytes, exceeding 10KB limit", proposed_content.len()),
+            &format!("Proposed content is {} bytes, exceeding 10KB limit", payload.len()),
             "Keep SOUL.md changes focused and concise (under 10KB)",
         ));
     }
@@ -80,10 +113,10 @@ pub fn verify_deterministic(
     // below (which already runs on `proposed_content`). If operators want
     // to force-strip an existing pattern from SOUL.md they should hand-edit
     // — GVU isn't in the business of unwinding human-authored content.
-    let lower_proposed = proposed_content.to_lowercase();
+    let lower_payload = payload.to_lowercase();
     for pattern in must_not {
         let lower_pattern = pattern.to_lowercase();
-        if lower_proposed.contains(&lower_pattern) {
+        if lower_payload.contains(&lower_pattern) {
             return Err(TextGradient::blocking(
                 "L1-Deterministic",
                 "proposal.content",
@@ -122,7 +155,7 @@ pub fn verify_deterministic(
         "LINE_CHANNEL_SECRET", "TELEGRAM_BOT_TOKEN", "token=",
     ];
     for pattern in &sensitive_patterns {
-        if proposed_content.contains(pattern) {
+        if payload.contains(pattern) {
             return Err(TextGradient::blocking(
                 "L1-Deterministic",
                 "proposal.content",
@@ -400,7 +433,7 @@ use super::generator::escape_xml_tag as escape_xml_tag_verifier;
 /// Strip markdown code fences (` ```json ... ``` ` or ` ``` ... ``` `)
 /// that LLMs commonly wrap around JSON responses.
 /// Handles: bare fences, preamble text before fence, and trailing text after closing fence.
-fn strip_json_fences(s: &str) -> &str {
+pub(crate) fn strip_json_fences(s: &str) -> &str {
     let trimmed = s.trim();
 
     // Find the opening fence — either at the start or after preamble text.
