@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use super::mistake_notebook::MistakeEntry;
-use super::proposal::{EvolutionProposal, ProposalStatus};
+use super::proposal::{EvolutionProposal, ProposalStatus, SoulPatch};
 use super::text_gradient::TextGradient;
 use super::version_store::VersionStore;
 
@@ -52,6 +52,12 @@ pub struct GeneratorOutput {
     /// When present, the Updater writes these pages to the agent's wiki/.
     #[serde(default)]
     pub wiki_proposals: Vec<duduclaw_memory::wiki::WikiProposal>,
+    /// Optional structured edit (preferred over [`Self::proposed_changes`]
+    /// when the LLM emits it). When present, [`Generator::apply_output`]
+    /// propagates it onto the proposal and the updater applies it via
+    /// [`crate::gvu::updater::apply_patch_to_soul`] instead of appending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soul_patch: Option<SoulPatch>,
 }
 
 /// Generator produces evolution proposals.
@@ -284,17 +290,57 @@ impl Generator {
              {contract}\
              {gradients}\n\
              ## Instructions\n\
-             Based on the history and current context, propose specific changes to SOUL.md.\n\
+             Based on the history and current context, propose ONE focused change to SOUL.md.\n\
              - Focus on the most impactful change (one focused modification, not a rewrite)\n\
              - Learn from history: if a direction was rolled back, avoid repeating it\n\
              - If a confirmed version improved metrics, build on that direction\n\
-             - Be specific: describe exactly what lines to change and how\n\
              - Honor the Behavioral Contract above — any must_always pattern listed \
-               as 'MUST RE-INTRODUCE' MUST appear verbatim in your proposed_changes\n\n\
-             Respond with:\n\
-             1. **proposed_changes**: The specific text modifications to make\n\
-             2. **rationale**: Why this will help\n\
-             3. **expected_improvement**: Which metric should improve\n\
+               as 'MUST RE-INTRODUCE' MUST appear verbatim in the new section content\n\n\
+             ## Output Format (CRITICAL)\n\
+             Respond with a JSON object. You MUST emit a `soul_patch` field containing \
+             a structured edit operation. The updater executes the patch deterministically — \
+             freeform Markdown narrative will NOT modify SOUL.md.\n\n\
+             Schema:\n\
+             ```json\n\
+             {{\n\
+               \"soul_patch\": {{\n\
+                 \"section\": \"<h2 title without ## prefix; case-sensitive>\",\n\
+                 \"op\": \"replace | append_within | prepend_within | add_section\",\n\
+                 \"content\": \"<the actual SOUL.md text to apply>\"\n\
+               }},\n\
+               \"proposed_changes\": \"<one-sentence human summary>\",\n\
+               \"rationale\": \"<why this helps>\",\n\
+               \"expected_improvement\": \"<which metric should improve>\"\n\
+             }}\n\
+             ```\n\n\
+             Op semantics:\n\
+             - `replace`: swap the entire body of the named section (keep header)\n\
+             - `append_within`: add lines at the END of the named section\n\
+             - `prepend_within`: add lines at the START of the named section\n\
+             - `add_section`: create a new section at the end of SOUL.md\n\n\
+             Hard rules:\n\
+             - `section` MUST match an existing `## <title>` in SOUL.md verbatim \
+               (or be a brand-new title when op=`add_section`)\n\
+             - `content` MUST be ONLY the behavioral text — no diagnosis, no rationale, \
+               no expected_improvement narrative, no `[保留現有內容]` placeholders, \
+               no markdown header for the section itself (the updater preserves the \
+               existing `## <title>` line)\n\
+             - `content` must be under 4 KB\n\
+             - Do NOT output a freeform `# Agnes — ...` whole-file rewrite. Pick ONE \
+               section and edit it.\n\n\
+             Example for op=`append_within`:\n\
+             ```json\n\
+             {{\n\
+               \"soul_patch\": {{\n\
+                 \"section\": \"核心價值\",\n\
+                 \"op\": \"append_within\",\n\
+                 \"content\": \"- 對於醫療、法律、財務題目，明確拒答並建議諮詢專業人士\"\n\
+               }},\n\
+               \"proposed_changes\": \"Add explicit refusal rule for out-of-scope topics\",\n\
+               \"rationale\": \"Round 4 user feedback flagged that medical advice is outside Agnes scope\",\n\
+               \"expected_improvement\": \"correction_rate ↓, topic_surprise ↓\"\n\
+             }}\n\
+             ```\n\
              {wiki_section}",
             agent_id = input.agent_id,
             history = history,
@@ -333,31 +379,52 @@ impl Generator {
     pub fn apply_output(&self, proposal: &mut EvolutionProposal, output: &GeneratorOutput) {
         proposal.content = output.proposed_changes.clone();
         proposal.rationale = output.rationale.clone();
+        proposal.patch = output.soul_patch.clone();
         proposal.status = ProposalStatus::Verifying;
     }
 
     /// Parse LLM text response into GeneratorOutput.
     ///
-    /// Tolerates free-form text by extracting sections.
-    /// Also attempts to parse wiki_proposals from JSON if present.
+    /// LLM output formats handled (in order of preference):
+    /// 1. Pure JSON object: `{"soul_patch": ..., "proposed_changes": ...}`
+    /// 2. JSON wrapped in markdown code fence: ` ```json\n{...}\n``` ` —
+    ///    common when the LLM emits narrative around its structured output.
+    ///    Observed on agnes 2026-05-18 02:32Z where the Gen-1 response was
+    ///    "根據分析... ```json\n{...}\n``` ...核心邏輯..." and the JSON parser
+    ///    fell back to section extraction, discarding `soul_patch`.
+    /// 3. Section-extracted Markdown ("**proposed_changes**: ...") — legacy
+    ///    fallback for non-structured responses.
     pub fn parse_response(response: &str) -> GeneratorOutput {
-        // Try JSON parse first (structured output)
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(response) {
-            if let Some(proposed) = parsed.get("proposed_changes").and_then(|v| v.as_str()) {
-                let wiki_proposals = parsed.get("wiki_proposals")
-                    .and_then(|v| serde_json::from_value::<Vec<duduclaw_memory::wiki::WikiProposal>>(v.clone()).ok())
-                    .unwrap_or_default();
+        // Try (1) pure JSON, then (2) strip markdown fences and try JSON again.
+        // We reuse the verifier's fence-stripper so behaviour stays consistent
+        // with `parse_judge_response`.
+        let candidates = [
+            response,
+            super::verifier::strip_json_fences(response),
+        ];
 
-                return GeneratorOutput {
-                    proposed_changes: proposed.to_string(),
-                    rationale: parsed.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    expected_improvement: parsed.get("expected_improvement").and_then(|v| v.as_str()).unwrap_or("satisfaction").to_string(),
-                    wiki_proposals,
-                };
+        for candidate in candidates.iter() {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(candidate) {
+                if let Some(proposed) = parsed.get("proposed_changes").and_then(|v| v.as_str()) {
+                    let wiki_proposals = parsed.get("wiki_proposals")
+                        .and_then(|v| serde_json::from_value::<Vec<duduclaw_memory::wiki::WikiProposal>>(v.clone()).ok())
+                        .unwrap_or_default();
+
+                    let soul_patch = parsed.get("soul_patch")
+                        .and_then(|v| serde_json::from_value::<SoulPatch>(v.clone()).ok());
+
+                    return GeneratorOutput {
+                        proposed_changes: proposed.to_string(),
+                        rationale: parsed.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        expected_improvement: parsed.get("expected_improvement").and_then(|v| v.as_str()).unwrap_or("satisfaction").to_string(),
+                        wiki_proposals,
+                        soul_patch,
+                    };
+                }
             }
         }
 
-        // Fallback: section extraction from free-form text
+        // Fallback (3): section extraction from free-form text
         let proposed = extract_section(response, "proposed_changes")
             .or_else(|| extract_section(response, "Proposed Changes"))
             .unwrap_or_else(|| response.to_string());
@@ -378,6 +445,7 @@ impl Generator {
             rationale,
             expected_improvement: improvement,
             wiki_proposals,
+            soul_patch: None,
         }
     }
 }
