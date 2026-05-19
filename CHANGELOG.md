@@ -1,6 +1,80 @@
 # Changelog
 
 
+## [1.15.2] - 2026-05-20 — agent_update_soul Audit + Drift Detection
+
+Follow-up to v1.15.1. Investigating an unexpected 11-line SOUL.md growth
+during agnes' 24h observation period revealed three pre-existing security
+gaps in the `agent_update_soul` MCP backdoor that long predated v1.15.1 but
+became visible thanks to the structured-patch path making routine GVU
+writes traceable by contrast.
+
+### Fixed
+
+- **`agent_update_soul` now refreshes the `soul_guard` integrity hash**
+  via `accept_soul_change` on every successful write. Before this fix the
+  stored fingerprint was never updated, so legitimate calls left permanent
+  drift that `check_soul_integrity` would (eventually, if a human invoked
+  it) flag as tampering. agnes' 2026-05-19 02:27Z self-modification was
+  the canonical observation.
+
+- **`agent_update_soul` now writes to `tool_calls.jsonl`** for every
+  invocation — success path with hash prefix + size, and four distinct
+  rejection paths (invalid agent_id / empty content / nonexistent agent /
+  tmp-write / rename failures). The trusted MCP backdoor was previously
+  invisible to post-hoc audit; `tool_calls.jsonl` had no `agent_update_soul`
+  entries between 2026-04-22 and today despite the tool being exercised at
+  least once on 2026-05-19.
+
+- **Heartbeat now runs `soul_guard::check_soul_integrity` per agent per
+  tick** via the new `check_soul_integrity_with_audit` helper.
+  Out-of-band SOUL.md modifications (whether legitimate-but-unaudited or
+  malicious) now produce a `WARN` log and a `_soul_integrity_drift`
+  synthetic audit row within one heartbeat interval (default 1 h). Prior
+  to this fix the integrity check had exactly one caller — the manual
+  `duduclaw test <agent>` CLI red-team — so drift sat silently until an
+  operator chose to investigate. Agents without a `SOUL.md` are silently
+  skipped (stub-agent configuration is documented and supported).
+
+### Why this is separate from v1.15.1
+
+These three gaps existed before v1.15.1 — the bloat-fix surfaced them but
+did not introduce them. They are filed as a separate patch release
+because their root cause (the `agent_update_soul` MCP tool bypassing the
+GVU safety stack) is structurally orthogonal to the GVU verifier path and
+deserves its own audit narrative.
+
+### Test coverage
+
+9 new tests, total workspace 1525 unit tests passing:
+
+- `mcp::wiki_namespace_tests::agent_update_soul_refreshes_soul_guard_hash`
+- `mcp::wiki_namespace_tests::agent_update_soul_appends_audit_row`
+- `mcp::wiki_namespace_tests::agent_update_soul_audits_validation_rejections`
+- `heartbeat::tests::soul_integrity_check_skips_agent_without_soul`
+- `heartbeat::tests::soul_integrity_check_clean_when_hash_matches`
+- `heartbeat::tests::soul_integrity_check_emits_audit_on_drift`
+
+### Operator action items
+
+After upgrading to 1.15.2 you may see `_soul_integrity_drift` audit rows
+in `tool_calls.jsonl` for agents whose SOUL.md was last modified by the
+pre-1.15.2 `agent_update_soul` (which never updated the hash). The drift
+is real — the stored hash genuinely doesn't match the file — but it's a
+historical artefact, not active tampering.
+
+To clear the false-positive baseline, delete the stored hash so the next
+integrity check re-fingerprints the current file as the new baseline:
+
+```
+rm ~/.duduclaw/soul_hashes/<agent>.hash
+```
+
+`check_soul_integrity` treats a missing hash as "first run" and stores
+the current SHA-256 automatically. Subsequent out-of-band modifications
+will then flag genuine drift.
+
+
 ## [1.15.1] - 2026-05-18 — SOUL.md Bloat Containment + Structured Patch Path
 
 Customer-reported regression: a production COO bot (`agnes`) had its
