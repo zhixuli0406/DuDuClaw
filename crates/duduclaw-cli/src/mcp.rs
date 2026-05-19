@@ -3584,9 +3584,23 @@ async fn handle_agent_remove(params: &Value, home_dir: &Path) -> Value {
 ///
 /// This bypasses file-protect.sh (which blocks Write/Edit on SOUL.md)
 /// because MCP tools are a trusted code path in the DuDuClaw architecture.
+///
+/// Post-write, this fn calls `soul_guard::store_hash` to keep the integrity
+/// fingerprint in sync (otherwise `check_soul_integrity` would forever
+/// report drift after every legitimate update — observed on agnes
+/// 2026-05-19 02:27Z) and `audit::append_tool_call` for traceability.
 async fn handle_agent_update_soul(params: &Value, home_dir: &Path) -> Value {
     let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
     if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+        // Audit even validation rejections so operators can spot agents
+        // probing the SOUL.md backdoor with malformed inputs.
+        duduclaw_security::audit::append_tool_call(
+            home_dir,
+            "",
+            "agent_update_soul",
+            &format!("REJECTED: invalid agent_id={agent_id:?}"),
+            false,
+        );
         return serde_json::json!({
             "content": [{"type": "text", "text": "Error: valid agent_id is required"}],
             "isError": true
@@ -3595,6 +3609,13 @@ async fn handle_agent_update_soul(params: &Value, home_dir: &Path) -> Value {
 
     let soul_content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
     if soul_content.is_empty() {
+        duduclaw_security::audit::append_tool_call(
+            home_dir,
+            agent_id,
+            "agent_update_soul",
+            "REJECTED: empty content",
+            false,
+        );
         return serde_json::json!({
             "content": [{"type": "text", "text": "Error: content is required (the new SOUL.md text)"}],
             "isError": true
@@ -3605,6 +3626,13 @@ async fn handle_agent_update_soul(params: &Value, home_dir: &Path) -> Value {
 
     // Verify agent exists
     if !agent_dir.join("agent.toml").exists() {
+        duduclaw_security::audit::append_tool_call(
+            home_dir,
+            agent_id,
+            "agent_update_soul",
+            &format!("REJECTED: agent '{agent_id}' not found"),
+            false,
+        );
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error: agent '{agent_id}' not found")}],
             "isError": true
@@ -3623,6 +3651,13 @@ async fn handle_agent_update_soul(params: &Value, home_dir: &Path) -> Value {
     // Atomic write: temp file + rename
     let tmp_path = soul_path.with_extension("md.tmp");
     if let Err(e) = tokio::fs::write(&tmp_path, soul_content).await {
+        duduclaw_security::audit::append_tool_call(
+            home_dir,
+            agent_id,
+            "agent_update_soul",
+            &format!("FAILED: write tmp: {e}"),
+            false,
+        );
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error writing SOUL.md: {e}")}],
             "isError": true
@@ -3630,6 +3665,13 @@ async fn handle_agent_update_soul(params: &Value, home_dir: &Path) -> Value {
     }
     if let Err(e) = tokio::fs::rename(&tmp_path, &soul_path).await {
         let _ = tokio::fs::remove_file(&tmp_path).await;
+        duduclaw_security::audit::append_tool_call(
+            home_dir,
+            agent_id,
+            "agent_update_soul",
+            &format!("FAILED: rename: {e}"),
+            false,
+        );
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error committing SOUL.md: {e}")}],
             "isError": true
@@ -3640,6 +3682,33 @@ async fn handle_agent_update_soul(params: &Value, home_dir: &Path) -> Value {
         let digest = <sha2::Sha256 as sha2::Digest>::digest(soul_content.as_bytes());
         format!("{:x}", digest)
     };
+
+    // Refresh the soul_guard integrity hash. Without this, the next
+    // `check_soul_integrity` call (and the new heartbeat check added in
+    // 2026-05-20) would flag every legitimate `agent_update_soul` call as
+    // tampering. Failure here is logged but does not fail the tool call —
+    // the SOUL.md was already updated and the heartbeat drift warning is
+    // a recoverable signal, not a security violation we can roll back.
+    if let Err(e) = duduclaw_security::soul_guard::accept_soul_change(agent_id, &agent_dir) {
+        tracing::warn!(
+            agent = %agent_id,
+            "Failed to refresh soul_guard hash after agent_update_soul: {e} — \
+             next integrity check will flag drift until manually re-accepted"
+        );
+    }
+
+    duduclaw_security::audit::append_tool_call(
+        home_dir,
+        agent_id,
+        "agent_update_soul",
+        &format!(
+            "ok: old_hash={}, new_hash={}, size={}",
+            &old_hash[..16.min(old_hash.len())],
+            &new_hash[..16.min(new_hash.len())],
+            soul_content.len()
+        ),
+        true,
+    );
 
     serde_json::json!({
         "content": [{"type": "text", "text": format!(
@@ -12380,6 +12449,134 @@ mod wiki_namespace_tests {
                 "skill_synthesis_run inputSchema must have property '{}'; schema: {}",
                 param,
                 tool["inputSchema"]
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // agent_update_soul follow-up fixes (#3, #4 — 2026-05-20)
+    //
+    // Pre-fix: handle_agent_update_soul wrote SOUL.md but did NOT refresh
+    // soul_guard hash and did NOT append to tool_calls.jsonl. Result was
+    // permanent silent drift after every legitimate use of the tool. The
+    // tests below pin the contract that BOTH side-effects fire on success
+    // and on selected failure paths.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Read `tool_calls.jsonl` and return rows matching the given tool name.
+    fn read_audit_rows(home: &std::path::Path, tool: &str) -> Vec<serde_json::Value> {
+        let path = home.join("tool_calls.jsonl");
+        if !path.exists() {
+            return vec![];
+        }
+        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        raw.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("tool_name").and_then(|t| t.as_str()) == Some(tool))
+            .collect()
+    }
+
+    /// Minimal agent directory — just enough to satisfy
+    /// `handle_agent_update_soul`'s "agent.toml exists" check.
+    fn make_minimal_agent(home: &std::path::Path, name: &str) {
+        let dir = home.join("agents").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.toml"),
+            format!("[agent]\nname = \"{name}\"\n"),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_update_soul_refreshes_soul_guard_hash() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        make_minimal_agent(home, "tester");
+        let agents_dir = home.join("agents");
+        // Seed an initial SOUL.md so the test exercises the "update" branch
+        // (not the create-from-nothing branch).
+        std::fs::write(agents_dir.join("tester").join("SOUL.md"), "initial soul\n").unwrap();
+
+        let new_content = "## Identity\n\nI am the test agent.\n";
+        let params = serde_json::json!({
+            "agent_id": "tester",
+            "content": new_content,
+        });
+
+        let result = handle_agent_update_soul(&params, home).await;
+        assert!(
+            result.get("isError").and_then(|v| v.as_bool()) != Some(true),
+            "agent_update_soul should succeed; got: {result}"
+        );
+
+        // The stored hash MUST equal the SHA-256 of the new content.
+        // Without the soul_guard::accept_soul_change call, the stored hash
+        // would still be the hash of "initial soul\n".
+        let agent_dir = agents_dir.join("tester");
+        let stored = duduclaw_security::soul_guard::read_stored_hash(&agent_dir)
+            .expect("stored hash must exist after agent_update_soul");
+        let expected = duduclaw_security::soul_guard::fingerprint_soul(&agent_dir)
+            .expect("SOUL.md must exist");
+        assert_eq!(
+            stored, expected,
+            "stored soul hash must match SOUL.md fingerprint after update"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_update_soul_appends_audit_row() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        make_minimal_agent(home, "tester");
+
+        let params = serde_json::json!({
+            "agent_id": "tester",
+            "content": "## Identity\n\nNew soul.\n",
+        });
+        let _ = handle_agent_update_soul(&params, home).await;
+
+        let rows = read_audit_rows(home, "agent_update_soul");
+        assert_eq!(rows.len(), 1, "exactly one audit row expected");
+        let row = &rows[0];
+        assert_eq!(row.get("agent_id").and_then(|v| v.as_str()), Some("tester"));
+        assert_eq!(row.get("success").and_then(|v| v.as_bool()), Some(true));
+        let summary = row.get("params_summary").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            summary.contains("ok:") && summary.contains("size="),
+            "audit summary should include hash + size; got: {summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_update_soul_audits_validation_rejections() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+
+        // Empty agent_id → rejected.
+        let params_no_id = serde_json::json!({ "agent_id": "", "content": "x" });
+        let r1 = handle_agent_update_soul(&params_no_id, home).await;
+        assert_eq!(r1.get("isError").and_then(|v| v.as_bool()), Some(true));
+
+        // Nonexistent agent_id → rejected (after agent_id validation passes).
+        let params_ghost = serde_json::json!({ "agent_id": "ghost", "content": "x" });
+        let r2 = handle_agent_update_soul(&params_ghost, home).await;
+        assert_eq!(r2.get("isError").and_then(|v| v.as_bool()), Some(true));
+
+        // Empty content with valid agent → also rejected.
+        make_minimal_agent(home, "real");
+        let params_empty = serde_json::json!({ "agent_id": "real", "content": "" });
+        let r3 = handle_agent_update_soul(&params_empty, home).await;
+        assert_eq!(r3.get("isError").and_then(|v| v.as_bool()), Some(true));
+
+        let rows = read_audit_rows(home, "agent_update_soul");
+        assert_eq!(rows.len(), 3, "all three rejections should be audited");
+        for row in &rows {
+            assert_eq!(row.get("success").and_then(|v| v.as_bool()), Some(false));
+            let summary = row.get("params_summary").and_then(|v| v.as_str()).unwrap_or("");
+            assert!(
+                summary.starts_with("REJECTED:"),
+                "rejection audit must start with REJECTED:; got: {summary}"
             );
         }
     }
