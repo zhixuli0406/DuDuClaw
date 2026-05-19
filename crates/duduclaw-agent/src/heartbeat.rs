@@ -480,10 +480,80 @@ async fn execute_heartbeat(
     // `HeartbeatScheduler::run` directly so it covers agents with
     // `heartbeat.enabled = false` too — see the comment block there.
 
+    // ── SOUL.md integrity check (added 2026-05-20) ──
+    //
+    // `soul_guard::check_soul_integrity` was previously only called by the
+    // `duduclaw test <agent>` CLI command. That meant any drift between
+    // SOUL.md and the stored hash — whether legitimate (failed
+    // `agent_update_soul` hash refresh) or malicious (out-of-band tampering) —
+    // sat silently until an operator manually ran the red-team test.
+    //
+    // Wiring it into the heartbeat means drift surfaces in the gateway log
+    // within one heartbeat interval (default 1h). We log at WARN and append a
+    // `_soul_integrity_drift` audit row so operators can grep / alert on it.
+    // No automatic recovery — that's a policy decision that needs human input
+    // (was the change intentional? rollback or accept?).
+    check_soul_integrity_with_audit(home_dir, agent_id).await;
+
     // ── Proactive check (new) ──
     execute_proactive_check(home_dir, agent_id, proactive_states).await;
 
     info!(agent = agent_id, "Heartbeat cycle complete");
+}
+
+/// Run `soul_guard::check_soul_integrity` and surface drift via WARN log +
+/// audit row. Pure side-effect; the result is reported but not acted upon.
+async fn check_soul_integrity_with_audit(home_dir: &Path, agent_id: &str) {
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    if !agent_dir.join("SOUL.md").exists() {
+        // Agent without SOUL.md — nothing to check. Don't warn; this is the
+        // documented configuration for stub agents.
+        return;
+    }
+
+    // Run on a blocking thread — `check_soul_integrity` does sync file I/O
+    // and SHA-256. The work is tiny but we avoid blocking the heartbeat
+    // executor in case the agent directory is on a slow disk.
+    let agent_dir_owned = agent_dir.clone();
+    let agent_id_owned = agent_id.to_string();
+    let result = match tokio::task::spawn_blocking(move || {
+        duduclaw_security::soul_guard::check_soul_integrity(&agent_id_owned, &agent_dir_owned)
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(agent = agent_id, "SOUL integrity check task panicked: {e}");
+            return;
+        }
+    };
+
+    if result.intact {
+        debug!(agent = agent_id, "SOUL.md integrity OK");
+        return;
+    }
+
+    warn!(
+        agent = agent_id,
+        current_hash = %result.current_hash,
+        expected_hash = %result.expected_hash,
+        "SOUL.md integrity drift detected: {}",
+        result.message,
+    );
+
+    // Audit so external alerting can pick it up without grepping logs.
+    duduclaw_security::audit::append_tool_call(
+        home_dir,
+        agent_id,
+        "_soul_integrity_drift",
+        &format!(
+            "drift: current={}, expected={}, msg={}",
+            &result.current_hash.chars().take(16).collect::<String>(),
+            &result.expected_hash.chars().take(16).collect::<String>(),
+            result.message,
+        ),
+        false,
+    );
 }
 
 /// Poll `tasks.db` for work assigned to this agent and enqueue a wake-up
@@ -1009,5 +1079,97 @@ mod tests {
         agent.last_run = Some(Utc.with_ymd_and_hms(2026, 4, 22, 1, 5, 0).unwrap());
         let next = agent.next_fire().expect("cron is set so next_fire is Some");
         assert_eq!(next, Utc.with_ymd_and_hms(2026, 4, 23, 1, 0, 0).unwrap());
+    }
+
+    // ── SOUL.md integrity drift detection (2026-05-20, #5) ──
+    //
+    // Heartbeat now calls soul_guard::check_soul_integrity per agent every
+    // tick. The tests below cover the three observable outcomes:
+    //   1. No SOUL.md → silent skip, no audit row, no warn log
+    //   2. SOUL.md matches stored hash → silent debug, no audit row
+    //   3. SOUL.md differs from stored hash → WARN log + drift audit row
+    // We assert via the audit log because that's the operator-visible artefact.
+
+    fn read_audit_rows(home: &Path, tool: &str) -> Vec<serde_json::Value> {
+        let path = home.join("tool_calls.jsonl");
+        if !path.exists() {
+            return vec![];
+        }
+        std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("tool_name").and_then(|t| t.as_str()) == Some(tool))
+            .collect()
+    }
+
+    fn make_test_agent_dir(home: &Path, name: &str, soul: Option<&str>) -> std::path::PathBuf {
+        let agent_dir = home.join("agents").join(name);
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        if let Some(soul_content) = soul {
+            std::fs::write(agent_dir.join("SOUL.md"), soul_content).unwrap();
+        }
+        agent_dir
+    }
+
+    #[tokio::test]
+    async fn soul_integrity_check_skips_agent_without_soul() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // No SOUL.md.
+        make_test_agent_dir(home, "stub", None);
+
+        check_soul_integrity_with_audit(home, "stub").await;
+
+        let rows = read_audit_rows(home, "_soul_integrity_drift");
+        assert!(rows.is_empty(), "agent without SOUL.md must not emit a drift audit row");
+    }
+
+    #[tokio::test]
+    async fn soul_integrity_check_clean_when_hash_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let soul = "## Identity\n\nI am the test agent.\n";
+        let agent_dir = make_test_agent_dir(home, "matchy", Some(soul));
+        // Bootstrap soul_guard hash to match current content.
+        duduclaw_security::soul_guard::accept_soul_change("matchy", &agent_dir).unwrap();
+
+        check_soul_integrity_with_audit(home, "matchy").await;
+
+        let rows = read_audit_rows(home, "_soul_integrity_drift");
+        assert!(
+            rows.is_empty(),
+            "matching hash must not flag drift; rows={:?}",
+            rows
+        );
+    }
+
+    #[tokio::test]
+    async fn soul_integrity_check_emits_audit_on_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let agent_dir = make_test_agent_dir(home, "drifty", Some("## v1\n\noriginal content\n"));
+        // Bootstrap hash to v1.
+        duduclaw_security::soul_guard::accept_soul_change("drifty", &agent_dir).unwrap();
+
+        // Simulate out-of-band tampering: rewrite SOUL.md without updating the hash.
+        std::fs::write(
+            agent_dir.join("SOUL.md"),
+            "## v2\n\nTAMPERED content — written outside MCP\n",
+        )
+        .unwrap();
+
+        check_soul_integrity_with_audit(home, "drifty").await;
+
+        let rows = read_audit_rows(home, "_soul_integrity_drift");
+        assert_eq!(rows.len(), 1, "one drift audit row expected; got: {rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.get("agent_id").and_then(|v| v.as_str()), Some("drifty"));
+        assert_eq!(row.get("success").and_then(|v| v.as_bool()), Some(false));
+        let summary = row.get("params_summary").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            summary.contains("drift:") && summary.contains("current=") && summary.contains("expected="),
+            "drift audit summary should include current + expected hash; got: {summary}"
+        );
     }
 }
