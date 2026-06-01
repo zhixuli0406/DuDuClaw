@@ -1,6 +1,118 @@
 # Changelog
 
 
+## [1.16.0] - 2026-06-01 — MCP Refresh Tokens + GVU Consolidate Op
+
+Two operationally-driven additions surfaced by the 12-day post-v1.15.2
+production soak.
+
+**Symptom 1**: agnes' Claude Desktop MCP server stopped working on
+2026-05-30 15:59 UTC with `API key expired (31 days old, max 30)` and
+sat broken for 2 days before being investigated. The 30-day rotation
+policy was sound, but the user-experience around it was not — Claude
+Desktop quietly disconnected and never retried, and there was no CLI
+to rotate cleanly.
+
+**Symptom 2**: agnes' SOUL.md has been growing at ~5 lines/week under
+healthy GVU operation and is now at 132 lines / 7909 bytes — within the
+150-line / 8 KB cap, but ~3 weeks from cap-rejection on current
+trajectory. The structured patch path can only grow SOUL.md; it has
+no shrink primitive.
+
+### Added — MCP refresh tokens (Phase A)
+
+- **New module `duduclaw-cli::mcp_refresh`** — SQLite-backed refresh
+  tokens that supersede the 30-day legacy API keys with 90-day
+  lifetime, per-token revocation, and a hash-only store (the raw
+  token is never persisted).
+  - Format: `ddc_refresh_<env>_<64hex>` (twice the entropy of legacy).
+  - Storage: `~/.duduclaw/mcp_tokens.db` table `refresh_tokens` with
+    columns `jti, token_hash, client_id, scopes, is_external,
+    issued_at, expires_at, revoked_at`.
+  - Validation: `authenticate_with_refresh_token` mirrors
+    `mcp_auth::authenticate_with_key`'s error model so the existing
+    dispatcher just needs prefix-based routing.
+
+- **`mcp_auth::authenticate_from_env`** now prefix-routes credentials:
+  values starting with `ddc_refresh_` go through the refresh-token
+  validator, everything else through the legacy `ddc_<env>_<32hex>`
+  validator. Both paths return the same `Principal` type so downstream
+  code is unchanged. Legacy keys keep working — no migration required
+  before refresh tokens are adopted.
+
+- **New CLI subcommand `duduclaw mcp …`**:
+  - `issue-refresh-token --env <prod|staging|dev> --client-id <id>
+    --scopes <csv> [--external]` — generates a fresh token, persists
+    its hash, prints the raw token ONCE.
+  - `revoke-token <jti>` — soft-deletes a refresh token by its
+    16-hex jti prefix.
+  - `list-tokens` — table view of all tokens with status / remaining
+    TTL / scopes.
+
+### Added — GVU `SoulPatchOp::Consolidate` (Phase B)
+
+- **New variant** in `crate::gvu::proposal::SoulPatchOp`.
+  Semantically equivalent to `Replace` but with a hard size-shrink
+  invariant: the patch is rejected if
+  `content.trim().len() >= existing_body.trim().len()`. Used when
+  SOUL.md is approaching the line/byte caps and the LLM is asked to
+  merge redundant bullets or tighten verbose phrasing without
+  changing behavior.
+
+- **`apply_patch_to_soul` enforces the shrink invariant** before
+  swapping. A `Consolidate` whose content does not shrink the section
+  is rejected with `"Consolidate must shrink the section — new
+  content is N bytes but existing body is M bytes"`. Empty existing
+  body is also rejected (cannot consolidate nothing).
+
+- **Generator prompt updated** with the `consolidate` op semantics so
+  the LLM can self-trigger it when it sees SOUL.md approaching cap.
+  Prompt change is additive — existing flows that don't need to
+  consolidate are unaffected.
+
+### Fixed
+
+- **`mcp_auth` test suite was a time-bomb**. Six test fixtures used
+  the hardcoded `created_at = "2026-04-29T00:00:00Z"`. On 2026-06-01
+  (33 days later) every test expecting `Ok(Principal)` started
+  failing with `KeyExpired { days_old: 33 }`. Replaced with
+  `Utc::now().to_rfc3339()` so the suite stays robust to time. Five
+  similar fixtures in `mcp_auth_strategy` already had this issue
+  (5/30 onward) and were similarly fixed.
+
+### Test coverage
+
+12 new unit tests, total workspace **1537 passing**:
+
+- `mcp_refresh::tests` ×8 — roundtrip, format rejection, unknown,
+  revoke, expired, list ordering, jti determinism, env-label
+  rejection at issue.
+- `soul_patch_tests::consolidate_*` ×4 — shrinks existing,
+  rejects-when-grows, rejects unknown section, rejects empty body.
+
+### Operator action items
+
+**Migrating Claude Desktop to a refresh token**:
+
+```
+duduclaw mcp issue-refresh-token \
+    --env dev \
+    --client-id claude-desktop \
+    --scopes memory:read,memory:write,wiki:read,wiki:write,messaging:send
+```
+
+Paste the printed token into `~/Library/Application Support/Claude/claude_desktop_config.json`
+under `mcpServers.duduclaw.env.DUDUCLAW_MCP_API_KEY`, then Quit and
+relaunch Claude Desktop. After verifying the new token works, revoke
+the old legacy key by removing it from `~/.duduclaw/config.toml` (or
+running `duduclaw mcp revoke-token <jti>` if it was already a
+refresh token).
+
+**Legacy keys remain supported indefinitely** — refresh tokens are
+strictly opt-in. Operators who prefer the file-based registry can
+continue using `[mcp_keys]` entries.
+
+
 ## [1.15.2] - 2026-05-20 — agent_update_soul Audit + Drift Detection
 
 Follow-up to v1.15.1. Investigating an unexpected 11-line SOUL.md growth
