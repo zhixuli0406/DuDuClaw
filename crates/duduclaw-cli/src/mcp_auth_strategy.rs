@@ -381,7 +381,7 @@ is_external = true
     #[test]
     fn test_api_key_strategy_authenticates_valid_key() {
         let key = valid_key();
-        let dir = make_config(key, "2026-04-29T00:00:00Z");
+        let dir = make_config(key, &Utc::now().to_rfc3339());
 
         let strategy = ApiKeyAuthStrategy;
         let ctx = AuthContext {
@@ -420,7 +420,7 @@ is_external = true
     fn test_api_key_strategy_no_credential_no_env_returns_missing_key() {
         // Use a temp config with at least one registered key so that the
         // "empty registry fallback" does NOT trigger.
-        let dir = make_config(valid_key(), "2026-04-29T00:00:00Z");
+        let dir = make_config(valid_key(), &Utc::now().to_rfc3339());
 
         // Ensure the env var is absent by using a non-existent var name variant.
         // We cannot safely call remove_var here without a global lock, so we
@@ -563,7 +563,7 @@ is_external = true
     #[test]
     fn test_middleware_delegates_to_strategy() {
         let key = valid_key();
-        let dir = make_config(key, "2026-04-29T00:00:00Z");
+        let dir = make_config(key, &Utc::now().to_rfc3339());
 
         let mw = McpAuthMiddleware::default_api_key();
         let ctx = AuthContext {
@@ -601,7 +601,7 @@ is_external = true
     #[test]
     fn test_middleware_rotation_not_due_for_fresh_key() {
         let key = valid_key();
-        let dir = make_config(key, "2026-04-29T00:00:00Z");
+        let dir = make_config(key, &Utc::now().to_rfc3339());
         let mw = McpAuthMiddleware::default_api_key();
         // Fresh key (today) should not trigger rotation warning
         assert!(!mw.is_rotation_due(dir.path()));
@@ -655,7 +655,7 @@ is_external = true
     #[test]
     fn test_rotation_check_fresh_key_not_due() {
         let key = valid_key();
-        let dir = make_config(key, "2026-04-29T00:00:00Z");
+        let dir = make_config(key, &Utc::now().to_rfc3339());
         assert!(!check_any_key_rotation_due(dir.path(), 7));
     }
 

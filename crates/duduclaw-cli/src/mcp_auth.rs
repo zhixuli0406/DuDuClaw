@@ -240,9 +240,19 @@ pub fn authenticate_with_key(raw_key: &str, config_dir: &Path) -> Result<Princip
 
 /// Authenticate from DUDUCLAW_MCP_API_KEY env var.
 ///
-/// Backwards-compatible: if the env var is absent AND the registry has no
-/// mcp_keys at all, returns a default internal Principal with all scopes so
-/// existing internal tooling keeps working unchanged.
+/// Accepts two credential formats and dispatches to the appropriate validator:
+///
+/// 1. **Refresh tokens** (v1.16.0+) — format `ddc_refresh_<env>_<64hex>`.
+///    Validated against the SQLite-backed token store, 90-day lifetime,
+///    individually revocable. See [`crate::mcp_refresh`].
+///
+/// 2. **Legacy API keys** — format `ddc_<env>_<32hex>`. Validated against
+///    `[mcp_keys]` in `config.toml`, 30-day rotation policy.
+///
+/// Backwards-compatible: if the env var is absent AND no `[mcp_keys]` is
+/// configured AND no refresh tokens exist, returns a default internal
+/// Principal with all scopes so existing internal tooling keeps working
+/// unchanged.
 ///
 /// For programmatic key injection (e.g. tests, HTTP transport), use
 /// [`authenticate_with_key`] directly.
@@ -268,6 +278,14 @@ pub fn authenticate_from_env(config_dir: &Path) -> Result<Principal, AuthError> 
             return Err(AuthError::MissingKey);
         }
     };
+
+    // Prefix-based dispatch: refresh tokens carry the explicit `ddc_refresh_`
+    // marker so the validator can tell which storage backend to query without
+    // attempting one then the other (and leaking which backend held the key
+    // via timing). Legacy API keys keep the original `ddc_<env>_<32hex>` path.
+    if raw_key.starts_with(crate::mcp_refresh::REFRESH_TOKEN_PREFIX) {
+        return crate::mcp_refresh::authenticate_with_refresh_token(&raw_key, config_dir);
+    }
 
     authenticate_with_key(&raw_key, config_dir)
 }
@@ -442,17 +460,29 @@ is_external = {is_external}
         format!("ddc_{env_suffix}_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4")
     }
 
+    /// Today's date in RFC-3339 form, for tests that need a fresh `created_at`.
+    ///
+    /// Replaces the hardcoded `2026-04-29T00:00:00Z` string that was used
+    /// across these tests pre-2026-06-01 and which became a time-bomb: once
+    /// the wall-clock crossed 30 days past 2026-04-29, every test that
+    /// expected `Ok(Principal)` started failing with `KeyExpired`. Calling
+    /// `Utc::now()` keeps the suite robust to time.
+    fn fresh_today_rfc3339() -> String {
+        Utc::now().to_rfc3339()
+    }
+
     // ── Test 1: valid key returns correct Principal ───────────────────────────
     #[test]
     fn test_valid_key_returns_principal() {
         let _guard = ENV_LOCK.lock().unwrap();
         let key = fresh_key("prod");
+        let today = fresh_today_rfc3339();
         let dir = make_config_dir_with_key(
             &key,
             "claude-desktop",
             &["memory:read", "wiki:read"],
             true,
-            "2026-04-29T00:00:00Z",
+            &today,
         );
         // SAFETY: protected by ENV_LOCK — no concurrent env mutation.
         unsafe { std::env::set_var("DUDUCLAW_MCP_API_KEY", &key) };
@@ -471,12 +501,13 @@ is_external = {is_external}
     fn test_missing_env_var_returns_missing_key() {
         let _guard = ENV_LOCK.lock().unwrap();
         let key = fresh_key("prod");
+        let today = fresh_today_rfc3339();
         let dir = make_config_dir_with_key(
             &key,
             "claude-desktop",
             &["memory:read"],
             true,
-            "2026-04-29T00:00:00Z",
+            &today,
         );
         // SAFETY: protected by ENV_LOCK.
         unsafe { std::env::remove_var("DUDUCLAW_MCP_API_KEY") };
@@ -593,18 +624,19 @@ is_external = {is_external}
         let key_a = "ddc_prod_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 32 × 'a'
         let key_b = "ddc_prod_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; // 32 × 'b'
         let dir = TempDir::new().unwrap();
+        let today = fresh_today_rfc3339();
         let content = format!(
             r#"
 [mcp_keys."{key_a}"]
 client_id = "client-a"
 scopes = ["memory:read"]
-created_at = "2026-04-29T00:00:00Z"
+created_at = "{today}"
 is_external = false
 
 [mcp_keys."{key_b}"]
 client_id = "client-b"
 scopes = ["wiki:read"]
-created_at = "2026-04-29T00:00:00Z"
+created_at = "{today}"
 is_external = true
 "#
         );

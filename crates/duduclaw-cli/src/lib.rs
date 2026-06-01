@@ -13,6 +13,7 @@ mod acp;
 mod mcp;
 pub mod mcp_auth;
 pub mod mcp_auth_strategy;
+pub mod mcp_refresh;             // v1.16.0: refresh-token credential type
 pub mod mcp_dispatch;          // W20-P1 Phase 2A: transport-agnostic dispatcher
 pub(crate) mod mcp_http_auth;  // W20-P1 Phase 2B: HTTP Bearer auth extractor
 pub(crate) mod mcp_http_errors; // W20-P1 Phase 2B: JSON-RPC ↔ HTTP status mapping
@@ -297,6 +298,15 @@ enum Commands {
     /// Start DuDuClaw MCP server (for Claude Code integration)
     McpServer,
 
+    /// MCP refresh-token management (v1.16.0).
+    ///
+    /// Refresh tokens supersede the 30-day legacy API keys with 90-day
+    /// lifetime, individual revocation, and SQLite-backed storage. Operators
+    /// rotate them with `issue-refresh-token` then update the Claude Desktop
+    /// (or other MCP client) config to use the new credential.
+    #[command(subcommand)]
+    Mcp(McpCommands),
+
     /// Interactive industry-specific agent setup wizard
     Wizard,
 
@@ -517,6 +527,46 @@ enum ServiceCommands {
 
     /// Uninstall the system service
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum McpCommands {
+    /// Issue a new refresh token for an MCP client.
+    ///
+    /// The raw token is printed to stdout once — capture it immediately and
+    /// paste into the client config. Only its SHA-256 hash is persisted in
+    /// `~/.duduclaw/mcp_tokens.db`, so if you lose the token you must issue
+    /// a new one (and revoke the old one if it's leaked).
+    IssueRefreshToken {
+        /// Environment label embedded in the token. Must be one of
+        /// prod / staging / dev. Used only for human inspection — does not
+        /// affect validation.
+        #[arg(long, default_value = "dev")]
+        env: String,
+
+        /// Client identifier shown in audit logs.
+        #[arg(long)]
+        client_id: String,
+
+        /// Comma-separated scope list.
+        /// Example: --scopes memory:read,memory:write,wiki:read,wiki:write,messaging:send
+        #[arg(long)]
+        scopes: String,
+
+        /// Mark the token's principal as external (untrusted).
+        #[arg(long, default_value_t = false)]
+        external: bool,
+    },
+
+    /// Revoke a refresh token by its jti (the 16-hex prefix shown in
+    /// `list-tokens`).
+    RevokeToken {
+        /// Token jti (first 16 hex chars of its SHA-256 hash).
+        jti: String,
+    },
+
+    /// List all refresh tokens (newest first) with status and TTL.
+    ListTokens,
 }
 
 #[derive(Subcommand)]
@@ -802,6 +852,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         }
         Commands::Migrate => cmd_migrate().await,
         Commands::McpServer => cmd_mcp_server().await,
+        Commands::Mcp(mcp_cmd) => cmd_mcp(mcp_cmd, &duduclaw_home()).await,
         Commands::Wizard => wizard::cmd_wizard(&duduclaw_home()).await,
         Commands::Test { name } => cmd_test_agent(&name).await,
         Commands::Reforward { message_id, dry_run } => {
@@ -3108,6 +3159,108 @@ async fn cmd_mcp_server() -> duduclaw_core::error::Result<()> {
 
     let home = duduclaw_home();
     mcp::run_mcp_server(&home).await
+}
+
+/// `duduclaw mcp <subcommand>` — refresh-token management (v1.16.0).
+async fn cmd_mcp(cmd: McpCommands, home: &std::path::Path) -> duduclaw_core::error::Result<()> {
+    use mcp_auth::parse_scopes;
+    use mcp_refresh::{issue_refresh_token, list_tokens, revoke_token};
+
+    match cmd {
+        McpCommands::IssueRefreshToken {
+            env,
+            client_id,
+            scopes,
+            external,
+        } => {
+            let scope_set = parse_scopes(&scopes).map_err(|e| {
+                duduclaw_core::error::DuDuClawError::Config(format!("invalid --scopes: {e}"))
+            })?;
+
+            let (token, meta) =
+                issue_refresh_token(home, &env, &client_id, &scope_set, external).map_err(|e| {
+                    duduclaw_core::error::DuDuClawError::Config(format!(
+                        "issue refresh token failed: {e}"
+                    ))
+                })?;
+
+            println!();
+            println!("🔑 Refresh token issued — copy NOW (it will not be shown again):");
+            println!();
+            println!("    {token}");
+            println!();
+            println!("    jti        : {}", meta.jti);
+            println!("    client_id  : {}", meta.client_id);
+            println!("    scopes     : {}", scopes);
+            println!("    is_external: {}", meta.is_external);
+            println!("    issued_at  : {}", meta.issued_at.to_rfc3339());
+            println!("    expires_at : {} ({} days)", meta.expires_at.to_rfc3339(), mcp_refresh::REFRESH_TOKEN_TTL_DAYS);
+            println!();
+            println!("Next steps:");
+            println!("  1. Paste the token above into the client's `DUDUCLAW_MCP_API_KEY` env var.");
+            println!("  2. Restart the client (e.g. Quit + relaunch Claude Desktop).");
+            println!("  3. Revoke the old credential after verifying the new one works:");
+            println!("        duduclaw mcp revoke-token <old-jti>");
+            Ok(())
+        }
+
+        McpCommands::RevokeToken { jti } => {
+            let revoked = revoke_token(home, &jti).map_err(|e| {
+                duduclaw_core::error::DuDuClawError::Config(format!("revoke failed: {e}"))
+            })?;
+            if revoked {
+                println!("✔ Token {jti} revoked.");
+            } else {
+                println!("⚠ No active token with jti={jti} (already revoked or never existed).");
+            }
+            Ok(())
+        }
+
+        McpCommands::ListTokens => {
+            let tokens = list_tokens(home).map_err(|e| {
+                duduclaw_core::error::DuDuClawError::Config(format!("list failed: {e}"))
+            })?;
+            if tokens.is_empty() {
+                println!("No refresh tokens issued yet.");
+                println!(
+                    "Use `duduclaw mcp issue-refresh-token --client-id <id> --scopes <list>`."
+                );
+                return Ok(());
+            }
+            let now = chrono::Utc::now();
+            println!(
+                "{:<18} {:<20} {:<10} {:<12} {:<32}",
+                "jti", "client_id", "status", "remaining", "scopes"
+            );
+            println!("{}", "─".repeat(96));
+            for t in tokens {
+                let status = if t.revoked_at.is_some() {
+                    "revoked"
+                } else if t.is_expired(now) {
+                    "expired"
+                } else {
+                    "active"
+                };
+                let remaining = if status == "active" {
+                    let days = (t.expires_at - now).num_days();
+                    format!("{days}d")
+                } else {
+                    "—".to_string()
+                };
+                let scopes_str = t
+                    .scopes
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                println!(
+                    "{:<18} {:<20} {:<10} {:<12} {:<32}",
+                    t.jti, t.client_id, status, remaining, scopes_str
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 /// `duduclaw test <agent>` - Red-team test an agent against its behavioral contract.

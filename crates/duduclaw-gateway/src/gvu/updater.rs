@@ -273,6 +273,34 @@ pub fn apply_patch_to_soul(current: &str, patch: &SoulPatch) -> Result<String, S
                     b.push('\n');
                     b
                 }
+                SoulPatchOp::Consolidate => {
+                    // Hard contract: new content must be shorter than the body
+                    // being replaced. Reject misclassified patches where the
+                    // LLM tagged the op as Consolidate but actually grew the
+                    // section — that is exactly the failure mode this op
+                    // exists to prevent.
+                    let existing_body = body.join("\n");
+                    let existing_trimmed = existing_body.trim();
+                    let new_trimmed = patch.content.trim();
+                    if existing_trimmed.is_empty() {
+                        return Err(
+                            "Consolidate target section has no body to compress".to_string(),
+                        );
+                    }
+                    if new_trimmed.len() >= existing_trimmed.len() {
+                        return Err(format!(
+                            "Consolidate must shrink the section — new content is {} bytes \
+                             but existing body is {} bytes",
+                            new_trimmed.len(),
+                            existing_trimmed.len(),
+                        ));
+                    }
+                    let mut b = String::new();
+                    b.push('\n');
+                    b.push_str(new_trimmed);
+                    b.push('\n');
+                    b
+                }
             };
 
             let mut out = String::new();

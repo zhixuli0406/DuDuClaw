@@ -317,7 +317,11 @@ impl Generator {
              - `replace`: swap the entire body of the named section (keep header)\n\
              - `append_within`: add lines at the END of the named section\n\
              - `prepend_within`: add lines at the START of the named section\n\
-             - `add_section`: create a new section at the end of SOUL.md\n\n\
+             - `add_section`: create a new section at the end of SOUL.md\n\
+             - `consolidate`: like `replace` but MUST shrink the section\n\
+               (content shorter than existing body). Use when SOUL.md is\n\
+               approaching the cap and a section has redundant bullets or\n\
+               verbose phrasing that can be tightened without losing meaning.\n\n\
              Hard rules:\n\
              - `section` MUST match an existing `## <title>` in SOUL.md verbatim \
                (or be a brand-new title when op=`add_section`)\n\
