@@ -1526,6 +1526,80 @@ mod soul_patch_tests {
         assert!(after_2.contains("## 個性特質"));
         assert!(after_2.contains("- 專業但不冰冷"));
     }
+
+    // ── Consolidate op (v1.16.0) ─────────────────────────────────────────
+    //
+    // Used when SOUL.md approaches the cap. Same write path as Replace, but
+    // with a hard shrink invariant — LLMs must demonstrate compression, not
+    // hide growth behind a Replace label.
+
+    #[test]
+    fn consolidate_shrinks_existing_section() {
+        let patch = SoulPatch {
+            section: "核心價值".to_string(),
+            op: SoulPatchOp::Consolidate,
+            // Original body has two bullets; consolidated to one shorter line.
+            content: "- 聽 + 寫 + 解釋".to_string(),
+        };
+        let out = apply_patch_to_soul(baseline(), &patch).unwrap();
+        assert!(out.contains("- 聽 + 寫 + 解釋"));
+        // Old bullets gone — consolidate is destructive like Replace.
+        assert!(!out.contains("- 用心傾聽"));
+        assert!(!out.contains("- 撰寫乾淨程式碼"));
+        // Final SOUL.md is shorter than baseline.
+        assert!(
+            out.len() < baseline().len(),
+            "consolidated SOUL.md must be shorter; {} vs {}",
+            out.len(),
+            baseline().len(),
+        );
+    }
+
+    #[test]
+    fn consolidate_rejects_when_content_grows() {
+        let patch = SoulPatch {
+            section: "核心價值".to_string(),
+            op: SoulPatchOp::Consolidate,
+            // Content is LONGER than the existing body — misclassified.
+            content: "- 用心傾聽，真誠回應\n\
+                      - 撰寫乾淨、可維護的程式碼\n\
+                      - 額外新增第三條長長長長長長長長長條"
+                .to_string(),
+        };
+        let err = apply_patch_to_soul(baseline(), &patch).unwrap_err();
+        assert!(
+            err.contains("Consolidate must shrink"),
+            "expected shrink-invariant rejection; got: {err}"
+        );
+    }
+
+    #[test]
+    fn consolidate_rejects_unknown_section() {
+        let patch = SoulPatch {
+            section: "不存在".to_string(),
+            op: SoulPatchOp::Consolidate,
+            content: "- 短內容".to_string(),
+        };
+        let err = apply_patch_to_soul(baseline(), &patch).unwrap_err();
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn consolidate_rejects_empty_existing_body() {
+        // Section exists but has no body — consolidating nothing is a nonsense
+        // operation and a sign the LLM is confused.
+        let soul = "# Agent\n\n## EmptySection\n\n## Next\n\n- has content\n";
+        let patch = SoulPatch {
+            section: "EmptySection".to_string(),
+            op: SoulPatchOp::Consolidate,
+            content: "- short".to_string(),
+        };
+        let err = apply_patch_to_soul(soul, &patch).unwrap_err();
+        assert!(
+            err.contains("no body to compress"),
+            "expected empty-body rejection; got: {err}"
+        );
+    }
 }
 
 #[cfg(test)]

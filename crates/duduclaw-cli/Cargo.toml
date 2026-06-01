@@ -45,6 +45,8 @@ base64 = { workspace = true }
 scraper = "0.22"
 sha2 = "0.10"
 hex = "0.4"
+# v1.16.0: refresh-token random bytes (mcp_refresh)
+rand = "0.8"
 rustls = { workspace = true }
 rusqlite = { workspace = true }
 argon2 = { version = "0.5", features = ["std"] }

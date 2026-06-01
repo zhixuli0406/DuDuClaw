@@ -21,6 +21,18 @@ pub enum SoulPatchOp {
     PrependWithin,
     /// Create a NEW section at the end of SOUL.md with this title.
     AddSection,
+    /// Consolidate / compress the named section's body (v1.16.0).
+    ///
+    /// Semantically equivalent to `Replace` but with a hard size-shrink
+    /// contract: `content.len() < (existing section body).len()`. Used when
+    /// SOUL.md is approaching the line/byte caps and the LLM is asked to
+    /// merge redundant bullets, tighten language, or summarize without
+    /// changing behavior.
+    ///
+    /// `apply_patch_to_soul` enforces the shrink invariant before swapping —
+    /// a `Consolidate` whose content is longer than the section it would
+    /// replace is rejected as a misclassified patch.
+    Consolidate,
 }
 
 /// A typed instruction for editing SOUL.md.
