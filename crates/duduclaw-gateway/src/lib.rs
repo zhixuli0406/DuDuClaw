@@ -42,6 +42,7 @@ pub mod claude_runner;
 pub mod cost_telemetry;
 pub mod cron_scheduler;
 pub mod cron_store;
+pub mod license_runtime;
 pub mod task_store;
 pub mod partner_store;
 pub mod autopilot_store;

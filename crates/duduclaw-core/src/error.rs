@@ -27,6 +27,9 @@ pub enum DuDuClawError {
     #[error("bridge error: {0}")]
     Bridge(String),
 
+    #[error("license error: {0}")]
+    License(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

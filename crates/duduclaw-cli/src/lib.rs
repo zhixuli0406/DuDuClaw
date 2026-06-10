@@ -28,6 +28,7 @@ pub mod mcp_redact;
 pub mod mcp_redaction;         // RFC-23 redaction pipeline integration
 pub(crate) mod mcp_sse_store;  // W20-P1 Phase 2C: SSE event ring buffer
 pub mod mcp_wiki;
+pub mod license;               // M1: license activate/status/refresh/export/import/deactivate
 mod migrate;
 pub mod odoo_pool;             // RFC-21 §2: per-agent Odoo connector pool
 mod ptc;
@@ -398,6 +399,23 @@ enum Commands {
     /// Not intended for direct user invocation.
     #[command(subcommand)]
     Hook(HookCommands),
+
+    /// Manage the DuDuClaw commercial license installed on this machine.
+    ///
+    /// Without a license the gateway runs in OpenSource mode (Apache 2.0
+    /// core fully usable, no commercial value-add modules). Use
+    /// `duduclaw license activate <key>` to install a paid license.
+    ///
+    /// Examples:
+    ///     duduclaw license fingerprint
+    ///     duduclaw license activate ./my-license.json
+    ///     duduclaw license status
+    ///     duduclaw license refresh
+    ///     duduclaw license export --base64 > license.b64
+    ///     duduclaw license import ./transferred.json
+    ///     duduclaw license deactivate
+    #[command(subcommand)]
+    License(license::LicenseCommands),
 
     /// Generate a per-agent usage report (default: last 7 days, Markdown).
     ///
@@ -875,6 +893,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             cmd_http_server(&bind, no_sse, timeout_secs).await
         }
         Commands::Hook(HookCommands::AgentFileGuard) => cmd_hook_agent_file_guard().await,
+        Commands::License(license_cmd) => license::run(license_cmd).await,
         Commands::WeeklyReport {
             days,
             agent,

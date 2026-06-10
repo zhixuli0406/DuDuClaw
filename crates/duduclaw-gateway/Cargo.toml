@@ -15,6 +15,7 @@ duduclaw-identity = { workspace = true }
 duduclaw-redaction = { workspace = true }
 duduclaw-cli-runtime = { workspace = true }
 duduclaw-cli-worker = { workspace = true }
+duduclaw-license = { workspace = true }
 thiserror = { workspace = true }
 tokio-util = "0.7"
 chrono = { workspace = true }

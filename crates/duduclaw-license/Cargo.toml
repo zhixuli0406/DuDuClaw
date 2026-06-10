@@ -1,0 +1,42 @@
+[package]
+name = "duduclaw-license"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "DuDuClaw license client — parse, verify, gate features. Apache 2.0."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Crypto: verification only (signing key stays in commercial/duduclaw-license)
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+sha2 = "0.10"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Encoding
+base64 = "0.22"
+hex = "0.4"
+
+# Machine identity
+gethostname = "0.4"
+mac_address = "1"
+
+# Error handling
+thiserror = { workspace = true }
+
+# Filesystem
+dirs = "5"
+
+[dev-dependencies]
+tempfile = "3"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+rand = "0.8"
