@@ -1,6 +1,63 @@
 # Changelog
 
 
+## [1.17.0] - 2026-06-10 — RFC-24 License v2.0 (Open Core foundation)
+
+Bootstrap of the DuDuClaw Open Core commercial layer. Apache 2.0 remains
+**fully usable with no limits and no commercial modules** — paid
+subscription tiers unlock value-add modules under `commercial/*`
+(premium templates, evolution params, enterprise dashboard, priority
+security patches). No license installed → OpenSource tier (current
+behavior, zero regression).
+
+### Added
+
+- **`duduclaw-license` crate** — verification-only client (signing key
+  stays in `commercial/duduclaw-license`).
+  - 7 tiers with inheritance chain: `OpenSource` / `Hobby` / `Solo` /
+    `Studio` / `Business` / `SelfHostPro` / `Oem`.
+  - Ed25519 trust registry seeded from `DUDUCLAW_LICENSE_PUBKEY_<ID>`
+    env vars; empty registry collapses to OpenSource (fail-safe).
+  - CRL polling for emergency revocations.
+  - Machine binding via hostname + MAC fingerprint.
+  - `~/.duduclaw/license.json` (`0o600`) storage.
+  - `features.toml` v2 subscription matrix: Solo NT$990 / Studio
+    NT$2,990 / Business NT$8,900 / Self-Host Pro NT$1,490·mo or
+    NT$14,900·yr / OEM (Year 2+).
+- **Gateway `license_runtime`** — bootstraps on `start_gateway`,
+  phone-home loop, CRL poll, process-global `LicenseRuntime`. Every
+  failure mode (missing file / empty key registry / signature mismatch
+  / expired / grace exceeded) collapses to OpenSource — gateway never
+  crashes on license errors.
+- **`license.status` RPC** (manager-only) — returns `LicenseSnapshot`
+  that intentionally **omits the raw Ed25519 signature and customer
+  email** so it is safe to render in the dashboard.
+- **`duduclaw license` CLI** — subcommands: `activate` / `status` /
+  `refresh` / `export` / `import` / `deactivate` / `fingerprint`.
+- **Web Dashboard `LicensePage`** — tier status, expiry warnings,
+  unlocked modules grid, CTAs (renew / pricing / docs). i18n: 39 keys
+  per locale (zh-TW / en / ja-JP).
+- **README Hire me block** — Fiverr / LinkedIn / Portfolio links above
+  the badges (GitHub long-URL SEO).
+- **`scripts/dev-replace-binary.sh`** — local build → npm-installed
+  binary replacement loop (rebuild dashboard + cargo `--release` +
+  backup + install + smoke). Does NOT auto-restart side-effectful
+  processes.
+- **`.cargo/config.toml`** — pin `PYO3_PYTHON=python3.13` (BLK-7
+  workaround; PyO3 0.24 max supported Python is 3.13, system default
+  is 3.14).
+- **Operational docs** — `marketing/blog/`, `marketing/press-kit/`,
+  `wiki/eval/`, `wiki/impl/`, `wiki/reports/`, `wiki/sprint-reports/`,
+  `docs/wiki/reports/`, `reports/tl-daily/`.
+
+### Backward compatibility
+
+- No license installed → OpenSource tier (current behavior, zero
+  regression).
+- All existing CLI / RPC / config surface unchanged.
+
+
+
 ## [1.16.0] - 2026-06-01 — MCP Refresh Tokens + GVU Consolidate Op
 
 Two operationally-driven additions surfaced by the 12-day post-v1.15.2
