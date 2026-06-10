@@ -1,0 +1,223 @@
+# DuDuClaw Feature Gate Definition (v2 — Solo-Founder Subscription Model)
+#
+# Version: 2.0
+# Date: 2026-06-04
+# Pricing model: Apache 2.0 open source + subscription-based commercial value-add
+#
+# Philosophy:
+#   Open source has ALL CORE features with NO artificial limits.
+#   Commercial subscriptions unlock VALUE-ADD modules under `commercial/*`
+#   (premium templates, evolution params, enterprise dashboard, priority patches).
+#   NEVER aspires to lock down the core — failed license = downgrade gracefully.
+#
+# Two delivery modes:
+#   - cloud-hosted tiers (hobby/solo/studio/business)
+#     enforced by Cloud control-plane multi-tenancy (max_* limits enforced)
+#   - self-hosted tier (self_host_pro)
+#     core remains unlimited (Apache 2.0 promise);
+#     `commercial/*` modules become loadable only when license is valid.
+#
+# Tier mapping to LicenseTier enum (see src/tier.rs):
+#   OpenSource     → no license file (default)
+#   Hobby          → Cloud trial (14d)
+#   Solo           → Cloud paid
+#   Studio         → Cloud paid
+#   Business       → Cloud paid
+#   SelfHostPro    → Self-host paid
+#   Oem            → Reserved for Year 2+
+#
+# See `commercial/docs/spec-license-module.md` for full specification.
+# See `commercial/docs/business-plan.md` for pricing rationale.
+
+# =============================================================================
+# OpenSource — default when no license file exists
+# Apache 2.0 — full core, zero limits, no commercial modules.
+# =============================================================================
+[opensource]
+description = "Apache 2.0 — full core, no commercial modules"
+
+# Limits: 0 = unlimited
+max_agents = 0
+max_channels = 0
+max_local_models = 0
+max_messages_per_month = 0
+memory_quota_gb = 0
+
+# Commercial value-add modules (all locked at this tier)
+premium_templates = false           # commercial/templates-premium
+industry_evolution_params = false   # commercial/evolution-params
+dashboard_enterprise = false        # commercial/dashboard-enterprise
+priority_security_patch = false     # 30-day delayed in OSS
+private_discord_support = false
+office_hour_hours_per_month = 0
+
+# Cloud-only features (always false for non-cloud tiers)
+cloud_only = false
+self_host_only = false
+
+# License heartbeat (irrelevant if no license)
+license_phone_home_interval_days = 0
+license_grace_period_days = 0
+
+# =============================================================================
+# Hobby — Cloud trial tier (free 14 days, auto-downgrade)
+# =============================================================================
+[hobby]
+description = "Cloud Hobby — free 14-day trial, then auto-downgrade to OpenSource"
+cloud_only = true
+trial_days = 14
+
+max_agents = 1
+max_channels = 1
+max_local_models = 0
+max_messages_per_month = 100
+memory_quota_gb = 0                 # share trial pool
+
+# No value-adds
+premium_templates = false
+industry_evolution_params = false
+dashboard_enterprise = false
+
+# Phone-home shorter to detect inactive trials early
+license_phone_home_interval_days = 3
+license_grace_period_days = 7
+
+# =============================================================================
+# Solo — Cloud paid tier NT$990/mo
+# =============================================================================
+[solo]
+description = "Cloud Solo — NT$990/mo (1 agent, 2 channels)"
+cloud_only = true
+
+max_agents = 1
+max_channels = 2
+max_local_models = 0
+max_messages_per_month = 0          # unlimited (fair-use enforced upstream)
+memory_quota_gb = 0                 # tiny — shared pool
+
+# Basic features
+premium_templates = false           # need Studio+ to unlock
+industry_evolution_params = false
+dashboard_enterprise = false
+
+license_phone_home_interval_days = 7
+license_grace_period_days = 30
+
+# =============================================================================
+# Studio — Cloud paid tier NT$2,990/mo (premium templates included)
+# =============================================================================
+[studio]
+description = "Cloud Studio — NT$2,990/mo (3 agents, 5 channels, templates)"
+cloud_only = true
+
+max_agents = 3
+max_channels = 5
+max_local_models = 0
+max_messages_per_month = 0
+memory_quota_gb = 1
+
+# Premium value-adds unlocked
+premium_templates = true            # ✓
+industry_evolution_params = false   # still need Business or Self-Host Pro
+dashboard_enterprise = false
+
+license_phone_home_interval_days = 7
+license_grace_period_days = 30
+
+# =============================================================================
+# Business — Cloud paid tier NT$8,900/mo (Odoo + private support)
+# =============================================================================
+[business]
+description = "Cloud Business — NT$8,900/mo (unlimited, Odoo, private support)"
+cloud_only = true
+
+max_agents = 0                      # unlimited
+max_channels = 0
+max_local_models = 0
+max_messages_per_month = 0
+memory_quota_gb = 10
+
+# All cloud value-adds
+premium_templates = true            # ✓
+industry_evolution_params = true    # ✓
+dashboard_enterprise = true         # ✓
+priority_security_patch = true      # ✓
+odoo_integration_supported = true   # ✓ (Cloud-hosted Odoo bridge)
+private_discord_support = true      # ✓ (private support channel)
+office_hour_hours_per_month = 4     # ✓ 4 hours/month
+
+license_phone_home_interval_days = 7
+license_grace_period_days = 30
+
+# =============================================================================
+# Self-Host Pro — On-prem paid tier NT$1,490/mo or NT$14,900/yr
+# Core is Apache 2.0, so NO max_* limits are enforced.
+# License gates only commercial/* modules.
+# =============================================================================
+[self_host_pro]
+description = "Self-Host Pro — NT$1,490/mo or NT$14,900/yr (commercial modules)"
+self_host_only = true
+
+# Limits ALWAYS unlimited for self-host (cannot enforce on customer's hardware
+# and would violate Apache 2.0 spirit; commercial value comes from the modules)
+max_agents = 0
+max_channels = 0
+max_local_models = 0
+max_messages_per_month = 0
+memory_quota_gb = 0
+
+# All commercial value-add modules unlocked
+premium_templates = true            # ✓
+industry_evolution_params = true    # ✓
+dashboard_enterprise = true         # ✓ (audit log export, ROI report)
+priority_security_patch = true      # ✓ (immediate vs 30-day OSS delay)
+private_discord_support = true      # ✓
+office_hour_hours_per_month = 0     # not bundled; sold separately
+
+# Phone-home: 7-day interval, 30-day grace for offline use
+license_phone_home_interval_days = 7
+license_grace_period_days = 30
+
+# =============================================================================
+# OEM — Reserved for Year 2+ white-label customers
+# =============================================================================
+[oem]
+description = "OEM license — white-label embedding/redistribution (Year 2+)"
+self_host_only = true
+
+max_agents = 0
+max_channels = 0
+max_local_models = 0
+max_messages_per_month = 0
+memory_quota_gb = 0
+
+premium_templates = true
+industry_evolution_params = true
+dashboard_enterprise = true
+priority_security_patch = true
+private_discord_support = true
+white_label = true                  # ✓ remove DuDuClaw branding
+redistribution = true               # ✓ embed in own product for sale
+dedicated_engineer = true
+
+license_phone_home_interval_days = 7
+license_grace_period_days = 60
+
+# =============================================================================
+# Notes for FeatureGate consumers
+# =============================================================================
+#
+# Tier inheritance chain (defined in src/gate.rs):
+#   OpenSource  → no inheritance
+#   Hobby       → opensource
+#   Solo        → hobby → opensource
+#   Studio      → solo → hobby → opensource
+#   Business    → studio → solo → hobby → opensource
+#   SelfHostPro → independent (uses its own values, does NOT inherit cloud chain)
+#   Oem         → self_host_pro → opensource
+#
+# When adding a new feature flag:
+#   1. Define it explicitly in `[opensource]` with the conservative default
+#   2. Override only in tiers where it should be enabled
+#   3. Update `gate.rs::check()` if the feature requires special handling
+#   4. Document the unlocked module in `commercial/docs/spec-license-module.md`

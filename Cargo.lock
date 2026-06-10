@@ -2411,6 +2411,7 @@ dependencies = [
  "duduclaw-gateway",
  "duduclaw-identity",
  "duduclaw-inference",
+ "duduclaw-license",
  "duduclaw-memory",
  "duduclaw-odoo",
  "duduclaw-redaction",
@@ -2585,6 +2586,7 @@ dependencies = [
  "duduclaw-desktop",
  "duduclaw-identity",
  "duduclaw-inference",
+ "duduclaw-license",
  "duduclaw-memory",
  "duduclaw-odoo",
  "duduclaw-redaction",
@@ -2689,6 +2691,26 @@ dependencies = [
  "uuid 1.23.1",
  "whisper-rs",
  "zeroize",
+]
+
+[[package]]
+name = "duduclaw-license"
+version = "1.16.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "dirs 5.0.1",
+ "ed25519-dalek",
+ "gethostname",
+ "hex",
+ "mac_address",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -2828,6 +2850,7 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core 0.6.4",
  "serde",
  "sha2",
  "subtle",
@@ -3753,6 +3776,16 @@ dependencies = [
  "typenum",
  "version_check",
  "zeroize",
+]
+
+[[package]]
+name = "gethostname"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0176e0459c2e4a1fe232f984bca6890e681076abb9934f6cea7c326f3fc47818"
+dependencies = [
+ "libc",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -5329,6 +5362,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 
 [[package]]
+name = "mac_address"
+version = "1.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0aeb26bf5e836cc1c341c8106051b573f1766dfa05aa87f0b98be5e51b02303"
+dependencies = [
+ "nix 0.29.0",
+ "winapi",
+]
+
+[[package]]
 name = "macro_rules_attribute"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5895,6 +5938,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases 0.2.1",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

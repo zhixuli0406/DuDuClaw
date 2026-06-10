@@ -200,6 +200,38 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // drops and the GC task receives its cancel signal — clean shutdown.
     let _redaction_gc = redaction_gc_handle;
 
+    // ── License runtime bootstrap ───────────────────────────────
+    //
+    // Loads ~/.duduclaw/license.json (when present), verifies its Ed25519
+    // signature against trusted issuer public keys collected from
+    // `DUDUCLAW_LICENSE_PUBKEY_<ID>` env vars, and spawns two background
+    // tasks: a phone-home loop (refreshes the license on the cadence
+    // dictated by features.toml) and a CRL poll (downgrades on emergency
+    // revocations).
+    //
+    // Failure modes never crash the gateway: a missing license, an
+    // empty key registry, signature mismatch, expired license, or
+    // grace-period exceeded all collapse to OpenSource mode.
+    let _license_runtime = {
+        let registry = crate::license_runtime::embedded_registry_from_env();
+        let runtime = crate::license_runtime::LicenseRuntime::bootstrap(
+            home_dir.clone(),
+            registry,
+        )
+        .await;
+        // Publish the runtime to the process-global slot so dashboard
+        // RPCs and other gateway services can read the current tier
+        // without having to thread a handle through the entire
+        // initialisation chain.
+        crate::license_runtime::set_global(runtime.clone());
+        // Spawn the background phone-home + CRL polling tasks. The
+        // returned JoinHandles are deliberately dropped — the tasks are
+        // long-lived and use cooperative cancellation via the runtime
+        // state itself, not handle abortion.
+        let _tasks = runtime.spawn_background_tasks();
+        runtime
+    };
+
     // Initialize wiki trust store (Phase 2 of wiki RL trust feedback).
     // Best-effort: if open fails, the rest of the system still works — RAG
     // simply falls back to frontmatter trust and trust feedback is skipped.

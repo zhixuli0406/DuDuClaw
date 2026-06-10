@@ -534,16 +534,39 @@ export interface PartnerCustomer {
   created_at: string;
 }
 
-export interface LicenseInfo {
-  tier: string;
-  activated: boolean;
-  expires_at?: string;
-  days_remaining?: number;
-  features: string[];
-  machine_fingerprint?: string;
-  customer_name?: string;
-  max_agents?: number;
-  max_channels?: number;
+/**
+ * License snapshot returned by `license.status` RPC.
+ *
+ * Shape mirrors `crate::license_runtime::LicenseSnapshot` exactly — adjust
+ * here and in the Rust struct in lockstep when extending. The snapshot
+ * deliberately omits the raw Ed25519 signature; the dashboard never needs
+ * it and serializing it would only invite copy-paste leaks.
+ */
+export interface LicenseSnapshot {
+  /** Active tier — `opensource` when no license is installed. */
+  tier:
+    | 'opensource'
+    | 'hobby'
+    | 'solo'
+    | 'studio'
+    | 'business'
+    | 'self_host_pro'
+    | 'oem';
+  /** Always one of two stable strings — useful for UI conditionals. */
+  mode: 'opensource' | 'commercial';
+  /** False when no license.json exists; true otherwise. */
+  installed: boolean;
+  customer_id?: string | null;
+  subscription_id?: string | null;
+  /** RFC3339 timestamp. */
+  expires_at?: string | null;
+  /** Negative when already expired. */
+  days_until_expiry?: number | null;
+  /** RFC3339 timestamp of last successful phone-home. */
+  last_phone_home?: string | null;
+  days_since_phone_home?: number | null;
+  /** `true` when the license fingerprint matches the current machine. */
+  fingerprint_match?: boolean | null;
 }
 
 // ── User management types ────────────────────────────────────
@@ -1083,6 +1106,14 @@ export const api = {
       client.call('billing.usage') as Promise<BillingUsage>,
     history: () =>
       client.call('billing.history') as Promise<{ invoices: BillingInvoice[] }>,
+  },
+  license: {
+    /**
+     * Read-only snapshot of the gateway LicenseRuntime. Returns
+     * OpenSource defaults when no license is installed, so the caller
+     * can render without conditional-loading the call.
+     */
+    status: () => client.call('license.status') as Promise<LicenseSnapshot>,
   },
   marketplace: {
     list: () =>

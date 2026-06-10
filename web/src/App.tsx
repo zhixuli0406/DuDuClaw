@@ -15,6 +15,7 @@ import { OrgChartPage } from './pages/OrgChartPage';
 import { SkillMarketPage } from './pages/SkillMarketPage';
 import { WebChatPage } from './pages/WebChatPage';
 import { BillingPage } from './pages/BillingPage';
+import { LicensePage } from './pages/LicensePage';
 import { ReportPage } from './pages/ReportPage';
 import { KnowledgeHubPage } from './pages/KnowledgeHubPage';
 import { SharedWikiPage } from './pages/SharedWikiPage';
@@ -73,6 +74,7 @@ export function App() {
             <Route path="partner" element={<PartnerPortalPage />} />
             <Route path="reports" element={<ReportPage />} />
             <Route path="billing" element={<BillingPage />} />
+            <Route path="license" element={<LicensePage />} />
             <Route path="logs" element={<LogsPage />} />
           </Route>
 

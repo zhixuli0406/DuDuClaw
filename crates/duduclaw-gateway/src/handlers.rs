@@ -390,6 +390,15 @@ impl MethodHandler {
             "channels.remove" => { require_admin!(); self.handle_channels_remove(params).await }
 
             // ── Account methods (admin only) ─────────────────
+            // ── License (read-only snapshot of the gateway LicenseRuntime) ──
+            //
+            // `license.status` lets the dashboard render tier + expiry +
+            // grace-period warnings without parsing ~/.duduclaw/license.json
+            // directly. Manager-level access — the snapshot intentionally
+            // omits the raw signature and customer email, so it is safe to
+            // show to anyone who can already see operational metrics.
+            "license.status" => { require_manager!(); self.handle_license_status().await }
+
             "accounts.list" => { require_admin!(); self.handle_accounts_list().await }
             "accounts.budget_summary" => { require_manager!(); self.handle_budget_summary().await }
             "accounts.rotate" => {
@@ -626,6 +635,45 @@ impl MethodHandler {
 
     fn handle_hello_ok(&self, _params: Value) -> WsFrame {
         WsFrame::ok_response("", json!({ "ack": true }))
+    }
+
+    /// `license.status` — read-only snapshot of the current LicenseRuntime.
+    ///
+    /// Returns OpenSource defaults when no runtime is registered (e.g. a
+    /// gateway started without `start_gateway`) or when no license file is
+    /// installed. Never errors — license queries must not break the
+    /// dashboard. Dashboard surface fields are stable across schema bumps
+    /// because we project through [`crate::license_runtime::LicenseSnapshot`]
+    /// rather than serializing the raw [`duduclaw_license::License`] (which
+    /// contains the Ed25519 signature).
+    async fn handle_license_status(&self) -> WsFrame {
+        let snapshot = match crate::license_runtime::global() {
+            Some(runtime) => runtime.snapshot().await,
+            None => crate::license_runtime::LicenseSnapshot {
+                tier: duduclaw_license::LicenseTier::OpenSource,
+                mode: "opensource",
+                installed: false,
+                customer_id: None,
+                subscription_id: None,
+                expires_at: None,
+                days_until_expiry: None,
+                last_phone_home: None,
+                days_since_phone_home: None,
+                fingerprint_match: None,
+            },
+        };
+
+        let payload = match serde_json::to_value(&snapshot) {
+            Ok(v) => v,
+            Err(e) => {
+                return WsFrame::error_response(
+                    "",
+                    &format!("serialize license snapshot: {e}"),
+                );
+            }
+        };
+
+        WsFrame::ok_response("", payload)
     }
 
     fn handle_tools_catalog(&self, _params: Value) -> WsFrame {
