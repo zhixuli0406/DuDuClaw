@@ -1,0 +1,6 @@
+# BLK-7 fix (2026-05-26): PyO3 0.24.2 max supported Python is 3.13, but system default is 3.14.
+# Pin PyO3 to use Python 3.13 (still installed at /usr/local/bin/python3.13).
+# Long-term plan: upgrade PyO3 to ≥ 0.25 when it supports Python 3.14 natively.
+# See TL-DEC-2026-05-26-001 in docs/tl/daily-report-2026-05-26.md
+[env]
+PYO3_PYTHON = "/usr/local/bin/python3.13"

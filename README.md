@@ -1,32 +1,50 @@
 # DuDuClaw 🐾
 
+<div align="center">
+
+### 🛠 Need a custom AI Agent built with the same engineering rigor?
+
+I'm available for freelance work — building **production-grade Agents**
+with multi-LLM routing, MCP integration, RAG, secrets vaults, and full
+observability. Same architecture standards as DuDuClaw.
+
+[**Hire me on Fiverr →**](https://www.fiverr.com/louis_li_0406/build-a-custom-ai-agent-with-claude-openai-or-gemini-for-your-workflow-fbf0)
+&nbsp;·&nbsp;
+[LinkedIn](https://www.linkedin.com/in/zhixuli0406/)
+&nbsp;·&nbsp;
+[Portfolio](https://github.com/zhixuli0406)
+
+</div>
+
+---
+
 > **Multi-Runtime AI Agent Platform** — 統一 Claude / Codex / Gemini 三大 CLI，打造你的多通道 AI 助理
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.15.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.16.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
 ---
 
-> 🎉 **v1.15.0 — Cross-Platform PTY Pool + Worker**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.15.0)）
+> 🎉 **v1.16.0 — MCP Refresh Tokens + GVU SoulPatchOp::Consolidate**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.16.0)）
 >
-> Anthropic 已封鎖 OAuth 訂閱帳號的 `claude -p`（推用戶用真互動式 TUI）；v1.15.0 上了一條跨平台 PTY 通道作為 OAuth 帳號的官方替代路徑，**預設關閉**，per-agent 透過 `agent.toml [runtime] pty_pool_enabled = true` 開啟。
+> 兩個由 v1.15.2 12 天 soak 暴露出來的生產面問題，一次補齊。
 >
-> - **新 crate `duduclaw-cli-runtime`** — `portable-pty` 跨平台抽象（ConPTY on Win 10 1809+、openpty on Unix），sentinel-framed in-band 回應協定（不用 scrollback scraping 也不用 sidecar），`PtySession` lifecycle、`PtyPool` per-agent semaphore + idle eviction + 健康檢查 + supervisor + restart policy
-> - **新 crate `duduclaw-cli-worker`** — 把 PTY pool 包成 localhost JSON-RPC 子進程（Bearer token + `/healthz`），gateway 可選 in-process 或 out-of-process 兩種模式，後者透過 `[runtime] worker_managed = true` 啟用
-> - **Gateway 整合**：`pty_runtime` adapter（`RuntimeMode::{FreshSpawn, PtyPool}` per-agent 路由）、`worker_supervisor` 把 SIGTERM/SIGKILL 順序排進 graceful shutdown future、`runtime_status` 暴露 `GET /api/runtime/status` JSON 端點（loopback-only）
-> - **`channel_reply` PTY 分支** — OAuth 帳號走互動式 REPL、API-key 帳號走 `oneshot_pty_invoke + claude -p`，新增 `parse_claude_stream_json_complete` + `StreamDiagnostics` 讓 `channel_failures.jsonl` 有可診斷的 stream-json 統計
-> - **Phase 8 Production Observability**：`pty_pool_*` Prometheus counters（acquires / cache-hit / spawn / 三種驅逐原因）、invoke outcome（ok/empty/error/timeout）+ duration histogram、worker health misses + restarts、`pty_pool_managed_worker_active` 模式 gauge
-> - **降級安全**：所有 PTY 路徑錯誤都會 fallback 回 legacy `tokio::process::Command + claude -p`；missing worker / 不健康 pool / spawn 失敗都可恢復
-> - **跨平台煙霧驗證**：`scripts/smoke-pty-pool.sh`（Unix/macOS）+ `.ps1`（Windows）build runtime + 跑 cli-runtime / gateway routing helper / stream-json parser 單元測試，`CLAUDE_SPIKE=1` 跑活的互動式 spike（消耗 OAuth 配額）
+> - **MCP Refresh Tokens（Phase A）** — Claude Desktop MCP server 2026-05-30 因 30 天舊 API key 過期靜默斷線兩天，因為 Claude Desktop 拿到 auth-fail 後就靜默 disconnect 不會重試。新模組 `mcp_refresh` 以 `~/.duduclaw/mcp_tokens.db` 後盾，token 形式 `ddc_refresh_<env>_<64hex>`、90 天壽命、可個別撤銷、僅儲 hash（原 token 永遠不落地）。`authenticate_from_env` 依 prefix 路由憑證，舊版 `ddc_<env>_<32hex>` 路徑完整保留。新 CLI：`duduclaw mcp { issue-refresh-token | revoke-token | list-tokens }`
+> - **GVU `SoulPatchOp::Consolidate`（Phase B）** — agnes SOUL.md 在健康 GVU 下仍以約 5 行／週的速度成長，132 行／7,909 bytes 距 150 行硬上限剩約 3 週；原本 structured patch path 只能讓 SOUL.md 變大。新增變體 `SoulPatchOp::Consolidate`，語意等同 `Replace` 但帶硬性「縮減不變式」：`apply_patch_to_soul` 在 patch 內容沒比現有正文短時直接拒絕。Generator prompt 也補上 op 語意，LLM 接近 cap 時可自我觸發整合
+> - **`mcp_auth` 測試時限炸彈拆除** — 11 個 fixture 把 `created_at` 硬寫成 `2026-04-29T00:00:00Z`，33 天後就過 30 天門檻開始集體爆。改成 `Utc::now().to_rfc3339()` 後對牆鐘時間免疫
+> - **測試覆蓋**：1,537 個單元測試（v1.15.2 起 +12）
 
 <details>
-<summary><strong>v1.10.0 → v1.14.0 累積亮點</strong></summary>
+<summary><strong>v1.9.4 → v1.15.x 累積亮點</strong></summary>
 
+- **v1.15.2** — `agent_update_soul` 信賴後門封補：原本寫 SOUL.md 後沒呼叫 `soul_guard::accept_soul_change` 更新完整性 hash，每次合法呼叫都會留下永久 stored-vs-current drift；且整條呼叫鏈不寫 `tool_calls.jsonl`，後門對事後分析完全隱形。v1.15.2 補齊 audit row（成功 + 四種拒絕路徑都記，hash 前綴 16 字元）並在每次寫入後同步 fingerprint
+- **v1.15.1** — GVU SOUL.md 無界成長修補：agnes/SOUL.md 5 個 GVU cycle 從 61 行膨脹到 592 行。三層防禦：(1) `strip_proposal_meta` 在 legacy 路徑剝除 `## 診斷` / `## rationale` / `## expected_improvement` 等 meta 段；(2) `SOUL_MAX_LINES = 150` / `SOUL_MAX_BYTES = 8KB` 硬上限獨立於 ASI 內容權重門檻；(3) 新增 structured `SoulPatch { section, op, content }` 與 `apply_patch_to_soul`，Generator→Verifier→Updater 全鏈路打通
+- **v1.15.0** — Cross-Platform PTY Pool + Worker：Anthropic 封鎖 OAuth 訂閱帳號的 `claude -p` 後的官方替代路徑。新 crate `duduclaw-cli-runtime`（`portable-pty` ConPTY/openpty 跨平台 + sentinel-framed in-band 協定 + `PtyPool` semaphore + idle eviction + supervisor + restart policy）與 `duduclaw-cli-worker`（localhost JSON-RPC + Bearer + `/healthz`，gateway 可選 in-process 或 out-of-process）；`channel_reply` OAuth 走 REPL / API-key 走 `oneshot_pty_invoke + claude -p`；Phase 8 `pty_pool_*` Prometheus 指標；所有失敗都 fallback 回 legacy `tokio::process::Command`。預設關閉，`agent.toml [runtime] pty_pool_enabled = true` 啟用
 - **v1.14.0** — RFC-23 Sensitive Data Redaction：新 crate `duduclaw-redaction`，內部資料（Odoo / shared wiki / file tools）以 `<REDACT:CATEGORY:hash8>` token 取代後才送 LLM，受信邊界（user channel reply、whitelist 工具 egress）自動還原；AES-256-GCM 加密 SQLite vault（per-agent 32-byte key，0o600 權限）+ TTL 7d 兩階段 GC（mark→30 天 purge）+ 5 個內建 profile + 五層 enable/disable resolver + JSONL audit 10MB rotation
 - **v1.13.1** — Odoo Test-Before-Save：`odoo.test` RPC 接受 inline params，Dashboard「測試連線」直接用表單目前的值打 Odoo 不必先儲存；inline credential 留空 fallback 已儲存的金鑰；同樣的 SSRF / HTTPS / db-name 驗證鏈、`scrub_odoo_error()` 截 240 字防 HTML 錯誤頁外洩
 - **v1.13.0** — Runtime-health overhaul（16 個 issue / 兩輪修補）：恢復 GVU/SOUL 自我演化、新增 `[prompt] mode = "minimal"` Anthropic Skills 風格系統提示、`[budget] max_input_tokens` 壓縮管線、async session summarizer、TF-IDF wiki 相關性排序、`duduclaw lifecycle flush` 季度冷熱分離 CLI
@@ -91,6 +109,7 @@ DuDuClaw (plumbing)
 | 特色 | 說明 |
 |------|------|
 | **MCP Server 架構** | `duduclaw mcp-server` 提供 80+ 工具，涵蓋通訊、記憶、Agent 管理、推論、排程、Skill 市場、任務看板、共享知識庫、Odoo ERP。註冊於每個 agent 目錄的 `.mcp.json`（Claude CLI `-p --dangerously-skip-permissions` 僅讀取專案級設定），gateway 啟動時自動建立/修復 |
+| **MCP Refresh Tokens**（v1.16.0）| `~/.duduclaw/mcp_tokens.db` 後盾的長壽憑證 — token 形式 `ddc_refresh_<env>_<64hex>`、90 天壽命、可個別撤銷、僅儲 hash（原 token 永遠不落地）；`authenticate_from_env` 依 prefix 路由憑證，舊版 `ddc_<env>_<32hex>` 完整保留；新 CLI `duduclaw mcp { issue-refresh-token \| revoke-token \| list-tokens }` 解決 Claude Desktop 拿到 auth-fail 後靜默斷線不重試的痛點 |
 | **Multi-Runtime** | `AgentRuntime` trait — Claude / Codex / Gemini / OpenAI-compat 四種後端，`RuntimeRegistry` 自動偵測，per-agent 設定 |
 | **本地推論引擎** | 統一 `InferenceBackend` trait — llama.cpp（Metal/CUDA/Vulkan）/ mistral.rs（ISQ + PagedAttention）/ Exo P2P 叢集 / llamafile / MLX（Apple Silicon）/ OpenAI-compat HTTP |
 | **三層信心路由** | LocalFast → LocalStrong → CloudAPI，基於啟發式信心評分自動分流，CJK-aware token estimation |
@@ -131,6 +150,8 @@ DuDuClaw (plumbing)
 | **Deferred GVU** | gradient 累積 + 延遲重試（最多 3 次 deferral，72h 跨度 9-21 輪有效迭代）|
 | **ConversationOutcome** | 零 LLM 對話結果偵測（TaskType / Satisfaction / Completion），zh-TW + en 雙語 |
 | **SOUL.md 版控** | 24h 觀察期 + 自動回滾，atomic write（SHA-256 fingerprint）|
+| **`SoulPatchOp::Consolidate`**（v1.16.0）| structured patch path 新增「縮減不變式」變體 — 語意等同 `Replace` 但 `apply_patch_to_soul` 在新內容沒比現有正文短時拒絕，LLM 可在 SOUL.md 接近 150 行 / 8KB 硬上限時自我觸發整合 |
+| **`agent_update_soul` 信賴鏈**（v1.15.2）| 寫入後自動 `soul_guard::accept_soul_change` 同步完整性 fingerprint + 成功/四種拒絕路徑皆寫入 `tool_calls.jsonl`（hash 前綴 16 字元），封補 stored-vs-current drift 與後門隱形問題 |
 | **Agent-as-Evaluator** | 獨立 Evaluator Agent（Haiku 成本控制）進行對抗式驗證，結構化 JSON verdict |
 | **DelegationEnvelope** | 結構化交接協議 — context / constraints / task_chain / expected_output，向後相容 Raw payload |
 | **TaskSpec 工作流** | 多步驟任務規劃 — dependency-aware scheduling / auto-retry（3x）/ replan（最多 2 次）/ persistence |
