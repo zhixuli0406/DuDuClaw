@@ -2,6 +2,12 @@
 
 <div align="center">
 
+**繁體中文** · [English](README.en.md) · [日本語](README.ja.md)
+
+</div>
+
+<div align="center">
+
 ### 🛠 Need a custom AI Agent built with the same engineering rigor?
 
 I'm available for freelance work — building **production-grade Agents**
@@ -60,6 +66,25 @@ observability. Same architecture standards as DuDuClaw.
 
 ---
 
+## 目錄
+
+- [什麼是 DuDuClaw？](#what)
+- [核心特色](#features)
+- [競品對比](#comparison)
+- [Agent 目錄結構](#directory)
+- [Security Hooks 安全防禦系統](#security)
+- [安裝](#install)
+- [CLI 指令](#cli)
+- [專案結構](#structure)
+- [技術決策](#tech)
+- [測試](#testing)
+- [文件](#docs)
+- [授權](#license)
+
+---
+
+<a id="what"></a>
+
 ## 什麼是 DuDuClaw？
 
 DuDuClaw 是一個 **Multi-Runtime AI Agent 平台**——同時支援 **Claude Code / Codex / Gemini** 三大 CLI 作為 AI 後端，並透過統一的 `AgentRuntime` trait 實現無縫切換與自動偵測。
@@ -92,6 +117,8 @@ DuDuClaw (plumbing)
 ```
 
 ---
+
+<a id="features"></a>
 
 ## 核心特色
 
@@ -246,6 +273,8 @@ DuDuClaw (plumbing)
 
 ---
 
+<a id="comparison"></a>
+
 ## 競品對比
 
 | | **DuDuClaw** | **OpenClaw** | **IronClaw** | **Moltis** | **Dify** |
@@ -266,6 +295,8 @@ DuDuClaw (plumbing)
 | 授權 | **Apache 2.0 (Open Core)** | MIT | 開源 | 開源 | $59+/月 |
 
 ---
+
+<a id="directory"></a>
 
 ## Agent 目錄結構
 
@@ -295,6 +326,8 @@ DuDuClaw (plumbing)
 使用 `duduclaw migrate` 可將舊版 `agent.toml` 自動轉換為 Claude Code 相容格式。
 
 ---
+
+<a id="security"></a>
 
 ## Security Hooks 安全防禦系統
 
@@ -337,6 +370,8 @@ DuDuClaw 在 Claude Code 的 Hook 系統上建構了三層漸進式防禦：
 降級：24 小時無事件自動降一級（RED→YELLOW→GREEN）。
 
 ---
+
+<a id="install"></a>
 
 ## 安裝
 
@@ -408,6 +443,8 @@ cargo build --release -p duduclaw-cli -p duduclaw-gateway --features duduclaw-ga
 
 ---
 
+<a id="cli"></a>
+
 ## CLI 指令
 
 ```
@@ -452,6 +489,8 @@ duduclaw version             # 版本資訊
 ```
 
 ---
+
+<a id="structure"></a>
 
 ## 專案結構
 
@@ -528,6 +567,8 @@ DuDuClaw/
 
 ---
 
+<a id="tech"></a>
+
 ## 技術決策
 
 | 項目 | 選擇 | 理由 |
@@ -544,6 +585,8 @@ DuDuClaw/
 | 即時通訊 | **WebRTC (LiveKit)** | 低延遲語音、多人會議 |
 
 ---
+
+<a id="testing"></a>
 
 ## 測試
 
@@ -562,6 +605,8 @@ cd web && npx tsc --noEmit
 
 ---
 
+<a id="docs"></a>
+
 ## 文件
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — 完整系統架構設計
@@ -578,6 +623,8 @@ cd web && npx tsc --noEmit
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md) — 自訂 MCP 工具教學
 
 ---
+
+<a id="license"></a>
 
 ## 授權
 
