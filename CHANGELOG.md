@@ -1,6 +1,39 @@
 # Changelog
 
 
+## [1.18.0] - 2026-06-15 — Dashboard budget/usage accuracy + reliability fixes
+
+Dashboard now reads real spend from the persistent `CostTelemetry` ledger
+instead of the `AccountRotator`'s in-memory counter (which reset on every
+5-minute rebuild / gateway restart and stayed 0 for OAuth-subscription
+accounts), plus a sweep of dashboard runtime-bug fixes.
+
+### Added
+
+- **`marketplace.install`** handler — installs a catalog MCP server into a
+  chosen agent's `.mcp.json` (was previously an error stub). Frontend gains
+  a target-agent picker dialog.
+- **`system.version` returns `edition`** so the dashboard can gate Pro-only
+  UI (auto-update toggle).
+- **Voice & Proactive settings persistence** — `system.update_config` writes
+  `[voice]` to `inference.toml`; per-agent `[proactive]` saved via
+  `agents.update` and surfaced through `agents.inspect`.
+- Language switcher + theme store wired into the dashboard Header.
+- 88 missing i18n keys across `zh-TW` / `en` / `ja-JP`.
+
+### Fixed
+
+- **Budget/usage shows real data**: `agents.list` / `agents.inspect` report
+  per-agent month-to-date spend (was one all-account aggregate shown
+  identically for every agent); `accounts.budget_summary` reports the real
+  global month-to-date total.
+- **Cost unit correction**: `cost_millicents` holds whole cents — removed the
+  erroneous `/10` in analytics savings/cost which under-reported by 10x.
+- **Schedule (cron) add**: sends required `name` + `task` (was failing).
+- **MCP servers** consumed as the array shape the backend serializes.
+- Division-by-zero guard in budget progress bars; silent account errors now
+  surface as toasts; assorted async-state and timer-cleanup fixes.
+
 ## [1.17.0] - 2026-06-10 — RFC-24 License v2.0 (Open Core foundation)
 
 Bootstrap of the DuDuClaw Open Core commercial layer. Apache 2.0 remains

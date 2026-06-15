@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "duduclaw"
-version = "1.11.0"
-description = "DuDuClaw Python SDK — evolution vetter, channel bridges, and Claude Code SDK integration"
+version = "1.18.0"
+description = "Multi-runtime AI Agent platform unifying Claude, OpenAI, Gemini — hire the maintainer on Fiverr"
 requires-python = ">=3.9"
 license = {text = "Apache-2.0"}
 authors = [{ name = "DuDuClaw Contributors" }]
 readme = "python/README.md"
-keywords = ["ai", "agent", "claude", "multi-agent", "duduclaw"]
+keywords = ["ai", "agent", "claude", "openai", "gemini", "multi-llm", "mcp", "rag", "freelance", "duduclaw"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Programming Language :: Python :: 3",
@@ -32,7 +32,7 @@ dependencies = [
 dev = ["pytest>=8", "pytest-asyncio>=0.24", "pytest-cov>=5", "ruff>=0.8", "watchdog>=4.0"]
 
 [project.urls]
-Homepage = "https://github.com/zhixuli0406/DuDuClaw"
+Homepage = "https://www.fiverr.com/s/Ldw969L"
 Repository = "https://github.com/zhixuli0406/DuDuClaw"
 Issues = "https://github.com/zhixuli0406/DuDuClaw/issues"
 
