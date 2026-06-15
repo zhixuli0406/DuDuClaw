@@ -5,7 +5,8 @@
 # Steps:
 #   1. Validate working tree is clean
 #   2. Bump version in all Cargo.toml files
-#   3. Bump the README.md version badge + remind to refresh release highlight
+#   3. Bump the version badge in all localized READMEs (zh-TW / en / ja)
+#      + remind to refresh & translate the release highlight in each
 #   4. Update CHANGELOG.md with new entry
 #   5. Build and run tests
 #   6. Create git commit + tag
@@ -110,14 +111,17 @@ if [[ -f "pyproject.toml" ]]; then
     echo "  Updated: pyproject.toml"
 fi
 
-# --- Bump README version badge ---
-# The shields.io badge is mechanical; the human-readable release highlight at
-# the top of README.md still needs a manual edit (see the reminder at the end).
-README_BADGE="README.md"
-if [[ -f "$README_BADGE" ]]; then
-    echo "Bumping README.md version badge..."
-    sed -i '' -E "s|(badge/version-)$SEMVER(-blue)|\1$NEW_VERSION\2|" "$README_BADGE"
-fi
+# --- Bump README version badges (all languages) ---
+# The shields.io badge is mechanical and lives in every localized README
+# (README.md / README.en.md / README.ja.md). The human-readable release
+# highlight at the top of each still needs a manual edit per language (see the
+# reminder at the end).
+echo "Bumping README version badges (zh-TW / en / ja)..."
+for readme in README.md README.en.md README.ja.md; do
+    [[ -f "$readme" ]] || continue
+    sed -i '' -E "s|(badge/version-)$SEMVER(-blue)|\1$NEW_VERSION\2|" "$readme"
+    echo "  Updated: $readme"
+done
 
 # --- Update CHANGELOG.md ---
 echo "Updating CHANGELOG.md..."
@@ -172,7 +176,7 @@ fi
 # --- Git commit + tag ---
 echo ""
 echo "Creating git commit and tag..."
-git add -A Cargo.toml crates/*/Cargo.toml npm/*/package.json pyproject.toml README.md CHANGELOG.md
+git add -A Cargo.toml crates/*/Cargo.toml npm/*/package.json pyproject.toml README.md README.en.md README.ja.md CHANGELOG.md
 git commit -m "chore: bump v$NEW_VERSION"
 git tag -a "v$NEW_VERSION" -m "Release v$NEW_VERSION"
 
@@ -183,10 +187,12 @@ echo "================================================"
 echo ""
 echo "Next steps:"
 echo "  1. Edit CHANGELOG.md to fill in release notes"
-echo "  2. Update README.md docs to match this release:"
+echo "  2. Update the release highlight in ALL THREE localized READMEs"
+echo "     (README.md / README.en.md / README.ja.md) — keep them aligned:"
 echo "       - Replace the top release highlight block with v$NEW_VERSION"
-echo "       - Demote the previous highlight into the '累積亮點' history <details>"
-echo "       (the version badge was bumped automatically; the prose is manual)"
+echo "       - Demote the previous highlight into the history <details>"
+echo "       - Translate the new highlight into en + ja (zh-TW is the source)"
+echo "       (version badges were bumped automatically; the prose is manual)"
 echo "  3. Amend the commit if needed:  git commit --amend"
 echo "  4. Push to remote:              git push && git push --tags"
 echo "  5. Create GitHub Release:       gh release create v$NEW_VERSION --generate-notes"
