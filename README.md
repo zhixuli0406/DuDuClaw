@@ -24,24 +24,27 @@ observability. Same architecture standards as DuDuClaw.
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.16.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.18.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
 ---
 
-> 🎉 **v1.16.0 — MCP Refresh Tokens + GVU SoulPatchOp::Consolidate**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.16.0)）
+> 🎉 **v1.18.0 — Dashboard 預算／用量正確化 + 可靠度修補**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.18.0)）
 >
-> 兩個由 v1.15.2 12 天 soak 暴露出來的生產面問題，一次補齊。
+> Dashboard 的預算與用量改讀持久化的 `CostTelemetry` 帳本，不再讀那個一重建就歸零的記憶體計數，外加一輪 dashboard runtime bug 清掃。
 >
-> - **MCP Refresh Tokens（Phase A）** — Claude Desktop MCP server 2026-05-30 因 30 天舊 API key 過期靜默斷線兩天，因為 Claude Desktop 拿到 auth-fail 後就靜默 disconnect 不會重試。新模組 `mcp_refresh` 以 `~/.duduclaw/mcp_tokens.db` 後盾，token 形式 `ddc_refresh_<env>_<64hex>`、90 天壽命、可個別撤銷、僅儲 hash（原 token 永遠不落地）。`authenticate_from_env` 依 prefix 路由憑證，舊版 `ddc_<env>_<32hex>` 路徑完整保留。新 CLI：`duduclaw mcp { issue-refresh-token | revoke-token | list-tokens }`
-> - **GVU `SoulPatchOp::Consolidate`（Phase B）** — agnes SOUL.md 在健康 GVU 下仍以約 5 行／週的速度成長，132 行／7,909 bytes 距 150 行硬上限剩約 3 週；原本 structured patch path 只能讓 SOUL.md 變大。新增變體 `SoulPatchOp::Consolidate`，語意等同 `Replace` 但帶硬性「縮減不變式」：`apply_patch_to_soul` 在 patch 內容沒比現有正文短時直接拒絕。Generator prompt 也補上 op 語意，LLM 接近 cap 時可自我觸發整合
-> - **`mcp_auth` 測試時限炸彈拆除** — 11 個 fixture 把 `created_at` 硬寫成 `2026-04-29T00:00:00Z`，33 天後就過 30 天門檻開始集體爆。改成 `Utc::now().to_rfc3339()` 後對牆鐘時間免疫
-> - **測試覆蓋**：1,537 個單元測試（v1.15.2 起 +12）
+> - **預算／用量顯示真實數字** — 原本所有預算顯示都讀 `AccountRotator.spent_this_month`，但這個記憶體計數每 5 分鐘 rotator 重建就歸零、gateway 重啟也歸零、OAuth 訂閱帳號每次呼叫成本又是 0，而且每個 agent 都顯示「全帳號加總」同一個數字。改為從 `CostTelemetry`（持久 SQLite 帳本）讀本月至今用量：`agents.list` / `agents.inspect` 顯示**各 agent 自己的**月度用量，`accounts.budget_summary` 顯示真實全域總額
+> - **成本單位修正** — `cost_millicents` 欄位名是誤稱，實際存的就是整數 cents（用定價反推驗證：某筆 309 = $3.09）。移除 analytics 成本／節省顯示裡多餘的 `/10`（原本少報 10 倍）
+> - **`marketplace.install` 補實作** — 原本是回錯誤的 stub，改為把 catalog MCP server 安裝進指定 agent 的 `.mcp.json`，前端加上目標 agent 選擇對話框
+> - **設定持久化補洞** — `system.version` 回傳 `edition` 供 dashboard 判斷 Pro-only UI；`system.update_config` 把 `[voice]` 寫進 `inference.toml`、per-agent `[proactive]` 經 `agents.update` 存進 `agent.toml` 並由 `agents.inspect` 回填
+> - **前端修補** — 排程新增送出必要的 `name`+`task`（原本失敗）、MCP servers 以後端序列化的陣列形狀消費、新增 theme store + 語言切換接進 Header、補 88 個跨 `zh-TW` / `en` / `ja-JP` 的 i18n key、預算進度條除零防護、帳號靜默錯誤改以 toast 呈現
 
 <details>
-<summary><strong>v1.9.4 → v1.15.x 累積亮點</strong></summary>
+<summary><strong>v1.9.4 → v1.17.x 累積亮點</strong></summary>
 
+- **v1.17.0** — RFC-24 License v2.0（Open Core 基礎）：新 crate `duduclaw-license`（verification-only 客戶端，簽章金鑰留在 `commercial/duduclaw-license`），7 個 tier 繼承鏈 `OpenSource` / `Hobby` / `Solo` / `Studio` / `Business` / `SelfHostPro` / `Oem`，Ed25519 trust registry 由 `DUDUCLAW_LICENSE_PUBKEY_<ID>` env 種子化（空 registry fail-safe 退回 OpenSource）。Apache 2.0 核心**無限制可用**，付費訂閱解鎖 `commercial/*` 加值模組
+- **v1.16.0** — MCP Refresh Tokens + GVU `SoulPatchOp::Consolidate`：新模組 `mcp_refresh` 以 `~/.duduclaw/mcp_tokens.db` 後盾的長壽憑證（`ddc_refresh_<env>_<64hex>`、90 天、可撤銷、僅儲 hash），解決 Claude Desktop auth-fail 後靜默斷線不重試；GVU 新增 `SoulPatchOp::Consolidate` 變體帶「縮減不變式」，讓 SOUL.md 接近 150 行／8KB 硬上限時可自我觸發整合
 - **v1.15.2** — `agent_update_soul` 信賴後門封補：原本寫 SOUL.md 後沒呼叫 `soul_guard::accept_soul_change` 更新完整性 hash，每次合法呼叫都會留下永久 stored-vs-current drift；且整條呼叫鏈不寫 `tool_calls.jsonl`，後門對事後分析完全隱形。v1.15.2 補齊 audit row（成功 + 四種拒絕路徑都記，hash 前綴 16 字元）並在每次寫入後同步 fingerprint
 - **v1.15.1** — GVU SOUL.md 無界成長修補：agnes/SOUL.md 5 個 GVU cycle 從 61 行膨脹到 592 行。三層防禦：(1) `strip_proposal_meta` 在 legacy 路徑剝除 `## 診斷` / `## rationale` / `## expected_improvement` 等 meta 段；(2) `SOUL_MAX_LINES = 150` / `SOUL_MAX_BYTES = 8KB` 硬上限獨立於 ASI 內容權重門檻；(3) 新增 structured `SoulPatch { section, op, content }` 與 `apply_patch_to_soul`，Generator→Verifier→Updater 全鏈路打通
 - **v1.15.0** — Cross-Platform PTY Pool + Worker：Anthropic 封鎖 OAuth 訂閱帳號的 `claude -p` 後的官方替代路徑。新 crate `duduclaw-cli-runtime`（`portable-pty` ConPTY/openpty 跨平台 + sentinel-framed in-band 協定 + `PtyPool` semaphore + idle eviction + supervisor + restart policy）與 `duduclaw-cli-worker`（localhost JSON-RPC + Bearer + `/healthz`，gateway 可選 in-process 或 out-of-process）；`channel_reply` OAuth 走 REPL / API-key 走 `oneshot_pty_invoke + claude -p`；Phase 8 `pty_pool_*` Prometheus 指標；所有失敗都 fallback 回 legacy `tokio::process::Command`。預設關閉，`agent.toml [runtime] pty_pool_enabled = true` 啟用
