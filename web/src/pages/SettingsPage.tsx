@@ -5,7 +5,7 @@ import { cn } from '@/lib/utils';
 import { useSystemStore } from '@/stores/system-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { api, type AutopilotRule, type AutopilotHistoryEntry } from '@/lib/api';
-import { Dialog } from '@/components/shared/Dialog';
+import { Dialog, FormField, inputClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import { toast, formatError } from '@/lib/toast';
 import { ToolApprovalPanel } from '@/components/ToolApprovalPanel';
 import { SessionReplayPanel } from '@/components/SessionReplayPanel';
@@ -29,6 +29,7 @@ import {
   Zap,
   Workflow,
   Globe,
+  Pencil,
 } from 'lucide-react';
 
 type TabId = 'general' | 'container' | 'heartbeat' | 'cron' | 'voice' | 'proactive' | 'autopilot' | 'doctor' | 'update' | 'browser';
@@ -139,7 +140,7 @@ function GeneralTab() {
   const selectStyle = 'rounded-lg border border-stone-300 bg-white px-3 py-1.5 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50';
 
   return (
-    <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+    <div className="glass-card rounded-2xl p-6">
       <h3 className="mb-4 text-lg font-medium text-stone-900 dark:text-stone-50">
         {intl.formatMessage({ id: 'settings.general' })}
       </h3>
@@ -197,7 +198,7 @@ function ContainerTab() {
   const intl = useIntl();
 
   return (
-    <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+    <div className="glass-card rounded-2xl p-6">
       <div className="flex items-center gap-3 mb-4">
         <Container className="h-5 w-5 text-amber-600 dark:text-amber-400" />
         <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
@@ -250,7 +251,7 @@ function HeartbeatTab() {
   }, [intl]);
 
   return (
-    <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+    <div className="glass-card rounded-2xl p-6">
       <div className="flex items-center gap-3 mb-4">
         <HeartPulse className="h-5 w-5 text-amber-600 dark:text-amber-400" />
         <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
@@ -320,25 +321,110 @@ function HeartbeatTab() {
   );
 }
 
+type CronTaskItem = {
+  id?: string;
+  name?: string;
+  agent_id: string;
+  cron?: string;
+  schedule?: string;
+  task?: string;
+  enabled: boolean;
+  last_run_at?: string | null;
+  last_status?: string | null;
+};
+
+/** Backend RPCs identify cron tasks by `id`; `name` is display-only. */
+const cronTaskId = (t: CronTaskItem) => t.id ?? t.name ?? '';
+
+function CronEditDialog({
+  task,
+  onClose,
+  onSaved,
+}: {
+  task: CronTaskItem;
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+}) {
+  const intl = useIntl();
+  const [name, setName] = useState(task.name ?? '');
+  const [schedule, setSchedule] = useState(task.schedule ?? task.cron ?? '');
+  const [agent, setAgent] = useState(task.agent_id);
+  const [body, setBody] = useState(task.task ?? '');
+  const [saving, setSaving] = useState(false);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      await api.cron.update(cronTaskId(task), {
+        name: name.trim() || undefined,
+        agent_id: agent.trim() || undefined,
+        cron: schedule.trim() || undefined,
+        task: body.trim() || undefined,
+      });
+      toast.success(intl.formatMessage({ id: 'common.saved' }));
+      await onSaved();
+      onClose();
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Dialog open onClose={onClose} title={intl.formatMessage({ id: 'settings.cron.editTitle' })}>
+      <div className="space-y-4">
+        <FormField label={intl.formatMessage({ id: 'settings.cron.name' })} htmlFor="cron-edit-name">
+          <input id="cron-edit-name" type="text" value={name} onChange={(e) => setName(e.target.value)} className={inputClass} />
+        </FormField>
+        <FormField label={intl.formatMessage({ id: 'settings.cron.schedule' })} htmlFor="cron-edit-schedule" hint="m h dom mon dow">
+          <input id="cron-edit-schedule" type="text" value={schedule} onChange={(e) => setSchedule(e.target.value)} className={cn(inputClass, 'font-mono')} placeholder="0 * * * *" />
+        </FormField>
+        <FormField label={intl.formatMessage({ id: 'settings.cron.agent' })} htmlFor="cron-edit-agent">
+          <input id="cron-edit-agent" type="text" value={agent} onChange={(e) => setAgent(e.target.value)} className={inputClass} />
+        </FormField>
+        <FormField label={intl.formatMessage({ id: 'settings.cron.task' })} htmlFor="cron-edit-task">
+          <textarea id="cron-edit-task" rows={3} value={body} onChange={(e) => setBody(e.target.value)} className={inputClass} />
+        </FormField>
+        <div className="flex justify-end gap-2 pt-1">
+          <button onClick={onClose} className={buttonSecondary}>
+            {intl.formatMessage({ id: 'common.cancel' })}
+          </button>
+          <button onClick={handleSave} disabled={saving || !schedule.trim()} className={buttonPrimary}>
+            {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
 function CronTab() {
   const intl = useIntl();
-  const [tasks, setTasks] = useState<
-    ReadonlyArray<{ id?: string; name?: string; agent_id: string; cron?: string; schedule?: string; enabled: boolean }>
-  >([]);
+  const [tasks, setTasks] = useState<ReadonlyArray<CronTaskItem>>([]);
   const [showAdd, setShowAdd] = useState(false);
+  const [editing, setEditing] = useState<CronTaskItem | null>(null);
   const [newName, setNewName] = useState('');
   const [newSchedule, setNewSchedule] = useState('0 * * * *');
   const [newAgent, setNewAgent] = useState('');
+  const [newTask, setNewTask] = useState('');
   const [adding, setAdding] = useState(false);
+
+  const reportError = useCallback(
+    (e: unknown) => {
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+    },
+    [intl]
+  );
 
   const fetchTasks = useCallback(async () => {
     try {
       const result = await api.cron.list();
       setTasks(result?.tasks ?? []);
-    } catch {
-      // error handled silently
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     }
-  }, []);
+  }, [intl]);
 
   useEffect(() => {
     fetchTasks();
@@ -348,44 +434,56 @@ function CronTab() {
     if (!newName.trim()) return;
     setAdding(true);
     try {
-      await api.cron.add(newAgent, newSchedule, newName.trim());
+      await api.cron.add({
+        name: newName.trim(),
+        agent_id: newAgent.trim() || 'default',
+        cron: newSchedule.trim(),
+        task: newTask.trim() || undefined,
+      });
       setShowAdd(false);
       setNewName('');
       setNewSchedule('0 * * * *');
       setNewAgent('');
+      setNewTask('');
       await fetchTasks();
-    } catch {
-      // error
+    } catch (e) {
+      reportError(e);
     } finally {
       setAdding(false);
     }
   };
 
-  const handlePause = async (name: string) => {
+  const handlePause = async (id: string) => {
     try {
-      await api.cron.pause(name);
+      await api.cron.pause(id);
       await fetchTasks();
-    } catch { /* ignore */ }
+    } catch (e) {
+      reportError(e);
+    }
   };
 
-  const handleResume = async (name: string) => {
+  const handleResume = async (id: string) => {
     try {
-      await api.cron.resume(name);
+      await api.cron.resume(id);
       await fetchTasks();
-    } catch { /* ignore */ }
+    } catch (e) {
+      reportError(e);
+    }
   };
 
-  const handleRemove = async (name: string) => {
+  const handleRemove = async (id: string) => {
     try {
-      await api.cron.remove(name);
+      await api.cron.remove(id);
       await fetchTasks();
-    } catch { /* ignore */ }
+    } catch (e) {
+      reportError(e);
+    }
   };
 
-  const inputStyle = 'rounded-lg border border-stone-300 bg-white px-3 py-1.5 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50';
+  const inputStyle = 'rounded-lg border border-stone-300/70 bg-white/60 px-3 py-1.5 text-sm text-stone-900 backdrop-blur focus:border-amber-500 focus:outline-none dark:border-white/10 dark:bg-white/5 dark:text-stone-50';
 
   return (
-    <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+    <div className="glass-card rounded-2xl p-6">
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-3">
           <Clock className="h-5 w-5 text-amber-600 dark:text-amber-400" />
@@ -402,16 +500,32 @@ function CronTab() {
         </button>
       </div>
 
+      {/* Edit dialog */}
+      {editing && (
+        <CronEditDialog
+          task={editing}
+          onClose={() => setEditing(null)}
+          onSaved={fetchTasks}
+        />
+      )}
+
       {/* Add task form */}
       {showAdd && (
-        <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50/50 p-4 dark:border-amber-800 dark:bg-amber-900/10">
+        <div className="mb-4 rounded-xl border border-amber-400/30 bg-amber-100/30 p-4 backdrop-blur dark:border-amber-500/20 dark:bg-amber-900/15">
           <div className="grid gap-3 sm:grid-cols-3">
             <input type="text" placeholder={intl.formatMessage({ id: 'settings.cron.name' })} value={newName} onChange={(e) => setNewName(e.target.value)} className={inputStyle} />
-            <input type="text" placeholder="0 * * * *" value={newSchedule} onChange={(e) => setNewSchedule(e.target.value)} className={inputStyle} />
+            <input type="text" placeholder="0 * * * *" value={newSchedule} onChange={(e) => setNewSchedule(e.target.value)} className={cn(inputStyle, 'font-mono')} />
             <input type="text" placeholder={intl.formatMessage({ id: 'settings.cron.agent' })} value={newAgent} onChange={(e) => setNewAgent(e.target.value)} className={inputStyle} />
           </div>
+          <textarea
+            rows={2}
+            placeholder={intl.formatMessage({ id: 'settings.cron.task' })}
+            value={newTask}
+            onChange={(e) => setNewTask(e.target.value)}
+            className={cn(inputStyle, 'mt-3 w-full')}
+          />
           <div className="mt-3 flex justify-end gap-2">
-            <button onClick={() => setShowAdd(false)} className="rounded-lg border border-stone-300 px-3 py-1.5 text-xs text-stone-600 dark:border-stone-600 dark:text-stone-400">
+            <button onClick={() => setShowAdd(false)} className="rounded-lg border border-stone-300/70 px-3 py-1.5 text-xs text-stone-600 dark:border-white/10 dark:text-stone-400">
               {intl.formatMessage({ id: 'common.cancel' })}
             </button>
             <button onClick={handleAdd} disabled={adding || !newName.trim()} className="rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-600 disabled:opacity-50">
@@ -447,15 +561,16 @@ function CronTab() {
             </thead>
             <tbody>
               {tasks.map((task) => {
-                const taskName = task.name ?? task.id ?? '';
+                const taskId = cronTaskId(task);
+                const taskLabel = task.name ?? task.id ?? '';
                 const taskCron = task.schedule ?? task.cron ?? '';
                 return (
                   <tr
-                    key={taskName}
+                    key={taskId}
                     className="border-b border-stone-100 dark:border-stone-800"
                   >
                     <td className="py-2 font-mono text-xs text-stone-700 dark:text-stone-300">
-                      {taskName}
+                      {taskLabel}
                     </td>
                     <td className="py-2 text-stone-700 dark:text-stone-300">
                       {task.agent_id}
@@ -472,29 +587,36 @@ function CronTab() {
                         </span>
                       ) : (
                         <span className="inline-flex items-center rounded-full bg-stone-100 px-2 py-0.5 text-xs font-medium text-stone-600 dark:bg-stone-800 dark:text-stone-400">
-                          Disabled
+                          {intl.formatMessage({ id: 'settings.cron.disabled' })}
                         </span>
                       )}
                     </td>
                     <td className="py-2 text-right">
                       <div className="flex justify-end gap-1">
+                        <button
+                          onClick={() => setEditing(task)}
+                          className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs text-stone-600 hover:bg-stone-500/10 dark:text-stone-300"
+                        >
+                          <Pencil className="h-3 w-3" />
+                          {intl.formatMessage({ id: 'common.edit' })}
+                        </button>
                         {task.enabled ? (
                           <button
-                            onClick={() => handlePause(taskName)}
+                            onClick={() => handlePause(taskId)}
                             className="rounded px-2 py-1 text-xs text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-amber-900/20"
                           >
                             {intl.formatMessage({ id: 'settings.cron.pause' })}
                           </button>
                         ) : (
                           <button
-                            onClick={() => handleResume(taskName)}
+                            onClick={() => handleResume(taskId)}
                             className="rounded px-2 py-1 text-xs text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-900/20"
                           >
                             {intl.formatMessage({ id: 'settings.cron.resume' })}
                           </button>
                         )}
                         <button
-                          onClick={() => handleRemove(taskName)}
+                          onClick={() => handleRemove(taskId)}
                           className="rounded px-2 py-1 text-xs text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-900/20"
                         >
                           {intl.formatMessage({ id: 'settings.cron.remove' })}
@@ -532,8 +654,8 @@ function DoctorTab() {
     try {
       await api.system.doctorRepair();
       await runDoctor();
-    } catch {
-      // error handled silently
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
     }
   };
 
@@ -679,16 +801,17 @@ function UpdateTab() {
     try {
       await api.system.updateConfig({ auto_update: enabled });
       setAutoUpdate(enabled);
-    } catch {
-      // revert on failure
+    } catch (e) {
+      // state was never flipped, so no revert needed — just surface the failure
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
     }
-  }, []);
+  }, [intl]);
 
   return (
     <div className="space-y-4">
       {/* Auto-update toggle — Pro only */}
       {isPro && (
-        <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+        <div className="glass-card rounded-2xl p-6">
           <div className="flex items-center justify-between">
             <div>
               <h3 className="text-sm font-medium text-stone-900 dark:text-stone-50">
@@ -711,7 +834,7 @@ function UpdateTab() {
         </div>
       )}
 
-      <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+      <div className="glass-card rounded-2xl p-6">
         <div className="flex items-center justify-between mb-6">
           <div className="flex items-center gap-3">
             <ArrowUpCircle className="h-5 w-5 text-amber-600 dark:text-amber-400" />
@@ -913,18 +1036,32 @@ function VoiceTab() {
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
 
+  // Load persisted [voice] settings from inference.toml on mount.
+  useEffect(() => {
+    api.system.config().then((res) => {
+      if (res?.voice) {
+        setConfig((prev) => ({ ...prev, ...res.voice }));
+      }
+    }).catch((e) => {
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    });
+  }, [intl]);
+
   const handleSave = async () => {
     setSaving(true);
     try {
       await api.system.updateConfig({ voice: config });
       setSaved(true);
       savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
-    } catch { /* ignore */ }
-    setSaving(false);
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
-    <div className="space-y-6 rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+    <div className="space-y-6 glass-card rounded-2xl p-6">
       <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
         {intl.formatMessage({ id: 'voice.title' })}
       </h3>
@@ -1001,7 +1138,11 @@ function VoiceTab() {
           disabled={saving}
           className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
         >
-          {saved ? intl.formatMessage({ id: 'settings.general.saved' }) : saving ? '...' : 'Save'}
+          {saved
+            ? intl.formatMessage({ id: 'settings.general.saved' })
+            : saving
+              ? intl.formatMessage({ id: 'common.saving' })
+              : intl.formatMessage({ id: 'common.save' })}
         </button>
       </div>
     </div>
@@ -1012,6 +1153,8 @@ function VoiceTab() {
 
 function ProactiveTab() {
   const intl = useIntl();
+  const { agents, fetchAgents } = useAgentsStore();
+  const [selectedAgent, setSelectedAgent] = useState('');
   const [config, setConfig] = useState({
     enabled: false,
     check_interval: '*/30 * * * *',
@@ -1026,21 +1169,62 @@ function ProactiveTab() {
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
 
+  useEffect(() => { fetchAgents(); }, [fetchAgents]);
+  useEffect(() => {
+    if (agents.length > 0 && !selectedAgent) setSelectedAgent(agents[0].name);
+  }, [agents, selectedAgent]);
+
+  // Proactive settings live in each agent's agent.toml [proactive] section.
+  useEffect(() => {
+    if (!selectedAgent) return;
+    api.agents.inspect(selectedAgent).then((detail) => {
+      // Always reset — switching to an agent without a [proactive] section
+      // must not carry over the previous agent's values.
+      setConfig({
+        enabled: detail?.proactive?.enabled ?? false,
+        check_interval: detail?.proactive?.check_interval ?? '*/30 * * * *',
+        quiet_hours_start: detail?.proactive?.quiet_hours_start ?? 23,
+        quiet_hours_end: detail?.proactive?.quiet_hours_end ?? 8,
+        max_messages_per_hour: detail?.proactive?.max_messages_per_hour ?? 3,
+        notify_channel: detail?.proactive?.notify_channel ?? '',
+        notify_chat_id: detail?.proactive?.notify_chat_id ?? '',
+      });
+    }).catch((e) => {
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    });
+  }, [selectedAgent, intl]);
+
   const handleSave = async () => {
+    if (!selectedAgent) return;
     setSaving(true);
     try {
-      await api.system.updateConfig({ proactive: config });
+      await api.agents.update(selectedAgent, { proactive: config });
       setSaved(true);
       savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
-    } catch { /* ignore */ }
-    setSaving(false);
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
-    <div className="space-y-6 rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
-      <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
-        {intl.formatMessage({ id: 'proactive.title' })}
-      </h3>
+    <div className="space-y-6 glass-card rounded-2xl p-6">
+      <div className="flex items-center justify-between">
+        <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
+          {intl.formatMessage({ id: 'proactive.title' })}
+        </h3>
+        <select
+          value={selectedAgent}
+          onChange={(e) => setSelectedAgent(e.target.value)}
+          className="rounded-lg border border-stone-300 bg-white px-3 py-1.5 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+        >
+          {agents.length === 0 && <option value="">{intl.formatMessage({ id: 'common.noData' })}</option>}
+          {agents.map((a) => (
+            <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
+          ))}
+        </select>
+      </div>
 
       <div className="grid gap-4 sm:grid-cols-2">
         <div className="flex items-center gap-3">
@@ -1060,7 +1244,7 @@ function ProactiveTab() {
 
         <div className="space-y-1.5">
           <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
-            Check Interval
+            {intl.formatMessage({ id: 'proactive.checkInterval' })}
           </label>
           <input
             type="text"
@@ -1069,7 +1253,7 @@ function ProactiveTab() {
             placeholder="*/30 * * * *"
             className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
           />
-          <p className="text-xs text-stone-400">Cron expression (UTC unless `cron_timezone` is set on the task)</p>
+          <p className="text-xs text-stone-400">{intl.formatMessage({ id: 'proactive.checkInterval.hint' })}</p>
         </div>
 
         <div className="space-y-1.5">
@@ -1089,7 +1273,7 @@ function ProactiveTab() {
 
         <div className="space-y-1.5">
           <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
-            Max messages / hour
+            {intl.formatMessage({ id: 'proactive.maxMessagesPerHour' })}
           </label>
           <input type="number" min={1} max={60} value={config.max_messages_per_hour}
             onChange={(e) => setConfig({ ...config, max_messages_per_hour: +e.target.value })}
@@ -1098,12 +1282,12 @@ function ProactiveTab() {
 
         <div className="space-y-1.5">
           <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
-            Notify Channel
+            {intl.formatMessage({ id: 'proactive.notifyChannel' })}
           </label>
           <select value={config.notify_channel}
             onChange={(e) => setConfig({ ...config, notify_channel: e.target.value })}
             className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50">
-            <option value="">Select...</option>
+            <option value="">{intl.formatMessage({ id: 'proactive.selectChannel' })}</option>
             <option value="telegram">Telegram</option>
             <option value="line">LINE</option>
             <option value="discord">Discord</option>
@@ -1112,7 +1296,7 @@ function ProactiveTab() {
 
         <div className="space-y-1.5">
           <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
-            Chat ID
+            {intl.formatMessage({ id: 'proactive.chatId' })}
           </label>
           <input type="text" value={config.notify_chat_id}
             onChange={(e) => setConfig({ ...config, notify_chat_id: e.target.value })}
@@ -1127,7 +1311,11 @@ function ProactiveTab() {
           disabled={saving}
           className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
         >
-          {saved ? intl.formatMessage({ id: 'settings.general.saved' }) : saving ? '...' : 'Save'}
+          {saved
+            ? intl.formatMessage({ id: 'settings.general.saved' })
+            : saving
+              ? intl.formatMessage({ id: 'common.saving' })
+              : intl.formatMessage({ id: 'common.save' })}
         </button>
       </div>
     </div>
@@ -1150,12 +1338,13 @@ function AutopilotTab() {
     try {
       const result = await api.autopilot.list();
       setRules(result?.rules ?? []);
-    } catch {
+    } catch (e) {
       setRules([]);
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [intl]);
 
   useEffect(() => { fetchRules(); }, [fetchRules]);
 
@@ -1163,29 +1352,33 @@ function AutopilotTab() {
     setRules((prev) => prev.map((r) => (r.id === ruleId ? { ...r, enabled } : r)));
     try {
       await api.autopilot.update(ruleId, { enabled });
-    } catch {
+    } catch (e) {
       setRules((prev) => prev.map((r) => (r.id === ruleId ? { ...r, enabled: !enabled } : r)));
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
     }
-  }, []);
+  }, [intl]);
 
   const handleRemove = useCallback(async () => {
     if (!removeTarget) return;
     try {
       await api.autopilot.remove(removeTarget.id);
       setRules((prev) => prev.filter((r) => r.id !== removeTarget.id));
-    } catch { /* noop */ }
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+    }
     setRemoveTarget(null);
-  }, [removeTarget]);
+  }, [removeTarget, intl]);
 
   const handleViewHistory = useCallback(async (ruleId: string) => {
     setHistoryRuleId(ruleId);
     try {
       const result = await api.autopilot.history(ruleId);
       setHistoryEntries(result?.entries ?? []);
-    } catch {
+    } catch (e) {
       setHistoryEntries([]);
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     }
-  }, []);
+  }, [intl]);
 
   return (
     <div className="space-y-6">
@@ -1223,7 +1416,7 @@ function AutopilotTab() {
           {rules.map((rule) => (
             <div
               key={rule.id}
-              className="rounded-xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900"
+              className="glass-card rounded-2xl p-5"
             >
               <div className="flex items-start justify-between">
                 <div className="flex items-center gap-3">
@@ -1385,7 +1578,9 @@ function AutopilotCreateDialog({
         },
       });
       onCreated();
-    } catch { /* noop */ } finally {
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    } finally {
       setSubmitting(false);
     }
   }, [name, triggerEvent, actionType, actionAgent, promptTemplate, skillName, fromStatus, toStatus, idleMinutes, cronExpr, onCreated]);

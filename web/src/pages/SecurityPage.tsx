@@ -247,7 +247,7 @@ function SecurityCard({
   children: React.ReactNode;
 }) {
   return (
-    <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+    <div className="glass-card rounded-2xl p-6">
       <div className="mb-4 flex items-center gap-3">
         <div className="rounded-lg bg-amber-100 p-2.5 dark:bg-amber-900/30">
           <Icon className="h-5 w-5 text-amber-600 dark:text-amber-400" />

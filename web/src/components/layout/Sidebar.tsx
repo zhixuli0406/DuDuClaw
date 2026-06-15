@@ -75,14 +75,18 @@ export function Sidebar() {
   );
 
   return (
-    <aside className="flex w-60 flex-col border-r border-stone-200 bg-stone-50/80 backdrop-blur-xl dark:border-stone-800 dark:bg-stone-900/80">
+    <aside className="glass-chrome relative z-40 flex w-60 flex-col border-r border-stone-300/40 dark:border-white/8">
       {/* Logo */}
       <div className="flex items-center gap-3 px-5 py-5">
-        <span className="text-2xl" role="img" aria-label="paw">
+        <span
+          className="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-b from-amber-400 to-amber-500 text-xl shadow-[0_4px_16px_-4px_rgba(245,158,11,0.6)]"
+          role="img"
+          aria-label="paw"
+        >
           🐾
         </span>
         <div>
-          <h1 className="text-lg font-semibold text-stone-900 dark:text-stone-50">
+          <h1 className="text-lg font-semibold tracking-tight text-stone-900 dark:text-stone-50">
             DuDuClaw
           </h1>
           <p className="text-xs text-stone-500 dark:text-stone-400">
@@ -92,7 +96,7 @@ export function Sidebar() {
       </div>
 
       {/* Navigation */}
-      <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-2">
+      <nav className="flex-1 space-y-0.5 overflow-y-auto px-3 py-2">
         {filteredNavItems.map(({ to, icon: Icon, label }) => (
           <NavLink
             key={to}
@@ -100,21 +104,33 @@ export function Sidebar() {
             end={to === '/'}
             className={({ isActive }) =>
               cn(
-                'flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors',
+                'group relative flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors',
                 isActive
-                  ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
-                  : 'text-stone-600 hover:bg-stone-100 hover:text-stone-900 dark:text-stone-400 dark:hover:bg-stone-800 dark:hover:text-stone-200'
+                  ? 'bg-amber-500/12 text-amber-700 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.25)] ring-1 ring-inset ring-amber-500/25 dark:bg-amber-400/10 dark:text-amber-300 dark:ring-amber-400/20'
+                  : 'text-stone-600 hover:bg-stone-500/8 hover:text-stone-900 dark:text-stone-400 dark:hover:bg-white/5 dark:hover:text-stone-200'
               )
             }
           >
-            <Icon className="h-[1.125rem] w-[1.125rem] shrink-0" />
-            <span>{intl.formatMessage({ id: label })}</span>
+            {({ isActive }) => (
+              <>
+                {/* Active indicator beam */}
+                <span
+                  className={cn(
+                    'absolute left-0 top-1/2 h-4 w-0.5 -translate-y-1/2 rounded-full bg-amber-500 transition-opacity dark:bg-amber-400',
+                    isActive ? 'opacity-100' : 'opacity-0'
+                  )}
+                  aria-hidden="true"
+                />
+                <Icon className="h-[1.125rem] w-[1.125rem] shrink-0" />
+                <span>{intl.formatMessage({ id: label })}</span>
+              </>
+            )}
           </NavLink>
         ))}
       </nav>
 
       {/* User Info + Footer */}
-      <div className="border-t border-stone-200 px-4 py-3 dark:border-stone-800">
+      <div className="border-t border-stone-300/40 px-4 py-3 dark:border-white/8">
         {user && (
           <div className="mb-2 flex items-center justify-between">
             <div className="min-w-0 flex-1">
@@ -127,14 +143,16 @@ export function Sidebar() {
             </div>
             <button
               onClick={logout}
-              className="rounded p-1.5 text-stone-400 transition-colors hover:bg-stone-100 hover:text-stone-600 dark:hover:bg-stone-800 dark:hover:text-stone-300"
+              className="rounded p-1.5 text-stone-400 transition-colors hover:bg-stone-500/10 hover:text-stone-600 dark:hover:text-stone-300"
               title={intl.formatMessage({ id: 'auth.logout' })}
             >
               <LogOut className="h-4 w-4" />
             </button>
           </div>
         )}
-        <p className="text-xs text-stone-400 dark:text-stone-500">{status?.version ?? 'v0.12.0'}</p>
+        <p className="font-mono text-[11px] tracking-wide text-stone-400 dark:text-stone-500">
+          {status?.version ?? 'v0.12.0'}
+        </p>
       </div>
     </aside>
   );

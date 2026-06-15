@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type AccountInfo, type BudgetSummary } from '@/lib/api';
+import { toast, formatError } from '@/lib/toast';
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import {
   Wallet,
@@ -25,12 +26,12 @@ export function AccountsPage() {
     try {
       const result = await api.accounts.budgetSummary();
       setBudget(result);
-    } catch {
-      // will show empty state
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [intl]);
 
   useEffect(() => {
     fetchBudget();
@@ -40,8 +41,8 @@ export function AccountsPage() {
     try {
       await api.accounts.rotate();
       await fetchBudget();
-    } catch {
-      // handled silently
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
     }
   };
 
@@ -75,7 +76,7 @@ export function AccountsPage() {
       </div>
 
       {/* Budget Summary */}
-      <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+      <div className="glass-card rounded-2xl p-6">
         <div className="flex items-center gap-3 mb-4">
           <div className="rounded-lg bg-amber-100 p-2.5 dark:bg-amber-900/30">
             <Wallet className="h-5 w-5 text-amber-600 dark:text-amber-400" />
@@ -293,15 +294,15 @@ function AccountCard({
       await api.accounts.updateBudget(account.id, Math.round(Number(budgetInput) * 100));
       setEditing(false);
       onBudgetUpdated();
-    } catch {
-      // error
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
     } finally {
       setSaving(false);
     }
   };
 
   return (
-    <div className="rounded-xl border border-stone-200 bg-white p-5 transition-shadow hover:shadow-md dark:border-stone-800 dark:bg-stone-900">
+    <div className="glass-card glass-card-hover rounded-2xl p-5">
       <div className="flex items-start justify-between">
         <div className="flex items-center gap-3">
           <div className="rounded-lg bg-stone-100 p-2 dark:bg-stone-800">

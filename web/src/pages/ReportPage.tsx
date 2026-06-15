@@ -46,7 +46,7 @@ function StatCard({
   color: string;
 }) {
   return (
-    <div className="rounded-xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900">
+    <div className="glass-card rounded-2xl p-5">
       <div className="flex items-center gap-3">
         <div className={cn('rounded-lg p-2.5', color)}>
           <Icon className="h-5 w-5 text-white" />
@@ -157,7 +157,7 @@ export function ReportPage() {
             subtitle={`${summary.total_messages.toLocaleString()} messages`}
             color="bg-amber-500"
           />
-          <div className="rounded-xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900">
+          <div className="glass-card rounded-2xl p-5">
             <div className="flex items-center gap-3">
               <div className={cn('rounded-lg p-2.5', rateBg(summary.auto_reply_rate))}>
                 <Zap className="h-5 w-5 text-white" />
@@ -190,7 +190,7 @@ export function ReportPage() {
 
       {/* Zero-cost ratio */}
       {summary && (
-        <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+        <div className="glass-card rounded-2xl p-6">
           <h3 className="mb-4 text-lg font-medium text-stone-900 dark:text-stone-50">
             {intl.formatMessage({ id: 'reports.zeroCostRatio' })}
           </h3>
@@ -214,7 +214,7 @@ export function ReportPage() {
       )}
 
       {/* Conversation trend (CSS bar chart) */}
-      <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+      <div className="glass-card rounded-2xl p-6">
         <h3 className="mb-4 text-lg font-medium text-stone-900 dark:text-stone-50">
           {intl.formatMessage({ id: 'reports.trend' })}
         </h3>
@@ -257,7 +257,7 @@ export function ReportPage() {
       </div>
 
       {/* Cost savings table */}
-      <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+      <div className="glass-card rounded-2xl p-6">
         <h3 className="mb-4 text-lg font-medium text-stone-900 dark:text-stone-50">
           {intl.formatMessage({ id: 'reports.costComparison' })}
         </h3>

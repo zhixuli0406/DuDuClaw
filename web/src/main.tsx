@@ -5,7 +5,13 @@ import { BrowserRouter } from 'react-router';
 import { App } from './App';
 import { ToastProvider } from './components/Toast';
 import { messages, useLocaleStore } from './i18n';
+import { applyTheme, useThemeStore } from './stores/theme-store';
 import './index.css';
+
+// Apply the persisted theme before first render. The embedded production
+// server sends a strict `script-src 'self'` CSP that blocks inline scripts,
+// so theme bootstrap lives here in the bundle rather than in index.html.
+applyTheme(useThemeStore.getState().theme);
 
 function Root() {
   const locale = useLocaleStore((s) => s.locale);

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type SkillIndexEntry, type SharedSkillInfo, type SkillInfo } from '@/lib/api';
@@ -218,6 +218,9 @@ function SharedSkillsTab() {
     })();
   }, [fetchAgents, intl]);
 
+  const adoptTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (adoptTimerRef.current) clearTimeout(adoptTimerRef.current); }, []);
+
   const handleAdopt = useCallback(async () => {
     if (!adoptTarget || !adoptAgent) return;
     try {
@@ -230,7 +233,7 @@ function SharedSkillsTab() {
             : s,
         ),
       );
-      setTimeout(() => { setAdoptTarget(null); setAdoptSuccess(null); }, 1500);
+      adoptTimerRef.current = setTimeout(() => { setAdoptTarget(null); setAdoptSuccess(null); }, 1500);
     } catch (e) {
       console.warn('[api]', e);
       toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
@@ -257,7 +260,7 @@ function SharedSkillsTab() {
           {sharedSkills.map((skill) => (
             <div
               key={skill.name}
-              className="rounded-xl border border-stone-200 bg-white p-5 transition-shadow hover:shadow-md dark:border-stone-800 dark:bg-stone-900"
+              className="glass-card glass-card-hover rounded-2xl p-5"
             >
               <h3 className="font-semibold text-stone-900 dark:text-stone-50">{skill.name}</h3>
               <p className="mt-1 text-sm text-stone-600 dark:text-stone-400">
@@ -429,7 +432,7 @@ function MySkillsTab() {
           {skills.map((skill) => (
             <div
               key={skill.name}
-              className="rounded-xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900"
+              className="glass-card rounded-2xl p-5"
             >
               <div className="flex items-start justify-between">
                 <h3 className="font-semibold text-stone-900 dark:text-stone-50">{skill.name}</h3>
@@ -484,7 +487,7 @@ function SkillCard({
 }) {
   const intl = useIntl();
   return (
-    <div className="rounded-xl border border-stone-200 bg-white p-5 transition-shadow hover:shadow-md dark:border-stone-800 dark:bg-stone-900">
+    <div className="glass-card glass-card-hover rounded-2xl p-5">
       <div className="mb-3 flex items-start justify-between">
         <h3 className="font-semibold text-stone-900 dark:text-stone-50">
           {skill.name}

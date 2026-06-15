@@ -243,11 +243,11 @@ function CreateUserDialog({
     setError('');
     // Frontend validation (MEDIUM-1 fix)
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      setError('Invalid email format');
+      setError(intl.formatMessage({ id: 'users.error.invalidEmail' }));
       return;
     }
     if (password.length < 8) {
-      setError('Password must be at least 8 characters');
+      setError(intl.formatMessage({ id: 'users.error.passwordTooShort' }));
       return;
     }
     setSubmitting(true);
@@ -336,6 +336,12 @@ function EditUserDialog({
 
   const handleSubmit = async () => {
     setError('');
+    // Match CreateUserDialog's client-side rule so the user gets a clear
+    // message instead of an opaque backend rejection.
+    if (newPassword && newPassword.length < 8) {
+      setError(intl.formatMessage({ id: 'users.error.passwordTooShort' }));
+      return;
+    }
     setSubmitting(true);
     try {
       await api.users.update({

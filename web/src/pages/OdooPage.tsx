@@ -243,7 +243,7 @@ export function OdooPage() {
       </div>
 
       {/* Connection Settings */}
-      <section className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+      <section className="glass-card rounded-2xl p-6">
         <div className="mb-5 flex items-center gap-2">
           <Plug className="h-4 w-4 text-stone-400" />
           <h3 className="text-base font-semibold text-stone-900 dark:text-stone-50">
@@ -369,7 +369,7 @@ export function OdooPage() {
       </section>
 
       {/* Feature Modules */}
-      <section className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+      <section className="glass-card rounded-2xl p-6">
         <h3 className="mb-4 text-base font-semibold text-stone-900 dark:text-stone-50">
           {t('odoo.features')}
         </h3>
@@ -419,7 +419,7 @@ export function OdooPage() {
       </section>
 
       {/* Polling & Webhook */}
-      <section className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+      <section className="glass-card rounded-2xl p-6">
         <h3 className="mb-5 text-base font-semibold text-stone-900 dark:text-stone-50">
           {t('odoo.sync')}
         </h3>

@@ -218,7 +218,7 @@ function BrowseTab({ agentId }: { agentId: string }) {
   return (
     <div className="flex gap-4 min-h-[500px]">
       {/* Sidebar: tree */}
-      <div className="w-72 shrink-0 rounded-xl border border-stone-200 bg-white p-4 dark:border-stone-800 dark:bg-stone-900 overflow-y-auto max-h-[calc(100vh-16rem)]">
+      <div className="w-72 shrink-0 glass-card rounded-2xl p-4 overflow-y-auto max-h-[calc(100vh-16rem)]">
         <div className="mb-3 flex items-center gap-2 text-sm font-medium text-stone-700 dark:text-stone-300">
           <FolderTree className="h-4 w-4" />
           {intl.formatMessage({ id: 'wiki.pages' })} ({pages.length})
@@ -235,7 +235,7 @@ function BrowseTab({ agentId }: { agentId: string }) {
       </div>
 
       {/* Content */}
-      <div className="flex-1 rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900 overflow-y-auto max-h-[calc(100vh-16rem)]">
+      <div className="flex-1 glass-card rounded-2xl p-6 overflow-y-auto max-h-[calc(100vh-16rem)]">
         {selectedPath ? (
           <WikiPageView path={selectedPath} content={pageContent} />
         ) : (
@@ -533,7 +533,7 @@ function SearchTab({ agentId }: { agentId: string }) {
           {hits.map((hit) => (
             <div
               key={hit.path}
-              className="rounded-xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900"
+              className="glass-card rounded-2xl p-5"
             >
               <div className="flex items-center justify-between mb-2">
                 <h3 className="font-medium text-stone-900 dark:text-stone-50">
@@ -642,7 +642,7 @@ function HealthTab({ agentId }: { agentId: string }) {
 
       {/* Directory breakdown */}
       {stats?.by_directory && Object.keys(stats.by_directory).length > 0 && (
-        <div className="rounded-xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900">
+        <div className="glass-card rounded-2xl p-5">
           <h3 className="mb-3 flex items-center gap-2 font-medium text-stone-900 dark:text-stone-50">
             <BarChart3 className="h-4 w-4" />
             {intl.formatMessage({ id: 'wiki.stats.byDirectory' })}
@@ -721,7 +721,7 @@ function StatCard({
   icon: React.ReactNode;
 }) {
   return (
-    <div className="rounded-xl border border-stone-200 bg-white p-4 dark:border-stone-800 dark:bg-stone-900">
+    <div className="glass-card rounded-2xl p-4">
       <div className="flex items-center gap-3">
         <div className="rounded-lg bg-amber-100 p-2 dark:bg-amber-900/30">
           {icon}

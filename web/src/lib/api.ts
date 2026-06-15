@@ -66,6 +66,25 @@ export interface AgentDetail extends AgentInfo {
   permissions: Record<string, boolean>;
   sticker?: AgentSticker;
   evolution?: AgentEvolution;
+  proactive?: ProactiveSettings;
+}
+
+export interface VoiceSettings {
+  asr_provider: string;
+  tts_provider: string;
+  asr_language: string;
+  tts_voice: string;
+  voice_reply_enabled: boolean;
+}
+
+export interface ProactiveSettings {
+  enabled: boolean;
+  check_interval: string;
+  quiet_hours_start: number;
+  quiet_hours_end: number;
+  max_messages_per_hour: number;
+  notify_channel: string;
+  notify_chat_id: string;
 }
 
 export interface ChannelStatus {
@@ -669,9 +688,14 @@ export interface McpServerDef {
   env: Record<string, string>;
 }
 
+export interface McpServerEntry extends McpServerDef {
+  name: string;
+}
+
 export interface McpAgentConfig {
   agent_id: string;
-  servers: Record<string, McpServerDef>;
+  /** The backend serializes servers as an array of named entries. */
+  servers: McpServerEntry[];
 }
 
 export interface McpCatalogItem {
@@ -761,6 +785,8 @@ export interface AgentUpdateParams {
   max_gvu_generations?: number;
   observation_period_hours?: number;
   skill_token_budget?: number;
+  // Proactive ([proactive] section, nested object)
+  proactive?: Partial<ProactiveSettings>;
   // Per-agent channels
   discord_bot_token?: string;
   telegram_bot_token?: string;
@@ -970,7 +996,10 @@ export const api = {
     version: () =>
       client.call('system.version') as Promise<{ version: string; auto_update: boolean; edition: string }>,
     config: () =>
-      client.call('system.config') as Promise<Record<string, unknown>>,
+      client.call('system.config') as Promise<{
+        config?: string;
+        voice?: Partial<VoiceSettings> | null;
+      }>,
     updateConfig: (fields: Record<string, unknown>) =>
       client.call('system.update_config', fields) as Promise<{ success: boolean; changes: string[] }>,
     checkUpdate: () =>
@@ -994,10 +1023,30 @@ export const api = {
   cron: {
     list: () =>
       client.call('cron.list') as Promise<{
-        tasks: Array<{ id: string; agent_id: string; cron: string; enabled: boolean }>;
+        tasks: Array<{
+          id: string;
+          name?: string;
+          agent_id: string;
+          cron: string;
+          schedule?: string;
+          task?: string;
+          enabled: boolean;
+          last_run_at?: string | null;
+          last_status?: string | null;
+        }>;
       }>,
-    add: (agentId: string, cron: string, task: string) =>
-      client.call('cron.add', { agent_id: agentId, cron, task }),
+    add: (params: { name: string; agent_id: string; cron: string; task?: string }) =>
+      client.call('cron.add', params),
+    update: (
+      id: string,
+      params: {
+        name?: string;
+        agent_id?: string;
+        cron?: string;
+        task?: string;
+        enabled?: boolean;
+      }
+    ) => client.call('cron.update', { id, ...params }),
     pause: (id: string) =>
       client.call('cron.pause', { id }),
     resume: (id: string) =>
@@ -1118,8 +1167,8 @@ export const api = {
   marketplace: {
     list: () =>
       client.call('marketplace.list') as Promise<{ servers: MarketplaceServer[] }>,
-    install: (id: string) =>
-      client.call('marketplace.install', { id }) as Promise<{ success: boolean }>,
+    install: (id: string, agentId: string) =>
+      client.call('marketplace.install', { id, agent_id: agentId }) as Promise<{ success: boolean; agent_id: string }>,
   },
   odoo: {
     status: () =>

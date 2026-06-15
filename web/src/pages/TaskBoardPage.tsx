@@ -632,6 +632,8 @@ export function TaskBoardPage() {
     if (removeTarget) {
       await removeTask(removeTarget.id);
       setRemoveTarget(null);
+      // The detail panel may still reference the task we just deleted.
+      setDetailTarget((prev) => (prev?.id === removeTarget.id ? null : prev));
     }
   }, [removeTarget, removeTask]);
 

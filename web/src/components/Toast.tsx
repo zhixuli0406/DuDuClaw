@@ -162,10 +162,10 @@ interface ToastItemProps {
 
 const VARIANT_STYLES: Record<ToastVariant, string> = {
   success:
-    'border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-800 dark:bg-emerald-900/20 dark:text-emerald-100',
+    'border-emerald-400/30 bg-emerald-50/85 text-emerald-900 dark:border-emerald-400/20 dark:bg-emerald-950/70 dark:text-emerald-100',
   error:
-    'border-rose-200 bg-rose-50 text-rose-900 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-100',
-  info: 'border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-100',
+    'border-rose-400/30 bg-rose-50/85 text-rose-900 dark:border-rose-400/20 dark:bg-rose-950/70 dark:text-rose-100',
+  info: 'border-amber-400/30 bg-amber-50/85 text-amber-900 dark:border-amber-400/20 dark:bg-amber-950/70 dark:text-amber-100',
 };
 
 const ICON_STYLES: Record<ToastVariant, string> = {
@@ -200,7 +200,7 @@ function ToastItem({ toast, onDismiss }: ToastItemProps) {
   const ariaLive = toast.variant === 'error' ? 'assertive' : 'polite';
 
   const baseClasses =
-    'pointer-events-auto flex items-start gap-3 rounded-xl border px-4 py-3 shadow-lg backdrop-blur-sm';
+    'pointer-events-auto flex items-start gap-3 rounded-xl border px-4 py-3 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.25),0_12px_32px_-12px_rgba(0,0,0,0.4)] backdrop-blur-xl backdrop-saturate-150';
   const variantClasses = VARIANT_STYLES[toast.variant];
   const motionClasses = reducedMotion
     ? ''

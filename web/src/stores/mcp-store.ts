@@ -51,12 +51,7 @@ export const useMcpStore = create<McpStore>((set, get) => ({
       set({
         agentConfigs: get().agentConfigs.map((cfg) =>
           cfg.agent_id === agentId
-            ? {
-                ...cfg,
-                servers: Object.fromEntries(
-                  Object.entries(cfg.servers).filter(([k]) => k !== name)
-                ),
-              }
+            ? { ...cfg, servers: cfg.servers.filter((s) => s.name !== name) }
             : cfg
         ),
       });

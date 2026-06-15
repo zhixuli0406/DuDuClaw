@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react';
 import { useNavigate } from 'react-router';
 import { useIntl } from 'react-intl';
 import { useAuthStore } from '@/stores/auth-store';
+import { inputClass, buttonPrimary } from '@/components/shared/Dialog';
 
 export function LoginPage() {
   const intl = useIntl();
@@ -25,14 +26,20 @@ export function LoginPage() {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-stone-50 dark:bg-stone-950">
-      <div className="w-full max-w-sm">
+    <div className="relative flex min-h-screen items-center justify-center p-4">
+      <div className="app-ambient" aria-hidden="true" />
+
+      <div className="page-enter w-full max-w-sm">
         {/* Logo */}
         <div className="mb-8 text-center">
-          <span className="text-5xl" role="img" aria-label="paw">
+          <span
+            className="inline-grid h-16 w-16 place-items-center rounded-2xl bg-gradient-to-b from-amber-400 to-amber-500 text-3xl shadow-[0_8px_32px_-8px_rgba(245,158,11,0.7),inset_0_1px_0_0_rgba(255,255,255,0.4)]"
+            role="img"
+            aria-label="paw"
+          >
             🐾
           </span>
-          <h1 className="mt-4 text-2xl font-semibold text-stone-900 dark:text-stone-50">
+          <h1 className="mt-4 text-2xl font-semibold tracking-tight text-stone-900 dark:text-stone-50">
             DuDuClaw
           </h1>
           <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
@@ -41,12 +48,9 @@ export function LoginPage() {
         </div>
 
         {/* Login Form */}
-        <form
-          onSubmit={handleSubmit}
-          className="rounded-xl border border-stone-200 bg-white p-6 shadow-sm dark:border-stone-800 dark:bg-stone-900"
-        >
+        <form onSubmit={handleSubmit} className="glass-overlay rounded-2xl p-6">
           {error && (
-            <div className="mb-4 rounded-lg bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:bg-rose-900/20 dark:text-rose-400">
+            <div className="mb-4 rounded-lg border border-rose-400/30 bg-rose-50/80 px-4 py-3 text-sm text-rose-700 dark:bg-rose-950/50 dark:text-rose-300">
               {error}
             </div>
           )}
@@ -66,7 +70,7 @@ export function LoginPage() {
                 required
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                className="mt-1 block w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm shadow-sm placeholder:text-stone-400 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-100"
+                className={`mt-1 ${inputClass}`}
                 placeholder="admin@local"
               />
             </div>
@@ -85,7 +89,7 @@ export function LoginPage() {
                 required
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                className="mt-1 block w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm shadow-sm placeholder:text-stone-400 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-100"
+                className={`mt-1 ${inputClass}`}
               />
             </div>
           </div>
@@ -93,7 +97,7 @@ export function LoginPage() {
           <button
             type="submit"
             disabled={loading}
-            className="mt-6 w-full rounded-lg bg-amber-500 px-4 py-2.5 text-sm font-medium text-white shadow-sm transition-colors hover:bg-amber-600 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 dark:focus:ring-offset-stone-900"
+            className={`mt-6 w-full ${buttonPrimary} py-2.5 disabled:cursor-not-allowed`}
           >
             {loading
               ? intl.formatMessage({ id: 'login.loading' })

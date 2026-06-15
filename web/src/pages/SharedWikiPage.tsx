@@ -180,7 +180,7 @@ function BrowseTab() {
   return (
     <div className="grid grid-cols-12 gap-4">
       {/* Tree sidebar */}
-      <div className="col-span-4 rounded-xl border border-stone-200 bg-white p-4 dark:border-stone-700 dark:bg-stone-800">
+      <div className="col-span-4 glass-card rounded-2xl p-4">
         <h3 className="mb-3 text-sm font-medium text-stone-500 dark:text-stone-400">
           {intl.formatMessage({ id: 'sharedWiki.pages' })} ({pages.length})
         </h3>
@@ -198,7 +198,7 @@ function BrowseTab() {
       </div>
 
       {/* Content viewer */}
-      <div className="col-span-8 rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-700 dark:bg-stone-800">
+      <div className="col-span-8 glass-card rounded-2xl p-6">
         {selectedPath ? (
           <div>
             <h3 className="mb-4 text-lg font-semibold text-stone-900 dark:text-stone-50">
@@ -319,7 +319,7 @@ function SearchTab() {
           {hits.map((hit) => (
             <div
               key={hit.path}
-              className="rounded-xl border border-stone-200 bg-white p-4 dark:border-stone-700 dark:bg-stone-800"
+              className="glass-card rounded-2xl p-4"
             >
               <div className="flex items-center gap-2">
                 <FileText className="h-4 w-4 text-amber-500" />
@@ -387,21 +387,21 @@ function StatsTab() {
     <div className="space-y-6">
       {/* Summary cards */}
       <div className="grid grid-cols-3 gap-4">
-        <div className="rounded-xl border border-stone-200 bg-white p-4 dark:border-stone-700 dark:bg-stone-800">
+        <div className="glass-card rounded-2xl p-4">
           <div className="flex items-center gap-2 text-stone-500 dark:text-stone-400">
             <FileText className="h-4 w-4" />
             <span className="text-sm">{intl.formatMessage({ id: 'sharedWiki.stats.totalPages' })}</span>
           </div>
           <p className="mt-1 text-2xl font-semibold text-stone-900 dark:text-stone-50">{stats.total_pages}</p>
         </div>
-        <div className="rounded-xl border border-stone-200 bg-white p-4 dark:border-stone-700 dark:bg-stone-800">
+        <div className="glass-card rounded-2xl p-4">
           <div className="flex items-center gap-2 text-stone-500 dark:text-stone-400">
             <Users className="h-4 w-4" />
             <span className="text-sm">{intl.formatMessage({ id: 'sharedWiki.stats.contributors' })}</span>
           </div>
           <p className="mt-1 text-2xl font-semibold text-stone-900 dark:text-stone-50">{authorEntries.length}</p>
         </div>
-        <div className="rounded-xl border border-stone-200 bg-white p-4 dark:border-stone-700 dark:bg-stone-800">
+        <div className="glass-card rounded-2xl p-4">
           <div className="flex items-center gap-2 text-stone-500 dark:text-stone-400">
             <Clock className="h-4 w-4" />
             <span className="text-sm">Last Updated</span>
@@ -419,7 +419,7 @@ function StatsTab() {
 
       {/* By author */}
       {authorEntries.length > 0 && (
-        <div className="rounded-xl border border-stone-200 bg-white p-4 dark:border-stone-700 dark:bg-stone-800">
+        <div className="glass-card rounded-2xl p-4">
           <h3 className="mb-3 text-sm font-medium text-stone-500 dark:text-stone-400">
             {intl.formatMessage({ id: 'sharedWiki.stats.byAuthor' })}
           </h3>
@@ -442,7 +442,7 @@ function StatsTab() {
 
       {/* By directory */}
       {dirEntries.length > 0 && (
-        <div className="rounded-xl border border-stone-200 bg-white p-4 dark:border-stone-700 dark:bg-stone-800">
+        <div className="glass-card rounded-2xl p-4">
           <h3 className="mb-3 text-sm font-medium text-stone-500 dark:text-stone-400">
             {intl.formatMessage({ id: 'sharedWiki.stats.byDirectory' })}
           </h3>
