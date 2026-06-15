@@ -5,10 +5,11 @@
 # Steps:
 #   1. Validate working tree is clean
 #   2. Bump version in all Cargo.toml files
-#   3. Update CHANGELOG.md with new entry
-#   4. Build and run tests
-#   5. Create git commit + tag
-#   6. Print next steps (push, GitHub release)
+#   3. Bump the README.md version badge + remind to refresh release highlight
+#   4. Update CHANGELOG.md with new entry
+#   5. Build and run tests
+#   6. Create git commit + tag
+#   7. Print next steps (push, GitHub release)
 set -euo pipefail
 
 # --- Config ---
@@ -89,6 +90,35 @@ for crate_toml in crates/*/Cargo.toml; do
     fi
 done
 
+# --- Sync sibling package manifests (npm + Python) ---
+# These ship to npm / PyPI and MUST track the Cargo version, otherwise the
+# published packages drift (e.g. the v1.17.0 vs npm 1.17.1 mismatch). They may
+# legitimately sit at a different patch level than Cargo, so rewrite every
+# version-shaped field rather than matching $CURRENT_VERSION exactly.
+echo "Syncing npm + pyproject versions to $NEW_VERSION..."
+# Extended-regex (sed -E) semver matcher.
+SEMVER='[0-9]+\.[0-9]+\.[0-9]+'
+for pkg in npm/*/package.json; do
+    [[ -f "$pkg" ]] || continue
+    # "version": "x.y.z" plus any "@duduclaw/<plat>": "x.y.z" optionalDependency refs
+    sed -i '' -E "s/(\"version\"[[:space:]]*:[[:space:]]*\")$SEMVER(\")/\1$NEW_VERSION\2/" "$pkg"
+    sed -i '' -E "s/(\"@duduclaw\/[a-z0-9-]+\"[[:space:]]*:[[:space:]]*\")$SEMVER(\")/\1$NEW_VERSION\2/" "$pkg"
+    echo "  Updated: $pkg"
+done
+if [[ -f "pyproject.toml" ]]; then
+    sed -i '' -E "s/^version = \"$SEMVER\"/version = \"$NEW_VERSION\"/" pyproject.toml
+    echo "  Updated: pyproject.toml"
+fi
+
+# --- Bump README version badge ---
+# The shields.io badge is mechanical; the human-readable release highlight at
+# the top of README.md still needs a manual edit (see the reminder at the end).
+README_BADGE="README.md"
+if [[ -f "$README_BADGE" ]]; then
+    echo "Bumping README.md version badge..."
+    sed -i '' -E "s|(badge/version-)$SEMVER(-blue)|\1$NEW_VERSION\2|" "$README_BADGE"
+fi
+
 # --- Update CHANGELOG.md ---
 echo "Updating CHANGELOG.md..."
 DATE=$(date +%Y-%m-%d)
@@ -142,7 +172,7 @@ fi
 # --- Git commit + tag ---
 echo ""
 echo "Creating git commit and tag..."
-git add -A Cargo.toml crates/*/Cargo.toml CHANGELOG.md
+git add -A Cargo.toml crates/*/Cargo.toml npm/*/package.json pyproject.toml README.md CHANGELOG.md
 git commit -m "chore: bump v$NEW_VERSION"
 git tag -a "v$NEW_VERSION" -m "Release v$NEW_VERSION"
 
@@ -153,8 +183,12 @@ echo "================================================"
 echo ""
 echo "Next steps:"
 echo "  1. Edit CHANGELOG.md to fill in release notes"
-echo "  2. Amend the commit if needed:  git commit --amend"
-echo "  3. Push to remote:              git push && git push --tags"
-echo "  4. Create GitHub Release:       gh release create v$NEW_VERSION --generate-notes"
-echo "  5. Build release binaries:      ./scripts/build-release.sh $NEW_VERSION"
+echo "  2. Update README.md docs to match this release:"
+echo "       - Replace the top release highlight block with v$NEW_VERSION"
+echo "       - Demote the previous highlight into the '累積亮點' history <details>"
+echo "       (the version badge was bumped automatically; the prose is manual)"
+echo "  3. Amend the commit if needed:  git commit --amend"
+echo "  4. Push to remote:              git push && git push --tags"
+echo "  5. Create GitHub Release:       gh release create v$NEW_VERSION --generate-notes"
+echo "  6. Build release binaries:      ./scripts/build-release.sh $NEW_VERSION"
 echo ""
