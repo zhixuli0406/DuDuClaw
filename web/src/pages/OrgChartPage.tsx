@@ -56,17 +56,13 @@ export function OrgChartPage() {
           onClose={() => setSelectedAgent(null)}
           onPause={async () => {
             await pauseAgent(selectedAgent.name);
-            setSelectedAgent({
-              ...selectedAgent,
-              status: 'paused',
-            });
+            // Functional update: the panel may already be closed (null) by
+            // the time the async call resolves.
+            setSelectedAgent((prev) => (prev ? { ...prev, status: 'paused' } : null));
           }}
           onResume={async () => {
             await resumeAgent(selectedAgent.name);
-            setSelectedAgent({
-              ...selectedAgent,
-              status: 'active',
-            });
+            setSelectedAgent((prev) => (prev ? { ...prev, status: 'active' } : null));
           }}
         />
       )}

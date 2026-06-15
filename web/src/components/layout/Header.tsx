@@ -3,11 +3,88 @@ import { useNavigate } from 'react-router';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useUpdateStore } from '@/stores/update-store';
 import { useAuthStore } from '@/stores/auth-store';
-import { Sun, Moon, Monitor, RefreshCw, ArrowUpCircle, X } from 'lucide-react';
+import { useThemeStore } from '@/stores/theme-store';
+import { useLocaleStore, localeNames } from '@/i18n';
+import {
+  Sun,
+  Moon,
+  Monitor,
+  RefreshCw,
+  ArrowUpCircle,
+  X,
+  Languages,
+  Check,
+} from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 
-type Theme = 'light' | 'dark' | 'system';
+function LanguageMenu() {
+  const intl = useIntl();
+  const locale = useLocaleStore((s) => s.locale);
+  const setLocale = useLocaleStore((s) => s.setLocale);
+  const [open, setOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [open]);
+
+  return (
+    <div ref={menuRef} className="relative">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title={intl.formatMessage({ id: 'header.language' })}
+        className="flex items-center gap-1.5 rounded-lg p-2 text-stone-500 hover:bg-stone-500/10 hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-200"
+      >
+        <Languages className="h-4 w-4" />
+        <span className="text-xs font-medium">{localeNames[locale] ?? locale}</span>
+      </button>
+      {open && (
+        <div
+          role="menu"
+          className="glass-overlay absolute right-0 top-full z-50 mt-2 w-36 overflow-hidden rounded-xl p-1"
+        >
+          {Object.entries(localeNames).map(([code, label]) => (
+            <button
+              key={code}
+              role="menuitemradio"
+              aria-checked={locale === code}
+              onClick={() => {
+                setLocale(code);
+                setOpen(false);
+              }}
+              className={cn(
+                'flex w-full items-center justify-between rounded-lg px-3 py-2 text-sm transition-colors',
+                locale === code
+                  ? 'font-medium text-amber-600 dark:text-amber-400'
+                  : 'text-stone-600 hover:bg-stone-500/10 dark:text-stone-300'
+              )}
+            >
+              <span>{label}</span>
+              {locale === code && <Check className="h-3.5 w-3.5" />}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function Header() {
   const intl = useIntl();
@@ -23,7 +100,8 @@ export function Header() {
   const updateDismissed = useUpdateStore((s) => s.dismissed);
   const dismissUpdate = useUpdateStore((s) => s.dismiss);
   const checkUpdate = useUpdateStore((s) => s.checkNow);
-  const [theme, setTheme] = useState<Theme>('system');
+  const theme = useThemeStore((s) => s.theme);
+  const cycleTheme = useThemeStore((s) => s.cycleTheme);
 
   // Check for updates on mount (in case gateway already has cached info)
   useEffect(() => {
@@ -31,34 +109,6 @@ export function Header() {
       checkUpdate();
     }
   }, [connectionState, checkUpdate]);
-
-  useEffect(() => {
-    const stored = localStorage.getItem('duduclaw-theme') as Theme | null;
-    if (stored) setTheme(stored);
-  }, []);
-
-  useEffect(() => {
-    const root = document.documentElement;
-    const applyTheme = () => {
-      if (theme === 'system') {
-        root.classList.toggle(
-          'dark',
-          window.matchMedia('(prefers-color-scheme: dark)').matches
-        );
-        localStorage.removeItem('duduclaw-theme');
-      } else {
-        root.classList.toggle('dark', theme === 'dark');
-        localStorage.setItem('duduclaw-theme', theme);
-      }
-    };
-    applyTheme();
-
-    // Listen for OS theme changes when in system mode (FE-M5)
-    const mq = window.matchMedia('(prefers-color-scheme: dark)');
-    const listener = () => { if (theme === 'system') applyTheme(); };
-    mq.addEventListener('change', listener);
-    return () => mq.removeEventListener('change', listener);
-  }, [theme]);
 
   const stateColor: Record<string, string> = {
     disconnected: 'bg-rose-400',
@@ -69,16 +119,10 @@ export function Header() {
 
   const stateLabel = intl.formatMessage({ id: `status.${connectionState}` });
 
-  const cycleTheme = () => {
-    const next: Theme =
-      theme === 'light' ? 'dark' : theme === 'dark' ? 'system' : 'light';
-    setTheme(next);
-  };
-
   const ThemeIcon = theme === 'light' ? Sun : theme === 'dark' ? Moon : Monitor;
 
   return (
-    <header className="flex h-14 items-center justify-between border-b border-stone-200 bg-white/80 px-6 backdrop-blur-sm dark:border-stone-800 dark:bg-stone-950/80">
+    <header className="glass-chrome relative z-40 flex h-14 items-center justify-between border-b border-stone-300/40 px-6 dark:border-white/8">
       {/* Connection error banner */}
       {connectionState === 'disconnected' && connectionError && (
         <div className="flex items-center gap-2 text-xs text-rose-600 dark:text-rose-400">
@@ -94,7 +138,7 @@ export function Header() {
       )}
       {/* Update notification banner */}
       {updateNotification?.available && !updateDismissed && connectionState !== 'disconnected' && (
-        <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 dark:border-amber-800 dark:bg-amber-900/20">
+        <div className="flex items-center gap-2 rounded-lg border border-amber-300/40 bg-amber-100/50 px-3 py-1.5 backdrop-blur-sm dark:border-amber-700/40 dark:bg-amber-900/25">
           <ArrowUpCircle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
           <span className="text-xs text-amber-700 dark:text-amber-400">
             {intl.formatMessage(
@@ -120,14 +164,14 @@ export function Header() {
 
       {(connectionState !== 'disconnected' || !connectionError) && !(updateNotification?.available && !updateDismissed && connectionState !== 'disconnected') && <div />}
 
-      <div className="flex items-center gap-4">
+      <div className="flex items-center gap-2">
         {/* Connection Status */}
         <button
           onClick={connectionState === 'disconnected' ? () => reconnect() : undefined}
           className={cn(
             'flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm transition-colors',
             connectionState === 'disconnected'
-              ? 'text-rose-500 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-900/20 cursor-pointer'
+              ? 'text-rose-500 hover:bg-rose-500/10 dark:text-rose-400 cursor-pointer'
               : 'text-stone-500 dark:text-stone-400 cursor-default'
           )}
         >
@@ -135,11 +179,14 @@ export function Header() {
           <span>{stateLabel}</span>
         </button>
 
+        {/* Language Switcher */}
+        <LanguageMenu />
+
         {/* Theme Toggle */}
         <button
           onClick={cycleTheme}
-          className="rounded-lg p-2 text-stone-500 hover:bg-stone-100 hover:text-stone-700 dark:text-stone-400 dark:hover:bg-stone-800 dark:hover:text-stone-200"
-          title={`Theme: ${theme}`}
+          title={intl.formatMessage({ id: 'header.theme' }, { theme })}
+          className="rounded-lg p-2 text-stone-500 hover:bg-stone-500/10 hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-200"
         >
           <ThemeIcon className="h-4 w-4" />
         </button>

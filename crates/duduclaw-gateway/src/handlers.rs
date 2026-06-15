@@ -37,6 +37,22 @@ fn is_valid_agent_id(id: &str) -> bool {
         && !id.contains("..")
 }
 
+/// Hours elapsed since the start of the current UTC month — the look-back
+/// window CostTelemetry uses to compute "this month" spend. Always ≥ 1 so the
+/// telemetry query never receives a zero window.
+fn hours_since_month_start() -> u64 {
+    let now = Utc::now();
+    let month_start = now
+        .date_naive()
+        .with_day(1)
+        .unwrap_or(now.date_naive())
+        .and_hms_opt(0, 0, 0)
+        .unwrap_or_default();
+    let month_start_utc =
+        chrono::DateTime::<Utc>::from_naive_utc_and_offset(month_start, Utc);
+    (now - month_start_utc).num_hours().max(1) as u64
+}
+
 /// Validate wiki page path: relative, .md suffix, no traversal, no NUL.
 /// Mirrors `WikiStore::validate_page_path` for use at the WS RPC boundary
 /// (review H2/M6 — page_path enters audit log + downstream file ops).
@@ -464,7 +480,7 @@ impl MethodHandler {
             "models.list" => self.handle_models_list().await,
             "system.config" => { require_admin!(); self.handle_system_config().await }
             "system.update_config" => { require_admin!(); self.handle_system_update_config(params).await }
-            "system.version" => self.handle_system_version(),
+            "system.version" => self.handle_system_version().await,
             "system.check_update" => { require_admin!(); self.handle_system_check_update().await }
             "system.apply_update" => { require_admin!(); self.handle_system_apply_update(params).await }
 
@@ -614,8 +630,7 @@ impl MethodHandler {
             | "browser.browserbase_sessions" | "browser.browserbase_cost" =>
                 WsFrame::error_response("", "Browser automation features require the Pro edition"),
             "marketplace.list" => self.handle_marketplace_list().await,
-            "marketplace.install" =>
-                WsFrame::error_response("", "Marketplace install is not yet available"),
+            "marketplace.install" => { require_admin!(); self.handle_marketplace_install(params).await }
 
             unknown => WsFrame::error_response("", &format!("Unknown method: {unknown}")),
         }
@@ -1248,6 +1263,48 @@ impl MethodHandler {
                 }
             }
 
+            // ── Proactive fields ([proactive] section) ──
+            if let Some(p) = params_clone.get("proactive").and_then(|v| v.as_object()) {
+                let proactive = table.entry("proactive")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut();
+                if let Some(pt) = proactive {
+                    if let Some(v) = p.get("enabled").and_then(|v| v.as_bool()) {
+                        pt.insert("enabled".into(), toml::Value::Boolean(v));
+                        changes.push(format!("proactive.enabled = {v}"));
+                    }
+                    if let Some(v) = p.get("check_interval").and_then(|v| v.as_str()) {
+                        let normalised = crate::cron_scheduler::normalise_cron(v);
+                        if normalised.parse::<cron::Schedule>().is_err() {
+                            return Err(format!("Invalid proactive check_interval cron expression: {v}"));
+                        }
+                        pt.insert("check_interval".into(), toml::Value::String(v.into()));
+                        changes.push(format!("proactive.check_interval = \"{v}\""));
+                    }
+                    for key in &["quiet_hours_start", "quiet_hours_end"] {
+                        if let Some(v) = p.get(*key).and_then(|v| v.as_u64()) {
+                            if v > 23 {
+                                return Err(format!("Invalid proactive {key}: {v} (must be 0-23)"));
+                            }
+                            pt.insert((*key).into(), toml::Value::Integer(v as i64));
+                            changes.push(format!("proactive.{key} = {v}"));
+                        }
+                    }
+                    if let Some(v) = p.get("max_messages_per_hour").and_then(|v| v.as_u64()) {
+                        pt.insert("max_messages_per_hour".into(), toml::Value::Integer(v as i64));
+                        changes.push(format!("proactive.max_messages_per_hour = {v}"));
+                    }
+                    if let Some(v) = p.get("notify_channel").and_then(|v| v.as_str()) {
+                        pt.insert("notify_channel".into(), toml::Value::String(v.into()));
+                        changes.push(format!("proactive.notify_channel = \"{v}\""));
+                    }
+                    if let Some(v) = p.get("notify_chat_id").and_then(|v| v.as_str()) {
+                        pt.insert("notify_chat_id".into(), toml::Value::String(v.into()));
+                        changes.push(format!("proactive.notify_chat_id = \"{v}\""));
+                    }
+                }
+            }
+
             // ── Permissions fields ([permissions] section) ──
             let perms = table.entry("permissions")
                 .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
@@ -1607,7 +1664,8 @@ impl MethodHandler {
 
     async fn handle_agents_inspect(&self, params: Value) -> WsFrame {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-        let spent = self.get_total_spent().await;
+        // Real month-to-date spend for THIS agent (not the all-account aggregate).
+        let spent = self.telemetry_spent_cents_for_agent(agent_id).await;
         let reg = self.registry.read().await;
         match reg.get(agent_id) {
             Some(a) => {
@@ -1646,6 +1704,15 @@ impl MethodHandler {
                     },
                     "budget": { "monthly_limit_cents": cfg.budget.monthly_limit_cents, "spent_cents": spent, "warn_threshold_percent": cfg.budget.warn_threshold_percent, "hard_stop": cfg.budget.hard_stop },
                     "heartbeat": { "enabled": cfg.heartbeat.enabled, "interval_seconds": cfg.heartbeat.interval_seconds },
+                    "proactive": {
+                        "enabled": cfg.proactive.enabled,
+                        "check_interval": cfg.proactive.check_interval,
+                        "quiet_hours_start": cfg.proactive.quiet_hours_start,
+                        "quiet_hours_end": cfg.proactive.quiet_hours_end,
+                        "max_messages_per_hour": cfg.proactive.max_messages_per_hour,
+                        "notify_channel": cfg.proactive.notify_channel,
+                        "notify_chat_id": cfg.proactive.notify_chat_id,
+                    },
                     "permissions": {
                         "can_create_agents": cfg.permissions.can_create_agents,
                         "can_send_cross_agent": cfg.permissions.can_send_cross_agent,
@@ -2180,7 +2247,16 @@ impl MethodHandler {
         let rotator = self.cached_rotator().await;
         let accounts = rotator.status().await;
         let total_budget: u64 = accounts.iter().map(|a| a.monthly_budget_cents).sum();
-        let total_spent: u64 = accounts.iter().map(|a| a.spent_this_month).sum();
+
+        // Headline "spent" comes from CostTelemetry (persistent, real) rather
+        // than summing the rotator's in-memory per-account counters, which reset
+        // on restart / rebuild and stay 0 for OAuth-subscription accounts.
+        //
+        // CostTelemetry attributes cost per AGENT, not per ACCOUNT (API key), so
+        // there is no faithful per-account breakdown — `spent_this_month` on each
+        // account card stays the rotator's best-effort value, but the aggregate
+        // bar (the figure users actually read) is now correct.
+        let total_spent = self.telemetry_spent_cents_total().await;
 
         let accounts_json: Vec<Value> = accounts.iter().map(|a| json!({
             "id": a.id,
@@ -2266,6 +2342,44 @@ impl MethodHandler {
         let rotator = self.cached_rotator().await;
         let accounts = rotator.status().await;
         accounts.iter().map(|a| a.spent_this_month).sum()
+    }
+
+    /// Real month-to-date spend in **cents** across all agents, sourced from
+    /// `CostTelemetry` (the persistent SQLite ledger).
+    ///
+    /// The `AccountRotator`'s `spent_this_month` counter is in-memory only: it
+    /// resets to 0 on every gateway restart and every 5-minute rotator rebuild,
+    /// and stays 0 for OAuth-subscription accounts (which have no per-call cost).
+    /// CostTelemetry records every request's real token cost keyed by agent, so
+    /// it is the correct source for "how much was actually used this month".
+    async fn telemetry_spent_cents_total(&self) -> u64 {
+        let Some(telemetry) = crate::cost_telemetry::get_telemetry() else {
+            return 0;
+        };
+        match telemetry.summary_global(hours_since_month_start()).await {
+            // `cost_millicents` is a misnomer — `estimated_cost_millicents()`
+            // produces whole CENTS (e.g. 1M output tokens @ $15/M → 1500 = $15.00),
+            // so this value is already in cents. No scaling.
+            Ok(summary) => summary.total_cost_millicents,
+            Err(_) => 0,
+        }
+    }
+
+    /// Real month-to-date spend in **cents** for a single agent, from
+    /// `CostTelemetry`. See [`Self::telemetry_spent_cents_total`] for why this
+    /// is preferred over the rotator counter.
+    async fn telemetry_spent_cents_for_agent(&self, agent_id: &str) -> u64 {
+        let Some(telemetry) = crate::cost_telemetry::get_telemetry() else {
+            return 0;
+        };
+        match telemetry
+            .summary_by_agent(agent_id, hours_since_month_start())
+            .await
+        {
+            // Already in cents — see `telemetry_spent_cents_total`.
+            Ok(agent) => agent.summary.total_cost_millicents,
+            Err(_) => 0,
+        }
     }
 
     // ── Memory ──────────────────────────────────────────────
@@ -3894,6 +4008,16 @@ impl MethodHandler {
 
     async fn handle_system_config(&self) -> WsFrame {
         let config_path = self.home_dir.join("config.toml");
+
+        // Current voice settings from inference.toml [voice] so the
+        // dashboard Voice tab can show saved values instead of defaults.
+        let voice = {
+            let inf_table = self.read_config_table(&self.home_dir.join("inference.toml")).await;
+            inf_table.get("voice").and_then(|v| {
+                serde_json::to_value(v.clone()).ok()
+            }).unwrap_or(Value::Null)
+        };
+
         match tokio::fs::read_to_string(&config_path).await {
             Ok(content) => {
                 // Mask sensitive fields
@@ -3901,7 +4025,7 @@ impl MethodHandler {
                     Ok(mut table) => {
                         Self::mask_sensitive_fields(&mut table);
                         let masked = toml::to_string_pretty(&table).unwrap_or_else(|_| content.clone());
-                        WsFrame::ok_response("", json!({ "config": masked }))
+                        WsFrame::ok_response("", json!({ "config": masked, "voice": voice }))
                     }
                     Err(_) => {
                         // Do NOT return raw content — it may contain unmasked tokens (MCP-H5)
@@ -3913,10 +4037,24 @@ impl MethodHandler {
         }
     }
 
-    fn handle_system_version(&self) -> WsFrame {
+    async fn handle_system_version(&self) -> WsFrame {
+        // `edition` mirrors the active license tier so the dashboard can
+        // gate Pro-only UI (e.g. the auto-update toggle). "community" when
+        // no license runtime is installed.
+        let edition = match crate::license_runtime::global() {
+            Some(runtime) => {
+                let snapshot = runtime.snapshot().await;
+                match snapshot.tier {
+                    duduclaw_license::LicenseTier::OpenSource => "community".to_string(),
+                    tier => tier.to_string(),
+                }
+            }
+            None => "community".to_string(),
+        };
         WsFrame::ok_response("", json!({
             "version": crate::updater::current_version(),
             "auto_update": crate::updater::auto_update_enabled(&self.home_dir),
+            "edition": edition,
         }))
     }
 
@@ -4644,7 +4782,10 @@ impl MethodHandler {
                         let total_reqs = summary.total_requests.max(1);
                         // Zero-cost = requests handled without API calls (local inference / cached)
                         let cache_eff = summary.avg_cache_efficiency;
-                        let savings = summary.total_cache_savings_millicents / 10; // millicents → cents
+                        // `*_millicents` already holds whole cents (see
+                        // `estimated_cost_millicents`); the dashboard divides by
+                        // 100 for dollars, so pass cents straight through.
+                        let savings = summary.total_cache_savings_millicents;
                         (cache_eff, savings)
                     }
                     Err(_) => (0.0, 0),
@@ -4734,11 +4875,14 @@ impl MethodHandler {
                 // Estimate human cost as 3x of agent cost (industry benchmark)
                 let human_cost_estimate = period_cost * 3;
 
+                // `*_millicents` already holds whole cents (see
+                // `estimated_cost_millicents`); the dashboard divides by 100 for
+                // dollars, so emit cents directly — no scaling.
                 result.push(json!({
                     "month": month_label,
-                    "human_cost": human_cost_estimate / 10, // millicents → cents
-                    "agent_cost": period_cost / 10,
-                    "savings": (human_cost_estimate.saturating_sub(period_cost)) / 10,
+                    "human_cost": human_cost_estimate,
+                    "agent_cost": period_cost,
+                    "savings": human_cost_estimate.saturating_sub(period_cost),
                 }));
             }
             result
@@ -4770,8 +4914,7 @@ impl MethodHandler {
             month_start,
             chrono::Utc,
         );
-        let hours_since_month_start =
-            (now - month_start_utc).num_hours().max(1) as u64;
+        let hours_since_start = hours_since_month_start();
 
         // Conversations this month from sessions.db
         let session_db = self.home_dir.join("sessions.db");
@@ -4805,7 +4948,7 @@ impl MethodHandler {
         // Rough heuristic: 1 hour ≈ 50 requests average
         let inference_hours_used: f64 =
             if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
-                match telemetry.summary_global(hours_since_month_start).await {
+                match telemetry.summary_global(hours_since_start).await {
                     Ok(summary) => summary.total_requests as f64 / 50.0,
                     Err(_) => 0.0,
                 }
@@ -5126,8 +5269,77 @@ impl MethodHandler {
             }
         }
 
+        // ── voice (persisted to inference.toml [voice], where VoiceConfig reads it) ──
+        // Track how many config.toml changes were accumulated BEFORE the voice
+        // block so the early-return below stays correct for mixed payloads.
+        let config_toml_changes = changes.len();
+        if let Some(voice) = params.get("voice").and_then(|v| v.as_object()) {
+            const VALID_ASR: &[&str] = &["auto", "whisper-api", "whisper-local", "sensevoice"];
+            const VALID_TTS: &[&str] = &["auto", "edge-tts", "minimax", "openai-tts", "piper"];
+
+            let inference_path = self.home_dir.join("inference.toml");
+            let mut inf_table = self.read_config_table(&inference_path).await;
+            let mut voice_dirty = false;
+            let voice_table = inf_table.entry("voice")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut();
+            if let Some(voice_table) = voice_table {
+                if let Some(v) = voice.get("asr_provider").and_then(|v| v.as_str()) {
+                    if !VALID_ASR.contains(&v) {
+                        return WsFrame::error_response("", &format!(
+                            "Invalid asr_provider '{v}'. Valid: {}", VALID_ASR.join(", ")
+                        ));
+                    }
+                    voice_table.insert("asr_provider".into(), toml::Value::String(v.into()));
+                    voice_dirty = true;
+                }
+                if let Some(v) = voice.get("tts_provider").and_then(|v| v.as_str()) {
+                    if !VALID_TTS.contains(&v) {
+                        return WsFrame::error_response("", &format!(
+                            "Invalid tts_provider '{v}'. Valid: {}", VALID_TTS.join(", ")
+                        ));
+                    }
+                    voice_table.insert("tts_provider".into(), toml::Value::String(v.into()));
+                    voice_dirty = true;
+                }
+                if let Some(v) = voice.get("asr_language").and_then(|v| v.as_str()) {
+                    voice_table.insert("asr_language".into(), toml::Value::String(v.into()));
+                    voice_dirty = true;
+                }
+                if let Some(v) = voice.get("tts_voice").and_then(|v| v.as_str()) {
+                    voice_table.insert("tts_voice".into(), toml::Value::String(v.into()));
+                    voice_dirty = true;
+                }
+                if let Some(v) = voice.get("voice_reply_enabled").and_then(|v| v.as_bool()) {
+                    voice_table.insert("voice_reply_enabled".into(), toml::Value::Boolean(v));
+                    voice_dirty = true;
+                }
+            }
+
+            if voice_dirty {
+                let tmp = inference_path.with_extension("toml.tmp");
+                if let Err(e) = self.write_config_table(&tmp, &inf_table).await {
+                    return WsFrame::error_response("", &format!("Failed to write inference.toml: {e}"));
+                }
+                if let Err(e) = tokio::fs::rename(&tmp, &inference_path).await {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return WsFrame::error_response("", &format!("Failed to commit inference.toml: {e}"));
+                }
+                changes.push("voice (inference.toml)".to_string());
+            }
+
+            // `voice` may be the only effective field in the payload;
+            // config.toml itself is untouched in that case, so return early
+            // before the config.toml write below complains about
+            // "no valid fields".
+            if config_toml_changes == 0 && !changes.is_empty() {
+                info!(?changes, "system.update_config completed");
+                return WsFrame::ok_response("", json!({ "success": true, "changes": changes }));
+            }
+        }
+
         if changes.is_empty() {
-            return WsFrame::error_response("", "No valid fields to update. Supported: log_level, rotation_strategy, auto_update");
+            return WsFrame::error_response("", "No valid fields to update. Supported: log_level, rotation_strategy, auto_update, voice");
         }
 
         // Atomic write: temp + rename
@@ -5905,8 +6117,23 @@ impl MethodHandler {
         }
 
         let reg = self.registry.read().await;
-        let total_spent = self.get_total_spent().await;
         let visible = ctx.visible_agents();
+
+        // Real per-agent month-to-date spend from CostTelemetry. Computed once
+        // per visible agent below (the rotator counter is unusable — see
+        // `telemetry_spent_cents_for_agent`).
+        let mut agent_spent: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for a in reg.list().iter() {
+            let name = a.config.agent.name.clone();
+            let visible_here = match &visible {
+                None => true,
+                Some(names) => names.contains(&name),
+            };
+            if visible_here && !agent_spent.contains_key(&name) {
+                let spent = self.telemetry_spent_cents_for_agent(&name).await;
+                agent_spent.insert(name, spent);
+            }
+        }
 
         let agents: Vec<Value> = reg.list().iter()
             .filter(|a| {
@@ -5941,7 +6168,7 @@ impl MethodHandler {
                     },
                     "budget": {
                         "monthly_limit_cents": cfg.budget.monthly_limit_cents,
-                        "spent_cents": total_spent,
+                        "spent_cents": agent_spent.get(&cfg.agent.name).copied().unwrap_or(0),
                         "warn_threshold_percent": cfg.budget.warn_threshold_percent,
                         "hard_stop": cfg.budget.hard_stop,
                     },
@@ -6334,6 +6561,63 @@ impl MethodHandler {
         };
 
         WsFrame::ok_response("", json!({ "servers": servers_json }))
+    }
+
+    /// Install a marketplace catalog server into an agent's `.mcp.json`.
+    ///
+    /// Params: `{ "id": "<catalog id>", "agent_id": "<agent>" }`.
+    /// Looks the item up in the built-in catalog plus the optional
+    /// user-contributed `~/.duduclaw/marketplace.json`, then reuses the
+    /// same `add_server_to_config` path as `mcp.update`.
+    async fn handle_marketplace_install(&self, params: Value) -> WsFrame {
+        use duduclaw_agent::mcp_template::{add_server_to_config, marketplace_catalog, McpCatalogItem};
+
+        let id = match params.get("id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'id' parameter"),
+        };
+        let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
+        };
+        if !is_valid_agent_id(&agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id");
+        }
+        let agent_dir = self.home_dir.join("agents").join(&agent_id);
+        if !agent_dir.is_dir() {
+            return WsFrame::error_response("", &format!("Agent '{agent_id}' not found"));
+        }
+
+        let mut catalog: Vec<McpCatalogItem> = marketplace_catalog();
+        let user_path = self.home_dir.join("marketplace.json");
+        if user_path.exists() {
+            if let Ok(content) = tokio::fs::read_to_string(&user_path).await {
+                #[derive(serde::Deserialize)]
+                struct UserCatalog {
+                    #[serde(default)]
+                    servers: Vec<McpCatalogItem>,
+                }
+                if let Ok(user) = serde_json::from_str::<UserCatalog>(&content) {
+                    catalog.extend(user.servers);
+                }
+            }
+        }
+
+        let item = match catalog.into_iter().find(|c| c.id == id) {
+            Some(c) => c,
+            None => return WsFrame::error_response("", &format!("Marketplace server '{id}' not found")),
+        };
+
+        let server_name = item.id.clone();
+        let def = item.default_def;
+        match tokio::task::spawn_blocking(move || add_server_to_config(&agent_dir, &server_name, &def)).await {
+            Ok(Ok(())) => {
+                info!(server = %id, agent = %agent_id, "Marketplace server installed");
+                WsFrame::ok_response("", json!({ "success": true, "agent_id": agent_id }))
+            }
+            Ok(Err(e)) => WsFrame::error_response("", &e),
+            Err(e) => WsFrame::error_response("", &format!("Internal error: {e}")),
+        }
     }
 
     // ── MCP Management ──────────────────────────────────────────

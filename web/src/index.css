@@ -1,6 +1,26 @@
 @import "tailwindcss";
 
+/* Tailwind v4 binds `dark:` to prefers-color-scheme by default; rebind it to
+   the `.dark` class so the in-app theme toggle actually controls styling. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
+  /* Graphite-titanium neutral ramp (cool, low-chroma OKLCH).
+     Overrides Tailwind's warm stone so every existing `stone-*` utility
+     across all pages inherits the tech palette without per-page edits. */
+  --color-stone-50: oklch(97.8% 0.003 250);
+  --color-stone-100: oklch(94.6% 0.004 250);
+  --color-stone-200: oklch(88.6% 0.006 251);
+  --color-stone-300: oklch(78.2% 0.008 252);
+  --color-stone-400: oklch(64.4% 0.011 253);
+  --color-stone-500: oklch(52.5% 0.013 255);
+  --color-stone-600: oklch(42.4% 0.015 257);
+  --color-stone-700: oklch(33.2% 0.016 259);
+  --color-stone-800: oklch(25.2% 0.017 261);
+  --color-stone-900: oklch(19.4% 0.017 263);
+  --color-stone-950: oklch(14.5% 0.016 265);
+
+  /* Brand amber — kept as the single signature accent over graphite. */
   --color-primary-50: #fffbeb;
   --color-primary-100: #fef3c7;
   --color-primary-200: #fde68a;
@@ -16,26 +36,202 @@
   --color-accent-400: #fb923c;
   --color-accent-500: #f97316;
 
-  --color-surface-light: #fafaf9;
-  --color-surface-dark: #1c1917;
-
   --radius-default: 0.75rem;
   --radius-lg: 1rem;
   --radius-sm: 0.5rem;
 
-  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans TC", "Helvetica Neue", Arial, sans-serif;
+  /* system-ui resolves to SF Pro on Apple platforms — the authentic
+     Liquid Glass companion. Noto Sans TC covers CJK. */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans TC", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Noto Sans Mono CJK TC", monospace;
 }
 
-/* Warm scrollbar */
+/* ───────────────────────── Liquid Glass material ─────────────────────────
+   Two-layer recipe: translucent gradient fill + backdrop blur/saturate,
+   finished with a specular top edge (inset highlight) and soft ambient
+   shadow. All knobs flip with the `.dark` class via custom properties. */
+:root {
+  color-scheme: light;
+  --app-bg: oklch(95.5% 0.006 250);
+  --glass-fill: linear-gradient(
+    165deg,
+    oklch(100% 0 0 / 0.72),
+    oklch(98% 0.004 250 / 0.5)
+  );
+  --glass-fill-strong: linear-gradient(
+    165deg,
+    oklch(100% 0 0 / 0.85),
+    oklch(98% 0.004 250 / 0.72)
+  );
+  --glass-border: oklch(100% 0 0 / 0.65);
+  --glass-edge: inset 0 1px 0 0 oklch(100% 0 0 / 0.9);
+  --glass-shadow: 0 8px 24px -10px oklch(30% 0.02 260 / 0.22);
+  --glass-shadow-hover: 0 16px 40px -12px oklch(30% 0.03 260 / 0.3);
+  --grid-line: oklch(40% 0.02 255 / 0.05);
+}
+
+.dark {
+  color-scheme: dark;
+  --app-bg: oklch(15% 0.014 263);
+  --glass-fill: linear-gradient(
+    165deg,
+    oklch(26% 0.015 260 / 0.62),
+    oklch(20% 0.015 262 / 0.5)
+  );
+  --glass-fill-strong: linear-gradient(
+    165deg,
+    oklch(26% 0.015 260 / 0.88),
+    oklch(19% 0.015 262 / 0.82)
+  );
+  --glass-border: oklch(100% 0 0 / 0.1);
+  --glass-edge: inset 0 1px 0 0 oklch(100% 0 0 / 0.13);
+  --glass-shadow: 0 12px 32px -12px oklch(0% 0 0 / 0.55);
+  --glass-shadow-hover: 0 20px 48px -14px oklch(0% 0 0 / 0.65);
+  --grid-line: oklch(85% 0.02 255 / 0.045);
+}
+
+/* Content card — the workhorse surface used across every page. */
+@utility glass-card {
+  background: var(--glass-fill);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-edge), var(--glass-shadow);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  backdrop-filter: blur(20px) saturate(160%);
+}
+
+@utility glass-card-hover {
+  transition: box-shadow 200ms cubic-bezier(0.22, 1, 0.36, 1),
+    transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
+  &:hover {
+    transform: translateY(-1px);
+    box-shadow: var(--glass-edge), var(--glass-shadow-hover);
+  }
+}
+
+/* Chrome — sidebar / header shell, heavier blur, no drop shadow. */
+@utility glass-chrome {
+  background: var(--glass-fill);
+  -webkit-backdrop-filter: blur(28px) saturate(170%);
+  backdrop-filter: blur(28px) saturate(170%);
+  box-shadow: var(--glass-edge);
+}
+
+/* Opaque-leaning glass for overlays that must stay readable (dialogs, menus). */
+@utility glass-overlay {
+  background: var(--glass-fill-strong);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-edge), var(--glass-shadow-hover);
+  -webkit-backdrop-filter: blur(32px) saturate(180%);
+  backdrop-filter: blur(32px) saturate(180%);
+}
+
+/* Honour macOS "Reduce transparency": fall back to solid surfaces. */
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --glass-fill: oklch(99% 0.002 250);
+    --glass-fill-strong: oklch(99% 0.002 250);
+  }
+  .dark {
+    --glass-fill: oklch(21% 0.015 262);
+    --glass-fill-strong: oklch(21% 0.015 262);
+  }
+  .glass-card,
+  .glass-chrome,
+  .glass-overlay {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+/* ───────────────────────── Ambient stage ─────────────────────────
+   Fixed backdrop the glass refracts: graphite field, amber light
+   sources, and a fine engineering grid fading out from the top. */
+.app-ambient {
+  position: fixed;
+  inset: 0;
+  z-index: -10;
+  pointer-events: none;
+  background:
+    radial-gradient(56rem 38rem at 10% -12%, oklch(82% 0.13 75 / 0.18), transparent 62%),
+    radial-gradient(48rem 34rem at 102% 8%, oklch(70% 0.09 255 / 0.1), transparent 60%),
+    radial-gradient(64rem 44rem at 55% 115%, oklch(74% 0.13 55 / 0.12), transparent 65%),
+    var(--app-bg);
+}
+
+.dark .app-ambient {
+  background:
+    radial-gradient(56rem 38rem at 10% -12%, oklch(60% 0.13 70 / 0.2), transparent 62%),
+    radial-gradient(48rem 34rem at 102% 8%, oklch(50% 0.08 260 / 0.16), transparent 60%),
+    radial-gradient(64rem 44rem at 55% 115%, oklch(50% 0.12 50 / 0.14), transparent 65%),
+    var(--app-bg);
+}
+
+.app-ambient::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 56px 56px;
+  mask-image: radial-gradient(90rem 64rem at 35% 0%, black 30%, transparent 75%);
+  -webkit-mask-image: radial-gradient(90rem 64rem at 35% 0%, black 30%, transparent 75%);
+}
+
+/* A single slow-drifting light orb keeps the stage alive without noise. */
+.app-ambient::after {
+  content: "";
+  position: absolute;
+  top: -20%;
+  left: 55%;
+  width: 42rem;
+  height: 42rem;
+  border-radius: 50%;
+  background: radial-gradient(circle, oklch(80% 0.13 80 / 0.1), transparent 70%);
+  animation: ambient-drift 36s ease-in-out infinite alternate;
+}
+
+.dark .app-ambient::after {
+  background: radial-gradient(circle, oklch(70% 0.14 75 / 0.12), transparent 70%);
+}
+
+@keyframes ambient-drift {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to { transform: translate3d(-18rem, 12rem, 0) scale(1.15); }
+}
+
+/* ───────────────────────── Base & details ───────────────────────── */
+body {
+  background: var(--app-bg);
+  font-feature-settings: "tnum" 1; /* tabular numerals for dashboard data */
+}
+
+h1, h2, h3 {
+  letter-spacing: -0.02em;
+}
+
+::selection {
+  background: oklch(82% 0.14 80 / 0.45);
+}
+
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: oklch(0.7 0.02 60); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: oklch(0.6 0.03 60); }
+::-webkit-scrollbar-thumb { background: oklch(60% 0.015 255 / 0.5); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: oklch(55% 0.02 255 / 0.7); }
 
-/* Smooth transitions */
+/* Smooth colour transitions (theme switch, hover states). */
 * { transition-property: background-color, border-color, color, opacity; transition-duration: 150ms; }
 
-/* Reduce motion */
+/* Page entrance — one orchestrated reveal per route change. */
+@keyframes page-enter {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.page-enter {
+  animation: page-enter 360ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }

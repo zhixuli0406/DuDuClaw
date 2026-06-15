@@ -59,7 +59,7 @@ function MetricGauge({
       : 'bg-rose-100 dark:bg-rose-900/30';
 
   return (
-    <div className="rounded-xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900">
+    <div className="glass-card rounded-2xl p-5">
       <div className="mb-3 flex items-start gap-3">
         <div className={cn('rounded-lg p-2', iconBg)}>
           <Icon className={cn('h-5 w-5', textColor)} />
@@ -88,7 +88,7 @@ function MetricGauge({
 
 function SkeletonGauge() {
   return (
-    <div className="rounded-xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900">
+    <div className="glass-card rounded-2xl p-5">
       <div className="mb-3 flex items-start gap-3">
         <div className="h-9 w-9 animate-pulse rounded-lg bg-stone-200 dark:bg-stone-700" />
         <div className="flex-1 space-y-1.5">

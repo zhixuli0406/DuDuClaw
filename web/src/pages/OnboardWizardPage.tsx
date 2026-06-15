@@ -561,7 +561,7 @@ function Step5({
 }) {
   return (
     <div className="mx-auto max-w-lg space-y-4">
-      <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-700 dark:bg-stone-800">
+      <div className="glass-card rounded-2xl p-6">
         <h3 className="mb-4 text-base font-semibold text-stone-900 dark:text-stone-50">
           {intl.formatMessage({ id: 'wizard.summary' })}
         </h3>
@@ -736,14 +736,19 @@ export function OnboardWizardPage() {
 
   if (deployed) {
     return (
-      <div className="space-y-6">
-        <SuccessScreen intl={intl} />
+      <div className="relative min-h-screen p-6">
+        <div className="app-ambient" aria-hidden="true" />
+        <div className="page-enter space-y-6">
+          <SuccessScreen intl={intl} />
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="space-y-8">
+    <div className="relative min-h-screen p-6">
+      <div className="app-ambient" aria-hidden="true" />
+      <div className="page-enter mx-auto max-w-4xl space-y-8">
       {/* Header */}
       <div className="text-center">
         <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
@@ -831,6 +836,7 @@ export function OnboardWizardPage() {
             </button>
           )}
         </div>
+      </div>
       </div>
     </div>
   );

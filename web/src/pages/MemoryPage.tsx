@@ -179,7 +179,7 @@ function MemoriesTab() {
           {entries.map((entry) => (
             <div
               key={entry.id}
-              className="rounded-xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900"
+              className="glass-card rounded-2xl p-5"
             >
               <div className="mb-2 flex items-center justify-between">
                 <span className="text-xs font-medium text-amber-600 dark:text-amber-400">
@@ -305,7 +305,7 @@ function SkillsTab() {
             return (
               <div
                 key={key}
-                className="rounded-xl border border-stone-200 bg-white p-5 transition-shadow hover:shadow-md dark:border-stone-800 dark:bg-stone-900"
+                className="glass-card glass-card-hover rounded-2xl p-5"
               >
                 <div className="flex items-start justify-between">
                   <div className="flex items-center gap-3">
@@ -464,7 +464,7 @@ function EvolutionTab() {
           {agents.map((agent) => (
             <div
               key={agent.agent_id}
-              className="rounded-xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900"
+              className="glass-card rounded-2xl p-5"
             >
               <div className="mb-4 flex items-center gap-3">
                 <div className="rounded-lg bg-amber-100 p-2 dark:bg-amber-900/30">
@@ -577,7 +577,7 @@ function EvolutionVersionCard({ version }: { version: EvolutionVersion }) {
   };
 
   return (
-    <div className="rounded-xl border border-stone-200 bg-white p-4 dark:border-stone-800 dark:bg-stone-900">
+    <div className="glass-card rounded-2xl p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium text-amber-600 dark:text-amber-400">
@@ -706,7 +706,7 @@ function InsightsTab() {
           {facts.map((fact) => (
             <div
               key={fact.id}
-              className="rounded-xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900"
+              className="glass-card rounded-2xl p-5"
             >
               <div className="mb-2 flex items-start justify-between gap-3">
                 <div className="flex items-center gap-2">

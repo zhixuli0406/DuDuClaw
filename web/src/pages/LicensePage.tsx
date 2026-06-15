@@ -222,7 +222,7 @@ export function LicensePage() {
       </header>
 
       {loading && !snapshot && (
-        <div className="rounded-xl border border-stone-200 bg-white p-8 text-center text-stone-500 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-400">
+        <div className="glass-card rounded-2xl p-8 text-center text-stone-500 dark:text-stone-400">
           {intl.formatMessage({ id: 'license.loading' })}
         </div>
       )}
@@ -230,7 +230,7 @@ export function LicensePage() {
       {snapshot && (
         <>
           {/* ── Tier card ───────────────────────────────────── */}
-          <section className="rounded-xl border border-stone-200 bg-white p-6 shadow-sm dark:border-stone-700 dark:bg-stone-900">
+          <section className="glass-card rounded-2xl p-6">
             <div className="flex flex-wrap items-start gap-4">
               <div className="rounded-lg bg-amber-100 p-3 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">
                 <KeyRound className="h-6 w-6" />
@@ -306,7 +306,7 @@ export function LicensePage() {
           </section>
 
           {/* ── Commercial modules matrix ───────────────────── */}
-          <section className="rounded-xl border border-stone-200 bg-white p-6 shadow-sm dark:border-stone-700 dark:bg-stone-900">
+          <section className="glass-card rounded-2xl p-6">
             <h3 className="text-lg font-semibold text-stone-900 dark:text-stone-50">
               {intl.formatMessage({ id: 'license.modules.title' })}
             </h3>

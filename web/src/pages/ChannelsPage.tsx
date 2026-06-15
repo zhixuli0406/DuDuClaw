@@ -217,7 +217,7 @@ export function ChannelsPage() {
             return (
               <div
                 key={channel.name}
-                className="rounded-xl border border-stone-200 bg-white p-5 transition-shadow hover:shadow-md dark:border-stone-800 dark:bg-stone-900"
+                className="glass-card glass-card-hover rounded-2xl p-5"
               >
                 <div className="flex items-start justify-between">
                   <div className="flex items-center gap-3">

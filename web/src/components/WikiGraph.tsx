@@ -226,7 +226,7 @@ export function WikiGraph({ pages, pageContents, width = 700, height = 500, onSe
   }
 
   return (
-    <div className="rounded-xl border border-stone-200 bg-white dark:border-stone-800 dark:bg-stone-900 overflow-hidden">
+    <div className="glass-card rounded-2xl overflow-hidden">
       {/* Legend */}
       <div className="flex items-center gap-4 px-4 py-2 border-b border-stone-200 dark:border-stone-800">
         {Object.entries(DIR_COLORS).map(([dir, color]) => (

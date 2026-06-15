@@ -307,7 +307,7 @@ export function PartnerPortalPage() {
           </div>
 
           {/* Customer Management Table */}
-          <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+          <div className="glass-card rounded-2xl p-6">
             <div className="mb-5 flex items-center justify-between">
               <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
                 {intl.formatMessage({ id: 'partner.customers' })}
@@ -404,7 +404,7 @@ export function PartnerPortalPage() {
       )}
 
       {/* License Generation Section — kept per spec */}
-      <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+      <div className="glass-card rounded-2xl p-6">
         <h3 className="mb-5 text-lg font-medium text-stone-900 dark:text-stone-50">
           {intl.formatMessage({ id: 'partner.generateLicense' })}
         </h3>
@@ -523,7 +523,7 @@ export function PartnerPortalPage() {
       </div>
 
       {/* Marketing Materials */}
-      <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+      <div className="glass-card rounded-2xl p-6">
         <h3 className="mb-5 text-lg font-medium text-stone-900 dark:text-stone-50">
           {intl.formatMessage({ id: 'partner.materials' })}
         </h3>
@@ -748,7 +748,7 @@ function AddCustomerModal({
       <form
         onSubmit={handleSubmit}
         onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-lg rounded-xl border border-stone-200 bg-white p-6 shadow-xl dark:border-stone-700 dark:bg-stone-900"
+        className="w-full max-w-lg glass-overlay rounded-2xl p-6"
       >
         <h3 className="mb-4 text-lg font-medium text-stone-900 dark:text-stone-50">
           {intl.formatMessage({ id: 'partner.addCustomer' })}
@@ -887,7 +887,7 @@ function StatCard({
   readonly bg: string;
 }) {
   return (
-    <div className="rounded-xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900">
+    <div className="glass-card rounded-2xl p-5">
       <div className="flex items-center gap-3">
         <div className={cn('rounded-lg p-2.5', bg)}>{icon}</div>
         <div>

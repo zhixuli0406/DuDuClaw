@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
-import { api, type MarketplaceServer } from '@/lib/api';
+import { api, type AgentInfo, type MarketplaceServer } from '@/lib/api';
+import { Dialog, FormField, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import {
   Search,
   Download,
@@ -50,7 +51,7 @@ function ServerCard({
   const Icon = iconForCategory(server.category);
 
   return (
-    <div className="rounded-xl border border-stone-200 bg-white p-5 transition-shadow hover:shadow-md dark:border-stone-800 dark:bg-stone-900">
+    <div className="glass-card glass-card-hover rounded-2xl p-5">
       <div className="flex items-start gap-3">
         <div className="rounded-lg bg-amber-100 p-2.5 dark:bg-amber-900/30">
           <Icon className="h-5 w-5 text-amber-600 dark:text-amber-400" />
@@ -128,6 +129,22 @@ export function MarketplacePage() {
   const [installError, setInstallError] = useState<string | null>(null);
   const [servers, setServers] = useState<ReadonlyArray<MarketplaceServer>>([]);
   const [loading, setLoading] = useState(true);
+  const [agents, setAgents] = useState<ReadonlyArray<AgentInfo>>([]);
+  const [installTarget, setInstallTarget] = useState<string | null>(null);
+  const [installAgent, setInstallAgent] = useState('');
+  const [installing, setInstalling] = useState(false);
+
+  useEffect(() => {
+    api.agents.list().then((res) => {
+      const list = res?.agents ?? [];
+      setAgents(list);
+      if (list.length > 0) {
+        setInstallAgent((prev) => prev || list[0].name);
+      }
+    }).catch(() => {
+      // Agent list failure surfaces when the install dialog opens (empty select).
+    });
+  }, []);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -181,16 +198,27 @@ export function MarketplacePage() {
     });
   }, [query, category, servers]);
 
-  const handleInstall = async (serverId: string) => {
+  // Installing requires a target agent — open a picker dialog first.
+  const handleInstall = (serverId: string) => {
+    setInstallError(null);
+    setInstallTarget(serverId);
+  };
+
+  const confirmInstall = async () => {
+    if (!installTarget || !installAgent) return;
+    setInstalling(true);
     setInstallError(null);
     try {
-      await api.marketplace.install(serverId);
-      setInstalledIds((prev) => new Set([...prev, serverId]));
+      await api.marketplace.install(installTarget, installAgent);
+      setInstalledIds((prev) => new Set([...prev, installTarget]));
+      setInstallTarget(null);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setInstallError(
         intl.formatMessage({ id: 'marketplace.installError' }, { message }),
       );
+    } finally {
+      setInstalling(false);
     }
   };
 
@@ -326,6 +354,53 @@ export function MarketplacePage() {
             </p>
           )}
         </div>
+      )}
+
+      {/* Install target agent picker */}
+      {installTarget && (
+        <Dialog
+          open
+          onClose={() => setInstallTarget(null)}
+          title={intl.formatMessage({ id: 'marketplace.install' })}
+        >
+          <div className="space-y-4">
+            <p className="text-sm text-stone-600 dark:text-stone-400">
+              {intl.formatMessage(
+                { id: 'marketplace.installTo' },
+                { server: servers.find((s) => s.id === installTarget)?.name ?? installTarget },
+              )}
+            </p>
+            <FormField label={intl.formatMessage({ id: 'marketplace.targetAgent' })} htmlFor="marketplace-install-agent">
+              <select
+                id="marketplace-install-agent"
+                value={installAgent}
+                onChange={(e) => setInstallAgent(e.target.value)}
+                className={selectClass}
+              >
+                {agents.length === 0 && (
+                  <option value="">{intl.formatMessage({ id: 'common.noData' })}</option>
+                )}
+                {agents.map((a) => (
+                  <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
+                ))}
+              </select>
+            </FormField>
+            <div className="flex justify-end gap-2 pt-1">
+              <button onClick={() => setInstallTarget(null)} className={buttonSecondary}>
+                {intl.formatMessage({ id: 'common.cancel' })}
+              </button>
+              <button
+                onClick={confirmInstall}
+                disabled={installing || !installAgent}
+                className={buttonPrimary}
+              >
+                {installing
+                  ? intl.formatMessage({ id: 'common.saving' })
+                  : intl.formatMessage({ id: 'marketplace.install' })}
+              </button>
+            </div>
+          </div>
+        </Dialog>
       )}
     </div>
   );

@@ -81,7 +81,7 @@ export function BillingPage() {
       </h2>
 
       {/* Usage Meters */}
-      <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+      <div className="glass-card rounded-2xl p-6">
         <h3 className="mb-5 text-lg font-medium text-stone-900 dark:text-stone-50">
           {intl.formatMessage({ id: 'billing.usage' })}
         </h3>

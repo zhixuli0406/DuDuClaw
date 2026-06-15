@@ -79,7 +79,15 @@ export function McpPage() {
   }, [agentConfigs, selectedAgentId]);
 
   const selectedConfig = agentConfigs.find((c) => c.agent_id === selectedAgentId);
-  const serverEntries = selectedConfig ? Object.entries(selectedConfig.servers) : [];
+  // Backend serializes servers as an array of `{ name, command, args, env }`
+  // entries; normalize to [name, def] tuples for rendering. The Array.isArray
+  // guard keeps older object-shaped payloads working.
+  const serverEntries: Array<[string, { command: string; args: string[]; env: Record<string, string> }]> =
+    selectedConfig
+      ? Array.isArray(selectedConfig.servers)
+        ? selectedConfig.servers.map((s) => [s.name, s])
+        : Object.entries(selectedConfig.servers)
+      : [];
 
   const handleRemoveServer = async (agentId: string, serverName: string) => {
     const agentLabel = agents.find((a) => a.name === agentId)?.display_name ?? agentId;
@@ -251,7 +259,7 @@ export function McpPage() {
                 {serverEntries.map(([name, def]) => (
                   <div
                     key={name}
-                    className="rounded-xl border border-stone-200 bg-white p-5 transition-shadow hover:shadow-md dark:border-stone-800 dark:bg-stone-900"
+                    className="glass-card glass-card-hover rounded-2xl p-5"
                   >
                     <div className="flex items-start justify-between">
                       <div className="flex items-center gap-3">
@@ -537,7 +545,7 @@ function OAuthTab({
             return (
               <div
                 key={provider.provider_id}
-                className="rounded-xl border border-stone-200 bg-white p-5 transition-shadow hover:shadow-md dark:border-stone-800 dark:bg-stone-900"
+                className="glass-card glass-card-hover rounded-2xl p-5"
               >
                 <div className="flex items-start justify-between">
                   <div className="flex items-center gap-3">
@@ -746,7 +754,7 @@ function CatalogCard({
 
   return (
     <>
-      <div className="rounded-xl border border-stone-200 bg-white p-5 transition-shadow hover:shadow-md dark:border-stone-800 dark:bg-stone-900">
+      <div className="glass-card glass-card-hover rounded-2xl p-5">
         <div className="flex items-start justify-between">
           <div className="flex items-center gap-3">
             <div className="rounded-lg bg-stone-100 p-2.5 dark:bg-stone-800">

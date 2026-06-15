@@ -71,7 +71,7 @@ export function AgentsPage() {
           {agents.map((agent) => (
             <div
               key={agent.name}
-              className="rounded-xl border border-stone-200 bg-white p-5 transition-shadow hover:shadow-md dark:border-stone-800 dark:bg-stone-900"
+              className="glass-card glass-card-hover rounded-2xl p-5"
             >
               <div className="flex items-start justify-between">
                 <div className="flex items-center gap-3">
@@ -105,7 +105,13 @@ export function AgentsPage() {
                   <div className="h-1.5 overflow-hidden rounded-full bg-stone-200 dark:bg-stone-700">
                     <div
                       className="h-full rounded-full bg-amber-500 transition-all"
-                      style={{ width: `${Math.min(100, (agent.budget.spent_cents / agent.budget.monthly_limit_cents) * 100)}%` }}
+                      style={{
+                        width: `${
+                          agent.budget.monthly_limit_cents > 0
+                            ? Math.min(100, (agent.budget.spent_cents / agent.budget.monthly_limit_cents) * 100)
+                            : 0
+                        }%`,
+                      }}
                     />
                   </div>
                 </div>

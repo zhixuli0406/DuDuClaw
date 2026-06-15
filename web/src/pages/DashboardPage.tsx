@@ -32,34 +32,63 @@ import {
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
 
+const STAT_ACCENTS = {
+  amber: {
+    beam: 'bg-amber-500 dark:bg-amber-400',
+    icon: 'text-amber-600 dark:text-amber-400',
+    glow: 'shadow-[0_0_24px_-6px_rgba(245,158,11,0.5)]',
+  },
+  emerald: {
+    beam: 'bg-emerald-500 dark:bg-emerald-400',
+    icon: 'text-emerald-600 dark:text-emerald-400',
+    glow: 'shadow-[0_0_24px_-6px_rgba(16,185,129,0.5)]',
+  },
+  orange: {
+    beam: 'bg-orange-500 dark:bg-orange-400',
+    icon: 'text-orange-600 dark:text-orange-400',
+    glow: 'shadow-[0_0_24px_-6px_rgba(249,115,22,0.5)]',
+  },
+  rose: {
+    beam: 'bg-rose-500 dark:bg-rose-400',
+    icon: 'text-rose-600 dark:text-rose-400',
+    glow: 'shadow-[0_0_24px_-6px_rgba(244,63,94,0.55)]',
+  },
+} as const;
+
 function StatCard({
   icon: Icon,
   title,
   value,
   subtitle,
-  color,
+  accent,
 }: {
   icon: React.ComponentType<{ className?: string }>;
   title: string;
   value: string | number;
   subtitle: string;
-  color: string;
+  accent: keyof typeof STAT_ACCENTS;
 }) {
+  const a = STAT_ACCENTS[accent];
   return (
-    <div className="rounded-xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900">
-      <div className="flex items-center gap-3">
-        <div className={cn('rounded-lg p-2.5', color)}>
-          <Icon className="h-5 w-5 text-white" />
-        </div>
-        <div>
-          <p className="text-sm text-stone-500 dark:text-stone-400">{title}</p>
-          <p className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
+    <div className="glass-card glass-card-hover relative overflow-hidden rounded-2xl p-5">
+      {/* Status beam */}
+      <span
+        className={cn('absolute bottom-4 left-0 top-4 w-[3px] rounded-r-full', a.beam, a.glow)}
+        aria-hidden="true"
+      />
+      <div className="flex items-start justify-between pl-2">
+        <div className="min-w-0">
+          <p className="text-xs font-medium uppercase tracking-wider text-stone-500 dark:text-stone-400">
+            {title}
+          </p>
+          <p className="mt-1.5 text-3xl font-semibold tracking-tight text-stone-900 dark:text-stone-50">
             {value}
           </p>
-          <p className="text-xs text-stone-400 dark:text-stone-500">
+          <p className="mt-0.5 truncate text-xs text-stone-400 dark:text-stone-500">
             {subtitle}
           </p>
         </div>
+        <Icon className={cn('h-5 w-5 shrink-0 opacity-80', a.icon)} />
       </div>
     </div>
   );
@@ -97,7 +126,7 @@ function TasksPreviewCard() {
   const notYetLoaded = loading && isEmpty;
 
   return (
-    <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+    <div className="glass-card rounded-2xl p-6">
       <div className="mb-4 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <KanbanSquare className="h-5 w-5 text-amber-500" />
@@ -281,46 +310,50 @@ export function DashboardPage() {
           title={intl.formatMessage({ id: 'dashboard.agents.title' })}
           value={agents.length}
           subtitle={intl.formatMessage({ id: 'dashboard.agents.active' }, { count: activeAgents })}
-          color="bg-amber-500"
+          accent="amber"
         />
         <StatCard
           icon={Radio}
           title={intl.formatMessage({ id: 'dashboard.channels.title' })}
           value={status?.channels_connected ?? 0}
           subtitle={intl.formatMessage({ id: 'dashboard.channels.connected' }, { count: status?.channels_connected ?? 0 })}
-          color="bg-emerald-500"
+          accent="emerald"
         />
         <StatCard
           icon={Wallet}
           title={intl.formatMessage({ id: 'dashboard.budget.title' })}
           value={`$${(totalSpent / 100).toFixed(2)}`}
           subtitle={`/ $${(totalBudget / 100).toFixed(2)}`}
-          color="bg-orange-400"
+          accent="orange"
         />
         <StatCard
           icon={HeartPulse}
           title={intl.formatMessage({ id: 'dashboard.health.title' })}
           value={healthValue}
           subtitle={healthSubtitle}
-          color={summary.fail ? 'bg-rose-500' : summary.warn ? 'bg-amber-500' : 'bg-emerald-500'}
+          accent={summary.fail ? 'rose' : summary.warn ? 'amber' : 'emerald'}
         />
       </div>
 
       {/* Doctor Checks */}
       {checks.length > 0 && (
-        <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+        <div className="glass-card rounded-2xl p-6">
           <h3 className="mb-4 text-lg font-medium text-stone-900 dark:text-stone-50">
             {intl.formatMessage({ id: 'dashboard.health.title' })}
           </h3>
-          <div className="space-y-2">
+          <div className="divide-y divide-stone-300/30 dark:divide-white/5">
             {checks.map((check) => (
-              <div key={check.name} className="flex items-center justify-between rounded-lg bg-stone-50 px-4 py-2.5 dark:bg-stone-800/50">
-                <span className="text-sm text-stone-700 dark:text-stone-300">{check.name}</span>
-                <div className="flex items-center gap-2">
+              <div key={check.name} className="flex items-center justify-between px-1 py-2.5">
+                <span className="font-mono text-xs text-stone-700 dark:text-stone-300">{check.name}</span>
+                <div className="flex items-center gap-2.5">
                   <span className="text-xs text-stone-500 dark:text-stone-400">{check.message}</span>
                   <span className={cn(
                     'inline-block h-2 w-2 rounded-full',
-                    check.status === 'pass' ? 'bg-emerald-500' : check.status === 'warn' ? 'bg-amber-500' : 'bg-rose-500'
+                    check.status === 'pass'
+                      ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.7)]'
+                      : check.status === 'warn'
+                        ? 'bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.7)]'
+                        : 'bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.7)]'
                   )} />
                 </div>
               </div>
@@ -333,7 +366,7 @@ export function DashboardPage() {
       {wikiStats?.exists && wikiPages.length > 0 && (
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
           {/* Knowledge Graph */}
-          <div className="lg:col-span-2 rounded-xl border border-stone-200 bg-white dark:border-stone-800 dark:bg-stone-900 overflow-hidden">
+          <div className="lg:col-span-2 glass-card rounded-2xl overflow-hidden">
             <div className="flex items-center justify-between border-b border-stone-200 px-5 py-3 dark:border-stone-800">
               <h3 className="flex items-center gap-2 text-lg font-medium text-stone-900 dark:text-stone-50">
                 <BookOpen className="h-5 w-5 text-amber-500" />
@@ -356,7 +389,7 @@ export function DashboardPage() {
           </div>
 
           {/* Recent Wiki Pages */}
-          <div className="rounded-xl border border-stone-200 bg-white p-5 dark:border-stone-800 dark:bg-stone-900">
+          <div className="glass-card rounded-2xl p-5">
             <div className="flex items-center justify-between mb-4">
               <h3 className="flex items-center gap-2 text-lg font-medium text-stone-900 dark:text-stone-50">
                 <FileText className="h-5 w-5 text-amber-500" />
@@ -417,7 +450,7 @@ export function DashboardPage() {
       <TasksPreviewCard />
 
       {/* Activity Feed */}
-      <div className="rounded-xl border border-stone-200 bg-white p-6 dark:border-stone-800 dark:bg-stone-900">
+      <div className="glass-card rounded-2xl p-6">
         <h3 className="mb-4 text-lg font-medium text-stone-900 dark:text-stone-50">
           {intl.formatMessage({ id: 'activity.title' })}
         </h3>
