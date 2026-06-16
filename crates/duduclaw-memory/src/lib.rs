@@ -10,7 +10,7 @@ pub mod trust_store;
 pub mod wiki;
 
 pub use embedding::VectorIndex;
-pub use engine::{KeyFact, SqliteMemoryEngine, word_jaccard};
+pub use engine::{KeyFact, SqliteMemoryEngine, TemporalMeta, TemporalRecord, word_jaccard};
 pub use feedback::{CitationTracker, DrainOnDrop, TrustSignal, WikiCitation};
 pub use janitor::{JanitorConfig, JanitorReport, WikiJanitor};
 pub use router::classify;

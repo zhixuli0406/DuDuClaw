@@ -1,6 +1,46 @@
 # Changelog
 
 
+## [1.19.0] - 2026-06-16 — Memory Intelligence: Temporal Memory + Reflexion Loop + Batch Fetch
+
+Three W18/W19-designed memory features, implemented non-invasively on the live
+Rust `SqliteMemoryEngine` (the original PostgreSQL/Python designs were updated to
+the actual SQLite architecture). No new infrastructure.
+
+### Added
+
+- **F1 Temporal Memory** (`duduclaw-memory`) — `memories` gains temporal /
+  knowledge-graph columns (`valid_from`, `valid_until`, `superseded_by`,
+  `supersedes`, `subject`, `predicate`, `object`, `confidence`, `metadata`) via
+  the existing idempotent migration loop, plus two indexes. New
+  `store_temporal(entry, TemporalMeta)` performs automatic conflict resolution:
+  writing the same `(agent, subject, predicate)` supersedes the prior fact
+  (closes its `valid_until`, links the supersession chain). `search()` /
+  `search_layer()` now return only currently-valid memories by default;
+  `get_history()` / `get_at()` expose the chain and point-in-time lookups.
+  `MemoryEntry` is **unchanged** (zero blast radius across 22+ construction sites).
+- **F2a Reflexion recall** (`duduclaw-gateway/channel_reply`) — an agent's recent
+  unresolved `MistakeNotebook` entries are now injected into the **answering
+  prompt** (`## Past Mistakes to Avoid`), not just the GVU SOUL.md generator —
+  delivering cross-task learning. CJK-safe (topic match with recency fallback).
+- **F2b Reflexion consolidation** (`duduclaw-gateway/reflexion`) — when the same
+  `MistakeCategory` accumulates ≥3 unresolved mistakes, they are distilled into a
+  single **semantic** memory rule (via F1 supersession) and the source mistakes
+  are marked resolved. Runs detached so it never delays replies. Deterministic
+  synthesis (zero LLM cost).
+- **F3 `memory_fetch_batch`** — new MCP tool + `SqliteMemoryEngine::get_by_ids`
+  fetch up to 100 entries by ID in one call (`Scope::MemoryRead`, namespace /
+  ownership enforced, partial hits return `missing_ids` without error).
+
+### Notes
+
+- Trigger signal for reflexion is the existing `ErrorCategory` (Significant /
+  Critical, MetaCognition-adaptive) — **not** the GVU Verifier (which validates
+  SOUL.md proposals, not task quality). No hard-coded score threshold.
+- The standalone Python MCP memory track remains superseded by the Rust CLI
+  endpoints (not revived).
+
+
 ## [1.18.0] - 2026-06-15 — Dashboard budget/usage accuracy + reliability fixes
 
 Dashboard now reads real spend from the persistent `CostTelemetry` ledger

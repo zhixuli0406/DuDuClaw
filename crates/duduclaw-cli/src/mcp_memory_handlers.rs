@@ -317,6 +317,100 @@ pub async fn handle_memory_read(
     }
 }
 
+// ── memory_fetch_batch (F3) ─────────────────────────────────────────────────────
+
+/// Fetch multiple memory entries by ID in a single call (F3 batch fetch).
+///
+/// # Access control
+/// Scope is strictly limited to `ns_ctx.write_namespace`; the engine's
+/// `get_by_ids` enforces ownership, so entries belonging to another namespace
+/// never appear in the result. Missing-vs-forbidden is intentionally
+/// indistinguishable: both land in `missing_ids` (no existence leak).
+///
+/// # Parameters
+/// - `ids`              : `array<string>` — required, max 100 IDs
+/// - `include_metadata` : `bool`          — optional (default false)
+///
+/// # Returns
+/// ```json
+/// { "memories": [...], "missing_ids": [...], "total_found": N, "total_missing": M }
+/// ```
+/// Partial hits are NOT an error — found entries plus a `missing_ids` list.
+pub async fn handle_memory_fetch_batch(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    ns_ctx: &NamespaceContext,
+) -> Value {
+    let ids: Vec<String> = match params.get("ids") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => return mcp_error("Missing required parameter: ids (array of memory IDs)"),
+    };
+
+    if ids.is_empty() {
+        return mcp_error("Parameter 'ids' must be a non-empty array of memory IDs");
+    }
+    if ids.len() > 100 {
+        return mcp_error("Parameter 'ids' exceeds the maximum of 100 entries per request");
+    }
+
+    let include_metadata = params
+        .get("include_metadata")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let namespace = &ns_ctx.write_namespace;
+
+    match memory.get_by_ids(namespace, &ids).await {
+        Ok(entries) => {
+            let found_ids: std::collections::HashSet<&str> =
+                entries.iter().map(|e| e.id.as_str()).collect();
+            let missing_ids: Vec<&String> = ids
+                .iter()
+                .filter(|id| !found_ids.contains(id.as_str()))
+                .collect();
+
+            let memories: Vec<Value> = entries
+                .iter()
+                .map(|e| {
+                    let mut obj = serde_json::json!({
+                        "id": e.id,
+                        "content": e.content,
+                        "namespace": e.agent_id,
+                        "layer": format!("{:?}", e.layer),
+                        "found": true,
+                    });
+                    if include_metadata {
+                        obj["tags"] = serde_json::json!(e.tags);
+                        obj["importance"] = serde_json::json!(e.importance);
+                        obj["access_count"] = serde_json::json!(e.access_count);
+                        obj["created_at"] = serde_json::json!(e.timestamp.to_rfc3339());
+                        obj["source_event"] = serde_json::json!(e.source_event);
+                    }
+                    obj
+                })
+                .collect();
+
+            let total_found = memories.len();
+            let total_missing = missing_ids.len();
+            let payload = serde_json::json!({
+                "memories": memories,
+                "missing_ids": missing_ids,
+                "total_found": total_found,
+                "total_missing": total_missing,
+            });
+            serde_json::json!({
+                "content": [{ "type": "text", "text": payload.to_string() }]
+            })
+        }
+        Err(e) => mcp_error(&format!("Error fetching memories: {e}")),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -752,5 +846,98 @@ mod tests {
             tags.iter().any(|t| t.as_str() == Some("beta")),
             "tag 'beta' must be present"
         );
+    }
+
+    // ── F3-T1: memory_fetch_batch partial hit ─────────────────────────────────
+    #[tokio::test]
+    async fn fetch_batch_partial_hit() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        let quota = DailyQuota::with_limit(100);
+        let ns = external_ns("batcher");
+
+        let mut ids = Vec::new();
+        for c in ["one", "two"] {
+            let r = handle_memory_store(
+                &params(serde_json::json!({ "content": c })),
+                &mem,
+                &ns,
+                &quota,
+            )
+            .await;
+            let p: Value = serde_json::from_str(&text_of(&r)).unwrap();
+            ids.push(p["id"].as_str().unwrap().to_string());
+        }
+
+        let resp = handle_memory_fetch_batch(
+            &params(serde_json::json!({ "ids": [ids[0], "missing-xyz", ids[1]] })),
+            &mem,
+            &ns,
+        )
+        .await;
+
+        assert!(!is_error(&resp));
+        let payload: Value = serde_json::from_str(&text_of(&resp)).unwrap();
+        assert_eq!(payload["total_found"].as_u64().unwrap(), 2);
+        assert_eq!(payload["total_missing"].as_u64().unwrap(), 1);
+        assert_eq!(
+            payload["missing_ids"][0].as_str().unwrap(),
+            "missing-xyz"
+        );
+    }
+
+    // ── F3-T2: empty / missing ids param → error ──────────────────────────────
+    #[tokio::test]
+    async fn fetch_batch_missing_ids_errors() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        let ns = external_ns("batcher");
+        let resp = handle_memory_fetch_batch(&params(serde_json::json!({})), &mem, &ns).await;
+        assert!(is_error(&resp));
+
+        let resp2 =
+            handle_memory_fetch_batch(&params(serde_json::json!({ "ids": [] })), &mem, &ns).await;
+        assert!(is_error(&resp2), "empty ids array must error");
+    }
+
+    // ── F3-T3: over 100 ids → error ───────────────────────────────────────────
+    #[tokio::test]
+    async fn fetch_batch_over_limit_errors() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        let ns = external_ns("batcher");
+        let ids: Vec<String> = (0..101).map(|i| format!("id-{i}")).collect();
+        let resp =
+            handle_memory_fetch_batch(&params(serde_json::json!({ "ids": ids })), &mem, &ns).await;
+        assert!(is_error(&resp));
+    }
+
+    // ── F3-T4: cross-namespace isolation ──────────────────────────────────────
+    #[tokio::test]
+    async fn fetch_batch_cross_namespace_isolation() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        let quota = DailyQuota::with_limit(100);
+        let ns_a = external_ns("owner-a");
+        let ns_b = external_ns("intruder-b");
+
+        let store = handle_memory_store(
+            &params(serde_json::json!({ "content": "a's secret" })),
+            &mem,
+            &ns_a,
+            &quota,
+        )
+        .await;
+        let id = {
+            let p: Value = serde_json::from_str(&text_of(&store)).unwrap();
+            p["id"].as_str().unwrap().to_string()
+        };
+
+        // Client B batch-fetches A's id → must land in missing_ids, no content.
+        let resp = handle_memory_fetch_batch(
+            &params(serde_json::json!({ "ids": [id] })),
+            &mem,
+            &ns_b,
+        )
+        .await;
+        let payload: Value = serde_json::from_str(&text_of(&resp)).unwrap();
+        assert_eq!(payload["total_found"].as_u64().unwrap(), 0);
+        assert_eq!(payload["total_missing"].as_u64().unwrap(), 1);
     }
 }

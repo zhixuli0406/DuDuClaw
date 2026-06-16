@@ -1041,6 +1041,36 @@ async fn build_reply_with_session_inner(
             }
         }
 
+        // F2a (Reflexion recall): surface this agent's recent unresolved mistakes
+        // into the answering prompt — not just the GVU Generator (SOUL.md path).
+        // Bridges MistakeNotebook → cross-task learning so the agent avoids
+        // repeating past failures on similar topics.
+        if let Some(ref nb) = ctx.mistake_notebook {
+            // Topic-scoped recall first (whitespace keywords); fall back to most
+            // recent unresolved so CJK queries (no whitespace tokens) aren't empty.
+            let kw: Vec<&str> = sanitized_text
+                .split_whitespace()
+                .filter(|w| w.chars().count() >= 3)
+                .take(12)
+                .collect();
+            let mut mistakes = if kw.is_empty() {
+                nb.query_by_agent(&agent_id, 3)
+            } else {
+                nb.query_by_topic(&kw, &agent_id, 3)
+            };
+            if mistakes.is_empty() {
+                mistakes = nb.query_by_agent(&agent_id, 3);
+            }
+            if !mistakes.is_empty() {
+                let section = mistakes
+                    .iter()
+                    .map(|m| m.to_prompt_section())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                prompt = format!("{prompt}\n\n## Past Mistakes to Avoid\n{section}");
+            }
+        }
+
         if !compression_summary.is_empty() {
             prompt = format!("{prompt}\n\n## Prior Conversation Summary\n{compression_summary}");
         }
@@ -1645,6 +1675,7 @@ async fn build_reply_with_session_inner(
             let gap_acc_for_pred = ctx.gap_accumulator.clone();
             let sandbox_for_pred = ctx.sandbox_store.clone();
             let notebook_for_pred = ctx.mistake_notebook.clone();
+            let memory_db_path_for_pred = ctx.memory_db_path.clone();
             let ext_factors_cfg = external_factors_config.clone();
             let evolution_emitter_for_pred = ctx.evolution_emitter.clone();
 
@@ -1752,6 +1783,31 @@ async fn build_reply_with_session_inner(
                             );
                             if let Err(e) = nb.record(&entry) {
                                 warn!(agent = %agent_id_for_pred, "Failed to record mistake: {e}");
+                            } else if let Some(ref dbp) = memory_db_path_for_pred {
+                                // F2b: when this category accumulates ≥3 unresolved
+                                // mistakes, consolidate them into a semantic memory
+                                // rule. Detached so it never delays the reply path.
+                                let nb2 = nb.clone();
+                                let dbp2 = dbp.clone();
+                                let aid2 = agent_id_for_pred.clone();
+                                tokio::spawn(async move {
+                                    match crate::reflexion::maybe_consolidate(
+                                        &nb2, &dbp2, &aid2, category,
+                                        crate::reflexion::DEFAULT_CONSOLIDATE_THRESHOLD,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(id)) => info!(
+                                            agent = %aid2, semantic_id = %id,
+                                            "reflexion consolidated mistakes into semantic memory"
+                                        ),
+                                        Ok(None) => {}
+                                        Err(e) => warn!(
+                                            agent = %aid2,
+                                            "reflexion consolidation failed: {e}"
+                                        ),
+                                    }
+                                });
                             }
                         }
                     }

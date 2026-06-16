@@ -342,6 +342,39 @@ impl MistakeNotebook {
         .unwrap_or(0)
     }
 
+    /// Count unresolved mistakes of a specific category for an agent (F2b).
+    pub fn count_unresolved_by_category(&self, agent_id: &str, category: MistakeCategory) -> u32 {
+        let conn = match self.open_conn() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("count_unresolved_by_category failed: {e}");
+                return 0;
+            }
+        };
+        conn.query_row(
+            "SELECT COUNT(*) FROM mistakes
+             WHERE agent_id = ?1 AND category = ?2 AND resolved = 0",
+            params![agent_id, category.as_str()],
+            |row| row.get::<_, u32>(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// Query unresolved mistakes of a specific category, newest/priority first (F2b).
+    pub fn query_unresolved_by_category(
+        &self,
+        agent_id: &str,
+        category: MistakeCategory,
+        limit: usize,
+    ) -> Vec<MistakeEntry> {
+        // Reuse query_by_agent's row mapping + priority ordering, then filter.
+        self.query_by_agent(agent_id, MAX_UNRESOLVED_PER_AGENT as usize)
+            .into_iter()
+            .filter(|m| m.category == category)
+            .take(limit)
+            .collect()
+    }
+
     /// Record a tool-use hallucination as a Hallucination-category mistake.
     ///
     /// This is a convenience method called by the dispatcher when the
