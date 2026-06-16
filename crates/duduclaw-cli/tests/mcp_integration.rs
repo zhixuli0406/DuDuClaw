@@ -45,12 +45,16 @@ fn make_config_with_key(key: &str, client_id: &str, scopes: &[&str], is_external
         .map(|s| format!("\"{s}\""))
         .collect::<Vec<_>>()
         .join(", ");
+    // Fresh timestamp: keys expire after 30 days (mcp_auth.rs). A hardcoded
+    // created_at is a time-bomb that fails every valid-key test once it ages
+    // past the rotation window. (The expiry-path test uses its own old date.)
+    let created_at = chrono::Utc::now().to_rfc3339();
     let content = format!(
         r#"
 [mcp_keys."{key}"]
 client_id = "{client_id}"
 scopes = [{scopes_toml}]
-created_at = "2026-04-29T00:00:00Z"
+created_at = "{created_at}"
 is_external = {is_external}
 "#
     );
