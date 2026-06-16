@@ -36,6 +36,27 @@ observability. Same architecture standards as DuDuClaw.
 
 ---
 
+## Why DuDuClaw vs Using Native Claude / GPT / Gemini CLIs?
+
+The native CLIs are great if you're using one LLM occasionally as a person.
+But once you need to ship to production, you'll quickly end up rebuilding what DuDuClaw already
+provides:
+
+| Need | Native CLIs | DuDuClaw |
+|---|---|---|
+| Multi-LLM auto-fallback | Manual restart | Built-in (4 strategies) |
+| Context preserved across LLM switches | Lost | Preserved |
+| Tools shared across LLMs | Rewrite per LLM | Write once, share |
+| Production hardening (DLQ/retry/observability) | Build yourself | Built-in |
+| Multi-channel (Telegram/LINE/Discord/...) | CLI only | 7 channels |
+| Secrets / audit / PII redaction | Build yourself | Built-in |
+
+If you're solo using `claude` or `gemini` occasionally — stick with native.
+If you're building **production multi-LLM Agent systems** — DuDuClaw saves you 3 months of
+infrastructure work.
+
+---
+
 > 🎉 **v1.18.0 — Dashboard budget/usage correctness + reliability fixes** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.18.0))
 >
 > The Dashboard's budget and usage now read from the persistent `CostTelemetry` ledger instead of the in-memory counter that reset to zero on every rebuild, plus a round of dashboard runtime bug cleanup.

@@ -36,6 +36,27 @@ observability. Same architecture standards as DuDuClaw.
 
 ---
 
+## なぜネイティブの Claude / GPT / Gemini CLI ではなく DuDuClaw なのか？
+
+ネイティブ CLI は、個人として単一の LLM をたまに使う分には十分優秀です。
+しかし本番環境へ投入する段階になると、DuDuClaw がすでに提供しているものを自分で作り直す羽目に
+なります：
+
+| 必要なもの | ネイティブ CLI | DuDuClaw |
+|---|---|---|
+| マルチ LLM 自動フォールバック | 手動で再起動 | 標準搭載（4 戦略） |
+| LLM 切り替え時のコンテキスト保持 | 失われる | 保持される |
+| LLM 横断のツール共有 | LLM ごとに書き直し | 一度書けば共有 |
+| 本番ハードニング（DLQ／リトライ／可観測性） | 自前で構築 | 標準搭載 |
+| マルチチャネル（Telegram／LINE／Discord／…） | CLI のみ | 7 チャネル |
+| シークレット／監査／PII マスキング | 自前で構築 | 標準搭載 |
+
+`claude` や `gemini` を一人でたまに使うだけなら — ネイティブのままで十分です。
+**本番のマルチ LLM Agent システム**を構築するなら — DuDuClaw が 3 か月分のインフラ構築を肩代わり
+します。
+
+---
+
 > 🎉 **v1.18.0 — Dashboard 予算／使用量の正確化 + 信頼性修正**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.18.0)）
 >
 > Dashboard の予算と使用量を、再構築のたびにゼロに戻るメモリ上のカウンタではなく、永続化された `CostTelemetry` 台帳から読むように変更し、さらに dashboard ランタイムのバグを一通り掃除しました。
