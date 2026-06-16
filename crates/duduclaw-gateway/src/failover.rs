@@ -195,7 +195,7 @@ fn is_non_retryable(error: &str) -> bool {
         || lower.contains("404 ") || lower.contains("422 ")
         // Structured API error codes (more specific than free-form message matching)
         || lower.contains("content_policy_violation")
-        || lower.contains("content policy") // free-form variant ("Content policy violation")
+        || lower.contains("content policy violation") // free-form variant (full phrase — avoid matching transient "content policy filter" errors)
         || lower.contains("invalid_api_key")
         || lower.contains("billing_hard_limit")
         // Legacy formatted messages kept for compatibility

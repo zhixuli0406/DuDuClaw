@@ -1,6 +1,51 @@
 # Changelog
 
 
+## [1.20.0] - 2026-06-16 — RFC-25 Multi-Runtime Unlock + A2A
+
+The "Multi-Runtime four-backend" abstraction was previously **orphan, uncompiled
+source** — every execution path hardcoded Claude. RFC-25 compiles and wires it,
+and routes the LLM-calling subsystems through a single provider-agnostic
+choke-point. Existing agents are unaffected (provider defaults to Claude); agents
+can now opt into Codex / Gemini / OpenAI-compat via `agent.toml [runtime] provider`.
+
+### Added
+
+- **`RuntimeType` (duduclaw-core)** — `{Claude, Codex, Gemini, OpenAiCompat}`,
+  unblocking the never-compiled `runtime/` abstraction (`AgentRuntime` trait,
+  `RuntimeRegistry`, four runtime impls) + `failover.rs` — now compiled for the
+  first time.
+- **`runtime_dispatch::run_agent_prompt` choke-point** — resolves the agent's
+  `[runtime] provider` → selects from a lazily-built, auto-detecting
+  `RuntimeRegistry` → executes, falling back to the configured fallback then Claude.
+- **`runtime_config`** — reads `[runtime] provider`/`fallback` and `[model] utility`;
+  `ModelConfig.utility` (default `claude-haiku-4-5`) centralizes the previously
+  scattered hardcoded utility-model literals.
+- **A2A real execution** — the ACP stdio server's `tasks/send` now runs the target
+  agent (via the provider-aware gateway dispatch) instead of a placeholder; the
+  responding agent's `[runtime] provider` is honoured.
+
+### Changed
+
+- **GVU evolution allowlist relaxed** — the hard `ALLOWED_EVOLUTION_MODELS` reject
+  (which forced `claude-haiku-4-5` and blocked everything else) is now a warning.
+- **Channel reply** routes non-Claude providers through the choke-point; Claude
+  keeps the optimized OAuth-rotation/PTY path (zero regression).
+- **GVU loop + sub-agent delegation** (`call_claude_for_agent_with_type`,
+  plain + worktree paths) route through the choke-point, honouring per-agent provider.
+
+### Fixed
+
+- `failover::is_non_retryable` now matches free-form "content policy" (a never-run
+  test in the previously-uncompiled module).
+
+### Notes
+
+- `a2a/1` HTTP capability stays gated (separate transport, not wired to A2A
+  execution). Sandbox (container) delegation and home-only utility tasks remain on
+  Claude — documented follow-ups in `commercial/docs/RFC-25-multi-runtime-unlock.md`.
+
+
 ## [1.19.0] - 2026-06-16 — Memory Intelligence: Temporal Memory + Reflexion Loop + Batch Fetch
 
 Three W18/W19-designed memory features, implemented non-invasively on the live

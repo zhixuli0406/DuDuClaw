@@ -125,7 +125,12 @@ pub(crate) fn handle_agent_discover(id: &Value) -> Value {
 }
 
 /// Handle `tasks/send` — creates a task, runs the prompt, returns result.
-pub(crate) fn handle_tasks_send(id: &Value, params: &Value, task_manager: &mut A2ATaskManager) -> Value {
+pub(crate) async fn handle_tasks_send(
+    id: &Value,
+    params: &Value,
+    task_manager: &mut A2ATaskManager,
+    home_dir: &std::path::Path,
+) -> Value {
     let message = match params.get("message").and_then(|v| v.as_str()) {
         Some(m) => m,
         None => {
@@ -144,10 +149,11 @@ pub(crate) fn handle_tasks_send(id: &Value, params: &Value, task_manager: &mut A
     let task = task_manager.create_task(context_id, message);
     let task_id = task.id.clone();
 
-    // Run the prompt through the agent handler
-    let updates = handle_prompt_with_agent(&task_id, message, model);
+    // Run the prompt through the agent handler. `context_id` is the A2A target
+    // agent (RFC-25 Phase 3); "default" resolves to the main agent.
+    let updates = handle_prompt_with_agent(home_dir, context_id, &task_id, message, model).await;
 
-    // Extract the final response from updates
+    // Extract the final response from updates.
     let final_message = updates
         .iter()
         .rev()
@@ -160,8 +166,16 @@ pub(crate) fn handle_tasks_send(id: &Value, params: &Value, task_manager: &mut A
         })
         .unwrap_or_else(|| "No response generated".to_string());
 
-    // Complete the task with the result
-    task_manager.complete_task(&task_id, final_message.clone());
+    // Mark the task Completed or Failed based on whether execution errored, so
+    // a remote A2A peer can tell success from failure (RFC-25 Phase 3 audit fix).
+    let errored = updates
+        .iter()
+        .any(|u| matches!(u, super::types::SessionUpdate::Error { .. }));
+    if errored {
+        task_manager.fail_task(&task_id, final_message.clone());
+    } else {
+        task_manager.complete_task(&task_id, final_message.clone());
+    }
 
     // Build A2A-compatible response
     let task_snapshot = task_manager.get_task(&task_id);
@@ -229,7 +243,7 @@ fn handle_tasks_cancel(id: &Value, params: &Value, task_manager: &mut A2ATaskMan
 /// - `tasks/send` — creates and executes a task, returns result with artifacts
 /// - `tasks/get` — retrieves task status by ID
 /// - `tasks/cancel` — cancels a task by ID
-pub async fn run_acp_server(_home_dir: &Path) -> Result<()> {
+pub async fn run_acp_server(home_dir: &Path) -> Result<()> {
     info!("Starting DuDuClaw ACP server (A2A protocol over stdio)");
 
     let mut task_manager = A2ATaskManager::new();
@@ -275,7 +289,7 @@ pub async fn run_acp_server(_home_dir: &Path) -> Result<()> {
 
         let response = match method {
             "agent/discover" => handle_agent_discover(&id),
-            "tasks/send" => handle_tasks_send(&id, &params, &mut task_manager),
+            "tasks/send" => handle_tasks_send(&id, &params, &mut task_manager, home_dir).await,
             "tasks/get" => handle_tasks_get(&id, &params, &task_manager),
             "tasks/cancel" => handle_tasks_cancel(&id, &params, &mut task_manager),
             _ => jsonrpc_error(&id, -32601, &format!("Method not found: {method}")),
