@@ -2189,13 +2189,28 @@ async fn build_reply_with_session_inner(
                             let pre_metrics = crate::gvu::version_store::VersionMetrics::default();
                             let home = home_for_pred.clone();
 
-                            // LLM caller: uses claude CLI
+                            // LLM caller: RFC-25 Phase 2 — route GVU evolution through
+                            // the provider-agnostic choke-point so it honours the agent's
+                            // [runtime] provider and [model] utility instead of forcing Claude.
+                            let utility_model = crate::runtime_config::agent_utility_model(dir);
                             let call_llm = |prompt: String| {
                                 let h = home.clone();
+                                let d = dir.clone();
+                                let aid = agent_id_for_pred.clone();
+                                let model = utility_model.clone();
                                 async move {
-                                    crate::channel_reply::call_claude_cli_public(
-                                        &prompt, crate::runtime_config::DEFAULT_UTILITY_MODEL, "", &h,
-                                    ).await
+                                    crate::runtime_dispatch::run_agent_prompt_text(
+                                        crate::runtime_dispatch::AgentPrompt {
+                                            agent_dir: Some(&d),
+                                            home_dir: &h,
+                                            agent_id: &aid,
+                                            prompt: &prompt,
+                                            system_prompt: "",
+                                            model: &model,
+                                            max_tokens: 4096,
+                                        },
+                                    )
+                                    .await
                                 }
                             };
 
