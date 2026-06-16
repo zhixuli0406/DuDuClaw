@@ -55,19 +55,21 @@ observability. Same architecture standards as DuDuClaw.
 
 ---
 
-> 🎉 **v1.18.0 — Dashboard 預算／用量正確化 + 可靠度修補**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.18.0)）
+> 🎉 **v1.20.0 — RFC-25 多模型解鎖 + A2A**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.20.0)）
 >
-> Dashboard 的預算與用量改讀持久化的 `CostTelemetry` 帳本，不再讀那個一重建就歸零的記憶體計數，外加一輪 dashboard runtime bug 清掃。
+> 「Multi-Runtime 四後端」過去是**未編譯的孤兒程式碼**，每條執行路徑都寫死 Claude。v1.20.0 把它接上電，並讓所有呼叫 LLM 的子系統走單一 provider-agnostic choke-point。既有 agent 不受影響（預設 Claude）；agent 可透過 `agent.toml [runtime] provider` 選 Codex / Gemini / OpenAI-compat。
 >
-> - **預算／用量顯示真實數字** — 原本所有預算顯示都讀 `AccountRotator.spent_this_month`，但這個記憶體計數每 5 分鐘 rotator 重建就歸零、gateway 重啟也歸零、OAuth 訂閱帳號每次呼叫成本又是 0，而且每個 agent 都顯示「全帳號加總」同一個數字。改為從 `CostTelemetry`（持久 SQLite 帳本）讀本月至今用量：`agents.list` / `agents.inspect` 顯示**各 agent 自己的**月度用量，`accounts.budget_summary` 顯示真實全域總額
-> - **成本單位修正** — `cost_millicents` 欄位名是誤稱，實際存的就是整數 cents（用定價反推驗證：某筆 309 = $3.09）。移除 analytics 成本／節省顯示裡多餘的 `/10`（原本少報 10 倍）
-> - **`marketplace.install` 補實作** — 原本是回錯誤的 stub，改為把 catalog MCP server 安裝進指定 agent 的 `.mcp.json`，前端加上目標 agent 選擇對話框
-> - **設定持久化補洞** — `system.version` 回傳 `edition` 供 dashboard 判斷 Pro-only UI；`system.update_config` 把 `[voice]` 寫進 `inference.toml`、per-agent `[proactive]` 經 `agents.update` 存進 `agent.toml` 並由 `agents.inspect` 回填
-> - **前端修補** — 排程新增送出必要的 `name`+`task`（原本失敗）、MCP servers 以後端序列化的陣列形狀消費、新增 theme store + 語言切換接進 Header、補 88 個跨 `zh-TW` / `en` / `ja-JP` 的 i18n key、預算進度條除零防護、帳號靜默錯誤改以 toast 呈現
+> - **接通 runtime 抽象** — 新增 `RuntimeType` 解掉編譯阻塞，`runtime/` 四後端 + `failover` 首次成功編譯；`runtime_dispatch::run_agent_prompt` choke-point + 首次使用時 lazy 自動偵測的 `RuntimeRegistry`
+> - **channel reply / GVU / 子 agent 派工** — 非 Claude provider 走 choke-point；Claude 維持 OAuth 輪替 / PTY 最佳化路徑（零回歸）
+> - **A2A 真實執行** — ACP `tasks/send` 改為實際執行目標 agent（provider-aware），正確回報 Failed / Completed（原為 placeholder）
+> - **Phase 0 解鎖** — 拆掉 GVU 演化模型硬鎖（reject → warn），集中 utility model 設定為單一來源
+> - 稽核（/code-review）修掉 2 個真 bug（failover 過度匹配、A2A 永遠 completed），8 個非 Claude 路徑的已知限制記錄於 `commercial/docs/RFC-25-*`
 
 <details>
-<summary><strong>v1.9.4 → v1.17.x 累積亮點</strong></summary>
+<summary><strong>v1.9.4 → v1.19.x 累積亮點</strong></summary>
 
+- **v1.19.0** — Memory Intelligence：把 W18/W19 設計但未實作的記憶層非侵入式落地於現行 Rust `SqliteMemoryEngine`。**Temporal Memory**（`memories` 加時態 / 知識圖譜欄位 + `store_temporal` 自動取代鏈 + `get_history`/`get_at`，搜尋預設只回有效記憶）；**Reflexion Loop**（橋接既有 `MistakeNotebook`：召回注入答題 prompt + 同 category ≥3 固化成 semantic 規則）；**`memory_fetch_batch`** MCP 工具（依 ID 批次讀取 ≤100，namespace/ownership 隔離）。`MemoryEntry` 不動，零破壞
+- **v1.18.0** — Dashboard 預算／用量正確化：改讀持久化 `CostTelemetry` 帳本（取代一重建就歸零的記憶體計數），修 `cost_millicents` 單位誤稱、`marketplace.install` 補實作、設定持久化補洞、前端一輪 runtime bug 清掃 + 88 個 i18n key
 - **v1.17.0** — RFC-24 License v2.0（Open Core 基礎）：新 crate `duduclaw-license`（verification-only 客戶端，簽章金鑰留在 `commercial/duduclaw-license`），7 個 tier 繼承鏈 `OpenSource` / `Hobby` / `Solo` / `Studio` / `Business` / `SelfHostPro` / `Oem`，Ed25519 trust registry 由 `DUDUCLAW_LICENSE_PUBKEY_<ID>` env 種子化（空 registry fail-safe 退回 OpenSource）。Apache 2.0 核心**無限制可用**，付費訂閱解鎖 `commercial/*` 加值模組
 - **v1.16.0** — MCP Refresh Tokens + GVU `SoulPatchOp::Consolidate`：新模組 `mcp_refresh` 以 `~/.duduclaw/mcp_tokens.db` 後盾的長壽憑證（`ddc_refresh_<env>_<64hex>`、90 天、可撤銷、僅儲 hash），解決 Claude Desktop auth-fail 後靜默斷線不重試；GVU 新增 `SoulPatchOp::Consolidate` 變體帶「縮減不變式」，讓 SOUL.md 接近 150 行／8KB 硬上限時可自我觸發整合
 - **v1.15.2** — `agent_update_soul` 信賴後門封補：原本寫 SOUL.md 後沒呼叫 `soul_guard::accept_soul_change` 更新完整性 hash，每次合法呼叫都會留下永久 stored-vs-current drift；且整條呼叫鏈不寫 `tool_calls.jsonl`，後門對事後分析完全隱形。v1.15.2 補齊 audit row（成功 + 四種拒絕路徑都記，hash 前綴 16 字元）並在每次寫入後同步 fingerprint

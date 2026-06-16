@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import hashlib
 
-import pytest
 
 from duduclaw.memory_eval.db.snapshots import _sha256_hash
 

@@ -11,13 +11,12 @@ from __future__ import annotations
 
 import hashlib
 from datetime import date
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from duduclaw.memory_eval.client import Memory
 from duduclaw.memory_eval.db.snapshots import (
-    _sha256_hash,
     cleanup_old_snapshots,
     get_snapshot_stats,
     take_memory_snapshot,

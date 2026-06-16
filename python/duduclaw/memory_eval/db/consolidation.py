@@ -163,7 +163,6 @@ async def get_recent_consolidation_events(
     Returns:
         consolidation event dict list（含 epr_* cache columns）
     """
-    from datetime import timedelta, date
     since = datetime.now(timezone.utc) - __import__("datetime").timedelta(days=lookback_days)
 
     async with db_pool.acquire() as conn:

@@ -223,7 +223,6 @@ def test_locomo_config_post_init_reads_version(tmp_path: Path) -> None:
     )
 
     # Patch get_dataset_version 使用 tmp_path 的 VERSION 文件
-    import importlib
     import duduclaw.memory_eval.locomo_integrity_check as lic
     from unittest.mock import patch
 

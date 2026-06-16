@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from abc import ABC, abstractmethod
 from urllib.parse import urlparse
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from .config import EvalConfig

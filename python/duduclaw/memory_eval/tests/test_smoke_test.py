@@ -8,7 +8,6 @@ TDD RED 先寫測試，GREEN 再寫實作
 from __future__ import annotations
 
 import pytest
-from unittest.mock import AsyncMock
 
 from duduclaw.memory_eval.smoke_test import (
     run_smoke_test,
@@ -268,7 +267,6 @@ async def test_smoke_test_all_pass():
 @pytest.mark.asyncio
 async def test_smoke_test_partial_fail():
     """部分測試失敗 → all_passed = False"""
-    client = MockMemoryClient(pressure=-5.0)  # TC-3 會失敗
     client_with_empty = MockMemoryClient(
         search_results=[],
         pressure=-5.0,

@@ -19,7 +19,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .client import MemoryClient
-from .config import EvalConfig
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +106,8 @@ async def _tc_basic_store_and_retrieve(client: MemoryClient) -> SmokeTestResult:
     store_content = f"{test_token} smoke_test_user 最愛的食物是拉麵"
 
     try:
-        # Step 1: Store
-        mem_id = await client.store(
+        # Step 1: Store (return value unused — the side effect is what we test)
+        await client.store(
             content=store_content,
             tags=["smoke-test", "temp", "locomo-eval"],
             namespace="smoke_test_ns",

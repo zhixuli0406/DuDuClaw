@@ -8,7 +8,6 @@ W21 Sprint — ENG-MEMORY
 from __future__ import annotations
 
 import json
-import asyncio
 import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -451,8 +450,8 @@ def test_print_stats_zero_total(tmp_path: Path, capsys) -> None:
 
 def test_main_seed_run_success(tmp_path: Path) -> None:
     """--seed-run 且無錯誤時應返回 0，並寫入輸出"""
-    from duduclaw.memory_eval.build_golden_qa import GoldenQAPair, print_stats
-    from unittest.mock import patch, AsyncMock
+    from duduclaw.memory_eval.build_golden_qa import GoldenQAPair
+    from unittest.mock import patch
 
     jsonl = tmp_path / "input.jsonl"
     jsonl.write_text(

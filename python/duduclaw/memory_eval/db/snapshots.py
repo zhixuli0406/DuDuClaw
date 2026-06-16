@@ -11,8 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import date, datetime, timezone
-from typing import Optional
+from datetime import date
 
 import asyncpg
 

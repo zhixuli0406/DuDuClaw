@@ -28,7 +28,7 @@ import asyncio
 import json
 import logging
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -295,13 +295,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.stats_only:
         empty_count = sum(1 for p in pairs if not p.relevant_memory_ids)
         filled_count = len(pairs) - empty_count
-        print(f"\n=== Golden QA Set 統計 ===")
+        print("\n=== Golden QA Set 統計 ===")
         print(f"總計：           {len(pairs)}")
         print(f"已填入 IDs：     {filled_count}")
         print(f"待 seed run：   {empty_count}")
         coverage = filled_count / len(pairs) * 100 if pairs else 0.0
         print(f"覆蓋率：        {coverage:.1f}%")
-        print(f"=============================\n")
+        print("=============================\n")
         return 0
 
     if not args.seed_run:
