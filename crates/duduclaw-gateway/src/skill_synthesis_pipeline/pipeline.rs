@@ -411,7 +411,7 @@ async fn graduate_trajectories(
 
         let llm_result = call_direct_api(
             &api_key,
-            "claude-haiku-4-5", // Cost-efficient model per W19 spec
+            crate::runtime_config::DEFAULT_UTILITY_MODEL, // RFC-25 Phase 0: centralized utility model
             system,
             &prompt,
             &[],

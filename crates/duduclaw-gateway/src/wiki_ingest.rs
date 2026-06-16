@@ -410,7 +410,7 @@ pub async fn run_ingest(
 
             // Call Claude Haiku for extraction
             match crate::channel_reply::call_claude_cli_public(
-                &prompt, "claude-haiku-4-5", "", home_dir,
+                &prompt, crate::runtime_config::DEFAULT_UTILITY_MODEL, "", home_dir,
             ).await {
                 Ok(response) => {
                     let proposals = parse_cloud_ingest_response(&response);

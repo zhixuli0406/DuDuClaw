@@ -132,10 +132,56 @@ pub struct ModelConfig {
     /// or "auto" (CLI first for zero-cost OAuth, fallback to Direct API when rate-limited).
     #[serde(default = "default_api_mode")]
     pub api_mode: String,
+    /// Lightweight "utility" model for cheap internal tasks (session compression,
+    /// key-fact extraction, GVU evolution, summarization, skill synthesis).
+    /// Defaults to claude-haiku-4-5. (RFC-25 Phase 0 — replaces scattered literals.)
+    #[serde(default = "default_utility_model")]
+    pub utility: String,
 }
 
 fn default_api_mode() -> String {
     "cli".to_string()
+}
+
+fn default_utility_model() -> String {
+    "claude-haiku-4-5".to_string()
+}
+
+/// Which agent runtime backend executes a prompt (RFC-25 multi-runtime).
+///
+/// Used as the `RuntimeRegistry` key and parsed from `agent.toml [runtime] provider`.
+/// Defaults to [`RuntimeType::Claude`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeType {
+    #[default]
+    Claude,
+    Codex,
+    Gemini,
+    #[serde(rename = "openai_compat")]
+    OpenAiCompat,
+}
+
+impl RuntimeType {
+    /// Stable lowercase identifier (matches `agent.toml` values).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
+            Self::OpenAiCompat => "openai_compat",
+        }
+    }
+
+    /// Parse from a config string; unknown values fall back to [`RuntimeType::Claude`].
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "codex" => Self::Codex,
+            "gemini" => Self::Gemini,
+            "openai_compat" | "openai" | "openai-compat" => Self::OpenAiCompat,
+            _ => Self::Claude,
+        }
+    }
 }
 
 /// Configuration for a local LLM model (per-agent).
