@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 
 import asyncpg
 
-from .config import EvalConfig, LOCOMOConfig
+from .config import EvalConfig
 from .smoke_test import run_smoke_test
 from .retention_rate import compute_retention_rate, evaluate_rr_alerts
 from .retrieval_accuracy import compute_retrieval_accuracy, evaluate_ra_alerts

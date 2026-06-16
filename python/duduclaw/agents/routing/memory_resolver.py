@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from .resolution import ResolutionError, ResolutionResult, Resolver

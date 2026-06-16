@@ -57,18 +57,21 @@ observability. Same architecture standards as DuDuClaw.
 
 ---
 
-> 🎉 **v1.18.0 — Dashboard 予算／使用量の正確化 + 信頼性修正**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.18.0)）
+> 🎉 **v1.20.0 — RFC-25 マルチランタイム解放 + A2A**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.20.0)）
 >
-> Dashboard の予算と使用量を、再構築のたびにゼロに戻るメモリ上のカウンタではなく、永続化された `CostTelemetry` 台帳から読むように変更し、さらに dashboard ランタイムのバグを一通り掃除しました。
+> 「Multi-Runtime 四バックエンド」はこれまで**コンパイルされない孤立ソース**で、すべての実行パスが Claude をハードコードしていました。v1.20.0 はこれを配線し、LLM を呼ぶサブシステムを単一の provider-agnostic な choke-point に通します。既存 agent は影響を受けず（provider は既定で Claude）、agent は `agent.toml [runtime] provider` で Codex / Gemini / OpenAI-compat を選べます。
 >
-> - **予算／使用量が実数値を表示** — 従来はすべての予算表示が `AccountRotator.spent_this_month` を読んでいましたが、このメモリ上のカウンタは 5 分ごとに rotator が再構築されるとゼロに戻り、gateway 再起動でもゼロに戻り、OAuth サブスクリプションアカウントは呼び出しごとのコストが 0 で、しかもすべての agent が「全アカウント合計」という同じ数字を表示していました。これを `CostTelemetry`（永続 SQLite 台帳）から今月分の使用量を読むように変更：`agents.list` / `agents.inspect` は**各 agent 自身の**月次使用量を表示し、`accounts.budget_summary` は実際のグローバル合計を表示
-> - **コスト単位の修正** — `cost_millicents` というフィールド名は誤称で、実際に格納されているのは整数の cents です（価格から逆算して検証：あるレコードの 309 = $3.09）。analytics のコスト／節約表示にあった余計な `/10` を削除（従来は 10 倍少なく報告していた）
-> - **`marketplace.install` の実装補完** — 従来はエラーを返す stub でしたが、catalog の MCP server を指定した agent の `.mcp.json` にインストールするように変更し、フロントエンドにターゲット agent 選択ダイアログを追加
-> - **設定の永続化の穴埋め** — `system.version` は dashboard が Pro 限定 UI を判定できるよう `edition` を返す；`system.update_config` は `[voice]` を `inference.toml` に書き込み、per-agent の `[proactive]` は `agents.update` 経由で `agent.toml` に保存され `agents.inspect` で復元される
-> - **フロントエンドの修正** — スケジュール新規作成で必須の `name`+`task` を送信（従来は失敗）、MCP servers をバックエンドのシリアライズした配列の形で消費、theme store + 言語切替を Header に接続、`zh-TW` / `en` / `ja-JP` をまたぐ 88 個の i18n キーを補完、予算プログレスバーのゼロ除算ガード、アカウントのサイレントエラーを toast 表示に変更
+> - **ランタイム抽象を配線** — 新しい `RuntimeType` がコンパイル阻害を解消し、`runtime/` の四バックエンド + `failover` が初めてコンパイル成功；`runtime_dispatch::run_agent_prompt` choke-point + 初回使用時に遅延自動検出する `RuntimeRegistry`
+> - **channel reply / GVU / サブ agent 委譲** — 非 Claude provider は choke-point を通り、Claude は OAuth ローテーション / PTY 最適化パスを維持（リグレッションなし）
+> - **A2A 実行** — ACP `tasks/send` がターゲット agent を実際に実行（provider-aware）し、Failed / Completed を正しく報告（従来は placeholder）
+> - **Phase 0 解放** — GVU 進化モデルのハードロックを撤廃（reject → warn）、utility model 設定を単一ソースに集約
+> - 監査（/code-review）で実バグ 2 件（failover の過剰マッチ、A2A が常に completed）を修正。非 Claude パスの既知の制限 8 件を `commercial/docs/RFC-25-*` に記録
 
 <details>
-<summary><strong>v1.9.4 → v1.17.x 累積ハイライト</strong></summary>
+<summary><strong>v1.9.4 → v1.19.x 累積ハイライト</strong></summary>
+
+- **v1.19.0** — Memory Intelligence：W18/W19 で設計された記憶層を、現行の Rust `SqliteMemoryEngine` に非侵襲的に実装。**Temporal Memory**（`memories` に時態 / ナレッジグラフ列 + `store_temporal` の自動 supersession チェーン + `get_history`/`get_at`、検索は既定で有効な記憶のみ返す）；**Reflexion Loop**（既存の `MistakeNotebook` をブリッジ：回答プロンプトへのリコール注入 + 同カテゴリ ≥3 件を semantic ルールに統合）；**`memory_fetch_batch`** MCP ツール（ID 一括取得 ≤100、namespace/ownership 隔離）。`MemoryEntry` は不変、影響ゼロ
+- **v1.18.0** — Dashboard 予算／使用量の正確化：永続化された `CostTelemetry` 台帳から読む（再構築でゼロに戻るメモリカウンタを置換）、`cost_millicents` の単位誤称を修正、`marketplace.install` を実装、設定永続化の穴埋め、フロントエンドの runtime バグ掃除 + 88 個の i18n キー
 
 - **v1.17.0** — RFC-24 License v2.0（Open Core 基盤）：新 crate `duduclaw-license`（verification-only クライアント、署名鍵は `commercial/duduclaw-license` に保持）、7 つの tier 継承チェーン `OpenSource` / `Hobby` / `Solo` / `Studio` / `Business` / `SelfHostPro` / `Oem`、Ed25519 trust registry は `DUDUCLAW_LICENSE_PUBKEY_<ID>` env でシード化（空の registry は fail-safe で OpenSource に退避）。Apache 2.0 コアは**無制限で利用可能**、有料サブスクリプションが `commercial/*` 付加価値モジュールをアンロック
 - **v1.16.0** — MCP Refresh Tokens + GVU `SoulPatchOp::Consolidate`：新モジュール `mcp_refresh` は `~/.duduclaw/mcp_tokens.db` を後ろ盾とする長寿命クレデンシャル（`ddc_refresh_<env>_<64hex>`、90 日、失効可能、hash のみ保存）で、Claude Desktop が auth-fail 後にサイレント切断してリトライしない問題を解決；GVU には「縮小不変式」を伴う `SoulPatchOp::Consolidate` バリアントを追加し、SOUL.md が 150 行／8KB のハードリミットに近づいたとき自己トリガーで統合できるようにした

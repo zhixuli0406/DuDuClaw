@@ -17,7 +17,7 @@ from duduclaw.memory_eval.retention_rate import (
     compute_retention_rate,
     evaluate_rr_alerts,
 )
-from duduclaw.memory_eval.client import MemoryClient, Memory, SearchResult
+from duduclaw.memory_eval.client import MemoryClient, SearchResult
 from duduclaw.memory_eval.config import EvalConfig
 
 

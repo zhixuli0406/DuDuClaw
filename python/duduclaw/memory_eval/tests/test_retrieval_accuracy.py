@@ -7,21 +7,18 @@ Retrieval Accuracy P1 — unit tests
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock
 
 import pytest
 
 from duduclaw.memory_eval.retrieval_accuracy import (
     GoldenQAPair,
     RAResult,
-    RAQueryResult,
     compute_retrieval_accuracy,
     evaluate_ra_alerts,
     load_golden_qa_set,
 )
-from duduclaw.memory_eval.client import MemoryClient, Memory, SearchResult
+from duduclaw.memory_eval.client import MemoryClient, SearchResult
 from duduclaw.memory_eval.config import EvalConfig
 
 

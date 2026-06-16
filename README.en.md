@@ -57,18 +57,21 @@ infrastructure work.
 
 ---
 
-> 🎉 **v1.18.0 — Dashboard budget/usage correctness + reliability fixes** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.18.0))
+> 🎉 **v1.20.0 — RFC-25 Multi-Runtime Unlock + A2A** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.20.0))
 >
-> The Dashboard's budget and usage now read from the persistent `CostTelemetry` ledger instead of the in-memory counter that reset to zero on every rebuild, plus a round of dashboard runtime bug cleanup.
+> The "Multi-Runtime four-backend" abstraction was previously **orphan, uncompiled source** — every execution path hardcoded Claude. v1.20.0 wires it up and routes the LLM-calling subsystems through a single provider-agnostic choke-point. Existing agents are unaffected (provider defaults to Claude); agents can opt into Codex / Gemini / OpenAI-compat via `agent.toml [runtime] provider`.
 >
-> - **Budget/usage shows real numbers** — Previously every budget display read `AccountRotator.spent_this_month`, but this in-memory counter reset to zero every 5 minutes when the rotator was rebuilt, reset to zero on gateway restart, cost 0 per call for OAuth subscription accounts anyway, and showed the same "sum across all accounts" number for every agent. It now reads month-to-date usage from `CostTelemetry` (a persistent SQLite ledger): `agents.list` / `agents.inspect` show **each agent's own** monthly usage, and `accounts.budget_summary` shows the real global total
-> - **Cost unit fix** — The `cost_millicents` field name was a misnomer; what's actually stored is integer cents (verified by back-calculating from pricing: one record of 309 = $3.09). Removed the redundant `/10` in the analytics cost/savings display (which previously under-reported by 10x)
-> - **`marketplace.install` properly implemented** — Previously a stub that returned an error; it now installs the catalog MCP server into the specified agent's `.mcp.json`, with a target-agent selection dialog added to the frontend
-> - **Settings persistence gaps filled** — `system.version` returns `edition` so the dashboard can determine Pro-only UI; `system.update_config` writes `[voice]` into `inference.toml`, and per-agent `[proactive]` is saved into `agent.toml` via `agents.update` and backfilled by `agents.inspect`
-> - **Frontend fixes** — Scheduling now sends the required `name`+`task` on submit (previously failed), MCP servers are consumed in the backend-serialized array shape, added a theme store + wired language switching into the Header, added 88 i18n keys across `zh-TW` / `en` / `ja-JP`, budget progress bar division-by-zero guard, and account silent errors now surface as toasts
+> - **Wired the runtime abstraction** — new `RuntimeType` unblocks compilation; the `runtime/` four backends + `failover` compile for the first time; `runtime_dispatch::run_agent_prompt` choke-point + a lazily auto-detecting `RuntimeRegistry`
+> - **Channel reply / GVU / sub-agent delegation** — non-Claude providers route through the choke-point; Claude keeps its OAuth-rotation / PTY-optimized path (zero regression)
+> - **A2A real execution** — the ACP `tasks/send` now actually runs the target agent (provider-aware) and correctly reports Failed / Completed (was a placeholder)
+> - **Phase 0 unlock** — removed the GVU evolution-model hard-lock (reject → warn), centralized the utility-model config to a single source
+> - Audit (/code-review) fixed 2 real bugs (failover over-match, A2A always-completed); 8 known limitations of the non-Claude path documented in `commercial/docs/RFC-25-*`
 
 <details>
-<summary><strong>v1.9.4 → v1.17.x cumulative highlights</strong></summary>
+<summary><strong>v1.9.4 → v1.19.x cumulative highlights</strong></summary>
+
+- **v1.19.0** — Memory Intelligence: the W18/W19-designed memory layer, implemented non-invasively on the live Rust `SqliteMemoryEngine`. **Temporal Memory** (`memories` gains temporal / knowledge-graph columns + `store_temporal` automatic supersession chain + `get_history`/`get_at`; search default-filters to currently-valid memories); **Reflexion Loop** (bridges the existing `MistakeNotebook`: recall injected into the answering prompt + ≥3 same-category mistakes consolidated into a semantic rule); **`memory_fetch_batch`** MCP tool (fetch ≤100 entries by ID, namespace/ownership enforced). `MemoryEntry` unchanged, zero blast radius
+- **v1.18.0** — Dashboard budget/usage correctness: reads from the persistent `CostTelemetry` ledger (replacing the in-memory counter that reset to zero on rebuild), fixes the `cost_millicents` unit misnomer, implements `marketplace.install`, fills settings-persistence gaps, plus a round of frontend runtime-bug cleanup + 88 i18n keys
 
 - **v1.17.0** — RFC-24 License v2.0 (Open Core foundation): new crate `duduclaw-license` (verification-only client, signing keys stay in `commercial/duduclaw-license`), a 7-tier inheritance chain `OpenSource` / `Hobby` / `Solo` / `Studio` / `Business` / `SelfHostPro` / `Oem`, an Ed25519 trust registry seeded from `DUDUCLAW_LICENSE_PUBKEY_<ID>` env (empty registry fail-safe falls back to OpenSource). The Apache 2.0 core is **available without restriction**; paid subscriptions unlock the `commercial/*` value-add modules
 - **v1.16.0** — MCP Refresh Tokens + GVU `SoulPatchOp::Consolidate`: new module `mcp_refresh` provides long-lived credentials backed by `~/.duduclaw/mcp_tokens.db` (`ddc_refresh_<env>_<64hex>`, 90 days, revocable, hash-only storage), solving the silent disconnect-without-retry after Claude Desktop auth-fail; GVU adds a `SoulPatchOp::Consolidate` variant carrying a "shrink invariant" so SOUL.md can self-trigger consolidation as it approaches the 150-line / 8KB hard cap
