@@ -185,6 +185,14 @@ const TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
+        name: "memory_fetch_batch",
+        description: "Fetch multiple memory entries by their IDs in a single call (max 100)",
+        params: &[
+            ParamDef { name: "ids", description: "Array of memory entry UUIDs to fetch (max 100)", required: true },
+            ParamDef { name: "include_metadata", description: "Include full metadata (tags, layer, created_at). Default false", required: false },
+        ],
+    },
+    ToolDef {
         name: "memory_search_by_layer",
         description: "Search agent memory filtered by cognitive layer (episodic or semantic)",
         params: &[
@@ -6485,6 +6493,7 @@ pub(crate) async fn handle_tools_call(
         "memory_search" => crate::mcp_memory_handlers::handle_memory_search(&arguments, memory, ns_ctx).await,
         "memory_store"  => crate::mcp_memory_handlers::handle_memory_store(&arguments, memory, ns_ctx, daily_quota).await,
         "memory_read"   => crate::mcp_memory_handlers::handle_memory_read(&arguments, memory, ns_ctx).await,
+        "memory_fetch_batch" => crate::mcp_memory_handlers::handle_memory_fetch_batch(&arguments, memory, ns_ctx).await,
         "memory_search_by_layer" => handle_memory_search_by_layer(&arguments, memory, default_agent).await,
         "memory_successful_conversations" => handle_memory_successful_conversations(&arguments, memory, default_agent).await,
         "memory_episodic_pressure" => handle_memory_episodic_pressure(&arguments, memory, default_agent).await,

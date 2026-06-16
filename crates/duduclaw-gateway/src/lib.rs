@@ -66,6 +66,7 @@ pub mod log;
 pub mod metrics;
 pub mod gvu;
 pub mod prediction;
+pub mod reflexion;
 pub mod prompt_audit;
 pub mod prompt_compression;
 pub mod prompt_minimal;

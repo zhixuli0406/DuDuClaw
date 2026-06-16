@@ -363,7 +363,7 @@ pub fn parse_scopes(s: &str) -> Result<HashSet<Scope>, AuthError> {
 /// Returns None for unknown / unrestricted tools.
 pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
     match tool_name {
-        "memory_search" | "memory_read" => Some(Scope::MemoryRead),
+        "memory_search" | "memory_read" | "memory_fetch_batch" => Some(Scope::MemoryRead),
         "memory_store" => Some(Scope::MemoryWrite),
         "wiki_read" | "wiki_search" => Some(Scope::WikiRead),
         "wiki_write" => Some(Scope::WikiWrite),

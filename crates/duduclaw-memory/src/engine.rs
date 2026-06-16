@@ -55,6 +55,42 @@ impl Default for RetrievalWeights {
     }
 }
 
+/// Optional temporal / knowledge-graph metadata for a memory write (F1, v1.19.0).
+///
+/// When both `subject` and `predicate` are set, [`SqliteMemoryEngine::store_temporal`]
+/// performs automatic conflict resolution: any currently-valid memory with the
+/// same `(agent_id, subject, predicate)` is closed out (`valid_until = now`,
+/// `superseded_by` pointed at the new row) before the new row is inserted,
+/// forming a supersession chain. Without a full triple it behaves like a plain
+/// insert that also populates the extra columns.
+#[derive(Debug, Clone, Default)]
+pub struct TemporalMeta {
+    pub subject: Option<String>,
+    pub predicate: Option<String>,
+    pub object: Option<String>,
+    /// World-time the fact becomes valid. Defaults to "now" when `None`.
+    pub valid_from: Option<DateTime<Utc>>,
+    /// World-time the fact expires. `None` = still valid.
+    pub valid_until: Option<DateTime<Utc>>,
+    /// 0.0–1.0 confidence; defaults to 1.0 when `None`.
+    pub confidence: Option<f64>,
+    /// JSON metadata blob (e.g. source mistake ids for reflexion consolidation).
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// One node in a temporal supersession chain, returned by
+/// [`SqliteMemoryEngine::get_history`] (F1).
+#[derive(Debug, Clone, Serialize)]
+pub struct TemporalRecord {
+    pub id: String,
+    pub content: String,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub superseded_by: Option<String>,
+    pub supersedes: Option<String>,
+    pub confidence: f64,
+}
+
 /// SQLite-backed memory engine with FTS5 full-text search.
 ///
 /// Note: `list_recent()` is an inherent method (not on the `MemoryEngine` trait)
@@ -154,6 +190,253 @@ impl SqliteMemoryEngine {
         }
     }
 
+    /// Fetch multiple memory entries by ID for a single agent in one query (F3).
+    ///
+    /// Ownership is enforced identically to [`get_by_id`]: only entries owned by
+    /// `agent_id` are returned. IDs that don't exist **or** belong to another
+    /// agent are simply absent from the result — callers diff against the
+    /// requested IDs to find misses (no existence leak between the two cases).
+    /// `ids` is capped at 100 per call.
+    pub async fn get_by_ids(
+        &self,
+        agent_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<MemoryEntry>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if ids.len() > 100 {
+            return Err(DuDuClawError::Memory(
+                "batch fetch limited to 100 ids per request".to_string(),
+            ));
+        }
+        let conn = self.conn.lock().await;
+        // Build a "?,?,?" placeholder list for the IN clause (one per id).
+        let placeholders = std::iter::repeat("?")
+            .take(ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT {cols} FROM memories AS m WHERE m.agent_id = ? AND m.id IN ({ph})",
+            cols = Self::SELECT_COLS,
+            ph = placeholders
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        // Bind agent_id first (the leading `?`), then every requested id.
+        let mut bind: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 1);
+        bind.push(&agent_id);
+        for id in ids {
+            bind.push(id);
+        }
+
+        let rows = stmt
+            .query_map(bind.as_slice(), Self::row_to_entry)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+        }
+        Ok(entries)
+    }
+
+    /// Store a memory with temporal / knowledge-graph metadata and automatic
+    /// conflict resolution (F1, v1.19.0).
+    ///
+    /// If `meta` carries both `subject` and `predicate`, any currently-valid
+    /// memory with the same triple is superseded (its `valid_until` is set to
+    /// now and `superseded_by` points at this new row). Without a full triple
+    /// this is a plain insert that also populates the temporal columns.
+    /// Returns the stored entry id.
+    pub async fn store_temporal(
+        &self,
+        agent_id: &str,
+        entry: MemoryEntry,
+        meta: TemporalMeta,
+    ) -> Result<String> {
+        let conn = self.conn.lock().await;
+
+        let now = Utc::now();
+        let valid_from = meta.valid_from.unwrap_or(now).to_rfc3339();
+        let valid_until = meta.valid_until.map(|t| t.to_rfc3339());
+        let confidence = meta.confidence.unwrap_or(1.0);
+        let metadata = meta
+            .metadata
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "{}".to_string());
+
+        // ── Conflict resolution: only when a full triple is supplied ──────────
+        let mut supersedes: Option<String> = None;
+        if let (Some(subj), Some(pred)) = (meta.subject.as_ref(), meta.predicate.as_ref()) {
+            let existing: Vec<String> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id FROM memories
+                         WHERE agent_id = ?1 AND subject = ?2 AND predicate = ?3
+                           AND valid_until IS NULL",
+                    )
+                    .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+                let rows = stmt
+                    .query_map(params![agent_id, subj, pred], |r| r.get::<_, String>(0))
+                    .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+                let mut v = Vec::new();
+                for r in rows {
+                    v.push(r.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+                }
+                v
+            };
+            if existing.len() > 1 {
+                warn!(
+                    agent_id,
+                    subject = %subj,
+                    predicate = %pred,
+                    count = existing.len(),
+                    "multiple active memories for the same triple — superseding all"
+                );
+            }
+            let now_str = now.to_rfc3339();
+            for old_id in &existing {
+                conn.execute(
+                    "UPDATE memories SET valid_until = ?1, superseded_by = ?2 WHERE id = ?3",
+                    params![now_str, entry.id, old_id],
+                )
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            }
+            // Record the most-recent superseded id for the new row's back-pointer.
+            supersedes = existing.into_iter().next();
+        }
+
+        let tags_json = serde_json::to_string(&entry.tags)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let timestamp_str = entry.timestamp.to_rfc3339();
+        let last_accessed_str = entry.last_accessed.map(|t| t.to_rfc3339());
+
+        conn.execute(
+            "INSERT INTO memories
+                (id, agent_id, content, timestamp, tags, layer, importance, access_count,
+                 last_accessed, source_event,
+                 valid_from, valid_until, superseded_by, supersedes,
+                 subject, predicate, object, confidence, metadata)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+            params![
+                entry.id, agent_id, entry.content, timestamp_str, tags_json,
+                entry.layer.as_str(), entry.importance, entry.access_count,
+                last_accessed_str, entry.source_event,
+                valid_from, valid_until, Option::<String>::None, supersedes,
+                meta.subject, meta.predicate, meta.object, confidence, metadata
+            ],
+        )
+        .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        conn.execute(
+            "INSERT INTO memories_fts (content, agent_id, memory_id) VALUES (?1, ?2, ?3)",
+            params![entry.content, agent_id, entry.id],
+        )
+        .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        info!(agent_id, entry_id = %entry.id, "temporal memory stored");
+        Ok(entry.id)
+    }
+
+    /// Return the full supersession chain for a `(subject, predicate)` pair,
+    /// oldest → newest, including expired/superseded rows (F1).
+    pub async fn get_history(
+        &self,
+        agent_id: &str,
+        subject: &str,
+        predicate: &str,
+    ) -> Result<Vec<TemporalRecord>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, content, valid_from, valid_until, superseded_by, supersedes, confidence
+                 FROM memories
+                 WHERE agent_id = ?1 AND subject = ?2 AND predicate = ?3
+                 ORDER BY COALESCE(valid_from, timestamp) ASC",
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![agent_id, subject, predicate], |r| {
+                Ok(TemporalRecord {
+                    id: r.get(0)?,
+                    content: r.get(1)?,
+                    valid_from: r.get(2)?,
+                    valid_until: r.get(3)?,
+                    superseded_by: r.get(4)?,
+                    supersedes: r.get(5)?,
+                    confidence: r.get::<_, Option<f64>>(6)?.unwrap_or(1.0),
+                })
+            })
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    /// Point-in-time lookup for a triple: the memory valid at instant `at`
+    /// (`valid_from <= at AND (valid_until IS NULL OR valid_until > at)`) (F1).
+    /// Engine-only for v1.19.0 (not exposed over MCP yet).
+    pub async fn get_at(
+        &self,
+        agent_id: &str,
+        subject: &str,
+        predicate: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Option<TemporalRecord>> {
+        let conn = self.conn.lock().await;
+        let at_str = at.to_rfc3339();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, content, valid_from, valid_until, superseded_by, supersedes, confidence
+                 FROM memories
+                 WHERE agent_id = ?1 AND subject = ?2 AND predicate = ?3
+                   AND COALESCE(valid_from, timestamp) <= ?4
+                   AND (valid_until IS NULL OR valid_until > ?4)
+                 ORDER BY COALESCE(valid_from, timestamp) DESC
+                 LIMIT 1",
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let mut rows = stmt
+            .query_map(params![agent_id, subject, predicate, at_str], |r| {
+                Ok(TemporalRecord {
+                    id: r.get(0)?,
+                    content: r.get(1)?,
+                    valid_from: r.get(2)?,
+                    valid_until: r.get(3)?,
+                    superseded_by: r.get(4)?,
+                    supersedes: r.get(5)?,
+                    confidence: r.get::<_, Option<f64>>(6)?.unwrap_or(1.0),
+                })
+            })
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        match rows.next() {
+            Some(r) => Ok(Some(r.map_err(|e| DuDuClawError::Memory(e.to_string()))?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Count currently-valid memories for an agent filtered by tag substring
+    /// (F2b helper). Matches against the JSON-encoded `tags` column.
+    pub async fn count_active_with_tag(&self, agent_id: &str, tag: &str) -> Result<u32> {
+        let conn = self.conn.lock().await;
+        let like = format!("%\"{}\"%", tag.replace('"', ""));
+        let n: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories
+                 WHERE agent_id = ?1 AND valid_until IS NULL AND tags LIKE ?2",
+                params![agent_id, like],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        Ok(n)
+    }
+
     /// Search memories filtered by cognitive layer.
     ///
     /// Same as `search()` but restricted to a specific layer (episodic/semantic).
@@ -175,6 +458,9 @@ impl SqliteMemoryEngine {
             return Ok(Vec::new());
         }
         let sanitized_query = format!("\"{}\"", cleaned.replace('"', ""));
+        // RFC3339 "now" bound as a param: comparing against datetime('now')
+        // (space-separated, no offset) would mis-sort vs our RFC3339 strings.
+        let now_rfc = Utc::now().to_rfc3339();
 
         let sql = format!(
             "SELECT {cols}
@@ -183,8 +469,9 @@ impl SqliteMemoryEngine {
              WHERE f.memories_fts MATCH ?1
                AND f.agent_id = ?2
                AND m.layer = ?3
+               AND (m.valid_until IS NULL OR m.valid_until > ?4)
              ORDER BY rank
-             LIMIT ?4",
+             LIMIT ?5",
             cols = Self::SELECT_COLS
         );
         let mut stmt = conn
@@ -192,7 +479,7 @@ impl SqliteMemoryEngine {
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
         let rows = stmt
-            .query_map(params![sanitized_query, agent_id, layer.as_str(), limit as i64], Self::row_to_entry)
+            .query_map(params![sanitized_query, agent_id, layer.as_str(), now_rfc, limit as i64], Self::row_to_entry)
             .map_err(|e| {
                 tracing::warn!("FTS5 layer search error: {e}");
                 DuDuClawError::Memory("Search query error".to_string())
@@ -389,6 +676,19 @@ impl SqliteMemoryEngine {
             "ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE memories ADD COLUMN last_accessed TEXT",
             "ALTER TABLE memories ADD COLUMN source_event TEXT DEFAULT ''",
+            // ── F1 Temporal Memory columns (v1.19.0) ──
+            // All nullable / constant-default so ALTER ADD COLUMN is legal on
+            // existing rows. NULL valid_from ⇒ fall back to `timestamp`;
+            // NULL valid_until ⇒ still valid.
+            "ALTER TABLE memories ADD COLUMN valid_from TEXT",
+            "ALTER TABLE memories ADD COLUMN valid_until TEXT",
+            "ALTER TABLE memories ADD COLUMN superseded_by TEXT",
+            "ALTER TABLE memories ADD COLUMN supersedes TEXT",
+            "ALTER TABLE memories ADD COLUMN subject TEXT",
+            "ALTER TABLE memories ADD COLUMN predicate TEXT",
+            "ALTER TABLE memories ADD COLUMN object TEXT",
+            "ALTER TABLE memories ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0",
+            "ALTER TABLE memories ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'",
         ];
         for sql in &migrations {
             match conn.execute_batch(sql) {
@@ -400,6 +700,17 @@ impl SqliteMemoryEngine {
                 }
             }
         }
+
+        // Temporal indexes — created AFTER the ALTERs so the columns exist on
+        // upgraded databases (F1). `idx_memories_triple` only indexes currently
+        // valid rows to keep conflict-resolution lookups cheap.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_memories_triple
+                 ON memories(agent_id, subject, predicate) WHERE valid_until IS NULL;
+             CREATE INDEX IF NOT EXISTS idx_memories_valid
+                 ON memories(agent_id, valid_until);",
+        )
+        .map_err(|e| DuDuClawError::Memory(format!("temporal index: {e}")))?;
 
         Ok(())
     }
@@ -514,14 +825,18 @@ impl MemoryEngine for SqliteMemoryEngine {
         // Use FTS5 MATCH to find relevant memory ids, then join back for full rows.
         // Retrieve more candidates than needed for post-retrieval re-ranking by importance.
         let fetch_limit = (limit * 4).max(20);
+        // RFC3339 "now" bound as a param (see search_layer for rationale): default
+        // search returns only currently-valid memories (F1 temporal filter).
+        let now_rfc = Utc::now().to_rfc3339();
         let sql = format!(
             "SELECT {cols}
              FROM memories_fts AS f
              JOIN memories AS m ON m.id = f.memory_id
              WHERE f.memories_fts MATCH ?1
                AND f.agent_id = ?2
+               AND (m.valid_until IS NULL OR m.valid_until > ?3)
              ORDER BY rank
-             LIMIT ?3",
+             LIMIT ?4",
             cols = Self::SELECT_COLS
         );
         let mut stmt = conn
@@ -529,7 +844,7 @@ impl MemoryEngine for SqliteMemoryEngine {
             .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
         let rows = stmt
-            .query_map(params![sanitized_query, agent_id, fetch_limit as i64], Self::row_to_entry)
+            .query_map(params![sanitized_query, agent_id, now_rfc, fetch_limit as i64], Self::row_to_entry)
             .map_err(|e| {
                 // Don't leak schema details — return generic error (BE-H2)
                 tracing::warn!("FTS5 search error: {e}");
@@ -986,5 +1301,223 @@ mod tests {
             result.is_none(),
             "cross-agent get_by_id must return None (ownership enforcement)"
         );
+    }
+
+    // ── get_by_ids (F3 batch fetch) tests ──────────────────────────────────────
+
+    /// Batch fetch returns all requested entries; order-independent partial hit.
+    #[tokio::test]
+    async fn get_by_ids_partial_hit() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "batch-agent";
+        let e1 = make_entry(agent, "first", vec![]);
+        let e2 = make_entry(agent, "second", vec![]);
+        let id1 = e1.id.clone();
+        let id2 = e2.id.clone();
+        engine.store(agent, e1).await.unwrap();
+        engine.store(agent, e2).await.unwrap();
+
+        let ids = vec![id1.clone(), "missing-id".to_string(), id2.clone()];
+        let found = engine.get_by_ids(agent, &ids).await.unwrap();
+        assert_eq!(found.len(), 2, "two of three ids should be found");
+        let found_ids: std::collections::HashSet<_> = found.iter().map(|e| e.id.clone()).collect();
+        assert!(found_ids.contains(&id1) && found_ids.contains(&id2));
+    }
+
+    /// Empty input returns empty result (not an error).
+    #[tokio::test]
+    async fn get_by_ids_empty_returns_empty() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let found = engine.get_by_ids("agent", &[]).await.unwrap();
+        assert!(found.is_empty());
+    }
+
+    /// All-missing returns empty (not an error).
+    #[tokio::test]
+    async fn get_by_ids_all_missing() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let ids = vec!["nope-1".to_string(), "nope-2".to_string()];
+        let found = engine.get_by_ids("agent", &ids).await.unwrap();
+        assert!(found.is_empty());
+    }
+
+    /// Cross-agent isolation: agent-b cannot batch-fetch agent-a's entries.
+    #[tokio::test]
+    async fn get_by_ids_cross_agent_isolation() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let e = make_entry("agent-a", "secret", vec![]);
+        let id = e.id.clone();
+        engine.store("agent-a", e).await.unwrap();
+
+        let found = engine.get_by_ids("agent-b", &[id]).await.unwrap();
+        assert!(found.is_empty(), "cross-agent batch fetch must return nothing");
+    }
+
+    /// Exceeding 100 ids returns an error.
+    #[tokio::test]
+    async fn get_by_ids_over_limit_errors() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let ids: Vec<String> = (0..101).map(|i| format!("id-{i}")).collect();
+        let result = engine.get_by_ids("agent", &ids).await;
+        assert!(result.is_err(), "more than 100 ids must error");
+    }
+
+    // ── F1 Temporal Memory tests ───────────────────────────────────────────────
+
+    fn triple_meta(subject: &str, predicate: &str, object: &str) -> TemporalMeta {
+        TemporalMeta {
+            subject: Some(subject.to_string()),
+            predicate: Some(predicate.to_string()),
+            object: Some(object.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Writing the same (subject, predicate) twice supersedes the old row:
+    /// old gets valid_until + superseded_by; new gets supersedes back-pointer.
+    #[tokio::test]
+    async fn store_temporal_supersedes_same_triple() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "temporal-agent";
+
+        let e1 = make_entry(agent, "user prefers python", vec![]);
+        let id1 = engine
+            .store_temporal(agent, e1, triple_meta("user:main", "prefers_language", "python"))
+            .await
+            .unwrap();
+
+        let e2 = make_entry(agent, "user prefers typescript", vec![]);
+        let id2 = engine
+            .store_temporal(agent, e2, triple_meta("user:main", "prefers_language", "typescript"))
+            .await
+            .unwrap();
+
+        let history = engine
+            .get_history(agent, "user:main", "prefers_language")
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 2, "both rows present in history");
+        // Oldest first.
+        assert_eq!(history[0].id, id1);
+        assert_eq!(history[1].id, id2);
+        // Old row closed out, pointing at the new one.
+        assert!(history[0].valid_until.is_some(), "old row must expire");
+        assert_eq!(history[0].superseded_by.as_deref(), Some(id2.as_str()));
+        // New row still valid, back-pointer set.
+        assert!(history[1].valid_until.is_none(), "new row must be valid");
+        assert_eq!(history[1].supersedes.as_deref(), Some(id1.as_str()));
+    }
+
+    /// Default search returns only currently-valid memories (superseded excluded).
+    #[tokio::test]
+    async fn search_excludes_superseded() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "temporal-search";
+
+        let e1 = make_entry(agent, "alpha keyword python rust", vec![]);
+        engine
+            .store_temporal(agent, e1, triple_meta("s", "p", "old"))
+            .await
+            .unwrap();
+        let e2 = make_entry(agent, "alpha keyword python rust", vec![]);
+        let id2 = engine
+            .store_temporal(agent, e2, triple_meta("s", "p", "new"))
+            .await
+            .unwrap();
+
+        let results = engine.search(agent, "alpha", 10).await.unwrap();
+        assert_eq!(results.len(), 1, "only the active row is returned");
+        assert_eq!(results[0].id, id2);
+    }
+
+    /// Explicitly-expired memory (valid_until in the past) is filtered out.
+    #[tokio::test]
+    async fn search_excludes_expired() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "expiry-agent";
+        let e = make_entry(agent, "ephemeral zzzkeyword", vec![]);
+        let meta = TemporalMeta {
+            valid_until: Some(Utc::now() - Duration::hours(1)),
+            ..Default::default()
+        };
+        engine.store_temporal(agent, e, meta).await.unwrap();
+
+        let results = engine.search(agent, "zzzkeyword", 10).await.unwrap();
+        assert!(results.is_empty(), "expired memory must not be returned");
+    }
+
+    /// Point-in-time lookup returns the row valid at that instant.
+    #[tokio::test]
+    async fn get_at_returns_point_in_time() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "pit-agent";
+
+        let t0 = Utc::now() - Duration::days(10);
+        let e1 = make_entry(agent, "python era", vec![]);
+        let m1 = TemporalMeta {
+            valid_from: Some(t0),
+            ..triple_meta("user", "lang", "python")
+        };
+        engine.store_temporal(agent, e1, m1).await.unwrap();
+
+        // Switch happens "now"; supersession closes the python row at now.
+        let e2 = make_entry(agent, "typescript era", vec![]);
+        engine
+            .store_temporal(agent, e2, triple_meta("user", "lang", "typescript"))
+            .await
+            .unwrap();
+
+        // 5 days ago → python was valid.
+        let mid = Utc::now() - Duration::days(5);
+        let at = engine.get_at(agent, "user", "lang", mid).await.unwrap();
+        assert!(at.is_some());
+        assert_eq!(at.unwrap().content, "python era");
+    }
+
+    /// store_temporal without a triple behaves like a plain insert (still searchable).
+    #[tokio::test]
+    async fn store_temporal_without_triple_is_plain_insert() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "plain-agent";
+        let e = make_entry(agent, "plain temporal content findme", vec![]);
+        engine
+            .store_temporal(agent, e, TemporalMeta::default())
+            .await
+            .unwrap();
+        let results = engine.search(agent, "findme", 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    /// Plain `store()` (no temporal columns) coexists and is searchable — the
+    /// temporal filter treats NULL valid_until as valid (backward compatible).
+    #[tokio::test]
+    async fn plain_store_still_searchable_after_temporal_migration() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "compat-agent";
+        engine
+            .store(agent, make_entry(agent, "legacy row keyword qwerty", vec![]))
+            .await
+            .unwrap();
+        let results = engine.search(agent, "qwerty", 10).await.unwrap();
+        assert_eq!(results.len(), 1, "legacy NULL-valid_until rows remain visible");
+    }
+
+    /// count_active_with_tag counts only valid rows whose tags contain the tag.
+    #[tokio::test]
+    async fn count_active_with_tag_counts_valid_only() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "tag-count";
+        for _ in 0..3 {
+            engine
+                .store(agent, make_entry(agent, "x", vec!["reflexion".to_string()]))
+                .await
+                .unwrap();
+        }
+        engine
+            .store(agent, make_entry(agent, "y", vec!["other".to_string()]))
+            .await
+            .unwrap();
+        let n = engine.count_active_with_tag(agent, "reflexion").await.unwrap();
+        assert_eq!(n, 3);
     }
 }
