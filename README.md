@@ -36,6 +36,25 @@ observability. Same architecture standards as DuDuClaw.
 
 ---
 
+## 為什麼選 DuDuClaw，而不是直接用原生 Claude / GPT / Gemini CLI？
+
+如果你只是偶爾以個人身分使用單一 LLM，原生 CLI 已經很好用。
+但一旦你要把東西推上生產環境，很快就會發現自己在重造 DuDuClaw 早就提供好的東西：
+
+| 需求 | 原生 CLI | DuDuClaw |
+|---|---|---|
+| 多 LLM 自動容錯切換 | 手動重啟 | 內建（4 種策略） |
+| 切換 LLM 時保留上下文 | 遺失 | 完整保留 |
+| 工具跨 LLM 共用 | 每個 LLM 重寫 | 寫一次，到處共用 |
+| 生產級韌性（DLQ／重試／可觀測性） | 自己造 | 內建 |
+| 多通道（Telegram／LINE／Discord／…） | 僅限 CLI | 7 種通道 |
+| 機密管理／稽核／PII 遮蔽 | 自己造 | 內建 |
+
+如果你只是偶爾單獨用 `claude` 或 `gemini` — 用原生就好。
+如果你要打造**生產級的多 LLM Agent 系統** — DuDuClaw 幫你省下 3 個月的基礎設施工作。
+
+---
+
 > 🎉 **v1.18.0 — Dashboard 預算／用量正確化 + 可靠度修補**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.18.0)）
 >
 > Dashboard 的預算與用量改讀持久化的 `CostTelemetry` 帳本，不再讀那個一重建就歸零的記憶體計數，外加一輪 dashboard runtime bug 清掃。
