@@ -345,6 +345,33 @@ pub async fn call_claude_for_agent_with_type(
     // agent-structure files outside <home>/agents/<name>/.
     // Best-effort — logs warning on failure and continues.
     let agent_dir = home_dir.join("agents").join(agent_id);
+
+    // RFC-25 Phase 2: when the delegated agent's [runtime] provider is not
+    // Claude, route the whole task through the provider-agnostic choke-point
+    // (Codex / Gemini / OpenAI-compat). Claude keeps the optimized rotation +
+    // local/hybrid path below. This makes sub-agent delegation respect the
+    // responding agent's runtime — and is the foundation A2A (Phase 3) builds on.
+    let runtime_provider = crate::runtime_config::agent_runtime_provider(&agent_dir);
+    if runtime_provider != duduclaw_core::types::RuntimeType::Claude {
+        info!(
+            agent = %agent_id,
+            provider = runtime_provider.as_str(),
+            "delegation: routing through multi-runtime choke-point (non-Claude provider)"
+        );
+        return crate::runtime_dispatch::run_agent_prompt_text(
+            crate::runtime_dispatch::AgentPrompt {
+                agent_dir: Some(&agent_dir),
+                home_dir,
+                agent_id,
+                prompt,
+                system_prompt: &system_prompt,
+                model: &claude_model,
+                max_tokens: 8192,
+            },
+        )
+        .await;
+    }
+
     if agent_dir.exists() {
         let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
         if let Err(e) = crate::agent_hook_installer::ensure_agent_hook_settings(&agent_dir, &bin).await {
