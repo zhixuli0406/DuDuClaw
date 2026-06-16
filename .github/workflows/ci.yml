@@ -34,7 +34,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libwayland-dev libxcb1-dev libxcb-randr0-dev \
-            libxrandr-dev libdbus-1-dev libgbm-dev libpipewire-0.3-dev
+            libxrandr-dev libdbus-1-dev libgbm-dev libpipewire-0.3-dev \
+            libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev libdrm-dev
       - name: Stub dashboard assets for compile
         # `duduclaw-cli` has `default = ["dashboard"]`, so the workspace build
         # compiles `duduclaw-dashboard` (via cli) even though it's `--exclude`d
@@ -79,7 +80,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libwayland-dev libxcb1-dev libxcb-randr0-dev \
-            libxrandr-dev libdbus-1-dev libgbm-dev libpipewire-0.3-dev
+            libxrandr-dev libdbus-1-dev libgbm-dev libpipewire-0.3-dev \
+            libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev libdrm-dev
       - name: Install frontend dependencies
         run: cd web && npm ci --legacy-peer-deps
       - name: TypeScript check
@@ -100,7 +102,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dev dependencies
-        run: pip install pytest==8.3.4 pytest-asyncio==0.24.0 ruff==0.8.6
+        # pytest/ruff toolchain + the package's runtime deps (pyyaml/httpx/anthropic)
+        # that the test modules import.
+        run: pip install pytest==8.3.4 pytest-asyncio==0.24.0 ruff==0.8.6 pyyaml>=6.0 httpx>=0.27 anthropic>=0.40
       - name: Lint
         run: ruff check python/
       - name: Test
