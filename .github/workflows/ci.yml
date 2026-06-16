@@ -34,7 +34,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libwayland-dev libxcb1-dev libxcb-randr0-dev \
-            libxrandr-dev libdbus-1-dev libgbm-dev
+            libxrandr-dev libdbus-1-dev libgbm-dev libpipewire-0.3-dev
       - name: Stub dashboard assets for compile
         # `duduclaw-cli` has `default = ["dashboard"]`, so the workspace build
         # compiles `duduclaw-dashboard` (via cli) even though it's `--exclude`d
@@ -79,7 +79,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libwayland-dev libxcb1-dev libxcb-randr0-dev \
-            libxrandr-dev libdbus-1-dev libgbm-dev
+            libxrandr-dev libdbus-1-dev libgbm-dev libpipewire-0.3-dev
       - name: Install frontend dependencies
         run: cd web && npm ci --legacy-peer-deps
       - name: TypeScript check
