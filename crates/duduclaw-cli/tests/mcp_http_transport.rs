@@ -40,12 +40,16 @@ fn make_home_with_key(key: &str, client_id: &str, scopes: &[&str]) -> TempDir {
         .map(|s| format!("\"{s}\""))
         .collect::<Vec<_>>()
         .join(", ");
+    // Use a fresh timestamp: keys expire after 30 days (mcp_auth.rs), so a
+    // hardcoded date becomes a time-bomb that fails these tests once it ages
+    // past the rotation window. Generate "now" so the key is always valid.
+    let created_at = chrono::Utc::now().to_rfc3339();
     let content = format!(
         r#"
 [mcp_keys."{key}"]
 client_id = "{client_id}"
 scopes = [{scopes_toml}]
-created_at = "2026-05-01T00:00:00Z"
+created_at = "{created_at}"
 is_external = true
 "#
     );
