@@ -51,3 +51,6 @@ line-length = 100
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests/python"]
+# The `duduclaw` package lives under python/; put it on sys.path so
+# `from duduclaw...` imports resolve without an editable install or PYTHONPATH.
+pythonpath = ["python"]
