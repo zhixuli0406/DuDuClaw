@@ -1288,31 +1288,59 @@ async fn build_reply_with_session_inner(
         );
     }
 
+    // RFC-25 Phase 1: provider-agnostic routing. When the agent's
+    // `[runtime] provider` is not Claude, route the whole reply through the
+    // multi-runtime choke-point (Codex / Gemini / OpenAI-compat). Claude keeps
+    // its optimized OAuth-rotation + PTY path below (unchanged, zero regression).
+    let runtime_provider = agent_dir
+        .as_deref()
+        .map(crate::runtime_config::agent_runtime_provider)
+        .unwrap_or_default();
+
     let cli_future: std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>,
-    > = match runtime_mode {
-        crate::pty_runtime::RuntimeMode::PtyPool => Box::pin(call_claude_cli_pty_rotated(
-            &effective_message,
-            &model,
-            &full_system_prompt,
-            &ctx.home_dir,
-            agent_dir.as_deref(),
-            on_progress.as_ref(),
-            capabilities.as_ref(),
-            if has_history { Some(session_id) } else { None },
-            &conversation_history,
-        )),
-        crate::pty_runtime::RuntimeMode::FreshSpawn => Box::pin(call_claude_cli_rotated(
-            &effective_message,
-            &model,
-            &full_system_prompt,
-            &ctx.home_dir,
-            agent_dir.as_deref(),
-            on_progress.as_ref(),
-            capabilities.as_ref(),
-            if has_history { Some(session_id) } else { None },
-            &conversation_history,
-        )),
+    > = if runtime_provider != duduclaw_core::types::RuntimeType::Claude {
+        info!(
+            agent_id = %agent_id,
+            provider = runtime_provider.as_str(),
+            "channel_reply: routing through multi-runtime choke-point (non-Claude provider)"
+        );
+        Box::pin(crate::runtime_dispatch::run_agent_prompt_text(
+            crate::runtime_dispatch::AgentPrompt {
+                agent_dir: agent_dir.as_deref(),
+                home_dir: &ctx.home_dir,
+                agent_id: &agent_id,
+                prompt: &effective_message,
+                system_prompt: &full_system_prompt,
+                model: &model,
+                max_tokens: 8192,
+            },
+        ))
+    } else {
+        match runtime_mode {
+            crate::pty_runtime::RuntimeMode::PtyPool => Box::pin(call_claude_cli_pty_rotated(
+                &effective_message,
+                &model,
+                &full_system_prompt,
+                &ctx.home_dir,
+                agent_dir.as_deref(),
+                on_progress.as_ref(),
+                capabilities.as_ref(),
+                if has_history { Some(session_id) } else { None },
+                &conversation_history,
+            )),
+            crate::pty_runtime::RuntimeMode::FreshSpawn => Box::pin(call_claude_cli_rotated(
+                &effective_message,
+                &model,
+                &full_system_prompt,
+                &ctx.home_dir,
+                agent_dir.as_deref(),
+                on_progress.as_ref(),
+                capabilities.as_ref(),
+                if has_history { Some(session_id) } else { None },
+                &conversation_history,
+            )),
+        }
     };
     let is_channel_session = duduclaw_core::SUPPORTED_CHANNEL_TYPES.iter()
         .any(|t| session_id.starts_with(&format!("{t}:")));
@@ -1568,7 +1596,7 @@ async fn build_reply_with_session_inner(
                      {user_text}"
                 );
                 match call_claude_cli_lightweight(
-                    &prompt, "claude-haiku-4-5", &home,
+                    &prompt, crate::runtime_config::DEFAULT_UTILITY_MODEL, &home,
                 ).await {
                     Ok(extracted) => {
                         if let Err(e) = sm.set_pinned(&sid, &extracted).await {
@@ -1608,7 +1636,7 @@ async fn build_reply_with_session_inner(
                          Assistant: {reply_snippet}"
                     );
                     let facts_text = match call_claude_cli_lightweight(
-                        &prompt, "claude-haiku-4-5", &home_for_facts,
+                        &prompt, crate::runtime_config::DEFAULT_UTILITY_MODEL, &home_for_facts,
                     ).await {
                         Ok(t) => t,
                         Err(e) => {
@@ -2166,7 +2194,7 @@ async fn build_reply_with_session_inner(
                                 let h = home.clone();
                                 async move {
                                     crate::channel_reply::call_claude_cli_public(
-                                        &prompt, "claude-haiku-4-5", "", &h,
+                                        &prompt, crate::runtime_config::DEFAULT_UTILITY_MODEL, "", &h,
                                     ).await
                                 }
                             };
@@ -2403,7 +2431,7 @@ async fn build_reply_with_session_inner(
                     "Summarize the following conversation history concisely for use as context \
                      in future turns. Include key facts, decisions, and outcomes. Max 400 words.\n\n{transcript}"
                 );
-                let summary = match call_claude_cli_lightweight(&prompt, "claude-haiku-4-5", &home_for_compress).await {
+                let summary = match call_claude_cli_lightweight(&prompt, crate::runtime_config::DEFAULT_UTILITY_MODEL, &home_for_compress).await {
                     Ok(s) => s,
                     Err(_) => "[Session compressed — previous conversation summary omitted for brevity]".to_string(),
                 };
@@ -3141,9 +3169,15 @@ pub(crate) const KEEPALIVE_INTERVAL_SECS: u64 = 90;
 /// Hard max timeout — absolute safety net to kill truly hung processes.
 const HARD_MAX_TIMEOUT_SECS: u64 = 30 * 60; // 30 minutes
 
-/// Internal wrapper for GVU loop LLM calls.
-/// Restricted to crate-internal use with model allowlist.
-const ALLOWED_EVOLUTION_MODELS: &[&str] = &["claude-haiku-4-5", "claude-haiku-4-5-20250307"];
+/// Internal wrapper for GVU loop / internal-utility LLM calls.
+///
+/// RFC-25 Phase 0: the previous hard allowlist *rejected* any model that wasn't
+/// `claude-haiku-4-5`, which made evolution/internal tasks impossible to run on
+/// a different (even Claude-family) model and blocked the multi-runtime goal.
+/// We now warn on unrecognised evolution models instead of failing — the agent's
+/// configured `[model] utility` is honoured. Provider-level routing (Codex/Gemini)
+/// arrives via the choke-point in Phase 1-2.
+const KNOWN_EVOLUTION_MODELS: &[&str] = &["claude-haiku-4-5", "claude-haiku-4-5-20250307"];
 
 pub(crate) async fn call_claude_cli_public(
     user_message: &str,
@@ -3151,8 +3185,8 @@ pub(crate) async fn call_claude_cli_public(
     system_prompt: &str,
     home_dir: &Path,
 ) -> Result<String, String> {
-    if !ALLOWED_EVOLUTION_MODELS.contains(&model) {
-        return Err(format!("Model '{model}' not allowed for evolution calls"));
+    if !KNOWN_EVOLUTION_MODELS.contains(&model) {
+        warn!(model, "call_claude_cli_public: non-default evolution/utility model — proceeding (RFC-25 Phase 0)");
     }
     // Use account-rotated path so GVU benefits from multi-account failover
     // instead of failing silently when the ambient account is rate-limited.

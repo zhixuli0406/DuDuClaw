@@ -175,7 +175,7 @@ async fn summarize_one(
     // the summarization prompt is fully self-contained.
     let summary = crate::channel_reply::call_claude_cli_public(
         &prompt,
-        "claude-haiku-4-5",
+        crate::runtime_config::DEFAULT_UTILITY_MODEL,
         "",
         home_dir,
     )

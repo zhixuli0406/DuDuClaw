@@ -29,15 +29,19 @@ impl AgentRuntime for ClaudeRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
-        // Delegate to existing claude_runner logic
+        // Delegate to the existing account-rotated Claude CLI path.
         info!(agent = %context.agent_id, model = %context.model, "ClaudeRuntime: executing via claude CLI");
 
-        let result = crate::channel_reply::call_claude_cli_simple(
+        let result = crate::channel_reply::call_claude_cli_rotated(
             prompt,
             &context.model,
             &context.system_prompt,
             &self.home_dir,
-            context.agent_dir.as_deref(),
+            context.agent_dir.as_deref(), // work_dir
+            None,                         // on_progress
+            None,                         // capabilities
+            None,                         // session_id (history folded into prompt)
+            &[],                          // conversation_history (threaded by caller for now)
         )
         .await?;
 

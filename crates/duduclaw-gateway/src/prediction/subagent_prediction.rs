@@ -198,7 +198,7 @@ pub async fn record_subagent_prediction(
             async move {
                 crate::channel_reply::call_claude_cli_public(
                     &prompt,
-                    "claude-haiku-4-5",
+                    crate::runtime_config::DEFAULT_UTILITY_MODEL,
                     "",
                     &h,
                 )

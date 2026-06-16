@@ -172,6 +172,7 @@ mod tests {
                 account_pool: vec![],
                 local: None,
                 api_mode: "cli".to_string(),
+                utility: "claude-haiku-4-5".to_string(),
             },
             container: ContainerConfig {
                 timeout_ms: 30000,
