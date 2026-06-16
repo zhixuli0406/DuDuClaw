@@ -1,45 +1,70 @@
-//! ACP session handlers — maps ACP protocol operations to DuDuClaw agent runner.
+//! ACP session handlers — maps ACP/A2A protocol operations to the DuDuClaw
+//! agent runner.
 //!
-//! Future work: wire to AgentRunner for real agent execution.
+//! RFC-25 Phase 3: `handle_prompt_with_agent` now executes a REAL agent through
+//! the gateway's provider-aware delegation path (`call_claude_for_agent_with_type`),
+//! so an A2A `tasks/send` runs the target agent on its configured `[runtime]`
+//! provider (Claude / Codex / Gemini / OpenAI-compat) — not a placeholder.
 
-use duduclaw_core::truncate_bytes;
+use std::path::Path;
+use std::sync::Arc;
+
+use tokio::sync::RwLock;
 use tracing::info;
+
+use duduclaw_agent::registry::AgentRegistry;
 
 use super::types::*;
 
-/// Handle a session prompt by routing to the appropriate agent.
+/// Execute an A2A/ACP prompt by routing to the target agent through the
+/// gateway's provider-agnostic dispatch (RFC-25 Phase 2 choke-point).
 ///
-/// Currently returns a placeholder response. Full implementation will:
-/// 1. Resolve agent from session config
-/// 2. Build system prompt via SystemPromptSnapshot
-/// 3. Call Claude CLI or Direct API
-/// 4. Stream SessionUpdate notifications back
-pub fn handle_prompt_with_agent(
+/// `agent_id` is the A2A `context_id` (the target agent; `"default"` → main agent).
+/// The target agent's `[runtime] provider` decides the backend.
+pub async fn handle_prompt_with_agent(
+    home_dir: &Path,
+    agent_id: &str,
     session_id: &str,
     message: &str,
-    model: Option<&str>,
+    _model: Option<&str>,
 ) -> Vec<SessionUpdate> {
-    info!(session_id, message_len = message.len(), model, "ACP prompt received");
+    info!(
+        session_id,
+        agent_id,
+        message_len = message.len(),
+        "ACP prompt → real agent execution (RFC-25 Phase 3)"
+    );
 
-    let mut updates = Vec::new();
+    // Build a registry snapshot from the home agents directory.
+    let mut reg = AgentRegistry::new(home_dir.join("agents"));
+    if let Err(e) = reg.scan().await {
+        return vec![SessionUpdate::Error {
+            session_id: session_id.to_string(),
+            message: format!("ACP: failed to scan agents directory: {e}"),
+        }];
+    }
+    let registry = Arc::new(RwLock::new(reg));
 
-    // Simulate a thinking step
-    updates.push(SessionUpdate::TextChunk {
-        session_id: session_id.to_string(),
-        content: format!("Processing: {}", truncate_bytes(message, 50)),
-    });
-
-    // Final response
-    updates.push(SessionUpdate::Complete {
-        session_id: session_id.to_string(),
-        final_message: format!(
-            "ACP response for session {}. Model: {}. Agent runner integration pending.",
-            session_id,
-            model.unwrap_or("default")
-        ),
-    });
-
-    updates
+    // Execute through the gateway delegation path. The target agent's runtime
+    // provider is honoured inside call_claude_for_agent_with_type.
+    match duduclaw_gateway::claude_runner::call_claude_for_agent_with_type(
+        home_dir,
+        &registry,
+        agent_id,
+        message,
+        duduclaw_gateway::cost_telemetry::RequestType::Dispatch,
+    )
+    .await
+    {
+        Ok(reply) => vec![SessionUpdate::Complete {
+            session_id: session_id.to_string(),
+            final_message: reply,
+        }],
+        Err(e) => vec![SessionUpdate::Error {
+            session_id: session_id.to_string(),
+            message: format!("ACP agent execution failed: {e}"),
+        }],
+    }
 }
 
 /// A2A Task lifecycle states.
@@ -123,6 +148,16 @@ impl A2ATaskManager {
     pub fn complete_task(&mut self, id: &str, result: String) -> bool {
         if let Some(task) = self.tasks.get_mut(id) {
             task.complete(result);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark a task as failed with an error message (A2A `Failed` state).
+    pub fn fail_task(&mut self, id: &str, error: String) -> bool {
+        if let Some(task) = self.tasks.get_mut(id) {
+            task.fail(error);
             true
         } else {
             false
