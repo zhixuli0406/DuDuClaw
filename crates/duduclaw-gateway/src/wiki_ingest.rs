@@ -408,9 +408,16 @@ pub async fn run_ingest(
 
             let prompt = build_cloud_ingest_prompt(user_text, assistant_reply, &index);
 
-            // Call Claude Haiku for extraction
-            match crate::channel_reply::call_claude_cli_public(
-                &prompt, crate::runtime_config::DEFAULT_UTILITY_MODEL, "", home_dir,
+            // Utility dispatch (RFC-25 N2): this agent's `[runtime] provider` +
+            // `[model] utility`, falling back to global config then Claude.
+            let agent_dir = home_dir.join("agents").join(agent_id);
+            match crate::runtime_dispatch::run_utility_prompt(
+                home_dir,
+                Some(&agent_dir),
+                agent_id,
+                "",
+                &prompt,
+                crate::runtime_dispatch::UTILITY_MAX_TOKENS,
             ).await {
                 Ok(response) => {
                     let proposals = parse_cloud_ingest_response(&response);

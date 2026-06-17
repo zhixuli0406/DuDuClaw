@@ -409,17 +409,34 @@ async fn graduate_trajectories(
             reusable SKILL.md files based on task execution patterns. \
             Output ONLY valid SKILL.md with YAML frontmatter.";
 
-        let llm_result = call_direct_api(
-            &api_key,
-            crate::runtime_config::DEFAULT_UTILITY_MODEL, // RFC-25 Phase 0: centralized utility model
-            system,
-            &prompt,
-            &[],
-        )
-        .await;
+        // Utility dispatch (RFC-25 N2): resolve the target agent's provider +
+        // utility model. Claude keeps the Direct API path (cache_control on the
+        // system prompt); any other provider routes through the registry
+        // choke-point. Falls back to global config / Claude when unconfigured.
+        let agent_dir = config
+            .home_dir
+            .join("agents")
+            .join(&config.target_agent_id);
+        let spec = crate::runtime_config::resolve_utility(&config.home_dir, Some(&agent_dir));
+        let llm_result: Result<String, String> =
+            if spec.provider == duduclaw_core::types::RuntimeType::Claude {
+                call_direct_api(&api_key, &spec.model, system, &prompt, &[])
+                    .await
+                    .map(|resp| resp.text)
+            } else {
+                crate::runtime_dispatch::run_utility_prompt(
+                    &config.home_dir,
+                    Some(&agent_dir),
+                    &config.target_agent_id,
+                    system,
+                    &prompt,
+                    4096,
+                )
+                .await
+            };
 
         let llm_response = match llm_result {
-            Ok(resp) => resp.text,
+            Ok(text) => text,
             Err(e) => {
                 let msg = format!("{span_prefix} LLM call failed: {e}");
                 warn!("{}", msg);
