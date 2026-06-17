@@ -186,21 +186,28 @@ pub async fn record_subagent_prediction(
     if let Some(ctx) = gvu_ctx {
         let agent_dir = ctx.home_dir.join("agents").join(&agent_id);
         let home_for_llm = ctx.home_dir.clone();
+        let agent_dir_for_llm = agent_dir.clone();
+        let agent_id_for_llm = agent_id.clone();
         let payload_preview: String = payload.chars().take(400).collect();
         let extra = format!(
             "Sub-agent dispatch payload preview:\n{payload_preview}"
         );
 
-        // LLM caller mirrors channel_reply's setup so the GVU loop has a
-        // working Generator/Judge backend.
+        // LLM caller via utility dispatch (RFC-25 N2): this agent's runtime
+        // provider + utility model, falling back to global config then Claude,
+        // so the GVU loop has a working Generator/Judge backend.
         let call_llm = move |prompt: String| {
             let h = home_for_llm.clone();
+            let ad = agent_dir_for_llm.clone();
+            let aid = agent_id_for_llm.clone();
             async move {
-                crate::channel_reply::call_claude_cli_public(
-                    &prompt,
-                    crate::runtime_config::DEFAULT_UTILITY_MODEL,
-                    "",
+                crate::runtime_dispatch::run_utility_prompt(
                     &h,
+                    Some(&ad),
+                    &aid,
+                    "",
+                    &prompt,
+                    crate::runtime_dispatch::UTILITY_MAX_TOKENS,
                 )
                 .await
             }

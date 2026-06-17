@@ -165,6 +165,8 @@ pub fn spawn_silence_event_consumer(
             if let Some(ctx) = gvu_ctx.clone() {
                 let agent_dir = ctx.home_dir.join("agents").join(&event.agent_id);
                 let home_for_llm = ctx.home_dir.clone();
+                let agent_dir_for_llm = agent_dir.clone();
+                let agent_id_for_llm = event.agent_id.clone();
                 let extra = format!(
                     "Silence breaker fired after {hours:.1}h without an organic \
                      evolution trigger. Treating this as a Critical reflection \
@@ -172,14 +174,20 @@ pub fn spawn_silence_event_consumer(
                      conversation produced a prediction error.",
                     hours = event.hours,
                 );
+                // Utility dispatch (RFC-25 N2): this agent's runtime provider +
+                // utility model, falling back to global config then Claude.
                 let call_llm = move |prompt: String| {
                     let h = home_for_llm.clone();
+                    let ad = agent_dir_for_llm.clone();
+                    let aid = agent_id_for_llm.clone();
                     async move {
-                        crate::channel_reply::call_claude_cli_public(
-                            &prompt,
-                            crate::runtime_config::DEFAULT_UTILITY_MODEL,
-                            "",
+                        crate::runtime_dispatch::run_utility_prompt(
                             &h,
+                            Some(&ad),
+                            &aid,
+                            "",
+                            &prompt,
+                            crate::runtime_dispatch::UTILITY_MAX_TOKENS,
                         )
                         .await
                     }

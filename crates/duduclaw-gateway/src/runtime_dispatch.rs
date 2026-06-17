@@ -7,22 +7,67 @@
 //! first use), and executes — falling back to the configured fallback provider,
 //! then to Claude, when the primary runtime is unavailable.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex;
 
 use duduclaw_core::types::RuntimeType;
 
-use crate::runtime::{RuntimeContext, RuntimeRegistry, RuntimeResponse};
+use crate::cost_telemetry::{RequestType, TokenUsage};
+use crate::runtime::{ConversationTurn, RuntimeContext, RuntimeRegistry, RuntimeResponse};
+use crate::runtime_config::RuntimeSettings;
 
-/// Process-wide registry, auto-detected once (codex/gemini CLI probing is async).
-static REGISTRY: OnceCell<RuntimeRegistry> = OnceCell::const_new();
+/// Per-`home_dir` registry cache (RFC-25 R2).
+///
+/// Previously a single `OnceCell` bound the registry to the *first* `home_dir`
+/// ever passed — wrong for multi-home / multi-process-test setups (production
+/// single-home was unaffected). Keyed by home so each home auto-detects its own
+/// runtimes once. Registries live for the process lifetime (the set of distinct
+/// homes is tiny), so each is `Box::leak`ed to hand out a `&'static` ref.
+static REGISTRIES: OnceLock<Mutex<HashMap<PathBuf, &'static RuntimeRegistry>>> = OnceLock::new();
 
-/// Get (or lazily build) the shared runtime registry.
+/// Cooldown for a provider that trips its failure threshold (RFC-25 R1).
+const FAILOVER_COOLDOWN_SECS: i64 = 60;
+
+/// Per-`home_dir` failover managers (RFC-25 R1, per-(home,provider) granularity).
+///
+/// Health is keyed per home, not process-globally: provider availability is
+/// partly config-driven (an OpenAI-compat `base_url` / API key lives in a home's
+/// `config.toml`), so one home's misconfigured endpoint must NOT trip the same
+/// `RuntimeType`'s health for another home. Each manager internally keys by
+/// `RuntimeType`. Managers live for the process lifetime (homes are few), so each
+/// is `Box::leak`ed for a `&'static` ref.
+static FAILOVERS: OnceLock<std::sync::Mutex<HashMap<PathBuf, &'static crate::failover::FailoverManager>>> =
+    OnceLock::new();
+
+fn failover(home_dir: &Path) -> &'static crate::failover::FailoverManager {
+    let map = FAILOVERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap();
+    if let Some(mgr) = guard.get(home_dir) {
+        return mgr;
+    }
+    let built: &'static crate::failover::FailoverManager =
+        Box::leak(Box::new(crate::failover::FailoverManager::new(FAILOVER_COOLDOWN_SECS)));
+    guard.insert(home_dir.to_path_buf(), built);
+    built
+}
+
+/// Get (or lazily build) the runtime registry for `home_dir`.
 pub async fn registry(home_dir: &Path) -> &'static RuntimeRegistry {
-    REGISTRY
-        .get_or_init(|| async { RuntimeRegistry::new(home_dir).await })
-        .await
+    let map = REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().await;
+    if let Some(reg) = guard.get(home_dir) {
+        return reg;
+    }
+    // Build while holding the lock so a concurrent first-call for the same home
+    // waits rather than double-building (CLI probing is async). Distinct homes
+    // serialize here only on their very first access.
+    let built: &'static RuntimeRegistry =
+        Box::leak(Box::new(RuntimeRegistry::new(home_dir).await));
+    guard.insert(home_dir.to_path_buf(), built);
+    built
 }
 
 /// Parameters for a provider-agnostic agent prompt.
@@ -35,27 +80,50 @@ pub struct AgentPrompt<'a> {
     /// Model id within the chosen provider (e.g. claude-sonnet-4-6, gemini-2.5-flash).
     pub model: &'a str,
     pub max_tokens: u32,
+    /// Force a specific provider, bypassing `agent_dir`-based resolution.
+    /// Used by utility dispatch where the provider is already resolved (including
+    /// the global-config path for agent-less tasks). `None` ⇒ resolve from `agent_dir`.
+    pub provider_override: Option<RuntimeType>,
+    /// Prior conversation turns (chronological, newest last; excludes the current
+    /// prompt). Threaded into non-Claude runtimes so Codex/Gemini/OpenAI agents
+    /// keep multi-turn context (RFC-25 A1). `&[]` for single-shot / utility calls.
+    pub conversation_history: &'a [ConversationTurn],
+    /// Cost-telemetry classification for this call (RFC-25 A3). Recorded against
+    /// the resolved provider/model so non-Claude usage is visible to
+    /// `CostTelemetry` / 200K warnings / adaptive routing.
+    pub request_type: RequestType,
+    /// Pre-parsed `agent.toml` runtime settings (RFC-25 L7 followup). When the
+    /// caller already loaded these (e.g. to make the non-Claude routing decision),
+    /// pass them here so the choke-point doesn't re-read + re-parse the file.
+    /// `None` ⇒ the choke-point reads from `agent_dir` itself.
+    pub runtime_settings: Option<&'a RuntimeSettings>,
 }
 
 /// Execute a prompt through the agent's configured runtime provider.
 ///
-/// Selection order: `[runtime] provider` → `[runtime] fallback` → Claude.
+/// Selection order: `provider_override` → `[runtime] provider` → `[runtime] fallback` → Claude.
 pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, String> {
-    let provider = req
-        .agent_dir
-        .map(crate::runtime_config::agent_runtime_provider)
-        .unwrap_or_default();
-    let fallback = req
-        .agent_dir
-        .and_then(crate::runtime_config::agent_runtime_fallback)
+    // Reuse caller-provided settings when present (RFC-25 L7 followup — avoids a
+    // second agent.toml read on paths that already parsed it to decide routing);
+    // otherwise read once here.
+    let owned_settings;
+    let settings: &RuntimeSettings = match req.runtime_settings {
+        Some(s) => s,
+        None => {
+            owned_settings = req
+                .agent_dir
+                .map(crate::runtime_config::load_runtime_settings)
+                .unwrap_or_default();
+            &owned_settings
+        }
+    };
+    let provider = req.provider_override.unwrap_or(settings.provider);
+    let fallback = settings
+        .fallback
         // Always fall back to Claude (the always-available core) if nothing set.
         .or(Some(RuntimeType::Claude));
 
     let reg = registry(req.home_dir).await;
-    let runtime = reg
-        .select(&provider, fallback.as_ref())
-        .or_else(|| reg.get(&RuntimeType::Claude))
-        .ok_or_else(|| format!("no runtime available for provider {provider:?}"))?;
 
     let ctx = RuntimeContext {
         agent_dir: req.agent_dir.map(PathBuf::from),
@@ -65,13 +133,108 @@ pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, S
         home_dir: req.home_dir.to_path_buf(),
         agent_id: req.agent_id.to_string(),
         preferred_provider: None,
-        conversation_history: Vec::new(),
+        conversation_history: req.conversation_history.to_vec(),
     };
 
-    runtime.execute(req.prompt, &ctx).await
+    // RFC-25 R1: route through the FailoverManager so provider health is tracked
+    // (3 consecutive failures → cooldown) and a failing primary auto-falls back to
+    // the configured fallback (defaulting to the always-available Claude core)
+    // instead of the old one-shot `select().execute()` with no health memory.
+    let resp = failover(req.home_dir)
+        .execute_with_failover(reg, &provider, fallback.as_ref(), req.prompt, &ctx)
+        .await?;
+    // RFC-25 A3: record token usage so non-Claude (Codex/Gemini/OpenAI) calls are
+    // visible to CostTelemetry / 200K price-cliff warnings / adaptive routing.
+    // Best-effort and detached: telemetry is a SQLite write under a mutex, so it
+    // must not add latency to the reply that's already in hand. Skip agent-less
+    // utility calls (empty agent_id) to avoid empty-string attribution.
+    if !req.agent_id.is_empty() {
+        let home = req.home_dir.to_path_buf();
+        let agent_id = req.agent_id.to_string();
+        let request_type = req.request_type;
+        let model = resp.model_used.clone();
+        let usage = TokenUsage {
+            input_tokens: resp.input_tokens,
+            cache_read_tokens: resp.cache_read_tokens,
+            cache_creation_tokens: 0,
+            output_tokens: resp.output_tokens,
+        };
+        tokio::spawn(async move {
+            record_usage(home, agent_id, request_type, model, usage).await;
+        });
+    }
+    Ok(resp)
+}
+
+/// Record token usage to the global cost telemetry (RFC-25 A3).
+/// Best-effort: silently no-ops if telemetry can't be initialised.
+async fn record_usage(
+    home_dir: PathBuf,
+    agent_id: String,
+    request_type: RequestType,
+    model: String,
+    usage: TokenUsage,
+) {
+    let telemetry = match crate::cost_telemetry::get_telemetry() {
+        Some(t) => t,
+        None => {
+            let _ = crate::cost_telemetry::init_telemetry(&home_dir);
+            match crate::cost_telemetry::get_telemetry() {
+                Some(t) => t,
+                None => return,
+            }
+        }
+    };
+    telemetry
+        .record(&agent_id, request_type, &model, &usage)
+        .await;
 }
 
 /// Convenience wrapper returning just the text content (most internal callers).
 pub async fn run_agent_prompt_text(req: AgentPrompt<'_>) -> Result<String, String> {
     run_agent_prompt(req).await.map(|r| r.content)
+}
+
+/// Default output cap for utility (cheap, fire-and-forget internal) prompts.
+pub const UTILITY_MAX_TOKENS: u32 = 2048;
+
+/// Run a utility (cheap, internal) prompt through the resolved utility runtime
+/// (RFC-25 N2).
+///
+/// Resolution (see [`crate::runtime_config::resolve_utility`]):
+/// - `agent_dir` present → that agent's `[runtime] provider` + `[model] utility`.
+/// - `agent_dir` absent  → global `config.toml [runtime] utility_provider` / `utility_model`.
+///
+/// Claude stays on the existing account-rotated CLI path
+/// ([`crate::channel_reply::call_claude_cli_public`]) so its behavior is
+/// byte-identical to the previous hardcoded `DEFAULT_UTILITY_MODEL` call; any
+/// other provider routes through the registry choke-point.
+pub async fn run_utility_prompt(
+    home_dir: &Path,
+    agent_dir: Option<&Path>,
+    agent_id: &str,
+    system_prompt: &str,
+    prompt: &str,
+    max_tokens: u32,
+) -> Result<String, String> {
+    let spec = crate::runtime_config::resolve_utility(home_dir, agent_dir);
+    if spec.provider == RuntimeType::Claude {
+        crate::channel_reply::call_claude_cli_public(prompt, &spec.model, system_prompt, home_dir)
+            .await
+    } else {
+        run_agent_prompt_text(AgentPrompt {
+            agent_dir,
+            home_dir,
+            agent_id,
+            prompt,
+            system_prompt,
+            model: &spec.model,
+            max_tokens,
+            provider_override: Some(spec.provider),
+            conversation_history: &[],
+            request_type: RequestType::Evolution,
+            runtime_settings: None,
+        })
+        .await
+    }
 }

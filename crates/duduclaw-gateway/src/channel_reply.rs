@@ -39,11 +39,11 @@ pub type ChannelStatusMap = Arc<RwLock<std::collections::HashMap<String, Channel
 // ── Multi-turn conversation types ──────────────────────────
 
 /// A single turn in conversation history, used for native multi-turn support.
-#[derive(Debug, Clone)]
-pub struct ConversationTurn {
-    pub role: String,    // "user" | "assistant"
-    pub content: String,
-}
+///
+/// Re-exported from [`crate::runtime`] so the channel-reply path and the runtime
+/// trait path share one type instead of two structurally-identical copies
+/// (RFC-25 A1).
+pub use crate::runtime::ConversationTurn;
 
 /// Maximum character count for a single turn before it gets trimmed.
 /// Inspired by Hermes Agent's tool output trimming (Phase 1 compression).
@@ -1288,34 +1288,78 @@ async fn build_reply_with_session_inner(
         );
     }
 
-    // RFC-25 Phase 1: provider-agnostic routing. When the agent's
-    // `[runtime] provider` is not Claude, route the whole reply through the
-    // multi-runtime choke-point (Codex / Gemini / OpenAI-compat). Claude keeps
-    // its optimized OAuth-rotation + PTY path below (unchanged, zero regression).
-    let runtime_provider = agent_dir
+    // RFC-25 Phase 1 (L8): provider-agnostic routing via the centralized
+    // decision predicate. When the agent's `[runtime] provider` is not Claude,
+    // route the whole reply through the multi-runtime choke-point (Codex /
+    // Gemini / OpenAI-compat). Claude keeps its optimized OAuth-rotation + PTY
+    // path below (unchanged, zero regression).
+    // Parse agent.toml once (L7 followup): the routing decision and the
+    // choke-point both need it, so load here and thread the settings through
+    // `AgentPrompt.runtime_settings` instead of re-reading inside the choke-point.
+    let runtime_settings = agent_dir
         .as_deref()
-        .map(crate::runtime_config::agent_runtime_provider)
-        .unwrap_or_default();
+        .map(crate::runtime_config::load_runtime_settings);
+    let non_claude = runtime_settings
+        .as_ref()
+        .and_then(|s| s.non_claude_provider());
 
     let cli_future: std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>,
-    > = if runtime_provider != duduclaw_core::types::RuntimeType::Claude {
+    > = if let Some(provider) = non_claude {
         info!(
             agent_id = %agent_id,
-            provider = runtime_provider.as_str(),
+            provider = provider.as_str(),
             "channel_reply: routing through multi-runtime choke-point (non-Claude provider)"
         );
-        Box::pin(crate::runtime_dispatch::run_agent_prompt_text(
-            crate::runtime_dispatch::AgentPrompt {
-                agent_dir: agent_dir.as_deref(),
-                home_dir: &ctx.home_dir,
-                agent_id: &agent_id,
-                prompt: &effective_message,
-                system_prompt: &full_system_prompt,
-                model: &model,
-                max_tokens: 8192,
-            },
-        ))
+        // RFC-25 A4: non-Claude runtimes don't stream incremental progress, so
+        // emit a periodic Keepalive while the (potentially long) call is in flight
+        // — same typing/"still working" indicator the Claude stream-json path
+        // drives — so the channel doesn't look stalled or hit an idle timeout.
+        // Bind plain references first so the `async move` captures only Copy
+        // references (not the owners, which the Claude `else` arm still borrows).
+        let hb_progress = on_progress.as_ref();
+        let hb_agent_dir = agent_dir.as_deref();
+        let hb_home = ctx.home_dir.as_path();
+        let hb_agent_id = agent_id.as_str();
+        let hb_prompt = effective_message.as_str();
+        let hb_system = full_system_prompt.as_str();
+        let hb_model = model.as_str();
+        let hb_history = conversation_history.as_slice();
+        let hb_settings = runtime_settings.as_ref();
+        Box::pin(async move {
+            let work = crate::runtime_dispatch::run_agent_prompt_text(
+                crate::runtime_dispatch::AgentPrompt {
+                    agent_dir: hb_agent_dir,
+                    home_dir: hb_home,
+                    agent_id: hb_agent_id,
+                    prompt: hb_prompt,
+                    system_prompt: hb_system,
+                    model: hb_model,
+                    max_tokens: 8192,
+                    provider_override: None,
+                    // RFC-25 A1: thread the real session history so non-Claude
+                    // (Codex/Gemini/OpenAI) agents keep multi-turn context.
+                    conversation_history: hb_history,
+                    request_type: crate::cost_telemetry::RequestType::Chat,
+                    // L7 followup: reuse the settings parsed above (1 read/reply).
+                    runtime_settings: hb_settings,
+                },
+            );
+            tokio::pin!(work);
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
+            ticker.tick().await; // consume the immediate first tick
+            loop {
+                tokio::select! {
+                    res = &mut work => break res,
+                    _ = ticker.tick() => {
+                        if let Some(cb) = hb_progress {
+                            cb(ProgressEvent::Keepalive);
+                        }
+                    }
+                }
+            }
+        })
     } else {
         match runtime_mode {
             crate::pty_runtime::RuntimeMode::PtyPool => Box::pin(call_claude_cli_pty_rotated(
@@ -2208,6 +2252,10 @@ async fn build_reply_with_session_inner(
                                             system_prompt: "",
                                             model: &model,
                                             max_tokens: 4096,
+                                            provider_override: None,
+                                            conversation_history: &[],
+                                            request_type: crate::cost_telemetry::RequestType::Evolution,
+                                            runtime_settings: None,
                                         },
                                     )
                                     .await

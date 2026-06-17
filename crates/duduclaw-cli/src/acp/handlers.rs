@@ -6,15 +6,72 @@
 //! so an A2A `tasks/send` runs the target agent on its configured `[runtime]`
 //! provider (Claude / Codex / Gemini / OpenAI-compat) — not a placeholder.
 
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 
 use duduclaw_agent::registry::AgentRegistry;
 
 use super::types::*;
+
+/// Shared per-`home_dir` agent-registry snapshot for A2A (RFC-25 R3 + followup).
+///
+/// Every `tasks/send` previously rebuilt the registry and re-scanned the agents
+/// directory. A2A is low-frequency, but caching the snapshot avoids the repeated
+/// filesystem scan. The cache is invalidated when the agents directory's mtime
+/// changes (a subdir added/removed bumps the parent mtime), so a long-running
+/// ACP server that gains or loses an agent picks it up on the next call without a
+/// restart. Edits *within* an existing agent's files don't bump the dir mtime;
+/// those still need a restart, which matches the low-churn A2A use case.
+static ACP_AGENT_REGISTRY: OnceLock<
+    Mutex<HashMap<PathBuf, (Option<std::time::SystemTime>, Arc<RwLock<AgentRegistry>>)>>,
+> = OnceLock::new();
+
+/// Get (or lazily build / refresh) the agent registry for `home_dir`.
+async fn shared_agent_registry(home_dir: &Path) -> Result<Arc<RwLock<AgentRegistry>>, String> {
+    let agents_dir = home_dir.join("agents");
+    let current_mtime = std::fs::metadata(&agents_dir)
+        .and_then(|m| m.modified())
+        .ok();
+
+    let map = ACP_AGENT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().await;
+    if let Some((cached_mtime, reg)) = guard.get(home_dir) {
+        // Reuse only when we could read a stable mtime that matches the cache;
+        // an unreadable mtime falls through to a rebuild (fail-safe).
+        if current_mtime.is_some() && *cached_mtime == current_mtime {
+            return Ok(reg.clone());
+        }
+    }
+    let mut reg = AgentRegistry::new(agents_dir);
+    reg.scan()
+        .await
+        .map_err(|e| format!("failed to scan agents directory: {e}"))?;
+    let arc = Arc::new(RwLock::new(reg));
+    guard.insert(home_dir.to_path_buf(), (current_mtime, arc.clone()));
+    Ok(arc)
+}
+
+/// Resolve an A2A `context_id` to a concrete, existing target agent (RFC-25 R3).
+///
+/// - `"default"` / `""` → the registry's `Main`-role agent (the team root).
+/// - any other value → that agent iff it exists in the registry.
+///
+/// Returns `None` when the requested target can't be resolved, so the caller can
+/// surface a clean A2A error instead of dispatching to a non-existent agent.
+async fn resolve_target_agent(
+    registry: &Arc<RwLock<AgentRegistry>>,
+    context_id: &str,
+) -> Option<String> {
+    let reg = registry.read().await;
+    if context_id.is_empty() || context_id == "default" {
+        return reg.main_agent().map(|a| a.config.agent.name.clone());
+    }
+    reg.get(context_id).map(|a| a.config.agent.name.clone())
+}
 
 /// Execute an A2A/ACP prompt by routing to the target agent through the
 /// gateway's provider-agnostic dispatch (RFC-25 Phase 2 choke-point).
@@ -35,22 +92,36 @@ pub async fn handle_prompt_with_agent(
         "ACP prompt → real agent execution (RFC-25 Phase 3)"
     );
 
-    // Build a registry snapshot from the home agents directory.
-    let mut reg = AgentRegistry::new(home_dir.join("agents"));
-    if let Err(e) = reg.scan().await {
-        return vec![SessionUpdate::Error {
-            session_id: session_id.to_string(),
-            message: format!("ACP: failed to scan agents directory: {e}"),
-        }];
-    }
-    let registry = Arc::new(RwLock::new(reg));
+    // Shared (cached) registry snapshot — no per-call agents-dir rescan (R3).
+    let registry = match shared_agent_registry(home_dir).await {
+        Ok(r) => r,
+        Err(e) => {
+            return vec![SessionUpdate::Error {
+                session_id: session_id.to_string(),
+                message: format!("ACP: {e}"),
+            }];
+        }
+    };
+
+    // Resolve the A2A target to a concrete existing agent (R3): "default"/"" →
+    // the Main-role agent; otherwise the named agent iff present. Reject unknown
+    // targets with a clean error instead of dispatching into the void.
+    let target_agent = match resolve_target_agent(&registry, agent_id).await {
+        Some(name) => name,
+        None => {
+            return vec![SessionUpdate::Error {
+                session_id: session_id.to_string(),
+                message: format!("ACP: unknown target agent '{agent_id}' (no such agent, and no Main-role agent for 'default')"),
+            }];
+        }
+    };
 
     // Execute through the gateway delegation path. The target agent's runtime
     // provider is honoured inside call_claude_for_agent_with_type.
     match duduclaw_gateway::claude_runner::call_claude_for_agent_with_type(
         home_dir,
         &registry,
-        agent_id,
+        &target_agent,
         message,
         duduclaw_gateway::cost_telemetry::RequestType::Dispatch,
     )

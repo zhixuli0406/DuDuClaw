@@ -143,8 +143,15 @@ fn default_api_mode() -> String {
     "cli".to_string()
 }
 
+/// Single source of truth for the default lightweight "utility" model.
+///
+/// Both the typed [`ModelConfig::utility`] serde default and the gateway's
+/// lightweight `agent.toml` reader (`runtime_config`, which re-exports this)
+/// resolve to this one literal (RFC-25 L6 — no duplicated string).
+pub const DEFAULT_UTILITY_MODEL: &str = "claude-haiku-4-5";
+
 fn default_utility_model() -> String {
-    "claude-haiku-4-5".to_string()
+    DEFAULT_UTILITY_MODEL.to_string()
 }
 
 /// Which agent runtime backend executes a prompt (RFC-25 multi-runtime).

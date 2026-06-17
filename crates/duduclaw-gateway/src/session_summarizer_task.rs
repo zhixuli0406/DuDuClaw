@@ -171,16 +171,20 @@ async fn summarize_one(
 
     let prompt = format_summarization_prompt(&transcript);
 
-    // Haiku via the public CLI helper. Empty system prompt is fine —
-    // the summarization prompt is fully self-contained.
-    let summary = crate::channel_reply::call_claude_cli_public(
-        &prompt,
-        crate::runtime_config::DEFAULT_UTILITY_MODEL,
-        "",
+    // Utility dispatch (RFC-25 N2). This task is agent-less (only a session id),
+    // so `agent_dir = None` ⇒ provider/model come from the global
+    // `config.toml [runtime] utility_provider` / `utility_model` (Claude default).
+    // Empty system prompt is fine — the summarization prompt is self-contained.
+    let summary = crate::runtime_dispatch::run_utility_prompt(
         home_dir,
+        None,
+        "",
+        "",
+        &prompt,
+        crate::runtime_dispatch::UTILITY_MAX_TOKENS,
     )
     .await
-    .map_err(|e| format!("call_claude_cli_public: {e}"))?;
+    .map_err(|e| format!("utility summarize: {e}"))?;
 
     let trimmed = summary.trim();
     if trimmed.is_empty() {

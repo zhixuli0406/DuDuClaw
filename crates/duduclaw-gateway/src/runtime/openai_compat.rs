@@ -112,16 +112,23 @@ impl AgentRuntime for OpenAiCompatRuntime {
 
         let client = http_client();
 
-        let messages = vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: context.system_prompt.clone(),
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: prompt.to_string(),
-            },
-        ];
+        // System prompt, then prior turns (RFC-25 A1 — native multi-turn so the
+        // agent keeps context across turns), then the current user message.
+        let mut messages = Vec::with_capacity(context.conversation_history.len() + 2);
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: context.system_prompt.clone(),
+        });
+        for turn in &context.conversation_history {
+            messages.push(ChatMessage {
+                role: turn.role.clone(),
+                content: turn.content.clone(),
+            });
+        }
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+        });
 
         let body = ChatCompletionRequest {
             model: context.model.clone(),
