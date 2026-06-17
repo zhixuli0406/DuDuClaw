@@ -30,7 +30,7 @@ observability. Same architecture standards as DuDuClaw.
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.20.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.21.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -57,18 +57,19 @@ infrastructure work.
 
 ---
 
-> 🎉 **v1.20.0 — RFC-25 Multi-Runtime Unlock + A2A** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.20.0))
+> 🎉 **v1.21.0 — RFC-25 §5 followups: the non-Claude path is now first-class** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.21.0))
 >
-> The "Multi-Runtime four-backend" abstraction was previously **orphan, uncompiled source** — every execution path hardcoded Claude. v1.20.0 wires it up and routes the LLM-calling subsystems through a single provider-agnostic choke-point. Existing agents are unaffected (provider defaults to Claude); agents can opt into Codex / Gemini / OpenAI-compat via `agent.toml [runtime] provider`.
+> v1.20.0 compiled the multi-runtime abstraction, but the non-Claude (Codex / Gemini / OpenAI-compat) path was still a thin opt-in with documented gaps. v1.21.0 closes all 11 of them so non-Claude agents are first-class, and hardens the release tooling so PyPI can no longer be silently skipped.
 >
-> - **Wired the runtime abstraction** — new `RuntimeType` unblocks compilation; the `runtime/` four backends + `failover` compile for the first time; `runtime_dispatch::run_agent_prompt` choke-point + a lazily auto-detecting `RuntimeRegistry`
-> - **Channel reply / GVU / sub-agent delegation** — non-Claude providers route through the choke-point; Claude keeps its OAuth-rotation / PTY-optimized path (zero regression)
-> - **A2A real execution** — the ACP `tasks/send` now actually runs the target agent (provider-aware) and correctly reports Failed / Completed (was a placeholder)
-> - **Phase 0 unlock** — removed the GVU evolution-model hard-lock (reject → warn), centralized the utility-model config to a single source
-> - Audit (/code-review) fixed 2 real bugs (failover over-match, A2A always-completed); 8 known limitations of the non-Claude path documented in `commercial/docs/RFC-25-*`
+> - **Multi-turn context** — `conversation_history` threaded through the choke-point and consumed by Codex / Gemini / OpenAI-compat (OpenAI-compat uses native multi-turn `messages`); duplicate `ConversationTurn` consolidated
+> - **Cost telemetry / keepalive / pending-tasks** — non-Claude usage recorded to `CostTelemetry` (detached); periodic `Keepalive` on long replies; the Task-Board queue inlined into non-Claude delegation prompts
+> - **Resilience** — per-(home,provider) failover health (3 failures → 60s cooldown → fallback), per-home `RuntimeRegistry` cache, A2A `resolve_target_agent` + AgentRegistry mtime-invalidated cache, single `agent.toml` parse per reply
+> - **Release fix** — `release.sh` multi-platform version sync + drift audit + post-bump assertion + `verify` (queries PyPI/npm); fixes the `pyproject.toml` drift (stuck at 1.18.0) that made CI build a stale wheel and `skip-existing` silently freeze PyPI
 
 <details>
-<summary><strong>v1.9.4 → v1.19.x cumulative highlights</strong></summary>
+<summary><strong>v1.9.4 → v1.20.x cumulative highlights</strong></summary>
+
+- **v1.20.0** — RFC-25 Multi-Runtime Unlock + A2A: the "Multi-Runtime four-backend" abstraction was previously orphan, uncompiled source — every execution path hardcoded Claude. v1.20.0 wires it up and routes the LLM-calling subsystems through a single provider-agnostic choke-point (`runtime_dispatch::run_agent_prompt` + a lazily auto-detecting `RuntimeRegistry`); channel reply / GVU / sub-agent delegation route through the choke-point for non-Claude providers (Claude keeps its OAuth-rotation / PTY path, zero regression); ACP `tasks/send` actually runs the target agent and reports Failed / Completed; Phase 0 removed the GVU evolution-model hard-lock (reject → warn)
 
 - **v1.19.0** — Memory Intelligence: the W18/W19-designed memory layer, implemented non-invasively on the live Rust `SqliteMemoryEngine`. **Temporal Memory** (`memories` gains temporal / knowledge-graph columns + `store_temporal` automatic supersession chain + `get_history`/`get_at`; search default-filters to currently-valid memories); **Reflexion Loop** (bridges the existing `MistakeNotebook`: recall injected into the answering prompt + ≥3 same-category mistakes consolidated into a semantic rule); **`memory_fetch_batch`** MCP tool (fetch ≤100 entries by ID, namespace/ownership enforced). `MemoryEntry` unchanged, zero blast radius
 - **v1.18.0** — Dashboard budget/usage correctness: reads from the persistent `CostTelemetry` ledger (replacing the in-memory counter that reset to zero on rebuild), fixes the `cost_millicents` unit misnomer, implements `marketplace.install`, fills settings-persistence gaps, plus a round of frontend runtime-bug cleanup + 88 i18n keys

@@ -1,6 +1,55 @@
 # Changelog
 
 
+## [1.21.0] - 2026-06-17 — RFC-25 §5 Followups: non-Claude path fully functional
+
+RFC-25 v1.20.0 compiled the multi-runtime abstraction but left the non-Claude
+(Codex / Gemini / OpenAI-compat) path as a thin opt-in with documented gaps.
+v1.21.0 closes all 11 of those gaps so non-Claude agents are first-class, and
+hardens the release tooling so PyPI can no longer be silently skipped.
+
+### Added
+- **Multi-turn context for non-Claude runtimes** (A1): `conversation_history`
+  threaded through the choke-point and consumed by Codex / Gemini / OpenAI-compat
+  (OpenAI-compat uses native multi-turn `messages`); duplicate `ConversationTurn`
+  consolidated onto `runtime::ConversationTurn`.
+- **Non-Claude cost telemetry** (A3): `run_agent_prompt` records token usage to
+  `CostTelemetry` (detached, classified by `request_type`) so Codex/Gemini/OpenAI
+  usage is visible to cost summaries, the 200K price-cliff warning, and adaptive routing.
+- **Non-Claude channel keepalive** (A4): periodic `ProgressEvent::Keepalive` during
+  long non-Claude replies so channels don't look stalled / hit idle timeouts.
+- **`scripts/release.sh` multi-platform sync**: `audit` (per-platform version + drift),
+  synchronized bump across every manifest, a post-bump assertion that aborts if any
+  platform is left behind, and `verify <version>` that queries PyPI + npm.
+
+### Changed
+- **Pending-tasks for non-Claude delegation** (A2): the Task-Board queue is inlined
+  into the non-Claude sub-agent system prompt.
+- **Routing decision centralized** (B1): `RuntimeSettings::non_claude_provider()`;
+  "Claude into the registry" is an explicit non-goal (orphan `runtime/claude.rs`).
+- **Single `agent.toml` parse per reply** (B2): `RuntimeSettings` + `load_runtime_settings`
+  threaded via `AgentPrompt.runtime_settings` (3 → 1 reads/reply).
+- **Per-(home,provider) failover health** (R1): choke-point routes through
+  `FailoverManager` (3 failures → 60s cooldown → fallback), keyed per home to avoid
+  cross-tenant bleed.
+- **Per-home `RuntimeRegistry` cache** (R2): replaces the first-home-binding `OnceCell`.
+- **A2A target resolution** (R3): `resolve_target_agent` (default → Main agent, else
+  validated) + per-home `AgentRegistry` cache with agents-dir mtime invalidation.
+- **Utility provider routing** (N2): summarizer / wiki-ingest / reflection / synthesis
+  honour the agent's (or global `config.toml [runtime] utility_provider`) runtime.
+- `DEFAULT_UTILITY_MODEL` is a single source in `duduclaw-core` (B3).
+
+### Fixed
+- **PyPI release miss**: `pyproject.toml` had drifted to 1.18.0 (while Cargo/READMEs
+  were at 1.20.0), so the CI `pypi-publish` job built a stale wheel that
+  `skip-existing` silently dropped. `release.sh` now syncs every manifest and
+  asserts they all reach the new version; this release also heals the drift
+  (pyproject + npm manifests → 1.21.0).
+- `record_usage` no longer blocks the reply on a synchronous SQLite write, and skips
+  empty-`agent_id` (agent-less utility) attribution.
+
+
+
 ## [1.20.0] - 2026-06-16 — RFC-25 Multi-Runtime Unlock + A2A
 
 The "Multi-Runtime four-backend" abstraction was previously **orphan, uncompiled

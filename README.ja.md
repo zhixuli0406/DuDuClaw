@@ -30,7 +30,7 @@ observability. Same architecture standards as DuDuClaw.
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.20.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.21.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -57,18 +57,19 @@ observability. Same architecture standards as DuDuClaw.
 
 ---
 
-> 🎉 **v1.20.0 — RFC-25 マルチランタイム解放 + A2A**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.20.0)）
+> 🎉 **v1.21.0 — RFC-25 §5 フォローアップ：非 Claude パスが一級市民に**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.21.0)）
 >
-> 「Multi-Runtime 四バックエンド」はこれまで**コンパイルされない孤立ソース**で、すべての実行パスが Claude をハードコードしていました。v1.20.0 はこれを配線し、LLM を呼ぶサブシステムを単一の provider-agnostic な choke-point に通します。既存 agent は影響を受けず（provider は既定で Claude）、agent は `agent.toml [runtime] provider` で Codex / Gemini / OpenAI-compat を選べます。
+> v1.20.0 はマルチランタイム抽象を配線しましたが、非 Claude（Codex / Gemini / OpenAI-compat）パスは既知の欠落を抱えた薄い opt-in のままでした。v1.21.0 はその 11 件すべてを解消し、非 Claude agent を一級市民にし、さらに PyPI が黙って取りこぼされないよう発版ツールを強化します。
 >
-> - **ランタイム抽象を配線** — 新しい `RuntimeType` がコンパイル阻害を解消し、`runtime/` の四バックエンド + `failover` が初めてコンパイル成功；`runtime_dispatch::run_agent_prompt` choke-point + 初回使用時に遅延自動検出する `RuntimeRegistry`
-> - **channel reply / GVU / サブ agent 委譲** — 非 Claude provider は choke-point を通り、Claude は OAuth ローテーション / PTY 最適化パスを維持（リグレッションなし）
-> - **A2A 実行** — ACP `tasks/send` がターゲット agent を実際に実行（provider-aware）し、Failed / Completed を正しく報告（従来は placeholder）
-> - **Phase 0 解放** — GVU 進化モデルのハードロックを撤廃（reject → warn）、utility model 設定を単一ソースに集約
-> - 監査（/code-review）で実バグ 2 件（failover の過剰マッチ、A2A が常に completed）を修正。非 Claude パスの既知の制限 8 件を `commercial/docs/RFC-25-*` に記録
+> - **マルチターン文脈** — `conversation_history` を choke-point に通し、Codex / Gemini / OpenAI-compat が消費（OpenAI-compat はネイティブのマルチターン `messages`）；重複した `ConversationTurn` 型を統合
+> - **コスト計測 / keepalive / pending-tasks** — 非 Claude の使用量を `CostTelemetry` に記録（detached）；長い応答で定期 `Keepalive`；非 Claude 委譲のシステムプロンプトに Task-Board キューを inline
+> - **耐障害性** — per-(home,provider) フェイルオーバー健全性（3 連続失敗 → 60 秒 cooldown → fallback）、per-home `RuntimeRegistry` キャッシュ、A2A `resolve_target_agent` + AgentRegistry の mtime 失効キャッシュ、1 応答あたり `agent.toml` を 1 回だけパース
+> - **発版修正** — `release.sh` のマルチプラットフォーム版数同期 + ドリフト監査 + bump 後アサート + `verify`（PyPI/npm を照会）；`pyproject.toml` のドリフト（1.18.0 に固着）→ CI が古い wheel をビルド → `skip-existing` で PyPI が黙って凍結、という問題を修正
 
 <details>
-<summary><strong>v1.9.4 → v1.19.x 累積ハイライト</strong></summary>
+<summary><strong>v1.9.4 → v1.20.x 累積ハイライト</strong></summary>
+
+- **v1.20.0** — RFC-25 マルチランタイム解放 + A2A：「Multi-Runtime 四バックエンド」はこれまでコンパイルされない孤立ソースで、すべての実行パスが Claude をハードコードしていました。v1.20.0 はこれを配線し、LLM を呼ぶサブシステムを単一の provider-agnostic な choke-point（`runtime_dispatch::run_agent_prompt` + 遅延自動検出する `RuntimeRegistry`）に通します。channel reply / GVU / サブ agent 委譲は非 Claude provider で choke-point を通り（Claude は OAuth ローテーション / PTY パスを維持、リグレッションなし）；ACP `tasks/send` がターゲット agent を実際に実行し Failed / Completed を報告；Phase 0 で GVU 進化モデルのハードロックを撤廃（reject → warn）
 
 - **v1.19.0** — Memory Intelligence：W18/W19 で設計された記憶層を、現行の Rust `SqliteMemoryEngine` に非侵襲的に実装。**Temporal Memory**（`memories` に時態 / ナレッジグラフ列 + `store_temporal` の自動 supersession チェーン + `get_history`/`get_at`、検索は既定で有効な記憶のみ返す）；**Reflexion Loop**（既存の `MistakeNotebook` をブリッジ：回答プロンプトへのリコール注入 + 同カテゴリ ≥3 件を semantic ルールに統合）；**`memory_fetch_batch`** MCP ツール（ID 一括取得 ≤100、namespace/ownership 隔離）。`MemoryEntry` は不変、影響ゼロ
 - **v1.18.0** — Dashboard 予算／使用量の正確化：永続化された `CostTelemetry` 台帳から読む（再構築でゼロに戻るメモリカウンタを置換）、`cost_millicents` の単位誤称を修正、`marketplace.install` を実装、設定永続化の穴埋め、フロントエンドの runtime バグ掃除 + 88 個の i18n キー

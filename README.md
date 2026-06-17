@@ -30,7 +30,7 @@ observability. Same architecture standards as DuDuClaw.
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.20.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.21.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -55,18 +55,19 @@ observability. Same architecture standards as DuDuClaw.
 
 ---
 
-> 🎉 **v1.20.0 — RFC-25 多模型解鎖 + A2A**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.20.0)）
+> 🎉 **v1.21.0 — RFC-25 §5 收尾：非 Claude 路徑真正可用**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.21.0)）
 >
-> 「Multi-Runtime 四後端」過去是**未編譯的孤兒程式碼**，每條執行路徑都寫死 Claude。v1.20.0 把它接上電，並讓所有呼叫 LLM 的子系統走單一 provider-agnostic choke-point。既有 agent 不受影響（預設 Claude）；agent 可透過 `agent.toml [runtime] provider` 選 Codex / Gemini / OpenAI-compat。
+> v1.20.0 把 multi-runtime 抽象接上電，但非 Claude（Codex / Gemini / OpenAI-compat）路徑仍是帶已知缺口的薄 opt-in。v1.21.0 補齊全部 11 項缺口，讓非 Claude agent 成為一等公民，並強化發版工具讓 PyPI 不再被靜默漏掉。
 >
-> - **接通 runtime 抽象** — 新增 `RuntimeType` 解掉編譯阻塞，`runtime/` 四後端 + `failover` 首次成功編譯；`runtime_dispatch::run_agent_prompt` choke-point + 首次使用時 lazy 自動偵測的 `RuntimeRegistry`
-> - **channel reply / GVU / 子 agent 派工** — 非 Claude provider 走 choke-point；Claude 維持 OAuth 輪替 / PTY 最佳化路徑（零回歸）
-> - **A2A 真實執行** — ACP `tasks/send` 改為實際執行目標 agent（provider-aware），正確回報 Failed / Completed（原為 placeholder）
-> - **Phase 0 解鎖** — 拆掉 GVU 演化模型硬鎖（reject → warn），集中 utility model 設定為單一來源
-> - 稽核（/code-review）修掉 2 個真 bug（failover 過度匹配、A2A 永遠 completed），8 個非 Claude 路徑的已知限制記錄於 `commercial/docs/RFC-25-*`
+> - **多輪上下文** — `conversation_history` 串接 choke-point，Codex / Gemini / OpenAI-compat 全消費（OpenAI-compat 原生多輪 `messages`）；收斂重複的 `ConversationTurn` 型別
+> - **成本遙測 / keepalive / pending-tasks** — 非 Claude 用量進 `CostTelemetry`（detached）；長回應週期 `Keepalive`；非 Claude 派工系統提示含 Task-Board 佇列
+> - **韌性** — per-(home,provider) failover 健康退避（3 連敗 → 60s cooldown → fallback）、per-home `RuntimeRegistry` 快取、A2A `resolve_target_agent` + AgentRegistry mtime 失效快取、每 reply 單次 parse `agent.toml`
+> - **發版修復** — `release.sh` 多平台版本同步 + 漂移偵測 + bump 後 assert + `verify` 查 registry；修好 `pyproject.toml` 漂移（卡 1.18.0）→ CI 建舊 wheel → `skip-existing` 靜默凍住 PyPI 的問題
 
 <details>
-<summary><strong>v1.9.4 → v1.19.x 累積亮點</strong></summary>
+<summary><strong>v1.9.4 → v1.20.x 累積亮點</strong></summary>
+
+- **v1.20.0** — RFC-25 多模型解鎖 + A2A：「Multi-Runtime 四後端」過去是未編譯的孤兒程式碼，每條執行路徑都寫死 Claude。v1.20.0 把它接上電，所有呼叫 LLM 的子系統走單一 provider-agnostic choke-point（`runtime_dispatch::run_agent_prompt` + lazy 自動偵測的 `RuntimeRegistry`）；channel reply / GVU / 子 agent 派工在非 Claude provider 時走 choke-point（Claude 維持 OAuth 輪替 / PTY 路徑，零回歸）；ACP `tasks/send` 改為實際執行目標 agent 並正確回報 Failed / Completed；Phase 0 拆掉 GVU 演化模型硬鎖（reject → warn）
 
 - **v1.19.0** — Memory Intelligence：把 W18/W19 設計但未實作的記憶層非侵入式落地於現行 Rust `SqliteMemoryEngine`。**Temporal Memory**（`memories` 加時態 / 知識圖譜欄位 + `store_temporal` 自動取代鏈 + `get_history`/`get_at`，搜尋預設只回有效記憶）；**Reflexion Loop**（橋接既有 `MistakeNotebook`：召回注入答題 prompt + 同 category ≥3 固化成 semantic 規則）；**`memory_fetch_batch`** MCP 工具（依 ID 批次讀取 ≤100，namespace/ownership 隔離）。`MemoryEntry` 不動，零破壞
 - **v1.18.0** — Dashboard 預算／用量正確化：改讀持久化 `CostTelemetry` 帳本（取代一重建就歸零的記憶體計數），修 `cost_millicents` 單位誤稱、`marketplace.install` 補實作、設定持久化補洞、前端一輪 runtime bug 清掃 + 88 個 i18n key
