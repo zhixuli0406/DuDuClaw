@@ -1,34 +1,167 @@
 #!/usr/bin/env bash
 # DuDuClaw Release Automation
-# Usage: ./scripts/release.sh <patch|minor|major> [--dry-run]
+# Usage:
+#   ./scripts/release.sh <patch|minor|major> [--dry-run]   # bump + sync all platforms
+#   ./scripts/release.sh audit                              # show every platform's version + drift
+#   ./scripts/release.sh verify [version]                  # confirm registries published <version>
 #
-# Steps:
+# Why this exists: the version lives in MANY platform manifests (Cargo, PyPI's
+# pyproject.toml, the npm wrapper + 5 platform sub-packages, README badges). When
+# a bump is done by hand it's easy to update Cargo + README and silently forget
+# pyproject.toml / npm — which then freezes PyPI/npm at the old version (the CI
+# `pypi-publish` job builds the stale pyproject version and `skip-existing` makes
+# the miss invisible). This script bumps EVERY manifest from one place and then
+# ASSERTS they all reached the new version, so no platform can be left behind.
+#
+# Steps (bump mode):
 #   1. Validate working tree is clean
-#   2. Bump version in all Cargo.toml files
-#   3. Bump the version badge in all localized READMEs (zh-TW / en / ja)
-#      + remind to refresh & translate the release highlight in each
-#   4. Update CHANGELOG.md with new entry
-#   5. Build and run tests
-#   6. Create git commit + tag
-#   7. Print next steps (push, GitHub release)
+#   2. Pre-flight audit: print every platform's current version + flag drift
+#   3. Bump version in all manifests (Cargo / crates / npm / pyproject / READMEs)
+#   4. POST-BUMP ASSERT: every platform manifest now reads the new version, else abort
+#   5. Update CHANGELOG.md
+#   6. cargo check
+#   7. git commit + tag
+#   8. Print next steps + the registry-verify command
 set -euo pipefail
 
 # --- Config ---
 WORKSPACE_TOML="Cargo.toml"
-HOMEBREW_FORMULA="Formula/duduclaw.rb"  # if exists
+PYPI_PKG="duduclaw"   # PyPI + npm package name (used by `verify`)
+NPM_PKG="duduclaw"
 DRY_RUN=false
 
-# --- Parse args ---
+# Extended-regex semver matcher (no leading anchor — reused in several patterns).
+SEMVER='[0-9]+\.[0-9]+\.[0-9]+'
+
+# --- Enumerate every version-bearing platform manifest as "kind|path" lines. ---
+# Adding a new publish target = add it here, and audit/bump/assert all pick it up.
+platform_manifests() {
+    echo "cargo|$WORKSPACE_TOML"
+    local t
+    for t in crates/*/Cargo.toml; do
+        # Only crates with a direct (non-workspace-inherited) version line.
+        if [[ -f "$t" ]] && grep -qE "^version = \"$SEMVER\"" "$t"; then
+            echo "cargo|$t"
+        fi
+    done
+    if [[ -f pyproject.toml ]]; then echo "pyproject|pyproject.toml"; fi
+    local p
+    for p in npm/*/package.json; do
+        if [[ -f "$p" ]]; then echo "npm|$p"; fi
+    done
+    local r
+    for r in README.md README.en.md README.ja.md; do
+        if [[ -f "$r" ]]; then echo "badge|$r"; fi
+    done
+}
+
+# --- Read the current version out of a manifest, by kind. (Never fails: empty on miss.) ---
+extract_version() {
+    local file="$1" kind="$2"
+    case "$kind" in
+        cargo|pyproject)
+            { grep -m1 -E "^version = \"$SEMVER\"" "$file" \
+                | sed -E "s/^version = \"($SEMVER)\".*/\1/"; } 2>/dev/null || true
+            ;;
+        npm)
+            { grep -m1 -E "\"version\"[[:space:]]*:" "$file" \
+                | sed -E "s/.*\"version\"[[:space:]]*:[[:space:]]*\"($SEMVER)\".*/\1/"; } 2>/dev/null || true
+            ;;
+        badge)
+            { grep -m1 -oE "badge/version-$SEMVER" "$file" \
+                | sed -E "s|badge/version-($SEMVER)|\1|"; } 2>/dev/null || true
+            ;;
+    esac
+}
+
+# --- Audit: print each platform's current version, flagging drift vs Cargo. ---
+# Returns non-zero if any manifest disagrees with the Cargo workspace version.
+run_audit() {
+    local truth="$1" drift=0 kind file v flag
+    echo "Platform version audit (source of truth: Cargo workspace = $truth)"
+    echo "------------------------------------------------------------------"
+    while IFS='|' read -r kind file; do
+        v="$(extract_version "$file" "$kind")"
+        flag=""
+        if [[ "$v" != "$truth" ]]; then
+            flag="   <-- DRIFT (publishes/freezes at $v)"
+            drift=1
+        fi
+        printf "  %-34s %-10s [%s]%s\n" "$file" "${v:-?}" "$kind" "$flag"
+    done < <(platform_manifests)
+    echo "------------------------------------------------------------------"
+    return $drift
+}
+
+# --- Verify: query the public registries for an actually-published version. ---
+run_verify() {
+    local want="$1" rc=0
+    echo "Verifying public registries published version: $want"
+    echo "------------------------------------------------------------------"
+
+    # PyPI JSON API
+    local pypi
+    pypi="$(curl -fsSL "https://pypi.org/pypi/$PYPI_PKG/json" 2>/dev/null \
+        | grep -oE "\"version\"[[:space:]]*:[[:space:]]*\"$SEMVER\"" | head -1 \
+        | sed -E "s/.*\"($SEMVER)\"/\1/")" || true
+    if [[ "$pypi" == "$want" ]]; then
+        printf "  %-10s %-10s OK\n" "PyPI" "$pypi"
+    else
+        printf "  %-10s %-10s MISMATCH (expected %s)\n" "PyPI" "${pypi:-unreachable}" "$want"
+        rc=1
+    fi
+
+    # npm registry
+    local npm
+    npm="$(curl -fsSL "https://registry.npmjs.org/$NPM_PKG/latest" 2>/dev/null \
+        | grep -oE "\"version\"[[:space:]]*:[[:space:]]*\"$SEMVER\"" | head -1 \
+        | sed -E "s/.*\"($SEMVER)\"/\1/")" || true
+    if [[ "$npm" == "$want" ]]; then
+        printf "  %-10s %-10s OK\n" "npm" "$npm"
+    else
+        printf "  %-10s %-10s MISMATCH (expected %s)\n" "npm" "${npm:-unreachable}" "$want"
+        rc=1
+    fi
+
+    echo "------------------------------------------------------------------"
+    if [[ $rc -ne 0 ]]; then
+        echo "One or more registries are behind. The CI release.yml jobs for those"
+        echo "platforms either skipped (stale manifest + skip-existing) or lack"
+        echo "credentials (PYPI_TRUSTED_PUBLISHER / PYPI_TOKEN / NPM_TOKEN)."
+    fi
+    return $rc
+}
+
+# --- Arg parsing / sub-commands ---
 if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <patch|minor|major> [--dry-run]"
-    echo ""
-    echo "Examples:"
-    echo "  $0 patch          # 0.12.0 -> 0.9.8"
-    echo "  $0 minor          # 0.12.0 -> 0.10.0"
-    echo "  $0 major          # 0.12.0 -> 1.0.0"
-    echo "  $0 patch --dry-run # preview changes without writing"
+    echo "Usage:"
+    echo "  $0 <patch|minor|major> [--dry-run]   bump + sync every platform manifest"
+    echo "  $0 audit                             show each platform's version + drift"
+    echo "  $0 verify [version]                  confirm PyPI/npm published <version>"
     exit 1
 fi
+
+# Read current version up-front (needed by all sub-commands).
+CURRENT_VERSION="$(extract_version "$WORKSPACE_TOML" cargo)"
+if [[ -z "$CURRENT_VERSION" ]]; then
+    echo "Error: could not read version from $WORKSPACE_TOML"
+    exit 1
+fi
+
+case "$1" in
+    audit)
+        run_audit "$CURRENT_VERSION" || {
+            echo ""
+            echo "DRIFT DETECTED: a manifest is behind the Cargo version. The next"
+            echo "'$0 <patch|minor|major>' run re-syncs every manifest to the new version."
+        }
+        exit 0
+        ;;
+    verify)
+        run_verify "${2:-$CURRENT_VERSION}"
+        exit $?
+        ;;
+esac
 
 BUMP_TYPE="$1"
 if [[ "${2:-}" == "--dry-run" ]]; then
@@ -36,9 +169,8 @@ if [[ "${2:-}" == "--dry-run" ]]; then
     echo "[DRY RUN] No files will be modified"
 fi
 
-# --- Validate ---
 if [[ "$BUMP_TYPE" != "patch" && "$BUMP_TYPE" != "minor" && "$BUMP_TYPE" != "major" ]]; then
-    echo "Error: bump type must be 'patch', 'minor', or 'major'"
+    echo "Error: bump type must be 'patch', 'minor', 'major', or sub-command 'audit'/'verify'"
     exit 1
 fi
 
@@ -49,16 +181,7 @@ if ! git diff --quiet HEAD 2>/dev/null; then
     exit 1
 fi
 
-# --- Read current version ---
-CURRENT_VERSION=$(grep '^version = ' "$WORKSPACE_TOML" | head -1 | sed 's/version = "\(.*\)"/\1/')
-if [[ -z "$CURRENT_VERSION" ]]; then
-    echo "Error: could not read version from $WORKSPACE_TOML"
-    exit 1
-fi
-
 IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
-
-# --- Calculate new version ---
 case "$BUMP_TYPE" in
     patch) NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))" ;;
     minor) NEW_VERSION="$MAJOR.$((MINOR + 1)).0" ;;
@@ -68,62 +191,59 @@ esac
 echo "Version: $CURRENT_VERSION -> $NEW_VERSION"
 echo ""
 
+# --- Pre-flight platform audit (always shown; surfaces pre-existing drift) ---
+run_audit "$CURRENT_VERSION" || echo "(drift above will be re-synced to $NEW_VERSION below)"
+echo ""
+
 if $DRY_RUN; then
-    echo "[DRY RUN] Would update the following files:"
-    echo "  - Cargo.toml (workspace.package.version)"
-    echo "  - All crate Cargo.toml files (via cargo)"
-    echo "  - CHANGELOG.md (new entry)"
-    echo "  - Git commit: 'chore: bump v$NEW_VERSION'"
-    echo "  - Git tag: 'v$NEW_VERSION'"
+    echo "[DRY RUN] Would bump every manifest above to $NEW_VERSION, update CHANGELOG,"
+    echo "          cargo check, then commit + tag v$NEW_VERSION."
+    echo "[DRY RUN] After tag push, CI release.yml publishes GitHub + npm + PyPI."
+    echo "[DRY RUN] Confirm with: $0 verify $NEW_VERSION"
     exit 0
 fi
 
-# --- Bump version in workspace Cargo.toml ---
-echo "Bumping version in Cargo.toml files..."
-sed -i '' "s/^version = \"$CURRENT_VERSION\"/version = \"$NEW_VERSION\"/" "$WORKSPACE_TOML"
+# --- Bump every platform manifest (rewrites ANY semver, so drift is corrected) ---
+echo "Bumping all platform manifests to $NEW_VERSION..."
+while IFS='|' read -r kind file; do
+    case "$kind" in
+        cargo|pyproject)
+            sed -i '' -E "s/^version = \"$SEMVER\"/version = \"$NEW_VERSION\"/" "$file"
+            ;;
+        npm)
+            # "version": "x.y.z" plus any "@duduclaw/<plat>": "x.y.z" dep refs
+            sed -i '' -E "s/(\"version\"[[:space:]]*:[[:space:]]*\")$SEMVER(\")/\1$NEW_VERSION\2/" "$file"
+            sed -i '' -E "s/(\"@duduclaw\/[a-z0-9-]+\"[[:space:]]*:[[:space:]]*\")$SEMVER(\")/\1$NEW_VERSION\2/" "$file"
+            ;;
+        badge)
+            sed -i '' -E "s|(badge/version-)$SEMVER(-blue)|\1$NEW_VERSION\2|" "$file"
+            ;;
+    esac
+    echo "  Updated: $file"
+done < <(platform_manifests)
 
-# Bump in individual crate Cargo.toml files that reference workspace version
-for crate_toml in crates/*/Cargo.toml; do
-    # Update direct version fields (not workspace inherited ones)
-    if grep -q "^version = \"$CURRENT_VERSION\"" "$crate_toml" 2>/dev/null; then
-        sed -i '' "s/^version = \"$CURRENT_VERSION\"/version = \"$NEW_VERSION\"/" "$crate_toml"
-        echo "  Updated: $crate_toml"
+# --- POST-BUMP ASSERT: every manifest must now read NEW_VERSION (the real fix) ---
+echo ""
+echo "Asserting all platform manifests reached $NEW_VERSION..."
+ASSERT_FAIL=0
+while IFS='|' read -r kind file; do
+    v="$(extract_version "$file" "$kind")"
+    if [[ "$v" != "$NEW_VERSION" ]]; then
+        echo "  ERROR: $file is '$v', expected '$NEW_VERSION'"
+        ASSERT_FAIL=1
     fi
-done
-
-# --- Sync sibling package manifests (npm + Python) ---
-# These ship to npm / PyPI and MUST track the Cargo version, otherwise the
-# published packages drift (e.g. the v1.17.0 vs npm 1.17.1 mismatch). They may
-# legitimately sit at a different patch level than Cargo, so rewrite every
-# version-shaped field rather than matching $CURRENT_VERSION exactly.
-echo "Syncing npm + pyproject versions to $NEW_VERSION..."
-# Extended-regex (sed -E) semver matcher.
-SEMVER='[0-9]+\.[0-9]+\.[0-9]+'
-for pkg in npm/*/package.json; do
-    [[ -f "$pkg" ]] || continue
-    # "version": "x.y.z" plus any "@duduclaw/<plat>": "x.y.z" optionalDependency refs
-    sed -i '' -E "s/(\"version\"[[:space:]]*:[[:space:]]*\")$SEMVER(\")/\1$NEW_VERSION\2/" "$pkg"
-    sed -i '' -E "s/(\"@duduclaw\/[a-z0-9-]+\"[[:space:]]*:[[:space:]]*\")$SEMVER(\")/\1$NEW_VERSION\2/" "$pkg"
-    echo "  Updated: $pkg"
-done
-if [[ -f "pyproject.toml" ]]; then
-    sed -i '' -E "s/^version = \"$SEMVER\"/version = \"$NEW_VERSION\"/" pyproject.toml
-    echo "  Updated: pyproject.toml"
+done < <(platform_manifests)
+if [[ $ASSERT_FAIL -eq 1 ]]; then
+    echo ""
+    echo "Aborting: not every platform reached $NEW_VERSION (PyPI/npm would silently"
+    echo "freeze). Reverting all changes."
+    git checkout -- .
+    exit 1
 fi
-
-# --- Bump README version badges (all languages) ---
-# The shields.io badge is mechanical and lives in every localized README
-# (README.md / README.en.md / README.ja.md). The human-readable release
-# highlight at the top of each still needs a manual edit per language (see the
-# reminder at the end).
-echo "Bumping README version badges (zh-TW / en / ja)..."
-for readme in README.md README.en.md README.ja.md; do
-    [[ -f "$readme" ]] || continue
-    sed -i '' -E "s|(badge/version-)$SEMVER(-blue)|\1$NEW_VERSION\2|" "$readme"
-    echo "  Updated: $readme"
-done
+echo "  All platforms synchronized at $NEW_VERSION."
 
 # --- Update CHANGELOG.md ---
+echo ""
 echo "Updating CHANGELOG.md..."
 DATE=$(date +%Y-%m-%d)
 CHANGELOG_ENTRY="## [$NEW_VERSION] - $DATE
@@ -140,7 +260,6 @@ CHANGELOG_ENTRY="## [$NEW_VERSION] - $DATE
 "
 
 if [[ -f "CHANGELOG.md" ]]; then
-    # Insert after the first line (header)
     TEMP=$(mktemp)
     head -2 CHANGELOG.md > "$TEMP"
     echo "" >> "$TEMP"
@@ -183,6 +302,7 @@ git tag -a "v$NEW_VERSION" -m "Release v$NEW_VERSION"
 echo ""
 echo "================================================"
 echo " Release v$NEW_VERSION prepared successfully!"
+echo " All platforms synchronized: Cargo / pyproject (PyPI) / npm / READMEs"
 echo "================================================"
 echo ""
 echo "Next steps:"
@@ -195,6 +315,9 @@ echo "       - Translate the new highlight into en + ja (zh-TW is the source)"
 echo "       (version badges were bumped automatically; the prose is manual)"
 echo "  3. Amend the commit if needed:  git commit --amend"
 echo "  4. Push to remote:              git push && git push --tags"
-echo "  5. Create GitHub Release:       gh release create v$NEW_VERSION --generate-notes"
-echo "  6. Build release binaries:      ./scripts/build-release.sh $NEW_VERSION"
+echo "     -> the tag push triggers .github/workflows/release.yml, which builds"
+echo "        binaries and AUTO-PUBLISHES GitHub Release + npm + PyPI (all 3)."
+echo "  5. After CI finishes, CONFIRM every registry actually got it:"
+echo "       ./scripts/release.sh verify $NEW_VERSION"
+echo "     (this catches a PyPI/npm 'skip-existing' silent miss)"
 echo ""
