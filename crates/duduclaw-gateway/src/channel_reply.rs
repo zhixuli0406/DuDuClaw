@@ -588,7 +588,23 @@ async fn build_reply_with_session_inner(
             // Fallback: config.toml default_agent → main_agent()
             let default_agent_name = get_default_agent(&ctx.home_dir).await;
             if let Some(name) = &default_agent_name {
-                reg.get(name).or_else(|| reg.main_agent())
+                match reg.get(name) {
+                    Some(a) => Some(a),
+                    None => {
+                        // A dangling `default_agent` (renamed/removed agent) is
+                        // the classic cause of "identity mixing": routing
+                        // silently falls back to an arbitrary main agent, so the
+                        // wrong agent answers. Warn loudly per turn so it's
+                        // visible in logs until config.toml is fixed.
+                        warn!(
+                            "default_agent '{name}' is not a loaded agent — \
+                             routing fell back to the main agent; replies may \
+                             come from the wrong agent. Fix `default_agent` in \
+                             config.toml or remove it."
+                        );
+                        reg.main_agent()
+                    }
+                }
             } else {
                 reg.main_agent()
             }
@@ -612,6 +628,21 @@ async fn build_reply_with_session_inner(
     let external_factors_config = agent
         .map(|a| a.config.evolution.external_factors.clone())
         .unwrap_or_default();
+
+    // Cognitive memory layer toggle (agent.toml [evolution] cognitive_memory).
+    // When disabled, every SqliteMemoryEngine path below is skipped: key-fact
+    // recall into the system prompt, key-fact extraction/storage, and the
+    // Reflexion → semantic-memory consolidation. Gating once here (rather than
+    // at each call site) keeps a single source of truth. Falls back to the
+    // EvolutionConfig default (true) when no agent resolved.
+    let cognitive_memory_db = if agent
+        .map(|a| a.config.evolution.cognitive_memory)
+        .unwrap_or(true)
+    {
+        ctx.memory_db_path.clone()
+    } else {
+        None
+    };
 
     // Refresh compressed skill cache from agent's loaded skills
     {
@@ -1025,7 +1056,7 @@ async fn build_reply_with_session_inner(
         // P2 Key-Fact Accumulator: inject cross-session facts (middle position —
         // stable reference data that doesn't need U-shaped peak attention).
         // Uses spawn_blocking because SqliteMemoryEngine is !Send (rusqlite).
-        if let Some(db_path) = ctx.memory_db_path.clone() {
+        if let Some(db_path) = cognitive_memory_db.clone() {
             let aid = agent_id.clone();
             let query = sanitized_text.clone();
             if let Ok(facts_text) = tokio::task::spawn_blocking(move || {
@@ -1660,7 +1691,7 @@ async fn build_reply_with_session_inner(
         // Only extracts when reply is long enough to contain useful information.
         // Async, non-blocking — same pattern as instruction extraction.
         if reply.len() > 100 {
-            if let Some(db_path) = ctx.memory_db_path.clone() {
+            if let Some(db_path) = cognitive_memory_db.clone() {
                 let agent_id_for_facts = agent_id.clone();
                 let user_text_for_facts = sanitized_text.clone();
                 let reply_snippet = duduclaw_core::truncate_bytes(&reply, 500).to_string();
@@ -1747,7 +1778,7 @@ async fn build_reply_with_session_inner(
             let gap_acc_for_pred = ctx.gap_accumulator.clone();
             let sandbox_for_pred = ctx.sandbox_store.clone();
             let notebook_for_pred = ctx.mistake_notebook.clone();
-            let memory_db_path_for_pred = ctx.memory_db_path.clone();
+            let memory_db_path_for_pred = cognitive_memory_db.clone();
             let ext_factors_cfg = external_factors_config.clone();
             let evolution_emitter_for_pred = ctx.evolution_emitter.clone();
 
@@ -2781,6 +2812,45 @@ mod multi_turn_tests {
             format!("<task_recap>\n{pinned}\n</task_recap>\n\n{msg}")
         };
         assert_eq!(effective, "hello");
+    }
+}
+
+#[cfg(test)]
+mod token_owner_tests {
+    use super::*;
+
+    fn agents(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(n, t)| (n.to_string(), t.to_string())).collect()
+    }
+
+    fn lookup<'a>(global: &str, agents: &'a [(String, String)]) -> Option<&'a str> {
+        find_global_token_owner(global, agents.iter().map(|(n, t)| (n.as_str(), t.as_str())))
+    }
+
+    #[test]
+    fn global_token_shared_with_agent_returns_owner() {
+        // The customer's CEO scenario: same token in config.toml and agent.ceo.
+        let agents = agents(&[("ceo", "TOK_CEO"), ("coo", "TOK_COO")]);
+        assert_eq!(lookup("TOK_CEO", &agents), Some("ceo"));
+    }
+
+    #[test]
+    fn global_only_token_has_no_owner() {
+        // COO-style: token lives only globally → global poller must run.
+        let agents = agents(&[("ceo", "TOK_CEO")]);
+        assert_eq!(lookup("TOK_GLOBAL_ONLY", &agents), None);
+    }
+
+    #[test]
+    fn no_agents_means_no_owner() {
+        let agents = agents(&[]);
+        assert_eq!(lookup("TOK_ANY", &agents), None);
+    }
+
+    #[test]
+    fn first_agent_wins_when_multiple_share_token() {
+        let agents = agents(&[("ceo", "TOK_DUP"), ("coo", "TOK_DUP")]);
+        assert_eq!(lookup("TOK_DUP", &agents), Some("ceo"));
     }
 }
 
@@ -5269,6 +5339,59 @@ async fn get_default_agent(home_dir: &Path) -> Option<String> {
     let general = table.get("general")?.as_table()?;
     let name = general.get("default_agent")?.as_str()?;
     if name.is_empty() { None } else { Some(name.to_string()) }
+}
+
+/// Return the name of the agent that binds `global_token`, if any.
+///
+/// Shared by every token-exclusive channel (Telegram / Slack / Discord) to
+/// decide whether the generic global poller must defer to an agent-bound one.
+/// When a token is configured both globally and on a specific agent, the global
+/// generic poller is skipped: running both fights over the exclusive long-poll /
+/// gateway session (409 Conflict) and the global path routes via `default_agent`
+/// rather than the bound agent, which surfaces as "identity mixing".
+pub(crate) fn find_global_token_owner<'a, I>(global_token: &str, agent_tokens: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    agent_tokens
+        .into_iter()
+        .find(|(_, token)| *token == global_token)
+        .map(|(name, _)| name)
+}
+
+/// Validate at startup that `default_agent` (if set) names a real, loaded agent.
+///
+/// A dangling `default_agent` — left over from a renamed or removed agent — does
+/// not error; at routing time it silently falls back to an arbitrary main agent,
+/// which surfaces as "identity mixing" (the wrong agent answers a channel). This
+/// is loud at boot so operators can fix `config.toml` before users notice.
+///
+/// Returns `true` when the configuration is sound (default_agent unset, or set
+/// and resolvable), `false` when it points at a missing agent.
+pub async fn validate_default_agent(
+    home_dir: &Path,
+    registry: &Arc<RwLock<AgentRegistry>>,
+) -> bool {
+    let Some(name) = get_default_agent(home_dir).await else {
+        return true; // unset → main_agent() fallback is intentional
+    };
+    let reg = registry.read().await;
+    if reg.get(&name).is_some() {
+        info!("default_agent '{name}' resolved successfully");
+        return true;
+    }
+    let available: Vec<&str> = reg
+        .list()
+        .iter()
+        .map(|a| a.config.agent.name.as_str())
+        .collect();
+    warn!(
+        "default_agent '{name}' in config.toml does not match any loaded agent \
+         (available: {available:?}) — channel messages without an explicit \
+         binding will fall back to the main agent and may be answered by the \
+         wrong agent. Fix [general] default_agent or remove it."
+    );
+    false
 }
 
 /// Estimate the token count for a piece of text.
