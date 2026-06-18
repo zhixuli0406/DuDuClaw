@@ -344,21 +344,37 @@ pub async fn start_discord_bots(
     };
     let has_agent_tokens = !agent_tokens.is_empty();
 
-    // 1. Global bot from config.toml (legacy when per-agent tokens exist)
+    // 1. Global bot from config.toml (legacy when per-agent tokens exist).
+    //    The Discord Gateway only allows one active session per token, and the
+    //    generic global bot routes via `default_agent` — so when an agent
+    //    already binds this token we skip the global bot to avoid a second
+    //    session fighting for it and to keep replies attributed to the right
+    //    agent (no identity mixing). The per-agent bot is authoritative.
     if let Some(token) = read_discord_token(home_dir).await {
         if !token.is_empty() {
-            seen_tokens.insert(token.clone());
-            if let Some(handle) = spawn_discord_bot(
-                token,
-                "discord".to_string(),
-                None,
-                ctx.clone(),
-                home_dir,
-                has_agent_tokens,
-            )
-            .await
-            {
-                results.push(("discord".to_string(), handle));
+            if let Some(owner) = crate::channel_reply::find_global_token_owner(
+                &token,
+                agent_tokens.iter().map(|(n, t)| (n.as_str(), t.as_str())),
+            ) {
+                warn!(
+                    "Discord global token is also bound to agent '{owner}' — \
+                     skipping the global bot to avoid a duplicate Gateway \
+                     session and identity mixing; the per-agent bot is authoritative"
+                );
+            } else {
+                seen_tokens.insert(token.clone());
+                if let Some(handle) = spawn_discord_bot(
+                    token,
+                    "discord".to_string(),
+                    None,
+                    ctx.clone(),
+                    home_dir,
+                    has_agent_tokens,
+                )
+                .await
+                {
+                    results.push(("discord".to_string(), handle));
+                }
             }
         }
     }
@@ -366,7 +382,7 @@ pub async fn start_discord_bots(
     // 2. Per-agent bots from agent configs
     for (agent_name, token) in agent_tokens {
         if seen_tokens.contains(&token) {
-            info!("Discord bot for agent '{agent_name}' shares global token — skipping duplicate");
+            info!("Discord bot for agent '{agent_name}' shares an already-claimed token — skipping duplicate");
             continue;
         }
         seen_tokens.insert(token.clone());

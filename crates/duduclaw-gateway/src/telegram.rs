@@ -171,8 +171,20 @@ pub async fn start_telegram_bot(
 ///
 /// Returns a Vec of (label, JoinHandle) where label is "telegram" for the global
 /// bot and "telegram:{agent_name}" for per-agent bots.
-/// Deduplicates by token value — if an agent token matches the global token, it
-/// is skipped (the global bot already covers it).
+///
+/// ## Token exclusivity & precedence (agent binding wins)
+///
+/// Telegram's `getUpdates` long-poll is **exclusive per token** — only one
+/// consumer may poll a given bot at a time; a second poller gets HTTP 409
+/// Conflict and updates are split non-deterministically between the two.
+///
+/// A token may legitimately appear in *both* `config.toml` (global) and a
+/// specific agent's `[channels.telegram]`. When that happens we must run exactly
+/// **one** poller for it, and it must be the **agent-bound** one: the global
+/// poller is generic and routes via `default_agent` (so a CEO bot could answer
+/// as COO — "identity mixing"), whereas the per-agent poller routes
+/// deterministically to its owner. We therefore collect agent tokens first and
+/// skip the global poller for any token an agent already claims.
 pub async fn start_telegram_bots(
     home_dir: &Path,
     ctx: Arc<ReplyContext>,
@@ -180,17 +192,7 @@ pub async fn start_telegram_bots(
     let mut results = Vec::new();
     let mut seen_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // 1. Global bot from config.toml
-    if let Some(token) = read_telegram_token(home_dir).await {
-        if !token.is_empty() {
-            seen_tokens.insert(token.clone());
-            if let Some(handle) = spawn_telegram_bot(token, "telegram".into(), None, ctx.clone(), home_dir).await {
-                results.push(("telegram".to_string(), handle));
-            }
-        }
-    }
-
-    // 2. Per-agent bots from agent configs
+    // Collect per-agent tokens FIRST so the global poller can defer to them.
     let agent_tokens: Vec<(String, String)> = {
         let reg = ctx.registry.read().await;
         let mut tokens = Vec::new();
@@ -208,10 +210,33 @@ pub async fn start_telegram_bots(
         }
         tokens
     };
+    // 1. Global bot from config.toml — skipped when an agent already owns the
+    //    same token (the per-agent poller below is authoritative). This is the
+    //    fix for the dual-registration 409 + identity-mixing bug.
+    if let Some(token) = read_telegram_token(home_dir).await {
+        if !token.is_empty() {
+            if let Some(owner) = crate::channel_reply::find_global_token_owner(
+                &token,
+                agent_tokens.iter().map(|(n, t)| (n.as_str(), t.as_str())),
+            ) {
+                warn!(
+                    "Telegram global token is also bound to agent '{owner}' — \
+                     skipping the global poller to avoid a 409 Conflict and \
+                     identity mixing; the per-agent bot is authoritative"
+                );
+            } else {
+                seen_tokens.insert(token.clone());
+                if let Some(handle) = spawn_telegram_bot(token, "telegram".into(), None, ctx.clone(), home_dir).await {
+                    results.push(("telegram".to_string(), handle));
+                }
+            }
+        }
+    }
 
+    // 2. Per-agent bots (dedup among agents themselves — first claim wins).
     for (agent_name, token) in agent_tokens {
         if seen_tokens.contains(&token) {
-            info!("Telegram bot for agent '{agent_name}' shares global token — skipping duplicate");
+            info!("Telegram bot for agent '{agent_name}' shares an already-claimed token — skipping duplicate");
             continue;
         }
         seen_tokens.insert(token.clone());

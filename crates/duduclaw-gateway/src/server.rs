@@ -485,6 +485,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Store background task handles for graceful shutdown (BE-L4)
     let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
+    // Validate default_agent before wiring channels — a dangling default_agent
+    // is the root cause of channel "identity mixing" (wrong agent answers).
+    crate::channel_reply::validate_default_agent(&home_dir, handler.registry()).await;
+
     // Start channel bots — per-agent where supported
     for (label, h) in crate::telegram::start_telegram_bots(&home_dir, reply_ctx.clone()).await {
         handler.register_channel_handle(&label, h).await;

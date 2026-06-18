@@ -70,20 +70,12 @@ pub async fn start_slack_bots(
     let mut results = Vec::new();
     let mut seen_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // 1. Global bot from config.toml
-    if let (Some(app_token), Some(bot_token)) = (
-        read_slack_token(home_dir, "slack_app_token").await,
-        read_slack_token(home_dir, "slack_bot_token").await,
-    ) {
-        if !app_token.is_empty() && !bot_token.is_empty() {
-            seen_tokens.insert(bot_token.clone());
-            if let Some(handle) = spawn_slack_bot(app_token, bot_token, "slack".into(), None, ctx.clone()).await {
-                results.push(("slack".to_string(), handle));
-            }
-        }
-    }
-
-    // 2. Per-agent bots from agent configs
+    // Collect per-agent tokens FIRST so the global Socket Mode connection can
+    // defer to them. A Slack bot token bound to a specific agent is more
+    // specific than the generic global connection, which routes via
+    // `default_agent` and can answer as the wrong agent ("identity mixing").
+    // When the same token is configured both globally and per-agent we keep
+    // only the agent-bound connection.
     let agent_tokens: Vec<(String, String, String)> = {
         let reg = ctx.registry.read().await;
         let mut tokens = Vec::new();
@@ -100,10 +92,35 @@ pub async fn start_slack_bots(
         }
         tokens
     };
+    // 1. Global bot from config.toml — skipped when an agent already owns the
+    //    same bot token (the per-agent connection below is authoritative).
+    if let (Some(app_token), Some(bot_token)) = (
+        read_slack_token(home_dir, "slack_app_token").await,
+        read_slack_token(home_dir, "slack_bot_token").await,
+    ) {
+        if !app_token.is_empty() && !bot_token.is_empty() {
+            if let Some(owner) = crate::channel_reply::find_global_token_owner(
+                &bot_token,
+                agent_tokens.iter().map(|(n, _, bot)| (n.as_str(), bot.as_str())),
+            ) {
+                warn!(
+                    "Slack global bot token is also bound to agent '{owner}' — \
+                     skipping the global connection to avoid identity mixing; \
+                     the per-agent bot is authoritative"
+                );
+            } else {
+                seen_tokens.insert(bot_token.clone());
+                if let Some(handle) = spawn_slack_bot(app_token, bot_token, "slack".into(), None, ctx.clone()).await {
+                    results.push(("slack".to_string(), handle));
+                }
+            }
+        }
+    }
 
+    // 2. Per-agent bots (dedup among agents themselves — first claim wins).
     for (agent_name, app_token, bot_token) in agent_tokens {
         if seen_tokens.contains(&bot_token) {
-            info!("Slack bot for agent '{agent_name}' shares global token — skipping duplicate");
+            info!("Slack bot for agent '{agent_name}' shares an already-claimed token — skipping duplicate");
             continue;
         }
         seen_tokens.insert(bot_token.clone());
