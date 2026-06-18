@@ -1,6 +1,28 @@
 # Changelog
 
 
+## [1.21.1] - 2026-06-18 — Channel routing: stop bot "identity mixing"
+
+### Fixed
+- **Agent-bound bot token now takes precedence over the global poller**
+  (Telegram / Slack / Discord). These channels' long-poll (`getUpdates`) and
+  gateway sessions are exclusive per bot token. When the same token was
+  configured both globally (`config.toml`) and on a specific agent, the dedup
+  kept the generic **global** poller and skipped the agent one — so two pollers
+  fought over the same token (Telegram **409 Conflict**, dropped messages) and
+  the surviving generic poller routed via `default_agent`, causing **identity
+  mixing** (e.g. a CEO bot sometimes answered as COO). Precedence is reversed:
+  agent tokens are collected first and the global poller is skipped (with a
+  `WARN` naming the owner) for any token an agent already binds. Extracted the
+  shared `find_global_token_owner` helper with unit tests.
+- **`default_agent` validation at startup** — a dangling `default_agent`
+  (pointing at a renamed/removed agent) silently fell back to an arbitrary main
+  agent at routing time, the other root cause of identity mixing. The gateway
+  now validates `default_agent` against the loaded registry at boot and `WARN`s
+  loudly (listing available agents), and the per-turn fallback path warns too.
+
+
+
 ## [1.21.0] - 2026-06-17 — RFC-25 §5 Followups: non-Claude path fully functional
 
 RFC-25 v1.20.0 compiled the multi-runtime abstraction but left the non-Claude
