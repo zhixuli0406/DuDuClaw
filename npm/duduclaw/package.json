@@ -1,6 +1,6 @@
 {
   "name": "duduclaw",
-  "version": "1.21.0",
+  "version": "1.21.1",
   "description": "Multi-runtime AI Agent platform unifying Claude, OpenAI, Gemini. Hire the maintainer: fiverr.com/s/Ldw969L",
   "license": "Apache-2.0",
   "repository": {
@@ -32,10 +32,10 @@
     "postinstall": "node scripts/install.js"
   },
   "optionalDependencies": {
-    "@duduclaw/darwin-arm64": "1.21.0",
-    "@duduclaw/darwin-x64": "1.21.0",
-    "@duduclaw/linux-x64": "1.21.0",
-    "@duduclaw/linux-arm64": "1.21.0",
-    "@duduclaw/win32-x64": "1.21.0"
+    "@duduclaw/darwin-arm64": "1.21.1",
+    "@duduclaw/darwin-x64": "1.21.1",
+    "@duduclaw/linux-x64": "1.21.1",
+    "@duduclaw/linux-arm64": "1.21.1",
+    "@duduclaw/win32-x64": "1.21.1"
   }
 }
