@@ -420,9 +420,13 @@ brew install zhixuli0406/tap/duduclaw
 curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | sh
 ```
 
-### Python SDK (required dependency)
+### Python SDK (library, not a CLI)
 
-DuDuClaw's evolution engine (Skill Vetter) and some channel bridges require a Python environment:
+> **Important**: The `duduclaw` package on PyPI is a **pure Python library** (for `import duduclaw`) and ships **no command-line tool**.
+> The DuDuClaw gateway / CLI (the `duduclaw` command) is a **Rust binary** — install it via **npm** or **Homebrew** above.
+> Consequently `pipx install duduclaw` fails (No apps associated with package); this is expected — pipx only installs apps that declare an entry point.
+
+DuDuClaw's evolution engine (Skill Vetter) and some channel bridges require this Python library:
 
 ```bash
 pip install duduclaw
@@ -434,6 +438,29 @@ This command installs the following required dependencies:
 |------|---------|------|
 | `anthropic` | ≥ 0.40 | Direct Claude API calls, Skill security scan |
 | `httpx` | ≥ 0.27 | Async HTTP client (account rotation, health checks) |
+| `pyyaml` | ≥ 6.0 | Config file parsing |
+
+#### macOS (Homebrew Python) / other externally-managed environments
+
+If the system reports `error: externally-managed-environment` ([PEP 668](https://peps.python.org/pep-0668/)), installing into the system Python is blocked. Use a virtual environment instead:
+
+```bash
+# venv
+python3 -m venv .venv && source .venv/bin/activate
+pip install --upgrade duduclaw
+
+# or use uv (already adopted by this project, much faster)
+uv venv && uv pip install --upgrade duduclaw
+```
+
+Verify the installed version:
+
+```python
+import duduclaw
+print(duduclaw.__version__)   # reflects the actually installed PyPI version
+```
+
+> `__version__` is read dynamically from the installed package metadata (`pyproject.toml`) via `importlib.metadata`; a source checkout (not pip-installed) falls back to a built-in string, kept in sync with the other platform versions by `scripts/release.sh`'s drift guard.
 
 For development environments, additionally install:
 
