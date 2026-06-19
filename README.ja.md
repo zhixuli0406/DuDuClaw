@@ -420,9 +420,13 @@ brew install zhixuli0406/tap/duduclaw
 curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | sh
 ```
 
-### Python SDK（必須依存）
+### Python SDK（ライブラリ、CLI ではありません）
 
-DuDuClaw の進化エンジン（Skill Vetter）と一部のチャネルブリッジは Python 環境を必要とします：
+> **重要**：PyPI 上の `duduclaw` は**純粋な Python ライブラリ**（`import duduclaw` 用）であり、**コマンドラインツールは含まれません**。
+> DuDuClaw の gateway / CLI（`duduclaw` コマンド）は **Rust バイナリ**です。上記の **npm** または **Homebrew** でインストールしてください。
+> したがって `pipx install duduclaw` は失敗します（No apps associated with package）。これは想定された動作で、pipx はエントリポイントを持つアプリのみをインストールします。
+
+DuDuClaw の進化エンジン（Skill Vetter）と一部のチャネルブリッジは、この Python ライブラリを必要とします：
 
 ```bash
 pip install duduclaw
@@ -434,6 +438,29 @@ pip install duduclaw
 |------|---------|------|
 | `anthropic` | ≥ 0.40 | Claude API 直接呼び出し、Skill セキュリティスキャン |
 | `httpx` | ≥ 0.27 | 非同期 HTTP クライアント（アカウントローテーション、ヘルスチェック）|
+| `pyyaml` | ≥ 6.0 | 設定ファイルのパース |
+
+#### macOS（Homebrew Python）／その他の externally-managed 環境
+
+`error: externally-managed-environment`（[PEP 668](https://peps.python.org/pep-0668/)）と表示される場合、システム Python への直接インストールは禁止されています。仮想環境を使用してください：
+
+```bash
+# venv
+python3 -m venv .venv && source .venv/bin/activate
+pip install --upgrade duduclaw
+
+# または uv を使用（本プロジェクトで採用済み、より高速）
+uv venv && uv pip install --upgrade duduclaw
+```
+
+インストール済みバージョンの確認：
+
+```python
+import duduclaw
+print(duduclaw.__version__)   # 実際にインストールされた PyPI バージョンを反映
+```
+
+> `__version__` は `importlib.metadata` 経由でインストール済みパッケージのメタデータ（`pyproject.toml`）から動的に読み込まれます。ソースチェックアウト（pip 未インストール）では組み込み文字列にフォールバックし、`scripts/release.sh` のドリフトガードによって他プラットフォームのバージョンと同期されます。
 
 開発環境では追加でインストール：
 

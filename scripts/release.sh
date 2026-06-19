@@ -45,6 +45,10 @@ platform_manifests() {
         fi
     done
     if [[ -f pyproject.toml ]]; then echo "pyproject|pyproject.toml"; fi
+    # Python SDK fallback version literal (__init__.py). pyproject is the real
+    # publish version; this only matters for source-tree imports, but it drifts
+    # silently if not synced (was stuck at 1.4.27 for many releases).
+    if [[ -f python/duduclaw/__init__.py ]]; then echo "pyinit|python/duduclaw/__init__.py"; fi
     local p
     for p in npm/*/package.json; do
         if [[ -f "$p" ]]; then echo "npm|$p"; fi
@@ -62,6 +66,10 @@ extract_version() {
         cargo|pyproject)
             { grep -m1 -E "^version = \"$SEMVER\"" "$file" \
                 | sed -E "s/^version = \"($SEMVER)\".*/\1/"; } 2>/dev/null || true
+            ;;
+        pyinit)
+            { grep -m1 -E "^[[:space:]]*__version__ = \"$SEMVER\"" "$file" \
+                | sed -E "s/^[[:space:]]*__version__ = \"($SEMVER)\".*/\1/"; } 2>/dev/null || true
             ;;
         npm)
             { grep -m1 -E "\"version\"[[:space:]]*:" "$file" \
@@ -209,6 +217,9 @@ while IFS='|' read -r kind file; do
     case "$kind" in
         cargo|pyproject)
             sed -i '' -E "s/^version = \"$SEMVER\"/version = \"$NEW_VERSION\"/" "$file"
+            ;;
+        pyinit)
+            sed -i '' -E "s/^([[:space:]]*)__version__ = \"$SEMVER\"/\1__version__ = \"$NEW_VERSION\"/" "$file"
             ;;
         npm)
             # "version": "x.y.z" plus any "@duduclaw/<plat>": "x.y.z" dep refs
