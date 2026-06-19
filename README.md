@@ -36,6 +36,65 @@ observability. Same architecture standards as DuDuClaw.
 
 ---
 
+## 🔒 信任與安全（Trust & Security）
+
+這是開源專案 — 完整透明地說明你安裝的是什麼。
+
+### 為什麼一個「新」的 npm 套件版本號已經 1.21+？
+
+DuDuClaw 在公開之前，已在私有 repository 經歷數個月密集開發（400+ commits）。
+完整歷史見 [git log](https://github.com/zhixuli0406/DuDuClaw/commits/main)。
+
+### npm 套件裡有什麼？
+
+- 一個小型 JS wrapper，僅負責呼叫對應平台的 Rust 二進位
+- 平台二進位透過 npm `optionalDependencies`（`@duduclaw/<platform>`）安裝 —
+  **沒有 postinstall 從任意 URL 下載並執行外部程式碼**
+- `postinstall` 只檢查平台套件是否就位（見 [`npm/duduclaw/scripts/install.js`](npm/duduclaw/scripts/install.js)），不下載、不執行任何東西
+- GitHub Releases 的二進位皆附 SHA-256 checksum
+
+### 不信任預編譯二進位？從原始碼建置
+
+```bash
+git clone https://github.com/zhixuli0406/DuDuClaw
+cd DuDuClaw
+cargo build --release
+```
+
+### 二進位驗證
+
+每個 Release 都附帶 SHA-256 checksum，並透過 [cosign](https://github.com/sigstore/cosign) keyless 簽章：
+
+```bash
+# 從 Releases 下載
+wget https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.21.1/duduclaw-darwin-arm64.tar.gz
+
+# 驗證 SHA-256（對照 release 內的 .sha256 檔）
+shasum -a 256 -c duduclaw-darwin-arm64.tar.gz.sha256
+
+# 驗證 cosign 簽章
+cosign verify-blob \
+  --certificate duduclaw-darwin-arm64.tar.gz.pem \
+  --signature duduclaw-darwin-arm64.tar.gz.sig \
+  --certificate-identity-regexp "https://github.com/zhixuli0406/DuDuClaw" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  duduclaw-darwin-arm64.tar.gz
+```
+
+### 供應鏈透明度
+
+- **授權**：Apache 2.0
+- **維護者**：嘟嘟數位科技有限公司（台灣登記公司，統編 94139082）
+- **公開 commit 歷史**：github.com/zhixuli0406/DuDuClaw
+- **CI/CD**：所有 Release 皆由 GitHub Actions 建置
+- **無遙測（No telemetry）**：零 phone-home 連線
+- **不蒐集 API 金鑰**：所有密鑰以 AES-256-GCM 留在你自己的機器上
+- **不需特權提升**：完全在 user space 執行
+
+漏洞回報請見 [SECURITY.md](SECURITY.md)。
+
+---
+
 ## 為什麼選 DuDuClaw，而不是直接用原生 Claude / GPT / Gemini CLI？
 
 如果你只是偶爾以個人身分使用單一 LLM，原生 CLI 已經很好用。
@@ -67,6 +126,7 @@ observability. Same architecture standards as DuDuClaw.
 <details>
 <summary><strong>v1.9.4 → v1.20.x 累積亮點</strong></summary>
 
+- **RFC-26 — Live Run Forking（分支決戰，受 [pydantic-deepagents](https://github.com/vstorm-co/pydantic-deepagents) 啟發）**：把進行中的任務分叉成 N 個並行競爭分支，各自在 copy-on-write 隔離工作區嘗試不同策略，由 AI judge 依 `quality·0.4 + test_pass·0.4 + consistency·0.2` 評分挑出勝者（4 種 merge 模式）。新 crate `duduclaw-fork` + 跨程序 SQLite `ForkStore`（MCP server 執行、gateway `/metrics` 與 dashboard `分支決戰` 頁可觀測）+ 6 個 MCP 工具（`fork_run`/`inspect_branches`/`diff_branches`/`merge_or_select`/`terminate_branch`/`fork_cost`）+ `AccountRotator` 分配每分支獨立帳號 + per-branch/aggregate 預算。附帶 parity 工具：`memory_improve`（反思提案）、`plan_start`（先澄清再規劃）、內建 skill（code-review/refactor/test-writer/git-workflow）、checkpoint fork/rewind 持久化、Task Board 原子 claim + 環路偵測。預設關閉，`agent.toml [fork] enabled = true` 啟用
 - **v1.20.0** — RFC-25 多模型解鎖 + A2A：「Multi-Runtime 四後端」過去是未編譯的孤兒程式碼，每條執行路徑都寫死 Claude。v1.20.0 把它接上電，所有呼叫 LLM 的子系統走單一 provider-agnostic choke-point（`runtime_dispatch::run_agent_prompt` + lazy 自動偵測的 `RuntimeRegistry`）；channel reply / GVU / 子 agent 派工在非 Claude provider 時走 choke-point（Claude 維持 OAuth 輪替 / PTY 路徑，零回歸）；ACP `tasks/send` 改為實際執行目標 agent 並正確回報 Failed / Completed；Phase 0 拆掉 GVU 演化模型硬鎖（reject → warn）
 
 - **v1.19.0** — Memory Intelligence：把 W18/W19 設計但未實作的記憶層非侵入式落地於現行 Rust `SqliteMemoryEngine`。**Temporal Memory**（`memories` 加時態 / 知識圖譜欄位 + `store_temporal` 自動取代鏈 + `get_history`/`get_at`，搜尋預設只回有效記憶）；**Reflexion Loop**（橋接既有 `MistakeNotebook`：召回注入答題 prompt + 同 category ≥3 固化成 semantic 規則）；**`memory_fetch_batch`** MCP 工具（依 ID 批次讀取 ≤100，namespace/ownership 隔離）。`MemoryEntry` 不動，零破壞

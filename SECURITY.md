@@ -15,7 +15,7 @@
 
 ### Preferred: GitHub Private Vulnerability Reporting
 
-1. Go to the [Security Advisories](https://github.com/anthropics/DuDuClaw/security/advisories) page
+1. Go to the [Security Advisories](https://github.com/zhixuli0406/DuDuClaw/security/advisories) page
 2. Click **"Report a vulnerability"**
 3. Fill in the details and submit
 
@@ -85,6 +85,27 @@ DuDuClaw implements defense in depth:
 - **Layer 7**: Audit Log — append-only JSONL security event trail
 
 For full architecture details, see [docs/CLAUDE.md](docs/CLAUDE.md).
+
+## Binary Distribution Security
+
+DuDuClaw binaries are:
+
+- Built via GitHub Actions from public source (see [`.github/workflows/release.yml`](.github/workflows/release.yml))
+- Published with SHA-256 checksums (`*.sha256`) in every release
+- Signed with [cosign](https://github.com/sigstore/cosign) keyless OIDC signing (`*.sig` + `*.pem`)
+- Distributed only via GitHub Releases (no third-party CDN)
+- Shipped to npm as platform packages through `optionalDependencies` — the `postinstall`
+  script ([`npm/duduclaw/scripts/install.js`](npm/duduclaw/scripts/install.js)) only verifies the
+  platform package is present; it never downloads or executes external code
+
+What we do **not** do:
+
+- ❌ Phone home / telemetry
+- ❌ Collect API keys (secrets stay on the user's machine via an AES-256-GCM vault)
+- ❌ Auto-execute untrusted downloaded code
+- ❌ Require root / privileged escalation
+
+Verification instructions are in the [README Trust & Security section](README.en.md#-trust--security).
 
 ## Disclosure Policy
 

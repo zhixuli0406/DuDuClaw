@@ -1,14 +1,22 @@
 {
   "name": "duduclaw",
   "version": "1.21.1",
-  "description": "Multi-runtime AI Agent platform unifying Claude, OpenAI, Gemini. Hire the maintainer: fiverr.com/s/Ldw969L",
+  "description": "Open-source AI Agent platform unifying Claude / Codex / Gemini CLIs. Multi-LLM routing, 80+ MCP tools, 7 messaging channels. Rust + Python.",
   "license": "Apache-2.0",
+  "author": {
+    "name": "Louis Li",
+    "email": "zhixuli0406@gmail.com",
+    "url": "https://github.com/zhixuli0406"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/zhixuli0406/DuDuClaw.git",
     "directory": "npm/duduclaw"
   },
-  "homepage": "https://www.fiverr.com/s/Ldw969L",
+  "homepage": "https://github.com/zhixuli0406/DuDuClaw#readme",
+  "bugs": {
+    "url": "https://github.com/zhixuli0406/DuDuClaw/issues"
+  },
   "keywords": [
     "ai",
     "agent",
@@ -17,8 +25,9 @@
     "gemini",
     "multi-llm",
     "mcp",
+    "model-context-protocol",
     "rag",
-    "freelance",
+    "rust",
     "duduclaw"
   ],
   "bin": {

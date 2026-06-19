@@ -36,6 +36,66 @@ observability. Same architecture standards as DuDuClaw.
 
 ---
 
+## 🔒 Trust & Security
+
+This is an open-source project — here's full transparency on what you're installing.
+
+### Why is a "new" npm package already at version 1.21+?
+
+DuDuClaw had several months of intensive development in a private repository (400+ commits) before
+going public. See the [git log](https://github.com/zhixuli0406/DuDuClaw/commits/main) for full history.
+
+### What's inside the npm package?
+
+- A small JS wrapper that only invokes the platform-specific Rust binary
+- The platform binary ships via npm `optionalDependencies` (`@duduclaw/<platform>`) —
+  **no postinstall script downloads and executes external code from arbitrary URLs**
+- `postinstall` only checks that the platform package is present (see
+  [`npm/duduclaw/scripts/install.js`](npm/duduclaw/scripts/install.js)) — it downloads and executes nothing
+- GitHub Release binaries ship with SHA-256 checksums
+
+### Building from source (if you don't trust the prebuilt binary)
+
+```bash
+git clone https://github.com/zhixuli0406/DuDuClaw
+cd DuDuClaw
+cargo build --release
+```
+
+### Binary verification
+
+Every release ships with SHA-256 checksums and a keyless [cosign](https://github.com/sigstore/cosign) signature:
+
+```bash
+# Download from Releases
+wget https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.21.1/duduclaw-darwin-arm64.tar.gz
+
+# Verify SHA-256 (against the .sha256 file in the release)
+shasum -a 256 -c duduclaw-darwin-arm64.tar.gz.sha256
+
+# Verify the cosign signature
+cosign verify-blob \
+  --certificate duduclaw-darwin-arm64.tar.gz.pem \
+  --signature duduclaw-darwin-arm64.tar.gz.sig \
+  --certificate-identity-regexp "https://github.com/zhixuli0406/DuDuClaw" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  duduclaw-darwin-arm64.tar.gz
+```
+
+### Supply chain transparency
+
+- **License**: Apache 2.0
+- **Maintainer**: 嘟嘟數位科技有限公司 (Taiwan-registered company, 統編 94139082)
+- **Public commit history**: github.com/zhixuli0406/DuDuClaw
+- **CI/CD**: All releases are built via GitHub Actions
+- **No telemetry**: zero phone-home calls
+- **No API key collection**: all secrets stay on your machine via an AES-256-GCM vault
+- **No privileged escalation**: runs entirely in user space
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
+
+---
+
 ## Why DuDuClaw vs Using Native Claude / GPT / Gemini CLIs?
 
 The native CLIs are great if you're using one LLM occasionally as a person.
@@ -69,6 +129,7 @@ infrastructure work.
 <details>
 <summary><strong>v1.9.4 → v1.20.x cumulative highlights</strong></summary>
 
+- **RFC-26 — Live Run Forking (inspired by [pydantic-deepagents](https://github.com/vstorm-co/pydantic-deepagents))**: split an in-flight task into N competing branches that explore different strategies in copy-on-write isolated workspaces, and let an AI judge pick the winner by `quality·0.4 + test_pass·0.4 + consistency·0.2` (4 merge modes). New `duduclaw-fork` crate + cross-process SQLite `ForkStore` (forks run in the MCP-server process; observable via the gateway `/metrics` endpoint and the dashboard **Forks** page) + 6 MCP tools (`fork_run`/`inspect_branches`/`diff_branches`/`merge_or_select`/`terminate_branch`/`fork_cost`) + a distinct `AccountRotator` account per branch + per-branch/aggregate USD budgets. Parity tools ship alongside: `memory_improve` (reflection proposals), `plan_start` (clarify-first planning), built-in skills (code-review/refactor/test-writer/git-workflow), checkpoint fork/rewind persistence, Task Board atomic claim + cycle detection. Default off; enable per agent via `agent.toml [fork] enabled = true`
 - **v1.20.0** — RFC-25 Multi-Runtime Unlock + A2A: the "Multi-Runtime four-backend" abstraction was previously orphan, uncompiled source — every execution path hardcoded Claude. v1.20.0 wires it up and routes the LLM-calling subsystems through a single provider-agnostic choke-point (`runtime_dispatch::run_agent_prompt` + a lazily auto-detecting `RuntimeRegistry`); channel reply / GVU / sub-agent delegation route through the choke-point for non-Claude providers (Claude keeps its OAuth-rotation / PTY path, zero regression); ACP `tasks/send` actually runs the target agent and reports Failed / Completed; Phase 0 removed the GVU evolution-model hard-lock (reject → warn)
 
 - **v1.19.0** — Memory Intelligence: the W18/W19-designed memory layer, implemented non-invasively on the live Rust `SqliteMemoryEngine`. **Temporal Memory** (`memories` gains temporal / knowledge-graph columns + `store_temporal` automatic supersession chain + `get_history`/`get_at`; search default-filters to currently-valid memories); **Reflexion Loop** (bridges the existing `MistakeNotebook`: recall injected into the answering prompt + ≥3 same-category mistakes consolidated into a semantic rule); **`memory_fetch_batch`** MCP tool (fetch ≤100 entries by ID, namespace/ownership enforced). `MemoryEntry` unchanged, zero blast radius
