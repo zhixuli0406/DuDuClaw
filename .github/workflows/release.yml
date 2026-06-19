@@ -17,6 +17,9 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+      id-token: write   # cosign keyless (Sigstore OIDC) signing
     strategy:
       matrix:
         include:
@@ -48,6 +51,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
 
       - name: Install cross (aarch64-linux)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -82,6 +88,14 @@ jobs:
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
           rm -rf _pkg
 
+      - name: Sign archive with cosign (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cosign sign-blob --yes \
+            --output-signature ${{ matrix.artifact }}.tar.gz.sig \
+            --output-certificate ${{ matrix.artifact }}.tar.gz.pem \
+            ${{ matrix.artifact }}.tar.gz
+
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
@@ -94,6 +108,14 @@ jobs:
           Get-FileHash ${{ matrix.artifact }}.zip -Algorithm SHA256 | Format-List Hash > ${{ matrix.artifact }}.zip.sha256
           Remove-Item -Recurse -Force _pkg
 
+      - name: Sign archive with cosign (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cosign sign-blob --yes `
+            --output-signature ${{ matrix.artifact }}.zip.sig `
+            --output-certificate ${{ matrix.artifact }}.zip.pem `
+            ${{ matrix.artifact }}.zip
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -101,6 +123,8 @@ jobs:
             duduclaw-*.tar.gz
             duduclaw-*.zip
             duduclaw-*.sha256
+            duduclaw-*.sig
+            duduclaw-*.pem
 
   release:
     needs: build
@@ -119,6 +143,8 @@ jobs:
             duduclaw-*.tar.gz
             duduclaw-*.zip
             duduclaw-*.sha256
+            duduclaw-*.sig
+            duduclaw-*.pem
 
   # Publish to npm
   npm-publish:

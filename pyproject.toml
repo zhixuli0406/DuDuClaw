@@ -5,22 +5,24 @@ build-backend = "hatchling.build"
 [project]
 name = "duduclaw"
 version = "1.21.1"
-description = "Multi-runtime AI Agent platform unifying Claude, OpenAI, Gemini — hire the maintainer on Fiverr"
+description = "Open-source AI Agent platform unifying Claude / Codex / Gemini CLIs. Multi-LLM routing, 80+ MCP tools, 7 messaging channels."
 requires-python = ">=3.9"
 license = {text = "Apache-2.0"}
-authors = [{ name = "DuDuClaw Contributors" }]
+authors = [{ name = "Louis Li", email = "zhixuli0406@gmail.com" }]
 readme = "python/README.md"
-keywords = ["ai", "agent", "claude", "openai", "gemini", "multi-llm", "mcp", "rag", "freelance", "duduclaw"]
+keywords = ["ai", "agent", "claude", "openai", "gemini", "multi-llm", "mcp", "model-context-protocol", "rag", "rust", "duduclaw"]
 classifiers = [
     "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
     "License :: OSI Approved :: Apache Software License",
-    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
 dependencies = [
     "anthropic>=0.40",
@@ -32,9 +34,11 @@ dependencies = [
 dev = ["pytest>=8", "pytest-asyncio>=0.24", "pytest-cov>=5", "ruff>=0.8", "watchdog>=4.0"]
 
 [project.urls]
-Homepage = "https://www.fiverr.com/s/Ldw969L"
+Homepage = "https://github.com/zhixuli0406/DuDuClaw"
 Repository = "https://github.com/zhixuli0406/DuDuClaw"
 Issues = "https://github.com/zhixuli0406/DuDuClaw/issues"
+Documentation = "https://github.com/zhixuli0406/DuDuClaw#readme"
+Changelog = "https://github.com/zhixuli0406/DuDuClaw/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["python/duduclaw"]

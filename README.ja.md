@@ -36,6 +36,66 @@ observability. Same architecture standards as DuDuClaw.
 
 ---
 
+## 🔒 信頼性とセキュリティ（Trust & Security）
+
+これはオープンソースプロジェクトです — インストールする内容を完全に透明化します。
+
+### なぜ「新しい」npm パッケージがすでに version 1.21+ なのか？
+
+DuDuClaw は公開前に、プライベートリポジトリで数か月の集中開発（400+ commits）を経ています。
+完全な履歴は [git log](https://github.com/zhixuli0406/DuDuClaw/commits/main) を参照してください。
+
+### npm パッケージの中身は？
+
+- 対応プラットフォームの Rust バイナリを呼び出すだけの小さな JS ラッパー
+- プラットフォームバイナリは npm `optionalDependencies`（`@duduclaw/<platform>`）で配布 —
+  **任意の URL から外部コードをダウンロードして実行する postinstall は存在しません**
+- `postinstall` はプラットフォームパッケージの有無を確認するだけ
+  （[`npm/duduclaw/scripts/install.js`](npm/duduclaw/scripts/install.js) 参照）— 何もダウンロード・実行しません
+- GitHub Releases のバイナリはすべて SHA-256 チェックサム付き
+
+### プリビルドバイナリを信頼しない場合はソースからビルド
+
+```bash
+git clone https://github.com/zhixuli0406/DuDuClaw
+cd DuDuClaw
+cargo build --release
+```
+
+### バイナリの検証
+
+各リリースには SHA-256 チェックサムと [cosign](https://github.com/sigstore/cosign) keyless 署名が付属します：
+
+```bash
+# Releases からダウンロード
+wget https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.21.1/duduclaw-darwin-arm64.tar.gz
+
+# SHA-256 を検証（リリース内の .sha256 ファイルと照合）
+shasum -a 256 -c duduclaw-darwin-arm64.tar.gz.sha256
+
+# cosign 署名を検証
+cosign verify-blob \
+  --certificate duduclaw-darwin-arm64.tar.gz.pem \
+  --signature duduclaw-darwin-arm64.tar.gz.sig \
+  --certificate-identity-regexp "https://github.com/zhixuli0406/DuDuClaw" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  duduclaw-darwin-arm64.tar.gz
+```
+
+### サプライチェーンの透明性
+
+- **ライセンス**：Apache 2.0
+- **メンテナー**：嘟嘟數位科技有限公司（台湾登記法人、統一番号 94139082）
+- **公開 commit 履歴**：github.com/zhixuli0406/DuDuClaw
+- **CI/CD**：すべてのリリースは GitHub Actions でビルド
+- **テレメトリなし**：phone-home 通信はゼロ
+- **API キーを収集しない**：すべての秘密情報は AES-256-GCM で自分のマシンに保管
+- **権限昇格なし**：完全に user space で動作
+
+脆弱性の報告は [SECURITY.md](SECURITY.md) を参照してください。
+
+---
+
 ## なぜネイティブの Claude / GPT / Gemini CLI ではなく DuDuClaw なのか？
 
 ネイティブ CLI は、個人として単一の LLM をたまに使う分には十分優秀です。
@@ -69,6 +129,7 @@ observability. Same architecture standards as DuDuClaw.
 <details>
 <summary><strong>v1.9.4 → v1.20.x 累積ハイライト</strong></summary>
 
+- **RFC-26 — Live Run Forking（[pydantic-deepagents](https://github.com/vstorm-co/pydantic-deepagents) に着想）**：実行中のタスクを N 個の競合ブランチに分岐し、それぞれ copy-on-write の隔離ワークスペースで異なる戦略を試行、AI judge が `quality·0.4 + test_pass·0.4 + consistency·0.2` で勝者を選定（4 つの merge モード）。新クレート `duduclaw-fork` + クロスプロセス SQLite `ForkStore`（fork は MCP サーバープロセスで実行、gateway `/metrics` とダッシュボード **Forks** ページで観測可能）+ 6 つの MCP ツール（`fork_run`/`inspect_branches`/`diff_branches`/`merge_or_select`/`terminate_branch`/`fork_cost`）+ ブランチごとに `AccountRotator` の独立アカウント + per-branch/aggregate の USD 予算。パリティツールも同梱：`memory_improve`（リフレクション提案）、`plan_start`（先に明確化してから計画）、組み込みスキル（code-review/refactor/test-writer/git-workflow）、checkpoint fork/rewind 永続化、Task Board のアトミック claim + 循環検出。デフォルト無効、`agent.toml [fork] enabled = true` で有効化
 - **v1.20.0** — RFC-25 マルチランタイム解放 + A2A：「Multi-Runtime 四バックエンド」はこれまでコンパイルされない孤立ソースで、すべての実行パスが Claude をハードコードしていました。v1.20.0 はこれを配線し、LLM を呼ぶサブシステムを単一の provider-agnostic な choke-point（`runtime_dispatch::run_agent_prompt` + 遅延自動検出する `RuntimeRegistry`）に通します。channel reply / GVU / サブ agent 委譲は非 Claude provider で choke-point を通り（Claude は OAuth ローテーション / PTY パスを維持、リグレッションなし）；ACP `tasks/send` がターゲット agent を実際に実行し Failed / Completed を報告；Phase 0 で GVU 進化モデルのハードロックを撤廃（reject → warn）
 
 - **v1.19.0** — Memory Intelligence：W18/W19 で設計された記憶層を、現行の Rust `SqliteMemoryEngine` に非侵襲的に実装。**Temporal Memory**（`memories` に時態 / ナレッジグラフ列 + `store_temporal` の自動 supersession チェーン + `get_history`/`get_at`、検索は既定で有効な記憶のみ返す）；**Reflexion Loop**（既存の `MistakeNotebook` をブリッジ：回答プロンプトへのリコール注入 + 同カテゴリ ≥3 件を semantic ルールに統合）；**`memory_fetch_batch`** MCP ツール（ID 一括取得 ≤100、namespace/ownership 隔離）。`MemoryEntry` は不変、影響ゼロ
