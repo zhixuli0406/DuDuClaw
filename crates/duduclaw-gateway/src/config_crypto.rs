@@ -85,20 +85,13 @@ fn load_or_create_keyfile(home_dir: &Path) -> Option<[u8; 32]> {
 }
 
 /// Decrypt a base64-encoded encrypted value using the per-machine keyfile.
+///
+/// Delegates to the canonical read-only primitive
+/// [`duduclaw_security::keyfile::decrypt_keyfile_value`] so all crates share
+/// one decrypt path. The encrypt/write helpers below keep their own
+/// `load_keyfile`-based body (which may *create* a keyfile).
 pub(crate) fn decrypt_value(encrypted: &str, home_dir: &Path) -> Option<String> {
-    let key = load_keyfile(home_dir).or_else(|| {
-        tracing::warn!("Keyfile not found — cannot decrypt config value");
-        None
-    })?;
-    let engine = duduclaw_security::crypto::CryptoEngine::new(&key).ok()?;
-    match engine.decrypt_string(encrypted) {
-        Ok(plain) if !plain.is_empty() => Some(plain),
-        Ok(_) => None,
-        Err(e) => {
-            tracing::warn!("Decryption failed: {e}");
-            None
-        }
-    }
+    duduclaw_security::keyfile::decrypt_keyfile_value(encrypted, home_dir)
 }
 
 /// Encrypt a plaintext value using the per-machine keyfile.
@@ -176,6 +169,13 @@ pub fn decrypt_config_field(
 }
 
 /// Read a config field from a TOML file, with encryption support.
+///
+/// Resolution order for the effective value:
+/// 1. `<field>_enc` (decrypted) → `<field>` plaintext (via [`decrypt_config_field`]).
+/// 2. If that value is a `secret://<backend>/<name>` reference, resolve it
+///    through the configured [`SecretManager`] (e.g. HashiCorp Vault) — this is
+///    the opt-in externalised-secret path. Non-reference values are returned
+///    unchanged, so existing inline / `_enc` secrets behave exactly as before.
 pub async fn read_encrypted_config_field(
     home_dir: &Path,
     section: &str,
@@ -184,7 +184,31 @@ pub async fn read_encrypted_config_field(
     let config_path = home_dir.join("config.toml");
     let content = tokio::fs::read_to_string(&config_path).await.ok()?;
     let table: toml::Table = content.parse().ok()?;
-    decrypt_config_field(&table, section, field_base, home_dir)
+    let value = decrypt_config_field(&table, section, field_base, home_dir)?;
+    resolve_secret_reference(value, &table, home_dir).await
+}
+
+/// If `value` is a `secret://<backend>/<name>` reference, resolve it via the
+/// `[secret_manager]`-configured backend (the reference's own backend is
+/// honored, e.g. `secret://vault/...` always uses Vault). Otherwise return
+/// `value` unchanged. Resolution failures are logged and yield `None` (the
+/// caller then behaves as if the secret were unset — fail-soft, never panics).
+async fn resolve_secret_reference(
+    value: String,
+    table: &toml::Table,
+    home_dir: &Path,
+) -> Option<String> {
+    use duduclaw_security::secret_manager::SecretManagerConfig;
+
+    // Load `[secret_manager]` from the already-parsed config table, then
+    // delegate to the canonical shared resolver.
+    let sm_cfg: SecretManagerConfig = table
+        .get("secret_manager")
+        .cloned()
+        .and_then(|v| v.try_into().ok())
+        .unwrap_or_default();
+
+    duduclaw_security::secret_manager::resolve_secret_reference(&value, &sm_cfg, home_dir).await
 }
 
 // ─── Per-agent channel token + reports_to cascade ───────────

@@ -1,0 +1,37 @@
+[package]
+name = "duduclaw-fork"
+version.workspace = true
+edition.workspace = true
+description = "RFC-26 Live Run Forking: split an in-flight agent run into N competing branches with copy-on-write workspaces, per-branch budgets, and AI-judge merge selection"
+
+[dependencies]
+# Shared helpers (truncate_bytes — CJK-safe snippet truncation per security conventions)
+duduclaw-core = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# IDs
+uuid = { workspace = true }
+
+# Copy-on-write workspace overlay (MVP backend — RFC-26 §6 Q1)
+tempfile = "3"
+
+# Cross-process shared fork store (WAL SQLite) — both the MCP server and the
+# gateway read/write fork state through this.
+rusqlite = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

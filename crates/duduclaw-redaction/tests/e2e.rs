@@ -117,7 +117,7 @@ fn send_email_tool_call_restores_args_and_executes() {
 
     // Egress evaluator restores tokens and yields the executable payload.
     let dec = manager
-        .decide_tool_call("send_email", &llm_tool_call, "agnes", Some("s1"))
+        .decide_tool_call("send_email", &llm_tool_call, "agnes", Some("s1"), &duduclaw_redaction::Caller::owner("agnes"))
         .unwrap();
     match dec {
         EgressDecision::Allow { args, tokens_restored } => {
@@ -153,6 +153,7 @@ fn web_fetch_is_denied_by_default() {
             &serde_json::json!({"url": format!("https://x.com?email={tok}")}),
             "agnes",
             Some("s1"),
+            &duduclaw_redaction::Caller::owner("agnes"),
         )
         .unwrap();
     match dec {
@@ -181,6 +182,7 @@ fn log_event_passthrough_keeps_tokens_in_arg() {
             &serde_json::json!({"message": format!("contacted {tok}")}),
             "agnes",
             Some("s1"),
+            &duduclaw_redaction::Caller::owner("agnes"),
         )
         .unwrap();
     match dec {

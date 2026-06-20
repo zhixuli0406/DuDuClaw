@@ -311,10 +311,41 @@ pub(crate) fn sanitize_worker_log_line(line: &str) -> String {
 
 /// **Round 4 fix (MED-3)**: cap `RUST_LOG` directive so the worker
 /// can't be set to `trace` (which floods stdout/stderr through
-/// `forward_stream`). Operates by string substitution because
-/// `tracing_subscriber::EnvFilter` doesn't expose its grammar.
+/// `forward_stream`).
+///
+/// **L2 fix**: a blanket substring replace of `"trace"` corrupts target names
+/// that merely contain the substring (e.g. `my_trace_mod=info` →
+/// `my_debug_mod=info`, or `tracecrate=warn`). `RUST_LOG` is a comma-separated
+/// list of directives; each is either a bare `level` or `target=level`. We only
+/// lower the *level* token of each directive, leaving target paths untouched.
 pub(crate) fn cap_rust_log_verbosity(filter: &str) -> String {
-    filter.replace("trace", "debug").replace("TRACE", "DEBUG")
+    /// Lower a single level token from trace → debug (case-insensitive),
+    /// preserving anything that isn't exactly the trace level.
+    fn cap_level(level: &str) -> String {
+        if level.eq_ignore_ascii_case("trace") {
+            // Preserve original case style: all-upper → DEBUG, else debug.
+            if level.chars().all(|c| c.is_ascii_uppercase()) {
+                "DEBUG".to_string()
+            } else {
+                "debug".to_string()
+            }
+        } else {
+            level.to_string()
+        }
+    }
+
+    filter
+        .split(',')
+        .map(|directive| {
+            // `target=level` → only the level (after the last '=') is a level.
+            // A bare directive with no '=' is itself a level (e.g. "trace").
+            match directive.rsplit_once('=') {
+                Some((target, level)) => format!("{target}={}", cap_level(level)),
+                None => cap_level(directive),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 async fn wait_for_healthy(
@@ -798,6 +829,29 @@ mod tests {
     fn cap_rust_log_leaves_other_levels_alone() {
         assert_eq!(cap_rust_log_verbosity("info"), "info");
         assert_eq!(cap_rust_log_verbosity("warn,foo::bar=debug"), "warn,foo::bar=debug");
+    }
+
+    /// L2: target names that merely *contain* "trace" must NOT be rewritten —
+    /// only the level token of each directive is capped.
+    #[test]
+    fn cap_rust_log_preserves_target_names_containing_trace() {
+        // Target substring "trace" must survive; its level (info) is unchanged.
+        assert_eq!(
+            cap_rust_log_verbosity("my_trace_mod=info"),
+            "my_trace_mod=info"
+        );
+        // A target literally named "trace" with a non-trace level is preserved.
+        assert_eq!(cap_rust_log_verbosity("trace=info"), "trace=info");
+        // Only the level is capped, the trace-containing target stays intact.
+        assert_eq!(
+            cap_rust_log_verbosity("opentelemetry_tracing=trace,info"),
+            "opentelemetry_tracing=debug,info"
+        );
+        // Mixed: a trace-containing target AND a bare trace level.
+        assert_eq!(
+            cap_rust_log_verbosity("tracer=warn,trace"),
+            "tracer=warn,debug"
+        );
     }
 
     // **Round 4 (MED-C1)** — wait_for_healthy honours shutdown signal.

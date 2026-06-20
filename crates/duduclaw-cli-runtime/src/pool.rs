@@ -251,6 +251,12 @@ impl PtyPool {
         self.sessions.len()
     }
 
+    /// **HP1**: number of live per-key semaphores (for diagnostics / tests).
+    /// Used to assert the `semaphores` map doesn't grow unboundedly.
+    pub fn semaphore_count(&self) -> usize {
+        self.semaphores.len()
+    }
+
     /// **Review fix (CRITICAL #1)**: non-spawning existence check. Used by
     /// `handle_shutdown_session` in the worker to avoid spawning a fresh
     /// session just to immediately destroy it — which was a token-cost
@@ -279,11 +285,28 @@ impl PtyPool {
         let cache_key = key.cache_key();
         if let Some((_, sess)) = self.sessions.remove(&cache_key) {
             self.supervisor.untrack(&cache_key);
+            // **HP1 fix**: drop the per-key semaphore too, or it accumulates
+            // unboundedly across distinct (agent, account, model) triples.
+            self.drop_semaphore(&cache_key);
             sess.shutdown().await;
             true
         } else {
             false
         }
+    }
+
+    /// **HP1 fix**: remove the per-key `Arc<Semaphore>` once its session is gone.
+    ///
+    /// The `semaphores` DashMap grew without bound because eviction/removal/
+    /// shutdown only ever cleaned up `sessions`. A caller looping invokes over
+    /// distinct `(agent_id, account_id, model)` triples would leak one
+    /// `Arc<Semaphore>` per unique key forever. Removing the map entry here is
+    /// safe: any task currently holding a permit keeps its own `Arc` clone (the
+    /// `acquire` path clones the `Arc` before awaiting), so in-flight invokes are
+    /// unaffected; a subsequent `acquire` for the same key simply re-creates a
+    /// fresh semaphore via the `entry().or_insert_with` path.
+    fn drop_semaphore(&self, cache_key: &str) {
+        self.semaphores.remove(cache_key);
     }
 
     /// Acquire (or spawn) a session for `key`. The returned [`PooledSession`]
@@ -318,6 +341,13 @@ impl PtyPool {
             warn!(key = %key.log_key(), "pool: existing session unhealthy — replacing");
             if let Some((_, sess)) = self.sessions.remove(&cache_key) {
                 self.supervisor.untrack(&cache_key);
+                // NOTE: we intentionally do NOT drop the semaphore here — we
+                // still hold a live permit from it (`permit` above) and are
+                // about to respawn under the SAME cache_key. Dropping it would
+                // orphan our permit's parent and the re-inserted session would
+                // get a brand-new semaphore, transiently allowing more than
+                // `max_per_agent` concurrent invokes. The semaphore is reclaimed
+                // by the eviction / removal paths once no session remains.
                 sess.shutdown().await;
             }
         }
@@ -354,9 +384,30 @@ impl PtyPool {
         for (key, reason) in victims {
             if let Some((_, sess)) = self.sessions.remove(&key) {
                 self.supervisor.untrack(&key);
+                // **HP1 fix**: reclaim the semaphore for the evicted key so the
+                // `semaphores` map tracks live sessions rather than growing
+                // unboundedly across distinct (agent, account, model) triples.
+                self.drop_semaphore(&key);
                 info!(key = %redact_cache_key_str(&key), reason, "pool: evicting session");
                 sess.shutdown().await;
             }
+        }
+
+        // **HP1 fix**: sweep orphaned semaphores — entries whose session was
+        // removed outside the standard eviction path (e.g. `PooledSession::
+        // invalidate`, which removes the session while still holding a permit so
+        // it cannot safely drop its own semaphore inline) or whose session spawn
+        // failed. Only remove a semaphore with no outstanding permits, so we
+        // never yank one out from under an in-flight invoke.
+        let orphans: Vec<String> = self
+            .semaphores
+            .iter()
+            .filter(|e| !self.sessions.contains_key(e.key()))
+            .filter(|e| e.value().available_permits() >= self.config.max_per_agent)
+            .map(|e| e.key().clone())
+            .collect();
+        for key in orphans {
+            self.drop_semaphore(&key);
         }
     }
 
@@ -366,9 +417,14 @@ impl PtyPool {
         for key in keys {
             if let Some((_, sess)) = self.sessions.remove(&key) {
                 self.supervisor.untrack(&key);
+                self.drop_semaphore(&key);
                 sess.shutdown().await;
             }
         }
+        // **HP1 fix**: clear any remaining semaphore entries (e.g. keys that had
+        // a semaphore created but whose session spawn failed) so nothing leaks
+        // past shutdown.
+        self.semaphores.clear();
     }
 }
 
@@ -596,5 +652,97 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(pool.session_count(), 0, "session should have been evicted");
         pool.shutdown().await;
+    }
+
+    // ── HP1: semaphore map must not grow unboundedly ──────────────────
+
+    #[tokio::test]
+    async fn idle_eviction_reclaims_semaphores() {
+        // Long-ish idle window so all 5 acquires complete + the count is stable
+        // before any eviction tick runs; then we let the tick reap everything.
+        let config = PoolConfig {
+            idle_timeout: Duration::from_millis(150),
+            eviction_interval: Duration::from_millis(60),
+            ..PoolConfig::default()
+        };
+        let pool = PtyPool::new(factory_for_cat(), config);
+        // Acquire across several distinct (agent) keys → one semaphore each.
+        // (We don't assert the peak count mid-loop because sessions are only
+        // touched at spawn — `last_used` isn't bumped by acquire — so the
+        // background tick may begin reaping idle sessions while the loop runs.
+        // The invariant under test is the *terminal* state: zero leaked
+        // semaphores once every session is gone.)
+        for i in 0..5 {
+            let key = AgentKey::new(format!("agent-{i}"), CliKind::Claude, false);
+            let _lease = pool.acquire(key).await.unwrap();
+        }
+
+        // Wait for idle eviction to reap all sessions AND their semaphores.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(pool.session_count(), 0, "all sessions evicted");
+        assert_eq!(
+            pool.semaphore_count(),
+            0,
+            "HP1: semaphores must be reclaimed alongside evicted sessions \
+             (would grow unboundedly before the fix)"
+        );
+        pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn remove_if_present_reclaims_semaphore() {
+        let pool = PtyPool::new(factory_for_cat(), PoolConfig::default());
+        let key = AgentKey::new("agent-rm", CliKind::Claude, false);
+        {
+            let _lease = pool.acquire(key.clone()).await.unwrap();
+        }
+        assert_eq!(pool.semaphore_count(), 1);
+        assert!(pool.remove_if_present(&key).await);
+        assert_eq!(pool.session_count(), 0);
+        assert_eq!(
+            pool.semaphore_count(),
+            0,
+            "HP1: remove_if_present must drop the semaphore too"
+        );
+        pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn invalidate_orphan_semaphore_is_swept_by_eviction() {
+        let config = PoolConfig {
+            idle_timeout: Duration::from_secs(3600), // long: only invalidate removes the session
+            eviction_interval: Duration::from_millis(80),
+            ..PoolConfig::default()
+        };
+        let pool = PtyPool::new(factory_for_cat(), config);
+        let key = AgentKey::new("agent-inv", CliKind::Claude, false);
+        let lease = pool.acquire(key.clone()).await.unwrap();
+        assert_eq!(pool.semaphore_count(), 1);
+        // invalidate() removes the session while the lease still holds a permit.
+        lease.invalidate();
+        // Drop the lease → permit returns to the (now session-less) semaphore.
+        drop(lease);
+        // The eviction sweep must reclaim the orphaned semaphore once no permits
+        // are outstanding.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(pool.session_count(), 0);
+        assert_eq!(
+            pool.semaphore_count(),
+            0,
+            "HP1: orphaned semaphore from invalidate() must be swept"
+        );
+        pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_clears_all_semaphores() {
+        let pool = PtyPool::new(factory_for_cat(), PoolConfig::default());
+        for i in 0..3 {
+            let key = AgentKey::new(format!("agent-sd-{i}"), CliKind::Claude, false);
+            let _lease = pool.acquire(key).await.unwrap();
+        }
+        assert_eq!(pool.semaphore_count(), 3);
+        pool.shutdown().await;
+        assert_eq!(pool.semaphore_count(), 0, "HP1: shutdown must clear semaphores");
     }
 }

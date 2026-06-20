@@ -219,6 +219,44 @@ impl TaskStore {
         Ok(())
     }
 
+    /// RFC-26 §4.5 (P6.5): atomically claim an unassigned task. Compare-and-set on
+    /// `assigned_to` — only succeeds if the task is currently unassigned (`''`).
+    /// Returns `true` if this caller won the claim, `false` if already assigned.
+    pub async fn claim_task(&self, id: &str, agent_id: &str, now: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE tasks SET assigned_to=?2, updated_at=?3 WHERE id=?1 AND assigned_to=''",
+                params![id, agent_id, now],
+            )
+            .map_err(|e| format!("claim task: {e}"))?;
+        Ok(n > 0)
+    }
+
+    /// All `(task_id, parent_task_id)` edges — for cycle detection.
+    pub async fn parent_edges(&self) -> Result<Vec<(String, Option<String>)>, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare("SELECT id, parent_task_id FROM tasks")
+            .map_err(|e| format!("prepare edges: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+            .map_err(|e| format!("query edges: {e}"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect edges: {e}"))?;
+        Ok(rows)
+    }
+
+    /// RFC-26 §4.5: would setting `child.parent = new_parent` create a cycle?
+    pub async fn would_create_parent_cycle(
+        &self,
+        child: &str,
+        new_parent: &str,
+    ) -> Result<bool, String> {
+        let edges = self.parent_edges().await?;
+        Ok(introduces_parent_cycle(&edges, child, new_parent))
+    }
+
     pub async fn update_task(&self, id: &str, fields: &serde_json::Value) -> Result<Option<TaskRow>, String> {
         // Scoped block ensures all non-Send refs are dropped before the next await.
         {
@@ -373,4 +411,84 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         tags: row.get(12)?,
         message_id: row.get(13)?,
     })
+}
+
+/// RFC-26 §4.5: would setting `child.parent = new_parent` introduce a cycle in the
+/// task parent graph? Walks up from `new_parent` via the existing edges; a cycle
+/// exists if the walk reaches `child` (or loops). Pure + deterministic.
+///
+/// `edges` is the current `(id, parent)` set. A self-parent (`child == new_parent`)
+/// is a trivial cycle.
+pub fn introduces_parent_cycle(
+    edges: &[(String, Option<String>)],
+    child: &str,
+    new_parent: &str,
+) -> bool {
+    if child == new_parent {
+        return true;
+    }
+    use std::collections::HashMap;
+    let parent_of: HashMap<&str, Option<&str>> = edges
+        .iter()
+        .map(|(id, p)| (id.as_str(), p.as_deref()))
+        .collect();
+
+    // Walk ancestors of new_parent; if we hit `child`, adding the edge closes a loop.
+    let mut seen = std::collections::HashSet::new();
+    let mut cur = Some(new_parent);
+    while let Some(node) = cur {
+        if node == child {
+            return true;
+        }
+        if !seen.insert(node) {
+            // Pre-existing cycle in the data — treat as unsafe.
+            return true;
+        }
+        cur = parent_of.get(node).copied().flatten();
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::introduces_parent_cycle;
+
+    fn edges(pairs: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
+        pairs
+            .iter()
+            .map(|(id, p)| (id.to_string(), p.map(|s| s.to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn self_parent_is_cycle() {
+        assert!(introduces_parent_cycle(&[], "a", "a"));
+    }
+
+    #[test]
+    fn simple_acyclic_is_safe() {
+        // a -> b -> c (root). Adding d's parent = a is safe.
+        let e = edges(&[("a", Some("b")), ("b", Some("c")), ("c", None)]);
+        assert!(!introduces_parent_cycle(&e, "d", "a"));
+    }
+
+    #[test]
+    fn direct_back_edge_is_cycle() {
+        // b's parent is a. Setting a's parent = b closes a 2-cycle.
+        let e = edges(&[("b", Some("a")), ("a", None)]);
+        assert!(introduces_parent_cycle(&e, "a", "b"));
+    }
+
+    #[test]
+    fn deep_back_edge_is_cycle() {
+        // a -> b -> c. Setting c's parent = a closes a 3-cycle.
+        let e = edges(&[("a", Some("b")), ("b", Some("c")), ("c", None)]);
+        assert!(introduces_parent_cycle(&e, "c", "a"));
+    }
+
+    #[test]
+    fn unrelated_parent_is_safe() {
+        let e = edges(&[("a", None), ("b", None), ("c", None)]);
+        assert!(!introduces_parent_cycle(&e, "a", "b"));
+    }
 }

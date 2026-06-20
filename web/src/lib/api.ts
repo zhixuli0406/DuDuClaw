@@ -440,6 +440,39 @@ export interface SharedSkillInfo {
   tags: string[];
 }
 
+// RFC-26 Live Run Forking
+export interface ForkSummary {
+  fork_id: string;
+  agent_id: string;
+  merge_mode: string;
+  resolved: boolean;
+  winner: string | null;
+  promoted: boolean;
+  aggregate_spent_usd: number;
+  created_at: string;
+}
+
+export interface ForkBranch {
+  branch_id: string;
+  steering: string | null;
+  state: string;
+  budget_usd: number;
+  spent_usd: number;
+  test_exit_code: number | null;
+  output: string;
+}
+
+export interface ForkDetail {
+  fork_id: string;
+  agent_id: string;
+  prompt: string;
+  merge_mode: string;
+  resolved: boolean;
+  winner: string | null;
+  promoted: boolean;
+  branches: ForkBranch[];
+}
+
 export interface EvolutionMetrics {
   positive_feedback_ratio: number;
   prediction_error: number;
@@ -723,6 +756,8 @@ export interface MarketplaceServer {
   featured: boolean;
   requires_oauth: boolean;
   required_env: string[];
+  /** Agent ids that already have this server in their `.mcp.json` (backend-derived). */
+  installed_by: string[];
 }
 
 export interface McpOAuthProvider {
@@ -785,8 +820,13 @@ export interface AgentUpdateParams {
   max_gvu_generations?: number;
   observation_period_hours?: number;
   skill_token_budget?: number;
-  // Proactive ([proactive] section, nested object)
-  proactive?: Partial<ProactiveSettings>;
+  // Proactive ([proactive] section, nested object). Includes G.8 extras
+  // (token_budget_per_check / timezone / max_turns) accepted by the backend.
+  proactive?: Partial<ProactiveSettings> & {
+    token_budget_per_check?: number;
+    timezone?: string;
+    max_turns?: number;
+  };
   // Per-agent channels
   discord_bot_token?: string;
   telegram_bot_token?: string;
@@ -807,6 +847,449 @@ export interface AgentUpdateParams {
   sticker_intensity_threshold?: number;
   sticker_cooldown_messages?: number;
   sticker_expressiveness?: 'minimal' | 'moderate' | 'expressive';
+  // Capabilities ([capabilities] section, nested object)
+  capabilities?: AgentCapabilities;
+  // RT — Runtime ([runtime] section, nested object)
+  runtime?: AgentRuntime;
+  // EVO — advanced evolution ([evolution.*] fields, nested object)
+  evolution_advanced?: AgentEvolutionAdvanced;
+  // CT — advanced container ([container.*] fields, nested object)
+  container_advanced?: AgentContainerAdvanced;
+  // ODO — per-agent [odoo] override (nested object). api_key/password write-only.
+  odoo?: AgentOdooOverride;
+  // G.8 — [model] extras
+  account_pool?: string[];
+  utility?: string;
+  // G.8 — [heartbeat] extras
+  heartbeat_max_concurrent_runs?: number;
+  heartbeat_cron_timezone?: string;
+  // UI.3 — stagnation detection ([evolution.stagnation_detection])
+  stagnation_enabled?: boolean;
+  stagnation_window_seconds?: number;
+  stagnation_trigger_threshold?: number;
+  stagnation_action?: 'log_only' | 'suppress';
+  // G.8 — free-form scalar tables
+  ptc?: Record<string, string | number | boolean>;
+  prompt?: Record<string, string | number | boolean>;
+  cultural_context?: Record<string, string | number | boolean>;
+}
+
+// ── ODO: per-agent [odoo] override ──────────────────────────────
+
+/** The `odoo` object accepted by `agents.update`. All fields optional —
+ *  the backend only writes fields that are present (partial update).
+ *  `api_key` / `password` are WRITE-ONLY: never returned, only sent when
+ *  the operator types a new value (sending the masked placeholder is a no-op). */
+export interface AgentOdooOverride {
+  profile?: string;
+  allowed_models?: string[];
+  /** Bare verb (read/write/create/unlink/execute) or `verb:model` (e.g. write:crm.lead). */
+  allowed_actions?: string[];
+  company_ids?: number[];
+  url?: string;
+  db?: string;
+  username?: string;
+  /** Write-only — encrypted server-side. */
+  api_key?: string;
+  /** Write-only — encrypted server-side. */
+  password?: string;
+}
+
+// ── RT: per-agent [runtime] ─────────────────────────────────────
+
+export type RuntimeProvider = 'claude' | 'codex' | 'gemini' | 'openai_compat';
+
+/** The `runtime` object accepted by `agents.update`. All fields optional —
+ *  the backend only writes fields that are present. An empty `fallback`
+ *  string clears the fallback. */
+export interface AgentRuntime {
+  provider?: RuntimeProvider;
+  /** A provider name, or '' to clear. Must be a valid provider when non-empty. */
+  fallback?: string;
+  pty_pool_enabled?: boolean;
+  worker_managed?: boolean;
+}
+
+// ── EVO: per-agent advanced [evolution] ─────────────────────────
+
+export interface EvolutionExternalFactors {
+  user_feedback?: boolean;
+  security_events?: boolean;
+  channel_metrics?: boolean;
+  business_context?: boolean;
+  peer_signals?: boolean;
+}
+
+/** The `evolution_advanced` object accepted by `agents.update`. All fields
+ *  optional. Thresholds are 0.0–1.0 floats; *_hours / *_daily / ttl are
+ *  unsigned integers. */
+export interface AgentEvolutionAdvanced {
+  external_factors?: EvolutionExternalFactors;
+  // Skill synthesis
+  skill_synthesis_enabled?: boolean;
+  skill_synthesis_threshold?: number;
+  skill_synthesis_cooldown_hours?: number;
+  skill_trial_ttl?: number;
+  // Skill graduation
+  skill_graduation_enabled?: boolean;
+  skill_graduation_min_lift?: number;
+  // Skill recommendation
+  skill_recommendation_enabled?: boolean;
+  skill_recommendation_threshold?: number;
+  // Curiosity
+  curiosity_enabled?: boolean;
+  curiosity_threshold?: number;
+  curiosity_max_daily?: number;
+  // Behavior monitor
+  skill_behavior_monitor_enabled?: boolean;
+  skill_behavior_drift_threshold?: number;
+}
+
+// ── CT: per-agent advanced [container] ──────────────────────────
+
+export interface ContainerMount {
+  host: string;
+  container: string;
+  readonly: boolean;
+}
+
+export interface ContainerEnvVar {
+  key: string;
+  value: string;
+}
+
+/** The `container_advanced` object accepted by `agents.update`. All fields
+ *  optional. Mount host paths matching the gateway blocked-pattern list
+ *  (e.g. `.ssh`, `.env`) are rejected server-side. */
+export interface AgentContainerAdvanced {
+  worktree_enabled?: boolean;
+  worktree_auto_merge?: boolean;
+  worktree_cleanup_on_exit?: boolean;
+  worktree_copy_files?: string[];
+  additional_mounts?: ContainerMount[];
+  cmd?: string[];
+  env?: ContainerEnvVar[];
+}
+
+// ── INF: inference.toml ─────────────────────────────────────────
+
+export interface InferenceGeneration {
+  max_tokens?: number;
+  temperature?: number;
+  top_p?: number;
+  stop?: string[];
+  gpu_layers?: number;
+  context_size?: number;
+}
+
+export interface InferenceRouter {
+  enabled?: boolean;
+  fast_threshold?: number;
+  /** Must be < fast_threshold (validated server-side). */
+  strong_threshold?: number;
+  fast_model?: string;
+  strong_model?: string;
+  max_fast_prompt_tokens?: number;
+  cloud_keywords?: string[];
+  fast_keywords?: string[];
+}
+
+/** `[openai_compat]` — the api_key is WRITE-ONLY. On read, the gateway returns
+ *  `api_key_set: bool` plus a masked placeholder in `api_key` ("***set***").
+ *  Only send a new `api_key` on update when the operator types one. */
+export interface InferenceOpenAiCompat {
+  base_url?: string;
+  model?: string;
+  /** On read: masked placeholder. On write: cleartext (encrypted server-side),
+   *  '' clears it. Never send back the masked placeholder. */
+  api_key?: string;
+  /** Read-only flag indicating a secret is stored. */
+  api_key_set?: boolean;
+}
+
+/** Generic pass-through backend sections — flat tables of scalars/arrays. */
+export type InferenceBackendSection = Record<string, unknown>;
+
+/** Full inference.toml shape returned by `inference.get`. The openai_compat
+ *  api_key is masked. Unknown sub-sections surface generically. */
+export interface InferenceConfig {
+  enabled?: boolean;
+  backend?: string;
+  models_dir?: string;
+  default_model?: string;
+  auto_load?: boolean;
+  max_memory_mb?: number;
+  generation?: InferenceGeneration;
+  router?: InferenceRouter;
+  openai_compat?: InferenceOpenAiCompat;
+  exo?: InferenceBackendSection;
+  llamafile?: InferenceBackendSection;
+  mlx?: InferenceBackendSection;
+  mistralrs?: InferenceBackendSection;
+  llmlingua?: InferenceBackendSection;
+  streaming_llm?: InferenceBackendSection;
+  embedding?: InferenceBackendSection;
+  [key: string]: unknown;
+}
+
+/** Partial update payload for `inference.update`. Omit a section to leave it
+ *  untouched. For openai_compat, omit `api_key` to keep the stored secret. */
+export interface InferenceUpdate {
+  enabled?: boolean;
+  backend?: string;
+  models_dir?: string;
+  default_model?: string;
+  auto_load?: boolean;
+  max_memory_mb?: number;
+  generation?: InferenceGeneration;
+  router?: InferenceRouter;
+  openai_compat?: InferenceOpenAiCompat;
+  exo?: InferenceBackendSection;
+  llamafile?: InferenceBackendSection;
+  mlx?: InferenceBackendSection;
+  mistralrs?: InferenceBackendSection;
+  llmlingua?: InferenceBackendSection;
+  streaming_llm?: InferenceBackendSection;
+  embedding?: InferenceBackendSection;
+}
+
+// ── CAP: per-agent [capabilities] ───────────────────────────────
+
+export type ComputerUseMode = 'container' | 'native' | 'auto';
+
+export interface ComputerUseConfig {
+  allowed_apps?: string[];
+  blocked_actions?: string[];
+  max_session_minutes?: number;
+  max_actions?: number;
+  display_width?: number;
+  display_height?: number;
+  auto_confirm_trusted?: boolean;
+}
+
+/** The `capabilities` object accepted by `agents.update`. All fields optional —
+ *  the backend only writes fields that are present (partial update). */
+export interface AgentCapabilities {
+  computer_use?: boolean;
+  computer_use_mode?: ComputerUseMode;
+  browser_via_bash?: boolean;
+  allowed_tools?: string[];
+  denied_tools?: string[];
+  wiki_visible_to?: string[];
+  computer_use_config?: ComputerUseConfig;
+}
+
+// ── CON: per-agent CONTRACT.toml ────────────────────────────────
+
+export interface ContractConfig {
+  must_not: string[];
+  must_always: string[];
+  max_tool_calls_per_turn: number;
+}
+
+// ── RED: global [redaction] ─────────────────────────────────────
+
+export type RedactionSourceMode = 'on' | 'off' | 'selective' | 'inherit';
+
+export interface RedactionSources {
+  user_input: RedactionSourceMode;
+  tool_results: RedactionSourceMode;
+  system_prompt: RedactionSourceMode;
+  sub_agent: RedactionSourceMode;
+  cron_context: RedactionSourceMode;
+}
+
+export type RedactionRestoreArgs = 'restore' | 'passthrough' | 'deny';
+
+export interface RedactionEgressRule {
+  restore_args: RedactionRestoreArgs;
+  audit_reveal: boolean;
+}
+
+export interface RedactionConfig {
+  enabled: boolean;
+  vault_ttl_hours: number;
+  purge_after_expire_days: number;
+  profiles: string[];
+  sources: RedactionSources;
+  tool_egress: Record<string, RedactionEgressRule>;
+}
+
+/** Partial update payload for `redaction.update`. A `tool_egress` value of
+ *  `null` removes that tool's rule. */
+export interface RedactionUpdate {
+  enabled?: boolean;
+  vault_ttl_hours?: number;
+  purge_after_expire_days?: number;
+  profiles?: string[];
+  sources?: Partial<RedactionSources>;
+  tool_egress?: Record<string, RedactionEgressRule | null>;
+}
+
+// ── MK: MCP API keys ────────────────────────────────────────────
+
+/** A masked MCP key entry from `mcp_keys.list`. The full cleartext key is
+ *  NEVER returned here — only on the one-time `mcp_keys.create` response. */
+export interface McpKeyEntry {
+  masked: string;
+  client_id: string;
+  is_external: boolean;
+  created_at: string;
+  scopes: string[];
+  rotate_recommended: boolean;
+}
+
+export interface McpKeyCreateResult {
+  success: boolean;
+  /** Cleartext key — shown exactly once, never recoverable afterward. */
+  key: string;
+  masked: string;
+  client_id: string;
+  is_external: boolean;
+  created_at: string;
+  scopes: string[];
+  message: string;
+}
+
+export type McpScope =
+  | 'memory:read'
+  | 'memory:write'
+  | 'wiki:read'
+  | 'wiki:write'
+  | 'messaging:send'
+  | 'identity:read'
+  | 'odoo:read'
+  | 'odoo:write'
+  | 'odoo:execute'
+  | 'admin';
+
+/** All known MCP scopes — mirrors gateway `KNOWN_MCP_SCOPES`. */
+export const MCP_SCOPES: ReadonlyArray<McpScope> = [
+  'memory:read',
+  'memory:write',
+  'wiki:read',
+  'wiki:write',
+  'messaging:send',
+  'identity:read',
+  'odoo:read',
+  'odoo:write',
+  'odoo:execute',
+  'admin',
+];
+
+// ── KS: KILLSWITCH.toml ─────────────────────────────────────────
+
+export interface KillswitchTriggers {
+  max_replies_per_minute: number;
+  max_consecutive_errors: number;
+  error_rate_threshold: number;
+  cost_limit_usd: number;
+}
+
+export interface KillswitchCircuitBreaker {
+  frequency_window_secs: number;
+  frequency_max_replies: number;
+  similarity_threshold: number;
+  token_explosion_multiplier: number;
+  cooldown_secs: number;
+  half_open_allow_count: number;
+}
+
+export interface KillswitchFailsafe {
+  l1_auto_recover_secs: number;
+  l2_auto_recover_secs: number;
+  l3_auto_recover_secs: number;
+  default_restricted_reply: string;
+  default_halted_reply: string;
+}
+
+export interface KillswitchSafetyWords {
+  stop: string[];
+  stop_all: string[];
+  resume: string[];
+  status: string[];
+}
+
+export interface KillswitchDefensivePrompt {
+  enabled: boolean;
+  languages: string[];
+}
+
+export interface KillswitchAudit {
+  enabled: boolean;
+  path: string;
+}
+
+export interface KillswitchConfig {
+  triggers: KillswitchTriggers;
+  circuit_breaker: KillswitchCircuitBreaker;
+  failsafe: KillswitchFailsafe;
+  safety_words: KillswitchSafetyWords;
+  defensive_prompt: KillswitchDefensivePrompt;
+  audit: KillswitchAudit;
+}
+
+export interface KillswitchUpdate {
+  triggers?: Partial<KillswitchTriggers>;
+  circuit_breaker?: Partial<KillswitchCircuitBreaker>;
+  failsafe?: Partial<KillswitchFailsafe>;
+  safety_words?: Partial<KillswitchSafetyWords>;
+  defensive_prompt?: Partial<KillswitchDefensivePrompt>;
+  audit?: Partial<KillswitchAudit>;
+}
+
+// ── GOV: governance policies (policies/*.yaml) ──────────────────
+
+export type GovPolicyType = 'rate' | 'permission' | 'quota' | 'lifecycle';
+
+/** Valid `rate` policy resources — mirrors gateway `GOV_RATE_RESOURCES`. */
+export const GOV_RATE_RESOURCES = ['mcp_calls', 'memory_writes', 'wiki_writes', 'message_sends'] as const;
+export type GovRateResource = (typeof GOV_RATE_RESOURCES)[number];
+
+/** Valid `rate` violation actions — mirrors gateway `GOV_ACTIONS`. */
+export const GOV_ACTIONS = ['reject', 'warn', 'throttle'] as const;
+export type GovAction = (typeof GOV_ACTIONS)[number];
+
+export const GOV_POLICY_TYPES = ['rate', 'permission', 'quota', 'lifecycle'] as const;
+
+/** A governance policy. The shape is a discriminated union on `policy_type`,
+ *  but the backend stores/returns a flat object — we keep it flat with all
+ *  per-type fields optional. `scope` is read-only (added by `governance.list`):
+ *  "global" or an agent id. `agent_id` is "*" (global) or a valid agent id. */
+export interface GovPolicy {
+  policy_type: GovPolicyType;
+  policy_id: string;
+  agent_id: string;
+  scope?: string;
+  // rate
+  resource?: GovRateResource;
+  limit?: number;
+  window_seconds?: number;
+  action_on_violation?: GovAction;
+  // permission
+  allowed_scopes?: string[];
+  denied_scopes?: string[];
+  requires_approval?: string[];
+  // quota
+  daily_token_budget?: number;
+  max_concurrent_tasks?: number;
+  max_memory_entries?: number;
+  reset_cron?: string;
+  // lifecycle
+  max_idle_hours?: number;
+  health_check_interval_seconds?: number;
+  auto_suspend_on_violation_count?: number;
+}
+
+// ── SCP: wiki namespace policy (.scope.toml) ────────────────────
+
+export type WikiScopeMode = 'agent_writable' | 'read_only' | 'operator_only';
+
+export interface WikiScopeNamespace {
+  namespace: string;
+  mode: WikiScopeMode;
+  /** Required (non-empty) when mode === 'read_only'. */
+  synced_from: string | null;
 }
 
 // API namespace
@@ -866,6 +1349,18 @@ export const api = {
       }) as Promise<{ success: boolean }>,
     add: (params: { id: string; type: string; key: string; monthly_budget_cents: number; priority: number }) =>
       client.call('accounts.add', params) as Promise<{ success: boolean }>,
+    /** G.5 — general per-account edit (no secret). Send only changed fields. */
+    update: (params: {
+      account_id: string;
+      priority?: number;
+      tags?: string[];
+      profile?: string;
+      email?: string;
+      subscription?: string;
+      label?: string;
+      monthly_budget_cents?: number;
+    }) =>
+      client.call('accounts.update', params) as Promise<{ success: boolean; changes: string[] }>,
   },
   memory: {
     search: (agentId: string, query: string, limit = 20) =>
@@ -1242,6 +1737,19 @@ export const api = {
     history: (ruleId?: string, limit = 20) =>
       client.call('autopilot.history', { rule_id: ruleId, limit }) as Promise<{ entries: AutopilotHistoryEntry[] }>,
   },
+  // RFC-26 Live Run Forking — read fork state from the cross-process ForkStore.
+  fork: {
+    list: (limit = 50) =>
+      client.call('fork.list', { limit }) as Promise<{ forks: ForkSummary[] }>,
+    inspect: (forkId: string) =>
+      client.call('fork.inspect', { fork_id: forkId }) as Promise<ForkDetail>,
+    resolve: (forkId: string, branchId: string) =>
+      client.call('fork.resolve', { fork_id: forkId, branch_id: branchId }) as Promise<{
+        fork_id: string;
+        resolved: boolean;
+        winner: string;
+      }>,
+  },
   sharedSkills: {
     list: () =>
       client.call('skills.shared') as Promise<{ skills: SharedSkillInfo[] }>,
@@ -1276,9 +1784,87 @@ export const api = {
       client.call('partner.customer.delete', { id }) as Promise<{
         success: boolean;
       }>,
-    // License generation — backend not yet implemented; calls reject with error.
-    generateLicense: (_params: { tier: string; customer: string; months: number }) =>
-      Promise.reject(new Error('Partner license generation not yet available')) as Promise<{ key: string }>,
+    // License generation is CLI-only (`duduclaw license generate`); the dashboard
+    // intentionally exposes no RPC for it (UI.4).
+  },
+  contract: {
+    get: (agentId: string) =>
+      client.call('contract.get', { agent_id: agentId }) as Promise<
+        ContractConfig & { agent_id: string }
+      >,
+    update: (agentId: string, fields: ContractConfig) =>
+      client.call('contract.update', { agent_id: agentId, ...fields }) as Promise<
+        ContractConfig & { success: boolean; agent_id: string; message: string }
+      >,
+  },
+  redaction: {
+    get: () => client.call('redaction.get') as Promise<RedactionConfig>,
+    update: (fields: RedactionUpdate) =>
+      client.call('redaction.update', { ...fields }) as Promise<{
+        success: boolean;
+        changes: string[];
+      }>,
+  },
+  mcpKeys: {
+    list: () => client.call('mcp_keys.list') as Promise<{ keys: McpKeyEntry[] }>,
+    create: (params: { client_id: string; is_external: boolean; scopes: string[]; env?: 'prod' | 'staging' | 'dev' }) =>
+      client.call('mcp_keys.create', { ...params }) as Promise<McpKeyCreateResult>,
+    revoke: (key: string) =>
+      client.call('mcp_keys.revoke', { key }) as Promise<{ success: boolean; revoked: string }>,
+  },
+  killswitch: {
+    get: () => client.call('killswitch.get') as Promise<KillswitchConfig>,
+    update: (fields: KillswitchUpdate) =>
+      client.call('killswitch.update', { ...fields }) as Promise<{
+        success: boolean;
+        changes: string[];
+        message: string;
+      }>,
+  },
+  governance: {
+    /** List policies. Omit agent_id for global + every per-agent file. */
+    list: (agentId?: string) =>
+      client.call('governance.list', agentId ? { agent_id: agentId } : {}) as Promise<{
+        policies: GovPolicy[];
+      }>,
+    /** Create or replace a policy (matched by policy_id within its scope). */
+    upsert: (policy: GovPolicy) =>
+      client.call('governance.upsert', { ...policy }) as Promise<{
+        success: boolean;
+        scope: string;
+        policy_id: string;
+        created: boolean;
+        message: string;
+      }>,
+    remove: (policyId: string, agentId?: string) =>
+      client.call('governance.remove', {
+        policy_id: policyId,
+        ...(agentId ? { agent_id: agentId } : {}),
+      }) as Promise<{ success: boolean; removed: string }>,
+  },
+  wikiScope: {
+    get: () =>
+      client.call('wiki_scope.get') as Promise<{ namespaces: WikiScopeNamespace[] }>,
+    /** Set (or, with remove=true, clear → agent_writable default) a namespace policy. */
+    update: (params: {
+      namespace: string;
+      mode?: WikiScopeMode;
+      synced_from?: string;
+      remove?: boolean;
+    }) =>
+      client.call('wiki_scope.update', params) as Promise<{ success: boolean; change: string }>,
+  },
+  inference: {
+    /** Read the full inference.toml. The openai_compat api_key is masked
+     *  (`api_key_set` + a placeholder); treat it as write-only. */
+    get: () => client.call('inference.get') as Promise<InferenceConfig>,
+    /** Partial update. Omit a section to leave it untouched. For openai_compat,
+     *  omit `api_key` to keep the stored secret; '' clears it. */
+    update: (fields: InferenceUpdate) =>
+      client.call('inference.update', { ...fields }) as Promise<{
+        success: boolean;
+        changes: string[];
+      }>,
   },
   users: {
     list: () =>

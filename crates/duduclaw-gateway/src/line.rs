@@ -133,6 +133,18 @@ pub async fn start_line_bot(
     if token.is_empty() {
         return None;
     }
+    // HS2 fix: an empty channel secret makes `verify_signature` accept any
+    // request — `HmacSha256::new_from_slice(b"")` succeeds and an attacker can
+    // compute `base64(HMAC(key="", body))`. Refuse to start the LINE bot
+    // without a secret (matches WhatsApp/Feishu fail-closed behavior).
+    if secret.is_empty() {
+        warn!(
+            "LINE bot NOT started: channel access token is set but \
+             line_channel_secret is empty — webhook signature verification \
+             would accept forged requests. Configure the channel secret."
+        );
+        return None;
+    }
 
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -366,15 +378,19 @@ async fn line_webhook_handler(
                 let reg = state.ctx.registry.read().await;
                 reg.main_agent().map(|a| a.config.agent.display_name.clone())
             };
-            let flex_msg = channel_format::to_line_flex_message(&reply, agent_name.as_deref());
+            // M25: segment long replies. A single Flex bubble has tight text
+            // limits, so an over-limit reply would be rejected and silently
+            // dropped. `segment_line_reply` returns one Flex bubble for short
+            // replies, or several plain-text messages (each within LINE's
+            // 5000-char text limit, capped at 5 messages/request) for long ones.
+            let messages = segment_line_reply(&reply, agent_name.as_deref());
 
             // Try Reply API first; if it fails (e.g. reply token expired after
             // long AI processing), fall back to Push API which doesn't require
             // a reply token but counts against the monthly message quota.
-            if !send_reply_rich(&state.http, &state.token, reply_token, flex_msg.clone()).await {
+            if !send_reply_rich(&state.http, &state.token, reply_token, messages.clone()).await {
                 warn!("LINE: reply API failed — falling back to push API for {sender}");
-                let push_msg = channel_format::to_line_flex_message(&reply, agent_name.as_deref());
-                push_message_rich(&state.http, &state.token, sender, push_msg).await;
+                push_message_rich(&state.http, &state.token, sender, messages).await;
             }
         }
     }
@@ -383,6 +399,58 @@ async fn line_webhook_handler(
 }
 
 // ── Helpers ─────────────────────────────────────────────────
+
+/// LINE limits for outbound message segmentation.
+mod line_limits {
+    /// Max messages per reply/push request.
+    pub const MAX_MESSAGES: usize = 5;
+    /// LINE text-message hard limit is 5000 chars; stay under it for safety.
+    pub const TEXT_CHUNK: usize = 4500;
+    /// Replies at or under this fit comfortably in a single Flex bubble.
+    pub const FLEX_SAFE: usize = 1800;
+}
+
+/// Build the LINE message array for a reply, segmenting long content.
+///
+/// M25: short/medium replies render as a single Flex bubble (existing
+/// behaviour). Long replies are split into multiple plain-text messages, each
+/// within LINE's 5000-char text limit and the 5-messages-per-request cap, so an
+/// over-limit reply is delivered across messages instead of being rejected.
+fn segment_line_reply(reply: &str, agent_name: Option<&str>) -> Vec<serde_json::Value> {
+    // Small enough for one bubble → keep the rich Flex format.
+    if reply.chars().count() <= line_limits::FLEX_SAFE {
+        return vec![channel_format::to_line_flex_message(reply, agent_name)];
+    }
+
+    // Long reply → split into text messages on char-safe boundaries.
+    let chunks = channel_format::split_text(reply, line_limits::TEXT_CHUNK);
+
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    // Reserve the last slot for a truncation notice if we overflow the cap.
+    let limit = line_limits::MAX_MESSAGES;
+    for chunk in chunks.iter() {
+        if messages.len() >= limit {
+            break;
+        }
+        messages.push(serde_json::json!({ "type": "text", "text": chunk }));
+    }
+
+    // If content didn't fit in the message cap, replace the last message with a
+    // notice so the user knows the reply was truncated rather than silently cut.
+    if chunks.len() > limit {
+        if let Some(last) = messages.last_mut() {
+            *last = serde_json::json!({
+                "type": "text",
+                "text": "⚠️ 回覆過長，已截斷。請縮小問題範圍或分次提問。"
+            });
+        }
+    }
+
+    if messages.is_empty() {
+        messages.push(channel_format::to_line_flex_message(reply, agent_name));
+    }
+    messages
+}
 
 fn verify_signature(secret: &str, body: &[u8], signature: &str) -> bool {
     use base64::Engine;
@@ -431,11 +499,11 @@ async fn send_reply_rich(
     http: &reqwest::Client,
     token: &str,
     reply_token: &str,
-    message: serde_json::Value,
+    messages: Vec<serde_json::Value>,
 ) -> bool {
     let body = serde_json::json!({
         "replyToken": reply_token,
-        "messages": [message]
+        "messages": messages
     });
 
     match http
@@ -464,10 +532,10 @@ async fn send_reply_rich(
 ///
 /// Used as fallback when the Reply API fails (e.g. reply token expired after
 /// long AI processing). Counts against the monthly message quota.
-async fn push_message_rich(http: &reqwest::Client, token: &str, user_id: &str, message: serde_json::Value) {
+async fn push_message_rich(http: &reqwest::Client, token: &str, user_id: &str, messages: Vec<serde_json::Value>) {
     let body = serde_json::json!({
         "to": user_id,
-        "messages": [message]
+        "messages": messages
     });
 
     match http
@@ -521,4 +589,41 @@ async fn read_line_config(home_dir: &Path) -> Option<(String, String)> {
         .await
         .unwrap_or_default();
     Some((token, secret))
+}
+
+// ── Tests ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_segment_line_reply_short_is_single_message() {
+        // M25: short replies stay as one (Flex or text) message.
+        let msgs = segment_line_reply("你好", Some("agent"));
+        assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn test_segment_line_reply_long_splits_into_text() {
+        // A reply well over the Flex-safe size must become multiple text msgs.
+        let long = "字".repeat(line_limits::FLEX_SAFE + 6000);
+        let msgs = segment_line_reply(&long, None);
+        assert!(msgs.len() > 1, "long reply should be segmented");
+        assert!(msgs.len() <= line_limits::MAX_MESSAGES, "must respect 5-message cap");
+        for m in &msgs {
+            assert_eq!(m["type"], "text");
+            // Each text message stays within LINE's 5000-char limit.
+            let chars = m["text"].as_str().unwrap().chars().count();
+            assert!(chars <= 5000, "text message exceeds LINE limit: {chars}");
+        }
+    }
+
+    #[test]
+    fn test_segment_line_reply_cjk_no_panic() {
+        // M25 robustness: pure-CJK long input must not panic during splitting.
+        let cjk = "繁體中文測試訊息".repeat(2000);
+        let msgs = segment_line_reply(&cjk, None);
+        assert!(!msgs.is_empty());
+    }
 }

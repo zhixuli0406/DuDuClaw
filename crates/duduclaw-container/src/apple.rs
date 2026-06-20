@@ -72,11 +72,19 @@ impl AppleContainerRuntime {
 #[async_trait]
 impl ContainerRuntime for AppleContainerRuntime {
     async fn create(&self, _config: ContainerConfig) -> Result<ContainerId> {
-        let id = format!("duduclaw-apple-{}", uuid::Uuid::new_v4());
-        // Apple Container uses `container run` (create + start combined)
-        // We store the intended ID for later use
-        info!(id = %id, "Apple Container ID reserved");
-        Ok(ContainerId(id))
+        // C6.4 fix: this backend never actually launches an isolated container
+        // (`create` only reserved an id and `start` was a no-op), so a task
+        // "sandboxed" via the Apple runtime previously ran with ZERO isolation
+        // while reporting success. Fail closed: refuse rather than silently run
+        // unsandboxed. Operators on macOS should use the Docker runtime until
+        // `container run` with network/tmpfs/memory isolation is implemented
+        // here.
+        Err(DuDuClawError::Container(
+            "Apple Container sandbox does not yet apply network/tmpfs/memory \
+             isolation; refusing to run unsandboxed (use the Docker runtime). \
+             See deep-review C6."
+                .to_string(),
+        ))
     }
 
     async fn start(&self, id: &ContainerId) -> Result<()> {
@@ -98,6 +106,17 @@ impl ContainerRuntime for AppleContainerRuntime {
 
     async fn logs(&self, id: &ContainerId) -> Result<String> {
         self.run_cmd(&["logs", &id.0]).await
+    }
+
+    async fn wait(&self, _id: &ContainerId) -> Result<ContainerExit> {
+        // HC5 / C6.4: `create` fails closed on this backend (no real isolation),
+        // so a container is never actually launched here. Refuse rather than
+        // fabricate an exit code.
+        Err(DuDuClawError::Container(
+            "Apple Container sandbox does not run containers (create is fail-closed); \
+             cannot wait for an exit code. Use the Docker runtime."
+                .to_string(),
+        ))
     }
 
     async fn health_check(&self) -> Result<RuntimeHealth> {

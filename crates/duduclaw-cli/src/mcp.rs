@@ -1102,6 +1102,75 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "target_agent", description: "Agent to adopt the skill into (default: caller)", required: false },
         ],
     },
+    // ── RFC-26 §4.1: Plan Mode (clarify-first planner) ──────────────────────
+    ToolDef {
+        name: "plan_start",
+        description: "Start clarify-first planning for an ambiguous task: returns up to 3 clarifying questions to ask the user before executing, then a decomposition instruction. Honours agent.toml [planner] clarify_first.",
+        params: &[
+            ParamDef { name: "task", description: "The task to plan", required: true },
+        ],
+    },
+    // ── RFC-26 §4.4: Memory reflection (propose, not auto-apply) ─────────────
+    ToolDef {
+        name: "memory_improve",
+        description: "Reflect over your memories about a topic and get a clustered proposal scaffold for consolidated MEMORY/SOUL rules. Returns candidates only — review, then persist with memory_store. Does not write anything itself.",
+        params: &[
+            ParamDef { name: "topic", description: "The area to reflect on (e.g. 'refund handling', 'deploy mistakes')", required: true },
+            ParamDef { name: "limit", description: "Max memories to examine (default 40, max 100)", required: false },
+        ],
+    },
+    // ── RFC-26: Live Run Forking ────────────────────────────────────────────
+    // Requires `agent.toml [fork] enabled = true` and the `fork:execute` scope.
+    ToolDef {
+        name: "fork_run",
+        description: "Split the current task into N competing branches that explore different strategies in parallel, each in an isolated copy-on-write workspace with its own budget. An AI judge later picks the winner via merge_or_select. Requires [fork] enabled in agent.toml.",
+        params: &[
+            ParamDef { name: "prompt", description: "The base task all branches work on", required: true },
+            ParamDef { name: "n", description: "Number of branches (capped at [fork] max_branches). Defaults to the number of strategies, min 2.", required: false },
+            ParamDef { name: "strategies", description: "Optional array of per-branch steering messages (e.g. [\"MVP-first\", \"risk-first\"]). Branch i gets strategies[i].", required: false },
+            ParamDef { name: "budget_usd", description: "Per-branch spend cap in USD (default: [fork] default_budget_usd)", required: false },
+            ParamDef { name: "merge_mode", description: "manual | auto | auto_with_fallback | vote (default: [fork] merge_mode)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "inspect_branches",
+        description: "List a fork's branches with their state, steering, spend, and test result.",
+        params: &[
+            ParamDef { name: "fork_id", description: "Fork id returned by fork_run", required: true },
+        ],
+    },
+    ToolDef {
+        name: "diff_branches",
+        description: "Show the outputs of two branches in a fork side by side.",
+        params: &[
+            ParamDef { name: "fork_id", description: "Fork id", required: true },
+            ParamDef { name: "branch_a", description: "First branch id", required: true },
+            ParamDef { name: "branch_b", description: "Second branch id", required: true },
+        ],
+    },
+    ToolDef {
+        name: "merge_or_select",
+        description: "Resolve a fork. Pass branch_id to select a winner explicitly; omit it to let the judge decide (judge auto-selection requires the execution backend). Promotes the winner's workspace.",
+        params: &[
+            ParamDef { name: "fork_id", description: "Fork id", required: true },
+            ParamDef { name: "branch_id", description: "Optional explicit winner branch id", required: false },
+        ],
+    },
+    ToolDef {
+        name: "terminate_branch",
+        description: "Terminate a runaway branch in a fork (kills its subprocess and marks it terminated).",
+        params: &[
+            ParamDef { name: "fork_id", description: "Fork id", required: true },
+            ParamDef { name: "branch_id", description: "Branch id to terminate", required: true },
+        ],
+    },
+    ToolDef {
+        name: "fork_cost",
+        description: "Report aggregate and per-branch spend for a fork.",
+        params: &[
+            ParamDef { name: "fork_id", description: "Fork id", required: true },
+        ],
+    },
 ];
 
 // ── External tool whitelist (W19-P0 BUG-QA-001) ─────────────
@@ -1260,7 +1329,7 @@ async fn handle_send_message(
 
     let result = match channel {
         "telegram" => {
-            let token = decrypt_channel_token(&config, "telegram_bot_token_enc", "telegram_bot_token", home_dir);
+            let token = decrypt_channel_token(&config, "telegram_bot_token_enc", "telegram_bot_token", home_dir).await;
             if token.is_empty() {
                 "Error: telegram_bot_token not configured".to_string()
             } else {
@@ -1283,7 +1352,7 @@ async fn handle_send_message(
             }
         }
         "line" => {
-            let token = decrypt_channel_token(&config, "line_channel_token_enc", "line_channel_token", home_dir);
+            let token = decrypt_channel_token(&config, "line_channel_token_enc", "line_channel_token", home_dir).await;
             if token.is_empty() {
                 "Error: line_channel_token not configured".to_string()
             } else {
@@ -1304,7 +1373,7 @@ async fn handle_send_message(
             }
         }
         "discord" => {
-            let token = decrypt_channel_token(&config, "discord_bot_token_enc", "discord_bot_token", home_dir);
+            let token = decrypt_channel_token(&config, "discord_bot_token_enc", "discord_bot_token", home_dir).await;
             if token.is_empty() {
                 "Error: discord_bot_token not configured".to_string()
             } else {
@@ -1913,9 +1982,10 @@ async fn handle_send_media(
     let config_ref = config.as_ref();
     let result = match channel {
         "telegram" => {
-            let token = config_ref
-                .map(|c| decrypt_channel_token(c, "telegram_bot_token_enc", "telegram_bot_token", home_dir))
-                .unwrap_or_default();
+            let token = match config_ref {
+                Some(c) => decrypt_channel_token(c, "telegram_bot_token_enc", "telegram_bot_token", home_dir).await,
+                None => String::new(),
+            };
             if token.is_empty() {
                 "Error: telegram_bot_token not configured".to_string()
             } else {
@@ -1934,9 +2004,10 @@ async fn handle_send_media(
             }
         }
         "discord" => {
-            let token = config_ref
-                .map(|c| decrypt_channel_token(c, "discord_bot_token_enc", "discord_bot_token", home_dir))
-                .unwrap_or_default();
+            let token = match config_ref {
+                Some(c) => decrypt_channel_token(c, "discord_bot_token_enc", "discord_bot_token", home_dir).await,
+                None => String::new(),
+            };
             if token.is_empty() {
                 "Error: discord_bot_token not configured".to_string()
             } else {
@@ -2665,6 +2736,15 @@ async fn handle_create_agent(params: &Value, home_dir: &Path) -> Value {
         });
     }
     let _ = tokio::fs::create_dir_all(agent_dir.join("SKILLS")).await;
+    // RFC-26 P6.3: seed the deep-agents default skill set (code-review / refactor
+    // / test-writer / git-workflow). Idempotent; never overwrites operator edits.
+    match crate::builtin_skills::install_builtin_skills(&agent_dir.join("SKILLS")) {
+        Ok(written) if !written.is_empty() => {
+            info!(agent = name, skills = ?written, "seeded built-in skills");
+        }
+        Ok(_) => {}
+        Err(e) => warn!("failed to seed built-in skills for {name}: {e}"),
+    }
 
     // Write agent.toml — use toml crate to prevent injection via display_name/trigger/icon
     // Clone values that will be consumed by the toml! macro
@@ -3201,7 +3281,10 @@ async fn handle_task_status(params: &Value, home_dir: &Path, caller: &str) -> Va
                     step.status,
                     step.description,
                     if let Some(ref result) = step.result {
-                        format!("\n      Output: {}...", &result.output[..result.output.len().min(200)])
+                        // HC3: byte-slice would panic on a multi-byte UTF-8
+                        // boundary (CJK). truncate_bytes walks back to a char
+                        // boundary ≤ 200 bytes.
+                        format!("\n      Output: {}...", truncate_bytes(&result.output, 200))
                     } else {
                         String::new()
                     }
@@ -3804,6 +3887,14 @@ async fn handle_evolution_toggle(params: &Value, home_dir: &Path) -> Value {
             "isError": true
         }),
     };
+    // M4: reject malformed ids (e.g. "../other") so the agents/<id>/agent.toml
+    // path can't be traversed out of the agents directory.
+    if !is_valid_agent_id(agent_id) {
+        return serde_json::json!({
+            "content": [{"type": "text", "text": "Error: invalid agent_id (lowercase alphanumeric and '-' only, max 64 chars)"}],
+            "isError": true
+        });
+    }
     let field = match params.get("field").and_then(|v| v.as_str()) {
         Some(f) if !f.is_empty() => f,
         _ => return serde_json::json!({
@@ -4987,7 +5078,7 @@ async fn handle_odoo_tool(
                 // Probe the connector by triggering get_or_connect; it's
                 // already cached so this is a hashmap lookup, not an HTTP
                 // call. The decrypt closure is a never-called fallback.
-                match odoo.get_or_connect(caller_agent, |_| Err::<String, String>("unreachable".into())).await {
+                match odoo.get_or_connect(caller_agent, |_: String| async { Err::<String, String>("unreachable".into()) }).await {
                     Ok(conn) => {
                         let s = conn.status();
                         let key = odoo.pool_key(caller_agent).await;
@@ -5033,9 +5124,11 @@ async fn handle_odoo_tool(
     // pool's cache fast-path; the decrypt closure is unreachable here
     // because cold-connect is owned by `handle_odoo_connect`.
     let conn_arc = match odoo
-        .get_or_connect(caller_agent, |_| Err::<String, String>(
-            "Odoo connector not initialised — call odoo_connect first".into(),
-        ))
+        .get_or_connect(caller_agent, |_: String| async {
+            Err::<String, String>(
+                "Odoo connector not initialised — call odoo_connect first".into(),
+            )
+        })
         .await
     {
         Ok(c) => c,
@@ -5289,13 +5382,44 @@ fn classify_odoo_call(tool: &str, params: &Value) -> Option<(&'static str, Strin
         }
         "odoo_execute" => {
             let model = params.get("model").and_then(|v| v.as_str()).unwrap_or("");
-            if model.is_empty() { None } else { Some(("execute", model.to_string())) }
+            if model.is_empty() {
+                return None;
+            }
+            // HS8: derive the real verb from `params["method"]` instead of
+            // hard-coding "execute". Otherwise `allowed_actions=["execute"]`
+            // (or even ["read","search","execute"]) would silently authorise a
+            // `method:"write"` / `method:"unlink"` / `action_archive` call that
+            // the per-agent action filter is supposed to block.
+            let method = params.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            Some((odoo_method_to_verb(method), model.to_string()))
         }
         "odoo_report" => {
             let name = params.get("report_name").and_then(|v| v.as_str()).unwrap_or("");
             if name.is_empty() { None } else { Some(("execute", name.to_string())) }
         }
         _ => None,
+    }
+}
+
+/// Map an Odoo ORM `method` name to the coarse verb used by the per-agent
+/// `allowed_actions` filter. CRUD methods map to `read`/`create`/`write`/
+/// `unlink`; `action_*` / `button_*` workflow methods map to the qualified
+/// `action_<name>` form (so `allowed_actions` can name them explicitly);
+/// everything else is treated as a generic `execute`.
+fn odoo_method_to_verb(method: &str) -> &'static str {
+    match method {
+        "read" | "search" | "search_read" | "search_count" | "fields_get" | "name_get"
+        | "name_search" | "default_get" | "read_group" => "read",
+        "create" | "copy" => "create",
+        "write" | "update" => "write",
+        "unlink" => "unlink",
+        // Workflow / archive / state-change buttons are the dangerous ones the
+        // reviewer flagged (e.g. action_archive). Classify them under the
+        // qualified `action_*` family so they don't slip through as `execute`.
+        m if m.starts_with("action_") || m.starts_with("button_") || m.starts_with("toggle_") => {
+            "action"
+        }
+        _ => "execute",
     }
 }
 
@@ -5348,9 +5472,27 @@ async fn handle_odoo_connect(home_dir: &Path, odoo: &OdooState, caller_agent: &s
     //       state we just registered.
     let home_dir_owned = home_dir.to_path_buf();
     let connector = match odoo
-        .get_or_connect(caller_agent, move |enc: &str| {
-            decrypt_encrypted_value(enc, &home_dir_owned)
-                .ok_or_else(|| "Odoo credential not found or could not be decrypted".to_string())
+        .get_or_connect(caller_agent, move |cred: String| {
+            // The credential source is normally AES ciphertext, but may be a
+            // `secret://<backend>/<name>` Vault reference — resolution differs
+            // and (for the reference case) is async, so this closure is async.
+            let home = home_dir_owned.clone();
+            async move {
+                if cred.starts_with("secret://") {
+                    // Load [secret_manager] from config.toml (fail-soft to default).
+                    let sm_cfg = match tokio::fs::read_to_string(home.join("config.toml")).await {
+                        Ok(s) => duduclaw_security::secret_manager::SecretManagerConfig::from_toml_str(&s)
+                            .unwrap_or_default(),
+                        Err(_) => Default::default(),
+                    };
+                    duduclaw_security::secret_manager::resolve_secret_reference(&cred, &sm_cfg, &home)
+                        .await
+                        .ok_or_else(|| "odoo secret:// reference resolution failed".to_string())
+                } else {
+                    decrypt_encrypted_value(&cred, &home)
+                        .ok_or_else(|| "Odoo credential not found or could not be decrypted".to_string())
+                }
+            }
         })
         .await
     {
@@ -6084,46 +6226,54 @@ async fn read_config(home_dir: &Path) -> Option<toml::Table> {
     content.parse().ok()
 }
 
-/// Load the AES-256 keyfile and create a CryptoEngine.
-fn load_crypto_engine(home_dir: &Path) -> Option<duduclaw_security::crypto::CryptoEngine> {
-    let keyfile = home_dir.join(".keyfile");
-    let bytes = std::fs::read(&keyfile).ok()?;
-    if bytes.len() == 32 {
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&bytes);
-        duduclaw_security::crypto::CryptoEngine::new(&key).ok()
-    } else {
-        None
-    }
-}
-
 /// Decrypt an encrypted base64 value using the per-machine keyfile.
+///
+/// Delegates to the canonical read-only primitive
+/// [`duduclaw_security::keyfile::decrypt_keyfile_value`] so the Odoo credential
+/// path (and channel-token reads) share one decrypt implementation with the
+/// gateway and account rotator.
+///
+/// `secret://` resolution for Odoo `api_key` / `password` is wired at the
+/// `odoo_connect` → `OdooConnectorPool::get_or_connect` async call site: the
+/// resolver closure inspects the `*_enc` credential source, and when it begins
+/// with `secret://` it loads `[secret_manager]` from `config.toml` and calls
+/// `duduclaw_security::secret_manager::resolve_secret_reference` instead of this
+/// sync AES primitive. This function remains the path for ordinary ciphertext.
 fn decrypt_encrypted_value(encrypted: &str, home_dir: &Path) -> Option<String> {
-    if encrypted.is_empty() { return None; }
-    let engine = load_crypto_engine(home_dir)?;
-    let plain = engine.decrypt_string(encrypted).ok()?;
-    if plain.is_empty() { None } else { Some(plain) }
+    duduclaw_security::keyfile::decrypt_keyfile_value(encrypted, home_dir)
 }
 
 /// Decrypt a channel token from config.toml.
 ///
 /// Tries the encrypted field (`_enc` suffix) first, then falls back to the
 /// plaintext field for backwards compatibility.
-fn decrypt_channel_token(config: &toml::Table, enc_key: &str, plain_key: &str, home_dir: &Path) -> String {
+async fn decrypt_channel_token(config: &toml::Table, enc_key: &str, plain_key: &str, home_dir: &Path) -> String {
     let channels = config.get("channels").and_then(|c| c.as_table());
 
-    // Try encrypted field first
+    // 1. Encrypted (`_enc`) field — AES via the shared keyfile primitive.
     if let Some(enc_val) = channels.and_then(|c| c.get(enc_key)).and_then(|v| v.as_str())
         && let Some(decrypted) = decrypt_encrypted_value(enc_val, home_dir) {
             return decrypted;
         }
 
-    // Fallback: plaintext field (backwards compat)
-    channels
+    // 2. Plaintext field — may be a `secret://<backend>/<name>` reference,
+    //    resolved through the configured SecretManager (e.g. Vault). Non-
+    //    reference plaintext is returned as-is (backwards compat). Fail-soft.
+    let plain = channels
         .and_then(|c| c.get(plain_key))
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
+        .unwrap_or("");
+    if plain.starts_with("secret://") {
+        let sm_cfg: duduclaw_security::secret_manager::SecretManagerConfig = config
+            .get("secret_manager")
+            .cloned()
+            .and_then(|v| v.try_into().ok())
+            .unwrap_or_default();
+        return duduclaw_security::secret_manager::resolve_secret_reference(plain, &sm_cfg, home_dir)
+            .await
+            .unwrap_or_default();
+    }
+    plain.to_string()
 }
 
 /// Resolve the caller-identity agent name for MCP authorization.
@@ -6485,6 +6635,9 @@ pub(crate) async fn handle_tools_call(
             | "activity_post"
             | "shared_skill_share"
             | "shared_skill_adopt"
+            | "fork_run"
+            | "merge_or_select"
+            | "terminate_branch"
     );
     let result = match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
@@ -6498,6 +6651,8 @@ pub(crate) async fn handle_tools_call(
         "memory_successful_conversations" => handle_memory_successful_conversations(&arguments, memory, default_agent).await,
         "memory_episodic_pressure" => handle_memory_episodic_pressure(&arguments, memory, default_agent).await,
         "memory_consolidation_status" => handle_memory_consolidation_status(memory, default_agent).await,
+        "memory_improve" => crate::mcp_memory_handlers::handle_memory_improve(&arguments, memory, ns_ctx).await,
+        "plan_start" => crate::mcp_planner::handle_plan_start(&arguments, home_dir, default_agent).await,
         "send_to_agent" => handle_send_to_agent(&arguments, home_dir, default_agent).await,
         "send_photo" => handle_send_media(&arguments, home_dir, http, "photo").await,
         "send_sticker" => handle_send_media(&arguments, home_dir, http, "sticker").await,
@@ -6637,6 +6792,14 @@ pub(crate) async fn handle_tools_call(
             }
             handle_computer_use_tool(tool_name, &arguments).await
         }
+        // RFC-26: Live Run Forking tools (gated by Scope::ForkExecute + per-agent
+        // [fork] enabled toggle checked inside each handler).
+        "fork_run" => crate::mcp_fork::handle_fork_run(&arguments, home_dir, default_agent).await,
+        "inspect_branches" => crate::mcp_fork::handle_inspect_branches(&arguments, home_dir, default_agent).await,
+        "diff_branches" => crate::mcp_fork::handle_diff_branches(&arguments, home_dir, default_agent).await,
+        "merge_or_select" => crate::mcp_fork::handle_merge_or_select(&arguments, home_dir, default_agent).await,
+        "terminate_branch" => crate::mcp_fork::handle_terminate_branch(&arguments, home_dir, default_agent).await,
+        "fork_cost" => crate::mcp_fork::handle_fork_cost(&arguments, home_dir, default_agent).await,
         // Odoo ERP tools
         t if t.starts_with("odoo_") => {
             handle_odoo_tool(t, &arguments, home_dir, odoo, default_agent).await
@@ -7414,6 +7577,19 @@ async fn handle_wiki_write(args: &Value, home_dir: &Path, default_agent: &str) -
         None => return tool_error("Missing required parameter: content"),
     };
 
+    // M5: cross-agent visibility check (parity with the read/search paths) —
+    // an agent must be in the target's wiki_visible_to to write into its wiki.
+    if agent_id != default_agent {
+        match check_wiki_visibility(home_dir, agent_id, default_agent) {
+            Ok(false) => return tool_error(&format!(
+                "Agent '{}' wiki is not visible to '{}'. Ask the owner to add you to wiki_visible_to.",
+                agent_id, default_agent
+            )),
+            Err(e) => return tool_error(&format!("Visibility check failed: {e}")),
+            _ => {}
+        }
+    }
+
     if let Err(e) = validate_wiki_page_path(page_path) {
         return tool_error(&e);
     }
@@ -7440,6 +7616,17 @@ async fn handle_wiki_write(args: &Value, home_dir: &Path, default_agent: &str) -
             && let Err(e) = std::fs::create_dir_all(parent) {
                 return tool_error(&format!("Failed to create directory: {e}"));
             }
+
+    // L11: symlink-escape guard (parity with the read path). Canonicalize the
+    // wiki dir and the parent of the target (the file itself may not exist yet)
+    // and reject if the resolved location escapes the wiki directory.
+    if let Ok(canon_wiki) = wiki_dir.canonicalize()
+        && let Some(parent) = full_path.parent()
+        && let Ok(canon_parent) = parent.canonicalize()
+        && !canon_parent.starts_with(&canon_wiki)
+    {
+        return tool_error("Path escapes wiki directory");
+    }
 
     let is_new = !full_path.exists();
 
@@ -11674,14 +11861,20 @@ mod mcp_scope_dispatch_tests {
         }
     }
 
-    // ── Test 4: unrestricted tool needs no scope ──────────────────────────────
+    // ── Test 4: unmapped tool is fail-closed (C2) ─────────────────────────────
     #[test]
-    fn unrestricted_tool_allowed_with_empty_scopes() {
+    fn unmapped_tool_is_fail_closed_with_empty_scopes() {
+        // C2 fail-closed: a tool not in the scope table requires Admin, so a
+        // principal with no scopes (and no Admin) must be denied. This replaces
+        // the obsolete expectation that unmapped tools were unrestricted.
         let p = make_principal(&[]); // no scopes at all
         assert!(
-            check_scope(&p, "web_search"),
-            "web_search must be unrestricted regardless of scopes"
+            !check_scope(&p, "web_search"),
+            "unmapped tool must be denied for a scope-less principal (fail-closed)"
         );
+        // An Admin principal still passes.
+        let admin = make_principal(&[Scope::Admin]);
+        assert!(check_scope(&admin, "web_search"), "Admin must pass any tool");
     }
 
     // ── Test 5: memory_store allowed when memory:write present ───────────────
@@ -11713,7 +11906,8 @@ mod mcp_scope_dispatch_tests {
         assert_eq!(tool_requires_scope("send_message"), Some(Scope::MessagingSend));
         assert_eq!(tool_requires_scope("memory_search"),Some(Scope::MemoryRead));
         assert_eq!(tool_requires_scope("wiki_read"),    Some(Scope::WikiRead));
-        assert_eq!(tool_requires_scope("totally_unknown"), None);
+        // C2 fail-closed: unmapped tools require Admin, not None.
+        assert_eq!(tool_requires_scope("totally_unknown"), Some(Scope::Admin));
     }
 }
 
@@ -12670,13 +12864,59 @@ mod odoo_pool_dispatch_tests {
 
     #[test]
     fn classify_extracts_model_from_params_for_generic_execute() {
+        // An unrecognised RPC method falls back to the generic `execute` verb.
         let (verb, model) = classify_odoo_call(
             "odoo_execute",
-            &serde_json::json!({ "model": "res.partner", "method": "search" }),
+            &serde_json::json!({ "model": "res.partner", "method": "some_custom_rpc" }),
         )
         .unwrap();
         assert_eq!(verb, "execute");
         assert_eq!(model, "res.partner");
+    }
+
+    #[test]
+    fn classify_odoo_execute_derives_verb_from_method() {
+        // HS8: the verb must reflect the actual ORM method, not a hard-coded
+        // "execute", so the per-agent allowed_actions filter can block writes
+        // that arrive through the generic odoo_execute tool.
+        let cases = [
+            ("search", "read"),
+            ("search_read", "read"),
+            ("read", "read"),
+            ("create", "create"),
+            ("write", "write"),
+            ("unlink", "unlink"),
+            ("action_archive", "action"),
+            ("button_confirm", "action"),
+            ("name_get", "read"),
+            ("custom_method", "execute"),
+        ];
+        for (method, want) in cases {
+            let (verb, model) = classify_odoo_call(
+                "odoo_execute",
+                &serde_json::json!({ "model": "crm.lead", "method": method }),
+            )
+            .unwrap();
+            assert_eq!(verb, want, "method {method} should classify as {want}");
+            assert_eq!(model, "crm.lead");
+        }
+    }
+
+    #[test]
+    fn classify_odoo_execute_write_blocked_when_only_execute_allowed() {
+        // Regression for HS8: allowed_actions=["read","search","execute"] must
+        // NOT permit a method:"write" call routed through odoo_execute.
+        let (verb, model) = classify_odoo_call(
+            "odoo_execute",
+            &serde_json::json!({ "model": "crm.lead", "method": "write" }),
+        )
+        .unwrap();
+        let cfg = duduclaw_odoo::AgentOdooConfig {
+            allowed_actions: vec!["read".into(), "search".into(), "execute".into()],
+            ..Default::default()
+        };
+        let res = crate::odoo_pool::check_action_permission(Some(&cfg), verb, &model);
+        assert!(res.is_err(), "write must be denied, got verb={verb}");
     }
 
     #[test]

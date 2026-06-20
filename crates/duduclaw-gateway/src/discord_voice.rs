@@ -77,7 +77,7 @@ impl Default for DiscordVoiceConfig {
 
 /// Tracks per-user audio accumulation in a voice channel.
 struct UserAudioBuffer {
-    /// Accumulated PCM samples (i16, 48kHz stereo from Discord).
+    /// Accumulated PCM samples (i16, 48kHz, interleaved per `channels`).
     samples: Vec<i16>,
     /// When this user last spoke.
     last_speech: std::time::Instant,
@@ -85,15 +85,27 @@ struct UserAudioBuffer {
     user_id: u64,
     /// Display name for logging.
     display_name: String,
+    /// Channel count of the decoded audio (1 = mono, 2 = stereo). Discord/
+    /// Songbird usually decodes to 48kHz stereo, but mono streams occur.
+    channels: u8,
 }
 
 impl UserAudioBuffer {
+    /// Create a buffer for the default stereo (2-channel) decode.
     fn new(user_id: u64, display_name: String) -> Self {
+        Self::new_with_channels(user_id, display_name, 2)
+    }
+
+    /// Create a buffer for a known channel count (1 = mono, 2 = stereo).
+    #[allow(dead_code)] // used by tests and future mono-decode wiring
+    fn new_with_channels(user_id: u64, display_name: String, channels: u8) -> Self {
         Self {
             samples: Vec::new(),
             last_speech: std::time::Instant::now(),
             user_id,
             display_name,
+            // Clamp to a sane minimum; 0 channels is meaningless.
+            channels: channels.max(1),
         }
     }
 
@@ -116,17 +128,28 @@ impl UserAudioBuffer {
         self.last_speech.elapsed().as_secs_f32()
     }
 
-    /// Convert accumulated Discord audio (48kHz stereo i16) to ASR format (16kHz mono f32).
+    /// Convert accumulated Discord audio (48kHz i16) to ASR format (16kHz mono f32).
+    ///
+    /// M27: honour the actual channel count. Stereo interleaves L/R and is
+    /// downmixed by averaging pairs; mono is already single-channel and must
+    /// NOT be folded as if it were stereo (doing so halves the sample count and
+    /// produces wrong-rate PCM for ASR).
     fn to_asr_pcm(&self) -> Vec<f32> {
-        // Step 1: Stereo to mono (average L+R)
-        let mono: Vec<f32> = self.samples
-            .chunks(2)
-            .map(|pair| {
-                let l = pair[0] as f32 / 32768.0;
-                let r = pair.get(1).map(|&v| v as f32 / 32768.0).unwrap_or(l);
-                (l + r) / 2.0
-            })
-            .collect();
+        // Step 1: downmix to mono f32 according to channel layout.
+        let mono: Vec<f32> = if self.channels >= 2 {
+            // Interleaved stereo (L, R, L, R, ...) → average each pair.
+            self.samples
+                .chunks(2)
+                .map(|pair| {
+                    let l = pair[0] as f32 / 32768.0;
+                    let r = pair.get(1).map(|&v| v as f32 / 32768.0).unwrap_or(l);
+                    (l + r) / 2.0
+                })
+                .collect()
+        } else {
+            // Already mono — just normalize, no L/R folding.
+            self.samples.iter().map(|&v| v as f32 / 32768.0).collect()
+        };
 
         // Step 2: Resample 48kHz → 16kHz (simple 3:1 decimation with averaging)
         mono.chunks(3)
@@ -139,8 +162,9 @@ impl UserAudioBuffer {
     }
 
     fn duration_seconds(&self) -> f32 {
-        // 48kHz stereo = 96000 samples/second
-        self.samples.len() as f32 / 96000.0
+        // 48kHz: samples-per-second = 48000 * channels.
+        let samples_per_sec = 48_000.0 * self.channels.max(1) as f32;
+        self.samples.len() as f32 / samples_per_sec
     }
 }
 
@@ -452,6 +476,21 @@ mod tests {
         let pcm = buf.to_asr_pcm();
         // 480 stereo samples → 240 mono → 80 at 16kHz (÷3)
         assert_eq!(pcm.len(), 80);
+    }
+
+    #[test]
+    fn user_audio_buffer_mono_conversion() {
+        // M27: a mono decode has no L/R interleave. 240 mono samples should
+        // resample to 80 at 16kHz (÷3) — NOT be halved as if stereo.
+        let mono_48k: Vec<i16> = (0..240).map(|i| (i * 10) as i16).collect();
+        let mut buf = UserAudioBuffer::new_with_channels(7, "MonoUser".into(), 1);
+        buf.append_samples(&mono_48k);
+
+        let pcm = buf.to_asr_pcm();
+        assert_eq!(pcm.len(), 80, "mono path must not fold L/R");
+
+        // 240 mono samples at 48kHz mono = 5ms.
+        assert!((buf.duration_seconds() - 0.005).abs() < 1e-4);
     }
 
     #[test]

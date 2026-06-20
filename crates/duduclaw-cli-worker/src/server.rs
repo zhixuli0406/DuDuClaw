@@ -103,6 +103,16 @@ tokio::task_local! {
     static SPAWN_WORK_DIR_HINT: Option<std::path::PathBuf>;
 }
 
+// **Review fix (HS14)**: per-invoke per-account environment variables
+// scoped via the same task-local mechanism as the work_dir hint. The
+// spawn factory only receives an `AgentKey` (cache identity), so the
+// caller-supplied env (e.g. `CLAUDE_CODE_OAUTH_TOKEN`,
+// `CLAUDE_CONFIG_DIR` from the gateway's account rotator) is threaded
+// through here and applied to `opts.env` on a cache miss.
+tokio::task_local! {
+    static SPAWN_ENV_HINT: std::collections::HashMap<String, String>;
+}
+
 /// Long-lived worker server.
 pub struct WorkerServer {
     pool: Arc<PtyPool>,
@@ -231,6 +241,19 @@ pub(crate) fn validate_model_name(m: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
 }
 
+/// **Review fix (HS14)**: returns `true` when the caller requested
+/// account-scoped rotation (`account_id` is `Some`) but supplied no
+/// per-account env. In that state the worker cannot bind the spawned
+/// CLI to the requested account, so it must reject rather than silently
+/// fall back to the ambient `~/.claude` OAuth (which bypasses
+/// per-account billing cooldown + budget caps).
+pub(crate) fn requires_env_for_account(
+    account_id: &Option<String>,
+    env: &std::collections::HashMap<String, String>,
+) -> bool {
+    account_id.is_some() && env.is_empty()
+}
+
 /// **Round 3 security helper (HIGH-H2)**: validate that `work_dir`
 /// canonicalises inside `<home>/agents/`. Returns `false` for
 /// non-existent paths, paths outside the constrained root, or
@@ -305,16 +328,22 @@ async fn spawn_session_default(
     };
 
     let mut opts = SpawnOpts::claude_interactive(key.agent_id.clone(), &program);
-    // **Round 2 review note (HIGH-2 — DEFERRED)**: `key.account_id`
-    // affects only the pool's cache_key here — the spawned CLI uses
-    // whatever ambient OAuth lives in `~/.claude/` / keychain. True
-    // per-account auth isolation in the worker requires accepting
-    // env_vars in `InvokeParams` and applying them to `opts.env`
-    // (the gateway has those env_vars from its rotator; passing them
-    // across the JSON-RPC boundary is a future schema change).
-    // Operators of multi-OAuth-account setups should not rely on the
-    // managed worker for account rotation until this lands.
-    let _account_id_for_future_env_injection = &key.account_id;
+    // **Review fix (HS14)**: apply the per-account env vars threaded
+    // through `SPAWN_ENV_HINT`. This binds the spawned CLI to a distinct
+    // account (via `CLAUDE_CODE_OAUTH_TOKEN` / `CLAUDE_CONFIG_DIR` etc.)
+    // instead of letting every child share one ambient `~/.claude`
+    // OAuth — which previously bypassed per-account billing cooldown +
+    // budget caps. `key.account_id` is the cache key; the env is the
+    // actual credential material. `handle_invoke` fails fast *before*
+    // acquiring a session when account rotation is requested
+    // (`account_id` is Some) but no env was supplied, so by the time we
+    // reach a fresh spawn the invariant "account_id ⇒ env present" holds.
+    let env_hint = SPAWN_ENV_HINT.try_with(|env| env.clone()).ok();
+    if let Some(env) = env_hint {
+        for (k, v) in env {
+            opts.env.insert(k, v);
+        }
+    }
     // **Review fix (CRITICAL #2)**: model precedence is
     // (1) key.model (per-Invoke override) →
     // (2) WorkerServerConfig.default_model (worker-wide default) →
@@ -372,11 +401,32 @@ async fn healthz_handler() -> impl IntoResponse {
 async fn rpc_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<Request>,
+    // **Review fix (L21)**: take the raw body bytes instead of an
+    // extracted `Json<Request>`. Axum extractors run in argument order,
+    // so a `Json<Request>` parameter would deserialize (and reject) the
+    // full body *before* `authorise` runs — letting an unauthenticated
+    // caller probe the schema via parse-error responses and forcing the
+    // worker to parse attacker-controlled JSON pre-auth. By accepting
+    // `Bytes` we authorise first, then deserialize only for authorised
+    // callers.
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
     if let Err(resp) = authorise(&state, &headers) {
         return resp;
     }
+
+    let req: Request = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(Response::<Value>::err(RpcError::bad_request(format!(
+                    "invalid request body: {e}"
+                )))),
+            )
+                .into_response();
+        }
+    };
 
     let result = match req {
         Request::Health => Ok(serde_json::json!({"alive": true})),
@@ -480,6 +530,27 @@ async fn handle_invoke(
             )));
         }
     }
+    // **Review fix (HS14)**: fail fast when account rotation is requested
+    // (`account_id` is Some) but no per-account env was supplied. Without
+    // env injection the spawned CLI would silently fall back to the
+    // ambient `~/.claude` OAuth, sharing a single account across every
+    // rotated session and bypassing per-account billing cooldown +
+    // budget caps. Refusing the request surfaces the misconfiguration to
+    // the gateway instead of leaking quota silently.
+    //
+    // NOTE FOR GATEWAY: to use the managed worker with multi-account
+    // rotation, the gateway must populate `InvokeParams.env` with the
+    // resolved account's credentials (e.g. `CLAUDE_CODE_OAUTH_TOKEN`
+    // and/or `CLAUDE_CONFIG_DIR`) whenever it sets `account_id`.
+    if requires_env_for_account(&params.account_id, &params.env) {
+        return Err(RpcError::bad_request(
+            "account_id was supplied but env is empty — per-account auth \
+             isolation requires the caller to populate InvokeParams.env \
+             (e.g. CLAUDE_CODE_OAUTH_TOKEN / CLAUDE_CONFIG_DIR); refusing \
+             to spawn a session that would silently share the ambient \
+             account",
+        ));
+    }
     // **Round 3 security fix (HIGH-H1)**: `model` is interpolated
     // directly into the CLI arg list as `--model <value>`. Reject any
     // value that could escape to a separate flag (leading `-`, control
@@ -536,8 +607,15 @@ async fn handle_invoke(
     // the *canonical* PathBuf into the task-local so the spawn
     // factory doesn't re-resolve the path (TOCTOU-free).
     let canonical_work_dir_for_check = canonical_work_dir.clone();
+    // **Review fix (HS14)**: scope both the work_dir hint and the
+    // per-account env hint around the pool acquire so the spawn factory
+    // (cache-miss path) can read them. Nesting the env scope inside the
+    // work_dir scope keeps both task-locals live for the same future.
     let lease = SPAWN_WORK_DIR_HINT
-        .scope(canonical_work_dir, state.pool.acquire(key))
+        .scope(
+            canonical_work_dir,
+            SPAWN_ENV_HINT.scope(params.env.clone(), state.pool.acquire(key)),
+        )
         .await
         .map_err(|e| RpcError::invoke_failed(format!("pool acquire: {e}")))?;
     let session = lease.arc();
@@ -551,11 +629,27 @@ async fn handle_invoke(
     // operationally valid setup, e.g. an agent whose root moved
     // mid-process). Logging it makes the divergence diagnosable
     // without changing the cache semantics.
-    if let (Some(requested), Some(actual)) =
-        (canonical_work_dir_for_check.as_ref(), session.spawn_cwd())
-    {
-        if requested.as_path() != actual {
-            warn_work_dir_divergence(requested, actual);
+    // **Review fix (M48)**: also handle the None→Some transition. The
+    // original code only compared when `spawn_cwd()` was `Some`, so a
+    // session first spawned with no cwd (worker's own cwd) that later
+    // receives an invoke carrying a `work_dir` was silently ignored —
+    // the agent kept running outside its per-agent dir and never loaded
+    // its `.mcp.json` / `CLAUDE.md`. We now warn on that case too.
+    if let Some(requested) = canonical_work_dir_for_check.as_ref() {
+        match session.spawn_cwd() {
+            Some(actual) if requested.as_path() != actual => {
+                warn_work_dir_divergence(requested, actual);
+            }
+            Some(_) => { /* cwd matches — nothing to warn about */ }
+            None => {
+                // Cached session was spawned without a cwd but this
+                // invoke wants one. Use the worker's own cwd as the
+                // "actual" in the divergence record so the log clearly
+                // shows the session is NOT running in the requested dir.
+                let actual = std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("<unknown>"));
+                warn_work_dir_divergence(requested, &actual);
+            }
         }
     }
     let result = session.invoke(&params.prompt, Some(timeout)).await;
@@ -688,6 +782,34 @@ mod tests {
     fn status_mapping_internal_default() {
         let s = status_for(&RpcError::internal("x"));
         assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // **Review tests (HS14)** — per-account env fail-fast guard.
+
+    #[test]
+    fn requires_env_when_account_set_but_env_empty() {
+        let empty = std::collections::HashMap::new();
+        assert!(requires_env_for_account(
+            &Some("alice@example.com".to_string()),
+            &empty
+        ));
+    }
+
+    #[test]
+    fn no_env_required_when_account_set_and_env_present() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "tok".to_string());
+        assert!(!requires_env_for_account(
+            &Some("alice@example.com".to_string()),
+            &env
+        ));
+    }
+
+    #[test]
+    fn no_env_required_when_no_account() {
+        // Legacy single-account path: no account_id, no env needed.
+        let empty = std::collections::HashMap::new();
+        assert!(!requires_env_for_account(&None, &empty));
     }
 
     // **Round 3 security tests (HIGH-H1)** — model name allowlist.

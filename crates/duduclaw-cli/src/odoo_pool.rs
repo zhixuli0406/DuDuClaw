@@ -116,13 +116,14 @@ impl OdooConnectorPool {
     /// `decrypt` is invoked lazily so a miss in either pool slot never
     /// surfaces a decryption error to handlers that don't actually need a
     /// credential (e.g. `odoo_status` on an unconnected pool).
-    fn merge_credentials<F>(
+    async fn merge_credentials<F, Fut>(
         global: &OdooConfig,
         override_cfg: Option<&AgentOdooConfig>,
-        decrypt: F,
+        resolve: F,
     ) -> Result<ResolvedCredentials, String>
     where
-        F: Fn(&str) -> Result<String, String>,
+        F: Fn(String) -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
     {
         // Username merge.
         let mut config = global.clone();
@@ -138,7 +139,10 @@ impl OdooConnectorPool {
             }
         }
 
-        // Pick which encrypted blob to decrypt. Prefer api_key over password.
+        // Pick which credential source to resolve. Prefer api_key over
+        // password. The `*_enc` field normally holds AES ciphertext but may
+        // hold a `secret://...` Vault reference — resolution is delegated to
+        // the (async) `resolve` closure, which handles both shapes.
         let enc = if !config.api_key_enc.is_empty() {
             config.api_key_enc.clone()
         } else if !config.password_enc.is_empty() {
@@ -149,20 +153,21 @@ impl OdooConnectorPool {
             );
         };
 
-        let credential = decrypt(&enc)?;
+        let credential = resolve(enc).await?;
         Ok(ResolvedCredentials { config, credential })
     }
 
     /// Get-or-connect the connector for `agent_id`. The decrypt closure is
     /// invoked at most once per slot — the cached `Arc<OdooConnector>` is
     /// returned by every subsequent call until [`disconnect`] is invoked.
-    pub async fn get_or_connect<F>(
+    pub async fn get_or_connect<F, Fut>(
         &self,
         agent_id: &str,
-        decrypt: F,
+        resolve: F,
     ) -> Result<Arc<OdooConnector>, String>
     where
-        F: Fn(&str) -> Result<String, String>,
+        F: Fn(String) -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
     {
         let key = self.pool_key(agent_id).await;
 
@@ -197,8 +202,17 @@ impl OdooConnectorPool {
         let agent_override = resolver.for_agent(agent_id).cloned();
         drop(resolver);
 
-        let creds = Self::merge_credentials(&global, agent_override.as_ref(), &decrypt)?;
-        let conn = OdooConnector::connect(&creds.config, &creds.credential).await?;
+        let creds = Self::merge_credentials(&global, agent_override.as_ref(), resolve).await?;
+        let mut conn = OdooConnector::connect(&creds.config, &creds.credential).await?;
+        // M18: apply the agent's cross-company scoping so every subsequent call
+        // carries `allowed_company_ids` / `company_id`. Without this the builder
+        // was never invoked and per-agent company isolation had no effect.
+        if let Some(cfg) = agent_override.as_ref()
+            && !cfg.company_ids.is_empty()
+        {
+            let ids: Vec<i64> = cfg.company_ids.iter().map(|&id| id as i64).collect();
+            conn = conn.with_company_ids(ids);
+        }
         let arc = Arc::new(conn);
         guard.connector = Some(arc.clone());
         info!(
@@ -345,9 +359,11 @@ mod tests {
         let mut global = OdooConfig::default();
         global.api_key_enc = "ENC_GLOBAL".into();
 
-        let creds =
-            OdooConnectorPool::merge_credentials(&global, None, |enc| Ok(format!("dec({enc})")))
-                .unwrap();
+        let creds = OdooConnectorPool::merge_credentials(&global, None, |enc: String| async move {
+            Ok(format!("dec({enc})"))
+        })
+        .await
+        .unwrap();
         assert_eq!(creds.credential, "dec(ENC_GLOBAL)");
         assert_eq!(creds.config.api_key_enc, "ENC_GLOBAL");
     }
@@ -364,10 +380,12 @@ mod tests {
             ..Default::default()
         };
 
-        let creds = OdooConnectorPool::merge_credentials(&global, Some(&agent_cfg), |enc| {
-            Ok(format!("dec({enc})"))
-        })
-        .unwrap();
+        let creds =
+            OdooConnectorPool::merge_credentials(&global, Some(&agent_cfg), |enc: String| async move {
+                Ok(format!("dec({enc})"))
+            })
+            .await
+            .unwrap();
         assert_eq!(creds.credential, "dec(ENC_ALPHA)");
         assert_eq!(creds.config.username, "alpha_user");
     }
@@ -375,9 +393,28 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn merge_credentials_errors_when_no_credential_present() {
         let global = OdooConfig::default(); // empty
-        let err = OdooConnectorPool::merge_credentials(&global, None, |_| Ok(String::new()))
-            .unwrap_err();
+        let err = OdooConnectorPool::merge_credentials(&global, None, |_: String| async {
+            Ok(String::new())
+        })
+        .await
+        .unwrap_err();
         assert!(err.contains("no Odoo credential"), "got: {err}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_credentials_passes_secret_reference_to_async_resolver() {
+        // A `secret://` reference must reach the async resolver verbatim — the
+        // pool itself does not interpret it, the resolver does.
+        let mut global = OdooConfig::default();
+        global.api_key_enc = "secret://vault/odoo-api-key".into();
+
+        let creds = OdooConnectorPool::merge_credentials(&global, None, |cred: String| async move {
+            assert!(cred.starts_with("secret://"));
+            Ok(format!("resolved({cred})"))
+        })
+        .await
+        .unwrap();
+        assert_eq!(creds.credential, "resolved(secret://vault/odoo-api-key)");
     }
 
     #[test]

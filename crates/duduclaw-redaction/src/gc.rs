@@ -157,7 +157,7 @@ mod tests {
         // Insert a TTL-0 (immediately expired) entry.
         vault
             .insert_mapping(
-                "<REDACT:E:abcdef01>",
+                "<REDACT:E:abcdef01abcdef01abcdef01abcdef01>",
                 "x",
                 "agnes",
                 Some("s1"),
@@ -183,7 +183,7 @@ mod tests {
 
         // Lookup an expired entry → returns Some with expired_marker = true.
         let entry = vault
-            .lookup_mapping("<REDACT:E:abcdef01>", "agnes", Some("s1"))
+            .lookup_mapping("<REDACT:E:abcdef01abcdef01abcdef01abcdef01>", "agnes", Some("s1"))
             .unwrap()
             .unwrap();
         assert!(entry.expired_marker);

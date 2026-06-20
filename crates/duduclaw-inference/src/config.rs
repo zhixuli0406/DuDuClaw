@@ -198,8 +198,12 @@ impl Default for InferenceConfig {
 pub struct OpenAiCompatConfig {
     /// Base URL (e.g., "http://localhost:8080/v1")
     pub base_url: String,
-    /// API key (if required)
+    /// API key (if required), plaintext form.
     pub api_key: Option<String>,
+    /// AES-256-GCM encrypted API key (base64), written by the gateway.
+    /// Preferred over `api_key` when set — see [`OpenAiCompatConfig::resolved_api_key`].
+    #[serde(default)]
+    pub api_key_enc: Option<String>,
     /// Model name to request
     pub model: String,
 }
@@ -209,8 +213,31 @@ impl std::fmt::Debug for OpenAiCompatConfig {
         f.debug_struct("OpenAiCompatConfig")
             .field("base_url", &self.base_url)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("api_key_enc", &self.api_key_enc.as_ref().map(|_| "[REDACTED]"))
             .field("model", &self.model)
             .finish()
+    }
+}
+
+impl OpenAiCompatConfig {
+    /// Resolve the effective API key, read-only / fail-soft.
+    ///
+    /// If `api_key_enc` is set + non-empty, decrypt it via the per-machine
+    /// keyfile (`~/.duduclaw/.keyfile`). On any decrypt failure (missing/short
+    /// keyfile, bad ciphertext) this falls back to the plaintext `api_key`.
+    /// Returns `None` when neither yields a non-empty key — callers should then
+    /// behave as today's "no key" case (no Authorization header).
+    pub fn resolved_api_key(&self, home_dir: &std::path::Path) -> Option<String> {
+        if let Some(enc) = self.api_key_enc.as_deref() {
+            if !enc.is_empty() {
+                if let Some(plain) =
+                    duduclaw_security::keyfile::decrypt_keyfile_value(enc, home_dir)
+                {
+                    return Some(plain);
+                }
+            }
+        }
+        self.api_key.clone().filter(|s| !s.is_empty())
     }
 }
 
@@ -398,5 +425,90 @@ impl InferenceConfig {
                 ));
             }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod openai_compat_key_tests {
+    use super::OpenAiCompatConfig;
+    use duduclaw_security::crypto::CryptoEngine;
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempHome(std::path::PathBuf);
+    impl TempHome {
+        fn new() -> Self {
+            let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!(
+                "duduclaw-inference-keytest-{}-{}",
+                std::process::id(),
+                n
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+        fn with_keyfile(&self) -> CryptoEngine {
+            let key = CryptoEngine::generate_key().unwrap();
+            std::fs::write(self.0.join(".keyfile"), key).unwrap();
+            CryptoEngine::new(&key).unwrap()
+        }
+    }
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn cfg(api_key: Option<&str>, api_key_enc: Option<&str>) -> OpenAiCompatConfig {
+        OpenAiCompatConfig {
+            base_url: "http://localhost:8080/v1".into(),
+            api_key: api_key.map(str::to_string),
+            api_key_enc: api_key_enc.map(str::to_string),
+            model: "test-model".into(),
+        }
+    }
+
+    #[test]
+    fn enc_key_resolves_to_plaintext() {
+        let home = TempHome::new();
+        let engine = home.with_keyfile();
+        let enc = engine.encrypt_string("sk-encrypted").unwrap();
+        let c = cfg(Some("sk-plain"), Some(&enc));
+        assert_eq!(c.resolved_api_key(home.path()).as_deref(), Some("sk-encrypted"));
+    }
+
+    #[test]
+    fn plaintext_only_returns_plaintext() {
+        let home = TempHome::new();
+        let c = cfg(Some("sk-plain"), None);
+        assert_eq!(c.resolved_api_key(home.path()).as_deref(), Some("sk-plain"));
+    }
+
+    #[test]
+    fn neither_returns_none() {
+        let home = TempHome::new();
+        let c = cfg(None, None);
+        assert!(c.resolved_api_key(home.path()).is_none());
+    }
+
+    #[test]
+    fn enc_failure_falls_back_to_plaintext() {
+        // No keyfile present → cannot decrypt enc → fall back to plaintext.
+        let home = TempHome::new();
+        let c = cfg(Some("sk-plain"), Some("garbage"));
+        assert_eq!(c.resolved_api_key(home.path()).as_deref(), Some("sk-plain"));
+    }
+
+    #[test]
+    fn debug_redacts_both_key_fields() {
+        let c = cfg(Some("sk-plain"), Some("enc-blob"));
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("sk-plain"));
+        assert!(!dbg.contains("enc-blob"));
+        assert!(dbg.contains("[REDACTED]"));
     }
 }

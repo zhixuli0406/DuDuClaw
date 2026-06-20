@@ -4,6 +4,7 @@ import { cn } from '@/lib/utils';
 import { api, type AccountInfo, type BudgetSummary } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { ChipEditor } from '@/components/shared/ChipEditor';
 import {
   Wallet,
   Plus,
@@ -13,6 +14,7 @@ import {
   Key,
   KeyRound,
   Pencil,
+  Settings2,
 } from 'lucide-react';
 
 export function AccountsPage() {
@@ -280,6 +282,7 @@ function AccountCard({
   onBudgetUpdated: () => void;
 }) {
   const [editing, setEditing] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
   const [budgetInput, setBudgetInput] = useState(String(account.monthly_budget_cents / 100));
   const [saving, setSaving] = useState(false);
 
@@ -319,12 +322,28 @@ function AccountCard({
             </p>
           </div>
         </div>
-        {account.is_healthy ? (
-          <CheckCircle className="h-5 w-5 text-emerald-500" />
-        ) : (
-          <AlertTriangle className="h-5 w-5 text-amber-500" />
-        )}
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowDetails(true)}
+            className="rounded p-1 text-stone-400 transition-colors hover:bg-stone-100 hover:text-stone-600 dark:hover:bg-stone-800 dark:hover:text-stone-300"
+            title={intl.formatMessage({ id: 'accounts.edit' })}
+          >
+            <Settings2 className="h-4 w-4" />
+          </button>
+          {account.is_healthy ? (
+            <CheckCircle className="h-5 w-5 text-emerald-500" />
+          ) : (
+            <AlertTriangle className="h-5 w-5 text-amber-500" />
+          )}
+        </div>
       </div>
+
+      <EditAccountDialog
+        account={account}
+        open={showDetails}
+        onClose={() => setShowDetails(false)}
+        onSaved={() => { setShowDetails(false); onBudgetUpdated(); }}
+      />
 
       <div className="mt-3 flex items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
         <span>
@@ -377,5 +396,105 @@ function AccountCard({
         </div>
       </div>
     </div>
+  );
+}
+
+// ── G.5 — full per-account edit (priority/tags/profile/email/subscription/label) ──
+
+function EditAccountDialog({
+  account,
+  open,
+  onClose,
+  onSaved,
+}: {
+  account: AccountInfo;
+  open: boolean;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const intl = useIntl();
+  const [priority, setPriority] = useState(String(account.priority ?? 1));
+  const [label, setLabel] = useState(account.label ?? '');
+  const [email, setEmail] = useState(account.email ?? '');
+  const [subscription, setSubscription] = useState(account.subscription ?? '');
+  const [profile, setProfile] = useState('');
+  const [tags, setTags] = useState<string[]>([]);
+  const [budget, setBudget] = useState(String((account.monthly_budget_cents ?? 0) / 100));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Reset form whenever a different account opens.
+  useEffect(() => {
+    if (open) {
+      setPriority(String(account.priority ?? 1));
+      setLabel(account.label ?? '');
+      setEmail(account.email ?? '');
+      setSubscription(account.subscription ?? '');
+      setProfile('');
+      setTags([]);
+      setBudget(String((account.monthly_budget_cents ?? 0) / 100));
+      setError(null);
+    }
+  }, [open, account]);
+
+  const handleSubmit = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      await api.accounts.update({
+        account_id: account.id,
+        priority: Number(priority),
+        label,
+        email,
+        subscription,
+        ...(profile.trim() !== '' ? { profile: profile.trim() } : {}),
+        ...(tags.length > 0 ? { tags } : {}),
+        monthly_budget_cents: Math.round(Number(budget) * 100),
+      });
+      onSaved();
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onClose={onClose} title={`${intl.formatMessage({ id: 'accounts.edit' })} — ${account.id}`}>
+      <div className="space-y-4">
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label={intl.formatMessage({ id: 'accounts.provider.priority' })}>
+            <input type="number" min={1} max={100} value={priority} onChange={(e) => setPriority(e.target.value)} className={inputClass} />
+          </FormField>
+          <FormField label={intl.formatMessage({ id: 'accounts.provider.budget' })}>
+            <input type="number" min={0} value={budget} onChange={(e) => setBudget(e.target.value)} className={inputClass} />
+          </FormField>
+        </div>
+        <FormField label={intl.formatMessage({ id: 'accounts.field.label' })}>
+          <input type="text" value={label} onChange={(e) => setLabel(e.target.value)} className={inputClass} />
+        </FormField>
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label={intl.formatMessage({ id: 'accounts.field.email' })}>
+            <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} className={inputClass} />
+          </FormField>
+          <FormField label={intl.formatMessage({ id: 'accounts.field.subscription' })}>
+            <input type="text" value={subscription} onChange={(e) => setSubscription(e.target.value)} placeholder="pro / max / team" className={inputClass} />
+          </FormField>
+        </div>
+        <FormField label={intl.formatMessage({ id: 'accounts.field.profile' })} hint={intl.formatMessage({ id: 'accounts.field.profile.hint' })}>
+          <input type="text" value={profile} onChange={(e) => setProfile(e.target.value)} className={inputClass} />
+        </FormField>
+        <FormField label={intl.formatMessage({ id: 'accounts.field.tags' })}>
+          <ChipEditor values={tags} onChange={setTags} placeholder="prod" addLabel={intl.formatMessage({ id: 'common.add' })} />
+        </FormField>
+        {error && <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>}
+        <div className="flex justify-end gap-3 pt-2">
+          <button onClick={onClose} className={buttonSecondary}>{intl.formatMessage({ id: 'common.cancel' })}</button>
+          <button onClick={handleSubmit} disabled={saving} className={buttonPrimary}>
+            {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+          </button>
+        </div>
+      </div>
+    </Dialog>
   );
 }

@@ -40,6 +40,25 @@ impl RuleEngine {
     /// silently skipped with a `tracing::warn` — this is intentional so a
     /// profile that ships with future rule types degrades gracefully.
     pub fn from_specs(specs: Vec<RuleSpec>) -> Result<Self> {
+        // Dedup by rule id with last-wins semantics: when two profiles (or a
+        // profile + inline config) define the same id, the later spec must
+        // override the earlier one. We keep the original ordering of the
+        // *first* occurrence so deterministic priority/ordering is stable,
+        // but swap in the latest spec body for that id.
+        let mut order: Vec<String> = Vec::new();
+        let mut by_id: std::collections::HashMap<String, RuleSpec> =
+            std::collections::HashMap::new();
+        for spec in specs {
+            if !by_id.contains_key(&spec.id) {
+                order.push(spec.id.clone());
+            }
+            by_id.insert(spec.id.clone(), spec);
+        }
+        let specs: Vec<RuleSpec> = order
+            .into_iter()
+            .filter_map(|id| by_id.remove(&id))
+            .collect();
+
         let mut rules: Vec<Arc<dyn Rule>> = Vec::new();
         for spec in specs {
             match &spec.kind {
@@ -208,6 +227,26 @@ mod tests {
         let tool_hits = engine.apply("X", &Source::ToolResult { tool_name: "x".into() });
         assert_eq!(tool_hits.len(), 1);
         // tool-source: which one wins is deterministic by id ordering
+    }
+
+    #[test]
+    fn duplicate_rule_id_last_wins() {
+        // Two specs share the id "dup"; the later one (priority 100, matching
+        // "bar") must override the earlier one (priority 50, matching "foo").
+        let engine = RuleEngine::from_specs(vec![
+            rspec("dup", r"foo", 50),
+            rspec("dup", r"bar", 100),
+        ])
+        .unwrap();
+        assert_eq!(engine.rule_count(), 1, "duplicate id must compile to one rule");
+
+        // The surviving rule matches "bar", not "foo".
+        let hits_bar = engine.apply("bar", &Source::ToolResult { tool_name: "x".into() });
+        assert_eq!(hits_bar.len(), 1);
+        assert_eq!(hits_bar[0].rule.priority(), 100);
+
+        let hits_foo = engine.apply("foo", &Source::ToolResult { tool_name: "x".into() });
+        assert!(hits_foo.is_empty(), "overridden rule must no longer fire");
     }
 
     #[test]

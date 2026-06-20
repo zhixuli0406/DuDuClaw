@@ -201,6 +201,10 @@ class AgentTools:
 
     async def agent_status(self, name: str) -> dict:
         """Get detailed status of a specific agent."""
+        # Validate name before using it in a path (prevents traversal, M21)
+        if not _is_valid_agent_id(name):
+            return {"name": name, "status": "invalid_name"}
+
         agents_dir = _get_agents_dir()
         toml_path = agents_dir / name / "agent.toml"
         if not toml_path.exists():
@@ -234,6 +238,10 @@ class AgentTools:
         return await self._set_status(name, "active")
 
     async def _set_status(self, name: str, status: str) -> dict:
+        # Validate name before using it in a path (prevents traversal, M21)
+        if not _is_valid_agent_id(name):
+            return {"success": False, "error": f"Invalid agent name: {name!r}"}
+
         agents_dir = _get_agents_dir()
         toml_path = agents_dir / name / "agent.toml"
         if not toml_path.exists():

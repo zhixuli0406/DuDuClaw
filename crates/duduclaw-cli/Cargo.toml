@@ -14,6 +14,7 @@ path = "src/bin/duduclaw.rs"
 [dependencies]
 duduclaw-core = { workspace = true }
 duduclaw-agent = { workspace = true }
+duduclaw-fork = { workspace = true }
 duduclaw-container = { workspace = true }
 duduclaw-security = { workspace = true }
 duduclaw-odoo = { workspace = true }

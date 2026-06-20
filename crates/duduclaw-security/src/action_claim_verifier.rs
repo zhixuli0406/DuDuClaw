@@ -176,6 +176,23 @@ pub fn extract_action_claims(output: &str) -> Vec<ActionClaim> {
     claims
 }
 
+/// Whether `params_summary` mentions `target_id` as a whole token.
+///
+/// `params_summary` is a free-form `key=value ...` string. We split it on any
+/// character that cannot be part of an agent id (the id char class is
+/// `[a-z][a-z0-9-]`, i.e. lowercase alphanumeric + hyphen) and require an exact
+/// token match. This prevents a short id from matching as a substring of a
+/// longer one — e.g. `tl` must not "Verify" against `name=tl-xianwen` (M10).
+fn params_mention_target(params_summary: &str, target_id: &str) -> bool {
+    if target_id.is_empty() {
+        return false;
+    }
+    let is_id_char = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
+    params_summary
+        .split(|c: char| !is_id_char(c))
+        .any(|token| token == target_id)
+}
+
 /// Verify extracted claims against MCP tool call records.
 ///
 /// `tool_calls` should be the records from `audit::read_tool_calls_since()`
@@ -200,14 +217,17 @@ pub fn verify_claims(
                     .unwrap_or(false);
 
                 // For claims with a target_id, also check if the tool call
-                // params mention the same target.
+                // params mention the same target. Use exact token equality
+                // rather than unanchored substring matching: a substring check
+                // falsely "Verifies" a short id (`tl`) against a tool call that
+                // targeted a longer one (`tl-xianwen`) (M10).
                 let target_match = if claim.target_id.is_empty() {
                     true
                 } else {
                     record
                         .get("params_summary")
                         .and_then(|v| v.as_str())
-                        .is_some_and(|p| p.contains(&claim.target_id))
+                        .is_some_and(|p| params_mention_target(p, &claim.target_id))
                 };
 
                 tool_match && success && target_match
@@ -401,6 +421,52 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0], VerifyResult::Hallucination { .. }),
             "should be hallucination: tool call was for a different agent");
+    }
+
+    // ── M10: exact target token matching ─────────────────────
+
+    #[test]
+    fn test_short_id_does_not_verify_against_longer_id() {
+        // Claim targets "tl", but the only tool call targeted "tl-xianwen".
+        // A substring match would falsely Verify; exact token match must not.
+        let claims = vec![ActionClaim {
+            claim_type: ClaimType::AgentCreated,
+            target_id: "tl".to_string(),
+            matched_text: "created agent tl".to_string(),
+        }];
+        let tool_calls = vec![serde_json::json!({
+            "tool_name": "create_agent",
+            "params_summary": "name=tl-xianwen display_name=TL Xianwen",
+            "success": true,
+        })];
+        let results = verify_claims(&claims, &tool_calls);
+        assert!(matches!(results[0], VerifyResult::Hallucination { .. }),
+            "short id must not match a longer hyphenated id as a substring");
+    }
+
+    #[test]
+    fn test_exact_id_verifies() {
+        let claims = vec![ActionClaim {
+            claim_type: ClaimType::AgentCreated,
+            target_id: "tl-xianwen".to_string(),
+            matched_text: "created agent tl-xianwen".to_string(),
+        }];
+        let tool_calls = vec![serde_json::json!({
+            "tool_name": "create_agent",
+            "params_summary": "name=tl-xianwen display_name=TL Xianwen",
+            "success": true,
+        })];
+        let results = verify_claims(&claims, &tool_calls);
+        assert!(matches!(results[0], VerifyResult::Verified { .. }));
+    }
+
+    #[test]
+    fn test_params_mention_target_tokenization() {
+        assert!(params_mention_target("name=tl-xianwen extra=1", "tl-xianwen"));
+        assert!(!params_mention_target("name=tl-xianwen", "tl"));
+        assert!(!params_mention_target("name=tl-xianwen", "xianwen"));
+        assert!(!params_mention_target("name=tl-xianwen", ""));
+        assert!(params_mention_target("a=b,target=qa-bot;", "qa-bot"));
     }
 
     // ── MAX_CLAIMS_PER_RESPONSE cap ──────────────────────────

@@ -5,10 +5,9 @@ Scope required: ``memory:write``
 
 Workflow:
   1. Validate input parameters (ValidationError → 422)
-  2. Check daily write quota — BEFORE write (QuotaExceededError → 429)
+  2. Atomically reserve a daily-write quota slot (QuotaExceededError → 429)
   3. Inject client namespace (caller cannot override)
-  4. Call internal memory_store backend
-  5. Increment quota counter AFTER successful write
+  4. Call internal memory_store backend (release the slot if the write fails)
 
 Quota (TL Decision 2026-04-29):
   - Default: 1000 records/day per client
@@ -111,13 +110,17 @@ class MemoryStoreTool:
         # Step 1: Validate and sanitise parameters
         params = validate_memory_store_params(raw_params)
 
-        # Step 2: Quota check BEFORE write — fail fast before any I/O
-        self._quota.check_or_raise(ctx.client_id)
+        # Step 2: Atomically reserve a quota slot BEFORE write. Atomic
+        # check-and-increment prevents concurrent writers from both passing the
+        # gate when only one slot remains (the old check → await → increment
+        # sequence had a race across the await). The reservation is rolled back
+        # via release() if the write fails.
+        quota_info = self._quota.reserve(ctx.client_id)
 
         # Step 3: Inject namespace
         scoped = self._ns.inject(params, ctx)
 
-        # Step 4: Write memory (quota is NOT incremented until write succeeds)
+        # Step 4: Write memory; roll back the reserved quota slot on failure.
         try:
             result = await self._store_fn(
                 content=scoped["content"],
@@ -127,13 +130,11 @@ class MemoryStoreTool:
                 ttl_days=scoped.get("ttl_days"),
             )
         except Exception:
+            self._quota.release(ctx.client_id)
             logger.exception(
                 "memory_store backend error (client_id=%s)", ctx.client_id
             )
             raise
-
-        # Step 5: Increment quota AFTER successful write
-        quota_info = self._quota.increment(ctx.client_id)
 
         return {
             "id": result["id"],

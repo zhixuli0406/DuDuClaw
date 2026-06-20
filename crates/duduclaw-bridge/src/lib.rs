@@ -23,6 +23,13 @@ const MAX_PAYLOAD_SIZE: usize = 1_048_576;
 /// Allowed channel types for incoming messages.
 const ALLOWED_CHANNELS: &[&str] = &["telegram", "line", "discord"];
 
+/// Maximum length for a channel `chat_id` (covers all supported channels).
+const MAX_CHAT_ID_LEN: usize = 256;
+/// Maximum length for a `sender` identifier/display name.
+const MAX_SENDER_LEN: usize = 256;
+/// Maximum length for incoming message `text`.
+const MAX_TEXT_LEN: usize = 32_768;
+
 /// Validate agent ID is safe for filesystem paths (no traversal).
 fn is_valid_agent_id(id: &str) -> bool {
     !id.is_empty()
@@ -42,12 +49,17 @@ fn write_to_queue(msg: &serde_json::Value) -> std::io::Result<()> {
         ));
     }
     let queue_path = get_duduclaw_home().join("bus_queue.jsonl");
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&queue_path)?;
-    use std::io::Write;
-    writeln!(file, "{}", serialized)
+    // Serialize concurrent appends across processes (Rust gateway + Python
+    // adapters). With MAX_PAYLOAD_SIZE (1 MiB) >> PIPE_BUF, plain append writes
+    // can interleave into malformed JSONL that the consumer silently drops.
+    duduclaw_core::with_file_lock(&queue_path, || {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&queue_path)?;
+        use std::io::Write;
+        writeln!(file, "{}", serialized)
+    })
 }
 
 /// Send a message to a specific agent via the Rust core bus.
@@ -92,6 +104,27 @@ fn send_to_bus(channel: &str, chat_id: &str, sender: &str, text: &str) -> PyResu
         return Err(pyo3::exceptions::PyValueError::new_err(
             format!("Unknown channel: {channel}. Allowed: {}", ALLOWED_CHANNELS.join(", ")),
         ));
+    }
+
+    // Validate required identifiers are present and within length caps.
+    // Reject control characters in identifiers to avoid corrupting the JSONL
+    // line format or downstream routing keys.
+    let is_clean_id = |s: &str| s.chars().all(|c| !c.is_control());
+    if chat_id.is_empty() || chat_id.len() > MAX_CHAT_ID_LEN || !is_clean_id(chat_id) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "chat_id must be non-empty, <= {MAX_CHAT_ID_LEN} bytes, no control chars"
+        )));
+    }
+    if sender.is_empty() || sender.len() > MAX_SENDER_LEN || !is_clean_id(sender) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "sender must be non-empty, <= {MAX_SENDER_LEN} bytes, no control chars"
+        )));
+    }
+    // `text` may be empty (e.g. sticker/attachment-only messages) but is capped.
+    if text.len() > MAX_TEXT_LEN {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "text exceeds maximum length ({MAX_TEXT_LEN} bytes)"
+        )));
     }
 
     let msg = serde_json::json!({

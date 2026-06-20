@@ -704,28 +704,69 @@ pub fn build_step_prompt(spec: &TaskSpec, step_index: usize) -> Option<String> {
 }
 
 /// Verify a step's output against its acceptance criteria (zero LLM for Auto).
+///
+/// M29: the previous heuristic passed if the output contained ANY single
+/// keyword from the criterion description, so an agent could pass merely by
+/// restating the goal. This is tightened to require *evidence*:
+///   - ALL significant key terms of the criterion must appear in the output
+///     (word-boundary, case-insensitive, CJK-safe via `word_contains_ci`); and
+///   - the output must carry more signal than just an echo of the criterion
+///     (it must be meaningfully longer than the criterion text).
+///
+/// This is still a zero-LLM heuristic — it cannot prove correctness — but it
+/// rejects the trivial "echo the goal back" pass that the old check allowed.
 pub fn verify_step_auto(step: &Step, output: &str) -> Vec<CriterionResult> {
+    use duduclaw_core::word_contains_ci;
+
     step.acceptance_criteria
         .iter()
         .filter(|c| matches!(c.method, VerificationMethod::Auto))
         .map(|c| {
-            // Simple keyword check: does the output seem to address the criterion?
-            let keywords: Vec<&str> = c.description.split_whitespace()
-                .filter(|w| w.len() > 3)
+            // Significant terms only (skip short stopword-like tokens).
+            let keywords: Vec<&str> = c
+                .description
+                .split_whitespace()
+                .filter(|w| w.chars().filter(|ch| ch.is_alphanumeric()).count() > 3)
                 .collect();
-            let matches = keywords.iter()
-                .filter(|kw| output.to_lowercase().contains(&kw.to_lowercase()))
+
+            let matched = keywords
+                .iter()
+                .filter(|kw| word_contains_ci(output, kw))
                 .count();
-            // Require at least 1 keyword match (review issue #14 — length fallback removed)
-            let passed = matches > 0;
+
+            // Require ALL significant terms to be present — partial keyword
+            // overlap (the old `> 0`) let an agent pass by mentioning a single
+            // shared word.
+            let all_terms_present = !keywords.is_empty() && matched == keywords.len();
+
+            // Guard against an output that is merely an echo of the criterion:
+            // demand the response be substantially longer than the criterion
+            // itself, indicating actual work was reported rather than restated.
+            let crit_len = c.description.chars().count();
+            let out_len = output.trim().chars().count();
+            let has_substance = out_len >= crit_len + 16;
+
+            let passed = all_terms_present && has_substance;
 
             CriterionResult {
                 description: c.description.clone(),
                 passed,
                 evidence: if passed {
-                    format!("Output matches {}/{} keywords", matches, keywords.len())
+                    format!(
+                        "Output addresses all {} key term(s) with {} chars of detail",
+                        keywords.len(),
+                        out_len
+                    )
+                } else if keywords.is_empty() {
+                    "Criterion has no checkable key terms — cannot auto-verify".to_string()
+                } else if !all_terms_present {
+                    format!(
+                        "Output matches only {}/{} key term(s) — insufficient evidence",
+                        matched,
+                        keywords.len()
+                    )
                 } else {
-                    "Output does not appear to address this criterion".to_string()
+                    "Output too short — looks like a restatement, not evidence of work".to_string()
                 },
             }
         })
@@ -922,5 +963,59 @@ mod tests {
         let loaded = TaskSpec::load(tmp.path(), &spec.task_id).unwrap();
         assert_eq!(loaded.task_id, spec.task_id);
         assert_eq!(loaded.steps.len(), 3);
+    }
+
+    fn step_with_auto_criterion(desc: &str) -> Step {
+        Step {
+            id: 0,
+            description: "do the thing".to_string(),
+            agent: "coder".to_string(),
+            depends_on: vec![],
+            acceptance_criteria: vec![Criterion {
+                description: desc.to_string(),
+                method: VerificationMethod::Auto,
+            }],
+            status: StepStatus::Pending,
+            result: None,
+            retry_count: 0,
+        }
+    }
+
+    #[test]
+    fn test_verify_step_auto_rejects_goal_restatement() {
+        // M29: an agent that merely echoes the criterion must NOT pass.
+        let step = step_with_auto_criterion("Create login endpoint returning token");
+        let echoed = "Create login endpoint returning token";
+        let results = verify_step_auto(&step, echoed);
+        assert_eq!(results.len(), 1);
+        assert!(
+            !results[0].passed,
+            "restating the criterion verbatim should not satisfy it: {:?}",
+            results[0].evidence
+        );
+    }
+
+    #[test]
+    fn test_verify_step_auto_rejects_partial_keyword_match() {
+        // M29: matching a single shared word is insufficient.
+        let step = step_with_auto_criterion("Create login endpoint returning token");
+        // Mentions only "endpoint" — never "login", "returning", or "token".
+        let partial = "I worked on some endpoint plumbing and wrote a short note \
+                       describing the general request handling for the service.";
+        let results = verify_step_auto(&step, partial);
+        assert!(!results[0].passed, "partial keyword overlap must not pass");
+    }
+
+    #[test]
+    fn test_verify_step_auto_passes_with_all_terms_and_substance() {
+        let step = step_with_auto_criterion("login endpoint token");
+        let real = "Implemented the /login endpoint which validates credentials and \
+                    issues a signed JWT token to the caller on success.";
+        let results = verify_step_auto(&step, real);
+        assert!(
+            results[0].passed,
+            "genuine work covering all terms should pass: {:?}",
+            results[0].evidence
+        );
     }
 }

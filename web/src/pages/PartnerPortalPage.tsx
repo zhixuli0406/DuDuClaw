@@ -6,17 +6,19 @@ import {
   DollarSign,
   TrendingUp,
   Award,
-  Copy,
   Check,
   Download,
   FileText,
   Presentation,
   BookOpen,
-  RefreshCw,
-  Eye,
   Plus,
   Loader2,
+  Pencil,
+  Trash2,
+  Terminal,
 } from 'lucide-react';
+import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { toast, formatError } from '@/lib/toast';
 import { cn } from '@/lib/utils';
 import {
   api,
@@ -48,12 +50,6 @@ const CUSTOMER_TIER_COLORS: Record<string, string> = {
   enterprise: 'bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-400',
 };
 
-const DURATION_OPTIONS = [
-  { months: 12, label: '1yr' },
-  { months: 24, label: '2yr' },
-  { months: 36, label: '3yr' },
-];
-
 const PROFILE_TIERS = ['standard', 'silver', 'gold', 'platinum'] as const;
 const CUSTOMER_TIERS = ['standard', 'pro', 'enterprise'] as const;
 const CUSTOMER_STATUSES = ['active', 'trial', 'expired', 'cancelled'] as const;
@@ -80,17 +76,10 @@ export function PartnerPortalPage() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  // License generation (existing)
-  const [licenseTier, setLicenseTier] = useState('pro');
-  const [customerName, setCustomerName] = useState('');
-  const [duration, setDuration] = useState(12);
-  const [generatedKey, setGeneratedKey] = useState('');
-  const [generating, setGenerating] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const [licenseError, setLicenseError] = useState<string | null>(null);
-
-  // Add customer modal
+  // Add / edit / delete customer modals
   const [showAddCustomer, setShowAddCustomer] = useState(false);
+  const [editCustomer, setEditCustomer] = useState<PartnerCustomer | null>(null);
+  const [deleteCustomer, setDeleteCustomer] = useState<PartnerCustomer | null>(null);
 
   const refresh = async () => {
     setLoading(true);
@@ -116,37 +105,15 @@ export function PartnerPortalPage() {
     void refresh();
   }, []);
 
-  const handleGenerate = async () => {
-    if (!customerName.trim()) return;
-    setGenerating(true);
-    setGeneratedKey('');
-    setLicenseError(null);
+  const handleDeleteCustomer = async () => {
+    if (!deleteCustomer) return;
     try {
-      const result = await api.partner.generateLicense({
-        tier: licenseTier,
-        customer: customerName,
-        months: duration,
-      });
-      setGeneratedKey(result?.key ?? '');
-    } catch (err) {
-      setGeneratedKey('');
-      const message = err instanceof Error ? err.message : String(err);
-      setLicenseError(
-        intl.formatMessage({ id: 'partner.licenseError' }, { message }),
-      );
-    } finally {
-      setGenerating(false);
-    }
-  };
-
-  const handleCopy = async () => {
-    if (!generatedKey) return;
-    try {
-      await navigator.clipboard.writeText(generatedKey);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // clipboard not available
+      await api.partner.deleteCustomer(deleteCustomer.id);
+      toast.success(intl.formatMessage({ id: 'partner.customer.deleted' }));
+      setDeleteCustomer(null);
+      void refresh();
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
     }
   };
 
@@ -385,11 +352,19 @@ export function PartnerPortalPage() {
                         </td>
                         <td className="py-3 text-right">
                           <div className="flex items-center justify-end gap-2">
-                            <button className="rounded-lg border border-stone-300 p-1.5 text-stone-500 transition-colors hover:bg-stone-50 dark:border-stone-600 dark:text-stone-400 dark:hover:bg-stone-800">
-                              <Eye className="h-3.5 w-3.5" />
+                            <button
+                              onClick={() => setEditCustomer(customer)}
+                              className="rounded-lg border border-stone-300 p-1.5 text-stone-500 transition-colors hover:bg-stone-50 dark:border-stone-600 dark:text-stone-400 dark:hover:bg-stone-800"
+                              title={intl.formatMessage({ id: 'common.edit' })}
+                            >
+                              <Pencil className="h-3.5 w-3.5" />
                             </button>
-                            <button className="rounded-lg border border-stone-300 p-1.5 text-stone-500 transition-colors hover:bg-stone-50 dark:border-stone-600 dark:text-stone-400 dark:hover:bg-stone-800">
-                              <RefreshCw className="h-3.5 w-3.5" />
+                            <button
+                              onClick={() => setDeleteCustomer(customer)}
+                              className="rounded-lg border border-stone-300 p-1.5 text-rose-500 transition-colors hover:bg-rose-50 dark:border-stone-600 dark:hover:bg-rose-900/20"
+                              title={intl.formatMessage({ id: 'common.delete' })}
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
                             </button>
                           </div>
                         </td>
@@ -403,123 +378,24 @@ export function PartnerPortalPage() {
         </>
       )}
 
-      {/* License Generation Section — kept per spec */}
+      {/* License Generation — CLI-only (UI.4). License activation is not exposed
+          over the dashboard RPC; surface a clear pointer to the CLI instead of a
+          non-functional client-side stub. */}
       <div className="glass-card rounded-2xl p-6">
-        <h3 className="mb-5 text-lg font-medium text-stone-900 dark:text-stone-50">
+        <h3 className="mb-3 text-lg font-medium text-stone-900 dark:text-stone-50">
           {intl.formatMessage({ id: 'partner.generateLicense' })}
         </h3>
-
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          {/* Tier selector */}
-          <div className="space-y-1.5">
-            <label className="text-sm text-stone-500 dark:text-stone-400">
-              {intl.formatMessage({ id: 'partner.licenseTier' })}
-            </label>
-            <select
-              value={licenseTier}
-              onChange={(e) => setLicenseTier(e.target.value)}
-              className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
-            >
-              <option value="pro">Pro</option>
-              <option value="enterprise">Enterprise</option>
-            </select>
-          </div>
-
-          {/* Customer name */}
-          <div className="space-y-1.5">
-            <label className="text-sm text-stone-500 dark:text-stone-400">
-              {intl.formatMessage({ id: 'partner.customerName' })}
-            </label>
-            <input
-              type="text"
-              value={customerName}
-              onChange={(e) => setCustomerName(e.target.value)}
-              placeholder="Acme Corp"
-              className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 placeholder:text-stone-400 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50 dark:placeholder:text-stone-500"
-            />
-          </div>
-
-          {/* Duration selector */}
-          <div className="space-y-1.5">
-            <label className="text-sm text-stone-500 dark:text-stone-400">
-              {intl.formatMessage({ id: 'partner.duration' })}
-            </label>
-            <select
-              value={duration}
-              onChange={(e) => setDuration(Number(e.target.value))}
-              className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
-            >
-              {DURATION_OPTIONS.map((opt) => (
-                <option key={opt.months} value={opt.months}>
-                  {opt.label}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          {/* Generate button */}
-          <div className="flex items-end">
-            <button
-              onClick={handleGenerate}
-              disabled={generating || !customerName.trim()}
-              className="w-full rounded-lg bg-amber-500 px-5 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
-            >
-              {generating
-                ? intl.formatMessage({ id: 'common.saving' })
-                : intl.formatMessage({ id: 'partner.generate' })}
-            </button>
+        <div className="flex items-start gap-3 rounded-lg border border-stone-200 bg-stone-50 p-4 dark:border-stone-700 dark:bg-stone-800/50">
+          <Terminal className="mt-0.5 h-5 w-5 shrink-0 text-stone-400" />
+          <div className="space-y-2">
+            <p className="text-sm text-stone-600 dark:text-stone-400">
+              {intl.formatMessage({ id: 'partner.license.cliOnly' })}
+            </p>
+            <code className="block rounded bg-stone-900 px-3 py-2 font-mono text-xs text-emerald-400">
+              duduclaw license generate --tier &lt;pro|enterprise&gt; --customer &lt;name&gt; --months &lt;n&gt;
+            </code>
           </div>
         </div>
-
-        {/* Generated key display */}
-        {generatedKey && (
-          <div className="mt-4 flex items-center gap-3 rounded-lg border border-emerald-200 bg-emerald-50 p-4 dark:border-emerald-800 dark:bg-emerald-900/20">
-            <code className="flex-1 font-mono text-sm font-semibold text-emerald-700 dark:text-emerald-400">
-              {generatedKey}
-            </code>
-            <button
-              onClick={handleCopy}
-              className="rounded-lg border border-emerald-300 p-2 text-emerald-600 transition-colors hover:bg-emerald-100 dark:border-emerald-700 dark:text-emerald-400 dark:hover:bg-emerald-900/40"
-            >
-              {copied ? (
-                <Check className="h-4 w-4" />
-              ) : (
-                <Copy className="h-4 w-4" />
-              )}
-            </button>
-          </div>
-        )}
-
-        {/* License generation error */}
-        {licenseError && (
-          <div
-            role="alert"
-            className="mt-4 flex items-start justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-300"
-          >
-            <span className="flex-1">{licenseError}</span>
-            <button
-              type="button"
-              onClick={() => setLicenseError(null)}
-              className="shrink-0 text-rose-500 hover:text-rose-700 dark:text-rose-400 dark:hover:text-rose-200"
-              aria-label="Dismiss"
-            >
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <line x1="18" y1="6" x2="6" y2="18"></line>
-                <line x1="6" y1="6" x2="18" y2="18"></line>
-              </svg>
-            </button>
-          </div>
-        )}
       </div>
 
       {/* Marketing Materials */}
@@ -559,7 +435,112 @@ export function PartnerPortalPage() {
           }}
         />
       )}
+
+      {editCustomer && (
+        <EditCustomerModal
+          customer={editCustomer}
+          onClose={() => setEditCustomer(null)}
+          onSaved={() => {
+            setEditCustomer(null);
+            void refresh();
+          }}
+        />
+      )}
+
+      {deleteCustomer && (
+        <Dialog open onClose={() => setDeleteCustomer(null)} title={intl.formatMessage({ id: 'partner.customer.delete' })}>
+          <div className="space-y-4">
+            <p className="text-sm text-stone-600 dark:text-stone-400">
+              {intl.formatMessage({ id: 'partner.customer.delete.confirm' }, { name: deleteCustomer.name })}
+            </p>
+            <div className="flex justify-end gap-3 pt-2">
+              <button onClick={() => setDeleteCustomer(null)} className={buttonSecondary}>{intl.formatMessage({ id: 'common.cancel' })}</button>
+              <button
+                onClick={handleDeleteCustomer}
+                className="inline-flex items-center justify-center gap-2 rounded-lg bg-rose-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-rose-600"
+              >
+                {intl.formatMessage({ id: 'common.delete' })}
+              </button>
+            </div>
+          </div>
+        </Dialog>
+      )}
     </div>
+  );
+}
+
+// ── UI.2 — edit customer modal ──
+
+function EditCustomerModal({
+  customer,
+  onClose,
+  onSaved,
+}: {
+  customer: PartnerCustomer;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const intl = useIntl();
+  const [name, setName] = useState(customer.name);
+  const [tier, setTier] = useState(customer.tier);
+  const [status, setStatus] = useState(customer.status);
+  const [notes, setNotes] = useState(customer.notes ?? '');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleSubmit = async () => {
+    setSubmitting(true);
+    setError(null);
+    try {
+      await api.partner.updateCustomer(customer.id, {
+        name,
+        tier,
+        status,
+        notes,
+      });
+      toast.success(intl.formatMessage({ id: 'partner.customer.updated' }));
+      onSaved();
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open onClose={onClose} title={intl.formatMessage({ id: 'partner.customer.edit' })}>
+      <div className="space-y-4">
+        <FormField label={intl.formatMessage({ id: 'partner.customerName' })}>
+          <input type="text" value={name} onChange={(e) => setName(e.target.value)} className={inputClass} />
+        </FormField>
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label={intl.formatMessage({ id: 'partner.licenseTier' })}>
+            <select value={tier} onChange={(e) => setTier(e.target.value)} className={selectClass}>
+              {CUSTOMER_TIERS.map((t) => (
+                <option key={t} value={t}>{intl.formatMessage({ id: `license.${t}` })}</option>
+              ))}
+            </select>
+          </FormField>
+          <FormField label={intl.formatMessage({ id: 'billing.status' })}>
+            <select value={status} onChange={(e) => setStatus(e.target.value)} className={selectClass}>
+              {CUSTOMER_STATUSES.map((s) => (
+                <option key={s} value={s}>{intl.formatMessage({ id: `partner.status.${s}` })}</option>
+              ))}
+            </select>
+          </FormField>
+        </div>
+        <FormField label={intl.formatMessage({ id: 'partner.customer.notes' })}>
+          <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} className={cn(inputClass, 'resize-none')} />
+        </FormField>
+        {error && <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>}
+        <div className="flex justify-end gap-3 pt-2">
+          <button onClick={onClose} className={buttonSecondary}>{intl.formatMessage({ id: 'common.cancel' })}</button>
+          <button onClick={handleSubmit} disabled={submitting} className={buttonPrimary}>
+            {submitting ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+          </button>
+        </div>
+      </div>
+    </Dialog>
   );
 }
 

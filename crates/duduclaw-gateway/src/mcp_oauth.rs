@@ -272,20 +272,76 @@ pub async fn refresh_token(
 }
 
 // ── Token persistence ───────────────────────────────────────
+//
+// XC.1: MCP OAuth tokens are encrypted at rest with the same AES-256-GCM
+// per-machine keyfile used for channel / API tokens (`config_crypto`). On disk
+// `access_token` / `refresh_token` hold the ciphertext; we decrypt on load and
+// encrypt on save. A legacy plaintext file (pre-encryption) is read
+// transparently: `decrypt_value` returns `None` for non-ciphertext, in which
+// case we keep the original value, so the next `save_tokens` migrates it.
 
-/// Load all stored tokens from disk.
-pub fn load_tokens(home_dir: &Path) -> Vec<McpOAuthToken> {
-    let path = home_dir.join(TOKEN_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-        Err(_) => Vec::new(),
+/// Marker prefix distinguishing an encrypted field from legacy plaintext.
+/// `config_crypto::encrypt_value` emits base64; we additionally tag it so a
+/// best-effort decrypt never mistakes a plausible-looking plaintext for cipher.
+const ENC_PREFIX: &str = "enc:v1:";
+
+fn encrypt_field(plaintext: &str, home_dir: &Path) -> String {
+    if plaintext.is_empty() {
+        return String::new();
+    }
+    match crate::config_crypto::encrypt_value(plaintext, home_dir) {
+        Some(enc) => format!("{ENC_PREFIX}{enc}"),
+        // Encryption unavailable (keyfile write failed): fall back to plaintext
+        // rather than losing the token. Logged by the caller of save_tokens.
+        None => plaintext.to_string(),
     }
 }
 
-/// Save tokens to disk using atomic write (temp + rename).
+fn decrypt_field(stored: &str, home_dir: &Path) -> String {
+    match stored.strip_prefix(ENC_PREFIX) {
+        Some(cipher) => crate::config_crypto::decrypt_value(cipher, home_dir)
+            .unwrap_or_else(|| stored.to_string()),
+        // No prefix → legacy plaintext, return as-is (migrated on next save).
+        None => stored.to_string(),
+    }
+}
+
+/// Load all stored tokens from disk, decrypting secrets.
+pub fn load_tokens(home_dir: &Path) -> Vec<McpOAuthToken> {
+    let path = home_dir.join(TOKEN_FILE);
+    let mut tokens: Vec<McpOAuthToken> = match std::fs::read_to_string(&path) {
+        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+        Err(_) => return Vec::new(),
+    };
+    for t in &mut tokens {
+        t.access_token = decrypt_field(&t.access_token, home_dir);
+        if let Some(rt) = t.refresh_token.take() {
+            t.refresh_token = Some(decrypt_field(&rt, home_dir));
+        }
+    }
+    tokens
+}
+
+/// Save tokens to disk using atomic write (temp + rename), encrypting secrets.
 pub fn save_tokens(home_dir: &Path, tokens: &[McpOAuthToken]) -> Result<(), String> {
     let path = home_dir.join(TOKEN_FILE);
-    let json = serde_json::to_string_pretty(tokens)
+
+    // Encrypt a copy so the in-memory caller keeps cleartext.
+    let on_disk: Vec<McpOAuthToken> = tokens
+        .iter()
+        .map(|t| McpOAuthToken {
+            provider_id: t.provider_id.clone(),
+            access_token: encrypt_field(&t.access_token, home_dir),
+            refresh_token: t
+                .refresh_token
+                .as_ref()
+                .map(|rt| encrypt_field(rt, home_dir)),
+            expires_at: t.expires_at,
+            scopes: t.scopes.clone(),
+        })
+        .collect();
+
+    let json = serde_json::to_string_pretty(&on_disk)
         .map_err(|e| format!("Failed to serialize tokens: {e}"))?;
 
     let tmp_path = path.with_extension("json.tmp");
@@ -333,4 +389,52 @@ pub fn upsert_token(home_dir: &Path, token: McpOAuthToken) -> Result<(), String>
 /// Remove pending entries older than 10 minutes.
 pub fn cleanup_pending(pending: &mut HashMap<String, PendingOAuth>) {
     pending.retain(|_, p| p.created_at.elapsed().as_secs() < PENDING_TTL_SECS);
+}
+
+#[cfg(test)]
+mod xc1_token_encryption_tests {
+    use super::*;
+
+    fn tmp_home() -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("ddc-mcpoauth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn tokens_round_trip_through_disk_and_are_encrypted_at_rest() {
+        let home = tmp_home();
+        let token = McpOAuthToken {
+            provider_id: "github".into(),
+            access_token: "gho_super_secret_value".into(),
+            refresh_token: Some("ghr_refresh_secret".into()),
+            expires_at: None,
+            scopes: vec!["repo".into()],
+        };
+        save_tokens(&home, &[token.clone()]).expect("save");
+
+        // On-disk JSON must NOT contain the cleartext secrets.
+        let raw = std::fs::read_to_string(home.join(TOKEN_FILE)).unwrap();
+        assert!(!raw.contains("gho_super_secret_value"), "access token leaked: {raw}");
+        assert!(!raw.contains("ghr_refresh_secret"), "refresh token leaked: {raw}");
+        assert!(raw.contains(ENC_PREFIX), "expected enc prefix in {raw}");
+
+        // load_tokens decrypts back to cleartext.
+        let loaded = load_tokens(&home);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].access_token, "gho_super_secret_value");
+        assert_eq!(loaded[0].refresh_token.as_deref(), Some("ghr_refresh_secret"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn legacy_plaintext_token_file_is_read_transparently() {
+        let home = tmp_home();
+        // Simulate a pre-encryption file with cleartext tokens.
+        let legacy = r#"[{"provider_id":"google","access_token":"ya29.legacy","refresh_token":null,"expires_at":null,"scopes":[]}]"#;
+        std::fs::write(home.join(TOKEN_FILE), legacy).unwrap();
+        let loaded = load_tokens(&home);
+        assert_eq!(loaded[0].access_token, "ya29.legacy");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

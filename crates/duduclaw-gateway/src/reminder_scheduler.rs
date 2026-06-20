@@ -23,6 +23,7 @@ use tracing::{info, warn};
 use crate::claude_runner::call_claude_for_agent_with_type;
 use duduclaw_agent::registry::AgentRegistry;
 use duduclaw_security::input_guard;
+use duduclaw_security::secret_manager::{resolve_secret_reference, SecretManagerConfig};
 
 // ── Constants ───────────────────────────────────────────────
 
@@ -218,7 +219,7 @@ pub async fn send_channel_message(
 
     match channel {
         "telegram" => {
-            let token = decrypt_channel_token(&config, "telegram_bot_token_enc", "telegram_bot_token", home_dir);
+            let token = decrypt_channel_token(&config, "telegram_bot_token_enc", "telegram_bot_token", home_dir).await;
             if token.is_empty() {
                 return Err("telegram_bot_token not configured".to_string());
             }
@@ -236,7 +237,7 @@ pub async fn send_channel_message(
             }
         }
         "line" => {
-            let token = decrypt_channel_token(&config, "line_channel_token_enc", "line_channel_token", home_dir);
+            let token = decrypt_channel_token(&config, "line_channel_token_enc", "line_channel_token", home_dir).await;
             if token.is_empty() {
                 return Err("line_channel_token not configured".to_string());
             }
@@ -261,7 +262,7 @@ pub async fn send_channel_message(
             if chat_id.is_empty() || !chat_id.chars().all(|c| c.is_ascii_digit()) {
                 return Err(format!("Invalid Discord channel ID: '{chat_id}' (must be numeric)"));
             }
-            let token = decrypt_channel_token(&config, "discord_bot_token_enc", "discord_bot_token", home_dir);
+            let token = decrypt_channel_token(&config, "discord_bot_token_enc", "discord_bot_token", home_dir).await;
             if token.is_empty() {
                 return Err("discord_bot_token not configured".to_string());
             }
@@ -296,39 +297,50 @@ async fn read_config(home_dir: &Path) -> Option<toml::Table> {
     content.parse().ok()
 }
 
-fn load_crypto_engine(home_dir: &Path) -> Option<duduclaw_security::crypto::CryptoEngine> {
-    let keyfile = home_dir.join(".keyfile");
-    let bytes = std::fs::read(&keyfile).ok()?;
-    if bytes.len() == 32 {
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&bytes);
-        duduclaw_security::crypto::CryptoEngine::new(&key).ok()
-    } else {
-        None
-    }
-}
-
 fn decrypt_encrypted_value(encrypted: &str, home_dir: &Path) -> Option<String> {
-    if encrypted.is_empty() {
-        return None;
-    }
-    let engine = load_crypto_engine(home_dir)?;
-    let plain = engine.decrypt_string(encrypted).ok()?;
-    if plain.is_empty() { None } else { Some(plain) }
+    // Converged onto the shared read-only decrypt primitive (deep-review unify):
+    // one keyfile-AES decrypt path across all crates. Handles empty/short-keyfile
+    // /non-empty-result internally.
+    duduclaw_security::keyfile::decrypt_keyfile_value(encrypted, home_dir)
 }
 
-fn decrypt_channel_token(config: &toml::Table, enc_key: &str, plain_key: &str, home_dir: &Path) -> String {
+async fn decrypt_channel_token(
+    config: &toml::Table,
+    enc_key: &str,
+    plain_key: &str,
+    home_dir: &Path,
+) -> String {
     let channels = config.get("channels").and_then(|c| c.as_table());
+
+    // 1. Encrypted form takes precedence (AES ciphertext on disk).
     if let Some(enc_val) = channels.and_then(|c| c.get(enc_key)).and_then(|v| v.as_str()) {
-        if let Some(decrypted) = decrypt_encrypted_value(enc_val, home_dir) {
-            return decrypted;
+        if !enc_val.is_empty() {
+            if let Some(decrypted) = decrypt_encrypted_value(enc_val, home_dir) {
+                return decrypted;
+            }
         }
     }
-    channels
+
+    // 2. Plaintext field — may itself be a `secret://` Vault reference.
+    let plain = channels
         .and_then(|c| c.get(plain_key))
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
+        .unwrap_or("");
+
+    if plain.starts_with("secret://") {
+        let sm_cfg: SecretManagerConfig = config
+            .get("secret_manager")
+            .cloned()
+            .and_then(|v| v.try_into().ok())
+            .unwrap_or_default();
+        // Fail-soft: an unresolvable reference yields an empty token, which
+        // the callers treat as "not configured" rather than crashing.
+        return resolve_secret_reference(plain, &sm_cfg, home_dir)
+            .await
+            .unwrap_or_default();
+    }
+
+    plain.to_string()
 }
 
 // ── JSONL persistence (lockfile-protected) ───────────────────
@@ -626,16 +638,14 @@ impl ReminderScheduler {
             let http = self.http.clone();
 
             handles.push(tokio::spawn(async move {
-                let Ok(_permit) = sem.acquire().await else {
-                    warn!(id = %reminder.id, "Semaphore closed, skipping reminder");
-                    return DeliveryResult {
-                        id: reminder.id.clone(),
-                        status: ReminderStatus::Failed,
-                        error: Some("Semaphore closed".to_string()),
-                    };
-                };
-
-                let result = deliver_reminder(&home, &http, &registry, &reminder).await;
+                // M61 fix: the semaphore permit is acquired INSIDE
+                // `deliver_reminder`, scoped to just the bounded channel-send
+                // step. Previously the permit was held here across the entire
+                // delivery — including the unbounded `AgentCallback` LLM call and
+                // the 2s retry sleep — so a handful of slow callbacks could
+                // saturate `MAX_CONCURRENT_DELIVER` and stall every other
+                // reminder. Text generation now runs without holding a permit.
+                let result = deliver_reminder(&home, &http, &registry, &sem, &reminder).await;
 
                 match result {
                     Ok(()) => DeliveryResult {
@@ -694,8 +704,20 @@ impl ReminderScheduler {
                 }
             }
             Err(e) => {
-                // Keep fired_ids so these reminders are NOT re-delivered on next reload
-                warn!("Failed to batch-update reminder statuses: {e}");
+                // M37 fix: the status write failed, so these reminders are still
+                // `Pending` on disk. If we keep them in `fired_ids`, the guard
+                // blocks them from ever being re-evaluated — they are permanently
+                // skipped until a process restart clears the in-memory set. Remove
+                // them from `fired_ids` so the next scheduler tick retries
+                // delivery (and re-attempts the status write). At-least-once
+                // delivery is preferred over silently dropping a reminder.
+                warn!(
+                    "Failed to batch-update reminder statuses: {e}; clearing fired guard so they retry"
+                );
+                let mut fired = self.fired_ids.write().await;
+                for id in &batch_ids {
+                    fired.remove(id);
+                }
             }
         }
     }
@@ -741,10 +763,15 @@ async fn run_gc(home_dir: &Path) {
 }
 
 /// Deliver a single reminder.
+///
+/// The `sem` permit is acquired only around the bounded channel-send step
+/// (M61) — the potentially-unbounded `AgentCallback` text generation runs
+/// without holding a permit so slow LLM callbacks cannot stall other reminders.
 async fn deliver_reminder(
     home_dir: &Path,
     http: &reqwest::Client,
     registry: &Arc<RwLock<AgentRegistry>>,
+    sem: &Arc<tokio::sync::Semaphore>,
     reminder: &Reminder,
 ) -> Result<(), String> {
     let text = match reminder.mode {
@@ -786,13 +813,21 @@ async fn deliver_reminder(
         }
     };
 
-    // Retry once on failure
-    let result = send_channel_message(home_dir, http, &reminder.channel, &reminder.chat_id, &text).await;
-    if let Err(first_err) = result {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        send_channel_message(home_dir, http, &reminder.channel, &reminder.chat_id, &text)
-            .await
-            .map_err(|e| format!("Delivery failed after retry (first: {first_err}): {e}"))?;
+    // M61: acquire the concurrency permit only for the bounded send step (and
+    // its single 2s retry). Held across the channel I/O, NOT across the LLM call
+    // above. The permit is dropped at the end of this scope.
+    {
+        let _permit = sem.acquire().await.map_err(|_| "Semaphore closed".to_string())?;
+
+        // Retry once on failure
+        let result =
+            send_channel_message(home_dir, http, &reminder.channel, &reminder.chat_id, &text).await;
+        if let Err(first_err) = result {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            send_channel_message(home_dir, http, &reminder.channel, &reminder.chat_id, &text)
+                .await
+                .map_err(|e| format!("Delivery failed after retry (first: {first_err}): {e}"))?;
+        }
     }
 
     info!(
@@ -880,4 +915,62 @@ pub fn start_reminder_scheduler(
     tokio::spawn(async move {
         scheduler.run().await;
     })
+}
+
+// ── Tests ───────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_home() -> PathBuf {
+        let p = std::env::temp_dir().join(format!("ddc-reminder-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn decrypt_channel_token_returns_plaintext_when_not_encrypted() {
+        let home = tmp_home();
+        let config: toml::Table = r#"
+[channels]
+telegram_bot_token = "plain-tg-token"
+"#
+        .parse()
+        .unwrap();
+        let token =
+            decrypt_channel_token(&config, "telegram_bot_token_enc", "telegram_bot_token", &home)
+                .await;
+        assert_eq!(token, "plain-tg-token");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn decrypt_channel_token_secret_ref_is_fail_soft_empty() {
+        // An unresolvable `secret://` reference (no [secret_manager] backend
+        // configured) must fail-soft to an empty token rather than panic.
+        let home = tmp_home();
+        let config: toml::Table = r#"
+[channels]
+telegram_bot_token = "secret://vault/tg-token"
+"#
+        .parse()
+        .unwrap();
+        let token =
+            decrypt_channel_token(&config, "telegram_bot_token_enc", "telegram_bot_token", &home)
+                .await;
+        assert_eq!(token, "");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn decrypt_channel_token_missing_returns_empty() {
+        let home = tmp_home();
+        let config: toml::Table = "".parse().unwrap();
+        let token =
+            decrypt_channel_token(&config, "discord_bot_token_enc", "discord_bot_token", &home)
+                .await;
+        assert_eq!(token, "");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

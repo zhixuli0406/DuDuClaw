@@ -177,7 +177,13 @@ pub struct WorktreeStatus {
 
 /// Pure function: decide what to do after agent exits.
 /// Separated from I/O for easy unit testing.
-pub fn determine_snap_action(status: &WorktreeStatus) -> SnapAction {
+///
+/// `auto_merge` reflects the operator's `worktree_auto_merge` setting. When it
+/// is `false`, sub-agent commits MUST NOT be merged into the target branch
+/// without consent — even if `worktree_cleanup_on_exit` is `true`. In that case
+/// new commits are still cleaned up at the worktree level (the branch ref is
+/// removed by `remove`), but the merge step is skipped (HC6).
+pub fn determine_snap_action(status: &WorktreeStatus, auto_merge: bool) -> SnapAction {
     if status.agent_requested_retry {
         return SnapAction::KeepWorktree;
     }
@@ -190,7 +196,14 @@ pub fn determine_snap_action(status: &WorktreeStatus) -> SnapAction {
     if !status.conflict_files.is_empty() {
         return SnapAction::MergeConflict(status.conflict_files.clone());
     }
-    SnapAction::MergeAndCleanup
+    // HC6: only merge when the operator explicitly opted into auto-merge.
+    // Otherwise downgrade to a non-merging cleanup so commits are never
+    // pushed to the target branch without consent.
+    if auto_merge {
+        SnapAction::MergeAndCleanup
+    } else {
+        SnapAction::AutoCleanup
+    }
 }
 
 // ── Exit Code Protocol ─────────────────────────────────────────────────────
@@ -491,7 +504,40 @@ impl WorktreeManager {
         let original_head = Self::git_rev_parse(repo_root, "HEAD").await.unwrap_or_default();
         let original_branch = Self::current_branch_name(repo_root).await;
 
-        // Step 1: Checkout target branch.
+        // M30: capture the worktree branch tip up front. Because the snap
+        // decision (inspect → merge) is not atomic and dispatch can run
+        // concurrently, the same `wt/...` branch could be advanced or its
+        // worktree swapped between inspection and merge. We re-verify this
+        // tip just before the real merge and abort if it moved, so we never
+        // merge a different commit than the one that was inspected.
+        let wt_tip_before = Self::git_rev_parse(
+            repo_root,
+            &format!("refs/heads/{worktree_branch}"),
+        )
+        .await
+        .unwrap_or_default();
+
+        // M30: under detached HEAD, the merge commit is only reachable if it
+        // lands on a *real* local branch ref. `git checkout <name>` on a name
+        // that has no local branch can leave us detached again (or create an
+        // ambiguous checkout), in which case advancing "the target" would not
+        // move any persistent ref and the merge commit would be lost on the
+        // next HEAD restore. Require the target to be an existing local branch.
+        let target_is_local_branch = tokio::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{target_branch}")])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !target_is_local_branch {
+            return MergeResult::Error(format!(
+                "Refusing to merge: target '{target_branch}' is not a local branch ref \
+                 (merge commit would be unreachable, esp. under detached HEAD)"
+            ));
+        }
+
+        // Step 1: Checkout target branch (now known to be a real local branch).
         let checkout = tokio::process::Command::new("git")
             .args(["checkout", target_branch])
             .current_dir(repo_root)
@@ -577,6 +623,26 @@ impl WorktreeManager {
         if !has_commits {
             Self::restore_head(repo_root, &original_branch, &original_head).await;
             return MergeResult::NothingToMerge;
+        }
+
+        // M30: concurrent-swap guard. Re-read the worktree branch tip and abort
+        // if it moved since we inspected it. A concurrent dispatch could have
+        // advanced or recreated this `wt/...` branch (or swapped its worktree)
+        // after our dry-run validated a clean merge; merging the new tip would
+        // bypass that validation. The empty-string case (branch vanished) also
+        // trips this guard.
+        let wt_tip_now = Self::git_rev_parse(
+            repo_root,
+            &format!("refs/heads/{worktree_branch}"),
+        )
+        .await
+        .unwrap_or_default();
+        if wt_tip_now != wt_tip_before || wt_tip_now.is_empty() {
+            Self::restore_head(repo_root, &original_branch, &original_head).await;
+            return MergeResult::Error(format!(
+                "Aborting merge: worktree branch '{worktree_branch}' changed concurrently \
+                 (inspected {wt_tip_before}, now {wt_tip_now}) — retry the snap"
+            ));
         }
 
         // Step 5: Real merge. `--` prevents branch name from being parsed as flag.
@@ -944,7 +1010,9 @@ mod tests {
             conflict_files: vec![],
             agent_requested_retry: false,
         };
-        assert_eq!(determine_snap_action(&status), SnapAction::AutoCleanup);
+        // auto_merge irrelevant when there are no commits.
+        assert_eq!(determine_snap_action(&status, true), SnapAction::AutoCleanup);
+        assert_eq!(determine_snap_action(&status, false), SnapAction::AutoCleanup);
     }
 
     #[test]
@@ -955,7 +1023,20 @@ mod tests {
             conflict_files: vec![],
             agent_requested_retry: false,
         };
-        assert_eq!(determine_snap_action(&status), SnapAction::MergeAndCleanup);
+        assert_eq!(determine_snap_action(&status, true), SnapAction::MergeAndCleanup);
+    }
+
+    #[test]
+    fn test_determine_snap_new_commits_no_auto_merge_does_not_merge() {
+        // HC6 regression: new commits + auto_merge=false must NOT merge.
+        // (worktree_cleanup_on_exit=true alone must never push to the target.)
+        let status = WorktreeStatus {
+            has_uncommitted: false,
+            new_commit_count: 3,
+            conflict_files: vec![],
+            agent_requested_retry: false,
+        };
+        assert_eq!(determine_snap_action(&status, false), SnapAction::AutoCleanup);
     }
 
     #[test]
@@ -966,7 +1047,7 @@ mod tests {
             conflict_files: vec![],
             agent_requested_retry: false,
         };
-        assert_eq!(determine_snap_action(&status), SnapAction::KeepWorktree);
+        assert_eq!(determine_snap_action(&status, true), SnapAction::KeepWorktree);
     }
 
     #[test]
@@ -977,8 +1058,10 @@ mod tests {
             conflict_files: vec!["src/main.rs".into()],
             agent_requested_retry: false,
         };
+        // Conflicts are surfaced regardless of auto_merge — the operator must
+        // resolve them; we never silently discard conflicting commits.
         assert_eq!(
-            determine_snap_action(&status),
+            determine_snap_action(&status, true),
             SnapAction::MergeConflict(vec!["src/main.rs".into()])
         );
     }
@@ -991,7 +1074,7 @@ mod tests {
             conflict_files: vec![],
             agent_requested_retry: true,
         };
-        assert_eq!(determine_snap_action(&status), SnapAction::KeepWorktree);
+        assert_eq!(determine_snap_action(&status, true), SnapAction::KeepWorktree);
     }
 
     #[test]

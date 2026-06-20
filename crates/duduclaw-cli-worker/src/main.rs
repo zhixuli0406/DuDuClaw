@@ -62,7 +62,7 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let cli = Cli::parse();
-    let home_dir = expand_home(&cli.home_dir);
+    let home_dir = expand_home(&cli.home_dir)?;
 
     let token = resolve_token(&home_dir)?;
     info!(
@@ -98,13 +98,28 @@ fn init_tracing() {
         .try_init();
 }
 
-fn expand_home(path: &std::path::Path) -> PathBuf {
+/// Expand a leading `~/` to the user's home directory.
+///
+/// **Review fix (L20)**: when the path begins with `~/` but `$HOME`
+/// cannot be resolved, return a clear error instead of leaking the
+/// literal `~/.duduclaw` path downstream. The previous code returned
+/// the un-expanded `~` path, which made `work_dir` validation reject
+/// every request with a misleading "must canonicalize inside
+/// <home>/agents/" message that pointed at a non-existent `~` dir.
+fn expand_home(path: &std::path::Path) -> anyhow::Result<PathBuf> {
     if let Some(stripped) = path.to_str().and_then(|s| s.strip_prefix("~/")) {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(stripped);
+        match dirs::home_dir() {
+            Some(home) => return Ok(home.join(stripped)),
+            None => {
+                anyhow::bail!(
+                    "home directory contains a leading `~` but $HOME could not be resolved; \
+                     pass an absolute --home-dir instead (got {})",
+                    path.display()
+                );
+            }
         }
     }
-    path.to_path_buf()
+    Ok(path.to_path_buf())
 }
 
 fn resolve_token(home: &std::path::Path) -> anyhow::Result<String> {
@@ -152,7 +167,11 @@ mod tests {
 
     #[test]
     fn expand_home_strips_tilde() {
-        let expanded = expand_home(Path::new("~/.duduclaw"));
+        // Only meaningful when $HOME resolves (always true in CI test envs).
+        if dirs::home_dir().is_none() {
+            return;
+        }
+        let expanded = expand_home(Path::new("~/.duduclaw")).expect("home should resolve");
         assert!(!expanded.starts_with("~"));
         assert!(expanded.to_string_lossy().ends_with(".duduclaw"));
     }
@@ -160,6 +179,31 @@ mod tests {
     #[test]
     fn expand_home_passes_through_absolute() {
         let p = Path::new("/tmp/explicit");
-        assert_eq!(expand_home(p), PathBuf::from("/tmp/explicit"));
+        assert_eq!(expand_home(p).unwrap(), PathBuf::from("/tmp/explicit"));
+    }
+
+    #[test]
+    fn expand_home_errors_when_home_unresolvable() {
+        // **Review fix (L20)**: a `~/`-prefixed path with no resolvable
+        // HOME must error, not silently return the literal `~` path.
+        // Simulate an unresolvable HOME by clearing it for this test.
+        // Note: this is best-effort — if the platform sources HOME from
+        // elsewhere (e.g. passwd), `dirs::home_dir()` may still resolve,
+        // in which case we just assert the happy path holds.
+        let saved = std::env::var_os("HOME");
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+        let result = expand_home(Path::new("~/.duduclaw"));
+        // Restore before asserting so a panic doesn't leak env state.
+        if let Some(v) = saved {
+            unsafe {
+                std::env::set_var("HOME", v);
+            }
+        }
+        match dirs::home_dir() {
+            None => assert!(result.is_err(), "expected error when HOME unresolvable"),
+            Some(_) => assert!(result.is_ok(), "HOME still resolved; happy path holds"),
+        }
     }
 }

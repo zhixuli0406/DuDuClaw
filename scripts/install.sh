@@ -7,7 +7,13 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DUDUCLAW_VERSION="0.12.0"
+# Version is auto-detected from the latest GitHub Release at runtime so this
+# script (served from `main`) never drifts behind published binaries. Override
+# with `DUDUCLAW_VERSION=1.2.3 ...` to pin. FALLBACK is used only when the
+# GitHub API is unreachable. NOTE: do NOT hardcode a version that lacks a
+# published Release — a 404 here silently forces an hour-long source build.
+DUDUCLAW_VERSION="${DUDUCLAW_VERSION:-}"
+FALLBACK_VERSION="1.21.1"
 GITHUB_REPO="zhixuli0406/DuDuClaw"
 INSTALL_DIR="${DUDUCLAW_HOME:-$HOME/.duduclaw}/bin"
 BINARY_NAME="duduclaw"
@@ -111,6 +117,29 @@ detect_platform() {
 # Download helpers
 # ---------------------------------------------------------------------------
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# Resolve DUDUCLAW_VERSION from the latest GitHub Release (unless pinned).
+resolve_version() {
+  if [ -n "$DUDUCLAW_VERSION" ]; then
+    info "Using pinned version v${DUDUCLAW_VERSION}"
+    return
+  fi
+
+  local api="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+  local tag=""
+  if has_cmd curl; then
+    tag="$(curl -fsSL "$api" 2>/dev/null | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v?([^"]+)".*/\1/')"
+  elif has_cmd wget; then
+    tag="$(wget -qO- "$api" 2>/dev/null | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v?([^"]+)".*/\1/')"
+  fi
+
+  if [ -n "$tag" ]; then
+    DUDUCLAW_VERSION="$tag"
+  else
+    DUDUCLAW_VERSION="$FALLBACK_VERSION"
+    warn "Could not query latest release; falling back to v${DUDUCLAW_VERSION}"
+  fi
+}
 
 download() {
   local url="$1" dest="$2"
@@ -304,6 +333,7 @@ check_docker() {
 # ---------------------------------------------------------------------------
 main() {
   echo ""
+  resolve_version
   echo "${BOLD}DuDuClaw Installer v${DUDUCLAW_VERSION}${RESET}"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
@@ -323,12 +353,17 @@ main() {
 
   # Try release binary first, fall back to source build
   if ! install_from_release "$target"; then
-    warn "Pre-built binary not available for ${target}."
+    warn "Pre-built binary download failed for ${target} (v${DUDUCLAW_VERSION})."
+    echo ""
+    echo "  ${BOLD}Recommended:${RESET} install the prebuilt binary via npm instead (no compiler needed):"
+    echo "       ${CYAN}npm install -g duduclaw${RESET}"
+    echo ""
+    echo "  Building from source requires Rust + a C toolchain and can take ~1.5h."
     echo ""
     if confirm "Build from source using cargo instead?"; then
       install_from_source
     else
-      fatal "Installation cancelled. No binary available."
+      fatal "Installation cancelled. Use 'npm install -g duduclaw' for the prebuilt binary."
     fi
   fi
 

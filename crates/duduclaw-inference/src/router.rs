@@ -94,8 +94,10 @@ impl ConfidenceRouter {
         }
 
         // 2. Fast keyword check (pre-lowercased)
+        // M39: use whole-word matching so "hi" does not match inside "this" and
+        // "list" does not match inside "realistic" (which mis-routed to local).
         for kw in &self.fast_keywords_lower {
-            if combined.contains(kw.as_str()) {
+            if duduclaw_core::word_contains_ci(&combined, kw) {
                 confidence += 0.2;
                 reasons.push(format!("fast keyword: '{kw}'"));
             }
@@ -249,6 +251,37 @@ mod tests {
         let router = ConfidenceRouter::new(test_config());
         let decision = router.route("", "請幫我翻譯這段文字");
         assert_ne!(decision.tier, RoutingTier::CloudApi, "CJK fast keyword should route locally");
+    }
+
+    #[test]
+    fn fast_keyword_matches_whole_word_only() {
+        // M39: "hi"/"list" must not match inside "this"/"realistic".
+        let mut config = test_config();
+        config.fast_keywords = vec!["hi".to_string(), "list".to_string()];
+        let router = ConfidenceRouter::new(config);
+        // A genuinely complex prompt that merely *contains* the substrings.
+        let decision = router.route(
+            "You are a senior architect.",
+            "Please refactor this realistic distributed architecture. First analyze the current structure, then propose a new design, and implement the migration?",
+        );
+        // No whole-word fast keyword present, so the fast-keyword boost must not
+        // fire and the complex prompt should not be routed to LocalFast.
+        assert_ne!(decision.tier, RoutingTier::LocalFast);
+        assert!(
+            !decision.reason.contains("fast keyword"),
+            "substring should not count as a fast keyword: {}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn fast_keyword_matches_real_word() {
+        // The whole-word keyword still matches when present as a real word.
+        let mut config = test_config();
+        config.fast_keywords = vec!["hi".to_string()];
+        let router = ConfidenceRouter::new(config);
+        let decision = router.route("", "hi there");
+        assert!(decision.reason.contains("fast keyword"));
     }
 
     #[test]

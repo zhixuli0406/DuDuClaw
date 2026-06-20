@@ -4,15 +4,20 @@ All user-supplied parameters are validated at the system boundary before
 entering any business logic.  Invalid inputs raise :exc:`ValidationError`
 immediately (fail-fast principle).
 
+Memory content and search queries are stored/searched as plain text — they are
+NOT HTML-escaped here.  HTML-escaping is a presentation-layer concern; escaping
+at storage time permanently corrupts natural-language text (e.g. ``x < 3 && y``)
+and hurts search recall.  Any rendering surface must escape at output time.
+
 Validation rules per endpoint:
   memory_search:
-    - query: required, non-empty, ≤ 500 chars, HTML-escaped
+    - query: required, non-empty, ≤ 500 chars
     - limit: optional int, 1–50, default 10
     - layer: optional enum {"episodic", "semantic", "all"}, default "all"
     - min_relevance: optional float 0.0–1.0, default 0.5
 
   memory_store:
-    - content: required, non-empty, ≤ 4096 chars, HTML-escaped
+    - content: required, non-empty, ≤ 4096 chars
     - layer: optional enum {"episodic", "semantic"}, default "episodic"
               NOTE: "all" is valid for search but NOT for store
     - tags: optional list[str], ≤ 10 items, each ≤ 50 chars
@@ -26,7 +31,6 @@ References: mcp-memory-endpoints-design.md §3 and §4.3
 
 from __future__ import annotations
 
-import html
 import re
 import uuid
 from typing import Any, Optional
@@ -53,17 +57,6 @@ _UUID_V4_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
-
-
-# ── Sanitisation helpers ──────────────────────────────────────────────────────
-
-
-def _sanitize(text: str) -> str:
-    """HTML-escape special characters to prevent injection attacks.
-
-    Escapes: ``<``, ``>``, ``"``, ``'``, ``&``.
-    """
-    return html.escape(text, quote=True)
 
 
 # ── Validators ────────────────────────────────────────────────────────────────
@@ -119,7 +112,8 @@ def validate_memory_search_params(params: dict[str, Any]) -> dict[str, Any]:
         )
 
     return {
-        "query": _sanitize(query),
+        # Query is plain text — not HTML-escaped (escaping hurts search recall).
+        "query": query,
         "limit": limit,
         "layer": layer,
         "min_relevance": min_relevance_f,
@@ -173,7 +167,9 @@ def validate_memory_store_params(params: dict[str, Any]) -> dict[str, Any]:
                 f"tags[{i}] must not exceed {MAX_TAG_LENGTH} characters "
                 f"(got {len(tag)})"
             )
-        validated_tags.append(_sanitize(tag))
+        # Tags are plain text — not HTML-escaped (escaping belongs at the
+        # presentation layer, not storage).
+        validated_tags.append(tag)
 
     # ── ttl_days ───────────────────────────────────────────────────────────────
     ttl_days: Optional[int] = params.get("ttl_days")
@@ -187,7 +183,9 @@ def validate_memory_store_params(params: dict[str, Any]) -> dict[str, Any]:
             )
 
     return {
-        "content": _sanitize(content),
+        # Content is plain text — not HTML-escaped (escaping permanently
+        # corrupts natural-language memory, e.g. "x < 3 && y").
+        "content": content,
         "layer": layer,
         "tags": validated_tags,
         "ttl_days": ttl_days,

@@ -328,16 +328,33 @@ impl ApprovalWorkflow {
     }
 
     /// 清理過期申請（可定期呼叫）。
+    ///
+    /// 同時驅逐已決策（Approved / Rejected）與過期（Expired）的記錄，
+    /// 只保留在 `TERMINAL_RETENTION_HOURS` 保留窗口內的歷史，否則 pending map
+    /// 會隨著每筆已決策的申請無限增長（M43）。
     pub async fn cleanup_expired(&self) {
+        const TERMINAL_RETENTION_HOURS: i64 = 24;
+        let now = Utc::now();
+        let retention = chrono::Duration::hours(TERMINAL_RETENTION_HOURS);
+
         let mut lock = self.pending.write().await;
         lock.retain(|_, v| {
             if v.status == ApprovalStatus::Pending && v.is_expired() {
                 v.status = ApprovalStatus::Expired;
             }
-            // 保留已決策的記錄（歷史）；只移除過期超過 24h 的空殼
-            let keep = v.status != ApprovalStatus::Expired
-                || Utc::now() - v.expires_at < chrono::Duration::hours(24);
-            keep
+
+            match v.status {
+                // Pending 一律保留，直到過期被轉成 Expired。
+                ApprovalStatus::Pending => true,
+                // 已決策的記錄保留至最後決策時間後 retention 窗口；無 decided_at
+                // 時退回以 expires_at 計算，避免永久滯留。
+                ApprovalStatus::Approved | ApprovalStatus::Rejected => {
+                    let anchor = v.decided_at.unwrap_or(v.expires_at);
+                    now - anchor < retention
+                }
+                // Expired 空殼僅保留 retention 窗口供歷史查詢。
+                ApprovalStatus::Expired => now - v.expires_at < retention,
+            }
         });
     }
 
@@ -561,5 +578,59 @@ mod tests {
         let pending = workflow.list_pending().await;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0], r2.approval_request_id);
+    }
+
+    /// M43: cleanup_expired 必須驅逐保留窗口外的已決策（Approved/Rejected）記錄，
+    /// 否則 pending map 隨每筆決策無限增長。
+    #[tokio::test]
+    async fn test_cleanup_evicts_old_terminal_entries() {
+        let sink = Arc::new(RecordingAuditSink::default());
+        let workflow = ApprovalWorkflow::new(Arc::clone(&sink) as Arc<dyn AuditEventSink>);
+
+        // Approve one request, reject another.
+        let r1 = workflow.request(make_request(3600)).await;
+        let r2 = workflow.request(make_request(3600)).await;
+        workflow
+            .decide(ApprovalDecision {
+                approval_request_id: r1.approval_request_id.clone(),
+                approver_id: "admin".into(),
+                decision: ApprovalDecisionType::Approve,
+                reason: None,
+            })
+            .await
+            .unwrap();
+        workflow
+            .decide(ApprovalDecision {
+                approval_request_id: r2.approval_request_id.clone(),
+                approver_id: "admin".into(),
+                decision: ApprovalDecisionType::Reject,
+                reason: None,
+            })
+            .await
+            .unwrap();
+
+        // A fresh terminal entry is within the retention window → cleanup keeps it.
+        workflow.cleanup_expired().await;
+        {
+            let lock = workflow.pending.read().await;
+            assert_eq!(lock.len(), 2, "recent terminal entries are retained");
+        }
+
+        // Backdate both decisions well past the 24h retention window.
+        {
+            let mut lock = workflow.pending.write().await;
+            let old = Utc::now() - chrono::Duration::hours(48);
+            for entry in lock.values_mut() {
+                entry.decided_at = Some(old);
+                entry.expires_at = old;
+            }
+        }
+
+        workflow.cleanup_expired().await;
+        let lock = workflow.pending.read().await;
+        assert!(
+            lock.is_empty(),
+            "terminal entries past the retention window must be evicted (no unbounded growth)"
+        );
     }
 }

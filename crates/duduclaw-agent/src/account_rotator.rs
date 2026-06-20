@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use duduclaw_security::secret_manager::SecretManagerConfig;
 use zeroize::Zeroize;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -247,12 +248,35 @@ impl AccountRotator {
                         let expires_at = acc_table.get("expires_at").and_then(|v| v.as_str()).map(|s| s.to_string());
                         let creds_dir = resolve_oauth_credentials(profile);
 
-                        // Decrypt oauth_token_enc if present
-                        let oauth_token = acc_table
+                        // Resolve the OAuth token. Precedence:
+                        //   1. inline oauth_token_enc (decrypted via keyfile)
+                        //   2. oauth_token plaintext that is a secret:// reference
+                        // A non-reference plaintext oauth_token is intentionally
+                        // NOT consumed here (preserving prior behavior, which
+                        // only ever read oauth_token_enc).
+                        let oauth_token = match acc_table
                             .get("oauth_token_enc")
                             .and_then(|v| v.as_str())
                             .filter(|s| !s.is_empty())
-                            .and_then(|enc| decrypt_with_keyfile(home_dir, enc));
+                            .and_then(|enc| {
+                                duduclaw_security::keyfile::decrypt_keyfile_value(enc, home_dir)
+                            }) {
+                            Some(tok) => Some(tok),
+                            None => match acc_table
+                                .get("oauth_token")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| s.starts_with("secret://"))
+                            {
+                                Some(reference) => {
+                                    let sm_cfg = load_secret_manager_config(home_dir).await;
+                                    duduclaw_security::secret_manager::resolve_secret_reference(
+                                        reference, &sm_cfg, home_dir,
+                                    )
+                                    .await
+                                }
+                                None => None,
+                            },
+                        };
 
                         let has_auth = oauth_token.is_some() || creds_dir.is_some();
 
@@ -401,10 +425,26 @@ impl AccountRotator {
                 available.iter().min_by_key(|a| a.priority).copied()
             }
             RotationStrategy::LeastCost => {
-                // Prefer OAuth (subscription, no per-token cost), then least spent API key
+                // Prefer OAuth (subscription, no per-token cost), then least spent API key.
                 let oauth: Vec<&&Account> = available.iter().filter(|a| a.auth_method == AuthMethod::OAuth).collect();
                 if !oauth.is_empty() {
-                    Some(*oauth[0])
+                    // Among OAuth accounts, the lowest "cost" tier is the one
+                    // with the least spend. Within that equal-cost tier, rotate
+                    // fairly using a least-recently-used tiebreaker instead of
+                    // always picking index 0 — otherwise the first OAuth account
+                    // takes every request and the others never get used.
+                    let min_spent = oauth
+                        .iter()
+                        .map(|a| a.spent_this_month)
+                        .min()
+                        .unwrap_or(0);
+                    oauth
+                        .iter()
+                        .filter(|a| a.spent_this_month == min_spent)
+                        // `None` (never used) sorts before any timestamp, so
+                        // unused accounts are preferred first.
+                        .min_by_key(|a| a.last_used)
+                        .map(|a| **a)
                 } else {
                     available.iter().min_by_key(|a| a.spent_this_month).copied()
                 }
@@ -747,32 +787,69 @@ fn resolve_oauth_credentials(profile: &str) -> Option<PathBuf> {
 
 // ── API Key helpers ─────────────────────────────────────────
 
-/// Resolve API key from a TOML table (encrypted first, then plaintext).
+/// Load the `[secret_manager]` config from a top-level config table.
+///
+/// `table` here is a sub-table (e.g. `[api]` or an `[[accounts]]` entry), so we
+/// cannot read `[secret_manager]` from it directly. The rotator only has the
+/// per-account table at the call sites, not the full config, so we re-read the
+/// top-level config to recover `[secret_manager]`. Absent / malformed →
+/// `Default` (backend `local`), matching the gateway's fail-safe behavior.
+async fn load_secret_manager_config(home_dir: &Path) -> SecretManagerConfig {
+    let config_path = home_dir.join("config.toml");
+    let content = match tokio::fs::read_to_string(&config_path).await {
+        Ok(c) => c,
+        Err(_) => return SecretManagerConfig::default(),
+    };
+    content
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|t| {
+            t.get("secret_manager")
+                .cloned()
+                .and_then(|v| v.try_into().ok())
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve API key from a TOML table.
+///
+/// Resolution precedence:
+/// 1. Inline `*_enc` (decrypted via the per-machine keyfile), if present.
+/// 2. A plaintext field that is a `secret://<backend>/<name>` reference →
+///    resolved through the configured secret backend.
+/// 3. A plaintext field used as-is (legacy / dev).
 async fn resolve_api_key(home_dir: &Path, table: &toml::Table) -> String {
     for key_name in &["anthropic_api_key_enc", "api_key_enc"] {
         if let Some(enc) = table.get(*key_name).and_then(|v| v.as_str())
             && !enc.is_empty()
-                && let Some(decrypted) = decrypt_with_keyfile(home_dir, enc) {
-                    return decrypted;
-                }
+                && let Some(decrypted) =
+                    duduclaw_security::keyfile::decrypt_keyfile_value(enc, home_dir)
+        {
+            return decrypted;
+        }
     }
     for key_name in &["anthropic_api_key", "api_key"] {
         if let Some(key) = table.get(*key_name).and_then(|v| v.as_str())
-            && !key.is_empty() {
-                warn!("Using plaintext API key — run `duduclaw onboard` to encrypt");
-                return key.to_string();
+            && !key.is_empty()
+        {
+            if key.starts_with("secret://") {
+                let sm_cfg = load_secret_manager_config(home_dir).await;
+                if let Some(resolved) =
+                    duduclaw_security::secret_manager::resolve_secret_reference(
+                        key, &sm_cfg, home_dir,
+                    )
+                    .await
+                {
+                    return resolved;
+                }
+                // Reference failed to resolve — fall through (treat as unset).
+                continue;
             }
+            warn!("Using plaintext API key — run `duduclaw onboard` to encrypt");
+            return key.to_string();
+        }
     }
     String::new()
-}
-
-fn decrypt_with_keyfile(home_dir: &Path, encrypted: &str) -> Option<String> {
-    let keyfile = home_dir.join(".keyfile");
-    let bytes = std::fs::read(&keyfile).ok()?;
-    if bytes.len() != 32 { return None; }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&bytes);
-    duduclaw_security::crypto::CryptoEngine::new(&key).ok()?.decrypt_string(encrypted).ok().filter(|s| !s.is_empty())
 }
 
 /// Create a rotator from config.toml rotation settings.
@@ -858,6 +935,61 @@ mod select_env_tests {
         assert_eq!(
             env.env_vars.get("CLAUDE_CONFIG_DIR").map(String::as_str),
             Some(profile_dir.to_string_lossy().as_ref())
+        );
+    }
+
+    /// Build an available OAuth account with an explicit setup-token so it
+    /// passes `is_available()` without touching the OS keychain.
+    fn oauth_account(id: &str) -> Account {
+        Account {
+            id: id.to_string(),
+            auth_method: AuthMethod::OAuth,
+            priority: 1,
+            monthly_budget_cents: 0,
+            tags: vec![],
+            profile: "default".to_string(),
+            email: String::new(),
+            subscription: "max".to_string(),
+            label: id.to_string(),
+            expires_at: None,
+            api_key: String::new(),
+            oauth_token: Some(format!("token-{id}")),
+            credentials_dir: None,
+            is_healthy: true,
+            consecutive_errors: 0,
+            spent_this_month: 0,
+            cooldown_until: None,
+            last_used: None,
+            total_requests: 0,
+        }
+    }
+
+    /// L4 regression: the `LeastCost` strategy must rotate fairly among
+    /// equal-cost (equal-spend) OAuth accounts instead of always returning
+    /// the first one. We simulate the realistic flow where each selection is
+    /// followed by `on_success`, which stamps `last_used` and makes the
+    /// least-recently-used tiebreaker advance to the next account.
+    #[tokio::test]
+    async fn least_cost_rotates_among_equal_cost_oauth_accounts() {
+        let rotator = AccountRotator::new(RotationStrategy::LeastCost, 120);
+        rotator.push_account_for_test(oauth_account("a")).await;
+        rotator.push_account_for_test(oauth_account("b")).await;
+        rotator.push_account_for_test(oauth_account("c")).await;
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let env = rotator.select().await.expect("should select account");
+            seen.insert(env.id.clone());
+            // Report success with zero cost so all accounts stay equal-cost;
+            // this updates `last_used` so the next select picks a different one.
+            rotator.on_success(&env.id, 0).await;
+        }
+
+        assert_eq!(
+            seen.len(),
+            3,
+            "LeastCost should rotate across all three equal-cost OAuth accounts, \
+             not repeatedly pick the first; saw {seen:?}"
         );
     }
 }

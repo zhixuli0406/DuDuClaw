@@ -509,7 +509,10 @@ pub async fn metrics_handler(
     }
 
     let metrics = global_metrics();
-    let body = metrics.render().await;
+    let mut body = metrics.render().await;
+    // RFC-26: fork metrics live in the cross-process ForkStore (forks run in the
+    // MCP-server process). Read them at scrape time and append.
+    body.push_str(&render_fork_metrics());
 
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
@@ -518,11 +521,98 @@ pub async fn metrics_handler(
         .into_response()
 }
 
+/// Render RFC-26 fork metrics from the shared `ForkStore` (`$DUDUCLAW_HOME/fork_store.db`).
+/// Returns an empty string when the store is absent/unreadable (forking off).
+pub fn render_fork_metrics() -> String {
+    let home = match std::env::var_os("DUDUCLAW_HOME") {
+        Some(h) => std::path::PathBuf::from(h),
+        None => return String::new(),
+    };
+    render_fork_metrics_from(&home.join("fork_store.db"))
+}
+
+/// Path-addressable variant for testing.
+pub fn render_fork_metrics_from(path: &std::path::Path) -> String {
+    if !path.exists() {
+        return String::new();
+    }
+    let store = match duduclaw_fork::ForkStore::open(path) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    let m = match store.metrics() {
+        Ok(m) => m,
+        Err(_) => return String::new(),
+    };
+    let mut out = String::new();
+    let counter = |out: &mut String, name: &str, help: &str, v: u64| {
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n{name} {v}\n"));
+    };
+    counter(&mut out, "duduclaw_fork_runs_total", "Total forks created.", m.forks_total);
+    counter(&mut out, "duduclaw_fork_resolved_total", "Forks resolved to a winner.", m.forks_resolved);
+    counter(&mut out, "duduclaw_fork_promoted_total", "Forks whose winner was promoted.", m.forks_promoted);
+    counter(&mut out, "duduclaw_fork_branches_total", "Total branches across all forks.", m.branches_total);
+    out.push_str("# HELP duduclaw_fork_branch_outcome Total branches by terminal outcome.\n");
+    out.push_str("# TYPE duduclaw_fork_branch_outcome counter\n");
+    out.push_str(&format!("duduclaw_fork_branch_outcome{{outcome=\"finished\"}} {}\n", m.branches_finished));
+    out.push_str(&format!("duduclaw_fork_branch_outcome{{outcome=\"budget_killed\"}} {}\n", m.branches_budget_killed));
+    out.push_str(&format!("duduclaw_fork_branch_outcome{{outcome=\"failed\"}} {}\n", m.branches_failed));
+    out.push_str("# HELP duduclaw_fork_spend_usd_total Aggregate USD spent across all forks.\n");
+    out.push_str("# TYPE duduclaw_fork_spend_usd_total counter\n");
+    out.push_str(&format!("duduclaw_fork_spend_usd_total {:.6}\n", m.aggregate_spent_usd));
+    out
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fork_metrics_absent_store_is_empty() {
+        let p = std::path::Path::new("/nonexistent/duduclaw_fork_metrics_test.db");
+        assert_eq!(render_fork_metrics_from(p), "");
+    }
+
+    #[test]
+    fn fork_metrics_render_from_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fork_store.db");
+        let store = duduclaw_fork::ForkStore::open(&path).unwrap();
+        store
+            .insert_fork(
+                &duduclaw_fork::ForkRow {
+                    fork_id: "f1".into(),
+                    agent_id: "a1".into(),
+                    prompt: "p".into(),
+                    merge_mode: "auto".into(),
+                    resolved: true,
+                    winner: Some("b1".into()),
+                    promoted: true,
+                    aggregate_spent_usd: 0.25,
+                    created_at: "2026-06-19T00:00:00Z".into(),
+                },
+                &[duduclaw_fork::BranchRow {
+                    branch_id: "b1".into(),
+                    fork_id: "f1".into(),
+                    steering: None,
+                    budget_usd: 0.5,
+                    state: "finished".into(),
+                    spent_usd: 0.25,
+                    output: String::new(),
+                    test_exit_code: None,
+                }],
+            )
+            .unwrap();
+        store.set_resolution("f1", Some("b1"), true, true, 0.25).unwrap();
+
+        let out = render_fork_metrics_from(&path);
+        assert!(out.contains("duduclaw_fork_runs_total 1"));
+        assert!(out.contains("duduclaw_fork_promoted_total 1"));
+        assert!(out.contains("duduclaw_fork_branch_outcome{outcome=\"finished\"} 1"));
+        assert!(out.contains("duduclaw_fork_spend_usd_total 0.25"));
+    }
 
     #[tokio::test]
     async fn test_record_and_render() {

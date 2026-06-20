@@ -336,7 +336,7 @@ GET https://api.anthropic.com/v1/models
 
 ## 七、自主進化引擎（Prediction-Driven + GVU）
 
-> 完整技術文件：[docs/evolution-engine.md](docs/evolution-engine.md)
+> 完整技術文件：[docs/architecture/evolution-engine.md](docs/architecture/evolution-engine.md)
 
 進化引擎以**預測誤差**驅動，取代固定計時器反思，約 90% 的對話零 LLM 成本。
 

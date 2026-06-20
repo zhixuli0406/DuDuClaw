@@ -13,6 +13,10 @@ mod acp;
 mod mcp;
 pub mod mcp_auth;
 pub mod mcp_auth_strategy;
+pub mod mcp_fork;                // RFC-26 P3: Live Run Forking tool surface
+pub mod mcp_fork_exec;           // RFC-26 P4: real branch execution + background driver
+pub mod mcp_planner;             // RFC-26 P6.1: clarify-first Plan Mode
+pub mod builtin_skills;          // RFC-26 P6.3: bundled SKILL.md set
 pub mod mcp_refresh;             // v1.16.0: refresh-token credential type
 pub mod mcp_dispatch;          // W20-P1 Phase 2A: transport-agnostic dispatcher
 pub(crate) mod mcp_http_auth;  // W20-P1 Phase 2B: HTTP Bearer auth extractor

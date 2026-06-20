@@ -16,6 +16,7 @@ Per-client state:
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -125,6 +126,10 @@ class QuotaEnforcer:
     def __init__(self, default_limit: int = DEFAULT_QUOTA) -> None:
         self._default_limit = default_limit
         self._store: dict[str, _QuotaEntry] = {}
+        # Guards check-and-increment so concurrent writers cannot both pass the
+        # quota gate (the await between a separate check and increment otherwise
+        # lets two coroutines each see used < limit before either increments).
+        self._lock = threading.Lock()
 
     def _get_or_create(self, client_id: str) -> _QuotaEntry:
         """Return existing entry (auto-resetting if expired) or create a new one."""
@@ -161,10 +166,70 @@ class QuotaEnforcer:
                 reset_at=_format_reset_at(entry.reset_at_ts),
             )
 
+    def reserve(self, client_id: str) -> QuotaInfo:
+        """Atomically check and increment the daily write counter.
+
+        This is the concurrency-safe replacement for the
+        ``check_or_raise`` → write → ``increment`` sequence: the check and the
+        increment happen together under a lock, so two concurrent writers can
+        never both pass the quota gate when only one slot remains.
+
+        Call :meth:`release` to roll back the reservation if the subsequent
+        write fails.
+
+        Args:
+            client_id: The client identifier.
+
+        Returns:
+            :class:`QuotaInfo` with the updated ``used`` and ``remaining`` counts.
+
+        Raises:
+            QuotaExceededError: When ``used >= limit`` for today.
+        """
+        with self._lock:
+            entry = self._get_or_create(client_id)
+            if entry.used >= entry.limit:
+                retry_after = max(0, int(entry.reset_at_ts - time.time()))
+                raise QuotaExceededError(
+                    message=(
+                        f"Daily write quota of {entry.limit} records exceeded "
+                        f"for your client."
+                    ),
+                    quota_limit=entry.limit,
+                    quota_used=entry.used,
+                    retry_after=retry_after,
+                    reset_at=_format_reset_at(entry.reset_at_ts),
+                )
+            entry.used += 1
+            return QuotaInfo(
+                client_id=client_id,
+                used=entry.used,
+                limit=entry.limit,
+                reset_at=_format_reset_at(entry.reset_at_ts),
+            )
+
+    def release(self, client_id: str) -> None:
+        """Roll back one reserved write slot after a failed write.
+
+        Safe to call even if the quota window has rolled over (never goes
+        below zero).
+
+        Args:
+            client_id: The client identifier.
+        """
+        with self._lock:
+            entry = self._store.get(client_id)
+            if entry is not None and not entry.is_expired() and entry.used > 0:
+                entry.used -= 1
+
     def increment(self, client_id: str) -> QuotaInfo:
         """Increment the write counter and return the updated quota snapshot.
 
         Call this **after** a successful write operation.
+
+        .. deprecated::
+            Prefer :meth:`reserve` (atomic check-and-increment) over a separate
+            ``check_or_raise`` + ``increment`` pair, which is not concurrency-safe.
 
         Args:
             client_id: The client identifier.
@@ -172,14 +237,15 @@ class QuotaEnforcer:
         Returns:
             :class:`QuotaInfo` with the updated ``used`` and ``remaining`` counts.
         """
-        entry = self._get_or_create(client_id)
-        entry.used += 1
-        return QuotaInfo(
-            client_id=client_id,
-            used=entry.used,
-            limit=entry.limit,
-            reset_at=_format_reset_at(entry.reset_at_ts),
-        )
+        with self._lock:
+            entry = self._get_or_create(client_id)
+            entry.used += 1
+            return QuotaInfo(
+                client_id=client_id,
+                used=entry.used,
+                limit=entry.limit,
+                reset_at=_format_reset_at(entry.reset_at_ts),
+            )
 
     def get_info(self, client_id: str) -> QuotaInfo:
         """Return the current quota snapshot without incrementing the counter.

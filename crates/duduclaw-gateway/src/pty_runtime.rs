@@ -229,6 +229,13 @@ pub struct AcquireOptions<'a> {
     pub bare_mode: bool,
     pub account_id: Option<&'a str>,
     pub model: Option<&'a str>,
+    /// HS14: per-account credential env vars (e.g. `CLAUDE_CODE_OAUTH_TOKEN`,
+    /// `CLAUDE_CONFIG_DIR`) resolved by the `AccountRotator` for `account_id`.
+    /// The managed worker enforces per-account OAuth isolation by REJECTING any
+    /// account-rotation request (`account_id = Some`) whose `env` is empty, so
+    /// the caller MUST populate this whenever it sets `account_id`. Owned map
+    /// (cheap; only the resolved-account env, a handful of entries).
+    pub env: HashMap<String, String>,
 }
 
 impl<'a> AcquireOptions<'a> {
@@ -239,6 +246,7 @@ impl<'a> AcquireOptions<'a> {
             bare_mode,
             account_id: None,
             model: None,
+            env: HashMap::new(),
         }
     }
 
@@ -249,6 +257,13 @@ impl<'a> AcquireOptions<'a> {
 
     pub fn model(mut self, model: Option<&'a str>) -> Self {
         self.model = model;
+        self
+    }
+
+    /// HS14: attach the resolved per-account credential env vars. Pass the same
+    /// `env_vars` map the rotator produced for the selected account.
+    pub fn env(mut self, env: HashMap<String, String>) -> Self {
+        self.env = env;
         self
     }
 
@@ -381,12 +396,16 @@ impl<'a> InvokeOptions<'a> {
 /// entry point. The historical 3 free-function variants now delegate
 /// here.
 pub async fn acquire_and_invoke_with(options: InvokeOptions<'_>) -> Result<String, String> {
-    acquire_and_invoke_for_account_with_model(
+    // HS14: forward the per-account credential env so the managed worker spawns
+    // each account's CLI under its own OAuth (per-account billing/budget
+    // cooldown is then honoured downstream).
+    acquire_and_invoke_inner(
         options.acquire.agent_id,
         options.acquire.cli_kind,
         options.acquire.bare_mode,
         options.acquire.account_id,
         options.acquire.model,
+        &options.acquire.env,
         options.prompt,
         options.deadline,
     )
@@ -433,33 +452,59 @@ pub async fn acquire_and_invoke_for_account_with_model(
     prompt: &str,
     deadline: Duration,
 ) -> Result<String, String> {
+    // Back-compat: callers using this positional variant supply no per-account
+    // env. HS14 isolation flows through [`acquire_and_invoke_with`] / the
+    // [`AcquireOptions::env`] builder instead.
+    acquire_and_invoke_inner(
+        agent_id, cli_kind, bare_mode, account_id, model, &HashMap::new(), prompt, deadline,
+    )
+    .await
+}
+
+/// Internal acquire-and-invoke that additionally carries the resolved
+/// per-account credential `env` (HS14). All public variants funnel here.
+#[allow(clippy::too_many_arguments)]
+async fn acquire_and_invoke_inner(
+    agent_id: &str,
+    cli_kind: CliKind,
+    bare_mode: bool,
+    account_id: Option<&str>,
+    model: Option<&str>,
+    env: &HashMap<String, String>,
+    prompt: &str,
+    deadline: Duration,
+) -> Result<String, String> {
     // Phase 7: prefer the out-of-process worker when one was registered
     // via [`set_managed_worker`]. Falls back to the in-process PTY_POOL
     // otherwise (the legacy Phase 3.C.4 path).
     if let Some(client) = MANAGED_WORKER.get() {
         return invoke_via_managed_worker(
-            client, agent_id, cli_kind, bare_mode, account_id, model, prompt, deadline,
+            client, agent_id, cli_kind, bare_mode, account_id, model, env, prompt, deadline,
         )
         .await;
     }
 
-    // Phase 8 metrics: count acquire (cache hit vs spawn) by sampling
-    // session_count before + after. A net-new session ⇒ spawn; otherwise
-    // cache hit. This is a heuristic for monitoring; exact attribution
-    // would require deeper instrumentation in cli-runtime.
+    // Phase 8 metrics: classify this acquire as spawn vs cache-hit.
+    //
+    // M31: the previous heuristic sampled the GLOBAL `session_count()` before
+    // and after acquiring. Under concurrency, another agent's acquire/evict
+    // between the two samples flipped this acquire's attribution (a cache hit
+    // could be counted as a spawn and vice-versa). Instead, derive the metric
+    // from THIS acquire's own session: a session whose `created_at()` is at or
+    // after our acquire start must have been freshly spawned for us; otherwise
+    // it was reused from the pool. This is per-acquire and immune to the shared
+    // counter race.
     let metrics = crate::metrics::global_metrics();
-    let pre_count = session_count();
     let acquire_start = std::time::Instant::now();
     let lease = acquire_for_account_with_model(agent_id, cli_kind, bare_mode, account_id, model)
         .await
         .map_err(|e| format!("pty_runtime: acquire failed: {e}"))?;
-    if session_count() > pre_count {
+    let session = lease.arc();
+    if session.created_at() >= acquire_start {
         metrics.pty_pool_acquire_spawn();
     } else {
         metrics.pty_pool_acquire_cache_hit();
     }
-
-    let session = lease.arc();
     let result = session.invoke(prompt, Some(deadline)).await;
     let elapsed_ms = acquire_start.elapsed().as_millis() as u64;
 
@@ -573,6 +618,7 @@ pub async fn acquire_and_invoke_for_account_with_model(
 /// session invalidation, matching the in-process `looks_like_oauth_expiry`
 /// heuristic.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn invoke_via_managed_worker(
     client: &WorkerClient,
     agent_id: &str,
@@ -580,10 +626,30 @@ async fn invoke_via_managed_worker(
     bare_mode: bool,
     account_id: Option<&str>,
     model: Option<&str>,
+    env: &HashMap<String, String>,
     prompt: &str,
     deadline: Duration,
 ) -> Result<String, String> {
     let metrics = crate::metrics::global_metrics();
+
+    // HS14: per-account OAuth isolation. The worker REJECTS any account-rotation
+    // request whose `env` is empty (it cannot otherwise scope the spawned CLI to
+    // that account's credentials). Fail fast here with an actionable message
+    // rather than shipping the request and letting the worker reject it — and
+    // never spawn a child under the WRONG account's ambient OAuth.
+    if account_id.is_some() && env.is_empty() {
+        warn!(
+            agent_id = %agent_id,
+            "pty_runtime: account-bound managed-worker invoke is missing per-account env \
+             (HS14) — refusing to spawn under ambient OAuth"
+        );
+        return Err(
+            "pty_runtime: account rotation requested but no per-account credentials were \
+             supplied (HS14) — caller must populate AcquireOptions::env"
+                .to_string(),
+        );
+    }
+
     metrics.pty_pool_acquire_cache_hit(); // worker manages its own pool; from our side every call is one acquire
     // **Round 2 review fix (HIGH-3)**: pass the agent dir as
     // `work_dir` so the worker can chdir the spawned CLI for
@@ -601,6 +667,9 @@ async fn invoke_via_managed_worker(
         account_id: account_id.map(|s| s.to_string()),
         model: model.map(|s| s.to_string()),
         work_dir: work_dir.clone(),
+        // HS14: forward the resolved per-account credential env so the worker's
+        // spawned CLI uses this account's own OAuth (token / config dir).
+        env: env.clone(),
     };
     let start = std::time::Instant::now();
     let result = client

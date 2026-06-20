@@ -174,6 +174,7 @@ async fn rpc_invoke_rejects_unknown_cli_kind() {
                 account_id: None,
                 model: None,
                 work_dir: None,
+                env: HashMap::new(),
             },
             Duration::from_secs(2),
         )
@@ -206,6 +207,7 @@ async fn rpc_invoke_rejects_empty_prompt() {
                 account_id: None,
                 model: None,
                 work_dir: None,
+                env: HashMap::new(),
             },
             Duration::from_secs(2),
         )
@@ -239,6 +241,85 @@ async fn rpc_shutdown_session_no_op_when_session_absent() {
         .await
         .expect("shutdown_session");
     assert!(!result, "must return false for keys with no cached session");
+    let _ = handle.shutdown_tx.send(());
+    let _ = handle.join.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rpc_rejects_invalid_body_only_after_auth() {
+    // **Review fix (L21)**: an *unauthenticated* request with a garbage
+    // body must be rejected as `unauthorized` (401), proving the Bearer
+    // token is checked BEFORE the body is deserialized. If auth ran after
+    // deserialization the worker would parse attacker-controlled JSON
+    // first and could leak schema details via parse errors.
+    let handle = boot_server("real-token").await;
+    let base = format!("http://{}", handle.local_addr);
+    let client = reqwest::Client::new();
+    // No Authorization header + malformed JSON body.
+    let resp = client
+        .post(format!("{}{}", base, RPC_PATH))
+        .header("content-type", "application/json")
+        .body("{ this is not valid json")
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "unauthenticated garbage body must be 401, not 400"
+    );
+    let payload: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(payload["error"]["kind"], "unauthorized");
+
+    // With a valid token, a malformed body is now a `bad_request`.
+    let resp2 = client
+        .post(format!("{}{}", base, RPC_PATH))
+        .header("authorization", "Bearer real-token")
+        .header("content-type", "application/json")
+        .body("{ this is not valid json")
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp2.status().as_u16(), 400);
+    let payload2: serde_json::Value = resp2.json().await.expect("json");
+    assert_eq!(payload2["error"]["kind"], "bad_request");
+
+    let _ = handle.shutdown_tx.send(());
+    let _ = handle.join.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rpc_invoke_rejects_account_without_env() {
+    // **Review fix (HS14)**: when account rotation is requested
+    // (`account_id` Some) but no per-account env is supplied, the worker
+    // must fail fast rather than silently sharing the ambient account.
+    let handle = boot_server("real-token").await;
+    let base = format!("http://{}", handle.local_addr);
+    let client = WorkerClient::new(&base, "real-token").expect("client new");
+    let err = client
+        .invoke(
+            InvokeParams {
+                agent_id: "agent-x".into(),
+                cli_kind: "claude".into(),
+                bare_mode: false,
+                prompt: "hi".into(),
+                timeout_ms: 500,
+                account_id: Some("alice@example.com".into()),
+                model: None,
+                work_dir: None,
+                env: HashMap::new(), // missing per-account env
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect_err("must reject account_id without env");
+    match err {
+        ClientError::Worker { kind, message } => {
+            assert_eq!(kind, "bad_request");
+            assert!(message.contains("env"), "got: {message}");
+        }
+        other => panic!("expected Worker(bad_request), got {other:?}"),
+    }
     let _ = handle.shutdown_tx.send(());
     let _ = handle.join.await;
 }

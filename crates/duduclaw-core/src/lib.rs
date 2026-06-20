@@ -1,6 +1,8 @@
 pub mod agent_guard;
 pub mod cron_tz;
 pub mod error;
+pub mod fs_lock;
+pub mod match_utils;
 pub mod platform;
 pub mod text_utils;
 pub mod traits;
@@ -9,6 +11,8 @@ pub mod types;
 pub use agent_guard::{check_agent_file_write, check_bash_command, GuardDecision, AGENT_STRUCTURE_FILES};
 pub use cron_tz::{parse_timezone, should_fire_in_tz};
 pub use error::{DuDuClawError, Result};
+pub use fs_lock::with_file_lock;
+pub use match_utils::{origin_host_matches, word_contains_ci};
 pub use text_utils::{truncate_bytes, truncate_chars};
 pub use traits::{Channel, ContainerRuntime, MemoryEngine};
 pub use types::*;

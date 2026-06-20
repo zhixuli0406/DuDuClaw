@@ -73,16 +73,20 @@ impl PollTracker {
                 (Utc::now() - chrono::Duration::minutes(5)).format("%Y-%m-%d %H:%M:%S").to_string()
             });
 
+        // M53: capture the cutoff BEFORE issuing the query. Recording the
+        // timestamp after `search_read` returns means any record written
+        // during the round-trip falls into the gap `(query_start, now)` and
+        // is skipped forever. Sampling the cutoff first turns the gap into a
+        // harmless overlap (re-seen records are deduped downstream).
+        let cutoff = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
         let domain = vec![json!(["write_date", ">", since])];
         // Use configurable limit; default 500 to reduce missed events (MW-M1)
         let poll_limit = self.poll_limit.unwrap_or(500);
         let result = conn.search_read(model, domain, fields, poll_limit).await?;
 
-        // Update last poll timestamp
-        self.last_poll.insert(
-            model.to_string(),
-            Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        );
+        // Update last poll timestamp to the pre-query cutoff.
+        self.last_poll.insert(model.to_string(), cutoff);
 
         let records = result.as_array().cloned().unwrap_or_default();
         if !records.is_empty() {

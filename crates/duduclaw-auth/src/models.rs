@@ -137,6 +137,11 @@ pub struct User {
     pub created_at: String,
     pub updated_at: String,
     pub last_login: Option<String>,
+    /// When true, the user must set a new password before any other operation
+    /// is permitted. Set for the bootstrap admin (random initial password) and
+    /// cleared once the password is changed.
+    #[serde(default)]
+    pub must_change_password: bool,
 }
 
 /// A binding between a user and an agent.

@@ -201,7 +201,12 @@ pub fn build_router(cfg: &HttpServerConfig, dispatcher: McpDispatcher) -> Router
         call_timeout: cfg.call_timeout,
         home_dir: cfg.home_dir.clone(),
     };
+    build_router_with_state(cfg, state)
+}
 
+/// Build the router from a pre-constructed `HttpState` (so the SSE store can be
+/// shared with the background idle-eviction task in `run`).
+fn build_router_with_state(cfg: &HttpServerConfig, state: HttpState) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(healthz_handler))
         .route("/mcp/v1/call", post(call_handler));
@@ -225,7 +230,24 @@ pub fn build_router(cfg: &HttpServerConfig, dispatcher: McpDispatcher) -> Router
 // ── Server entry point ────────────────────────────────────────────────────────
 
 pub async fn run(cfg: HttpServerConfig, dispatcher: McpDispatcher) -> Result<(), String> {
-    let router = build_router(&cfg, dispatcher);
+    let state = HttpState {
+        dispatcher: Arc::new(dispatcher),
+        sse_store: Arc::new(SseEventStore::new()),
+        call_timeout: cfg.call_timeout,
+        home_dir: cfg.home_dir.clone(),
+    };
+
+    // D4: periodically evict idle SSE connections (no client ever called this before).
+    let sse_store = state.sse_store.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            ticker.tick().await;
+            sse_store.evict_idle();
+        }
+    });
+
+    let router = build_router_with_state(&cfg, state);
 
     info!(bind = %cfg.bind, "MCP HTTP server listening");
 
@@ -316,6 +338,19 @@ struct StreamQuery {
     api_key: Option<String>,
 }
 
+/// RAII guard that removes the SSE connection from the store when the response
+/// stream is dropped (i.e. the client disconnects), so the broadcast `tx` doesn't leak.
+struct ConnGuard {
+    store: Arc<SseEventStore>,
+    conn_id: String,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.store.remove_connection(&self.conn_id);
+    }
+}
+
 async fn stream_handler(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -328,19 +363,44 @@ async fn stream_handler(
             Err(r) => return r,
         };
 
+    // HP2: rate-gate the SSE endpoint just like the JSON-RPC endpoints.
+    if let Err(e) = state.dispatcher.rate_limiter.check(&principal.client_id, OpType::HttpRequest) {
+        let mut resp = into_axum_response(crate::mcp_dispatch::jsonrpc_error(
+            &Value::Null,
+            -32029,
+            &format!("HTTP rate limit exceeded, retry after {} seconds", e.retry_after_secs),
+        ));
+        resp.headers_mut().insert(
+            "Retry-After",
+            e.retry_after_secs.to_string().parse().unwrap_or_else(|_| "1".parse().unwrap()),
+        );
+        return resp;
+    }
+
     let conn_id = query
         .conn_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let (tx, rx) = broadcast::channel::<String>(256);
-    state.sse_store.register_connection(&conn_id, tx);
+    // HS7: record the owning principal so stream/call can verify ownership.
+    state
+        .sse_store
+        .register_connection(&conn_id, tx, &principal.client_id);
+
+    // D4: remove the connection when this stream is dropped (client disconnect).
+    let guard = ConnGuard {
+        store: state.sse_store.clone(),
+        conn_id: conn_id.clone(),
+    };
 
     let conn_id_clone = conn_id.clone();
     let client_id = principal.client_id.clone();
 
-    // Convert broadcast receiver to a Stream of SSE Events
+    // Convert broadcast receiver to a Stream of SSE Events. The `guard` is moved
+    // into the closure so it lives as long as the stream and runs on drop.
     let bcast_stream =
         tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(move |msg| {
+            let _ = &guard; // keep guard alive for the stream's lifetime
             let conn_id = conn_id_clone.clone();
             match msg {
                 Ok(data) => Some(Ok::<Event, std::convert::Infallible>(
@@ -400,6 +460,16 @@ async fn stream_call_handler(
     }
 
     let conn_id = query.conn_id.clone();
+
+    // HS7: only the principal that opened the SSE stream may push into it.
+    // Fail-closed: a non-existent connection is not owned by anyone.
+    if !state.sse_store.is_owner(&conn_id, &principal.client_id) {
+        return into_axum_response(crate::mcp_dispatch::jsonrpc_error(
+            &id,
+            -32003,
+            "Forbidden: conn_id does not belong to the authenticated principal",
+        ));
+    }
 
     // Push progress event
     let progress = serde_json::json!({

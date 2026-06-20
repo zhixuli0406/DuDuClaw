@@ -24,6 +24,11 @@ export default defineConfig({
       '/health': {
         target: gatewayUrl,
       },
+      // Dev-only: forward REST API calls (e.g. /api/login, /api/refresh,
+      // /api/me) to the gateway so `npm run dev` works without CORS issues.
+      '/api': {
+        target: gatewayUrl,
+      },
     },
   },
   build: {

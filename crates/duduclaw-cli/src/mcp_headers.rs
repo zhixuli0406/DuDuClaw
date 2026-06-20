@@ -169,7 +169,8 @@ impl std::fmt::Display for CapabilityMismatchError {
 /// Validate client's capability requirements against the server's [`CAPABILITY_REGISTRY`].
 ///
 /// **Permissive mode**: if `request_header` is `None`, all requests pass through.
-/// **Malformed header**: treated permissively (don't block clients on parse failures).
+/// **Malformed header**: fail-closed (M9) — a header that can't be parsed is
+/// rejected with a mismatch error rather than silently allowed.
 ///
 /// Returns `Err(CapabilityMismatchError)` listing each unsatisfied capability when:
 /// - A required capability is disabled or absent on this server, OR
@@ -183,7 +184,18 @@ pub fn validate_client_capabilities(
 
     let requested = match parse_capabilities(header_val) {
         Ok(caps) => caps,
-        Err(_) => return Ok(()), // malformed header → permissive (don't block)
+        // M9: a malformed capabilities header is a client error, not a licence
+        // to skip negotiation. Fail closed — reject rather than silently allow,
+        // so a garbled (or adversarially crafted) header can't bypass the gate.
+        Err(_) => {
+            return Err(CapabilityMismatchError {
+                missing: vec![MissingCapability {
+                    capability: "malformed-capabilities-header".to_string(),
+                    required_version: 0,
+                    server_version: None,
+                }],
+            });
+        }
     };
 
     if requested.is_empty() {
@@ -460,11 +472,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_malformed_header_is_permissive() {
-        // No '/' separator → parse_capabilities returns Err → permissive fallback
+    fn validate_malformed_header_is_fail_closed() {
+        // M9: No '/' separator → parse_capabilities returns Err → must be
+        // rejected (fail-closed), NOT silently allowed.
         let hv = HeaderValue::from_static("badformat");
         let result = validate_client_capabilities(Some(&hv));
-        assert!(result.is_ok(), "malformed header must not block the request (permissive fallback)");
+        assert!(result.is_err(), "malformed header must be rejected (fail-closed)");
     }
 
     // ── build_missing_capabilities_header tests ───────────────────────────────

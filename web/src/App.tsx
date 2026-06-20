@@ -21,13 +21,17 @@ import { KnowledgeHubPage } from './pages/KnowledgeHubPage';
 import { SharedWikiPage } from './pages/SharedWikiPage';
 import { OnboardWizardPage } from './pages/OnboardWizardPage';
 import { OdooPage } from './pages/OdooPage';
+import { InferencePage } from './pages/InferencePage';
 import { UsersPage } from './pages/UsersPage';
 import { McpPage } from './pages/McpPage';
+import { McpKeysPage } from './pages/McpKeysPage';
 import { TaskBoardPage } from './pages/TaskBoardPage';
+import { ForkPage } from './pages/ForkPage';
 import { MarketplacePage } from './pages/MarketplacePage';
 import { PartnerPortalPage } from './pages/PartnerPortalPage';
 import { ReliabilityPage } from './pages/ReliabilityPage';
 import { WikiTrustPage } from './pages/WikiTrustPage';
+import { GovernancePage } from './pages/GovernancePage';
 import { useConnectionStore } from './stores/connection-store';
 import { useAuthStore } from './stores/auth-store';
 import { ApprovalModal } from './components/ApprovalModal';
@@ -62,6 +66,7 @@ export function App() {
           <Route path="webchat" element={<WebChatPage />} />
           <Route path="agents" element={<AgentsPage />} />
           <Route path="tasks" element={<TaskBoardPage />} />
+          <Route path="forks" element={<ForkPage />} />
           <Route path="skills" element={<SkillMarketPage />} />
           <Route path="marketplace" element={<MarketplacePage />} />
           <Route path="memory" element={<MemoryPage />} />
@@ -83,11 +88,14 @@ export function App() {
             <Route path="channels" element={<ChannelsPage />} />
             <Route path="accounts" element={<AccountsPage />} />
             <Route path="security" element={<SecurityPage />} />
+            <Route path="governance" element={<GovernancePage />} />
             <Route path="reliability" element={<ReliabilityPage />} />
             <Route path="wiki-trust" element={<WikiTrustPage />} />
             <Route path="settings" element={<SettingsPage />} />
             <Route path="mcp" element={<McpPage />} />
+            <Route path="mcp-keys" element={<McpKeysPage />} />
             <Route path="odoo" element={<OdooPage />} />
+            <Route path="inference" element={<InferencePage />} />
             <Route path="users" element={<UsersPage />} />
           </Route>
         </Route>

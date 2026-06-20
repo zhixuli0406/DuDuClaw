@@ -1369,15 +1369,29 @@ fn prepare_claude_cmd(
         // Prior to v1.8.30 only `mcp__duduclaw__*` was listed, which meant
         // `WebSearch` / `WebFetch` (Anthropic server-side) silently returned
         // 0 results for cron researcher agents even though they work fine in
-        // interactive Claude Code. Explicitly listing them here restores
-        // research capability without opening up arbitrary code execution.
-        "--allowedTools", "mcp__duduclaw__*,WebSearch,WebFetch,Read,Write,Edit,Glob,Grep,Bash,TodoWrite",
+        // interactive Claude Code. The allowlist is applied below so a
+        // per-agent `allowed_tools` override (HS12) can narrow it.
         // Allow enough agentic turns for complex tasks (read → think → write).
         "--max-turns", "50",
     ]);
 
     // Apply tool restrictions based on agent capabilities (deny-by-default)
     let caps = capabilities.cloned().unwrap_or_default();
+
+    // HS12: honor a per-agent `allowed_tools` override. When configured, it
+    // becomes the ONLY auto-approved set (Claude Code allowlist mode), so an
+    // operator can pin a sub-agent to e.g. `["Read"]`. When unset, fall back to
+    // the curated default that restores WebSearch/WebFetch research capability.
+    const DEFAULT_ALLOWED_TOOLS: &str =
+        "mcp__duduclaw__*,WebSearch,WebFetch,Read,Write,Edit,Glob,Grep,Bash,TodoWrite";
+    let allowed = caps.allowed_tools();
+    let allowed_csv = if allowed.is_empty() {
+        DEFAULT_ALLOWED_TOOLS.to_string()
+    } else {
+        allowed.join(",")
+    };
+    cmd.args(["--allowedTools", &allowed_csv]);
+
     let denied = caps.disallowed_tools();
     if !denied.is_empty() {
         let denied_csv = denied.join(",");

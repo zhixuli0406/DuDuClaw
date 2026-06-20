@@ -213,6 +213,27 @@ impl QuotaState {
     }
 }
 
+/// 記錄單次 `evaluate_quota` 通過時所做的預留，供後續政策拒絕時回滾（HC11）。
+#[derive(Debug, Clone, Copy, Default)]
+struct QuotaReservation {
+    /// 是否預留了 1 個 token slot（`token_reserved += 1`）。
+    token_reserved: bool,
+    /// 是否預留了 1 個並發任務 slot（`pending_tasks += 1`）。
+    pending_task_reserved: bool,
+}
+
+impl QuotaReservation {
+    /// 未預留任何資源（拒絕路徑使用）。
+    fn none() -> Self {
+        Self::default()
+    }
+
+    /// 是否實際預留了任何資源。
+    fn is_active(&self) -> bool {
+        self.token_reserved || self.pending_task_reserved
+    }
+}
+
 // ── PolicyEvaluator ───────────────────────────────────────────────────────────
 
 /// 速率計數器的 Key：(agent_id, resource)。
@@ -276,12 +297,26 @@ impl PolicyEvaluator {
         }
 
         // 2. Quota check
+        //
+        // 通過後 evaluate_quota 會預留 token / task slot。若後續的 Lifecycle / Rate
+        // 政策拒絕了此操作，必須回滾預留，否則永久洩漏配額直到 24h 重置（HC11）。
+        let mut reservation = QuotaReservation::none();
         for policy in &policies {
             if let PolicyType::Quota(q) = policy {
                 if Self::applies_to(&q.agent_id, agent_id) {
-                    let result = self.evaluate_quota(agent_id, q, operation).await;
-                    if result.is_some() {
-                        return result.unwrap();
+                    let (result, res) = self.evaluate_quota(agent_id, q, operation).await;
+                    if let Some(deny) = result {
+                        // Quota itself denied — roll back any prior quota reservation,
+                        // then propagate the denial.
+                        if reservation.is_active() {
+                            self.rollback_quota_reservation(agent_id, &reservation).await;
+                        }
+                        return deny;
+                    }
+                    if res.is_active() {
+                        // Accumulate reservations across multiple applicable quota policies.
+                        reservation.token_reserved |= res.token_reserved;
+                        reservation.pending_task_reserved |= res.pending_task_reserved;
                     }
                 }
             }
@@ -292,8 +327,11 @@ impl PolicyEvaluator {
             if let PolicyType::Lifecycle(lp) = policy {
                 if Self::applies_to(&lp.agent_id, agent_id) {
                     let result = self.evaluate_lifecycle(agent_id, lp).await;
-                    if result.is_some() {
-                        return result.unwrap();
+                    if let Some(deny) = result {
+                        if reservation.is_active() {
+                            self.rollback_quota_reservation(agent_id, &reservation).await;
+                        }
+                        return deny;
                     }
                 }
             }
@@ -307,8 +345,13 @@ impl PolicyEvaluator {
                     && resource.as_ref().map_or(false, |res| *res == r.resource)
                 {
                     let result = self.evaluate_rate(agent_id, r).await;
-                    if result.is_some() {
-                        return result.unwrap();
+                    if let Some(rate_result) = result {
+                        // A Warn result is still "allowed" — keep the reservation in that
+                        // case; only roll back when the operation is actually denied.
+                        if !rate_result.allowed && reservation.is_active() {
+                            self.rollback_quota_reservation(agent_id, &reservation).await;
+                        }
+                        return rate_result;
                     }
                 }
             }
@@ -322,6 +365,18 @@ impl PolicyEvaluator {
     /// 檢查政策是否適用於此 Agent（`"*"` 適用於所有）。
     fn applies_to(policy_agent_id: &str, agent_id: &str) -> bool {
         policy_agent_id == "*" || policy_agent_id == agent_id
+    }
+
+    /// 判斷操作是否為唯讀（不佔用並發任務 slot）。
+    ///
+    /// Read-only operations don't spawn a task, so they must not reserve a
+    /// `pending_tasks` slot (HC11). They still count against the token budget
+    /// because reads can consume tokens.
+    fn is_read_only(operation: &Operation) -> bool {
+        matches!(
+            operation.op_type,
+            OperationType::MemoryRead | OperationType::WikiRead
+        )
     }
 
     /// 將操作類型對應到 Rate 資源類型。
@@ -346,20 +401,21 @@ impl PolicyEvaluator {
     ) -> Option<EvaluationResult> {
         let scope = &operation.scope;
 
-        // Check if scope requires approval
-        if policy.requires_approval_for(scope) {
-            return Some(EvaluationResult::require_approval(
-                &policy.policy_id,
-                format!("operation '{scope}' requires approval per policy '{}'", policy.policy_id),
-            ));
-        }
-
-        // Check if scope is denied
+        // Check if scope is denied FIRST — an explicit deny always wins over
+        // approval routing, even if the same scope also appears in requires_approval.
         if policy.denied_scopes.contains(scope) {
             return Some(EvaluationResult::deny(
                 &policy.policy_id,
                 ViolationType::PermissionDenied,
                 format!("scope '{scope}' is denied by policy '{}'", policy.policy_id),
+            ));
+        }
+
+        // Check if scope requires approval
+        if policy.requires_approval_for(scope) {
+            return Some(EvaluationResult::require_approval(
+                &policy.policy_id,
+                format!("operation '{scope}' requires approval per policy '{}'", policy.policy_id),
             ));
         }
 
@@ -385,12 +441,17 @@ impl PolicyEvaluator {
     /// 呼叫者在實際執行後必須：
     /// - 呼叫 `increment_concurrent_tasks()` 確認並轉為正式計數（同時釋放 `pending_tasks`）
     /// - 呼叫 `record_tokens_used()` 記錄實際用量（同時釋放 `token_reserved`）
+    ///
+    /// 回傳 `(result, reservation)`：`result` 為 `Some` 表示拒絕（未預留任何資源）；
+    /// `result` 為 `None` 表示通過，`reservation` 記錄此次預留了哪些資源，
+    /// 供呼叫端在後續政策拒絕時回滾（HC11）。
     async fn evaluate_quota(
         &self,
         agent_id: &str,
         policy: &QuotaPolicy,
-        _operation: &Operation,
-    ) -> Option<EvaluationResult> {
+        operation: &Operation,
+    ) -> (Option<EvaluationResult>, QuotaReservation) {
+        let read_only = Self::is_read_only(operation);
         let mut quota_map = self.quota_states.write().await;
         let state = quota_map
             .entry(agent_id.to_string())
@@ -398,48 +459,90 @@ impl PolicyEvaluator {
 
         state.reset_if_needed();
 
-        // Check concurrent tasks（含 pending 預留，防 TOCTOU）
-        if state.concurrent_tasks.saturating_add(state.pending_tasks) >= policy.max_concurrent_tasks
+        // Check concurrent tasks（含 pending 預留，防 TOCTOU）。
+        // 唯讀操作不會啟動任務，因此跳過此檢查並不預留 task slot（HC11）。
+        if !read_only
+            && state.concurrent_tasks.saturating_add(state.pending_tasks)
+                >= policy.max_concurrent_tasks
         {
-            return Some(EvaluationResult::deny(
-                &policy.policy_id,
-                ViolationType::QuotaExceeded,
-                format!(
-                    "max_concurrent_tasks ({}) exceeded for agent '{}' per policy '{}'",
-                    policy.max_concurrent_tasks, agent_id, policy.policy_id
-                ),
-            ));
+            return (
+                Some(EvaluationResult::deny(
+                    &policy.policy_id,
+                    ViolationType::QuotaExceeded,
+                    format!(
+                        "max_concurrent_tasks ({}) exceeded for agent '{}' per policy '{}'",
+                        policy.max_concurrent_tasks, agent_id, policy.policy_id
+                    ),
+                )),
+                QuotaReservation::none(),
+            );
         }
 
         // Check token budget（含 reserved 預留，防 TOCTOU）
         if state.token_used.saturating_add(state.token_reserved) >= policy.daily_token_budget {
-            return Some(EvaluationResult::deny(
-                &policy.policy_id,
-                ViolationType::QuotaExceeded,
-                format!(
-                    "daily_token_budget ({}) exhausted for agent '{}' per policy '{}'",
-                    policy.daily_token_budget, agent_id, policy.policy_id
-                ),
-            ));
+            return (
+                Some(EvaluationResult::deny(
+                    &policy.policy_id,
+                    ViolationType::QuotaExceeded,
+                    format!(
+                        "daily_token_budget ({}) exhausted for agent '{}' per policy '{}'",
+                        policy.daily_token_budget, agent_id, policy.policy_id
+                    ),
+                )),
+                QuotaReservation::none(),
+            );
         }
 
         // Check memory entries
         if state.memory_entries >= policy.max_memory_entries {
-            return Some(EvaluationResult::deny(
-                &policy.policy_id,
-                ViolationType::QuotaExceeded,
-                format!(
-                    "max_memory_entries ({}) exceeded for agent '{}' per policy '{}'",
-                    policy.max_memory_entries, agent_id, policy.policy_id
-                ),
-            ));
+            return (
+                Some(EvaluationResult::deny(
+                    &policy.policy_id,
+                    ViolationType::QuotaExceeded,
+                    format!(
+                        "max_memory_entries ({}) exceeded for agent '{}' per policy '{}'",
+                        policy.max_memory_entries, agent_id, policy.policy_id
+                    ),
+                )),
+                QuotaReservation::none(),
+            );
         }
 
-        // 原子性預留：在同一寫鎖內標記資源已被預定，防止並發請求競爭同一配額
-        state.pending_tasks = state.pending_tasks.saturating_add(1);
+        // 原子性預留：在同一寫鎖內標記資源已被預定，防止並發請求競爭同一配額。
+        // 唯讀操作只預留 token（不預留 task slot）。
+        let reserved_task = !read_only;
+        if reserved_task {
+            state.pending_tasks = state.pending_tasks.saturating_add(1);
+        }
         state.token_reserved = state.token_reserved.saturating_add(1);
 
-        None
+        (
+            None,
+            QuotaReservation {
+                token_reserved: true,
+                pending_task_reserved: reserved_task,
+            },
+        )
+    }
+
+    /// 回滾 `evaluate_quota()` 所做的預留（HC11）。
+    ///
+    /// 當 quota 通過後，後續政策（Lifecycle / Rate）拒絕該操作時呼叫，
+    /// 否則預留的 `token_reserved` / `pending_tasks` 永遠不會被釋放，
+    /// 直到 24h 重置為止 → 配額洩漏。
+    async fn rollback_quota_reservation(&self, agent_id: &str, reservation: &QuotaReservation) {
+        if !reservation.token_reserved && !reservation.pending_task_reserved {
+            return;
+        }
+        let mut quota_map = self.quota_states.write().await;
+        if let Some(state) = quota_map.get_mut(agent_id) {
+            if reservation.token_reserved {
+                state.token_reserved = state.token_reserved.saturating_sub(1);
+            }
+            if reservation.pending_task_reserved {
+                state.pending_tasks = state.pending_tasks.saturating_sub(1);
+            }
+        }
     }
 
     /// 評估 LifecyclePolicy（idle 時間計算）。
@@ -853,6 +956,161 @@ policies:
         let result = evaluator.evaluate("test-agent", &op).await;
         assert!(!result.allowed);
         assert_eq!(result.violation_type, Some(ViolationType::QuotaExceeded));
+    }
+
+    // ── HC11: quota reservation rollback / read-only ──────────────────────────
+
+    /// 測試輔助：讀取 agent 目前的預留量。
+    async fn reservations(evaluator: &PolicyEvaluator, agent_id: &str) -> (u64, u32) {
+        let map = evaluator.quota_states.read().await;
+        map.get(agent_id)
+            .map(|s| (s.token_reserved, s.pending_tasks))
+            .unwrap_or((0, 0))
+    }
+
+    /// HC11: quota 通過後若 Rate 政策拒絕，必須回滾預留，否則永久洩漏。
+    #[tokio::test]
+    async fn test_quota_reservation_rolled_back_on_rate_deny() {
+        let yaml = r#"
+policies:
+  - policy_type: quota
+    policy_id: q
+    agent_id: "*"
+    daily_token_budget: 1000000
+    max_concurrent_tasks: 100
+    max_memory_entries: 100000
+  - policy_type: rate
+    policy_id: r
+    agent_id: "*"
+    resource: mcp_calls
+    limit: 1
+    window_seconds: 60
+    action_on_violation: reject
+"#;
+        let (_reg, evaluator, _dir) = make_evaluator_with_policies(yaml).await;
+
+        let op = Operation {
+            op_type: OperationType::McpCall,
+            resource_id: None,
+            scope: "mcp:call".into(),
+            metadata: serde_json::json!({}),
+        };
+
+        // 1st call passes quota + rate → reservation stays (consumed by caller later).
+        let r1 = evaluator.evaluate("agent", &op).await;
+        assert!(r1.allowed);
+        let (tok1, task1) = reservations(&evaluator, "agent").await;
+        assert_eq!((tok1, task1), (1, 1), "1st pass reserves 1 token + 1 task");
+
+        // 2nd call: quota passes (reserves), but rate REJECTS → reservation must roll back.
+        let r2 = evaluator.evaluate("agent", &op).await;
+        assert!(!r2.allowed);
+        assert_eq!(r2.violation_type, Some(ViolationType::RateExceeded));
+        let (tok2, task2) = reservations(&evaluator, "agent").await;
+        assert_eq!(
+            (tok2, task2),
+            (1, 1),
+            "denied call must not leak a reservation"
+        );
+    }
+
+    /// HC11: quota 通過後若 Lifecycle 政策拒絕，必須回滾預留。
+    #[tokio::test]
+    async fn test_quota_reservation_rolled_back_on_lifecycle_deny() {
+        let yaml = r#"
+policies:
+  - policy_type: quota
+    policy_id: q
+    agent_id: "*"
+    daily_token_budget: 1000000
+    max_concurrent_tasks: 100
+    max_memory_entries: 100000
+  - policy_type: lifecycle
+    policy_id: lc
+    agent_id: "*"
+    max_idle_hours: 1
+    health_check_interval_seconds: 60
+    auto_suspend_on_violation_count: 10
+"#;
+        let (_reg, evaluator, _dir) = make_evaluator_with_policies(yaml).await;
+
+        // Make the agent appear idle for 2h → lifecycle denies.
+        evaluator
+            .set_last_activity_for_test("agent", Instant::now() - Duration::from_secs(7200))
+            .await;
+
+        let op = Operation {
+            op_type: OperationType::McpCall,
+            resource_id: None,
+            scope: "mcp:call".into(),
+            metadata: serde_json::json!({}),
+        };
+
+        let r = evaluator.evaluate("agent", &op).await;
+        assert!(!r.allowed);
+        assert_eq!(r.violation_type, Some(ViolationType::LifecycleViolation));
+        let (tok, task) = reservations(&evaluator, "agent").await;
+        assert_eq!((tok, task), (0, 0), "lifecycle deny must roll back reservation");
+    }
+
+    /// HC11: 唯讀操作不應預留並發任務 slot（只預留 token）。
+    #[tokio::test]
+    async fn test_read_only_op_does_not_reserve_task_slot() {
+        let yaml = r#"
+policies:
+  - policy_type: quota
+    policy_id: q
+    agent_id: "*"
+    daily_token_budget: 1000000
+    max_concurrent_tasks: 1
+    max_memory_entries: 100000
+"#;
+        let (_reg, evaluator, _dir) = make_evaluator_with_policies(yaml).await;
+
+        let read_op = Operation {
+            op_type: OperationType::MemoryRead,
+            resource_id: None,
+            scope: "memory:read".into(),
+            metadata: serde_json::json!({}),
+        };
+
+        // Many read-only ops must all pass without exhausting the 1-task slot.
+        for _ in 0..5 {
+            let r = evaluator.evaluate("agent", &read_op).await;
+            assert!(r.allowed, "read-only op must not consume a task slot");
+        }
+        let (_tok, task) = reservations(&evaluator, "agent").await;
+        assert_eq!(task, 0, "read-only ops reserve no task slots");
+    }
+
+    // ── M11: deny wins over approval ──────────────────────────────────────────
+
+    /// M11: 同時在 denied_scopes 與 requires_approval 的 scope 應被硬拒絕，而非送審批。
+    #[tokio::test]
+    async fn test_denied_scope_wins_over_approval() {
+        let yaml = r#"
+policies:
+  - policy_type: permission
+    policy_id: p
+    agent_id: "*"
+    allowed_scopes: []
+    denied_scopes:
+      - dangerous
+    requires_approval:
+      - dangerous
+"#;
+        let (_reg, evaluator, _dir) = make_evaluator_with_policies(yaml).await;
+
+        let op = Operation {
+            op_type: OperationType::McpCall,
+            resource_id: None,
+            scope: "dangerous".into(),
+            metadata: serde_json::json!({}),
+        };
+        let result = evaluator.evaluate("agent", &op).await;
+        assert!(!result.allowed);
+        assert!(!result.approval_required, "deny must win over approval");
+        assert_eq!(result.violation_type, Some(ViolationType::PermissionDenied));
     }
 
     // ── No policy = allow ─────────────────────────────────────────────────────

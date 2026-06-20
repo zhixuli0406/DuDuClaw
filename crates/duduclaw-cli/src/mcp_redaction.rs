@@ -136,8 +136,24 @@ impl McpRedactionLayer {
     /// Decide what to do with a tool call whose arguments may contain
     /// `<REDACT:...>` tokens.
     pub fn decide_tool_args(&self, tool_name: &str, args: &Value) -> EgressDecision {
+        // C3 fix: build a Caller so the egress path enforces each token's
+        // RestoreScope. An MCP tool call is made by the agent (not the channel
+        // end-user), so it is never `owner`; Owner-scoped PII therefore will not
+        // be exfiltrated to external tools. Operators grant an agent the scopes
+        // a tool legitimately needs via `DUDUCLAW_REDACTION_SCOPES`
+        // (comma-separated, e.g. `FinanceRead`); `RedactionAdmin` bypasses all.
+        let scopes: Vec<String> = std::env::var("DUDUCLAW_REDACTION_SCOPES")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let caller = duduclaw_redaction::Caller::agent(self.agent_id.clone(), scopes);
         self.manager
-            .decide_tool_call(tool_name, args, &self.agent_id, Some(&self.session_id))
+            .decide_tool_call(tool_name, args, &self.agent_id, Some(&self.session_id), &caller)
             .unwrap_or_else(|e| {
                 tracing::error!(
                     target: "duduclaw_cli::mcp_redaction",

@@ -101,14 +101,16 @@ pub fn check_agent_file_write(file_path: &Path, home: &Path) -> GuardDecision {
     // Using components lets us avoid a false positive where a file path
     // is *equal to* `<home>/agents/` itself (which has no <name> segment),
     // and also avoids being fooled by sibling paths like `<home>/agentsX/`.
-    if normalized.starts_with(&agents_root) {
-        let suffix: Vec<_> = normalized
-            .strip_prefix(&agents_root)
-            .map(|p| p.components().collect())
-            .unwrap_or_default();
+    //
+    // L19 fix: `Path::starts_with` is case-sensitive, which wrongly *rejects*
+    // a legitimate write on a case-insensitive filesystem (macOS / Windows)
+    // when the configured `home` and the actual `file_path` differ only in
+    // case (e.g. `/Users/Alice/...` vs `/users/alice/...`). Use a
+    // case-insensitive component comparison instead.
+    if let Some(suffix_len) = strip_prefix_ci(&normalized, &agents_root) {
         // Need at least one component (the agent name) after `agents/`,
         // plus the file basename — so >= 2 components total.
-        if suffix.len() >= 2 {
+        if suffix_len >= 2 {
             return GuardDecision::AllowedAgentWrite;
         }
     }
@@ -153,8 +155,21 @@ pub fn check_agent_file_write(file_path: &Path, home: &Path) -> GuardDecision {
 pub fn check_bash_command(command: &str, _home: &Path) -> GuardDecision {
     const SENTINEL: &str = ".claude/agents/";
 
+    // L19 fix: match the sentinel robustly. The previous `command.find(...)`
+    // matched only forward slashes and was case-sensitive, so
+    // `.claude\agents\` (Windows separators) or `.CLAUDE/Agents/`
+    // (case-insensitive filesystems) slipped through. Normalize a scratch
+    // copy — backslashes → forward slashes, lowercased — and locate the
+    // sentinel there. Since this transform is 1:1 on byte length, the match
+    // offset maps directly back onto the original `command` for the
+    // human-readable "attempted path" extraction below.
+    let normalized: String = command
+        .chars()
+        .map(|c| if c == '\\' { '/' } else { c.to_ascii_lowercase() })
+        .collect();
+
     // Fast path — no sentinel anywhere means nothing to inspect.
-    let Some(idx) = command.find(SENTINEL) else {
+    let Some(idx) = normalized.find(SENTINEL) else {
         return GuardDecision::NotAgentFile;
     };
 
@@ -177,6 +192,30 @@ pub fn check_bash_command(command: &str, _home: &Path) -> GuardDecision {
         file_name: SENTINEL.trim_end_matches('/').to_string(),
         attempted_path: PathBuf::from(attempted),
     }
+}
+
+/// Case-insensitive component-wise prefix check.
+///
+/// Returns `Some(suffix_component_count)` when `path` is `prefix` followed by
+/// zero or more components, comparing each component case-insensitively
+/// (matching how macOS/Windows filesystems treat paths). Returns `None` when
+/// `path` is not under `prefix`. The leading root/prefix components are
+/// matched verbatim via `eq_ignore_ascii_case` on their lossy string form.
+fn strip_prefix_ci(path: &Path, prefix: &Path) -> Option<usize> {
+    let mut path_comps = path.components();
+    for pc in prefix.components() {
+        let Some(actual) = path_comps.next() else {
+            return None;
+        };
+        if !pc
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&actual.as_os_str().to_string_lossy())
+        {
+            return None;
+        }
+    }
+    Some(path_comps.count())
 }
 
 /// Lexical path normalization — resolves `.`, `..`, and duplicate separators
@@ -439,6 +478,64 @@ mod tests {
         let cmd = "mkdir -p /Users/alice/.duduclaw/agents/agnes/.claude/agents/bad";
         assert!(matches!(
             check_bash_command(cmd, &home()),
+            GuardDecision::BlockedOutsideHome { .. }
+        ));
+    }
+
+    // ── L19: separator / case variants ──────────────────────────────
+
+    #[test]
+    fn bash_with_windows_backslash_separators_is_blocked() {
+        // Windows-style backslashes must not bypass the sentinel.
+        let cmd = r"mkdir C:\Users\bob\project\.claude\agents\evil";
+        assert!(matches!(
+            check_bash_command(cmd, &home()),
+            GuardDecision::BlockedOutsideHome { .. }
+        ));
+    }
+
+    #[test]
+    fn bash_with_mixed_case_sentinel_is_blocked() {
+        // Case-insensitive filesystems: `.CLAUDE/Agents/` is the same path.
+        let cmd = "mkdir -p /project/.CLAUDE/Agents/evil";
+        assert!(matches!(
+            check_bash_command(cmd, &home()),
+            GuardDecision::BlockedOutsideHome { .. }
+        ));
+    }
+
+    #[test]
+    fn bash_backslash_attempted_path_is_recovered() {
+        // The human-readable attempted path is still extracted correctly even
+        // when the original used backslashes (offsets are length-preserving).
+        let cmd = r"cp t.toml C:\proj\.claude\agents\x\agent.toml";
+        match check_bash_command(cmd, &home()) {
+            GuardDecision::BlockedOutsideHome { attempted_path, .. } => {
+                assert!(attempted_path.to_string_lossy().contains(".claude"));
+            }
+            other => panic!("expected block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_write_with_mixed_case_home_is_allowed() {
+        // On a case-insensitive FS the configured home and the actual path may
+        // differ only in case; the legitimate write must still be allowed.
+        let home = PathBuf::from("/Users/Alice/.duduclaw");
+        let p = PathBuf::from("/users/alice/.duduclaw/agents/agnes/agent.toml");
+        assert_eq!(
+            check_agent_file_write(&p, &home),
+            GuardDecision::AllowedAgentWrite
+        );
+    }
+
+    #[test]
+    fn file_write_sibling_dir_still_blocked_case_insensitive() {
+        // `agentsX` must not be mistaken for `agents` even case-insensitively.
+        let home = PathBuf::from("/Users/Alice/.duduclaw");
+        let p = PathBuf::from("/users/alice/.duduclaw/agentsX/agnes/agent.toml");
+        assert!(matches!(
+            check_agent_file_write(&p, &home),
             GuardDecision::BlockedOutsideHome { .. }
         ));
     }

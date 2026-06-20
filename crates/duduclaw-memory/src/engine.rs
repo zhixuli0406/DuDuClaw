@@ -277,7 +277,8 @@ impl SqliteMemoryEngine {
                     .prepare(
                         "SELECT id FROM memories
                          WHERE agent_id = ?1 AND subject = ?2 AND predicate = ?3
-                           AND valid_until IS NULL",
+                           AND valid_until IS NULL
+                         ORDER BY COALESCE(valid_from, timestamp) DESC, created_at DESC, id DESC",
                     )
                     .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
                 let rows = stmt
@@ -578,11 +579,16 @@ impl SqliteMemoryEngine {
             |row| row.get(0),
         ).unwrap_or(0);
 
+        // `timestamp` is stored as RFC3339; comparing it against SQLite's
+        // `datetime('now', ...)` format (YYYY-MM-DD HH:MM:SS, no 'T'/offset) is an
+        // unreliable string compare. Bind an RFC3339 cutoff computed in Rust instead
+        // (mirrors the fix applied in `search()`).
+        let cutoff_rfc = (Utc::now() - chrono::Duration::days(7)).to_rfc3339();
         let high_episodic: u32 = conn.query_row(
             "SELECT COUNT(*) FROM memories
              WHERE agent_id = ?1 AND layer = 'episodic' AND importance >= 7.0
-             AND timestamp >= datetime('now', '-7 days')",
-            params![agent_id],
+             AND timestamp >= ?2",
+            params![agent_id, cutoff_rfc],
             |row| row.get(0),
         ).unwrap_or(0);
 
@@ -1072,6 +1078,22 @@ impl SqliteMemoryEngine {
 
     /// Search key facts by query using FTS5 full-text search.
     pub async fn search_facts(&self, agent_id: &str, query: &str, limit: u32) -> Result<Vec<KeyFact>> {
+        // Sanitize FTS5 query the same way `search()`/`search_layer()` do: strip ALL
+        // special characters and operators, then wrap as a phrase query (HC8). Without
+        // this, an unescaped colon — e.g. the `[sender_id: {id}]` prefix injected on
+        // authenticated turns — is parsed as an FTS5 column operator and MATCH fails.
+        // Done before locking `conn` so the empty-query fallback can re-lock safely.
+        let cleaned: String = query
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\'' | ':' | '^' | '{' | '}' | '*' | '(' | ')'))
+            .take(500)
+            .collect();
+        if cleaned.trim().is_empty() {
+            // Nothing searchable — fall back to recency.
+            return self.get_recent_facts(agent_id, limit).await;
+        }
+        let sanitized_query = format!("\"{}\"", cleaned.replace('"', ""));
+
         let conn = self.conn.lock().await;
 
         // FTS5 search with agent_id filter via JOIN
@@ -1087,7 +1109,7 @@ impl SqliteMemoryEngine {
             .map_err(|e| DuDuClawError::Memory(format!("search_facts prepare: {e}")))?;
 
         let rows = stmt
-            .query_map(params![agent_id, query, limit], |row| {
+            .query_map(params![agent_id, sanitized_query, limit], |row| {
                 Ok(KeyFact {
                     id: row.get(0)?,
                     agent_id: row.get(1)?,
@@ -1106,9 +1128,12 @@ impl SqliteMemoryEngine {
             facts.push(row.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
         }
 
-        // Fallback: if FTS5 returns nothing (query too short, no match), use recency
+        // Fallback: if FTS5 returns nothing (query too short, no match), use recency.
+        // Release the connection lock first — `get_recent_facts` re-acquires it, so
+        // holding it here would deadlock.
         if facts.is_empty() {
             drop(stmt);
+            drop(conn);
             return self.get_recent_facts(agent_id, limit).await;
         }
 
@@ -1519,5 +1544,112 @@ mod tests {
             .unwrap();
         let n = engine.count_active_with_tag(agent, "reflexion").await.unwrap();
         assert_eq!(n, 3);
+    }
+
+    // ── HC8: search_facts FTS5 sanitization ─────────────────────────────────────
+
+    /// A query containing a colon (FTS5 column operator) — e.g. the `[sender_id: x]`
+    /// prefix injected on authenticated turns — must not break MATCH; sanitization
+    /// strips it so the remaining terms still match.
+    #[tokio::test]
+    async fn search_facts_sanitizes_colon_prefix() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "facts-agent";
+        engine
+            .store_fact(agent, "the deploy password is hunter2", "tg", "c1", "s1")
+            .await
+            .unwrap();
+
+        // Without sanitization the colon is parsed as a column filter and MATCH errors
+        // (which the old code surfaced as an error / empty result).
+        let results = engine
+            .search_facts(agent, "[sender_id: 12345] deploy password", 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "colon-prefixed query should still match");
+        assert!(results[0].fact.contains("deploy password"));
+    }
+
+    /// Other FTS5 special characters must not break MATCH either.
+    #[tokio::test]
+    async fn search_facts_sanitizes_special_chars() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "facts-agent-2";
+        engine
+            .store_fact(agent, "favorite editor is neovim", "tg", "c1", "s1")
+            .await
+            .unwrap();
+
+        let results = engine
+            .search_facts(agent, "(favorite* editor) OR \"neovim\"", 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "special chars should be stripped, term matched");
+    }
+
+    // ── M38: semantic_conflict_count timestamp normalization ────────────────────
+
+    /// High-importance episodic memories stored with an RFC3339 timestamp must be
+    /// counted as recent (the comparison cutoff is now an RFC3339 param, not the
+    /// mismatched SQLite `datetime('now')` string format).
+    #[tokio::test]
+    async fn semantic_conflict_counts_recent_rfc3339_episodic() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "conflict-agent";
+        for i in 0..4 {
+            let mut e = make_entry(agent, &format!("important episodic memory {i}"), vec![]);
+            e.importance = 8.0; // >= 7.0 threshold
+            engine.store(agent, e).await.unwrap();
+        }
+        // No semantic memories, 4 high-importance episodic ⇒ count == high_episodic.
+        let n = engine.semantic_conflict_count(agent).await;
+        assert_eq!(n, 4, "recent RFC3339 episodic memories must be counted");
+    }
+
+    // ── M57: store_temporal deterministic supersedes back-pointer ───────────────
+
+    /// When multiple active rows share the same (subject, predicate), the new row's
+    /// `supersedes` back-pointer must deterministically point at the most recent of
+    /// them (ordered by valid_from/created_at DESC, then id).
+    #[tokio::test]
+    async fn store_temporal_supersedes_picks_most_recent_deterministically() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "det-agent";
+
+        // Insert two active rows for the same triple directly so both have
+        // valid_until = NULL (simulating a pre-existing ambiguous state).
+        {
+            let conn = engine.conn.lock().await;
+            let older = Utc::now() - Duration::hours(2);
+            let newer = Utc::now() - Duration::hours(1);
+            for (id, vf) in [("old-id", older), ("new-id", newer)] {
+                conn.execute(
+                    "INSERT INTO memories
+                        (id, agent_id, content, timestamp, tags, layer, importance,
+                         access_count, source_event, valid_from, subject, predicate, object)
+                     VALUES (?1,?2,?3,?4,'[]','semantic',5.0,0,'',?5,?6,?7,?8)",
+                    params![id, agent, "x", vf.to_rfc3339(), vf.to_rfc3339(), "s", "p", "o"],
+                )
+                .unwrap();
+            }
+        }
+
+        let e = make_entry(agent, "superseding value", vec![]);
+        let new_id = engine
+            .store_temporal(agent, e, triple_meta("s", "p", "z"))
+            .await
+            .unwrap();
+
+        let row = engine.get_by_id(agent, &new_id).await.unwrap().unwrap();
+        // Most recent active row was "new-id" (valid_from -1h > -2h).
+        let history = engine.get_history(agent, "s", "p").await.unwrap();
+        let new_row = history.iter().find(|r| r.id == new_id).unwrap();
+        assert_eq!(
+            new_row.supersedes.as_deref(),
+            Some("new-id"),
+            "back-pointer must deterministically target the most recent active row"
+        );
+        // Sanity: the stored row exists.
+        assert_eq!(row.id, new_id);
     }
 }

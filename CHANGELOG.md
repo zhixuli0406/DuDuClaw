@@ -1,6 +1,63 @@
 # Changelog
 
 
+## [Unreleased] — RFC-26: Live Run Forking (deep-agents alignment)
+
+Inspired by [vstorm-co/pydantic-deepagents](https://github.com/vstorm-co/pydantic-deepagents),
+this adds **Live Run Forking** — split an in-flight agent task into N competing
+branches that explore different strategies in isolated copy-on-write workspaces,
+then let an AI judge pick the winner. **Default off**; per-agent opt-in via
+`agent.toml [fork] enabled = true`. See `docs/rfc/RFC-26-deep-agents-alignment.md` and
+`docs/todo/TODO-rfc26-live-forking.md`.
+
+### Added
+- **New crate `duduclaw-fork`** — the forking engine: `Branch`/`BranchState`,
+  copy-on-write `BranchOverlay` (reads fall through to parent, writes stay local,
+  `promote()` merges the winner), per-branch + aggregate `budget::Pool`,
+  `ForkController` over a decoupled `BranchExecutor` trait, a `JudgeAgent` with the
+  deep-agents confidence formula (`quality·0.4 + test_pass·0.4 + consistency·0.2`),
+  4 merge modes (`manual`/`auto`/`auto_with_fallback`/`vote`), and a `test_runner`
+  that scores branches by their configured test command. (49 unit tests.)
+- **6 MCP tools** gated by the new `Scope::ForkExecute` + the `[fork] enabled`
+  toggle: `fork_run`, `inspect_branches`, `diff_branches`, `merge_or_select`,
+  `terminate_branch`, `fork_cost` (`crates/duduclaw-cli/src/mcp_fork.rs`).
+- **`RotatingBranchExecutor`** — runs each branch through the `AccountRotator`
+  + a real `claude` spawner, enforcing per-branch and aggregate USD budgets; forks
+  execute in a **background** task so the MCP stdio loop never blocks. Branch
+  outcomes + spend recorded to `~/.duduclaw/fork_history.jsonl` (advisory-locked)
+  with in-process `FORK_METRICS` counters (`crates/duduclaw-cli/src/mcp_fork_exec.rs`).
+- **Checkpoint fork/rewind** (`duduclaw-durability`) — `fork(checkpoint_id, new_task)`
+  copies state under a new lineage, `rewind(task, checkpoint_id)` restores an earlier
+  snapshot, `Checkpoint.parent_checkpoint_id` tracks lineage; id-addressable archive.
+- **Smoke harness** `scripts/smoke-fork.{sh,ps1}`.
+
+### Added (round 2 — cross-process + parity follow-ups)
+- **Shared SQLite fork store** (`duduclaw-fork::ForkStore`, WAL at `~/.duduclaw/fork_store.db`) — the
+  cross-process source of truth. `mcp_fork`/`mcp_fork_exec` refactored onto it.
+- **Gateway `/metrics`** emits `duduclaw_fork_*` lines (read from the store at scrape time).
+- **Dashboard ForkPage** (`web/`) + `fork.list/inspect/resolve` WebSocket RPC — list forks, compare
+  branches side by side, see the judge's winner, resolve manually. New `/forks` route + nav.
+- **`memory_improve`** MCP tool — clusters memories by tag into a propose-not-apply reflection scaffold.
+- **`plan_start`** MCP tool (Plan Mode) — clarify-first planning scaffold, `agent.toml [planner]` toggle.
+- **Built-in skills** — `code-review`/`refactor`/`test-writer`/`git-workflow` seeded idempotently into
+  every new agent's `SKILLS/` at creation.
+- **Checkpoint durability** — `CheckpointManager::with_persistence` SQLite backend; fork/rewind/lineage
+  survive restart. **Task Board** — `claim_task` (atomic CAS) + parent-cycle detection.
+- **Fork executor hardening** — branches capped to distinct available accounts (logged); pre-spawn
+  cancellation registry for `terminate_branch`.
+
+### Added (round 3 — the last deferred items)
+- **Native copy-on-write overlay** — `BranchOverlay` clones the parent workspace via `clonefile(2)`
+  (`cp -c`, macOS/APFS) or `cp --reflink` (Linux btrfs/XFS); `detect_backend()` probes once and falls
+  back to the snapshot copy if unavailable.
+- **Streaming budget enforcement + external SIGKILL** — `ClaudeCliSpawner` streams stream-json, charges
+  `total_cost_usd` incrementally, and kills the child mid-stream on per-branch overspend
+  (`SpawnOutcome::BudgetExceeded`); a per-branch kill-switch registry lets `terminate_branch` SIGKILL an
+  in-flight subprocess (`→ Terminated`).
+- **Activity-Feed mirroring** — fork resolutions write a `fork_resolved` row into the gateway's
+  cross-process `activity` table (`<home>/tasks.db`), surfacing on the dashboard Activity Feed.
+
+
 ## [1.21.1] - 2026-06-18 — Channel routing: stop bot "identity mixing"
 
 ### Fixed

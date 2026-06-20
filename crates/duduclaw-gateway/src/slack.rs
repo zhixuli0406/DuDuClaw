@@ -478,18 +478,43 @@ async fn remove_reaction_add_done(http: &reqwest::Client, token: &str, channel: 
         .await;
 }
 
-/// Split a message into chunks of max_len characters, respecting line boundaries.
+/// Split a message into chunks of at most `max_len` bytes, respecting line
+/// boundaries. Byte offsets are snapped to UTF-8 char boundaries.
+///
+/// L9: a long CJK run with no newline would previously slice `text[start..end]`
+/// mid-character and panic. `truncate_bytes` walks back to the nearest char
+/// boundary, so the split is always safe.
 fn split_message(text: &str, max_len: usize) -> Vec<&str> {
     let mut chunks = Vec::new();
     let mut start = 0;
     while start < text.len() {
-        let end = (start + max_len).min(text.len());
-        let chunk_end = if end < text.len() {
-            // Find last newline within range
-            text[start..end].rfind('\n').map(|i| start + i + 1).unwrap_or(end)
+        let remaining = &text[start..];
+        // Char-boundary-safe end within the byte budget.
+        let safe = truncate_bytes(remaining, max_len);
+        let safe_len = safe.len();
+        let reached_end = start + safe_len >= text.len();
+
+        let chunk_end = if !reached_end {
+            // Prefer to break at the last newline within the safe window.
+            match safe.rfind('\n') {
+                Some(i) => start + i + 1,
+                None => start + safe_len,
+            }
         } else {
-            end
+            text.len()
         };
+
+        // Guard forward progress: a single char wider than max_len, or a
+        // pathological input, must still advance by at least one char.
+        let chunk_end = if chunk_end <= start {
+            match remaining.char_indices().nth(1) {
+                Some((i, _)) => start + i,
+                None => text.len(),
+            }
+        } else {
+            chunk_end
+        };
+
         chunks.push(&text[start..chunk_end]);
         start = chunk_end;
     }
@@ -557,6 +582,21 @@ mod tests {
         let chunks = split_message(text, 12);
         assert_eq!(chunks.len(), 3);
         assert!(chunks[0].ends_with('\n'));
+    }
+
+    #[test]
+    fn test_split_message_cjk_no_newline_no_panic() {
+        // L9: a long CJK run with no newline must not panic on a char boundary.
+        // Each CJK char is 3 bytes; max_len=10 lands mid-char repeatedly.
+        let text = "你好世界這是一段很長的中文訊息沒有換行符號".repeat(20);
+        let chunks = split_message(&text, 10);
+        // Reassembling the chunks must reproduce the original exactly (no loss).
+        let joined: String = chunks.concat();
+        assert_eq!(joined, text);
+        // Every chunk is valid UTF-8 (slicing succeeded) and within budget-ish.
+        for c in &chunks {
+            assert!(!c.is_empty());
+        }
     }
 
     #[test]

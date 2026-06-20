@@ -186,6 +186,8 @@ mod tests {
                 worktree_auto_merge: true,
                 worktree_cleanup_on_exit: true,
                 worktree_copy_files: vec![],
+                cmd: vec![],
+                env: vec![],
             },
             heartbeat: HeartbeatConfig {
                 enabled: false,

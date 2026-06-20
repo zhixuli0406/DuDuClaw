@@ -182,9 +182,14 @@ impl PolicyRegistry {
             .map(|v| v.iter().collect())
             .unwrap_or_default();
 
-        // Collect agent-specific policy IDs for dedup
-        let agent_ids: std::collections::HashSet<&str> =
-            agent_specific.iter().map(|p| p.policy_id()).collect();
+        // Collect agent-specific (policy_id, policy_type) pairs for dedup.
+        // Dedup must consider the policy type too — an agent policy that shares a
+        // policy_id with a global policy of a *different* type must NOT erase that
+        // global policy (M42). Only a same-id + same-type agent policy overrides.
+        let agent_keys: std::collections::HashSet<(&str, &str)> = agent_specific
+            .iter()
+            .map(|p| (p.policy_id(), p.type_name()))
+            .collect();
 
         // Merge: agent-specific first, then global (if not overridden)
         let mut merged: Vec<PolicyType> = agent_specific
@@ -193,7 +198,7 @@ impl PolicyRegistry {
             .collect();
 
         for global_policy in global {
-            if !agent_ids.contains(global_policy.policy_id()) {
+            if !agent_keys.contains(&(global_policy.policy_id(), global_policy.type_name())) {
                 merged.push(global_policy.clone());
             }
         }
@@ -450,6 +455,54 @@ policies:
             .iter()
             .any(|p| matches!(p, PolicyType::Permission(pp) if pp.policy_id == "default-permission"));
         assert!(has_permission, "global permission policy should be inherited");
+    }
+
+    /// M42: 同 policy_id 但不同 policy_type 的 agent 政策不應抹掉全域政策。
+    #[tokio::test]
+    async fn test_same_id_different_type_does_not_clobber_global() {
+        let dir = TempDir::new().unwrap();
+        // Global declares a QUOTA policy with id "shared".
+        let global = r#"
+policies:
+  - policy_type: quota
+    policy_id: shared
+    agent_id: "*"
+    daily_token_budget: 1000
+    max_concurrent_tasks: 5
+    max_memory_entries: 100
+"#;
+        // Agent declares a PERMISSION policy with the SAME id "shared".
+        let agent = r#"
+policies:
+  - policy_type: permission
+    policy_id: shared
+    agent_id: "alice"
+    allowed_scopes:
+      - memory:read
+    denied_scopes: []
+    requires_approval: []
+"#;
+        std::fs::write(dir.path().join("global.yaml"), global).unwrap();
+        std::fs::write(dir.path().join("alice.yaml"), agent).unwrap();
+
+        let registry = PolicyRegistry::new(dir.path());
+        registry.load().await.unwrap();
+
+        let policies = registry.get_policies_for_agent("alice").await;
+
+        // Both must survive: the agent permission AND the global quota.
+        let has_quota = policies
+            .iter()
+            .any(|p| matches!(p, PolicyType::Quota(q) if q.policy_id == "shared"));
+        let has_permission = policies
+            .iter()
+            .any(|p| matches!(p, PolicyType::Permission(pp) if pp.policy_id == "shared"));
+        assert!(
+            has_quota,
+            "global quota 'shared' must NOT be erased by a same-id different-type agent policy"
+        );
+        assert!(has_permission, "agent permission 'shared' should be present");
+        assert_eq!(policies.len(), 2);
     }
 
     #[tokio::test]

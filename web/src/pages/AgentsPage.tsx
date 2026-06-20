@@ -2,8 +2,23 @@ import { useEffect, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
 import { useAgentsStore } from '@/stores/agents-store';
 import { cn } from '@/lib/utils';
-import { api, type AgentDetail, type AgentUpdateParams } from '@/lib/api';
+import {
+  api,
+  type AgentDetail,
+  type AgentUpdateParams,
+  type AgentCapabilities,
+  type ComputerUseMode,
+  type ComputerUseConfig,
+  type ContractConfig,
+  type AgentRuntime,
+  type RuntimeProvider,
+  type AgentEvolutionAdvanced,
+  type ContainerMount,
+  type ContainerEnvVar,
+  type AgentOdooOverride,
+} from '@/lib/api';
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { ChipEditor } from '@/components/shared/ChipEditor';
 import { toast, formatError } from '@/lib/toast';
 import { Bot, Pause, Play, Send, Eye, Plus, X, ShieldCheck, Pencil, Trash2 } from 'lucide-react';
 
@@ -414,7 +429,157 @@ function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: 
 
 // ── Edit Agent Dialog ──
 
-type EditTab = 'identity' | 'model' | 'heartbeat' | 'container' | 'permissions' | 'sticker' | 'channels';
+type EditTab = 'identity' | 'model' | 'runtime' | 'heartbeat' | 'container' | 'evolution' | 'permissions' | 'capabilities' | 'contract' | 'odoo' | 'sticker' | 'channels' | 'advanced';
+
+const RUNTIME_PROVIDERS: ReadonlyArray<RuntimeProvider> = ['claude', 'codex', 'gemini', 'openai_compat'];
+
+/** RT — runtime form defaults. `agents.inspect` does not return [runtime], so
+ *  this tab is write-only: it shows defaults and writes a partial update only
+ *  when the operator touches it. */
+const DEFAULT_RUNTIME: Required<Omit<AgentRuntime, 'fallback'>> & { fallback: string } = {
+  provider: 'claude',
+  fallback: '',
+  pty_pool_enabled: false,
+  worker_managed: false,
+};
+
+/** EVO — advanced evolution form defaults (write-only tab). */
+const DEFAULT_EVOLUTION_ADVANCED: {
+  external_factors: Required<NonNullable<AgentEvolutionAdvanced['external_factors']>>;
+  skill_synthesis_enabled: boolean;
+  skill_synthesis_threshold: number;
+  skill_synthesis_cooldown_hours: number;
+  skill_trial_ttl: number;
+  skill_graduation_enabled: boolean;
+  skill_graduation_min_lift: number;
+  skill_recommendation_enabled: boolean;
+  skill_recommendation_threshold: number;
+  curiosity_enabled: boolean;
+  curiosity_threshold: number;
+  curiosity_max_daily: number;
+  skill_behavior_monitor_enabled: boolean;
+  skill_behavior_drift_threshold: number;
+} = {
+  external_factors: {
+    user_feedback: true,
+    security_events: true,
+    channel_metrics: false,
+    business_context: false,
+    peer_signals: false,
+  },
+  skill_synthesis_enabled: false,
+  skill_synthesis_threshold: 0.7,
+  skill_synthesis_cooldown_hours: 24,
+  skill_trial_ttl: 7,
+  skill_graduation_enabled: false,
+  skill_graduation_min_lift: 0.1,
+  skill_recommendation_enabled: false,
+  skill_recommendation_threshold: 0.6,
+  curiosity_enabled: false,
+  curiosity_threshold: 0.5,
+  curiosity_max_daily: 3,
+  skill_behavior_monitor_enabled: false,
+  skill_behavior_drift_threshold: 0.3,
+};
+
+/** CT — advanced container form defaults (write-only tab). */
+const DEFAULT_CONTAINER_ADVANCED: {
+  worktree_enabled: boolean;
+  worktree_auto_merge: boolean;
+  worktree_cleanup_on_exit: boolean;
+  worktree_copy_files: string[];
+  additional_mounts: ContainerMount[];
+  cmd: string[];
+  env: ContainerEnvVar[];
+} = {
+  worktree_enabled: false,
+  worktree_auto_merge: false,
+  worktree_cleanup_on_exit: true,
+  worktree_copy_files: [],
+  additional_mounts: [],
+  cmd: [],
+  env: [],
+};
+
+/** Default capability values written when the operator hasn't changed a field.
+ *  Note: `agents.inspect` does not return the current [capabilities] block, so
+ *  this form is write-only — it shows defaults and writes a partial update. */
+const DEFAULT_CAPABILITIES: Required<Omit<AgentCapabilities, 'computer_use_config'>> & {
+  computer_use_config: Required<ComputerUseConfig>;
+} = {
+  computer_use: false,
+  computer_use_mode: 'container',
+  browser_via_bash: false,
+  allowed_tools: [],
+  denied_tools: [],
+  wiki_visible_to: [],
+  computer_use_config: {
+    allowed_apps: [],
+    blocked_actions: [],
+    max_session_minutes: 30,
+    max_actions: 100,
+    display_width: 1280,
+    display_height: 800,
+    auto_confirm_trusted: false,
+  },
+};
+
+/** ODO — per-agent Odoo override (write-only tab; inspect doesn't return it). */
+const DEFAULT_ODOO: {
+  profile: string;
+  allowed_models: string[];
+  allowed_actions: string[];
+  company_ids: string; // comma-separated ints in the form
+  url: string;
+  db: string;
+  username: string;
+  api_key: string;
+  password: string;
+} = {
+  profile: '',
+  allowed_models: [],
+  allowed_actions: [],
+  company_ids: '',
+  url: '',
+  db: '',
+  username: '',
+  api_key: '',
+  password: '',
+};
+
+/** Advanced (G.8 free-form scalar tables) — write-only. Stored as KV rows. */
+interface KvRow { key: string; value: string }
+const DEFAULT_ADVANCED: {
+  account_pool: string[];
+  utility: string;
+  heartbeat_max_concurrent_runs: number;
+  heartbeat_cron_timezone: string;
+  proactive_token_budget_per_check: number;
+  proactive_timezone: string;
+  proactive_max_turns: number;
+  stagnation_enabled: boolean;
+  stagnation_window_seconds: number;
+  stagnation_trigger_threshold: number;
+  stagnation_action: 'log_only' | 'suppress';
+  ptc: KvRow[];
+  prompt: KvRow[];
+  cultural_context: KvRow[];
+} = {
+  account_pool: [],
+  utility: '',
+  heartbeat_max_concurrent_runs: 1,
+  heartbeat_cron_timezone: '',
+  proactive_token_budget_per_check: 0,
+  proactive_timezone: '',
+  proactive_max_turns: 1,
+  stagnation_enabled: false,
+  stagnation_window_seconds: 3600,
+  stagnation_trigger_threshold: 3,
+  stagnation_action: 'log_only',
+  ptc: [],
+  prompt: [],
+  cultural_context: [],
+};
 
 function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | null; onClose: () => void; onSaved: () => void }) {
   const intl = useIntl();
@@ -428,6 +593,37 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
 
   // Local form state — initialized from agent when dialog opens
   const [form, setForm] = useState<AgentUpdateParams>({});
+
+  // CAP — capabilities form (write-only; inspect doesn't return current values)
+  const [caps, setCaps] = useState<typeof DEFAULT_CAPABILITIES>(DEFAULT_CAPABILITIES);
+  // Tracks whether the operator touched the Capabilities tab — if untouched we
+  // omit `capabilities` from the update so we don't overwrite existing config.
+  const [capsDirty, setCapsDirty] = useState(false);
+
+  // CON — contract form, loaded lazily via contract.get on first tab open
+  const [contract, setContract] = useState<ContractConfig>({ must_not: [], must_always: [], max_tool_calls_per_turn: 0 });
+  const [contractLoaded, setContractLoaded] = useState(false);
+  const [contractSaving, setContractSaving] = useState(false);
+
+  // RT — runtime form (write-only; inspect doesn't return [runtime])
+  const [runtime, setRuntime] = useState<typeof DEFAULT_RUNTIME>(DEFAULT_RUNTIME);
+  const [runtimeDirty, setRuntimeDirty] = useState(false);
+
+  // EVO — advanced evolution form (write-only)
+  const [evoAdv, setEvoAdv] = useState<typeof DEFAULT_EVOLUTION_ADVANCED>(DEFAULT_EVOLUTION_ADVANCED);
+  const [evoAdvDirty, setEvoAdvDirty] = useState(false);
+
+  // CT — advanced container form (write-only)
+  const [ctAdv, setCtAdv] = useState<typeof DEFAULT_CONTAINER_ADVANCED>(DEFAULT_CONTAINER_ADVANCED);
+  const [ctAdvDirty, setCtAdvDirty] = useState(false);
+
+  // ODO — per-agent Odoo override form (write-only)
+  const [odoo, setOdoo] = useState<typeof DEFAULT_ODOO>(DEFAULT_ODOO);
+  const [odooDirty, setOdooDirty] = useState(false);
+
+  // Advanced — G.8 scattered fields (write-only); account_pool prefilled from inspect.
+  const [adv, setAdv] = useState<typeof DEFAULT_ADVANCED>(DEFAULT_ADVANCED);
+  const [advDirty, setAdvDirty] = useState(false);
 
   useEffect(() => {
     if (agent) {
@@ -483,8 +679,101 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
       });
       setTab('identity');
       setError(null);
+      // Reset CAP/CON state for the newly-opened agent.
+      setCaps(DEFAULT_CAPABILITIES);
+      setCapsDirty(false);
+      setContract({ must_not: [], must_always: [], max_tool_calls_per_turn: 0 });
+      setContractLoaded(false);
+      // RT/EVO/CT — reset write-only advanced forms.
+      setRuntime(DEFAULT_RUNTIME);
+      setRuntimeDirty(false);
+      setEvoAdv(DEFAULT_EVOLUTION_ADVANCED);
+      setEvoAdvDirty(false);
+      setCtAdv(DEFAULT_CONTAINER_ADVANCED);
+      setCtAdvDirty(false);
+      // ODO — reset write-only Odoo override form.
+      setOdoo(DEFAULT_ODOO);
+      setOdooDirty(false);
+      // Advanced — seed account_pool from inspect; rest are write-only defaults.
+      setAdv({ ...DEFAULT_ADVANCED, account_pool: agent.model?.account_pool ?? [] });
+      setAdvDirty(false);
     }
   }, [agent]);
+
+  // CON — lazily load CONTRACT.toml when the Contract tab is first opened.
+  useEffect(() => {
+    if (tab !== 'contract' || !agent || contractLoaded) return;
+    api.contract.get(agent.name).then((res) => {
+      setContract({
+        must_not: res.must_not ?? [],
+        must_always: res.must_always ?? [],
+        max_tool_calls_per_turn: res.max_tool_calls_per_turn ?? 0,
+      });
+      setContractLoaded(true);
+    }).catch((e) => {
+      console.warn('[api]', e);
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      setContractLoaded(true);
+    });
+  }, [tab, agent, contractLoaded, intl]);
+
+  const updateCap = useCallback(<K extends keyof typeof DEFAULT_CAPABILITIES>(key: K, value: (typeof DEFAULT_CAPABILITIES)[K]) => {
+    setCapsDirty(true);
+    setCaps((prev) => ({ ...prev, [key]: value }));
+  }, []);
+
+  const updateCapConfig = useCallback(<K extends keyof Required<ComputerUseConfig>>(key: K, value: Required<ComputerUseConfig>[K]) => {
+    setCapsDirty(true);
+    setCaps((prev) => ({ ...prev, computer_use_config: { ...prev.computer_use_config, [key]: value } }));
+  }, []);
+
+  // RT — runtime field updater.
+  const updateRuntime = useCallback(<K extends keyof typeof DEFAULT_RUNTIME>(key: K, value: (typeof DEFAULT_RUNTIME)[K]) => {
+    setRuntimeDirty(true);
+    setRuntime((prev) => ({ ...prev, [key]: value }));
+  }, []);
+
+  // EVO — advanced evolution field updater.
+  const updateEvoAdv = useCallback(<K extends keyof typeof DEFAULT_EVOLUTION_ADVANCED>(key: K, value: (typeof DEFAULT_EVOLUTION_ADVANCED)[K]) => {
+    setEvoAdvDirty(true);
+    setEvoAdv((prev) => ({ ...prev, [key]: value }));
+  }, []);
+
+  const updateEvoFactor = useCallback((key: keyof typeof DEFAULT_EVOLUTION_ADVANCED.external_factors, value: boolean) => {
+    setEvoAdvDirty(true);
+    setEvoAdv((prev) => ({ ...prev, external_factors: { ...prev.external_factors, [key]: value } }));
+  }, []);
+
+  // CT — advanced container field updater.
+  const updateCtAdv = useCallback(<K extends keyof typeof DEFAULT_CONTAINER_ADVANCED>(key: K, value: (typeof DEFAULT_CONTAINER_ADVANCED)[K]) => {
+    setCtAdvDirty(true);
+    setCtAdv((prev) => ({ ...prev, [key]: value }));
+  }, []);
+
+  // ODO — per-agent Odoo override field updater.
+  const updateOdoo = useCallback(<K extends keyof typeof DEFAULT_ODOO>(key: K, value: (typeof DEFAULT_ODOO)[K]) => {
+    setOdooDirty(true);
+    setOdoo((prev) => ({ ...prev, [key]: value }));
+  }, []);
+
+  // Advanced — G.8 field updater.
+  const updateAdv = useCallback(<K extends keyof typeof DEFAULT_ADVANCED>(key: K, value: (typeof DEFAULT_ADVANCED)[K]) => {
+    setAdvDirty(true);
+    setAdv((prev) => ({ ...prev, [key]: value }));
+  }, []);
+
+  const handleContractSave = async () => {
+    if (!agent) return;
+    setContractSaving(true);
+    try {
+      await api.contract.update(agent.name, contract);
+      toast.success(intl.formatMessage({ id: 'agents.contract.saved' }));
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    } finally {
+      setContractSaving(false);
+    }
+  };
 
   const updateField = useCallback(<K extends keyof AgentUpdateParams>(key: K, value: AgentUpdateParams[K]) => {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -515,6 +804,119 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
         submitForm.fallback = 'claude-haiku-4-5';
       }
 
+      // CAP — only include capabilities when the operator edited that tab, so we
+      // never clobber an existing [capabilities] block with defaults.
+      if (capsDirty) {
+        submitForm.capabilities = {
+          computer_use: caps.computer_use,
+          computer_use_mode: caps.computer_use_mode,
+          browser_via_bash: caps.browser_via_bash,
+          allowed_tools: caps.allowed_tools,
+          denied_tools: caps.denied_tools,
+          wiki_visible_to: caps.wiki_visible_to,
+          computer_use_config: { ...caps.computer_use_config },
+        };
+      }
+
+      // RT — only include runtime when the operator edited that tab.
+      if (runtimeDirty) {
+        submitForm.runtime = {
+          provider: runtime.provider,
+          fallback: runtime.fallback,
+          pty_pool_enabled: runtime.pty_pool_enabled,
+          worker_managed: runtime.worker_managed,
+        };
+      }
+
+      // EVO — only include evolution_advanced when edited.
+      if (evoAdvDirty) {
+        submitForm.evolution_advanced = {
+          external_factors: { ...evoAdv.external_factors },
+          skill_synthesis_enabled: evoAdv.skill_synthesis_enabled,
+          skill_synthesis_threshold: evoAdv.skill_synthesis_threshold,
+          skill_synthesis_cooldown_hours: evoAdv.skill_synthesis_cooldown_hours,
+          skill_trial_ttl: evoAdv.skill_trial_ttl,
+          skill_graduation_enabled: evoAdv.skill_graduation_enabled,
+          skill_graduation_min_lift: evoAdv.skill_graduation_min_lift,
+          skill_recommendation_enabled: evoAdv.skill_recommendation_enabled,
+          skill_recommendation_threshold: evoAdv.skill_recommendation_threshold,
+          curiosity_enabled: evoAdv.curiosity_enabled,
+          curiosity_threshold: evoAdv.curiosity_threshold,
+          curiosity_max_daily: evoAdv.curiosity_max_daily,
+          skill_behavior_monitor_enabled: evoAdv.skill_behavior_monitor_enabled,
+          skill_behavior_drift_threshold: evoAdv.skill_behavior_drift_threshold,
+        };
+      }
+
+      // CT — only include container_advanced when edited. Drop env vars with an
+      // empty key (backend rejects them).
+      if (ctAdvDirty) {
+        submitForm.container_advanced = {
+          worktree_enabled: ctAdv.worktree_enabled,
+          worktree_auto_merge: ctAdv.worktree_auto_merge,
+          worktree_cleanup_on_exit: ctAdv.worktree_cleanup_on_exit,
+          worktree_copy_files: ctAdv.worktree_copy_files,
+          additional_mounts: ctAdv.additional_mounts.filter(
+            (m) => m.host.trim() !== '' && m.container.trim() !== ''
+          ),
+          cmd: ctAdv.cmd,
+          env: ctAdv.env.filter((e) => e.key.trim() !== ''),
+        };
+      }
+
+      // ODO — only include odoo when the operator edited that tab. company_ids
+      // are parsed from the comma-separated form. api_key/password are sent only
+      // when non-empty (write-only — never echoed back).
+      if (odooDirty) {
+        const companyIds = odoo.company_ids
+          .split(',')
+          .map((s) => s.trim())
+          .filter((s) => s !== '')
+          .map((s) => Number(s))
+          .filter((n) => Number.isInteger(n) && n >= 0);
+        const odooPayload: AgentOdooOverride = {
+          profile: odoo.profile,
+          allowed_models: odoo.allowed_models,
+          allowed_actions: odoo.allowed_actions,
+          company_ids: companyIds,
+          url: odoo.url,
+          db: odoo.db,
+          username: odoo.username,
+        };
+        if (odoo.api_key.trim() !== '') odooPayload.api_key = odoo.api_key;
+        if (odoo.password.trim() !== '') odooPayload.password = odoo.password;
+        submitForm.odoo = odooPayload;
+      }
+
+      // Advanced — G.8 scattered fields. Only include when edited.
+      if (advDirty) {
+        submitForm.account_pool = adv.account_pool;
+        submitForm.utility = adv.utility;
+        submitForm.heartbeat_max_concurrent_runs = adv.heartbeat_max_concurrent_runs;
+        if (adv.heartbeat_cron_timezone.trim() !== '') submitForm.heartbeat_cron_timezone = adv.heartbeat_cron_timezone.trim();
+        // proactive extras go under the nested proactive object.
+        submitForm.proactive = {
+          ...(submitForm.proactive ?? {}),
+          token_budget_per_check: adv.proactive_token_budget_per_check,
+          max_turns: adv.proactive_max_turns,
+          ...(adv.proactive_timezone.trim() !== '' ? { timezone: adv.proactive_timezone.trim() } : {}),
+        };
+        // UI.3 — stagnation detection.
+        submitForm.stagnation_enabled = adv.stagnation_enabled;
+        submitForm.stagnation_window_seconds = adv.stagnation_window_seconds;
+        submitForm.stagnation_trigger_threshold = adv.stagnation_trigger_threshold;
+        submitForm.stagnation_action = adv.stagnation_action;
+        // Free-form scalar tables — drop empty keys.
+        const kvToObj = (rows: ReadonlyArray<KvRow>): Record<string, string> =>
+          Object.fromEntries(rows.filter((r) => r.key.trim() !== '').map((r) => [r.key.trim(), r.value]));
+        const ptc = kvToObj(adv.ptc);
+        const prompt = kvToObj(adv.prompt);
+        const cultural = kvToObj(adv.cultural_context);
+        if (Object.keys(ptc).length > 0) submitForm.ptc = ptc;
+        if (Object.keys(prompt).length > 0) submitForm.prompt = prompt;
+        if (Object.keys(cultural).length > 0) submitForm.cultural_context = cultural;
+      }
+
       await updateAgent(agent.name, submitForm);
       onSaved();
     } catch {
@@ -529,11 +931,17 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
   const tabs: ReadonlyArray<{ id: EditTab; label: string }> = [
     { id: 'identity', label: intl.formatMessage({ id: 'agents.edit.identity' }) },
     { id: 'model', label: intl.formatMessage({ id: 'agents.edit.model' }) },
+    { id: 'runtime', label: intl.formatMessage({ id: 'agents.edit.runtime' }) },
     { id: 'heartbeat', label: intl.formatMessage({ id: 'agents.edit.heartbeat' }) },
     { id: 'container', label: intl.formatMessage({ id: 'settings.container' }) },
+    { id: 'evolution', label: intl.formatMessage({ id: 'agents.edit.evolution' }) },
     { id: 'permissions', label: intl.formatMessage({ id: 'agents.edit.permissions' }) },
+    { id: 'capabilities', label: intl.formatMessage({ id: 'agents.edit.capabilities' }) },
+    { id: 'contract', label: intl.formatMessage({ id: 'agents.edit.contract' }) },
+    { id: 'odoo', label: intl.formatMessage({ id: 'agents.edit.odoo' }) },
     { id: 'sticker', label: intl.formatMessage({ id: 'agents.edit.sticker' }) },
     { id: 'channels', label: intl.formatMessage({ id: 'channels.title' }) },
+    { id: 'advanced', label: intl.formatMessage({ id: 'agents.edit.advanced' }) },
   ];
 
   return (
@@ -663,6 +1071,35 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
             );
           })()}
 
+          {tab === 'runtime' && (
+            <div className="space-y-4">
+              <p className="text-xs text-stone-400 dark:text-stone-500">
+                {intl.formatMessage({ id: 'agents.runtime.desc' })}
+              </p>
+              <FormField label={intl.formatMessage({ id: 'agents.runtime.provider' })} hint={intl.formatMessage({ id: 'agents.runtime.provider.hint' })}>
+                <select value={runtime.provider} onChange={(e) => updateRuntime('provider', e.target.value as RuntimeProvider)} className={selectClass}>
+                  {RUNTIME_PROVIDERS.map((p) => (
+                    <option key={p} value={p}>{p}</option>
+                  ))}
+                </select>
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'agents.runtime.fallback' })} hint={intl.formatMessage({ id: 'agents.runtime.fallback.hint' })}>
+                <select value={runtime.fallback} onChange={(e) => updateRuntime('fallback', e.target.value)} className={selectClass}>
+                  <option value="">{intl.formatMessage({ id: 'agents.runtime.fallback.none' })}</option>
+                  {RUNTIME_PROVIDERS.map((p) => (
+                    <option key={p} value={p}>{p}</option>
+                  ))}
+                </select>
+              </FormField>
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-1">
+                <h4 className="mb-2 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.runtime.ptyTitle' })}</h4>
+                <Toggle checked={runtime.pty_pool_enabled} onChange={(v) => updateRuntime('pty_pool_enabled', v)} label={intl.formatMessage({ id: 'agents.runtime.ptyPoolEnabled' })} />
+                <Toggle checked={runtime.worker_managed} onChange={(v) => updateRuntime('worker_managed', v)} label={intl.formatMessage({ id: 'agents.runtime.workerManaged' })} />
+                <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'agents.runtime.pty.hint' })}</p>
+              </div>
+            </div>
+          )}
+
           {tab === 'heartbeat' && (
             <>
               <Toggle checked={form.heartbeat_enabled ?? false} onChange={(v) => updateField('heartbeat_enabled', v)} label={intl.formatMessage({ id: 'agents.edit.heartbeatEnabled' })} />
@@ -686,7 +1123,100 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
               <FormField label={intl.formatMessage({ id: 'agents.edit.maxConcurrent' })}>
                 <input type="number" min={1} max={10} value={form.max_concurrent ?? 1} onChange={(e) => updateField('max_concurrent', Number(e.target.value))} className={inputClass} />
               </FormField>
+
+              {/* CT — advanced container (worktree / mounts / cmd / env). Write-only. */}
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-4">
+                <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'agents.container.advancedDesc' })}</p>
+                <div className="space-y-1">
+                  <h4 className="mb-1 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.container.worktreeTitle' })}</h4>
+                  <Toggle checked={ctAdv.worktree_enabled} onChange={(v) => updateCtAdv('worktree_enabled', v)} label={intl.formatMessage({ id: 'agents.container.worktreeEnabled' })} />
+                  <Toggle checked={ctAdv.worktree_auto_merge} onChange={(v) => updateCtAdv('worktree_auto_merge', v)} label={intl.formatMessage({ id: 'agents.container.worktreeAutoMerge' })} />
+                  <Toggle checked={ctAdv.worktree_cleanup_on_exit} onChange={(v) => updateCtAdv('worktree_cleanup_on_exit', v)} label={intl.formatMessage({ id: 'agents.container.worktreeCleanup' })} />
+                  <FormField label={intl.formatMessage({ id: 'agents.container.worktreeCopyFiles' })} hint={intl.formatMessage({ id: 'agents.container.worktreeCopyFiles.hint' })}>
+                    <ChipEditor values={ctAdv.worktree_copy_files} onChange={(v) => updateCtAdv('worktree_copy_files', v)} placeholder=".env" addLabel={intl.formatMessage({ id: 'common.add' })} />
+                  </FormField>
+                </div>
+
+                <MountTable
+                  mounts={ctAdv.additional_mounts}
+                  onChange={(v) => updateCtAdv('additional_mounts', v)}
+                />
+
+                <FormField label={intl.formatMessage({ id: 'agents.container.cmd' })} hint={intl.formatMessage({ id: 'agents.container.cmd.hint' })}>
+                  <ChipEditor values={ctAdv.cmd} onChange={(v) => updateCtAdv('cmd', v)} placeholder="bash" addLabel={intl.formatMessage({ id: 'common.add' })} />
+                </FormField>
+
+                <EnvTable env={ctAdv.env} onChange={(v) => updateCtAdv('env', v)} />
+              </div>
             </>
+          )}
+
+          {tab === 'evolution' && (
+            <div className="space-y-4">
+              <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'agents.evo.desc' })}</p>
+
+              <div className="space-y-1">
+                <h4 className="mb-1 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.evo.externalFactors' })}</h4>
+                <Toggle checked={evoAdv.external_factors.user_feedback} onChange={(v) => updateEvoFactor('user_feedback', v)} label={intl.formatMessage({ id: 'agents.evo.userFeedback' })} />
+                <Toggle checked={evoAdv.external_factors.security_events} onChange={(v) => updateEvoFactor('security_events', v)} label={intl.formatMessage({ id: 'agents.evo.securityEvents' })} />
+                <Toggle checked={evoAdv.external_factors.channel_metrics} onChange={(v) => updateEvoFactor('channel_metrics', v)} label={intl.formatMessage({ id: 'agents.evo.channelMetrics' })} />
+                <Toggle checked={evoAdv.external_factors.business_context} onChange={(v) => updateEvoFactor('business_context', v)} label={intl.formatMessage({ id: 'agents.evo.businessContext' })} />
+                <Toggle checked={evoAdv.external_factors.peer_signals} onChange={(v) => updateEvoFactor('peer_signals', v)} label={intl.formatMessage({ id: 'agents.evo.peerSignals' })} />
+              </div>
+
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-2">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.evo.skillSynthesis' })}</h4>
+                <Toggle checked={evoAdv.skill_synthesis_enabled} onChange={(v) => updateEvoAdv('skill_synthesis_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
+                <div className="grid grid-cols-2 gap-3">
+                  <FormField label={intl.formatMessage({ id: 'agents.evo.threshold' })} hint="0.0-1.0">
+                    <input type="number" min={0} max={1} step={0.05} value={evoAdv.skill_synthesis_threshold} onChange={(e) => updateEvoAdv('skill_synthesis_threshold', Number(e.target.value))} className={inputClass} />
+                  </FormField>
+                  <FormField label={intl.formatMessage({ id: 'agents.evo.cooldownHours' })}>
+                    <input type="number" min={0} value={evoAdv.skill_synthesis_cooldown_hours} onChange={(e) => updateEvoAdv('skill_synthesis_cooldown_hours', Number(e.target.value))} className={inputClass} />
+                  </FormField>
+                  <FormField label={intl.formatMessage({ id: 'agents.evo.trialTtl' })} hint={intl.formatMessage({ id: 'agents.evo.trialTtl.hint' })}>
+                    <input type="number" min={0} value={evoAdv.skill_trial_ttl} onChange={(e) => updateEvoAdv('skill_trial_ttl', Number(e.target.value))} className={inputClass} />
+                  </FormField>
+                </div>
+              </div>
+
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-2">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.evo.skillGraduation' })}</h4>
+                <Toggle checked={evoAdv.skill_graduation_enabled} onChange={(v) => updateEvoAdv('skill_graduation_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
+                <FormField label={intl.formatMessage({ id: 'agents.evo.minLift' })} hint="0.0-1.0">
+                  <input type="number" min={0} max={1} step={0.05} value={evoAdv.skill_graduation_min_lift} onChange={(e) => updateEvoAdv('skill_graduation_min_lift', Number(e.target.value))} className={inputClass} />
+                </FormField>
+              </div>
+
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-2">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.evo.skillRecommendation' })}</h4>
+                <Toggle checked={evoAdv.skill_recommendation_enabled} onChange={(v) => updateEvoAdv('skill_recommendation_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
+                <FormField label={intl.formatMessage({ id: 'agents.evo.threshold' })} hint="0.0-1.0">
+                  <input type="number" min={0} max={1} step={0.05} value={evoAdv.skill_recommendation_threshold} onChange={(e) => updateEvoAdv('skill_recommendation_threshold', Number(e.target.value))} className={inputClass} />
+                </FormField>
+              </div>
+
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-2">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.evo.curiosity' })}</h4>
+                <Toggle checked={evoAdv.curiosity_enabled} onChange={(v) => updateEvoAdv('curiosity_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
+                <div className="grid grid-cols-2 gap-3">
+                  <FormField label={intl.formatMessage({ id: 'agents.evo.threshold' })} hint="0.0-1.0">
+                    <input type="number" min={0} max={1} step={0.05} value={evoAdv.curiosity_threshold} onChange={(e) => updateEvoAdv('curiosity_threshold', Number(e.target.value))} className={inputClass} />
+                  </FormField>
+                  <FormField label={intl.formatMessage({ id: 'agents.evo.maxDaily' })}>
+                    <input type="number" min={0} value={evoAdv.curiosity_max_daily} onChange={(e) => updateEvoAdv('curiosity_max_daily', Number(e.target.value))} className={inputClass} />
+                  </FormField>
+                </div>
+              </div>
+
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-2">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.evo.behaviorMonitor' })}</h4>
+                <Toggle checked={evoAdv.skill_behavior_monitor_enabled} onChange={(v) => updateEvoAdv('skill_behavior_monitor_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
+                <FormField label={intl.formatMessage({ id: 'agents.evo.driftThreshold' })} hint="0.0-1.0">
+                  <input type="number" min={0} max={1} step={0.05} value={evoAdv.skill_behavior_drift_threshold} onChange={(e) => updateEvoAdv('skill_behavior_drift_threshold', Number(e.target.value))} className={inputClass} />
+                </FormField>
+              </div>
+            </div>
           )}
 
           {tab === 'permissions' && (
@@ -715,6 +1245,140 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
                 </FormField>
               </div>
             </>
+          )}
+
+          {tab === 'capabilities' && (
+            <div className="space-y-4">
+              <p className="text-xs text-stone-400 dark:text-stone-500">
+                {intl.formatMessage({ id: 'agents.cap.desc' })}
+              </p>
+              <Toggle checked={caps.computer_use} onChange={(v) => updateCap('computer_use', v)} label={intl.formatMessage({ id: 'agents.cap.computerUse' })} />
+              <FormField label={intl.formatMessage({ id: 'agents.cap.computerUseMode' })}>
+                <select value={caps.computer_use_mode} onChange={(e) => updateCap('computer_use_mode', e.target.value as ComputerUseMode)} className={selectClass}>
+                  <option value="container">container</option>
+                  <option value="native">native</option>
+                  <option value="auto">auto</option>
+                </select>
+              </FormField>
+              <Toggle checked={caps.browser_via_bash} onChange={(v) => updateCap('browser_via_bash', v)} label={intl.formatMessage({ id: 'agents.cap.browserViaBash' })} />
+
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-4">
+                <FormField label={intl.formatMessage({ id: 'agents.cap.allowedTools' })} hint={intl.formatMessage({ id: 'agents.cap.allowedTools.hint' })}>
+                  <ChipEditor values={caps.allowed_tools} onChange={(v) => updateCap('allowed_tools', v)} placeholder="Read" addLabel={intl.formatMessage({ id: 'common.add' })} />
+                </FormField>
+                <FormField label={intl.formatMessage({ id: 'agents.cap.deniedTools' })} hint={intl.formatMessage({ id: 'agents.cap.deniedTools.hint' })}>
+                  <ChipEditor values={caps.denied_tools} onChange={(v) => updateCap('denied_tools', v)} placeholder="Bash" addLabel={intl.formatMessage({ id: 'common.add' })} />
+                </FormField>
+                <FormField label={intl.formatMessage({ id: 'agents.cap.wikiVisibleTo' })} hint={intl.formatMessage({ id: 'agents.cap.wikiVisibleTo.hint' })}>
+                  <ChipEditor values={caps.wiki_visible_to} onChange={(v) => updateCap('wiki_visible_to', v)} placeholder="coder" addLabel={intl.formatMessage({ id: 'common.add' })} />
+                </FormField>
+              </div>
+
+              <div className="rounded-lg border border-amber-200 bg-amber-50/50 p-4 dark:border-amber-800 dark:bg-amber-900/10 space-y-4">
+                <h4 className="text-xs font-semibold uppercase text-amber-700 dark:text-amber-400">{intl.formatMessage({ id: 'agents.cap.computerUseConfig' })}</h4>
+                <FormField label={intl.formatMessage({ id: 'agents.cap.allowedApps' })}>
+                  <ChipEditor values={caps.computer_use_config.allowed_apps ?? []} onChange={(v) => updateCapConfig('allowed_apps', v)} placeholder="Safari" addLabel={intl.formatMessage({ id: 'common.add' })} />
+                </FormField>
+                <FormField label={intl.formatMessage({ id: 'agents.cap.blockedActions' })}>
+                  <ChipEditor values={caps.computer_use_config.blocked_actions ?? []} onChange={(v) => updateCapConfig('blocked_actions', v)} placeholder="key:cmd+q" addLabel={intl.formatMessage({ id: 'common.add' })} />
+                </FormField>
+                <div className="grid grid-cols-2 gap-3">
+                  <FormField label={intl.formatMessage({ id: 'agents.cap.maxSessionMinutes' })} hint="1-1440">
+                    <input type="number" min={1} max={1440} value={caps.computer_use_config.max_session_minutes} onChange={(e) => updateCapConfig('max_session_minutes', Number(e.target.value))} className={inputClass} />
+                  </FormField>
+                  <FormField label={intl.formatMessage({ id: 'agents.cap.maxActions' })} hint="1-10000">
+                    <input type="number" min={1} max={10000} value={caps.computer_use_config.max_actions} onChange={(e) => updateCapConfig('max_actions', Number(e.target.value))} className={inputClass} />
+                  </FormField>
+                  <FormField label={intl.formatMessage({ id: 'agents.cap.displayWidth' })} hint="320-7680">
+                    <input type="number" min={320} max={7680} value={caps.computer_use_config.display_width} onChange={(e) => updateCapConfig('display_width', Number(e.target.value))} className={inputClass} />
+                  </FormField>
+                  <FormField label={intl.formatMessage({ id: 'agents.cap.displayHeight' })} hint="240-4320">
+                    <input type="number" min={240} max={4320} value={caps.computer_use_config.display_height} onChange={(e) => updateCapConfig('display_height', Number(e.target.value))} className={inputClass} />
+                  </FormField>
+                </div>
+                <Toggle checked={caps.computer_use_config.auto_confirm_trusted ?? false} onChange={(v) => updateCapConfig('auto_confirm_trusted', v)} label={intl.formatMessage({ id: 'agents.cap.autoConfirmTrusted' })} />
+              </div>
+            </div>
+          )}
+
+          {tab === 'contract' && (
+            <div className="space-y-4">
+              <p className="text-xs text-stone-400 dark:text-stone-500">
+                {intl.formatMessage({ id: 'agents.contract.desc' })}
+              </p>
+              {!contractLoaded ? (
+                <p className="py-8 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
+              ) : (
+                <>
+                  <FormField label={intl.formatMessage({ id: 'agents.contract.mustNot' })} hint={intl.formatMessage({ id: 'agents.contract.mustNot.hint' })}>
+                    <textarea
+                      value={contract.must_not.join('\n')}
+                      onChange={(e) => setContract((p) => ({ ...p, must_not: e.target.value.split('\n').map((s) => s.trimEnd()).filter((s) => s.trim() !== '') }))}
+                      rows={4}
+                      placeholder={intl.formatMessage({ id: 'agents.contract.mustNot.placeholder' })}
+                      className={cn(inputClass, 'resize-none font-mono')}
+                    />
+                  </FormField>
+                  <FormField label={intl.formatMessage({ id: 'agents.contract.mustAlways' })} hint={intl.formatMessage({ id: 'agents.contract.mustAlways.hint' })}>
+                    <textarea
+                      value={contract.must_always.join('\n')}
+                      onChange={(e) => setContract((p) => ({ ...p, must_always: e.target.value.split('\n').map((s) => s.trimEnd()).filter((s) => s.trim() !== '') }))}
+                      rows={4}
+                      placeholder={intl.formatMessage({ id: 'agents.contract.mustAlways.placeholder' })}
+                      className={cn(inputClass, 'resize-none font-mono')}
+                    />
+                  </FormField>
+                  <FormField label={intl.formatMessage({ id: 'agents.contract.maxToolCalls' })} hint={intl.formatMessage({ id: 'agents.contract.maxToolCalls.hint' })}>
+                    <input type="number" min={0} max={1000} value={contract.max_tool_calls_per_turn} onChange={(e) => setContract((p) => ({ ...p, max_tool_calls_per_turn: Number(e.target.value) }))} className={inputClass} />
+                  </FormField>
+                  <div className="flex justify-end">
+                    <button onClick={handleContractSave} disabled={contractSaving} className={buttonPrimary}>
+                      {contractSaving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'agents.contract.save' })}
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {tab === 'odoo' && (
+            <div className="space-y-4">
+              <p className="text-xs text-stone-400 dark:text-stone-500">
+                {intl.formatMessage({ id: 'agents.odoo.desc' })}
+              </p>
+              <FormField label={intl.formatMessage({ id: 'agents.odoo.profile' })} hint={intl.formatMessage({ id: 'agents.odoo.profile.hint' })}>
+                <input type="text" value={odoo.profile} onChange={(e) => updateOdoo('profile', e.target.value)} placeholder="default" className={inputClass} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'agents.odoo.allowedModels' })} hint={intl.formatMessage({ id: 'agents.odoo.allowedModels.hint' })}>
+                <ChipEditor values={odoo.allowed_models} onChange={(v) => updateOdoo('allowed_models', v)} placeholder="crm.lead" addLabel={intl.formatMessage({ id: 'common.add' })} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'agents.odoo.allowedActions' })} hint={intl.formatMessage({ id: 'agents.odoo.allowedActions.hint' })}>
+                <ChipEditor values={odoo.allowed_actions} onChange={(v) => updateOdoo('allowed_actions', v)} placeholder="write:crm.lead" addLabel={intl.formatMessage({ id: 'common.add' })} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'agents.odoo.companyIds' })} hint={intl.formatMessage({ id: 'agents.odoo.companyIds.hint' })}>
+                <input type="text" value={odoo.company_ids} onChange={(e) => updateOdoo('company_ids', e.target.value)} placeholder="1, 2" className={inputClass} />
+              </FormField>
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-4">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.odoo.connection' })}</h4>
+                <FormField label="URL">
+                  <input type="text" value={odoo.url} onChange={(e) => updateOdoo('url', e.target.value)} placeholder="https://erp.example.com" className={inputClass} />
+                </FormField>
+                <div className="grid grid-cols-2 gap-3">
+                  <FormField label="DB">
+                    <input type="text" value={odoo.db} onChange={(e) => updateOdoo('db', e.target.value)} className={inputClass} />
+                  </FormField>
+                  <FormField label={intl.formatMessage({ id: 'agents.odoo.username' })}>
+                    <input type="text" value={odoo.username} onChange={(e) => updateOdoo('username', e.target.value)} className={inputClass} />
+                  </FormField>
+                </div>
+                <FormField label={intl.formatMessage({ id: 'agents.odoo.apiKey' })} hint={intl.formatMessage({ id: 'agents.odoo.secret.hint' })}>
+                  <input type="password" value={odoo.api_key} onChange={(e) => updateOdoo('api_key', e.target.value)} className={inputClass} autoComplete="off" />
+                </FormField>
+                <FormField label={intl.formatMessage({ id: 'agents.odoo.password' })} hint={intl.formatMessage({ id: 'agents.odoo.secret.hint' })}>
+                  <input type="password" value={odoo.password} onChange={(e) => updateOdoo('password', e.target.value)} className={inputClass} autoComplete="off" />
+                </FormField>
+              </div>
+            </div>
           )}
 
           {tab === 'sticker' && (
@@ -811,7 +1475,106 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
                 <FormField label="App Secret">
                   <input type="password" value={form.feishu_app_secret ?? ''} onChange={(e) => updateField('feishu_app_secret', e.target.value)} className={inputClass} autoComplete="off" />
                 </FormField>
+                <FormField label="Verification Token">
+                  <input type="password" value={form.feishu_verification_token ?? ''} onChange={(e) => updateField('feishu_verification_token', e.target.value)} className={inputClass} autoComplete="off" />
+                </FormField>
               </div>
+
+              {/* UI.3 — WhatsApp App Secret (already-supported field) */}
+              <div className="space-y-2 border-t border-stone-200 pt-4 dark:border-stone-700">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">WhatsApp (extra)</h4>
+                <FormField label="App Secret">
+                  <input type="password" value={form.whatsapp_app_secret ?? ''} onChange={(e) => updateField('whatsapp_app_secret', e.target.value)} className={inputClass} autoComplete="off" />
+                </FormField>
+              </div>
+            </div>
+          )}
+
+          {tab === 'advanced' && (
+            <div className="space-y-5">
+              <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'agents.adv.desc' })}</p>
+
+              {/* UI.3 — already-supported scalar fields */}
+              <div className="space-y-3">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.adv.status' })}</h4>
+                <FormField label={intl.formatMessage({ id: 'agents.adv.statusField' })}>
+                  <select value={form.status ?? 'active'} onChange={(e) => updateField('status', e.target.value)} className={selectClass}>
+                    {['active', 'paused', 'terminated'].map((s) => (
+                      <option key={s} value={s}>{intl.formatMessage({ id: `status.${s}` })}</option>
+                    ))}
+                  </select>
+                </FormField>
+                <div className="grid grid-cols-2 gap-3">
+                  <FormField label={intl.formatMessage({ id: 'agents.adv.maxGvuGenerations' })}>
+                    <input type="number" min={0} value={form.max_gvu_generations ?? 3} onChange={(e) => updateField('max_gvu_generations', Number(e.target.value))} className={inputClass} />
+                  </FormField>
+                  <FormField label={intl.formatMessage({ id: 'agents.adv.observationHours' })}>
+                    <input type="number" min={0} step={0.5} value={form.observation_period_hours ?? 24} onChange={(e) => updateField('observation_period_hours', Number(e.target.value))} className={inputClass} />
+                  </FormField>
+                  <FormField label={intl.formatMessage({ id: 'agents.adv.skillTokenBudget' })}>
+                    <input type="number" min={0} value={form.skill_token_budget ?? 0} onChange={(e) => updateField('skill_token_budget', Number(e.target.value))} className={inputClass} />
+                  </FormField>
+                </div>
+              </div>
+
+              {/* UI.3 — stagnation detection */}
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-2">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.adv.stagnation' })}</h4>
+                <Toggle checked={adv.stagnation_enabled} onChange={(v) => updateAdv('stagnation_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
+                <div className="grid grid-cols-2 gap-3">
+                  <FormField label={intl.formatMessage({ id: 'agents.adv.stagnationWindow' })}>
+                    <input type="number" min={1} value={adv.stagnation_window_seconds} onChange={(e) => updateAdv('stagnation_window_seconds', Number(e.target.value))} className={inputClass} />
+                  </FormField>
+                  <FormField label={intl.formatMessage({ id: 'agents.adv.stagnationThreshold' })}>
+                    <input type="number" min={1} value={adv.stagnation_trigger_threshold} onChange={(e) => updateAdv('stagnation_trigger_threshold', Number(e.target.value))} className={inputClass} />
+                  </FormField>
+                </div>
+                <FormField label={intl.formatMessage({ id: 'agents.adv.stagnationAction' })}>
+                  <select value={adv.stagnation_action} onChange={(e) => updateAdv('stagnation_action', e.target.value as 'log_only' | 'suppress')} className={selectClass}>
+                    <option value="log_only">log_only</option>
+                    <option value="suppress">suppress</option>
+                  </select>
+                </FormField>
+              </div>
+
+              {/* G.8 — model extras */}
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-3">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.adv.modelExtras' })}</h4>
+                <FormField label={intl.formatMessage({ id: 'agents.adv.accountPool' })} hint={intl.formatMessage({ id: 'agents.adv.accountPool.hint' })}>
+                  <ChipEditor values={adv.account_pool} onChange={(v) => updateAdv('account_pool', v)} placeholder="oauth-pro" addLabel={intl.formatMessage({ id: 'common.add' })} />
+                </FormField>
+                <FormField label={intl.formatMessage({ id: 'agents.adv.utility' })} hint={intl.formatMessage({ id: 'agents.adv.utility.hint' })}>
+                  <input type="text" value={adv.utility} onChange={(e) => updateAdv('utility', e.target.value)} placeholder="claude-haiku-4-5" className={inputClass} />
+                </FormField>
+              </div>
+
+              {/* G.8 — heartbeat extras */}
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 grid grid-cols-2 gap-3">
+                <FormField label={intl.formatMessage({ id: 'agents.adv.maxConcurrentRuns' })}>
+                  <input type="number" min={1} max={64} value={adv.heartbeat_max_concurrent_runs} onChange={(e) => updateAdv('heartbeat_max_concurrent_runs', Number(e.target.value))} className={inputClass} />
+                </FormField>
+                <FormField label={intl.formatMessage({ id: 'agents.adv.cronTimezone' })} hint="Asia/Taipei">
+                  <input type="text" value={adv.heartbeat_cron_timezone} onChange={(e) => updateAdv('heartbeat_cron_timezone', e.target.value)} placeholder="Asia/Taipei" className={inputClass} />
+                </FormField>
+              </div>
+
+              {/* G.8 — proactive extras */}
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 grid grid-cols-2 gap-3">
+                <FormField label={intl.formatMessage({ id: 'agents.adv.tokenBudgetPerCheck' })}>
+                  <input type="number" min={0} value={adv.proactive_token_budget_per_check} onChange={(e) => updateAdv('proactive_token_budget_per_check', Number(e.target.value))} className={inputClass} />
+                </FormField>
+                <FormField label={intl.formatMessage({ id: 'agents.adv.proactiveMaxTurns' })}>
+                  <input type="number" min={1} max={100} value={adv.proactive_max_turns} onChange={(e) => updateAdv('proactive_max_turns', Number(e.target.value))} className={inputClass} />
+                </FormField>
+                <FormField label={intl.formatMessage({ id: 'agents.adv.proactiveTimezone' })} hint="Asia/Taipei">
+                  <input type="text" value={adv.proactive_timezone} onChange={(e) => updateAdv('proactive_timezone', e.target.value)} placeholder="Asia/Taipei" className={inputClass} />
+                </FormField>
+              </div>
+
+              {/* G.8 — free-form scalar tables */}
+              <KvTable title={intl.formatMessage({ id: 'agents.adv.ptc' })} rows={adv.ptc} onChange={(v) => updateAdv('ptc', v)} />
+              <KvTable title={intl.formatMessage({ id: 'agents.adv.prompt' })} rows={adv.prompt} onChange={(v) => updateAdv('prompt', v)} />
+              <KvTable title={intl.formatMessage({ id: 'agents.adv.culturalContext' })} rows={adv.cultural_context} onChange={(v) => updateAdv('cultural_context', v)} />
             </div>
           )}
         </div>
@@ -882,6 +1645,119 @@ function InfoRow({ label, value }: { label: string; value: string }) {
     <div className="flex justify-between py-1 text-sm">
       <span className="text-stone-500 dark:text-stone-400">{label}</span>
       <span className="font-medium text-stone-900 dark:text-stone-50">{value}</span>
+    </div>
+  );
+}
+
+// ── CT — additional_mounts table editor ──
+
+function MountTable({ mounts, onChange }: { mounts: ReadonlyArray<ContainerMount>; onChange: (next: ContainerMount[]) => void }) {
+  const intl = useIntl();
+  const update = (idx: number, patch: Partial<ContainerMount>) =>
+    onChange(mounts.map((m, i) => (i === idx ? { ...m, ...patch } : m)));
+  const remove = (idx: number) => onChange(mounts.filter((_, i) => i !== idx));
+  const add = () => onChange([...mounts, { host: '', container: '', readonly: true }]);
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.container.mounts' })}</h4>
+        <button type="button" onClick={add} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-amber-900/20">
+          <Plus className="h-3.5 w-3.5" /> {intl.formatMessage({ id: 'common.add' })}
+        </button>
+      </div>
+      <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'agents.container.mounts.hint' })}</p>
+      {mounts.length === 0 ? (
+        <p className="py-2 text-center text-xs text-stone-400">{intl.formatMessage({ id: 'agents.container.mounts.empty' })}</p>
+      ) : (
+        <div className="space-y-2">
+          {mounts.map((m, idx) => (
+            <div key={idx} className="flex items-center gap-2">
+              <input type="text" value={m.host} onChange={(e) => update(idx, { host: e.target.value })} placeholder={intl.formatMessage({ id: 'agents.container.mounts.host' })} className={cn(inputClass, 'flex-1')} />
+              <input type="text" value={m.container} onChange={(e) => update(idx, { container: e.target.value })} placeholder={intl.formatMessage({ id: 'agents.container.mounts.container' })} className={cn(inputClass, 'flex-1')} />
+              <label className="flex shrink-0 items-center gap-1 text-xs text-stone-500 dark:text-stone-400">
+                <input type="checkbox" checked={m.readonly} onChange={(e) => update(idx, { readonly: e.target.checked })} className="accent-amber-500" />
+                {intl.formatMessage({ id: 'agents.container.mounts.readonly' })}
+              </label>
+              <button type="button" onClick={() => remove(idx)} className="shrink-0 rounded p-1.5 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20" aria-label="remove mount">
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Advanced — generic key/value scalar table editor (G.8 ptc/prompt/cultural) ──
+
+function KvTable({ title, rows, onChange }: { title: string; rows: ReadonlyArray<KvRow>; onChange: (next: KvRow[]) => void }) {
+  const intl = useIntl();
+  const update = (idx: number, patch: Partial<KvRow>) =>
+    onChange(rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+  const remove = (idx: number) => onChange(rows.filter((_, i) => i !== idx));
+  const add = () => onChange([...rows, { key: '', value: '' }]);
+
+  return (
+    <div className="space-y-2 border-t border-stone-200 pt-4 dark:border-stone-700">
+      <div className="flex items-center justify-between">
+        <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{title}</h4>
+        <button type="button" onClick={add} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-amber-900/20">
+          <Plus className="h-3.5 w-3.5" /> {intl.formatMessage({ id: 'common.add' })}
+        </button>
+      </div>
+      {rows.length === 0 ? (
+        <p className="py-1 text-center text-xs text-stone-400">{intl.formatMessage({ id: 'agents.adv.kv.empty' })}</p>
+      ) : (
+        <div className="space-y-2">
+          {rows.map((r, idx) => (
+            <div key={idx} className="flex items-center gap-2">
+              <input type="text" value={r.key} onChange={(e) => update(idx, { key: e.target.value })} placeholder="key" className={cn(inputClass, 'flex-1')} />
+              <input type="text" value={r.value} onChange={(e) => update(idx, { value: e.target.value })} placeholder="value" className={cn(inputClass, 'flex-1')} />
+              <button type="button" onClick={() => remove(idx)} className="shrink-0 rounded p-1.5 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20" aria-label="remove row">
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── CT — env table editor ──
+
+function EnvTable({ env, onChange }: { env: ReadonlyArray<ContainerEnvVar>; onChange: (next: ContainerEnvVar[]) => void }) {
+  const intl = useIntl();
+  const update = (idx: number, patch: Partial<ContainerEnvVar>) =>
+    onChange(env.map((e, i) => (i === idx ? { ...e, ...patch } : e)));
+  const remove = (idx: number) => onChange(env.filter((_, i) => i !== idx));
+  const add = () => onChange([...env, { key: '', value: '' }]);
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.container.env' })}</h4>
+        <button type="button" onClick={add} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-amber-900/20">
+          <Plus className="h-3.5 w-3.5" /> {intl.formatMessage({ id: 'common.add' })}
+        </button>
+      </div>
+      {env.length === 0 ? (
+        <p className="py-2 text-center text-xs text-stone-400">{intl.formatMessage({ id: 'agents.container.env.empty' })}</p>
+      ) : (
+        <div className="space-y-2">
+          {env.map((e, idx) => (
+            <div key={idx} className="flex items-center gap-2">
+              <input type="text" value={e.key} onChange={(ev) => update(idx, { key: ev.target.value })} placeholder="KEY" className={cn(inputClass, 'flex-1')} />
+              <input type="text" value={e.value} onChange={(ev) => update(idx, { value: ev.target.value })} placeholder="value" className={cn(inputClass, 'flex-1')} />
+              <button type="button" onClick={() => remove(idx)} className="shrink-0 rounded p-1.5 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20" aria-label="remove env">
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

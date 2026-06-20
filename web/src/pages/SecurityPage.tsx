@@ -1,7 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
-import { api, type AuditEvent } from '@/lib/api';
+import { api, type AuditEvent, type KillswitchConfig } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
+import { FormField, inputClass, buttonPrimary } from '@/components/shared/Dialog';
+import { ChipEditor } from '@/components/shared/ChipEditor';
+import { toast, formatError } from '@/lib/toast';
 import {
   Shield,
   Lock,
@@ -11,6 +14,7 @@ import {
   AlertTriangle,
   FileWarning,
   History,
+  OctagonX,
 } from 'lucide-react';
 
 interface SecurityStatus {
@@ -188,7 +192,153 @@ export function SecurityPage() {
           </div>
         </SecurityCard>
       </div>
+
+      {/* Killswitch (KS) — editable */}
+      <KillswitchSection />
     </div>
+  );
+}
+
+// ── Killswitch editor (KS) ──────────────────────────────────────
+
+function KillswitchSection() {
+  const intl = useIntl();
+  const connectionState = useConnectionStore((s) => s.state);
+  const [config, setConfig] = useState<KillswitchConfig | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
+
+  const load = useCallback(async () => {
+    try {
+      setConfig(await api.killswitch.get());
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    }
+  }, [intl]);
+
+  useEffect(() => {
+    if (connectionState !== 'authenticated') return;
+    load();
+  }, [connectionState, load]);
+
+  const handleSave = async () => {
+    if (!config) return;
+    setSaving(true);
+    try {
+      await api.killswitch.update({
+        triggers: config.triggers,
+        circuit_breaker: config.circuit_breaker,
+        safety_words: config.safety_words,
+        defensive_prompt: config.defensive_prompt,
+      });
+      setSaved(true);
+      savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <SecurityCard
+      icon={OctagonX}
+      title={intl.formatMessage({ id: 'killswitch.title' })}
+      description={intl.formatMessage({ id: 'killswitch.desc' })}
+    >
+      {!config ? (
+        <p className="py-4 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
+      ) : (
+        <div className="space-y-6">
+          {/* Triggers */}
+          <div>
+            <h4 className="mb-3 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'killswitch.triggers' })}</h4>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <FormField label={intl.formatMessage({ id: 'killswitch.maxRepliesPerMinute' })} hint="1-10000">
+                <input type="number" min={1} max={10000} value={config.triggers.max_replies_per_minute} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, max_replies_per_minute: Number(e.target.value) } })} className={inputClass} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'killswitch.maxConsecutiveErrors' })} hint="1-1000">
+                <input type="number" min={1} max={1000} value={config.triggers.max_consecutive_errors} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, max_consecutive_errors: Number(e.target.value) } })} className={inputClass} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'killswitch.errorRateThreshold' })} hint="0.0-1.0">
+                <input type="number" min={0} max={1} step={0.01} value={config.triggers.error_rate_threshold} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, error_rate_threshold: Number(e.target.value) } })} className={inputClass} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'killswitch.costLimitUsd' })} hint="0-1000000">
+                <input type="number" min={0} step={0.01} value={config.triggers.cost_limit_usd} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, cost_limit_usd: Number(e.target.value) } })} className={inputClass} />
+              </FormField>
+            </div>
+          </div>
+
+          {/* Circuit breaker */}
+          <div className="border-t border-stone-200 pt-4 dark:border-stone-700">
+            <h4 className="mb-3 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'killswitch.circuitBreaker' })}</h4>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <FormField label={intl.formatMessage({ id: 'killswitch.frequencyWindowSecs' })} hint="1-86400">
+                <input type="number" min={1} max={86400} value={config.circuit_breaker.frequency_window_secs} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, frequency_window_secs: Number(e.target.value) } })} className={inputClass} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'killswitch.frequencyMaxReplies' })} hint="1-10000">
+                <input type="number" min={1} max={10000} value={config.circuit_breaker.frequency_max_replies} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, frequency_max_replies: Number(e.target.value) } })} className={inputClass} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'killswitch.similarityThreshold' })} hint="0.0-1.0">
+                <input type="number" min={0} max={1} step={0.01} value={config.circuit_breaker.similarity_threshold} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, similarity_threshold: Number(e.target.value) } })} className={inputClass} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'killswitch.tokenExplosionMultiplier' })} hint="1.0-1000.0">
+                <input type="number" min={1} max={1000} step={0.1} value={config.circuit_breaker.token_explosion_multiplier} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, token_explosion_multiplier: Number(e.target.value) } })} className={inputClass} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'killswitch.cooldownSecs' })} hint="0-86400">
+                <input type="number" min={0} max={86400} value={config.circuit_breaker.cooldown_secs} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, cooldown_secs: Number(e.target.value) } })} className={inputClass} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'killswitch.halfOpenAllowCount' })} hint="1-1000">
+                <input type="number" min={1} max={1000} value={config.circuit_breaker.half_open_allow_count} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, half_open_allow_count: Number(e.target.value) } })} className={inputClass} />
+              </FormField>
+            </div>
+          </div>
+
+          {/* Safety words */}
+          <div className="border-t border-stone-200 pt-4 dark:border-stone-700">
+            <h4 className="mb-3 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'killswitch.safetyWords' })}</h4>
+            <div className="space-y-4">
+              {(['stop', 'stop_all', 'resume', 'status'] as const).map((key) => (
+                <FormField key={key} label={intl.formatMessage({ id: `killswitch.safetyWords.${key}` })}>
+                  <ChipEditor
+                    values={config.safety_words[key]}
+                    onChange={(v) => setConfig({ ...config, safety_words: { ...config.safety_words, [key]: v } })}
+                    placeholder={key}
+                    addLabel={intl.formatMessage({ id: 'common.add' })}
+                  />
+                </FormField>
+              ))}
+            </div>
+          </div>
+
+          {/* Defensive prompt */}
+          <div className="border-t border-stone-200 pt-4 dark:border-stone-700">
+            <h4 className="mb-3 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'killswitch.defensivePrompt' })}</h4>
+            <label className="flex items-center justify-between py-1.5">
+              <span className="text-sm text-stone-700 dark:text-stone-300">{intl.formatMessage({ id: 'killswitch.defensivePrompt.enabled' })}</span>
+              <input type="checkbox" checked={config.defensive_prompt.enabled} onChange={(e) => setConfig({ ...config, defensive_prompt: { ...config.defensive_prompt, enabled: e.target.checked } })} className="h-4 w-4 accent-amber-500" />
+            </label>
+            <FormField label={intl.formatMessage({ id: 'killswitch.defensivePrompt.languages' })}>
+              <ChipEditor
+                values={config.defensive_prompt.languages}
+                onChange={(v) => setConfig({ ...config, defensive_prompt: { ...config.defensive_prompt, languages: v } })}
+                placeholder="zh-TW"
+                addLabel={intl.formatMessage({ id: 'common.add' })}
+              />
+            </FormField>
+          </div>
+
+          <div className="flex justify-end gap-2 pt-2">
+            {saved && <span className="self-center text-xs text-emerald-600 dark:text-emerald-400">{intl.formatMessage({ id: 'settings.general.saved' })}</span>}
+            <button onClick={handleSave} disabled={saving} className={buttonPrimary}>
+              {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+            </button>
+          </div>
+        </div>
+      )}
+    </SecurityCard>
   );
 }
 

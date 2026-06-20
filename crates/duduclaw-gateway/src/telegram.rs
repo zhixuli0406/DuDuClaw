@@ -304,11 +304,11 @@ async fn spawn_telegram_bot(
 async fn register_commands(client: &reqwest::Client, api_base: &str) {
     let commands = json!({
         "commands": [
-            { "command": "ask", "description": "Ask DuDuClaw AI a question" },
-            { "command": "status", "description": "Show bot status" },
-            { "command": "voice", "description": "Toggle voice reply mode" },
-            { "command": "reset", "description": "Clear conversation session" },
-            { "command": "help", "description": "Show available commands" }
+            { "command": "ask", "description": "向 DuDuClaw AI 提問" },
+            { "command": "status", "description": "顯示機器人狀態" },
+            { "command": "voice", "description": "切換語音回覆模式" },
+            { "command": "reset", "description": "清除對話工作階段" },
+            { "command": "help", "description": "顯示可用指令" }
         ]
     });
 
@@ -445,7 +445,7 @@ async fn poll_loop(
                         }
                         Err(e) => {
                             warn!("Voice transcription failed: {e}");
-                            send_reply(&client, &api_base, chat_id, "⚠️ Voice transcription failed — please try again", thread_id, msg_id, None).await;
+                            send_reply(&client, &api_base, chat_id, "⚠️ 語音轉文字失敗 — 請再試一次", thread_id, msg_id, None).await;
                             continue;
                         }
                     }
@@ -455,7 +455,7 @@ async fn poll_loop(
                         Ok(text) => text,
                         Err(e) => {
                             warn!("Audio transcription failed: {e}");
-                            send_reply(&client, &api_base, chat_id, "⚠️ Audio transcription failed — please try again", thread_id, msg_id, None).await;
+                            send_reply(&client, &api_base, chat_id, "⚠️ 音訊轉文字失敗 — 請再試一次", thread_id, msg_id, None).await;
                             continue;
                         }
                     }
@@ -657,7 +657,7 @@ async fn handle_command(
     match cmd {
         "/ask" => {
             if args.is_empty() {
-                send_reply(client, api_base, chat_id, "Usage: /ask <your question>", thread_id, None, None).await;
+                send_reply(client, api_base, chat_id, "用法：/ask <你的問題>", thread_id, None, None).await;
                 return;
             }
             let session_id = if let Some(tid) = thread_id {
@@ -676,15 +676,15 @@ async fn handle_command(
             let agent_info = {
                 let reg = ctx.registry.read().await;
                 reg.main_agent().map(|a| {
-                    format!("*Agent*: {} ({})\n*Model*: {}",
+                    format!("*代理*：{} ({})\n*模型*：{}",
                         a.config.agent.display_name,
                         a.config.agent.name,
                         a.config.model.preferred)
-                }).unwrap_or_else(|| "No agent configured".to_string())
+                }).unwrap_or_else(|| "尚未設定代理".to_string())
             };
 
             let mention_only = ctx.channel_settings.get_bool("telegram", scope_id, keys::MENTION_ONLY, false).await;
-            let status = format!("{agent_info}\n\nMention Only: {}", if mention_only { "✅" } else { "❌" });
+            let status = format!("{agent_info}\n\n僅在被提及時回覆：{}", if mention_only { "✅" } else { "❌" });
             send_reply(client, api_base, chat_id, &status, thread_id, None, None).await;
         }
         "/voice" => {
@@ -692,10 +692,10 @@ async fn handle_command(
             let mut sessions = ctx.voice_sessions.lock().await;
             let msg = if sessions.contains(&session_key) {
                 sessions.remove(&session_key);
-                "🔇 Voice reply mode disabled"
+                "🔇 已關閉語音回覆模式"
             } else {
                 sessions.insert(session_key);
-                "🎤 Voice reply mode enabled"
+                "🎤 已開啟語音回覆模式"
             };
             send_reply(client, api_base, chat_id, msg, thread_id, None, None).await;
         }
@@ -706,18 +706,18 @@ async fn handle_command(
                 format!("telegram:{chat_id}")
             };
             let msg = match ctx.session_manager.delete_session(&session_id).await {
-                Ok(()) => format!("✅ Session `{session_id}` cleared."),
-                Err(e) => format!("⚠️ Failed to clear session: {e}"),
+                Ok(()) => format!("✅ 已清除工作階段 `{session_id}`。"),
+                Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
             };
             send_reply(client, api_base, chat_id, &msg, thread_id, None, None).await;
         }
         "/help" => {
             let help = "\
-/ask <prompt> — Ask AI a question\n\
-/status — Show bot status\n\
-/voice — Toggle voice reply mode\n\
-/reset — Clear conversation session\n\
-/help — Show this help";
+/ask <提問> — 向 AI 提問\n\
+/status — 顯示機器人狀態\n\
+/voice — 切換語音回覆模式\n\
+/reset — 清除對話工作階段\n\
+/help — 顯示本說明";
             send_reply(client, api_base, chat_id, help, thread_id, None, None).await;
         }
         _ => {} // Unknown command — ignore
@@ -755,7 +755,7 @@ async fn handle_callback_query(
                 } else {
                     format!("telegram:{chat_id}")
                 };
-                let msg = format!("Started new session. Previous: `{session_id}`");
+                let msg = format!("已開始新的工作階段。先前的：`{session_id}`");
                 send_reply(client, api_base, chat_id, &msg, thread_id, None, None).await;
             }
             "voice_toggle" => {
@@ -763,10 +763,10 @@ async fn handle_callback_query(
                 let mut sessions = ctx.voice_sessions.lock().await;
                 let msg = if sessions.contains(&session_key) {
                     sessions.remove(&session_key);
-                    "🔇 Voice mode disabled"
+                    "🔇 已關閉語音模式"
                 } else {
                     sessions.insert(session_key);
-                    "🎤 Voice mode enabled"
+                    "🎤 已開啟語音模式"
                 };
                 send_reply(client, api_base, chat_id, msg, thread_id, None, None).await;
             }
@@ -1041,11 +1041,15 @@ async fn send_reply(
                         || desc.contains("replied message not found")
                         || desc.contains("Bad Request"))
                     {
-                        warn!("Telegram: retrying without reply_parameters");
+                        warn!("Telegram: retrying without reply_parameters / Markdown");
+                        // HC1: drop parse_mode on retry. A Markdown parse error
+                        // would otherwise re-fail identically and silently drop the
+                        // reply. `parse_mode` is `skip_serializing_if=Option::is_none`,
+                        // so `None` sends plain text. Mirrors dispatcher.rs.
                         let fallback = SendMessage {
                             chat_id,
                             text: chunk.to_string(),
-                            parse_mode: Some("Markdown".to_string()),
+                            parse_mode: None,
                             message_thread_id,
                             reply_parameters: None,
                             reply_markup: if i == chunks.len() - 1 { reply_markup.clone() } else { None },

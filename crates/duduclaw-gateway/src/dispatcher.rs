@@ -651,11 +651,9 @@ async fn poll_and_dispatch(
                      likely missing --allowedTools in CLI spawn"
                 );
                 response_text.push_str(
-                    "\n\n[DUDUCLAW_SYSTEM:MCP_PERMISSION_BLOCKED] ⚠️ This agent reported \
-                     MCP tool permission failures. This is a system configuration issue, \
-                     not an agent error. The gateway needs to pass --allowedTools \
-                     'mcp__duduclaw__*' when spawning sub-agents. Please update the \
-                     gateway binary to fix this.",
+                    "\n\n[DUDUCLAW_SYSTEM:MCP_PERMISSION_BLOCKED] ⚠️ 此代理回報 MCP 工具權限不足。\
+                     這是系統設定問題，並非代理本身的錯誤。請在閘道設定中允許此代理使用 \
+                     DuDuClaw MCP 工具後再試一次。",
                 );
             }
 
@@ -864,7 +862,10 @@ async fn dispatch_in_worktree(
 
     if cfg.auto_merge || cfg.cleanup {
         let status = manager.inspect_worktree(&wt.path, &repo_root).await;
-        let action = crate::worktree::determine_snap_action(&status);
+        // HC6: pass `auto_merge` so commits are merged into the target branch
+        // only with explicit consent. With cleanup-on-exit but no auto-merge,
+        // the snap downgrades to a non-merging cleanup.
+        let action = crate::worktree::determine_snap_action(&status, cfg.auto_merge);
 
         let target_branch = get_main_branch(&repo_root).await;
         match manager.execute_snap(&action, &repo_root, &wt.path, &wt.branch, &target_branch).await {
@@ -1065,12 +1066,30 @@ async fn poll_pending_taskspecs(
                 continue;
             }
 
+            // M28: atomically claim the taskspec BEFORE spawning. Flipping the
+            // status inside the spawned task left a window in which a concurrent
+            // poll cycle could observe the spec still `Planned` and double-pick
+            // it. Persist `Running` to disk here, while still in the sequential
+            // scan, so any subsequent load (this cycle or another) sees it
+            // claimed. If the persist fails we skip the spec rather than risk a
+            // double dispatch.
+            spec.status = crate::task_spec::TaskStatus::Running;
+            if let Err(e) = spec.save(&agent_dir) {
+                warn!(
+                    task = %spec.task_id,
+                    agent = %agent_name,
+                    error = %e,
+                    "Failed to claim TaskSpec (persist Running) — skipping to avoid double-pickup"
+                );
+                continue;
+            }
+
             info!(
                 task = %spec.task_id,
                 agent = %agent_name,
                 goal = %spec.goal,
                 steps = spec.steps.len(),
-                "Picking up planned TaskSpec for execution"
+                "Claimed planned TaskSpec for execution"
             );
 
             // Clone for the spawned task.

@@ -112,17 +112,34 @@ impl IdentityProvider for WikiCacheIdentityProvider {
             return Ok(None);
         }
         let wire = channel.as_wire();
-        for person in self.iter_people() {
-            if person
+        // Collect ALL records declaring this handle. `identity/` is
+        // agent-writable, so an attacker could plant a second file claiming a
+        // trusted person's channel id. If more than one record matches we must
+        // NOT pick one (read_dir order is non-deterministic) — that would let
+        // the attacker's roles/project_ids flow into the trusted `<sender>`
+        // block. Treat an ambiguous handle as unresolved (fail-safe: the
+        // sender is handled as an unknown stranger).
+        let mut matches = self.iter_people().into_iter().filter(|person| {
+            person
                 .channel_handles
                 .get(&wire)
                 .map(|s| s.as_str() == external_id)
                 .unwrap_or(false)
-            {
-                return Ok(Some(person));
-            }
+        });
+
+        let first = match matches.next() {
+            Some(person) => person,
+            None => return Ok(None),
+        };
+        if matches.next().is_some() {
+            warn!(
+                "identity wiki cache: ambiguous handle for channel {} id {} \
+                 declared by multiple records — refusing to resolve",
+                wire, external_id
+            );
+            return Ok(None);
         }
-        Ok(None)
+        Ok(Some(first))
     }
 
     async fn lookup_project_members(
@@ -187,15 +204,28 @@ fn parse_person_file(path: &Path) -> Result<ResolvedPerson, String> {
     })
 }
 
-/// Extract the YAML frontmatter block — the substring between the first
-/// `---` line and the next `---` line. Returns `None` for files without a
-/// frontmatter block.
+/// Extract the YAML frontmatter block — the substring between the opening
+/// `---` line and the next line that is exactly `---`. A `---` appearing
+/// inside a value does not close the block. Returns `None` for files without
+/// a frontmatter block.
 fn extract_frontmatter(raw: &str) -> Option<&str> {
     let trimmed = raw.trim_start();
     let body = trimmed.strip_prefix("---")?;
     let body = body.strip_prefix('\n').or_else(|| body.strip_prefix("\r\n"))?;
-    let end = body.find("\n---")?;
-    Some(&body[..end])
+
+    // Find the closing delimiter — only a line that is exactly `---` counts.
+    // Searching for the `\n---` substring would close the block early if a
+    // frontmatter VALUE happened to contain `---` (e.g. `note: "a---b"`),
+    // silently truncating and dropping the record.
+    let mut offset = 0;
+    for line in body.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\n', '\r']);
+        if content == "---" {
+            return Some(&body[..offset]);
+        }
+        offset += line.len();
+    }
+    None
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -388,6 +418,76 @@ mod tests {
         let provider = WikiCacheIdentityProvider::for_home("/some/home");
         // Probe via the people_dir path.
         assert!(provider.people_dir().ends_with("shared/wiki/identity/people"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ambiguous_handle_across_records_is_rejected() {
+        // HS10: two files claim the same Discord handle. Since `identity/` is
+        // agent-writable, an attacker could plant the second file to hijack a
+        // trusted person's identity. The resolver must refuse (return None)
+        // rather than pick one non-deterministically.
+        let tmp = TempDir::new().unwrap();
+        let provider = WikiCacheIdentityProvider::for_wiki_root(tmp.path().to_path_buf());
+
+        write_person(
+            tmp.path(),
+            "trusted.md",
+            "person_id: person_trusted\n\
+             display_name: Trusted Person\n\
+             roles: [admin]\n\
+             channel_handles:\n  discord: \"1234567890\"\n",
+        );
+        write_person(
+            tmp.path(),
+            "attacker.md",
+            "person_id: person_attacker\n\
+             display_name: Attacker\n\
+             roles: [admin]\n\
+             channel_handles:\n  discord: \"1234567890\"\n",
+        );
+
+        let resolved = provider
+            .resolve_by_channel(ChannelKind::Discord, "1234567890")
+            .await
+            .unwrap();
+        assert!(
+            resolved.is_none(),
+            "ambiguous handle must not resolve to any record"
+        );
+    }
+
+    #[test]
+    fn extract_frontmatter_keeps_value_containing_dashes() {
+        // M55: a value containing `---` must NOT close the block early. The
+        // closing delimiter is only a line that is exactly `---`.
+        let raw = "---\nperson_id: x\nnote: \"a---b---c\"\ndisplay_name: y\n---\n\nbody\n";
+        let yaml = extract_frontmatter(raw).expect("frontmatter present");
+        assert!(yaml.contains("person_id: x"));
+        assert!(yaml.contains("display_name: y"));
+        assert!(yaml.contains("a---b---c"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn record_with_dashes_in_value_still_resolves() {
+        // M55 end-to-end: a frontmatter value containing `---` must not drop
+        // the whole record.
+        let tmp = TempDir::new().unwrap();
+        let provider = WikiCacheIdentityProvider::for_wiki_root(tmp.path().to_path_buf());
+        write_person(
+            tmp.path(),
+            "dashes.md",
+            "person_id: person_dash\n\
+             display_name: Dash --- Person\n\
+             channel_handles:\n  discord: \"55\"\n",
+        );
+
+        let resolved = provider
+            .resolve_by_channel(ChannelKind::Discord, "55")
+            .await
+            .unwrap()
+            .expect("record with dashes in a value should still resolve");
+        assert_eq!(resolved.person_id, "person_dash");
+        assert_eq!(resolved.display_name, "Dash --- Person");
     }
 
     #[test]

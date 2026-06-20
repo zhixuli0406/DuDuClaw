@@ -26,6 +26,9 @@ pub struct InferenceEngine {
     router: Option<ConfidenceRouter>,
     manager: InferenceManager,
     mlx: Option<MlxBridge>,
+    /// DuDuClaw home dir (`~/.duduclaw`), used to resolve encrypted config
+    /// fields (e.g. `openai_compat.api_key_enc`) read-only at backend build.
+    home_dir: std::path::PathBuf,
 }
 
 impl InferenceEngine {
@@ -47,6 +50,7 @@ impl InferenceEngine {
             router,
             manager,
             mlx,
+            home_dir: home_dir.to_path_buf(),
         }
     }
 
@@ -104,9 +108,11 @@ impl InferenceEngine {
                 let compat = crate::config::OpenAiCompatConfig {
                     base_url: url,
                     api_key: None,
+                    api_key_enc: None,
                     model,
                 };
-                *self.backend.write().await = Some(Arc::new(OpenAiCompatBackend::new(compat)));
+                *self.backend.write().await =
+                    Some(Arc::new(OpenAiCompatBackend::new_with_home(compat, &self.home_dir)));
             }
         }
 
@@ -133,7 +139,10 @@ impl InferenceEngine {
         // OpenAI-compat takes priority if configured
         if let Some(ref compat) = self.config.openai_compat {
             info!(url = %compat.base_url, "Using OpenAI-compatible backend");
-            return Ok(Box::new(OpenAiCompatBackend::new(compat.clone())));
+            return Ok(Box::new(OpenAiCompatBackend::new_with_home(
+                compat.clone(),
+                &self.home_dir,
+            )));
         }
 
         let backend_type = self.config.backend.unwrap_or(hw.recommended_backend);

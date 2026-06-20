@@ -43,6 +43,11 @@ pub trait ContainerRuntime: Send + Sync {
     /// Retrieve the stdout/stderr logs of a container.
     async fn logs(&self, id: &ContainerId) -> Result<String>;
 
+    /// Wait for the container to exit, then return its exit code + captured
+    /// logs (HC5). Backends that cannot observe the exit code should return a
+    /// clear `Err` rather than faking success.
+    async fn wait(&self, id: &ContainerId) -> Result<ContainerExit>;
+
     /// Perform a health check on the runtime itself.
     async fn health_check(&self) -> Result<RuntimeHealth>;
 }

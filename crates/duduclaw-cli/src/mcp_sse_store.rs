@@ -40,14 +40,17 @@ struct ConnectionEntry {
     tx: broadcast::Sender<String>,
     /// Last activity timestamp for idle TTL eviction.
     last_active: Instant,
+    /// Owning principal (client_id) — only this principal may push to / read this connection.
+    owner: String,
 }
 
 impl ConnectionEntry {
-    fn new(tx: broadcast::Sender<String>) -> Self {
+    fn new(tx: broadcast::Sender<String>, owner: String) -> Self {
         Self {
             buffer: VecDeque::with_capacity(RING_BUFFER_CAPACITY),
             tx,
             last_active: Instant::now(),
+            owner,
         }
     }
 
@@ -107,13 +110,34 @@ impl SseEventStore {
         }
     }
 
-    /// Register a new SSE connection with the given ID and broadcast sender.
-    pub fn register_connection(&self, conn_id: &str, tx: broadcast::Sender<String>) {
+    /// Register a new SSE connection with the given ID, broadcast sender, and owning principal.
+    /// The `owner` (principal client_id) is recorded so later push/read can verify ownership.
+    pub fn register_connection(&self, conn_id: &str, tx: broadcast::Sender<String>, owner: &str) {
         let mut inner = self.inner.lock().unwrap();
+        inner.connections.insert(
+            conn_id.to_string(),
+            ConnectionEntry::new(tx, owner.to_string()),
+        );
+        debug!(conn_id, owner, "SSE connection registered");
+    }
+
+    /// Return `true` if `owner` owns `conn_id`. A non-existent connection is NOT owned
+    /// by anyone, so this returns `false` (fail-closed).
+    pub fn is_owner(&self, conn_id: &str, owner: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
         inner
             .connections
-            .insert(conn_id.to_string(), ConnectionEntry::new(tx));
-        debug!(conn_id, "SSE connection registered");
+            .get(conn_id)
+            .map(|e| e.owner == owner)
+            .unwrap_or(false)
+    }
+
+    /// Remove a connection (e.g. on client disconnect) so its broadcast sender is dropped.
+    pub fn remove_connection(&self, conn_id: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.connections.remove(conn_id).is_some() {
+            debug!(conn_id, "SSE connection removed");
+        }
     }
 
     /// Push an event to the connection's ring buffer and live stream.
@@ -185,7 +209,7 @@ mod tests {
 
     fn make_conn(store: &SseEventStore, id: &str) -> broadcast::Receiver<String> {
         let (tx, rx) = broadcast::channel(64);
-        store.register_connection(id, tx);
+        store.register_connection(id, tx, "owner");
         rx
     }
 
@@ -284,7 +308,7 @@ mod tests {
         // Manually insert a connection with an old timestamp
         {
             let mut inner = store.inner.lock().unwrap();
-            let mut entry = ConnectionEntry::new(tx);
+            let mut entry = ConnectionEntry::new(tx, "owner".to_string());
             // Backdate last_active by 11 minutes
             entry.last_active = Instant::now() - Duration::from_secs(660);
             inner.connections.insert("stale_conn".to_string(), entry);
@@ -304,6 +328,28 @@ mod tests {
 
         store.evict_idle();
         assert_eq!(store.connection_count(), 1, "Active connection should be preserved");
+    }
+
+    // ── Test: ownership is recorded and enforced ──────────────────────────────
+    #[test]
+    fn is_owner_matches_registering_principal() {
+        let store = make_store();
+        let (tx, _rx) = broadcast::channel(4);
+        store.register_connection("owned", tx, "alice");
+
+        assert!(store.is_owner("owned", "alice"), "alice owns the connection");
+        assert!(!store.is_owner("owned", "mallory"), "mallory must not own it");
+        // Fail-closed: unknown connection is owned by nobody.
+        assert!(!store.is_owner("ghost", "alice"));
+    }
+
+    #[test]
+    fn remove_connection_drops_entry() {
+        let store = make_store();
+        make_conn(&store, "to_remove");
+        assert_eq!(store.connection_count(), 1);
+        store.remove_connection("to_remove");
+        assert_eq!(store.connection_count(), 0);
     }
 
     // ── Test: event IDs are monotonically increasing ──────────────────────────

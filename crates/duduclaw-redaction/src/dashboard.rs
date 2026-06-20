@@ -174,7 +174,7 @@ mod tests {
         )
         .unwrap();
         let _ = p.restore(
-            "<REDACT:EMAIL:00000000>",
+            "<REDACT:EMAIL:00000000000000000000000000000000>",
             &Caller::owner("agnes"),
             RestoreTarget::UserChannel,
         );

@@ -78,6 +78,9 @@ pub struct LlamafileManager {
     state: RwLock<ServerState>,
     child: RwLock<Option<tokio::process::Child>>,
     client: reqwest::Client,
+    /// L6: serializes `start()` so concurrent callers cannot each spawn a
+    /// process through the check-then-set TOCTOU window.
+    start_lock: tokio::sync::Mutex<()>,
 }
 
 impl LlamafileManager {
@@ -92,6 +95,7 @@ impl LlamafileManager {
             state: RwLock::new(ServerState::Stopped),
             child: RwLock::new(None),
             client,
+            start_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -118,6 +122,11 @@ impl LlamafileManager {
 
     /// Start the llamafile server.
     pub async fn start(&self, llamafile_name: Option<&str>) -> Result<()> {
+        // L6: hold the start lock across the whole check-and-spawn so two
+        // concurrent callers cannot both pass the "already running" check and
+        // each spawn a process.
+        let _start_guard = self.start_lock.lock().await;
+
         {
             let state = self.state.read().await;
             if *state == ServerState::Running {

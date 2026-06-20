@@ -344,6 +344,97 @@ fn collapse_blank_lines(s: &str) -> String {
     out
 }
 
+/// Severity at or above which a single SOUL-scanner finding blocks the apply.
+const SOUL_SCANNER_BLOCK_SEVERITY: u32 = 70;
+
+/// Cumulative threat score (sum of finding severities) at or above which an
+/// accumulation of *individually* low-severity hidden-content findings is
+/// treated as blockable.
+///
+/// M33: a patch can smuggle several sub-threshold fragments (e.g. multiple
+/// short HTML comments / zero-width runs) that each score < 70 and would
+/// otherwise all be waved through with a log line. Summing the severities
+/// closes that bypass while still tolerating one benign low-severity hit.
+const SOUL_SCANNER_BLOCK_CUMULATIVE: u32 = 120;
+
+/// Run the three GVU content-safety gates against an arbitrary payload:
+/// (1) prompt-injection scan, (2) SOUL.md hidden-content scan, and
+/// (3) the NFKC-normalized contract-override token check.
+///
+/// HS1: callers MUST pass the text that actually lands in SOUL.md (the patch
+/// body or sanitized append) — not just the LLM narrative — so the structured
+/// patch payload cannot bypass these gates.
+fn scan_content_safety(agent_id: &str, payload: &str) -> Result<(), String> {
+    // (1) Prompt-injection scan.
+    let scan = duduclaw_security::input_guard::scan_input(
+        payload,
+        duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
+    );
+    if scan.blocked {
+        warn!(
+            agent = %agent_id,
+            score = scan.risk_score,
+            rules = ?scan.matched_rules,
+            "GVU proposal blocked by content safety scan"
+        );
+        return Err(format!(
+            "GVU proposal contains unsafe content (score {}): {:?}",
+            scan.risk_score, scan.matched_rules
+        ));
+    }
+
+    // (2) Hidden/malicious Markdown content (Soul-Evil Attack defense).
+    let soul_scan = duduclaw_security::soul_scanner::scan_soul(payload);
+    if !soul_scan.clean {
+        let max_severity = soul_scan.findings.iter().map(|f| f.severity).max().unwrap_or(0);
+        // M33: also reject when many low-severity fragments accumulate.
+        let cumulative: u32 = soul_scan.findings.iter().map(|f| f.severity).sum();
+        if max_severity >= SOUL_SCANNER_BLOCK_SEVERITY
+            || cumulative >= SOUL_SCANNER_BLOCK_CUMULATIVE
+        {
+            warn!(
+                agent = %agent_id,
+                threat_score = soul_scan.threat_score,
+                findings = soul_scan.findings.len(),
+                max_severity,
+                cumulative,
+                "GVU proposal blocked by SOUL.md scanner"
+            );
+            return Err(format!(
+                "GVU proposal contains hidden content (threat score {}/100, \
+                 {} findings, cumulative severity {}): {}",
+                soul_scan.threat_score,
+                soul_scan.findings.len(),
+                cumulative,
+                soul_scan.summary,
+            ));
+        }
+        // A single sub-threshold finding: log but allow (e.g., short HTML comment).
+        info!(
+            agent = %agent_id,
+            threat_score = soul_scan.threat_score,
+            findings = soul_scan.findings.len(),
+            "GVU proposal has low-severity SOUL.md scanner findings — allowing"
+        );
+    }
+
+    // (3) Contract-override token check. NFKC-normalize and strip invisible
+    // characters first to prevent Unicode fullwidth/homoglyph bypass (R4-H2).
+    let normalized: String = payload.nfkc().collect();
+    let clean: String = normalized
+        .chars()
+        .filter(|c| !matches!(*c,
+            '\u{00AD}' | '\u{200B}'..='\u{200F}' | '\u{FEFF}' | '\u{00A0}'
+        ))
+        .collect();
+    let lower = clean.to_lowercase();
+    if lower.contains("must_not") || lower.contains("must_always") || lower.contains("contract.toml") {
+        return Err("GVU proposal cannot modify behavioral contracts".to_string());
+    }
+
+    Ok(())
+}
+
 /// Outcome of judging an observation period.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OutcomeVerdict {
@@ -385,62 +476,12 @@ impl Updater {
     ) -> Result<SoulVersion, String> {
         let soul_path = agent_dir.join("SOUL.md");
 
-        // Scan proposal content for prompt injection before applying to SOUL.md.
-        let scan = duduclaw_security::input_guard::scan_input(
-            &proposal.content,
-            duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
-        );
-        if scan.blocked {
-            warn!(
-                agent = %proposal.agent_id,
-                score = scan.risk_score,
-                rules = ?scan.matched_rules,
-                "GVU proposal blocked by content safety scan"
-            );
-            return Err(format!(
-                "GVU proposal contains unsafe content (score {}): {:?}",
-                scan.risk_score, scan.matched_rules
-            ));
-        }
-
-        // Scan proposal for hidden/malicious Markdown content (Soul-Evil Attack defense).
-        let soul_scan = duduclaw_security::soul_scanner::scan_soul(&proposal.content);
-        if !soul_scan.clean {
-            let max_severity = soul_scan.findings.iter().map(|f| f.severity).max().unwrap_or(0);
-            if max_severity >= 70 {
-                warn!(
-                    agent = %proposal.agent_id,
-                    threat_score = soul_scan.threat_score,
-                    findings = soul_scan.findings.len(),
-                    "GVU proposal blocked by SOUL.md scanner"
-                );
-                return Err(format!(
-                    "GVU proposal contains hidden content (threat score {}/100): {}",
-                    soul_scan.threat_score, soul_scan.summary,
-                ));
-            }
-            // Low-severity findings: log but allow (e.g., short HTML comments)
-            info!(
-                agent = %proposal.agent_id,
-                threat_score = soul_scan.threat_score,
-                "GVU proposal has low-severity SOUL.md scanner findings — allowing"
-            );
-        }
-
-        // Verify the proposal does not attempt to override behavioral contracts.
-        // NFKC-normalize and strip invisible characters before checking to prevent
-        // Unicode fullwidth/homoglyph bypass attacks (R4-H2).
-        let normalized: String = proposal.content.nfkc().collect();
-        let clean: String = normalized
-            .chars()
-            .filter(|c| !matches!(*c,
-                '\u{00AD}' | '\u{200B}'..='\u{200F}' | '\u{FEFF}' | '\u{00A0}'
-            ))
-            .collect();
-        let lower = clean.to_lowercase();
-        if lower.contains("must_not") || lower.contains("must_always") || lower.contains("contract.toml") {
-            return Err("GVU proposal cannot modify behavioral contracts".to_string());
-        }
+        // Scan the proposal narrative early — cheap and gives an informative
+        // rejection before we bother computing the patched document. NOTE: this
+        // is NOT sufficient on its own (HS1) — `apply_patch_to_soul` writes
+        // `patch.content`, not `proposal.content`, so the SAME gates are re-run
+        // below against the actual `new_content` that lands in SOUL.md.
+        scan_content_safety(&proposal.agent_id, &proposal.content)?;
 
         // Read current SOUL.md (for rollback)
         let current_content = std::fs::read_to_string(&soul_path)
@@ -449,9 +490,15 @@ impl Updater {
         // Prefer the structured patch path when the Generator emitted one.
         // The legacy free-form append remains as a fallback so older LLM outputs
         // (and existing in-flight proposals) continue to apply.
-        let new_content = if let Some(patch) = &proposal.patch {
-            apply_patch_to_soul(&current_content, patch)
-                .map_err(|e| format!("Structured patch failed: {e}"))?
+        //
+        // `applied_payload` is the text actually introduced into SOUL.md by this
+        // proposal (the patch body, or the sanitized append). The content-safety
+        // gates below run on it — NOT on `proposal.content` — because the patch
+        // path writes `patch.content`, which the early narrative scan never saw.
+        let (new_content, applied_payload): (String, String) = if let Some(patch) = &proposal.patch {
+            let applied = apply_patch_to_soul(&current_content, patch)
+                .map_err(|e| format!("Structured patch failed: {e}"))?;
+            (applied, patch.content.clone())
         } else {
             // Strip LLM proposal-meta sections (diagnosis, rationale, expected_improvement,
             // wiki_proposals, etc.) before appending. Without this, every GVU cycle would
@@ -470,13 +517,21 @@ impl Updater {
             // Build new SOUL.md content by appending the proposed changes.
             // Always append rather than replace — this prevents a malicious or
             // broken LLM output from wiping out the entire SOUL.md.
-            format!(
+            let merged = format!(
                 "{}\n\n<!-- Evolution update ({}) -->\n{}",
                 current_content,
                 Utc::now().format("%Y-%m-%d"),
                 sanitized_trimmed,
-            )
+            );
+            (merged, sanitized_trimmed.to_string())
         };
+
+        // HS1: re-run the content-safety gates against the payload that is
+        // ACTUALLY written. A benign-looking `proposed_changes` narrative can
+        // ship a `soul_patch` carrying hidden HTML-comment / zero-width
+        // instructions or contract-override tokens that the early narrative
+        // scan never inspected.
+        scan_content_safety(&proposal.agent_id, &applied_payload)?;
 
         // Validate new content
         if new_content.trim().is_empty() {
@@ -692,7 +747,7 @@ impl Updater {
 
         let pre = &version.pre_metrics;
 
-        // Check feedback ratio: tolerate 3% dip
+        // Check feedback ratio: tolerate 3% dip (relative to a real baseline).
         let feedback_delta = post_metrics.positive_feedback_ratio - pre.positive_feedback_ratio;
         if feedback_delta < -0.03 && pre.positive_feedback_ratio > 0.0 {
             return OutcomeVerdict::Rollback {
@@ -700,6 +755,24 @@ impl Updater {
                     "Feedback ratio dropped {:.1}% (from {:.2} to {:.2})",
                     feedback_delta.abs() * 100.0,
                     pre.positive_feedback_ratio,
+                    post_metrics.positive_feedback_ratio,
+                ),
+            };
+        }
+        // M32: when there is NO baseline feedback (common case — pre ratio is
+        // 0.0 because the agent had no feedback file before this version), the
+        // relative-dip check above can never fire. Guard against a version that
+        // collected real but clearly-poor feedback during observation by also
+        // applying an absolute floor. Only engages once enough feedback exists
+        // for the post ratio to be meaningful (>= 5 conversations is already
+        // guaranteed by the early-return above).
+        if pre.positive_feedback_ratio == 0.0
+            && post_metrics.positive_feedback_ratio > 0.0
+            && post_metrics.positive_feedback_ratio < 0.5
+        {
+            return OutcomeVerdict::Rollback {
+                reason: format!(
+                    "Post-change feedback ratio is poor ({:.2}) with no positive baseline to compare against",
                     post_metrics.positive_feedback_ratio,
                 ),
             };
@@ -795,5 +868,80 @@ impl Updater {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gvu::version_store::VersionStore;
+
+    fn make_updater() -> Updater {
+        let tmp = std::env::temp_dir().join(format!("dudu_upd_{}.db", uuid::Uuid::new_v4()));
+        Updater::new(VersionStore::new(&tmp), Some(24.0))
+    }
+
+    fn make_version(pre: VersionMetrics) -> SoulVersion {
+        SoulVersion {
+            version_id: "v1".to_string(),
+            agent_id: "agent-a".to_string(),
+            soul_hash: "h".to_string(),
+            soul_summary: "s".to_string(),
+            applied_at: Utc::now(),
+            observation_end: Utc::now(),
+            status: VersionStatus::Observing,
+            pre_metrics: pre,
+            post_metrics: None,
+            proposal_id: "p1".to_string(),
+            rollback_diff: "old".to_string(),
+            rollback_diff_hash: None,
+        }
+    }
+
+    #[test]
+    fn test_scan_content_safety_blocks_contract_override_in_payload() {
+        // HS1: a payload (patch body) that strips/edits contract tokens must be
+        // rejected even though the narrative the early scan saw was benign.
+        let err = scan_content_safety("agent-a", "Update: remove must_always rule X")
+            .unwrap_err();
+        assert!(err.contains("behavioral contracts"));
+    }
+
+    #[test]
+    fn test_scan_content_safety_passes_clean_payload() {
+        assert!(scan_content_safety("agent-a", "- Be concise and helpful.").is_ok());
+    }
+
+    #[test]
+    fn test_m32_no_baseline_poor_feedback_rolls_back() {
+        // M32: pre ratio 0.0 (no feedback file) + poor post feedback → rollback.
+        let updater = make_updater();
+        let version = make_version(VersionMetrics {
+            positive_feedback_ratio: 0.0,
+            ..Default::default()
+        });
+        let post = VersionMetrics {
+            positive_feedback_ratio: 0.3,
+            conversations_count: 10,
+            ..Default::default()
+        };
+        let verdict = updater.judge_outcome_at(&version, &post, Utc::now());
+        assert!(matches!(verdict, OutcomeVerdict::Rollback { .. }));
+    }
+
+    #[test]
+    fn test_m32_no_baseline_good_feedback_confirms() {
+        let updater = make_updater();
+        let version = make_version(VersionMetrics {
+            positive_feedback_ratio: 0.0,
+            ..Default::default()
+        });
+        let post = VersionMetrics {
+            positive_feedback_ratio: 0.9,
+            conversations_count: 10,
+            ..Default::default()
+        };
+        let verdict = updater.judge_outcome_at(&version, &post, Utc::now());
+        assert!(matches!(verdict, OutcomeVerdict::Confirm));
     }
 }

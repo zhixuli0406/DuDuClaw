@@ -457,13 +457,16 @@ DuDuClaw 在 Claude Code 的 Hook 系統上建構了三層漸進式防禦：
 
 ## 安裝
 
-### npm（推薦）
+### npm（推薦，所有平台含 Windows）
 
 ```bash
 npm install -g duduclaw
 ```
 
-安裝完成後會自動下載對應平台的預編譯 binary（支援 macOS ARM64/x64、Linux x64/ARM64、Windows x64）。
+安裝完成後會自動下載對應平台的**預編譯 binary**（支援 macOS ARM64/x64、Linux x64/ARM64、Windows x64），**無需編譯器、無需 Rust、無需 MSVC Build Tools**。Windows 使用者只要先裝 [Node.js](https://nodejs.org/) 即可，這是唯一前置需求。
+
+> **⚠️ 如果安裝過程要求你安裝 Rust / MSVC Build Tools（~2GB）並編譯（約 1.5 小時），代表你走錯路徑了。**
+> 那是「[從原始碼建構](#從原始碼建構)」路徑，只有想改程式碼的貢獻者才需要。一般使用請務必用上面的 `npm install -g duduclaw`（或下方 Homebrew / 一行安裝），會直接下載官方預編譯 binary。
 
 ### Homebrew（macOS / Linux）
 
@@ -473,9 +476,19 @@ brew install zhixuli0406/tap/duduclaw
 
 ### 一行安裝
 
+**macOS / Linux：**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | sh
 ```
+
+**Windows（PowerShell）：**
+
+```powershell
+irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.ps1 | iex
+```
+
+> 一行安裝腳本會自動偵測**最新 release** 並下載對應平台的預編譯 binary，同樣免編譯。若 GitHub 下載失敗才會詢問是否改用原始碼建構（此時建議改用 `npm install -g duduclaw`）。可用環境變數 `DUDUCLAW_VERSION` 釘選特定版本。
 
 ### Python SDK（函式庫，非 CLI）
 
@@ -726,9 +739,9 @@ cd web && npx tsc --noEmit
 - [docs/spec/soul-md-spec.md](docs/spec/soul-md-spec.md) — SOUL.md 格式規範 v1.0
 - [docs/spec/contract-toml-spec.md](docs/spec/contract-toml-spec.md) — CONTRACT.toml 格式規範 v1.0
 - [docs/api/README.md](docs/api/README.md) — WebSocket RPC 協議 + JSON-RPC 2.0 介面
-- [docs/evolution-engine.md](docs/evolution-engine.md) — Evolution Engine v2 設計文件
-- [docs/deployment-guide.md](docs/deployment-guide.md) — 生產環境部署指南
-- [docs/development-guide.md](docs/development-guide.md) — 開發者設定與 Agent 開發
+- [docs/architecture/evolution-engine.md](docs/architecture/evolution-engine.md) — Evolution Engine v2 設計文件
+- [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md) — 生產環境部署指南
+- [docs/guides/development-guide.md](docs/guides/development-guide.md) — 開發者設定與 Agent 開發
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md) — 自訂 MCP 工具教學
 
 ---

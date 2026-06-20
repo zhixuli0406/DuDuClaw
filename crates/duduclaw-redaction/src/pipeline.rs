@@ -104,7 +104,19 @@ impl RedactionPipeline {
                     tokens_written: Vec::new(),
                 });
             }
-            SourceMode::On | SourceMode::Selective => {}
+            SourceMode::On => {}
+            SourceMode::Selective => {
+                // Selective only takes effect for the system-prompt source,
+                // where the engine restricts firing to `apply_to_system_prompt`
+                // rules. For any other source, Selective must NOT force a full
+                // redact — pass the text through unchanged.
+                if !matches!(source, Source::SystemPrompt { .. }) {
+                    return Ok(RedactionOutput {
+                        redacted_text: text.to_string(),
+                        tokens_written: Vec::new(),
+                    });
+                }
+            }
         }
 
         let matches = self.engine.apply(text, source);
@@ -234,7 +246,11 @@ impl RedactionPipeline {
                     }
                     match entry.original {
                         Some(plain) => {
-                            let _ = vault.record_reveal(tok.as_str());
+                            let _ = vault.record_reveal(
+                                tok.as_str(),
+                                &entry.agent_id,
+                                entry.session_id.as_deref(),
+                            );
                             audit.emit(AuditEvent::RestoreOk {
                                 agent_id: agent_id.clone(),
                                 caller: caller_label(caller),
@@ -244,8 +260,12 @@ impl RedactionPipeline {
                             TokenAction::Replace(plain)
                         }
                         None => {
+                            // Expired token: no cleartext is revealed, only a
+                            // placeholder is emitted. Emitting RestoreOk here
+                            // would inflate the audit's PII-reveal count, so we
+                            // emit a non-reveal event instead.
                             let placeholder = expired_placeholder(entry.expires_at);
-                            audit.emit(AuditEvent::RestoreOk {
+                            audit.emit(AuditEvent::RestoreMiss {
                                 agent_id: agent_id.clone(),
                                 caller: caller_label(caller),
                                 target: format!("{target_str}#expired"),
@@ -335,6 +355,20 @@ mod tests {
     use crate::rules::{RestoreScope, RuleKind, RuleSpec};
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    use std::sync::Mutex;
+
+    /// Audit sink that records every event for assertion in tests.
+    #[derive(Default)]
+    struct RecordingAuditSink {
+        events: Mutex<Vec<AuditEvent>>,
+    }
+
+    impl AuditSink for RecordingAuditSink {
+        fn emit(&self, event: AuditEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
 
     fn email_rule(priority: i32) -> RuleSpec {
         RuleSpec {
@@ -488,12 +522,12 @@ mod tests {
         let (p, _t) = build_pipeline(vec![email_rule(50)], Some("s1"));
         let out = p
             .restore(
-                "ping <REDACT:EMAIL:deadbeef> please",
+                "ping <REDACT:EMAIL:deadbeefdeadbeefdeadbeefdeadbeef> please",
                 &Caller::owner("agnes"),
                 RestoreTarget::UserChannel,
             )
             .unwrap();
-        assert!(out.contains("<REDACT:EMAIL:deadbeef>"));
+        assert!(out.contains("<REDACT:EMAIL:deadbeefdeadbeefdeadbeefdeadbeef>"));
     }
 
     #[test]
@@ -507,6 +541,134 @@ mod tests {
             .unwrap();
         assert_eq!(out, red.redacted_text);
         assert!(!out.contains("alice@acme.com"));
+    }
+
+    fn build_pipeline_with_policy(
+        rules: Vec<RuleSpec>,
+        session: Option<&str>,
+        policy: SourcePolicy,
+    ) -> (RedactionPipeline, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let key_dir: PathBuf = tmp.path().to_path_buf();
+        let vault = Arc::new(VaultStore::in_memory(key_dir.clone()).unwrap());
+        let engine = Arc::new(RuleEngine::from_specs(rules).unwrap());
+        let audit: Arc<dyn AuditSink> = Arc::new(NullAuditSink);
+        let agent_key = [7u8; 32];
+        let pipeline = RedactionPipeline::new(
+            engine,
+            vault,
+            audit,
+            "agnes",
+            session.map(|s| s.to_string()),
+            &agent_key,
+            policy,
+            24,
+        );
+        (pipeline, tmp)
+    }
+
+    #[test]
+    fn selective_does_not_redact_non_system_prompt_source() {
+        use crate::config::SourceMode;
+        // tool_results = Selective: must NOT force a full redact for a
+        // tool-result source (Selective only applies to system-prompt).
+        let policy = SourcePolicy {
+            tool_results: SourceMode::Selective,
+            ..SourcePolicy::default()
+        };
+        let (p, _t) = build_pipeline_with_policy(vec![email_rule(50)], Some("s1"), policy);
+        let out = p
+            .redact(
+                "contact alice@acme.com",
+                &Source::ToolResult { tool_name: "x".into() },
+            )
+            .unwrap();
+        assert_eq!(out.redacted_text, "contact alice@acme.com");
+        assert!(out.tokens_written.is_empty());
+    }
+
+    #[test]
+    fn selective_redacts_opted_in_rule_on_system_prompt() {
+        use crate::config::SourceMode;
+        // system_prompt = Selective + an opted-in rule must still redact.
+        let mut rule = email_rule(50);
+        rule.apply_to_system_prompt = true;
+        let policy = SourcePolicy {
+            system_prompt: SourceMode::Selective,
+            ..SourcePolicy::default()
+        };
+        let (p, _t) = build_pipeline_with_policy(vec![rule], Some("s1"), policy);
+        let out = p
+            .redact(
+                "soul says alice@acme.com",
+                &Source::SystemPrompt { component: "soul".into() },
+            )
+            .unwrap();
+        assert_ne!(out.redacted_text, "soul says alice@acme.com");
+        assert_eq!(out.tokens_written.len(), 1);
+    }
+
+    #[test]
+    fn expired_token_does_not_emit_restore_ok() {
+        // Build the pieces directly so we can hold the vault + recording sink.
+        let tmp = TempDir::new().unwrap();
+        let vault = Arc::new(VaultStore::in_memory(tmp.path().to_path_buf()).unwrap());
+        let engine = Arc::new(RuleEngine::from_specs(vec![email_rule(50)]).unwrap());
+        let sink = Arc::new(RecordingAuditSink::default());
+        let audit: Arc<dyn AuditSink> = sink.clone();
+        let agent_key = [7u8; 32];
+        let p = RedactionPipeline::new(
+            engine,
+            vault.clone(),
+            audit,
+            "agnes",
+            Some("s1".into()),
+            &agent_key,
+            SourcePolicy::default(),
+            24,
+        );
+
+        // Insert a mapping that is already expired (negative TTL ⇒ expires_at <= now).
+        let hash = token::session_hash(&[0u8; 32], b"alice@acme.com");
+        let tok = Token::new("EMAIL", &hash).unwrap();
+        vault
+            .insert_mapping(
+                tok.as_str(),
+                "alice@acme.com",
+                "agnes",
+                Some("s1"),
+                "EMAIL",
+                "email",
+                &RestoreScope::Owner,
+                false,
+                -1,
+            )
+            .unwrap();
+
+        let text = format!("contact {} please", tok.as_str());
+        let restored = p
+            .restore(&text, &Caller::owner("agnes"), RestoreTarget::UserChannel)
+            .unwrap();
+
+        // Placeholder is rendered, cleartext is NOT revealed.
+        assert!(restored.contains("已過期 PII"));
+        assert!(!restored.contains("alice@acme.com"));
+
+        // No RestoreOk event for an expired token — it must not inflate the
+        // PII-reveal count. A RestoreMiss is emitted instead.
+        let events = sink.events.lock().unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AuditEvent::RestoreOk { .. })),
+            "expired restore must not emit RestoreOk"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AuditEvent::RestoreMiss { .. })),
+            "expired restore should emit a non-reveal event"
+        );
     }
 
     #[test]

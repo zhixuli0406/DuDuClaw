@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type AgentInfo, type MarketplaceServer } from '@/lib/api';
@@ -108,6 +108,9 @@ function ServerCard({
             <>
               <Check className="h-3.5 w-3.5" />
               {intl.formatMessage({ id: 'marketplace.installed' })}
+              {server.installed_by.length > 1 && (
+                <span className="ml-0.5 opacity-70">({server.installed_by.length})</span>
+              )}
             </>
           ) : (
             <>
@@ -125,7 +128,6 @@ export function MarketplacePage() {
   const intl = useIntl();
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<Category>('all');
-  const [installedIds, setInstalledIds] = useState<ReadonlySet<string>>(new Set());
   const [installError, setInstallError] = useState<string | null>(null);
   const [servers, setServers] = useState<ReadonlyArray<MarketplaceServer>>([]);
   const [loading, setLoading] = useState(true);
@@ -147,34 +149,25 @@ export function MarketplacePage() {
   }, []);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-
-    const load = async () => {
-      setLoading(true);
-      setLoadError(null);
-      try {
-        const res = await api.marketplace.list();
-        if (!cancelled) {
-          setServers(res.servers ?? []);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          const message = err instanceof Error ? err.message : String(err);
-          setLoadError(message);
-        }
-      } finally {
-        if (!cancelled) {
-          setLoading(false);
-        }
-      }
-    };
-
-    load();
-    return () => {
-      cancelled = true;
-    };
+  // Fetch the catalog (including backend-derived `installed_by`) so the
+  // "installed" state survives reloads and reflects real `.mcp.json` content.
+  const load = useCallback(async () => {
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const res = await api.marketplace.list();
+      setServers(res.servers ?? []);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setLoadError(message);
+    } finally {
+      setLoading(false);
+    }
   }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
 
   const featuredServers = useMemo(
     () => servers.filter((s) => s.featured),
@@ -210,8 +203,9 @@ export function MarketplacePage() {
     setInstallError(null);
     try {
       await api.marketplace.install(installTarget, installAgent);
-      setInstalledIds((prev) => new Set([...prev, installTarget]));
       setInstallTarget(null);
+      // Refetch so installed_by reflects the new `.mcp.json` state.
+      await load();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setInstallError(
@@ -320,7 +314,7 @@ export function MarketplacePage() {
               <ServerCard
                 key={server.id}
                 server={server}
-                installed={installedIds.has(server.id)}
+                installed={server.installed_by.length > 0}
                 onInstall={() => handleInstall(server.id)}
               />
             ))}
@@ -341,7 +335,7 @@ export function MarketplacePage() {
               <ServerCard
                 key={server.id}
                 server={server}
-                installed={installedIds.has(server.id)}
+                installed={server.installed_by.length > 0}
                 onInstall={() => handleInstall(server.id)}
               />
             ))}

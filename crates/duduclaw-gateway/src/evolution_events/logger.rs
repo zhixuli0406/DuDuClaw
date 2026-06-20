@@ -221,13 +221,48 @@ impl EvolutionEventLogger {
                 state.bytes_written += bytes.len() as u64;
             }
             Err(e) => {
-                tracing::error!(
+                tracing::warn!(
                     target: "evolution_events",
                     base_dir = %self.base_dir.display(),
-                    "Audit log write error: {e}"
+                    "Audit log write error: {e}; retrying once with a fresh handle"
                 );
-                // Invalidate cached handle so next call retries open.
+                // L30: invalidate the stale handle, reopen, and retry once before
+                // giving up — a transient write failure (e.g. handle gone stale
+                // after a rotation/FS hiccup) should not silently drop the record.
+                let date_str = state.date_str.clone();
+                let seq = state.seq;
                 *guard = None;
+                match self.open_file(&date_str, seq).await {
+                    Ok(file) => {
+                        let mut fresh = FileState {
+                            date_str,
+                            bytes_written: 0,
+                            seq,
+                            file,
+                        };
+                        match fresh.file.write_all(bytes).await {
+                            Ok(()) => {
+                                fresh.bytes_written += bytes.len() as u64;
+                                *guard = Some(fresh);
+                            }
+                            Err(e2) => {
+                                tracing::error!(
+                                    target: "evolution_events",
+                                    base_dir = %self.base_dir.display(),
+                                    "Audit log write retry failed, dropping record: {e2}"
+                                );
+                                // Leave handle invalidated so the next call reopens.
+                            }
+                        }
+                    }
+                    Err(e2) => {
+                        tracing::error!(
+                            target: "evolution_events",
+                            base_dir = %self.base_dir.display(),
+                            "Audit log reopen-for-retry failed, dropping record: {e2}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -277,37 +312,61 @@ fn today_utc() -> String {
 
 /// Remove or truncate sensitive metadata fields before persisting to JSONL.
 ///
-/// ## Fields handled
+/// ## Fields handled (M8 — scrubbed RECURSIVELY at any nesting depth)
 ///
 /// | Field | Risk | Action |
 /// |-------|------|--------|
 /// | `critique` | May contain verbatim SOUL.md instruction fragments produced by GVU gradient descent | Replaced with `"[REDACTED]"` |
+/// | `last_error` | W19-P1 durability `durability_retry_exhausted` — may carry raw error strings (URLs, secrets, stack fragments) | Replaced with `"[REDACTED]"` |
+/// | `violation_detail` | W19-P1 governance `governance_violation` — may carry the violating payload | Replaced with `"[REDACTED]"` |
 /// | `reason` | May contain user-conversation context surfaced by sandbox trial evaluation | Truncated to 200 chars to prevent bulk leakage |
+///
+/// Previously only top-level `critique`/`reason` were scrubbed, so nested copies
+/// (e.g. `{"detail": {"critique": "..."}}`) and the W19-P1 fields landed in
+/// cleartext. We now walk the whole JSON tree (objects and arrays).
 ///
 /// All other fields are passed through unchanged.
 fn scrub_metadata(mut meta: serde_json::Value) -> serde_json::Value {
-    const MAX_REASON_LEN: usize = 200;
+    scrub_value(&mut meta);
+    meta
+}
 
-    if let Some(obj) = meta.as_object_mut() {
-        // GVU critique: may contain SOUL.md private instructions.
-        if obj.contains_key("critique") {
-            obj.insert(
-                "critique".into(),
-                serde_json::Value::String("[REDACTED]".into()),
-            );
-        }
-        // Sandbox reason: may contain traceable user conversation content.
-        if let Some(serde_json::Value::String(s)) = obj.get("reason") {
-            if s.len() > MAX_REASON_LEN {
-                let truncated = s.chars().take(MAX_REASON_LEN).collect::<String>() + "…";
-                obj.insert(
-                    "reason".into(),
-                    serde_json::Value::String(truncated),
-                );
+/// Maximum retained length for the `reason` field before truncation.
+const MAX_REASON_LEN: usize = 200;
+
+/// Recursively scrub a JSON value in place. Objects have their sensitive keys
+/// redacted/truncated; arrays and nested objects are descended into.
+fn scrub_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(obj) => {
+            // Fields whose values may carry private instructions / raw error or
+            // payload content — fully redacted regardless of value type/length.
+            for key in ["critique", "last_error", "violation_detail"] {
+                if obj.contains_key(key) {
+                    obj.insert(key.into(), serde_json::Value::String("[REDACTED]".into()));
+                }
+            }
+            // `reason`: may contain traceable user-conversation content — truncate.
+            if let Some(serde_json::Value::String(s)) = obj.get("reason") {
+                if s.chars().count() > MAX_REASON_LEN {
+                    let truncated = s.chars().take(MAX_REASON_LEN).collect::<String>() + "…";
+                    obj.insert("reason".into(), serde_json::Value::String(truncated));
+                }
+            }
+            // Descend into remaining values to catch nested occurrences. The keys
+            // redacted above now hold a plain string, so recursing is a no-op for
+            // them; recursion still covers any other nested objects/arrays.
+            for (_k, v) in obj.iter_mut() {
+                scrub_value(v);
             }
         }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                scrub_value(v);
+            }
+        }
+        _ => {}
     }
-    meta
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -598,6 +657,42 @@ mod tests {
     fn test_scrub_metadata_null_is_unchanged() {
         let scrubbed = scrub_metadata(serde_json::Value::Null);
         assert_eq!(scrubbed, serde_json::Value::Null);
+    }
+
+    /// M8: W19-P1 fields `last_error` / `violation_detail` must be redacted.
+    #[test]
+    fn test_scrub_metadata_redacts_w19p1_fields() {
+        let meta = serde_json::json!({
+            "operation_type": "odoo_write",
+            "last_error": "HTTP 500 https://erp.internal/db?secret=abcd",
+            "violation_detail": "payload contained PII: a@b.com"
+        });
+        let scrubbed = scrub_metadata(meta);
+        assert_eq!(scrubbed["last_error"], "[REDACTED]");
+        assert_eq!(scrubbed["violation_detail"], "[REDACTED]");
+        // Non-sensitive sibling passes through.
+        assert_eq!(scrubbed["operation_type"], "odoo_write");
+    }
+
+    /// M8: nested sensitive fields (at any depth, inside objects or arrays)
+    /// must be scrubbed, not just the top-level copy.
+    #[test]
+    fn test_scrub_metadata_recurses_into_nested_structures() {
+        let meta = serde_json::json!({
+            "detail": {
+                "critique": "SOUL secret instruction",
+                "inner": { "last_error": "boom raw error" }
+            },
+            "events": [
+                { "violation_detail": "leaked payload" },
+                { "ok": "keep me" }
+            ]
+        });
+        let scrubbed = scrub_metadata(meta);
+        assert_eq!(scrubbed["detail"]["critique"], "[REDACTED]");
+        assert_eq!(scrubbed["detail"]["inner"]["last_error"], "[REDACTED]");
+        assert_eq!(scrubbed["events"][0]["violation_detail"], "[REDACTED]");
+        assert_eq!(scrubbed["events"][1]["ok"], "keep me");
     }
 
     #[tokio::test]

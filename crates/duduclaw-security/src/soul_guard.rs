@@ -77,6 +77,30 @@ pub fn read_stored_hash(agent_dir: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Path of the first-run baseline marker.
+///
+/// The marker records that a trusted baseline hash *was* established for this
+/// agent at some point. It lives next to the hash file (in the protected
+/// `soul_hashes/` dir, not inside the attacker-writable agent directory) so that
+/// deleting the hash file alone cannot reset the trust state (HS11).
+fn baseline_marker_path(agent_dir: &Path) -> std::path::PathBuf {
+    let mut path = hash_path(agent_dir);
+    // hash_path returns ".../soul_hashes/<agent>.hash" — swap the extension.
+    path.set_extension("established");
+    path
+}
+
+/// Whether a trusted baseline was ever established for this agent.
+fn baseline_established(agent_dir: &Path) -> bool {
+    baseline_marker_path(agent_dir).exists()
+}
+
+/// Record that a trusted baseline has been established (best-effort).
+fn mark_baseline_established(agent_dir: &Path) {
+    let path = baseline_marker_path(agent_dir);
+    let _ = std::fs::write(&path, chrono::Utc::now().to_rfc3339());
+}
+
 /// Persist the fingerprint to the soul_hashes directory.
 pub fn store_hash(agent_dir: &Path, hash: &str) -> std::io::Result<()> {
     let path = hash_path(agent_dir);
@@ -165,11 +189,46 @@ pub fn check_soul_integrity(agent_id: &str, agent_dir: &Path) -> SoulCheckResult
                 scan,
             }
         }
+        None if baseline_established(agent_dir) => {
+            // A baseline WAS established before, but the stored hash is now
+            // missing. This is suspicious: an attacker who tampers with SOUL.md
+            // can also delete the hash file to force a re-fingerprint of the
+            // current (possibly malicious) content. Do NOT auto-trust — report
+            // not-intact / needs-verification and let an operator re-establish
+            // the baseline explicitly via `accept_soul_change` (HS11).
+            warn!(
+                agent = agent_id,
+                current = %current,
+                "SOUL.md hash file missing but baseline was previously established — \
+                 treating as suspicious, NOT re-trusting current content"
+            );
+
+            // ASI here is advisory only and is NOT a trust root: it derives from
+            // the attacker-writable `.soul_history`, so we never use it to bless
+            // content. It is surfaced purely to give an operator context.
+            let asi = compute_asi_from_history(agent_dir, soul_content.as_deref());
+
+            SoulCheckResult {
+                agent_id: agent_id.to_string(),
+                intact: false,
+                current_hash: current.clone(),
+                expected_hash: String::new(),
+                message: "SOUL.md baseline hash is missing — integrity cannot be \
+                          verified. Re-establish the baseline explicitly if this \
+                          change is legitimate."
+                    .to_string(),
+                asi,
+                scan,
+            }
+        }
         None => {
-            // First run — store initial fingerprint
+            // Genuine first run — no hash AND no baseline marker. Establish the
+            // initial fingerprint and record the marker so that a later missing
+            // hash is recognised as tampering rather than another "first run".
             if let Err(e) = store_hash(agent_dir, &current) {
                 warn!(agent = agent_id, "Failed to store initial SOUL hash: {e}");
             } else {
+                mark_baseline_established(agent_dir);
                 info!(agent = agent_id, hash = %current, "SOUL.md fingerprint initialized");
             }
             SoulCheckResult {
@@ -198,6 +257,9 @@ pub fn accept_soul_change(agent_id: &str, agent_dir: &Path) -> std::io::Result<(
     save_soul_version(agent_dir)?;
 
     store_hash(agent_dir, &current)?;
+    // Record the baseline marker: an explicit accept is a trusted establishment,
+    // so a subsequently-missing hash should be treated as tampering (HS11).
+    mark_baseline_established(agent_dir);
     info!(agent = agent_id, hash = %current, "SOUL.md change accepted, hash updated");
     Ok(())
 }
@@ -282,6 +344,85 @@ fn compute_asi_from_history(
         &[], // Version distances could be populated from history
         &config,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Minimal temp-dir guard so this module needs no `tempfile` dev-dependency.
+    struct TmpDir(PathBuf);
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Build an agent dir layout `<tmp>/.duduclaw/agents/<name>` so that
+    /// `hash_path` resolves to `<tmp>/.duduclaw/soul_hashes/<name>.hash`.
+    fn setup_agent(name: &str, soul: &str) -> (TmpDir, PathBuf) {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ddc-soul-test-{}-{n}",
+            std::process::id()
+        ));
+        let agent_dir = root.join(".duduclaw").join("agents").join(name);
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(agent_dir.join("SOUL.md"), soul).unwrap();
+        (TmpDir(root), agent_dir)
+    }
+
+    #[test]
+    fn first_run_establishes_baseline_and_marker() {
+        let (_tmp, agent_dir) = setup_agent("first-run", "original soul");
+        let r = check_soul_integrity("first-run", &agent_dir);
+        assert!(r.intact, "genuine first run should establish baseline");
+        assert!(read_stored_hash(&agent_dir).is_some());
+        assert!(baseline_established(&agent_dir), "marker must be recorded");
+    }
+
+    #[test]
+    fn matching_hash_reports_intact() {
+        let (_tmp, agent_dir) = setup_agent("matchy", "stable soul");
+        check_soul_integrity("matchy", &agent_dir); // establish
+        let r = check_soul_integrity("matchy", &agent_dir);
+        assert!(r.intact);
+    }
+
+    #[test]
+    fn missing_hash_after_baseline_is_not_trusted() {
+        // HS11: attacker tampers SOUL.md AND deletes the hash file. The marker
+        // remains, so the check must report not-intact instead of re-blessing.
+        let (_tmp, agent_dir) = setup_agent("victim", "original soul");
+        check_soul_integrity("victim", &agent_dir); // establish baseline + marker
+
+        // Attacker edits SOUL.md and removes the stored hash.
+        fs::write(agent_dir.join("SOUL.md"), "malicious soul").unwrap();
+        fs::remove_file(hash_path(&agent_dir)).unwrap();
+        assert!(read_stored_hash(&agent_dir).is_none());
+
+        let r = check_soul_integrity("victim", &agent_dir);
+        assert!(
+            !r.intact,
+            "deleting the hash after a baseline must NOT auto-trust current content"
+        );
+        // It must not silently re-establish a hash for the tampered content.
+        assert!(
+            read_stored_hash(&agent_dir).is_none(),
+            "tampered content must not be re-fingerprinted as the new baseline"
+        );
+    }
+
+    #[test]
+    fn accept_soul_change_sets_marker() {
+        let (_tmp, agent_dir) = setup_agent("acceptor", "v1");
+        accept_soul_change("acceptor", &agent_dir).unwrap();
+        assert!(baseline_established(&agent_dir));
+        assert!(read_stored_hash(&agent_dir).is_some());
+    }
 }
 
 /// List all SOUL.md version history files for an agent.
