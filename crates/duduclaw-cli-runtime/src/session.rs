@@ -25,6 +25,17 @@ use crate::error::{PtyError, SessionError};
 use crate::platform::ChildGroup;
 use crate::pty::{PtyCommand, PtyHandle};
 
+/// **HC13 fix**: bracketed-paste mode delimiters.
+///
+/// `ESC[200~` opens a paste, `ESC[201~` closes it. Terminals (and the CLI's
+/// readline-style line editor) treat everything between them as a single
+/// pasted block — embedded `\n` are inserted literally rather than acting as
+/// Enter. This lets a multi-line prompt be submitted as one message via a
+/// single trailing `\r`, instead of the first `\n` prematurely submitting only
+/// the first line and leaving the remainder to pollute the next invoke.
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+
 /// Which CLI we're driving. Determines flag conventions used to inject the
 /// sentinel-protocol instructions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -480,16 +491,41 @@ impl PtySession {
             // prior turns + TUI redraws BEFORE we write — that way our
             // collector sees only this turn's bytes when looking for the
             // sentinel pair.
-            let _ = self.inner.pty.drain_buffer();
+            //
+            // **HC14 fix**: `drain_residual` (not `drain_buffer`) so we also
+            // purge chunks the reader pump queued onto the mpsc channel but
+            // never pulled into `rx_buffer`. Otherwise a stray closing sentinel
+            // from the previous turn lingers on the channel and the very next
+            // `read_until` surfaces it, breaking positional sentinel pairing.
+            let _ = self.inner.pty.drain_residual();
             // Send just the user prompt. The protocol is already loaded
             // via --append-system-prompt; we deliberately do NOT include
             // the literal sentinel string in the user message because the
             // TUI echoes user input verbatim, which would confuse the
             // positional pairing (echoed copy would become a third
             // sentinel occurrence in the rolling buffer).
+            //
+            // **HC13 fix**: a prompt may be multi-line (e.g. history rendered
+            // by `format_history_as_prompt`). Writing the raw prompt followed
+            // by a single `\r` means the first embedded `\n` is interpreted by
+            // the line discipline as Enter — submitting only the first line and
+            // leaving the rest to pollute the next invoke. Wrap the prompt in a
+            // bracketed-paste sequence (ESC[200~ … ESC[201~) so the terminal
+            // treats the whole multi-line payload as one pasted unit; the
+            // trailing `\r` then submits it as a single message.
+            self.inner
+                .pty
+                .write_all(BRACKETED_PASTE_START)
+                .await
+                .map_err(SessionError::Pty)?;
             self.inner
                 .pty
                 .write_all(prompt.as_bytes())
+                .await
+                .map_err(SessionError::Pty)?;
+            self.inner
+                .pty
+                .write_all(BRACKETED_PASTE_END)
                 .await
                 .map_err(SessionError::Pty)?;
             self.inner
@@ -536,7 +572,7 @@ impl PtySession {
     ) -> Result<String, SessionError> {
         let start = Instant::now();
         let mut raw = String::new();
-        raw.push_str(&self.inner.pty.drain_buffer());
+        raw.push_str(&self.inner.pty.drain_residual());
 
         // Try once with what was already buffered, in case the response
         // arrived during a tight turnaround (rare for interactive but
@@ -557,10 +593,20 @@ impl PtySession {
             // Use the closing sentinel as the read-until probe. False
             // positives just cause the inner extractor to keep looking;
             // misses fall back to the timeout drain path.
+            //
+            // **M47 fix**: floor the per-read window at 200 ms. Without a floor,
+            // as `start.elapsed()` approaches the deadline, `remaining` shrinks
+            // toward zero and each `read_until` returns `ReadTimeout` almost
+            // instantly. The `continue` below would then spin tightly (burning
+            // CPU while still holding the semaphore permit) until the outer
+            // deadline check finally fires. `read_until` blocks on `recv()`
+            // inside this window, so a healthy floor turns the would-be spin
+            // into a proper blocking wait.
+            let read_window = remaining.min(Duration::from_secs(3)).max(Duration::from_millis(200));
             let chunk = match self
                 .inner
                 .pty
-                .read_until(INTERACTIVE_SENTINEL, remaining.min(Duration::from_secs(3)))
+                .read_until(INTERACTIVE_SENTINEL, read_window)
                 .await
             {
                 Ok(prefix) => {
@@ -572,6 +618,10 @@ impl PtySession {
                     // Drain whatever buffered up + keep trying.
                     let drained = self.inner.pty.drain_buffer();
                     if drained.is_empty() {
+                        // Nothing arrived during the whole `read_window` — the
+                        // child is genuinely idle. `read_until` already blocked
+                        // (awaiting `recv()`) for the window, so simply looping
+                        // back is a proper blocking wait, not a busy-spin.
                         continue;
                     }
                     drained
@@ -637,20 +687,21 @@ impl PtySession {
             accumulator.push_str(&chunk);
 
             if let Some(frame) = parse_frame(&mut accumulator) {
-                // Anything left in `accumulator` belongs to a subsequent request —
-                // stuff it back into the PTY's rolling buffer.
+                // **M46 fix**: anything left in `accumulator` after the closing
+                // frame belongs to a subsequent response on this (reused)
+                // session. Previously these tail bytes were merely logged and
+                // dropped, so the next `invoke` lost the head of its response.
+                // Re-buffer them (ahead of anything the reader pump has since
+                // queued) so the next `collect_response` picks up from the
+                // correct stream position.
                 if !accumulator.is_empty() {
-                    let mut buf = self.inner.pty.drain_buffer();
-                    accumulator.push_str(&buf);
-                    buf.clear();
-                    // PtyHandle exposes only drain_buffer + write side, so we
-                    // re-buffer via the next read cycle. Until then, keep the
-                    // tail on the side stack: the next invoke() will pick it up.
-                    // To do that we'd need a `push_buffer` API — Phase 2 enhancement.
+                    // Append any bytes already buffered by the reader pump so we
+                    // preserve stream order, then push the whole tail back.
+                    accumulator.push_str(&self.inner.pty.drain_buffer());
+                    self.inner.pty.push_buffer(&accumulator);
                     debug!(
                         leftover = accumulator.len(),
-                        "discarding tail bytes after frame match \
-                         (Phase 2 will re-buffer)"
+                        "re-buffered tail bytes after frame match for next invoke"
                     );
                 }
                 return finalize_frame(frame, req_id);
@@ -675,9 +726,40 @@ impl PtySession {
         self.inner.shutdown_token.cancel();
 
         // Step 1: SIGTERM / TerminateJobObject (gentle).
+        //
+        // **L17 fix**: `child_group` is built from `pty.pid()` at spawn time.
+        // If the pid was unavailable then (None), process-group termination was
+        // permanently skipped, leaking any descendant processes the CLI spawned
+        // (Bash tools, Python eval, MCP servers). Re-probe the pid at shutdown
+        // time and synthesise a transient `ChildGroup` so we still deliver a
+        // best-effort group SIGTERM. `ChildGroup::terminate` tolerates ESRCH, so
+        // a stale/dead pid is harmless. The hard SIGKILL of the direct child
+        // still happens in Step 3 via `PtyHandle::shutdown` regardless.
         let grace = Duration::from_secs(3);
-        if let Some(grp) = self.inner.child_group.lock().as_ref() {
-            grp.terminate(grace);
+        {
+            let guard = self.inner.child_group.lock();
+            if let Some(grp) = guard.as_ref() {
+                // We have the process group captured at spawn time.
+                grp.terminate(grace);
+            } else if let Some(pid) = self.inner.pty.pid() {
+                // No group was captured (pid was unavailable at spawn). Re-probe
+                // the pid now and build a transient group for a best-effort
+                // SIGTERM (Unix: killpg the leader's group; Windows: terminate
+                // the leader process). Tolerant of ESRCH if already dead.
+                warn!(
+                    agent_id = %self.inner.agent_id,
+                    pid,
+                    "pty session shutdown: no captured child group — \
+                     using transient group for best-effort termination"
+                );
+                ChildGroup::new(pid).terminate(grace);
+            } else {
+                debug!(
+                    agent_id = %self.inner.agent_id,
+                    "pty session shutdown: no pid available; relying on \
+                     PtyHandle::shutdown child.kill()"
+                );
+            }
         }
 
         // Step 2: give the child up to `grace` to exit on its own. We
@@ -1260,5 +1342,94 @@ mod tests {
         assert_eq!(opts.agent_id, "alice");
         assert_eq!(opts.cli_kind, CliKind::Claude);
         assert!(opts.boot_timeout >= Duration::from_secs(30));
+    }
+
+    // ── HC13: bracketed-paste framing of multi-line prompts ───────────
+
+    #[test]
+    fn bracketed_paste_delimiters_are_the_standard_sequences() {
+        // ESC[200~ / ESC[201~ — the de-facto bracketed-paste mode markers.
+        assert_eq!(BRACKETED_PASTE_START, b"\x1b[200~");
+        assert_eq!(BRACKETED_PASTE_END, b"\x1b[201~");
+    }
+
+    /// HC13: drive an interactive-style multi-line write through a real PTY
+    /// (`cat`, which echoes stdin via the slave PTY's ECHO mode) and confirm
+    /// the prompt is wrapped in bracketed-paste delimiters with the embedded
+    /// newline preserved *inside* the paste block — i.e. it is NOT submitted
+    /// line-by-line. We exercise the exact byte sequence `invoke` emits.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn multiline_prompt_is_bracketed_paste_wrapped() {
+        let (program, args) = cat_program();
+        let opts = SpawnOpts {
+            agent_id: "test-hc13".into(),
+            cli_kind: CliKind::Claude,
+            program,
+            extra_args: args,
+            env: HashMap::new(),
+            cwd: None,
+            session_id: None,
+            boot_timeout: Duration::from_millis(300),
+            default_invoke_timeout: Duration::from_secs(2),
+            rows: 24,
+            cols: 200,
+            interactive: false, // skip the claude-specific boot dance; we drive bytes directly
+            pre_trusted: false,
+        };
+        let session = PtySession::spawn(opts).await.expect("spawn cat");
+
+        let prompt = "line one\nline two\nline three";
+        // Mirror invoke()'s interactive write path exactly.
+        session.inner.pty.write_all(BRACKETED_PASTE_START).await.unwrap();
+        session.inner.pty.write_all(prompt.as_bytes()).await.unwrap();
+        session.inner.pty.write_all(BRACKETED_PASTE_END).await.unwrap();
+        session.inner.pty.write_all(b"\r").await.unwrap();
+
+        // Collect a generous slice of the echoed/passed-through stream. (Unix
+        // PTY ECHO renders control bytes in caret notation `^[`, but `cat`'s
+        // stdout pass-through preserves the raw ESC bytes — we assert on the
+        // raw-byte paste block.)
+        let mut captured = String::new();
+        let read_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < read_deadline {
+            match session
+                .inner
+                .pty
+                .read_until("\u{0}NEVER\u{0}", Duration::from_millis(150))
+                .await
+            {
+                Ok(p) => captured.push_str(&p),
+                Err(PtyError::ReadTimeout(_)) => {
+                    captured.push_str(&session.inner.pty.drain_residual());
+                }
+                Err(_) => break,
+            }
+            let start_seq = std::str::from_utf8(BRACKETED_PASTE_START).unwrap();
+            if captured.contains(start_seq) && captured.contains("line three") {
+                break;
+            }
+        }
+
+        let start_seq = std::str::from_utf8(BRACKETED_PASTE_START).unwrap();
+        let end_seq = std::str::from_utf8(BRACKETED_PASTE_END).unwrap();
+        // Locate the raw-ESC paste block in the pass-through output.
+        let start_at = captured
+            .find(start_seq)
+            .unwrap_or_else(|| panic!("no raw bracketed-paste start in: {captured:?}"));
+        let block = &captured[start_at + start_seq.len()..];
+        // Everything up to the closing delimiter (if present) is the paste body.
+        let body = match block.find(end_seq) {
+            Some(end_at) => &block[..end_at],
+            None => block,
+        };
+        // The single paste body must contain all three lines with their embedded
+        // newlines intact — proving the multi-line prompt was submitted as ONE
+        // unit rather than the first `\n` prematurely ending it.
+        assert!(body.contains("line one"), "paste body missing line one: {body:?}");
+        assert!(body.contains("line two"), "paste body missing line two: {body:?}");
+        assert!(body.contains("line three"), "paste body missing line three: {body:?}");
+
+        session.shutdown().await;
     }
 }

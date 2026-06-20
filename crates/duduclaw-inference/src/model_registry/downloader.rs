@@ -119,6 +119,22 @@ pub fn validate_repo(repo: &str) -> Result<()> {
 /// Maximum download size (100 GB).
 const MAX_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 
+/// HC9: Decide how many existing partial bytes to keep based on the HTTP
+/// response status of a resume request.
+///
+/// When we sent a `Range` header (`existing_size > 0`) we only keep the partial
+/// bytes if the server honoured the range with `206 Partial Content`. If the
+/// server returned the full body (`200`, or anything else), the partial bytes
+/// are stale relative to the body about to be streamed, so we must restart from
+/// offset 0 to avoid producing a corrupt file.
+fn resume_offset(existing_size: u64, status: u16) -> u64 {
+    if existing_size > 0 && status == 206 {
+        existing_size
+    } else {
+        0
+    }
+}
+
 /// Download with resume support.
 async fn download_with_resume(
     url: &str,
@@ -162,6 +178,13 @@ async fn download_with_resume(
             "Download HTTP {}: {}", resp.status(), url
         )));
     }
+
+    // HC9: If we requested a Range (existing_size > 0) but the server ignored it
+    // and returned 200 (full body) instead of 206 Partial Content, appending the
+    // full body after the stale partial bytes would corrupt the file. In that case
+    // restart from scratch: discard the partial and download the whole body.
+    // Only keep the partial bytes when the server actually returned 206.
+    let existing_size = resume_offset(existing_size, resp.status().as_u16());
 
     // Get total size from Content-Length or Content-Range
     let total_bytes = if resp.status().as_u16() == 206 {
@@ -313,4 +336,34 @@ pub async fn is_hf_reachable() -> bool {
         client.head("https://huggingface.co").send().await,
         Ok(r) if r.status().is_success() || r.status().is_redirection()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resume_offset;
+
+    #[test]
+    fn keeps_partial_bytes_on_206() {
+        // Server honoured the Range request: resume from the existing offset.
+        assert_eq!(resume_offset(1024, 206), 1024);
+    }
+
+    #[test]
+    fn restarts_when_server_ignores_range_and_returns_200() {
+        // HC9: server returned the full body — must restart from 0 to avoid
+        // appending the full body after stale partial bytes.
+        assert_eq!(resume_offset(1024, 200), 0);
+    }
+
+    #[test]
+    fn restarts_on_other_success_statuses() {
+        assert_eq!(resume_offset(1024, 203), 0);
+    }
+
+    #[test]
+    fn fresh_download_starts_at_zero() {
+        // No partial bytes — always start at 0 regardless of status.
+        assert_eq!(resume_offset(0, 200), 0);
+        assert_eq!(resume_offset(0, 206), 0);
+    }
 }

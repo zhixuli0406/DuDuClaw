@@ -241,25 +241,36 @@ impl AuditEventIndex {
                 }
             };
 
-            // `lines_indexed` tracks the **number of lines scanned** (not inserted),
-            // so the slice offset stays correct even when empty/malformed lines are
-            // skipped.  Using inserted-count as the offset would mis-align the cursor
-            // on subsequent syncs (HIGH bug fix — QA round 2).
+            // HC7 fix: the cursor must only advance past lines we have *durably
+            // accounted for* — either successfully inserted, or permanently
+            // un-indexable (blank / malformed JSONL). A *transient* INSERT failure
+            // must NOT advance the cursor, so the line is retried on the next sync
+            // instead of being silently lost forever.
+            //
+            // We walk the new lines in order and stop advancing the cursor at the
+            // first transient INSERT failure: every prior line was either inserted
+            // or permanently skippable, so it is safe to commit that prefix. The
+            // failing line (and everything after it) is retained for retry.
             let all_lines: Vec<&str> = content.lines().collect();
             let new_lines = &all_lines[(already as usize).min(all_lines.len())..];
             let mut inserted = 0usize;
-            let mut scanned = 0usize; // lines actually examined in this batch
+            // Number of leading lines in this batch that are durably accounted for
+            // (inserted or permanently skipped) up to the first transient failure.
+            let mut committed = 0usize;
 
             for line in new_lines {
-                scanned += 1;
-                let line = line.trim();
-                if line.is_empty() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    // Blank line — permanently skippable, advance cursor.
+                    committed += 1;
                     continue;
                 }
-                let ev: AuditEvent = match serde_json::from_str(line) {
+                let ev: AuditEvent = match serde_json::from_str(trimmed) {
                     Ok(e) => e,
                     Err(e) => {
                         warn!("sync_from_files: malformed JSONL line in {filename}: {e}");
+                        // Malformed line — permanently skippable, advance cursor.
+                        committed += 1;
                         continue;
                     }
                 };
@@ -283,15 +294,23 @@ impl AuditEventIndex {
                         filename,
                     ],
                 ) {
-                    Ok(_) => inserted += 1,
-                    Err(e) => warn!("sync_from_files: INSERT failed in {filename}: {e}"),
+                    Ok(_) => {
+                        inserted += 1;
+                        committed += 1;
+                    }
+                    Err(e) => {
+                        // Transient INSERT failure: do NOT advance the cursor past
+                        // this line. Stop committing so it is retried next sync.
+                        warn!("sync_from_files: INSERT failed in {filename}: {e}; retaining cursor for retry");
+                        break;
+                    }
                 }
             }
 
-            // Record the number of lines *scanned* (not just inserted), so that the
-            // next sync correctly skips blank / malformed lines via the slice offset.
-            // Upsert uses SQLite ≥ 3.24 ON CONFLICT syntax.
-            let new_lines_indexed = already + scanned as i64;
+            // Record only the durably-accounted-for prefix so that the next sync
+            // resumes at the first un-committed (failed) line. Upsert uses SQLite
+            // ≥ 3.24 ON CONFLICT syntax.
+            let new_lines_indexed = already + committed as i64;
             let now = chrono::Utc::now().to_rfc3339();
             conn.execute(
                 "INSERT INTO indexed_files (filename, lines_indexed, last_synced_at)
@@ -588,11 +607,32 @@ impl AuditEventIndex {
         let conn = self.conn.lock().await;
 
         // ── Single-pass aggregate query (total, success, skill, fallback) ──────
-        let (total, success_count, skill_count, fallback_count): (i64, i64, i64, i64) = conn
+        //
+        // M36 fix: `skill_adoption_rate` and `fallback_trigger_rate` must NOT be
+        // diluted by W19-P1 governance / durability infrastructure events, which
+        // are emitted independently of core agent activity. Using the all-events
+        // COUNT(*) as the denominator means that simply turning on more governance
+        // or durability instrumentation mechanically drives these rates toward 0.
+        //
+        // We therefore compute `core_total` — the count of *core agent-activity*
+        // events (everything except the `governance_*` / `durability_*` families) —
+        // and use it as the denominator for the skill/fallback rates. `total`
+        // (all events) is still reported as `total_events` and used for the
+        // success rate, which is genuinely a property of every audited action.
+        let (total, success_count, core_total, skill_count, fallback_count): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = conn
             .query_row(
                 "SELECT
                      COUNT(*),
                      SUM(CASE WHEN outcome    = 'success'                THEN 1 ELSE 0 END),
+                     SUM(CASE WHEN event_type NOT LIKE 'governance\\_%' ESCAPE '\\'
+                               AND event_type NOT LIKE 'durability\\_%' ESCAPE '\\'
+                              THEN 1 ELSE 0 END),
                      SUM(CASE WHEN event_type = 'skill_activate'         THEN 1 ELSE 0 END),
                      SUM(CASE WHEN event_type = 'llm_fallback_triggered' THEN 1 ELSE 0 END)
                  FROM audit_index
@@ -604,6 +644,7 @@ impl AuditEventIndex {
                         row.get::<_, i64>(1).unwrap_or(0),
                         row.get::<_, i64>(2).unwrap_or(0),
                         row.get::<_, i64>(3).unwrap_or(0),
+                        row.get::<_, i64>(4).unwrap_or(0),
                     ))
                 },
             )
@@ -640,8 +681,10 @@ impl AuditEventIndex {
             window_days,
             consistency_score: consistency_from_rows(&per_type_rows),
             task_success_rate: task_success_rate_from_counts(total, success_count),
-            skill_adoption_rate: skill_adoption_rate_from_counts(total, skill_count),
-            fallback_trigger_rate: fallback_trigger_rate_from_counts(total, fallback_count),
+            // M36: use core-activity denominator (excludes governance/durability)
+            // so adding infra instrumentation cannot dilute these rates.
+            skill_adoption_rate: skill_adoption_rate_from_counts(core_total, skill_count),
+            fallback_trigger_rate: fallback_trigger_rate_from_counts(core_total, fallback_count),
             total_events: total,
             generated_at,
         })
@@ -829,6 +872,82 @@ mod tests {
         let idx = open_index(&home, &events);
         let n = idx.sync_from_files().await.unwrap();
         assert_eq!(n, 1, "only the valid line must be indexed");
+    }
+
+    /// HC7: a malformed line in the MIDDLE must be permanently skipped (cursor
+    /// advances past it) while the valid lines on either side are still indexed.
+    /// This exercises the "permanently skippable → keep advancing" branch and
+    /// guards against a regression where a non-insertable line stalls the cursor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sync_advances_cursor_past_malformed_middle_line() {
+        let (home, events) = fresh_dirs();
+        let path = events.path().join("2026-04-29.jsonl");
+        std::fs::write(
+            &path,
+            b"{\"timestamp\":\"2026-04-29T00:00:00Z\",\"event_type\":\"skill_activate\",\
+              \"agent_id\":\"a\",\"skill_id\":null,\"generation\":null,\
+              \"outcome\":\"success\",\"trigger_signal\":null,\"metadata\":{}}\n\
+              NOT VALID JSON\n\
+              {\"timestamp\":\"2026-04-29T00:00:01Z\",\"event_type\":\"skill_activate\",\
+              \"agent_id\":\"b\",\"skill_id\":null,\"generation\":null,\
+              \"outcome\":\"success\",\"trigger_signal\":null,\"metadata\":{}}\n",
+        )
+        .unwrap();
+        let idx = open_index(&home, &events);
+
+        // First sync indexes both valid lines and permanently skips the bad one.
+        let first = idx.sync_from_files().await.unwrap();
+        assert_eq!(first, 2, "both valid lines must be indexed");
+
+        // Second sync must not re-index anything: the cursor advanced past all
+        // three lines (2 inserted + 1 permanently-skipped malformed line).
+        let second = idx.sync_from_files().await.unwrap();
+        assert_eq!(
+            second, 0,
+            "cursor must have advanced past the malformed line; no re-index"
+        );
+    }
+
+    /// HC7 (unit): directly assert the committed-prefix accounting that drives the
+    /// indexed_files cursor. The cursor must advance only by lines that are
+    /// durably accounted for (inserted or permanently skipped), stopping at the
+    /// first transient INSERT failure so it can be retried.
+    #[test]
+    fn hc7_committed_prefix_stops_at_first_transient_failure() {
+        // Outcome of examining each line in a batch.
+        enum LineFate {
+            InsertedOk,
+            PermanentlySkipped, // blank / malformed JSONL
+            TransientFailure,   // INSERT errored — must be retried
+        }
+
+        // Mirror of the production cursor-advance loop: advance `committed` for
+        // inserted or permanently-skipped lines, but break on the first transient
+        // failure so the cursor is retained for retry.
+        fn committed_prefix(fates: &[LineFate]) -> usize {
+            let mut committed = 0usize;
+            for fate in fates {
+                match fate {
+                    LineFate::InsertedOk | LineFate::PermanentlySkipped => committed += 1,
+                    LineFate::TransientFailure => break,
+                }
+            }
+            committed
+        }
+
+        use LineFate::*;
+        // Insert, skip, insert → all three committed.
+        assert_eq!(
+            committed_prefix(&[InsertedOk, PermanentlySkipped, InsertedOk]),
+            3
+        );
+        // Failure at index 2 → only the first two are committed; cursor retained.
+        assert_eq!(
+            committed_prefix(&[InsertedOk, PermanentlySkipped, TransientFailure, InsertedOk]),
+            2
+        );
+        // Failure on the very first line → nothing committed; full retry.
+        assert_eq!(committed_prefix(&[TransientFailure, InsertedOk]), 0);
     }
 
     // ── query — no filters ────────────────────────────────────────────────────
@@ -1472,6 +1591,47 @@ mod tests {
             .unwrap();
         assert_eq!(s.total_events, 10);
         assert!((s.skill_adoption_rate - 0.3).abs() < 1e-9, "sar={}", s.skill_adoption_rate);
+    }
+
+    /// M36: governance / durability events must NOT dilute the skill / fallback
+    /// rates. The denominator is "core agent-activity" events only, so adding
+    /// infra instrumentation leaves the rate unchanged.
+    #[tokio::test]
+    async fn reliability_governance_durability_do_not_dilute_rates() {
+        let (home, events) = fresh_dirs();
+        let mut lines = Vec::new();
+        // Core activity: 3 skill_activate + 7 gvu_generation = 10 core events.
+        for _ in 0..3 {
+            lines.push(jsonl_line("agent-m36", "skill_activate", "success"));
+        }
+        for _ in 0..7 {
+            lines.push(jsonl_line("agent-m36", "gvu_generation", "success"));
+        }
+        // Pure infra noise that previously diluted the rate.
+        for _ in 0..40 {
+            lines.push(jsonl_line("agent-m36", "governance_violation", "blocked"));
+        }
+        for _ in 0..50 {
+            lines.push(jsonl_line("agent-m36", "durability_retry_attempt", "failure"));
+        }
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        write_raw_jsonl(events.path(), "2026-05-01.jsonl", &refs);
+
+        let idx = open_index(&home, &events);
+        idx.sync_from_files().await.unwrap();
+
+        let s = idx
+            .compute_reliability_summary("agent-m36", 7)
+            .await
+            .unwrap();
+        // total_events still counts everything (100), but the rate uses the
+        // core denominator (10), so skill adoption stays 3/10 = 0.3.
+        assert_eq!(s.total_events, 100, "total counts all events");
+        assert!(
+            (s.skill_adoption_rate - 0.3).abs() < 1e-9,
+            "skill rate must be undiluted by infra events, got {}",
+            s.skill_adoption_rate
+        );
     }
 
     /// Fallback trigger rate: 2/10 events are llm_fallback_triggered

@@ -67,7 +67,19 @@ pub async fn wait_for_confirmation(
     timeout_secs: u64,
 ) -> Result<bool, ChannelSendError> {
     let (tx, rx) = oneshot::channel();
-    confirmation_registry().lock().await.insert(user_id.to_string(), tx);
+    {
+        // L33: don't clobber an in-flight confirmation for the same user. The
+        // previous code overwrote the prior oneshot, so the first waiter was
+        // silently dropped (its sender freed → it resolved as "declined").
+        // Reject the new request instead and let the caller retry later.
+        let mut reg = confirmation_registry().lock().await;
+        if reg.contains_key(user_id) {
+            return Err(ChannelSendError(format!(
+                "a confirmation is already pending for user {user_id}"
+            )));
+        }
+        reg.insert(user_id.to_string(), tx);
+    }
 
     match tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
@@ -94,11 +106,30 @@ pub async fn wait_for_confirmation(
 /// replies to a confirmation prompt. The reply text is matched against
 /// known confirmation/denial words.
 ///
-/// Returns `true` if there was a pending confirmation for this user.
+/// L33: only a CLEAR yes or CLEAR no is treated as a decision. An ambiguous
+/// message (anything that is neither an affirmation nor a denial) is left
+/// pending — previously any non-affirmative text consumed the confirmation and
+/// resolved it as "declined", so an unrelated message cancelled the prompt.
+///
+/// Returns `true` only when the reply was decisive and consumed the pending
+/// confirmation. Returns `false` when there was no pending confirmation OR the
+/// reply was ambiguous (the confirmation stays pending).
 pub async fn resolve_confirmation(user_id: &str, reply_text: &str) -> bool {
+    let decision = if is_confirmation_reply(reply_text) {
+        Some(true)
+    } else if is_denial_reply(reply_text) {
+        Some(false)
+    } else {
+        None // ambiguous — leave pending
+    };
+
+    let Some(confirmed) = decision else {
+        return false;
+    };
+
+    // Only remove the pending sender once we know the reply is decisive.
     let sender = confirmation_registry().lock().await.remove(user_id);
     if let Some(tx) = sender {
-        let confirmed = is_confirmation_reply(reply_text);
         let _ = tx.send(confirmed);
         true
     } else {
@@ -114,6 +145,17 @@ fn is_confirmation_reply(text: &str) -> bool {
         "yes" | "y" | "ok" | "sure" | "confirm"
             | "好" | "確認" | "繼續" | "可以" | "對"
             | "はい" | "うん"
+    )
+}
+
+/// Check if a reply text is a clear denial.
+fn is_denial_reply(text: &str) -> bool {
+    let t = text.trim().to_lowercase();
+    matches!(
+        t.as_str(),
+        "no" | "n" | "cancel" | "stop" | "nope" | "abort"
+            | "取消" | "否" | "不" | "不要" | "停"
+            | "いいえ" | "やめて"
     )
 }
 
@@ -952,6 +994,63 @@ mod tests {
 
         // Should have received true
         assert!(rx.await.unwrap());
+    }
+
+    #[test]
+    fn denial_reply_detection() {
+        assert!(super::is_denial_reply("no"));
+        assert!(super::is_denial_reply("Cancel"));
+        assert!(super::is_denial_reply("取消"));
+        assert!(super::is_denial_reply("不要"));
+        assert!(super::is_denial_reply("いいえ"));
+        assert!(!super::is_denial_reply("yes"));
+        assert!(!super::is_denial_reply("好"));
+        assert!(!super::is_denial_reply("maybe later"));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_reply_leaves_confirmation_pending() {
+        // L33: a non-affirmative, non-denial message must NOT consume the
+        // pending confirmation.
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        super::confirmation_registry()
+            .lock()
+            .await
+            .insert("amb-user".into(), tx);
+
+        // Ambiguous message → not resolved, still pending.
+        assert!(!super::resolve_confirmation("amb-user", "什麼意思？").await);
+        assert!(super::has_pending_confirmation("amb-user").await);
+
+        // A clear denial now resolves it.
+        assert!(super::resolve_confirmation("amb-user", "取消").await);
+        assert!(!super::has_pending_confirmation("amb-user").await);
+    }
+
+    #[tokio::test]
+    async fn concurrent_confirmation_not_clobbered() {
+        // L33: a second confirmation for the same user is rejected rather than
+        // silently overwriting the first.
+        let user = "dup-user-l33";
+        // Spawn the first waiter; it registers the slot on first poll.
+        let h = tokio::spawn(async move { wait_for_confirmation(user, 5).await });
+        // Spin until the slot is registered.
+        let mut registered = false;
+        for _ in 0..200 {
+            if super::has_pending_confirmation(user).await {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(registered, "first confirmation never registered");
+        // Second request must be rejected (slot already taken).
+        let second = wait_for_confirmation(user, 1).await;
+        assert!(second.is_err(), "second confirmation should be rejected");
+
+        // Resolve the first so the background task completes.
+        assert!(super::resolve_confirmation(user, "yes").await);
+        assert!(h.await.unwrap().unwrap());
     }
 
     #[tokio::test]

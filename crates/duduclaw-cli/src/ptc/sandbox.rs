@@ -232,7 +232,40 @@ impl PtcSandbox {
         let mut child_stdout = child.stdout.take();
         let mut child_stderr = child.stderr.take();
 
-        let result = tokio::time::timeout(timeout, child.wait()).await;
+        // HC4: drain stdout+stderr CONCURRENTLY with the wait. Reading only after
+        // `child.wait()` deadlocks once the child writes more than the OS pipe
+        // buffer (~64KB): the child blocks on a full pipe waiting for us to read,
+        // while we block in wait() waiting for the child to exit. tokio::join!
+        // on (wait, drain_stdout, drain_stderr) keeps the pipes draining.
+        let read_limit = req.max_output_bytes as u64 + 1024;
+        let drain = |handle: Option<tokio::process::ChildStdout>| async move {
+            let mut buf = Vec::with_capacity(65536);
+            if let Some(out) = handle {
+                use tokio::io::AsyncReadExt as _;
+                let mut limited = out.take(read_limit);
+                let _ = limited.read_to_end(&mut buf).await;
+            }
+            buf
+        };
+        let drain_err = |handle: Option<tokio::process::ChildStderr>| async move {
+            let mut buf = Vec::with_capacity(4096);
+            if let Some(err) = handle {
+                use tokio::io::AsyncReadExt as _;
+                let mut limited = err.take(read_limit);
+                let _ = limited.read_to_end(&mut buf).await;
+            }
+            buf
+        };
+
+        let result = tokio::time::timeout(timeout, async {
+            let (status, raw_stdout, raw_stderr) = tokio::join!(
+                child.wait(),
+                drain(child_stdout.take()),
+                drain_err(child_stderr.take()),
+            );
+            status.map(|s| (s, raw_stdout, raw_stderr))
+        })
+        .await;
 
         // Cleanup temp files
         let _ = std::fs::remove_file(&script_path);
@@ -241,21 +274,7 @@ impl PtcSandbox {
         let execution_ms = start.elapsed().as_millis() as u64;
 
         match result {
-            Ok(Ok(status)) => {
-                // Read captured output with bounded limits to prevent OOM
-                let read_limit = req.max_output_bytes as u64 + 1024;
-                let mut raw_stdout = Vec::with_capacity(65536);
-                let mut raw_stderr = Vec::with_capacity(4096);
-                if let Some(ref mut out) = child_stdout {
-                    use tokio::io::AsyncReadExt as _;
-                    let mut limited = out.take(read_limit);
-                    let _ = limited.read_to_end(&mut raw_stdout).await;
-                }
-                if let Some(ref mut err) = child_stderr {
-                    use tokio::io::AsyncReadExt as _;
-                    let mut limited = err.take(read_limit);
-                    let _ = limited.read_to_end(&mut raw_stderr).await;
-                }
+            Ok(Ok((status, raw_stdout, raw_stderr))) => {
                 let mut stdout = String::from_utf8_lossy(&raw_stdout).to_string();
                 let stderr = String::from_utf8_lossy(&raw_stderr).to_string();
                 let exit_code = status.code().unwrap_or(-1);
@@ -320,7 +339,10 @@ impl PtcSandbox {
         ));
         let _ = std::fs::create_dir_all(&tmp_dir);
 
-        let _script_file = match req.language {
+        // The in-container path where the script + client stub are mounted, and
+        // the program/args that run it.
+        const CONTAINER_WORKSPACE: &str = "/workspace";
+        let (container_script, container_cmd) = match req.language {
             ScriptLanguage::Python => {
                 let path = tmp_dir.join("script.py");
                 std::fs::write(&path, &req.script)
@@ -328,7 +350,13 @@ impl PtcSandbox {
                 let client_path = tmp_dir.join("ptc_client.py");
                 std::fs::write(&client_path, python_client_stub())
                     .map_err(|e| DuDuClawError::Agent(format!("Failed to write client stub: {e}")))?;
-                path
+                (
+                    format!("{CONTAINER_WORKSPACE}/script.py"),
+                    vec![
+                        duduclaw_core::platform::python3_command().to_string(),
+                        format!("{CONTAINER_WORKSPACE}/script.py"),
+                    ],
+                )
             }
             ScriptLanguage::Bash => {
                 let path = tmp_dir.join("script.sh");
@@ -337,29 +365,61 @@ impl PtcSandbox {
                 let client_path = tmp_dir.join("ptc_client.sh");
                 std::fs::write(&client_path, bash_client_stub())
                     .map_err(|e| DuDuClawError::Agent(format!("Failed to write client stub: {e}")))?;
-                path
+                (
+                    format!("{CONTAINER_WORKSPACE}/script.sh"),
+                    vec!["bash".to_string(), format!("{CONTAINER_WORKSPACE}/script.sh")],
+                )
             }
         };
+        let _ = &container_script;
 
-        // Container sandbox configuration:
-        // - Mount workspace directory read-only
-        // - --network=none (scripts must use MCP tools for network access)
-        // - Read-only rootfs
+        // Container sandbox configuration (HC5):
+        // - Mount workspace directory read-only (/workspace holds the script).
+        // - Bind-mount the directory containing the PTC UDS socket read-write so
+        //   in-container scripts can reach the host RPC bridge.
+        // - Set DUDUCLAW_PTC_SOCKET to the in-container socket path.
+        // - Set `cmd` to actually run the mounted user script.
+        // - --network=none (scripts must use MCP tools for network access),
+        //   read-only rootfs.
+        const CONTAINER_PTC_DIR: &str = "/run/duduclaw";
+        let socket_host = rpc_server.socket_path();
+        let socket_parent = socket_host
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/tmp".to_string());
+        // Preserve the host socket file name so the in-container path is correct
+        // even if the bridge does not use the canonical "ptc.sock" name.
+        let socket_file = socket_host
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "ptc.sock".to_string());
+        let container_socket = format!("{CONTAINER_PTC_DIR}/{socket_file}");
         let container_config = ContainerConfig {
             timeout_ms: req.timeout_ms,
             max_concurrent: 1,
             readonly_project: true,
-            additional_mounts: vec![MountConfig {
-                host: tmp_dir.to_string_lossy().to_string(),
-                container: "/workspace".to_string(),
-                readonly: true,
-            }],
+            additional_mounts: vec![
+                MountConfig {
+                    host: tmp_dir.to_string_lossy().to_string(),
+                    container: CONTAINER_WORKSPACE.to_string(),
+                    readonly: true,
+                },
+                // Bind-mount the directory containing the UDS socket read-write
+                // (a socket needs rw to connect) at a fixed in-container path.
+                MountConfig {
+                    host: socket_parent,
+                    container: CONTAINER_PTC_DIR.to_string(),
+                    readonly: false,
+                },
+            ],
             sandbox_enabled: true,
             network_access: false, // --network=none
             worktree_enabled: false,
             worktree_auto_merge: true,
             worktree_cleanup_on_exit: true,
             worktree_copy_files: vec![],
+            cmd: container_cmd,
+            env: vec![("DUDUCLAW_PTC_SOCKET".to_string(), container_socket)],
         };
 
         let start = std::time::Instant::now();
@@ -389,15 +449,14 @@ impl PtcSandbox {
             return Self::execute(req, rpc_server).await;
         }
 
-        // Wait for completion with timeout
+        // HC5: wait for the script to actually finish, then collect the real exit
+        // code + logs. The container now runs the mounted user script (via
+        // `config.cmd`) with `DUDUCLAW_PTC_SOCKET` pointing at the bind-mounted
+        // UDS socket, so MCP tool calls work and the result is genuine.
         let timeout = std::time::Duration::from_millis(req.timeout_ms);
-        let logs = tokio::time::timeout(timeout, runtime.logs(&container_id)).await;
+        let wait_result = tokio::time::timeout(timeout, runtime.wait(&container_id)).await;
 
-        let (stdout, exit_code) = match logs {
-            Ok(Ok(output)) => (output, 0),
-            Ok(Err(e)) => (format!("Container error: {e}"), 1),
-            Err(_) => ("Container execution timed out".to_string(), 124),
-        };
+        let execution_ms = start.elapsed().as_millis() as u64;
 
         // Cleanup: stop, remove container, delete temp files
         let _ = runtime
@@ -406,19 +465,31 @@ impl PtcSandbox {
         let _ = runtime.remove(&container_id).await;
         let _ = std::fs::remove_dir_all(&tmp_dir);
 
-        let execution_ms = start.elapsed().as_millis() as u64;
-
-        let mut stdout = stdout;
-        let truncated = safe_truncate_string(&mut stdout, req.max_output_bytes);
-
-        Ok(ScriptResult {
-            stdout,
-            stderr: String::new(),
-            exit_code,
-            tool_calls_count: rpc_server.call_count(),
-            execution_ms,
-            truncated,
-        })
+        match wait_result {
+            Ok(Ok(exit)) => {
+                let mut stdout = exit.logs;
+                let truncated = safe_truncate_string(&mut stdout, req.max_output_bytes);
+                Ok(ScriptResult {
+                    stdout,
+                    stderr: String::new(),
+                    exit_code: exit.exit_code as i32,
+                    tool_calls_count: rpc_server.call_count(),
+                    execution_ms,
+                    truncated,
+                })
+            }
+            Ok(Err(e)) => Err(DuDuClawError::Agent(format!(
+                "PTC container execution failed: {e}"
+            ))),
+            Err(_) => Ok(ScriptResult {
+                stdout: String::new(),
+                stderr: "PTC container execution timed out".to_string(),
+                exit_code: 124,
+                tool_calls_count: rpc_server.call_count(),
+                execution_ms,
+                truncated: false,
+            }),
+        }
     }
 }
 

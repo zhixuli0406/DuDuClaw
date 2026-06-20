@@ -33,12 +33,31 @@ pub struct OpenAiCompatBackend {
     loaded_model: RwLock<Option<ModelInfo>>,
     chat_url: String,
     models_url: String,
+    /// Resolved API key (decrypted from `api_key_enc` or plaintext `api_key`).
+    /// Resolved once at construction — read-only / fail-soft. `None` means no
+    /// Authorization header is sent (same as today's empty-key behaviour).
+    resolved_api_key: Option<String>,
     /// Optional system prompt content hash for cache monitoring.
     prefix_hash: Option<String>,
 }
 
+/// Resolve the standard DuDuClaw home dir (`~/.duduclaw`).
+///
+/// `dirs` is not a dependency of this crate, so we derive it from the same
+/// `HOME` / `USERPROFILE` env vars used by [`crate::util::expand_tilde`].
+fn default_duduclaw_home() -> std::path::PathBuf {
+    crate::util::expand_tilde("~/.duduclaw")
+}
+
 impl OpenAiCompatBackend {
+    /// Construct using the standard `~/.duduclaw` home dir for key resolution.
     pub fn new(config: OpenAiCompatConfig) -> Self {
+        let home = default_duduclaw_home();
+        Self::new_with_home(config, &home)
+    }
+
+    /// Construct, resolving `api_key_enc` against an explicit `home_dir`.
+    pub fn new_with_home(config: OpenAiCompatConfig, home_dir: &std::path::Path) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             .build()
@@ -48,12 +67,15 @@ impl OpenAiCompatBackend {
         let chat_url = format!("{base}/chat/completions");
         let models_url = format!("{base}/models");
 
+        let resolved_api_key = config.resolved_api_key(home_dir);
+
         Self {
             config,
             client,
             loaded_model: RwLock::new(None),
             chat_url,
             models_url,
+            resolved_api_key,
             prefix_hash: None,
         }
     }
@@ -177,7 +199,7 @@ impl InferenceBackend for OpenAiCompatBackend {
         let url = &self.chat_url;
 
         let mut req = self.client.post(url).json(&body);
-        if let Some(ref key) = self.config.api_key {
+        if let Some(ref key) = self.resolved_api_key {
             req = req.bearer_auth(key);
         }
         if let Some(ref hash) = self.prefix_hash {
@@ -229,7 +251,7 @@ impl InferenceBackend for OpenAiCompatBackend {
     async fn is_available(&self) -> bool {
         let url = &self.models_url;
         let mut req = self.client.get(url);
-        if let Some(ref key) = self.config.api_key {
+        if let Some(ref key) = self.resolved_api_key {
             req = req.bearer_auth(key);
         }
         matches!(req.send().await, Ok(r) if r.status().is_success())

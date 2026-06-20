@@ -287,8 +287,54 @@ impl UserModel {
             }
         }
 
+        // D1 fix: `avg_satisfaction` was previously only written by
+        // `update_from_feedback`, which had no production caller, so the
+        // satisfaction model never learned and `delta_satisfaction` always
+        // compared against the frozen cold-start constant (0.7). We now update
+        // satisfaction on every completed conversation:
+        //   1. If the conversation carried an explicit feedback signal, route it
+        //      through the same scoring path as explicit feedback.
+        //   2. Otherwise infer a satisfaction score from behavioural signals
+        //      (corrections strongly negative, follow-ups mildly negative, a
+        //      natural ending positive) so the model converges on real data.
+        if let Some(signal) = metrics.feedback_signal.as_deref() {
+            // Explicit signal present — reuse the canonical scoring + side effects.
+            self.update_from_feedback(signal);
+        } else {
+            self.avg_satisfaction
+                .push(Self::infer_satisfaction(metrics));
+        }
+
         self.total_conversations += 1;
         self.last_updated = Utc::now();
+    }
+
+    /// Infer a satisfaction score in `[0.0, 1.0]` from behavioural signals when
+    /// no explicit feedback was given.
+    ///
+    /// Starts from a neutral baseline and adjusts:
+    /// - each correction is a strong dissatisfaction signal,
+    /// - excess follow-ups (relative to assistant turns) are a mild one,
+    /// - a natural conversation ending is a mild positive signal.
+    fn infer_satisfaction(metrics: &super::metrics::ConversationMetrics) -> f64 {
+        const BASELINE: f64 = 0.7;
+        const CORRECTION_PENALTY: f64 = 0.25;
+        const FOLLOW_UP_PENALTY: f64 = 0.05;
+        const NATURAL_END_BONUS: f64 = 0.1;
+
+        let user_msgs = metrics.user_message_count.max(1) as f64;
+        let exchanges = metrics.assistant_message_count.max(1) as f64;
+
+        let correction_ratio = metrics.user_corrections as f64 / user_msgs;
+        let follow_up_ratio = metrics.user_follow_ups as f64 / exchanges;
+
+        let mut score = BASELINE;
+        score -= CORRECTION_PENALTY * correction_ratio.min(1.0);
+        score -= FOLLOW_UP_PENALTY * follow_up_ratio.min(1.0);
+        if metrics.ended_naturally {
+            score += NATURAL_END_BONUS;
+        }
+        score.clamp(0.0, 1.0)
     }
 
     /// Store an embedding vector for this conversation.

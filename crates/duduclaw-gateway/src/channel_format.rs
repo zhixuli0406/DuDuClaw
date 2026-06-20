@@ -59,38 +59,90 @@ const DUDUCLAW_COLOR: u32 = 0xF59E0B;
 /// Error embed color.
 const ERROR_COLOR: u32 = 0xFF4444;
 
-/// Format a reply as a Discord message payload (JSON).
+/// Max embeds Discord accepts in a single message.
+const DISCORD_MAX_EMBEDS_PER_MSG: usize = 10;
+/// Max aggregate characters across all embeds in a single message.
+const DISCORD_EMBED_AGGREGATE: usize = 6000;
+
+/// Format a reply as a single Discord message payload (JSON).
+///
+/// Backwards-compatible single-payload entry point. For long replies this
+/// returns the FIRST message produced by [`to_discord_messages`]; callers that
+/// must not drop overflow should prefer [`to_discord_messages`].
 ///
 /// - Short replies (<200 chars, no code blocks) → plain text
-/// - Long replies → embed with amber accent
-/// - Splits at 4096 chars for embed description
+/// - Long replies → embed(s) with amber accent
 pub fn to_discord_message(text: &str, agent_name: Option<&str>, error: bool) -> Value {
+    to_discord_messages(text, agent_name, error)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| json!({ "content": "" }))
+}
+
+/// Format a reply as one OR MORE Discord message payloads (JSON).
+///
+/// HC2: a single Discord message is capped at 10 embeds AND 6000 aggregate
+/// embed characters. The previous single-message formatter silently dropped
+/// the 10th+ embed (`&embeds[..min(10)]`) and ignored the 6000-char cap.
+/// This splits the embeds across as many messages as needed so nothing is lost.
+/// Each returned `Value` is a complete message body ready to POST.
+pub fn to_discord_messages(text: &str, agent_name: Option<&str>, error: bool) -> Vec<Value> {
     let color = if error { ERROR_COLOR } else { DUDUCLAW_COLOR };
     let footer_text = agent_name
         .map(|n| format!("DuDuClaw \u{00b7} {n}"))
         .unwrap_or_else(|| "DuDuClaw".to_string());
 
-    // Short, simple replies → plain text
+    // Short, simple replies → single plain-text message
     if text.len() < 200 && !text.contains("```") && !error {
-        return json!({ "content": text });
+        return vec![json!({ "content": text })];
     }
 
-    // Long replies → embed(s)
+    // Long replies → embed(s). Build all chunks first (never dropped).
     let chunks = split_text(text, limits::DISCORD_EMBED_DESC);
+    let last_idx = chunks.len().saturating_sub(1);
     let embeds: Vec<Value> = chunks.iter().enumerate().map(|(i, chunk)| {
         let mut embed = json!({
             "description": chunk,
             "color": color,
         });
-        // Footer only on last embed
-        if i == chunks.len() - 1 {
+        // Footer only on the very last embed of the whole reply.
+        if i == last_idx {
             embed["footer"] = json!({ "text": footer_text });
         }
         embed
     }).collect();
 
-    // Discord allows max 10 embeds per message
-    json!({ "embeds": &embeds[..embeds.len().min(10)] })
+    // Pack embeds into messages, respecting both the 10-embeds and the
+    // 6000-aggregate-char limits. Each chunk is already ≤ DISCORD_EMBED_DESC
+    // (4096) so a single embed always fits in one message on its own.
+    let mut messages: Vec<Value> = Vec::new();
+    let mut current: Vec<Value> = Vec::new();
+    let mut current_chars = 0usize;
+
+    for embed in embeds {
+        let embed_chars = embed["description"].as_str().map(|s| s.chars().count()).unwrap_or(0);
+        let would_overflow_count = current.len() >= DISCORD_MAX_EMBEDS_PER_MSG;
+        let would_overflow_chars =
+            !current.is_empty() && current_chars + embed_chars > DISCORD_EMBED_AGGREGATE;
+
+        if would_overflow_count || would_overflow_chars {
+            messages.push(json!({ "embeds": std::mem::take(&mut current) }));
+            current_chars = 0;
+        }
+
+        current_chars += embed_chars;
+        current.push(embed);
+    }
+
+    if !current.is_empty() {
+        messages.push(json!({ "embeds": current }));
+    }
+
+    if messages.is_empty() {
+        messages.push(json!({ "content": "" }));
+    }
+
+    messages
 }
 
 // ── Telegram formatting ────────────────────────────────────────
@@ -426,5 +478,53 @@ mod tests {
         let msg = to_slack_blocks("**hello**");
         let block = &msg["blocks"][0];
         assert_eq!(block["text"]["text"], "*hello*");
+    }
+
+    // ── HC2: Discord embed splitting ───────────────────────────────
+
+    #[test]
+    fn test_discord_messages_short_plain() {
+        let msgs = to_discord_messages("Hi!", None, false);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["content"], "Hi!");
+    }
+
+    #[test]
+    fn test_discord_messages_no_drop_over_ten_embeds() {
+        // Each chunk is ~4096 chars → one embed each. 12 chunks * 4096 ≈ 49k
+        // chars: well over both the 10-embed and 6000-char caps, forcing
+        // several messages. Crucially, NO embed may be dropped.
+        let big = "a".repeat(limits::DISCORD_EMBED_DESC * 12);
+        let msgs = to_discord_messages(&big, Some("agent"), false);
+        assert!(msgs.len() > 1, "expected multiple messages, got {}", msgs.len());
+
+        let mut total_embeds = 0usize;
+        for m in &msgs {
+            let embeds = m["embeds"].as_array().expect("each message has embeds");
+            // Never exceed Discord's 10-embed-per-message hard limit.
+            assert!(embeds.len() <= 10, "message exceeds 10 embeds: {}", embeds.len());
+            // Never exceed the 6000 aggregate-char cap (unless a single embed
+            // alone is larger, which split_text prevents at 4096).
+            let agg: usize = embeds.iter()
+                .map(|e| e["description"].as_str().map(|s| s.chars().count()).unwrap_or(0))
+                .sum();
+            assert!(agg <= 6000, "message exceeds 6000 aggregate chars: {agg}");
+            total_embeds += embeds.len();
+        }
+        // 12 * 4096 chars split at 4096 → at least 12 embeds, all preserved.
+        assert!(total_embeds >= 12, "embeds were dropped: only {total_embeds}");
+
+        // Footer must appear exactly once, on the final embed.
+        let last_msg = msgs.last().unwrap();
+        let last_embeds = last_msg["embeds"].as_array().unwrap();
+        let last_embed = last_embeds.last().unwrap();
+        assert!(last_embed["footer"]["text"].as_str().unwrap().contains("agent"));
+    }
+
+    #[test]
+    fn test_discord_message_single_compat() {
+        // Backwards-compat: single-payload form still returns a valid body.
+        let msg = to_discord_message("Error", None, true);
+        assert!(msg.get("embeds").is_some());
     }
 }

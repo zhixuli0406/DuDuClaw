@@ -146,6 +146,42 @@ impl License {
         Ok(())
     }
 
+    /// Validate the tier ↔ deployment-mode binding (M51 fix).
+    ///
+    /// A cloud-only tier (Hobby/Solo/Studio/Business) must never be honoured on
+    /// a self-hosted deployment, and a self-host-only tier (SelfHostPro/Oem)
+    /// must never be honoured when running in DuDuClaw Cloud. `validate()`
+    /// alone did not enforce this, so e.g. a `Solo` license passed on a
+    /// self-host box. The deployment mode is a property of the *running
+    /// binary*, not of the `License` model, so it is supplied by the caller
+    /// rather than read from a (non-existent) license field.
+    ///
+    /// `OpenSource` is deployment-agnostic and always passes.
+    ///
+    /// TODO(M51): wire `is_self_host` from a real deployment-mode signal at the
+    /// gateway license-load sites (`license_runtime.rs`) — e.g. a build flag or
+    /// `DUDUCLAW_DEPLOYMENT` env var — and call this from `validate()` once that
+    /// signal exists. The License model carries no deployment field, so no
+    /// schema change is invented here.
+    pub fn validate_tier_deployment_binding(
+        &self,
+        is_self_host: bool,
+    ) -> Result<(), LicenseError> {
+        if is_self_host && self.tier.is_cloud_only() {
+            return Err(LicenseError::TierModeMismatch(format!(
+                "{} is cloud-only but was issued to a self-host machine",
+                self.tier
+            )));
+        }
+        if !is_self_host && self.tier.is_self_host_only() {
+            return Err(LicenseError::TierModeMismatch(format!(
+                "{} is self-host-only but was issued to a cloud deployment",
+                self.tier
+            )));
+        }
+        Ok(())
+    }
+
     /// Returns the canonical payload bytes used for signing/verification.
     /// This is the deterministic serialization of all fields except `signature`.
     ///
@@ -340,6 +376,42 @@ mod tests {
         let license = make_license(LicenseTier::SelfHostPro, 30, 1);
         // grace_period = 0 disables the check
         assert!(license.validate("abc123", 7, 0).is_ok());
+    }
+
+    // ── M51: tier ↔ deployment-mode binding ─────────────────────────
+
+    #[test]
+    fn deployment_binding_rejects_cloud_tier_on_self_host() {
+        let license = make_license(LicenseTier::Solo, 30, 0);
+        let err = license
+            .validate_tier_deployment_binding(true)
+            .unwrap_err();
+        assert!(matches!(err, LicenseError::TierModeMismatch(_)));
+    }
+
+    #[test]
+    fn deployment_binding_rejects_self_host_tier_on_cloud() {
+        let license = make_license(LicenseTier::SelfHostPro, 30, 0);
+        let err = license
+            .validate_tier_deployment_binding(false)
+            .unwrap_err();
+        assert!(matches!(err, LicenseError::TierModeMismatch(_)));
+    }
+
+    #[test]
+    fn deployment_binding_allows_matching_modes() {
+        let cloud = make_license(LicenseTier::Business, 30, 0);
+        assert!(cloud.validate_tier_deployment_binding(false).is_ok());
+
+        let self_host = make_license(LicenseTier::Oem, 30, 0);
+        assert!(self_host.validate_tier_deployment_binding(true).is_ok());
+    }
+
+    #[test]
+    fn deployment_binding_opensource_is_mode_agnostic() {
+        let license = make_license(LicenseTier::OpenSource, 30, 0);
+        assert!(license.validate_tier_deployment_binding(true).is_ok());
+        assert!(license.validate_tier_deployment_binding(false).is_ok());
     }
 
     #[test]

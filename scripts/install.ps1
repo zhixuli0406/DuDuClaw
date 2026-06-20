@@ -6,7 +6,13 @@ $ErrorActionPreference = "Stop"
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-$DuDuClawVersion = "0.1.0"
+# Version is auto-detected from the latest GitHub Release at runtime so this
+# script (served from `main`) never drifts behind published binaries. Override
+# with $env:DUDUCLAW_VERSION to pin. Fallback is used only if the API is
+# unreachable. NOTE: never hardcode a version lacking a published Release — a
+# 404 here silently forces an hour-long MSVC + cargo source build.
+$DuDuClawVersion = if ($env:DUDUCLAW_VERSION) { $env:DUDUCLAW_VERSION } else { "" }
+$FallbackVersion = "1.21.1"
 $GitHubRepo = "zhixuli0406/DuDuClaw"
 $InstallDir = if ($env:DUDUCLAW_HOME) { "$env:DUDUCLAW_HOME\bin" } else { "$env:USERPROFILE\.duduclaw\bin" }
 $BinaryName = "duduclaw.exe"
@@ -20,6 +26,30 @@ function Write-Info    { param([string]$Message) Write-Host "  [OK] " -Foregroun
 function Write-Warn    { param([string]$Message) Write-Host "  [!!] " -ForegroundColor Yellow -NoNewline; Write-Host $Message }
 function Write-Err     { param([string]$Message) Write-Host "  [XX] " -ForegroundColor Red -NoNewline; Write-Host $Message }
 function Write-Heading { param([string]$Message) Write-Host ""; Write-Host "  $Message" -ForegroundColor Cyan }
+
+# ---------------------------------------------------------------------------
+# Resolve version from the latest GitHub Release (unless pinned)
+# ---------------------------------------------------------------------------
+function Resolve-Version {
+    if ($DuDuClawVersion) {
+        Write-Info "Using pinned version v$DuDuClawVersion"
+        return
+    }
+    $api = "https://api.github.com/repos/$GitHubRepo/releases/latest"
+    try {
+        $resp = Invoke-RestMethod -Uri $api -UseBasicParsing -Headers @{ "User-Agent" = "duduclaw-installer" } -ErrorAction Stop
+        $tag = $resp.tag_name
+        if ($tag) {
+            $script:DuDuClawVersion = $tag -replace '^v', ''
+        }
+    } catch {
+        # fall through to fallback below
+    }
+    if (-not $DuDuClawVersion) {
+        $script:DuDuClawVersion = $FallbackVersion
+        Write-Warn "Could not query latest release; falling back to v$DuDuClawVersion"
+    }
+}
 
 # ---------------------------------------------------------------------------
 # Detect architecture
@@ -224,6 +254,7 @@ function Test-WSL {
 # ---------------------------------------------------------------------------
 function Main {
     Write-Host ""
+    Resolve-Version
     Write-Host "  DuDuClaw Installer v$DuDuClawVersion" -ForegroundColor White
     Write-Host "  ======================================"
 
@@ -239,13 +270,18 @@ function Main {
     $installed = Install-FromRelease -Target $target
 
     if (-not $installed) {
-        Write-Warn "Pre-built binary not available for $target."
+        Write-Warn "Pre-built binary download failed for $target (v$DuDuClawVersion)."
+        Write-Host ""
+        Write-Host "  Recommended: install the prebuilt binary via npm instead (no MSVC/compiler needed):" -ForegroundColor White
+        Write-Host "       npm install -g duduclaw" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  Building from source requires Rust + MSVC Build Tools (~2GB) and can take ~1.5h." -ForegroundColor Yellow
         Write-Host ""
         $answer = Read-Host "  Build from source using cargo instead? [y/N]"
         if ($answer -match "^[Yy]") {
             Install-FromSource
         } else {
-            throw "Installation cancelled. No binary available."
+            throw "Installation cancelled. Use 'npm install -g duduclaw' for the prebuilt binary."
         }
     }
 

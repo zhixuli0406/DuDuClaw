@@ -57,6 +57,11 @@ platform_manifests() {
     for r in README.md README.en.md README.ja.md; do
         if [[ -f "$r" ]]; then echo "badge|$r"; fi
     done
+    # Installer fallback versions (used only when the GitHub "latest release" API
+    # is unreachable). These silently drifted to ancient v0.x for many releases,
+    # causing a 404 → source-build fallback (MSVC + ~1.5h compile) on Windows.
+    if [[ -f scripts/install.sh ]]; then echo "installer_sh|scripts/install.sh"; fi
+    if [[ -f scripts/install.ps1 ]]; then echo "installer_ps1|scripts/install.ps1"; fi
 }
 
 # --- Read the current version out of a manifest, by kind. (Never fails: empty on miss.) ---
@@ -78,6 +83,14 @@ extract_version() {
         badge)
             { grep -m1 -oE "badge/version-$SEMVER" "$file" \
                 | sed -E "s|badge/version-($SEMVER)|\1|"; } 2>/dev/null || true
+            ;;
+        installer_sh)
+            { grep -m1 -E "^FALLBACK_VERSION=\"$SEMVER\"" "$file" \
+                | sed -E "s/^FALLBACK_VERSION=\"($SEMVER)\".*/\1/"; } 2>/dev/null || true
+            ;;
+        installer_ps1)
+            { grep -m1 -E "^\\\$FallbackVersion = \"$SEMVER\"" "$file" \
+                | sed -E "s/^\\\$FallbackVersion = \"($SEMVER)\".*/\1/"; } 2>/dev/null || true
             ;;
     esac
 }
@@ -228,6 +241,12 @@ while IFS='|' read -r kind file; do
             ;;
         badge)
             sed -i '' -E "s|(badge/version-)$SEMVER(-blue)|\1$NEW_VERSION\2|" "$file"
+            ;;
+        installer_sh)
+            sed -i '' -E "s/^(FALLBACK_VERSION=\")$SEMVER(\")/\1$NEW_VERSION\2/" "$file"
+            ;;
+        installer_ps1)
+            sed -i '' -E "s/^(\\\$FallbackVersion = \")$SEMVER(\")/\1$NEW_VERSION\2/" "$file"
             ;;
     esac
     echo "  Updated: $file"

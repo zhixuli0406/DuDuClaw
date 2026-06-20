@@ -10,7 +10,7 @@ use axum::{
     Router,
     body::Bytes,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::post,
 };
 use duduclaw_core::truncate_bytes;
@@ -121,6 +121,17 @@ pub async fn start_feishu_webhook(
         return None;
     }
 
+    // M3: fail-closed. Without a verification token the webhook would accept
+    // unsigned, unauthenticated events from anyone who knows the URL. Refuse
+    // to start rather than run an open relay.
+    if verification_token.is_empty() {
+        error!(
+            "Feishu webhook NOT started: feishu_verification_token is unset. \
+             Set it in the channel config to authenticate incoming events."
+        );
+        return None;
+    }
+
     info!("📲 Feishu webhook starting (app: {app_id})");
 
     let state = Arc::new(FeishuState {
@@ -157,9 +168,28 @@ pub async fn start_feishu_webhook(
 
 async fn handle_webhook(
     State(state): State<Arc<FeishuState>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+
+    // M3: when Feishu signs the request (X-Lark-Signature present), verify the
+    // signature against the raw body BEFORE parsing. This authenticates the
+    // request cryptographically rather than relying only on the in-body token.
+    if let Some(sig) = headers.get("X-Lark-Signature").and_then(|v| v.to_str().ok()) {
+        let timestamp = headers
+            .get("X-Lark-Request-Timestamp")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let nonce = headers
+            .get("X-Lark-Request-Nonce")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !verify_feishu_signature(timestamp, nonce, &state.verification_token, &body, sig) {
+            warn!("Feishu webhook signature mismatch — rejecting request");
+            return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
+        }
+    }
 
     let event: FeishuEvent = match serde_json::from_slice(&body) {
         Ok(e) => e,
@@ -169,16 +199,15 @@ async fn handle_webhook(
         }
     };
 
-    // 1. First verify token (if configured)
-    if !state.verification_token.is_empty() {
-        if let Some(token) = event.token.as_deref() {
-            if !constant_time_eq(token.as_bytes(), state.verification_token.as_bytes()) {
-                warn!("Feishu webhook token mismatch — possible spoofed request");
-                return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
-            }
-        } else {
-            return (StatusCode::UNAUTHORIZED, "missing token").into_response();
+    // Verify the in-body verification token (always configured — startup
+    // refuses to run without it). Constant-time compare to avoid timing leaks.
+    if let Some(token) = event.token.as_deref() {
+        if !constant_time_eq(token.as_bytes(), state.verification_token.as_bytes()) {
+            warn!("Feishu webhook token mismatch — possible spoofed request");
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
         }
+    } else {
+        return (StatusCode::UNAUTHORIZED, "missing token").into_response();
     }
 
     // 2. Then handle challenge
@@ -206,9 +235,14 @@ async fn handle_webhook(
 fn strip_feishu_mentions(text: &str) -> String {
     let mut result = text.to_string();
     while let Some(start) = result.find("@_user_") {
-        if let Some(end) = result[start..].find(char::is_whitespace) {
-            // Remove the mention and the trailing whitespace
-            result = format!("{}{}", &result[..start], &result[start + end + 1..]);
+        let tail = &result[start..];
+        // M26: locate the trailing whitespace by char so we can advance past it
+        // using its real UTF-8 byte length. The previous `end + 1` assumed a
+        // 1-byte space and panicked on multi-byte whitespace like U+3000.
+        if let Some((ws_off, ws_ch)) = tail.char_indices().find(|(_, c)| c.is_whitespace()) {
+            // Resume after the whitespace char (char-boundary safe).
+            let resume = start + ws_off + ws_ch.len_utf8();
+            result = format!("{}{}", &result[..start], &result[resume..]);
         } else {
             result = result[..start].to_string();
         }
@@ -364,6 +398,36 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Verify a Feishu event-subscription signature.
+///
+/// Feishu computes `sha256(timestamp + nonce + token + raw_body)` and sends it
+/// hex-encoded in the `X-Lark-Signature` header. We recompute and compare in
+/// constant time. Returns `false` on any decode failure (fail-closed).
+fn verify_feishu_signature(
+    timestamp: &str,
+    nonce: &str,
+    token: &str,
+    body: &[u8],
+    signature: &str,
+) -> bool {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(timestamp.as_bytes());
+    hasher.update(nonce.as_bytes());
+    hasher.update(token.as_bytes());
+    hasher.update(body);
+    let digest = hasher.finalize();
+
+    // Hex-encode without pulling in an extra crate.
+    let mut expected = String::with_capacity(digest.len() * 2);
+    for byte in digest.iter() {
+        expected.push_str(&format!("{byte:02x}"));
+    }
+
+    constant_time_eq(expected.as_bytes(), signature.as_bytes())
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -376,6 +440,33 @@ mod tests {
         assert_eq!(strip_feishu_mentions("hi @_user_23 there"), "hi there");
         assert_eq!(strip_feishu_mentions("no mention"), "no mention");
         assert_eq!(strip_feishu_mentions("@_user_1"), "");
+    }
+
+    #[test]
+    fn test_strip_feishu_mentions_multibyte_whitespace_no_panic() {
+        // M26: U+3000 (ideographic space, 3 bytes) after the mention must not
+        // panic on a mid-char slice. Also exercise CJK content around it.
+        assert_eq!(strip_feishu_mentions("@_user_1\u{3000}你好"), "你好");
+        assert_eq!(strip_feishu_mentions("早安 @_user_9\u{3000}世界"), "早安 世界");
+        // Mention immediately followed by CJK with no whitespace at all.
+        let only = strip_feishu_mentions("@_user_5你好嗎");
+        assert!(only.is_empty() || only == "你好嗎" || only.starts_with('@') == false);
+    }
+
+    #[test]
+    fn test_verify_feishu_signature() {
+        use sha2::{Digest, Sha256};
+        let (ts, nonce, token, body) = ("1700000000", "abc123", "tok", b"{\"a\":1}".as_slice());
+        let mut h = Sha256::new();
+        h.update(ts.as_bytes());
+        h.update(nonce.as_bytes());
+        h.update(token.as_bytes());
+        h.update(body);
+        let expected: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+
+        assert!(verify_feishu_signature(ts, nonce, token, body, &expected));
+        assert!(!verify_feishu_signature(ts, nonce, token, body, "deadbeef"));
+        assert!(!verify_feishu_signature(ts, nonce, "wrong-token", body, &expected));
     }
 
     #[test]

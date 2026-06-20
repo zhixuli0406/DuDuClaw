@@ -461,13 +461,16 @@ Degradation: automatically drops one level after 24 hours with no events (RED→
 
 ## Installation
 
-### npm (recommended)
+### npm (recommended, all platforms incl. Windows)
 
 ```bash
 npm install -g duduclaw
 ```
 
-After installation it automatically downloads the precompiled binary for your platform (supports macOS ARM64/x64, Linux x64/ARM64, Windows x64).
+After installation it automatically downloads the **precompiled binary** for your platform (supports macOS ARM64/x64, Linux x64/ARM64, Windows x64) — **no compiler, no Rust, no MSVC Build Tools required**. Windows users only need [Node.js](https://nodejs.org/) installed first; that is the only prerequisite.
+
+> **⚠️ If installation asks you to install Rust / MSVC Build Tools (~2GB) and compile (~1.5h), you're on the wrong path.**
+> That's the "[Build from source](#build-from-source)" path, only needed by contributors who modify the code. For normal use, always use `npm install -g duduclaw` above (or Homebrew / one-line install below) — it downloads the official prebuilt binary directly.
 
 ### Homebrew (macOS / Linux)
 
@@ -477,9 +480,19 @@ brew install zhixuli0406/tap/duduclaw
 
 ### One-line install
 
+**macOS / Linux:**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | sh
 ```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.ps1 | iex
+```
+
+> The one-line installer auto-detects the **latest release** and downloads the prebuilt binary for your platform — also compile-free. It only offers a source build if the GitHub download fails (in which case prefer `npm install -g duduclaw`). Pin a specific version with the `DUDUCLAW_VERSION` environment variable.
 
 ### Python SDK (library, not a CLI)
 
@@ -730,9 +743,9 @@ cd web && npx tsc --noEmit
 - [docs/spec/soul-md-spec.md](docs/spec/soul-md-spec.md) — SOUL.md format spec v1.0
 - [docs/spec/contract-toml-spec.md](docs/spec/contract-toml-spec.md) — CONTRACT.toml format spec v1.0
 - [docs/api/README.md](docs/api/README.md) — WebSocket RPC protocol + JSON-RPC 2.0 interface
-- [docs/evolution-engine.md](docs/evolution-engine.md) — Evolution Engine v2 design document
-- [docs/deployment-guide.md](docs/deployment-guide.md) — Production deployment guide
-- [docs/development-guide.md](docs/development-guide.md) — Developer setup and Agent development
+- [docs/architecture/evolution-engine.md](docs/architecture/evolution-engine.md) — Evolution Engine v2 design document
+- [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md) — Production deployment guide
+- [docs/guides/development-guide.md](docs/guides/development-guide.md) — Developer setup and Agent development
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md) — Custom MCP tool tutorial
 
 ---

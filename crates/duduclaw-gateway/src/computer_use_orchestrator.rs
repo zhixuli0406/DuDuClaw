@@ -49,6 +49,31 @@ fn session_registry() -> &'static tokio::sync::Mutex<HashMap<String, Arc<Orchest
 /// Maximum concurrent computer use sessions (prevents DoS).
 const MAX_CONCURRENT_SESSIONS: usize = 5;
 
+/// Window titles that indicate a credential / secret context. Mirrors the
+/// `capture_masked_screenshot` list so masking and risk assessment agree.
+const SENSITIVE_WINDOW_MARKERS: &[&str] = &[
+    "1password", "bitwarden", "lastpass", "keepass",
+    "keychain", "密碼", "password", "credential",
+    "ssh", "gpg", "pgp",
+];
+
+/// D12: does this action enter input (text/keystrokes) that could land in a
+/// sensitive field? `Type` and `Key` write characters; clicks/moves do not.
+fn action_targets_input(action: &ComputerAction) -> bool {
+    matches!(action, ComputerAction::Type { .. } | ComputerAction::Key { .. })
+}
+
+/// D12: is the focused window a known credential / secret context?
+fn window_is_sensitive(title: Option<&str>) -> bool {
+    match title {
+        Some(t) => {
+            let lower = t.to_lowercase();
+            SENSITIVE_WINDOW_MARKERS.iter().any(|m| lower.contains(m))
+        }
+        None => false,
+    }
+}
+
 /// Register an orchestrator's control handle in the global registry.
 ///
 /// Returns `Err` if the maximum concurrent session limit is reached.
@@ -485,39 +510,58 @@ impl ComputerUseOrchestrator {
     pub async fn capture_masked_screenshot(&self) -> Result<String, ComputerUseError> {
         let b64 = self.capture_screenshot().await?;
 
-        // L5a: Detect sensitive regions via DOM queries inside the container
+        // L5a: Detect sensitive regions via DOM queries inside the container.
+        //
+        // HS5 fix (fail closed): detection now returns `Err` on failure. If it
+        // fails we MUST NOT ship the raw screenshot — we mask the entire screen
+        // as a fail-safe. This previously only happened (and only in Native
+        // mode); a container detection failure used to leak an unmasked image.
         if let Some(ref container) = self.container_id {
-            let regions = crate::computer_use::detect_sensitive_regions(
+            match crate::computer_use::detect_sensitive_regions(
                 container,
                 &self.masking.patterns,
             )
             .await
-            .unwrap_or_default();
-
-            if !regions.is_empty() {
-                return mask_screenshot_regions(&b64, &regions, self.masking.fill_color);
-            }
-        }
-
-        // L5b (native): Check active window title for known sensitive apps
-        if self.config.execution_mode == ComputerUseMode::Native {
-            if let Some(ref title) = self.get_active_window_title().await {
-                let lower = title.to_lowercase();
-                let sensitive_windows = [
-                    "1password", "bitwarden", "lastpass", "keepass",
-                    "keychain", "密碼", "password", "credential",
-                    "ssh", "gpg", "pgp",
-                ];
-                if sensitive_windows.iter().any(|w| lower.contains(w)) {
-                    warn!(window = %title, "Sensitive window detected — masking full screenshot");
-                    // Mask the entire screenshot as a safety measure
-                    let regions = vec![[0_u32, 0, self.config.display_width, self.config.display_height]];
+            {
+                Ok(regions) if !regions.is_empty() => {
                     return mask_screenshot_regions(&b64, &regions, self.masking.fill_color);
+                }
+                Ok(_) => { /* genuinely no sensitive regions — fall through */ }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Sensitive region detection failed — masking full screenshot (fail closed)"
+                    );
+                    return self.mask_full_screen(&b64);
                 }
             }
         }
 
+        // Check active window title for known sensitive apps. HS5 fix: this
+        // full-screen fail-safe now runs in ALL modes, not only Native — a
+        // password manager / credential window must be masked regardless of
+        // whether we're driving a container or the host display.
+        if let Some(ref title) = self.get_active_window_title().await {
+            let lower = title.to_lowercase();
+            let sensitive_windows = [
+                "1password", "bitwarden", "lastpass", "keepass",
+                "keychain", "密碼", "password", "credential",
+                "ssh", "gpg", "pgp",
+            ];
+            if sensitive_windows.iter().any(|w| lower.contains(w)) {
+                warn!(window = %title, "Sensitive window detected — masking full screenshot");
+                return self.mask_full_screen(&b64);
+            }
+        }
+
         Ok(b64)
+    }
+
+    /// Mask the entire screenshot. Used as the fail-closed safety measure when
+    /// sensitive-region detection fails or a known credential window is focused.
+    fn mask_full_screen(&self, b64: &str) -> Result<String, ComputerUseError> {
+        let regions = vec![[0_u32, 0, self.config.display_width, self.config.display_height]];
+        mask_screenshot_regions(b64, &regions, self.masking.fill_color)
     }
 
     // ── Action execution ──────────────────────────────────────
@@ -831,10 +875,19 @@ impl ComputerUseOrchestrator {
                     for action in &cu_result.actions {
                         // ── Risk assessment before execution ──
                         let window_title = self.get_active_window_title().await;
+                        // D12: wire `targets_sensitive_input` to a real signal
+                        // instead of a hard-coded `false` (which made the
+                        // High-risk sensitive-input branch in `assess_risk`
+                        // unreachable). We flag it when the action enters text
+                        // into a known credential/secret context — i.e. a
+                        // `Type`/`Key` action while a sensitive window is
+                        // focused.
+                        let targets_sensitive_input =
+                            action_targets_input(action) && window_is_sensitive(window_title.as_deref());
                         let action_ctx = ActionContext {
                             action: action.clone(),
                             model_reasoning: cu_result.text_response.clone(),
-                            targets_sensitive_input: false, // detected from DOM in capture
+                            targets_sensitive_input,
                             active_window_title: window_title,
                         };
                         let risk = risk_detector::assess_risk(&action_ctx, &self.config);

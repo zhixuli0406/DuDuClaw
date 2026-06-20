@@ -88,6 +88,15 @@ impl ContainerRuntime for RuntimeBackend {
         }
     }
 
+    async fn wait(&self, id: &ContainerId) -> Result<ContainerExit> {
+        match self {
+            RuntimeBackend::Docker(rt) => rt.wait(id).await,
+            RuntimeBackend::Apple(rt) => rt.wait(id).await,
+            #[cfg(target_os = "windows")]
+            RuntimeBackend::Wsl2(rt) => rt.wait(id).await,
+        }
+    }
+
     async fn health_check(&self) -> Result<RuntimeHealth> {
         match self {
             RuntimeBackend::Docker(rt) => rt.health_check().await,

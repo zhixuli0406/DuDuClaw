@@ -127,6 +127,15 @@ impl QuotaManager {
             false
         };
 
+        // Boundary semantics, aligned with `check_token_budget` (L14):
+        //   * consume_tokens — a consume is rejected only when the running total
+        //     would STRICTLY EXCEED the budget; reaching exactly the budget is
+        //     allowed (the last legitimate token still fits).
+        //   * check_token_budget — reports "exhausted" once `token_used >= budget`,
+        //     i.e. no positive consume can succeed afterwards.
+        // These two views describe the same state consistently: after a consume
+        // brings `token_used` to exactly `budget`, the next `consume_tokens(>0)`
+        // is rejected (`used + t > budget`) and `check_token_budget` is exhausted.
         let new_total = entry.token_used.saturating_add(tokens);
         if new_total > policy.daily_token_budget {
             let err = QuotaError::TokenBudgetExhausted {

@@ -21,7 +21,7 @@
 //! and the loop continues. We never panic on a license problem — the
 //! Apache 2.0 core must keep running.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -37,6 +37,18 @@ use tracing::{debug, info, warn};
 
 /// Default fall-back when `DUDUCLAW_CONTROL_URL` is unset.
 const DEFAULT_CONTROL_URL: &str = "https://api.duduclaw.tw";
+
+/// L7: process-wide cache for the machine fingerprint. `generate_fingerprint`
+/// enumerates the hostname + MAC addresses on every call, which is wasteful on
+/// hot paths like `LicenseSnapshot::from_state` (one dashboard poll per second).
+/// The fingerprint is host-stable for the lifetime of the process, so we compute
+/// it once and reuse it.
+static FINGERPRINT_CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Return the cached machine fingerprint, computing it on first use.
+fn cached_fingerprint() -> &'static str {
+    FINGERPRINT_CACHE.get_or_init(generate_fingerprint)
+}
 
 /// Env-var prefix for trusted issuer public keys.
 ///
@@ -84,7 +96,16 @@ struct LicenseRuntimeInner {
     /// OpenSource mode. The runtime exposes a stable `LicenseTier::OpenSource`
     /// to callers in this state.
     license: Option<License>,
+
+    /// HS13/D5: `generated_at` of the most recent *accepted* CRL. Used to
+    /// reject replays of an older (e.g. pre-revocation) CRL. Loaded from disk
+    /// at bootstrap so the freshness floor survives restarts.
+    last_seen_crl_at: Option<chrono::DateTime<Utc>>,
 }
+
+/// File (under `home_dir`) that persists the last-seen CRL `generated_at`
+/// timestamp so the monotonicity floor survives restarts.
+const LAST_CRL_FILENAME: &str = "license_crl_last_seen.txt";
 
 impl LicenseRuntime {
     /// Bootstrap the runtime from `home_dir`. Always succeeds — a missing
@@ -103,7 +124,17 @@ impl LicenseRuntime {
         let control_url = std::env::var("DUDUCLAW_CONTROL_URL")
             .unwrap_or_else(|_| DEFAULT_CONTROL_URL.to_string());
 
-        let license = load_and_validate(&registry, &gate).await;
+        // M52 fix: honor a persisted revocation marker — if a prior revocation
+        // could not delete license.json, do NOT reload it on restart.
+        let license = if home_dir.join(REVOKED_FILENAME).exists() {
+            warn!(
+                "license revocation marker present — refusing to load license.json; \
+                 running OpenSource until a successful re-subscription clears it"
+            );
+            None
+        } else {
+            load_and_validate(&registry, &gate).await
+        };
 
         let tier = license
             .as_ref()
@@ -115,12 +146,24 @@ impl LicenseRuntime {
                 .as_ref()
                 .map(|l| l.customer_id.as_str())
                 .unwrap_or("<none>"),
-            registry_keys = registry.is_empty().then_some(0usize).unwrap_or(1),
+            // L22: the previous `then_some(0).unwrap_or(1)` could only ever log
+            // 0 or 1 regardless of how many issuer keys were embedded. We report
+            // the real count. NOTE for coordinator: `PublicKeyRegistry` currently
+            // exposes only `is_empty()`/`get()`, so a `len()` accessor must be
+            // added to `duduclaw-license/src/key.rs` for this to be exact; until
+            // then we fall back to the env-derived count (the only construction
+            // path that carries multiple keys in practice).
+            registry_keys = count_embedded_issuer_keys(),
             "license runtime initialised"
         );
 
+        let last_seen_crl_at = read_last_seen_crl(&home_dir);
+
         Self {
-            state: Arc::new(RwLock::new(LicenseRuntimeInner { license })),
+            state: Arc::new(RwLock::new(LicenseRuntimeInner {
+                license,
+                last_seen_crl_at,
+            })),
             gate,
             registry: Arc::new(registry),
             home_dir,
@@ -190,7 +233,8 @@ pub struct LicenseSnapshot {
 impl LicenseSnapshot {
     fn from_state(license: Option<&License>, tier: LicenseTier) -> Self {
         let installed = license.is_some();
-        let current_fp = generate_fingerprint();
+        // L7: reuse the cached fingerprint instead of re-enumerating host MACs.
+        let current_fp = cached_fingerprint();
         Self {
             tier,
             mode: if installed { "commercial" } else { "opensource" },
@@ -201,7 +245,7 @@ impl LicenseSnapshot {
             days_until_expiry: license.map(|l| l.days_until_expiry()),
             last_phone_home: license.map(|l| l.last_phone_home),
             days_since_phone_home: license.map(|l| l.days_since_phone_home()),
-            fingerprint_match: license.map(|l| l.is_valid_for_machine(&current_fp)),
+            fingerprint_match: license.map(|l| l.is_valid_for_machine(current_fp)),
         }
     }
 }
@@ -276,6 +320,21 @@ pub fn embedded_registry_from_env() -> PublicKeyRegistry {
         info!(key_id, "registered trusted issuer public key");
     }
     registry
+}
+
+/// L22: count the trusted issuer public keys derived from the environment.
+///
+/// Mirrors the validation in [`embedded_registry_from_env`] (suffix present +
+/// 32-byte hex) so the logged count matches what was actually registered. This
+/// exists because `PublicKeyRegistry` does not yet expose a `len()` accessor.
+fn count_embedded_issuer_keys() -> usize {
+    std::env::vars()
+        .filter(|(k, v)| {
+            k.strip_prefix(PUBKEY_ENV_PREFIX)
+                .is_some_and(|suffix| !suffix.is_empty())
+                && matches!(hex::decode(v.trim()), Ok(b) if b.len() == 32)
+        })
+        .count()
 }
 
 // ── Bootstrap helpers ─────────────────────────────────────────
@@ -397,10 +456,21 @@ impl LicenseRuntime {
             "{}/v1/license/refresh",
             self.control_url.trim_end_matches('/')
         );
+
+        // C4.3: anti-replay nonce. Generate a fresh random value per request
+        // and require the control-plane to echo it back in the response. A
+        // replayed (previously-signed) `{"status":"active", license}` body will
+        // carry a stale/absent nonce and is therefore rejected before install.
+        //
+        // Server-side contract: the control-plane MUST copy the request's
+        // `"nonce"` verbatim into the top-level `"nonce"` field of its JSON
+        // response. Responses without a matching nonce are treated as replays.
+        let nonce = uuid::Uuid::new_v4().to_string();
         let request_body = json!({
             "subscription_id": subscription_id,
             "machine_fingerprint": machine_fingerprint,
             "current_version": env!("CARGO_PKG_VERSION"),
+            "nonce": nonce,
             "telemetry": {},
         });
 
@@ -429,23 +499,49 @@ impl LicenseRuntime {
 
         match body.get("status").and_then(|v| v.as_str()) {
             Some("active") => {
+                // C4.3: reject replays before doing any further work. A captured
+                // old `active` response will not carry the freshly-generated
+                // nonce, so this fails closed without installing anything.
+                if !response_nonce_ok(&nonce, &body) {
+                    return Err(PhoneHomeError::NonceMismatch);
+                }
+
                 let new_license_value = body
                     .get("license")
                     .ok_or_else(|| PhoneHomeError::Parse("missing 'license' field".into()))?;
                 let new_license: License = serde_json::from_value(new_license_value.clone())
                     .map_err(|e| PhoneHomeError::Parse(e.to_string()))?;
 
-                if let Err(e) = self.registry.verify(&new_license) {
-                    return Err(PhoneHomeError::Parse(format!(
-                        "control-plane returned license with invalid signature: {e}"
-                    )));
-                }
+                // C4 / C4.4: a valid signature is necessary but NOT sufficient.
+                // The bootstrap path (`load_and_validate`) also enforces
+                // expiry / machine-fingerprint / grace via `validate()`; the
+                // refresh path previously skipped it, so a buggy/compromised
+                // control plane (or a replayed signed response) could install
+                // an expired or other-machine license. `accept_refreshed_license`
+                // composes signature-trust + `validate()` so the acceptance
+                // decision is pure and unit-testable.
+                let current_fp = generate_fingerprint();
+                let phone_home = self.gate.phone_home_interval_days(new_license.tier);
+                let grace = self.gate.grace_period_days(new_license.tier);
+                accept_refreshed_license(
+                    &self.registry,
+                    &new_license,
+                    &current_fp,
+                    phone_home,
+                    grace,
+                )?;
 
                 save_default(&new_license)
                     .map_err(|e| PhoneHomeError::Save(e.to_string()))?;
                 {
                     let mut inner = self.state.write().await;
                     inner.license = Some(new_license);
+                }
+                // M52: a successful re-subscription clears any prior revocation
+                // marker so the customer recovers paid features on restart.
+                let marker = self.home_dir.join(REVOKED_FILENAME);
+                if marker.exists() {
+                    let _ = std::fs::remove_file(&marker);
                 }
                 info!(tier = %current_tier, "phone-home succeeded; license refreshed");
                 Ok(())
@@ -469,15 +565,29 @@ impl LicenseRuntime {
     async fn downgrade_to_opensource(&self, reason: &str) {
         let mut inner = self.state.write().await;
         inner.license = None;
-        // Best-effort: also remove the local file so subsequent restarts
-        // don't reload a known-bad license. Failures are logged but not
-        // propagated — the in-memory state is the source of truth.
+        // Best-effort: remove the local file so subsequent restarts don't
+        // reload a known-bad license.
         if let Err(e) = storage::delete_default() {
             warn!(error = %e, "could not delete license.json after revocation");
+            // M52 fix: if deletion fails, a restart would reload the revoked
+            // license and run as paid until the next 24h CRL poll. Persist a
+            // revocation marker that bootstrap honors regardless, so revocation
+            // survives restarts even when the file can't be removed.
+            if let Err(e) = std::fs::write(
+                self.home_dir.join(REVOKED_FILENAME),
+                format!("revoked: {reason}\n"),
+            ) {
+                warn!(error = %e, "could not write license revocation marker");
+            }
         }
         info!(reason, "downgraded to OpenSource mode");
     }
 }
+
+/// File (under `home_dir`) marking that the installed license was revoked.
+/// Honored at bootstrap so a revocation survives restarts even if the license
+/// file itself could not be deleted. Cleared on a successful re-subscription.
+const REVOKED_FILENAME: &str = "license_revoked.marker";
 
 #[derive(Debug, thiserror::Error)]
 enum PhoneHomeError {
@@ -489,6 +599,48 @@ enum PhoneHomeError {
     Parse(String),
     #[error("save error: {0}")]
     Save(String),
+    /// C4.3: the refresh response did not echo our request nonce — treated as a
+    /// replay and the license is NOT installed.
+    #[error("refresh response nonce missing or mismatched — rejecting replay")]
+    NonceMismatch,
+    /// C4.4: a (possibly validly-signed) refreshed license failed acceptance —
+    /// untrusted signature, expired, wrong machine, or grace exceeded.
+    #[error("refreshed license rejected: {0}")]
+    Rejected(String),
+}
+
+/// C4.3: pure nonce-echo check. The response is accepted only when it carries a
+/// top-level `"nonce"` string equal to the one we sent. Missing field, wrong
+/// type, or a different value all fail (a replayed old response can't echo a
+/// freshly-generated nonce).
+fn response_nonce_ok(sent: &str, body: &serde_json::Value) -> bool {
+    body.get("nonce").and_then(|v| v.as_str()) == Some(sent)
+}
+
+/// C4.4: pure acceptance decision for a refreshed license. Composes the two
+/// checks the refresh path must perform before swapping in a license:
+///
+///   1. signature trust — `registry.verify` (Ed25519, dispatched by key id)
+///   2. `validate()` — schema / expiry / machine-fingerprint / grace
+///
+/// Extracted so the acceptance logic is testable without a live control-plane:
+/// construct + sign a `License`, build a trusting `PublicKeyRegistry`, and
+/// assert valid ⇒ Ok while expired / wrong-fingerprint / bad-signature ⇒ Err.
+fn accept_refreshed_license(
+    registry: &PublicKeyRegistry,
+    new_license: &License,
+    current_fp: &str,
+    phone_home_days: i64,
+    grace_days: i64,
+) -> Result<(), PhoneHomeError> {
+    registry.verify(new_license).map_err(|e| {
+        PhoneHomeError::Rejected(format!("invalid signature: {e}"))
+    })?;
+    new_license
+        .validate(current_fp, phone_home_days, grace_days)
+        .map_err(|e| {
+            PhoneHomeError::Rejected(format!("expiry/fingerprint/grace: {e}"))
+        })
 }
 
 // ── CRL loop ──────────────────────────────────────────────────
@@ -535,6 +687,45 @@ impl LicenseRuntime {
             )));
         }
 
+        // HS13/D5: a valid signature is not enough — a signed-but-old CRL can be
+        // replayed forever to mask a later revocation. Enforce two freshness
+        // checks before trusting the document:
+        //
+        //   1. `is_stale()` — reject CRLs older than their own declared TTL.
+        //   2. Monotonicity floor — reject any CRL whose `generated_at` is not
+        //      strictly newer than the last CRL we accepted (persisted to disk),
+        //      so a replayed pre-revocation snapshot is rejected even within TTL.
+        if crl.is_stale() {
+            return Err(PhoneHomeError::Parse(format!(
+                "CRL is stale (generated_at {} older than ttl {}s) — rejecting replay",
+                crl.generated_at, crl.ttl_seconds
+            )));
+        }
+
+        {
+            let inner = self.state.read().await;
+            if let Err(reason) =
+                check_crl_monotonic(crl.generated_at, inner.last_seen_crl_at)
+            {
+                return Err(PhoneHomeError::Parse(reason));
+            }
+        }
+
+        // Accepted: advance the last-seen floor (in-memory + on-disk) before
+        // acting on the revocation list. We only move the floor forward.
+        {
+            let mut inner = self.state.write().await;
+            let advance = inner
+                .last_seen_crl_at
+                .map_or(true, |prev| crl.generated_at > prev);
+            if advance {
+                inner.last_seen_crl_at = Some(crl.generated_at);
+                if let Err(e) = write_last_seen_crl(&self.home_dir, crl.generated_at) {
+                    warn!(error = %e, "could not persist last-seen CRL timestamp");
+                }
+            }
+        }
+
         if crl.is_revoked(&subscription_id) {
             warn!(subscription_id = %subscription_id, "CRL lists our subscription as revoked — downgrading to OpenSource");
             self.downgrade_to_opensource("crl_revoked").await;
@@ -543,6 +734,40 @@ impl LicenseRuntime {
         }
         Ok(())
     }
+}
+
+/// HS13/D5: pure monotonicity check. A CRL is rejected when its `generated_at`
+/// is older than the last-seen accepted CRL (a replay). Equal-or-newer is
+/// accepted (equal allows a benign re-fetch of the same document).
+fn check_crl_monotonic(
+    crl_generated_at: chrono::DateTime<Utc>,
+    last_seen: Option<chrono::DateTime<Utc>>,
+) -> Result<(), String> {
+    match last_seen {
+        Some(prev) if crl_generated_at < prev => Err(format!(
+            "CRL generated_at {crl_generated_at} older than last-seen {prev} — rejecting replay"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Read the persisted last-seen CRL `generated_at` timestamp, if present and
+/// parseable. Any error (missing file, malformed contents) yields `None` so a
+/// fresh install simply starts with no floor.
+fn read_last_seen_crl(home_dir: &Path) -> Option<chrono::DateTime<Utc>> {
+    let path = home_dir.join(LAST_CRL_FILENAME);
+    let raw = std::fs::read_to_string(path).ok()?;
+    chrono::DateTime::parse_from_rfc3339(raw.trim())
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Persist the last-seen CRL `generated_at` timestamp (RFC3339) under
+/// `home_dir`. Best-effort; callers log but do not propagate failures.
+fn write_last_seen_crl(home_dir: &Path, ts: chrono::DateTime<Utc>) -> std::io::Result<()> {
+    std::fs::create_dir_all(home_dir)?;
+    let path = home_dir.join(LAST_CRL_FILENAME);
+    std::fs::write(path, ts.to_rfc3339())
 }
 
 #[cfg(test)]
@@ -671,5 +896,160 @@ mod tests {
         assert!(r.get("wrong_len").is_none());
         assert!(r.get("").is_none());
         assert!(r.get("ok").is_some());
+    }
+
+    // ── HS13 / D5: CRL freshness + monotonicity ────────────────────────────────
+
+    #[test]
+    fn crl_monotonic_rejects_older_than_last_seen() {
+        let last_seen = Utc::now();
+        let older = last_seen - ChronoDuration::seconds(10);
+        // An older CRL (a replay of a pre-revocation snapshot) must be rejected.
+        assert!(check_crl_monotonic(older, Some(last_seen)).is_err());
+    }
+
+    #[test]
+    fn crl_monotonic_accepts_newer_or_equal() {
+        let last_seen = Utc::now();
+        let newer = last_seen + ChronoDuration::seconds(10);
+        assert!(check_crl_monotonic(newer, Some(last_seen)).is_ok());
+        // Equal generated_at is a benign re-fetch of the same document.
+        assert!(check_crl_monotonic(last_seen, Some(last_seen)).is_ok());
+    }
+
+    #[test]
+    fn crl_monotonic_accepts_first_ever() {
+        // No floor yet → first CRL is always accepted.
+        assert!(check_crl_monotonic(Utc::now(), None).is_ok());
+    }
+
+    // ── C4.3: phone-home nonce anti-replay ─────────────────────────────────
+
+    #[test]
+    fn response_nonce_matches() {
+        let body = json!({ "status": "active", "nonce": "abc-123" });
+        assert!(response_nonce_ok("abc-123", &body));
+    }
+
+    #[test]
+    fn response_nonce_mismatch_rejected() {
+        let body = json!({ "status": "active", "nonce": "different" });
+        assert!(!response_nonce_ok("abc-123", &body));
+    }
+
+    #[test]
+    fn response_nonce_missing_rejected() {
+        // No nonce at all (e.g. a replayed pre-nonce response) must fail closed.
+        let body = json!({ "status": "active" });
+        assert!(!response_nonce_ok("abc-123", &body));
+        // Wrong type also fails.
+        let body_num = json!({ "status": "active", "nonce": 42 });
+        assert!(!response_nonce_ok("abc-123", &body_num));
+    }
+
+    // ── C4.4: refreshed-license acceptance (signature + validate) ───────────
+
+    /// Generate a fresh Ed25519 issuer keypair via `ring` (already a gateway
+    /// dep). Returns (signing key pair, 32-byte public key bytes). `ring`'s
+    /// Ed25519 is standards-compliant, so signatures verify under the license
+    /// crate's `ed25519-dalek` verifier.
+    fn gen_issuer_keypair() -> (ring::signature::Ed25519KeyPair, Vec<u8>) {
+        use ring::signature::KeyPair as _;
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
+            .expect("generate pkcs8");
+        let kp = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
+            .expect("from pkcs8");
+        let pubkey = kp.public_key().as_ref().to_vec();
+        (kp, pubkey)
+    }
+
+    /// Sign `license`'s canonical payload with `kp`, mutating its `signature`
+    /// field in place — mirrors what the closed-source signer does on the wire.
+    fn sign_license(license: &mut License, kp: &ring::signature::Ed25519KeyPair) {
+        let payload = license.canonical_payload().expect("canonical payload");
+        let sig = kp.sign(&payload);
+        license.signature = sig.as_ref().to_vec();
+    }
+
+    /// Build a freshly-issued, currently-valid license bound to `fp`.
+    fn valid_license_for(fp: &str) -> License {
+        // 30-day expiry, last_phone_home = now → well within any grace window.
+        fake_license(LicenseTier::SelfHostPro, fp)
+    }
+
+    #[test]
+    fn accept_refreshed_license_accepts_valid() {
+        let (kp, pubkey) = gen_issuer_keypair();
+        let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+        let fp = generate_fingerprint();
+
+        let mut lic = valid_license_for(&fp);
+        sign_license(&mut lic, &kp);
+
+        let res = accept_refreshed_license(&registry, &lic, &fp, 7, 14);
+        assert!(res.is_ok(), "valid signed+current license must be accepted: {res:?}");
+    }
+
+    #[test]
+    fn accept_refreshed_license_rejects_expired() {
+        let (kp, pubkey) = gen_issuer_keypair();
+        let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+        let fp = generate_fingerprint();
+
+        // Issued + expired in the past — validly signed but past expiry.
+        let mut lic = License::new(
+            "sub_exp",
+            "cus_exp",
+            LicenseTier::SelfHostPro,
+            &fp,
+            ChronoDuration::days(-1),
+            "v1",
+        );
+        sign_license(&mut lic, &kp);
+
+        let res = accept_refreshed_license(&registry, &lic, &fp, 7, 14);
+        assert!(res.is_err(), "expired license must be rejected");
+    }
+
+    #[test]
+    fn accept_refreshed_license_rejects_wrong_fingerprint() {
+        let (kp, pubkey) = gen_issuer_keypair();
+        let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+        let current_fp = generate_fingerprint();
+
+        // Validly signed but bound to a *different* machine.
+        let mut lic = valid_license_for("some-other-machine-fingerprint");
+        sign_license(&mut lic, &kp);
+
+        let res = accept_refreshed_license(&registry, &lic, &current_fp, 7, 14);
+        assert!(res.is_err(), "license bound to another machine must be rejected");
+    }
+
+    #[test]
+    fn accept_refreshed_license_rejects_bad_signature() {
+        // Sign with one key but trust a *different* key → signature untrusted.
+        let (kp, _pubkey) = gen_issuer_keypair();
+        let (_other_kp, other_pubkey) = gen_issuer_keypair();
+        let registry = PublicKeyRegistry::new().with_key("v1", other_pubkey);
+        let fp = generate_fingerprint();
+
+        let mut lic = valid_license_for(&fp);
+        sign_license(&mut lic, &kp);
+
+        let res = accept_refreshed_license(&registry, &lic, &fp, 7, 14);
+        assert!(res.is_err(), "license signed by an untrusted key must be rejected");
+    }
+
+    #[test]
+    fn last_seen_crl_round_trips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_last_seen_crl(dir.path()).is_none(), "no file → None");
+
+        let ts = Utc::now();
+        write_last_seen_crl(dir.path(), ts).unwrap();
+        let read = read_last_seen_crl(dir.path()).expect("persisted timestamp");
+        // RFC3339 round-trip preserves to (at least) second precision.
+        assert_eq!(read.timestamp(), ts.timestamp());
     }
 }

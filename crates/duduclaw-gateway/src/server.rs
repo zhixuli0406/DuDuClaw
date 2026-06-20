@@ -35,23 +35,37 @@ fn check_ws_rate_limit(ip: IpAddr) -> bool {
     entry.1 <= 30 // max 30 WS connections per minute per IP
 }
 
-/// Login attempt rate limiter: max 5 attempts per email per 15 minutes.
-static LOGIN_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<String, (Instant, u32)>>> =
+/// Login attempt rate limiter: max 5 attempts per (IP, email) per 15 minutes.
+///
+/// M2: previously keyed by email alone and never reset on success, which let a
+/// remote attacker lock out any known account for 15 minutes simply by sending
+/// bad passwords. Now the key includes the source IP (so one attacker IP cannot
+/// exhaust the limit for a victim on a different IP) and a successful login
+/// clears the counter (`reset_login_rate_limit`).
+static LOGIN_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<(IpAddr, String), (Instant, u32)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn check_login_rate_limit(email: &str) -> bool {
+/// Returns `true` if the attempt from `(ip, email)` is within the rate budget.
+fn check_login_rate_limit(ip: IpAddr, email: &str) -> bool {
     let mut map = LOGIN_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     if map.len() > 10000 {
         map.retain(|_, (t, _)| now.duration_since(*t).as_secs() < 900);
     }
-    let entry = map.entry(email.to_string()).or_insert((now, 0));
+    let entry = map.entry((ip, email.to_string())).or_insert((now, 0));
     if now.duration_since(entry.0).as_secs() > 900 {
         *entry = (now, 1);
         return true;
     }
     entry.1 += 1;
     entry.1 <= 5
+}
+
+/// Clear the failed-attempt counter for `(ip, email)` after a successful login
+/// so a legitimate user is never penalised for earlier typos (M2).
+fn reset_login_rate_limit(ip: IpAddr, email: &str) {
+    let mut map = LOGIN_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
+    map.remove(&(ip, email.to_string()));
 }
 
 use crate::auth::AuthManager;
@@ -968,8 +982,27 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         jwt_config,
     });
 
-    // WebChat endpoint — separate state from main /ws (different auth model)
-    let webchat_state = Arc::new(crate::webchat::WebChatState::new(webchat_ctx));
+    // M1/M60: open the shared audit index once and refresh it on a background
+    // interval, so audit/reliability requests reuse one connection instead of
+    // opening + full-syncing per request.
+    {
+        let bg_state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                bg_state.handler.refresh_audit_index().await;
+            }
+        });
+    }
+
+    // WebChat endpoint — C5: now requires JWT auth (in-band) + Origin check,
+    // mirroring the main /ws gate instead of being unauthenticated.
+    let webchat_state = Arc::new(crate::webchat::WebChatState::new(
+        webchat_ctx,
+        state.jwt_config.clone(),
+        state.user_db.clone(),
+    ));
     let webchat_router = Router::new()
         .route("/ws/chat", get(crate::webchat::ws_chat_handler))
         .with_state(webchat_state);
@@ -979,6 +1012,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/api/login", post(handle_login))
         .route("/api/refresh", post(handle_refresh))
         .route("/api/me", get(handle_me))
+        .route("/api/change-password", post(handle_change_password))
         .with_state(state.clone());
 
     let mut app = Router::new()
@@ -1114,10 +1148,12 @@ struct ErrorResponse {
 /// POST /api/login — Authenticate with email + password, return JWT tokens.
 async fn handle_login(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<LoginRequest>,
 ) -> impl IntoResponse {
-    // Rate limit login attempts
-    if !check_login_rate_limit(&body.email) {
+    let ip = addr.ip();
+    // Rate limit login attempts — M2: scoped by (IP, email).
+    if !check_login_rate_limit(ip, &body.email) {
         return (
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({"error": "too many login attempts, try again in 15 minutes"})),
@@ -1129,6 +1165,17 @@ async fn handle_login(
         Ok(u) => u,
         Err(e) => {
             warn!(email = %body.email, "Login failed: {e}");
+            // M16: record failed logins so brute force is auditable. We log the
+            // attempted email + source IP under the dedicated `login_failed`
+            // action; user_id is unknown/untrusted so it stays NULL.
+            let ip_str = ip.to_string();
+            let _ = state.user_db.log_action(
+                None,
+                "login_failed",
+                Some(&body.email),
+                None,
+                Some(&ip_str),
+            );
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({"error": "invalid email or password"})),
@@ -1166,16 +1213,21 @@ async fn handle_login(
         }
     };
 
+    // M2: clear the failed-attempt counter on success so legitimate users are
+    // not penalised by earlier typos and an attacker cannot lock the account.
+    reset_login_rate_limit(ip, &body.email);
+
     // Update last login
     let _ = state.user_db.update_last_login(&user.id);
 
     // Audit log
+    let ip_str = ip.to_string();
     let _ = state.user_db.log_action(
         Some(&user.id),
         "login",
         None,
         None,
-        None,
+        Some(&ip_str),
     );
 
     Json(serde_json::json!({
@@ -1362,6 +1414,87 @@ async fn handle_me(
     })).into_response()
 }
 
+#[derive(serde::Deserialize)]
+struct ChangePasswordRequest {
+    new_password: String,
+}
+
+/// POST /api/change-password — Set a new password for the authenticated user.
+///
+/// Intentionally does NOT pass through `authenticate_jwt`, so a user flagged
+/// `must_change_password` (e.g. the bootstrap admin) can recover. A valid access
+/// token (issued at login) is required; possession of it proves the caller knew
+/// the current password. Clears the forced-change flag on success.
+async fn handle_change_password(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ChangePasswordRequest>,
+) -> impl IntoResponse {
+    let token = match extract_bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "missing Authorization header"})),
+            )
+                .into_response();
+        }
+    };
+
+    let claims = match state.jwt_config.verify_access_token(token) {
+        Ok(c) => c,
+        _ => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "invalid or expired token"})),
+            )
+                .into_response();
+        }
+    };
+
+    if body.new_password.chars().count() < 8 {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "password must be at least 8 characters"})),
+        )
+            .into_response();
+    }
+
+    match state
+        .user_db
+        .update_user(&claims.sub, None, None, Some(&body.new_password))
+    {
+        Ok(()) => {
+            let _ = state
+                .user_db
+                .log_action(Some(&claims.sub), "change_password", None, None, None);
+            Json(serde_json::json!({"ok": true})).into_response()
+        }
+        Err(e) => {
+            warn!(user = %claims.sub, "change-password failed: {e}");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to update password"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Whether the request's `Origin` is an allowed local dashboard origin.
+///
+/// HS3/C5: uses exact authority matching (any port on localhost / 127.0.0.1 /
+/// [::1]). Absent Origin (non-browser clients like curl/SDK) is allowed. Rejects
+/// suffix-attack origins such as `http://localhost.evil.com`.
+pub(crate) fn origin_is_allowed(headers: &axum::http::HeaderMap) -> bool {
+    match headers.get("origin").and_then(|v| v.to_str().ok()) {
+        None => true,
+        Some(origin) => {
+            duduclaw_core::origin_host_matches(origin, &["localhost", "127.0.0.1", "[::1]"])
+        }
+    }
+}
+
 /// Extract Bearer token from Authorization header.
 fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
     headers
@@ -1387,15 +1520,11 @@ async fn ws_handler(
 
     // Validate Origin header to prevent cross-site WebSocket hijacking.
     // Non-browser clients (curl, SDK) don't send Origin, so absent is OK.
-    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
-        let is_safe = origin.starts_with("http://127.0.0.1")
-            || origin.starts_with("http://localhost")
-            || origin.starts_with("https://127.0.0.1")
-            || origin.starts_with("https://localhost");
-        if !is_safe {
-            warn!(origin, "WebSocket connection rejected: invalid origin");
-            return axum::http::StatusCode::FORBIDDEN.into_response();
-        }
+    // HS3 fix: exact host match — `starts_with` accepted `localhost.evil.com`.
+    if !origin_is_allowed(&headers) {
+        let origin = headers.get("origin").and_then(|v| v.to_str().ok()).unwrap_or("");
+        warn!(origin, "WebSocket connection rejected: invalid origin");
+        return axum::http::StatusCode::FORBIDDEN.into_response();
     }
     ws.max_message_size(1024 * 1024) // 1MB max WebSocket message
       .on_upgrade(move |socket| handle_socket(socket, state))
@@ -1457,10 +1586,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         }
                         // ── Ed25519 challenge-response ──────────────────────
                         else if state.auth.is_ed25519() {
-                            let challenge = state.auth.issue_challenge();
+                            // M23: challenge is per-connection — held in this
+                            // local and threaded into verify_ed25519 below, so
+                            // concurrent handshakes never clobber each other.
+                            let (challenge_b64, challenge) = state.auth.issue_challenge();
                             let resp = WsFrame::ok_response(
                                 &id,
-                                serde_json::json!({ "challenge": challenge }),
+                                serde_json::json!({ "challenge": challenge_b64 }),
                             );
                             let _ = socket.send(Message::Text(
                                 serde_json::to_string(&resp).unwrap_or_default().into(),
@@ -1477,7 +1609,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                                 .get("signature")
                                                 .and_then(|v| v.as_str())
                                                 .unwrap_or("");
-                                            match state.auth.verify_ed25519(sig) {
+                                            match state.auth.verify_ed25519(sig, &challenge) {
                                                 Ok(()) => {
                                                     let ok = WsFrame::ok_response(
                                                         &auth_id,
@@ -1690,7 +1822,14 @@ fn authenticate_jwt(state: &AppState, jwt_str: &str) -> Result<UserContext, Stri
 
     // Single DB lookup — fail-closed: DB error = reject
     match state.user_db.get_user(&claims.sub) {
-        Ok(Some(user)) if user.status == duduclaw_auth::UserStatus::Active => {}
+        Ok(Some(user)) if user.status == duduclaw_auth::UserStatus::Active => {
+            // C1: block all operations until the bootstrap/forced password is
+            // changed. The dedicated POST /api/change-password endpoint does not
+            // pass through this gate, so the user can still recover.
+            if user.must_change_password {
+                return Err("password change required before any operation".to_string());
+            }
+        }
         Ok(Some(_)) => return Err("account is suspended or offboarded".to_string()),
         Ok(None) => return Err("user not found".to_string()),
         Err(_) => return Err("authentication service unavailable".to_string()),
@@ -1726,9 +1865,10 @@ struct ReliabilitySummaryParams {
 /// Returns a JSON object with four reliability metrics for the requested agent
 /// over a configurable time window backed by the EvolutionEvent audit trail.
 ///
-/// **Authorization**: Not guarded at the HTTP layer (read-only, no sensitive
-/// mutation). Sensitive audit queries require the MCP `reliability_summary`
-/// tool which enforces Admin scope.
+/// **Authorization** (M1): requires a valid access-token Bearer header and an
+/// allowed `Origin`. Previously unauthenticated, which leaked per-agent
+/// reliability metrics and allowed I/O amplification (a full `sync_from_files`
+/// ran per request). The index is now shared + background-synced.
 ///
 /// ## Query parameters
 /// - `agent_id` (required) — Agent to query.
@@ -1736,13 +1876,39 @@ struct ReliabilitySummaryParams {
 ///
 /// ## Example
 /// ```text
-/// curl "http://localhost:8080/api/reliability/summary?agent_id=my-agent&window_days=7"
+/// curl -H "Authorization: Bearer <token>" \
+///   "http://localhost:8080/api/reliability/summary?agent_id=my-agent&window_days=7"
 /// ```
 async fn handle_reliability_summary_http(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<ReliabilitySummaryParams>,
 ) -> impl IntoResponse {
-    use crate::evolution_events::query::AuditEventIndex;
+    // M1: enforce Origin + JWT auth at the HTTP layer.
+    if !origin_is_allowed(&headers) {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "origin not allowed"})),
+        )
+            .into_response();
+    }
+    let token = match extract_bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "missing Authorization header"})),
+            )
+                .into_response();
+        }
+    };
+    if state.jwt_config.verify_access_token(token).is_err() {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "invalid or expired token"})),
+        )
+            .into_response();
+    }
 
     let agent_id = match params.agent_id.as_deref() {
         Some(id) if !id.is_empty() => id.to_owned(),
@@ -1759,9 +1925,9 @@ async fn handle_reliability_summary_http(
         .unwrap_or(7)
         .clamp(1, 365);
 
-    let home_dir = state.handler.home_dir().to_owned();
-
-    let idx = match AuditEventIndex::open(&home_dir) {
+    // M1/M60: reuse the shared, background-synced index instead of opening a
+    // fresh DB connection and running a full sync on every request.
+    let idx = match state.handler.audit_index().await {
         Ok(i) => i,
         Err(e) => {
             warn!("GET /api/reliability/summary: index open failed: {e}");
@@ -1771,10 +1937,6 @@ async fn handle_reliability_summary_http(
             .into_response();
         }
     };
-
-    if let Err(e) = idx.sync_from_files().await {
-        warn!("GET /api/reliability/summary: sync warning (stale index): {e}");
-    }
 
     match idx.compute_reliability_summary(&agent_id, window_days).await {
         Ok(s) => Json(serde_json::json!({
@@ -1896,6 +2058,53 @@ async fn well_known_mcp_server_card() -> axum::Json<serde_json::Value> {
         ],
         "capabilities": ["memory", "agents", "channels", "inference", "skills", "evolution"],
     }))
+}
+
+#[cfg(test)]
+mod login_rate_limit_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn allows_up_to_five_then_blocks() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let email = "rl-block@test.invalid";
+        // 5 attempts permitted, the 6th is blocked.
+        for i in 1..=5 {
+            assert!(check_login_rate_limit(ip, email), "attempt {i} should pass");
+        }
+        assert!(!check_login_rate_limit(ip, email), "6th attempt must be blocked");
+    }
+
+    #[test]
+    fn reset_on_success_clears_counter() {
+        // M2: a successful login clears the counter so the account is not
+        // locked out by earlier failures.
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 20));
+        let email = "rl-reset@test.invalid";
+        for _ in 0..5 {
+            assert!(check_login_rate_limit(ip, email));
+        }
+        assert!(!check_login_rate_limit(ip, email), "should be blocked before reset");
+        reset_login_rate_limit(ip, email);
+        // After reset the budget is replenished.
+        assert!(check_login_rate_limit(ip, email), "should pass after reset");
+    }
+
+    #[test]
+    fn different_ips_have_independent_budgets() {
+        // M2: keying by IP+email prevents one attacker IP from locking out a
+        // victim authenticating from a different IP.
+        let email = "rl-iso@test.invalid";
+        let attacker = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 30));
+        let victim = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 31));
+        for _ in 0..6 {
+            let _ = check_login_rate_limit(attacker, email);
+        }
+        assert!(!check_login_rate_limit(attacker, email), "attacker should be blocked");
+        // Victim on a different IP is unaffected.
+        assert!(check_login_rate_limit(victim, email), "victim should still pass");
+    }
 }
 
 async fn well_known_agent_card() -> axum::Json<serde_json::Value> {

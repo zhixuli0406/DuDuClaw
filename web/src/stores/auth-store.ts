@@ -36,6 +36,60 @@ interface AuthStore {
 
 const STORAGE_KEY_REFRESH = 'duduclaw-refresh-token';
 
+// M22 mitigation (client-only): the access token (`jwt`) is already held in
+// memory only (zustand state, never persisted), so it is not readable from
+// any persistent store. The refresh token is moved from `localStorage` to
+// `sessionStorage` to shrink its XSS-exposure surface:
+//   - it is scoped to the originating tab/window and is NOT shared with other
+//     tabs, and
+//   - it is cleared automatically when the tab/window closes (no indefinite
+//     persistence on the device).
+// A new tab requires a fresh login, which is an acceptable trade-off and a
+// strict improvement over an indefinitely-persisted localStorage token.
+//
+// NOTE: this is a partial mitigation only. The full fix requires the backend
+// to deliver the refresh token in an httpOnly + SameSite + Secure cookie so it
+// is never reachable from JavaScript at all. That needs gateway Set-Cookie
+// support (out of scope for this client-side change). Until then, any code
+// reading the token MUST go through `refreshTokenStorage` below.
+//
+// We also migrate any pre-existing localStorage token to sessionStorage on
+// first read so users who logged in before this change are not force-logged-out.
+const refreshTokenStorage = {
+  get(): string | null {
+    if (typeof sessionStorage === 'undefined') return null;
+    const fromSession = sessionStorage.getItem(STORAGE_KEY_REFRESH);
+    if (fromSession) return fromSession;
+    // One-time migration from the legacy localStorage location.
+    if (typeof localStorage !== 'undefined') {
+      const legacy = localStorage.getItem(STORAGE_KEY_REFRESH);
+      if (legacy) {
+        sessionStorage.setItem(STORAGE_KEY_REFRESH, legacy);
+        localStorage.removeItem(STORAGE_KEY_REFRESH);
+        return legacy;
+      }
+    }
+    return null;
+  },
+  set(token: string): void {
+    if (typeof sessionStorage !== 'undefined') {
+      sessionStorage.setItem(STORAGE_KEY_REFRESH, token);
+    }
+    // Ensure no stale copy lingers in localStorage.
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem(STORAGE_KEY_REFRESH);
+    }
+  },
+  clear(): void {
+    if (typeof sessionStorage !== 'undefined') {
+      sessionStorage.removeItem(STORAGE_KEY_REFRESH);
+    }
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem(STORAGE_KEY_REFRESH);
+    }
+  },
+};
+
 // Auto-refresh interval — JWT access token TTL is 30min server-side,
 // refresh at 25min so we never serve a request with an expired token.
 const REFRESH_INTERVAL_MS = 25 * 60 * 1000;
@@ -125,7 +179,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         user: AuthUser;
       }>('/api/login', { email, password });
 
-      localStorage.setItem(STORAGE_KEY_REFRESH, data.refresh_token);
+      refreshTokenStorage.set(data.refresh_token);
 
       // Intentional: fetch bindings + validate token server-side (login response
       // doesn't include bindings to keep the REST endpoint simple)
@@ -154,7 +208,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   logout: () => {
     stopRefreshTimer();
     client.disconnect();
-    localStorage.removeItem(STORAGE_KEY_REFRESH);
+    refreshTokenStorage.clear();
     set({
       user: null,
       jwt: null,
@@ -171,7 +225,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     if (refreshPromise) return refreshPromise;
     refreshPromise = (async () => {
       try {
-        const refreshToken = get().refreshToken ?? localStorage.getItem(STORAGE_KEY_REFRESH);
+        const refreshToken = get().refreshToken ?? refreshTokenStorage.get();
         if (!refreshToken) {
           get().logout();
           return;
@@ -213,7 +267,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   loadFromStorage: async () => {
     if (get().initialized) return get().isAuthenticated;
 
-    const refreshToken = localStorage.getItem(STORAGE_KEY_REFRESH);
+    const refreshToken = refreshTokenStorage.get();
     if (!refreshToken) {
       set({ initialized: true });
       return false;
@@ -240,7 +294,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       startRefreshTimer(get().refresh);
       return true;
     } catch {
-      localStorage.removeItem(STORAGE_KEY_REFRESH);
+      refreshTokenStorage.clear();
       set({ initialized: true });
       return false;
     }

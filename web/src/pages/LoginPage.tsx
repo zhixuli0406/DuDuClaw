@@ -14,6 +14,25 @@ export function LoginPage() {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
 
+  // L35 fix: map raw (English) server errors to localized, user-facing
+  // messages. Server strings come from the gateway /api/login handler; any
+  // unmatched error falls back to a generic localized message so we never
+  // surface raw English / HTTP-status text to the user.
+  const localizeLoginError = (raw: string): string => {
+    const msg = raw.toLowerCase();
+    let id = 'login.error.generic';
+    if (msg.includes('invalid email or password')) {
+      id = 'login.error.invalidCredentials';
+    } else if (msg.includes('too many login attempts')) {
+      id = 'login.error.tooManyAttempts';
+    } else if (msg.includes('token generation failed') || msg.includes('http 5')) {
+      id = 'login.error.serverError';
+    } else if (msg.includes('failed to fetch') || msg.includes('networkerror')) {
+      id = 'login.error.network';
+    }
+    return intl.formatMessage({ id });
+  };
+
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError('');
@@ -21,7 +40,8 @@ export function LoginPage() {
       await login(email, password);
       navigate('/', { replace: true });
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const raw = err instanceof Error ? err.message : String(err);
+      setError(localizeLoginError(raw));
     }
   };
 

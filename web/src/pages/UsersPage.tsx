@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type UserDetail } from '@/lib/api';
-import { Dialog } from '@/components/shared/Dialog';
-import { Shield, UserPlus, Pencil, Link2, UserX } from 'lucide-react';
+import { Dialog, buttonSecondary } from '@/components/shared/Dialog';
+import { toast, formatError } from '@/lib/toast';
+import { Shield, UserPlus, Pencil, Link2, UserX, Trash2, X } from 'lucide-react';
 
 export function UsersPage() {
   const intl = useIntl();
@@ -13,6 +14,7 @@ export function UsersPage() {
   const [showBind, setShowBind] = useState<string | null>(null);
   const [showEdit, setShowEdit] = useState<UserDetail | null>(null);
   const [showOffboard, setShowOffboard] = useState<UserDetail | null>(null);
+  const [showRemove, setShowRemove] = useState<UserDetail | null>(null);
 
   const fetchUsers = useCallback(async () => {
     try {
@@ -29,6 +31,17 @@ export function UsersPage() {
   useEffect(() => {
     fetchUsers();
   }, [fetchUsers]);
+
+  // UI.1 — unbind a single user↔agent binding.
+  const handleUnbind = useCallback(async (userId: string, agentName: string) => {
+    try {
+      await api.users.unbindAgent(userId, agentName);
+      toast.success(intl.formatMessage({ id: 'users.unbound' }));
+      fetchUsers();
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+    }
+  }, [intl, fetchUsers]);
 
   const statusBadge = (status: string) => {
     const styles: Record<string, string> = {
@@ -130,6 +143,14 @@ export function UsersPage() {
                         >
                           {b.agent_name}
                           <span className="text-stone-400">({b.access_level})</span>
+                          <button
+                            onClick={() => handleUnbind(user.id, b.agent_name)}
+                            className="rounded-full p-0.5 text-stone-400 hover:bg-rose-100 hover:text-rose-600 dark:hover:bg-rose-900/30"
+                            title={intl.formatMessage({ id: 'users.action.unbind' })}
+                            aria-label={`unbind ${b.agent_name}`}
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
                         </span>
                       ))}
                       {user.bindings.length === 0 && (
@@ -162,6 +183,13 @@ export function UsersPage() {
                           <UserX className="h-4 w-4" />
                         </button>
                       )}
+                      <button
+                        onClick={() => setShowRemove(user)}
+                        className="rounded p-1.5 text-rose-500 transition-colors hover:bg-rose-50 hover:text-rose-700 dark:hover:bg-rose-900/20 dark:hover:text-rose-400"
+                        title={intl.formatMessage({ id: 'users.action.remove' })}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
                     </div>
                   </td>
                 </tr>
@@ -218,7 +246,76 @@ export function UsersPage() {
           }}
         />
       )}
+
+      {/* Remove (delete) Dialog */}
+      {showRemove && (
+        <RemoveUserDialog
+          user={showRemove}
+          onClose={() => setShowRemove(null)}
+          onRemoved={() => {
+            setShowRemove(null);
+            fetchUsers();
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+// ── UI.1 — delete-user confirm dialog ──
+
+function RemoveUserDialog({
+  user,
+  onClose,
+  onRemoved,
+}: {
+  user: UserDetail;
+  onClose: () => void;
+  onRemoved: () => void;
+}) {
+  const intl = useIntl();
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleConfirm = async () => {
+    setError('');
+    setSubmitting(true);
+    try {
+      await api.users.remove(user.id);
+      toast.success(intl.formatMessage({ id: 'users.removed' }));
+      onRemoved();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open title={intl.formatMessage({ id: 'users.action.remove' })} onClose={onClose}>
+      <div className="space-y-4">
+        <p className="text-sm text-stone-600 dark:text-stone-400">
+          {intl.formatMessage({ id: 'users.remove.confirm' }, { name: user.display_name })}
+        </p>
+        {error && (
+          <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
+            {error}
+          </p>
+        )}
+        <div className="flex justify-end gap-2">
+          <button onClick={onClose} className={buttonSecondary}>
+            {intl.formatMessage({ id: 'common.cancel' })}
+          </button>
+          <button
+            onClick={handleConfirm}
+            disabled={submitting}
+            className="rounded-lg bg-rose-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-rose-600 disabled:opacity-50"
+          >
+            {submitting ? intl.formatMessage({ id: 'common.loading' }) : intl.formatMessage({ id: 'common.delete' })}
+          </button>
+        </div>
+      </div>
+    </Dialog>
   );
 }
 

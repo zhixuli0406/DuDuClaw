@@ -132,12 +132,21 @@ pub fn mask_screenshot_regions(
     let (img_w, img_h) = (img.width(), img.height());
     let fill = image::Rgba([fill_color[0], fill_color[1], fill_color[2], 255]);
 
-    // Apply mask rectangles
+    // Apply mask rectangles.
+    //
+    // M7: `x + w` / `y + h` are attacker-influenced (regions come from
+    // DOM-reported bounding boxes). Plain `+` overflows on large values —
+    // a panic in debug builds, a silent wrap in release that would skip the
+    // mask entirely and ship an UNMASKED sensitive region. Use
+    // `saturating_add` and clamp both the start and end to the image bounds
+    // so an out-of-range region is harmlessly empty rather than unsafe.
     for &[x, y, w, h] in regions {
-        let x_end = (x + w).min(img_w);
-        let y_end = (y + h).min(img_h);
-        for py in y..y_end {
-            for px in x..x_end {
+        let x_start = x.min(img_w);
+        let y_start = y.min(img_h);
+        let x_end = x.saturating_add(w).min(img_w);
+        let y_end = y.saturating_add(h).min(img_h);
+        for py in y_start..y_end {
+            for px in x_start..x_end {
                 img.put_pixel(px, py, fill);
             }
         }
@@ -219,31 +228,44 @@ pub async fn detect_sensitive_regions(
         )"#
     );
 
-    // Execute in container via docker exec
+    // Execute the DOM-rect query inside the container.
+    //
+    // HS5 fix (invocation): `chromium-browser --evaluate-script=...` is NOT a
+    // valid Chromium flag, so the old call failed virtually every time. We run
+    // the JS through the container's Node + CDP helper instead. The container
+    // image is expected to expose `duduclaw-eval-dom` (a thin Node/puppeteer or
+    // CDP wrapper) that reads the script from argv and prints the JSON result on
+    // stdout. The JS is passed as a single argument; it is already constrained
+    // to JSON-escaped, validated CSS selectors (see `safe_patterns` above) so it
+    // cannot inject shell metacharacters across the `docker exec` boundary.
     let output = tokio::process::Command::new("docker")
-        .args([
-            "exec",
-            container_name,
-            "chromium-browser",
-            "--headless",
-            "--disable-gpu",
-            &format!("--evaluate-script={js}"),
-        ])
+        .args(["exec", container_name, "duduclaw-eval-dom", &js])
         .output()
         .await
         .map_err(|e| ComputerUseError::ApiError(format!("container exec failed: {e}")))?;
 
     if !output.status.success() {
-        // If detection fails, return empty (don't block the operation)
-        tracing::warn!("Sensitive region detection failed, proceeding without masking");
-        return Ok(Vec::new());
+        // HS5 fix (fail closed): detection failure must NOT silently proceed
+        // without masking — that ships an unmasked screenshot. Return an error
+        // so the caller can fail closed (mask the full screen / abort upload).
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!(stderr = %stderr.trim(), "Sensitive region detection failed");
+        return Err(ComputerUseError::ApiError(format!(
+            "sensitive region detection failed: {}",
+            stderr.trim()
+        )));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let regions: Vec<[u32; 4]> = serde_json::from_str(stdout.trim()).unwrap_or_default();
+    // HS5 fix (fail closed): an unparseable result is also a failure, not an
+    // "all clear". The previous `unwrap_or_default()` turned malformed output
+    // into an empty (no-mask) result.
+    let regions: Vec<[u32; 4]> = serde_json::from_str(stdout.trim()).map_err(|e| {
+        ComputerUseError::ParseError(format!("could not parse detected regions: {e}"))
+    })?;
 
     if !regions.is_empty() {
-        tracing::info!(count = regions.len(), "Masked sensitive regions in screenshot");
+        tracing::info!(count = regions.len(), "Detected sensitive regions in screenshot");
     }
 
     Ok(regions)
@@ -816,6 +838,58 @@ mod tests {
         // With empty regions, should return input unchanged
         let result = mask_screenshot_regions("dGVzdA==", &[], [0, 0, 0]).unwrap();
         assert_eq!(result, "dGVzdA==");
+    }
+
+    #[test]
+    fn mask_region_near_u32_max_does_not_overflow() {
+        // M7 regression: a region with x/y/w/h near u32::MAX must not panic
+        // (debug) or wrap (release). `saturating_add` + clamp keeps it in
+        // bounds; the mask is harmlessly empty rather than unsafe.
+        use base64::Engine;
+
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255]));
+        let mut buf = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut buf)
+            .write_image(img.as_raw(), 4, 4, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+
+        // x + w would overflow u32 with naive `+`.
+        let masked = mask_screenshot_regions(
+            &b64,
+            &[[u32::MAX - 1, u32::MAX - 1, u32::MAX, u32::MAX]],
+            [0, 0, 0],
+        )
+        .expect("must not panic on overflowing region");
+
+        // Out-of-bounds region masks nothing → image unchanged (still white).
+        let masked_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&masked)
+            .unwrap();
+        let masked_img = image::load_from_memory(&masked_bytes).unwrap().to_rgba8();
+        assert_eq!(masked_img.get_pixel(0, 0), &image::Rgba([255, 255, 255, 255]));
+        assert_eq!(masked_img.get_pixel(3, 3), &image::Rgba([255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn mask_region_clamps_oversized_to_bounds() {
+        // A region starting in-bounds but extending past the edge clamps to the
+        // image rather than overflowing or skipping the mask.
+        use base64::Engine;
+
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255]));
+        let mut buf = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut buf)
+            .write_image(img.as_raw(), 4, 4, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+
+        let masked = mask_screenshot_regions(&b64, &[[2, 2, u32::MAX, u32::MAX]], [0, 0, 0]).unwrap();
+        let masked_bytes = base64::engine::general_purpose::STANDARD.decode(&masked).unwrap();
+        let masked_img = image::load_from_memory(&masked_bytes).unwrap().to_rgba8();
+        // (3,3) inside the clamped region → black; (0,0) untouched → white.
+        assert_eq!(masked_img.get_pixel(3, 3), &image::Rgba([0, 0, 0, 255]));
+        assert_eq!(masked_img.get_pixel(0, 0), &image::Rgba([255, 255, 255, 255]));
     }
 
     #[test]

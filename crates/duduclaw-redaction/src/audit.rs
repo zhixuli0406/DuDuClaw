@@ -209,7 +209,7 @@ mod tests {
             source_detail: Some("odoo.search".into()),
             rule_id: "email".into(),
             category: "EMAIL".into(),
-            token: "<REDACT:EMAIL:abcdef01>".into(),
+            token: "<REDACT:EMAIL:abcdef01abcdef01abcdef01abcdef01>".into(),
         });
         sink.emit(AuditEvent::VaultGc {
             expired_marked: 3,

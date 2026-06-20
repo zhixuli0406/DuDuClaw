@@ -6,6 +6,7 @@ description = "Local LLM inference engine for DuDuClaw — multi-backend support
 
 [dependencies]
 duduclaw-core = { workspace = true }
+duduclaw-security = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

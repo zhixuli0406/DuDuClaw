@@ -69,6 +69,23 @@ pub struct InvokeParams {
     /// the worker's cwd rather than erroring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_dir: Option<String>,
+    /// **Review fix (HS14)**: per-account environment variables applied
+    /// to the spawned CLI child process. The gateway's account rotator
+    /// populates this with the resolved account's auth — typically
+    /// `CLAUDE_CODE_OAUTH_TOKEN` and/or `CLAUDE_CONFIG_DIR` — so each
+    /// pooled session is bound to a *distinct* account instead of all
+    /// children silently sharing one ambient `~/.claude` OAuth (which
+    /// bypassed per-account billing cooldown + budget caps).
+    ///
+    /// These env vars only take effect on a cache *miss* (when a fresh
+    /// session is spawned). Because `account_id` is part of the pool
+    /// cache key, distinct accounts already map to distinct sessions, so
+    /// the env applied at spawn time stays consistent for the session's
+    /// lifetime.
+    ///
+    /// Back-compat: older clients omit this field (empty map).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 /// Parameters for [`Request::ShutdownSession`].
@@ -172,6 +189,7 @@ mod tests {
             account_id: None,
             model: None,
             work_dir: None,
+            env: std::collections::HashMap::new(),
         });
         let s = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&s).unwrap();
@@ -224,6 +242,54 @@ mod tests {
         let s = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&s).unwrap();
         assert!(matches!(back, Request::ShutdownSession(_)));
+    }
+
+    #[test]
+    fn invoke_env_round_trips_and_empty_is_skipped() {
+        // **Review fix (HS14)**: env must round-trip, and an empty map
+        // must be omitted on the wire so older clients stay compatible.
+        let mut env = std::collections::HashMap::new();
+        env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "tok-123".to_string());
+        let req = Request::Invoke(InvokeParams {
+            agent_id: "agnes".into(),
+            cli_kind: "claude".into(),
+            bare_mode: false,
+            prompt: "hi".into(),
+            timeout_ms: 1000,
+            account_id: Some("alice@example.com".into()),
+            model: None,
+            work_dir: None,
+            env: env.clone(),
+        });
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains("CLAUDE_CODE_OAUTH_TOKEN"), "got {s}");
+        let back: Request = serde_json::from_str(&s).unwrap();
+        match back {
+            Request::Invoke(p) => assert_eq!(p.env, env),
+            other => panic!("expected Invoke, got {other:?}"),
+        }
+
+        // Empty map → field omitted on the wire.
+        let empty = Request::Invoke(InvokeParams {
+            agent_id: "a".into(),
+            cli_kind: "claude".into(),
+            bare_mode: false,
+            prompt: "hi".into(),
+            timeout_ms: 1000,
+            account_id: None,
+            model: None,
+            work_dir: None,
+            env: std::collections::HashMap::new(),
+        });
+        let s2 = serde_json::to_string(&empty).unwrap();
+        assert!(!s2.contains("\"env\""), "empty env must be omitted: {s2}");
+        // Older client payload without `env` still deserializes.
+        let legacy = r#"{"method":"invoke","params":{"agent_id":"a","cli_kind":"claude","prompt":"hi","timeout_ms":1000}}"#;
+        let parsed: Request = serde_json::from_str(legacy).unwrap();
+        match parsed {
+            Request::Invoke(p) => assert!(p.env.is_empty()),
+            other => panic!("expected Invoke, got {other:?}"),
+        }
     }
 
     #[test]

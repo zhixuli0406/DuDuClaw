@@ -119,6 +119,17 @@ impl AgentRegistry {
                     agent.skills = merged;
 
                     let name = agent.config.agent.name.clone();
+                    // Two agent directories sharing the same agent name would
+                    // silently overwrite each other (last scan wins). Keep the
+                    // last-wins behavior but make the collision observable.
+                    if let Some(prev) = loaded.get(&name) {
+                        warn!(
+                            agent = %name,
+                            previous_dir = %prev.dir.display(),
+                            new_dir = %path.display(),
+                            "duplicate agent name; later directory overwrites earlier one"
+                        );
+                    }
                     info!(agent = %name, dir = %dir_name, "loaded agent");
                     loaded.insert(name, agent);
                 }

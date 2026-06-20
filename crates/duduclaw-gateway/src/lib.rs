@@ -60,6 +60,7 @@ pub mod handlers;
 pub mod line;
 pub mod mcp_oauth;
 pub mod media;
+pub mod model_capabilities;
 pub mod tts;
 pub mod lifecycle_flush;
 pub mod log;

@@ -1,11 +1,13 @@
-//! Redaction token type — `<REDACT:CATEGORY:HASH8>`.
+//! Redaction token type — `<REDACT:CATEGORY:HASH32>`.
 //!
 //! The token format is intentionally LLM-friendly:
 //! - bracketed (`<` / `>`) so models tend not to truncate or paraphrase
 //! - the category survives in plain text so the model retains type context
 //!   ("this is an email address")
-//! - the 8-hex hash is short enough to fit alongside surrounding prose
-//!   but long enough (~32 bits of session-scoped entropy) for distinctness.
+//! - the 32-hex hash carries 128 bits of session-scoped entropy. A short
+//!   (32-bit) hash had a ~50% birthday-collision chance at ~77k distinct
+//!   values; a collision lets one vault mapping clobber another, leaking
+//!   cross-entity PII or losing data. 128 bits makes that negligible.
 
 use std::fmt;
 use std::str::FromStr;
@@ -19,8 +21,8 @@ use crate::error::{RedactionError, Result};
 pub const TOKEN_PREFIX: &str = "<REDACT:";
 /// Token wire suffix.
 pub const TOKEN_SUFFIX: &str = ">";
-/// Hash length in hex chars (== 4 bytes of HMAC output).
-pub const TOKEN_HASH_LEN: usize = 8;
+/// Hash length in hex chars (== 16 bytes / 128 bits of HMAC output).
+pub const TOKEN_HASH_LEN: usize = 32;
 /// Maximum category string length.
 pub const CATEGORY_MAX_LEN: usize = 32;
 
@@ -35,7 +37,7 @@ pub struct Token(String);
 impl Token {
     /// Construct a token from a `(category, hash)` pair. Both inputs are
     /// validated: category must be A-Z/0-9/`_`, hash must be exactly
-    /// 8 lowercase hex chars.
+    /// 32 lowercase hex chars.
     pub fn new(category: &str, hash: &str) -> Result<Self> {
         validate_category(category)?;
         validate_hash(hash)?;
@@ -59,7 +61,7 @@ impl Token {
         body.split_once(':').map(|(c, _)| c).unwrap_or("")
     }
 
-    /// Token hash (8 lowercase hex chars).
+    /// Token hash (32 lowercase hex chars).
     pub fn hash(&self) -> &str {
         let body = &self.0[TOKEN_PREFIX.len()..self.0.len() - TOKEN_SUFFIX.len()];
         body.split_once(':').map(|(_, h)| h).unwrap_or("")
@@ -118,15 +120,20 @@ fn validate_hash(hash: &str) -> Result<()> {
     Ok(())
 }
 
-/// Compute the 8-hex-char session hash for a given (salt, original) pair.
+/// Number of HMAC output bytes used for the session hash (16 bytes = 128 bits).
+const SESSION_HASH_BYTES: usize = TOKEN_HASH_LEN / 2;
+
+/// Compute the 32-hex-char session hash for a given (salt, original) pair.
 ///
-/// Uses HMAC-SHA256 truncated to the first 4 bytes, encoded as lowercase hex.
-/// The same salt + original always produce the same hash, which is what
-/// allows redact-side determinism (same value within a session → same token).
+/// Uses HMAC-SHA256 truncated to the first 16 bytes (128 bits), encoded as
+/// lowercase hex. The same salt + original always produce the same hash, which
+/// is what allows redact-side determinism (same value within a session → same
+/// token). 128 bits keeps the birthday-collision probability negligible even
+/// for very large vaults, preventing one mapping from clobbering another.
 pub fn session_hash(salt: &[u8], original: &[u8]) -> String {
     let key = hmac::Key::new(hmac::HMAC_SHA256, salt);
     let sig = hmac::sign(&key, original);
-    let bytes = &sig.as_ref()[..4];
+    let bytes = &sig.as_ref()[..SESSION_HASH_BYTES];
     hex_lower(bytes)
 }
 
@@ -167,39 +174,45 @@ fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    // A valid 32-hex-char hash literal for tests.
+    const H32: &str = "a3f9b2c10123abcd0123abcda3f9b2c1";
+
     #[test]
     fn new_and_display_round_trip() {
-        let t = Token::new("EMAIL", "a3f9b2c1").unwrap();
-        assert_eq!(t.to_string(), "<REDACT:EMAIL:a3f9b2c1>");
+        let t = Token::new("EMAIL", H32).unwrap();
+        assert_eq!(t.to_string(), format!("<REDACT:EMAIL:{H32}>"));
         assert_eq!(t.category(), "EMAIL");
-        assert_eq!(t.hash(), "a3f9b2c1");
+        assert_eq!(t.hash(), H32);
     }
 
     #[test]
     fn parse_valid_token() {
-        let t = Token::parse("<REDACT:CUSTOMER_EMAIL:0123abcd>").unwrap();
+        let t = Token::parse(&format!("<REDACT:CUSTOMER_EMAIL:{H32}>")).unwrap();
         assert_eq!(t.category(), "CUSTOMER_EMAIL");
-        assert_eq!(t.hash(), "0123abcd");
+        assert_eq!(t.hash(), H32);
     }
 
     #[test]
     fn parse_rejects_bad_prefix() {
-        assert!(Token::parse("REDACT:EMAIL:a3f9b2c1").is_none());
-        assert!(Token::parse("<REDACTX:EMAIL:a3f9b2c1>").is_none());
+        assert!(Token::parse(&format!("REDACT:EMAIL:{H32}")).is_none());
+        assert!(Token::parse(&format!("<REDACTX:EMAIL:{H32}>")).is_none());
     }
 
     #[test]
     fn parse_rejects_bad_hash() {
+        // Too short (the old 8-char width is no longer valid).
+        assert!(Token::parse("<REDACT:EMAIL:a3f9b2c1>").is_none());
         assert!(Token::parse("<REDACT:EMAIL:short>").is_none());
-        assert!(Token::parse("<REDACT:EMAIL:UPPERCASE>").is_none());
-        assert!(Token::parse("<REDACT:EMAIL:zz337799>").is_none());
+        // Uppercase / non-hex chars at the correct length.
+        assert!(Token::parse("<REDACT:EMAIL:A3F9B2C10123ABCD0123ABCDA3F9B2C1>").is_none());
+        assert!(Token::parse("<REDACT:EMAIL:zz337799zz337799zz337799zz337799>").is_none());
     }
 
     #[test]
     fn parse_rejects_bad_category() {
-        assert!(Token::parse("<REDACT:lowercase:a3f9b2c1>").is_none());
-        assert!(Token::parse("<REDACT:HAS SPACE:a3f9b2c1>").is_none());
-        assert!(Token::parse("<REDACT::a3f9b2c1>").is_none());
+        assert!(Token::parse(&format!("<REDACT:lowercase:{H32}>")).is_none());
+        assert!(Token::parse(&format!("<REDACT:HAS SPACE:{H32}>")).is_none());
+        assert!(Token::parse(&format!("<REDACT::{H32}>")).is_none());
     }
 
     #[test]
@@ -212,6 +225,16 @@ mod tests {
     }
 
     #[test]
+    fn session_hash_is_128_bits() {
+        // 32 hex chars == 16 bytes == 128 bits of entropy. This is the
+        // core defence against birthday collisions in the vault.
+        let h = session_hash(b"some-salt-bytes-32-bytes-long-xx", b"value");
+        assert_eq!(h.len(), 32);
+        assert_eq!(TOKEN_HASH_LEN, 32);
+        assert!(h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+    }
+
+    #[test]
     fn session_hash_differs_across_salts() {
         let h1 = session_hash(b"salt-A--padding-to-make-it-32byt", b"alice@acme.com");
         let h2 = session_hash(b"salt-B--padding-to-make-it-32byt", b"alice@acme.com");
@@ -220,15 +243,16 @@ mod tests {
 
     #[test]
     fn from_str_works() {
-        let t: Token = "<REDACT:EMAIL:abcdef01>".parse().unwrap();
+        let t: Token = format!("<REDACT:EMAIL:{H32}>").parse().unwrap();
         assert_eq!(t.category(), "EMAIL");
     }
 
     #[test]
     fn new_rejects_invalid_inputs() {
-        assert!(Token::new("lower", "abcdef01").is_err());
+        assert!(Token::new("lower", H32).is_err());
         assert!(Token::new("EMAIL", "tooshort").is_err());
-        assert!(Token::new("EMAIL", "ZZZZZZZZ").is_err());
-        assert!(Token::new("", "abcdef01").is_err());
+        assert!(Token::new("EMAIL", "abcdef01").is_err()); // old 8-char width rejected
+        assert!(Token::new("EMAIL", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ").is_err());
+        assert!(Token::new("", H32).is_err());
     }
 }

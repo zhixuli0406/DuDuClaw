@@ -660,6 +660,20 @@ impl PredictionEngine {
             }
         }
 
+        // D2 fix: feed the anti-sycophancy ConsistencyTracker. Previously
+        // `ConsistencyTracker::record` had no production caller, so the
+        // `is_sycophantic` guard in `router::route` always evaluated against an
+        // empty tracker and could never fire. We record one capitulation sample
+        // per conversation: the agent is treated as having "capitulated" when the
+        // user corrected it despite a confident (high expected-satisfaction)
+        // prediction — i.e. an unexpected correction. The tracker is the same
+        // `Arc<Mutex<_>>` that `channel_reply` snapshots immediately before
+        // routing, so the signal is visible to the very next `route()` call.
+        {
+            let mut consistency = self.consistency.lock().await;
+            consistency.record(error.unexpected_correction);
+        }
+
         // Record in consecutive errors buffer
         {
             let mut errors = self.consecutive_errors.lock().await;

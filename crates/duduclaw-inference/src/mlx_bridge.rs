@@ -63,24 +63,36 @@ impl MlxBridge {
         }
     }
 
-    /// Check if MLX is available on this system (cached).
+    /// Check if MLX is available on this system.
+    ///
+    /// L5: only a *positive* probe is cached permanently. A negative result
+    /// (e.g. a transient failure to spawn the python probe, or `mlx_lm` not yet
+    /// importable) is not cached, so a later call can re-probe and succeed
+    /// instead of MLX being disabled forever after one bad probe.
     pub async fn is_available(&self) -> bool {
-        *self.available_cache.get_or_init(|| async {
-            if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-                return false;
-            }
-            if !self.config.enabled {
-                return false;
-            }
-            if !Self::validate_python(&self.config.python) {
-                return false;
-            }
-            let output = tokio::process::Command::new(&self.config.python)
-                .args(["-c", "import mlx_lm; print('ok')"])
-                .output()
-                .await;
-            matches!(output, Ok(o) if o.status.success())
-        }).await
+        if let Some(cached) = self.available_cache.get() {
+            return *cached;
+        }
+        if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            return false;
+        }
+        if !self.config.enabled {
+            return false;
+        }
+        if !Self::validate_python(&self.config.python) {
+            return false;
+        }
+        let output = tokio::process::Command::new(&self.config.python)
+            .args(["-c", "import mlx_lm; print('ok')"])
+            .output()
+            .await;
+        let available = matches!(output, Ok(o) if o.status.success());
+        if available {
+            // Cache only the positive result; ignore the race where another
+            // task set it first (the value is identical).
+            let _ = self.available_cache.set(true);
+        }
+        available
     }
 
     /// Generate text using MLX locally via JSON stdin protocol.

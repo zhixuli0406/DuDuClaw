@@ -163,10 +163,77 @@ impl IdempotencyGuard {
         }
     }
 
-    /// 檢查 key 是否在 dedup 視窗內已存在。
+    /// 原子地檢查並（必要時）佔位記錄一個冪等鍵。
+    ///
+    /// 這是 HC17 修正的核心：`check()` + `record()` 兩步驟之間存在 TOCTOU 競態
+    /// （讀鎖釋放後、寫鎖取得前，另一個並發呼叫可能也判定為 New）。本方法在
+    /// **單一寫鎖** 內完成「檢查是否已存在 → 不存在則立即插入佔位記錄」（CAS 語意），
+    /// 確保同一 key 的並發呼叫只有一個得到 `CheckResult::New`。
+    ///
+    /// - 若是新操作：插入以 `placeholder` 為內容的記錄並回傳 `CheckResult::New`；
+    ///   呼叫者執行操作後應呼叫 [`record`](Self::record) 以實際結果覆寫佔位值。
+    /// - 若是重複（dedup 視窗內已存在）：不改動既有記錄，回傳 `CheckResult::Duplicate`。
+    ///
+    /// 停用、或 key 超過 `max_key_length` 時，一律視為 New 且不記錄。
+    pub async fn check_and_record(
+        &self,
+        key: &IdempotencyKey,
+        placeholder: serde_json::Value,
+    ) -> CheckResult {
+        if !self.config.enabled {
+            return CheckResult::New;
+        }
+
+        if key.len() > self.config.max_key_length {
+            tracing::warn!(
+                key = key.as_str(),
+                max_len = self.config.max_key_length,
+                "idempotency key exceeds max_key_length, treating as New"
+            );
+            return CheckResult::New;
+        }
+
+        self.maybe_cleanup().await;
+
+        let window = Duration::from_secs(self.config.dedup_window_seconds);
+
+        // Single write lock guarantees check + insert is atomic (no TOCTOU window).
+        let mut records = self.records.write().await;
+
+        if let Some(record) = records.get(key.as_str()) {
+            if record.recorded_at.elapsed() < window {
+                let expires_at = chrono::Utc::now()
+                    + chrono::Duration::from_std(
+                        window.saturating_sub(record.recorded_at.elapsed()),
+                    )
+                    .unwrap_or_default();
+                return CheckResult::Duplicate {
+                    original_result: record.result.clone(),
+                    original_timestamp: record.timestamp_iso.clone(),
+                    dedup_window_expires_at: expires_at.to_rfc3339(),
+                };
+            }
+        }
+
+        // New (or expired) → claim the slot atomically with a placeholder record.
+        records.insert(
+            key.as_str().to_string(),
+            IdempotencyRecord {
+                result: placeholder,
+                recorded_at: Instant::now(),
+                timestamp_iso: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+        CheckResult::New
+    }
+
+    /// 檢查 key 是否在 dedup 視窗內已存在（**唯讀**，不記錄）。
     ///
     /// - 若是新操作：回傳 `CheckResult::New`，**不**自動記錄結果（需呼叫 `record`）。
     /// - 若是重複：回傳 `CheckResult::Duplicate` 含原始結果。
+    ///
+    /// 注意：`check()` 與 `record()` 兩步驟之間並非原子，並發呼叫可能皆判定為 New
+    /// （TOCTOU）。需要原子去重保證時請改用 [`check_and_record`](Self::check_and_record)。
     pub async fn check(&self, key: &IdempotencyKey) -> CheckResult {
         if !self.config.enabled {
             return CheckResult::New;
@@ -461,6 +528,84 @@ mod tests {
             panic!("expected Duplicate");
         }
     }
+
+    // ── check_and_record (HC17) ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_check_and_record_first_is_new_second_is_duplicate() {
+        let guard = make_guard(3600);
+        let key = IdempotencyKey::new("agent-1", "op", b"data");
+
+        let r1 = guard.check_and_record(&key, serde_json::json!("placeholder")).await;
+        assert!(matches!(r1, CheckResult::New), "first call must be New");
+
+        let r2 = guard.check_and_record(&key, serde_json::json!("placeholder")).await;
+        assert!(matches!(r2, CheckResult::Duplicate { .. }), "second call must be Duplicate");
+    }
+
+    #[tokio::test]
+    async fn test_check_and_record_concurrent_only_one_new() {
+        // HC17 regression: under concurrency, exactly one caller may observe New.
+        let guard = Arc::new(make_guard(3600));
+        let key = IdempotencyKey::new("agent-1", "op", b"shared");
+
+        let mut handles = vec![];
+        for _ in 0..32 {
+            let g = Arc::clone(&guard);
+            let k = key.clone();
+            handles.push(tokio::spawn(async move {
+                matches!(
+                    g.check_and_record(&k, serde_json::json!("placeholder")).await,
+                    CheckResult::New
+                )
+            }));
+        }
+
+        let mut new_count = 0;
+        for h in handles {
+            if h.await.unwrap() {
+                new_count += 1;
+            }
+        }
+        assert_eq!(new_count, 1, "exactly one concurrent caller must observe New");
+        assert_eq!(guard.record_count().await, 1, "only one record must exist");
+    }
+
+    #[tokio::test]
+    async fn test_check_and_record_record_overwrites_placeholder() {
+        let guard = make_guard(3600);
+        let key = IdempotencyKey::new("agent-1", "op", b"data");
+
+        // Claim with placeholder, then overwrite with real result.
+        assert!(matches!(
+            guard.check_and_record(&key, serde_json::json!("placeholder")).await,
+            CheckResult::New
+        ));
+        guard.record(&key, serde_json::json!("real-result")).await;
+
+        if let CheckResult::Duplicate { original_result, .. } = guard.check(&key).await {
+            assert_eq!(original_result, "real-result");
+        } else {
+            panic!("expected Duplicate after record");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_and_record_disabled_always_new() {
+        let guard = IdempotencyGuard::new(IdempotencyConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let key = IdempotencyKey::new("agent-1", "op", b"data");
+        assert!(matches!(
+            guard.check_and_record(&key, serde_json::json!("x")).await,
+            CheckResult::New
+        ));
+        // Disabled guard records nothing.
+        assert_eq!(guard.record_count().await, 0);
+    }
+
+    use std::sync::Arc;
 
     // ── Config defaults ───────────────────────────────────────────────────────
 

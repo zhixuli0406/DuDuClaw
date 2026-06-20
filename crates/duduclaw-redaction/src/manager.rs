@@ -207,9 +207,10 @@ impl RedactionManager {
         args: &Value,
         agent_id: &str,
         session_id: Option<&str>,
+        caller: &crate::source::Caller,
     ) -> Result<EgressDecision> {
         self.egress
-            .decide(tool_name, args, agent_id, session_id, &self.vault, &*self.audit)
+            .decide(tool_name, args, agent_id, session_id, caller, &self.vault, &*self.audit)
     }
 }
 
@@ -304,6 +305,7 @@ mod tests {
                 &serde_json::json!({"url": tok}),
                 "agnes",
                 Some("s1"),
+                &crate::source::Caller::owner("agnes"),
             )
             .unwrap();
         assert!(matches!(dec, EgressDecision::Deny { .. }));
@@ -335,6 +337,7 @@ mod tests {
                 &serde_json::json!({"to": tok}),
                 "agnes",
                 Some("s1"),
+                &crate::source::Caller::owner("agnes"),
             )
             .unwrap();
         match dec {

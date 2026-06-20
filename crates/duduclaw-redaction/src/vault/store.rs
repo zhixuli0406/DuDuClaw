@@ -13,6 +13,15 @@ use crate::error::{RedactionError, Result};
 use crate::rules::RestoreScope;
 use crate::vault::{key, schema};
 
+/// Normalise an optional session id into the non-null key form used by the
+/// composite primary key `(token, agent_id, session_id)`. `None` (a
+/// cross-session / sessionless entry) maps to the empty string because SQLite
+/// treats NULLs as distinct in a PRIMARY KEY, which would otherwise allow
+/// duplicate sessionless rows for the same token.
+fn session_key(session_id: Option<&str>) -> &str {
+    session_id.unwrap_or("")
+}
+
 /// One row in the vault, decrypted.
 #[derive(Debug, Clone)]
 pub struct VaultEntry {
@@ -125,6 +134,10 @@ impl VaultStore {
         let now = Utc::now().timestamp();
         let expires_at = now + ttl_hours * 3600;
         let scope_wire = serde_json::to_string(restore_scope)?;
+        // The composite primary key is (token, agent_id, session_id); SQLite
+        // treats NULLs as distinct in a PK, so normalise `None` to the empty
+        // string so cross-session entries de-duplicate correctly.
+        let session_key = session_key(session_id);
 
         let conn = self.conn.lock().map_err(|e| RedactionError::vault(e.to_string()))?;
         conn.execute(
@@ -140,7 +153,7 @@ impl VaultStore {
                 category,
                 rule_id,
                 agent_id,
-                session_id,
+                session_key,
                 scope_wire,
                 cross_session as i64,
                 now,
@@ -162,16 +175,24 @@ impl VaultStore {
         agent_id: &str,
         session_id: Option<&str>,
     ) -> Result<Option<VaultEntry>> {
+        // Scope the lookup to the exact `(token, agent_id, session_id)` so a
+        // token-hash collision belonging to a *different* (agent, session)
+        // can never be returned. A `cross_session` entry is stored with
+        // `session_id = ''` and matches regardless of the caller's session.
+        let session_key = session_key(session_id);
         let row_opt = {
             let conn = self.conn.lock().map_err(|e| RedactionError::vault(e.to_string()))?;
             let mut stmt = conn.prepare(
                 "SELECT token, original_enc, category, rule_id, agent_id, session_id,
                         restore_scope, cross_session, created_at, expires_at,
                         reveal_count, last_reveal_at, expired_marker
-                 FROM redaction_mappings WHERE token = ?1",
+                 FROM redaction_mappings
+                 WHERE token = ?1 AND agent_id = ?2
+                   AND (session_id = ?3 OR cross_session = 1)
+                 LIMIT 1",
             )?;
 
-            stmt.query_row(params![token], |row| {
+            stmt.query_row(params![token, agent_id, session_key], |row| {
                 Ok(RawRow {
                     token: row.get(0)?,
                     original_enc: row.get(1)?,
@@ -192,14 +213,6 @@ impl VaultStore {
         };
 
         let Some(row) = row_opt else { return Ok(None) };
-
-        // Cross-session check.
-        if row.agent_id != agent_id {
-            return Ok(None);
-        }
-        if !row.cross_session && row.session_id.as_deref() != session_id {
-            return Ok(None);
-        }
 
         let restore_scope: RestoreScope = serde_json::from_str(&row.restore_scope)?;
 
@@ -223,7 +236,8 @@ impl VaultStore {
             category: row.category,
             rule_id: row.rule_id,
             agent_id: row.agent_id,
-            session_id: row.session_id,
+            // `''` is the stored sentinel for "no session"; surface it as None.
+            session_id: row.session_id.filter(|s| !s.is_empty()),
             restore_scope,
             cross_session: row.cross_session,
             created_at: row.created_at,
@@ -234,15 +248,26 @@ impl VaultStore {
         }))
     }
 
-    /// Bump the reveal counter — called after a successful restore.
-    pub fn record_reveal(&self, token: &str) -> Result<()> {
+    /// Bump the reveal counter — called after a successful restore. Scoped to
+    /// the exact `(token, agent_id, session_id)` row so a token-hash collision
+    /// in another (agent, session) is never touched. A `cross_session` entry
+    /// is matched regardless of the caller's session (it is stored with an
+    /// empty `session_id`).
+    pub fn record_reveal(
+        &self,
+        token: &str,
+        agent_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<()> {
         let now = Utc::now().timestamp();
+        let session_key = session_key(session_id);
         let conn = self.conn.lock().map_err(|e| RedactionError::vault(e.to_string()))?;
         conn.execute(
             "UPDATE redaction_mappings
                 SET reveal_count = reveal_count + 1, last_reveal_at = ?1
-              WHERE token = ?2",
-            params![now, token],
+              WHERE token = ?2 AND agent_id = ?3
+                AND (session_id = ?4 OR cross_session = 1)",
+            params![now, token, agent_id, session_key],
         )?;
         Ok(())
     }
@@ -541,8 +566,8 @@ mod tests {
                 24,
             )
             .unwrap();
-        store.record_reveal("<REDACT:E:abcdef01>").unwrap();
-        store.record_reveal("<REDACT:E:abcdef01>").unwrap();
+        store.record_reveal("<REDACT:E:abcdef01>", "agnes", Some("s1")).unwrap();
+        store.record_reveal("<REDACT:E:abcdef01>", "agnes", Some("s1")).unwrap();
 
         let e = store
             .lookup_mapping("<REDACT:E:abcdef01>", "agnes", Some("s1"))
@@ -550,6 +575,174 @@ mod tests {
             .unwrap();
         assert_eq!(e.reveal_count, 2);
         assert!(e.last_reveal_at.is_some());
+    }
+
+    #[test]
+    fn colliding_token_across_sessions_does_not_clobber() {
+        // Two different sessions of the same agent end up with the SAME token
+        // string (simulating a hash collision) but different plaintext. With
+        // the composite primary key, neither must overwrite the other.
+        let (store, _tmp) = fresh_store();
+        let token = "<REDACT:EMAIL:abcdef01>"; // deliberately short/colliding
+        store
+            .insert_mapping(
+                token, "alice@a.com", "agnes", Some("session-A"), "EMAIL", "r",
+                &RestoreScope::Owner, false, 24,
+            )
+            .unwrap();
+        store
+            .insert_mapping(
+                token, "bob@b.com", "agnes", Some("session-B"), "EMAIL", "r",
+                &RestoreScope::Owner, false, 24,
+            )
+            .unwrap();
+
+        // Each session resolves to its OWN plaintext — no clobbering.
+        let a = store
+            .lookup_mapping(token, "agnes", Some("session-A"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.original.as_deref(), Some("alice@a.com"));
+        let b = store
+            .lookup_mapping(token, "agnes", Some("session-B"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.original.as_deref(), Some("bob@b.com"));
+    }
+
+    #[test]
+    fn colliding_token_across_agents_does_not_clobber() {
+        // Same token string, same session label, but two different agents.
+        let (store, _tmp) = fresh_store();
+        let token = "<REDACT:EMAIL:abcdef01>";
+        store
+            .insert_mapping(
+                token, "alice@a.com", "agnes", Some("s1"), "EMAIL", "r",
+                &RestoreScope::Owner, false, 24,
+            )
+            .unwrap();
+        store
+            .insert_mapping(
+                token, "carol@c.com", "bobby", Some("s1"), "EMAIL", "r",
+                &RestoreScope::Owner, false, 24,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .lookup_mapping(token, "agnes", Some("s1"))
+                .unwrap()
+                .unwrap()
+                .original
+                .as_deref(),
+            Some("alice@a.com")
+        );
+        assert_eq!(
+            store
+                .lookup_mapping(token, "bobby", Some("s1"))
+                .unwrap()
+                .unwrap()
+                .original
+                .as_deref(),
+            Some("carol@c.com")
+        );
+
+        // Three distinct rows can coexist under one colliding token.
+        assert_eq!(store.stats().unwrap().total, 2);
+    }
+
+    #[test]
+    fn same_key_reinsert_replaces_in_place() {
+        // Re-inserting the exact same (token, agent, session) updates the row
+        // rather than creating a duplicate — INSERT OR REPLACE still applies
+        // for an identical primary key.
+        let (store, _tmp) = fresh_store();
+        let token = "<REDACT:EMAIL:abcdef01>";
+        store
+            .insert_mapping(
+                token, "old@a.com", "agnes", Some("s1"), "EMAIL", "r",
+                &RestoreScope::Owner, false, 24,
+            )
+            .unwrap();
+        store
+            .insert_mapping(
+                token, "new@a.com", "agnes", Some("s1"), "EMAIL", "r",
+                &RestoreScope::Owner, false, 24,
+            )
+            .unwrap();
+
+        assert_eq!(store.stats().unwrap().total, 1);
+        assert_eq!(
+            store
+                .lookup_mapping(token, "agnes", Some("s1"))
+                .unwrap()
+                .unwrap()
+                .original
+                .as_deref(),
+            Some("new@a.com")
+        );
+    }
+
+    #[test]
+    fn sessionless_entries_dedup_under_composite_key() {
+        // Two cross-session (session_id = None) inserts of the same token for
+        // the same agent must collapse to one row, not create duplicate NULL
+        // primary-key rows.
+        let (store, _tmp) = fresh_store();
+        let token = "<REDACT:CODE:abcdef01>";
+        store
+            .insert_mapping(
+                token, "Falcon", "agnes", None, "CODE", "r",
+                &RestoreScope::Owner, true, 24,
+            )
+            .unwrap();
+        store
+            .insert_mapping(
+                token, "Falcon", "agnes", None, "CODE", "r",
+                &RestoreScope::Owner, true, 24,
+            )
+            .unwrap();
+
+        assert_eq!(store.stats().unwrap().total, 1);
+        let e = store
+            .lookup_mapping(token, "agnes", Some("any-session"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.original.as_deref(), Some("Falcon"));
+        assert!(e.session_id.is_none(), "cross-session entry surfaces None");
+    }
+
+    #[test]
+    fn record_reveal_only_bumps_matching_session() {
+        // A colliding token shared by two sessions: revealing one must not
+        // bump the other's counter.
+        let (store, _tmp) = fresh_store();
+        let token = "<REDACT:EMAIL:abcdef01>";
+        store
+            .insert_mapping(
+                token, "alice@a.com", "agnes", Some("session-A"), "EMAIL", "r",
+                &RestoreScope::Owner, false, 24,
+            )
+            .unwrap();
+        store
+            .insert_mapping(
+                token, "bob@b.com", "agnes", Some("session-B"), "EMAIL", "r",
+                &RestoreScope::Owner, false, 24,
+            )
+            .unwrap();
+
+        store.record_reveal(token, "agnes", Some("session-A")).unwrap();
+
+        let a = store
+            .lookup_mapping(token, "agnes", Some("session-A"))
+            .unwrap()
+            .unwrap();
+        let b = store
+            .lookup_mapping(token, "agnes", Some("session-B"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.reveal_count, 1);
+        assert_eq!(b.reveal_count, 0);
     }
 
     #[test]

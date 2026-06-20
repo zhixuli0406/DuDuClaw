@@ -715,6 +715,18 @@ fn notify_http_client() -> &'static reqwest::Client {
     })
 }
 
+/// L29: validate a Discord snowflake id. Discord ids are unsigned 64-bit
+/// integers serialized as decimal strings (17-20 digits in practice). We accept
+/// any all-ASCII-digit string of a sane length and reject anything else so it
+/// cannot be smuggled into the request path.
+fn is_discord_snowflake(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 20
+        && s.bytes().all(|b| b.is_ascii_digit())
+        // A snowflake is non-zero; "0" is not a real channel.
+        && s.bytes().any(|b| b != b'0')
+}
+
 async fn send_channel_text(
     channel: &str,
     chat_id: &str,
@@ -754,6 +766,14 @@ async fn send_channel_text(
             Ok(())
         }
         "discord" => {
+            // L29: the chat_id is interpolated directly into the request path,
+            // so validate it is a Discord snowflake (a positive integer, 17-20
+            // digits in practice) before use. This prevents path traversal /
+            // injection (e.g. "../guilds/..." or query-string smuggling) when the
+            // notify rule's chat_id comes from less-trusted rule config.
+            if !is_discord_snowflake(chat_id) {
+                return Err(format!("invalid discord chat_id (not a snowflake): {chat_id}"));
+            }
             let url =
                 format!("https://discord.com/api/v10/channels/{chat_id}/messages");
             let resp = client
@@ -874,6 +894,21 @@ mod tests {
     fn eval_null_is_true() {
         let m = serde_json::Map::new();
         assert!(evaluate(&Value::Null, &m));
+    }
+
+    /// L29: only numeric, non-zero, sanely-sized snowflakes are accepted.
+    #[test]
+    fn discord_snowflake_validation() {
+        assert!(is_discord_snowflake("123456789012345678")); // 18-digit id
+        assert!(is_discord_snowflake("1")); // minimal non-zero
+        assert!(!is_discord_snowflake("")); // empty
+        assert!(!is_discord_snowflake("0")); // zero
+        assert!(!is_discord_snowflake("00")); // all-zero
+        assert!(!is_discord_snowflake("../guilds/1")); // path traversal
+        assert!(!is_discord_snowflake("123/messages")); // path smuggle
+        assert!(!is_discord_snowflake("123?x=1")); // query smuggle
+        assert!(!is_discord_snowflake("12a45")); // non-digit
+        assert!(!is_discord_snowflake("123456789012345678901")); // 21 digits, too long
     }
 
     #[test]

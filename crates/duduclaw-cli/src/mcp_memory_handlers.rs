@@ -411,6 +411,87 @@ pub async fn handle_memory_fetch_batch(
     }
 }
 
+// ── memory_improve (RFC-26 §4.4 / P6.4) ────────────────────────────────────────
+
+/// Group memory entries by their tags into `(tag, contents)` clusters, largest
+/// cluster first. Untagged entries collect under `"(untagged)"`. Pure + testable.
+fn cluster_by_tag(entries: &[MemoryEntry]) -> Vec<(String, Vec<String>)> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for e in entries {
+        let snippet = duduclaw_core::truncate_bytes(&e.content, 240).to_string();
+        if e.tags.is_empty() {
+            map.entry("(untagged)".to_string()).or_default().push(snippet);
+        } else {
+            for t in &e.tags {
+                map.entry(t.clone()).or_default().push(snippet.clone());
+            }
+        }
+    }
+    let mut clusters: Vec<(String, Vec<String>)> = map.into_iter().collect();
+    // Largest clusters first (most repeated theme = best consolidation candidate).
+    clusters.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    clusters
+}
+
+/// `memory_improve` — reflection data-provider. Gathers memories related to a
+/// `topic`, clusters them, and returns a **proposal scaffold** for the calling
+/// agent to draft consolidated MEMORY/SOUL rules. Writes nothing: the agent
+/// reviews then persists via `memory_store` (propose-not-apply).
+pub async fn handle_memory_improve(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    ns_ctx: &NamespaceContext,
+) -> Value {
+    let topic = match params.get("topic").and_then(|v| v.as_str()) {
+        Some(t) if !t.trim().is_empty() => t.trim(),
+        _ => return mcp_error("Missing required parameter: topic (the area to reflect on)"),
+    };
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(40)
+        .min(100) as usize;
+    let namespace = &ns_ctx.write_namespace;
+
+    let entries = match memory.search(namespace, topic, limit).await {
+        Ok(e) => e,
+        Err(e) => return mcp_error(&format!("Error gathering memories: {e}")),
+    };
+    if entries.is_empty() {
+        let payload = serde_json::json!({
+            "topic": topic,
+            "clusters": [],
+            "proposal_scaffold": format!(
+                "No memories found for '{topic}'. Nothing to consolidate yet."
+            ),
+        });
+        return serde_json::json!({ "content": [{ "type": "text", "text": payload.to_string() }] });
+    }
+
+    let clusters = cluster_by_tag(&entries);
+    let cluster_json: Vec<Value> = clusters
+        .iter()
+        .map(|(tag, contents)| {
+            serde_json::json!({ "tag": tag, "count": contents.len(), "samples": contents })
+        })
+        .collect();
+
+    let payload = serde_json::json!({
+        "topic": topic,
+        "memories_examined": entries.len(),
+        "clusters": cluster_json,
+        "proposal_scaffold": format!(
+            "Reflexion over {} memories about '{topic}'. For each cluster above, draft ONE \
+             consolidated rule capturing the recurring lesson, then — after the user confirms — \
+             persist it with memory_store (layer=semantic) or propose a SOUL.md edit. \
+             Do NOT auto-apply; these are candidates for review.",
+            entries.len()
+        ),
+    });
+    serde_json::json!({ "content": [{ "type": "text", "text": payload.to_string() }] })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -428,6 +509,43 @@ mod tests {
                 "shared/public".to_string(),
             ],
         }
+    }
+
+    fn mk_entry(content: &str, tags: &[&str]) -> MemoryEntry {
+        MemoryEntry {
+            id: "x".into(),
+            agent_id: "internal/a1".into(),
+            content: content.into(),
+            timestamp: chrono::Utc::now(),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+            embedding: None,
+            layer: duduclaw_core::types::MemoryLayer::Episodic,
+            importance: 0.5,
+            access_count: 0,
+            last_accessed: None,
+            source_event: String::new(),
+        }
+    }
+
+    #[test]
+    fn cluster_by_tag_groups_and_orders_by_size() {
+        let entries = vec![
+            mk_entry("a", &["billing", "refund"]),
+            mk_entry("b", &["billing"]),
+            mk_entry("c", &["billing"]),
+            mk_entry("d", &[]),
+        ];
+        let clusters = super::cluster_by_tag(&entries);
+        // billing (3) should come before refund (1) and (untagged) (1).
+        assert_eq!(clusters[0].0, "billing");
+        assert_eq!(clusters[0].1.len(), 3);
+        assert!(clusters.iter().any(|(t, _)| t == "(untagged)"));
+        assert!(clusters.iter().any(|(t, _)| t == "refund"));
+    }
+
+    #[test]
+    fn cluster_by_tag_empty_is_empty() {
+        assert!(super::cluster_by_tag(&[]).is_empty());
     }
 
     fn internal_ns(agent_id: &str) -> NamespaceContext {

@@ -3660,6 +3660,11 @@ async fn spawn_claude_cli_with_env(
     // Apply tool restrictions based on agent capabilities (deny-by-default)
     {
         let caps = capabilities.cloned().unwrap_or_default();
+        // HS12: enforce a per-agent allowlist when configured.
+        let allowed = caps.allowed_tools();
+        if !allowed.is_empty() {
+            cmd.args(["--allowedTools", &allowed.join(",")]);
+        }
         let denied = caps.disallowed_tools();
         if !denied.is_empty() {
             let denied_csv = denied.join(",");
@@ -4329,6 +4334,12 @@ fn build_claude_cli_args(
     ]);
 
     let caps = capabilities.cloned().unwrap_or_default();
+    // HS12: enforce a per-agent allowlist when configured.
+    let allowed = caps.allowed_tools();
+    if !allowed.is_empty() {
+        args.push("--allowedTools".to_string());
+        args.push(allowed.join(","));
+    }
     let denied = caps.disallowed_tools();
     if !denied.is_empty() {
         args.push("--disallowedTools".to_string());
@@ -4672,7 +4683,11 @@ async fn invoke_pty_branch(
             false, // bare_mode
         )
         .account_id(account_id.as_deref())
-        .model(Some(model));
+        .model(Some(model))
+        // HS14: pass the rotator-resolved per-account env (OAuth token /
+        // config dir) so the managed worker spawns the child under the
+        // correct account instead of a shared ambient OAuth.
+        .env(env_vars.clone());
         crate::pty_runtime::acquire_and_invoke_with(
             crate::pty_runtime::InvokeOptions::new(acquire, user_message, deadline),
         )

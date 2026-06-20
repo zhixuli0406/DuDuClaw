@@ -56,6 +56,26 @@ impl JwtConfig {
         let secret_path = home_dir.join("jwt_secret");
 
         let secret = if secret_path.exists() {
+            // M15 fix: an existing secret with group/other-readable permissions
+            // lets any local user read it and forge tokens. Lock it down to
+            // owner-only (0o600) before trusting it. On Windows this is a no-op
+            // (NTFS ACLs already restrict to the current user).
+            if duduclaw_core::platform::has_loose_permissions(&secret_path) {
+                match duduclaw_core::platform::set_owner_only(&secret_path) {
+                    Ok(()) => tracing::warn!(
+                        "jwt_secret at {} had group/other-readable permissions; \
+                         tightened to owner-only (0o600)",
+                        secret_path.display()
+                    ),
+                    Err(e) => tracing::warn!(
+                        "jwt_secret at {} is group/other-readable and could NOT be \
+                         secured ({e}); anyone with read access can forge tokens — \
+                         fix the file permissions to 0o600 manually",
+                        secret_path.display()
+                    ),
+                }
+            }
+
             let bytes = std::fs::read(&secret_path)
                 .map_err(|e| format!("failed to read jwt_secret: {e}"))?;
             if bytes.len() < 32 {
@@ -182,6 +202,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             last_login: None,
+            must_change_password: false,
         }
     }
 

@@ -22,6 +22,7 @@ use serde_json::Value;
 use crate::audit::{AuditEvent, AuditSink};
 use crate::config::{RestoreArgsMode, ToolEgressRule};
 use crate::error::Result;
+use crate::source::Caller;
 use crate::token::Token;
 use crate::vault::VaultStore;
 
@@ -82,6 +83,7 @@ impl EgressEvaluator {
         args: &Value,
         agent_id: &str,
         session_id: Option<&str>,
+        caller: &Caller,
         vault: &VaultStore,
         audit: &dyn AuditSink,
     ) -> Result<EgressDecision> {
@@ -123,24 +125,49 @@ impl EgressEvaluator {
                 let mut restored = args.clone();
                 let mut count: usize = 0;
                 let mut hallucinated = false;
+                let mut scope_denied = false;
                 substitute_tokens(&mut restored, &mut |tok| {
                     match vault.lookup_mapping(tok.as_str(), agent_id, session_id) {
-                        Ok(Some(entry)) => match entry.original {
-                            Some(plain) => {
-                                count += 1;
-                                Some(plain)
+                        Ok(Some(entry)) => {
+                            // C3 fix: enforce the per-token RestoreScope on the
+                            // egress path too (the pipeline restore path already
+                            // did; this one silently revealed scoped/Owner PII).
+                            if !entry.restore_scope.allows(caller) {
+                                scope_denied = true;
+                                audit.emit(AuditEvent::RestoreDenied {
+                                    agent_id: agent_id.into(),
+                                    caller: caller_label(caller),
+                                    target: format!("tool:{tool_name}"),
+                                    token: tok.as_str().into(),
+                                    required_scope: entry.restore_scope.wire(),
+                                });
+                                return None;
                             }
-                            None => {
-                                hallucinated = true;
-                                None
+                            match entry.original {
+                                Some(plain) => {
+                                    count += 1;
+                                    Some(plain)
+                                }
+                                None => {
+                                    hallucinated = true;
+                                    None
+                                }
                             }
-                        },
+                        }
                         _ => {
                             hallucinated = true;
                             None
                         }
                     }
                 });
+                if scope_denied {
+                    return Ok(EgressDecision::Deny {
+                        reason: format!(
+                            "tool '{tool_name}' refused: caller lacks restore scope for one or more tokens"
+                        ),
+                        tokens_seen: tokens.len(),
+                    });
+                }
                 if hallucinated {
                     audit.emit(AuditEvent::EgressDeny {
                         agent_id: agent_id.into(),
@@ -168,6 +195,17 @@ impl EgressEvaluator {
                 })
             }
         }
+    }
+}
+
+/// Stable audit label for a caller (mirrors the pipeline restore path).
+fn caller_label(c: &Caller) -> String {
+    if c.is_owner {
+        format!("owner:{}", c.agent_id)
+    } else if c.scopes.is_empty() {
+        format!("agent:{}", c.agent_id)
+    } else {
+        format!("agent:{}({})", c.agent_id, c.scopes.join(","))
     }
 }
 
@@ -293,6 +331,7 @@ mod tests {
                 &json!({"to": "alice@acme.com"}),
                 "agnes",
                 Some("s1"),
+                &Caller::owner("test"),
                 &vault,
                 &NullAuditSink,
             )
@@ -306,7 +345,7 @@ mod tests {
         let (vault, _t) = fresh_vault();
         vault
             .insert_mapping(
-                "<REDACT:EMAIL:abcdef01>",
+                "<REDACT:EMAIL:abcdef01abcdef01abcdef01abcdef01>",
                 "alice@acme.com",
                 "agnes",
                 Some("s1"),
@@ -320,9 +359,10 @@ mod tests {
         let dec = ev
             .decide(
                 "web_fetch",
-                &json!({"url": "<REDACT:EMAIL:abcdef01>"}),
+                &json!({"url": "<REDACT:EMAIL:abcdef01abcdef01abcdef01abcdef01>"}),
                 "agnes",
                 Some("s1"),
+                &Caller::owner("test"),
                 &vault,
                 &NullAuditSink,
             )
@@ -341,7 +381,7 @@ mod tests {
         let (vault, _t) = fresh_vault();
         vault
             .insert_mapping(
-                "<REDACT:EMAIL:abcdef01>",
+                "<REDACT:EMAIL:abcdef01abcdef01abcdef01abcdef01>",
                 "alice@acme.com",
                 "agnes",
                 Some("s1"),
@@ -355,9 +395,10 @@ mod tests {
         let dec = ev
             .decide(
                 "send_email",
-                &json!({"to": "<REDACT:EMAIL:abcdef01>", "body": "hi"}),
+                &json!({"to": "<REDACT:EMAIL:abcdef01abcdef01abcdef01abcdef01>", "body": "hi"}),
                 "agnes",
                 Some("s1"),
+                &Caller::owner("test"),
                 &vault,
                 &NullAuditSink,
             )
@@ -380,7 +421,7 @@ mod tests {
         let (vault, _t) = fresh_vault();
         vault
             .insert_mapping(
-                "<REDACT:E:abcdef01>",
+                "<REDACT:E:abcdef01abcdef01abcdef01abcdef01>",
                 "alice",
                 "a",
                 Some("s"),
@@ -394,9 +435,10 @@ mod tests {
         let dec = ev
             .decide(
                 "odoo.search_partner",
-                &json!({"q": "<REDACT:E:abcdef01>"}),
+                &json!({"q": "<REDACT:E:abcdef01abcdef01abcdef01abcdef01>"}),
                 "a",
                 Some("s"),
+                &Caller::owner("test"),
                 &vault,
                 &NullAuditSink,
             )
@@ -414,9 +456,10 @@ mod tests {
         let dec = ev
             .decide(
                 "send_email",
-                &json!({"to": "<REDACT:EMAIL:11111111>"}),
+                &json!({"to": "<REDACT:EMAIL:11111111111111111111111111111111>"}),
                 "a",
                 Some("s"),
+                &Caller::owner("test"),
                 &vault,
                 &NullAuditSink,
             )
@@ -432,7 +475,7 @@ mod tests {
         let (vault, _t) = fresh_vault();
         vault
             .insert_mapping(
-                "<REDACT:E:abcdef01>",
+                "<REDACT:E:abcdef01abcdef01abcdef01abcdef01>",
                 "x",
                 "a",
                 Some("s"),
@@ -446,9 +489,10 @@ mod tests {
         let dec = ev
             .decide(
                 "web_fetch",
-                &json!({"url": "<REDACT:E:abcdef01>"}),
+                &json!({"url": "<REDACT:E:abcdef01abcdef01abcdef01abcdef01>"}),
                 "a",
                 Some("s"),
+                &Caller::owner("test"),
                 &vault,
                 &NullAuditSink,
             )
@@ -464,7 +508,7 @@ mod tests {
         let (vault, _t) = fresh_vault();
         vault
             .insert_mapping(
-                "<REDACT:E:abcdef01>",
+                "<REDACT:E:abcdef01abcdef01abcdef01abcdef01>",
                 "alice@acme.com",
                 "a",
                 Some("s"),
@@ -476,10 +520,10 @@ mod tests {
             )
             .unwrap();
         let args = json!({
-            "to": ["<REDACT:E:abcdef01>"],
-            "options": {"reply_to": "<REDACT:E:abcdef01>"}
+            "to": ["<REDACT:E:abcdef01abcdef01abcdef01abcdef01>"],
+            "options": {"reply_to": "<REDACT:E:abcdef01abcdef01abcdef01abcdef01>"}
         });
-        let dec = ev.decide("send_email", &args, "a", Some("s"), &vault, &NullAuditSink).unwrap();
+        let dec = ev.decide("send_email", &args, "a", Some("s"), &Caller::owner("test"), &vault, &NullAuditSink).unwrap();
         match dec {
             EgressDecision::Allow { args, tokens_restored } => {
                 assert_eq!(tokens_restored, 2);
@@ -491,8 +535,53 @@ mod tests {
     }
 
     #[test]
+    fn scoped_token_denied_for_unscoped_agent_caller() {
+        // C3 regression: a FinanceRead-scoped token must NOT be restored to a
+        // whitelisted tool for a non-owner agent that lacks the scope.
+        let mut rules = HashMap::new();
+        rules.insert("send_email".into(), rule_restore());
+        let ev = EgressEvaluator::new(rules);
+        let (vault, _t) = fresh_vault();
+        vault
+            .insert_mapping(
+                "<REDACT:ACCT:abcdef01abcdef01abcdef01abcdef01>",
+                "ACME-12345",
+                "agnes",
+                Some("s1"),
+                "ACCT",
+                "account",
+                &RestoreScope::AnyScope { scope: "FinanceRead".into() },
+                false,
+                24,
+            )
+            .unwrap();
+        let args = json!({"to": "x", "body": "<REDACT:ACCT:abcdef01abcdef01abcdef01abcdef01>"});
+
+        // Unscoped agent → denied.
+        let dec = ev
+            .decide("send_email", &args, "agnes", Some("s1"),
+                &Caller::agent("agnes", vec![]), &vault, &NullAuditSink)
+            .unwrap();
+        assert!(matches!(dec, EgressDecision::Deny { .. }), "unscoped agent must be denied");
+
+        // Owner (channel end-user) does NOT satisfy an AnyScope requirement.
+        let dec_owner = ev
+            .decide("send_email", &args, "agnes", Some("s1"),
+                &Caller::owner("agnes"), &vault, &NullAuditSink)
+            .unwrap();
+        assert!(matches!(dec_owner, EgressDecision::Deny { .. }), "owner without scope must be denied");
+
+        // Agent granted the scope → allowed.
+        let dec_ok = ev
+            .decide("send_email", &args, "agnes", Some("s1"),
+                &Caller::agent("agnes", vec!["FinanceRead".into()]), &vault, &NullAuditSink)
+            .unwrap();
+        assert!(matches!(dec_ok, EgressDecision::Allow { .. }), "scoped agent must be allowed");
+    }
+
+    #[test]
     fn extract_tokens_from_str_works() {
-        let toks = extract_tokens_from_str("a <REDACT:E:abcdef01> b <REDACT:F:11223344> c");
+        let toks = extract_tokens_from_str("a <REDACT:E:abcdef01abcdef01abcdef01abcdef01> b <REDACT:F:11223344112233441122334411223344> c");
         assert_eq!(toks.len(), 2);
         let toks2 = extract_tokens_from_str("no tokens here");
         assert!(toks2.is_empty());

@@ -32,6 +32,11 @@ pub enum Scope {
     /// `action_confirm`) and the generic `odoo_execute` / `odoo_report`
     /// surfaces, which can fire side-effects beyond simple writes.
     OdooExecute,
+    /// RFC-26: gates the Live Run Forking tools (`fork_run`, `inspect_branches`,
+    /// `diff_branches`, `merge_or_select`, `terminate_branch`, `fork_cost`).
+    /// Distinct from `Admin` so operators can grant an agent the ability to fork
+    /// its own runs without granting full superuser scope.
+    ForkExecute,
     Admin,
 }
 
@@ -47,6 +52,7 @@ impl std::fmt::Display for Scope {
             Scope::OdooRead => "odoo:read",
             Scope::OdooWrite => "odoo:write",
             Scope::OdooExecute => "odoo:execute",
+            Scope::ForkExecute => "fork:execute",
             Scope::Admin => "admin",
         };
         write!(f, "{s}")
@@ -223,9 +229,11 @@ pub fn authenticate_with_key(raw_key: &str, config_dir: &Path) -> Result<Princip
         found.ok_or(AuthError::UnknownKey)?
     };
 
-    // Expiry check: key must not be older than 30 days
+    // Expiry check: key must not be older than 30 days.
+    // L12: a future-dated `created_at` yields a negative duration; clamp to 0
+    // so the `as u64` cast can't wrap into an absurd "age" and falsely expire it.
     let age = Utc::now().signed_duration_since(entry.created_at);
-    let days_old = age.num_days() as u64;
+    let days_old = age.num_days().max(0) as u64;
     if days_old > 30 {
         return Err(AuthError::KeyExpired { days_old });
     }
@@ -262,15 +270,17 @@ pub fn authenticate_from_env(config_dir: &Path) -> Result<Principal, AuthError> 
     let raw_key = match std::env::var("DUDUCLAW_MCP_API_KEY") {
         Ok(k) => k,
         Err(_) => {
-            // No env var set — fall back to default internal principal
-            // when registry is also empty (backwards-compatible).
-            if registry.is_empty() {
-                // ⚠️ SECURITY WARNING: Running without any MCP key authentication.
-                // Set DUDUCLAW_MCP_API_KEY and configure [mcp_keys] in config.toml
-                // for production deployments.
+            // M6: fail-closed. Previously an unconfigured peer (no
+            // DUDUCLAW_MCP_API_KEY *and* no [mcp_keys]) was silently granted an
+            // all-scopes Admin principal. That fails open: any stdio/external
+            // caller would inherit Admin. Now the unauthenticated default
+            // requires an *explicit* operator opt-in so it can never be granted
+            // by accident.
+            if registry.is_empty() && allow_unauthenticated_default() {
                 tracing::warn!(
-                    "MCP server starting without API key authentication (no DUDUCLAW_MCP_API_KEY \
-                     and no [mcp_keys] in config.toml). All scopes granted to default internal \
+                    "MCP server starting without API key authentication \
+                     (DUDUCLAW_MCP_ALLOW_UNAUTHENTICATED=1, no DUDUCLAW_MCP_API_KEY and no \
+                     [mcp_keys] in config.toml). All scopes granted to default internal \
                      principal. This is only safe for trusted local usage."
                 );
                 return Ok(default_internal_principal());
@@ -288,6 +298,17 @@ pub fn authenticate_from_env(config_dir: &Path) -> Result<Principal, AuthError> 
     }
 
     authenticate_with_key(&raw_key, config_dir)
+}
+
+/// M6: whether the operator has explicitly opted into running the MCP server
+/// without any authentication (granting the default Admin principal). Defaults
+/// to `false` (deny). Set `DUDUCLAW_MCP_ALLOW_UNAUTHENTICATED=1` to enable for
+/// trusted local-only usage.
+fn allow_unauthenticated_default() -> bool {
+    matches!(
+        std::env::var("DUDUCLAW_MCP_ALLOW_UNAUTHENTICATED").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
 }
 
 /// Build a default all-scopes internal principal for backwards-compatible
@@ -350,6 +371,9 @@ pub fn parse_scopes(s: &str) -> Result<HashSet<Scope>, AuthError> {
             "odoo:execute" => {
                 result.insert(Scope::OdooExecute);
             }
+            "fork:execute" => {
+                result.insert(Scope::ForkExecute);
+            }
             "admin" => {
                 result.insert(Scope::Admin);
             }
@@ -360,14 +384,51 @@ pub fn parse_scopes(s: &str) -> Result<HashSet<Scope>, AuthError> {
 }
 
 /// Return the minimum Scope required to call this tool.
-/// Returns None for unknown / unrestricted tools.
+///
+/// C2 (2026-06 deep review): this table is **fail-closed**. Every tool not
+/// explicitly mapped to a narrower scope falls through to `Some(Scope::Admin)`,
+/// so a deliberately narrow-scoped key (e.g. `memory:read`) can never reach an
+/// unenumerated high-impact tool (`execute_program`, `agent_update_soul`, …).
+/// The default in-process agent uses `default_internal_principal`, which holds
+/// `Scope::Admin` (a superuser in the dispatcher check), so normal operation is
+/// unaffected. When adding a new tool, map it to the least scope it needs here;
+/// leaving it unmapped means it requires Admin.
 pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
     match tool_name {
-        "memory_search" | "memory_read" | "memory_fetch_batch" => Some(Scope::MemoryRead),
+        // ── Memory: read family ──────────────────────────────────────────
+        "memory_search"
+        | "memory_read"
+        | "memory_fetch_batch"
+        | "memory_search_by_layer"
+        | "memory_successful_conversations"
+        | "memory_consolidation_status"
+        | "memory_improve"
+        | "memory_episodic_pressure" => Some(Scope::MemoryRead),
         "memory_store" => Some(Scope::MemoryWrite),
-        "wiki_read" | "wiki_search" => Some(Scope::WikiRead),
-        "wiki_write" => Some(Scope::WikiWrite),
-        "send_message" => Some(Scope::MessagingSend),
+        // ── Wiki: read family ────────────────────────────────────────────
+        "wiki_read"
+        | "wiki_search"
+        | "wiki_ls"
+        | "wiki_stats"
+        | "wiki_export"
+        | "wiki_graph"
+        | "wiki_lint"
+        | "wiki_namespace_status"
+        | "shared_wiki_read"
+        | "shared_wiki_search"
+        | "shared_wiki_ls"
+        | "shared_wiki_stats"
+        | "shared_wiki_lint" => Some(Scope::WikiRead),
+        // ── Wiki: write family (incl. destructive shared_wiki_delete) ─────
+        "wiki_write"
+        | "wiki_share"
+        | "wiki_dedup"
+        | "wiki_rebuild_fts"
+        | "shared_wiki_write"
+        | "shared_wiki_delete" => Some(Scope::WikiWrite),
+        // ── Messaging / media egress ─────────────────────────────────────
+        "send_message" | "send_photo" | "send_sticker" | "synthesize_speech"
+        | "transcribe_audio" => Some(Scope::MessagingSend),
         // RFC-21 §1: identity resolution requires its own scope so operators
         // can grant wiki access without exposing the person registry.
         "identity_resolve" => Some(Scope::IdentityRead),
@@ -408,7 +469,48 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // page-level trust trends; `wiki_trust_history` exposes
         // `conversation_id` correlatable with user activity.
         "wiki_trust_audit" | "wiki_trust_history" => Some(Scope::Admin),
-        _ => None,
+        // RFC-26: Live Run Forking surface. Gated by its own `fork:execute`
+        // scope (defence-in-depth in addition to the per-agent `[fork] enabled`
+        // toggle, which is checked at handler entry).
+        "fork_run"
+        | "inspect_branches"
+        | "diff_branches"
+        | "merge_or_select"
+        | "terminate_branch"
+        | "fork_cost" => Some(Scope::ForkExecute),
+        // ── High-impact tools — explicitly Admin (C2 fix) ────────────────
+        // Arbitrary code execution, agent lifecycle/identity mutation, prompt
+        // rewrite, cross-agent dispatch, scheduling, and evolution control.
+        // These previously fell through to `None` (no scope), letting any
+        // narrowly-scoped internal key invoke them.
+        "execute_program"
+        | "create_agent"
+        | "spawn_agent"
+        | "agent_update"
+        | "agent_update_soul"
+        | "agent_remove"
+        | "send_to_agent"
+        | "evolution_toggle"
+        | "schedule_task"
+        | "delete_cron_task"
+        | "update_cron_task"
+        | "pause_cron_task"
+        | "channel_config"
+        | "model_download"
+        | "model_load"
+        | "model_unload"
+        | "llamafile_start"
+        | "llamafile_stop"
+        | "inference_mode"
+        | "skill_extract"
+        | "skill_graduate"
+        | "skill_security_scan"
+        | "skill_synthesis_run"
+        | "shared_skill_adopt"
+        | "shared_skill_share" => Some(Scope::Admin),
+        // Fail-closed: any tool not enumerated above requires Admin. See the
+        // doc comment on this function.
+        _ => Some(Scope::Admin),
     }
 }
 
@@ -608,7 +710,100 @@ is_external = {is_external}
     // ── Test 10: tool_requires_scope totally_unknown → None ──────────────────
     #[test]
     fn test_tool_requires_scope_unknown_tool() {
-        assert_eq!(tool_requires_scope("totally_unknown"), None);
+        // C2: fail-closed — unknown tools require Admin, not None.
+        assert_eq!(tool_requires_scope("totally_unknown"), Some(Scope::Admin));
+    }
+
+    #[test]
+    fn test_dangerous_tools_require_admin() {
+        // C2 regression: these previously returned None (no scope), letting a
+        // narrowly-scoped key invoke them.
+        for tool in [
+            "execute_program",
+            "agent_update_soul",
+            "agent_remove",
+            "agent_update",
+            "spawn_agent",
+            "create_agent",
+            "send_to_agent",
+            "evolution_toggle",
+            "schedule_task",
+            "delete_cron_task",
+            "shared_wiki_write",
+            "shared_wiki_delete",
+        ] {
+            let req = tool_requires_scope(tool);
+            assert!(
+                matches!(req, Some(Scope::Admin) | Some(Scope::WikiWrite)),
+                "tool {tool} must require a real scope, got {req:?}"
+            );
+            // A memory:read-only principal must NOT satisfy it.
+            assert_ne!(req, Some(Scope::MemoryRead));
+        }
+    }
+
+    #[test]
+    fn test_read_tools_keep_narrow_scope() {
+        // Narrow read keys must keep working (not forced to Admin).
+        assert_eq!(tool_requires_scope("wiki_ls"), Some(Scope::WikiRead));
+        assert_eq!(
+            tool_requires_scope("memory_search_by_layer"),
+            Some(Scope::MemoryRead)
+        );
+        assert_eq!(tool_requires_scope("send_photo"), Some(Scope::MessagingSend));
+    }
+
+    // ── M6: fail-closed when nothing is configured ────────────────────────────
+    #[test]
+    fn test_unconfigured_is_fail_closed_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new().unwrap(); // no config.toml ⇒ empty registry
+        // SAFETY: protected by ENV_LOCK.
+        unsafe {
+            std::env::remove_var("DUDUCLAW_MCP_API_KEY");
+            std::env::remove_var("DUDUCLAW_MCP_ALLOW_UNAUTHENTICATED");
+        }
+        let result = authenticate_from_env(dir.path());
+        assert_eq!(
+            result.unwrap_err(),
+            AuthError::MissingKey,
+            "unauthenticated peer must NOT be granted the default Admin principal"
+        );
+    }
+
+    #[test]
+    fn test_unconfigured_grants_default_only_with_explicit_optin() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        // SAFETY: protected by ENV_LOCK.
+        unsafe {
+            std::env::remove_var("DUDUCLAW_MCP_API_KEY");
+            std::env::set_var("DUDUCLAW_MCP_ALLOW_UNAUTHENTICATED", "1");
+        }
+        let result = authenticate_from_env(dir.path());
+        unsafe { std::env::remove_var("DUDUCLAW_MCP_ALLOW_UNAUTHENTICATED") };
+        let principal = result.expect("explicit opt-in should grant default principal");
+        assert_eq!(principal.client_id, "default");
+        assert!(principal.scopes.contains(&Scope::Admin));
+        assert!(!principal.is_external);
+    }
+
+    // ── L12: future-dated key must not be treated as ancient ──────────────────
+    #[test]
+    fn test_future_dated_key_is_not_expired() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = fresh_key("prod");
+        // created_at 10 days in the FUTURE (clock skew / mis-set system time).
+        let future = (Utc::now() + chrono::Duration::days(10)).to_rfc3339();
+        let dir = make_config_dir_with_key(&key, "client-future", &["memory:read"], false, &future);
+        // SAFETY: protected by ENV_LOCK.
+        unsafe { std::env::set_var("DUDUCLAW_MCP_API_KEY", &key) };
+        let result = authenticate_from_env(dir.path());
+        unsafe { std::env::remove_var("DUDUCLAW_MCP_API_KEY") };
+        // Before the L12 fix, num_days() was negative and `as u64` wrapped to a
+        // huge value ⇒ KeyExpired. Now age clamps to 0 ⇒ authenticates.
+        let principal = result.expect("future-dated key must authenticate, not falsely expire");
+        assert_eq!(principal.client_id, "client-future");
     }
 
     // ── Test 11: constant-time lookup — valid key matching different entries ──

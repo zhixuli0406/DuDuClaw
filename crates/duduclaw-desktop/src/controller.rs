@@ -176,12 +176,14 @@ impl DesktopController for NativeDesktopController {
     }
 
     fn key_press(&mut self, key_str: &str) -> Result<(), DesktopError> {
-        // Parse key combinations like "ctrl+s", "Return", "Tab"
-        let parts: Vec<&str> = key_str.split('+').collect();
+        // Parse key combinations like "ctrl+s", "Return", "Tab", "ctrl++".
+        // `parse_key_combo` handles a literal '+' as the final key (which a naive
+        // `split('+')` would turn into empty segments and silently drop).
+        let (modifiers, final_key) = parse_key_combo(key_str);
 
         // Press modifier keys
-        for part in &parts[..parts.len().saturating_sub(1)] {
-            if let Some(key) = parse_enigo_key(part.trim()) {
+        for part in &modifiers {
+            if let Some(key) = parse_enigo_key(part) {
                 self.enigo
                     .key(key, Direction::Press)
                     .map_err(|e| DesktopError::InputFailed(format!("key press {part}: {e}")))?;
@@ -189,8 +191,8 @@ impl DesktopController for NativeDesktopController {
         }
 
         // Press and release the final key
-        if let Some(last) = parts.last() {
-            if let Some(key) = parse_enigo_key(last.trim()) {
+        if let Some(last) = &final_key {
+            if let Some(key) = parse_enigo_key(last) {
                 self.enigo
                     .key(key, Direction::Click)
                     .map_err(|e| DesktopError::InputFailed(format!("key click {last}: {e}")))?;
@@ -198,8 +200,8 @@ impl DesktopController for NativeDesktopController {
         }
 
         // Release modifier keys (reverse order)
-        for part in parts[..parts.len().saturating_sub(1)].iter().rev() {
-            if let Some(key) = parse_enigo_key(part.trim()) {
+        for part in modifiers.iter().rev() {
+            if let Some(key) = parse_enigo_key(part) {
                 self.enigo
                     .key(key, Direction::Release)
                     .map_err(|e| DesktopError::InputFailed(format!("key release {part}: {e}")))?;
@@ -227,6 +229,48 @@ impl DesktopController for NativeDesktopController {
             .scroll(clicks, axis)
             .map_err(|e| DesktopError::InputFailed(format!("scroll: {e}")))
     }
+}
+
+/// Split a key-combination string into (modifier tokens, final key token).
+///
+/// Splitting naively on '+' is wrong for combos whose final key is itself a
+/// literal '+': `"ctrl++"` -> `["ctrl", "", ""]`, where the empty trailing
+/// segments cause the actual '+' key to never be pressed. This parser treats a
+/// trailing '+' (or a combo that is just "+") as a literal plus key, and drops
+/// empty/whitespace-only modifier tokens.
+///
+/// Examples:
+/// - `"ctrl+s"`  -> (["ctrl"], Some("s"))
+/// - `"ctrl++"`  -> (["ctrl"], Some("+"))
+/// - `"+"`        -> ([], Some("+"))
+/// - `"Return"`  -> ([], Some("Return"))
+pub fn parse_key_combo(key_str: &str) -> (Vec<String>, Option<String>) {
+    let trimmed = key_str.trim();
+
+    // A bare "+" means the literal plus key with no modifiers.
+    if trimmed == "+" {
+        return (Vec::new(), Some("+".to_string()));
+    }
+
+    // A trailing '+' (e.g. "ctrl++") means the final key is the literal '+'.
+    // Everything before the last '+' is the modifier portion.
+    let (modifier_str, final_key) = if let Some(prefix) = trimmed.strip_suffix("++") {
+        (prefix, "+".to_string())
+    } else {
+        match trimmed.rsplit_once('+') {
+            Some((prefix, last)) => (prefix, last.trim().to_string()),
+            None => return (Vec::new(), Some(trimmed.to_string())),
+        }
+    };
+
+    let modifiers: Vec<String> = modifier_str
+        .split('+')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    (modifiers, Some(final_key))
 }
 
 /// Parse a key name string to an enigo Key.
@@ -310,5 +354,60 @@ mod tests {
     #[test]
     fn parse_key_unknown() {
         assert!(parse_enigo_key("unknownkey").is_none());
+    }
+
+    #[test]
+    fn combo_simple_with_modifier() {
+        let (mods, key) = parse_key_combo("ctrl+s");
+        assert_eq!(mods, vec!["ctrl".to_string()]);
+        assert_eq!(key.as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn combo_single_key_no_modifier() {
+        let (mods, key) = parse_key_combo("Return");
+        assert!(mods.is_empty());
+        assert_eq!(key.as_deref(), Some("Return"));
+    }
+
+    #[test]
+    fn combo_literal_plus_with_modifier() {
+        // "ctrl++" must resolve to ctrl + literal '+', not a dropped empty key.
+        let (mods, key) = parse_key_combo("ctrl++");
+        assert_eq!(mods, vec!["ctrl".to_string()]);
+        assert_eq!(key.as_deref(), Some("+"));
+        // And the literal '+' must be a recognized key.
+        assert!(matches!(
+            parse_enigo_key(&key.unwrap()),
+            Some(enigo::Key::Unicode('+'))
+        ));
+    }
+
+    #[test]
+    fn combo_bare_plus() {
+        let (mods, key) = parse_key_combo("+");
+        assert!(mods.is_empty());
+        assert_eq!(key.as_deref(), Some("+"));
+    }
+
+    #[test]
+    fn combo_multiple_modifiers() {
+        let (mods, key) = parse_key_combo("ctrl+shift+s");
+        assert_eq!(mods, vec!["ctrl".to_string(), "shift".to_string()]);
+        assert_eq!(key.as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn combo_multiple_modifiers_literal_plus() {
+        let (mods, key) = parse_key_combo("ctrl+shift++");
+        assert_eq!(mods, vec!["ctrl".to_string(), "shift".to_string()]);
+        assert_eq!(key.as_deref(), Some("+"));
+    }
+
+    #[test]
+    fn combo_trims_whitespace() {
+        let (mods, key) = parse_key_combo(" ctrl + s ");
+        assert_eq!(mods, vec!["ctrl".to_string()]);
+        assert_eq!(key.as_deref(), Some("s"));
     }
 }

@@ -66,7 +66,8 @@ _PATTERN_DEFS: List[Tuple[str, VetterResult, List[str]]] = [
         r'(password|passwd|pwd)\s*[=:]\s*["\'][^"\']+["\']',
         r'(secret|token)\s*[=:]\s*["\'][^"\']+["\']',
         r'sk-[a-zA-Z0-9]{20,}',  # API key pattern
-        r'ghp_[a-zA-Z0-9]{36}',  # GitHub token
+        r'ghp_[a-zA-Z0-9]{36}',  # GitHub classic personal access token
+        r'github_pat_[A-Za-z0-9_]{22,}',  # GitHub fine-grained PAT
     ]),
 ]
 

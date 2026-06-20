@@ -1,5 +1,5 @@
 # Behavioral Contract for Restaurant Agent
-# See: https://github.com/user/DuDuClaw/docs/evolution-engine.md
+# See: https://github.com/user/DuDuClaw/docs/architecture/evolution-engine.md
 
 [boundaries]
 must_not = [

@@ -6,7 +6,11 @@ import {
   type WikiPageMeta,
   type WikiSearchHit,
   type SharedWikiStats,
+  type WikiScopeNamespace,
+  type WikiScopeMode,
 } from '@/lib/api';
+import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { toast, formatError } from '@/lib/toast';
 import {
   BookOpen,
   Search,
@@ -17,9 +21,13 @@ import {
   ChevronRight,
   ChevronDown,
   Users,
+  Lock,
+  Plus,
+  Pencil,
+  Trash2,
 } from 'lucide-react';
 
-type TabId = 'browse' | 'search' | 'stats';
+type TabId = 'browse' | 'search' | 'stats' | 'policy';
 
 export function SharedWikiPage() {
   const intl = useIntl();
@@ -29,6 +37,7 @@ export function SharedWikiPage() {
     { id: 'browse', label: intl.formatMessage({ id: 'sharedWiki.tab.browse' }) },
     { id: 'search', label: intl.formatMessage({ id: 'sharedWiki.tab.search' }) },
     { id: 'stats', label: intl.formatMessage({ id: 'sharedWiki.tab.stats' }) },
+    { id: 'policy', label: intl.formatMessage({ id: 'sharedWiki.tab.policy' }) },
   ];
 
   return (
@@ -66,6 +75,7 @@ export function SharedWikiPage() {
         {activeTab === 'browse' && <BrowseTab />}
         {activeTab === 'search' && <SearchTab />}
         {activeTab === 'stats' && <StatsTab />}
+        {activeTab === 'policy' && <PolicyTab />}
       </div>
     </div>
   );
@@ -458,5 +468,198 @@ function StatsTab() {
         </div>
       )}
     </div>
+  );
+}
+
+// ── Namespace Policy Tab (SCP.2) ──────────────────────────
+
+const SCOPE_MODE_COLORS: Record<WikiScopeMode, string> = {
+  agent_writable: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
+  read_only: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
+  operator_only: 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400',
+};
+
+function PolicyTab() {
+  const intl = useIntl();
+  const [namespaces, setNamespaces] = useState<ReadonlyArray<WikiScopeNamespace>>([]);
+  const [loading, setLoading] = useState(false);
+  const [editing, setEditing] = useState<{ ns: WikiScopeNamespace; isNew: boolean } | null>(null);
+
+  const fetchScope = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await api.wikiScope.get();
+      setNamespaces(res?.namespaces ?? []);
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    } finally {
+      setLoading(false);
+    }
+  }, [intl]);
+
+  useEffect(() => {
+    fetchScope();
+  }, [fetchScope]);
+
+  const handleRemove = async (ns: string) => {
+    try {
+      await api.wikiScope.update({ namespace: ns, remove: true });
+      toast.success(intl.formatMessage({ id: 'scp.removed' }));
+      fetchScope();
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <p className="text-sm text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'scp.desc' })}</p>
+        <button
+          onClick={() => setEditing({ ns: { namespace: '', mode: 'agent_writable', synced_from: null }, isNew: true })}
+          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-amber-600"
+        >
+          <Plus className="h-4 w-4" />
+          {intl.formatMessage({ id: 'scp.add' })}
+        </button>
+      </div>
+
+      <div className="glass-card rounded-2xl p-6">
+        {loading ? (
+          <p className="py-8 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
+        ) : namespaces.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-12">
+            <Lock className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
+            <p className="text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'scp.empty' })}</p>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-stone-200 dark:border-stone-700">
+                  <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'scp.col.namespace' })}</th>
+                  <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'scp.col.mode' })}</th>
+                  <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'scp.col.syncedFrom' })}</th>
+                  <th className="py-2 text-right font-medium text-stone-500 dark:text-stone-400" />
+                </tr>
+              </thead>
+              <tbody>
+                {namespaces.map((n) => (
+                  <tr key={n.namespace} className="border-b border-stone-100 dark:border-stone-800">
+                    <td className="py-2.5 font-medium text-stone-800 dark:text-stone-200">{n.namespace}/</td>
+                    <td className="py-2.5">
+                      <span className={`inline-flex rounded-full px-2 py-0.5 text-[11px] font-medium ${SCOPE_MODE_COLORS[n.mode]}`}>
+                        {n.mode}
+                      </span>
+                    </td>
+                    <td className="py-2.5 text-xs text-stone-500 dark:text-stone-400">{n.synced_from ?? '—'}</td>
+                    <td className="py-2.5 text-right">
+                      <div className="flex items-center justify-end gap-1">
+                        <button
+                          onClick={() => setEditing({ ns: { ...n }, isNew: false })}
+                          className="rounded p-1.5 text-stone-500 hover:bg-stone-100 hover:text-stone-700 dark:hover:bg-stone-800 dark:hover:text-stone-300"
+                          title={intl.formatMessage({ id: 'common.edit' })}
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          onClick={() => handleRemove(n.namespace)}
+                          className="rounded p-1.5 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20"
+                          title={intl.formatMessage({ id: 'common.delete' })}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {editing && (
+        <NamespacePolicyDialog
+          initial={editing.ns}
+          isNew={editing.isNew}
+          onClose={() => setEditing(null)}
+          onSaved={() => { setEditing(null); fetchScope(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+function NamespacePolicyDialog({
+  initial,
+  isNew,
+  onClose,
+  onSaved,
+}: {
+  initial: WikiScopeNamespace;
+  isNew: boolean;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const intl = useIntl();
+  const [namespace, setNamespace] = useState(initial.namespace);
+  const [mode, setMode] = useState<WikiScopeMode>(initial.mode);
+  const [syncedFrom, setSyncedFrom] = useState(initial.synced_from ?? '');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleSubmit = async () => {
+    if (!namespace.trim()) {
+      setError(intl.formatMessage({ id: 'scp.error.nsRequired' }));
+      return;
+    }
+    if (mode === 'read_only' && !syncedFrom.trim()) {
+      setError(intl.formatMessage({ id: 'scp.error.syncedRequired' }));
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    try {
+      await api.wikiScope.update({
+        namespace: namespace.trim(),
+        mode,
+        ...(mode === 'read_only' ? { synced_from: syncedFrom.trim() } : {}),
+      });
+      onSaved();
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open onClose={onClose} title={isNew ? intl.formatMessage({ id: 'scp.add' }) : intl.formatMessage({ id: 'scp.edit' })}>
+      <div className="space-y-4">
+        <FormField label={intl.formatMessage({ id: 'scp.col.namespace' })} hint={intl.formatMessage({ id: 'scp.field.namespace.hint' })}>
+          <input type="text" value={namespace} onChange={(e) => setNamespace(e.target.value)} disabled={!isNew} placeholder="identity" className={inputClass} />
+        </FormField>
+        <FormField label={intl.formatMessage({ id: 'scp.col.mode' })} hint={intl.formatMessage({ id: 'scp.field.mode.hint' })}>
+          <select value={mode} onChange={(e) => setMode(e.target.value as WikiScopeMode)} className={selectClass}>
+            <option value="agent_writable">agent_writable</option>
+            <option value="read_only">read_only</option>
+            <option value="operator_only">operator_only</option>
+          </select>
+        </FormField>
+        {mode === 'read_only' && (
+          <FormField label={intl.formatMessage({ id: 'scp.col.syncedFrom' })} hint={intl.formatMessage({ id: 'scp.field.syncedFrom.hint' })}>
+            <input type="text" value={syncedFrom} onChange={(e) => setSyncedFrom(e.target.value)} placeholder="identity:read" className={inputClass} />
+          </FormField>
+        )}
+        {error && <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>}
+        <div className="flex justify-end gap-3 border-t border-stone-200 pt-4 dark:border-stone-700">
+          <button onClick={onClose} className={buttonSecondary}>{intl.formatMessage({ id: 'common.cancel' })}</button>
+          <button onClick={handleSubmit} disabled={submitting} className={buttonPrimary}>
+            {submitting ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+          </button>
+        </div>
+      </div>
+    </Dialog>
   );
 }

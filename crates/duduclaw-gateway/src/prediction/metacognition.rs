@@ -421,7 +421,19 @@ pub struct MetaCognition {
     /// Determines whether to extend beyond the default 3 generations.
     #[serde(default)]
     pub gvu_generation_stats: GvuGenerationStats,
+
+    // ── M35: windowed Critical proportion ───────────────────────
+    /// Rolling window of recent prediction category labels (most recent at the
+    /// back). Used to compute a *windowed* Critical proportion instead of the
+    /// lifetime-cumulative one, which otherwise ratchets `significant_upper`
+    /// down to its 0.4 floor permanently after any early burst of Critical
+    /// errors and then mis-fires emergency GVU forever.
+    #[serde(default)]
+    pub recent_categories: VecDeque<ErrorCategory>,
 }
+
+/// Window size for the M35 recent-Critical-proportion calculation.
+const RECENT_CATEGORY_WINDOW: usize = 100;
 
 impl Default for MetaCognition {
     fn default() -> Self {
@@ -441,6 +453,7 @@ impl Default for MetaCognition {
             proactive_dismissed: 0,
             proactive_since_last_cal: 0,
             gvu_generation_stats: GvuGenerationStats::default(),
+            recent_categories: VecDeque::new(),
         }
     }
 }
@@ -466,6 +479,13 @@ impl MetaCognition {
         let key = format!("{:?}", error.category);
         let stats = self.layer_stats.entry(key).or_default();
         stats.record_trigger();
+
+        // M35: track the category in a bounded rolling window so the Critical
+        // proportion reflects *recent* behaviour, not lifetime cumulative.
+        self.recent_categories.push_back(error.category);
+        while self.recent_categories.len() > RECENT_CATEGORY_WINDOW {
+            self.recent_categories.pop_front();
+        }
 
         self.predictions_since_last_eval += 1;
         self.total_predictions += 1;
@@ -527,7 +547,6 @@ impl MetaCognition {
     /// threshold might be too high (missing opportunities).
     pub fn evaluate_and_adjust(&mut self) {
         let sig_key = format!("{:?}", ErrorCategory::Significant);
-        let crit_key = format!("{:?}", ErrorCategory::Critical);
         let mod_key = format!("{:?}", ErrorCategory::Moderate);
 
         let current_sig_rate = self
@@ -553,14 +572,21 @@ impl MetaCognition {
             current_sig_rate
         };
 
-        let crit_proportion = {
-            let crit_triggers = self.layer_stats.get(&crit_key).map(|s| s.total_triggers).unwrap_or(0);
-            let total_triggers: u64 = self.layer_stats.values().map(|s| s.total_triggers).sum();
-            if total_triggers > 0 {
-                crit_triggers as f64 / total_triggers as f64
-            } else {
-                0.0
-            }
+        // M35: compute the Critical proportion over the recent window, NOT the
+        // lifetime cumulative `total_triggers`. With the cumulative form, once the
+        // proportion exceeded 0.2 it could essentially never fall back below it
+        // (a fixed historical numerator), so `significant_upper` ratcheted down to
+        // its 0.4 floor and emergency GVU mis-fired indefinitely. The windowed
+        // proportion recovers as recent behaviour normalises.
+        let crit_proportion = if self.recent_categories.is_empty() {
+            0.0
+        } else {
+            let crit_recent = self
+                .recent_categories
+                .iter()
+                .filter(|&&c| c == ErrorCategory::Critical)
+                .count();
+            crit_recent as f64 / self.recent_categories.len() as f64
         };
 
         let _mod_rate = self
@@ -947,5 +973,65 @@ mod bug4_tests {
         let v = meta.original_sig_improvement_rate.unwrap();
         // 3 of 5 improved.
         assert!((v - 0.6).abs() < 1e-9, "baseline = 3/5 = 0.6 (got {v})");
+    }
+
+    // ── M35: windowed Critical proportion ──────────────────────────────────────
+
+    /// Push `n` copies of `category` into the recent-category window, evicting
+    /// oldest entries beyond `RECENT_CATEGORY_WINDOW` exactly like
+    /// `record_prediction` does. (Constructing a full `PredictionError` here is
+    /// unnecessary — only the category bookkeeping is under test.)
+    fn push_categories(meta: &mut MetaCognition, category: ErrorCategory, n: usize) {
+        for _ in 0..n {
+            meta.recent_categories.push_back(category);
+            while meta.recent_categories.len() > RECENT_CATEGORY_WINDOW {
+                meta.recent_categories.pop_front();
+            }
+        }
+    }
+
+    /// M35: a window dominated by recent non-Critical predictions must yield a
+    /// LOW Critical proportion even after an early burst of Critical errors, so
+    /// `significant_upper` is NOT ratcheted down to its 0.4 floor.
+    #[test]
+    fn test_crit_proportion_is_windowed_not_cumulative() {
+        let mut meta = MetaCognition::default();
+        let baseline_sig_upper = meta.thresholds.significant_upper;
+
+        // Early burst of Critical errors (would dominate a lifetime-cumulative
+        // proportion forever) followed by a long stretch of well-behaved
+        // predictions that pushes the Critical errors out of the rolling window.
+        push_categories(&mut meta, ErrorCategory::Critical, 30);
+        push_categories(&mut meta, ErrorCategory::Negligible, RECENT_CATEGORY_WINDOW);
+
+        // Window is now entirely Negligible → recent Critical proportion ≈ 0.
+        let crit_recent = meta
+            .recent_categories
+            .iter()
+            .filter(|&&c| c == ErrorCategory::Critical)
+            .count();
+        assert_eq!(crit_recent, 0, "early Critical burst must age out of window");
+
+        meta.evaluate_and_adjust();
+        assert!(
+            meta.thresholds.significant_upper >= baseline_sig_upper - 1e-9,
+            "windowed crit_proportion must not ratchet significant_upper down \
+             (was {baseline_sig_upper}, now {})",
+            meta.thresholds.significant_upper
+        );
+    }
+
+    /// M35: a window genuinely dominated by recent Critical errors should still
+    /// trigger the downward adjustment (the guard must remain effective).
+    #[test]
+    fn test_crit_proportion_recent_high_still_adjusts() {
+        let mut meta = MetaCognition::default();
+        let baseline_sig_upper = meta.thresholds.significant_upper;
+        push_categories(&mut meta, ErrorCategory::Critical, 50);
+        meta.evaluate_and_adjust();
+        assert!(
+            meta.thresholds.significant_upper < baseline_sig_upper,
+            "recent-Critical-heavy window must lower significant_upper"
+        );
     }
 }

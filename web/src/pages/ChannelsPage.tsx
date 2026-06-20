@@ -350,6 +350,10 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
 
   const [token, setToken] = useState('');
   const [secret, setSecret] = useState('');
+  // G.6 — extra per-platform tokens stored under config.* keys (write-only).
+  const [waVerifyToken, setWaVerifyToken] = useState('');
+  const [waAppSecret, setWaAppSecret] = useState('');
+  const [feishuVerifyToken, setFeishuVerifyToken] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
 
@@ -359,11 +363,22 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
     try {
       const config: Record<string, string> = { token: token.trim() };
       if (secret.trim()) config.secret = secret.trim();
+      // G.6 — extra global channel tokens; only sent when typed.
+      if (channelType === 'whatsapp') {
+        if (waVerifyToken.trim()) config.whatsapp_verify_token = waVerifyToken.trim();
+        if (waAppSecret.trim()) config.whatsapp_app_secret = waAppSecret.trim();
+      }
+      if (channelType === 'feishu' && feishuVerifyToken.trim()) {
+        config.feishu_verification_token = feishuVerifyToken.trim();
+      }
       await api.channels.add(channelType, config, selectedAgent || undefined);
       onCreated();
       onClose();
       setToken('');
       setSecret('');
+      setWaVerifyToken('');
+      setWaAppSecret('');
+      setFeishuVerifyToken('');
       setSelectedAgent('');
     } catch (e) {
       setAddError(String(e));
@@ -510,6 +525,25 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
               placeholder={guide.secretLabel}
               className={inputClass}
             />
+          </FormField>
+        )}
+
+        {/* G.6 — extra WhatsApp tokens (global) */}
+        {channelType === 'whatsapp' && (
+          <>
+            <FormField label="Verify Token" hint={intl.formatMessage({ id: 'channels.field.writeOnly' })}>
+              <input type="password" value={waVerifyToken} onChange={(e) => setWaVerifyToken(e.target.value)} className={inputClass} autoComplete="off" />
+            </FormField>
+            <FormField label="App Secret" hint={intl.formatMessage({ id: 'channels.field.writeOnly' })}>
+              <input type="password" value={waAppSecret} onChange={(e) => setWaAppSecret(e.target.value)} className={inputClass} autoComplete="off" />
+            </FormField>
+          </>
+        )}
+
+        {/* G.6 — extra Feishu token (global) */}
+        {channelType === 'feishu' && (
+          <FormField label="Verification Token" hint={intl.formatMessage({ id: 'channels.field.writeOnly' })}>
+            <input type="password" value={feishuVerifyToken} onChange={(e) => setFeishuVerifyToken(e.target.value)} className={inputClass} autoComplete="off" />
           </FormField>
         )}
 

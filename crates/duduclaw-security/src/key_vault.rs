@@ -59,22 +59,34 @@ pub fn resolve_agent_keys(
         }
     }
 
-    // API key (Anthropic) — try encrypted field first
-    let api_key = config
-        .get("api")
-        .and_then(|a| a.get("anthropic_api_key_enc"))
-        .and_then(|v| v.as_str())
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            config
-                .get("api")
-                .and_then(|a| a.get("anthropic_api_key"))
-                .and_then(|v| v.as_str())
-                .filter(|v| !v.is_empty())
-        });
+    // API key (Anthropic) — gated by `allowed_channels` just like channel keys.
+    //
+    // D9/D10: previously the global Anthropic key was returned unconditionally,
+    // ignoring `allowed_channels`. We now require the agent to be allowed `"*"`
+    // or the `"anthropic"` capability before exposing the LLM key. This is a
+    // guarded check that is correct once a caller actually passes the agent's
+    // channel/capability list — today there is NO production caller of
+    // `resolve_agent_keys` (latent), so this changes no live behaviour, but it
+    // closes the gap by construction the moment one is added.
+    let anthropic_allowed =
+        allow_all || allowed_channels.iter().any(|c| c == "anthropic");
+    if anthropic_allowed {
+        let api_key = config
+            .get("api")
+            .and_then(|a| a.get("anthropic_api_key_enc"))
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                config
+                    .get("api")
+                    .and_then(|a| a.get("anthropic_api_key"))
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty())
+            });
 
-    if let Some(api_key) = api_key {
-        keys.insert("anthropic".to_string(), api_key.to_string());
+        if let Some(api_key) = api_key {
+            keys.insert("anthropic".to_string(), api_key.to_string());
+        }
     }
 
     info!(
@@ -110,4 +122,44 @@ pub async fn resolve_keys_from_config(
     };
 
     resolve_agent_keys(agent_id, allowed_channels, &config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_api() -> toml::Table {
+        r#"
+[api]
+anthropic_api_key = "sk-test-123"
+
+[channels]
+telegram_bot_token = "tg-token"
+"#
+        .parse()
+        .unwrap()
+    }
+
+    #[test]
+    fn anthropic_key_granted_with_wildcard() {
+        let cfg = config_with_api();
+        let ks = resolve_agent_keys("a", &["*".to_string()], &cfg);
+        assert_eq!(ks.keys.get("anthropic").map(String::as_str), Some("sk-test-123"));
+    }
+
+    #[test]
+    fn anthropic_key_granted_when_explicitly_allowed() {
+        let cfg = config_with_api();
+        let ks = resolve_agent_keys("a", &["anthropic".to_string()], &cfg);
+        assert!(ks.keys.contains_key("anthropic"));
+    }
+
+    #[test]
+    fn anthropic_key_withheld_when_not_allowed() {
+        // D9/D10: an agent restricted to telegram must not receive the LLM key.
+        let cfg = config_with_api();
+        let ks = resolve_agent_keys("a", &["telegram".to_string()], &cfg);
+        assert!(!ks.keys.contains_key("anthropic"), "anthropic key must be gated");
+        assert!(ks.keys.contains_key("telegram"));
+    }
 }

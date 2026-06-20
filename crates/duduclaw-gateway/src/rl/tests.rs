@@ -130,6 +130,89 @@ mod rl_tests {
         assert!(!traj.turns[2].is_agent_generated); // tool
     }
 
+    /// D3: an agent turn followed by a tool result must populate `tool_calls`
+    /// so the tool-efficiency reward varies (was always None → constant reward).
+    #[test]
+    fn test_build_trajectory_populates_tool_calls_from_adjacency() {
+        let messages = vec![
+            ("user".to_string(), "search the docs".to_string()),
+            ("assistant".to_string(), "let me look".to_string()),
+            ("tool".to_string(), "{\"results\": [1,2,3]}".to_string()),
+        ];
+        let traj =
+            TrajectoryExporter::build_trajectory("sess_12345678", "agent1", "model1", &messages, 1.0);
+
+        assert_eq!(
+            traj.total_tool_calls(),
+            1,
+            "adjacency to a tool result must yield one inferred tool call"
+        );
+        // Non-error result → counted as successful.
+        assert_eq!(traj.successful_tool_calls(), 1);
+    }
+
+    /// D3: structured tool_use blocks in agent content are extracted with names.
+    #[test]
+    fn test_build_trajectory_parses_structured_tool_use() {
+        let content =
+            "{\"content\":[{\"type\":\"tool_use\",\"name\":\"grep\",\"input\":{\"q\":\"x\"}}]}";
+        let messages = vec![
+            ("assistant".to_string(), content.to_string()),
+            ("tool".to_string(), "matched 2 files".to_string()),
+        ];
+        let traj =
+            TrajectoryExporter::build_trajectory("sess_abcdef00", "agent1", "model1", &messages, 1.0);
+
+        let calls = traj.turns[0].tool_calls.as_ref().expect("tool_calls present");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "grep");
+    }
+
+    /// D3: an error tool result marks the call unsuccessful, so reward signals
+    /// can distinguish good vs bad tool use.
+    #[test]
+    fn test_build_trajectory_marks_error_result_unsuccessful() {
+        let messages = vec![
+            ("assistant".to_string(), "run it".to_string()),
+            ("tool".to_string(), "Error: command failed".to_string()),
+        ];
+        let traj =
+            TrajectoryExporter::build_trajectory("sess_12345678", "agent1", "model1", &messages, 1.0);
+        assert_eq!(traj.total_tool_calls(), 1);
+        assert_eq!(traj.successful_tool_calls(), 0, "error result → not successful");
+    }
+
+    /// D3: a plain agent turn with no following tool result has no tool calls
+    /// (preserves loss masking / None semantics).
+    #[test]
+    fn test_build_trajectory_no_tool_call_without_result() {
+        let messages = vec![
+            ("user".to_string(), "hi".to_string()),
+            ("assistant".to_string(), "hello!".to_string()),
+        ];
+        let traj =
+            TrajectoryExporter::build_trajectory("sess_12345678", "agent1", "model1", &messages, 1.0);
+        assert!(traj.turns[1].tool_calls.is_none());
+        assert_eq!(traj.total_tool_calls(), 0);
+    }
+
+    /// L8: a short / multi-byte session_id must not panic on the `[..8]` slice.
+    #[test]
+    fn test_build_trajectory_short_and_multibyte_session_id_no_panic() {
+        let messages = vec![("user".to_string(), "hi".to_string())];
+
+        // Short ID (fewer than 8 bytes).
+        let t1 = TrajectoryExporter::build_trajectory("ab", "a", "m", &messages, 1.0);
+        assert!(t1.trajectory_id.contains("ab"));
+
+        // Multi-byte ID where byte 8 lands inside a CJK char (would panic with a
+        // raw byte slice). "會話" is 3 bytes per char.
+        let t2 =
+            TrajectoryExporter::build_trajectory("會話會話會話", "a", "m", &messages, 1.0);
+        // 8 chars requested, only 6 available → no panic, prefix is the 6 chars.
+        assert!(t2.trajectory_id.starts_with("traj_"));
+    }
+
     #[test]
     fn test_token_estimation_ascii() {
         // 12 ASCII chars -> (12 + 3) / 4 = 3 tokens

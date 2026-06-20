@@ -120,7 +120,30 @@ impl ContainerRuntime for Wsl2Runtime {
                 args.push("--read-only");
             }
 
+            if !config.network_access {
+                args.push("--network");
+                args.push("none");
+            }
+
+            // HC5: inject env vars (`-e K=V`) so DUDUCLAW_PTC_SOCKET reaches the
+            // in-container script.
+            let env_strings: Vec<String> = config
+                .env
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            for env_str in &env_strings {
+                args.push("-e");
+                args.push(env_str);
+            }
+
             args.push("duduclaw-agent:latest");
+
+            // HC5: append the user command (after the image name) so the script
+            // actually runs.
+            for part in &config.cmd {
+                args.push(part);
+            }
 
             let output = self.wsl_exec(&args).await?;
             info!(name = %container_name, "WSL2 container created");
@@ -189,6 +212,25 @@ impl ContainerRuntime for Wsl2Runtime {
         #[cfg(target_os = "windows")]
         {
             self.wsl_exec(&["docker", "logs", &id.0]).await
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = id;
+            Err(DuDuClawError::Container(
+                "WSL2 runtime only available on Windows".into(),
+            ))
+        }
+    }
+
+    async fn wait(&self, id: &ContainerId) -> Result<ContainerExit> {
+        #[cfg(target_os = "windows")]
+        {
+            // `docker wait` blocks until exit and prints the status code.
+            let code_out = self.wsl_exec(&["docker", "wait", &id.0]).await?;
+            let exit_code = code_out.trim().parse::<i64>().unwrap_or(-1);
+            let logs = self.logs(id).await.unwrap_or_default();
+            info!(id = %id.0, exit_code, "WSL2 container exited");
+            Ok(ContainerExit { exit_code, logs })
         }
         #[cfg(not(target_os = "windows"))]
         {

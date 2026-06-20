@@ -16,6 +16,13 @@ static VERSION_STORE_NO_CRYPTO_WARNED: AtomicBool = AtomicBool::new(false);
 
 use duduclaw_security::crypto::CryptoEngine;
 
+/// SHA-256 hex digest of arbitrary bytes — shared by the rollback integrity path.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use ring::digest;
+    let d = digest::digest(&digest::SHA256, bytes);
+    d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Performance metrics measured over a time period.
 ///
 /// Used as both pre_metrics (baseline) and post_metrics (after change).
@@ -140,7 +147,8 @@ impl VersionStore {
                 pre_metrics_json TEXT NOT NULL,
                 post_metrics_json TEXT,
                 proposal_id TEXT NOT NULL,
-                rollback_diff TEXT NOT NULL
+                rollback_diff TEXT NOT NULL,
+                rollback_diff_hash TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_versions_agent
                 ON soul_versions(agent_id);
@@ -188,7 +196,20 @@ impl VersionStore {
             );
             CREATE INDEX IF NOT EXISTS idx_experiment_agent_time
                 ON gvu_experiment_log(agent_id, timestamp DESC);"
-        ).map_err(|e| e.to_string())
+        ).map_err(|e| e.to_string())?;
+
+        // Idempotent migration: add rollback_diff_hash to pre-existing DBs.
+        // `CREATE TABLE IF NOT EXISTS` does not alter an already-created table,
+        // so older databases won't have this column. Ignore the "duplicate
+        // column" error that fires once the column already exists.
+        if let Err(e) = conn.execute("ALTER TABLE soul_versions ADD COLUMN rollback_diff_hash TEXT", []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column") {
+                warn!("Failed to migrate soul_versions.rollback_diff_hash: {msg}");
+            }
+        }
+
+        Ok(())
     }
 
     /// Expose db_path for creating sibling VersionStore instances.
@@ -214,8 +235,9 @@ impl VersionStore {
         conn.execute(
             "INSERT OR REPLACE INTO soul_versions
              (version_id, agent_id, soul_hash, soul_summary, applied_at, observation_end,
-              status, pre_metrics_json, post_metrics_json, proposal_id, rollback_diff)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              status, pre_metrics_json, post_metrics_json, proposal_id, rollback_diff,
+              rollback_diff_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 version.version_id,
                 version.agent_id,
@@ -228,6 +250,7 @@ impl VersionStore {
                 post_json,
                 version.proposal_id,
                 encrypted_rollback,
+                version.rollback_diff_hash,
             ],
         ).map_err(|e| e.to_string())?;
 
@@ -308,24 +331,45 @@ impl VersionStore {
         }
     }
 
-    /// Decrypt rollback_diff if crypto is available, otherwise return as-is.
-    fn decrypt_rollback(&self, stored: &str) -> String {
+    /// Decrypt rollback_diff if crypto is available.
+    ///
+    /// On decryption failure we fall back to treating `stored` as
+    /// pre-encryption plaintext **only when its hash matches the recorded
+    /// `rollback_diff_hash`** — otherwise the bytes are corrupt or tampered
+    /// and returning them as a "rollback" would silently write garbage into
+    /// SOUL.md. In that case this returns an error so the row is dropped
+    /// instead of surfaced as a usable version.
+    fn decrypt_rollback(&self, stored: &str, expected_hash: Option<&str>) -> Result<String, String> {
         match &self.crypto {
-            Some(engine) => engine.decrypt_string(stored).unwrap_or_else(|e| {
-                // May be plaintext from before encryption was enabled — log and fallback
-                warn!("Failed to decrypt rollback_diff (may be pre-encryption plaintext): {e}");
-                stored.to_string()
-            }),
-            None => stored.to_string(),
+            Some(engine) => match engine.decrypt_string(stored) {
+                Ok(plain) => Ok(plain),
+                Err(e) => {
+                    // Accept legacy plaintext only if it matches the integrity hash.
+                    if let Some(expected) = expected_hash {
+                        if sha256_hex(stored.as_bytes()) == expected {
+                            return Ok(stored.to_string());
+                        }
+                    }
+                    Err(format!(
+                        "Failed to decrypt rollback_diff and plaintext fallback failed integrity check: {e}"
+                    ))
+                }
+            },
+            None => Ok(stored.to_string()),
         }
     }
 
     // ── Query helpers ─────────────────────────────────────────
 
     fn query_single(&self, conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Option<SoulVersion> {
-        conn.query_row(sql, params, |row| Self::row_to_version(row))
-            .ok()
-            .map(|mut v| { v.rollback_diff = self.decrypt_rollback(&v.rollback_diff); v })
+        let mut v = conn.query_row(sql, params, |row| Self::row_to_version(row)).ok()?;
+        match self.decrypt_rollback(&v.rollback_diff, v.rollback_diff_hash.as_deref()) {
+            Ok(plain) => { v.rollback_diff = plain; Some(v) }
+            Err(e) => {
+                warn!(version = %v.version_id, "Dropping soul version with undecryptable rollback_diff: {e}");
+                None
+            }
+        }
     }
 
     fn query_many(&self, conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Vec<SoulVersion> {
@@ -338,7 +382,15 @@ impl VersionStore {
             Err(_) => return vec![],
         };
         rows.filter_map(|r| r.ok())
-            .map(|mut v| { v.rollback_diff = self.decrypt_rollback(&v.rollback_diff); v })
+            .filter_map(|mut v| {
+                match self.decrypt_rollback(&v.rollback_diff, v.rollback_diff_hash.as_deref()) {
+                    Ok(plain) => { v.rollback_diff = plain; Some(v) }
+                    Err(e) => {
+                        warn!(version = %v.version_id, "Dropping soul version with undecryptable rollback_diff: {e}");
+                        None
+                    }
+                }
+            })
             .collect()
     }
 
@@ -365,8 +417,9 @@ impl VersionStore {
             post_metrics: post_json.and_then(|j| serde_json::from_str(&j).ok()),
             proposal_id: row.get("proposal_id")?,
             rollback_diff: row.get("rollback_diff")?,
-            // Hash not stored in legacy DB rows — integrity check skipped for old records
-            rollback_diff_hash: None,
+            // NULL for legacy rows written before this column existed —
+            // execute_rollback skips the integrity check in that case.
+            rollback_diff_hash: row.get("rollback_diff_hash").ok().flatten(),
         })
     }
 
@@ -647,4 +700,81 @@ pub struct ExperimentSummary {
     pub avg_generations_used: f64,
     /// Success rate: applied / (total - skipped).
     pub success_rate: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_version(rollback: &str) -> SoulVersion {
+        let hash = sha256_hex(rollback.as_bytes());
+        SoulVersion {
+            version_id: uuid::Uuid::new_v4().to_string(),
+            agent_id: "agent-a".to_string(),
+            soul_hash: "deadbeef".to_string(),
+            soul_summary: "summary".to_string(),
+            applied_at: Utc::now(),
+            observation_end: Utc::now(),
+            status: VersionStatus::Observing,
+            pre_metrics: VersionMetrics::default(),
+            post_metrics: None,
+            proposal_id: "prop-1".to_string(),
+            rollback_diff: rollback.to_string(),
+            rollback_diff_hash: Some(hash),
+        }
+    }
+
+    #[test]
+    fn test_rollback_diff_hash_persisted_and_read_back() {
+        // HC10/D7: the integrity hash must survive a record → read round-trip
+        // so that execute_rollback's `if let Some(...)` check actually runs.
+        let tmp = std::env::temp_dir().join(format!("dudu_vs_{}.db", uuid::Uuid::new_v4()));
+        let store = VersionStore::new(&tmp);
+        let v = sample_version("original SOUL.md content");
+        store.record_version(&v).unwrap();
+
+        let read = store.get_observing_version("agent-a").expect("version present");
+        assert_eq!(read.rollback_diff, "original SOUL.md content");
+        assert_eq!(
+            read.rollback_diff_hash.as_deref(),
+            v.rollback_diff_hash.as_deref(),
+            "rollback_diff_hash must be persisted, not hard-coded None"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_decrypt_rollback_rejects_corrupt_ciphertext() {
+        // With crypto enabled, ciphertext that fails to decrypt and whose
+        // plaintext form does not match the integrity hash must error out
+        // rather than silently returning the garbage bytes.
+        let key = [7u8; 32];
+        let tmp = std::env::temp_dir().join(format!("dudu_vs_{}.db", uuid::Uuid::new_v4()));
+        let store = VersionStore::with_crypto(&tmp, Some(&key));
+
+        let expected_hash = sha256_hex(b"real plaintext rollback");
+        let err = store
+            .decrypt_rollback("not-valid-ciphertext", Some(&expected_hash))
+            .unwrap_err();
+        assert!(err.contains("integrity check") || err.contains("decrypt"));
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_decrypt_rollback_accepts_legacy_plaintext_matching_hash() {
+        // Pre-encryption plaintext rows are still accepted when the stored
+        // hash matches — this preserves backward compatibility.
+        let key = [9u8; 32];
+        let tmp = std::env::temp_dir().join(format!("dudu_vs_{}.db", uuid::Uuid::new_v4()));
+        let store = VersionStore::with_crypto(&tmp, Some(&key));
+
+        let plaintext = "legacy plaintext rollback";
+        let hash = sha256_hex(plaintext.as_bytes());
+        let got = store.decrypt_rollback(plaintext, Some(&hash)).unwrap();
+        assert_eq!(got, plaintext);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
 }

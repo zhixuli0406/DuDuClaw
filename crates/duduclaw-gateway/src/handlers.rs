@@ -37,6 +37,1949 @@ fn is_valid_agent_id(id: &str) -> bool {
         && !id.contains("..")
 }
 
+// ── P0 dashboard-config helpers (CAP / CON / RED / MK / KS) ───────────────────
+//
+// These are module-level pure functions so the validation + TOML round-trip
+// logic can be unit-tested directly without spinning up a full MethodHandler.
+// They never touch the network or the filesystem; the async `handle_*` wrappers
+// own the read → mutate → atomic-write + encryption side of things.
+
+/// Known MCP scope strings (mirrors `duduclaw-cli::mcp_auth::parse_scopes`).
+/// The gateway crate does not depend on duduclaw-cli, so the list is duplicated
+/// here. Keep in sync with `Scope::as_str` in mcp_auth.rs.
+const KNOWN_MCP_SCOPES: &[&str] = &[
+    "memory:read",
+    "memory:write",
+    "wiki:read",
+    "wiki:write",
+    "messaging:send",
+    "identity:read",
+    "odoo:read",
+    "odoo:write",
+    "odoo:execute",
+    "admin",
+];
+
+/// Validate an MCP API key against `^ddc_(prod|staging|dev)_[a-f0-9]{32}$`
+/// (mirrors `duduclaw-cli::mcp_auth::is_valid_key_format`).
+fn is_valid_mcp_key_format(key: &str) -> bool {
+    let rest = match key.strip_prefix("ddc_") {
+        Some(r) => r,
+        None => return false,
+    };
+    let hex = if let Some(h) = rest.strip_prefix("prod_") {
+        h
+    } else if let Some(h) = rest.strip_prefix("staging_") {
+        h
+    } else if let Some(h) = rest.strip_prefix("dev_") {
+        h
+    } else {
+        return false;
+    };
+    hex.len() == 32 && hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
+/// Generate a fresh MCP API key of the form `ddc_<env>_<32hex>`.
+/// `env` must already be validated to one of prod/staging/dev.
+fn generate_mcp_key(env: &str) -> String {
+    // `Uuid::simple()` renders 32 lowercase hex chars (`[a-f0-9]{32}`) — exactly
+    // the suffix format required by `is_valid_mcp_key_format`.
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    format!("ddc_{env}_{suffix}")
+}
+
+/// Mask an MCP key for display: keep the `ddc_<env>_` prefix + first 4 hex of
+/// the suffix, replace the rest with `…`. NEVER returns the full key.
+fn mask_mcp_key(key: &str) -> String {
+    // Find the second underscore (after the env segment) to keep the prefix.
+    let parts: Vec<&str> = key.splitn(3, '_').collect();
+    if parts.len() == 3 {
+        let suffix = parts[2];
+        let head: String = suffix.chars().take(4).collect();
+        format!("{}_{}_{}…", parts[0], parts[1], head)
+    } else {
+        // Unrecognised shape — mask aggressively.
+        let head: String = key.chars().take(6).collect();
+        format!("{head}…")
+    }
+}
+
+/// Validate + write the `[capabilities]` section into an agent.toml table from
+/// the `agents.update` params. Returns the human-readable change list (may be
+/// empty if no capability fields were present). Errors on invalid enum / range.
+fn apply_capabilities_to_table(
+    table: &mut toml::Table,
+    params: &Value,
+) -> Result<Vec<String>, String> {
+    let mut changes: Vec<String> = Vec::new();
+
+    // Only act if the payload actually carries a `capabilities` object — this
+    // keeps `agents.update` calls that don't touch capabilities clean.
+    let cap = match params.get("capabilities").and_then(|v| v.as_object()) {
+        Some(c) => c,
+        None => return Ok(changes),
+    };
+
+    let section = table
+        .entry("capabilities")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| "Invalid [capabilities] section".to_string())?;
+
+    // ── Scalars ──
+    if let Some(v) = cap.get("computer_use").and_then(|v| v.as_bool()) {
+        section.insert("computer_use".into(), toml::Value::Boolean(v));
+        changes.push(format!("capabilities.computer_use = {v}"));
+    }
+    if let Some(v) = cap.get("computer_use_mode").and_then(|v| v.as_str()) {
+        match v {
+            "container" | "native" | "auto" => {
+                section.insert("computer_use_mode".into(), toml::Value::String(v.into()));
+                changes.push(format!("capabilities.computer_use_mode = \"{v}\""));
+            }
+            _ => {
+                return Err(format!(
+                    "Invalid computer_use_mode '{v}'. Valid: container, native, auto"
+                ))
+            }
+        }
+    }
+    if let Some(v) = cap.get("browser_via_bash").and_then(|v| v.as_bool()) {
+        section.insert("browser_via_bash".into(), toml::Value::Boolean(v));
+        changes.push(format!("capabilities.browser_via_bash = {v}"));
+    }
+
+    // ── Array fields (tool names must be non-empty strings) ──
+    for (param_key, toml_key) in &[
+        ("allowed_tools", "allowed_tools"),
+        ("denied_tools", "denied_tools"),
+        ("wiki_visible_to", "wiki_visible_to"),
+    ] {
+        if let Some(arr) = cap.get(*param_key).and_then(|v| v.as_array()) {
+            let mut out: Vec<toml::Value> = Vec::with_capacity(arr.len());
+            for item in arr {
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| format!("capabilities.{param_key} entries must be strings"))?;
+                let s = s.trim();
+                if s.is_empty() {
+                    return Err(format!("capabilities.{param_key} entries must be non-empty"));
+                }
+                out.push(toml::Value::String(s.into()));
+            }
+            section.insert((*toml_key).into(), toml::Value::Array(out));
+            changes.push(format!("capabilities.{toml_key} = [{} entries]", arr.len()));
+        }
+    }
+
+    // ── [capabilities.computer_use_config] sub-table ──
+    if let Some(cfg) = cap.get("computer_use_config").and_then(|v| v.as_object()) {
+        let sub = section
+            .entry("computer_use_config")
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .ok_or_else(|| "Invalid [capabilities.computer_use_config] section".to_string())?;
+
+        for (param_key, toml_key) in &[
+            ("allowed_apps", "allowed_apps"),
+            ("blocked_actions", "blocked_actions"),
+        ] {
+            if let Some(arr) = cfg.get(*param_key).and_then(|v| v.as_array()) {
+                let mut out: Vec<toml::Value> = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let s = item.as_str().ok_or_else(|| {
+                        format!("computer_use_config.{param_key} entries must be strings")
+                    })?;
+                    let s = s.trim();
+                    if s.is_empty() {
+                        return Err(format!(
+                            "computer_use_config.{param_key} entries must be non-empty"
+                        ));
+                    }
+                    out.push(toml::Value::String(s.into()));
+                }
+                sub.insert((*toml_key).into(), toml::Value::Array(out));
+                changes.push(format!(
+                    "capabilities.computer_use_config.{toml_key} = [{} entries]",
+                    arr.len()
+                ));
+            }
+        }
+
+        if let Some(v) = cfg.get("max_session_minutes").and_then(|v| v.as_u64()) {
+            if v == 0 || v > 1440 {
+                return Err("max_session_minutes must be 1-1440".into());
+            }
+            sub.insert("max_session_minutes".into(), toml::Value::Integer(v as i64));
+            changes.push(format!("capabilities.computer_use_config.max_session_minutes = {v}"));
+        }
+        if let Some(v) = cfg.get("max_actions").and_then(|v| v.as_u64()) {
+            if v == 0 || v > 10000 {
+                return Err("max_actions must be 1-10000".into());
+            }
+            sub.insert("max_actions".into(), toml::Value::Integer(v as i64));
+            changes.push(format!("capabilities.computer_use_config.max_actions = {v}"));
+        }
+        if let Some(v) = cfg.get("display_width").and_then(|v| v.as_u64()) {
+            if !(320..=7680).contains(&v) {
+                return Err("display_width must be 320-7680".into());
+            }
+            sub.insert("display_width".into(), toml::Value::Integer(v as i64));
+            changes.push(format!("capabilities.computer_use_config.display_width = {v}"));
+        }
+        if let Some(v) = cfg.get("display_height").and_then(|v| v.as_u64()) {
+            if !(240..=4320).contains(&v) {
+                return Err("display_height must be 240-4320".into());
+            }
+            sub.insert("display_height".into(), toml::Value::Integer(v as i64));
+            changes.push(format!("capabilities.computer_use_config.display_height = {v}"));
+        }
+        if let Some(v) = cfg.get("auto_confirm_trusted").and_then(|v| v.as_bool()) {
+            sub.insert("auto_confirm_trusted".into(), toml::Value::Boolean(v));
+            changes.push(format!("capabilities.computer_use_config.auto_confirm_trusted = {v}"));
+        }
+    }
+
+    Ok(changes)
+}
+
+// ── P1 dashboard-config helpers (RT / EVO / CT) ───────────────────────────────
+//
+// Same contract as `apply_capabilities_to_table`: pure functions that mutate a
+// `toml::Table` in place from an `agents.update` params object, returning the
+// human-readable change list (empty if the relevant param object was absent).
+// They validate enums / numeric ranges; the async wrapper owns IO + encryption.
+//
+// IMPORTANT: these only handle the *advanced* fields NOT already written inline
+// in `handle_agents_update`. They do not duplicate `[evolution]` gvu/cognitive/
+// max_active_skills/stagnation_* nor `[container]` sandbox_enabled/network_access/
+// readonly_project/timeout_ms/max_concurrent.
+
+/// Valid AI runtime providers (mirrors the `AgentRuntime` registry backends).
+const VALID_RUNTIME_PROVIDERS: &[&str] = &["claude", "codex", "gemini", "openai_compat"];
+
+/// Validate + write the `[runtime]` section from the `runtime` params object.
+/// Fields: `provider` (enum), `fallback` (string), `pty_pool_enabled` (bool),
+/// `worker_managed` (bool). (RT.1)
+fn apply_runtime_to_table(
+    table: &mut toml::Table,
+    params: &Value,
+) -> Result<Vec<String>, String> {
+    let mut changes: Vec<String> = Vec::new();
+
+    let rt = match params.get("runtime").and_then(|v| v.as_object()) {
+        Some(r) => r,
+        None => return Ok(changes),
+    };
+
+    let section = table
+        .entry("runtime")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| "Invalid [runtime] section".to_string())?;
+
+    if let Some(v) = rt.get("provider").and_then(|v| v.as_str()) {
+        if !VALID_RUNTIME_PROVIDERS.contains(&v) {
+            return Err(format!(
+                "Invalid runtime.provider '{v}'. Valid: claude, codex, gemini, openai_compat"
+            ));
+        }
+        section.insert("provider".into(), toml::Value::String(v.into()));
+        changes.push(format!("runtime.provider = \"{v}\""));
+    }
+    if let Some(v) = rt.get("fallback").and_then(|v| v.as_str()) {
+        let v = v.trim();
+        // Empty string clears the fallback.
+        if v.is_empty() {
+            section.remove("fallback");
+            changes.push("runtime.fallback cleared".to_string());
+        } else {
+            if !VALID_RUNTIME_PROVIDERS.contains(&v) {
+                return Err(format!(
+                    "Invalid runtime.fallback '{v}'. Valid: claude, codex, gemini, openai_compat"
+                ));
+            }
+            section.insert("fallback".into(), toml::Value::String(v.into()));
+            changes.push(format!("runtime.fallback = \"{v}\""));
+        }
+    }
+    if let Some(v) = rt.get("pty_pool_enabled").and_then(|v| v.as_bool()) {
+        section.insert("pty_pool_enabled".into(), toml::Value::Boolean(v));
+        changes.push(format!("runtime.pty_pool_enabled = {v}"));
+    }
+    if let Some(v) = rt.get("worker_managed").and_then(|v| v.as_bool()) {
+        section.insert("worker_managed".into(), toml::Value::Boolean(v));
+        changes.push(format!("runtime.worker_managed = {v}"));
+    }
+
+    Ok(changes)
+}
+
+/// Validate a 0.0–1.0 threshold field, returning the float or an error.
+fn validate_unit_threshold(name: &str, v: f64) -> Result<f64, String> {
+    if !(0.0..=1.0).contains(&v) {
+        return Err(format!("{name} must be 0.0-1.0"));
+    }
+    Ok(v)
+}
+
+/// Apply the *advanced* `[evolution]` fields (EVO.1–EVO.3) NOT already handled
+/// inline in `handle_agents_update`. Reads from the `evolution_advanced` params
+/// object. Covers `[evolution.external_factors]` + skill-synthesis / graduation /
+/// recommendation / curiosity / behavior-monitor scalars.
+fn apply_evolution_advanced_to_table(
+    table: &mut toml::Table,
+    params: &Value,
+) -> Result<Vec<String>, String> {
+    let mut changes: Vec<String> = Vec::new();
+
+    let adv = match params.get("evolution_advanced").and_then(|v| v.as_object()) {
+        Some(a) => a,
+        None => return Ok(changes),
+    };
+
+    let evo = table
+        .entry("evolution")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| "Invalid [evolution] section".to_string())?;
+
+    // ── [evolution.external_factors] sub-table (EVO.1) ──
+    if let Some(ef) = adv.get("external_factors").and_then(|v| v.as_object()) {
+        let sub = evo
+            .entry("external_factors")
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .ok_or_else(|| "Invalid [evolution.external_factors] section".to_string())?;
+        for key in &[
+            "user_feedback",
+            "security_events",
+            "channel_metrics",
+            "business_context",
+            "peer_signals",
+        ] {
+            if let Some(v) = ef.get(*key).and_then(|v| v.as_bool()) {
+                sub.insert((*key).into(), toml::Value::Boolean(v));
+                changes.push(format!("evolution.external_factors.{key} = {v}"));
+            }
+        }
+    }
+
+    // ── Boolean toggles (EVO.2–EVO.3) ──
+    for key in &[
+        "skill_synthesis_enabled",
+        "skill_graduation_enabled",
+        "skill_recommendation_enabled",
+        "curiosity_enabled",
+        "skill_behavior_monitor_enabled",
+    ] {
+        if let Some(v) = adv.get(*key).and_then(|v| v.as_bool()) {
+            evo.insert((*key).into(), toml::Value::Boolean(v));
+            changes.push(format!("evolution.{key} = {v}"));
+        }
+    }
+
+    // ── 0.0–1.0 thresholds (EVO.2–EVO.3) ──
+    for key in &[
+        "skill_synthesis_threshold",
+        "skill_graduation_min_lift",
+        "skill_recommendation_threshold",
+        "curiosity_threshold",
+        "skill_behavior_drift_threshold",
+    ] {
+        if let Some(v) = adv.get(*key).and_then(|v| v.as_f64()) {
+            let v = validate_unit_threshold(&format!("evolution.{key}"), v)?;
+            evo.insert((*key).into(), toml::Value::Float(v));
+            changes.push(format!("evolution.{key} = {v}"));
+        }
+    }
+
+    // ── Unsigned-integer fields (EVO.2–EVO.3) ──
+    for key in &[
+        "skill_synthesis_cooldown_hours",
+        "skill_trial_ttl",
+        "curiosity_max_daily",
+    ] {
+        if let Some(v) = adv.get(*key).and_then(|v| v.as_u64()) {
+            evo.insert((*key).into(), toml::Value::Integer(v as i64));
+            changes.push(format!("evolution.{key} = {v}"));
+        }
+    }
+
+    Ok(changes)
+}
+
+/// Parse a mount entry `{ host, container, readonly? }` into a TOML table,
+/// rejecting empty paths and ones touching the mount-allowlist blocked patterns.
+fn parse_mount_entry(item: &Value) -> Result<toml::Value, String> {
+    /// Sensitive path fragments that must never be bind-mounted into a sandbox.
+    /// Mirrors `config/mount-allowlist.example.json` `blocked_patterns`.
+    const BLOCKED_PATTERNS: &[&str] = &[
+        ".ssh",
+        ".gnupg",
+        ".env",
+        ".aws",
+        ".config/gcloud",
+        ".docker/config.json",
+        "secret.key",
+        ".kube/config",
+    ];
+
+    let obj = item
+        .as_object()
+        .ok_or_else(|| "additional_mounts entries must be objects".to_string())?;
+    let host = obj
+        .get("host")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "additional_mounts.host must be a non-empty string".to_string())?;
+    let container = obj
+        .get("container")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "additional_mounts.container must be a non-empty string".to_string())?;
+    let readonly = obj.get("readonly").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    for pat in BLOCKED_PATTERNS {
+        if host.contains(pat) {
+            return Err(format!("additional_mounts.host '{host}' matches blocked pattern '{pat}'"));
+        }
+    }
+
+    let mut m = toml::map::Map::new();
+    m.insert("host".into(), toml::Value::String(host.into()));
+    m.insert("container".into(), toml::Value::String(container.into()));
+    m.insert("readonly".into(), toml::Value::Boolean(readonly));
+    Ok(toml::Value::Table(m))
+}
+
+/// Parse an env entry — either `{ key, value }` or a `[k, v]` 2-tuple — into a
+/// `[key, value]` TOML array (the container env representation).
+fn parse_env_entry(item: &Value) -> Result<toml::Value, String> {
+    if let Some(obj) = item.as_object() {
+        let k = obj
+            .get("key")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "env entries must have a non-empty 'key'".to_string())?;
+        let v = obj.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        return Ok(toml::Value::Array(vec![
+            toml::Value::String(k.into()),
+            toml::Value::String(v.into()),
+        ]));
+    }
+    if let Some(arr) = item.as_array() {
+        if arr.len() != 2 {
+            return Err("env [k, v] entries must have exactly 2 elements".to_string());
+        }
+        let k = arr[0]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "env key must be a non-empty string".to_string())?;
+        let v = arr[1].as_str().unwrap_or("");
+        return Ok(toml::Value::Array(vec![
+            toml::Value::String(k.into()),
+            toml::Value::String(v.into()),
+        ]));
+    }
+    Err("env entries must be {key,value} objects or [k,v] arrays".to_string())
+}
+
+/// Apply the *advanced* `[container]` fields (CT.1–CT.2) NOT already handled
+/// inline in `handle_agents_update`. Reads from the `container_advanced` params
+/// object. Covers worktree_* toggles + worktree_copy_files / additional_mounts /
+/// cmd / env arrays.
+fn apply_container_advanced_to_table(
+    table: &mut toml::Table,
+    params: &Value,
+) -> Result<Vec<String>, String> {
+    let mut changes: Vec<String> = Vec::new();
+
+    let adv = match params.get("container_advanced").and_then(|v| v.as_object()) {
+        Some(a) => a,
+        None => return Ok(changes),
+    };
+
+    let ct = table
+        .entry("container")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| "Invalid [container] section".to_string())?;
+
+    // ── worktree toggles (CT.1) ──
+    for key in &[
+        "worktree_enabled",
+        "worktree_auto_merge",
+        "worktree_cleanup_on_exit",
+    ] {
+        if let Some(v) = adv.get(*key).and_then(|v| v.as_bool()) {
+            ct.insert((*key).into(), toml::Value::Boolean(v));
+            changes.push(format!("container.{key} = {v}"));
+        }
+    }
+
+    // ── String-array fields: worktree_copy_files, cmd (CT.1–CT.2) ──
+    for key in &["worktree_copy_files", "cmd"] {
+        if let Some(arr) = adv.get(*key).and_then(|v| v.as_array()) {
+            let mut out: Vec<toml::Value> = Vec::with_capacity(arr.len());
+            for entry in arr {
+                let s = entry
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| format!("container.{key} entries must be non-empty strings"))?;
+                out.push(toml::Value::String(s.into()));
+            }
+            ct.insert((*key).into(), toml::Value::Array(out));
+            changes.push(format!("container.{key} = [{} entries]", arr.len()));
+        }
+    }
+
+    // ── additional_mounts (CT.2) ──
+    if let Some(arr) = adv.get("additional_mounts").and_then(|v| v.as_array()) {
+        let mut out: Vec<toml::Value> = Vec::with_capacity(arr.len());
+        for entry in arr {
+            out.push(parse_mount_entry(entry)?);
+        }
+        ct.insert("additional_mounts".into(), toml::Value::Array(out));
+        changes.push(format!("container.additional_mounts = [{} entries]", arr.len()));
+    }
+
+    // ── env (CT.2) ──
+    if let Some(arr) = adv.get("env").and_then(|v| v.as_array()) {
+        let mut out: Vec<toml::Value> = Vec::with_capacity(arr.len());
+        for entry in arr {
+            out.push(parse_env_entry(entry)?);
+        }
+        ct.insert("env".into(), toml::Value::Array(out));
+        changes.push(format!("container.env = [{} entries]", arr.len()));
+    }
+
+    Ok(changes)
+}
+
+// ── P2 GOV helpers (governance policies/*.yaml) ───────────────────────────────
+//
+// The gateway crate does NOT depend on `duduclaw-governance` or `serde_yaml`
+// (adding a dependency would require touching Cargo.toml, out of scope for this
+// pass). The policy YAML schema is small, fixed, and fully under our control —
+// so we round-trip it with a focused, deterministic emitter/parser that mirrors
+// `duduclaw-governance::policy::{PolicyType, RatePolicy, ...}` field-for-field.
+// Keep in sync with `crates/duduclaw-governance/src/policy.rs`.
+
+/// Valid `resource` strings for a Rate policy (mirror `Resource` enum).
+const GOV_RATE_RESOURCES: &[&str] = &["mcp_calls", "memory_writes", "wiki_writes", "message_sends"];
+/// Valid `action_on_violation` strings (mirror `ActionOnViolation` enum).
+const GOV_ACTIONS: &[&str] = &["reject", "warn", "throttle"];
+/// Valid `policy_type` strings (mirror `PolicyType` tag).
+const GOV_POLICY_TYPES: &[&str] = &["rate", "permission", "quota", "lifecycle"];
+
+/// One parsed governance policy held as a flat JSON object (the same shape the
+/// dashboard sends/receives). `policy_type`, `policy_id`, `agent_id` are always
+/// present; the remaining keys depend on the type.
+type GovPolicy = serde_json::Map<String, Value>;
+
+/// Validate a `policy_id` token: non-empty, ≤128 chars, `[a-zA-Z0-9._-]`.
+fn gov_valid_policy_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
+/// Validate a governance policy object per its `policy_type`, returning a
+/// normalised copy (only known fields, correct numeric types). Mirrors the
+/// `validate()` methods in `duduclaw-governance::policy`.
+fn gov_validate_policy(p: &Value) -> Result<GovPolicy, String> {
+    let obj = p.as_object().ok_or("policy must be an object")?;
+    let policy_type = obj
+        .get("policy_type")
+        .and_then(|v| v.as_str())
+        .ok_or("policy missing 'policy_type'")?;
+    if !GOV_POLICY_TYPES.contains(&policy_type) {
+        return Err(format!(
+            "Invalid policy_type '{policy_type}'. Valid: {}",
+            GOV_POLICY_TYPES.join(", ")
+        ));
+    }
+    let policy_id = obj.get("policy_id").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if !gov_valid_policy_id(policy_id) {
+        return Err("policy_id must be 1-128 chars of [a-zA-Z0-9._-]".into());
+    }
+    let agent_id = obj.get("agent_id").and_then(|v| v.as_str()).unwrap_or("*").trim();
+    // agent_id is "*" (global) or a valid agent id.
+    if agent_id != "*" && !is_valid_agent_id(agent_id) {
+        return Err(format!("Invalid agent_id '{agent_id}' (use '*' for global)"));
+    }
+
+    let mut out = GovPolicy::new();
+    out.insert("policy_type".into(), json!(policy_type));
+    out.insert("policy_id".into(), json!(policy_id));
+    out.insert("agent_id".into(), json!(agent_id));
+
+    // Helper closures for required numeric fields.
+    let req_u64 = |key: &str| -> Result<u64, String> {
+        obj.get(key)
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("{policy_type} policy missing/invalid '{key}' (positive integer)"))
+    };
+    let str_arr = |key: &str| -> Vec<Value> {
+        obj.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| json!(s))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    match policy_type {
+        "rate" => {
+            let resource = obj.get("resource").and_then(|v| v.as_str()).unwrap_or("");
+            if !GOV_RATE_RESOURCES.contains(&resource) {
+                return Err(format!(
+                    "Invalid rate resource '{resource}'. Valid: {}",
+                    GOV_RATE_RESOURCES.join(", ")
+                ));
+            }
+            let limit = req_u64("limit")?;
+            if limit == 0 {
+                return Err("rate limit must be > 0".into());
+            }
+            let window = req_u64("window_seconds")?;
+            if window == 0 {
+                return Err("window_seconds must be > 0".into());
+            }
+            let action = obj
+                .get("action_on_violation")
+                .and_then(|v| v.as_str())
+                .unwrap_or("reject");
+            if !GOV_ACTIONS.contains(&action) {
+                return Err(format!(
+                    "Invalid action_on_violation '{action}'. Valid: {}",
+                    GOV_ACTIONS.join(", ")
+                ));
+            }
+            out.insert("resource".into(), json!(resource));
+            out.insert("limit".into(), json!(limit));
+            out.insert("window_seconds".into(), json!(window));
+            out.insert("action_on_violation".into(), json!(action));
+        }
+        "permission" => {
+            // Conflict check: a scope cannot be both allowed and denied.
+            let allowed = str_arr("allowed_scopes");
+            let denied = str_arr("denied_scopes");
+            for a in &allowed {
+                if denied.contains(a) {
+                    return Err(format!(
+                        "scope {} appears in both allowed_scopes and denied_scopes",
+                        a.as_str().unwrap_or("")
+                    ));
+                }
+            }
+            out.insert("allowed_scopes".into(), json!(allowed));
+            out.insert("denied_scopes".into(), json!(denied));
+            out.insert("requires_approval".into(), json!(str_arr("requires_approval")));
+        }
+        "quota" => {
+            let budget = req_u64("daily_token_budget")?;
+            if budget == 0 {
+                return Err("daily_token_budget must be > 0".into());
+            }
+            let max_tasks = req_u64("max_concurrent_tasks")?;
+            if max_tasks == 0 {
+                return Err("max_concurrent_tasks must be > 0".into());
+            }
+            let max_mem = obj.get("max_memory_entries").and_then(|v| v.as_u64()).unwrap_or(0);
+            let reset_cron = obj
+                .get("reset_cron")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("0 0 * * *");
+            out.insert("daily_token_budget".into(), json!(budget));
+            out.insert("max_concurrent_tasks".into(), json!(max_tasks));
+            out.insert("max_memory_entries".into(), json!(max_mem));
+            out.insert("reset_cron".into(), json!(reset_cron));
+        }
+        "lifecycle" => {
+            let idle = req_u64("max_idle_hours")?;
+            if idle == 0 {
+                return Err("max_idle_hours must be > 0".into());
+            }
+            let hc = req_u64("health_check_interval_seconds")?;
+            if hc == 0 {
+                return Err("health_check_interval_seconds must be > 0".into());
+            }
+            let suspend = obj
+                .get("auto_suspend_on_violation_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            out.insert("max_idle_hours".into(), json!(idle));
+            out.insert("health_check_interval_seconds".into(), json!(hc));
+            out.insert("auto_suspend_on_violation_count".into(), json!(suspend));
+        }
+        _ => unreachable!(),
+    }
+    Ok(out)
+}
+
+/// Escape a scalar string for safe YAML emission: always double-quote and
+/// escape `\` and `"`. Deterministic + injection-safe (never emits a bare
+/// value that could be re-read as a different YAML type).
+fn gov_yaml_quote(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// Serialise an ordered list of validated policies into the canonical
+/// `policies:` YAML document (matches `duduclaw-governance::PolicyFile`).
+fn gov_emit_yaml(policies: &[GovPolicy]) -> String {
+    let mut out = String::from("# DuDuClaw Governance policies — managed by dashboard (governance.upsert)\n");
+    out.push_str("policies:\n");
+    if policies.is_empty() {
+        out.push_str("  []\n");
+        return out;
+    }
+    for p in policies {
+        let ptype = p.get("policy_type").and_then(|v| v.as_str()).unwrap_or("");
+        out.push_str(&format!("  - policy_type: {ptype}\n"));
+        out.push_str(&format!(
+            "    policy_id: {}\n",
+            gov_yaml_quote(p.get("policy_id").and_then(|v| v.as_str()).unwrap_or(""))
+        ));
+        out.push_str(&format!(
+            "    agent_id: {}\n",
+            gov_yaml_quote(p.get("agent_id").and_then(|v| v.as_str()).unwrap_or("*"))
+        ));
+        // Per-type scalar + list fields, in a stable order.
+        let scalar = |out: &mut String, key: &str| {
+            if let Some(v) = p.get(key) {
+                if let Some(n) = v.as_u64() {
+                    out.push_str(&format!("    {key}: {n}\n"));
+                } else if let Some(s) = v.as_str() {
+                    out.push_str(&format!("    {key}: {}\n", gov_yaml_quote(s)));
+                }
+            }
+        };
+        let list = |out: &mut String, key: &str| {
+            if let Some(arr) = p.get(key).and_then(|v| v.as_array()) {
+                if arr.is_empty() {
+                    out.push_str(&format!("    {key}: []\n"));
+                } else {
+                    out.push_str(&format!("    {key}:\n"));
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            out.push_str(&format!("      - {}\n", gov_yaml_quote(s)));
+                        }
+                    }
+                }
+            }
+        };
+        match ptype {
+            "rate" => {
+                scalar(&mut out, "resource");
+                scalar(&mut out, "limit");
+                scalar(&mut out, "window_seconds");
+                scalar(&mut out, "action_on_violation");
+            }
+            "permission" => {
+                list(&mut out, "allowed_scopes");
+                list(&mut out, "denied_scopes");
+                list(&mut out, "requires_approval");
+            }
+            "quota" => {
+                scalar(&mut out, "daily_token_budget");
+                scalar(&mut out, "max_concurrent_tasks");
+                scalar(&mut out, "max_memory_entries");
+                scalar(&mut out, "reset_cron");
+            }
+            "lifecycle" => {
+                scalar(&mut out, "max_idle_hours");
+                scalar(&mut out, "health_check_interval_seconds");
+                scalar(&mut out, "auto_suspend_on_violation_count");
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Minimal block-YAML parser for the canonical `policies:` document this module
+/// emits (and the hand-written `policies/global.yaml`). Handles `key: value`
+/// scalars, `key:` followed by `  - item` lists, `#` comments, and `[]` empty
+/// lists. NOT a general YAML parser — it only needs to round-trip the policy
+/// schema, but is also lenient enough to read the existing default file.
+fn gov_parse_yaml(raw: &str) -> Result<Vec<GovPolicy>, String> {
+    let mut policies: Vec<GovPolicy> = Vec::new();
+    let mut current: Option<GovPolicy> = None;
+    let mut pending_list: Option<String> = None;
+
+    let unquote = |s: &str| -> String {
+        let t = s.trim();
+        if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+            t[1..t.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\")
+        } else if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+            t[1..t.len() - 1].to_string()
+        } else {
+            t.to_string()
+        }
+    };
+    // Coerce a scalar string to a JSON number when it looks like a bare integer.
+    let coerce = |s: String| -> Value {
+        if let Ok(n) = s.parse::<u64>() {
+            json!(n)
+        } else {
+            json!(s)
+        }
+    };
+
+    for line_raw in raw.lines() {
+        // Strip trailing comments only when not inside quotes (cheap heuristic:
+        // our emitter never embeds `#`; the default file keeps comments on their
+        // own lines), so dropping leading-`#` lines + trimming is sufficient.
+        let line = line_raw.trim_end();
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed == "policies:" || trimmed == "policies: []" {
+            pending_list = None;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("- ") {
+            // A "- policy_type: <x>" line ALWAYS starts a new policy entry.
+            // Otherwise, if we're inside a pending list, it's a list item
+            // (e.g. "- memory:read" under "allowed_scopes:").
+            let starts_policy = rest.trim_start().starts_with("policy_type:");
+            if !starts_policy && pending_list.is_some() {
+                if let (Some(p), Some(key)) = (current.as_mut(), pending_list.as_ref()) {
+                    let entry = p.entry(key.clone()).or_insert_with(|| json!([]));
+                    if let Some(arr) = entry.as_array_mut() {
+                        arr.push(json!(unquote(rest)));
+                    }
+                }
+                continue;
+            }
+            // New policy entry: "- policy_type: rate".
+            if let Some(p) = current.take() {
+                policies.push(p);
+            }
+            pending_list = None;
+            let mut p = GovPolicy::new();
+            if let Some((k, v)) = rest.split_once(':') {
+                let key = k.trim().to_string();
+                let val = unquote(v);
+                if !val.is_empty() && val != "[]" {
+                    p.insert(key, coerce(val));
+                } else if val == "[]" {
+                    p.insert(key, json!([]));
+                }
+            }
+            current = Some(p);
+            continue;
+        }
+        // "key: value" or "key:" (list header).
+        if let Some((k, v)) = trimmed.split_once(':') {
+            let key = k.trim().to_string();
+            let val = v.trim();
+            let p = match current.as_mut() {
+                Some(p) => p,
+                None => continue, // keys before first "- " → ignore
+            };
+            if val.is_empty() {
+                // List header — subsequent "  - item" lines belong here.
+                pending_list = Some(key.clone());
+                p.entry(key).or_insert_with(|| json!([]));
+            } else if val == "[]" {
+                pending_list = None;
+                p.insert(key, json!([]));
+            } else {
+                pending_list = None;
+                p.insert(key, coerce(unquote(val)));
+            }
+        }
+    }
+    if let Some(p) = current.take() {
+        policies.push(p);
+    }
+    Ok(policies)
+}
+
+// ── P2 SCP helpers (.scope.toml wiki namespace policy) ────────────────────────
+//
+// Mirrors `duduclaw-cli::wiki_scope` (`[namespaces."<ns>"] mode = "..."`).
+// Path: `<home>/shared/wiki/.scope.toml`.
+
+/// Valid namespace modes (mirror `wiki_scope::NamespaceMode`).
+const SCP_MODES: &[&str] = &["agent_writable", "read_only", "operator_only"];
+
+/// Convert a parsed `.scope.toml` table into the `wiki_scope.get` response:
+/// `{ namespaces: [{ namespace, mode, synced_from }] }`.
+fn scp_table_to_response(table: &toml::Table) -> Value {
+    let mut out: Vec<Value> = Vec::new();
+    if let Some(ns) = table.get("namespaces").and_then(|v| v.as_table()) {
+        for (name, entry) in ns {
+            let t = match entry.as_table() {
+                Some(t) => t,
+                None => continue,
+            };
+            let mode = t.get("mode").and_then(|v| v.as_str()).unwrap_or("agent_writable");
+            let synced_from = t.get("synced_from").and_then(|v| v.as_str());
+            out.push(json!({
+                "namespace": name,
+                "mode": mode,
+                "synced_from": synced_from,
+            }));
+        }
+    }
+    out.sort_by(|a, b| {
+        a["namespace"].as_str().unwrap_or("").cmp(b["namespace"].as_str().unwrap_or(""))
+    });
+    json!({ "namespaces": out })
+}
+
+/// Apply a `wiki_scope.update` payload onto a `.scope.toml` table. Sets (or, on
+/// `mode == "agent_writable"` with `remove == true`, deletes) a single
+/// namespace's policy. Returns the change description. Validates the mode enum
+/// + that `read_only` carries a non-empty `synced_from`.
+fn scp_apply_namespace(
+    table: &mut toml::Table,
+    namespace: &str,
+    mode: &str,
+    synced_from: Option<&str>,
+    remove: bool,
+) -> Result<String, String> {
+    if namespace.is_empty() || namespace.contains('/') || namespace.len() > 128 {
+        return Err("namespace must be a non-empty top-level segment (no '/'), ≤128 chars".into());
+    }
+    let ns_table = table
+        .entry("namespaces")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or("Invalid [namespaces] section")?;
+
+    if remove {
+        ns_table.remove(namespace);
+        return Ok(format!("namespace '{namespace}' policy removed (defaults to agent_writable)"));
+    }
+
+    if !SCP_MODES.contains(&mode) {
+        return Err(format!("Invalid mode '{mode}'. Valid: {}", SCP_MODES.join(", ")));
+    }
+    let mut entry = toml::map::Map::new();
+    entry.insert("mode".into(), toml::Value::String(mode.into()));
+    if mode == "read_only" {
+        let sf = synced_from.map(str::trim).unwrap_or("");
+        if sf.is_empty() {
+            return Err("mode 'read_only' requires a non-empty 'synced_from'".into());
+        }
+        entry.insert("synced_from".into(), toml::Value::String(sf.into()));
+    }
+    ns_table.insert(namespace.into(), toml::Value::Table(entry));
+    Ok(format!("namespace '{namespace}' = {mode}"))
+}
+
+// ── P2 ODO helpers (per-agent [odoo] override) ────────────────────────────────
+
+/// Validate a per-agent Odoo `allowed_actions` entry. Accepts a bare verb
+/// (`read`/`write`/`create`/`unlink`/`execute`) or a qualified `verb:model`
+/// form (e.g. `write:crm.lead`). The model part is validated like an Odoo model
+/// name (alphanumeric + `.` + `_`).
+fn odo_valid_action(action: &str) -> bool {
+    const VERBS: &[&str] = &["read", "write", "create", "unlink", "execute"];
+    let (verb, model) = match action.split_once(':') {
+        Some((v, m)) => (v, Some(m)),
+        None => (action, None),
+    };
+    if !VERBS.contains(&verb) {
+        return false;
+    }
+    match model {
+        None => true,
+        Some(m) => {
+            !m.is_empty()
+                && m.len() <= 128
+                && m.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+        }
+    }
+}
+
+/// Apply the per-agent `[odoo]` override fields from `agents.update` params.
+/// Encrypts `api_key`/`password` into their `_enc` variants — cleartext is
+/// never written. Returns the change list (empty if no `odoo` object present).
+fn apply_odoo_to_table(
+    table: &mut toml::Table,
+    params: &Value,
+    home_dir: &Path,
+) -> Result<Vec<String>, String> {
+    let mut changes: Vec<String> = Vec::new();
+    let odoo_in = match params.get("odoo").and_then(|v| v.as_object()) {
+        Some(o) => o,
+        None => return Ok(changes),
+    };
+
+    let section = table
+        .entry("odoo")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or("Invalid [odoo] section")?;
+
+    // profile (string)
+    if let Some(v) = odoo_in.get("profile").and_then(|v| v.as_str()) {
+        let v = v.trim();
+        if v.is_empty() {
+            section.remove("profile");
+            changes.push("odoo.profile cleared".into());
+        } else if v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            section.insert("profile".into(), toml::Value::String(v.into()));
+            changes.push(format!("odoo.profile = \"{v}\""));
+        } else {
+            return Err("odoo.profile must be ≤64 chars of [a-zA-Z0-9_-]".into());
+        }
+    }
+
+    // allowed_models[] (Odoo model names)
+    if let Some(arr) = odoo_in.get("allowed_models").and_then(|v| v.as_array()) {
+        let mut out: Vec<toml::Value> = Vec::new();
+        for item in arr {
+            let m = item.as_str().unwrap_or("").trim();
+            if m.is_empty() {
+                continue;
+            }
+            if !MethodHandler::is_valid_odoo_model(m) {
+                return Err(format!("Invalid odoo allowed_models entry '{m}'"));
+            }
+            out.push(toml::Value::String(m.into()));
+        }
+        section.insert("allowed_models".into(), toml::Value::Array(out.clone()));
+        changes.push(format!("odoo.allowed_models = [{} entries]", out.len()));
+    }
+
+    // allowed_actions[] (bare verb or verb:model)
+    if let Some(arr) = odoo_in.get("allowed_actions").and_then(|v| v.as_array()) {
+        let mut out: Vec<toml::Value> = Vec::new();
+        for item in arr {
+            let a = item.as_str().unwrap_or("").trim();
+            if a.is_empty() {
+                continue;
+            }
+            if !odo_valid_action(a) {
+                return Err(format!(
+                    "Invalid odoo allowed_actions entry '{a}' (expected verb or verb:model, \
+                     e.g. 'read' or 'write:crm.lead')"
+                ));
+            }
+            out.push(toml::Value::String(a.into()));
+        }
+        section.insert("allowed_actions".into(), toml::Value::Array(out.clone()));
+        changes.push(format!("odoo.allowed_actions = [{} entries]", out.len()));
+    }
+
+    // company_ids[] (ints)
+    if let Some(arr) = odoo_in.get("company_ids").and_then(|v| v.as_array()) {
+        let mut out: Vec<toml::Value> = Vec::new();
+        for item in arr {
+            let n = item
+                .as_i64()
+                .ok_or("odoo company_ids entries must be integers")?;
+            if n < 0 {
+                return Err("odoo company_ids must be non-negative".into());
+            }
+            out.push(toml::Value::Integer(n));
+        }
+        section.insert("company_ids".into(), toml::Value::Array(out.clone()));
+        changes.push(format!("odoo.company_ids = [{} entries]", out.len()));
+    }
+
+    // url / db / username (plaintext scalars, optional overrides)
+    for (param_key, toml_key) in &[("url", "url"), ("db", "db"), ("username", "username")] {
+        if let Some(v) = odoo_in.get(*param_key).and_then(|v| v.as_str()) {
+            let v = v.trim();
+            if v.is_empty() {
+                section.remove(*toml_key);
+                changes.push(format!("odoo.{toml_key} cleared"));
+            } else {
+                section.insert((*toml_key).into(), toml::Value::String(v.into()));
+                changes.push(format!("odoo.{toml_key} = [SET]"));
+            }
+        }
+    }
+
+    // api_key / password → encrypt to *_enc, never store cleartext.
+    for (param_key, enc_key) in &[("api_key", "api_key_enc"), ("password", "password_enc")] {
+        if let Some(v) = odoo_in.get(*param_key).and_then(|v| v.as_str()) {
+            // Refuse to persist the masked placeholder back as a real secret.
+            if v == SECRET_MASK_SET {
+                continue;
+            }
+            // Drop any stale cleartext mirror.
+            section.remove(*param_key);
+            if v.is_empty() {
+                section.remove(*enc_key);
+                changes.push(format!("odoo.{param_key} cleared"));
+            } else if v.starts_with("secret://") {
+                // A `secret://` reference is a POINTER, not a secret to be
+                // encrypted. Store it RAW into `*_enc` (the field
+                // merge_credentials reads) so the connector pool can resolve it
+                // via the SecretManager at connect time.
+                section.insert((*enc_key).into(), toml::Value::String(v.into()));
+                changes.push(format!("odoo.{param_key} = [SECRET REF]"));
+            } else if let Some(enc) = crate::config_crypto::encrypt_value(v, home_dir) {
+                section.insert((*enc_key).into(), toml::Value::String(enc));
+                changes.push(format!("odoo.{param_key} = [ENCRYPTED]"));
+            } else {
+                return Err(format!("Failed to encrypt odoo.{param_key}"));
+            }
+        }
+    }
+
+    Ok(changes)
+}
+
+// ── P1 INF helpers (inference.toml) ───────────────────────────────────────────
+
+/// Masked placeholder returned to the dashboard in place of a stored secret.
+const SECRET_MASK_SET: &str = "***set***";
+
+/// Convert a parsed inference.toml table into the `inference.get` response JSON,
+/// MASKING the `[openai_compat]` api key — the cleartext (or `_enc`) is NEVER
+/// returned; instead `api_key_set: bool` + a masked placeholder are exposed.
+fn inference_table_to_response(table: &toml::Table) -> Value {
+    // Serialise the whole table to JSON, then scrub the secret in-place. Using
+    // the generic round-trip means new inference.toml sub-sections surface
+    // automatically without per-field plumbing.
+    let mut v = serde_json::to_value(table).unwrap_or_else(|_| json!({}));
+    if let Some(oc) = v.get_mut("openai_compat").and_then(|o| o.as_object_mut()) {
+        let has_secret = oc
+            .get("api_key")
+            .and_then(|k| k.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+            || oc
+                .get("api_key_enc")
+                .and_then(|k| k.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+        // Never echo the raw / encrypted secret.
+        oc.remove("api_key");
+        oc.remove("api_key_enc");
+        oc.insert("api_key_set".into(), json!(has_secret));
+        oc.insert(
+            "api_key".into(),
+            json!(if has_secret { SECRET_MASK_SET } else { "" }),
+        );
+    }
+    v
+}
+
+/// Get-or-create a sub-table by `key` on `table`.
+fn inf_subtable<'a>(table: &'a mut toml::Table, key: &str) -> Result<&'a mut toml::Table, String> {
+    table
+        .entry(key)
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| format!("Invalid [{key}] section"))
+}
+
+/// Apply scalar `bool`/`i64`/`f64`/`str` fields from a params object to a TOML
+/// table, recording changes. `prefix` is used only for the change message.
+#[allow(clippy::too_many_arguments)]
+fn inf_apply_scalars(
+    section: &mut toml::Table,
+    src: &serde_json::Map<String, Value>,
+    prefix: &str,
+    bools: &[&str],
+    ints: &[&str],
+    floats: &[&str],
+    strings: &[&str],
+    str_arrays: &[&str],
+    changes: &mut Vec<String>,
+) -> Result<(), String> {
+    for k in bools {
+        if let Some(v) = src.get(*k).and_then(|v| v.as_bool()) {
+            section.insert((*k).into(), toml::Value::Boolean(v));
+            changes.push(format!("{prefix}.{k} = {v}"));
+        }
+    }
+    for k in ints {
+        if let Some(v) = src.get(*k).and_then(|v| v.as_i64()) {
+            section.insert((*k).into(), toml::Value::Integer(v));
+            changes.push(format!("{prefix}.{k} = {v}"));
+        }
+    }
+    for k in floats {
+        if let Some(v) = src.get(*k).and_then(|v| v.as_f64()) {
+            section.insert((*k).into(), toml::Value::Float(v));
+            changes.push(format!("{prefix}.{k} = {v}"));
+        }
+    }
+    for k in strings {
+        if let Some(v) = src.get(*k).and_then(|v| v.as_str()) {
+            section.insert((*k).into(), toml::Value::String(v.into()));
+            changes.push(format!("{prefix}.{k} = \"{v}\""));
+        }
+    }
+    for k in str_arrays {
+        if let Some(arr) = src.get(*k).and_then(|v| v.as_array()) {
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| format!("{prefix}.{k} entries must be strings"))?;
+                out.push(toml::Value::String(s.into()));
+            }
+            section.insert((*k).into(), toml::Value::Array(out));
+            changes.push(format!("{prefix}.{k} = [{} entries]", arr.len()));
+        }
+    }
+    Ok(())
+}
+
+/// Apply an `inference.update` params object onto an inference.toml table.
+/// Returns the change list. Validates router thresholds (strong < fast) and
+/// generation ranges. Does NOT handle the openai_compat secret — that is done
+/// in the async handler so it can call `config_crypto::encrypt_value`.
+fn apply_inference_to_table(
+    table: &mut toml::Table,
+    params: &Value,
+) -> Result<Vec<String>, String> {
+    let mut changes: Vec<String> = Vec::new();
+    let p = params
+        .as_object()
+        .ok_or_else(|| "params must be an object".to_string())?;
+
+    // ── root scalars (INF.2) ──
+    inf_apply_scalars(
+        table,
+        p,
+        "inference",
+        &["enabled", "auto_load"],
+        &["max_memory_mb"],
+        &[],
+        &["backend", "models_dir", "default_model"],
+        &[],
+        &mut changes,
+    )?;
+
+    // ── [generation] (INF.3) ──
+    if let Some(g) = p.get("generation").and_then(|v| v.as_object()) {
+        if let Some(t) = g.get("temperature").and_then(|v| v.as_f64()) {
+            if !(0.0..=2.0).contains(&t) {
+                return Err("generation.temperature must be 0.0-2.0".into());
+            }
+        }
+        if let Some(tp) = g.get("top_p").and_then(|v| v.as_f64()) {
+            if !(0.0..=1.0).contains(&tp) {
+                return Err("generation.top_p must be 0.0-1.0".into());
+            }
+        }
+        let section = inf_subtable(table, "generation")?;
+        inf_apply_scalars(
+            section,
+            g,
+            "generation",
+            &[],
+            &["max_tokens", "gpu_layers", "context_size"],
+            &["temperature", "top_p"],
+            &[],
+            &["stop"],
+            &mut changes,
+        )?;
+    }
+
+    // ── [router] (INF.4) — cross-field validation strong < fast ──
+    if let Some(r) = p.get("router").and_then(|v| v.as_object()) {
+        // Resolve the *effective* thresholds (incoming overrides existing).
+        let existing = table.get("router").and_then(|v| v.as_table());
+        let fast = r
+            .get("fast_threshold")
+            .and_then(|v| v.as_f64())
+            .or_else(|| {
+                existing
+                    .and_then(|e| e.get("fast_threshold"))
+                    .and_then(|v| v.as_float())
+            });
+        let strong = r
+            .get("strong_threshold")
+            .and_then(|v| v.as_f64())
+            .or_else(|| {
+                existing
+                    .and_then(|e| e.get("strong_threshold"))
+                    .and_then(|v| v.as_float())
+            });
+        if let (Some(f), Some(s)) = (fast, strong) {
+            if s >= f {
+                return Err(format!(
+                    "router.strong_threshold ({s}) must be < router.fast_threshold ({f})"
+                ));
+            }
+        }
+        for (name, val) in [("fast_threshold", fast), ("strong_threshold", strong)] {
+            if let Some(v) = val {
+                if !(0.0..=1.0).contains(&v) {
+                    return Err(format!("router.{name} must be 0.0-1.0"));
+                }
+            }
+        }
+        let section = inf_subtable(table, "router")?;
+        inf_apply_scalars(
+            section,
+            r,
+            "router",
+            &["enabled"],
+            &["max_fast_prompt_tokens"],
+            &["fast_threshold", "strong_threshold"],
+            &["fast_model", "strong_model"],
+            &["cloud_keywords", "fast_keywords"],
+            &mut changes,
+        )?;
+    }
+
+    // ── [openai_compat] non-secret fields (INF.5; api_key handled in caller) ──
+    if let Some(oc) = p.get("openai_compat").and_then(|v| v.as_object()) {
+        let section = inf_subtable(table, "openai_compat")?;
+        inf_apply_scalars(
+            section,
+            oc,
+            "openai_compat",
+            &[],
+            &[],
+            &[],
+            &["base_url", "model"],
+            &[],
+            &mut changes,
+        )?;
+    }
+
+    // ── Generic pass-through sub-sections (INF.5) ──
+    // Each is a flat table of scalars/arrays; apply them generically so new
+    // backend fields don't require per-field plumbing. Secrets are not expected
+    // in these sections.
+    for sect in &[
+        "exo",
+        "llamafile",
+        "mlx",
+        "mistralrs",
+        "llmlingua",
+        "streaming_llm",
+        "embedding",
+    ] {
+        if let Some(obj) = p.get(*sect).and_then(|v| v.as_object()) {
+            let section = inf_subtable(table, sect)?;
+            for (k, val) in obj {
+                let tv = json_to_toml(val)
+                    .ok_or_else(|| format!("Unsupported value type for {sect}.{k}"))?;
+                section.insert(k.clone(), tv);
+            }
+            changes.push(format!("{sect} = [updated]"));
+        }
+    }
+
+    Ok(changes)
+}
+
+/// Convert a JSON value into a TOML value for generic pass-through sections.
+/// Returns None for null / unrepresentable values.
+fn json_to_toml(v: &Value) -> Option<toml::Value> {
+    match v {
+        Value::Bool(b) => Some(toml::Value::Boolean(*b)),
+        Value::String(s) => Some(toml::Value::String(s.clone())),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(toml::Value::Integer(i))
+            } else {
+                n.as_f64().map(toml::Value::Float)
+            }
+        }
+        Value::Array(a) => {
+            let mut out = Vec::with_capacity(a.len());
+            for item in a {
+                out.push(json_to_toml(item)?);
+            }
+            Some(toml::Value::Array(out))
+        }
+        Value::Object(o) => {
+            let mut m = toml::map::Map::new();
+            for (k, val) in o {
+                m.insert(k.clone(), json_to_toml(val)?);
+            }
+            Some(toml::Value::Table(m))
+        }
+        Value::Null => None,
+    }
+}
+
+/// Build the `[boundaries]` table for a CONTRACT.toml from `contract.update`
+/// params. Validates `max_tool_calls_per_turn` range. Returns the full table to
+/// serialise (the contract file only contains `[boundaries]`).
+fn build_contract_table(params: &Value) -> Result<toml::Table, String> {
+    fn string_array(params: &Value, key: &str) -> Result<Vec<toml::Value>, String> {
+        let arr = params
+            .get(key)
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| format!("Missing or invalid '{key}' (expected array of strings)"))?;
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            let s = item
+                .as_str()
+                .ok_or_else(|| format!("'{key}' entries must be strings"))?;
+            let s = s.trim();
+            if s.is_empty() {
+                return Err(format!("'{key}' entries must be non-empty"));
+            }
+            out.push(toml::Value::String(s.into()));
+        }
+        Ok(out)
+    }
+
+    let must_not = string_array(params, "must_not")?;
+    let must_always = string_array(params, "must_always")?;
+    let max_calls = params
+        .get("max_tool_calls_per_turn")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if max_calls > 1000 {
+        return Err("max_tool_calls_per_turn must be 0-1000 (0 = unlimited)".into());
+    }
+
+    let mut boundaries = toml::map::Map::new();
+    boundaries.insert("must_not".into(), toml::Value::Array(must_not));
+    boundaries.insert("must_always".into(), toml::Value::Array(must_always));
+    boundaries.insert(
+        "max_tool_calls_per_turn".into(),
+        toml::Value::Integer(max_calls as i64),
+    );
+
+    let mut table = toml::Table::new();
+    table.insert("boundaries".into(), toml::Value::Table(boundaries));
+    Ok(table)
+}
+
+/// Parse a CONTRACT.toml table into the `contract.get` response shape.
+fn contract_table_to_response(table: &toml::Table) -> Value {
+    let boundaries = table.get("boundaries").and_then(|v| v.as_table());
+    let str_arr = |key: &str| -> Vec<String> {
+        boundaries
+            .and_then(|b| b.get(key))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    };
+    let max_calls = boundaries
+        .and_then(|b| b.get("max_tool_calls_per_turn"))
+        .and_then(|v| v.as_integer())
+        .unwrap_or(0);
+    json!({
+        "must_not": str_arr("must_not"),
+        "must_always": str_arr("must_always"),
+        "max_tool_calls_per_turn": max_calls,
+    })
+}
+
+/// Validate a redaction source mode string.
+fn is_valid_source_mode(v: &str) -> bool {
+    matches!(v, "on" | "off" | "selective" | "inherit")
+}
+
+/// Apply a `redaction.update` payload onto a config.toml table's `[redaction]`
+/// section. Returns the change list. Validates ttl/purge ranges + source-mode
+/// + tool-egress restore-args enums.
+fn apply_redaction_to_table(table: &mut toml::Table, params: &Value) -> Result<Vec<String>, String> {
+    let mut changes: Vec<String> = Vec::new();
+
+    let red = table
+        .entry("redaction")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| "Invalid [redaction] section".to_string())?;
+
+    // ── Root scalars ──
+    if let Some(v) = params.get("enabled").and_then(|v| v.as_bool()) {
+        red.insert("enabled".into(), toml::Value::Boolean(v));
+        changes.push(format!("redaction.enabled = {v}"));
+    }
+    if let Some(v) = params.get("vault_ttl_hours").and_then(|v| v.as_i64()) {
+        if v <= 0 || v > 8760 {
+            return Err("vault_ttl_hours must be 1-8760".into());
+        }
+        red.insert("vault_ttl_hours".into(), toml::Value::Integer(v));
+        changes.push(format!("redaction.vault_ttl_hours = {v}"));
+    }
+    if let Some(v) = params.get("purge_after_expire_days").and_then(|v| v.as_u64()) {
+        if v > 3650 {
+            return Err("purge_after_expire_days must be 0-3650".into());
+        }
+        red.insert("purge_after_expire_days".into(), toml::Value::Integer(v as i64));
+        changes.push(format!("redaction.purge_after_expire_days = {v}"));
+    }
+    if let Some(arr) = params.get("profiles").and_then(|v| v.as_array()) {
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            let s = item
+                .as_str()
+                .ok_or_else(|| "profiles entries must be strings".to_string())?;
+            let s = s.trim();
+            if s.is_empty() {
+                return Err("profiles entries must be non-empty".into());
+            }
+            out.push(toml::Value::String(s.into()));
+        }
+        red.insert("profiles".into(), toml::Value::Array(out));
+        changes.push(format!("redaction.profiles = [{} entries]", arr.len()));
+    }
+
+    // ── [redaction.sources] per-source modes ──
+    if let Some(sources) = params.get("sources").and_then(|v| v.as_object()) {
+        let sub = red
+            .entry("sources")
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .ok_or_else(|| "Invalid [redaction.sources] section".to_string())?;
+        for key in &[
+            "user_input",
+            "tool_results",
+            "system_prompt",
+            "sub_agent",
+            "cron_context",
+        ] {
+            if let Some(v) = sources.get(*key).and_then(|v| v.as_str()) {
+                if !is_valid_source_mode(v) {
+                    return Err(format!(
+                        "Invalid redaction source mode '{v}' for {key}. Valid: on, off, selective, inherit"
+                    ));
+                }
+                sub.insert((*key).into(), toml::Value::String(v.into()));
+                changes.push(format!("redaction.sources.{key} = \"{v}\""));
+            }
+        }
+    }
+
+    // ── [redaction.tool_egress.<tool>] add/update/remove ──
+    // `tool_egress` is an object keyed by tool name. A value of `null` removes
+    // that tool's rule; otherwise `{ restore_args, audit_reveal }` upserts it.
+    if let Some(egress) = params.get("tool_egress").and_then(|v| v.as_object()) {
+        for (tool, rule) in egress {
+            let tool_trim = tool.trim();
+            if tool_trim.is_empty() {
+                return Err("tool_egress tool names must be non-empty".into());
+            }
+            if rule.is_null() {
+                if let Some(eg) = red.get_mut("tool_egress").and_then(|v| v.as_table_mut()) {
+                    eg.remove(tool_trim);
+                    changes.push(format!("redaction.tool_egress.{tool_trim} removed"));
+                }
+                continue;
+            }
+            let rule_obj = rule
+                .as_object()
+                .ok_or_else(|| format!("tool_egress.{tool_trim} must be an object or null"))?;
+            let restore = rule_obj
+                .get("restore_args")
+                .and_then(|v| v.as_str())
+                .unwrap_or("deny");
+            if !matches!(restore, "restore" | "passthrough" | "deny") {
+                return Err(format!(
+                    "Invalid restore_args '{restore}' for tool_egress.{tool_trim}. Valid: restore, passthrough, deny"
+                ));
+            }
+            let audit_reveal = rule_obj
+                .get("audit_reveal")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let eg = red
+                .entry("tool_egress")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .ok_or_else(|| "Invalid [redaction.tool_egress] section".to_string())?;
+            let mut entry = toml::map::Map::new();
+            entry.insert("restore_args".into(), toml::Value::String(restore.into()));
+            entry.insert("audit_reveal".into(), toml::Value::Boolean(audit_reveal));
+            eg.insert(tool_trim.to_string(), toml::Value::Table(entry));
+            changes.push(format!(
+                "redaction.tool_egress.{tool_trim} = {{ restore_args = \"{restore}\", audit_reveal = {audit_reveal} }}"
+            ));
+        }
+    }
+
+    Ok(changes)
+}
+
+/// Parse a config.toml `[redaction]` section into the `redaction.get`
+/// response shape.
+fn redaction_table_to_response(table: &toml::Table) -> Value {
+    let red = table.get("redaction").and_then(|v| v.as_table());
+    let enabled = red.and_then(|r| r.get("enabled")).and_then(|v| v.as_bool()).unwrap_or(false);
+    let vault_ttl = red
+        .and_then(|r| r.get("vault_ttl_hours"))
+        .and_then(|v| v.as_integer())
+        .unwrap_or(168);
+    let purge = red
+        .and_then(|r| r.get("purge_after_expire_days"))
+        .and_then(|v| v.as_integer())
+        .unwrap_or(30);
+    let profiles: Vec<String> = red
+        .and_then(|r| r.get("profiles"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    let sources = red.and_then(|r| r.get("sources")).and_then(|v| v.as_table());
+    let source_mode = |key: &str, default: &str| -> String {
+        sources
+            .and_then(|s| s.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or(default)
+            .to_string()
+    };
+
+    let egress = red.and_then(|r| r.get("tool_egress")).and_then(|v| v.as_table());
+    let mut egress_out = serde_json::Map::new();
+    if let Some(eg) = egress {
+        for (tool, rule) in eg {
+            let rule_t = rule.as_table();
+            let restore = rule_t
+                .and_then(|t| t.get("restore_args"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("deny");
+            let audit = rule_t
+                .and_then(|t| t.get("audit_reveal"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            egress_out.insert(
+                tool.clone(),
+                json!({ "restore_args": restore, "audit_reveal": audit }),
+            );
+        }
+    }
+
+    json!({
+        "enabled": enabled,
+        "vault_ttl_hours": vault_ttl,
+        "purge_after_expire_days": purge,
+        "profiles": profiles,
+        "sources": {
+            "user_input": source_mode("user_input", "off"),
+            "tool_results": source_mode("tool_results", "on"),
+            "system_prompt": source_mode("system_prompt", "selective"),
+            "sub_agent": source_mode("sub_agent", "inherit"),
+            "cron_context": source_mode("cron_context", "on"),
+        },
+        "tool_egress": Value::Object(egress_out),
+    })
+}
+
+/// Validate + apply a `killswitch.update` payload onto a KILLSWITCH.toml table.
+/// Returns the change list. Validates numeric ranges across all sub-sections.
+fn apply_killswitch_to_table(table: &mut toml::Table, params: &Value) -> Result<Vec<String>, String> {
+    let mut changes: Vec<String> = Vec::new();
+
+    // Helper: get-or-create a sub-table.
+    fn sub<'a>(table: &'a mut toml::Table, key: &str) -> Result<&'a mut toml::Table, String> {
+        table
+            .entry(key.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .ok_or_else(|| format!("Invalid [{key}] section"))
+    }
+
+    // ── [triggers] ──
+    if let Some(t) = params.get("triggers").and_then(|v| v.as_object()) {
+        let sect = sub(table, "triggers")?;
+        if let Some(v) = t.get("max_replies_per_minute").and_then(|v| v.as_u64()) {
+            if v == 0 || v > 10000 {
+                return Err("triggers.max_replies_per_minute must be 1-10000".into());
+            }
+            sect.insert("max_replies_per_minute".into(), toml::Value::Integer(v as i64));
+            changes.push(format!("triggers.max_replies_per_minute = {v}"));
+        }
+        if let Some(v) = t.get("max_consecutive_errors").and_then(|v| v.as_u64()) {
+            if v == 0 || v > 1000 {
+                return Err("triggers.max_consecutive_errors must be 1-1000".into());
+            }
+            sect.insert("max_consecutive_errors".into(), toml::Value::Integer(v as i64));
+            changes.push(format!("triggers.max_consecutive_errors = {v}"));
+        }
+        if let Some(v) = t.get("error_rate_threshold").and_then(|v| v.as_f64()) {
+            if !(0.0..=1.0).contains(&v) {
+                return Err("triggers.error_rate_threshold must be 0.0-1.0".into());
+            }
+            sect.insert("error_rate_threshold".into(), toml::Value::Float(v));
+            changes.push(format!("triggers.error_rate_threshold = {v}"));
+        }
+        if let Some(v) = t.get("cost_limit_usd").and_then(|v| v.as_f64()) {
+            if v < 0.0 || v > 1_000_000.0 {
+                return Err("triggers.cost_limit_usd must be 0-1000000".into());
+            }
+            sect.insert("cost_limit_usd".into(), toml::Value::Float(v));
+            changes.push(format!("triggers.cost_limit_usd = {v}"));
+        }
+    }
+
+    // ── [circuit_breaker] ──
+    if let Some(c) = params.get("circuit_breaker").and_then(|v| v.as_object()) {
+        let sect = sub(table, "circuit_breaker")?;
+        if let Some(v) = c.get("frequency_window_secs").and_then(|v| v.as_u64()) {
+            if v == 0 || v > 86400 {
+                return Err("circuit_breaker.frequency_window_secs must be 1-86400".into());
+            }
+            sect.insert("frequency_window_secs".into(), toml::Value::Integer(v as i64));
+            changes.push(format!("circuit_breaker.frequency_window_secs = {v}"));
+        }
+        if let Some(v) = c.get("frequency_max_replies").and_then(|v| v.as_u64()) {
+            if v == 0 || v > 10000 {
+                return Err("circuit_breaker.frequency_max_replies must be 1-10000".into());
+            }
+            sect.insert("frequency_max_replies".into(), toml::Value::Integer(v as i64));
+            changes.push(format!("circuit_breaker.frequency_max_replies = {v}"));
+        }
+        if let Some(v) = c.get("similarity_threshold").and_then(|v| v.as_f64()) {
+            if !(0.0..=1.0).contains(&v) {
+                return Err("circuit_breaker.similarity_threshold must be 0.0-1.0".into());
+            }
+            sect.insert("similarity_threshold".into(), toml::Value::Float(v));
+            changes.push(format!("circuit_breaker.similarity_threshold = {v}"));
+        }
+        if let Some(v) = c.get("token_explosion_multiplier").and_then(|v| v.as_f64()) {
+            if v < 1.0 || v > 1000.0 {
+                return Err("circuit_breaker.token_explosion_multiplier must be 1.0-1000.0".into());
+            }
+            sect.insert("token_explosion_multiplier".into(), toml::Value::Float(v));
+            changes.push(format!("circuit_breaker.token_explosion_multiplier = {v}"));
+        }
+        if let Some(v) = c.get("cooldown_secs").and_then(|v| v.as_u64()) {
+            if v > 86400 {
+                return Err("circuit_breaker.cooldown_secs must be 0-86400".into());
+            }
+            sect.insert("cooldown_secs".into(), toml::Value::Integer(v as i64));
+            changes.push(format!("circuit_breaker.cooldown_secs = {v}"));
+        }
+        if let Some(v) = c.get("half_open_allow_count").and_then(|v| v.as_u64()) {
+            if v == 0 || v > 1000 {
+                return Err("circuit_breaker.half_open_allow_count must be 1-1000".into());
+            }
+            sect.insert("half_open_allow_count".into(), toml::Value::Integer(v as i64));
+            changes.push(format!("circuit_breaker.half_open_allow_count = {v}"));
+        }
+    }
+
+    // ── [failsafe] ──
+    if let Some(f) = params.get("failsafe").and_then(|v| v.as_object()) {
+        let sect = sub(table, "failsafe")?;
+        for key in &["l1_auto_recover_secs", "l2_auto_recover_secs", "l3_auto_recover_secs"] {
+            if let Some(v) = f.get(*key).and_then(|v| v.as_u64()) {
+                if v > 86400 {
+                    return Err(format!("failsafe.{key} must be 0-86400 (0 = manual only)"));
+                }
+                sect.insert((*key).into(), toml::Value::Integer(v as i64));
+                changes.push(format!("failsafe.{key} = {v}"));
+            }
+        }
+        for (param_key, toml_key) in &[
+            ("default_restricted_reply", "default_restricted_reply"),
+            ("default_halted_reply", "default_halted_reply"),
+        ] {
+            if let Some(v) = f.get(*param_key).and_then(|v| v.as_str()) {
+                sect.insert((*toml_key).into(), toml::Value::String(v.into()));
+                changes.push(format!("failsafe.{toml_key} updated"));
+            }
+        }
+    }
+
+    // ── [safety_words] ──
+    if let Some(s) = params.get("safety_words").and_then(|v| v.as_object()) {
+        let sect = sub(table, "safety_words")?;
+        for key in &["stop", "stop_all", "resume", "status"] {
+            if let Some(arr) = s.get(*key).and_then(|v| v.as_array()) {
+                let mut out = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let w = item
+                        .as_str()
+                        .ok_or_else(|| format!("safety_words.{key} entries must be strings"))?;
+                    let w = w.trim();
+                    if w.is_empty() {
+                        return Err(format!("safety_words.{key} entries must be non-empty"));
+                    }
+                    out.push(toml::Value::String(w.into()));
+                }
+                sect.insert((*key).into(), toml::Value::Array(out));
+                changes.push(format!("safety_words.{key} = [{} entries]", arr.len()));
+            }
+        }
+    }
+
+    // ── [defensive_prompt] ──
+    if let Some(d) = params.get("defensive_prompt").and_then(|v| v.as_object()) {
+        let sect = sub(table, "defensive_prompt")?;
+        if let Some(v) = d.get("enabled").and_then(|v| v.as_bool()) {
+            sect.insert("enabled".into(), toml::Value::Boolean(v));
+            changes.push(format!("defensive_prompt.enabled = {v}"));
+        }
+        if let Some(arr) = d.get("languages").and_then(|v| v.as_array()) {
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                let l = item
+                    .as_str()
+                    .ok_or_else(|| "defensive_prompt.languages entries must be strings".to_string())?;
+                let l = l.trim();
+                if l.is_empty() {
+                    return Err("defensive_prompt.languages entries must be non-empty".into());
+                }
+                out.push(toml::Value::String(l.into()));
+            }
+            sect.insert("languages".into(), toml::Value::Array(out));
+            changes.push(format!("defensive_prompt.languages = [{} entries]", arr.len()));
+        }
+    }
+
+    // ── [audit] ──
+    if let Some(a) = params.get("audit").and_then(|v| v.as_object()) {
+        let sect = sub(table, "audit")?;
+        if let Some(v) = a.get("enabled").and_then(|v| v.as_bool()) {
+            sect.insert("enabled".into(), toml::Value::Boolean(v));
+            changes.push(format!("audit.enabled = {v}"));
+        }
+        if let Some(v) = a.get("path").and_then(|v| v.as_str()) {
+            let v = v.trim();
+            if v.is_empty() {
+                return Err("audit.path must be non-empty".into());
+            }
+            sect.insert("path".into(), toml::Value::String(v.into()));
+            changes.push("audit.path updated".to_string());
+        }
+    }
+
+    Ok(changes)
+}
+
+/// Parse a KILLSWITCH.toml table into the `killswitch.get` response shape.
+/// Falls back to the documented defaults for any missing field so the dashboard
+/// always renders a complete form.
+fn killswitch_table_to_response(table: &toml::Table) -> Value {
+    let ks = duduclaw_security::killswitch::KillswitchConfig::default();
+
+    let t = table.get("triggers").and_then(|v| v.as_table());
+    let cb = table.get("circuit_breaker").and_then(|v| v.as_table());
+    let fs = table.get("failsafe").and_then(|v| v.as_table());
+    let sw = table.get("safety_words").and_then(|v| v.as_table());
+    let dp = table.get("defensive_prompt").and_then(|v| v.as_table());
+    let au = table.get("audit").and_then(|v| v.as_table());
+
+    let int = |tbl: Option<&toml::Table>, key: &str, default: i64| -> i64 {
+        tbl.and_then(|t| t.get(key)).and_then(|v| v.as_integer()).unwrap_or(default)
+    };
+    let flt = |tbl: Option<&toml::Table>, key: &str, default: f64| -> f64 {
+        tbl.and_then(|t| t.get(key)).and_then(|v| v.as_float()).unwrap_or(default)
+    };
+    let boolean = |tbl: Option<&toml::Table>, key: &str, default: bool| -> bool {
+        tbl.and_then(|t| t.get(key)).and_then(|v| v.as_bool()).unwrap_or(default)
+    };
+    let strv = |tbl: Option<&toml::Table>, key: &str, default: &str| -> String {
+        tbl.and_then(|t| t.get(key)).and_then(|v| v.as_str()).unwrap_or(default).to_string()
+    };
+    let arr = |tbl: Option<&toml::Table>, key: &str, default: &[String]| -> Vec<String> {
+        tbl.and_then(|t| t.get(key))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_else(|| default.to_vec())
+    };
+
+    json!({
+        "triggers": {
+            "max_replies_per_minute": int(t, "max_replies_per_minute", ks.triggers.max_replies_per_minute as i64),
+            "max_consecutive_errors": int(t, "max_consecutive_errors", ks.triggers.max_consecutive_errors as i64),
+            "error_rate_threshold": flt(t, "error_rate_threshold", ks.triggers.error_rate_threshold),
+            "cost_limit_usd": flt(t, "cost_limit_usd", ks.triggers.cost_limit_usd),
+        },
+        "circuit_breaker": {
+            "frequency_window_secs": int(cb, "frequency_window_secs", ks.circuit_breaker.frequency_window_secs as i64),
+            "frequency_max_replies": int(cb, "frequency_max_replies", ks.circuit_breaker.frequency_max_replies as i64),
+            "similarity_threshold": flt(cb, "similarity_threshold", ks.circuit_breaker.similarity_threshold),
+            "token_explosion_multiplier": flt(cb, "token_explosion_multiplier", ks.circuit_breaker.token_explosion_multiplier),
+            "cooldown_secs": int(cb, "cooldown_secs", ks.circuit_breaker.cooldown_secs as i64),
+            "half_open_allow_count": int(cb, "half_open_allow_count", ks.circuit_breaker.half_open_allow_count as i64),
+        },
+        "failsafe": {
+            "l1_auto_recover_secs": int(fs, "l1_auto_recover_secs", ks.failsafe.l1_auto_recover_secs as i64),
+            "l2_auto_recover_secs": int(fs, "l2_auto_recover_secs", ks.failsafe.l2_auto_recover_secs as i64),
+            "l3_auto_recover_secs": int(fs, "l3_auto_recover_secs", ks.failsafe.l3_auto_recover_secs as i64),
+            "default_restricted_reply": strv(fs, "default_restricted_reply", &ks.failsafe.default_restricted_reply),
+            "default_halted_reply": strv(fs, "default_halted_reply", &ks.failsafe.default_halted_reply),
+        },
+        "safety_words": {
+            "stop": arr(sw, "stop", &ks.safety_words.stop),
+            "stop_all": arr(sw, "stop_all", &ks.safety_words.stop_all),
+            "resume": arr(sw, "resume", &ks.safety_words.resume),
+            "status": arr(sw, "status", &ks.safety_words.status),
+        },
+        "defensive_prompt": {
+            "enabled": boolean(dp, "enabled", ks.defensive_prompt.enabled),
+            "languages": arr(dp, "languages", &ks.defensive_prompt.languages),
+        },
+        "audit": {
+            "enabled": boolean(au, "enabled", ks.audit.enabled),
+            "path": strv(au, "path", &ks.audit.path),
+        },
+    })
+}
+
+/// Redact URLs and credential-like tokens from a free-form error string before
+/// it is forwarded to a client (M19).
+///
+/// Operates per whitespace-separated token so surrounding prose is preserved:
+/// - Tokens containing a scheme (`://`) have any `user:pass@` userinfo and any
+///   `?query` string stripped, leaving `scheme://host[:port]/path`.
+/// - `key=value` pairs whose key looks sensitive (api_key / token / password /
+///   secret / pwd / auth) have their value replaced with `[REDACTED]`.
+fn scrub_secrets_from_text(raw: &str) -> String {
+    fn is_sensitive_key(key: &str) -> bool {
+        let k = key.to_ascii_lowercase();
+        ["api_key", "apikey", "token", "password", "passwd", "pwd", "secret", "auth", "key"]
+            .iter()
+            .any(|s| k.contains(s))
+    }
+
+    fn scrub_token(token: &str) -> String {
+        // 1. URL: strip userinfo + query string, keep scheme://host/path.
+        if let Some(scheme_idx) = token.find("://") {
+            let scheme = &token[..scheme_idx];
+            let rest = &token[scheme_idx + 3..];
+            // Drop everything from the first query/fragment marker onward.
+            let rest = rest
+                .split(['?', '#'])
+                .next()
+                .unwrap_or("");
+            // Drop userinfo (anything up to and including '@' in the authority).
+            // The authority ends at the first '/'.
+            let (authority, path) = match rest.find('/') {
+                Some(i) => (&rest[..i], &rest[i..]),
+                None => (rest, ""),
+            };
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            return format!("{scheme}://{host}{path}");
+        }
+        // 2. key=value: redact sensitive values.
+        if let Some(eq) = token.find('=') {
+            let (key, _val) = token.split_at(eq);
+            if is_sensitive_key(key) {
+                return format!("{key}=[REDACTED]");
+            }
+        }
+        token.to_string()
+    }
+
+    raw.split_whitespace()
+        .map(scrub_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Hours elapsed since the start of the current UTC month — the look-back
 /// window CostTelemetry uses to compute "this month" spend. Always ≥ 1 so the
 /// telemetry query never receives a zero window.
@@ -108,6 +2051,13 @@ pub struct MethodHandler {
     >,
     /// RFC-23 redaction manager. `None` ⇒ pipeline disabled at this layer.
     redaction_manager: RwLock<Option<Arc<duduclaw_redaction::RedactionManager>>>,
+    /// M1/M60: long-lived SQLite-backed audit/reliability index, lazily opened
+    /// once and synced by a background task — so audit/reliability RPCs and the
+    /// `/api/reliability/summary` HTTP endpoint reuse one connection instead of
+    /// opening a fresh DB + running a full `sync_from_files` on every request.
+    audit_index: tokio::sync::OnceCell<
+        Arc<crate::evolution_events::query::AuditEventIndex>,
+    >,
 }
 
 /// Cached update info from the last `system.check_update` call. [M2][R2:NM1]
@@ -196,6 +2146,46 @@ impl MethodHandler {
             event_tx: RwLock::new(None),
             autopilot_event_tx: RwLock::new(None),
             redaction_manager: RwLock::new(None),
+            audit_index: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Lazily open (once) the shared [`AuditEventIndex`] and return it.
+    ///
+    /// M1/M60: the index is opened a single time (a fresh DB connection per
+    /// request was O(total-audit-history) on a hot path). The first call also
+    /// runs an initial `sync_from_files`; thereafter a background task that
+    /// calls [`refresh_audit_index`](Self::refresh_audit_index) keeps it fresh,
+    /// so request handlers do NOT sync inline.
+    pub(crate) async fn audit_index(
+        &self,
+    ) -> Result<Arc<crate::evolution_events::query::AuditEventIndex>, String> {
+        use crate::evolution_events::query::AuditEventIndex;
+        let idx = self
+            .audit_index
+            .get_or_try_init(|| async {
+                let idx = AuditEventIndex::open(&self.home_dir)?;
+                // Initial sync so the very first query isn't empty/stale.
+                if let Err(e) = idx.sync_from_files().await {
+                    warn!("audit_index: initial sync warning (stale index): {e}");
+                }
+                Ok::<_, String>(Arc::new(idx))
+            })
+            .await?;
+        Ok(idx.clone())
+    }
+
+    /// Refresh the shared audit index once (called on a background interval by
+    /// the gateway — M1/M60 — to replace per-request `sync_from_files`).
+    /// Best-effort: errors are logged and swallowed.
+    pub async fn refresh_audit_index(&self) {
+        match self.audit_index().await {
+            Ok(idx) => {
+                if let Err(e) = idx.sync_from_files().await {
+                    warn!("audit_index background sync warning: {e}");
+                }
+            }
+            Err(e) => warn!("audit_index background sync: open failed: {e}"),
         }
     }
 
@@ -367,6 +2357,38 @@ impl MethodHandler {
                 }
             };
         }
+        // Helper: check access to a specifically-named agent (used when the
+        // binding key is not the literal `agent_id` param — e.g. `assigned_to`).
+        macro_rules! check_agent_named {
+            ($agent:expr, $min_level:expr) => {
+                if let Err(e) = acl::require_agent_access(ctx, $agent, $min_level) {
+                    return WsFrame::error_response("", &e);
+                }
+            };
+        }
+        // Helper for list/filter RPCs that accept an OPTIONAL `agent_id` filter.
+        // Admins may list across all agents; non-admins must scope the query to
+        // an agent they are bound to (otherwise they could enumerate other
+        // teams' tasks/activity). Mirrors the agent-binding intent of memory.*.
+        macro_rules! check_agent_filter {
+            ($min_level:expr) => {
+                if !ctx.is_admin() {
+                    match params.get("agent_id").and_then(|v| v.as_str()) {
+                        Some(id) if !id.is_empty() => {
+                            if let Err(e) = acl::require_agent_access(ctx, id, $min_level) {
+                                return WsFrame::error_response("", &e);
+                            }
+                        }
+                        _ => {
+                            return WsFrame::error_response(
+                                "",
+                                "agent_id parameter is required",
+                            );
+                        }
+                    }
+                }
+            };
+        }
 
         match method {
             "connect.challenge" => self.handle_connect_challenge(params),
@@ -399,6 +2421,36 @@ impl MethodHandler {
                 self.handle_agents_inspect(params).await
             }
 
+            // ── Behavioral contract (per-agent CONTRACT.toml, CON.1–CON.3) ──
+            "contract.get" => { require_admin!(); self.handle_contract_get(params).await }
+            "contract.update" => { require_admin!(); self.handle_contract_update(params).await }
+
+            // ── Redaction / privacy (global config.toml [redaction], RED.1–RED.4) ──
+            "redaction.get" => { require_admin!(); self.handle_redaction_get().await }
+            "redaction.update" => { require_admin!(); self.handle_redaction_update(params).await }
+
+            // ── Inference (global ~/.duduclaw/inference.toml, INF.1–INF.5) ──
+            "inference.get" => { require_admin!(); self.handle_inference_get().await }
+            "inference.update" => { require_admin!(); self.handle_inference_update(params).await }
+
+            // ── MCP API keys (global config.toml [mcp_keys], MK.1–MK.4) ──
+            "mcp_keys.list" => { require_admin!(); self.handle_mcp_keys_list().await }
+            "mcp_keys.create" => { require_admin!(); self.handle_mcp_keys_create(params).await }
+            "mcp_keys.revoke" => { require_admin!(); self.handle_mcp_keys_revoke(params).await }
+
+            // ── Kill switch (global ~/.duduclaw/KILLSWITCH.toml, KS.1–KS.2) ──
+            "killswitch.get" => { require_admin!(); self.handle_killswitch_get().await }
+            "killswitch.update" => { require_admin!(); self.handle_killswitch_update(params).await }
+
+            // ── Governance policies (policies/*.yaml, GOV.1–GOV.2) ──
+            "governance.list" => { require_admin!(); self.handle_governance_list(params).await }
+            "governance.upsert" => { require_admin!(); self.handle_governance_upsert(params).await }
+            "governance.remove" => { require_admin!(); self.handle_governance_remove(params).await }
+
+            // ── Wiki namespace scope (.scope.toml, SCP.1) ──
+            "wiki_scope.get" => { require_admin!(); self.handle_wiki_scope_get().await }
+            "wiki_scope.update" => { require_admin!(); self.handle_wiki_scope_update(params).await }
+
             // ── Channel methods (admin only) ─────────────────
             "channels.status" => { require_admin!(); self.handle_channels_status().await }
             "channels.add" => { require_admin!(); self.handle_channels_add(params).await }
@@ -424,6 +2476,7 @@ impl MethodHandler {
             "accounts.health" => { require_admin!(); self.handle_accounts_health().await }
             "accounts.add" => { require_admin!(); self.handle_accounts_add(params).await }
             "accounts.update_budget" => { require_admin!(); self.handle_accounts_update_budget(params).await }
+            "accounts.update" => { require_admin!(); self.handle_accounts_update(params).await }
 
             // ── Memory (agent-scoped, H2 fix) ────────────────
             "memory.search" => {
@@ -439,12 +2492,29 @@ impl MethodHandler {
                 self.handle_memory_key_facts(params).await
             }
 
-            // ── Wiki (open to all authenticated users) ───────
-            "wiki.pages" => self.handle_wiki_pages(params).await,
-            "wiki.read" => self.handle_wiki_read(params).await,
-            "wiki.search" => self.handle_wiki_search(params).await,
-            "wiki.lint" => self.handle_wiki_lint(params).await,
-            "wiki.stats" => self.handle_wiki_stats(params).await,
+            // ── Wiki (agent-scoped — HS4 fix, mirrors memory.*) ───────
+            // Each arm reads `agent_id` from params; an Employee bound only to
+            // agent A must not be able to read agent B's private wiki/SOPs.
+            "wiki.pages" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_wiki_pages(params).await
+            }
+            "wiki.read" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_wiki_read(params).await
+            }
+            "wiki.search" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_wiki_search(params).await
+            }
+            "wiki.lint" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_wiki_lint(params).await
+            }
+            "wiki.stats" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_wiki_stats(params).await
+            }
             // Phase 4: trust feedback inspection + manual override.
             // Trust state exposes per-conversation citation history that
             // can correlate with user activity → manager+ only (review H1).
@@ -461,7 +2531,12 @@ impl MethodHandler {
             // ── Skills (open to all) ─────────────────────────
             "skills.list" => self.handle_skills_list(params).await,
             "skills.search" => self.handle_skills_search(params).await,
-            "skills.content" => self.handle_skills_content(params).await,
+            "skills.content" => {
+                // HS4: skill content is read from a specific agent's registry —
+                // scope to an agent the caller is bound to.
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_skills_content(params).await
+            }
             "skills.vet" => { require_admin!(); self.handle_skills_vet(params).await }
             "skills.install" => { require_admin!(); self.handle_skills_install(params).await }
 
@@ -564,15 +2639,34 @@ impl MethodHandler {
             "mcp.oauth.status" => { require_admin!(); self.handle_mcp_oauth_status(params).await }
             "mcp.oauth.revoke" => { require_admin!(); self.handle_mcp_oauth_revoke(params).await }
 
-            // ── Task Board (open to all authenticated) ────
-            "tasks.list" => self.handle_tasks_list(params).await,
-            "tasks.create" => self.handle_tasks_create(params, ctx).await,
-            "tasks.update" => self.handle_tasks_update(params).await,
-            "tasks.remove" => self.handle_tasks_remove(params).await,
-            "tasks.assign" => self.handle_tasks_assign(params).await,
+            // ── Task Board (agent-scoped — HS4 fix) ────
+            "tasks.list" => {
+                // Non-admins must scope the listing to a bound agent.
+                check_agent_filter!(AccessLevel::Viewer);
+                self.handle_tasks_list(params).await
+            }
+            "tasks.create" => {
+                // The target agent is `assigned_to`; creating work for an agent
+                // is a side-effecting operation → Operator level.
+                let assigned_to = params
+                    .get("assigned_to")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if assigned_to.is_empty() {
+                    return WsFrame::error_response("", "assigned_to is required");
+                }
+                check_agent_named!(assigned_to, AccessLevel::Operator);
+                self.handle_tasks_create(params, ctx).await
+            }
+            "tasks.update" => self.handle_tasks_update(params, ctx).await,
+            "tasks.remove" => self.handle_tasks_remove(params, ctx).await,
+            "tasks.assign" => self.handle_tasks_assign(params, ctx).await,
 
-            // ── Activity Feed (open to all authenticated) ───
-            "activity.list" => self.handle_activity_list(params).await,
+            // ── Activity Feed (agent-scoped — HS4 fix) ───
+            "activity.list" => {
+                check_agent_filter!(AccessLevel::Viewer);
+                self.handle_activity_list(params).await
+            }
             // Per-topic filtering is NOT implemented: BroadcastLayer fans out every
             // activity event to every authenticated WS client unconditionally. This
             // RPC exists purely as a client-intent signal and future-compat hook so
@@ -582,6 +2676,12 @@ impl MethodHandler {
                 "broadcast_mode": "all_events",
                 "note": "All authenticated WS clients receive activity events automatically; no per-client filter is in effect.",
             })),
+
+            // ── Live Run Forking (RFC-26) ───────────────────
+            "fork.list" => self.handle_fork_list(params),
+            "fork.inspect" => self.handle_fork_inspect(params),
+            // Resolving a fork promotes a winner's workspace → side-effecting.
+            "fork.resolve" => { require_manager!(); self.handle_fork_resolve(params) }
 
             // ── Autopilot (admin only) ──────────────────────
             "autopilot.list" => { require_admin!(); self.handle_autopilot_list().await }
@@ -861,8 +2961,15 @@ impl MethodHandler {
         };
         let agent_toml = toml::to_string_pretty(&agent_config).unwrap_or_default();
 
-        if let Err(e) = tokio::fs::write(agent_dir.join("agent.toml"), &agent_toml).await {
-            return WsFrame::error_response("", &format!("Failed to write agent.toml: {e}"));
+        // XC.2: atomic write (temp + rename) — mirror the per-agent update path.
+        let agent_toml_path = agent_dir.join("agent.toml");
+        let agent_toml_tmp = agent_toml_path.with_extension("toml.tmp");
+        if let Err(e) = tokio::fs::write(&agent_toml_tmp, &agent_toml).await {
+            return WsFrame::error_response("", &format!("Failed to write agent.toml.tmp: {e}"));
+        }
+        if let Err(e) = tokio::fs::rename(&agent_toml_tmp, &agent_toml_path).await {
+            let _ = tokio::fs::remove_file(&agent_toml_tmp).await;
+            return WsFrame::error_response("", &format!("Failed to commit agent.toml: {e}"));
         }
 
         let soul = format!("# {display_name}\n\nI am {display_name}, a specialist AI agent.\n");
@@ -1567,6 +3674,166 @@ impl MethodHandler {
                 }
             }
 
+            // ── Capabilities fields ([capabilities] section, CAP.1–CAP.4) ──
+            // High-risk tool / computer-use / browser permissions. Delegated to
+            // a pure, unit-tested helper that validates enum + numeric ranges.
+            let cap_changes = apply_capabilities_to_table(table, &params_clone)?;
+            changes.extend(cap_changes);
+
+            // ── Runtime ([runtime] section, RT.1) ──
+            // provider enum / fallback / pty_pool_enabled / worker_managed.
+            let rt_changes = apply_runtime_to_table(table, &params_clone)?;
+            changes.extend(rt_changes);
+
+            // ── Evolution advanced ([evolution.*] fields, EVO.1–EVO.3) ──
+            // external_factors + skill-synthesis / graduation / recommendation /
+            // curiosity / behavior-monitor. Does NOT duplicate the inline
+            // gvu/cognitive/max_active_skills/stagnation_* handling above.
+            let evo_adv_changes = apply_evolution_advanced_to_table(table, &params_clone)?;
+            changes.extend(evo_adv_changes);
+
+            // ── Container advanced ([container.*] fields, CT.1–CT.2) ──
+            // worktree toggles + worktree_copy_files / additional_mounts / cmd /
+            // env. Does NOT duplicate the inline sandbox/network/timeout handling.
+            let ct_adv_changes = apply_container_advanced_to_table(table, &params_clone)?;
+            changes.extend(ct_adv_changes);
+
+            // ── Per-agent Odoo override ([odoo] section, ODO.1) ──
+            // profile / allowed_models / allowed_actions (verb:model) /
+            // company_ids + api_key|password → *_enc. Delegated to a helper so
+            // the encryption + validation are unit-testable.
+            let odoo_changes = apply_odoo_to_table(table, &params_clone, &home_for_update)?;
+            changes.extend(odoo_changes);
+
+            // ── Per-agent scattered fields (G.8) ──
+            // These extend existing sections WITHOUT duplicating fields already
+            // handled inline above (preferred/fallback, enabled/interval/cron, …).
+
+            // [model].account_pool[] + [model].utility
+            {
+                let has_model_extra = ["account_pool", "utility"]
+                    .iter()
+                    .any(|k| params_clone.get(*k).is_some());
+                if has_model_extra {
+                    let model = table
+                        .entry("model")
+                        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                        .as_table_mut()
+                        .ok_or("Invalid [model] section")?;
+                    if let Some(arr) = params_clone.get("account_pool").and_then(|v| v.as_array()) {
+                        let pool: Vec<toml::Value> = arr
+                            .iter()
+                            .filter_map(|v| v.as_str().filter(|s| !s.is_empty()).map(|s| toml::Value::String(s.into())))
+                            .collect();
+                        model.insert("account_pool".into(), toml::Value::Array(pool.clone()));
+                        changes.push(format!("model.account_pool = [{} entries]", pool.len()));
+                    }
+                    if let Some(v) = params_clone.get("utility").and_then(|v| v.as_str()) {
+                        model.insert("utility".into(), toml::Value::String(v.into()));
+                        changes.push(format!("model.utility = \"{v}\""));
+                    }
+                }
+            }
+
+            // [heartbeat].max_concurrent_runs + [heartbeat].cron_timezone
+            {
+                let has_hb_extra = ["heartbeat_max_concurrent_runs", "heartbeat_cron_timezone"]
+                    .iter()
+                    .any(|k| params_clone.get(*k).is_some());
+                if has_hb_extra {
+                    let hb = table
+                        .entry("heartbeat")
+                        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                        .as_table_mut()
+                        .ok_or("Invalid [heartbeat] section")?;
+                    if let Some(v) = params_clone.get("heartbeat_max_concurrent_runs").and_then(|v| v.as_u64()) {
+                        if v == 0 || v > 64 {
+                            return Err("heartbeat max_concurrent_runs must be 1-64".into());
+                        }
+                        hb.insert("max_concurrent_runs".into(), toml::Value::Integer(v as i64));
+                        changes.push(format!("heartbeat.max_concurrent_runs = {v}"));
+                    }
+                    if let Some(v) = params_clone.get("heartbeat_cron_timezone").and_then(|v| v.as_str()) {
+                        if v.parse::<chrono_tz::Tz>().is_err() {
+                            return Err(format!("Invalid heartbeat cron_timezone '{v}' (IANA tz, e.g. Asia/Taipei)"));
+                        }
+                        hb.insert("cron_timezone".into(), toml::Value::String(v.into()));
+                        changes.push(format!("heartbeat.cron_timezone = \"{v}\""));
+                    }
+                }
+            }
+
+            // [proactive].token_budget_per_check / timezone / max_turns
+            if let Some(p) = params_clone.get("proactive").and_then(|v| v.as_object()) {
+                let has_pro_extra = ["token_budget_per_check", "timezone", "max_turns"]
+                    .iter()
+                    .any(|k| p.contains_key(*k));
+                if has_pro_extra {
+                    let pt = table
+                        .entry("proactive")
+                        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                        .as_table_mut()
+                        .ok_or("Invalid [proactive] section")?;
+                    if let Some(v) = p.get("token_budget_per_check").and_then(|v| v.as_u64()) {
+                        pt.insert("token_budget_per_check".into(), toml::Value::Integer(v as i64));
+                        changes.push(format!("proactive.token_budget_per_check = {v}"));
+                    }
+                    if let Some(v) = p.get("timezone").and_then(|v| v.as_str()) {
+                        if v.parse::<chrono_tz::Tz>().is_err() {
+                            return Err(format!("Invalid proactive timezone '{v}' (IANA tz)"));
+                        }
+                        pt.insert("timezone".into(), toml::Value::String(v.into()));
+                        changes.push(format!("proactive.timezone = \"{v}\""));
+                    }
+                    if let Some(v) = p.get("max_turns").and_then(|v| v.as_u64()) {
+                        if v == 0 || v > 100 {
+                            return Err("proactive max_turns must be 1-100".into());
+                        }
+                        pt.insert("max_turns".into(), toml::Value::Integer(v as i64));
+                        changes.push(format!("proactive.max_turns = {v}"));
+                    }
+                }
+            }
+
+            // [ptc] / [prompt] / [cultural_context] — string-keyed scalar tables.
+            // Each accepts a flat object of string|bool|int|float scalars; unknown
+            // keys are written verbatim (these sections are free-form per-agent
+            // tuning, not enum-validated). Empty object is a no-op.
+            for sect in &["ptc", "prompt", "cultural_context"] {
+                if let Some(obj) = params_clone.get(*sect).and_then(|v| v.as_object()) {
+                    if obj.is_empty() {
+                        continue;
+                    }
+                    let st = table
+                        .entry(*sect)
+                        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                        .as_table_mut()
+                        .ok_or_else(|| format!("Invalid [{sect}] section"))?;
+                    for (k, v) in obj {
+                        if !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                            return Err(format!("Invalid {sect} key '{k}' (alphanumeric + underscore only)"));
+                        }
+                        let tv = match v {
+                            Value::String(s) => toml::Value::String(s.clone()),
+                            Value::Bool(b) => toml::Value::Boolean(*b),
+                            Value::Number(n) if n.is_i64() => toml::Value::Integer(n.as_i64().unwrap()),
+                            Value::Number(n) if n.is_u64() => toml::Value::Integer(n.as_u64().unwrap() as i64),
+                            Value::Number(n) => toml::Value::Float(n.as_f64().unwrap_or(0.0)),
+                            Value::Array(a) => {
+                                let items: Vec<toml::Value> = a
+                                    .iter()
+                                    .filter_map(|x| x.as_str().map(|s| toml::Value::String(s.into())))
+                                    .collect();
+                                toml::Value::Array(items)
+                            }
+                            _ => return Err(format!("Unsupported {sect}.{k} value type")),
+                        };
+                        st.insert(k.clone(), tv);
+                        changes.push(format!("{sect}.{k} updated"));
+                    }
+                }
+            }
+
             if changes.is_empty() {
                 return Err("No valid fields to update".into());
             }
@@ -1606,6 +3873,601 @@ impl MethodHandler {
             }
             Err(e) => WsFrame::error_response("", &e),
         }
+    }
+
+    /// Resolve an agent's on-disk directory from the registry.
+    async fn resolve_agent_dir(&self, agent_id: &str) -> Result<PathBuf, String> {
+        if !is_valid_agent_id(agent_id) {
+            return Err(format!("Invalid agent_id: {agent_id}"));
+        }
+        let reg = self.registry.read().await;
+        reg.get(agent_id)
+            .map(|a| a.dir.clone())
+            .ok_or_else(|| format!("Agent not found: {agent_id}"))
+    }
+
+    /// Atomic write of a TOML table to `path` (temp + rename).
+    async fn atomic_write_toml(&self, path: &Path, table: &toml::Table) -> Result<(), String> {
+        let tmp = path.with_extension("toml.tmp");
+        if let Err(e) = self.write_config_table(&tmp, table).await {
+            return Err(format!("Failed to write {}: {e}", path.display()));
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, path).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(format!("Failed to commit {}: {e}", path.display()));
+        }
+        Ok(())
+    }
+
+    // ── CON: CONTRACT.toml (per-agent) ────────────────────────────────────────
+
+    /// `contract.get` — read `agents/<id>/CONTRACT.toml`.
+    /// Params: `{ agent_id }`. Response:
+    /// `{ agent_id, must_not[], must_always[], max_tool_calls_per_turn }`.
+    async fn handle_contract_get(&self, params: Value) -> WsFrame {
+        let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
+        };
+        let dir = match self.resolve_agent_dir(&agent_id).await {
+            Ok(d) => d,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let path = dir.join("CONTRACT.toml");
+        let table = self.read_config_table(&path).await;
+        let mut resp = contract_table_to_response(&table);
+        if let Some(obj) = resp.as_object_mut() {
+            obj.insert("agent_id".into(), json!(agent_id));
+        }
+        WsFrame::ok_response("", resp)
+    }
+
+    /// `contract.update` — atomic write of `agents/<id>/CONTRACT.toml`.
+    /// Params: `{ agent_id, must_not[], must_always[], max_tool_calls_per_turn }`.
+    /// Response: `{ success, agent_id, must_not[], must_always[], max_tool_calls_per_turn }`.
+    async fn handle_contract_update(&self, params: Value) -> WsFrame {
+        let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
+        };
+        let dir = match self.resolve_agent_dir(&agent_id).await {
+            Ok(d) => d,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let table = match build_contract_table(&params) {
+            Ok(t) => t,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let path = dir.join("CONTRACT.toml");
+        if let Err(e) = self.atomic_write_toml(&path, &table).await {
+            return WsFrame::error_response("", &e);
+        }
+        info!(agent_id = agent_id.as_str(), "contract.update completed");
+        let mut resp = contract_table_to_response(&table);
+        if let Some(obj) = resp.as_object_mut() {
+            obj.insert("success".into(), json!(true));
+            obj.insert("agent_id".into(), json!(agent_id));
+            // The contract is loaded per-invocation from disk by the agent
+            // runner, so the next turn picks up the new boundaries automatically.
+            obj.insert(
+                "message".into(),
+                json!("Contract updated — applies on the agent's next turn"),
+            );
+        }
+        WsFrame::ok_response("", resp)
+    }
+
+    // ── RED: global [redaction] in config.toml ────────────────────────────────
+
+    /// `redaction.get` — read config.toml `[redaction]`.
+    /// Response: `{ enabled, vault_ttl_hours, purge_after_expire_days, profiles[],
+    /// sources{...}, tool_egress{...} }`.
+    async fn handle_redaction_get(&self) -> WsFrame {
+        let config_path = self.home_dir.join("config.toml");
+        let table = self.read_config_table(&config_path).await;
+        WsFrame::ok_response("", redaction_table_to_response(&table))
+    }
+
+    /// `redaction.update` — atomic write of config.toml `[redaction]`.
+    /// Params (all optional, partial update): `{ enabled, vault_ttl_hours,
+    /// purge_after_expire_days, profiles[], sources{user_input|tool_results|
+    /// system_prompt|sub_agent|cron_context = on|off|selective|inherit},
+    /// tool_egress{<tool>: {restore_args: restore|passthrough|deny, audit_reveal}
+    /// | null} }`. Response: `{ success, changes[] }`.
+    async fn handle_redaction_update(&self, params: Value) -> WsFrame {
+        let config_path = self.home_dir.join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+        let changes = match apply_redaction_to_table(&mut table, &params) {
+            Ok(c) => c,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        if changes.is_empty() {
+            return WsFrame::error_response("", "No valid redaction fields to update");
+        }
+        if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
+            return WsFrame::error_response("", &e);
+        }
+        info!(?changes, "redaction.update completed");
+        WsFrame::ok_response("", json!({ "success": true, "changes": changes }))
+    }
+
+    // ── INF: global inference.toml (INF.1–INF.5) ──────────────────────────────
+
+    /// `inference.get` — read `~/.duduclaw/inference.toml` into structured JSON.
+    /// The `[openai_compat].api_key` secret is MASKED: the response carries
+    /// `openai_compat.api_key_set` (bool) + `openai_compat.api_key` = "***set***"
+    /// (or "") — NEVER the cleartext / encrypted value.
+    async fn handle_inference_get(&self) -> WsFrame {
+        let path = self.home_dir.join("inference.toml");
+        let table = self.read_config_table(&path).await;
+        WsFrame::ok_response("", inference_table_to_response(&table))
+    }
+
+    /// `inference.update` — atomic write of `~/.duduclaw/inference.toml`.
+    /// Params (all optional, partial update): root (`enabled`/`backend`/
+    /// `models_dir`/`default_model`/`auto_load`/`max_memory_mb`), `generation`,
+    /// `router` (validates `strong_threshold < fast_threshold`), `openai_compat`
+    /// (`base_url`/`model`/`api_key` → encrypted to `api_key_enc`), and the
+    /// `exo`/`llamafile`/`mlx`/`mistralrs`/`llmlingua`/`streaming_llm`/`embedding`
+    /// sub-sections (generic pass-through). Response: `{ success, changes[] }`.
+    async fn handle_inference_update(&self, params: Value) -> WsFrame {
+        let path = self.home_dir.join("inference.toml");
+        let mut table = self.read_config_table(&path).await;
+
+        // Pure validation + field application (no secret handling).
+        let mut changes = match apply_inference_to_table(&mut table, &params) {
+            Ok(c) => c,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+
+        // ── openai_compat.api_key secret: encrypt → `api_key_enc`, never store
+        // cleartext. An empty string clears the secret. (INF.5 / INF.8)
+        if let Some(api_key) = params
+            .get("openai_compat")
+            .and_then(|v| v.as_object())
+            .and_then(|oc| oc.get("api_key"))
+            .and_then(|v| v.as_str())
+        {
+            // Refuse to persist the masked placeholder back as a real secret —
+            // the dashboard echoes it when the field was left untouched.
+            if api_key != SECRET_MASK_SET {
+                let section = match table
+                    .entry("openai_compat")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                {
+                    Some(s) => s,
+                    None => return WsFrame::error_response("", "Invalid [openai_compat] section"),
+                };
+                // Never keep a cleartext `api_key` on disk.
+                section.remove("api_key");
+                if api_key.is_empty() {
+                    section.remove("api_key_enc");
+                    changes.push("openai_compat.api_key cleared".to_string());
+                } else if let Some(enc) =
+                    crate::config_crypto::encrypt_value(api_key, &self.home_dir)
+                {
+                    section.insert("api_key_enc".into(), toml::Value::String(enc));
+                    changes.push("openai_compat.api_key = [ENCRYPTED]".to_string());
+                } else {
+                    return WsFrame::error_response("", "Failed to encrypt openai_compat.api_key");
+                }
+            }
+        }
+
+        if changes.is_empty() {
+            return WsFrame::error_response("", "No valid inference fields to update");
+        }
+        if let Err(e) = self.atomic_write_toml(&path, &table).await {
+            return WsFrame::error_response("", &e);
+        }
+        info!(?changes, "inference.update completed");
+        WsFrame::ok_response("", json!({ "success": true, "changes": changes }))
+    }
+
+    // ── MK: global [mcp_keys] in config.toml ──────────────────────────────────
+
+    /// `mcp_keys.list` — list MCP API keys. NEVER returns cleartext keys; each
+    /// entry carries a masked preview. Response:
+    /// `{ keys: [{ masked, client_id, is_external, created_at, scopes[],
+    /// rotate_recommended }] }`.
+    async fn handle_mcp_keys_list(&self) -> WsFrame {
+        let config_path = self.home_dir.join("config.toml");
+        let table = self.read_config_table(&config_path).await;
+        let mut out: Vec<Value> = Vec::new();
+        if let Some(keys) = table.get("mcp_keys").and_then(|v| v.as_table()) {
+            for (key, val) in keys {
+                let t = match val.as_table() {
+                    Some(t) => t,
+                    None => continue,
+                };
+                let client_id = t.get("client_id").and_then(|v| v.as_str()).unwrap_or("");
+                let is_external = t.get("is_external").and_then(|v| v.as_bool()).unwrap_or(false);
+                let created_at = t.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+                let scopes: Vec<String> = t
+                    .get("scopes")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                // 30-day rotation reminder (MK.4).
+                let rotate_recommended = chrono::DateTime::parse_from_rfc3339(created_at)
+                    .map(|dt| (Utc::now() - dt.with_timezone(&Utc)).num_days() >= 30)
+                    .unwrap_or(false);
+                out.push(json!({
+                    "masked": mask_mcp_key(key),
+                    "client_id": client_id,
+                    "is_external": is_external,
+                    "created_at": created_at,
+                    "scopes": scopes,
+                    "rotate_recommended": rotate_recommended,
+                }));
+            }
+        }
+        WsFrame::ok_response("", json!({ "keys": out }))
+    }
+
+    /// `mcp_keys.create` — generate a new MCP API key. Returns the cleartext key
+    /// ONCE (it is never recoverable afterwards). Params:
+    /// `{ client_id, env?: prod|staging|dev, is_external?, scopes[] }`.
+    /// Response: `{ success, key (cleartext, once), masked, client_id,
+    /// is_external, created_at, scopes[] }`.
+    async fn handle_mcp_keys_create(&self, params: Value) -> WsFrame {
+        let client_id = match params.get("client_id").and_then(|v| v.as_str()).map(str::trim) {
+            Some(c) if !c.is_empty() && c.len() <= 128 => c.to_string(),
+            _ => return WsFrame::error_response("", "Missing or invalid 'client_id' (1-128 chars)"),
+        };
+        let env = match params.get("env").and_then(|v| v.as_str()) {
+            Some("prod") | None => "prod",
+            Some("staging") => "staging",
+            Some("dev") => "dev",
+            Some(other) => {
+                return WsFrame::error_response(
+                    "",
+                    &format!("Invalid env '{other}'. Valid: prod, staging, dev"),
+                )
+            }
+        };
+        let is_external = params.get("is_external").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // Validate scopes against the known scope list (MK.4).
+        let scopes_arr = match params.get("scopes").and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => return WsFrame::error_response("", "Missing 'scopes' (array of scope strings)"),
+        };
+        let mut scopes: Vec<String> = Vec::with_capacity(scopes_arr.len());
+        for s in scopes_arr {
+            let s = match s.as_str() {
+                Some(s) => s.trim(),
+                None => return WsFrame::error_response("", "scopes entries must be strings"),
+            };
+            if !KNOWN_MCP_SCOPES.contains(&s) {
+                return WsFrame::error_response(
+                    "",
+                    &format!("Unknown scope '{s}'. Valid: {}", KNOWN_MCP_SCOPES.join(", ")),
+                );
+            }
+            if !scopes.contains(&s.to_string()) {
+                scopes.push(s.to_string());
+            }
+        }
+        if scopes.is_empty() {
+            return WsFrame::error_response("", "At least one scope is required");
+        }
+
+        let key = generate_mcp_key(env);
+        // Defence-in-depth: ensure the generated key matches the canonical format.
+        if !is_valid_mcp_key_format(&key) {
+            return WsFrame::error_response("", "Internal error: generated key failed format check");
+        }
+        let created_at = Utc::now().to_rfc3339();
+
+        let config_path = self.home_dir.join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+        let mcp_keys = table
+            .entry("mcp_keys")
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        let mcp_keys = match mcp_keys.as_table_mut() {
+            Some(t) => t,
+            None => return WsFrame::error_response("", "Invalid [mcp_keys] section in config.toml"),
+        };
+        let mut entry = toml::map::Map::new();
+        entry.insert("client_id".into(), toml::Value::String(client_id.clone()));
+        entry.insert("is_external".into(), toml::Value::Boolean(is_external));
+        entry.insert("created_at".into(), toml::Value::String(created_at.clone()));
+        entry.insert(
+            "scopes".into(),
+            toml::Value::Array(scopes.iter().map(|s| toml::Value::String(s.clone())).collect()),
+        );
+        mcp_keys.insert(key.clone(), toml::Value::Table(entry));
+
+        if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
+            return WsFrame::error_response("", &e);
+        }
+        info!(client_id = client_id.as_str(), env, "mcp_keys.create completed");
+        WsFrame::ok_response("", json!({
+            "success": true,
+            // Returned exactly once — the gateway never stores or echoes it again.
+            "key": key,
+            "masked": mask_mcp_key(&key),
+            "client_id": client_id,
+            "is_external": is_external,
+            "created_at": created_at,
+            "scopes": scopes,
+            "message": "Store this key now — it cannot be retrieved again.",
+        }))
+    }
+
+    /// `mcp_keys.revoke` — remove an `[mcp_keys.<key>]` entry. Params:
+    /// `{ key }` (the full cleartext key). Response: `{ success, revoked }`.
+    async fn handle_mcp_keys_revoke(&self, params: Value) -> WsFrame {
+        let key = match params.get("key").and_then(|v| v.as_str()).map(str::trim) {
+            Some(k) if !k.is_empty() => k.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'key' parameter"),
+        };
+        let config_path = self.home_dir.join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+        let removed = match table.get_mut("mcp_keys").and_then(|v| v.as_table_mut()) {
+            Some(keys) => keys.remove(&key).is_some(),
+            None => false,
+        };
+        if !removed {
+            return WsFrame::error_response("", "Key not found");
+        }
+        if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
+            return WsFrame::error_response("", &e);
+        }
+        info!("mcp_keys.revoke completed");
+        WsFrame::ok_response("", json!({ "success": true, "revoked": mask_mcp_key(&key) }))
+    }
+
+    // ── KS: global ~/.duduclaw/KILLSWITCH.toml ────────────────────────────────
+
+    /// `killswitch.get` — read the global `~/.duduclaw/KILLSWITCH.toml`, filling
+    /// any missing field with the documented default so the form is complete.
+    async fn handle_killswitch_get(&self) -> WsFrame {
+        let path = self.home_dir.join("KILLSWITCH.toml");
+        let table = self.read_config_table(&path).await;
+        WsFrame::ok_response("", killswitch_table_to_response(&table))
+    }
+
+    /// `killswitch.update` — atomic write of `~/.duduclaw/KILLSWITCH.toml`.
+    /// Params (all sub-sections optional, partial update):
+    /// `{ triggers{}, circuit_breaker{}, failsafe{}, safety_words{},
+    /// defensive_prompt{}, audit{} }`. Response: `{ success, changes[] }`.
+    async fn handle_killswitch_update(&self, params: Value) -> WsFrame {
+        let path = self.home_dir.join("KILLSWITCH.toml");
+        let mut table = self.read_config_table(&path).await;
+        let changes = match apply_killswitch_to_table(&mut table, &params) {
+            Ok(c) => c,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        if changes.is_empty() {
+            return WsFrame::error_response("", "No valid killswitch fields to update");
+        }
+        if let Err(e) = self.atomic_write_toml(&path, &table).await {
+            return WsFrame::error_response("", &e);
+        }
+        info!(?changes, "killswitch.update completed");
+        WsFrame::ok_response("", json!({
+            "success": true,
+            "changes": changes,
+            "message": "Kill switch updated — most thresholds apply on gateway restart",
+        }))
+    }
+
+    // ── GOV: governance policies (policies/*.yaml) ────────────────────────────
+    //
+    // Files live under `<home>/policies/`: `global.yaml` (agent_id "*") +
+    // `<agent_id>.yaml` (per-agent). The YAML schema mirrors
+    // `duduclaw-governance::PolicyFile`. The gateway crate has no governance /
+    // serde_yaml dependency, so we round-trip with the module-level
+    // `gov_parse_yaml` / `gov_emit_yaml` / `gov_validate_policy` helpers.
+
+    /// Resolve the policy file path for an `agent_id` (`*`/empty → global.yaml).
+    fn gov_policy_path(&self, agent_id: &str) -> Result<PathBuf, String> {
+        let dir = self.home_dir.join("policies");
+        if agent_id.is_empty() || agent_id == "*" {
+            return Ok(dir.join("global.yaml"));
+        }
+        if !is_valid_agent_id(agent_id) {
+            return Err(format!("Invalid agent_id: {agent_id}"));
+        }
+        Ok(dir.join(format!("{agent_id}.yaml")))
+    }
+
+    /// `governance.list` — read global + (optional) per-agent policies.
+    /// Params: `{ agent_id? }` — when omitted, returns both `global` and every
+    /// `<agent>.yaml` found. When set, returns just that scope's policies.
+    /// Response: `{ policies: [{ scope, ...policy fields }] }`.
+    async fn handle_governance_list(&self, params: Value) -> WsFrame {
+        let dir = self.home_dir.join("policies");
+        let mut out: Vec<Value> = Vec::new();
+
+        let mut read_scope = |scope: &str, path: &Path, out: &mut Vec<Value>| -> Result<(), String> {
+            let raw = match std::fs::read_to_string(path) {
+                Ok(r) => r,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(format!("Failed to read {}: {e}", path.display())),
+            };
+            for p in gov_parse_yaml(&raw)? {
+                let mut obj = p;
+                obj.insert("scope".into(), json!(scope));
+                out.push(Value::Object(obj));
+            }
+            Ok(())
+        };
+
+        if let Some(agent_id) = params.get("agent_id").and_then(|v| v.as_str()) {
+            let path = match self.gov_policy_path(agent_id) {
+                Ok(p) => p,
+                Err(e) => return WsFrame::error_response("", &e),
+            };
+            let scope = if agent_id.is_empty() || agent_id == "*" { "global".to_string() } else { agent_id.to_string() };
+            if let Err(e) = read_scope(&scope, &path, &mut out) {
+                return WsFrame::error_response("", &e);
+            }
+        } else {
+            // Global first.
+            if let Err(e) = read_scope("global", &dir.join("global.yaml"), &mut out) {
+                return WsFrame::error_response("", &e);
+            }
+            // Then every <agent>.yaml.
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                let mut names: Vec<String> = entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|n| n.ends_with(".yaml") && n != "global.yaml")
+                    .map(|n| n.trim_end_matches(".yaml").to_string())
+                    .collect();
+                names.sort();
+                for name in names {
+                    if let Err(e) = read_scope(&name, &dir.join(format!("{name}.yaml")), &mut out) {
+                        return WsFrame::error_response("", &e);
+                    }
+                }
+            }
+        }
+
+        WsFrame::ok_response("", json!({ "policies": out }))
+    }
+
+    /// `governance.upsert` — create or replace a policy (matched by `policy_id`)
+    /// in its scope's YAML file. Params: a policy object `{ policy_type,
+    /// policy_id, agent_id, ... }`. Atomic write. Response: `{ success,
+    /// scope, policy_id, created }`.
+    async fn handle_governance_upsert(&self, params: Value) -> WsFrame {
+        let validated = match gov_validate_policy(&params) {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let agent_id = validated.get("agent_id").and_then(|v| v.as_str()).unwrap_or("*").to_string();
+        let policy_id = validated.get("policy_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let path = match self.gov_policy_path(&agent_id) {
+            Ok(p) => p,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+
+        let mut policies = match std::fs::read_to_string(&path) {
+            Ok(raw) => match gov_parse_yaml(&raw) {
+                Ok(p) => p,
+                Err(e) => return WsFrame::error_response("", &format!("Failed to parse {}: {e}", path.display())),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return WsFrame::error_response("", &format!("Failed to read {}: {e}", path.display())),
+        };
+
+        let mut created = true;
+        for p in &mut policies {
+            if p.get("policy_id").and_then(|v| v.as_str()) == Some(policy_id.as_str()) {
+                *p = validated.clone();
+                created = false;
+                break;
+            }
+        }
+        if created {
+            policies.push(validated);
+        }
+
+        if let Some(parent) = path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                return WsFrame::error_response("", &format!("Failed to create policies dir: {e}"));
+            }
+        }
+        if let Err(e) = self.gov_atomic_write_yaml(&path, &gov_emit_yaml(&policies)).await {
+            return WsFrame::error_response("", &e);
+        }
+        let scope = if agent_id == "*" { "global".to_string() } else { agent_id };
+        info!(scope = scope.as_str(), policy_id = policy_id.as_str(), created, "governance.upsert completed");
+        WsFrame::ok_response("", json!({
+            "success": true, "scope": scope, "policy_id": policy_id, "created": created,
+            "message": "Policy saved — applies on next PolicyRegistry reload",
+        }))
+    }
+
+    /// `governance.remove` — delete a policy by `policy_id` from its scope.
+    /// Params: `{ policy_id, agent_id? }`. Response: `{ success, removed }`.
+    async fn handle_governance_remove(&self, params: Value) -> WsFrame {
+        let policy_id = match params.get("policy_id").and_then(|v| v.as_str()).map(str::trim) {
+            Some(p) if !p.is_empty() => p.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'policy_id' parameter"),
+        };
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("*").to_string();
+        let path = match self.gov_policy_path(&agent_id) {
+            Ok(p) => p,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+
+        let mut policies = match std::fs::read_to_string(&path) {
+            Ok(raw) => match gov_parse_yaml(&raw) {
+                Ok(p) => p,
+                Err(e) => return WsFrame::error_response("", &format!("Failed to parse {}: {e}", path.display())),
+            },
+            Err(_) => return WsFrame::error_response("", "Policy not found"),
+        };
+        let before = policies.len();
+        policies.retain(|p| p.get("policy_id").and_then(|v| v.as_str()) != Some(policy_id.as_str()));
+        if policies.len() == before {
+            return WsFrame::error_response("", &format!("Policy not found: {policy_id}"));
+        }
+        if let Err(e) = self.gov_atomic_write_yaml(&path, &gov_emit_yaml(&policies)).await {
+            return WsFrame::error_response("", &e);
+        }
+        info!(policy_id = policy_id.as_str(), "governance.remove completed");
+        WsFrame::ok_response("", json!({ "success": true, "removed": policy_id }))
+    }
+
+    /// Atomic write of a YAML string (temp + rename).
+    async fn gov_atomic_write_yaml(&self, path: &Path, content: &str) -> Result<(), String> {
+        let tmp = path.with_extension("yaml.tmp");
+        tokio::fs::write(&tmp, content).await
+            .map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
+        tokio::fs::rename(&tmp, path).await.map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("Failed to commit {}: {e}", path.display())
+        })
+    }
+
+    // ── SCP: wiki namespace scope (.scope.toml) ───────────────────────────────
+    //
+    // Path: `<home>/shared/wiki/.scope.toml` (mirrors duduclaw-cli::wiki_scope).
+
+    /// `wiki_scope.get` — read the shared wiki `.scope.toml`. Response:
+    /// `{ namespaces: [{ namespace, mode, synced_from }] }`. Absent file → `[]`.
+    async fn handle_wiki_scope_get(&self) -> WsFrame {
+        let path = self.home_dir.join("shared").join("wiki").join(".scope.toml");
+        let table = self.read_config_table(&path).await;
+        WsFrame::ok_response("", scp_table_to_response(&table))
+    }
+
+    /// `wiki_scope.update` — set (or clear) a single namespace's policy. Params:
+    /// `{ namespace, mode: agent_writable|read_only|operator_only, synced_from?,
+    /// remove? }`. `remove=true` deletes the entry (reverts to agent_writable
+    /// default). Atomic write. Response: `{ success, change }`.
+    async fn handle_wiki_scope_update(&self, params: Value) -> WsFrame {
+        let namespace = match params.get("namespace").and_then(|v| v.as_str()).map(str::trim) {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'namespace' parameter"),
+        };
+        let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("agent_writable");
+        let synced_from = params.get("synced_from").and_then(|v| v.as_str());
+        let remove = params.get("remove").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let path = self.home_dir.join("shared").join("wiki").join(".scope.toml");
+        let mut table = self.read_config_table(&path).await;
+        let change = match scp_apply_namespace(&mut table, &namespace, mode, synced_from, remove) {
+            Ok(c) => c,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                return WsFrame::error_response("", &format!("Failed to create wiki dir: {e}"));
+            }
+        }
+        if let Err(e) = self.atomic_write_toml(&path, &table).await {
+            return WsFrame::error_response("", &e);
+        }
+        info!(namespace = namespace.as_str(), mode, "wiki_scope.update completed");
+        WsFrame::ok_response("", json!({ "success": true, "change": change }))
     }
 
     /// Remove an agent by moving its directory to `_trash/`.
@@ -1924,18 +4786,14 @@ impl MethodHandler {
             _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
         };
 
-        // Encrypt tokens before storing (H3)
+        // Encrypt the primary token before storing (H3).
         let enc_token_key = format!("{token_key}_enc");
         let encrypted_token = crate::config_crypto::encrypt_value(token, &self.home_dir);
-        let enc_secret = if let Some(sk) = secret_key {
-            if !secret.is_empty() {
-                Some((format!("{sk}_enc"), crate::config_crypto::encrypt_value(secret, &self.home_dir)))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+
+        // XC.3: `whatsapp_phone_number_id` is NOT a secret — it must be stored as
+        // plaintext (consistent with the per-agent `agents.update` path, which
+        // does not encrypt it). All other secret_key fields ARE encrypted.
+        let secret_is_plain = secret_key == Some("whatsapp_phone_number_id");
 
         let config_path = self.home_dir.join("config.toml");
         let mut table = self.read_config_table(&config_path).await;
@@ -1955,17 +4813,43 @@ impl MethodHandler {
         if let Some(enc) = &encrypted_token {
             channels.insert(enc_token_key, toml::Value::String(enc.clone()));
         }
-        if let Some((sk_enc, enc_val)) = &enc_secret {
-            if let Some(sk) = secret_key {
+        if let Some(sk) = secret_key {
+            if !secret.is_empty() {
                 channels.insert(sk.to_string(), toml::Value::String(secret.to_string()));
-            }
-            if let Some(v) = enc_val {
-                channels.insert(sk_enc.clone(), toml::Value::String(v.clone()));
+                if !secret_is_plain {
+                    if let Some(enc) = crate::config_crypto::encrypt_value(secret, &self.home_dir) {
+                        channels.insert(format!("{sk}_enc"), toml::Value::String(enc));
+                    }
+                }
             }
         }
 
-        if let Err(e) = self.write_config_table(&config_path, &table).await {
-            return WsFrame::error_response("", &format!("Failed to write config.toml: {e}"));
+        // ── G.6: additional global channel tokens carried in `config.*` ──
+        // whatsapp_verify_token / whatsapp_app_secret / feishu_verification_token.
+        // Secrets are encrypted to `_enc`; never echoed back.
+        let extra_secret_fields: &[&str] = match channel_type {
+            "whatsapp" => &["whatsapp_verify_token", "whatsapp_app_secret"],
+            "feishu" => &["feishu_verification_token"],
+            _ => &[],
+        };
+        for field in extra_secret_fields {
+            if let Some(v) = config_obj.get(*field).and_then(|v| v.as_str()) {
+                let v = v.trim();
+                if v.is_empty() {
+                    channels.remove(*field);
+                    channels.remove(&format!("{field}_enc"));
+                    continue;
+                }
+                channels.insert((*field).to_string(), toml::Value::String(v.into()));
+                if let Some(enc) = crate::config_crypto::encrypt_value(v, &self.home_dir) {
+                    channels.insert(format!("{field}_enc"), toml::Value::String(enc));
+                }
+            }
+        }
+
+        // XC.2: atomic write (temp + rename), mirroring the per-agent path.
+        if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
+            return WsFrame::error_response("", &e);
         }
 
         info!(channel_type, "Channel config saved");
@@ -2102,8 +4986,9 @@ impl MethodHandler {
             }
         }
 
-        if let Err(e) = self.write_config_table(&config_path, &table).await {
-            return WsFrame::error_response("", &format!("Failed to write config.toml: {e}"));
+        // XC.2: atomic write (temp + rename).
+        if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
+            return WsFrame::error_response("", &e);
         }
 
         // Hot-stop: abort the running global channel bot task
@@ -3008,9 +5893,12 @@ impl MethodHandler {
             Some(id) => {
                 match reg.get(id) {
                     Some(agent) => {
+                        // Include `content` so the dashboard "My Skills" tab can render a
+                        // preview — the SkillInfo frontend contract requires it, and omitting
+                        // it made `skill.content.slice(...)` throw whenever an agent had skills.
                         let skills: Vec<Value> = agent.skills.iter().map(|s| {
                             let scope = if global_names.contains(s.name.as_str()) { "global" } else { "agent" };
-                            json!({ "name": s.name, "size": s.content.len(), "scope": scope })
+                            json!({ "name": s.name, "size": s.content.len(), "scope": scope, "content": s.content })
                         }).collect();
                         WsFrame::ok_response("", json!({ "agent_id": id, "skills": skills }))
                     }
@@ -4511,7 +7399,7 @@ impl MethodHandler {
     /// { "events": [...], "total": N, "limit": L, "offset": O }
     /// ```
     async fn handle_audit_evolution_query(&self, params: Value) -> WsFrame {
-        use crate::evolution_events::query::{AuditEventIndex, AuditQueryFilter};
+        use crate::evolution_events::query::AuditQueryFilter;
 
         let filter = AuditQueryFilter {
             agent_id:   params.get("agent_id").and_then(|v| v.as_str()).map(|s| s.to_owned()),
@@ -4524,18 +7412,15 @@ impl MethodHandler {
             offset:     params.get("offset").and_then(|v| v.as_i64()),
         };
 
-        let idx = match AuditEventIndex::open(&self.home_dir) {
+        // M60: reuse the shared, background-synced index (no per-request open +
+        // full sync). The background task keeps it fresh.
+        let idx = match self.audit_index().await {
             Ok(i) => i,
             Err(e) => {
                 warn!("audit.evolution_query: cannot open index: {e}");
                 return WsFrame::error_response("", &format!("index open failed: {e}"));
             }
         };
-
-        // Sync new events from JSONL files before querying.
-        if let Err(e) = idx.sync_from_files().await {
-            warn!("audit.evolution_query: sync error (proceeding with stale index): {e}");
-        }
 
         match idx.query(filter).await {
             Ok(result) => {
@@ -4587,8 +7472,6 @@ impl MethodHandler {
     /// { "agent_id": "...", "window_days": 7, "consistency_score": 0.87, ... }
     /// ```
     async fn handle_audit_reliability_summary(&self, params: Value) -> WsFrame {
-        use crate::evolution_events::query::AuditEventIndex;
-
         let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id.to_owned(),
             _ => return WsFrame::error_response("", "agent_id is required"),
@@ -4600,18 +7483,14 @@ impl MethodHandler {
             .map(|d| d.clamp(1, 365) as u32)
             .unwrap_or(7);
 
-        let idx = match AuditEventIndex::open(&self.home_dir) {
+        // M60: reuse the shared, background-synced index.
+        let idx = match self.audit_index().await {
             Ok(i) => i,
             Err(e) => {
                 warn!("audit.reliability_summary: cannot open index: {e}");
                 return WsFrame::error_response("", &format!("index open failed: {e}"));
             }
         };
-
-        // Sync new events from JSONL files before querying.
-        if let Err(e) = idx.sync_from_files().await {
-            warn!("audit.reliability_summary: sync warning (proceeding with stale index): {e}");
-        }
 
         match idx.compute_reliability_summary(&agent_id, window_days).await {
             Ok(s) => WsFrame::ok_response(
@@ -5269,6 +8148,154 @@ impl MethodHandler {
             }
         }
 
+        // ── G.1 [gateway] bind / port / auth_token (restart required) ──
+        // bind/port/auth_token change the listening socket + admin token, which
+        // are read once at gateway start — we persist + flag, never hot-apply.
+        {
+            let has_gw = ["bind", "port", "auth_token"].iter().any(|k| params.get(*k).is_some());
+            if has_gw {
+                let gateway = table.entry("gateway")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .unwrap();
+                if let Some(v) = params.get("bind").and_then(|v| v.as_str()) {
+                    let v = v.trim();
+                    if v.is_empty() || v.len() > 64 {
+                        return WsFrame::error_response("", "gateway.bind must be 1-64 chars");
+                    }
+                    gateway.insert("bind".into(), toml::Value::String(v.into()));
+                    changes.push(format!("gateway.bind = \"{v}\" (restart required)"));
+                }
+                if let Some(v) = params.get("port").and_then(|v| v.as_u64()) {
+                    if v == 0 || v > 65535 {
+                        return WsFrame::error_response("", "gateway.port must be 1-65535");
+                    }
+                    gateway.insert("port".into(), toml::Value::Integer(v as i64));
+                    changes.push(format!("gateway.port = {v} (restart required)"));
+                }
+                if let Some(v) = params.get("auth_token").and_then(|v| v.as_str()) {
+                    let v = v.trim();
+                    // auth_token is the dashboard admin token — encrypt at rest.
+                    gateway.remove("auth_token");
+                    if v.is_empty() {
+                        gateway.remove("auth_token_enc");
+                        changes.push("gateway.auth_token cleared (restart required)".into());
+                    } else if v == SECRET_MASK_SET {
+                        // untouched — leave existing value
+                    } else if let Some(enc) = crate::config_crypto::encrypt_value(v, &self.home_dir) {
+                        gateway.insert("auth_token_enc".into(), toml::Value::String(enc));
+                        changes.push("gateway.auth_token = [ENCRYPTED] (restart required)".into());
+                    } else {
+                        return WsFrame::error_response("", "Failed to encrypt gateway.auth_token");
+                    }
+                }
+            }
+        }
+
+        // ── G.2 [rotation] health_check_interval_seconds / cooldown_after_rate_limit_seconds ──
+        {
+            let has_rot = ["health_check_interval_seconds", "cooldown_after_rate_limit_seconds"]
+                .iter()
+                .any(|k| params.get(*k).is_some());
+            if has_rot {
+                let rotation = table.entry("rotation")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .unwrap();
+                for key in &["health_check_interval_seconds", "cooldown_after_rate_limit_seconds"] {
+                    if let Some(v) = params.get(*key).and_then(|v| v.as_u64()) {
+                        if v == 0 || v > 86400 {
+                            return WsFrame::error_response("", &format!("rotation.{key} must be 1-86400"));
+                        }
+                        rotation.insert((*key).into(), toml::Value::Integer(v as i64));
+                        changes.push(format!("rotation.{key} = {v}"));
+                    }
+                }
+            }
+        }
+
+        // ── G.3 [general] default_agent / inference_mode ──
+        {
+            let has_gen = ["default_agent", "inference_mode"].iter().any(|k| params.get(*k).is_some());
+            if has_gen {
+                let general = table.entry("general")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .unwrap();
+                if let Some(v) = params.get("default_agent").and_then(|v| v.as_str()) {
+                    let v = v.trim();
+                    if !v.is_empty() && !is_valid_agent_id(v) {
+                        return WsFrame::error_response("", "Invalid default_agent id");
+                    }
+                    general.insert("default_agent".into(), toml::Value::String(v.into()));
+                    changes.push(format!("general.default_agent = \"{v}\""));
+                }
+                if let Some(v) = params.get("inference_mode").and_then(|v| v.as_str()) {
+                    match v {
+                        "local" | "claude" | "hybrid" => {
+                            general.insert("inference_mode".into(), toml::Value::String(v.into()));
+                            changes.push(format!("general.inference_mode = \"{v}\""));
+                        }
+                        _ => return WsFrame::error_response("", "Invalid inference_mode. Valid: local, claude, hybrid"),
+                    }
+                }
+            }
+        }
+
+        // ── G.4 [logging] format (pretty/json) ──
+        if let Some(v) = params.get("log_format").and_then(|v| v.as_str()) {
+            match v {
+                "pretty" | "json" => {
+                    let logging = table.entry("logging")
+                        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                        .as_table_mut()
+                        .unwrap();
+                    logging.insert("format".into(), toml::Value::String(v.into()));
+                    changes.push(format!("logging.format = \"{v}\""));
+                }
+                _ => return WsFrame::error_response("", "Invalid log_format. Valid: pretty, json"),
+            }
+        }
+
+        // ── G.7 [secret_manager] backend / vault_addr / vault_token(→_enc) / vault_mount ──
+        if let Some(sm) = params.get("secret_manager").and_then(|v| v.as_object()) {
+            let section = table.entry("secret_manager")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .unwrap();
+            if let Some(v) = sm.get("backend").and_then(|v| v.as_str()) {
+                match v {
+                    "env" | "vault" | "config" | "keychain" => {
+                        section.insert("backend".into(), toml::Value::String(v.into()));
+                        changes.push(format!("secret_manager.backend = \"{v}\""));
+                    }
+                    _ => return WsFrame::error_response("", "Invalid secret_manager.backend. Valid: env, vault, config, keychain"),
+                }
+            }
+            for (param_key, toml_key) in &[("vault_addr", "vault_addr"), ("vault_mount", "vault_mount")] {
+                if let Some(v) = sm.get(*param_key).and_then(|v| v.as_str()) {
+                    section.insert((*toml_key).into(), toml::Value::String(v.trim().into()));
+                    changes.push(format!("secret_manager.{toml_key} = \"{}\"", v.trim()));
+                }
+            }
+            // vault_token → encrypt to vault_token_enc (G.7 / XC.5).
+            if let Some(v) = sm.get("vault_token").and_then(|v| v.as_str()) {
+                let v = v.trim();
+                section.remove("vault_token");
+                if v.is_empty() {
+                    section.remove("vault_token_enc");
+                    changes.push("secret_manager.vault_token cleared".into());
+                } else if v == SECRET_MASK_SET {
+                    // untouched
+                } else if let Some(enc) = crate::config_crypto::encrypt_value(v, &self.home_dir) {
+                    section.insert("vault_token_enc".into(), toml::Value::String(enc));
+                    changes.push("secret_manager.vault_token = [ENCRYPTED]".into());
+                } else {
+                    return WsFrame::error_response("", "Failed to encrypt secret_manager.vault_token");
+                }
+            }
+        }
+
         // ── voice (persisted to inference.toml [voice], where VoiceConfig reads it) ──
         // Track how many config.toml changes were accumulated BEFORE the voice
         // block so the early-return below stays correct for mixed payloads.
@@ -5339,7 +8366,7 @@ impl MethodHandler {
         }
 
         if changes.is_empty() {
-            return WsFrame::error_response("", "No valid fields to update. Supported: log_level, rotation_strategy, auto_update, voice");
+            return WsFrame::error_response("", "No valid fields to update. Supported: log_level, log_format, rotation_strategy, auto_update, voice, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode), secret_manager");
         }
 
         // Atomic write: temp + rename
@@ -5476,6 +8503,66 @@ impl MethodHandler {
             "account_id": account_id,
             "monthly_budget_cents": budget_cents,
         }))
+    }
+
+    /// `accounts.update` — general edit of a `[[accounts]]` entry (G.5).
+    /// Params: `{ account_id, priority?, tags?[], profile?, email?,
+    /// subscription?, label?, monthly_budget_cents? }`. Does NOT touch the
+    /// account secret (use `accounts.add` to (re)set keys). Atomic write.
+    async fn handle_accounts_update(&self, params: Value) -> WsFrame {
+        let account_id = match params.get("account_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return WsFrame::error_response("", "Missing 'account_id' parameter"),
+        };
+
+        let config_path = self.home_dir.join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+
+        let accounts = match table.get_mut("accounts").and_then(|v| v.as_array_mut()) {
+            Some(arr) => arr,
+            None => return WsFrame::error_response("", "No [[accounts]] section in config.toml"),
+        };
+        let target = accounts.iter_mut().find(|a| {
+            a.as_table().and_then(|t| t.get("id").and_then(|v| v.as_str())) == Some(account_id.as_str())
+        });
+        let account = match target.and_then(|a| a.as_table_mut()) {
+            Some(t) => t,
+            None => return WsFrame::error_response("", &format!("Account not found: {account_id}")),
+        };
+
+        let mut changes: Vec<String> = Vec::new();
+        if let Some(v) = params.get("priority").and_then(|v| v.as_u64()) {
+            account.insert("priority".into(), toml::Value::Integer(v as i64));
+            changes.push(format!("priority = {v}"));
+        }
+        if let Some(v) = params.get("monthly_budget_cents").and_then(|v| v.as_u64()) {
+            account.insert("monthly_budget_cents".into(), toml::Value::Integer(v as i64));
+            changes.push(format!("monthly_budget_cents = {v}"));
+        }
+        for key in &["profile", "email", "subscription", "label"] {
+            if let Some(v) = params.get(*key).and_then(|v| v.as_str()) {
+                account.insert((*key).into(), toml::Value::String(v.trim().into()));
+                changes.push(format!("{key} = \"{}\"", v.trim()));
+            }
+        }
+        if let Some(arr) = params.get("tags").and_then(|v| v.as_array()) {
+            let tags: Vec<toml::Value> = arr
+                .iter()
+                .filter_map(|v| v.as_str().filter(|s| !s.is_empty()).map(|s| toml::Value::String(s.into())))
+                .collect();
+            account.insert("tags".into(), toml::Value::Array(tags.clone()));
+            changes.push(format!("tags = [{} entries]", tags.len()));
+        }
+
+        if changes.is_empty() {
+            return WsFrame::error_response("", "No valid fields to update (priority/tags/profile/email/subscription/label/monthly_budget_cents)");
+        }
+
+        if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
+            return WsFrame::error_response("", &e);
+        }
+        info!(account_id, ?changes, "accounts.update completed");
+        WsFrame::ok_response("", json!({ "success": true, "account_id": account_id, "changes": changes }))
     }
 
 
@@ -6034,16 +9121,20 @@ impl MethodHandler {
     /// Strip identifiers that an attacker could weaponize from a connector
     /// error before forwarding it to the dashboard.
     ///
-    /// The reqwest error includes the full URL (with any query string) on
-    /// failure. We keep the high-level reason so the user can act on it.
+    /// The reqwest error includes the full URL (with any query string), and may
+    /// echo embedded userinfo (`user:pass@host`) or `?api_key=…` query params on
+    /// failure. We redact those first, then cap the length. M19: truncation
+    /// alone leaked the URL/token on short errors, so scrubbing must happen
+    /// regardless of length. We keep the high-level reason so the user can act.
     fn scrub_odoo_error(raw: &str) -> String {
+        let scrubbed = scrub_secrets_from_text(raw);
         // Cap to avoid pushing megabyte HTML error pages back to the client.
         const MAX_LEN: usize = 240;
-        let mut out = String::with_capacity(raw.len().min(MAX_LEN));
-        for ch in raw.chars().take(MAX_LEN) {
+        let mut out = String::with_capacity(scrubbed.len().min(MAX_LEN));
+        for ch in scrubbed.chars().take(MAX_LEN) {
             out.push(ch);
         }
-        if raw.chars().count() > MAX_LEN {
+        if scrubbed.chars().count() > MAX_LEN {
             out.push_str("…");
         }
         out
@@ -6552,15 +9643,64 @@ impl MethodHandler {
             }
         }
 
-        let servers_json = match serde_json::to_value(&servers) {
-            Ok(v) => v,
+        // Build a map of catalog id -> agents that already have it installed.
+        // Install writes the catalog `id` as the server key in the agent's
+        // `.mcp.json` (see handle_marketplace_install), so a server counts as
+        // installed for an agent when that id appears among its mcp_servers.
+        let installed_by = self.marketplace_installed_map().await;
+
+        let mut servers_json = match serde_json::to_value(&servers) {
+            Ok(Value::Array(arr)) => arr,
+            Ok(_) => Vec::new(),
             Err(e) => return WsFrame::error_response(
                 "",
                 &format!("Failed to serialize marketplace catalog: {e}"),
             ),
         };
 
+        // Annotate each server with its backend-derived installed_by list so the
+        // dashboard reflects real `.mcp.json` state instead of ephemeral UI state.
+        for entry in servers_json.iter_mut() {
+            let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let agents = installed_by.get(&id).cloned().unwrap_or_default();
+            if let Value::Object(map) = entry {
+                map.insert("installed_by".to_string(), json!(agents));
+            }
+        }
+
         WsFrame::ok_response("", json!({ "servers": servers_json }))
+    }
+
+    /// Scan every agent's `.mcp.json` and return a map of server key (catalog id)
+    /// -> sorted list of agent ids that have it installed. Used by the Marketplace
+    /// page to render an accurate, reload-safe "installed" state.
+    async fn marketplace_installed_map(&self) -> std::collections::HashMap<String, Vec<String>> {
+        use duduclaw_agent::mcp_template::read_mcp_config;
+
+        let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let agents_dir = self.home_dir.join("agents");
+        if let Ok(mut entries) = tokio::fs::read_dir(&agents_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let dir = entry.path();
+                if !dir.is_dir() {
+                    continue;
+                }
+                let name = match dir.file_name().and_then(|n| n.to_str()) {
+                    Some(n) if !n.starts_with('_') && !n.starts_with('.') => n.to_string(),
+                    _ => continue,
+                };
+                if let Ok(config) = read_mcp_config(&dir) {
+                    for key in config.mcp_servers.keys() {
+                        map.entry(key.clone()).or_default().push(name.clone());
+                    }
+                }
+            }
+        }
+        for agents in map.values_mut() {
+            agents.sort();
+            agents.dedup();
+        }
+        map
     }
 
     /// Install a marketplace catalog server into an agent's `.mcp.json`.
@@ -7032,7 +10172,7 @@ impl MethodHandler {
         WsFrame::ok_response("", json!({ "task": task_json }))
     }
 
-    async fn handle_tasks_update(&self, params: Value) -> WsFrame {
+    async fn handle_tasks_update(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let store = match self.task_store().await {
             Ok(s) => s,
             Err(f) => return f,
@@ -7041,13 +10181,30 @@ impl MethodHandler {
         if task_id.is_empty() {
             return WsFrame::error_response("", "task_id is required");
         }
+        // HS4: enforce the caller is bound (Operator) to the task's agent before
+        // any mutation. Resolving the agent from the task prevents an Employee
+        // bound only to agent A from mutating agent B's tasks.
+        let existing = store.get_task(task_id).await.ok().flatten();
+        let owner_agent = existing.as_ref().map(|r| r.assigned_to.clone());
+        if let Some(agent) = owner_agent.as_deref() {
+            if let Err(e) = acl::require_agent_access(ctx, agent, AccessLevel::Operator) {
+                return WsFrame::error_response("", &e);
+            }
+        } else if !ctx.is_admin() {
+            // Unknown task → only admins may probe; others get a generic denial.
+            return WsFrame::error_response("", "permission denied");
+        }
+        // If re-assigning to a different agent, the caller must also be bound
+        // (Operator) to the destination agent.
+        if let Some(dest) = params.get("assigned_to").and_then(|v| v.as_str()) {
+            if !dest.is_empty() {
+                if let Err(e) = acl::require_agent_access(ctx, dest, AccessLevel::Operator) {
+                    return WsFrame::error_response("", &e);
+                }
+            }
+        }
         // Capture previous status for TaskStatusChanged event emission.
-        let prev_status = store
-            .get_task(task_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|r| r.status);
+        let prev_status = existing.map(|r| r.status);
         match store.update_task(task_id, &params).await {
             Ok(Some(row)) => {
                 let task_json = task_row_to_json(&row);
@@ -7106,7 +10263,7 @@ impl MethodHandler {
         }
     }
 
-    async fn handle_tasks_remove(&self, params: Value) -> WsFrame {
+    async fn handle_tasks_remove(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let store = match self.task_store().await {
             Ok(s) => s,
             Err(f) => return f,
@@ -7114,6 +10271,20 @@ impl MethodHandler {
         let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
         if task_id.is_empty() {
             return WsFrame::error_response("", "task_id is required");
+        }
+        // HS4: resolve the task's agent and require Operator binding before removal.
+        match store.get_task(task_id).await.ok().flatten() {
+            Some(row) => {
+                if let Err(e) =
+                    acl::require_agent_access(ctx, &row.assigned_to, AccessLevel::Operator)
+                {
+                    return WsFrame::error_response("", &e);
+                }
+            }
+            None if !ctx.is_admin() => {
+                return WsFrame::error_response("", "permission denied");
+            }
+            None => {}
         }
         match store.remove_task(task_id).await {
             Ok(true) => {
@@ -7125,14 +10296,16 @@ impl MethodHandler {
         }
     }
 
-    async fn handle_tasks_assign(&self, params: Value) -> WsFrame {
+    async fn handle_tasks_assign(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
         if task_id.is_empty() || agent_id.is_empty() {
             return WsFrame::error_response("", "task_id and agent_id are required");
         }
-        let update = json!({ "assigned_to": agent_id });
-        self.handle_tasks_update(json!({ "task_id": task_id, "assigned_to": agent_id })).await
+        // L1: dead `update` binding removed. Authorization (source + destination
+        // agent binding) is enforced by `handle_tasks_update`.
+        self.handle_tasks_update(json!({ "task_id": task_id, "assigned_to": agent_id }), ctx)
+            .await
     }
 
     // ── Activity handlers ───────────────────────────────────
@@ -7153,6 +10326,124 @@ impl MethodHandler {
                 WsFrame::ok_response("", json!({ "events": events, "total": total }))
             }
             Err(e) => WsFrame::error_response("", &format!("list activity: {e}")),
+        }
+    }
+
+    // ── Live Run Forking handlers (RFC-26) ──────────────────
+    //
+    // Forks execute in the MCP-server process and persist to the cross-process
+    // `ForkStore` (`<home>/fork_store.db`); the dashboard reads it here.
+
+    fn open_fork_store(&self) -> Result<duduclaw_fork::ForkStore, WsFrame> {
+        let path = self.home_dir.join("fork_store.db");
+        if !path.exists() {
+            return Err(WsFrame::error_response("", "no forks yet (fork store not created)"));
+        }
+        duduclaw_fork::ForkStore::open(&path)
+            .map_err(|e| WsFrame::error_response("", &format!("open fork store: {e}")))
+    }
+
+    fn handle_fork_list(&self, params: Value) -> WsFrame {
+        let store = match self.open_fork_store() {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50).min(500) as usize;
+        match store.list_forks(limit) {
+            Ok(forks) => {
+                let rows: Vec<Value> = forks
+                    .iter()
+                    .map(|f| {
+                        json!({
+                            "fork_id": f.fork_id,
+                            "agent_id": f.agent_id,
+                            "merge_mode": f.merge_mode,
+                            "resolved": f.resolved,
+                            "winner": f.winner,
+                            "promoted": f.promoted,
+                            "aggregate_spent_usd": f.aggregate_spent_usd,
+                            "created_at": f.created_at,
+                        })
+                    })
+                    .collect();
+                WsFrame::ok_response("", json!({ "forks": rows }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("list forks: {e}")),
+        }
+    }
+
+    fn handle_fork_inspect(&self, params: Value) -> WsFrame {
+        let store = match self.open_fork_store() {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let fork_id = match params.get("fork_id").and_then(|v| v.as_str()) {
+            Some(f) => f,
+            None => return WsFrame::error_response("", "fork_id is required"),
+        };
+        let fork = match store.get_fork(fork_id) {
+            Ok(Some(f)) => f,
+            Ok(None) => return WsFrame::error_response("", "fork not found"),
+            Err(e) => return WsFrame::error_response("", &format!("get fork: {e}")),
+        };
+        let branches = store.list_branches(fork_id).unwrap_or_default();
+        let branch_json: Vec<Value> = branches
+            .iter()
+            .map(|b| {
+                json!({
+                    "branch_id": b.branch_id,
+                    "steering": b.steering,
+                    "state": b.state,
+                    "budget_usd": b.budget_usd,
+                    "spent_usd": b.spent_usd,
+                    "test_exit_code": b.test_exit_code,
+                    "output": duduclaw_core::truncate_bytes(&b.output, 8000),
+                })
+            })
+            .collect();
+        WsFrame::ok_response("", json!({
+            "fork_id": fork.fork_id,
+            "agent_id": fork.agent_id,
+            "prompt": duduclaw_core::truncate_bytes(&fork.prompt, 4000),
+            "merge_mode": fork.merge_mode,
+            "resolved": fork.resolved,
+            "winner": fork.winner,
+            "promoted": fork.promoted,
+            "branches": branch_json,
+        }))
+    }
+
+    fn handle_fork_resolve(&self, params: Value) -> WsFrame {
+        let store = match self.open_fork_store() {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let fork_id = match params.get("fork_id").and_then(|v| v.as_str()) {
+            Some(f) => f,
+            None => return WsFrame::error_response("", "fork_id is required"),
+        };
+        let branch_id = match params.get("branch_id").and_then(|v| v.as_str()) {
+            Some(b) => b,
+            None => return WsFrame::error_response("", "branch_id is required"),
+        };
+        let fork = match store.get_fork(fork_id) {
+            Ok(Some(f)) => f,
+            Ok(None) => return WsFrame::error_response("", "fork not found"),
+            Err(e) => return WsFrame::error_response("", &format!("get fork: {e}")),
+        };
+        if fork.resolved {
+            return WsFrame::error_response("", "fork already resolved");
+        }
+        let branches = store.list_branches(fork_id).unwrap_or_default();
+        if !branches.iter().any(|b| b.branch_id == branch_id) {
+            return WsFrame::error_response("", "branch not found in fork");
+        }
+        let aggregate = branches.iter().map(|b| b.spent_usd).sum();
+        match store.set_resolution(fork_id, Some(branch_id), true, true, aggregate) {
+            Ok(_) => WsFrame::ok_response("", json!({
+                "fork_id": fork_id, "resolved": true, "winner": branch_id,
+            })),
+            Err(e) => WsFrame::error_response("", &format!("resolve fork: {e}")),
         }
     }
 
@@ -7445,6 +10736,17 @@ impl MethodHandler {
         let target_agent = params.get("target_agent_id").and_then(|v| v.as_str()).unwrap_or("");
         if skill_name.is_empty() || target_agent.is_empty() {
             return WsFrame::error_response("", "skill_name and target_agent_id are required");
+        }
+        // XC.4: validate target_agent_id (mirror other agent-targeting handlers)
+        // — prevents path traversal / writing outside the agents tree.
+        if !is_valid_agent_id(target_agent) {
+            return WsFrame::error_response("", "Invalid target_agent_id format");
+        }
+        // skill_name is used in a filename — restrict to a safe charset.
+        if !skill_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            || skill_name.len() > 128
+        {
+            return WsFrame::error_response("", "Invalid skill_name (alphanumeric, _, -; ≤128 chars)");
         }
         // Read from shared
         let shared_path = self.home_dir.join("shared").join("skills").join(format!("{skill_name}.md"));
@@ -7870,5 +11172,573 @@ mod odoo_test_params_tests {
         let short = "401 Unauthorized";
         let out = MethodHandler::scrub_odoo_error(short);
         assert_eq!(out, short);
+    }
+
+    // ── M19: scrubbing must strip URLs/credentials even on SHORT errors ──
+
+    #[test]
+    fn scrub_short_error_removes_url_query_string() {
+        // The reqwest error echoes the full URL incl. a leaking query string.
+        let err = "error sending request for url (https://erp.example.com/jsonrpc?api_key=topsecret)";
+        let out = MethodHandler::scrub_odoo_error(err);
+        assert!(!out.contains("topsecret"), "token leaked: {out}");
+        assert!(!out.contains("api_key=topsecret"), "query string leaked: {out}");
+        // Host is retained so the user can still act on the error.
+        assert!(out.contains("erp.example.com"), "host should remain: {out}");
+    }
+
+    #[test]
+    fn scrub_short_error_removes_url_userinfo() {
+        let err = "connect failed: https://admin:hunter2@erp.example.com/odoo";
+        let out = MethodHandler::scrub_odoo_error(err);
+        assert!(!out.contains("hunter2"), "password leaked: {out}");
+        assert!(!out.contains("admin:"), "userinfo leaked: {out}");
+        assert!(out.contains("erp.example.com"), "host should remain: {out}");
+    }
+
+    #[test]
+    fn scrub_short_error_redacts_credential_kv() {
+        let err = "auth rejected token=abc123 password=p@ss";
+        let out = MethodHandler::scrub_odoo_error(err);
+        assert!(!out.contains("abc123"), "token leaked: {out}");
+        assert!(!out.contains("p@ss"), "password leaked: {out}");
+        assert!(out.contains("[REDACTED]"), "expected redaction marker: {out}");
+    }
+}
+
+// ── P1 dashboard-config helper tests (RT / EVO / CT / INF) ────────────────────
+#[cfg(test)]
+mod p1_config_helper_tests {
+    use super::*;
+
+    // ── RT: runtime provider enum validation ──
+
+    #[test]
+    fn runtime_valid_provider_and_toggles_written() {
+        let mut t = toml::Table::new();
+        let params = json!({ "runtime": {
+            "provider": "codex",
+            "fallback": "claude",
+            "pty_pool_enabled": true,
+            "worker_managed": false,
+        }});
+        let changes = apply_runtime_to_table(&mut t, &params).unwrap();
+        assert_eq!(changes.len(), 4);
+        let rt = t.get("runtime").unwrap().as_table().unwrap();
+        assert_eq!(rt.get("provider").unwrap().as_str(), Some("codex"));
+        assert_eq!(rt.get("fallback").unwrap().as_str(), Some("claude"));
+        assert_eq!(rt.get("pty_pool_enabled").unwrap().as_bool(), Some(true));
+        assert_eq!(rt.get("worker_managed").unwrap().as_bool(), Some(false));
+    }
+
+    #[test]
+    fn runtime_unknown_provider_rejected() {
+        let mut t = toml::Table::new();
+        let params = json!({ "runtime": { "provider": "gpt4" } });
+        let err = apply_runtime_to_table(&mut t, &params).unwrap_err();
+        assert!(err.contains("provider"), "got: {err}");
+    }
+
+    #[test]
+    fn runtime_unknown_fallback_rejected() {
+        let mut t = toml::Table::new();
+        let params = json!({ "runtime": { "fallback": "bogus" } });
+        let err = apply_runtime_to_table(&mut t, &params).unwrap_err();
+        assert!(err.contains("fallback"), "got: {err}");
+    }
+
+    #[test]
+    fn runtime_empty_fallback_clears() {
+        let mut t = toml::Table::new();
+        t.insert("runtime".into(), toml::Value::Table({
+            let mut m = toml::map::Map::new();
+            m.insert("fallback".into(), toml::Value::String("claude".into()));
+            m
+        }));
+        let params = json!({ "runtime": { "fallback": "" } });
+        let changes = apply_runtime_to_table(&mut t, &params).unwrap();
+        assert!(changes.iter().any(|c| c.contains("cleared")));
+        let rt = t.get("runtime").unwrap().as_table().unwrap();
+        assert!(rt.get("fallback").is_none());
+    }
+
+    #[test]
+    fn runtime_absent_object_is_noop() {
+        let mut t = toml::Table::new();
+        let changes = apply_runtime_to_table(&mut t, &json!({})).unwrap();
+        assert!(changes.is_empty());
+        assert!(t.get("runtime").is_none());
+    }
+
+    // ── EVO: range validation + external_factors ──
+
+    #[test]
+    fn evolution_advanced_writes_external_factors_and_scalars() {
+        let mut t = toml::Table::new();
+        let params = json!({ "evolution_advanced": {
+            "external_factors": { "user_feedback": true, "peer_signals": false },
+            "skill_synthesis_enabled": true,
+            "skill_synthesis_threshold": 0.6,
+            "skill_synthesis_cooldown_hours": 12,
+            "curiosity_max_daily": 5,
+        }});
+        let changes = apply_evolution_advanced_to_table(&mut t, &params).unwrap();
+        assert!(!changes.is_empty());
+        let evo = t.get("evolution").unwrap().as_table().unwrap();
+        let ef = evo.get("external_factors").unwrap().as_table().unwrap();
+        assert_eq!(ef.get("user_feedback").unwrap().as_bool(), Some(true));
+        assert_eq!(ef.get("peer_signals").unwrap().as_bool(), Some(false));
+        assert_eq!(evo.get("skill_synthesis_enabled").unwrap().as_bool(), Some(true));
+        assert_eq!(evo.get("skill_synthesis_threshold").unwrap().as_float(), Some(0.6));
+        assert_eq!(evo.get("skill_synthesis_cooldown_hours").unwrap().as_integer(), Some(12));
+        assert_eq!(evo.get("curiosity_max_daily").unwrap().as_integer(), Some(5));
+    }
+
+    #[test]
+    fn evolution_threshold_out_of_range_rejected() {
+        let mut t = toml::Table::new();
+        let params = json!({ "evolution_advanced": { "curiosity_threshold": 1.5 } });
+        let err = apply_evolution_advanced_to_table(&mut t, &params).unwrap_err();
+        assert!(err.contains("0.0-1.0"), "got: {err}");
+    }
+
+    #[test]
+    fn evolution_min_lift_negative_rejected() {
+        let mut t = toml::Table::new();
+        let params = json!({ "evolution_advanced": { "skill_graduation_min_lift": -0.1 } });
+        let err = apply_evolution_advanced_to_table(&mut t, &params).unwrap_err();
+        assert!(err.contains("0.0-1.0"), "got: {err}");
+    }
+
+    #[test]
+    fn evolution_absent_object_is_noop() {
+        let mut t = toml::Table::new();
+        let changes = apply_evolution_advanced_to_table(&mut t, &json!({})).unwrap();
+        assert!(changes.is_empty());
+    }
+
+    // ── CT: mount parsing ──
+
+    #[test]
+    fn container_advanced_worktree_and_mounts_written() {
+        let mut t = toml::Table::new();
+        let params = json!({ "container_advanced": {
+            "worktree_enabled": true,
+            "worktree_copy_files": [".env.example", "config.toml"],
+            "additional_mounts": [
+                { "host": "~/projects", "container": "/projects", "readonly": false },
+                { "host": "~/Documents", "container": "/docs", "readonly": true },
+            ],
+            "cmd": ["bash", "-c", "echo hi"],
+            "env": [ { "key": "FOO", "value": "bar" }, ["BAZ", "qux"] ],
+        }});
+        let changes = apply_container_advanced_to_table(&mut t, &params).unwrap();
+        assert!(!changes.is_empty());
+        let ct = t.get("container").unwrap().as_table().unwrap();
+        assert_eq!(ct.get("worktree_enabled").unwrap().as_bool(), Some(true));
+        let mounts = ct.get("additional_mounts").unwrap().as_array().unwrap();
+        assert_eq!(mounts.len(), 2);
+        let m0 = mounts[0].as_table().unwrap();
+        assert_eq!(m0.get("host").unwrap().as_str(), Some("~/projects"));
+        assert_eq!(m0.get("readonly").unwrap().as_bool(), Some(false));
+        let env = ct.get("env").unwrap().as_array().unwrap();
+        assert_eq!(env.len(), 2);
+        let e0 = env[0].as_array().unwrap();
+        assert_eq!(e0[0].as_str(), Some("FOO"));
+        assert_eq!(e0[1].as_str(), Some("bar"));
+        let e1 = env[1].as_array().unwrap();
+        assert_eq!(e1[0].as_str(), Some("BAZ"));
+    }
+
+    #[test]
+    fn container_mount_blocked_pattern_rejected() {
+        let mut t = toml::Table::new();
+        let params = json!({ "container_advanced": {
+            "additional_mounts": [ { "host": "~/.ssh", "container": "/keys" } ]
+        }});
+        let err = apply_container_advanced_to_table(&mut t, &params).unwrap_err();
+        assert!(err.contains("blocked pattern"), "got: {err}");
+    }
+
+    #[test]
+    fn container_mount_empty_path_rejected() {
+        let mut t = toml::Table::new();
+        let params = json!({ "container_advanced": {
+            "additional_mounts": [ { "host": "", "container": "/x" } ]
+        }});
+        let err = apply_container_advanced_to_table(&mut t, &params).unwrap_err();
+        assert!(err.contains("host"), "got: {err}");
+    }
+
+    #[test]
+    fn container_env_bad_arity_rejected() {
+        let mut t = toml::Table::new();
+        let params = json!({ "container_advanced": { "env": [ ["ONLY_ONE"] ] } });
+        let err = apply_container_advanced_to_table(&mut t, &params).unwrap_err();
+        assert!(err.contains("2 elements"), "got: {err}");
+    }
+
+    // ── INF: router cross-validation + secret masking ──
+
+    #[test]
+    fn inference_router_strong_must_be_less_than_fast() {
+        let mut t = toml::Table::new();
+        let params = json!({ "router": { "fast_threshold": 0.5, "strong_threshold": 0.6 } });
+        let err = apply_inference_to_table(&mut t, &params).unwrap_err();
+        assert!(err.contains("must be <"), "got: {err}");
+    }
+
+    #[test]
+    fn inference_router_valid_thresholds_pass() {
+        let mut t = toml::Table::new();
+        let params = json!({ "router": {
+            "enabled": true,
+            "fast_threshold": 0.7,
+            "strong_threshold": 0.35,
+            "cloud_keywords": ["refactor"],
+        }});
+        let changes = apply_inference_to_table(&mut t, &params).unwrap();
+        assert!(!changes.is_empty());
+        let r = t.get("router").unwrap().as_table().unwrap();
+        assert_eq!(r.get("fast_threshold").unwrap().as_float(), Some(0.7));
+        assert_eq!(r.get("strong_threshold").unwrap().as_float(), Some(0.35));
+    }
+
+    #[test]
+    fn inference_router_uses_existing_fast_for_cross_check() {
+        // Existing fast=0.7; incoming strong=0.8 only → must still be rejected.
+        let mut t = toml::Table::new();
+        t.insert("router".into(), toml::Value::Table({
+            let mut m = toml::map::Map::new();
+            m.insert("fast_threshold".into(), toml::Value::Float(0.7));
+            m
+        }));
+        let params = json!({ "router": { "strong_threshold": 0.8 } });
+        let err = apply_inference_to_table(&mut t, &params).unwrap_err();
+        assert!(err.contains("must be <"), "got: {err}");
+    }
+
+    #[test]
+    fn inference_generation_temperature_range_enforced() {
+        let mut t = toml::Table::new();
+        let params = json!({ "generation": { "temperature": 3.0 } });
+        let err = apply_inference_to_table(&mut t, &params).unwrap_err();
+        assert!(err.contains("temperature"), "got: {err}");
+    }
+
+    #[test]
+    fn inference_root_and_passthrough_sections_written() {
+        let mut t = toml::Table::new();
+        let params = json!({
+            "enabled": true,
+            "backend": "llama_cpp",
+            "max_memory_mb": 8192,
+            "llamafile": { "auto_start": true, "port": 8080 },
+            "embedding": { "enabled": false, "model": "bge-small-zh" },
+        });
+        let changes = apply_inference_to_table(&mut t, &params).unwrap();
+        assert!(!changes.is_empty());
+        assert_eq!(t.get("enabled").unwrap().as_bool(), Some(true));
+        assert_eq!(t.get("max_memory_mb").unwrap().as_integer(), Some(8192));
+        let lf = t.get("llamafile").unwrap().as_table().unwrap();
+        assert_eq!(lf.get("port").unwrap().as_integer(), Some(8080));
+    }
+
+    #[test]
+    fn inference_response_masks_api_key_cleartext() {
+        let mut t = toml::Table::new();
+        t.insert("openai_compat".into(), toml::Value::Table({
+            let mut m = toml::map::Map::new();
+            m.insert("base_url".into(), toml::Value::String("http://x/v1".into()));
+            m.insert("api_key".into(), toml::Value::String("sk-supersecret".into()));
+            m
+        }));
+        let resp = inference_table_to_response(&t);
+        let oc = resp.get("openai_compat").unwrap();
+        let serialised = serde_json::to_string(&resp).unwrap();
+        assert!(!serialised.contains("sk-supersecret"), "cleartext leaked: {serialised}");
+        assert_eq!(oc.get("api_key").unwrap().as_str(), Some(SECRET_MASK_SET));
+        assert_eq!(oc.get("api_key_set").unwrap().as_bool(), Some(true));
+        assert!(oc.get("api_key_enc").is_none());
+    }
+
+    #[test]
+    fn inference_response_masks_encrypted_key_too() {
+        let mut t = toml::Table::new();
+        t.insert("openai_compat".into(), toml::Value::Table({
+            let mut m = toml::map::Map::new();
+            m.insert("api_key_enc".into(), toml::Value::String("ENCBLOB==".into()));
+            m
+        }));
+        let resp = inference_table_to_response(&t);
+        let serialised = serde_json::to_string(&resp).unwrap();
+        assert!(!serialised.contains("ENCBLOB"), "enc leaked: {serialised}");
+        let oc = resp.get("openai_compat").unwrap();
+        assert_eq!(oc.get("api_key_set").unwrap().as_bool(), Some(true));
+    }
+
+    #[test]
+    fn inference_response_no_secret_reports_unset() {
+        let mut t = toml::Table::new();
+        t.insert("openai_compat".into(), toml::Value::Table({
+            let mut m = toml::map::Map::new();
+            m.insert("base_url".into(), toml::Value::String("http://x/v1".into()));
+            m
+        }));
+        let resp = inference_table_to_response(&t);
+        let oc = resp.get("openai_compat").unwrap();
+        assert_eq!(oc.get("api_key_set").unwrap().as_bool(), Some(false));
+        assert_eq!(oc.get("api_key").unwrap().as_str(), Some(""));
+    }
+}
+
+#[cfg(test)]
+mod p2_dashboard_config_tests {
+    use super::*;
+
+    // ── GOV: governance policy validation + YAML round-trip ──────────────────
+
+    #[test]
+    fn gov_rate_policy_valid_round_trips() {
+        let p = json!({
+            "policy_type": "rate",
+            "policy_id": "rate-mcp",
+            "agent_id": "*",
+            "resource": "mcp_calls",
+            "limit": 200,
+            "window_seconds": 60,
+            "action_on_violation": "reject",
+        });
+        let v = gov_validate_policy(&p).expect("should validate");
+        let yaml = gov_emit_yaml(&[v]);
+        assert!(yaml.contains("policy_type: rate"));
+        assert!(yaml.contains("limit: 200"));
+        // Parse back and confirm fields survive.
+        let parsed = gov_parse_yaml(&yaml).expect("parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["policy_id"].as_str(), Some("rate-mcp"));
+        assert_eq!(parsed[0]["limit"].as_u64(), Some(200));
+        assert_eq!(parsed[0]["resource"].as_str(), Some("mcp_calls"));
+    }
+
+    #[test]
+    fn gov_rate_rejects_zero_limit_and_bad_resource() {
+        let zero = json!({
+            "policy_type": "rate", "policy_id": "x", "agent_id": "*",
+            "resource": "mcp_calls", "limit": 0, "window_seconds": 60,
+        });
+        assert!(gov_validate_policy(&zero).is_err());
+        let bad_res = json!({
+            "policy_type": "rate", "policy_id": "x", "agent_id": "*",
+            "resource": "rocket_launches", "limit": 5, "window_seconds": 60,
+        });
+        assert!(gov_validate_policy(&bad_res).is_err());
+    }
+
+    #[test]
+    fn gov_permission_rejects_scope_conflict() {
+        let p = json!({
+            "policy_type": "permission", "policy_id": "perm", "agent_id": "*",
+            "allowed_scopes": ["memory:read"],
+            "denied_scopes": ["memory:read"],
+        });
+        assert!(gov_validate_policy(&p).is_err());
+    }
+
+    #[test]
+    fn gov_rejects_unknown_type_and_bad_id() {
+        assert!(gov_validate_policy(&json!({"policy_type": "nuke", "policy_id": "x", "agent_id": "*"})).is_err());
+        assert!(gov_validate_policy(&json!({"policy_type": "rate", "policy_id": "bad id!", "agent_id": "*"})).is_err());
+    }
+
+    #[test]
+    fn gov_parses_existing_global_yaml_shape() {
+        let raw = r#"
+policies:
+  - policy_type: rate
+    policy_id: default-rate-mcp
+    agent_id: "*"
+    resource: mcp_calls
+    limit: 200
+    window_seconds: 60
+    action_on_violation: reject
+  - policy_type: permission
+    policy_id: default-permission
+    agent_id: "*"
+    allowed_scopes:
+      - memory:read
+      - wiki:read
+    denied_scopes:
+      - admin
+    requires_approval:
+      - agent:create
+"#;
+        let parsed = gov_parse_yaml(raw).expect("parse");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["policy_type"].as_str(), Some("rate"));
+        assert_eq!(parsed[0]["window_seconds"].as_u64(), Some(60));
+        let perm = &parsed[1];
+        assert_eq!(perm["allowed_scopes"].as_array().unwrap().len(), 2);
+        assert_eq!(perm["denied_scopes"].as_array().unwrap()[0].as_str(), Some("admin"));
+    }
+
+    // ── ODO: qualified-action parse ──────────────────────────────────────────
+
+    #[test]
+    fn odo_action_accepts_bare_and_qualified() {
+        assert!(odo_valid_action("read"));
+        assert!(odo_valid_action("write"));
+        assert!(odo_valid_action("write:crm.lead"));
+        assert!(odo_valid_action("execute:sale.order"));
+    }
+
+    #[test]
+    fn odo_action_rejects_bad_verb_and_model() {
+        assert!(!odo_valid_action("destroy"));
+        assert!(!odo_valid_action("write:"));
+        assert!(!odo_valid_action("write:bad model!"));
+        assert!(!odo_valid_action(""));
+    }
+
+    #[test]
+    fn odo_apply_encrypts_secret_and_keeps_qualified_action() {
+        let tmp = std::env::temp_dir().join(format!("ddc-odo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut table = toml::Table::new();
+        let params = json!({
+            "odoo": {
+                "profile": "sales",
+                "allowed_actions": ["read", "write:crm.lead"],
+                "company_ids": [1, 2],
+                "api_key": "super-secret",
+            }
+        });
+        let changes = apply_odoo_to_table(&mut table, &params, &tmp).expect("apply");
+        let odoo = table.get("odoo").unwrap().as_table().unwrap();
+        // Cleartext api_key must NOT be present; only api_key_enc.
+        assert!(odoo.get("api_key").is_none());
+        assert!(odoo.get("api_key_enc").is_some());
+        // Qualified action preserved.
+        let actions: Vec<&str> = odoo.get("allowed_actions").unwrap().as_array().unwrap()
+            .iter().filter_map(|v| v.as_str()).collect();
+        assert!(actions.contains(&"write:crm.lead"));
+        assert_eq!(odoo.get("company_ids").unwrap().as_array().unwrap().len(), 2);
+        assert!(changes.iter().any(|c| c.contains("[ENCRYPTED]")));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn odo_apply_stores_secret_reference_raw() {
+        // A `secret://` value is a pointer, not a secret — it must be stored
+        // verbatim into `*_enc` (NOT AES-encrypted), so the connector pool can
+        // resolve it via the SecretManager at connect time.
+        let tmp = std::env::temp_dir().join(format!("ddc-odo-secret-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut table = toml::Table::new();
+        let params = json!({
+            "odoo": {
+                "api_key": "secret://vault/odoo-api-key",
+                "password": "secret://vault/odoo-password",
+            }
+        });
+        let changes = apply_odoo_to_table(&mut table, &params, &tmp).expect("apply");
+        let odoo = table.get("odoo").unwrap().as_table().unwrap();
+        // Stored raw, NOT encrypted.
+        assert_eq!(
+            odoo.get("api_key_enc").and_then(|v| v.as_str()),
+            Some("secret://vault/odoo-api-key")
+        );
+        assert_eq!(
+            odoo.get("password_enc").and_then(|v| v.as_str()),
+            Some("secret://vault/odoo-password")
+        );
+        // No cleartext mirror left behind.
+        assert!(odoo.get("api_key").is_none());
+        assert!(odoo.get("password").is_none());
+        assert!(changes.iter().any(|c| c.contains("[SECRET REF]")));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn odo_apply_rejects_bad_action() {
+        let mut table = toml::Table::new();
+        let params = json!({ "odoo": { "allowed_actions": ["nuke:crm.lead"] } });
+        let tmp = std::env::temp_dir();
+        assert!(apply_odoo_to_table(&mut table, &params, &tmp).is_err());
+    }
+
+    // ── SCP: namespace mode parse ────────────────────────────────────────────
+
+    #[test]
+    fn scp_apply_sets_read_only_with_synced_from() {
+        let mut table = toml::Table::new();
+        let change = scp_apply_namespace(&mut table, "identity", "read_only", Some("identity-provider"), false)
+            .expect("apply");
+        assert!(change.contains("read_only"));
+        let ns = table["namespaces"].as_table().unwrap()["identity"].as_table().unwrap();
+        assert_eq!(ns["mode"].as_str(), Some("read_only"));
+        assert_eq!(ns["synced_from"].as_str(), Some("identity-provider"));
+    }
+
+    #[test]
+    fn scp_read_only_requires_synced_from() {
+        let mut table = toml::Table::new();
+        assert!(scp_apply_namespace(&mut table, "identity", "read_only", None, false).is_err());
+    }
+
+    #[test]
+    fn scp_rejects_bad_mode_and_nested_namespace() {
+        let mut table = toml::Table::new();
+        assert!(scp_apply_namespace(&mut table, "identity", "broadcast", None, false).is_err());
+        assert!(scp_apply_namespace(&mut table, "a/b", "agent_writable", None, false).is_err());
+    }
+
+    #[test]
+    fn scp_remove_deletes_entry() {
+        let mut table = toml::Table::new();
+        scp_apply_namespace(&mut table, "policies", "operator_only", None, false).unwrap();
+        assert!(table["namespaces"].as_table().unwrap().contains_key("policies"));
+        scp_apply_namespace(&mut table, "policies", "agent_writable", None, true).unwrap();
+        assert!(!table["namespaces"].as_table().unwrap().contains_key("policies"));
+    }
+
+    #[test]
+    fn scp_response_sorted_and_shaped() {
+        let mut table = toml::Table::new();
+        scp_apply_namespace(&mut table, "zeta", "operator_only", None, false).unwrap();
+        scp_apply_namespace(&mut table, "alpha", "agent_writable", None, false).unwrap();
+        let resp = scp_table_to_response(&table);
+        let arr = resp["namespaces"].as_array().unwrap();
+        assert_eq!(arr[0]["namespace"].as_str(), Some("alpha"));
+        assert_eq!(arr[1]["namespace"].as_str(), Some("zeta"));
+    }
+
+    // ── XC.3: phone_number_id is NOT encrypted (alignment) ───────────────────
+
+    #[test]
+    fn xc3_whatsapp_phone_number_id_not_encrypted_in_agent_path() {
+        // The per-agent set_channel_token path only encrypts keys containing
+        // "token"/"secret"/"app_id". phone_number_id does NOT match → plaintext.
+        let field = "phone_number_id";
+        let should_encrypt = field.contains("token") || field.contains("secret") || field == "app_id";
+        assert!(!should_encrypt, "phone_number_id must not be encrypted");
+    }
+
+    #[test]
+    fn xc3_global_secret_is_plain_only_for_phone_number_id() {
+        // Mirrors the secret_is_plain decision in handle_channels_add.
+        let plain = |sk: Option<&str>| sk == Some("whatsapp_phone_number_id");
+        assert!(plain(Some("whatsapp_phone_number_id")));
+        assert!(!plain(Some("slack_app_token")));
+        assert!(!plain(Some("line_channel_secret")));
+    }
+
+    // ── XC.4: skills.adopt agent-id validation surface ───────────────────────
+
+    #[test]
+    fn xc4_invalid_target_agent_id_rejected() {
+        assert!(!is_valid_agent_id("../etc"));
+        assert!(!is_valid_agent_id("Bad Name"));
+        assert!(is_valid_agent_id("bruno"));
     }
 }

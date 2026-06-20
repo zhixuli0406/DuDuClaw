@@ -180,13 +180,28 @@ impl RuntimeType {
         }
     }
 
-    /// Parse from a config string; unknown values fall back to [`RuntimeType::Claude`].
+    /// Parse from a config string; unknown values fall back to
+    /// [`RuntimeType::Claude`].
+    ///
+    /// L18 fix: an unknown provider (typically a typo such as `"claudee"` or
+    /// `"openai_compatible"`) used to be silently coerced to `Claude`, masking
+    /// the misconfiguration. We now emit a `tracing::warn!` before defaulting so
+    /// operators can spot the bad value. The signature is unchanged to keep the
+    /// existing `.map(RuntimeType::parse)` callers working.
     pub fn parse(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
+        let normalized = s.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "claude" => Self::Claude,
             "codex" => Self::Codex,
             "gemini" => Self::Gemini,
             "openai_compat" | "openai" | "openai-compat" => Self::OpenAiCompat,
-            _ => Self::Claude,
+            other => {
+                tracing::warn!(
+                    provider = %other,
+                    "unknown runtime provider in config; defaulting to Claude"
+                );
+                Self::Claude
+            }
         }
     }
 }
@@ -269,6 +284,18 @@ pub struct ContainerConfig {
     /// Non-git-tracked files to copy into the worktree (e.g. `.env`, `.env.local`).
     #[serde(default)]
     pub worktree_copy_files: Vec<String>,
+    /// Command + args to run inside the container (empty = use the image default).
+    ///
+    /// HC5: the PTC container path sets this to the user-script invocation so the
+    /// script actually executes inside the sandbox (instead of the image default).
+    #[serde(default)]
+    pub cmd: Vec<String>,
+    /// Environment variables to inject into the container, as `(key, value)` pairs.
+    ///
+    /// HC5: used to inject `DUDUCLAW_PTC_SOCKET` so in-container scripts can reach
+    /// the host RPC bridge over the bind-mounted UDS socket.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
 }
 
 /// Heartbeat / scheduled-task configuration.
@@ -487,6 +514,22 @@ impl CapabilitiesConfig {
         denied.sort();
         denied.dedup();
         denied
+    }
+
+    /// Compute the explicit tool allowlist for Claude CLI (`--allowedTools`).
+    ///
+    /// HS12 (2026-06 deep review): `allowed_tools` was previously parsed but
+    /// never enforced — an operator who set `allowed_tools = ["Read"]` expecting
+    /// a read-only sub-agent still got full Write/Edit/Bash. When this returns a
+    /// non-empty list, spawn sites MUST pass it as `--allowedTools`, which puts
+    /// Claude Code into allowlist mode (only the listed tools are usable). An
+    /// empty list means "no explicit allowlist" — spawn sites keep their default
+    /// behavior. Returns a deduplicated, sorted Vec for deterministic CLI args.
+    pub fn allowed_tools(&self) -> Vec<String> {
+        let mut allowed = self.allowed_tools.clone();
+        allowed.sort();
+        allowed.dedup();
+        allowed
     }
 }
 
@@ -1528,6 +1571,16 @@ pub struct TimeWindow {
 /// Opaque identifier for a running container.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContainerId(pub String);
+
+/// Result of waiting for a container to exit (HC5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ContainerExit {
+    /// Process exit code reported by the container.
+    pub exit_code: i64,
+    /// Combined stdout/stderr captured from the container logs.
+    pub logs: String,
+}
 
 /// Health status returned by a container runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -164,10 +164,18 @@ impl NotionIdentityProvider {
 
         let status = resp.status();
         if !status.is_success() {
+            // Do NOT pass the raw upstream body through — it can carry HTML
+            // error pages, request echoes, or other sensitive detail that
+            // would then flow into the LLM prompt / user-facing logs. Surface
+            // only the status code; log the body at debug for operators.
             let txt = resp.text().await.unwrap_or_default();
+            tracing::debug!(
+                "notion query failed: HTTP {status}: {}",
+                truncate(&txt, 200)
+            );
             return Err(IdentityError::malformed(
                 PROVIDER_NAME,
-                format!("HTTP {status}: {}", truncate(&txt, 200)),
+                format!("upstream returned HTTP {status}"),
             ));
         }
 
@@ -227,10 +235,22 @@ impl IdentityProvider for NotionIdentityProvider {
         }
         let filter = self.build_channel_filter(&channel, external_id);
         let body = self.query_database(filter).await?;
-        let results = body.get("results").and_then(|v| v.as_array());
-        match results {
-            Some(rows) if !rows.is_empty() => Ok(self.map_row(&rows[0])),
-            _ => Ok(None),
+        match unique_result_row(&body) {
+            RowSelection::One(row) => Ok(self.map_row(row)),
+            RowSelection::None => Ok(None),
+            // A handle should map to exactly one person. Multiple rows mean an
+            // ambiguous/forged mapping — refuse to resolve rather than picking
+            // an arbitrary row, which could leak a trusted person's identity.
+            RowSelection::Ambiguous(n) => {
+                tracing::warn!(
+                    "notion: ambiguous handle for channel {} id {} matched {} rows — \
+                     refusing to resolve",
+                    channel.as_wire(),
+                    external_id,
+                    n
+                );
+                Ok(None)
+            }
         }
     }
 
@@ -254,6 +274,25 @@ impl IdentityProvider for NotionIdentityProvider {
 
     fn name(&self) -> &str {
         PROVIDER_NAME
+    }
+}
+
+/// Outcome of narrowing a `databases/query` response to a single person.
+enum RowSelection<'a> {
+    None,
+    One(&'a Value),
+    /// More than one row matched — the count is kept for logging.
+    Ambiguous(usize),
+}
+
+/// Pick the unique `results` row from a Notion query response. A channel
+/// handle must map to exactly one person; zero or multiple rows are not a
+/// resolvable identity.
+fn unique_result_row(body: &Value) -> RowSelection<'_> {
+    match body.get("results").and_then(|v| v.as_array()) {
+        Some(rows) if rows.len() == 1 => RowSelection::One(&rows[0]),
+        Some(rows) if rows.len() > 1 => RowSelection::Ambiguous(rows.len()),
+        _ => RowSelection::None,
     }
 }
 
@@ -465,6 +504,37 @@ mod tests {
         assert!(person.roles.is_empty());
         assert!(person.project_ids.is_empty());
         assert!(person.channel_handles.is_empty());
+    }
+
+    #[test]
+    fn unique_result_row_selects_single_match() {
+        let body = serde_json::json!({ "results": [{ "id": "only" }] });
+        assert!(matches!(unique_result_row(&body), RowSelection::One(_)));
+    }
+
+    #[test]
+    fn unique_result_row_rejects_ambiguous_matches() {
+        // HS10: two rows claiming the same handle must NOT resolve to either —
+        // an attacker could forge a duplicate to impersonate a trusted person.
+        let body = serde_json::json!({
+            "results": [{ "id": "trusted" }, { "id": "attacker" }]
+        });
+        assert!(matches!(
+            unique_result_row(&body),
+            RowSelection::Ambiguous(2)
+        ));
+    }
+
+    #[test]
+    fn unique_result_row_handles_empty_and_missing() {
+        assert!(matches!(
+            unique_result_row(&serde_json::json!({ "results": [] })),
+            RowSelection::None
+        ));
+        assert!(matches!(
+            unique_result_row(&serde_json::json!({})),
+            RowSelection::None
+        ));
     }
 
     #[test]

@@ -28,7 +28,11 @@ impl<'a> AgentResolver<'a> {
     ///    is in the agent's `permissions.allowed_channels` list.
     /// 4. Fall back to the main agent (role = Main).
     pub fn resolve(&self, message: &Message) -> Option<&'a LoadedAgent> {
-        let agents = self.registry.list();
+        // `registry.list()` is backed by a HashMap, so its iteration order is
+        // non-deterministic. Sort by agent name so that when multiple agents
+        // match the same message, resolution is stable across runs.
+        let mut agents = self.registry.list();
+        agents.sort_by(|a, b| a.config.agent.name.cmp(&b.config.agent.name));
 
         // 1. Trigger word match
         for agent in &agents {
@@ -182,5 +186,128 @@ mod tests {
     fn binding_matches_unknown_kind_fail_closed() {
         assert!(!binding_matches("nonsense", "abc", "channel", "abc"));
         assert!(!binding_matches("", "abc", "channel", "abc"));
+    }
+}
+
+#[cfg(test)]
+mod resolve_order_tests {
+    use super::*;
+    use chrono::Utc;
+    use duduclaw_core::types::{Message, MessageType};
+    use tempfile::TempDir;
+
+    /// Write an agent dir whose agent.toml grants `discord` channel access,
+    /// so every agent matches the coarse-permission rule (step 3) — the
+    /// branch where ordering across multiple matches actually matters.
+    ///
+    /// The config is a minimal but currently-valid `agent.toml` (mirrors the
+    /// `duduclaw init` scaffold) so the test does not depend on external
+    /// template files that may drift out of sync with the schema.
+    fn write_agent(root: &std::path::Path, name: &str) {
+        let toml = format!(
+            r#"[agent]
+name = "{name}"
+display_name = "{name}"
+role = "specialist"
+status = "active"
+trigger = ""
+reports_to = ""
+icon = "🐾"
+
+[model]
+preferred = "claude-haiku-4-5"
+fallback = "claude-haiku-4-5"
+account_pool = ["main"]
+api_mode = "cli"
+
+[container]
+timeout_ms = 60000
+max_concurrent = 1
+readonly_project = true
+additional_mounts = []
+
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 500
+warn_threshold_percent = 80
+hard_stop = false
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = false
+can_modify_own_skills = false
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = ["discord"]
+
+[evolution]
+skill_auto_activate = false
+skill_security_scan = true
+gvu_enabled = false
+cognitive_memory = false
+max_silence_hours = 168.0
+max_gvu_generations = 0
+observation_period_hours = 24.0
+skill_token_budget = 500
+max_active_skills = 2
+"#
+        );
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), toml).unwrap();
+    }
+
+    fn discord_message() -> Message {
+        Message {
+            id: "m1".to_string(),
+            message_type: MessageType::Incoming,
+            channel: "discord".to_string(),
+            chat_id: "discord:999".to_string(),
+            sender: "u".to_string(),
+            text: "hello".to_string(),
+            timestamp: Utc::now(),
+            agent_id: None,
+        }
+    }
+
+    /// M40 regression: when several agents match the same message, resolution
+    /// must be deterministic (same agent every time) instead of depending on
+    /// HashMap iteration order. The resolver sorts by name, so the
+    /// alphabetically-first matching agent always wins.
+    #[tokio::test]
+    async fn resolve_is_deterministic_across_multiple_matches() {
+        let tmp = TempDir::new().unwrap();
+        // Names deliberately out of alphabetical creation order.
+        for name in ["zeta", "alpha", "mike", "beta"] {
+            write_agent(tmp.path(), name);
+        }
+
+        let mut registry = AgentRegistry::new(tmp.path().to_path_buf());
+        registry.scan().await.unwrap();
+        assert_eq!(registry.list().len(), 4, "all four agents should load");
+
+        let resolver = AgentResolver::new(&registry);
+        let msg = discord_message();
+
+        // Resolve many times — every call must return the same agent, and it
+        // must be the alphabetically-first ("alpha"), independent of HashMap
+        // ordering between runs.
+        let first = resolver
+            .resolve(&msg)
+            .expect("a discord-permitted agent should resolve")
+            .config
+            .agent
+            .name
+            .clone();
+        assert_eq!(first, "alpha", "lowest-sorted matching agent should win");
+        for _ in 0..20 {
+            let again = resolver.resolve(&msg).expect("should resolve").config.agent.name.clone();
+            assert_eq!(again, first, "resolution must be stable across calls");
+        }
     }
 }

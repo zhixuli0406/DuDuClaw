@@ -445,6 +445,11 @@ async fn call_claude_streaming(
         "50",
     ]);
 
+    // HS12: enforce a per-agent allowlist when configured.
+    let allowed = capabilities.allowed_tools();
+    if !allowed.is_empty() {
+        cmd.args(["--allowedTools", &allowed.join(",")]);
+    }
     // Apply tool restrictions (deny-by-default)
     let denied = capabilities.disallowed_tools();
     if !denied.is_empty() {

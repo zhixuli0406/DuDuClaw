@@ -15,6 +15,7 @@ cron = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+fs2 = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

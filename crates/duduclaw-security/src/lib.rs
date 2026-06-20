@@ -7,6 +7,7 @@ pub mod failsafe;
 pub mod filter_chain;
 pub mod input_guard;
 pub mod key_vault;
+pub mod keyfile;
 pub mod killswitch;
 pub mod mount_guard;
 pub mod rate_limiter;

@@ -173,10 +173,17 @@ mod launchd {
             .args(["unload", &plist_path.to_string_lossy()])
             .status();
 
-        // 2. Find process occupying the port
-        let pids = find_pids_on_port(port);
+        // 2. Find process occupying the port.
+        //    M13: `lsof -ti :PORT` returns whatever happens to hold the port —
+        //    which may be an unrelated process if duduclaw already died and the
+        //    port was reused. Only target PIDs whose executable is duduclaw so
+        //    we never SIGKILL a bystander.
+        let pids: Vec<i32> = find_pids_on_port(port)
+            .into_iter()
+            .filter(|&pid| is_duduclaw_process(pid))
+            .collect();
         if pids.is_empty() {
-            println!("✓ No process found on port {port}. Service stopped.");
+            println!("✓ No duduclaw process found on port {port}. Service stopped.");
             return Ok(());
         }
 
@@ -189,7 +196,12 @@ mod launchd {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let remaining = find_pids_on_port(port);
+            // M13: re-filter to duduclaw PIDs each tick — a different process
+            // grabbing the freed port must not keep us in the loop or get killed.
+            let remaining: Vec<i32> = find_pids_on_port(port)
+                .into_iter()
+                .filter(|&pid| is_duduclaw_process(pid))
+                .collect();
             if remaining.is_empty() {
                 println!("✓ Service stopped gracefully. Port {port} released.");
                 return Ok(());
@@ -202,7 +214,10 @@ mod launchd {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-                let still_alive = find_pids_on_port(port);
+                let still_alive: Vec<i32> = find_pids_on_port(port)
+                    .into_iter()
+                    .filter(|&pid| is_duduclaw_process(pid))
+                    .collect();
                 if still_alive.is_empty() {
                     println!("✓ Service killed. Port {port} released.");
                 } else {
@@ -229,13 +244,43 @@ mod launchd {
         }
     }
 
+    /// M13: verify a PID actually belongs to a duduclaw process before we kill it.
+    /// Reads the process command via `ps -o comm=` and matches "duduclaw" in the
+    /// executable's basename. Fail-closed: if we can't determine the command, we
+    /// do NOT treat it as duduclaw (better to leave it alone than kill a stranger).
+    fn is_duduclaw_process(pid: i32) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {
+                let comm = String::from_utf8_lossy(&out.stdout);
+                comm.trim()
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .contains("duduclaw")
+            }
+            _ => false,
+        }
+    }
+
     pub async fn status() -> Result<()> {
         println!("Run: launchctl list | grep duduclaw");
         Ok(())
     }
 
     pub async fn logs() -> Result<()> {
-        println!("Run: tail -f /tmp/duduclaw.stdout.log /tmp/duduclaw.stderr.log");
+        // L34: launchd writes StandardOutPath/StandardErrorPath under
+        // ~/Library/Logs (see the plist above), not /tmp.
+        let home = dirs::home_dir().unwrap_or_default();
+        let stdout_log = home.join("Library/Logs/duduclaw.stdout.log");
+        let stderr_log = home.join("Library/Logs/duduclaw.stderr.log");
+        println!(
+            "Run: tail -f {} {}",
+            stdout_log.display(),
+            stderr_log.display()
+        );
         Ok(())
     }
 

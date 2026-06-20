@@ -21,10 +21,19 @@
 //! [secret_manager]
 //! backend = "vault"          # "local" | "vault" | "env"
 //! vault_addr  = "http://127.0.0.1:8200"
-//! vault_token = ""           # set directly or use vault_token_enc
-//! vault_token_enc = ""       # base64(AES-256-GCM encrypted token)
+//! vault_token = ""           # plaintext Vault token (currently the only field used)
+//! vault_token_enc = ""       # base64(AES-256-GCM encrypted token) — RESERVED, see note
 //! vault_mount = "secret"     # KV v2 mount point
 //! ```
+//!
+//! ## Note on `vault_token_enc`
+//!
+//! `vault_token_enc` is decrypted read-only at runtime via the per-machine
+//! keyfile (`~/.duduclaw/.keyfile`). Callers that have a `home_dir` should use
+//! [`SecretManagerConfig::resolved_vault_token`], which prefers the decrypted
+//! `vault_token_enc` and falls back to the plaintext `vault_token`. The
+//! plaintext-only [`SecretManagerConfig::effective_vault_token`] is retained
+//! for callers without a `home_dir`.
 
 mod env;
 mod local;
@@ -38,6 +47,7 @@ use async_trait::async_trait;
 use duduclaw_core::error::{DuDuClawError, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::Path;
 
 // ─── SecretBackend ─────────────────────────────────────────────────────────
 
@@ -162,6 +172,9 @@ pub struct SecretManagerConfig {
     pub vault_token: Option<String>,
 
     /// AES-256-GCM encrypted Vault token (base64 encoded).
+    ///
+    /// Decrypted read-side via [`SecretManagerConfig::resolved_vault_token`]
+    /// (preferred over the plaintext `vault_token` when set).
     pub vault_token_enc: Option<String>,
 
     /// KV v2 mount point (defaults to `"secret"`).
@@ -211,5 +224,392 @@ impl SecretManagerConfig {
             .as_deref()
             .filter(|s| !s.is_empty())
             .unwrap_or("secret")
+    }
+
+    /// Plaintext-only effective Vault token (no decryption).
+    ///
+    /// Prefer [`Self::resolved_vault_token`], which additionally decrypts
+    /// `vault_token_enc`. This accessor is retained for callers that do not
+    /// have a `home_dir` and only ever set the plaintext `vault_token`.
+    pub fn effective_vault_token(&self) -> Option<&str> {
+        self.vault_token.as_deref().filter(|s| !s.is_empty())
+    }
+
+    /// Resolve the effective Vault token to authenticate with.
+    ///
+    /// Resolution order:
+    /// 1. If `vault_token_enc` is set + non-empty, decrypt it read-only via the
+    ///    per-machine keyfile ([`crate::keyfile::decrypt_keyfile_value`]). On
+    ///    any decrypt failure (missing/short keyfile, bad ciphertext) this
+    ///    falls through to step 2 rather than failing hard.
+    /// 2. Otherwise fall back to the plaintext `vault_token`.
+    ///
+    /// Returns `None` when neither yields a non-empty token. The decrypted
+    /// token is never logged.
+    pub fn resolved_vault_token(&self, home_dir: &std::path::Path) -> Option<String> {
+        if let Some(enc) = self.vault_token_enc.as_deref() {
+            if !enc.is_empty() {
+                if let Some(plain) = crate::keyfile::decrypt_keyfile_value(enc, home_dir) {
+                    return Some(plain);
+                }
+                tracing::warn!(
+                    "[secret_manager] vault_token_enc set but could not be decrypted; \
+                     falling back to plaintext vault_token if present"
+                );
+            }
+        }
+        self.vault_token
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Build a concrete [`SecretManager`] backend from this config.
+    ///
+    /// This is the wiring entry point that turns `[secret_manager]` config into
+    /// a live adapter:
+    /// - `"local"` → in-process AES adapter ([`LocalSecretAdapter`]).
+    /// - `"env"`   → process environment variables ([`EnvSecretAdapter`]).
+    /// - `"vault"` → HashiCorp Vault KV v2 ([`VaultHttpAdapter`]), authenticated
+    ///   with the token from [`Self::resolved_vault_token`] (which decrypts
+    ///   `vault_token_enc` via the per-machine keyfile when present).
+    ///
+    /// `home_dir` is the DuDuClaw home (`~/.duduclaw`) used to locate the
+    /// keyfile for `vault_token_enc` decryption. Returns an error when the
+    /// `vault` backend is selected but no token can be resolved, or when
+    /// `backend` is unrecognised.
+    pub fn build_manager(
+        &self,
+        home_dir: &std::path::Path,
+    ) -> Result<Box<dyn SecretManager>> {
+        let backend = match self.backend.as_str() {
+            "local" => SecretBackend::Local,
+            "vault" => SecretBackend::Vault,
+            "env" => SecretBackend::Env,
+            other => {
+                return Err(DuDuClawError::Security(format!(
+                    "unknown secret_manager backend '{other}' (expected local|vault|env)"
+                )))
+            }
+        };
+        self.build_manager_for(backend, home_dir)
+    }
+
+    /// Build a [`SecretManager`] for an explicitly-chosen backend, using this
+    /// config's connection params (addr/mount/token).
+    ///
+    /// Used by the `secret://<backend>/<name>` indirection path so that a
+    /// reference's own backend (e.g. `secret://vault/...`) is honored even when
+    /// the default `[secret_manager].backend` differs.
+    pub fn build_manager_for(
+        &self,
+        backend: SecretBackend,
+        home_dir: &std::path::Path,
+    ) -> Result<Box<dyn SecretManager>> {
+        match backend {
+            SecretBackend::Local => Ok(Box::new(LocalSecretAdapter::new_ephemeral())),
+            SecretBackend::Env => Ok(Box::new(EnvSecretAdapter::new())),
+            SecretBackend::Vault => {
+                let token = self.resolved_vault_token(home_dir).ok_or_else(|| {
+                    DuDuClawError::Security(
+                        "secret_manager vault backend selected but no token could be \
+                         resolved (set vault_token, or vault_token_enc with a valid \
+                         ~/.duduclaw/.keyfile)"
+                            .to_string(),
+                    )
+                })?;
+                Ok(Box::new(VaultHttpAdapter::new(
+                    self.effective_vault_addr(),
+                    token,
+                    self.effective_vault_mount(),
+                )))
+            }
+        }
+    }
+}
+
+// ─── secret:// reference resolver ──────────────────────────────────────────
+
+/// Resolve a config value that may be a `secret://<backend>/<name>` reference.
+///
+/// - **Non-reference** (anything not starting with `secret://`) → returns the
+///   value unchanged (wrapped in `Some`). Existing inline / `_enc` secrets are
+///   passed through untouched.
+/// - **Reference** → parses the URI, builds the backend via
+///   [`SecretManagerConfig::build_manager_for`] (the reference's own backend is
+///   honored, e.g. `secret://vault/...` always uses Vault), and fetches
+///   `uri.name`.
+///
+/// Fail-soft: any parse / build / fetch error logs a `warn` and yields `None`,
+/// so the caller behaves as if the secret were unset rather than panicking.
+/// The resolved secret value is never logged.
+///
+/// `home_dir` is the DuDuClaw home (`~/.duduclaw`), used to locate the keyfile
+/// for `vault_token_enc` decryption when building a Vault backend.
+pub async fn resolve_secret_reference(
+    value: &str,
+    sm_cfg: &SecretManagerConfig,
+    home_dir: &Path,
+) -> Option<String> {
+    if !value.starts_with("secret://") {
+        return Some(value.to_string());
+    }
+
+    let uri = match SecretUri::parse(value) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(reference = %value, "invalid secret:// reference: {e}");
+            return None;
+        }
+    };
+
+    let manager = match sm_cfg.build_manager_for(uri.backend, home_dir) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(reference = %value, "cannot build secret backend: {e}");
+            return None;
+        }
+    };
+
+    match manager.get(&uri.name).await {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(reference = %value, "secret resolution failed: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolve_reference_tests {
+    use super::*;
+
+    fn tmp_home() -> std::path::PathBuf {
+        std::env::temp_dir()
+    }
+
+    #[tokio::test]
+    async fn non_reference_passthrough() {
+        let cfg = SecretManagerConfig::default();
+        // A plain token / inline value is returned unchanged.
+        assert_eq!(
+            resolve_secret_reference("plain-token", &cfg, &tmp_home()).await,
+            Some("plain-token".to_string())
+        );
+        // Empty string is also a non-reference passthrough.
+        assert_eq!(
+            resolve_secret_reference("", &cfg, &tmp_home()).await,
+            Some(String::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_uri_returns_none() {
+        let cfg = SecretManagerConfig::default();
+        // Looks like a reference but the backend is unknown → fail-soft None.
+        assert!(
+            resolve_secret_reference("secret://bogus/whatever", &cfg, &tmp_home())
+                .await
+                .is_none()
+        );
+        // Missing backend/name separator.
+        assert!(
+            resolve_secret_reference("secret://oops", &cfg, &tmp_home())
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn env_backend_round_trip() {
+        // Use a unique env var name so parallel tests don't collide.
+        let var = format!("DUDUCLAW_TEST_SECRET_{}", std::process::id());
+        // SAFETY: single-threaded test setup/teardown around this env var; the
+        // name is process-unique so concurrent tests don't race on it.
+        unsafe { std::env::set_var(&var, "resolved-via-env") };
+        let cfg = SecretManagerConfig::default();
+        let reference = format!("secret://env/{var}");
+        let resolved = resolve_secret_reference(&reference, &cfg, &tmp_home()).await;
+        unsafe { std::env::remove_var(&var) };
+        assert_eq!(resolved.as_deref(), Some("resolved-via-env"));
+    }
+
+    #[tokio::test]
+    async fn env_backend_missing_var_returns_none() {
+        let cfg = SecretManagerConfig::default();
+        assert!(
+            resolve_secret_reference(
+                "secret://env/DUDUCLAW_DEFINITELY_UNSET_VAR_XYZ",
+                &cfg,
+                &tmp_home()
+            )
+            .await
+            .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod token_resolution_tests {
+    use super::*;
+    use crate::crypto::CryptoEngine;
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempHome(std::path::PathBuf);
+    impl TempHome {
+        fn new() -> Self {
+            let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!(
+                "duduclaw-secretmgr-test-{}-{}",
+                std::process::id(),
+                n
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+        fn with_keyfile(&self) -> CryptoEngine {
+            let key = CryptoEngine::generate_key().unwrap();
+            std::fs::write(self.0.join(".keyfile"), key).unwrap();
+            CryptoEngine::new(&key).unwrap()
+        }
+    }
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn enc_token_wins_over_plaintext() {
+        let home = TempHome::new();
+        let engine = home.with_keyfile();
+        let enc = engine.encrypt_string("encrypted-token").unwrap();
+        let cfg = SecretManagerConfig {
+            vault_token: Some("plaintext-token".into()),
+            vault_token_enc: Some(enc),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolved_vault_token(home.path()).as_deref(),
+            Some("encrypted-token")
+        );
+    }
+
+    #[test]
+    fn plaintext_only_returns_plaintext() {
+        let home = TempHome::new();
+        let cfg = SecretManagerConfig {
+            vault_token: Some("plaintext-token".into()),
+            vault_token_enc: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolved_vault_token(home.path()).as_deref(),
+            Some("plaintext-token")
+        );
+    }
+
+    #[test]
+    fn neither_returns_none() {
+        let home = TempHome::new();
+        let cfg = SecretManagerConfig::default();
+        assert!(cfg.resolved_vault_token(home.path()).is_none());
+    }
+
+    #[test]
+    fn enc_decrypt_failure_falls_back_to_plaintext() {
+        // No keyfile present → enc cannot be decrypted → fall back.
+        let home = TempHome::new();
+        let cfg = SecretManagerConfig {
+            vault_token: Some("plaintext-token".into()),
+            vault_token_enc: Some("garbage-ciphertext".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolved_vault_token(home.path()).as_deref(),
+            Some("plaintext-token")
+        );
+    }
+
+    // ─── build_manager factory (Vault adapter wiring) ───────────
+
+    #[test]
+    fn build_manager_local_and_env_ok() {
+        let home = TempHome::new();
+        let local = SecretManagerConfig { backend: "local".into(), ..Default::default() };
+        assert!(local.build_manager(home.path()).is_ok());
+        let env = SecretManagerConfig { backend: "env".into(), ..Default::default() };
+        assert!(env.build_manager(home.path()).is_ok());
+    }
+
+    #[test]
+    fn build_manager_unknown_backend_errors() {
+        let home = TempHome::new();
+        let cfg = SecretManagerConfig { backend: "bogus".into(), ..Default::default() };
+        assert!(cfg.build_manager(home.path()).is_err());
+    }
+
+    #[test]
+    fn build_manager_vault_without_token_errors() {
+        let home = TempHome::new();
+        let cfg = SecretManagerConfig {
+            backend: "vault".into(),
+            vault_addr: Some("http://127.0.0.1:8200".into()),
+            ..Default::default()
+        };
+        assert!(
+            cfg.build_manager(home.path()).is_err(),
+            "vault backend without a token must fail to build"
+        );
+    }
+
+    #[test]
+    fn build_manager_vault_with_plaintext_token_ok() {
+        let home = TempHome::new();
+        let cfg = SecretManagerConfig {
+            backend: "vault".into(),
+            vault_token: Some("s.dev-token".into()),
+            ..Default::default()
+        };
+        assert!(cfg.build_manager(home.path()).is_ok());
+    }
+
+    #[test]
+    fn build_manager_for_honors_reference_backend_over_default() {
+        // Default backend is "local", but a `secret://vault/...` reference must
+        // still build a Vault adapter (per-reference backend wins).
+        let home = TempHome::new();
+        let cfg = SecretManagerConfig {
+            backend: "local".into(),
+            vault_token: Some("s.dev-token".into()),
+            ..Default::default()
+        };
+        assert!(cfg.build_manager_for(SecretBackend::Vault, home.path()).is_ok());
+        // And Vault-without-token still errors even via the explicit path.
+        let cfg2 = SecretManagerConfig { backend: "local".into(), ..Default::default() };
+        assert!(cfg2.build_manager_for(SecretBackend::Vault, home.path()).is_err());
+    }
+
+    #[test]
+    fn build_manager_vault_with_encrypted_token_ok() {
+        // vault_token_enc + a valid keyfile → resolved_vault_token decrypts it,
+        // so the Vault adapter builds successfully without any plaintext token.
+        let home = TempHome::new();
+        let engine = home.with_keyfile();
+        let enc = engine.encrypt_string("s.encrypted-token").unwrap();
+        let cfg = SecretManagerConfig {
+            backend: "vault".into(),
+            vault_token_enc: Some(enc),
+            ..Default::default()
+        };
+        assert!(
+            cfg.build_manager(home.path()).is_ok(),
+            "vault backend with decryptable vault_token_enc must build"
+        );
     }
 }

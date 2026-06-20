@@ -49,4 +49,28 @@ mod tests {
     fn unknown_profile_returns_none() {
         assert!(load_builtin("does_not_exist").unwrap().is_none());
     }
+
+    #[test]
+    fn taiwan_national_id_has_word_boundaries() {
+        use crate::engine::RuleEngine;
+        use crate::source::Source;
+
+        let prof = load_builtin("taiwan_strict").unwrap().unwrap();
+        let engine = RuleEngine::from_specs(prof.into_specs()).unwrap();
+        let src = Source::ToolResult { tool_name: "x".into() };
+
+        // A clean, delimited national ID still matches.
+        let hits = engine.apply("id is A123456789 thanks", &src);
+        assert!(
+            hits.iter().any(|m| m.span.original == "A123456789"),
+            "well-formed national ID must match"
+        );
+
+        // A longer alnum run must NOT yield a national-ID substring match.
+        let over = engine.apply("XA1234567890", &src);
+        assert!(
+            !over.iter().any(|m| m.rule.category() == "TW_ID"),
+            "national ID must not over-match inside a longer token, got {over:?}"
+        );
+    }
 }

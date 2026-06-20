@@ -523,7 +523,9 @@ impl CostTelemetry {
                         total_input_tokens: safe_u64(row.get::<_, i64>(2)?),
                         total_cache_read_tokens: safe_u64(row.get::<_, i64>(3)?),
                         total_cache_creation_tokens: safe_u64(row.get::<_, i64>(4)?),
-                        total_output_tokens: row.get::<_, i64>(5)? as u64,
+                        // L10: clamp via safe_u64 like the sibling fields — a raw
+                        // `as u64` cast of a negative i64 wraps to a huge value.
+                        total_output_tokens: safe_u64(row.get::<_, i64>(5)?),
                         avg_cache_efficiency: avg_eff,
                         total_cost_millicents: safe_u64(row.get::<_, i64>(7)?),
                         avg_cache_hit_rate: row.get(8)?,
@@ -807,6 +809,16 @@ mod tests {
     fn test_cache_efficiency_zero_tokens() {
         let usage = TokenUsage::default();
         assert_eq!(usage.cache_efficiency(), 0.0);
+    }
+
+    /// L10: a negative i64 must clamp to 0, not wrap to a huge u64.
+    #[test]
+    fn test_safe_u64_clamps_negative() {
+        assert_eq!(safe_u64(-1), 0);
+        assert_eq!(safe_u64(i64::MIN), 0);
+        assert_eq!(safe_u64(0), 0);
+        assert_eq!(safe_u64(42), 42);
+        assert_eq!(safe_u64(i64::MAX), i64::MAX as u64);
     }
 
     #[test]

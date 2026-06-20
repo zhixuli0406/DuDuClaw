@@ -5,7 +5,9 @@ version = "1.0.0"
 
 [rules.tw_national_id]
 type = "regex"
-pattern = '''[A-Z][12]\d{8}'''
+# Word boundaries prevent substring over-match (e.g. a longer alnum run like
+# "A1234567890" or "XA123456789" must not match a national ID embedded inside).
+pattern = '''\b[A-Z][12]\d{8}\b'''
 category = "TW_ID"
 priority = 100
 

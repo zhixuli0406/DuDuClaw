@@ -149,7 +149,16 @@ impl RetryPolicy {
             // INFRA-SEC-03 fix: use true random jitter to prevent synchronized retry storms.
             // When many agents fail simultaneously, deterministic jitter causes all retries
             // to land at the exact same millisecond — defeating the purpose of jitter.
-            rand::thread_rng().gen_range(0.0..capped * 0.3) as u64
+            //
+            // M49 fix: `gen_range` panics on an empty range. When `capped == 0.0` (e.g. a
+            // policy with `initial_delay_ms == 0` or a zero `max_delay_ms`), the jitter
+            // range `0.0..0.0` is empty — guard against it by skipping jitter entirely.
+            let jitter_high = capped * 0.3;
+            if jitter_high > 0.0 {
+                rand::thread_rng().gen_range(0.0..jitter_high) as u64
+            } else {
+                0
+            }
         } else {
             0
         };
@@ -441,6 +450,24 @@ mod tests {
             "delay should not greatly exceed max_delay_ms (got {}ms)",
             d.as_millis()
         );
+    }
+
+    #[test]
+    fn test_zero_capped_delay_with_jitter_does_not_panic() {
+        // M49 regression: when the capped delay is 0, jitter range 0.0..0.0 is empty
+        // and gen_range would panic. Guard must skip jitter and return zero delay.
+        let p = RetryPolicy {
+            initial_delay_ms: 0,
+            max_delay_ms: 0,
+            multiplier: 2.0,
+            jitter: true,
+            ..RetryPolicy::default_mcp_call()
+        };
+        // Must not panic for any attempt.
+        for attempt in 0..5 {
+            let d = p.delay_for_attempt(attempt);
+            assert_eq!(d, Duration::ZERO, "zero-capped delay must stay zero");
+        }
     }
 
     #[test]

@@ -148,16 +148,38 @@ impl ChannelSettingsManager {
     }
 
     /// Get allowed channels list (JSON array of strings).
+    ///
+    /// M24: resolve with scope → global fallback. If no per-scope allowlist is
+    /// set, the global allowlist (`scope_id = "global"`) applies. Without this
+    /// fallback a configured global allowlist was silently ignored (= allow-all).
     pub async fn get_allowed_channels(&self, channel_type: &str, scope_id: &str) -> Vec<String> {
-        let val = self.get(channel_type, scope_id, keys::ALLOWED_CHANNELS).await
-            .unwrap_or_default();
-        if val.is_empty() {
-            return Vec::new();
+        // Try the per-scope value first.
+        if let Some(list) = self.parse_allowed_channels(channel_type, scope_id).await {
+            return list;
         }
-        serde_json::from_str(&val).unwrap_or_else(|e| {
-            tracing::warn!(key = "allowed_channels", error = %e, "Corrupt JSON in channel settings — falling back to allow-all");
+        // Fall back to the global allowlist when no per-scope one is set.
+        if scope_id != "global" {
+            if let Some(list) = self.parse_allowed_channels(channel_type, "global").await {
+                return list;
+            }
+        }
+        Vec::new()
+    }
+
+    /// Parse the allowed-channels JSON for a single scope.
+    ///
+    /// Returns `None` when the key is unset/empty (so the caller can fall back),
+    /// and `Some(vec)` otherwise. Corrupt JSON degrades to `Some(empty)` =
+    /// allow-all for that scope to avoid locking everyone out on bad data.
+    async fn parse_allowed_channels(&self, channel_type: &str, scope_id: &str) -> Option<Vec<String>> {
+        let val = self.get(channel_type, scope_id, keys::ALLOWED_CHANNELS).await?;
+        if val.is_empty() {
+            return None;
+        }
+        Some(serde_json::from_str(&val).unwrap_or_else(|e| {
+            tracing::warn!(key = "allowed_channels", scope = scope_id, error = %e, "Corrupt JSON in channel settings — falling back to allow-all");
             Vec::new()
-        })
+        }))
     }
 
     /// Set a setting value (upsert). Invalidates cache for this key.
@@ -302,6 +324,26 @@ mod tests {
         mgr.set("discord", "guild123", "allowed_channels", r#"["ch1","ch2"]"#).await.unwrap();
         assert!(mgr.is_channel_allowed("discord", "guild123", "ch1").await);
         assert!(!mgr.is_channel_allowed("discord", "guild123", "ch999").await);
+    }
+
+    #[tokio::test]
+    async fn test_allowed_channels_global_fallback() {
+        // M24: a global allowlist must apply to scopes without their own list.
+        let (_tmp, mgr) = temp_db();
+        mgr.set("discord", "global", "allowed_channels", r#"["chA"]"#).await.unwrap();
+        // guild999 has no per-scope allowlist → inherits global.
+        assert!(mgr.is_channel_allowed("discord", "guild999", "chA").await);
+        assert!(!mgr.is_channel_allowed("discord", "guild999", "chZ").await);
+    }
+
+    #[tokio::test]
+    async fn test_allowed_channels_scope_overrides_global() {
+        // A per-scope allowlist takes precedence over the global one.
+        let (_tmp, mgr) = temp_db();
+        mgr.set("discord", "global", "allowed_channels", r#"["chA"]"#).await.unwrap();
+        mgr.set("discord", "guild1", "allowed_channels", r#"["chB"]"#).await.unwrap();
+        assert!(mgr.is_channel_allowed("discord", "guild1", "chB").await);
+        assert!(!mgr.is_channel_allowed("discord", "guild1", "chA").await);
     }
 
     #[tokio::test]

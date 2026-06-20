@@ -4,8 +4,19 @@ import { useSearchParams } from 'react-router';
 import { cn } from '@/lib/utils';
 import { useSystemStore } from '@/stores/system-store';
 import { useAgentsStore } from '@/stores/agents-store';
-import { api, type AutopilotRule, type AutopilotHistoryEntry } from '@/lib/api';
-import { Dialog, FormField, inputClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import {
+  api,
+  type AutopilotRule,
+  type AutopilotHistoryEntry,
+  type RedactionConfig,
+  type RedactionSourceMode,
+  type RedactionSources,
+  type RedactionRestoreArgs,
+  type RedactionEgressRule,
+  type RedactionUpdate,
+} from '@/lib/api';
+import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { ChipEditor } from '@/components/shared/ChipEditor';
 import { toast, formatError } from '@/lib/toast';
 import { ToolApprovalPanel } from '@/components/ToolApprovalPanel';
 import { SessionReplayPanel } from '@/components/SessionReplayPanel';
@@ -30,9 +41,12 @@ import {
   Workflow,
   Globe,
   Pencil,
+  EyeOff,
+  Trash2,
+  Server,
 } from 'lucide-react';
 
-type TabId = 'general' | 'container' | 'heartbeat' | 'cron' | 'voice' | 'proactive' | 'autopilot' | 'doctor' | 'update' | 'browser';
+type TabId = 'general' | 'system' | 'container' | 'heartbeat' | 'cron' | 'voice' | 'proactive' | 'autopilot' | 'redaction' | 'doctor' | 'update' | 'browser';
 
 export function SettingsPage() {
   const intl = useIntl();
@@ -42,12 +56,14 @@ export function SettingsPage() {
 
   const tabs: ReadonlyArray<{ id: TabId; label: string; icon: React.ComponentType<{ className?: string }> }> = [
     { id: 'general', label: intl.formatMessage({ id: 'settings.general' }), icon: Settings },
+    { id: 'system', label: intl.formatMessage({ id: 'settings.system' }), icon: Server },
     { id: 'container', label: intl.formatMessage({ id: 'settings.container' }), icon: Container },
     { id: 'heartbeat', label: intl.formatMessage({ id: 'settings.heartbeat' }), icon: HeartPulse },
     { id: 'cron', label: intl.formatMessage({ id: 'settings.cron' }), icon: Clock },
     { id: 'voice', label: intl.formatMessage({ id: 'settings.voice' }), icon: Mic },
     { id: 'proactive', label: intl.formatMessage({ id: 'settings.proactive' }), icon: Zap },
     { id: 'autopilot', label: intl.formatMessage({ id: 'settings.autopilot' }), icon: Workflow },
+    { id: 'redaction', label: intl.formatMessage({ id: 'settings.redaction' }), icon: EyeOff },
     { id: 'doctor', label: intl.formatMessage({ id: 'settings.doctor' }), icon: Stethoscope },
     { id: 'update', label: intl.formatMessage({ id: 'settings.update' }), icon: Download },
     { id: 'browser', label: intl.formatMessage({ id: 'settings.browser' }), icon: Globe },
@@ -82,12 +98,14 @@ export function SettingsPage() {
       </div>
 
       {activeTab === 'general' && <GeneralTab />}
+      {activeTab === 'system' && <SystemTab />}
       {activeTab === 'container' && <ContainerTab />}
       {activeTab === 'heartbeat' && <HeartbeatTab />}
       {activeTab === 'cron' && <CronTab />}
       {activeTab === 'voice' && <VoiceTab />}
       {activeTab === 'proactive' && <ProactiveTab />}
       {activeTab === 'autopilot' && <AutopilotTab />}
+      {activeTab === 'redaction' && <RedactionTab />}
       {activeTab === 'doctor' && <DoctorTab />}
       {activeTab === 'update' && <UpdateTab />}
       {activeTab === 'browser' && <BrowserTab />}
@@ -189,6 +207,194 @@ function GeneralTab() {
             {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ── G — System tab (gateway / rotation / general / logging / secret_manager) ──
+
+function SystemTab() {
+  const intl = useIntl();
+  const { agents, fetchAgents } = useAgentsStore();
+  // [gateway] — bind/port require restart; auth_token is write-only.
+  const [bind, setBind] = useState('');
+  const [port, setPort] = useState('');
+  const [authToken, setAuthToken] = useState('');
+  // [rotation]
+  const [healthInterval, setHealthInterval] = useState('');
+  const [cooldown, setCooldown] = useState('');
+  // [general]
+  const [defaultAgent, setDefaultAgent] = useState('');
+  const [inferenceMode, setInferenceMode] = useState('claude');
+  // [logging]
+  const [logFormat, setLogFormat] = useState('pretty');
+  // [secret_manager]
+  const [smBackend, setSmBackend] = useState('config');
+  const [vaultAddr, setVaultAddr] = useState('');
+  const [vaultMount, setVaultMount] = useState('');
+  const [vaultToken, setVaultToken] = useState('');
+
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
+
+  useEffect(() => { fetchAgents(); }, [fetchAgents]);
+
+  // Load non-secret current values from the TOML config string. Secrets
+  // (auth_token / vault_token) are write-only — left blank, only sent if typed.
+  useEffect(() => {
+    api.system.config().then((res) => {
+      const raw = (res as Record<string, unknown>)?.config;
+      if (typeof raw !== 'string') return;
+      const m = (re: RegExp) => raw.match(re)?.[1];
+      setBind(m(/\bbind\s*=\s*"([^"]*)"/) ?? '');
+      setPort(m(/\bport\s*=\s*(\d+)/) ?? '');
+      setHealthInterval(m(/health_check_interval_seconds\s*=\s*(\d+)/) ?? '');
+      setCooldown(m(/cooldown_after_rate_limit_seconds\s*=\s*(\d+)/) ?? '');
+      setDefaultAgent(m(/default_agent\s*=\s*"([^"]*)"/) ?? '');
+      setInferenceMode(m(/inference_mode\s*=\s*"(\w+)"/) ?? 'claude');
+      setLogFormat(m(/\bformat\s*=\s*"(\w+)"/) ?? 'pretty');
+      setSmBackend(m(/\bbackend\s*=\s*"(\w+)"/) ?? 'config');
+      setVaultAddr(m(/vault_addr\s*=\s*"([^"]*)"/) ?? '');
+      setVaultMount(m(/vault_mount\s*=\s*"([^"]*)"/) ?? '');
+    }).catch((e) => {
+      console.warn('[api]', e);
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    });
+  }, [intl]);
+
+  const handleSave = async () => {
+    setSaving(true);
+    setSaved(false);
+    try {
+      const payload: Record<string, unknown> = {};
+      if (bind.trim() !== '') payload.bind = bind.trim();
+      if (port.trim() !== '') payload.port = Number(port);
+      if (authToken.trim() !== '') payload.auth_token = authToken.trim();
+      if (healthInterval.trim() !== '') payload.health_check_interval_seconds = Number(healthInterval);
+      if (cooldown.trim() !== '') payload.cooldown_after_rate_limit_seconds = Number(cooldown);
+      payload.default_agent = defaultAgent;
+      payload.inference_mode = inferenceMode;
+      payload.log_format = logFormat;
+      const sm: Record<string, unknown> = { backend: smBackend, vault_addr: vaultAddr, vault_mount: vaultMount };
+      if (vaultToken.trim() !== '') sm.vault_token = vaultToken.trim();
+      payload.secret_manager = sm;
+
+      await api.system.updateConfig(payload);
+      setAuthToken('');
+      setVaultToken('');
+      setSaved(true);
+      savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      console.warn('[api]', e);
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* Gateway */}
+      <div className="glass-card rounded-2xl p-6 space-y-4">
+        <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">{intl.formatMessage({ id: 'settings.system.gateway' })}</h3>
+        <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-700 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-400">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>{intl.formatMessage({ id: 'settings.system.restartNote' })}</span>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label={intl.formatMessage({ id: 'settings.system.bind' })}>
+            <input type="text" value={bind} onChange={(e) => setBind(e.target.value)} placeholder="0.0.0.0" className={inputClass} />
+          </FormField>
+          <FormField label={intl.formatMessage({ id: 'settings.system.port' })}>
+            <input type="number" min={1} max={65535} value={port} onChange={(e) => setPort(e.target.value)} placeholder="3100" className={inputClass} />
+          </FormField>
+        </div>
+        <FormField label={intl.formatMessage({ id: 'settings.system.authToken' })} hint={intl.formatMessage({ id: 'settings.system.writeOnly' })}>
+          <input type="password" value={authToken} onChange={(e) => setAuthToken(e.target.value)} placeholder="••••••••" className={inputClass} autoComplete="off" />
+        </FormField>
+      </div>
+
+      {/* Rotation */}
+      <div className="glass-card rounded-2xl p-6 space-y-4">
+        <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">{intl.formatMessage({ id: 'settings.system.rotation' })}</h3>
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label={intl.formatMessage({ id: 'settings.system.healthInterval' })}>
+            <input type="number" min={1} max={86400} value={healthInterval} onChange={(e) => setHealthInterval(e.target.value)} placeholder="60" className={inputClass} />
+          </FormField>
+          <FormField label={intl.formatMessage({ id: 'settings.system.cooldown' })}>
+            <input type="number" min={1} max={86400} value={cooldown} onChange={(e) => setCooldown(e.target.value)} placeholder="120" className={inputClass} />
+          </FormField>
+        </div>
+      </div>
+
+      {/* General + Logging */}
+      <div className="glass-card rounded-2xl p-6 space-y-4">
+        <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">{intl.formatMessage({ id: 'settings.system.general' })}</h3>
+        <FormField label={intl.formatMessage({ id: 'settings.system.defaultAgent' })}>
+          <select value={defaultAgent} onChange={(e) => setDefaultAgent(e.target.value)} className={selectClass}>
+            <option value="">{intl.formatMessage({ id: 'settings.system.none' })}</option>
+            {agents.map((a) => (
+              <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
+            ))}
+          </select>
+        </FormField>
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label={intl.formatMessage({ id: 'settings.system.inferenceMode' })}>
+            <select value={inferenceMode} onChange={(e) => setInferenceMode(e.target.value)} className={selectClass}>
+              <option value="local">local</option>
+              <option value="claude">claude</option>
+              <option value="hybrid">hybrid</option>
+            </select>
+          </FormField>
+          <FormField label={intl.formatMessage({ id: 'settings.system.logFormat' })}>
+            <select value={logFormat} onChange={(e) => setLogFormat(e.target.value)} className={selectClass}>
+              <option value="pretty">pretty</option>
+              <option value="json">json</option>
+            </select>
+          </FormField>
+        </div>
+      </div>
+
+      {/* Secret manager */}
+      <div className="glass-card rounded-2xl p-6 space-y-4">
+        <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">{intl.formatMessage({ id: 'settings.system.secrets' })}</h3>
+        <FormField label={intl.formatMessage({ id: 'settings.system.smBackend' })}>
+          <select value={smBackend} onChange={(e) => setSmBackend(e.target.value)} className={selectClass}>
+            <option value="env">env</option>
+            <option value="vault">vault</option>
+            <option value="config">config</option>
+            <option value="keychain">keychain</option>
+          </select>
+        </FormField>
+        {smBackend === 'vault' && (
+          <>
+            <div className="grid grid-cols-2 gap-3">
+              <FormField label={intl.formatMessage({ id: 'settings.system.vaultAddr' })}>
+                <input type="text" value={vaultAddr} onChange={(e) => setVaultAddr(e.target.value)} placeholder="https://vault:8200" className={inputClass} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'settings.system.vaultMount' })}>
+                <input type="text" value={vaultMount} onChange={(e) => setVaultMount(e.target.value)} placeholder="secret" className={inputClass} />
+              </FormField>
+            </div>
+            <FormField label={intl.formatMessage({ id: 'settings.system.vaultToken' })} hint={intl.formatMessage({ id: 'settings.system.writeOnly' })}>
+              <input type="password" value={vaultToken} onChange={(e) => setVaultToken(e.target.value)} placeholder="••••••••" className={inputClass} autoComplete="off" />
+            </FormField>
+          </>
+        )}
+      </div>
+
+      <div className="flex justify-end gap-2">
+        {saved && (
+          <span className="self-center text-xs text-emerald-600 dark:text-emerald-400">
+            {intl.formatMessage({ id: 'settings.general.saved' })}
+          </span>
+        )}
+        <button onClick={handleSave} disabled={saving} className={buttonPrimary}>
+          {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+        </button>
       </div>
     </div>
   );
@@ -1016,6 +1222,184 @@ function SettingRow({
           {value}
         </span>
       )}
+    </div>
+  );
+}
+
+// ── Privacy / Redaction Tab (RED) ──────────────────────────────
+
+const REDACTION_SOURCE_KEYS: ReadonlyArray<keyof RedactionSources> = [
+  'user_input',
+  'tool_results',
+  'system_prompt',
+  'sub_agent',
+  'cron_context',
+];
+const REDACTION_MODES: ReadonlyArray<RedactionSourceMode> = ['on', 'off', 'selective', 'inherit'];
+const REDACTION_RESTORE: ReadonlyArray<RedactionRestoreArgs> = ['restore', 'passthrough', 'deny'];
+
+function RedactionTab() {
+  const intl = useIntl();
+  const [config, setConfig] = useState<RedactionConfig | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [newTool, setNewTool] = useState('');
+  const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await api.redaction.get();
+      setConfig(res);
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    }
+  }, [intl]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const handleSave = async () => {
+    if (!config) return;
+    setSaving(true);
+    try {
+      const payload: RedactionUpdate = {
+        enabled: config.enabled,
+        vault_ttl_hours: config.vault_ttl_hours,
+        purge_after_expire_days: config.purge_after_expire_days,
+        profiles: config.profiles,
+        sources: config.sources,
+        tool_egress: config.tool_egress,
+      };
+      await api.redaction.update(payload);
+      setSaved(true);
+      savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const addEgress = () => {
+    const tool = newTool.trim();
+    if (!tool || !config || config.tool_egress[tool]) {
+      setNewTool('');
+      return;
+    }
+    setConfig({ ...config, tool_egress: { ...config.tool_egress, [tool]: { restore_args: 'deny', audit_reveal: false } } });
+    setNewTool('');
+  };
+
+  const removeEgress = (tool: string) => {
+    if (!config) return;
+    const next = { ...config.tool_egress };
+    delete next[tool];
+    setConfig({ ...config, tool_egress: next });
+  };
+
+  if (!config) {
+    return (
+      <div className="glass-card rounded-2xl p-6">
+        <p className="py-8 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6 glass-card rounded-2xl p-6">
+      <div className="flex items-center gap-3">
+        <EyeOff className="h-5 w-5 text-amber-600 dark:text-amber-400" />
+        <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
+          {intl.formatMessage({ id: 'settings.redaction' })}
+        </h3>
+      </div>
+      <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'redaction.desc' })}</p>
+
+      {/* Master toggle + scalars */}
+      <div className="space-y-4">
+        <label className="flex items-center justify-between py-1.5">
+          <span className="text-sm text-stone-700 dark:text-stone-300">{intl.formatMessage({ id: 'redaction.enabled' })}</span>
+          <input type="checkbox" checked={config.enabled} onChange={(e) => setConfig({ ...config, enabled: e.target.checked })} className="h-4 w-4 accent-amber-500" />
+        </label>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <FormField label={intl.formatMessage({ id: 'redaction.vaultTtl' })} hint="1-8760">
+            <input type="number" min={1} max={8760} value={config.vault_ttl_hours} onChange={(e) => setConfig({ ...config, vault_ttl_hours: Number(e.target.value) })} className={inputClass} />
+          </FormField>
+          <FormField label={intl.formatMessage({ id: 'redaction.purgeAfter' })} hint="0-3650">
+            <input type="number" min={0} max={3650} value={config.purge_after_expire_days} onChange={(e) => setConfig({ ...config, purge_after_expire_days: Number(e.target.value) })} className={inputClass} />
+          </FormField>
+        </div>
+        <FormField label={intl.formatMessage({ id: 'redaction.profiles' })} hint={intl.formatMessage({ id: 'redaction.profiles.hint' })}>
+          <ChipEditor values={config.profiles} onChange={(v) => setConfig({ ...config, profiles: v })} placeholder="pii" addLabel={intl.formatMessage({ id: 'common.add' })} />
+        </FormField>
+      </div>
+
+      {/* Sources matrix */}
+      <div className="border-t border-stone-200 pt-4 dark:border-stone-700">
+        <h4 className="mb-3 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'redaction.sources' })}</h4>
+        <div className="space-y-3">
+          {REDACTION_SOURCE_KEYS.map((key) => (
+            <div key={key} className="flex items-center justify-between gap-3">
+              <span className="text-sm text-stone-700 dark:text-stone-300">{intl.formatMessage({ id: `redaction.source.${key}` })}</span>
+              <select
+                value={config.sources[key]}
+                onChange={(e) => setConfig({ ...config, sources: { ...config.sources, [key]: e.target.value as RedactionSourceMode } })}
+                className={cn(selectClass, 'w-40')}
+              >
+                {REDACTION_MODES.map((m) => (
+                  <option key={m} value={m}>{intl.formatMessage({ id: `redaction.mode.${m}` })}</option>
+                ))}
+              </select>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Tool egress rules */}
+      <div className="border-t border-stone-200 pt-4 dark:border-stone-700">
+        <h4 className="mb-3 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'redaction.toolEgress' })}</h4>
+        <p className="mb-3 text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'redaction.toolEgress.hint' })}</p>
+        <div className="space-y-2">
+          {(Object.entries(config.tool_egress) as Array<[string, RedactionEgressRule]>).map(([tool, rule]) => (
+            <div key={tool} className="flex flex-wrap items-center gap-2 rounded-lg bg-stone-50 p-2.5 dark:bg-stone-800/50">
+              <code className="rounded bg-stone-100 px-2 py-0.5 font-mono text-xs text-stone-700 dark:bg-stone-700 dark:text-stone-300">{tool}</code>
+              <select
+                value={rule.restore_args}
+                onChange={(e) => setConfig({ ...config, tool_egress: { ...config.tool_egress, [tool]: { ...rule, restore_args: e.target.value as RedactionRestoreArgs } } })}
+                className={cn(selectClass, 'w-36')}
+              >
+                {REDACTION_RESTORE.map((r) => (
+                  <option key={r} value={r}>{intl.formatMessage({ id: `redaction.restore.${r}` })}</option>
+                ))}
+              </select>
+              <label className="flex items-center gap-1.5 text-xs text-stone-600 dark:text-stone-400">
+                <input type="checkbox" checked={rule.audit_reveal} onChange={(e) => setConfig({ ...config, tool_egress: { ...config.tool_egress, [tool]: { ...rule, audit_reveal: e.target.checked } } })} className="accent-amber-500" />
+                {intl.formatMessage({ id: 'redaction.auditReveal' })}
+              </label>
+              <button onClick={() => removeEgress(tool)} className="ml-auto rounded p-1 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20">
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ))}
+          {Object.keys(config.tool_egress).length === 0 && (
+            <p className="text-xs text-stone-400">{intl.formatMessage({ id: 'common.noData' })}</p>
+          )}
+        </div>
+        <div className="mt-3 flex gap-2">
+          <input type="text" value={newTool} onChange={(e) => setNewTool(e.target.value)} placeholder={intl.formatMessage({ id: 'redaction.toolEgress.toolName' })} className={cn(inputClass, 'flex-1')} />
+          <button onClick={addEgress} className={buttonSecondary}>
+            <Plus className="h-4 w-4" />
+            {intl.formatMessage({ id: 'redaction.toolEgress.add' })}
+          </button>
+        </div>
+      </div>
+
+      <div className="flex justify-end gap-2 pt-2">
+        {saved && <span className="self-center text-xs text-emerald-600 dark:text-emerald-400">{intl.formatMessage({ id: 'settings.general.saved' })}</span>}
+        <button onClick={handleSave} disabled={saving} className={buttonPrimary}>
+          {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+        </button>
+      </div>
     </div>
   );
 }

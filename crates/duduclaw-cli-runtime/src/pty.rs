@@ -295,9 +295,72 @@ impl PtyHandle {
 
     /// Read whatever bytes are currently buffered (non-blocking). Returns an empty
     /// string if nothing is available.
+    ///
+    /// **HC14 fix**: this only drains `rx_buffer` — bytes that the reader pump
+    /// has produced but `read_until` has not yet pulled off the mpsc channel
+    /// are NOT touched here. Callers that need to fully purge residual bytes
+    /// from a previous turn (so they don't pollute the next response) must use
+    /// [`PtyHandle::drain_residual`], which also non-blockingly drains the
+    /// reader channel.
     pub fn drain_buffer(&self) -> String {
         let mut buf = self.inner.rx_buffer.lock();
         std::mem::take(&mut *buf)
+    }
+
+    /// **HC14 fix**: fully drain residual bytes left over from a prior turn —
+    /// both the rolling `rx_buffer` AND any chunks the reader pump has already
+    /// queued onto the mpsc channel but `read_until` never consumed.
+    ///
+    /// Without this, the reader channel can hold the previous turn's trailing
+    /// bytes (e.g. a stray closing sentinel or TUI redraw), which the next
+    /// `read_until` would then surface as the head of the new response,
+    /// corrupting sentinel pairing.
+    ///
+    /// Non-blocking: uses `try_recv` in a tight loop so it never awaits. Drains
+    /// the rolling buffer first, then everything currently sitting on the
+    /// channel. Returns all drained bytes (the boot path / diagnostics may want
+    /// to inspect them; the per-invoke path simply discards the result).
+    pub fn drain_residual(&self) -> String {
+        let mut out = self.drain_buffer();
+        // Drain the reader channel without awaiting. We may not get the async
+        // mutex if a `read_until` is concurrently in flight — but `invoke`
+        // single-flights, so the per-invoke caller always has exclusive access.
+        if let Ok(mut guard) = self.inner.reader_rx.try_lock() {
+            loop {
+                match guard.try_recv() {
+                    Ok(ReadEvent::Chunk(c)) => out.push_str(&c),
+                    // Stop on EOF / error / empty / disconnected — there's
+                    // nothing more buffered to drain right now.
+                    _ => break,
+                }
+            }
+        }
+        out
+    }
+
+    /// **M46 fix**: push bytes back onto the FRONT of the rolling buffer so the
+    /// next `read_until` / `drain_buffer` sees them first.
+    ///
+    /// `collect_response` uses this when a frame's closing sentinel is followed
+    /// by the start of the *next* response on a reused session: those trailing
+    /// bytes must be re-buffered rather than discarded, or the next invoke loses
+    /// its response head.
+    pub fn push_buffer(&self, bytes: &str) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut buf = self.inner.rx_buffer.lock();
+        // Prepend: existing buffered bytes are newer relative to `bytes` only if
+        // `bytes` truly came earlier in the stream. In practice the caller hands
+        // us the tail it over-read, and the buffer is empty (just drained), so a
+        // prepend keeps stream order correct in every case.
+        if buf.is_empty() {
+            buf.push_str(bytes);
+        } else {
+            let existing = std::mem::take(&mut *buf);
+            buf.push_str(bytes);
+            buf.push_str(&existing);
+        }
     }
 
     /// Check whether the child process is still alive.
@@ -488,5 +551,69 @@ mod tests {
         assert_eq!(kind, PtySystemKind::Unix);
         #[cfg(windows)]
         assert_eq!(kind, PtySystemKind::ConPty);
+    }
+
+    // ── M46: push_buffer re-buffering ─────────────────────────────────
+
+    #[tokio::test]
+    async fn push_buffer_round_trips_via_drain() {
+        let (program, args) = echo_program();
+        let cmd = PtyCommand::new(program).args(args);
+        let pty = PtyHandle::spawn(cmd).expect("spawn echo");
+        // Push synthetic tail bytes; drain_buffer must return them verbatim.
+        pty.push_buffer("tail-bytes-from-prev-turn");
+        let drained = pty.drain_buffer();
+        assert!(
+            drained.starts_with("tail-bytes-from-prev-turn"),
+            "push_buffer content must be drained first: {drained:?}"
+        );
+        pty.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn push_buffer_preserves_stream_order_when_buffer_nonempty() {
+        let (program, args) = echo_program();
+        let cmd = PtyCommand::new(program).args(args);
+        let pty = PtyHandle::spawn(cmd).expect("spawn echo");
+        // Simulate: buffer already holds "newer" bytes, then we push back the
+        // "older" tail we over-read. Older must come out first.
+        pty.push_buffer("NEWER");
+        pty.push_buffer("OLDER");
+        // After two pushes onto a (logically) growing front, the second push is
+        // prepended ahead of the first.
+        let drained = pty.drain_buffer();
+        assert_eq!(drained, "OLDERNEWER", "second push must precede first");
+        pty.shutdown().await;
+    }
+
+    // ── HC14: drain_residual drains the reader channel too ────────────
+
+    #[tokio::test]
+    async fn drain_residual_purges_reader_channel() {
+        // `echo hello-pty` emits bytes that the reader pump queues onto the
+        // mpsc channel. Without consuming via read_until, drain_buffer alone
+        // would miss them (they're on the channel, not in rx_buffer).
+        // drain_residual must surface them.
+        let (program, args) = echo_program();
+        let cmd = PtyCommand::new(program).args(args);
+        let pty = PtyHandle::spawn(cmd).expect("spawn echo");
+
+        // Give the reader pump time to push the echo onto the channel.
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            // Peek: if drain_residual already sees the marker, stop early.
+            let snapshot = {
+                // Non-destructive-ish: we just check via a residual drain.
+                pty.drain_residual()
+            };
+            if snapshot.contains("hello-pty") {
+                // Success: the channel-queued bytes were drained.
+                pty.shutdown().await;
+                return;
+            }
+            // Re-buffer what we drained so the next iteration can still find it.
+            pty.push_buffer(&snapshot);
+        }
+        panic!("drain_residual never surfaced reader-channel bytes");
     }
 }

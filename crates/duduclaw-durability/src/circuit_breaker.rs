@@ -59,10 +59,19 @@ pub struct CircuitBreakerDependencyConfig {
     /// 滑動視窗大小（用於計算失敗率的最近 N 次請求）。
     #[serde(default = "default_window_size")]
     pub window_size: u32,
+    /// HALF_OPEN 探測逾時（秒）。探測在此時間內未回報結果（after_call 未被呼叫，
+    /// 例如 panic / cancel / future 被 drop）即視為已放棄，釋放其佔用的 probe slot，
+    /// 讓後續呼叫可重新發起探測 —— 否則熔斷器會永久卡在 OPEN。可配置，禁止硬編碼。
+    #[serde(default = "default_probe_timeout_seconds")]
+    pub probe_timeout_seconds: u64,
 }
 
 fn default_window_size() -> u32 {
     20
+}
+
+fn default_probe_timeout_seconds() -> u64 {
+    30
 }
 
 impl CircuitBreakerDependencyConfig {
@@ -89,6 +98,9 @@ impl CircuitBreakerDependencyConfig {
         if self.window_size == 0 {
             return Err("window_size must be >= 1".into());
         }
+        if self.probe_timeout_seconds == 0 {
+            return Err("probe_timeout_seconds must be >= 1".into());
+        }
         Ok(())
     }
 
@@ -101,6 +113,7 @@ impl CircuitBreakerDependencyConfig {
             reset_timeout_seconds: 30,
             probe_success_required: 2,
             window_size: 20,
+            probe_timeout_seconds: 30,
         }
     }
 
@@ -113,6 +126,7 @@ impl CircuitBreakerDependencyConfig {
             reset_timeout_seconds: 60,
             probe_success_required: 1,
             window_size: 20,
+            probe_timeout_seconds: 30,
         }
     }
 
@@ -125,6 +139,7 @@ impl CircuitBreakerDependencyConfig {
             reset_timeout_seconds: 45,
             probe_success_required: 2,
             window_size: 20,
+            probe_timeout_seconds: 30,
         }
     }
 }
@@ -183,6 +198,12 @@ struct DependencyState {
     /// 限制並發探測數量不超過 `probe_success_required`，防止多個並發
     /// 探測同時成功導致 `consecutive_successes` 過度遞增而過早恢復到 CLOSED。
     probe_inflight: u32,
+    /// 最近一次允許探測通過的時間（用於 HC16 probe deadline）。
+    ///
+    /// 若一個探測在 `probe_timeout_seconds` 內未透過 `after_call` 回報結果
+    /// （panic / cancel / future drop），視為已放棄，釋放其佔用的 slot，
+    /// 避免 `probe_inflight` 永久卡住、熔斷器永遠 OPEN。
+    probe_started_at: Option<Instant>,
 }
 
 impl DependencyState {
@@ -193,6 +214,7 @@ impl DependencyState {
             opened_at: None,
             consecutive_successes: 0,
             probe_inflight: 0,
+            probe_started_at: None,
         }
     }
 
@@ -310,6 +332,7 @@ impl CircuitBreakerRegistry {
                         state.state = BreakerState::HalfOpen;
                         state.consecutive_successes = 0;
                         state.probe_inflight = state.probe_inflight.saturating_add(1);
+                        state.probe_started_at = Some(Instant::now());
                         drop(states);
                         info!(dependency, "circuit breaker: OPEN → HALF_OPEN");
                         self.fire_transition(StateTransition {
@@ -333,6 +356,27 @@ impl CircuitBreakerRegistry {
                 })
             }
             BreakerState::HalfOpen => {
+                // HC16 fix: re-arm a stuck probe. If probes are inflight but the last one
+                // was started longer ago than `probe_timeout_seconds`, its `after_call` was
+                // never invoked (panic / cancel / dropped future). Treat the abandoned
+                // probe(s) as released so a fresh probe can proceed — otherwise the slot
+                // (and the breaker) stays stuck forever.
+                if state.probe_inflight > 0 {
+                    let timed_out = state
+                        .probe_started_at
+                        .map(|t| t.elapsed() >= Duration::from_secs(config.probe_timeout_seconds))
+                        .unwrap_or(true);
+                    if timed_out {
+                        warn!(
+                            dependency,
+                            inflight = state.probe_inflight,
+                            "circuit breaker: HALF_OPEN probe timed out, re-arming"
+                        );
+                        state.probe_inflight = 0;
+                        state.probe_started_at = None;
+                    }
+                }
+
                 // 限制並發探測數量不超過 probe_success_required，防止多個探測並發
                 // 導致 consecutive_successes 過度計數，過早觸發 HALF_OPEN → CLOSED。
                 if state.probe_inflight >= config.probe_success_required {
@@ -345,6 +389,7 @@ impl CircuitBreakerRegistry {
                     });
                 }
                 state.probe_inflight = state.probe_inflight.saturating_add(1);
+                state.probe_started_at = Some(Instant::now());
                 Ok(())
             }
         }
@@ -393,8 +438,23 @@ impl CircuitBreakerRegistry {
                 }
             }
             BreakerState::HalfOpen => {
-                // 探測結果回報，釋放 probe_inflight slot（無論成功或失敗）
+                // HC16 fix: only a result that corresponds to an actually-inflight probe
+                // may count toward closing the breaker. A spurious after_call (no probe
+                // inflight — e.g. a late report from an already re-armed/abandoned probe)
+                // must NOT increment consecutive_successes, or it could close the breaker
+                // prematurely without a genuine probe succeeding.
+                let had_inflight_probe = state.probe_inflight > 0;
+
+                // 釋放 probe_inflight slot（無論成功或失敗）
                 state.probe_inflight = state.probe_inflight.saturating_sub(1);
+                if state.probe_inflight == 0 {
+                    state.probe_started_at = None;
+                }
+
+                if !had_inflight_probe {
+                    // No probe was inflight — ignore this stray report entirely.
+                    return;
+                }
 
                 if success {
                     state.consecutive_successes += 1;
@@ -405,6 +465,7 @@ impl CircuitBreakerRegistry {
                         state.opened_at = None;
                         state.consecutive_successes = 0;
                         state.probe_inflight = 0;
+                        state.probe_started_at = None;
                         drop(states);
                         info!(dependency, "circuit breaker: HALF_OPEN → CLOSED (recovered)");
                         self.fire_transition(StateTransition {
@@ -423,6 +484,7 @@ impl CircuitBreakerRegistry {
                     state.opened_at = Some(Instant::now());
                     state.consecutive_successes = 0;
                     state.probe_inflight = 0;
+                    state.probe_started_at = None;
                     drop(states);
                     warn!(dependency, "circuit breaker: HALF_OPEN → OPEN (probe failed)");
                     self.fire_transition(StateTransition {
@@ -460,6 +522,7 @@ impl CircuitBreakerRegistry {
             state.opened_at = None;
             state.consecutive_successes = 0;
             state.probe_inflight = 0;
+            state.probe_started_at = None;
         }
     }
 
@@ -497,6 +560,7 @@ mod tests {
             reset_timeout_seconds: reset_secs,
             probe_success_required: probe_required,
             window_size: 10,
+            probe_timeout_seconds: 30,
         }
     }
 
@@ -643,12 +707,17 @@ mod tests {
         }
         assert_eq!(reg.state("svc").await, Some(BreakerState::Open));
 
-        // Force to HALF_OPEN for testing (bypassing reset_timeout)
+        // Force to HALF_OPEN for testing (bypassing reset_timeout).
+        // Set probe_inflight so each after_call corresponds to a real inflight probe
+        // (HC16: stray reports without an inflight probe are ignored). probe_success_required
+        // is 2, so two probe slots are available concurrently.
         {
             let mut states = reg.states.write().await;
             if let Some(s) = states.get_mut("svc") {
                 s.state = BreakerState::HalfOpen;
                 s.consecutive_successes = 0;
+                s.probe_inflight = 2;
+                s.probe_started_at = Some(Instant::now());
             }
         }
         assert_eq!(reg.state("svc").await, Some(BreakerState::HalfOpen));
@@ -679,13 +748,99 @@ mod tests {
                 window: Default::default(),
                 opened_at: None,
                 consecutive_successes: 0,
-                probe_inflight: 0,
+                probe_inflight: 1,
+                probe_started_at: Some(Instant::now()),
             });
         }
 
         // Probe failure → OPEN again
         reg.after_call("svc", false).await;
         assert_eq!(reg.state("svc").await, Some(BreakerState::Open));
+    }
+
+    // ── HC16: stuck probe re-arm + success-only-when-inflight ─────────────────
+
+    #[tokio::test]
+    async fn test_halfopen_stuck_probe_rearms_after_timeout() {
+        // probe_success_required=1, probe_timeout=1s. A probe is allowed but its
+        // after_call is never invoked (simulating panic/cancel/drop). After the
+        // timeout, a fresh before_call must be allowed again (re-arm) rather than
+        // staying stuck OPEN forever.
+        let mut cfg = make_config("svc", 0.5, 4, 3600, 1);
+        cfg.probe_timeout_seconds = 1;
+        let reg = registry_with(cfg).await;
+
+        // Force HALF_OPEN with a stale inflight probe (started long ago).
+        {
+            let mut states = reg.states.write().await;
+            states.insert("svc".into(), DependencyState {
+                state: BreakerState::HalfOpen,
+                window: Default::default(),
+                opened_at: None,
+                consecutive_successes: 0,
+                probe_inflight: 1,
+                // Started well beyond probe_timeout_seconds ago.
+                probe_started_at: Some(Instant::now() - Duration::from_secs(5)),
+            });
+        }
+
+        // The slot is "full" (1 inflight, max 1) but the probe is stale → re-arm.
+        assert!(
+            reg.before_call("svc").await.is_ok(),
+            "stuck probe should be re-armed after probe_timeout, allowing a fresh probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_halfopen_fresh_probe_slot_full_is_rejected() {
+        // A *fresh* inflight probe (not timed out) must still block additional probes.
+        let mut cfg = make_config("svc", 0.5, 4, 3600, 1);
+        cfg.probe_timeout_seconds = 3600;
+        let reg = registry_with(cfg).await;
+
+        {
+            let mut states = reg.states.write().await;
+            states.insert("svc".into(), DependencyState {
+                state: BreakerState::HalfOpen,
+                window: Default::default(),
+                opened_at: None,
+                consecutive_successes: 0,
+                probe_inflight: 1,
+                probe_started_at: Some(Instant::now()),
+            });
+        }
+
+        assert!(
+            reg.before_call("svc").await.is_err(),
+            "fresh inflight probe at capacity should reject additional probes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_halfopen_stray_success_without_inflight_probe_does_not_close() {
+        // HC16: after_call(success) with no inflight probe must NOT count toward closing.
+        let reg = registry_with(make_config("svc", 0.5, 4, 3600, 1)).await;
+
+        // Force HALF_OPEN with NO inflight probe.
+        {
+            let mut states = reg.states.write().await;
+            states.insert("svc".into(), DependencyState {
+                state: BreakerState::HalfOpen,
+                window: Default::default(),
+                opened_at: None,
+                consecutive_successes: 0,
+                probe_inflight: 0,
+                probe_started_at: None,
+            });
+        }
+
+        // Stray success — should be ignored, breaker stays HALF_OPEN.
+        reg.after_call("svc", true).await;
+        assert_eq!(
+            reg.state("svc").await,
+            Some(BreakerState::HalfOpen),
+            "stray success without an inflight probe must not close the breaker"
+        );
     }
 
     // ── Configurable thresholds ───────────────────────────────────────────────

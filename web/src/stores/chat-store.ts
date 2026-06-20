@@ -1,4 +1,10 @@
 import { create } from 'zustand';
+import { useAuthStore } from './auth-store';
+
+export interface ChatAttachmentMeta {
+  readonly name: string;
+  readonly mime: string;
+}
 
 export interface ChatMessage {
   readonly id: string;
@@ -6,6 +12,15 @@ export interface ChatMessage {
   readonly content: string;
   readonly timestamp: number;
   readonly tokens?: number;
+  /** Files attached to a user message (display chips). */
+  readonly attachments?: readonly ChatAttachmentMeta[];
+}
+
+/** A file selected for upload, already read into base64. */
+export interface PendingAttachment {
+  readonly name: string;
+  readonly mime: string;
+  readonly dataBase64: string;
 }
 
 interface ChatStore {
@@ -14,11 +29,15 @@ interface ChatStore {
   readonly sessionId: string | null;
   readonly agentName: string;
   readonly agentIcon: string;
+  /** Whether the agent's model can interpret uploaded images (from session_info). */
+  readonly supportsVision: boolean;
+  /** The agent's preferred model id (from session_info). */
+  readonly model: string;
   readonly connectionState: 'disconnected' | 'connecting' | 'connected';
 
   connect: () => void;
   disconnect: () => void;
-  send: (text: string) => void;
+  send: (text: string, attachments?: readonly PendingAttachment[]) => void;
   reset: () => void;
 }
 
@@ -63,6 +82,17 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
     socket.onopen = () => {
       reconnectAttempt = 0;
+      // C5: the server now requires the first frame to authenticate the
+      // connection with the current access token before any message is accepted.
+      const jwt = useAuthStore.getState().jwt;
+      if (jwt) {
+        socket.send(JSON.stringify({ type: 'auth', token: jwt }));
+      } else {
+        // No session — close; the user must log in first.
+        socket.close();
+        set({ connectionState: 'disconnected' });
+        return;
+      }
       set({ connectionState: 'connected' });
     };
 
@@ -75,6 +105,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
               sessionId: data.session_id,
               agentName: data.agent_name,
               agentIcon: data.agent_icon,
+              supportsVision: data.supports_vision ?? false,
+              model: data.model ?? '',
             });
             break;
 
@@ -161,6 +193,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
     sessionId: null,
     agentName: 'DuDuClaw',
     agentIcon: '🐾',
+    supportsVision: false,
+    model: '',
     connectionState: 'disconnected',
 
     connect,
@@ -179,10 +213,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
       set({ connectionState: 'disconnected' });
     },
 
-    send: (text: string) => {
+    send: (text: string, attachments?: readonly PendingAttachment[]) => {
       if (!wsRef || wsRef.readyState !== WebSocket.OPEN) return;
 
-      // Add user message to local state immediately
+      const atts = attachments ?? [];
+
+      // Add user message to local state immediately (with attachment chips)
       set((state) => ({
         messages: [
           ...state.messages,
@@ -191,6 +227,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
             role: 'user' as const,
             content: text,
             timestamp: Date.now(),
+            attachments: atts.map((a) => ({ name: a.name, mime: a.mime })),
           },
         ],
         isStreaming: true,
@@ -201,6 +238,11 @@ export const useChatStore = create<ChatStore>((set, get) => {
           type: 'user_message',
           content: text,
           session_id: get().sessionId,
+          attachments: atts.map((a) => ({
+            filename: a.name,
+            mime: a.mime,
+            data_base64: a.dataBase64,
+          })),
         })
       );
     },
