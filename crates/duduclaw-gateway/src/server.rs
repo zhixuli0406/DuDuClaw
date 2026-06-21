@@ -499,6 +499,15 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Store background task handles for graceful shutdown (BE-L4)
     let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
+    // ── Skill synthesis auto-run scheduler (W19-P1) ───────────────────────────
+    // Makes conversation→skill extraction autonomous: runs the Rollout-to-Skill
+    // pipeline on an interval instead of waiting for a manual `skill_synthesis_run`
+    // MCP call. Off by default — enable via `config.toml [skill_synthesis]
+    // auto_run = true` (still dry-run unless `dry_run = false`). The flag is
+    // re-read each poll, so it can be toggled without a gateway restart.
+    bg_handles.push(crate::skill_synthesis_pipeline::scheduler::spawn(home_dir.clone()));
+    info!("Skill synthesis auto-run scheduler started (gated by config [skill_synthesis] auto_run)");
+
     // Validate default_agent before wiring channels — a dangling default_agent
     // is the root cause of channel "identity mixing" (wrong agent answers).
     crate::channel_reply::validate_default_agent(&home_dir, handler.registry()).await;
