@@ -2,9 +2,20 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type AuditEvent, type KillswitchConfig } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
-import { FormField, inputClass, buttonPrimary } from '@/components/shared/Dialog';
+import { FormField } from '@/components/shared/Dialog';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { toast, formatError } from '@/lib/toast';
+import {
+  Page,
+  PageHeader,
+  Card,
+  Section,
+  Badge,
+  Button,
+  EmptyState,
+  controlClass,
+} from '@/components/ui';
+import { cn } from '@/lib/utils';
 import {
   Shield,
   Lock,
@@ -52,10 +63,12 @@ export function SecurityPage() {
   }, [connectionState]);
 
   return (
-    <div className="space-y-6">
-      <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-        {intl.formatMessage({ id: 'security.title' })}
-      </h2>
+    <Page wide>
+      <PageHeader
+        icon={Shield}
+        title={intl.formatMessage({ id: 'nav.security' })}
+        subtitle={intl.formatMessage({ id: 'app.subtitle' })}
+      />
 
       <div className="grid gap-6 lg:grid-cols-2">
         {/* Audit Log */}
@@ -69,9 +82,10 @@ export function SecurityPage() {
               {intl.formatMessage({ id: 'common.loading' })}
             </p>
           ) : auditEvents.length === 0 ? (
-            <p className="py-4 text-center text-sm text-stone-400">
-              {intl.formatMessage({ id: 'security.audit.empty' })}
-            </p>
+            <EmptyState
+              icon={History}
+              title={intl.formatMessage({ id: 'security.audit.empty' })}
+            />
           ) : (
             <div className="max-h-64 space-y-2 overflow-y-auto">
               {auditEvents.map((evt, i) => (
@@ -131,7 +145,7 @@ export function SecurityPage() {
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
-                <tr className="border-b border-stone-200 dark:border-stone-700">
+                <tr className="border-b border-[var(--panel-border)]">
                   <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">
                     Agent
                   </th>
@@ -151,7 +165,7 @@ export function SecurityPage() {
               </thead>
               <tbody className="text-stone-700 dark:text-stone-300">
                 {(status?.rbac ?? []).map((agent) => (
-                  <tr key={agent.agent_id} className="border-b border-stone-100 dark:border-stone-800">
+                  <tr key={agent.agent_id} className="border-b border-[var(--panel-border)]">
                     <td className="py-2 text-stone-700 dark:text-stone-300">
                       <code className="text-xs">{agent.agent_id}</code>
                       <span className="ml-1 text-xs text-stone-400">({agent.role})</span>
@@ -195,7 +209,7 @@ export function SecurityPage() {
 
       {/* Killswitch (KS) — editable */}
       <KillswitchSection />
-    </div>
+    </Page>
   );
 }
 
@@ -253,52 +267,55 @@ function KillswitchSection() {
       ) : (
         <div className="space-y-6">
           {/* Triggers */}
-          <div>
-            <h4 className="mb-3 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'killswitch.triggers' })}</h4>
+          <Section title={intl.formatMessage({ id: 'killswitch.triggers' })}>
             <div className="grid gap-4 sm:grid-cols-2">
               <FormField label={intl.formatMessage({ id: 'killswitch.maxRepliesPerMinute' })} hint="1-10000">
-                <input type="number" min={1} max={10000} value={config.triggers.max_replies_per_minute} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, max_replies_per_minute: Number(e.target.value) } })} className={inputClass} />
+                <input type="number" min={1} max={10000} value={config.triggers.max_replies_per_minute} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, max_replies_per_minute: Number(e.target.value) } })} className={controlClass} />
               </FormField>
               <FormField label={intl.formatMessage({ id: 'killswitch.maxConsecutiveErrors' })} hint="1-1000">
-                <input type="number" min={1} max={1000} value={config.triggers.max_consecutive_errors} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, max_consecutive_errors: Number(e.target.value) } })} className={inputClass} />
+                <input type="number" min={1} max={1000} value={config.triggers.max_consecutive_errors} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, max_consecutive_errors: Number(e.target.value) } })} className={controlClass} />
               </FormField>
               <FormField label={intl.formatMessage({ id: 'killswitch.errorRateThreshold' })} hint="0.0-1.0">
-                <input type="number" min={0} max={1} step={0.01} value={config.triggers.error_rate_threshold} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, error_rate_threshold: Number(e.target.value) } })} className={inputClass} />
+                <input type="number" min={0} max={1} step={0.01} value={config.triggers.error_rate_threshold} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, error_rate_threshold: Number(e.target.value) } })} className={controlClass} />
               </FormField>
               <FormField label={intl.formatMessage({ id: 'killswitch.costLimitUsd' })} hint="0-1000000">
-                <input type="number" min={0} step={0.01} value={config.triggers.cost_limit_usd} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, cost_limit_usd: Number(e.target.value) } })} className={inputClass} />
+                <input type="number" min={0} step={0.01} value={config.triggers.cost_limit_usd} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, cost_limit_usd: Number(e.target.value) } })} className={controlClass} />
               </FormField>
             </div>
-          </div>
+          </Section>
 
           {/* Circuit breaker */}
-          <div className="border-t border-stone-200 pt-4 dark:border-stone-700">
-            <h4 className="mb-3 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'killswitch.circuitBreaker' })}</h4>
+          <Section
+            title={intl.formatMessage({ id: 'killswitch.circuitBreaker' })}
+            className="border-t border-[var(--panel-border)] pt-4"
+          >
             <div className="grid gap-4 sm:grid-cols-2">
               <FormField label={intl.formatMessage({ id: 'killswitch.frequencyWindowSecs' })} hint="1-86400">
-                <input type="number" min={1} max={86400} value={config.circuit_breaker.frequency_window_secs} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, frequency_window_secs: Number(e.target.value) } })} className={inputClass} />
+                <input type="number" min={1} max={86400} value={config.circuit_breaker.frequency_window_secs} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, frequency_window_secs: Number(e.target.value) } })} className={controlClass} />
               </FormField>
               <FormField label={intl.formatMessage({ id: 'killswitch.frequencyMaxReplies' })} hint="1-10000">
-                <input type="number" min={1} max={10000} value={config.circuit_breaker.frequency_max_replies} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, frequency_max_replies: Number(e.target.value) } })} className={inputClass} />
+                <input type="number" min={1} max={10000} value={config.circuit_breaker.frequency_max_replies} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, frequency_max_replies: Number(e.target.value) } })} className={controlClass} />
               </FormField>
               <FormField label={intl.formatMessage({ id: 'killswitch.similarityThreshold' })} hint="0.0-1.0">
-                <input type="number" min={0} max={1} step={0.01} value={config.circuit_breaker.similarity_threshold} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, similarity_threshold: Number(e.target.value) } })} className={inputClass} />
+                <input type="number" min={0} max={1} step={0.01} value={config.circuit_breaker.similarity_threshold} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, similarity_threshold: Number(e.target.value) } })} className={controlClass} />
               </FormField>
               <FormField label={intl.formatMessage({ id: 'killswitch.tokenExplosionMultiplier' })} hint="1.0-1000.0">
-                <input type="number" min={1} max={1000} step={0.1} value={config.circuit_breaker.token_explosion_multiplier} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, token_explosion_multiplier: Number(e.target.value) } })} className={inputClass} />
+                <input type="number" min={1} max={1000} step={0.1} value={config.circuit_breaker.token_explosion_multiplier} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, token_explosion_multiplier: Number(e.target.value) } })} className={controlClass} />
               </FormField>
               <FormField label={intl.formatMessage({ id: 'killswitch.cooldownSecs' })} hint="0-86400">
-                <input type="number" min={0} max={86400} value={config.circuit_breaker.cooldown_secs} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, cooldown_secs: Number(e.target.value) } })} className={inputClass} />
+                <input type="number" min={0} max={86400} value={config.circuit_breaker.cooldown_secs} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, cooldown_secs: Number(e.target.value) } })} className={controlClass} />
               </FormField>
               <FormField label={intl.formatMessage({ id: 'killswitch.halfOpenAllowCount' })} hint="1-1000">
-                <input type="number" min={1} max={1000} value={config.circuit_breaker.half_open_allow_count} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, half_open_allow_count: Number(e.target.value) } })} className={inputClass} />
+                <input type="number" min={1} max={1000} value={config.circuit_breaker.half_open_allow_count} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, half_open_allow_count: Number(e.target.value) } })} className={controlClass} />
               </FormField>
             </div>
-          </div>
+          </Section>
 
           {/* Safety words */}
-          <div className="border-t border-stone-200 pt-4 dark:border-stone-700">
-            <h4 className="mb-3 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'killswitch.safetyWords' })}</h4>
+          <Section
+            title={intl.formatMessage({ id: 'killswitch.safetyWords' })}
+            className="border-t border-[var(--panel-border)] pt-4"
+          >
             <div className="space-y-4">
               {(['stop', 'stop_all', 'resume', 'status'] as const).map((key) => (
                 <FormField key={key} label={intl.formatMessage({ id: `killswitch.safetyWords.${key}` })}>
@@ -311,11 +328,13 @@ function KillswitchSection() {
                 </FormField>
               ))}
             </div>
-          </div>
+          </Section>
 
           {/* Defensive prompt */}
-          <div className="border-t border-stone-200 pt-4 dark:border-stone-700">
-            <h4 className="mb-3 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'killswitch.defensivePrompt' })}</h4>
+          <Section
+            title={intl.formatMessage({ id: 'killswitch.defensivePrompt' })}
+            className="border-t border-[var(--panel-border)] pt-4"
+          >
             <label className="flex items-center justify-between py-1.5">
               <span className="text-sm text-stone-700 dark:text-stone-300">{intl.formatMessage({ id: 'killswitch.defensivePrompt.enabled' })}</span>
               <input type="checkbox" checked={config.defensive_prompt.enabled} onChange={(e) => setConfig({ ...config, defensive_prompt: { ...config.defensive_prompt, enabled: e.target.checked } })} className="h-4 w-4 accent-amber-500" />
@@ -328,13 +347,13 @@ function KillswitchSection() {
                 addLabel={intl.formatMessage({ id: 'common.add' })}
               />
             </FormField>
-          </div>
+          </Section>
 
           <div className="flex justify-end gap-2 pt-2">
             {saved && <span className="self-center text-xs text-emerald-600 dark:text-emerald-400">{intl.formatMessage({ id: 'settings.general.saved' })}</span>}
-            <button onClick={handleSave} disabled={saving} className={buttonPrimary}>
+            <Button variant="primary" onClick={handleSave} disabled={saving}>
               {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
-            </button>
+            </Button>
           </div>
         </div>
       )}
@@ -356,7 +375,7 @@ function PermCell({ allowed }: { allowed: boolean }) {
 
 function AuditRow({ event }: { event: AuditEvent }) {
   const severityStyles: Record<string, string> = {
-    info: 'text-blue-500',
+    info: 'text-sky-500',
     warning: 'text-amber-500',
     critical: 'text-rose-500',
   };
@@ -368,8 +387,8 @@ function AuditRow({ event }: { event: AuditEvent }) {
   const time = new Date(event.timestamp).toLocaleString();
 
   return (
-    <div className="flex items-start gap-2 rounded-lg bg-stone-50 p-2.5 dark:bg-stone-800/50">
-      <SevIcon className={`mt-0.5 h-4 w-4 shrink-0 ${severityStyles[event.severity] ?? 'text-stone-400'}`} />
+    <div className="flex items-start gap-2 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-fill)] p-2.5">
+      <SevIcon className={cn('mt-0.5 h-4 w-4 shrink-0', severityStyles[event.severity] ?? 'text-stone-400')} />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           <span className="text-xs font-medium text-stone-900 dark:text-stone-100">
@@ -397,22 +416,17 @@ function SecurityCard({
   children: React.ReactNode;
 }) {
   return (
-    <div className="glass-card rounded-2xl p-6">
-      <div className="mb-4 flex items-center gap-3">
-        <div className="rounded-lg bg-amber-100 p-2.5 dark:bg-amber-900/30">
-          <Icon className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-        </div>
-        <div>
-          <h3 className="font-semibold text-stone-900 dark:text-stone-50">
-            {title}
-          </h3>
-          <p className="text-xs text-stone-500 dark:text-stone-400">
-            {description}
-          </p>
-        </div>
-      </div>
+    <Card
+      title={
+        <span className="flex items-center gap-2">
+          <Icon className="h-4 w-4 text-amber-500" />
+          {title}
+        </span>
+      }
+    >
+      <p className="mb-4 text-xs text-stone-500 dark:text-stone-400">{description}</p>
       {children}
-    </div>
+    </Card>
   );
 }
 
@@ -429,14 +443,12 @@ function StatusRow({
     <div className="flex items-center justify-between text-sm">
       <span className="text-stone-600 dark:text-stone-400">{label}</span>
       {status === 'active' ? (
-        <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2.5 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400">
+        <Badge tone="success">
           <Shield className="h-3 w-3" />
           Active
-        </span>
+        </Badge>
       ) : status === 'inactive' ? (
-        <span className="inline-flex items-center gap-1 rounded-full bg-stone-100 px-2.5 py-0.5 text-xs font-medium text-stone-500 dark:bg-stone-800 dark:text-stone-400">
-          Inactive
-        </span>
+        <Badge tone="neutral">Inactive</Badge>
       ) : (
         <span className="font-medium text-stone-900 dark:text-stone-50">
           {value}
@@ -447,22 +459,18 @@ function StatusRow({
 }
 
 function RuleRow({ path, access }: { path: string; access: string }) {
-  const accessStyles: Record<string, string> = {
-    rw: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
-    ro: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
-    deny: 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400',
+  const accessTone: Record<string, 'success' | 'warning' | 'danger'> = {
+    rw: 'success',
+    ro: 'warning',
+    deny: 'danger',
   };
 
   return (
     <div className="flex items-center justify-between text-sm">
-      <code className="rounded bg-stone-100 px-2 py-0.5 font-mono text-xs text-stone-700 dark:bg-stone-800 dark:text-stone-300">
+      <code className="rounded bg-stone-500/10 px-2 py-0.5 font-mono text-xs text-stone-700 dark:text-stone-300">
         {path}
       </code>
-      <span
-        className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${accessStyles[access] ?? ''}`}
-      >
-        {access}
-      </span>
+      <Badge tone={accessTone[access] ?? 'neutral'}>{access}</Badge>
     </div>
   );
 }

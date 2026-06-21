@@ -7,12 +7,23 @@ import { useConnectionStore } from '@/stores/connection-store';
 import { type McpServerDef, type McpCatalogItem, type McpOAuthProvider } from '@/lib/api';
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import {
+  Page,
+  PageHeader,
+  Card,
+  Section,
+  Badge,
+  Button,
+  EmptyState,
+  Toolbar,
+  Tabs,
+  type TabItem,
+} from '@/components/ui';
+import {
   Plug,
   Plus,
   Trash2,
   Package,
   ChevronRight,
-  Search,
   Globe,
   Database,
   MessageSquare,
@@ -121,12 +132,29 @@ export function McpPage() {
   const isInstalled = (catalogId: string) =>
     agentConfigs.some((cfg) => Object.keys(cfg.servers).includes(catalogId));
 
+  const tabItems: TabItem[] = [
+    { id: 'agents', label: intl.formatMessage({ id: 'mcp.tab.agents' }) },
+    { id: 'marketplace', label: intl.formatMessage({ id: 'mcp.tab.marketplace' }) },
+    { id: 'oauth', label: intl.formatMessage({ id: 'mcp.tab.oauth' }) },
+  ];
+
   return (
-    <div className="space-y-6">
+    <Page wide>
+      <PageHeader
+        icon={Plug}
+        title={intl.formatMessage({ id: 'nav.mcp' })}
+        subtitle={intl.formatMessage({ id: 'mcp.title' })}
+        actions={
+          <Button variant="primary" icon={Plus} onClick={() => setShowAddDialog(true)}>
+            {intl.formatMessage({ id: 'mcp.add' })}
+          </Button>
+        }
+      />
+
       {/* Toast */}
       {toast && (
         <div className={cn(
-          'flex items-start gap-3 rounded-lg px-4 py-3 text-sm shadow-sm transition-all',
+          'flex items-start gap-3 rounded-lg px-4 py-3 text-sm transition-all',
           toast.type === 'success'
             ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400'
             : 'bg-rose-50 text-rose-700 dark:bg-rose-900/20 dark:text-rose-400'
@@ -146,56 +174,8 @@ export function McpPage() {
         </div>
       )}
 
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'mcp.title' })}
-        </h2>
-        <button
-          onClick={() => setShowAddDialog(true)}
-          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600"
-        >
-          <Plus className="h-4 w-4" />
-          {intl.formatMessage({ id: 'mcp.add' })}
-        </button>
-      </div>
-
       {/* Tabs */}
-      <div className="flex gap-1 rounded-lg bg-stone-100 p-1 dark:bg-stone-800">
-        <button
-          onClick={() => setActiveTab('agents')}
-          className={cn(
-            'flex-1 rounded-md px-4 py-2 text-sm font-medium transition-colors',
-            activeTab === 'agents'
-              ? 'bg-white text-stone-900 shadow-sm dark:bg-stone-700 dark:text-stone-50'
-              : 'text-stone-500 hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-300'
-          )}
-        >
-          {intl.formatMessage({ id: 'mcp.tab.agents' })}
-        </button>
-        <button
-          onClick={() => setActiveTab('marketplace')}
-          className={cn(
-            'flex-1 rounded-md px-4 py-2 text-sm font-medium transition-colors',
-            activeTab === 'marketplace'
-              ? 'bg-white text-stone-900 shadow-sm dark:bg-stone-700 dark:text-stone-50'
-              : 'text-stone-500 hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-300'
-          )}
-        >
-          {intl.formatMessage({ id: 'mcp.tab.marketplace' })}
-        </button>
-        <button
-          onClick={() => setActiveTab('oauth')}
-          className={cn(
-            'flex-1 rounded-md px-4 py-2 text-sm font-medium transition-colors',
-            activeTab === 'oauth'
-              ? 'bg-white text-stone-900 shadow-sm dark:bg-stone-700 dark:text-stone-50'
-              : 'text-stone-500 hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-300'
-          )}
-        >
-          {intl.formatMessage({ id: 'mcp.tab.oauth' })}
-        </button>
-      </div>
+      <Tabs items={tabItems} value={activeTab} onChange={(id) => setActiveTab(id as Tab)} />
 
       {loading && (
         <div className="flex items-center justify-center py-12">
@@ -209,9 +189,9 @@ export function McpPage() {
           {/* Left panel: agent list */}
           <div className="w-56 shrink-0 space-y-1">
             {agentConfigs.length === 0 ? (
-              <div className="rounded-lg border border-dashed border-stone-300 px-4 py-8 text-center text-sm text-stone-400 dark:border-stone-700 dark:text-stone-500">
-                {intl.formatMessage({ id: 'mcp.empty' })}
-              </div>
+              <Card>
+                <EmptyState icon={Plug} title={intl.formatMessage({ id: 'mcp.empty' })} />
+              </Card>
             ) : (
               agentConfigs.map((cfg) => {
                 const agent = agents.find((a) => a.name === cfg.agent_id);
@@ -223,13 +203,13 @@ export function McpPage() {
                     className={cn(
                       'flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm transition-colors',
                       selectedAgentId === cfg.agent_id
-                        ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
-                        : 'text-stone-600 hover:bg-stone-100 dark:text-stone-400 dark:hover:bg-stone-800'
+                        ? 'bg-amber-500/12 text-amber-700 dark:text-amber-400'
+                        : 'text-stone-600 hover:bg-stone-500/8 dark:text-stone-400 dark:hover:bg-white/5'
                     )}
                   >
                     <span className="truncate font-medium">{agent?.display_name ?? cfg.agent_id}</span>
                     <div className="flex items-center gap-1">
-                      <span className="text-xs text-stone-400 dark:text-stone-500">{serverCount}</span>
+                      <span className="text-xs tabular-nums text-stone-400 dark:text-stone-500">{serverCount}</span>
                       <ChevronRight className="h-3.5 w-3.5 text-stone-400 dark:text-stone-500" />
                     </div>
                   </button>
@@ -241,29 +221,20 @@ export function McpPage() {
           {/* Right panel: server cards */}
           <div className="flex-1">
             {!selectedAgentId ? (
-              <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-                <Plug className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-                <p className="text-stone-500 dark:text-stone-400">
-                  {intl.formatMessage({ id: 'mcp.selectAgent' })}
-                </p>
-              </div>
+              <Card>
+                <EmptyState icon={Plug} title={intl.formatMessage({ id: 'mcp.selectAgent' })} />
+              </Card>
             ) : serverEntries.length === 0 ? (
-              <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-                <Package className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-                <p className="text-stone-500 dark:text-stone-400">
-                  {intl.formatMessage({ id: 'mcp.noServers' })}
-                </p>
-              </div>
+              <Card>
+                <EmptyState icon={Package} title={intl.formatMessage({ id: 'mcp.noServers' })} />
+              </Card>
             ) : (
               <div className="grid gap-4 sm:grid-cols-2">
                 {serverEntries.map(([name, def]) => (
-                  <div
-                    key={name}
-                    className="glass-card glass-card-hover rounded-2xl p-5"
-                  >
+                  <Card key={name}>
                     <div className="flex items-start justify-between">
                       <div className="flex items-center gap-3">
-                        <div className="rounded-lg bg-amber-100 p-2.5 dark:bg-amber-900/30">
+                        <div className="rounded-lg bg-amber-500/12 p-2.5 dark:bg-amber-400/10">
                           <Plug className="h-5 w-5 text-amber-600 dark:text-amber-400" />
                         </div>
                         <div>
@@ -295,7 +266,7 @@ export function McpPage() {
                           {Object.keys(def.env).map((key) => (
                             <span
                               key={key}
-                              className="inline-flex items-center rounded bg-stone-100 px-1.5 py-0.5 text-xs font-mono text-stone-600 dark:bg-stone-800 dark:text-stone-400"
+                              className="inline-flex items-center rounded bg-stone-500/10 px-1.5 py-0.5 text-xs font-mono text-stone-600 dark:text-stone-400"
                             >
                               {key}=***
                             </span>
@@ -305,16 +276,18 @@ export function McpPage() {
                     )}
 
                     {/* Actions */}
-                    <div className="mt-4 flex border-t border-stone-100 pt-3 dark:border-stone-800">
-                      <button
+                    <div className="mt-4 flex border-t border-[var(--panel-border)] pt-3">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        icon={Trash2}
                         onClick={() => handleRemoveServer(selectedAgentId!, name)}
-                        className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-900/20"
+                        className="text-rose-600 hover:bg-rose-500/10 hover:text-rose-700 dark:text-rose-400 dark:hover:bg-rose-500/10"
                       >
-                        <Trash2 className="h-3.5 w-3.5" />
                         {intl.formatMessage({ id: 'mcp.remove' })}
-                      </button>
+                      </Button>
                     </div>
-                  </div>
+                  </Card>
                 ))}
               </div>
             )}
@@ -326,65 +299,54 @@ export function McpPage() {
       {!loading && activeTab === 'marketplace' && (
         <div className="space-y-4">
           {/* Search + category filters */}
-          <div className="flex flex-wrap items-center gap-3">
-            <div className="relative flex-1 min-w-[200px]">
-              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-stone-400" />
-              <input
-                type="text"
-                value={catalogSearch}
-                onChange={(e) => setCatalogSearch(e.target.value)}
-                placeholder={intl.formatMessage({ id: 'mcp.serverName' })}
-                className={cn(inputClass, 'pl-9')}
-              />
-            </div>
-            <div className="flex gap-1">
-              <button
-                onClick={() => setCatalogFilter(null)}
-                className={cn(
-                  'rounded-full px-3 py-1.5 text-xs font-medium transition-colors',
-                  !catalogFilter
-                    ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
-                    : 'text-stone-500 hover:bg-stone-100 dark:text-stone-400 dark:hover:bg-stone-800'
-                )}
-              >
-                All
-              </button>
-              {categories.map((cat) => {
-                const CatIcon = getCategoryIcon(cat);
-                const labelKey = `mcp.catalog.${cat}` as const;
-                return (
-                  <button
-                    key={cat}
-                    onClick={() => setCatalogFilter(cat === catalogFilter ? null : cat)}
-                    className={cn(
-                      'inline-flex items-center gap-1 rounded-full px-3 py-1.5 text-xs font-medium transition-colors',
-                      catalogFilter === cat
-                        ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
-                        : 'text-stone-500 hover:bg-stone-100 dark:text-stone-400 dark:hover:bg-stone-800'
-                    )}
-                  >
-                    <CatIcon className="h-3 w-3" />
-                    {intl.formatMessage({ id: labelKey, defaultMessage: cat })}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
+          <Toolbar
+            search={catalogSearch}
+            onSearchChange={setCatalogSearch}
+            searchPlaceholder={intl.formatMessage({ id: 'mcp.serverName' })}
+          >
+            <button
+              onClick={() => setCatalogFilter(null)}
+              className={cn(
+                'rounded-full px-3 py-1.5 text-xs font-medium transition-colors',
+                !catalogFilter
+                  ? 'bg-amber-500/12 text-amber-700 dark:text-amber-400'
+                  : 'text-stone-500 hover:bg-stone-500/8 dark:text-stone-400 dark:hover:bg-white/5'
+              )}
+            >
+              All
+            </button>
+            {categories.map((cat) => {
+              const CatIcon = getCategoryIcon(cat);
+              const labelKey = `mcp.catalog.${cat}` as const;
+              return (
+                <button
+                  key={cat}
+                  onClick={() => setCatalogFilter(cat === catalogFilter ? null : cat)}
+                  className={cn(
+                    'inline-flex items-center gap-1 rounded-full px-3 py-1.5 text-xs font-medium transition-colors',
+                    catalogFilter === cat
+                      ? 'bg-amber-500/12 text-amber-700 dark:text-amber-400'
+                      : 'text-stone-500 hover:bg-stone-500/8 dark:text-stone-400 dark:hover:bg-white/5'
+                  )}
+                >
+                  <CatIcon className="h-3 w-3" />
+                  {intl.formatMessage({ id: labelKey, defaultMessage: cat })}
+                </button>
+              );
+            })}
+          </Toolbar>
 
           {/* Catalog grid */}
           {Object.keys(groupedCatalog).length === 0 ? (
-            <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-              <Package className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-              <p className="text-stone-500 dark:text-stone-400">
-                {intl.formatMessage({ id: 'mcp.empty' })}
-              </p>
-            </div>
+            <Card>
+              <EmptyState icon={Package} title={intl.formatMessage({ id: 'mcp.empty' })} />
+            </Card>
           ) : (
             Object.entries(groupedCatalog).map(([category, items]) => (
-              <div key={category}>
-                <h3 className="mb-3 text-sm font-semibold text-stone-500 uppercase tracking-wider dark:text-stone-400">
-                  {intl.formatMessage({ id: `mcp.catalog.${category}`, defaultMessage: category })}
-                </h3>
+              <Section
+                key={category}
+                title={intl.formatMessage({ id: `mcp.catalog.${category}`, defaultMessage: category })}
+              >
                 <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
                   {items.map((item) => {
                     const installed = isInstalled(item.id);
@@ -409,7 +371,7 @@ export function McpPage() {
                     );
                   })}
                 </div>
-              </div>
+              </Section>
             ))
           )}
         </div>
@@ -434,32 +396,35 @@ export function McpPage() {
           showToast('error', intl.formatMessage({ id: 'mcp.loadFailed' }));
         }}
       />
-    </div>
+    </Page>
   );
 }
 
-function getStatusBadge(provider: McpOAuthProvider, intl: ReturnType<typeof useIntl>) {
+function getStatusBadge(
+  provider: McpOAuthProvider,
+  intl: ReturnType<typeof useIntl>
+): { label: string; tone: 'neutral' | 'success' | 'danger' | 'warning' } {
   if (!provider.configured) {
     return {
       label: intl.formatMessage({ id: 'mcp.oauth.notConfigured' }),
-      className: 'bg-stone-100 text-stone-500 dark:bg-stone-800 dark:text-stone-400',
+      tone: 'neutral',
     };
   }
   switch (provider.token_status) {
     case 'authenticated':
       return {
         label: intl.formatMessage({ id: 'mcp.oauth.authenticated' }),
-        className: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
+        tone: 'success',
       };
     case 'expired':
       return {
         label: intl.formatMessage({ id: 'mcp.oauth.expired' }),
-        className: 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400',
+        tone: 'danger',
       };
     default:
       return {
         label: intl.formatMessage({ id: 'mcp.oauth.notAuthenticated' }),
-        className: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
+        tone: 'warning',
       };
   }
 }
@@ -524,18 +489,11 @@ function OAuthTab({
   };
 
   return (
-    <div className="space-y-4">
-      <h3 className="text-lg font-semibold text-stone-900 dark:text-stone-50">
-        {intl.formatMessage({ id: 'mcp.oauth.title' })}
-      </h3>
-
+    <Section title={intl.formatMessage({ id: 'mcp.oauth.title' })}>
       {providers.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-          <Shield className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-          <p className="text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'mcp.empty' })}
-          </p>
-        </div>
+        <Card>
+          <EmptyState icon={Shield} title={intl.formatMessage({ id: 'mcp.empty' })} />
+        </Card>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {providers.map((provider) => {
@@ -543,20 +501,15 @@ function OAuthTab({
             const isPending = pendingProvider === provider.provider_id;
 
             return (
-              <div
-                key={provider.provider_id}
-                className="glass-card glass-card-hover rounded-2xl p-5"
-              >
+              <Card key={provider.provider_id}>
                 <div className="flex items-start justify-between">
                   <div className="flex items-center gap-3">
-                    <div className="rounded-lg bg-amber-100 p-2.5 dark:bg-amber-900/30">
+                    <div className="rounded-lg bg-amber-500/12 p-2.5 dark:bg-amber-400/10">
                       <Globe className="h-5 w-5 text-amber-600 dark:text-amber-400" />
                     </div>
                     <div>
                       <h3 className="font-semibold text-stone-900 dark:text-stone-50">{provider.name}</h3>
-                      <span className={cn('inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium', status.className)}>
-                        {status.label}
-                      </span>
+                      <Badge tone={status.tone}>{status.label}</Badge>
                     </div>
                   </div>
                 </div>
@@ -571,7 +524,7 @@ function OAuthTab({
                       {provider.scopes.map((scope) => (
                         <span
                           key={scope}
-                          className="inline-flex items-center rounded bg-stone-100 px-1.5 py-0.5 text-xs font-mono text-stone-600 dark:bg-stone-800 dark:text-stone-400"
+                          className="inline-flex items-center rounded bg-stone-500/10 px-1.5 py-0.5 text-xs font-mono text-stone-600 dark:text-stone-400"
                         >
                           {scope}
                         </span>
@@ -596,36 +549,40 @@ function OAuthTab({
                 )}
 
                 {/* Actions */}
-                <div className="mt-4 flex gap-2 border-t border-stone-100 pt-3 dark:border-stone-800">
+                <div className="mt-4 flex gap-2 border-t border-[var(--panel-border)] pt-3">
                   {!provider.configured && (
-                    <button
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      icon={KeyRound}
                       onClick={() => setConfigureProvider(provider)}
-                      className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-amber-600"
                     >
-                      <KeyRound className="h-3.5 w-3.5" />
                       {intl.formatMessage({ id: 'mcp.oauth.configure' })}
-                    </button>
+                    </Button>
                   )}
                   {provider.configured && provider.token_status !== 'authenticated' && !isPending && (
-                    <button
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      icon={Shield}
                       onClick={() => handleAuthenticate(provider)}
-                      className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-amber-600"
                     >
-                      <Shield className="h-3.5 w-3.5" />
                       {intl.formatMessage({ id: 'mcp.oauth.authenticate' })}
-                    </button>
+                    </Button>
                   )}
                   {provider.token_status === 'authenticated' && (
-                    <button
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      icon={Trash2}
                       onClick={() => handleRevoke(provider)}
-                      className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-900/20"
+                      className="text-rose-600 hover:bg-rose-500/10 hover:text-rose-700 dark:text-rose-400 dark:hover:bg-rose-500/10"
                     >
-                      <Trash2 className="h-3.5 w-3.5" />
                       {intl.formatMessage({ id: 'mcp.oauth.revoke' })}
-                    </button>
+                    </Button>
                   )}
                 </div>
-              </div>
+              </Card>
             );
           })}
         </div>
@@ -639,7 +596,7 @@ function OAuthTab({
           showToast={showToast}
         />
       )}
-    </div>
+    </Section>
   );
 }
 
@@ -754,17 +711,17 @@ function CatalogCard({
 
   return (
     <>
-      <div className="glass-card glass-card-hover rounded-2xl p-5">
+      <Card>
         <div className="flex items-start justify-between">
           <div className="flex items-center gap-3">
-            <div className="rounded-lg bg-stone-100 p-2.5 dark:bg-stone-800">
+            <div className="rounded-lg bg-stone-500/10 p-2.5">
               <CatIcon className="h-5 w-5 text-stone-600 dark:text-stone-400" />
             </div>
             <div>
               <h3 className="font-semibold text-stone-900 dark:text-stone-50">{item.name}</h3>
-              <span className="inline-flex items-center rounded-full bg-stone-100 px-2 py-0.5 text-xs text-stone-500 dark:bg-stone-800 dark:text-stone-400">
+              <Badge tone="neutral">
                 {intl.formatMessage({ id: `mcp.catalog.${item.category}`, defaultMessage: item.category })}
-              </span>
+              </Badge>
             </div>
           </div>
           {installed && (
@@ -780,16 +737,12 @@ function CatalogCard({
           </p>
         )}
 
-        <div className="mt-4 border-t border-stone-100 pt-3 dark:border-stone-800">
-          <button
-            onClick={() => setShowInstall(true)}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-amber-600"
-          >
-            <Plus className="h-3.5 w-3.5" />
+        <div className="mt-4 border-t border-[var(--panel-border)] pt-3">
+          <Button variant="primary" size="sm" icon={Plus} onClick={() => setShowInstall(true)}>
             {intl.formatMessage({ id: 'mcp.catalog.install' })}
-          </button>
+          </Button>
         </div>
-      </div>
+      </Card>
 
       {/* Install target agent dialog */}
       <Dialog

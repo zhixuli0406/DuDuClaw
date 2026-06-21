@@ -3,7 +3,7 @@ import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { cn } from '@/lib/utils';
 import { api } from '@/lib/api';
-import { inputClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { Card, Button, Badge, Field, controlClass } from '@/components/ui';
 import {
   ChevronLeft,
   ChevronRight,
@@ -65,11 +65,11 @@ const INDUSTRIES: ReadonlyArray<{
   readonly icon: typeof UtensilsCrossed;
   readonly emoji: string;
 }> = [
-  { id: 'restaurant', icon: UtensilsCrossed, emoji: '\uD83C\uDF7D\uFE0F' },
-  { id: 'manufacturing', icon: Factory, emoji: '\uD83C\uDFED' },
-  { id: 'trading', icon: Package, emoji: '\uD83D\uDCE6' },
-  { id: 'retail', icon: ShoppingBag, emoji: '\uD83D\uDECD\uFE0F' },
-  { id: 'other', icon: Settings, emoji: '\u2699\uFE0F' },
+  { id: 'restaurant', icon: UtensilsCrossed, emoji: '🍽️' },
+  { id: 'manufacturing', icon: Factory, emoji: '🏭' },
+  { id: 'trading', icon: Package, emoji: '📦' },
+  { id: 'retail', icon: ShoppingBag, emoji: '🛍️' },
+  { id: 'other', icon: Settings, emoji: '⚙️' },
 ] as const;
 
 // ---------------------------------------------------------------------------
@@ -103,7 +103,7 @@ function sanitizeSoulField(input: string): string {
 function toAgentName(companyName: string): string {
   return companyName
     .toLowerCase()
-    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-')
+    .replace(/[^a-z0-9一-鿿]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 30)
     + '-agent';
@@ -168,10 +168,11 @@ function StepIndicator({ current, total, intl }: { current: number; total: numbe
             <div className="flex flex-col items-center">
               <div
                 className={cn(
-                  'flex h-9 w-9 items-center justify-center rounded-full text-sm font-semibold transition-all duration-200',
-                  isActive && 'bg-amber-500 text-white shadow-md shadow-amber-500/30',
-                  isDone && 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400',
-                  !isActive && !isDone && 'bg-stone-100 text-stone-400 dark:bg-stone-800 dark:text-stone-500',
+                  'flex h-9 w-9 items-center justify-center rounded-full text-sm font-semibold transition-colors duration-200',
+                  isActive && 'bg-amber-500 text-white',
+                  isDone && 'bg-amber-500/15 text-amber-700 dark:text-amber-300',
+                  !isActive && !isDone &&
+                    'border border-[var(--panel-border)] bg-[var(--panel-fill)] text-stone-400 dark:text-stone-500',
                 )}
               >
                 {isDone ? <Check className="h-4 w-4" /> : step}
@@ -191,7 +192,7 @@ function StepIndicator({ current, total, intl }: { current: number; total: numbe
               <div
                 className={cn(
                   'mx-2 mt-[-1.25rem] h-0.5 w-8 sm:w-12 transition-colors duration-200',
-                  isDone ? 'bg-amber-400 dark:bg-amber-500' : 'bg-stone-200 dark:bg-stone-700',
+                  isDone ? 'bg-amber-500' : 'bg-[var(--panel-border)]',
                 )}
               />
             )}
@@ -217,31 +218,34 @@ function Step1({
 }) {
   return (
     <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
-      {INDUSTRIES.map(({ id, emoji }) => (
-        <button
-          key={id}
-          type="button"
-          onClick={() => onSelect(id)}
-          className={cn(
-            'flex flex-col items-center gap-3 rounded-xl border-2 p-6 transition-all duration-200',
-            selected === id
-              ? 'border-amber-500 bg-amber-50 shadow-md shadow-amber-500/10 dark:border-amber-400 dark:bg-amber-900/20'
-              : 'border-stone-200 bg-white hover:border-stone-300 hover:shadow-sm dark:border-stone-700 dark:bg-stone-800 dark:hover:border-stone-600',
-          )}
-        >
-          <span className="text-4xl" role="img" aria-label={id}>
-            {emoji}
-          </span>
-          <div className="text-center">
-            <p className="text-sm font-semibold text-stone-900 dark:text-stone-50">
-              {intl.formatMessage({ id: `wizard.industry.${id}` })}
-            </p>
-            <p className="mt-1 text-xs text-stone-500 dark:text-stone-400">
-              {intl.formatMessage({ id: `wizard.industry.${id}.desc` })}
-            </p>
-          </div>
-        </button>
-      ))}
+      {INDUSTRIES.map(({ id, emoji }) => {
+        const isSelected = selected === id;
+        return (
+          <button
+            key={id}
+            type="button"
+            onClick={() => onSelect(id)}
+            aria-pressed={isSelected}
+            className={cn(
+              'panel panel-hover flex flex-col items-center gap-3 p-6 transition-colors duration-200',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
+              isSelected && 'border-amber-500/70 ring-1 ring-amber-500/40',
+            )}
+          >
+            <span className="text-4xl" role="img" aria-label={id}>
+              {emoji}
+            </span>
+            <div className="text-center">
+              <p className="text-sm font-semibold text-stone-900 dark:text-stone-50">
+                {intl.formatMessage({ id: `wizard.industry.${id}` })}
+              </p>
+              <p className="mt-1 text-xs text-stone-500 dark:text-stone-400">
+                {intl.formatMessage({ id: `wizard.industry.${id}.desc` })}
+              </p>
+            </div>
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -271,40 +275,31 @@ function Step2({
 
   return (
     <div className="mx-auto max-w-lg space-y-5">
-      <div className="space-y-1.5">
-        <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
-          {intl.formatMessage({ id: 'wizard.companyName' })} *
-        </label>
+      <Field label={intl.formatMessage({ id: 'wizard.companyName' })} required>
         <input
           type="text"
           value={state.companyName}
           onChange={handleCompanyChange}
-          className={inputClass}
+          className={controlClass}
           placeholder={intl.formatMessage({ id: 'wizard.companyName' })}
         />
-      </div>
+      </Field>
 
-      <div className="space-y-1.5">
-        <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
-          {intl.formatMessage({ id: 'wizard.contactName' })} *
-        </label>
+      <Field label={intl.formatMessage({ id: 'wizard.contactName' })} required>
         <input
           type="text"
           value={state.contactName}
           onChange={(e) => onChange({ contactName: e.target.value })}
-          className={inputClass}
+          className={controlClass}
           placeholder={intl.formatMessage({ id: 'wizard.contactName' })}
         />
-      </div>
+      </Field>
 
-      <div className="space-y-1.5">
-        <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
-          {intl.formatMessage({ id: 'wizard.primaryChannel' })} *
-        </label>
+      <Field label={intl.formatMessage({ id: 'wizard.primaryChannel' })} required>
         <select
           value={state.primaryChannel}
           onChange={(e) => onChange({ primaryChannel: e.target.value as Channel })}
-          className={inputClass}
+          className={controlClass}
         >
           <option value="">{intl.formatMessage({ id: 'wizard.primaryChannel.placeholder' })}</option>
           {channels.map((ch) => (
@@ -313,20 +308,17 @@ function Step2({
             </option>
           ))}
         </select>
-      </div>
+      </Field>
 
-      <div className="space-y-1.5">
-        <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
-          {intl.formatMessage({ id: 'wizard.agentName' })}
-        </label>
+      <Field label={intl.formatMessage({ id: 'wizard.agentName' })}>
         <input
           type="text"
           value={state.agentName}
           onChange={(e) => onChange({ agentName: e.target.value })}
-          className={inputClass}
+          className={controlClass}
           placeholder="my-company-agent"
         />
-      </div>
+      </Field>
     </div>
   );
 }
@@ -353,11 +345,11 @@ function Step3({
             key={id}
             type="button"
             onClick={() => onToggle(id)}
+            aria-pressed={isSelected}
             className={cn(
-              'flex items-start gap-4 rounded-xl border-2 p-5 text-left transition-all duration-200',
-              isSelected
-                ? 'border-amber-500 bg-amber-50 dark:border-amber-400 dark:bg-amber-900/20'
-                : 'border-stone-200 bg-white hover:border-stone-300 dark:border-stone-700 dark:bg-stone-800 dark:hover:border-stone-600',
+              'panel panel-hover flex items-start gap-4 p-5 text-left transition-colors duration-200',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
+              isSelected && 'border-amber-500/70 ring-1 ring-amber-500/40',
             )}
           >
             <div
@@ -365,7 +357,7 @@ function Step3({
                 'flex h-10 w-10 shrink-0 items-center justify-center rounded-lg',
                 isSelected
                   ? 'bg-amber-500 text-white'
-                  : 'bg-stone-100 text-stone-500 dark:bg-stone-700 dark:text-stone-400',
+                  : 'bg-stone-500/10 text-stone-500 dark:text-stone-400',
               )}
             >
               <Icon className="h-5 w-5" />
@@ -382,7 +374,7 @@ function Step3({
               className={cn(
                 'mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded border-2 transition-colors',
                 isSelected
-                  ? 'border-amber-500 bg-amber-500 dark:border-amber-400 dark:bg-amber-400'
+                  ? 'border-amber-500 bg-amber-500'
                   : 'border-stone-300 dark:border-stone-600',
               )}
             >
@@ -474,10 +466,11 @@ function Step4({
             if (e.key === 'Enter' || e.key === ' ') fileRef.current?.click();
           }}
           className={cn(
-            'flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed py-16 transition-all duration-200',
+            'flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed py-16 transition-colors duration-200',
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
             isDragging
-              ? 'border-amber-500 bg-amber-50 dark:bg-amber-900/20'
-              : 'border-stone-300 bg-white hover:border-stone-400 dark:border-stone-600 dark:bg-stone-800 dark:hover:border-stone-500',
+              ? 'border-amber-500 bg-amber-500/10'
+              : 'border-[var(--panel-border-strong)] bg-[var(--panel-fill)] hover:border-amber-500/50',
           )}
         >
           <Upload className="mb-3 h-10 w-10 text-stone-400 dark:text-stone-500" />
@@ -490,25 +483,25 @@ function Step4({
         </div>
       ) : (
         <div className="space-y-4">
-          <div className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 dark:border-stone-700 dark:bg-stone-800">
+          <div className="panel flex items-center gap-3 px-4 py-3">
             <FileUp className="h-5 w-5 text-amber-500" />
             <span className="flex-1 truncate text-sm font-medium text-stone-900 dark:text-stone-50">
               {state.importFile.name}
             </span>
-            <button
-              type="button"
+            <Button
+              variant="ghost"
+              size="sm"
+              icon={X}
               onClick={clearFile}
-              className="rounded-lg p-1 text-stone-400 hover:bg-stone-100 hover:text-stone-600 dark:hover:bg-stone-700 dark:hover:text-stone-300"
-            >
-              <X className="h-4 w-4" />
-            </button>
+              aria-label={intl.formatMessage({ id: 'wizard.import.none' })}
+            />
           </div>
 
           {state.importPreview.length > 0 && (
-            <div className="overflow-x-auto rounded-xl border border-stone-200 dark:border-stone-700">
+            <Card padded={false} bodyClassName="overflow-x-auto">
               <table className="w-full text-left text-xs">
                 <thead>
-                  <tr className="border-b border-stone-200 bg-stone-50 dark:border-stone-700 dark:bg-stone-800">
+                  <tr className="border-b border-[var(--panel-border)] bg-stone-500/5">
                     {state.importPreview[0].map((header, i) => (
                       <th key={i} className="px-3 py-2 font-semibold text-stone-600 dark:text-stone-300">
                         {header}
@@ -518,7 +511,7 @@ function Step4({
                 </thead>
                 <tbody>
                   {state.importPreview.slice(1).map((row, ri) => (
-                    <tr key={ri} className="border-b border-stone-100 last:border-0 dark:border-stone-800">
+                    <tr key={ri} className="border-b border-[var(--panel-border)] last:border-0">
                       {row.map((cell, ci) => (
                         <td key={ci} className="px-3 py-2 text-stone-700 dark:text-stone-300">
                           {cell}
@@ -528,7 +521,7 @@ function Step4({
                   ))}
                 </tbody>
               </table>
-            </div>
+            </Card>
           )}
         </div>
       )}
@@ -561,10 +554,7 @@ function Step5({
 }) {
   return (
     <div className="mx-auto max-w-lg space-y-4">
-      <div className="glass-card rounded-2xl p-6">
-        <h3 className="mb-4 text-base font-semibold text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'wizard.summary' })}
-        </h3>
+      <Card title={intl.formatMessage({ id: 'wizard.summary' })}>
         <dl className="space-y-3 text-sm">
           <div className="flex justify-between">
             <dt className="text-stone-500 dark:text-stone-400">
@@ -610,16 +600,20 @@ function Step5({
               {state.agentName || '-'}
             </dd>
           </div>
-          <div className="flex justify-between">
+          <div className="flex items-start justify-between gap-3">
             <dt className="text-stone-500 dark:text-stone-400">
               {intl.formatMessage({ id: 'wizard.step3.title' })}
             </dt>
-            <dd className="font-medium text-stone-900 dark:text-stone-50">
-              {state.features.length > 0
-                ? state.features
-                    .map((f) => intl.formatMessage({ id: `wizard.feature.${f}` }))
-                    .join(', ')
-                : '-'}
+            <dd className="flex flex-wrap justify-end gap-1.5">
+              {state.features.length > 0 ? (
+                state.features.map((f) => (
+                  <Badge key={f} tone="accent">
+                    {intl.formatMessage({ id: `wizard.feature.${f}` })}
+                  </Badge>
+                ))
+              ) : (
+                <span className="font-medium text-stone-900 dark:text-stone-50">-</span>
+              )}
             </dd>
           </div>
           <div className="flex justify-between">
@@ -631,7 +625,7 @@ function Step5({
             </dd>
           </div>
         </dl>
-      </div>
+      </Card>
     </div>
   );
 }
@@ -645,7 +639,7 @@ function SuccessScreen({ intl }: { intl: ReturnType<typeof useIntl> }) {
 
   return (
     <div className="flex flex-col items-center justify-center py-16">
-      <div className="mb-6 flex h-20 w-20 items-center justify-center rounded-full bg-emerald-100 dark:bg-emerald-900/30">
+      <div className="mb-6 flex h-20 w-20 items-center justify-center rounded-full bg-emerald-500/15">
         <Check className="h-10 w-10 text-emerald-600 dark:text-emerald-400 animate-[scale-in_0.3s_ease-out]" />
       </div>
       <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
@@ -654,13 +648,9 @@ function SuccessScreen({ intl }: { intl: ReturnType<typeof useIntl> }) {
       <p className="mt-2 text-sm text-stone-500 dark:text-stone-400">
         {intl.formatMessage({ id: 'wizard.success.desc' })}
       </p>
-      <button
-        type="button"
-        onClick={() => navigate('/agents')}
-        className={cn(buttonPrimary, 'mt-8')}
-      >
+      <Button variant="primary" onClick={() => navigate('/agents')} className="mt-8">
         {intl.formatMessage({ id: 'wizard.goToAgents' })}
-      </button>
+      </Button>
     </div>
   );
 }
@@ -751,7 +741,7 @@ export function OnboardWizardPage() {
       <div className="page-enter mx-auto max-w-4xl space-y-8">
       {/* Header */}
       <div className="text-center">
-        <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
+        <h2 className="text-2xl font-semibold tracking-tight text-stone-900 dark:text-stone-50">
           {intl.formatMessage({ id: 'wizard.title' })}
         </h2>
       </div>
@@ -790,50 +780,39 @@ export function OnboardWizardPage() {
       <div className="flex items-center justify-between pt-2">
         <div>
           {step > 1 && (
-            <button
-              type="button"
-              onClick={() => setStep((s) => s - 1)}
-              className={buttonSecondary}
-            >
-              <ChevronLeft className="h-4 w-4" />
+            <Button variant="secondary" icon={ChevronLeft} onClick={() => setStep((s) => s - 1)}>
               {intl.formatMessage({ id: 'wizard.back' })}
-            </button>
+            </Button>
           )}
         </div>
 
         <div className="flex items-center gap-3">
           {step === 4 && !state.importFile && (
-            <button
-              type="button"
-              onClick={() => setStep(5)}
-              className={buttonSecondary}
-            >
+            <Button variant="ghost" onClick={() => setStep(5)}>
               {intl.formatMessage({ id: 'wizard.skip' })}
-            </button>
+            </Button>
           )}
 
           {step < TOTAL_STEPS ? (
-            <button
-              type="button"
+            <Button
+              variant="primary"
+              iconRight={ChevronRight}
               disabled={!canAdvance()}
               onClick={() => setStep((s) => s + 1)}
-              className={buttonPrimary}
             >
               {intl.formatMessage({ id: 'wizard.next' })}
-              <ChevronRight className="h-4 w-4" />
-            </button>
+            </Button>
           ) : (
-            <button
-              type="button"
+            <Button
+              variant="primary"
+              icon={Rocket}
               disabled={deploying}
               onClick={handleDeploy}
-              className={cn(buttonPrimary, 'gap-2')}
             >
-              <Rocket className="h-4 w-4" />
               {deploying
                 ? intl.formatMessage({ id: 'wizard.deploying' })
                 : intl.formatMessage({ id: 'wizard.deploy' })}
-            </button>
+            </Button>
           )}
         </div>
       </div>

@@ -67,7 +67,16 @@
   --glass-edge: inset 0 1px 0 0 oklch(100% 0 0 / 0.9);
   --glass-shadow: 0 8px 24px -10px oklch(30% 0.02 260 / 0.22);
   --glass-shadow-hover: 0 16px 40px -12px oklch(30% 0.03 260 / 0.3);
-  --grid-line: oklch(40% 0.02 255 / 0.05);
+  --grid-line: oklch(40% 0.02 255 / 0.035);
+
+  /* Calm Glass — flat content panels. Near-opaque, hairline border, no blur.
+     The workhorse surface for content in the refactored dashboard; glass is
+     now reserved for chrome (sidebar/header) and overlays (dialogs/menus). */
+  --panel-fill: oklch(99.4% 0.001 250 / 0.86);
+  --panel-fill-hover: oklch(100% 0 0 / 0.95);
+  --panel-border: oklch(82% 0.006 255 / 0.7);
+  --panel-border-strong: oklch(74% 0.008 255 / 0.85);
+  --panel-shadow-hover: 0 6px 20px -12px oklch(30% 0.02 260 / 0.18);
 }
 
 .dark {
@@ -87,7 +96,13 @@
   --glass-edge: inset 0 1px 0 0 oklch(100% 0 0 / 0.13);
   --glass-shadow: 0 12px 32px -12px oklch(0% 0 0 / 0.55);
   --glass-shadow-hover: 0 20px 48px -14px oklch(0% 0 0 / 0.65);
-  --grid-line: oklch(85% 0.02 255 / 0.045);
+  --grid-line: oklch(85% 0.02 255 / 0.03);
+
+  --panel-fill: oklch(23% 0.014 262 / 0.66);
+  --panel-fill-hover: oklch(26% 0.015 261 / 0.82);
+  --panel-border: oklch(100% 0 0 / 0.08);
+  --panel-border-strong: oklch(100% 0 0 / 0.14);
+  --panel-shadow-hover: 0 10px 28px -14px oklch(0% 0 0 / 0.5);
 }
 
 /* Content card — the workhorse surface used across every page. */
@@ -125,6 +140,33 @@
   backdrop-filter: blur(32px) saturate(180%);
 }
 
+/* ── Calm Glass content panel — the default content surface (flat, hairline) ──
+   Reserve `glass-card` for legacy code; new pages compose <Card>/<Section>
+   which render `panel`. No backdrop blur → cheaper, calmer, genspark-clean. */
+@utility panel {
+  background: var(--panel-fill);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-default);
+}
+
+@utility panel-hover {
+  transition: background-color 160ms ease, border-color 160ms ease,
+    box-shadow 200ms cubic-bezier(0.22, 1, 0.36, 1),
+    transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
+  cursor: pointer;
+  &:hover {
+    background: var(--panel-fill-hover);
+    border-color: var(--panel-border-strong);
+    box-shadow: var(--panel-shadow-hover);
+    transform: translateY(-1px);
+  }
+}
+
+/* Hairline divider matched to panel borders. */
+@utility hairline {
+  border-color: var(--panel-border);
+}
+
 /* Honour macOS "Reduce transparency": fall back to solid surfaces. */
 @media (prefers-reduced-transparency: reduce) {
   :root {
@@ -152,17 +194,15 @@
   z-index: -10;
   pointer-events: none;
   background:
-    radial-gradient(56rem 38rem at 10% -12%, oklch(82% 0.13 75 / 0.18), transparent 62%),
-    radial-gradient(48rem 34rem at 102% 8%, oklch(70% 0.09 255 / 0.1), transparent 60%),
-    radial-gradient(64rem 44rem at 55% 115%, oklch(74% 0.13 55 / 0.12), transparent 65%),
+    radial-gradient(60rem 40rem at 8% -16%, oklch(82% 0.13 75 / 0.09), transparent 60%),
+    radial-gradient(52rem 36rem at 104% 6%, oklch(70% 0.09 255 / 0.05), transparent 58%),
     var(--app-bg);
 }
 
 .dark .app-ambient {
   background:
-    radial-gradient(56rem 38rem at 10% -12%, oklch(60% 0.13 70 / 0.2), transparent 62%),
-    radial-gradient(48rem 34rem at 102% 8%, oklch(50% 0.08 260 / 0.16), transparent 60%),
-    radial-gradient(64rem 44rem at 55% 115%, oklch(50% 0.12 50 / 0.14), transparent 65%),
+    radial-gradient(60rem 40rem at 8% -16%, oklch(60% 0.13 70 / 0.12), transparent 60%),
+    radial-gradient(52rem 36rem at 104% 6%, oklch(50% 0.08 260 / 0.1), transparent 58%),
     var(--app-bg);
 }
 
@@ -182,17 +222,17 @@
 .app-ambient::after {
   content: "";
   position: absolute;
-  top: -20%;
-  left: 55%;
-  width: 42rem;
-  height: 42rem;
+  top: -22%;
+  left: 58%;
+  width: 40rem;
+  height: 40rem;
   border-radius: 50%;
-  background: radial-gradient(circle, oklch(80% 0.13 80 / 0.1), transparent 70%);
-  animation: ambient-drift 36s ease-in-out infinite alternate;
+  background: radial-gradient(circle, oklch(80% 0.13 80 / 0.05), transparent 72%);
+  animation: ambient-drift 48s ease-in-out infinite alternate;
 }
 
 .dark .app-ambient::after {
-  background: radial-gradient(circle, oklch(70% 0.14 75 / 0.12), transparent 70%);
+  background: radial-gradient(circle, oklch(70% 0.14 75 / 0.07), transparent 72%);
 }
 
 @keyframes ambient-drift {

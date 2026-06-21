@@ -2,7 +2,6 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type OdooStatus } from '@/lib/api';
-import { FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import {
   Building2,
   Briefcase,
@@ -19,6 +18,16 @@ import {
   Plug,
   AlertTriangle,
 } from 'lucide-react';
+import {
+  Page,
+  PageHeader,
+  Card,
+  Section,
+  Button,
+  Badge,
+  Field,
+  controlClass,
+} from '@/components/ui';
 
 const FEATURE_MODULES = [
   { key: 'crm', icon: Users, color: 'text-blue-500' },
@@ -199,156 +208,137 @@ export function OdooPage() {
   }
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="rounded-lg bg-violet-100 p-2.5 dark:bg-violet-900/30">
-            <Building2 className="h-5 w-5 text-violet-600 dark:text-violet-400" />
-          </div>
-          <div>
-            <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-              {t('odoo.title')}
-            </h2>
-            <p className="text-sm text-stone-500 dark:text-stone-400">
-              {t('odoo.subtitle')}
-            </p>
-          </div>
-        </div>
-
-        {/* Connection status badge */}
-        {status && (
-          <div
-            className={cn(
-              'inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-sm font-medium',
-              status.connected
-                ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'
-                : 'bg-stone-100 text-stone-500 dark:bg-stone-800 dark:text-stone-400'
-            )}
-          >
-            {status.connected ? (
-              <CheckCircle className="h-4 w-4" />
-            ) : (
-              <XCircle className="h-4 w-4" />
-            )}
-            {status.connected ? t('odoo.connected') : t('odoo.disconnected')}
-            {status.edition && (
-              <span className="ml-1 text-xs opacity-70">({status.edition})</span>
-            )}
-          </div>
-        )}
-        {status && !status.connected && status.error && (
-          <p className="text-xs text-rose-500 dark:text-rose-400">{status.error}</p>
-        )}
-      </div>
+    <Page>
+      <PageHeader
+        icon={Building2}
+        title={t('nav.odoo')}
+        subtitle={t('odoo.subtitle')}
+        actions={
+          status ? (
+            <div className="flex flex-col items-end gap-1">
+              <Badge tone={status.connected ? 'success' : 'neutral'} dot>
+                {status.connected ? (
+                  <CheckCircle className="h-3.5 w-3.5" />
+                ) : (
+                  <XCircle className="h-3.5 w-3.5" />
+                )}
+                {status.connected ? t('odoo.connected') : t('odoo.disconnected')}
+                {status.edition && (
+                  <span className="ml-0.5 opacity-70">({status.edition})</span>
+                )}
+              </Badge>
+              {!status.connected && status.error && (
+                <p className="text-xs text-rose-500 dark:text-rose-400">{status.error}</p>
+              )}
+            </div>
+          ) : undefined
+        }
+      />
 
       {/* Connection Settings */}
-      <section className="glass-card rounded-2xl p-6">
-        <div className="mb-5 flex items-center gap-2">
-          <Plug className="h-4 w-4 text-stone-400" />
-          <h3 className="text-base font-semibold text-stone-900 dark:text-stone-50">
+      <Card
+        title={
+          <span className="flex items-center gap-2">
+            <Plug className="h-4 w-4 text-stone-400" />
             {t('odoo.connection')}
-          </h3>
-        </div>
-
+          </span>
+        }
+      >
         <div className="grid gap-4 sm:grid-cols-2">
-          <FormField label={t('odoo.url')} htmlFor="odoo-url">
+          <Field label={t('odoo.url')} htmlFor="odoo-url">
             <input
               id="odoo-url"
               type="url"
-              className={inputClass}
+              className={controlClass}
               placeholder="https://mycompany.odoo.com"
               value={url}
               onChange={(e) => setUrl(e.target.value)}
             />
-          </FormField>
+          </Field>
 
-          <FormField label={t('odoo.db')} htmlFor="odoo-db">
+          <Field label={t('odoo.db')} htmlFor="odoo-db">
             <input
               id="odoo-db"
               type="text"
-              className={inputClass}
+              className={controlClass}
               placeholder="mycompany"
               value={db}
               onChange={(e) => setDb(e.target.value)}
             />
-          </FormField>
+          </Field>
 
-          <FormField label={t('odoo.protocol')} htmlFor="odoo-protocol">
+          <Field label={t('odoo.protocol')} htmlFor="odoo-protocol">
             <select
               id="odoo-protocol"
-              className={selectClass}
+              className={controlClass}
               value={protocol}
               onChange={(e) => setProtocol(e.target.value)}
             >
               <option value="jsonrpc">JSON-RPC</option>
               <option value="xmlrpc">XML-RPC</option>
             </select>
-          </FormField>
+          </Field>
 
-          <FormField label={t('odoo.authMethod')} htmlFor="odoo-auth-method">
+          <Field label={t('odoo.authMethod')} htmlFor="odoo-auth-method">
             <select
               id="odoo-auth-method"
-              className={selectClass}
+              className={controlClass}
               value={authMethod}
               onChange={(e) => setAuthMethod(e.target.value)}
             >
               <option value="api_key">{t('odoo.authApiKey')}</option>
               <option value="password">{t('odoo.authPassword')}</option>
             </select>
-          </FormField>
+          </Field>
 
-          <FormField label={t('odoo.username')} htmlFor="odoo-username">
+          <Field label={t('odoo.username')} htmlFor="odoo-username">
             <input
               id="odoo-username"
               type="text"
-              className={inputClass}
+              className={controlClass}
               placeholder="admin@mycompany.com"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
             />
-          </FormField>
+          </Field>
 
           {authMethod === 'api_key' ? (
-            <FormField label={t('odoo.apiKey')} htmlFor="odoo-api-key" hint={t('odoo.apiKeyHint')}>
+            <Field label={t('odoo.apiKey')} htmlFor="odoo-api-key" help={t('odoo.apiKeyHint')}>
               <input
                 id="odoo-api-key"
                 type="password"
-                className={inputClass}
+                className={controlClass}
                 placeholder="••••••••"
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
               />
-            </FormField>
+            </Field>
           ) : (
-            <FormField label={t('odoo.password')} htmlFor="odoo-password">
+            <Field label={t('odoo.password')} htmlFor="odoo-password">
               <input
                 id="odoo-password"
                 type="password"
-                className={inputClass}
+                className={controlClass}
                 placeholder="••••••••"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
               />
-            </FormField>
+            </Field>
           )}
         </div>
 
         {/* Test connection */}
         <div className="mt-5 flex items-center gap-3">
-          <button
+          <Button
+            variant="secondary"
             onClick={handleTest}
             disabled={testing || !url.trim() || !db.trim() || saving}
             title={!status?.connected ? t('odoo.testHint') : undefined}
-            className={cn(buttonSecondary, 'gap-2')}
+            icon={testing ? undefined : RefreshCw}
           >
-            {testing ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <RefreshCw className="h-4 w-4" />
-            )}
+            {testing && <Loader2 className="h-4 w-4 animate-spin" />}
             {t('odoo.testConnection')}
-          </button>
+          </Button>
 
           {testResult && (
             <span
@@ -366,13 +356,10 @@ export function OdooPage() {
             </span>
           )}
         </div>
-      </section>
+      </Card>
 
       {/* Feature Modules */}
-      <section className="glass-card rounded-2xl p-6">
-        <h3 className="mb-4 text-base font-semibold text-stone-900 dark:text-stone-50">
-          {t('odoo.features')}
-        </h3>
+      <Card title={t('odoo.features')}>
         <p className="mb-5 text-sm text-stone-500 dark:text-stone-400">
           {t('odoo.featuresDesc')}
         </p>
@@ -388,7 +375,7 @@ export function OdooPage() {
                 'flex items-center gap-3 rounded-lg border px-4 py-3 text-left transition-colors',
                 features[key]
                   ? 'border-amber-300 bg-amber-50 dark:border-amber-700 dark:bg-amber-900/20'
-                  : 'border-stone-200 bg-white hover:bg-stone-50 dark:border-stone-700 dark:bg-stone-800 dark:hover:bg-stone-750'
+                  : 'border-[var(--panel-border)] bg-[var(--panel-fill)] hover:bg-[var(--panel-fill-hover)]'
               )}
             >
               <Icon className={cn('h-5 w-5 shrink-0', features[key] ? color : 'text-stone-400')} />
@@ -416,17 +403,13 @@ export function OdooPage() {
             </button>
           ))}
         </div>
-      </section>
+      </Card>
 
       {/* Polling & Webhook */}
-      <section className="glass-card rounded-2xl p-6">
-        <h3 className="mb-5 text-base font-semibold text-stone-900 dark:text-stone-50">
-          {t('odoo.sync')}
-        </h3>
-
+      <Card title={t('odoo.sync')}>
         <div className="grid gap-5 sm:grid-cols-2">
           {/* Polling */}
-          <div className="space-y-3">
+          <Section className="space-y-3">
             <label className="flex items-center gap-2">
               <input
                 type="checkbox"
@@ -441,34 +424,34 @@ export function OdooPage() {
 
             {pollEnabled && (
               <>
-                <FormField label={t('odoo.pollInterval')} htmlFor="odoo-poll-interval" hint={t('odoo.pollIntervalHint')}>
+                <Field label={t('odoo.pollInterval')} htmlFor="odoo-poll-interval" help={t('odoo.pollIntervalHint')}>
                   <input
                     id="odoo-poll-interval"
                     type="number"
-                    className={inputClass}
+                    className={controlClass}
                     min={60}
                     max={86400}
                     value={pollInterval}
                     onChange={(e) => setPollInterval(e.target.value)}
                   />
-                </FormField>
+                </Field>
 
-                <FormField label={t('odoo.pollModels')} htmlFor="odoo-poll-models" hint={t('odoo.pollModelsHint')}>
+                <Field label={t('odoo.pollModels')} htmlFor="odoo-poll-models" help={t('odoo.pollModelsHint')}>
                   <input
                     id="odoo-poll-models"
                     type="text"
-                    className={inputClass}
+                    className={controlClass}
                     placeholder="crm.lead,sale.order"
                     value={pollModels}
                     onChange={(e) => setPollModels(e.target.value)}
                   />
-                </FormField>
+                </Field>
               </>
             )}
-          </div>
+          </Section>
 
           {/* Webhook */}
-          <div className="space-y-3">
+          <Section className="space-y-3">
             <label className="flex items-center gap-2">
               <input
                 type="checkbox"
@@ -482,20 +465,20 @@ export function OdooPage() {
             </label>
 
             {webhookEnabled && (
-              <FormField label={t('odoo.webhookSecret')} htmlFor="odoo-webhook-secret" hint={t('odoo.webhookSecretHint')}>
+              <Field label={t('odoo.webhookSecret')} htmlFor="odoo-webhook-secret" help={t('odoo.webhookSecretHint')}>
                 <input
                   id="odoo-webhook-secret"
                   type="password"
-                  className={inputClass}
+                  className={controlClass}
                   placeholder="••••••••"
                   value={webhookSecret}
                   onChange={(e) => setWebhookSecret(e.target.value)}
                 />
-              </FormField>
+              </Field>
             )}
-          </div>
+          </Section>
         </div>
-      </section>
+      </Card>
 
       {/* Save bar */}
       <div className="flex items-center justify-end gap-3">
@@ -508,19 +491,16 @@ export function OdooPage() {
             {t('common.saved')}
           </span>
         )}
-        <button
+        <Button
+          variant="primary"
           onClick={handleSave}
           disabled={saving || !url.trim()}
-          className={cn(buttonPrimary, 'gap-2')}
+          icon={saving ? undefined : Save}
         >
-          {saving ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
-          ) : (
-            <Save className="h-4 w-4" />
-          )}
+          {saving && <Loader2 className="h-4 w-4 animate-spin" />}
           {saving ? t('common.saving') : t('common.save')}
-        </button>
+        </Button>
       </div>
-    </div>
+    </Page>
   );
 }

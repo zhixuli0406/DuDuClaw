@@ -8,8 +8,9 @@ import {
   type McpKeyCreateResult,
   type McpScope,
 } from '@/lib/api';
-import { Dialog, FormField, inputClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { Dialog } from '@/components/shared/Dialog';
 import { toast, formatError } from '@/lib/toast';
+import { Page, PageHeader, Card, Button, Badge, EmptyState, Field, controlClass } from '@/components/ui';
 import { KeyRound, Plus, Trash2, Copy, Check, AlertTriangle } from 'lucide-react';
 
 export function McpKeysPage() {
@@ -37,87 +38,79 @@ export function McpKeysPage() {
   }, [fetchKeys]);
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'mcpKeys.title' })}
-        </h2>
-        <button
-          onClick={() => setShowCreate(true)}
-          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600"
-        >
-          <Plus className="h-4 w-4" />
-          {intl.formatMessage({ id: 'mcpKeys.create' })}
-        </button>
-      </div>
+    <Page>
+      <PageHeader
+        icon={KeyRound}
+        title={intl.formatMessage({ id: 'nav.mcpKeys' })}
+        subtitle={intl.formatMessage({ id: 'mcpKeys.desc' })}
+        actions={
+          <Button variant="primary" icon={Plus} onClick={() => setShowCreate(true)}>
+            {intl.formatMessage({ id: 'mcpKeys.create' })}
+          </Button>
+        }
+      />
 
-      <p className="text-sm text-stone-500 dark:text-stone-400">
-        {intl.formatMessage({ id: 'mcpKeys.desc' })}
-      </p>
-
-      <div className="glass-card rounded-2xl p-6">
+      <Card padded={false}>
         {loading ? (
-          <p className="py-8 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
+          <p className="py-12 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
         ) : keys.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-12">
-            <KeyRound className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-            <p className="text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.empty' })}</p>
-          </div>
+          <EmptyState
+            icon={KeyRound}
+            title={intl.formatMessage({ id: 'mcpKeys.empty' })}
+          />
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
-                <tr className="border-b border-stone-200 dark:border-stone-700">
-                  <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.col.key' })}</th>
-                  <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.col.clientId' })}</th>
-                  <th className="py-2 text-center font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.col.external' })}</th>
-                  <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.col.scopes' })}</th>
-                  <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.col.created' })}</th>
-                  <th className="py-2 text-right font-medium text-stone-500 dark:text-stone-400" />
+                <tr className="border-b border-[var(--panel-border)]">
+                  <th className="px-5 py-3 text-left text-xs font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.col.key' })}</th>
+                  <th className="px-5 py-3 text-left text-xs font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.col.clientId' })}</th>
+                  <th className="px-5 py-3 text-center text-xs font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.col.external' })}</th>
+                  <th className="px-5 py-3 text-left text-xs font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.col.scopes' })}</th>
+                  <th className="px-5 py-3 text-left text-xs font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.col.created' })}</th>
+                  <th className="px-5 py-3 text-right text-xs font-medium text-stone-500 dark:text-stone-400" />
                 </tr>
               </thead>
-              <tbody>
+              <tbody className="divide-y divide-[var(--panel-border)]">
                 {keys.map((k) => (
-                  <tr key={k.masked} className="border-b border-stone-100 dark:border-stone-800">
-                    <td className="py-2.5">
-                      <code className="rounded bg-stone-100 px-2 py-0.5 font-mono text-xs text-stone-700 dark:bg-stone-800 dark:text-stone-300">
-                        {k.masked}
-                      </code>
-                      {k.rotate_recommended && (
-                        <span className="ml-2 inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
-                          <AlertTriangle className="h-3 w-3" />
-                          {intl.formatMessage({ id: 'mcpKeys.rotate' })}
-                        </span>
-                      )}
+                  <tr key={k.masked}>
+                    <td className="px-5 py-2.5">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <code className="rounded bg-stone-500/10 px-2 py-0.5 font-mono text-xs text-stone-700 dark:text-stone-300">
+                          {k.masked}
+                        </code>
+                        {k.rotate_recommended && (
+                          <Badge tone="warning">
+                            <AlertTriangle className="h-3 w-3" />
+                            {intl.formatMessage({ id: 'mcpKeys.rotate' })}
+                          </Badge>
+                        )}
+                      </div>
                     </td>
-                    <td className="py-2.5 text-stone-700 dark:text-stone-300">{k.client_id || '—'}</td>
-                    <td className="py-2.5 text-center">
+                    <td className="px-5 py-2.5 text-stone-700 dark:text-stone-300">{k.client_id || '—'}</td>
+                    <td className="px-5 py-2.5 text-center">
                       {k.is_external ? (
                         <span className="text-emerald-500">&#10003;</span>
                       ) : (
                         <span className="text-stone-300 dark:text-stone-600">&#10005;</span>
                       )}
                     </td>
-                    <td className="py-2.5">
+                    <td className="px-5 py-2.5">
                       <div className="flex flex-wrap gap-1">
                         {k.scopes.map((s) => (
-                          <span key={s} className="rounded-full bg-stone-100 px-2 py-0.5 text-[11px] text-stone-600 dark:bg-stone-800 dark:text-stone-400">
-                            {s}
-                          </span>
+                          <Badge key={s} tone="neutral">
+                            <span className="font-mono">{s}</span>
+                          </Badge>
                         ))}
                       </div>
                     </td>
-                    <td className="py-2.5 text-xs text-stone-400">
+                    <td className="px-5 py-2.5 text-xs text-stone-400">
                       {k.created_at ? new Date(k.created_at).toLocaleDateString() : '—'}
                     </td>
-                    <td className="py-2.5 text-right">
-                      <button
-                        onClick={() => setRevoking(k.masked)}
-                        className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-900/20"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
+                    <td className="px-5 py-2.5 text-right">
+                      <Button variant="ghost" size="sm" icon={Trash2} onClick={() => setRevoking(k.masked)} className="text-rose-600 hover:bg-rose-500/10 hover:text-rose-700 dark:text-rose-400">
                         {intl.formatMessage({ id: 'mcpKeys.revoke' })}
-                      </button>
+                      </Button>
                     </td>
                   </tr>
                 ))}
@@ -125,7 +118,7 @@ export function McpKeysPage() {
             </table>
           </div>
         )}
-      </div>
+      </Card>
 
       <CreateKeyDialog
         open={showCreate}
@@ -144,7 +137,7 @@ export function McpKeysPage() {
         onClose={() => setRevoking(null)}
         onRevoked={fetchKeys}
       />
-    </div>
+    </Page>
   );
 }
 
@@ -200,16 +193,16 @@ function CreateKeyDialog({
   return (
     <Dialog open={open} onClose={handleClose} title={intl.formatMessage({ id: 'mcpKeys.create' })}>
       <div className="space-y-4">
-        <FormField label={intl.formatMessage({ id: 'mcpKeys.clientId' })} hint={intl.formatMessage({ id: 'mcpKeys.clientId.hint' })}>
-          <input type="text" value={clientId} onChange={(e) => setClientId(e.target.value)} placeholder="my-integration" className={inputClass} />
-        </FormField>
-        <FormField label={intl.formatMessage({ id: 'mcpKeys.env' })}>
-          <select value={env} onChange={(e) => setEnv(e.target.value as 'prod' | 'staging' | 'dev')} className={inputClass}>
+        <Field label={intl.formatMessage({ id: 'mcpKeys.clientId' })} help={intl.formatMessage({ id: 'mcpKeys.clientId.hint' })}>
+          <input type="text" value={clientId} onChange={(e) => setClientId(e.target.value)} placeholder="my-integration" className={controlClass} />
+        </Field>
+        <Field label={intl.formatMessage({ id: 'mcpKeys.env' })}>
+          <select value={env} onChange={(e) => setEnv(e.target.value as 'prod' | 'staging' | 'dev')} className={controlClass}>
             <option value="prod">prod</option>
             <option value="staging">staging</option>
             <option value="dev">dev</option>
           </select>
-        </FormField>
+        </Field>
         <label className="flex items-center justify-between py-1.5">
           <span className="text-sm text-stone-700 dark:text-stone-300">{intl.formatMessage({ id: 'mcpKeys.external' })}</span>
           <button
@@ -222,7 +215,7 @@ function CreateKeyDialog({
             <span className={cn('pointer-events-none inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform mt-0.5', isExternal ? 'translate-x-4 ml-0.5' : 'translate-x-0.5')} />
           </button>
         </label>
-        <FormField label={intl.formatMessage({ id: 'mcpKeys.scopes' })} hint={intl.formatMessage({ id: 'mcpKeys.scopes.hint' })}>
+        <Field label={intl.formatMessage({ id: 'mcpKeys.scopes' })} help={intl.formatMessage({ id: 'mcpKeys.scopes.hint' })}>
           <div className="grid grid-cols-2 gap-2">
             {MCP_SCOPES.map((s) => (
               <label key={s} className="flex items-center gap-2 text-sm text-stone-700 dark:text-stone-300">
@@ -231,13 +224,13 @@ function CreateKeyDialog({
               </label>
             ))}
           </div>
-        </FormField>
+        </Field>
         {error && <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>}
         <div className="flex justify-end gap-3 pt-2">
-          <button onClick={handleClose} className={buttonSecondary}>{intl.formatMessage({ id: 'common.cancel' })}</button>
-          <button onClick={handleSubmit} disabled={submitting || !clientId.trim() || scopes.length === 0} className={buttonPrimary}>
+          <Button variant="secondary" onClick={handleClose}>{intl.formatMessage({ id: 'common.cancel' })}</Button>
+          <Button variant="primary" onClick={handleSubmit} disabled={submitting || !clientId.trim() || scopes.length === 0}>
             {submitting ? intl.formatMessage({ id: 'common.loading' }) : intl.formatMessage({ id: 'mcpKeys.create' })}
-          </button>
+          </Button>
         </div>
       </div>
     </Dialog>
@@ -269,13 +262,12 @@ function RevealKeyDialog({ result, onClose }: { result: McpKeyCreateResult | nul
         </div>
         <div className="flex items-center gap-2">
           <code className="flex-1 break-all rounded-lg bg-stone-900 px-3 py-2 font-mono text-xs text-emerald-400">{result.key}</code>
-          <button onClick={handleCopy} className={buttonSecondary}>
-            {copied ? <Check className="h-4 w-4 text-emerald-500" /> : <Copy className="h-4 w-4" />}
+          <Button variant="secondary" onClick={handleCopy} icon={copied ? Check : Copy} className={copied ? '[&_svg]:text-emerald-500' : undefined}>
             {copied ? intl.formatMessage({ id: 'mcpKeys.copied' }) : intl.formatMessage({ id: 'mcpKeys.copy' })}
-          </button>
+          </Button>
         </div>
         <div className="flex justify-end pt-2">
-          <button onClick={onClose} className={buttonPrimary}>{intl.formatMessage({ id: 'mcpKeys.created.done' })}</button>
+          <Button variant="primary" onClick={onClose}>{intl.formatMessage({ id: 'mcpKeys.created.done' })}</Button>
         </div>
       </div>
     </Dialog>
@@ -325,15 +317,15 @@ function RevokeKeyDialog({
     <Dialog open={masked !== null} onClose={handleClose} title={intl.formatMessage({ id: 'mcpKeys.revoke.title' })}>
       <div className="space-y-4">
         <p className="text-sm text-stone-600 dark:text-stone-400">{intl.formatMessage({ id: 'mcpKeys.revoke.confirm' })}</p>
-        <code className="block rounded bg-stone-100 px-2 py-1 font-mono text-xs text-stone-700 dark:bg-stone-800 dark:text-stone-300">{masked}</code>
-        <FormField label={intl.formatMessage({ id: 'mcpKeys.revoke.fullKey' })} hint={intl.formatMessage({ id: 'mcpKeys.revoke.fullKey.hint' })}>
-          <input type="text" value={fullKey} onChange={(e) => setFullKey(e.target.value)} placeholder="ddc_prod_..." className={cn(inputClass, 'font-mono')} autoComplete="off" />
-        </FormField>
+        <code className="block rounded bg-stone-500/10 px-2 py-1 font-mono text-xs text-stone-700 dark:text-stone-300">{masked}</code>
+        <Field label={intl.formatMessage({ id: 'mcpKeys.revoke.fullKey' })} help={intl.formatMessage({ id: 'mcpKeys.revoke.fullKey.hint' })}>
+          <input type="text" value={fullKey} onChange={(e) => setFullKey(e.target.value)} placeholder="ddc_prod_..." className={cn(controlClass, 'font-mono')} autoComplete="off" />
+        </Field>
         <div className="flex justify-end gap-3 pt-2">
-          <button onClick={handleClose} className={buttonSecondary}>{intl.formatMessage({ id: 'common.cancel' })}</button>
-          <button onClick={handleConfirm} disabled={confirming || !fullKey.trim()} className="inline-flex items-center justify-center gap-2 rounded-lg bg-rose-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-rose-600 disabled:opacity-50">
+          <Button variant="secondary" onClick={handleClose}>{intl.formatMessage({ id: 'common.cancel' })}</Button>
+          <Button variant="danger" onClick={handleConfirm} disabled={confirming || !fullKey.trim()}>
             {confirming ? intl.formatMessage({ id: 'common.loading' }) : intl.formatMessage({ id: 'mcpKeys.revoke' })}
-          </button>
+          </Button>
         </div>
       </div>
     </Dialog>

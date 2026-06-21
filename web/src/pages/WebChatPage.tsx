@@ -4,6 +4,7 @@ import { useChatStore, type ChatMessage, type PendingAttachment } from '@/stores
 import { cn } from '@/lib/utils';
 import { Send, RotateCcw, Loader2, Paperclip, X, Eye, EyeOff, FileText, Image as ImageIcon } from 'lucide-react';
 import { toast } from '@/lib/toast';
+import { Button, Badge } from '@/components/ui';
 
 /** 20 MB — must match the backend `media::MAX_FILE_SIZE` guard. */
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
@@ -37,13 +38,13 @@ function AttachmentChip({
 }) {
   const Icon = isImageMime(mime) ? ImageIcon : FileText;
   return (
-    <span className="inline-flex max-w-[12rem] items-center gap-1.5 rounded-lg bg-stone-200/70 px-2 py-1 text-xs text-stone-700 dark:bg-stone-700/70 dark:text-stone-200">
+    <span className="inline-flex max-w-[12rem] items-center gap-1.5 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-fill)] px-2 py-1 text-xs text-stone-700 dark:text-stone-200">
       <Icon className="h-3.5 w-3.5 flex-shrink-0" />
       <span className="truncate">{name}</span>
       {onRemove && (
         <button
           onClick={onRemove}
-          className="flex-shrink-0 rounded p-0.5 hover:bg-stone-300 dark:hover:bg-stone-600"
+          className="flex-shrink-0 rounded p-0.5 text-stone-400 transition-colors hover:bg-stone-500/10 hover:text-stone-600 dark:hover:bg-white/5 dark:hover:text-stone-300"
           aria-label="Remove attachment"
         >
           <X className="h-3 w-3" />
@@ -70,8 +71,8 @@ function MessageBubble({ message }: { message: ChatMessage }) {
           isUser
             ? 'bg-amber-500 text-white'
             : isSystem
-              ? 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400'
-              : 'bg-stone-100 text-stone-800 dark:bg-stone-800 dark:text-stone-200'
+              ? 'bg-rose-500/10 text-rose-700 ring-1 ring-inset ring-rose-500/20 dark:text-rose-400'
+              : 'border border-[var(--panel-border)] bg-[var(--panel-fill)] text-stone-800 dark:text-stone-200'
         )}
       >
         {message.attachments && message.attachments.length > 0 && (
@@ -85,7 +86,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
           <div className="whitespace-pre-wrap break-words">{message.content}</div>
         )}
         {message.tokens != null && message.tokens > 0 && (
-          <div className="mt-1 text-xs opacity-50">{message.tokens} tokens</div>
+          <div className="mt-1 text-xs opacity-50 tabular-nums">{message.tokens} tokens</div>
         )}
       </div>
     </div>
@@ -95,7 +96,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
 function TypingIndicator() {
   return (
     <div className="flex justify-start">
-      <div className="flex items-center gap-1 rounded-2xl bg-stone-100 px-4 py-3 dark:bg-stone-800">
+      <div className="flex items-center gap-1 rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-fill)] px-4 py-3">
         <span className="h-2 w-2 animate-bounce rounded-full bg-stone-400 [animation-delay:0ms]" />
         <span className="h-2 w-2 animate-bounce rounded-full bg-stone-400 [animation-delay:150ms]" />
         <span className="h-2 w-2 animate-bounce rounded-full bg-stone-400 [animation-delay:300ms]" />
@@ -201,42 +202,40 @@ export function WebChatPage() {
   return (
     <div className="flex h-full flex-col">
       {/* Header */}
-      <div className="flex items-center justify-between border-b border-stone-200 px-6 py-4 dark:border-stone-800">
+      <div className="flex items-center justify-between border-b border-[var(--panel-border)] px-6 py-4">
         <div className="flex items-center gap-3">
           <span className="text-2xl">{agentIcon}</span>
           <div>
-            <h2 className="text-lg font-semibold text-stone-900 dark:text-stone-50">
+            <h2 className="text-lg font-semibold tracking-tight text-stone-900 dark:text-stone-50">
               {agentName}
             </h2>
-            <div className="flex items-center gap-1.5">
-              <span
-                className={cn(
-                  'h-2 w-2 rounded-full',
+            <div className="mt-0.5">
+              <Badge
+                dot
+                tone={
                   connectionState === 'connected'
-                    ? 'bg-emerald-500'
+                    ? 'success'
                     : connectionState === 'connecting'
-                      ? 'bg-amber-500'
-                      : 'bg-stone-400'
-                )}
-              />
-              <span className="text-xs text-stone-500 dark:text-stone-400">
+                      ? 'warning'
+                      : 'neutral'
+                }
+              >
                 {connectionState === 'connected'
                   ? intl.formatMessage({ id: 'webchat.connected', defaultMessage: 'Connected' })
                   : connectionState === 'connecting'
                     ? intl.formatMessage({ id: 'webchat.connecting', defaultMessage: 'Connecting...' })
                     : intl.formatMessage({ id: 'webchat.disconnected', defaultMessage: 'Disconnected' })}
-              </span>
+              </Badge>
             </div>
           </div>
         </div>
 
-        <button
+        <Button
+          variant="ghost"
+          icon={RotateCcw}
           onClick={reset}
-          className="rounded-lg p-2 text-stone-500 transition-colors hover:bg-stone-100 hover:text-stone-700 dark:hover:bg-stone-800 dark:hover:text-stone-300"
           title={intl.formatMessage({ id: 'webchat.reset', defaultMessage: 'New conversation' })}
-        >
-          <RotateCcw className="h-4 w-4" />
-        </button>
+        />
       </div>
 
       {/* Messages */}
@@ -265,39 +264,41 @@ export function WebChatPage() {
       </div>
 
       {/* Input */}
-      <div className="border-t border-stone-200 px-6 py-4 dark:border-stone-800">
+      <div className="border-t border-[var(--panel-border)] px-6 py-4">
         <div className="mx-auto max-w-2xl space-y-2">
           {/* Capability badge */}
           <div className="flex items-center gap-2 text-xs text-stone-400 dark:text-stone-500">
             {supportsVision ? (
               <span
-                className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400"
                 title={intl.formatMessage({
                   id: 'webchat.visionOnTip',
                   defaultMessage: '此模型可理解上傳的圖片內容',
                 })}
               >
-                <Eye className="h-3.5 w-3.5" />
-                {intl.formatMessage({ id: 'webchat.visionOn', defaultMessage: '支援圖片' })}
+                <Badge tone="success">
+                  <Eye className="h-3.5 w-3.5" />
+                  {intl.formatMessage({ id: 'webchat.visionOn', defaultMessage: '支援圖片' })}
+                </Badge>
               </span>
             ) : (
               <span
-                className="inline-flex items-center gap-1"
                 title={intl.formatMessage({
                   id: 'webchat.visionOffTip',
                   defaultMessage: '此模型不支援圖片理解,僅會讀取文件的文字內容',
                 })}
               >
-                <EyeOff className="h-3.5 w-3.5" />
-                {intl.formatMessage({ id: 'webchat.visionOff', defaultMessage: '僅文件' })}
+                <Badge tone="neutral">
+                  <EyeOff className="h-3.5 w-3.5" />
+                  {intl.formatMessage({ id: 'webchat.visionOff', defaultMessage: '僅文件' })}
+                </Badge>
               </span>
             )}
-            {model && <span className="opacity-70">· {model}</span>}
+            {model && <span className="opacity-70 tabular-nums">· {model}</span>}
           </div>
 
           {/* Vision warning when an image is queued for a text-only model */}
           {showVisionWarning && (
-            <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-400">
+            <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
               {intl.formatMessage({
                 id: 'webchat.visionWarning',
                 defaultMessage: '⚠️ 目前模型不支援圖片理解 — 圖片仍會送出,但模型可能無法看見內容。',
@@ -322,18 +323,14 @@ export function WebChatPage() {
               className="hidden"
               onChange={(e) => handleFilesSelected(e.target.files)}
             />
-            <button
+            <Button
+              variant="secondary"
+              icon={Paperclip}
               onClick={() => fileInputRef.current?.click()}
               disabled={connectionState !== 'connected'}
               title={intl.formatMessage({ id: 'webchat.attach', defaultMessage: '上傳檔案' })}
-              className={cn(
-                'flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-xl border transition-colors',
-                'border-stone-200 text-stone-500 hover:bg-stone-100 disabled:opacity-50',
-                'dark:border-stone-700 dark:text-stone-400 dark:hover:bg-stone-800'
-              )}
-            >
-              <Paperclip className="h-5 w-5" />
-            </button>
+              className="h-11 w-11 shrink-0 rounded-xl"
+            />
             <textarea
               ref={inputRef}
               value={input}
@@ -345,28 +342,24 @@ export function WebChatPage() {
               })}
               rows={1}
               className={cn(
-                'flex-1 resize-none rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm',
-                'placeholder:text-stone-400 focus:border-amber-400 focus:outline-none focus:ring-2 focus:ring-amber-400/20',
-                'dark:border-stone-700 dark:bg-stone-800 dark:text-stone-200 dark:placeholder:text-stone-500 dark:focus:border-amber-500'
+                'flex-1 resize-none rounded-xl border border-[var(--panel-border)] bg-[var(--panel-fill)] px-4 py-3 text-sm',
+                'text-stone-800 placeholder:text-stone-400 focus-visible:border-amber-500/50 focus-visible:outline-none',
+                'focus-visible:ring-2 focus-visible:ring-amber-500/30 dark:text-stone-100 dark:placeholder:text-stone-500'
               )}
               disabled={connectionState !== 'connected'}
             />
-            <button
+            <Button
+              variant="primary"
               onClick={handleSend}
               disabled={!canSend}
-              className={cn(
-                'flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-xl transition-colors',
-                canSend
-                  ? 'bg-amber-500 text-white hover:bg-amber-600'
-                  : 'bg-stone-100 text-stone-400 dark:bg-stone-800'
-              )}
+              className="h-11 w-11 shrink-0 rounded-xl px-0"
             >
               {isStreaming ? (
                 <Loader2 className="h-5 w-5 animate-spin" />
               ) : (
                 <Send className="h-5 w-5" />
               )}
-            </button>
+            </Button>
           </div>
         </div>
       </div>

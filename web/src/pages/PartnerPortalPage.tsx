@@ -16,10 +16,22 @@ import {
   Pencil,
   Trash2,
   Terminal,
+  X,
 } from 'lucide-react';
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import { toast, formatError } from '@/lib/toast';
 import { cn } from '@/lib/utils';
+import {
+  Page,
+  PageHeader,
+  Card,
+  StatCard,
+  Badge,
+  Button,
+  EmptyState,
+  Field,
+  controlClass,
+} from '@/components/ui';
 import {
   api,
   type PartnerProfile,
@@ -29,25 +41,27 @@ import {
 
 // ── Styling helpers (not mock data) ──────────────────────
 
-const TIER_COLORS: Record<string, string> = {
-  standard: 'bg-stone-100 text-stone-700 dark:bg-stone-800 dark:text-stone-300',
-  silver: 'bg-stone-100 text-stone-700 dark:bg-stone-800 dark:text-stone-300',
-  gold: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
-  platinum: 'bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-400',
+type BadgeTone = 'neutral' | 'success' | 'warning' | 'danger' | 'info' | 'accent';
+
+const TIER_TONES: Record<string, BadgeTone> = {
+  standard: 'neutral',
+  silver: 'neutral',
+  gold: 'accent',
+  platinum: 'info',
 };
 
-const STATUS_COLORS: Record<string, string> = {
-  active: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
-  trial: 'bg-sky-100 text-sky-700 dark:bg-sky-900/30 dark:text-sky-400',
-  expiring: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
-  expired: 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400',
-  cancelled: 'bg-stone-100 text-stone-700 dark:bg-stone-800 dark:text-stone-400',
+const STATUS_TONES: Record<string, BadgeTone> = {
+  active: 'success',
+  trial: 'info',
+  expiring: 'warning',
+  expired: 'danger',
+  cancelled: 'neutral',
 };
 
-const CUSTOMER_TIER_COLORS: Record<string, string> = {
-  standard: 'bg-stone-100 text-stone-700 dark:bg-stone-800 dark:text-stone-300',
-  pro: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
-  enterprise: 'bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-400',
+const CUSTOMER_TIER_TONES: Record<string, BadgeTone> = {
+  standard: 'neutral',
+  pro: 'accent',
+  enterprise: 'info',
 };
 
 const PROFILE_TIERS = ['standard', 'silver', 'gold', 'platinum'] as const;
@@ -120,10 +134,12 @@ export function PartnerPortalPage() {
   const isProfileEmpty = !profile || !profile.company || profile.company.trim() === '';
 
   return (
-    <div className="space-y-6">
-      <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-        {intl.formatMessage({ id: 'partner.title' })}
-      </h2>
+    <Page>
+      <PageHeader
+        icon={Handshake}
+        title={intl.formatMessage({ id: 'nav.partner' })}
+        subtitle={intl.formatMessage({ id: 'app.subtitle' })}
+      />
 
       {/* Top-of-page load error (R1 pattern: rose alert, dismissible). */}
       {loadError && (
@@ -143,29 +159,18 @@ export function PartnerPortalPage() {
             className="shrink-0 text-rose-500 hover:text-rose-700 dark:text-rose-400 dark:hover:text-rose-200"
             aria-label="Dismiss"
           >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <line x1="18" y1="6" x2="6" y2="18"></line>
-              <line x1="6" y1="6" x2="18" y2="18"></line>
-            </svg>
+            <X className="h-4 w-4" />
           </button>
         </div>
       )}
 
       {loading && !profile && (
-        <div className="flex items-center gap-2 rounded-xl border border-stone-200 bg-white p-6 text-sm text-stone-600 dark:border-stone-800 dark:bg-stone-900 dark:text-stone-400">
-          <Loader2 className="h-4 w-4 animate-spin" />
-          <span>{intl.formatMessage({ id: 'common.loading' })}</span>
-        </div>
+        <Card>
+          <div className="flex items-center gap-2 text-sm text-stone-600 dark:text-stone-400">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            <span>{intl.formatMessage({ id: 'common.loading' })}</span>
+          </div>
+        </Card>
       )}
 
       {!loading && isProfileEmpty && (
@@ -175,16 +180,14 @@ export function PartnerPortalPage() {
       {!isProfileEmpty && profile && (
         <>
           {/* Partner Status Card */}
-          <div className="rounded-xl border-2 border-amber-300 bg-white p-6 dark:border-amber-700 dark:bg-stone-900">
-            <div className="flex items-center gap-3 mb-6">
-              <div className="rounded-lg bg-amber-500 p-2.5">
-                <Handshake className="h-5 w-5 text-white" />
-              </div>
-              <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
+          <Card
+            title={
+              <span className="flex items-center gap-2">
+                <Handshake className="h-4 w-4 text-amber-500" />
                 {intl.formatMessage({ id: 'partner.status' })}
-              </h3>
-            </div>
-
+              </span>
+            }
+          >
             <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
               <div className="space-y-1.5">
                 <span className="text-sm text-stone-500 dark:text-stone-400">
@@ -192,14 +195,9 @@ export function PartnerPortalPage() {
                 </span>
                 <div className="flex items-center gap-2">
                   <Award className="h-4 w-4 text-amber-500" />
-                  <span
-                    className={cn(
-                      'inline-flex rounded-full px-3 py-1 text-sm font-semibold',
-                      TIER_COLORS[profile.tier] ?? TIER_COLORS.standard,
-                    )}
-                  >
+                  <Badge tone={TIER_TONES[profile.tier] ?? 'neutral'}>
                     {intl.formatMessage({ id: `partner.tier.${profile.tier}` })}
-                  </span>
+                  </Badge>
                 </div>
               </div>
 
@@ -207,7 +205,7 @@ export function PartnerPortalPage() {
                 <span className="text-sm text-stone-500 dark:text-stone-400">
                   {intl.formatMessage({ id: 'partner.partnerId' })}
                 </span>
-                <code className="block rounded bg-stone-100 px-2 py-0.5 font-mono text-xs text-stone-600 dark:bg-stone-800 dark:text-stone-400">
+                <code className="block rounded bg-stone-500/10 px-2 py-0.5 font-mono text-xs text-stone-600 dark:text-stone-400">
                   {profile.partner_id ?? '—'}
                 </code>
               </div>
@@ -243,74 +241,74 @@ export function PartnerPortalPage() {
                 </span>
               </div>
             </div>
-          </div>
+          </Card>
 
           {/* Sales Dashboard - 4 StatCards */}
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
             <StatCard
-              icon={<FileText className="h-5 w-5 text-white" />}
+              icon={FileText}
+              tone="accent"
               label={intl.formatMessage({ id: 'partner.totalSold' })}
               value={(stats?.total_sold ?? 0).toLocaleString()}
-              bg="bg-amber-500"
             />
             <StatCard
-              icon={<Users className="h-5 w-5 text-white" />}
+              icon={Users}
+              tone="success"
               label={intl.formatMessage({ id: 'partner.activeCustomers' })}
               value={(stats?.active_customers ?? 0).toLocaleString()}
-              bg="bg-emerald-500"
             />
             <StatCard
-              icon={<DollarSign className="h-5 w-5 text-white" />}
+              icon={DollarSign}
+              tone="warning"
               label={intl.formatMessage({ id: 'partner.monthlyRevenue' })}
               value={formatDollars(stats?.this_month_commission_cents ?? 0)}
-              bg="bg-sky-500"
             />
             <StatCard
-              icon={<TrendingUp className="h-5 w-5 text-white" />}
+              icon={TrendingUp}
+              tone="neutral"
               label={intl.formatMessage({ id: 'partner.commission' })}
               value={formatDollars(stats?.lifetime_commission_cents ?? 0)}
-              bg="bg-violet-500"
             />
           </div>
 
           {/* Customer Management Table */}
-          <div className="glass-card rounded-2xl p-6">
-            <div className="mb-5 flex items-center justify-between">
-              <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
-                {intl.formatMessage({ id: 'partner.customers' })}
-              </h3>
-              <button
-                type="button"
+          <Card
+            padded={false}
+            title={intl.formatMessage({ id: 'partner.customers' })}
+            actions={
+              <Button
+                variant="primary"
+                size="sm"
+                icon={Plus}
                 onClick={() => setShowAddCustomer(true)}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-amber-600"
               >
-                <Plus className="h-4 w-4" />
                 {intl.formatMessage({ id: 'partner.addCustomer' })}
-              </button>
-            </div>
-
+              </Button>
+            }
+          >
             {customers.length === 0 ? (
-              <div className="py-8 text-center text-sm text-stone-500 dark:text-stone-400">
-                {intl.formatMessage({ id: 'partner.empty' })}
-              </div>
+              <EmptyState
+                icon={Users}
+                title={intl.formatMessage({ id: 'partner.empty' })}
+              />
             ) : (
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
-                    <tr className="border-b border-stone-200 dark:border-stone-700">
-                      <th className="py-3 text-left font-medium text-stone-500 dark:text-stone-400">
+                    <tr className="border-b border-[var(--panel-border)]">
+                      <th className="px-5 py-3 text-left font-medium text-stone-500 dark:text-stone-400">
                         {intl.formatMessage({ id: 'partner.customerName' })}
                       </th>
-                      <th className="py-3 text-left font-medium text-stone-500 dark:text-stone-400">
+                      <th className="px-5 py-3 text-left font-medium text-stone-500 dark:text-stone-400">
                         {intl.formatMessage({ id: 'partner.licenseTier' })}
                       </th>
-                      <th className="py-3 text-left font-medium text-stone-500 dark:text-stone-400">
+                      <th className="px-5 py-3 text-left font-medium text-stone-500 dark:text-stone-400">
                         {intl.formatMessage({ id: 'partner.activated' })}
                       </th>
-                      <th className="py-3 text-left font-medium text-stone-500 dark:text-stone-400">
+                      <th className="px-5 py-3 text-left font-medium text-stone-500 dark:text-stone-400">
                         {intl.formatMessage({ id: 'billing.status' })}
                       </th>
-                      <th className="py-3 text-right font-medium text-stone-500 dark:text-stone-400">
+                      <th className="px-5 py-3 text-right font-medium text-stone-500 dark:text-stone-400">
                         {intl.formatMessage({ id: 'partner.actions' })}
                       </th>
                     </tr>
@@ -319,53 +317,45 @@ export function PartnerPortalPage() {
                     {customers.map((customer) => (
                       <tr
                         key={customer.id}
-                        className="border-b border-stone-100 last:border-0 dark:border-stone-800"
+                        className="border-b border-[var(--panel-border)] last:border-0"
                       >
-                        <td className="py-3 text-sm font-medium text-stone-900 dark:text-stone-100">
+                        <td className="px-5 py-3 text-sm font-medium text-stone-900 dark:text-stone-100">
                           {customer.name}
                         </td>
-                        <td className="py-3">
-                          <span
-                            className={cn(
-                              'inline-flex rounded-full px-2.5 py-0.5 text-xs font-semibold',
-                              CUSTOMER_TIER_COLORS[customer.tier] ??
-                                CUSTOMER_TIER_COLORS.standard,
-                            )}
-                          >
+                        <td className="px-5 py-3">
+                          <Badge tone={CUSTOMER_TIER_TONES[customer.tier] ?? 'neutral'}>
                             {intl.formatMessage({ id: `license.${customer.tier}` })}
-                          </span>
+                          </Badge>
                         </td>
-                        <td className="py-3 text-sm text-stone-600 dark:text-stone-400">
+                        <td className="px-5 py-3 text-sm text-stone-600 dark:text-stone-400">
                           {new Date(customer.activated_at).toLocaleDateString()}
                         </td>
-                        <td className="py-3">
-                          <span
-                            className={cn(
-                              'inline-flex rounded-full px-2.5 py-0.5 text-xs font-semibold capitalize',
-                              STATUS_COLORS[customer.status] ?? STATUS_COLORS.active,
-                            )}
-                          >
+                        <td className="px-5 py-3">
+                          <Badge tone={STATUS_TONES[customer.status] ?? 'success'}>
                             {intl.formatMessage({
                               id: `partner.status.${customer.status}`,
                             })}
-                          </span>
+                          </Badge>
                         </td>
-                        <td className="py-3 text-right">
+                        <td className="px-5 py-3 text-right">
                           <div className="flex items-center justify-end gap-2">
-                            <button
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              icon={Pencil}
                               onClick={() => setEditCustomer(customer)}
-                              className="rounded-lg border border-stone-300 p-1.5 text-stone-500 transition-colors hover:bg-stone-50 dark:border-stone-600 dark:text-stone-400 dark:hover:bg-stone-800"
                               title={intl.formatMessage({ id: 'common.edit' })}
-                            >
-                              <Pencil className="h-3.5 w-3.5" />
-                            </button>
-                            <button
+                              aria-label={intl.formatMessage({ id: 'common.edit' })}
+                            />
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              icon={Trash2}
                               onClick={() => setDeleteCustomer(customer)}
-                              className="rounded-lg border border-stone-300 p-1.5 text-rose-500 transition-colors hover:bg-rose-50 dark:border-stone-600 dark:hover:bg-rose-900/20"
                               title={intl.formatMessage({ id: 'common.delete' })}
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
+                              aria-label={intl.formatMessage({ id: 'common.delete' })}
+                              className="text-rose-500 hover:text-rose-600 dark:text-rose-400"
+                            />
                           </div>
                         </td>
                       </tr>
@@ -374,18 +364,15 @@ export function PartnerPortalPage() {
                 </table>
               </div>
             )}
-          </div>
+          </Card>
         </>
       )}
 
       {/* License Generation — CLI-only (UI.4). License activation is not exposed
           over the dashboard RPC; surface a clear pointer to the CLI instead of a
           non-functional client-side stub. */}
-      <div className="glass-card rounded-2xl p-6">
-        <h3 className="mb-3 text-lg font-medium text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'partner.generateLicense' })}
-        </h3>
-        <div className="flex items-start gap-3 rounded-lg border border-stone-200 bg-stone-50 p-4 dark:border-stone-700 dark:bg-stone-800/50">
+      <Card title={intl.formatMessage({ id: 'partner.generateLicense' })}>
+        <div className="flex items-start gap-3 rounded-lg border border-[var(--panel-border)] bg-stone-500/5 p-4 dark:bg-white/5">
           <Terminal className="mt-0.5 h-5 w-5 shrink-0 text-stone-400" />
           <div className="space-y-2">
             <p className="text-sm text-stone-600 dark:text-stone-400">
@@ -396,14 +383,10 @@ export function PartnerPortalPage() {
             </code>
           </div>
         </div>
-      </div>
+      </Card>
 
       {/* Marketing Materials */}
-      <div className="glass-card rounded-2xl p-6">
-        <h3 className="mb-5 text-lg font-medium text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'partner.materials' })}
-        </h3>
-
+      <Card title={intl.formatMessage({ id: 'partner.materials' })}>
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <MaterialCard
             icon={<Presentation className="h-5 w-5 text-amber-600 dark:text-amber-400" />}
@@ -424,7 +407,7 @@ export function PartnerPortalPage() {
             href="#"
           />
         </div>
-      </div>
+      </Card>
 
       {showAddCustomer && (
         <AddCustomerModal
@@ -465,7 +448,7 @@ export function PartnerPortalPage() {
           </div>
         </Dialog>
       )}
-    </div>
+    </Page>
   );
 }
 
@@ -580,97 +563,84 @@ function PartnerOnboardingCard({ onSaved }: { readonly onSaved: () => void }) {
   };
 
   return (
-    <form
-      onSubmit={handleSubmit}
-      className="rounded-xl border-2 border-dashed border-amber-300 bg-amber-50/40 p-6 dark:border-amber-700 dark:bg-amber-900/10"
-    >
-      <div className="mb-2 flex items-center gap-3">
-        <div className="rounded-lg bg-amber-500 p-2.5">
-          <Handshake className="h-5 w-5 text-white" />
+    <Card>
+      <form onSubmit={handleSubmit}>
+        <div className="mb-2 flex items-center gap-3">
+          <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-amber-500/12 text-amber-600 ring-1 ring-inset ring-amber-500/20 dark:bg-amber-400/10 dark:text-amber-400">
+            <Handshake className="h-5 w-5" />
+          </span>
+          <h3 className="text-sm font-semibold text-stone-800 dark:text-stone-100">
+            {intl.formatMessage({ id: 'partner.setup.title' })}
+          </h3>
         </div>
-        <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'partner.setup.title' })}
-        </h3>
-      </div>
-      <p className="mb-5 text-sm text-stone-600 dark:text-stone-400">
-        {intl.formatMessage({ id: 'partner.setup.description' })}
-      </p>
+        <p className="mb-5 text-sm text-stone-600 dark:text-stone-400">
+          {intl.formatMessage({ id: 'partner.setup.description' })}
+        </p>
 
-      <div className="grid gap-4 sm:grid-cols-2">
-        <div className="space-y-1.5">
-          <label className="text-sm text-stone-600 dark:text-stone-300">
-            {intl.formatMessage({ id: 'partner.setup.company' })}
-          </label>
-          <input
-            type="text"
-            value={company}
-            onChange={(e) => setCompany(e.target.value)}
-            required
-            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
-          />
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label={intl.formatMessage({ id: 'partner.setup.company' })} required>
+            <input
+              type="text"
+              value={company}
+              onChange={(e) => setCompany(e.target.value)}
+              required
+              className={controlClass}
+            />
+          </Field>
+          <Field label={intl.formatMessage({ id: 'partner.setup.tier' })}>
+            <select
+              value={tier}
+              onChange={(e) => setTier(e.target.value)}
+              className={controlClass}
+            >
+              {PROFILE_TIERS.map((t) => (
+                <option key={t} value={t}>
+                  {intl.formatMessage({ id: `partner.tier.${t}` })}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label={intl.formatMessage({ id: 'partner.setup.partnerId' })}>
+            <input
+              type="text"
+              value={partnerId}
+              onChange={(e) => setPartnerId(e.target.value)}
+              placeholder="PTR-2025-0042"
+              className={controlClass}
+            />
+          </Field>
+          <Field label={intl.formatMessage({ id: 'partner.setup.certifiedAt' })}>
+            <input
+              type="date"
+              value={certifiedAt}
+              onChange={(e) => setCertifiedAt(e.target.value)}
+              className={controlClass}
+            />
+          </Field>
         </div>
-        <div className="space-y-1.5">
-          <label className="text-sm text-stone-600 dark:text-stone-300">
-            {intl.formatMessage({ id: 'partner.setup.tier' })}
-          </label>
-          <select
-            value={tier}
-            onChange={(e) => setTier(e.target.value)}
-            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+
+        {error && (
+          <div
+            role="alert"
+            className="mt-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-2 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-300"
           >
-            {PROFILE_TIERS.map((t) => (
-              <option key={t} value={t}>
-                {intl.formatMessage({ id: `partner.tier.${t}` })}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div className="space-y-1.5">
-          <label className="text-sm text-stone-600 dark:text-stone-300">
-            {intl.formatMessage({ id: 'partner.setup.partnerId' })}
-          </label>
-          <input
-            type="text"
-            value={partnerId}
-            onChange={(e) => setPartnerId(e.target.value)}
-            placeholder="PTR-2025-0042"
-            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
-          />
-        </div>
-        <div className="space-y-1.5">
-          <label className="text-sm text-stone-600 dark:text-stone-300">
-            {intl.formatMessage({ id: 'partner.setup.certifiedAt' })}
-          </label>
-          <input
-            type="date"
-            value={certifiedAt}
-            onChange={(e) => setCertifiedAt(e.target.value)}
-            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
-          />
-        </div>
-      </div>
+            {error}
+          </div>
+        )}
 
-      {error && (
-        <div
-          role="alert"
-          className="mt-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-2 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-300"
-        >
-          {error}
+        <div className="mt-5 flex justify-end">
+          <Button
+            type="submit"
+            variant="primary"
+            disabled={saving || !company.trim()}
+          >
+            {saving
+              ? intl.formatMessage({ id: 'common.saving' })
+              : intl.formatMessage({ id: 'partner.setup.save' })}
+          </Button>
         </div>
-      )}
-
-      <div className="mt-5 flex justify-end">
-        <button
-          type="submit"
-          disabled={saving || !company.trim()}
-          className="rounded-lg bg-amber-500 px-5 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
-        >
-          {saving
-            ? intl.formatMessage({ id: 'common.saving' })
-            : intl.formatMessage({ id: 'partner.setup.save' })}
-        </button>
-      </div>
-    </form>
+      </form>
+    </Card>
   );
 }
 
@@ -731,33 +701,27 @@ function AddCustomerModal({
         onClick={(e) => e.stopPropagation()}
         className="w-full max-w-lg glass-overlay rounded-2xl p-6"
       >
-        <h3 className="mb-4 text-lg font-medium text-stone-900 dark:text-stone-50">
+        <h3 className="mb-4 text-lg font-semibold tracking-tight text-stone-900 dark:text-stone-50">
           {intl.formatMessage({ id: 'partner.addCustomer' })}
         </h3>
 
         <div className="space-y-4">
-          <div className="space-y-1.5">
-            <label className="text-sm text-stone-600 dark:text-stone-300">
-              {intl.formatMessage({ id: 'partner.customerName' })}
-            </label>
+          <Field label={intl.formatMessage({ id: 'partner.customerName' })} required>
             <input
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
               required
-              className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+              className={controlClass}
             />
-          </div>
+          </Field>
 
           <div className="grid gap-4 sm:grid-cols-2">
-            <div className="space-y-1.5">
-              <label className="text-sm text-stone-600 dark:text-stone-300">
-                {intl.formatMessage({ id: 'partner.licenseTier' })}
-              </label>
+            <Field label={intl.formatMessage({ id: 'partner.licenseTier' })}>
               <select
                 value={tier}
                 onChange={(e) => setTier(e.target.value)}
-                className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+                className={controlClass}
               >
                 {CUSTOMER_TIERS.map((t) => (
                   <option key={t} value={t}>
@@ -765,15 +729,12 @@ function AddCustomerModal({
                   </option>
                 ))}
               </select>
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-sm text-stone-600 dark:text-stone-300">
-                {intl.formatMessage({ id: 'billing.status' })}
-              </label>
+            </Field>
+            <Field label={intl.formatMessage({ id: 'billing.status' })}>
               <select
                 value={status}
                 onChange={(e) => setStatus(e.target.value)}
-                className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+                className={controlClass}
               >
                 {CUSTOMER_STATUSES.map((s) => (
                   <option key={s} value={s}>
@@ -781,45 +742,36 @@ function AddCustomerModal({
                   </option>
                 ))}
               </select>
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-sm text-stone-600 dark:text-stone-300">
-                {intl.formatMessage({ id: 'partner.activated' })}
-              </label>
+            </Field>
+            <Field label={intl.formatMessage({ id: 'partner.activated' })}>
               <input
                 type="date"
                 value={activatedAt}
                 onChange={(e) => setActivatedAt(e.target.value)}
                 required
-                className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+                className={controlClass}
               />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-sm text-stone-600 dark:text-stone-300">
-                {intl.formatMessage({ id: 'partner.commissionDollars' })}
-              </label>
+            </Field>
+            <Field label={intl.formatMessage({ id: 'partner.commissionDollars' })}>
               <input
                 type="number"
                 min="0"
                 step="0.01"
                 value={commissionDollars}
                 onChange={(e) => setCommissionDollars(e.target.value)}
-                className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+                className={controlClass}
               />
-            </div>
+            </Field>
           </div>
 
-          <div className="space-y-1.5">
-            <label className="text-sm text-stone-600 dark:text-stone-300">
-              {intl.formatMessage({ id: 'partner.notes' })}
-            </label>
+          <Field label={intl.formatMessage({ id: 'partner.notes' })}>
             <textarea
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
               rows={2}
-              className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+              className={cn(controlClass, 'h-auto py-2 resize-none')}
             />
-          </div>
+          </Field>
         </div>
 
         {error && (
@@ -832,22 +784,14 @@ function AddCustomerModal({
         )}
 
         <div className="mt-5 flex items-center justify-end gap-2">
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-lg border border-stone-300 px-4 py-2 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-50 dark:border-stone-600 dark:text-stone-300 dark:hover:bg-stone-800"
-          >
+          <Button type="button" variant="secondary" onClick={onClose}>
             {intl.formatMessage({ id: 'common.cancel' })}
-          </button>
-          <button
-            type="submit"
-            disabled={saving || !name.trim()}
-            className="rounded-lg bg-amber-500 px-5 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
-          >
+          </Button>
+          <Button type="submit" variant="primary" disabled={saving || !name.trim()}>
             {saving
               ? intl.formatMessage({ id: 'common.saving' })
               : intl.formatMessage({ id: 'common.save' })}
-          </button>
+          </Button>
         </div>
       </form>
     </div>
@@ -855,32 +799,6 @@ function AddCustomerModal({
 }
 
 // ── Sub-components ───────────────────────────────────────
-
-function StatCard({
-  icon,
-  label,
-  value,
-  bg,
-}: {
-  readonly icon: React.ReactNode;
-  readonly label: string;
-  readonly value: string;
-  readonly bg: string;
-}) {
-  return (
-    <div className="glass-card rounded-2xl p-5">
-      <div className="flex items-center gap-3">
-        <div className={cn('rounded-lg p-2.5', bg)}>{icon}</div>
-        <div>
-          <p className="text-sm text-stone-500 dark:text-stone-400">{label}</p>
-          <p className="text-xl font-semibold text-stone-900 dark:text-stone-50">
-            {value}
-          </p>
-        </div>
-      </div>
-    </div>
-  );
-}
 
 function MaterialCard({
   icon,
@@ -896,7 +814,7 @@ function MaterialCard({
   return (
     <a
       href={href}
-      className="flex items-start gap-3 rounded-xl border border-stone-200 p-4 transition-colors hover:bg-stone-50 dark:border-stone-700 dark:hover:bg-stone-800"
+      className="panel panel-hover flex items-start gap-3 p-4"
     >
       <div className="mt-0.5">{icon}</div>
       <div className="flex-1">

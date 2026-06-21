@@ -13,6 +13,17 @@ import {
 import { cn } from '@/lib/utils';
 import { api, type WikiTrustHistoryRow, type WikiTrustRow } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
+import {
+  Page,
+  PageHeader,
+  Card,
+  StatCard,
+  Badge,
+  Button,
+  EmptyState,
+  Field,
+  controlClass,
+} from '@/components/ui';
 
 // ───────────────────────────────────────────────────────────────────────
 // Page
@@ -72,97 +83,103 @@ export function WikiTrustPage() {
   }, [rows]);
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center gap-3">
-        <Shield className="h-6 w-6 text-amber-500" />
-        <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'wikiTrust.title', defaultMessage: 'Wiki Trust 反饋' })}
-        </h2>
-      </div>
-
-      <p className="text-sm text-stone-600 dark:text-stone-400">
-        {intl.formatMessage({
+    <Page wide>
+      <PageHeader
+        icon={Shield}
+        title={intl.formatMessage({ id: 'wikiTrust.title', defaultMessage: 'Wiki Trust 反饋' })}
+        subtitle={intl.formatMessage({
           id: 'wikiTrust.subtitle',
           defaultMessage:
             '由 prediction error 驅動的 wiki 自我清洗 — trust 過低的頁面會被自動隔離。可手動覆寫並鎖定可信頁面，避免被噪音壓抑。',
         })}
-      </p>
-
-      {/* Filters */}
-      <div className="flex flex-wrap items-end gap-4 rounded-lg border border-stone-200 bg-white p-4 dark:border-stone-800 dark:bg-stone-900">
-        <div className="flex flex-col gap-1">
-          <label className="text-xs font-medium text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'wikiTrust.agent', defaultMessage: 'Agent' })}
-          </label>
-          <select
-            value={selectedAgent}
-            onChange={(e) => setSelectedAgent(e.target.value)}
-            className="rounded-md border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800 dark:text-stone-100"
+        actions={
+          <Button
+            variant="primary"
+            onClick={() => refresh(selectedAgent, maxTrust)}
+            disabled={loading || !selectedAgent}
           >
-            {agents.map((a) => (
-              <option key={a.name} value={a.name}>
-                {a.display_name} ({a.name})
-              </option>
-            ))}
-          </select>
-        </div>
+            {loading
+              ? intl.formatMessage({ id: 'common.loading', defaultMessage: '載入中...' })
+              : intl.formatMessage({ id: 'common.refresh', defaultMessage: '重新整理' })}
+          </Button>
+        }
+      />
 
-        <div className="flex flex-col gap-1">
-          <label className="text-xs font-medium text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'wikiTrust.maxTrust', defaultMessage: 'Trust 上限' })}
-          </label>
-          <select
-            value={maxTrust}
-            onChange={(e) => setMaxTrust(Number(e.target.value))}
-            className="rounded-md border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800 dark:text-stone-100"
-          >
-            <option value={0.3}>≤ 0.30 (低)</option>
-            <option value={0.5}>≤ 0.50 (中等)</option>
-            <option value={0.7}>≤ 0.70 (含中高)</option>
-            <option value={1.0}>1.00 (全部)</option>
-          </select>
-        </div>
-
-        <button
-          onClick={() => refresh(selectedAgent, maxTrust)}
-          disabled={loading || !selectedAgent}
-          className="rounded-md bg-amber-500 px-4 py-2 text-sm font-medium text-white hover:bg-amber-600 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {loading
-            ? intl.formatMessage({ id: 'common.loading', defaultMessage: '載入中...' })
-            : intl.formatMessage({ id: 'common.refresh', defaultMessage: '重新整理' })}
-        </button>
-
-        <div className="ml-auto flex gap-3 text-sm">
-          <SummaryStat
-            icon={<ShieldAlert className="h-4 w-4 text-rose-500" />}
-            label={intl.formatMessage({ id: 'wikiTrust.archived', defaultMessage: '已隔離' })}
-            value={summary.archived}
-          />
-          <SummaryStat
-            icon={<Lock className="h-4 w-4 text-emerald-500" />}
-            label={intl.formatMessage({ id: 'wikiTrust.locked', defaultMessage: '鎖定' })}
-            value={summary.locked}
-          />
-          <SummaryStat
-            icon={<Activity className="h-4 w-4 text-stone-500" />}
-            label={intl.formatMessage({ id: 'wikiTrust.signals', defaultMessage: '錯誤/成功' })}
-            value={`${summary.totalErr} / ${summary.totalOk}`}
-          />
-        </div>
+      {/* Summary metrics */}
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-3">
+        <StatCard
+          icon={ShieldAlert}
+          tone="danger"
+          label={intl.formatMessage({ id: 'wikiTrust.archived', defaultMessage: '已隔離' })}
+          value={summary.archived}
+        />
+        <StatCard
+          icon={Lock}
+          tone="success"
+          label={intl.formatMessage({ id: 'wikiTrust.locked', defaultMessage: '鎖定' })}
+          value={summary.locked}
+        />
+        <StatCard
+          icon={Activity}
+          tone="neutral"
+          label={intl.formatMessage({ id: 'wikiTrust.signals', defaultMessage: '錯誤/成功' })}
+          value={`${summary.totalErr} / ${summary.totalOk}`}
+          className="col-span-2 lg:col-span-1"
+        />
       </div>
 
-      {available === false && note && (
-        <div className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">
-          {note}
+      {/* Filters */}
+      <Card>
+        <div className="flex flex-wrap items-end gap-4">
+          <Field
+            label={intl.formatMessage({ id: 'wikiTrust.agent', defaultMessage: 'Agent' })}
+            className="min-w-[14rem]"
+          >
+            <select
+              value={selectedAgent}
+              onChange={(e) => setSelectedAgent(e.target.value)}
+              className={controlClass}
+            >
+              {agents.map((a) => (
+                <option key={a.name} value={a.name}>
+                  {a.display_name} ({a.name})
+                </option>
+              ))}
+            </select>
+          </Field>
+
+          <Field
+            label={intl.formatMessage({ id: 'wikiTrust.maxTrust', defaultMessage: 'Trust 上限' })}
+            className="min-w-[12rem]"
+          >
+            <select
+              value={maxTrust}
+              onChange={(e) => setMaxTrust(Number(e.target.value))}
+              className={controlClass}
+            >
+              <option value={0.3}>≤ 0.30 (低)</option>
+              <option value={0.5}>≤ 0.50 (中等)</option>
+              <option value={0.7}>≤ 0.70 (含中高)</option>
+              <option value={1.0}>1.00 (全部)</option>
+            </select>
+          </Field>
         </div>
+      </Card>
+
+      {available === false && note && (
+        <Card>
+          <p className="flex items-start gap-2 text-sm text-amber-700 dark:text-amber-300">
+            <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+            {note}
+          </p>
+        </Card>
       )}
 
       {/* Table */}
-      <div className="overflow-hidden rounded-lg border border-stone-200 bg-white dark:border-stone-800 dark:bg-stone-900">
+      <Card padded={false}>
         <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-stone-200 text-sm dark:divide-stone-800">
-            <thead className="bg-stone-50 dark:bg-stone-800/50">
+          <table className="min-w-full divide-y divide-[var(--panel-border)] text-sm">
+            <thead>
               <tr>
                 <Th>{intl.formatMessage({ id: 'wikiTrust.col.page', defaultMessage: '頁面' })}</Th>
                 <Th>{intl.formatMessage({ id: 'wikiTrust.col.trust', defaultMessage: 'Trust' })}</Th>
@@ -174,14 +191,17 @@ export function WikiTrustPage() {
                 <Th>{intl.formatMessage({ id: 'wikiTrust.col.actions', defaultMessage: '操作' })}</Th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-stone-200 dark:divide-stone-800">
+            <tbody className="divide-y divide-[var(--panel-border)]">
               {rows.length === 0 && !loading && (
                 <tr>
-                  <td colSpan={8} className="px-4 py-12 text-center text-stone-500 dark:text-stone-400">
-                    {intl.formatMessage({
-                      id: 'wikiTrust.empty',
-                      defaultMessage: '沒有頁面落在這個 trust 範圍。',
-                    })}
+                  <td colSpan={8} className="px-4 py-2">
+                    <EmptyState
+                      icon={Shield}
+                      title={intl.formatMessage({
+                        id: 'wikiTrust.empty',
+                        defaultMessage: '沒有頁面落在這個 trust 範圍。',
+                      })}
+                    />
                   </td>
                 </tr>
               )}
@@ -189,7 +209,7 @@ export function WikiTrustPage() {
                 <tr
                   key={`${r.page_path}-${r.agent_id}`}
                   className={cn(
-                    'transition-colors hover:bg-stone-50 dark:hover:bg-stone-800/50',
+                    'transition-colors hover:bg-stone-500/5 dark:hover:bg-white/5',
                     r.do_not_inject && 'bg-rose-50/30 dark:bg-rose-950/10'
                   )}
                 >
@@ -199,14 +219,14 @@ export function WikiTrustPage() {
                   <td className="px-4 py-2">
                     <TrustBar value={r.trust} />
                   </td>
-                  <td className="px-4 py-2 text-stone-600 dark:text-stone-400">{r.citation_count}</td>
+                  <td className="px-4 py-2 tabular-nums text-stone-600 dark:text-stone-400">{r.citation_count}</td>
                   <td className="px-4 py-2">
-                    <span className={cn('text-rose-600 dark:text-rose-400', r.error_signal_count === 0 && 'text-stone-400 dark:text-stone-600')}>
+                    <span className={cn('tabular-nums text-rose-600 dark:text-rose-400', r.error_signal_count === 0 && 'text-stone-400 dark:text-stone-600')}>
                       {r.error_signal_count}
                     </span>
                   </td>
                   <td className="px-4 py-2">
-                    <span className={cn('text-emerald-600 dark:text-emerald-400', r.success_signal_count === 0 && 'text-stone-400 dark:text-stone-600')}>
+                    <span className={cn('tabular-nums text-emerald-600 dark:text-emerald-400', r.success_signal_count === 0 && 'text-stone-400 dark:text-stone-600')}>
                       {r.success_signal_count}
                     </span>
                   </td>
@@ -216,31 +236,30 @@ export function WikiTrustPage() {
                   <td className="px-4 py-2">
                     <div className="flex gap-1">
                       {r.do_not_inject && (
-                        <Badge tone="rose" icon={<EyeOff className="h-3 w-3" />}>
+                        <Badge tone="danger">
+                          <EyeOff className="h-3 w-3" />
                           {intl.formatMessage({ id: 'wikiTrust.flag.archived', defaultMessage: '隔離' })}
                         </Badge>
                       )}
                       {r.locked && (
-                        <Badge tone="emerald" icon={<Lock className="h-3 w-3" />}>
+                        <Badge tone="success">
+                          <Lock className="h-3 w-3" />
                           {intl.formatMessage({ id: 'wikiTrust.flag.locked', defaultMessage: '鎖定' })}
                         </Badge>
                       )}
                     </div>
                   </td>
                   <td className="px-4 py-2">
-                    <button
-                      onClick={() => setActiveRow(r)}
-                      className="text-xs font-medium text-amber-600 hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300"
-                    >
+                    <Button variant="ghost" size="sm" onClick={() => setActiveRow(r)}>
                       {intl.formatMessage({ id: 'wikiTrust.action.inspect', defaultMessage: '詳情' })}
-                    </button>
+                    </Button>
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
-      </div>
+      </Card>
 
       {activeRow && (
         <TrustDetailModal
@@ -253,7 +272,7 @@ export function WikiTrustPage() {
           }}
         />
       )}
-    </div>
+    </Page>
   );
 }
 
@@ -326,15 +345,15 @@ function TrustDetailModal({ row, agentId, onClose, onChanged }: TrustDetailModal
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/50 p-4 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/45 p-4 backdrop-blur-sm"
       onClick={onClose}
     >
       <div
-        className="max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-xl border border-stone-200 bg-white shadow-2xl dark:border-stone-700 dark:bg-stone-900"
+        className="glass-overlay max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-start justify-between border-b border-stone-200 px-6 py-4 dark:border-stone-800">
+        <div className="flex items-start justify-between border-b border-[var(--panel-border)] px-6 py-4">
           <div className="space-y-1">
             <h3 className="font-mono text-sm text-stone-700 dark:text-stone-300">{row.page_path}</h3>
             <div className="flex items-center gap-3 text-xs text-stone-500 dark:text-stone-400">
@@ -343,12 +362,7 @@ function TrustDetailModal({ row, agentId, onClose, onChanged }: TrustDetailModal
               <span>updated: {new Date(row.updated_at).toLocaleString()}</span>
             </div>
           </div>
-          <button
-            onClick={onClose}
-            className="rounded-md p-1 text-stone-400 hover:bg-stone-100 hover:text-stone-700 dark:hover:bg-stone-800"
-          >
-            <X className="h-5 w-5" />
-          </button>
+          <Button variant="ghost" size="sm" icon={X} onClick={onClose} aria-label="close" />
         </div>
 
         {/* History */}
@@ -366,9 +380,9 @@ function TrustDetailModal({ row, agentId, onClose, onChanged }: TrustDetailModal
               {intl.formatMessage({ id: 'wikiTrust.detail.historyEmpty', defaultMessage: '無歷史記錄' })}
             </p>
           ) : (
-            <div className="overflow-hidden rounded-md border border-stone-200 dark:border-stone-800">
-              <table className="min-w-full divide-y divide-stone-200 text-xs dark:divide-stone-800">
-                <thead className="bg-stone-50 dark:bg-stone-800/50">
+            <div className="overflow-hidden rounded-lg border border-[var(--panel-border)]">
+              <table className="min-w-full divide-y divide-[var(--panel-border)] text-xs">
+                <thead>
                   <tr>
                     <Th>{intl.formatMessage({ id: 'wikiTrust.col.ts', defaultMessage: '時間' })}</Th>
                     <Th>{intl.formatMessage({ id: 'wikiTrust.col.delta', defaultMessage: '變化' })}</Th>
@@ -377,7 +391,7 @@ function TrustDetailModal({ row, agentId, onClose, onChanged }: TrustDetailModal
                     <Th>{intl.formatMessage({ id: 'wikiTrust.col.error', defaultMessage: '誤差' })}</Th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-stone-200 dark:divide-stone-800">
+                <tbody className="divide-y divide-[var(--panel-border)]">
                   {history.map((h, idx) => (
                     <tr key={`${h.ts}-${idx}`}>
                       <td className="px-3 py-1.5 text-stone-600 dark:text-stone-400">
@@ -406,7 +420,7 @@ function TrustDetailModal({ row, agentId, onClose, onChanged }: TrustDetailModal
         </div>
 
         {/* Override */}
-        <div className="border-t border-stone-200 px-6 py-4 dark:border-stone-800">
+        <div className="border-t border-[var(--panel-border)] px-6 py-4">
           <button
             onClick={() => setOverrideOpen((v) => !v)}
             className="flex items-center gap-2 text-sm font-semibold text-amber-600 hover:text-amber-700 dark:text-amber-400"
@@ -467,13 +481,12 @@ function TrustDetailModal({ row, agentId, onClose, onChanged }: TrustDetailModal
                 </label>
               </div>
 
-              <div>
-                <label className="text-xs font-medium text-stone-600 dark:text-stone-400">
-                  {intl.formatMessage({
-                    id: 'wikiTrust.override.reason',
-                    defaultMessage: '修改原因（必填）',
-                  })}
-                </label>
+              <Field
+                label={intl.formatMessage({
+                  id: 'wikiTrust.override.reason',
+                  defaultMessage: '修改原因（必填）',
+                })}
+              >
                 <input
                   type="text"
                   value={reason}
@@ -482,26 +495,19 @@ function TrustDetailModal({ row, agentId, onClose, onChanged }: TrustDetailModal
                     id: 'wikiTrust.override.reasonPlaceholder',
                     defaultMessage: '例：人工審核確認此頁面為事實基準',
                   })}
-                  className="mt-1 w-full rounded-md border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800"
+                  className={controlClass}
                 />
-              </div>
+              </Field>
 
               <div className="flex justify-end gap-2">
-                <button
-                  onClick={() => setOverrideOpen(false)}
-                  className="rounded-md px-4 py-2 text-sm font-medium text-stone-600 hover:bg-stone-100 dark:text-stone-300 dark:hover:bg-stone-800"
-                >
+                <Button variant="ghost" onClick={() => setOverrideOpen(false)}>
                   {intl.formatMessage({ id: 'common.cancel', defaultMessage: '取消' })}
-                </button>
-                <button
-                  onClick={submitOverride}
-                  disabled={submitting}
-                  className="rounded-md bg-amber-500 px-4 py-2 text-sm font-medium text-white hover:bg-amber-600 disabled:opacity-50"
-                >
+                </Button>
+                <Button variant="primary" onClick={submitOverride} disabled={submitting}>
                   {submitting
                     ? intl.formatMessage({ id: 'common.saving', defaultMessage: '儲存中...' })
                     : intl.formatMessage({ id: 'wikiTrust.override.apply', defaultMessage: '套用覆寫' })}
-                </button>
+                </Button>
               </div>
             </div>
           )}
@@ -529,64 +535,29 @@ function TrustBar({ value }: { value: number }) {
     value >= 0.7 ? 'bg-emerald-500' : value >= 0.4 ? 'bg-amber-500' : value >= 0.2 ? 'bg-orange-500' : 'bg-rose-500';
   return (
     <div className="flex items-center gap-2">
-      <div className="h-1.5 w-24 overflow-hidden rounded-full bg-stone-200 dark:bg-stone-800">
+      <div className="h-1.5 w-24 overflow-hidden rounded-full bg-stone-500/15">
         <div className={cn('h-full transition-all', tone)} style={{ width: `${pct}%` }} />
       </div>
-      <span className="font-mono text-xs text-stone-700 dark:text-stone-300">{value.toFixed(3)}</span>
+      <span className="font-mono text-xs tabular-nums text-stone-700 dark:text-stone-300">{value.toFixed(3)}</span>
     </div>
   );
 }
 
-interface BadgeProps {
-  tone: 'rose' | 'emerald' | 'amber' | 'stone' | 'sky';
-  icon?: React.ReactNode;
-  children: React.ReactNode;
-}
+type BadgeTone = 'neutral' | 'success' | 'warning' | 'danger' | 'info' | 'accent';
 
-function Badge({ tone, icon, children }: BadgeProps) {
-  const tones: Record<BadgeProps['tone'], string> = {
-    rose: 'bg-rose-100 text-rose-700 dark:bg-rose-950/40 dark:text-rose-300',
-    emerald: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300',
-    amber: 'bg-amber-100 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300',
-    stone: 'bg-stone-100 text-stone-700 dark:bg-stone-800 dark:text-stone-300',
-    sky: 'bg-sky-100 text-sky-700 dark:bg-sky-950/40 dark:text-sky-300',
-  };
-  return (
-    <span
-      className={cn(
-        'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium',
-        tones[tone]
-      )}
-    >
-      {icon}
-      {children}
-    </span>
-  );
-}
-
-function SummaryStat({ icon, label, value }: { icon: React.ReactNode; label: string; value: number | string }) {
-  return (
-    <div className="flex items-center gap-2 rounded-md bg-stone-100 px-3 py-1.5 dark:bg-stone-800">
-      {icon}
-      <span className="text-xs text-stone-500 dark:text-stone-400">{label}</span>
-      <span className="font-mono text-sm font-semibold text-stone-900 dark:text-stone-100">{value}</span>
-    </div>
-  );
-}
-
-function triggerTone(trigger: string): BadgeProps['tone'] {
+function triggerTone(trigger: string): BadgeTone {
   switch (trigger) {
     case 'prediction_error':
-      return 'amber';
+      return 'warning';
     case 'auto_correct':
-      return 'rose';
+      return 'danger';
     case 'manual':
-      return 'sky';
+      return 'info';
     case 'rollback':
-      return 'stone';
+      return 'neutral';
     case 'federated_import':
-      return 'emerald';
+      return 'success';
     default:
-      return 'stone';
+      return 'neutral';
   }
 }

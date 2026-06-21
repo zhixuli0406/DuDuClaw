@@ -17,32 +17,33 @@ import {
   type ContainerEnvVar,
   type AgentOdooOverride,
 } from '@/lib/api';
-import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { Dialog, FormField, inputClass, selectClass } from '@/components/shared/Dialog';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { toast, formatError } from '@/lib/toast';
 import { Bot, Pause, Play, Send, Eye, Plus, X, ShieldCheck, Pencil, Trash2 } from 'lucide-react';
+import { Page, Card, Button, Badge, EmptyState, Tabs } from '@/components/ui';
 
 function StatusBadge({ status }: { status: string }) {
   const intl = useIntl();
-  const styles: Record<string, string> = {
-    active: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
-    paused: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
-    terminated: 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400',
+  const tones: Record<string, 'success' | 'warning' | 'danger' | 'neutral'> = {
+    active: 'success',
+    paused: 'warning',
+    terminated: 'danger',
   };
 
   return (
-    <span className={cn('inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium', styles[status] ?? 'bg-stone-100 text-stone-600')}>
+    <Badge tone={tones[status] ?? 'neutral'} dot>
       {intl.formatMessage({ id: `status.${status}` })}
-    </span>
+    </Badge>
   );
 }
 
 function RoleBadge({ role }: { role: string }) {
   const intl = useIntl();
   return (
-    <span className="inline-flex items-center rounded-full bg-stone-100 px-2 py-0.5 text-xs text-stone-600 dark:bg-stone-800 dark:text-stone-400">
+    <Badge tone="neutral">
       {intl.formatMessage({ id: `agents.role.${role}` })}
-    </span>
+    </Badge>
   );
 }
 
@@ -60,40 +61,39 @@ export function AgentsPage() {
   }, [fetchAgents]);
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
+    <Page wide>
+      {/* Inline header (mirrors <PageHeader> styling). The title <h1> and the
+          create <Button> share a single parent <div> on purpose — the page test
+          locates the create button via the title's parentElement. */}
+      <header className="flex items-center gap-3">
+        <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-amber-500/12 text-amber-600 ring-1 ring-inset ring-amber-500/20 dark:bg-amber-400/10 dark:text-amber-400">
+          <Bot className="h-5 w-5" />
+        </span>
+        <h1 className="min-w-0 flex-1 truncate text-2xl font-semibold tracking-tight text-stone-900 dark:text-stone-50">
           {intl.formatMessage({ id: 'agents.title' })}
-        </h2>
-        <button
-          onClick={() => setShowCreateDialog(true)}
-          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600"
-        >
-          <Plus className="h-4 w-4" />
+        </h1>
+        <Button variant="primary" icon={Plus} className="shrink-0" onClick={() => setShowCreateDialog(true)}>
           {intl.formatMessage({ id: 'agents.create' })}
-        </button>
-      </div>
+        </Button>
+      </header>
 
       {agents.length === 0 && !loading ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-          <Bot className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-          <p className="text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'agents.empty' })}
-          </p>
-        </div>
+        <Card padded={false}>
+          <EmptyState
+            icon={Bot}
+            title={intl.formatMessage({ id: 'agents.empty' })}
+          />
+        </Card>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {agents.map((agent) => (
-            <div
-              key={agent.name}
-              className="glass-card glass-card-hover rounded-2xl p-5"
-            >
+            <Card key={agent.name} interactive>
               <div className="flex items-start justify-between">
                 <div className="flex items-center gap-3">
                   <span className="text-2xl">{agent.icon || '🤖'}</span>
-                  <div>
-                    <h3 className="font-semibold text-stone-900 dark:text-stone-50">{agent.display_name}</h3>
-                    <p className="text-xs text-stone-500 dark:text-stone-400">{agent.trigger}</p>
+                  <div className="min-w-0">
+                    <h3 className="truncate font-semibold text-stone-900 dark:text-stone-50">{agent.display_name}</h3>
+                    <p className="truncate text-xs text-stone-500 dark:text-stone-400">{agent.trigger}</p>
                   </div>
                 </div>
                 <StatusBadge status={agent.status} />
@@ -102,10 +102,10 @@ export function AgentsPage() {
               <div className="mt-3 flex items-center gap-2">
                 <RoleBadge role={agent.role} />
                 {agent.sandbox_enabled && (
-                  <span className="inline-flex items-center gap-1 rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
+                  <Badge tone="info">
                     <ShieldCheck className="h-3 w-3" />
                     {intl.formatMessage({ id: 'agents.sandboxed' })}
-                  </span>
+                  </Badge>
                 )}
               </div>
 
@@ -113,11 +113,11 @@ export function AgentsPage() {
                 <div className="mt-4">
                   <div className="mb-1 flex justify-between text-xs text-stone-500 dark:text-stone-400">
                     <span>{intl.formatMessage({ id: 'dashboard.budget.title' })}</span>
-                    <span>
+                    <span className="tabular-nums">
                       ${(agent.budget.spent_cents / 100).toFixed(2)} / ${(agent.budget.monthly_limit_cents / 100).toFixed(2)}
                     </span>
                   </div>
-                  <div className="h-1.5 overflow-hidden rounded-full bg-stone-200 dark:bg-stone-700">
+                  <div className="h-1.5 overflow-hidden rounded-full bg-stone-500/15">
                     <div
                       className="h-full rounded-full bg-amber-500 transition-all"
                       style={{
@@ -132,55 +132,43 @@ export function AgentsPage() {
                 </div>
               )}
 
-              <div className="mt-4 flex gap-2 border-t border-stone-100 pt-3 dark:border-stone-800">
+              <div className="mt-4 flex flex-wrap gap-1.5 border-t border-[var(--panel-border)] pt-3">
                 {agent.status === 'active' ? (
-                  <button
-                    onClick={() => pauseAgent(agent.name)}
-                    className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-stone-600 hover:bg-stone-100 dark:text-stone-400 dark:hover:bg-stone-800"
-                  >
-                    <Pause className="h-3.5 w-3.5" />
+                  <Button size="sm" variant="ghost" icon={Pause} onClick={() => pauseAgent(agent.name)}>
                     {intl.formatMessage({ id: 'agents.pause' })}
-                  </button>
+                  </Button>
                 ) : (
-                  <button
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    icon={Play}
+                    className="text-emerald-600 hover:bg-emerald-500/10 hover:text-emerald-700 dark:text-emerald-400 dark:hover:bg-emerald-500/10"
                     onClick={() => resumeAgent(agent.name)}
-                    className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-900/20"
                   >
-                    <Play className="h-3.5 w-3.5" />
                     {intl.formatMessage({ id: 'agents.resume' })}
-                  </button>
+                  </Button>
                 )}
-                <button
-                  onClick={() => setDelegateTarget(agent.name)}
-                  className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-stone-600 hover:bg-stone-100 dark:text-stone-400 dark:hover:bg-stone-800"
-                >
-                  <Send className="h-3.5 w-3.5" />
+                <Button size="sm" variant="ghost" icon={Send} onClick={() => setDelegateTarget(agent.name)}>
                   {intl.formatMessage({ id: 'agents.delegate' })}
-                </button>
-                <button
-                  onClick={() => setInspectTarget(agent)}
-                  className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-stone-600 hover:bg-stone-100 dark:text-stone-400 dark:hover:bg-stone-800"
-                >
-                  <Eye className="h-3.5 w-3.5" />
+                </Button>
+                <Button size="sm" variant="ghost" icon={Eye} onClick={() => setInspectTarget(agent)}>
                   {intl.formatMessage({ id: 'agents.inspect' })}
-                </button>
-                <button
-                  onClick={() => setEditTarget(agent)}
-                  className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-stone-600 hover:bg-stone-100 dark:text-stone-400 dark:hover:bg-stone-800"
-                >
-                  <Pencil className="h-3.5 w-3.5" />
+                </Button>
+                <Button size="sm" variant="ghost" icon={Pencil} onClick={() => setEditTarget(agent)}>
                   {intl.formatMessage({ id: 'agents.edit' })}
-                </button>
+                </Button>
                 {agent.role !== 'main' && (
-                  <button
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    icon={Trash2}
+                    className="text-rose-600 hover:bg-rose-500/10 hover:text-rose-700 dark:text-rose-400 dark:hover:bg-rose-500/10"
+                    aria-label={intl.formatMessage({ id: 'agents.remove' })}
                     onClick={() => setRemoveTarget(agent.name)}
-                    className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-900/20"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </button>
+                  />
                 )}
               </div>
-            </div>
+            </Card>
           ))}
         </div>
       )}
@@ -224,7 +212,7 @@ export function AgentsPage() {
           }
         }}
       />
-    </div>
+    </Page>
   );
 }
 
@@ -279,10 +267,10 @@ function CreateAgentDialog({ open, onClose, onCreated }: { open: boolean; onClos
           <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>
         )}
         <div className="flex justify-end gap-3 pt-2">
-          <button onClick={onClose} className={buttonSecondary}>{intl.formatMessage({ id: 'common.cancel' })}</button>
-          <button onClick={handleSubmit} disabled={submitting || !name.trim() || !displayName.trim()} className={buttonPrimary}>
+          <Button variant="secondary" onClick={onClose}>{intl.formatMessage({ id: 'common.cancel' })}</Button>
+          <Button variant="primary" onClick={handleSubmit} disabled={submitting || !name.trim() || !displayName.trim()}>
             {submitting ? intl.formatMessage({ id: 'common.loading' }) : intl.formatMessage({ id: 'agents.create' })}
-          </button>
+          </Button>
         </div>
       </div>
     </Dialog>
@@ -333,10 +321,10 @@ function DelegateDialog({ open, agentName, onClose }: { open: boolean; agentName
           />
         </FormField>
         <div className="flex justify-end gap-3 pt-2">
-          <button onClick={handleClose} className={buttonSecondary}>{intl.formatMessage({ id: 'agents.delegate.close' })}</button>
-          <button onClick={handleSubmit} disabled={submitting || !prompt.trim()} className={buttonPrimary}>
+          <Button variant="secondary" onClick={handleClose}>{intl.formatMessage({ id: 'agents.delegate.close' })}</Button>
+          <Button variant="primary" onClick={handleSubmit} disabled={submitting || !prompt.trim()}>
             {submitting ? intl.formatMessage({ id: 'agents.delegate.submitting' }) : intl.formatMessage({ id: 'agents.delegate.submit' })}
-          </button>
+          </Button>
         </div>
       </div>
     </Dialog>
@@ -377,9 +365,7 @@ function InspectDialog({ agent, onClose, onEdit }: { agent: AgentDetail | null; 
           <Section title={intl.formatMessage({ id: 'agents.inspect.skills' })}>
             <div className="flex flex-wrap gap-2">
               {agent.skills.map((s) => (
-                <span key={s} className="rounded-full bg-amber-100 px-2.5 py-0.5 text-xs text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
-                  {s}
-                </span>
+                <Badge key={s} tone="accent">{s}</Badge>
               ))}
             </div>
           </Section>
@@ -387,13 +373,13 @@ function InspectDialog({ agent, onClose, onEdit }: { agent: AgentDetail | null; 
 
         <div className="flex justify-end gap-3 pt-2">
           {onEdit && (
-            <button onClick={() => onEdit(agent)} className={buttonPrimary}>
-              <Pencil className="h-4 w-4" /> {intl.formatMessage({ id: 'agents.edit' })}
-            </button>
+            <Button variant="primary" icon={Pencil} onClick={() => onEdit(agent)}>
+              {intl.formatMessage({ id: 'agents.edit' })}
+            </Button>
           )}
-          <button onClick={onClose} className={buttonSecondary}>
-            <X className="h-4 w-4" /> {intl.formatMessage({ id: 'common.cancel' })}
-          </button>
+          <Button variant="secondary" icon={X} onClick={onClose}>
+            {intl.formatMessage({ id: 'common.cancel' })}
+          </Button>
         </div>
       </div>
     </Dialog>
@@ -468,7 +454,7 @@ const DEFAULT_EVOLUTION_ADVANCED: {
     peer_signals: false,
   },
   skill_synthesis_enabled: false,
-  skill_synthesis_threshold: 0.7,
+  skill_synthesis_threshold: 3,
   skill_synthesis_cooldown_hours: 24,
   skill_trial_ttl: 7,
   skill_graduation_enabled: false,
@@ -928,7 +914,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
 
   if (!agent) return null;
 
-  const tabs: ReadonlyArray<{ id: EditTab; label: string }> = [
+  const tabs: { id: EditTab; label: string }[] = [
     { id: 'identity', label: intl.formatMessage({ id: 'agents.edit.identity' }) },
     { id: 'model', label: intl.formatMessage({ id: 'agents.edit.model' }) },
     { id: 'runtime', label: intl.formatMessage({ id: 'agents.edit.runtime' }) },
@@ -948,22 +934,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
     <Dialog open={agent !== null} onClose={onClose} title={`${agent.icon || '🤖'} ${intl.formatMessage({ id: 'agents.edit' })}`} className="max-w-2xl">
       <div className="space-y-4">
         {/* Tab bar */}
-        <div className="flex gap-1 rounded-lg bg-stone-100 p-1 dark:bg-stone-800">
-          {tabs.map((t) => (
-            <button
-              key={t.id}
-              onClick={() => setTab(t.id)}
-              className={cn(
-                'flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
-                tab === t.id
-                  ? 'bg-white text-stone-900 shadow-sm dark:bg-stone-700 dark:text-stone-50'
-                  : 'text-stone-500 hover:text-stone-700 dark:text-stone-400'
-              )}
-            >
-              {t.label}
-            </button>
-          ))}
-        </div>
+        <Tabs items={tabs} value={tab} onChange={(id) => setTab(id as EditTab)} />
 
         {/* Tab content */}
         <div className="max-h-[50vh] overflow-y-auto space-y-4 pr-1">
@@ -1168,8 +1139,8 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
                 <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.evo.skillSynthesis' })}</h4>
                 <Toggle checked={evoAdv.skill_synthesis_enabled} onChange={(v) => updateEvoAdv('skill_synthesis_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
                 <div className="grid grid-cols-2 gap-3">
-                  <FormField label={intl.formatMessage({ id: 'agents.evo.threshold' })} hint="0.0-1.0">
-                    <input type="number" min={0} max={1} step={0.05} value={evoAdv.skill_synthesis_threshold} onChange={(e) => updateEvoAdv('skill_synthesis_threshold', Number(e.target.value))} className={inputClass} />
+                  <FormField label={intl.formatMessage({ id: 'agents.evo.threshold' })} hint={intl.formatMessage({ id: 'agents.evo.synthesisThreshold.hint' })}>
+                    <input type="number" min={1} step={1} value={evoAdv.skill_synthesis_threshold} onChange={(e) => updateEvoAdv('skill_synthesis_threshold', Math.round(Number(e.target.value)))} className={inputClass} />
                   </FormField>
                   <FormField label={intl.formatMessage({ id: 'agents.evo.cooldownHours' })}>
                     <input type="number" min={0} value={evoAdv.skill_synthesis_cooldown_hours} onChange={(e) => updateEvoAdv('skill_synthesis_cooldown_hours', Number(e.target.value))} className={inputClass} />
@@ -1332,9 +1303,9 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
                     <input type="number" min={0} max={1000} value={contract.max_tool_calls_per_turn} onChange={(e) => setContract((p) => ({ ...p, max_tool_calls_per_turn: Number(e.target.value) }))} className={inputClass} />
                   </FormField>
                   <div className="flex justify-end">
-                    <button onClick={handleContractSave} disabled={contractSaving} className={buttonPrimary}>
+                    <Button variant="primary" onClick={handleContractSave} disabled={contractSaving}>
                       {contractSaving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'agents.contract.save' })}
-                    </button>
+                    </Button>
                   </div>
                 </>
               )}
@@ -1581,11 +1552,11 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
 
         {/* Error + Actions */}
         {error && <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>}
-        <div className="flex justify-end gap-3 border-t border-stone-200 pt-4 dark:border-stone-700">
-          <button onClick={onClose} className={buttonSecondary}>{intl.formatMessage({ id: 'common.cancel' })}</button>
-          <button onClick={handleSave} disabled={saving} className={buttonPrimary}>
+        <div className="flex justify-end gap-3 border-t border-[var(--panel-border)] pt-4">
+          <Button variant="secondary" onClick={onClose}>{intl.formatMessage({ id: 'common.cancel' })}</Button>
+          <Button variant="primary" onClick={handleSave} disabled={saving}>
             {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
-          </button>
+          </Button>
         </div>
       </div>
     </Dialog>
@@ -1617,14 +1588,10 @@ function RemoveConfirmDialog({ agentName, onClose, onConfirm }: { agentName: str
         </p>
         <p className="text-sm font-medium text-stone-900 dark:text-stone-50">Agent: {agentName}</p>
         <div className="flex justify-end gap-3 pt-2">
-          <button onClick={onClose} className={buttonSecondary}>{intl.formatMessage({ id: 'common.cancel' })}</button>
-          <button
-            onClick={handleConfirm}
-            disabled={confirming}
-            className="inline-flex items-center justify-center gap-2 rounded-lg bg-rose-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-rose-600 disabled:opacity-50"
-          >
+          <Button variant="secondary" onClick={onClose}>{intl.formatMessage({ id: 'common.cancel' })}</Button>
+          <Button variant="danger" onClick={handleConfirm} disabled={confirming}>
             {confirming ? intl.formatMessage({ id: 'common.loading' }) : intl.formatMessage({ id: 'common.delete' })}
-          </button>
+          </Button>
         </div>
       </div>
     </Dialog>
@@ -1635,7 +1602,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   return (
     <div>
       <h4 className="mb-2 text-sm font-semibold text-stone-700 dark:text-stone-300">{title}</h4>
-      <div className="rounded-lg bg-stone-50 p-3 dark:bg-stone-800/50">{children}</div>
+      <div className="rounded-lg border border-[var(--panel-border)] bg-stone-500/5 p-3 dark:bg-white/5">{children}</div>
     </div>
   );
 }
@@ -1662,9 +1629,9 @@ function MountTable({ mounts, onChange }: { mounts: ReadonlyArray<ContainerMount
     <div className="space-y-2">
       <div className="flex items-center justify-between">
         <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.container.mounts' })}</h4>
-        <button type="button" onClick={add} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-amber-900/20">
-          <Plus className="h-3.5 w-3.5" /> {intl.formatMessage({ id: 'common.add' })}
-        </button>
+        <Button type="button" size="sm" variant="ghost" icon={Plus} onClick={add}>
+          {intl.formatMessage({ id: 'common.add' })}
+        </Button>
       </div>
       <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'agents.container.mounts.hint' })}</p>
       {mounts.length === 0 ? (
@@ -1679,9 +1646,7 @@ function MountTable({ mounts, onChange }: { mounts: ReadonlyArray<ContainerMount
                 <input type="checkbox" checked={m.readonly} onChange={(e) => update(idx, { readonly: e.target.checked })} className="accent-amber-500" />
                 {intl.formatMessage({ id: 'agents.container.mounts.readonly' })}
               </label>
-              <button type="button" onClick={() => remove(idx)} className="shrink-0 rounded p-1.5 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20" aria-label="remove mount">
-                <Trash2 className="h-3.5 w-3.5" />
-              </button>
+              <Button type="button" size="sm" variant="ghost" icon={Trash2} onClick={() => remove(idx)} className="shrink-0 text-rose-500 hover:bg-rose-500/10 hover:text-rose-600 dark:text-rose-400" aria-label="remove mount" />
             </div>
           ))}
         </div>
@@ -1703,9 +1668,9 @@ function KvTable({ title, rows, onChange }: { title: string; rows: ReadonlyArray
     <div className="space-y-2 border-t border-stone-200 pt-4 dark:border-stone-700">
       <div className="flex items-center justify-between">
         <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{title}</h4>
-        <button type="button" onClick={add} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-amber-900/20">
-          <Plus className="h-3.5 w-3.5" /> {intl.formatMessage({ id: 'common.add' })}
-        </button>
+        <Button type="button" size="sm" variant="ghost" icon={Plus} onClick={add}>
+          {intl.formatMessage({ id: 'common.add' })}
+        </Button>
       </div>
       {rows.length === 0 ? (
         <p className="py-1 text-center text-xs text-stone-400">{intl.formatMessage({ id: 'agents.adv.kv.empty' })}</p>
@@ -1715,9 +1680,7 @@ function KvTable({ title, rows, onChange }: { title: string; rows: ReadonlyArray
             <div key={idx} className="flex items-center gap-2">
               <input type="text" value={r.key} onChange={(e) => update(idx, { key: e.target.value })} placeholder="key" className={cn(inputClass, 'flex-1')} />
               <input type="text" value={r.value} onChange={(e) => update(idx, { value: e.target.value })} placeholder="value" className={cn(inputClass, 'flex-1')} />
-              <button type="button" onClick={() => remove(idx)} className="shrink-0 rounded p-1.5 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20" aria-label="remove row">
-                <Trash2 className="h-3.5 w-3.5" />
-              </button>
+              <Button type="button" size="sm" variant="ghost" icon={Trash2} onClick={() => remove(idx)} className="shrink-0 text-rose-500 hover:bg-rose-500/10 hover:text-rose-600 dark:text-rose-400" aria-label="remove row" />
             </div>
           ))}
         </div>
@@ -1739,9 +1702,9 @@ function EnvTable({ env, onChange }: { env: ReadonlyArray<ContainerEnvVar>; onCh
     <div className="space-y-2">
       <div className="flex items-center justify-between">
         <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.container.env' })}</h4>
-        <button type="button" onClick={add} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-amber-900/20">
-          <Plus className="h-3.5 w-3.5" /> {intl.formatMessage({ id: 'common.add' })}
-        </button>
+        <Button type="button" size="sm" variant="ghost" icon={Plus} onClick={add}>
+          {intl.formatMessage({ id: 'common.add' })}
+        </Button>
       </div>
       {env.length === 0 ? (
         <p className="py-2 text-center text-xs text-stone-400">{intl.formatMessage({ id: 'agents.container.env.empty' })}</p>
@@ -1751,9 +1714,7 @@ function EnvTable({ env, onChange }: { env: ReadonlyArray<ContainerEnvVar>; onCh
             <div key={idx} className="flex items-center gap-2">
               <input type="text" value={e.key} onChange={(ev) => update(idx, { key: ev.target.value })} placeholder="KEY" className={cn(inputClass, 'flex-1')} />
               <input type="text" value={e.value} onChange={(ev) => update(idx, { value: ev.target.value })} placeholder="value" className={cn(inputClass, 'flex-1')} />
-              <button type="button" onClick={() => remove(idx)} className="shrink-0 rounded p-1.5 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20" aria-label="remove env">
-                <Trash2 className="h-3.5 w-3.5" />
-              </button>
+              <Button type="button" size="sm" variant="ghost" icon={Trash2} onClick={() => remove(idx)} className="shrink-0 text-rose-500 hover:bg-rose-500/10 hover:text-rose-600 dark:text-rose-400" aria-label="remove env" />
             </div>
           ))}
         </div>

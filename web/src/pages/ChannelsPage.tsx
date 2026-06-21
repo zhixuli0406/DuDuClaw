@@ -5,7 +5,17 @@ import { api, type ChannelStatus, type AgentInfo } from '@/lib/api';
 import { client } from '@/lib/ws-client';
 import { toast, formatError } from '@/lib/toast';
 import { useConnectionStore } from '@/stores/connection-store';
-import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { Dialog, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import {
+  Page,
+  PageHeader,
+  Card,
+  Badge,
+  Button,
+  EmptyState,
+  Field,
+  controlClass,
+} from '@/components/ui';
 import {
   Radio,
   Plus,
@@ -166,11 +176,22 @@ export function ChannelsPage() {
   };
 
   return (
-    <div className="space-y-6">
+    <Page>
+      <PageHeader
+        icon={Radio}
+        title={intl.formatMessage({ id: 'channels.title' })}
+        subtitle={intl.formatMessage({ id: 'channels.subtitle' })}
+        actions={
+          <Button variant="primary" icon={Plus} onClick={() => setShowAddDialog(true)}>
+            {intl.formatMessage({ id: 'channels.add' })}
+          </Button>
+        }
+      />
+
       {/* Toast notification */}
       {toast && (
         <div className={cn(
-          'flex items-start gap-3 rounded-lg px-4 py-3 text-sm shadow-sm transition-all',
+          'flex items-start gap-3 rounded-lg px-4 py-3 text-sm transition-all',
           toast.type === 'success'
             ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400'
             : 'bg-rose-50 text-rose-700 dark:bg-rose-900/20 dark:text-rose-400'
@@ -190,35 +211,19 @@ export function ChannelsPage() {
         </div>
       )}
 
-      <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'channels.title' })}
-        </h2>
-        <button
-          onClick={() => setShowAddDialog(true)}
-          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600"
-        >
-          <Plus className="h-4 w-4" />
-          {intl.formatMessage({ id: 'channels.add' })}
-        </button>
-      </div>
-
       {channels.length === 0 && !loading ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-          <Radio className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-          <p className="text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'channels.empty' })}
-          </p>
-        </div>
+        <Card padded={false}>
+          <EmptyState
+            icon={Radio}
+            title={intl.formatMessage({ id: 'channels.empty' })}
+          />
+        </Card>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {channels.map((channel) => {
             const style = getChannelStyle(channel.name);
             return (
-              <div
-                key={channel.name}
-                className="glass-card glass-card-hover rounded-2xl p-5"
-              >
+              <Card key={channel.name} interactive>
                 <div className="flex items-start justify-between">
                   <div className="flex items-center gap-3">
                     <div
@@ -246,22 +251,22 @@ export function ChannelsPage() {
 
                   {/* Connection status */}
                   {channel.connected ? (
-                    <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2.5 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400">
+                    <Badge tone="success">
                       <CheckCircle className="h-3 w-3" />
                       {intl.formatMessage({ id: 'status.connected' })}
-                    </span>
+                    </Badge>
                   ) : channel.error === 'connecting' || channel.error === 'reconnecting' ? (
-                    <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+                    <Badge tone="warning">
                       <Loader2 className="h-3 w-3 animate-spin" />
                       {channel.error === 'reconnecting'
                         ? intl.formatMessage({ id: 'status.reconnecting' })
                         : intl.formatMessage({ id: 'status.connecting' })}
-                    </span>
+                    </Badge>
                   ) : (
-                    <span className="inline-flex items-center gap-1 rounded-full bg-rose-100 px-2.5 py-0.5 text-xs font-medium text-rose-700 dark:bg-rose-900/30 dark:text-rose-400">
+                    <Badge tone="danger">
                       <XCircle className="h-3 w-3" />
                       {intl.formatMessage({ id: 'status.disconnected' })}
-                    </span>
+                    </Badge>
                   )}
                 </div>
 
@@ -274,30 +279,18 @@ export function ChannelsPage() {
                 )}
 
                 {/* Actions */}
-                <div className="mt-4 flex gap-2 border-t border-stone-100 pt-3 dark:border-stone-800">
-                  <button
-                    onClick={() => handleTest(channel.name)}
-                    className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-stone-600 hover:bg-stone-100 dark:text-stone-400 dark:hover:bg-stone-800"
-                  >
-                    <TestTube className="h-3.5 w-3.5" />
+                <div className="mt-4 flex gap-2 border-t border-[var(--panel-border)] pt-3">
+                  <Button size="sm" variant="ghost" icon={TestTube} onClick={() => handleTest(channel.name)}>
                     {intl.formatMessage({ id: 'channels.test' })}
-                  </button>
-                  <button
-                    onClick={() => setEditChannel(channel.name)}
-                    className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-stone-600 hover:bg-stone-100 dark:text-stone-400 dark:hover:bg-stone-800"
-                  >
-                    <Pencil className="h-3.5 w-3.5" />
+                  </Button>
+                  <Button size="sm" variant="ghost" icon={Pencil} onClick={() => setEditChannel(channel.name)}>
                     {intl.formatMessage({ id: 'channels.edit' })}
-                  </button>
-                  <button
-                    onClick={() => handleRemove(channel.name)}
-                    className="inline-flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-900/20"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                  <Button size="sm" variant="ghost" icon={Trash2} onClick={() => handleRemove(channel.name)} className="text-rose-600 hover:bg-rose-50 hover:text-rose-700 dark:text-rose-400 dark:hover:bg-rose-900/20">
                     {intl.formatMessage({ id: 'channels.remove' })}
-                  </button>
+                  </Button>
                 </div>
-              </div>
+              </Card>
             );
           })}
         </div>
@@ -316,7 +309,7 @@ export function ChannelsPage() {
         onCreated={() => { setEditChannel(null); fetchChannels(); }}
         fixedType={editChannel ?? undefined}
       />
-    </div>
+    </Page>
   );
 }
 
@@ -471,8 +464,8 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
   return (
     <Dialog open={open} onClose={onClose} title={fixedType ? intl.formatMessage({ id: 'channels.dialog.editTitle' }, { type: fixedType }) : intl.formatMessage({ id: 'channels.dialog.addTitle' })}>
       <div className="space-y-4">
-        <FormField label={intl.formatMessage({ id: 'channels.dialog.type' })}>
-          <select value={channelType} onChange={(e) => setChannelType(e.target.value)} disabled={!!fixedType} className={selectClass}>
+        <Field label={intl.formatMessage({ id: 'channels.dialog.type' })}>
+          <select value={channelType} onChange={(e) => setChannelType(e.target.value)} disabled={!!fixedType} className={controlClass}>
             <option value="telegram">Telegram</option>
             <option value="line">LINE</option>
             <option value="discord">Discord</option>
@@ -480,20 +473,20 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
             <option value="whatsapp">WhatsApp</option>
             <option value="feishu">Feishu</option>
           </select>
-        </FormField>
+        </Field>
 
         {SUPPORTS_PER_AGENT.includes(channelType) && agents.length > 0 && (
-          <FormField label={intl.formatMessage({ id: 'channels.dialog.assignAgent' })}>
-            <select value={selectedAgent} onChange={(e) => setSelectedAgent(e.target.value)} className={selectClass}>
+          <Field
+            label={intl.formatMessage({ id: 'channels.dialog.assignAgent' })}
+            help={intl.formatMessage({ id: 'channels.dialog.assignAgentHint' })}
+          >
+            <select value={selectedAgent} onChange={(e) => setSelectedAgent(e.target.value)} className={controlClass}>
               <option value="">{intl.formatMessage({ id: 'channels.dialog.global' })}</option>
               {agents.map((a) => (
                 <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
               ))}
             </select>
-            <p className="mt-1 text-xs text-stone-500 dark:text-stone-400">
-              {intl.formatMessage({ id: 'channels.dialog.assignAgentHint' })}
-            </p>
-          </FormField>
+          </Field>
         )}
 
         {/* Setup guide */}
@@ -506,45 +499,45 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
           ))}
         </div>
 
-        <FormField label={guide.tokenLabel}>
+        <Field label={guide.tokenLabel}>
           <input
             type="password"
             value={token}
             onChange={(e) => setToken(e.target.value)}
             placeholder={intl.formatMessage({ id: 'channels.dialog.pastePlaceholder' }, { tokenLabel: guide.tokenLabel.toLowerCase() })}
-            className={inputClass}
+            className={controlClass}
           />
-        </FormField>
+        </Field>
 
         {guide.secretLabel && (
-          <FormField label={guide.secretLabel}>
+          <Field label={guide.secretLabel}>
             <input
               type="password"
               value={secret}
               onChange={(e) => setSecret(e.target.value)}
               placeholder={guide.secretLabel}
-              className={inputClass}
+              className={controlClass}
             />
-          </FormField>
+          </Field>
         )}
 
         {/* G.6 — extra WhatsApp tokens (global) */}
         {channelType === 'whatsapp' && (
           <>
-            <FormField label="Verify Token" hint={intl.formatMessage({ id: 'channels.field.writeOnly' })}>
-              <input type="password" value={waVerifyToken} onChange={(e) => setWaVerifyToken(e.target.value)} className={inputClass} autoComplete="off" />
-            </FormField>
-            <FormField label="App Secret" hint={intl.formatMessage({ id: 'channels.field.writeOnly' })}>
-              <input type="password" value={waAppSecret} onChange={(e) => setWaAppSecret(e.target.value)} className={inputClass} autoComplete="off" />
-            </FormField>
+            <Field label="Verify Token" help={intl.formatMessage({ id: 'channels.field.writeOnly' })}>
+              <input type="password" value={waVerifyToken} onChange={(e) => setWaVerifyToken(e.target.value)} className={controlClass} autoComplete="off" />
+            </Field>
+            <Field label="App Secret" help={intl.formatMessage({ id: 'channels.field.writeOnly' })}>
+              <input type="password" value={waAppSecret} onChange={(e) => setWaAppSecret(e.target.value)} className={controlClass} autoComplete="off" />
+            </Field>
           </>
         )}
 
         {/* G.6 — extra Feishu token (global) */}
         {channelType === 'feishu' && (
-          <FormField label="Verification Token" hint={intl.formatMessage({ id: 'channels.field.writeOnly' })}>
-            <input type="password" value={feishuVerifyToken} onChange={(e) => setFeishuVerifyToken(e.target.value)} className={inputClass} autoComplete="off" />
-          </FormField>
+          <Field label="Verification Token" help={intl.formatMessage({ id: 'channels.field.writeOnly' })}>
+            <input type="password" value={feishuVerifyToken} onChange={(e) => setFeishuVerifyToken(e.target.value)} className={controlClass} autoComplete="off" />
+          </Field>
         )}
 
         {addError && (

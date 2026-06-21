@@ -26,6 +26,20 @@ import {
 } from 'lucide-react';
 import { WikiGraph } from '@/components/WikiGraph';
 import { toast, formatError } from '@/lib/toast';
+import {
+  Page,
+  PageHeader,
+  Card,
+  Section,
+  StatCard,
+  Button,
+  Badge,
+  EmptyState,
+  Toolbar,
+  Tabs,
+  controlClass,
+  type TabItem,
+} from '@/components/ui';
 
 type TabId = 'browse' | 'search' | 'graph' | 'health';
 
@@ -49,52 +63,37 @@ export function KnowledgeHubPage() {
     // Run once on mount; selectedAgent seeding doesn't warrant re-fetching.
   }, []);
 
-  const tabs: ReadonlyArray<{ id: TabId; label: string }> = [
-    { id: 'browse', label: intl.formatMessage({ id: 'wiki.tab.browse' }) },
-    { id: 'search', label: intl.formatMessage({ id: 'wiki.tab.search' }) },
-    { id: 'graph', label: intl.formatMessage({ id: 'wiki.tab.graph' }) },
-    { id: 'health', label: intl.formatMessage({ id: 'wiki.tab.health' }) },
+  const tabs: TabItem[] = [
+    { id: 'browse', label: intl.formatMessage({ id: 'wiki.tab.browse' }), icon: FolderTree },
+    { id: 'search', label: intl.formatMessage({ id: 'wiki.tab.search' }), icon: Search },
+    { id: 'graph', label: intl.formatMessage({ id: 'wiki.tab.graph' }), icon: Share2 },
+    { id: 'health', label: intl.formatMessage({ id: 'wiki.tab.health' }), icon: BarChart3 },
   ];
 
-  const selectStyle = 'rounded-lg border border-stone-200 bg-white px-3 py-2.5 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-700 dark:bg-stone-800 dark:text-stone-50';
-
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'wiki.title' })}
-        </h2>
-        <select
-          value={selectedAgent}
-          onChange={(e) => setSelectedAgent(e.target.value)}
-          className={selectStyle}
-        >
-          {agents.map((a) => (
-            <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
-          ))}
-        </select>
-      </div>
-
-      {/* Tabs — WAI-ARIA Tabs Pattern */}
-      <div role="tablist" className="flex gap-1 rounded-lg bg-stone-100 p-1 dark:bg-stone-800">
-        {tabs.map((tab) => (
-          <button
-            key={tab.id}
-            role="tab"
-            aria-selected={activeTab === tab.id}
-            aria-controls={`wiki-panel-${tab.id}`}
-            onClick={() => setActiveTab(tab.id)}
-            className={cn(
-              'flex-1 rounded-md px-4 py-2 text-sm font-medium transition-colors',
-              activeTab === tab.id
-                ? 'bg-white text-stone-900 shadow-sm dark:bg-stone-700 dark:text-stone-50'
-                : 'text-stone-500 hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-300'
-            )}
+    <Page wide>
+      <PageHeader
+        icon={BookOpen}
+        title={intl.formatMessage({ id: 'nav.wiki' })}
+        subtitle={intl.formatMessage({ id: 'app.subtitle' })}
+        actions={
+          <select
+            value={selectedAgent}
+            onChange={(e) => setSelectedAgent(e.target.value)}
+            className={cn(controlClass, 'w-auto')}
           >
-            {tab.label}
-          </button>
-        ))}
-      </div>
+            {agents.map((a) => (
+              <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
+            ))}
+          </select>
+        }
+      />
+
+      <Tabs
+        items={tabs}
+        value={activeTab}
+        onChange={(id) => setActiveTab(id as TabId)}
+      />
 
       <div role="tabpanel" id={`wiki-panel-${activeTab}`}>
         {selectedAgent && activeTab === 'browse' && <BrowseTab agentId={selectedAgent} />}
@@ -102,7 +101,7 @@ export function KnowledgeHubPage() {
         {selectedAgent && activeTab === 'graph' && <GraphTab agentId={selectedAgent} />}
         {selectedAgent && activeTab === 'health' && <HealthTab agentId={selectedAgent} />}
       </div>
-    </div>
+    </Page>
   );
 }
 
@@ -206,19 +205,19 @@ function BrowseTab({ agentId }: { agentId: string }) {
 
   if (!wikiExists && !loading) {
     return (
-      <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-        <BookOpen className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-        <p className="text-stone-500 dark:text-stone-400">
-          {intl.formatMessage({ id: 'wiki.empty' })}
-        </p>
-      </div>
+      <Card padded={false}>
+        <EmptyState icon={BookOpen} title={intl.formatMessage({ id: 'wiki.empty' })} />
+      </Card>
     );
   }
 
   return (
-    <div className="flex gap-4 min-h-[500px]">
+    <div className="flex min-h-[500px] gap-4">
       {/* Sidebar: tree */}
-      <div className="w-72 shrink-0 glass-card rounded-2xl p-4 overflow-y-auto max-h-[calc(100vh-16rem)]">
+      <Card
+        className="w-72 shrink-0 max-h-[calc(100vh-16rem)] overflow-y-auto"
+        bodyClassName="p-4"
+      >
         <div className="mb-3 flex items-center gap-2 text-sm font-medium text-stone-700 dark:text-stone-300">
           <FolderTree className="h-4 w-4" />
           {intl.formatMessage({ id: 'wiki.pages' })} ({pages.length})
@@ -232,19 +231,19 @@ function BrowseTab({ agentId }: { agentId: string }) {
             onSelect={handleSelect}
           />
         ))}
-      </div>
+      </Card>
 
       {/* Content */}
-      <div className="flex-1 glass-card rounded-2xl p-6 overflow-y-auto max-h-[calc(100vh-16rem)]">
+      <Card
+        className="flex-1 max-h-[calc(100vh-16rem)] overflow-y-auto"
+        bodyClassName="p-6"
+      >
         {selectedPath ? (
           <WikiPageView path={selectedPath} content={pageContent} />
         ) : (
-          <div className="flex flex-col items-center justify-center h-full text-stone-400 dark:text-stone-500">
-            <FileText className="mb-3 h-10 w-10" />
-            <p>{intl.formatMessage({ id: 'wiki.selectPage' })}</p>
-          </div>
+          <EmptyState icon={FileText} title={intl.formatMessage({ id: 'wiki.selectPage' })} />
         )}
-      </div>
+      </Card>
     </div>
   );
 }
@@ -272,7 +271,7 @@ function TreeNodeItem({
       <div>
         <button
           onClick={() => setExpanded(!expanded)}
-          className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-sm text-stone-600 hover:bg-stone-100 dark:text-stone-400 dark:hover:bg-stone-800"
+          className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-sm text-stone-600 hover:bg-stone-500/8 dark:text-stone-400 dark:hover:bg-white/5"
           style={{ paddingLeft: `${depth * 12 + 8}px` }}
         >
           {expanded ? (
@@ -307,8 +306,8 @@ function TreeNodeItem({
       className={cn(
         'flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-sm transition-colors',
         isSelected
-          ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
-          : 'text-stone-600 hover:bg-stone-100 dark:text-stone-400 dark:hover:bg-stone-800'
+          ? 'bg-amber-500/15 text-amber-700 dark:bg-amber-400/15 dark:text-amber-400'
+          : 'text-stone-600 hover:bg-stone-500/8 dark:text-stone-400 dark:hover:bg-white/5'
       )}
       style={{ paddingLeft: `${depth * 12 + 8}px` }}
     >
@@ -346,26 +345,24 @@ function WikiPageView({ path, content }: { path: string; content: string }) {
     return result;
   }, [frontmatter]);
 
+  const maturityTone =
+    meta.maturity === 'internalized'
+      ? 'success'
+      : meta.maturity === 'validated'
+        ? 'info'
+        : 'neutral';
+
   return (
     <div>
       {/* Header */}
-      <div className="mb-4 border-b border-stone-200 pb-4 dark:border-stone-700">
-        <div className="flex items-start justify-between">
+      <div className="mb-4 border-b border-[var(--panel-border)] pb-4">
+        <div className="flex items-start justify-between gap-3">
           <h3 className="text-xl font-semibold text-stone-900 dark:text-stone-50">
             {meta.title || path}
           </h3>
           {/* Maturity badge */}
           {meta.maturity && (
-            <span className={cn(
-              'inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium',
-              meta.maturity === 'internalized'
-                ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'
-                : meta.maturity === 'validated'
-                ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400'
-                : 'bg-stone-100 text-stone-600 dark:bg-stone-800 dark:text-stone-400'
-            )}>
-              {meta.maturity}
-            </span>
+            <Badge tone={maturityTone}>{meta.maturity}</Badge>
           )}
         </div>
         <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-stone-500 dark:text-stone-400">
@@ -458,22 +455,21 @@ function GraphTab({ agentId }: { agentId: string }) {
 
   if (!loading && pages.length === 0) {
     return (
-      <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-        <Share2 className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-        <p className="text-stone-500 dark:text-stone-400">
-          {intl.formatMessage({ id: 'wiki.empty' })}
-        </p>
-      </div>
+      <Card padded={false}>
+        <EmptyState icon={Share2} title={intl.formatMessage({ id: 'wiki.empty' })} />
+      </Card>
     );
   }
 
   return (
-    <WikiGraph
-      pages={pages}
-      pageContents={pageContents}
-      width={900}
-      height={550}
-    />
+    <Card padded={false} bodyClassName="p-4">
+      <WikiGraph
+        pages={pages}
+        pageContents={pageContents}
+        width={900}
+        height={550}
+      />
+    </Card>
   );
 }
 
@@ -500,60 +496,47 @@ function SearchTab({ agentId }: { agentId: string }) {
 
   return (
     <div className="space-y-4">
-      <div className="flex gap-2">
-        <div className="relative flex-1">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-stone-400" />
-          <input
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-            placeholder={intl.formatMessage({ id: 'wiki.search.placeholder' })}
-            className="w-full rounded-lg border border-stone-200 bg-white py-2.5 pl-10 pr-4 text-sm text-stone-900 placeholder:text-stone-400 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-50 dark:placeholder:text-stone-500"
-          />
-        </div>
-        <button
+      <Toolbar
+        search={query}
+        onSearchChange={setQuery}
+        onSearchEnter={handleSearch}
+        searchPlaceholder={intl.formatMessage({ id: 'wiki.search.placeholder' })}
+      >
+        <Button
+          variant="primary"
+          icon={Search}
           onClick={handleSearch}
           disabled={loading || !query.trim()}
-          className="rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
-        >
-          <Search className="h-4 w-4" />
-        </button>
-      </div>
+        />
+      </Toolbar>
 
       {hits.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-          <Search className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-          <p className="text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'wiki.search.empty' })}
-          </p>
-        </div>
+        <Card padded={false}>
+          <EmptyState icon={Search} title={intl.formatMessage({ id: 'wiki.search.empty' })} />
+        </Card>
       ) : (
         <div className="space-y-3">
           {hits.map((hit) => (
-            <div
-              key={hit.path}
-              className="glass-card rounded-2xl p-5"
-            >
-              <div className="flex items-center justify-between mb-2">
+            <Card key={hit.path}>
+              <div className="mb-2 flex items-center justify-between gap-3">
                 <h3 className="font-medium text-stone-900 dark:text-stone-50">
                   {hit.title}
                 </h3>
-                <span className="text-xs text-amber-600 dark:text-amber-400 font-medium">
+                <span className="shrink-0 text-xs font-medium text-amber-600 dark:text-amber-400">
                   {intl.formatMessage({ id: 'wiki.relevance' })}: {Number(hit.score).toFixed(1)}
                 </span>
               </div>
-              <p className="text-xs text-stone-500 dark:text-stone-400 mb-2">{hit.path}</p>
+              <p className="mb-2 text-xs text-stone-500 dark:text-stone-400">{hit.path}</p>
               {hit.context_lines.length > 0 && (
-                <div className="rounded-lg bg-stone-50 p-3 dark:bg-stone-800">
+                <div className="rounded-lg bg-stone-500/5 p-3 dark:bg-white/5">
                   {hit.context_lines.map((line, i) => (
-                    <p key={i} className="text-xs text-stone-600 dark:text-stone-400 font-mono">
+                    <p key={i} className="font-mono text-xs text-stone-600 dark:text-stone-400">
                       {line}
                     </p>
                   ))}
                 </div>
               )}
-            </div>
+            </Card>
           ))}
         </div>
       )}
@@ -591,62 +574,68 @@ function HealthTab({ agentId }: { agentId: string }) {
 
   if (!stats?.exists && !loading) {
     return (
-      <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-        <BookOpen className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-        <p className="text-stone-500 dark:text-stone-400">
-          {intl.formatMessage({ id: 'wiki.empty' })}
-        </p>
-      </div>
+      <Card padded={false}>
+        <EmptyState icon={BookOpen} title={intl.formatMessage({ id: 'wiki.empty' })} />
+      </Card>
     );
   }
+
+  const orphanCount = lint?.orphan_pages.length ?? 0;
 
   return (
     <div className="space-y-4">
       {/* Stats overview */}
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard
+          tone="accent"
+          icon={FileText}
           label={intl.formatMessage({ id: 'wiki.stats.totalPages' })}
           value={stats?.total_pages ?? 0}
-          icon={<FileText className="h-5 w-5 text-amber-600 dark:text-amber-400" />}
         />
         <StatCard
+          tone="accent"
+          icon={FolderTree}
           label={intl.formatMessage({ id: 'wiki.stats.directories' })}
           value={Object.keys(stats?.by_directory ?? {}).length}
-          icon={<FolderTree className="h-5 w-5 text-amber-600 dark:text-amber-400" />}
         />
         <StatCard
+          tone={orphanCount > 0 ? 'warning' : 'success'}
+          icon={AlertTriangle}
           label={intl.formatMessage({ id: 'wiki.stats.orphans' })}
-          value={lint?.orphan_pages.length ?? 0}
-          icon={<AlertTriangle className={cn('h-5 w-5', (lint?.orphan_pages.length ?? 0) > 0 ? 'text-amber-500' : 'text-emerald-500')} />}
+          value={orphanCount}
         />
         <StatCard
+          tone={lint?.healthy ? 'success' : 'danger'}
+          icon={lint?.healthy ? CheckCircle2 : AlertTriangle}
           label={intl.formatMessage({ id: 'wiki.stats.health' })}
           value={lint?.healthy ? intl.formatMessage({ id: 'wiki.healthy' }) : intl.formatMessage({ id: 'wiki.unhealthy' })}
-          icon={lint?.healthy
-            ? <CheckCircle2 className="h-5 w-5 text-emerald-500" />
-            : <AlertTriangle className="h-5 w-5 text-rose-500" />}
         />
       </div>
 
       {/* Refresh button */}
       <div className="flex justify-end">
-        <button
+        <Button
+          variant="secondary"
+          size="sm"
+          icon={RefreshCw}
           onClick={fetchData}
           disabled={loading}
-          className="flex items-center gap-2 rounded-lg bg-stone-100 px-3 py-2 text-sm text-stone-700 transition-colors hover:bg-stone-200 disabled:opacity-50 dark:bg-stone-800 dark:text-stone-300 dark:hover:bg-stone-700"
+          className={cn(loading && '[&_svg]:animate-spin')}
         >
-          <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
           {intl.formatMessage({ id: 'wiki.lint.refresh' })}
-        </button>
+        </Button>
       </div>
 
       {/* Directory breakdown */}
       {stats?.by_directory && Object.keys(stats.by_directory).length > 0 && (
-        <div className="glass-card rounded-2xl p-5">
-          <h3 className="mb-3 flex items-center gap-2 font-medium text-stone-900 dark:text-stone-50">
-            <BarChart3 className="h-4 w-4" />
-            {intl.formatMessage({ id: 'wiki.stats.byDirectory' })}
-          </h3>
+        <Card
+          title={
+            <span className="flex items-center gap-2">
+              <BarChart3 className="h-4 w-4" />
+              {intl.formatMessage({ id: 'wiki.stats.byDirectory' })}
+            </span>
+          }
+        >
           <div className="space-y-2">
             {Object.entries(stats.by_directory)
               .sort(([, a], [, b]) => b - a)
@@ -655,82 +644,62 @@ function HealthTab({ agentId }: { agentId: string }) {
                   <span className="text-sm text-stone-600 dark:text-stone-400">{dir}/</span>
                   <div className="flex items-center gap-2">
                     <div className="h-2 rounded-full bg-amber-500" style={{ width: `${Math.max(20, (count / stats.total_pages) * 200)}px` }} />
-                    <span className="text-sm font-medium text-stone-700 dark:text-stone-300">{count}</span>
+                    <span className="text-sm font-medium tabular-nums text-stone-700 dark:text-stone-300">{count}</span>
                   </div>
                 </div>
               ))}
           </div>
-        </div>
+        </Card>
       )}
 
       {/* Lint issues */}
       {lint && !lint.healthy && (
-        <div className="rounded-xl border border-amber-200 bg-amber-50 p-5 dark:border-amber-900/30 dark:bg-amber-950/20">
-          <h3 className="mb-3 flex items-center gap-2 font-medium text-amber-800 dark:text-amber-300">
-            <AlertTriangle className="h-4 w-4" />
-            {intl.formatMessage({ id: 'wiki.lint.issues' })}
-          </h3>
-
-          {lint.orphan_pages.length > 0 && (
-            <div className="mb-3">
-              <p className="text-sm font-medium text-amber-700 dark:text-amber-400 mb-1">
-                {intl.formatMessage({ id: 'wiki.lint.orphans' })} ({lint.orphan_pages.length})
-              </p>
-              {lint.orphan_pages.map((p) => (
-                <p key={p} className="text-xs text-amber-600 dark:text-amber-500 ml-4">- {p}</p>
-              ))}
-            </div>
-          )}
-
-          {lint.broken_links.length > 0 && (
-            <div className="mb-3">
-              <p className="text-sm font-medium text-amber-700 dark:text-amber-400 mb-1">
-                {intl.formatMessage({ id: 'wiki.lint.brokenLinks' })} ({lint.broken_links.length})
-              </p>
-              {lint.broken_links.map(([from, to], i) => (
-                <p key={i} className="text-xs text-amber-600 dark:text-amber-500 ml-4">
-                  {from} → {to}
+        <Section
+          title={
+            <span className="flex items-center gap-2 text-amber-800 dark:text-amber-300">
+              <AlertTriangle className="h-4 w-4" />
+              {intl.formatMessage({ id: 'wiki.lint.issues' })}
+            </span>
+          }
+        >
+          <div className="rounded-xl border border-amber-500/30 bg-amber-500/8 p-5 dark:bg-amber-950/20">
+            {lint.orphan_pages.length > 0 && (
+              <div className="mb-3">
+                <p className="mb-1 text-sm font-medium text-amber-700 dark:text-amber-400">
+                  {intl.formatMessage({ id: 'wiki.lint.orphans' })} ({lint.orphan_pages.length})
                 </p>
-              ))}
-            </div>
-          )}
+                {lint.orphan_pages.map((p) => (
+                  <p key={p} className="ml-4 text-xs text-amber-600 dark:text-amber-500">- {p}</p>
+                ))}
+              </div>
+            )}
 
-          {lint.stale_pages.length > 0 && (
-            <div>
-              <p className="text-sm font-medium text-amber-700 dark:text-amber-400 mb-1">
-                {intl.formatMessage({ id: 'wiki.lint.stale' })} ({lint.stale_pages.length})
-              </p>
-              {lint.stale_pages.map((p) => (
-                <p key={p} className="text-xs text-amber-600 dark:text-amber-500 ml-4">- {p}</p>
-              ))}
-            </div>
-          )}
-        </div>
+            {lint.broken_links.length > 0 && (
+              <div className="mb-3">
+                <p className="mb-1 text-sm font-medium text-amber-700 dark:text-amber-400">
+                  {intl.formatMessage({ id: 'wiki.lint.brokenLinks' })} ({lint.broken_links.length})
+                </p>
+                {lint.broken_links.map(([from, to], i) => (
+                  <p key={i} className="ml-4 text-xs text-amber-600 dark:text-amber-500">
+                    {from} → {to}
+                  </p>
+                ))}
+              </div>
+            )}
+
+            {lint.stale_pages.length > 0 && (
+              <div>
+                <p className="mb-1 text-sm font-medium text-amber-700 dark:text-amber-400">
+                  {intl.formatMessage({ id: 'wiki.lint.stale' })} ({lint.stale_pages.length})
+                </p>
+                {lint.stale_pages.map((p) => (
+                  <p key={p} className="ml-4 text-xs text-amber-600 dark:text-amber-500">- {p}</p>
+                ))}
+              </div>
+            )}
+          </div>
+        </Section>
       )}
-    </div>
-  );
-}
-
-function StatCard({
-  label,
-  value,
-  icon,
-}: {
-  label: string;
-  value: string | number;
-  icon: React.ReactNode;
-}) {
-  return (
-    <div className="glass-card rounded-2xl p-4">
-      <div className="flex items-center gap-3">
-        <div className="rounded-lg bg-amber-100 p-2 dark:bg-amber-900/30">
-          {icon}
-        </div>
-        <div>
-          <p className="text-2xl font-semibold text-stone-900 dark:text-stone-50">{value}</p>
-          <p className="text-xs text-stone-500 dark:text-stone-400">{label}</p>
-        </div>
-      </div>
     </div>
   );
 }
