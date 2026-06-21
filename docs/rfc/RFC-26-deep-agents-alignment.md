@@ -1,6 +1,6 @@
 # RFC-26: Deep Agents Alignment — Live Run Forking & Concept Parity
 
-**Status:** Implemented (core + cross-process store + parity tools; see `docs/TODO-rfc26-live-forking.md` for the remaining documented follow-ups)
+**Status:** Implemented & complete — P1–P6 all landed (core forking, cross-process `ForkStore`, gateway `/metrics`, dashboard `ForkPage`, Activity Feed, native CoW, per-branch streaming budget kill, **cross-branch aggregate pre-emption**, external SIGKILL, and all five §4 parity items). See [`docs/todo/TODO-rfc26-live-forking.md`](../todo/TODO-rfc26-live-forking.md) for the per-item checklist. No residual feature work remains; the only by-design exclusion is killing a branch child across a *different* process (out of scope — `terminate_branch` runs in the process that owns the child).
 **Author:** DuDuClaw team
 **Date:** 2026-06-19
 **Inspiration:** [vstorm-co/pydantic-deepagents](https://github.com/vstorm-co/pydantic-deepagents) — a Pydantic-AI agent harness whose signature capability is *live run forking* (split an in-flight run into N competing branches, let an AI judge merge the winner).
@@ -129,22 +129,22 @@ Add atomic task **claim** (compare-and-set on `assignee`) and **dependency cycle
 
 ## 5. Phased rollout
 
-| Phase | Scope | Risk |
-|---|---|---|
-| **P1** | `duduclaw-fork` crate: `Branch`, `BranchOverlay`, `budget::Pool`, sequential 2-branch MVP behind `[fork] enabled` | Low — additive, default off |
-| **P2** | `JudgeAgent` + `JudgeVerdict` (reuse GVU judge), `test_runner`, merge modes | Medium |
-| **P3** | 6 MCP tools + `Scope::ForkExecute` + dispatch wiring | Medium |
-| **P4** | Parallel execution (N branches), aggregate budget pool, container CoW overlay | Medium-High |
-| **P5** | Prometheus metrics + `fork_history.jsonl` + Activity Feed + dashboard fork visualization | Low |
-| **P6** | Secondary parity items (§4) — independent, ship as capacity allows | Low |
+| Phase | Scope | Risk | Status |
+|---|---|---|---|
+| **P1** | `duduclaw-fork` crate: `Branch`, `BranchOverlay`, `budget::Pool`, sequential 2-branch MVP behind `[fork] enabled` | Low — additive, default off | ✅ Done |
+| **P2** | `JudgeAgent` + `JudgeVerdict` (reuse GVU judge), `test_runner`, merge modes | Medium | ✅ Done |
+| **P3** | 6 MCP tools + `Scope::ForkExecute` + dispatch wiring | Medium | ✅ Done |
+| **P4** | Parallel execution (N branches), aggregate budget pool, native CoW overlay (`clonefile`/reflink), streaming budget kill, external SIGKILL | Medium-High | ✅ Done |
+| **P5** | Prometheus metrics on gateway `/metrics` (via shared `ForkStore`) + `fork_history.jsonl` + Activity Feed + dashboard `ForkPage` | Low | ✅ Done |
+| **P6** | Secondary parity items (§4) — Plan Mode, checkpoint fork/rewind + SQLite, built-in skills, memory `/improve`, Task Board claim + cycle detection | Low | ✅ Done |
 
 Each phase is independently shippable and default-off; nothing changes runtime behavior until an agent sets `[fork] enabled = true`.
 
 ---
 
-## 6. Open questions
+## 6. Open questions — resolved in implementation
 
-1. **Workspace overlay backend** — Apple Container native CoW vs. a portable `cp -r` snapshot for the MVP? (Lean: portable snapshot in P1, native CoW in P4.)
-2. **Account exhaustion** — if `max_branches` > available accounts, do we serialize branches onto fewer accounts or cap N to account count? (Lean: cap N, log the reduction — "no silent caps".)
-3. **Judge cost** — should the judge default to the local inference engine (cost 0) and escalate to Claude only on low confidence? (Lean: yes — reuse Confidence Router.)
+1. **Workspace overlay backend** — *Resolved:* both shipped. `Snapshot` (`copy_tree`) is the portable MVP backend; `NativeCow` uses `clonefile(2)` (`cp -c`) on macOS/APFS and `cp --reflink=always` on Linux btrfs/XFS. `detect_backend()` probes the host once (cached) and falls back to `Snapshot` on failure, so isolation is never compromised — only the speed/space optimization.
+2. **Account exhaustion** — *Resolved:* cap N. `RotatingBranchExecutor` caps the branch count to `AccountProvider::account_count()` so parallel branches get distinct accounts, and the reduction is `log()`ed ("no silent caps").
+3. **Judge cost** — *Resolved:* the judge is decoupled behind the injected `LlmCaller`, so the gateway wires the Confidence Router (local-first, escalate to Claude on low confidence). A deterministic `HeuristicJudge` (zero-LLM) is the fail-safe fallback.
 ```

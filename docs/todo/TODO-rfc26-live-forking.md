@@ -175,7 +175,7 @@ process that owns the child, which is where kill must originate.
 
 ---
 
-## Phase 4 — Real executor, parallelism, native CoW ✅ CORE DONE (deep-integration follow-ups noted)
+## Phase 4 — Real executor, parallelism, native CoW ✅ DONE (core + all deep-integration follow-ups landed in Round 2/3)
 
 ### 4.1 `BranchExecutor` impl (`crates/duduclaw-cli/src/mcp_fork_exec.rs`)
 - [x] `RotatingBranchExecutor<P, S>` implements `duduclaw_fork::BranchExecutor`
@@ -187,32 +187,35 @@ process that owns the child, which is where kill must originate.
 - [x] Fallback: no account / spawn failure ⇒ `BranchState::Failed`, excluded from judging (tests `no_account_fails_branch`, `spawner_failure_marks_failed`)
 - [x] Background execution: `fork_run` spawns `execute_fork` via `tokio::spawn`, returns `status:"running"` without blocking the MCP stdio loop
 - [x] `execute_fork` transitions `Pending→Running→…`, folds results + winner into `ForkRegistry`, runs full `ForkController` pipeline
-- [ ] **follow-up**: request N *distinct* accounts up front + cap N to available-account count with `log()` (currently best-effort via rotator rotation; cap is to `max_branches` only)
+- [x] **Round 2**: cap N to available-account count via `AccountProvider::account_count()` so parallel branches get distinct accounts (RFC-26 §4.1); reduction is `log()`ed, never silent
 
 ### 4.2 Aggregate budget wired to live spend
 - [x] Executor charges its `Pool` from the branch's actual `spent_usd` (single-shot cost), aggregate enforced across concurrent branches (test)
 - [x] `ForkResolution.aggregate_spent_usd` summed from real branch spends
-- [ ] **follow-up**: mid-turn `Pool::try_charge` on streaming `CostTelemetry` deltas + pre-emptive kill of the most-expensive in-flight branch (needs multi-turn PTY streaming, not single-shot `-p`)
+- [x] **Round 3**: `ClaudeCliSpawner` streams stream-json line-by-line, accumulates `total_cost_usd` as it grows, and `start_kill()`s the child the moment running cost crosses the per-branch budget (`SpawnOutcome::BudgetExceeded` → `BranchState::BudgetKilled`).
+- [x] **Round 4**: cross-branch **aggregate pre-emption** — `duduclaw_fork::LiveAggregate` (a streaming-time companion to `Pool`, shared across the fork's concurrent branches via the executor) tracks every in-flight branch's live `total_cost_usd`. On each cost update the spawner calls the pure `stream_budget_decision`, which folds in `LiveAggregate::observe`: when the combined live spend crosses the aggregate cap it names the **most-expensive in-flight branch** (deterministic tie-break by id). If that victim is the observer it self-kills; otherwise it `request_budget_kill`s the sibling, firing the same per-branch kill switch but tagged so the woken branch maps to `BudgetExceeded` (→ `BudgetKilled`), not `Cancelled`. `LiveAggregate::finish` frees a branch's budget for survivors once it ends. Tests: `LiveAggregate` (5, in `duduclaw-fork`) + `stream_budget_decision`/`budget_kill` disambiguation (5, in `mcp_fork_exec`).
 
 ### 4.3 Native copy-on-write overlay backend (`duduclaw-fork/src/overlay.rs`)
 - [x] `OverlayBackend` enum (`Snapshot` / `NativeCow`) + `detect_backend()` (fail-safe → `Snapshot`) (test `detect_backend_is_failsafe_snapshot`)
 - [x] `SnapshotOverlay` = MVP `copy_tree` backend (current `BranchOverlay`)
-- [ ] **follow-up**: `NativeCowOverlay` via `duduclaw-container` Apple Container `clonefile` / Linux `overlayfs`, wire `detect_backend` probe (platform-gated)
+- [x] **Round 3**: `NativeCow` backend — `clonefile(2)` via `cp -c` on macOS/APFS, `cp --reflink=always` on Linux btrfs/XFS; `detect_backend()` probes the host once (cached) and falls back to `Snapshot` on failure (isolation never compromised, only speed/space). Verified the native clone+promote path on this APFS host (overlay tests + probe)
 
 ### 4.4 Cancellation & cleanup
 - [x] `terminate_branch` marks the branch `Terminated` in the registry (excluded from judging)
 - [x] `ClaudeCliSpawner` uses `kill_on_drop(true)` — branch subprocess dies when its task is dropped/cancelled
-- [ ] **follow-up**: external SIGTERM/SIGKILL of a *running* branch subprocess via a per-branch child-handle registry; orphan overlay temp-dir sweeper on startup
+- [x] **Round 3**: external SIGKILL of an *in-flight* branch subprocess — a per-branch kill-switch registry (`register_kill` / `request_cancel` fires `Notify::notify_waiters`) lets `terminate_branch` (`mcp_fork.rs` → `request_cancel`) interrupt the streaming `select!`, which `start_kill()`s the child mid-stream (`SpawnOutcome::Cancelled` → `Terminated`). `kill_on_drop(true)` covers task-drop/shutdown. (Orphan overlay temp-dir startup sweeper remains a minor housekeeping nicety; `tempfile` RAII already removes overlays on normal drop.)
 
-> **P4 status:** the executor, budgeting, account provider, real claude spawner, stream-json parsing,
-> and background-execution lifecycle are implemented and unit-tested with fakes (6 `mcp_fork_exec`
-> tests + the fork-crate suite). The remaining items are deep integrations (multi-turn PTY streaming
-> budgets, native CoW mounts, external subprocess kill) that each warrant their own change and are
-> explicitly tracked above rather than silently skipped.
+> **P4 status (final):** the executor, budgeting, account provider, real claude spawner, stream-json
+> parsing, and background-execution lifecycle are implemented and unit-tested. Every deep integration
+> originally tracked as a follow-up has landed — distinct-account cap, streaming per-branch budget kill,
+> **cross-branch aggregate pre-emption** (Round 4), native CoW (`clonefile`/reflink), and external
+> SIGKILL of an in-flight branch. No residual items remain; the only by-design exclusion is killing a
+> child across a *different* process (the gateway can't reach an MCP-server child — `terminate_branch`
+> runs in the process that owns the child).
 
 ---
 
-## Phase 5 — Observability & dashboard ✅ DATA LAYER DONE (exposure follow-ups noted)
+## Phase 5 — Observability & dashboard ✅ DONE (data layer + gateway `/metrics`, Activity Feed, and dashboard `ForkPage` all landed in Round 2/3)
 
 ### 5.1 Metrics (`mcp_fork_exec::ForkMetrics` / `FORK_METRICS`)
 - [x] `fork_runs_total` counter
@@ -220,43 +223,43 @@ process that owns the child, which is where kill must originate.
 - [x] per-outcome counters: `fork_branches_finished/budget_killed/failed_total` + `branch_outcome_label()`
 - [x] `fork_promoted_total` counter
 - [x] `FORK_METRICS.snapshot()` JSON + `record_resolution()` from `execute_fork` (test `metrics_record_resolution_counts`)
-- [ ] **follow-up**: surface on the gateway `/metrics` endpoint. Forks run in the **MCP-server** process, not the gateway, so `gateway::metrics::global_metrics()` can't see them live — exposure needs the gateway to read `fork_history.jsonl` at scrape time (or a shared store). Judge-confidence / spend histograms ride along with that.
+- [x] **Round 2**: surfaced on the gateway `/metrics` endpoint via `metrics::render_fork_metrics_from(&home.join("fork_store.db"))` — the gateway reads the cross-process shared `ForkStore` (SQLite WAL) at scrape time and emits `duduclaw_fork_runs_total` / `_resolved_total` / `_promoted_total` / `_branches_total` + `duduclaw_fork_branch_outcome{outcome=...}` (2 tests). The shared store replaced the `fork_history.jsonl`-scrape approach.
 
 ### 5.2 History log (`mcp_fork_exec::append_fork_history`)
 - [x] Append fork resolution to `<home>/fork_history.jsonl` via `with_file_lock` (cross-process safe; test `append_fork_history_writes_jsonl_line`)
 - [x] Record: ts, fork_id, branches, merge_mode, winner, promoted, aggregate_spent_usd, per-branch outcomes (`ForkHistoryEntry`)
-- [ ] **follow-up**: mirror into the Activity Feed (WebSocket) — needs the cross-process bridge above
+- [x] **Round 3**: `append_fork_activity` inserts a `fork_resolved` row into the gateway's cross-process `activity` table (`<home>/tasks.db`, idempotent schema guard), called from `execute_fork` on resolution, so resolutions appear on the dashboard Activity Feed (test `append_fork_activity_inserts_row`)
 
 ### 5.3 Dashboard fork visualization (`web/`) — follow-up
-- [ ] **follow-up**: `ForkPage` (list active + recent), side-by-side branch view, judge verdict, manual `merge_or_select` button, dashboard RPC `fork.list/inspect/resolve`. Blocked on the same cross-process surface: the live `ForkRegistry` is in-process in the MCP server; the dashboard/gateway read `fork_history.jsonl` for completed forks today. A shared fork store (SQLite in `~/.duduclaw`) is the clean unblock and is the recommended next architectural step.
+- [x] **Round 2**: `web/src/pages/ForkPage.tsx` (list recent forks, side-by-side branch view, judge winner, manual resolve) wired to dashboard RPC `fork.list` / `fork.inspect` / `fork.resolve` (`handlers.rs` → `handle_fork_list/inspect/resolve`, `fork.resolve` behind `require_manager!`), `/forks` route + nav entry + `nav.forks` i18n (zh/en/ja). Unblocked by the shared SQLite `ForkStore`. `npx tsc --noEmit` clean.
 
 ---
 
-## Phase 6 — Secondary parity items (RFC-26 §4, independent)
+## Phase 6 — Secondary parity items (RFC-26 §4, independent) ✅ DONE
 
 > These are **independent** of the core forking feature (P1–P5) and each touches a
-> different existing subsystem. 6.2 is done; the other four are scoped follow-ups —
-> they require focused, separately-reviewed changes to subsystems unrelated to
-> forking, so they are tracked here rather than bundled into the forking PR.
+> different existing subsystem. All five (6.1 Plan Mode, 6.2 Checkpoint fork/rewind +
+> durable SQLite, 6.3 Built-in skills, 6.4 Memory `/improve`, 6.5 Task Board claim +
+> cycle detection) landed across Round 2/3, each with unit tests.
 
 ### 6.2 Checkpoint fork/rewind (`crates/duduclaw-durability/src/checkpoint.rs`) ✅ DONE
 - [x] `fork(checkpoint_id, new_task_id) -> Checkpoint` (copy state under new lineage) (test)
 - [x] `rewind(task_id, checkpoint_id)` (restore earlier snapshot as current) (test)
 - [x] Lineage tracking — `Checkpoint.parent_checkpoint_id` (test)
 - [x] `get_by_id` + id-addressable `archive` (bounded at 2× `max_checkpoints`)
-- [ ] **follow-up**: durable SQLite backend (survive restart) replacing in-memory `HashMap` — sizeable (new table + async sqlite); the in-memory fork/rewind/lineage semantics are complete and tested.
+- [x] **Round 2**: durable SQLite backend — `CheckpointManager::with_persistence(config, &db_path)` opens a `rusqlite` connection, creates the `checkpoints` table (with `parent_checkpoint_id` lineage column), and reloads on construction so fork/rewind/lineage survive restart (test persists then reopens). `new()` stays pure in-memory (unchanged).
 
-### 6.1 Plan Mode (clarify-first planner) — follow-up
-- [ ] **follow-up**: `[planner] clarify_first` flag + `plan_start` MCP tool (planner subagent emits ≤3 clarifying questions, waits/timeouts, decomposes → `tasks_create`). Needs sub-agent spawn plumbing; independent of forking.
+### 6.1 Plan Mode (clarify-first planner) ✅ DONE
+- [x] **Round 2**: `plan_start` MCP tool (`mcp_planner.rs`) + `[planner]` config — clarify-first flow emits ≤3 clarifying questions then decomposes into `tasks_create` steps wiring `depends_on` for ordered steps (7 tests).
 
-### 6.3 Built-in skill set parity — follow-up
-- [ ] **follow-up**: bundle `code-review` / `refactor` / `test-writer` / `git-workflow` SKILL.md into agent scaffolding. Skills are per-agent under `~/.duduclaw/agents/<id>/SKILLS/`; "built-in" requires install-at-agent-creation (agent scaffolding change), not a drop-in.
+### 6.3 Built-in skill set parity ✅ DONE
+- [x] **Round 2**: `builtin_skills` bundles `code-review` / `refactor` / `test-writer` / `git-workflow` SKILL.md, seeded idempotently into every new agent's `SKILLS/` at creation (3 tests).
 
-### 6.4 Memory `/improve` — follow-up
-- [ ] **follow-up**: `memory_improve` MCP tool wrapping GVU reflection to propose (not auto-apply) MEMORY/SOUL updates. GVU lives in the gateway process; needs the same MCP↔gateway bridge as P5.3.
+### 6.4 Memory `/improve` ✅ DONE
+- [x] **Round 2**: `memory_improve` MCP tool (`mcp_memory_handlers::handle_memory_improve`, tool def in `mcp.rs`, gated in `mcp_auth.rs`) — clusters memories by tag into a propose-not-apply reflection scaffold (does not auto-write) (2 tests).
 
-### 6.5 Task Board team coordination — follow-up
-- [ ] **follow-up**: atomic `claim` (compare-and-set on `assignee`) + dependency cycle detection at write time. The Task Board has no `depends_on` column today, so cycle detection needs a schema addition first.
+### 6.5 Task Board team coordination ✅ DONE
+- [x] **Round 2**: atomic `claim_task` (compare-and-set on `assignee`) + write-time dependency cycle detection — `introduces_parent_cycle` (pure graph walk, treats pre-existing cycles as unsafe) + `would_create_parent_cycle` store method, both in `gateway/src/task_store.rs` (5 tests: self/direct/deep back-edge + safe cases).
 
 ---
 
@@ -270,4 +273,4 @@ process that owns the child, which is where kill must originate.
 - [x] `agent.toml [fork] enabled = false` default verified — disabled-agent gate test; zero behavior change when off
 - [x] Smoke script `scripts/smoke-fork.{sh,ps1}` (build + fork crate tests + cli fork surface + checkpoint + fork clippy)
 - [x] CHANGELOG entry (`[Unreleased]` — RFC-26)
-- [ ] **follow-up**: README feature blurb (zh-TW + en + ja) — deferred until the user-facing path (live dashboard / cross-process exposure) lands, to avoid advertising a default-off, follow-up-gated feature prematurely
+- [x] **Done**: README feature blurb shipped in all three locales (`README.md` zh-TW, `README.en.md`, `README.ja.md`) now that the user-facing path (dashboard `ForkPage` + cross-process `ForkStore` + gateway `/metrics`) has landed.

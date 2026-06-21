@@ -32,7 +32,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 pub use branch::{Branch, BranchId, BranchResult, BranchSpec, BranchState};
-pub use budget::{Charge, Pool};
+pub use budget::{Charge, LiveAggregate, Pool, Preempt};
 pub use error::{ForkError, Result};
 pub use judge::{JudgeAgent, JudgeScores, JudgeVerdict};
 pub use merge::{MergeDecision, DEFAULT_CONFIDENCE_THRESHOLD};

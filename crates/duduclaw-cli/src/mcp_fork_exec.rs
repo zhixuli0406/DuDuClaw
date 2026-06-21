@@ -59,7 +59,9 @@ pub trait AccountProvider: Send + Sync {
 pub enum SpawnOutcome {
     /// Ran to completion successfully.
     Completed,
-    /// Killed mid-stream because running cost crossed the per-branch budget.
+    /// Killed mid-stream for budget — either this branch's own per-branch cap, or
+    /// cross-branch aggregate pre-emption (it was the most-expensive in-flight
+    /// branch when the combined live spend crossed the aggregate cap).
     BudgetExceeded,
     /// Killed by an external `terminate_branch` request.
     Cancelled,
@@ -82,11 +84,15 @@ impl CliRunOutput {
 }
 
 /// Context for one branch spawn: identity + budget so the spawner can stream cost
-/// and self-kill on overspend or external cancellation.
+/// and self-kill on per-branch overspend, cross-branch aggregate pre-emption, or
+/// external cancellation.
 #[derive(Debug, Clone)]
 pub struct SpawnCtx {
     pub branch_id: String,
     pub budget_usd: f64,
+    /// Shared cross-branch live-aggregate tracker (RFC-26 §4.2). `None` ⇒ only the
+    /// per-branch streaming budget is enforced (single-branch / test paths).
+    pub aggregate: Option<Arc<duduclaw_fork::LiveAggregate>>,
 }
 
 #[async_trait]
@@ -147,20 +153,84 @@ pub fn is_cancelled(branch_id: &str) -> bool {
     cancel_set().lock().expect("cancel set poisoned").contains(branch_id)
 }
 
+// ── Aggregate budget pre-emption (RFC-26 §4.2) ──────────────────────────────
+
+/// Branches the cross-branch aggregate pre-emptor asked to kill *for budget*
+/// (as opposed to an operator `terminate_branch`). The two share one per-branch
+/// `Notify` kill switch, so this set is how the spawner tells *why* it was woken:
+/// a tagged branch maps to `BudgetExceeded` (→ `BudgetKilled`), an untagged one
+/// to `Cancelled` (→ `Terminated`).
+fn budget_kill_set() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Pre-empt a *running* branch for aggregate budget: tag the reason, then fire
+/// its kill switch so the in-flight subprocess is SIGKILLed mid-stream.
+pub fn request_budget_kill(branch_id: &str) {
+    budget_kill_set().lock().expect("budget kill set poisoned").insert(branch_id.to_string());
+    if let Some(notify) = kill_registry().lock().expect("kill registry poisoned").get(branch_id) {
+        notify.notify_waiters();
+    }
+}
+
+/// Consume a branch's budget-kill tag, returning whether it was set. Removing it
+/// keeps the process-global set from growing and resets state for branch-id reuse.
+fn took_budget_kill(branch_id: &str) -> bool {
+    budget_kill_set().lock().expect("budget kill set poisoned").remove(branch_id)
+}
+
+/// Pure streaming-budget decision for one cost update (RFC-26 §4.2). Factored out
+/// so the real `claude` spawner and the unit tests exercise identical logic:
+/// per-branch cap first, then cross-branch aggregate pre-emption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamAction {
+    /// Within budget — keep streaming.
+    Continue,
+    /// This branch must die now (its own per-branch cap, or it is itself the
+    /// most-expensive branch over the aggregate cap).
+    SelfKill,
+    /// A *different* branch is the most-expensive over-aggregate one; ask the
+    /// registry to kill it, then keep streaming this branch.
+    PreemptOther(String),
+}
+
+/// Decide what a branch should do given its latest cumulative `running_cost`.
+pub fn stream_budget_decision(ctx: &SpawnCtx, running_cost: f64) -> StreamAction {
+    if running_cost > ctx.budget_usd {
+        return StreamAction::SelfKill;
+    }
+    match &ctx.aggregate {
+        None => StreamAction::Continue,
+        Some(agg) => match agg.observe(&ctx.branch_id, running_cost) {
+            duduclaw_fork::Preempt::Ok => StreamAction::Continue,
+            duduclaw_fork::Preempt::Kill(v) if v == ctx.branch_id => StreamAction::SelfKill,
+            duduclaw_fork::Preempt::Kill(v) => StreamAction::PreemptOther(v),
+        },
+    }
+}
+
 // ── Executor ────────────────────────────────────────────────────────────────
 
 pub struct RotatingBranchExecutor<P: AccountProvider, S: CliSpawner> {
     provider: Arc<P>,
     spawner: Arc<S>,
     pool: Arc<Pool>,
+    /// Streaming-time aggregate tracker shared across this fork's concurrent
+    /// branches, enabling cross-branch pre-emption (RFC-26 §4.2). Complements
+    /// `pool`'s post-completion fail-closed accounting.
+    aggregate: Arc<duduclaw_fork::LiveAggregate>,
 }
 
 impl<P: AccountProvider, S: CliSpawner> RotatingBranchExecutor<P, S> {
     pub fn new(provider: Arc<P>, spawner: Arc<S>, aggregate_budget_usd: f64) -> Self {
+        let cap = aggregate_budget_usd.max(0.0);
         RotatingBranchExecutor {
             provider,
             spawner,
-            pool: Arc::new(Pool::new(aggregate_budget_usd)),
+            pool: Arc::new(Pool::new(cap)),
+            aggregate: Arc::new(duduclaw_fork::LiveAggregate::new(cap)),
         }
     }
 }
@@ -200,14 +270,22 @@ impl<P: AccountProvider, S: CliSpawner> BranchExecutor for RotatingBranchExecuto
             _ => inv.prompt.clone(),
         };
 
-        // Register a kill switch so an external terminate_branch can SIGKILL the
-        // in-flight subprocess mid-stream.
+        // Register a kill switch so an external terminate_branch — or a
+        // cross-branch aggregate pre-emption — can SIGKILL the in-flight
+        // subprocess mid-stream.
         let _kill = register_kill(&inv.branch_id.0);
-        let ctx = SpawnCtx { branch_id: inv.branch_id.0.clone(), budget_usd: inv.budget_usd };
+        let ctx = SpawnCtx {
+            branch_id: inv.branch_id.0.clone(),
+            budget_usd: inv.budget_usd,
+            aggregate: Some(self.aggregate.clone()),
+        };
         let out = self
             .spawner
             .spawn(&ctx, &full_prompt, &inv.workspace, &account.env_vars)
             .await;
+        // Stop counting this branch toward the live aggregate so its siblings'
+        // combined spend drops once it has finished or been killed.
+        self.aggregate.finish(&inv.branch_id.0);
         unregister_kill(&inv.branch_id.0);
 
         // Charge the aggregate pool for whatever was spent.
@@ -500,10 +578,15 @@ impl CliSpawner for ClaudeCliSpawner {
 
         let outcome = loop {
             tokio::select! {
-                // External terminate_branch.
+                // Woken by an external terminate_branch OR a cross-branch budget
+                // pre-emption — the budget-kill tag tells which.
                 _ = kill.notified() => {
                     let _ = child.start_kill();
-                    break SpawnOutcome::Cancelled;
+                    break if took_budget_kill(&ctx.branch_id) {
+                        SpawnOutcome::BudgetExceeded
+                    } else {
+                        SpawnOutcome::Cancelled
+                    };
                 }
                 line = reader.next_line() => {
                     match line {
@@ -512,10 +595,17 @@ impl CliSpawner for ClaudeCliSpawner {
                                 if let Some(t) = t { text = t; }
                                 if let Some(c) = c {
                                     running_cost = c;
-                                    // Stream budget enforcement: kill on overspend.
-                                    if running_cost > ctx.budget_usd {
-                                        let _ = child.start_kill();
-                                        break SpawnOutcome::BudgetExceeded;
+                                    // Stream budget enforcement: per-branch cap +
+                                    // cross-branch aggregate pre-emption.
+                                    match stream_budget_decision(ctx, running_cost) {
+                                        StreamAction::Continue => {}
+                                        StreamAction::SelfKill => {
+                                            let _ = child.start_kill();
+                                            break SpawnOutcome::BudgetExceeded;
+                                        }
+                                        StreamAction::PreemptOther(victim) => {
+                                            request_budget_kill(&victim);
+                                        }
                                     }
                                 }
                             }
@@ -526,6 +616,9 @@ impl CliSpawner for ClaudeCliSpawner {
                 }
             }
         };
+        // Hygiene: clear any budget-kill tag not consumed by the kill arm (e.g.
+        // this branch was pre-empted but reached EOF before the switch fired).
+        let _ = took_budget_kill(&ctx.branch_id);
 
         let final_outcome = match outcome {
             SpawnOutcome::Completed => match child.wait().await {
@@ -941,5 +1034,71 @@ mod tests {
         assert_eq!(branch_outcome_label(BranchState::Finished), "win_or_finish");
         assert_eq!(branch_outcome_label(BranchState::BudgetKilled), "budget_killed");
         assert_eq!(branch_outcome_label(BranchState::Failed), "failed");
+    }
+
+    // ── Cross-branch aggregate pre-emption (RFC-26 §4.2) ────────────────────
+
+    fn ctx_with(id: &str, budget: f64, agg: Option<Arc<duduclaw_fork::LiveAggregate>>) -> SpawnCtx {
+        SpawnCtx { branch_id: id.into(), budget_usd: budget, aggregate: agg }
+    }
+
+    #[test]
+    fn stream_decision_per_branch_cap_self_kills() {
+        // No aggregate board: only the per-branch cap applies.
+        let ctx = ctx_with("b", 0.5, None);
+        assert_eq!(stream_budget_decision(&ctx, 0.4), StreamAction::Continue);
+        assert_eq!(stream_budget_decision(&ctx, 0.6), StreamAction::SelfKill);
+    }
+
+    #[test]
+    fn stream_decision_aggregate_self_kill_when_observer_is_priciest() {
+        let agg = Arc::new(duduclaw_fork::LiveAggregate::new(1.0));
+        let cheap = ctx_with("cheap", 10.0, Some(agg.clone()));
+        let pricey = ctx_with("pricey", 10.0, Some(agg.clone()));
+        // cheap(0.3) under aggregate; pricey(0.9) pushes total 1.2 > 1.0 and is
+        // itself the most expensive ⇒ it self-kills (no sibling sacrificed).
+        assert_eq!(stream_budget_decision(&cheap, 0.3), StreamAction::Continue);
+        assert_eq!(stream_budget_decision(&pricey, 0.9), StreamAction::SelfKill);
+    }
+
+    #[test]
+    fn stream_decision_aggregate_preempts_priciest_sibling() {
+        let agg = Arc::new(duduclaw_fork::LiveAggregate::new(1.0));
+        let pricey = ctx_with("pricey", 10.0, Some(agg.clone()));
+        let cheap = ctx_with("cheap", 10.0, Some(agg.clone()));
+        // pricey(0.9) under aggregate alone; when cheap(0.3) tips the total over
+        // the cap, the cheap observer pre-empts the priciest in-flight sibling.
+        assert_eq!(stream_budget_decision(&pricey, 0.9), StreamAction::Continue);
+        assert_eq!(
+            stream_budget_decision(&cheap, 0.3),
+            StreamAction::PreemptOther("pricey".into())
+        );
+    }
+
+    #[test]
+    fn stream_decision_finish_frees_aggregate_for_survivors() {
+        let agg = Arc::new(duduclaw_fork::LiveAggregate::new(1.0));
+        let a = ctx_with("a", 10.0, Some(agg.clone()));
+        let b = ctx_with("b", 10.0, Some(agg.clone()));
+        // a is the pricier branch (0.7), still under the aggregate alone.
+        assert_eq!(stream_budget_decision(&a, 0.7), StreamAction::Continue);
+        // b(0.4) tips the total to 1.1 > 1.0; a is the priciest in-flight branch,
+        // so the cheaper observer b pre-empts a (not itself).
+        assert_eq!(stream_budget_decision(&b, 0.4), StreamAction::PreemptOther("a".into()));
+        // Once the pre-empted a finishes, b's continued spend fits under the cap.
+        agg.finish("a");
+        assert_eq!(stream_budget_decision(&b, 0.9), StreamAction::Continue);
+    }
+
+    #[test]
+    fn budget_kill_tag_maps_woken_branch_to_budget_outcome() {
+        // A budget pre-emption tags the branch; the spawner's kill arm consumes
+        // the tag exactly once to choose BudgetExceeded over Cancelled.
+        let bid = "agg-victim-unique-xyz";
+        let _switch = register_kill(bid);
+        request_budget_kill(bid);
+        assert!(took_budget_kill(bid), "first take sees the budget tag");
+        assert!(!took_budget_kill(bid), "tag is consumed exactly once");
+        unregister_kill(bid);
     }
 }
