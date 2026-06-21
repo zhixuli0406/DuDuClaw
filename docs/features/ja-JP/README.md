@@ -1,6 +1,6 @@
 # DuDuClaw 主要機能紹介
 
-> DuDuClaw v1.8.14 | 最終更新：2026-04-21
+> DuDuClaw v1.21.1 | 最終更新：2026-06-21
 
 本ディレクトリには、DuDuClawの注目機能に関する詳細な紹介記事を収録しています。各記事では設計思想、システム動作、運用フローを解説しており、ソースコードを読まずに「仕組み」を理解したい開発者を対象としています。
 
@@ -25,12 +25,20 @@
 | 13 | [マルチランタイムエージェント実行](13-multi-runtime.md) | Claude / Codex / Gemini / OpenAI互換統一バックエンド |
 | 14 | [音声パイプライン](14-voice-pipeline.md) | ASR / TTS / VAD / LiveKit — ローカル優先音声インテリジェンス |
 | 15 | [スキルライフサイクルエンジン](15-skill-lifecycle.md) | 7段階の自動スキル抽出・管理 |
-| 16 | [セッションメモリスタック](../16-session-memory-stack.md) | Instruction Pinning + Snowball Recap + Key-Fact Accumulator |
-| 17 | [Wiki 知識レイヤー](../17-wiki-knowledge-layer.md) | L0-L3 信頼度加重知識の自動注入 |
-| 18 | [Git Worktree L0 分離](../18-worktree-isolation.md) | タスク毎の軽量ワークスペース + アトミックマージ |
-| 19 | [Agent Client Protocol (ACP/A2A)](../19-agent-client-protocol.md) | stdio JSON-RPC 2.0 — Zed/JetBrains/Neovim 統合 |
-
-> 注：16-19 は現在英語版のみ。翻訳の PR を歓迎します。
+| 16 | [セッションメモリスタック](16-session-memory-stack.md) | Instruction Pinning + Snowball Recap + Key-Fact Accumulator |
+| 17 | [Wiki 知識レイヤー](17-wiki-knowledge-layer.md) | L0-L3 信頼度加重知識の自動注入 |
+| 18 | [Git Worktree L0 分離](18-worktree-isolation.md) | タスク毎の軽量ワークスペース + アトミックマージ |
+| 19 | [Agent Client Protocol (ACP/A2A)](19-agent-client-protocol.md) | stdio JSON-RPC 2.0 — Zed/JetBrains/Neovim 統合 |
+| 20 | [メモリインテリジェンス](20-memory-intelligence.md) | 時系列ファクト + Reflexionループ + バッチ取得（v1.19.0） |
+| 21 | [ガバナンス層](21-governance-layer.md) | ポリシーレジストリ + エージェント別クォータ（duduclaw-governance） |
+| 22 | [永続化フレームワーク](22-durability-framework.md) | 冪等性 / リトライ / サーキットブレーカー / チェックポイント / DLQ |
+| 23 | [Autopilot ルールエンジン](23-autopilot-engine.md) | イベント駆動の自動化 + サーキットブレーカー |
+| 24 | [タスクボードとアクティビティフィード](24-task-board.md) | チームメイトとしてのエージェントのタスク管理 |
+| 25 | [アイデンティティ解決](25-identity-resolution.md) | WikiCache / Notion / Chained プロバイダー（RFC-21 §1） |
+| 26 | [MCP HTTP/SSE トランスポート](26-mcp-http-sse.md) | Bearer 認証 REST + SSE エンドポイント（W20） |
+| 27 | [クロスプラットフォーム PTY プール + ワーカー](27-pty-pool-runtime.md) | 対話型 `claude` REPL を駆動（v1.15.0） |
+| 28 | [ライブ実行フォーク（Live Forking）](28-live-forking.md) | 並列ブランチ + AI ジャッジ（duduclaw-fork, RFC-26） |
+| 29 | [進化イベント](29-evolution-events.md) | バッチ + リトライ配信のブラックボックスレコーダー |
 
 ---
 

@@ -1,6 +1,6 @@
 # DuDuClaw Feature Highlights
 
-> DuDuClaw v1.8.14 | Last updated: 2026-04-21
+> DuDuClaw v1.21.1 | Last updated: 2026-06-21
 
 This directory contains detailed introductions to DuDuClaw's standout features. Each article explains the design rationale, system behavior, and operational flow — aimed at developers who want to understand *how things work* without diving into source code.
 
@@ -29,6 +29,16 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 17 | [Wiki Knowledge Layer](17-wiki-knowledge-layer.md) | L0-L3 trust-weighted knowledge with auto-injection |
 | 18 | [Git Worktree L0 Isolation](18-worktree-isolation.md) | Lightweight per-task sandbox with atomic merge |
 | 19 | [Agent Client Protocol (ACP/A2A)](19-agent-client-protocol.md) | IDE-grade stdio JSON-RPC for Zed/JetBrains/Neovim |
+| 20 | [Memory Intelligence](20-memory-intelligence.md) | Temporal facts + reflexion loop + batch fetch |
+| 21 | [Governance Layer](21-governance-layer.md) | Policy registry + per-agent quotas (duduclaw-governance) |
+| 22 | [Durability Framework](22-durability-framework.md) | Idempotency / retry / circuit breaker / checkpoint / DLQ |
+| 23 | [Autopilot Rule Engine](23-autopilot-engine.md) | Event-driven automation + circuit breaker |
+| 24 | [Task Board & Activity Feed](24-task-board.md) | Agent-as-teammate task management |
+| 25 | [Identity Resolution](25-identity-resolution.md) | WikiCache / Notion / Chained providers (RFC-21 §1) |
+| 26 | [MCP HTTP/SSE Transport](26-mcp-http-sse.md) | Bearer-authed REST + SSE endpoints (W20) |
+| 27 | [Cross-Platform PTY Pool + Worker](27-pty-pool-runtime.md) | Drive the interactive `claude` REPL (v1.15.0) |
+| 28 | [Live Run Forking](28-live-forking.md) | Parallel branches + AI judge (duduclaw-fork, RFC-26) |
+| 29 | [Evolution Events](29-evolution-events.md) | Black-box recorder with batch+retry delivery |
 
 ---
 

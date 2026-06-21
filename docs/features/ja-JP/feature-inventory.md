@@ -1,6 +1,6 @@
 # DuDuClaw 全機能一覧
 
-> v1.8.14 | 最終更新：2026-04-21
+> v1.21.1 | 最終更新：2026-06-21
 
 ---
 
@@ -63,6 +63,7 @@
 | メディアパイプライン | 自動リサイズ（max 1568px）+ MIME 検出 + Vision 統合 |
 | スタンプシステム | LINE スタンプカタログ + 感情検出 + Discord emoji 対応 |
 | チャネル失敗追跡 | `channel_failures.jsonl` + `FailureReason` 列挙 |
+| Discord Gateway 強化（v1.9.2）| 本物の op 6 RESUME — 再接続を跨いで `session_id` + `resume_gateway_url` + sequence を保持；`select!` 停滞ウォッチドッグが 2× ハートビート沈黙で中断（18 分ゾンビ修正）；ハートビート channel 容量 1→16 を `try_send`；op 9 は `d.bool` で RESUME か IDENTIFY を選択し 1-5s jitter；close code 4007/4009/4003 で session クリア；バックオフ上限 300s→60s；`RESUMED` dispatch 対応 |
 
 ## 進化システム
 
@@ -93,7 +94,7 @@
 | Dedup 検出 | `wiki_dedup` — タイトルマッチ + タグ Jaccard 類似度（≥0.8） |
 | 逆 backlink 索引 | `related` frontmatter + body markdown リンクをスキャン |
 | 検索フィルタ | `min_trust` / `layer` / `expand`（1-hop related/backlink 拡張） |
-| 共有 Wiki | `~/.duduclaw/shared/wiki/` — 組織横断 SOP/ポリシー/仕様、`wiki_visible_to` 可視性制御 |
+| 共有 Wiki | `~/.duduclaw/shared/wiki/` — 組織横断 SOP/ポリシー/仕様、`wiki_visible_to` 可視性制御；MCP ツール `shared_wiki_ls/read/write/search/delete/stats`、`wiki_share`；`.scope.toml` SoT ポリシー（「アイデンティティとアクセス」参照）|
 | CLAUDE_WIKI テンプレート | 新規エージェント作成時に CLAUDE.md へ同梱、LLM に wiki MCP ツールの使い方を教示 |
 
 ## スキルエコシステム
@@ -171,6 +172,9 @@
 | 認知メモリ MCP ツール | `memory_search_by_layer` / `memory_successful_conversations` / `memory_episodic_pressure` / `memory_consolidation_status` |
 | フェデレーションメモリ | エージェント横断知識共有（Private / Team / Public） |
 | Key-Fact Accumulator | `key_facts` + FTS5 — セッション横断の軽量メモリ（セッションメモリスタック参照） |
+| Temporal Memory（F1、v1.19.0）| `memories` に冪等マイグレーションで時系列/ナレッジグラフ列（`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`）を追加；`store_temporal()` が同一 `(agent, subject, predicate)` を自動コンフリクト解決し supersession chain を連結；`search()` はデフォルトで現行有効行のみフィルタ；`get_history()` / `get_at()` がチェーンとポイントインタイムを提供 |
+| Reflexion Loop（F2、v1.19.0）| 既存 `MistakeNotebook` をブリッジ — F2a は未解決の最近のミスを回答プロンプトに注入（`## Past Mistakes to Avoid`、CJK セーフ照合 + recency フォールバック）；F2b は同一 `MistakeCategory` のミス ≥3 件を 1 つの意味メモリルールに統合（`reflexion.rs`）し元を解決済みに。トリガー = `ErrorCategory` Significant/Critical（MetaCognition 適応） |
+| `memory_fetch_batch`（F3、v1.19.0）| MCP ツール + `get_by_ids` が ≤100 件を ID で一括取得（名前空間/所有権を強制、部分ヒット → `missing_ids`） |
 
 ## Git Worktree 分離（v1.6.0）
 
@@ -220,6 +224,76 @@
 | CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` 永続化（v1.8.12）、`schedule_task` MCP スキーマ修正（`agent_id` + `name` を含む） |
 | ReminderScheduler | 一度限りのリマインダー（相対 `5m`/`2h`/`1d` または ISO 8601）、`direct` / `agent_callback` モード |
 | HeartbeatScheduler | エージェント毎統一スケジューリング — バスポーリング + GVU サイレンスブレイカー + cron |
+| スケジューラレベルのタスクボードプル（v1.9.3）| `poll_assigned_tasks` を `HeartbeatScheduler::run` tick へ移動 — 30s 毎に全エージェントレジストリを走査（`enabled=false` をスキップしない）；1 時間 LIKE-marker クールダウンでスタンピード防止 |
+| `duduclaw evolution finalize` CLI（v1.9.1）| 既に終了しているはずの SOUL.md 観察ウィンドウのワンショット回収；`--dry-run` / `--agent` フィルタ；30 分 `ObservationFinalizer` バックグラウンドタスクのバックストップ |
+
+## タスクボードと Activity Feed
+
+| 機能 | 説明 |
+|------|------|
+| タスクボード | SQLite バックエンドのタスク管理 — status / priority / assignment 追跡 |
+| Dashboard RPC | `tasks.list/create/update/remove/assign`、`activity.list`（Web UI 向け）|
+| Agent MCP ツール | `tasks_list`、`tasks_create`、`tasks_update`、`tasks_claim`、`tasks_complete`、`tasks_block`、`activity_list`、`activity_post` — エージェントが自身のキュー把握、作業クレーム、進捗投稿 |
+| リアルタイム Activity Feed | WebSocket ストリーミングの activity イベント |
+| システムプロンプト注入 | 保留タスク（最大 5 件）をエージェント system prompt へ自動注入 |
+
+## Autopilot ルールエンジン
+
+| 機能 | 説明 |
+|------|------|
+| イベントバス | `tokio::broadcast`（容量 8192）— `TaskCreated` / `TaskStatusChanged` / `ChannelMessage` / `AgentIdle` / `CronTick` |
+| ルール条件 | `all` / `any` + `eq/neq/in/gt/lt/contains` 演算子 |
+| アクション型 | `delegate`（bus task をエンキュー）、`notify`（チャネル）、`run_skill`（skill 名 + ターゲットを alphanumeric allowlist + `canonicalize()` パス封じ込めで検証）|
+| ルール CRUD | Dashboard RPC `autopilot.list/create/update/remove/history` + agent MCP `autopilot_list`；書込時に構造検証 |
+| 3 状態サーキットブレーカー | ルール毎 `Closed` / `Open` / `HalfOpen` — 60s 内 10 回発火で Open（60s クールダウン）、その後 HalfOpen probe；自己強化ループを防止；遷移は history + Activity Feed に記録 |
+| events.db ブリッジ | SQLite（WAL + 単調増加 id + 7 日 prune）が旧 `events.jsonl` を置換 — rotation race・partial-line ハザードなし |
+
+## 信頼性とガバナンス
+
+| 機能 | 説明 |
+|------|------|
+| Durability フレームワーク（`duduclaw-durability`、v1.9.4）| 5 つの柱 — `idempotency`（key ベース重複排除）、`retry`（指数バックオフ + jitter）、`circuit_breaker`（3 状態 + `probe_inflight` 計上）、`checkpoint`（再開可能タスク進捗）、`dlq`（デッドレターキュー）。gateway LLM フォールバック + 永続 cron で使用 |
+| ガバナンス層（`duduclaw-governance`、v1.9.4）| `PolicyRegistry` — YAML ロード + ホットリロード + agent 優先マージ + フェイルセーフ（不正ポリシーはスキップ、不正 YAML で panic しない）。4 種の `PolicyType` — Rate / Permission / Quota / Lifecycle |
+| クォータマネージャ | agent 毎 / ポリシー毎の soft + hard クォータ強制；`error_codes.rs` がガバナンスエラー（QUOTA_EXCEEDED / POLICY_DENIED / ...）を標準化。デフォルトセットは `policies/global.yaml`（例：`default-rate-mcp` 200/min）|
+| LLM フォールバックチェーン（`gateway/llm_fallback.rs`、v1.9.4）| プライマリの timeout/503/429/overloaded がフォールバックモデルへ自動切替；純関数 `is_llm_fallback_error` / `should_attempt_model_fallback` をユニットテスト；hard-deadline アームが `Err("hard timeout")` を返しフォールバックを確実に発動 |
+| Evolution Events システム（v1.9.4）| 30+ イベントスキーマ（`schema.rs`）、非同期 batch+retry emitter（`emitter.rs`）、クエリインターフェース（`query.rs`）、信頼性保証（`reliability.rs`）；HTTP エンドポイントを Web `ReliabilityPage` に表示 |
+
+## アイデンティティとアクセス
+
+| 機能 | 説明 |
+|------|------|
+| Identity Resolution（`duduclaw-identity`、RFC-21 §1、v1.11.0）| `IdentityProvider` async trait — `WikiCacheIdentityProvider`（`shared/wiki/identity/people/*.md`）、`NotionIdentityProvider`（Notion `databases/query` + `field_map`）、`ChainedProvider`（cache → upstream、障害時は優雅にデグレード）|
+| `identity_resolve` MCP ツール | `Scope::IdentityRead` でゲート、標準 `ResolvedPerson` レコードを返却 |
+| Sender 自動注入 | チャネル返信が XML 区切りの `<sender>` ブロックを system prompt へ注入（ターン毎に 1 回解決）、SOUL.md「非メンバー拒否」ルールをデータ駆動化 |
+| 共有 Wiki SoT ポリシー（RFC-21 §3、v1.11.0）| `~/.duduclaw/shared/wiki/.scope.toml` が名前空間所有権を宣言 — `agent_writable`（デフォルト）、`read_only { synced_from }`、`operator_only`；`shared_wiki_write` / `shared_wiki_delete` が遵守；`wiki_namespace_status` が現行ポリシーを公開；ファイル欠如/不正 ⇒ フェイルセーフでポリシーなし |
+
+## Live Forking（RFC-26）
+
+| 機能 | 説明 |
+|------|------|
+| Live Run Forking（`duduclaw-fork`）| pydantic-deepagents 由来の実行中ブランチング — 複数の継続を並行探索 |
+| AI Judge | 並行ブランチをスコアリングし最良の継続を選択 |
+| 予算制御 | `budget.rs` が fork fan-out / コストを制限 |
+
+## CLI ランタイム（PTY Pool）
+
+| 機能 | 説明 |
+|------|------|
+| クロスプラットフォーム PTY Pool（`duduclaw-cli-runtime`、v1.15.0）| 本物のインタラクティブ `claude` REPL を駆動（Win 10 1809+ は ConPTY、Unix は `portable-pty` 経由 openpty）、sentinel-framed in-band レスポンスプロトコル — Anthropic が OAuth サブスク口座向けに `claude -p` をブロックした問題に対応。デフォルトオフ、per-agent オプトイン `[runtime] pty_pool_enabled = true` |
+| Worker Supervisor（`duduclaw-cli-worker`）| `[runtime] worker_managed = true` でゲートされる out-of-process worker サブプロセス；SIGTERM/SIGKILL を gateway の優雅シャットダウンに連動 |
+| `pty_runtime.rs` アダプタ | `RuntimeMode::{FreshSpawn, PtyPool}` per-agent ルーティング、`acquire_and_invoke` サーフェス；OAuth → インタラクティブ REPL、API-key → `oneshot_pty_invoke + claude -p` |
+| Runtime ステータスエンドポイント | `GET /api/runtime/status` loopback 限定 JSON（Phase 8.5）|
+| 可観測性 | `pty_pool_*` Prometheus カウンタ（acquires / cache-hit / spawn / eviction / invoke outcomes / duration histogram）、`worker_health_misses_total`、`worker_restarts_total`、`pty_pool_managed_worker_active` ゲージ |
+| 優雅なフォールバック | 全 PTY パスはエラー時にレガシー `tokio::process::Command + claude -p` へフォールバック — worker 欠如 / pool 不健全 / spawn 失敗は回復可能 |
+
+## MCP HTTP/SSE トランスポート（W20）
+
+| 機能 | 説明 |
+|------|------|
+| HTTP Server | `duduclaw http-server --bind 127.0.0.1:8765` — Bearer 認証 REST + SSE |
+| エンドポイント | `POST /mcp/v1/call`（単一 JSON-RPC ツール呼出）、`GET /mcp/v1/stream`（長命 SSE）、`POST /mcp/v1/stream/call`（非同期 + SSE push）、`GET /healthz`（認証なし）|
+| レート制限 | Token bucket `OpType::HttpRequest`、60 req/min |
+| SSE 接続ストア | `mcp_sse_store.rs` が broadcast channel で SSE 接続を管理 |
 
 ## ERP 連携
 
@@ -240,6 +314,14 @@
 | Prometheus メトリクス | `GET /metrics` — requests / tokens / duration histogram / channel status |
 | Dashboard WS ハートビート | サーバー Ping 30s + 60s アイドルクローズ；クライアント `ping` RPC 25s |
 | BroadcastLayer | tracing レイヤー、リアルタイムログを WebSocket 購読者にストリーミング |
+
+## メモリ評価と Python レイヤー
+
+| 機能 | 説明 |
+|------|------|
+| LOCOMO メモリ評価（W21、v1.9.4）| `python/duduclaw/memory_eval/` — `retrieval_accuracy` / `retention_rate` / `locomo_integrity_check`；`cron_runner` 毎日 03:00 UTC；5 分 `smoke_test` P0；`build_golden_qa.py` がゴールデン QA セットを構築；200 件 `data/golden_qa_set.jsonl`；`duduclaw-memory` バッチクエリ API |
+| Python Agents ルーティング（v1.9.4）| `python/duduclaw/agents/` — 能力ベースルーティング（`capabilities/` manifest loader + matcher、`routing/` router + resolution + memory_resolver）|
+| Python MCP スコープ強制（v1.9.4）| `python/duduclaw/mcp/` — API key 認証 + key masking；memory ツール（store/read/search/namespace/quota）を `execute()` 入口で厳格にスコープ強制（`memory:write` / `memory:read`）|
 
 ## Web ダッシュボード
 

@@ -1,6 +1,6 @@
 # DuDuClaw 特色功能介紹
 
-> DuDuClaw v1.8.14 | 最後更新：2026-04-21
+> DuDuClaw v1.21.1 | 最後更新：2026-06-21
 
 本目錄收錄 DuDuClaw 各項特色功能的詳細介紹。每篇文章以設計理念、系統行為與運作流程為主軸——面向想深入了解「系統如何運作」的開發者，無需閱讀原始碼。
 
@@ -25,12 +25,20 @@
 | 13 | [Multi-Runtime Agent 執行](13-multi-runtime.md) | Claude / Codex / Gemini / OpenAI-compat 統一後端 |
 | 14 | [語音管線](14-voice-pipeline.md) | ASR / TTS / VAD / LiveKit — 本地優先語音智慧 |
 | 15 | [Skill 生命週期引擎](15-skill-lifecycle.md) | 7 階段自動化技能萃取與管理 |
-| 16 | [Session 記憶堆疊](../16-session-memory-stack.md) | Instruction Pinning + Snowball Recap + Key-Fact Accumulator |
-| 17 | [Wiki 知識分層](../17-wiki-knowledge-layer.md) | L0-L3 四層信任加權知識，自動注入系統 prompt |
-| 18 | [Git Worktree L0 隔離](../18-worktree-isolation.md) | 每任務獨立工作區，原子合併 |
-| 19 | [Agent Client Protocol (ACP/A2A)](../19-agent-client-protocol.md) | stdio JSON-RPC 2.0，Zed/JetBrains/Neovim 整合 |
-
-> 註：16-19 篇目前僅提供英文版，歡迎 PR 翻譯。
+| 16 | [Session 記憶堆疊](16-session-memory-stack.md) | Instruction Pinning + Snowball Recap + Key-Fact Accumulator |
+| 17 | [Wiki 知識分層](17-wiki-knowledge-layer.md) | L0-L3 四層信任加權知識，自動注入系統 prompt |
+| 18 | [Git Worktree L0 隔離](18-worktree-isolation.md) | 每任務獨立工作區，原子合併 |
+| 19 | [Agent Client Protocol (ACP/A2A)](19-agent-client-protocol.md) | stdio JSON-RPC 2.0，Zed/JetBrains/Neovim 整合 |
+| 20 | [記憶智能](20-memory-intelligence.md) | 時序事實 + Reflexion 迴圈 + 批次擷取（v1.19.0） |
+| 21 | [治理層](21-governance-layer.md) | 政策註冊表 + 每 Agent 配額（duduclaw-governance） |
+| 22 | [持久化框架](22-durability-framework.md) | 冪等 / 重試 / 斷路器 / 檢查點 / DLQ |
+| 23 | [Autopilot 規則引擎](23-autopilot-engine.md) | 事件驅動自動化 + 斷路器 |
+| 24 | [任務看板與活動動態](24-task-board.md) | Agent 即隊友的任務管理 |
+| 25 | [身分解析](25-identity-resolution.md) | WikiCache / Notion / Chained 供應器（RFC-21 §1） |
+| 26 | [MCP HTTP/SSE 傳輸](26-mcp-http-sse.md) | Bearer 認證 REST + SSE 端點（W20） |
+| 27 | [跨平台 PTY Pool + Worker](27-pty-pool-runtime.md) | 驅動互動式 `claude` REPL（v1.15.0） |
+| 28 | [即時執行分支（Live Forking）](28-live-forking.md) | 並行分支 + AI 評審（duduclaw-fork, RFC-26） |
+| 29 | [演化事件](29-evolution-events.md) | 黑盒紀錄器，批次 + 重試遞送 |
 
 ---
 
