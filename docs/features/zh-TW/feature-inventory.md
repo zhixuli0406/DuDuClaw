@@ -1,6 +1,6 @@
 # DuDuClaw 完整功能清單
 
-> v1.8.14 | 最後更新：2026-04-21
+> v1.21.1 | 最後更新：2026-06-21
 
 ---
 
@@ -63,6 +63,7 @@
 | Media Pipeline | 自動縮放（max 1568px）+ MIME 偵測 + Vision 整合 |
 | Sticker 系統 | LINE 貼圖目錄 + 情緒偵測 + Discord emoji 等價映射 |
 | 通道失敗追蹤 | `channel_failures.jsonl` + `FailureReason` 分類（RateLimited/Billing/Timeout/BinaryMissing/SpawnError/EmptyResponse/NoAccounts/Unknown）|
+| Discord Gateway 強化（v1.9.2）| 真正的 op 6 RESUME — 跨重連保存 `session_id` + `resume_gateway_url` + sequence；`select!` 停滯看門狗於 2× 心跳沉默後中斷（修復 18 分鐘殭屍狀態）；心跳 channel 容量 1→16 配 `try_send`；op 9 依 `d.bool` 選 RESUME 或 IDENTIFY 並加 1-5s jitter；close code 4007/4009/4003 清除 session；backoff 上限 300s→60s；處理 `RESUMED` dispatch |
 
 ## 演化系統
 
@@ -93,7 +94,7 @@
 | Dedup 偵測 | `wiki_dedup` — 標題匹配 + 標籤 Jaccard 相似度（≥0.8）|
 | 反向 backlink 索引 | 掃描 `related` frontmatter + body markdown 連結 |
 | 搜尋篩選 | `min_trust` / `layer` / `expand`（1-hop related/backlink 擴充）|
-| 共享 Wiki | `~/.duduclaw/shared/wiki/` 跨 Agent SOP / 政策 / 規格；`wiki_visible_to` 可見度控制 |
+| 共享 Wiki | `~/.duduclaw/shared/wiki/` 跨 Agent SOP / 政策 / 規格；`wiki_visible_to` 可見度控制；MCP 工具 `shared_wiki_ls/read/write/search/delete/stats`、`wiki_share`；`.scope.toml` SoT 政策（見「身分與存取」）|
 | CLAUDE_WIKI 模板 | 新 Agent 建立時納入 CLAUDE.md，教導 LLM 使用 wiki MCP 工具 |
 
 ## 技能生態
@@ -171,6 +172,9 @@
 | 認知記憶 MCP 工具 | `memory_search_by_layer` / `memory_successful_conversations` / `memory_episodic_pressure` / `memory_consolidation_status` |
 | 聯邦記憶 | 跨 Agent 知識共享（Private / Team / Public）|
 | Key-Fact Accumulator | `key_facts` + FTS5 — 跨 session 輕量記憶（見 Session 記憶堆疊）|
+| Temporal Memory（F1，v1.19.0）| `memories` 經冪等遷移新增時序/知識圖譜欄位（`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`）；`store_temporal()` 對同一 `(agent, subject, predicate)` 自動衝突解析並串接 supersession chain；`search()` 預設僅過濾現行有效列；`get_history()` / `get_at()` 提供鏈與時間點查詢 |
+| Reflexion Loop（F2，v1.19.0）| 橋接既有 `MistakeNotebook` — F2a 將近期未解決錯誤注入作答 prompt（`## Past Mistakes to Avoid`，CJK-safe 比對 + recency fallback）；F2b 將 ≥3 則同 `MistakeCategory` 錯誤整併為一條語意記憶規則（`reflexion.rs`）後標記來源已解決。觸發訊號 = `ErrorCategory` Significant/Critical（MetaCognition 自適應）|
+| `memory_fetch_batch`（F3，v1.19.0）| MCP 工具 + `get_by_ids` 一次以 ID 取回 ≤100 筆（命名空間/擁有權強制，部分命中 → `missing_ids`）|
 
 ## Git Worktree 隔離（v1.6.0）
 
@@ -220,6 +224,76 @@
 | CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` 永久化（v1.8.12），`schedule_task` MCP schema 修正（含 `agent_id` + `name`）|
 | ReminderScheduler | 一次性提醒（相對 `5m`/`2h`/`1d` 或 ISO 8601），`direct` / `agent_callback` 兩種模式 |
 | HeartbeatScheduler | 每 Agent 統一排程 — bus polling + GVU 沉默喚醒 + cron |
+| 排程器級任務板拉取（v1.9.3）| `poll_assigned_tasks` 移入 `HeartbeatScheduler::run` tick — 每 30s 掃描整個 agent registry（不再略過 `enabled=false` 的 agent）；1 小時 LIKE-marker 冷卻防止 stampede |
+| `duduclaw evolution finalize` CLI（v1.9.1）| 一次性回收應已結束的 SOUL.md 觀察窗；`--dry-run` / `--agent` 篩選；作為 30 分鐘 `ObservationFinalizer` 背景任務的後備 |
+
+## 任務板與 Activity Feed
+
+| 功能 | 說明 |
+|------|------|
+| 任務板 | SQLite 後端任務管理 — status / priority / assignment 追蹤 |
+| Dashboard RPC | `tasks.list/create/update/remove/assign`、`activity.list` 供 Web UI |
+| Agent MCP 工具 | `tasks_list`、`tasks_create`、`tasks_update`、`tasks_claim`、`tasks_complete`、`tasks_block`、`activity_list`、`activity_post` — Agent 可見自身佇列、認領工作、回報進度 |
+| 即時 Activity Feed | WebSocket 串流 activity 事件 |
+| 系統 prompt 注入 | 待辦任務（最多 5 筆）自動注入 Agent system prompt |
+
+## Autopilot 規則引擎
+
+| 功能 | 說明 |
+|------|------|
+| 事件匯流排 | `tokio::broadcast`（容量 8192）— `TaskCreated` / `TaskStatusChanged` / `ChannelMessage` / `AgentIdle` / `CronTick` |
+| 規則條件 | `all` / `any` + `eq/neq/in/gt/lt/contains` 運算子 |
+| 動作型別 | `delegate`（enqueue bus task）、`notify`（通道）、`run_skill`（skill 名稱 + 目標經 alphanumeric allowlist + `canonicalize()` 路徑圍堵驗證）|
+| 規則 CRUD | Dashboard RPC `autopilot.list/create/update/remove/history` + agent MCP `autopilot_list`；寫入時驗證結構 |
+| 三態斷路器 | 每規則 `Closed` / `Open` / `HalfOpen` — 60s 內 10 次觸發轉 Open（60s 冷卻），再 HalfOpen probe；防止自我增強迴圈；轉換記入 history + Activity Feed |
+| events.db 橋接 | SQLite（WAL + 單調遞增 id + 7 天 prune）取代舊 `events.jsonl` — 無 rotation race、無 partial-line 風險 |
+
+## 可靠性與治理
+
+| 功能 | 說明 |
+|------|------|
+| Durability 框架（`duduclaw-durability`，v1.9.4）| 五大支柱 — `idempotency`（key 去重）、`retry`（指數退避 + jitter）、`circuit_breaker`（三態 + `probe_inflight` 計數）、`checkpoint`（可恢復任務進度）、`dlq`（死信佇列）。用於 gateway LLM fallback + 持久化 cron |
+| 治理層（`duduclaw-governance`，v1.9.4）| `PolicyRegistry` 支援 YAML 載入 + 熱重載 + agent 優先合併 + fail-safe（非法政策略過、malformed YAML 不 panic）。四種 `PolicyType` — Rate / Permission / Quota / Lifecycle |
+| 配額管理 | 每 agent / 每政策 soft + hard 配額強制；`error_codes.rs` 標準化治理錯誤（QUOTA_EXCEEDED / POLICY_DENIED / ...）。預設集於 `policies/global.yaml`（如 `default-rate-mcp` 200/min）|
+| LLM Fallback 鏈（`gateway/llm_fallback.rs`，v1.9.4）| 主模型 timeout/503/429/overloaded 自動切換 fallback；純函數 `is_llm_fallback_error` / `should_attempt_model_fallback` 有單元測試；hard-deadline arm 回傳 `Err("hard timeout")` 確保 fallback 可靠觸發 |
+| Evolution Events 系統（v1.9.4）| 30+ 事件 schema（`schema.rs`）、async batch+retry emitter（`emitter.rs`）、查詢介面（`query.rs`）、可靠性保證（`reliability.rs`）；HTTP 端點呈現於 Web `ReliabilityPage` |
+
+## 身分與存取
+
+| 功能 | 說明 |
+|------|------|
+| Identity Resolution（`duduclaw-identity`，RFC-21 §1，v1.11.0）| `IdentityProvider` async trait — `WikiCacheIdentityProvider`（`shared/wiki/identity/people/*.md`）、`NotionIdentityProvider`（Notion `databases/query` + `field_map`）、`ChainedProvider`（cache → upstream，故障時優雅降級）|
+| `identity_resolve` MCP 工具 | 受 `Scope::IdentityRead` 閘控，回傳標準 `ResolvedPerson` 紀錄 |
+| Sender 自動注入 | 頻道回覆將 XML 分隔的 `<sender>` 區塊注入 system prompt（每輪解析一次），使 SOUL.md「拒絕非成員」規則可由資料判定 |
+| 共享 Wiki SoT 政策（RFC-21 §3，v1.11.0）| `~/.duduclaw/shared/wiki/.scope.toml` 宣告命名空間擁有權 — `agent_writable`（預設）、`read_only { synced_from }`、`operator_only`；`shared_wiki_write` / `shared_wiki_delete` 遵循；`wiki_namespace_status` 揭示現行政策；檔案缺失/格式錯誤 ⇒ fail-safe 無政策 |
+
+## Live Forking（RFC-26）
+
+| 功能 | 說明 |
+|------|------|
+| Live Run Forking（`duduclaw-fork`）| 受 pydantic-deepagents 啟發的執行中分支 — 並行探索多種延續路徑 |
+| AI Judge | 為並行分支評分以挑選最佳延續 |
+| 預算控制 | `budget.rs` 限制 fork fan-out / 成本 |
+
+## CLI Runtime（PTY Pool）
+
+| 功能 | 說明 |
+|------|------|
+| 跨平台 PTY Pool（`duduclaw-cli-runtime`，v1.15.0）| 驅動真正的互動式 `claude` REPL（Win 10 1809+ 用 ConPTY、Unix 經 `portable-pty` 用 openpty），以 sentinel-framed in-band 回應協定 — 因應 Anthropic 對 OAuth 訂閱帳號封鎖 `claude -p`。預設關閉，per-agent 開啟 `[runtime] pty_pool_enabled = true` |
+| Worker Supervisor（`duduclaw-cli-worker`）| 受 `[runtime] worker_managed = true` 閘控的跨程序 worker 子程序；SIGTERM/SIGKILL 接入 gateway 優雅關機序列 |
+| `pty_runtime.rs` 轉接器 | `RuntimeMode::{FreshSpawn, PtyPool}` per-agent 路由，`acquire_and_invoke` 介面；OAuth → 互動式 REPL，API-key → `oneshot_pty_invoke + claude -p` |
+| Runtime 狀態端點 | `GET /api/runtime/status` 僅 loopback JSON（Phase 8.5）|
+| 可觀測性 | `pty_pool_*` Prometheus 計數器（acquires / cache-hit / spawn / eviction / invoke outcomes / duration histogram）、`worker_health_misses_total`、`worker_restarts_total`、`pty_pool_managed_worker_active` gauge |
+| 優雅 fallback | 所有 PTY 路徑出錯時退回舊版 `tokio::process::Command + claude -p` — worker 缺失 / pool 不健康 / spawn 失敗皆可恢復 |
+
+## MCP HTTP/SSE 傳輸（W20）
+
+| 功能 | 說明 |
+|------|------|
+| HTTP Server | `duduclaw http-server --bind 127.0.0.1:8765` — Bearer 認證 REST + SSE |
+| 端點 | `POST /mcp/v1/call`（單次 JSON-RPC 工具呼叫）、`GET /mcp/v1/stream`（長連 SSE）、`POST /mcp/v1/stream/call`（async + SSE push）、`GET /healthz`（免認證）|
+| 速率限制 | Token bucket `OpType::HttpRequest`，60 req/min |
+| SSE 連線管理 | `mcp_sse_store.rs` 以 broadcast channel 管理 SSE 連線 |
 
 ## ERP 整合
 
@@ -240,6 +314,14 @@
 | Prometheus 指標 | `GET /metrics` — requests / tokens / duration histogram / channel status |
 | Dashboard WS 心跳 | Server Ping 30s + 60s 空閒關閉；client `ping` RPC 25s |
 | BroadcastLayer | tracing layer 即時串流至 WebSocket 訂閱者 |
+
+## 記憶評測與 Python 層
+
+| 功能 | 說明 |
+|------|------|
+| LOCOMO 記憶評測（W21，v1.9.4）| `python/duduclaw/memory_eval/` — `retrieval_accuracy` / `retention_rate` / `locomo_integrity_check`；`cron_runner` 每日 03:00 UTC；5 分鐘 `smoke_test` P0；`build_golden_qa.py` 建立黃金 QA 集；200 筆 `data/golden_qa_set.jsonl`；`duduclaw-memory` 批次查詢 API |
+| Python Agents 路由（v1.9.4）| `python/duduclaw/agents/` — 能力導向路由（`capabilities/` manifest loader + matcher、`routing/` router + resolution + memory_resolver）|
+| Python MCP 範圍強制（v1.9.4）| `python/duduclaw/mcp/` — API key 認證 + key masking；memory 工具（store/read/search/namespace/quota）在 `execute()` 入口嚴格強制範圍（`memory:write` / `memory:read`）|
 
 ## Web 儀表板
 

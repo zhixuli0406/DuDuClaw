@@ -1,6 +1,6 @@
 # DuDuClaw Documentation
 
-> Public documentation for the DuDuClaw Multi-Runtime AI Agent Platform (v1.9.4).
+> Public documentation for the DuDuClaw Multi-Runtime AI Agent Platform (v1.21.1).
 
 ---
 
@@ -30,6 +30,16 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/17-wiki-knowledge-layer.md](features/17-wiki-knowledge-layer.md) | Wiki knowledge layer — L0-L3 trust-weighted auto-injection |
 | [features/18-worktree-isolation.md](features/18-worktree-isolation.md) | Git worktree L0 isolation — lightweight per-task sandbox |
 | [features/19-agent-client-protocol.md](features/19-agent-client-protocol.md) | ACP/A2A protocol server — Zed / JetBrains / Neovim integration |
+| [features/20-memory-intelligence.md](features/20-memory-intelligence.md) | Memory intelligence — temporal facts + reflexion loop + batch fetch |
+| [features/21-governance-layer.md](features/21-governance-layer.md) | Governance layer — policy registry + per-agent quotas |
+| [features/22-durability-framework.md](features/22-durability-framework.md) | Durability — idempotency / retry / circuit breaker / checkpoint / DLQ |
+| [features/23-autopilot-engine.md](features/23-autopilot-engine.md) | Autopilot rule engine — event-driven automation + circuit breaker |
+| [features/24-task-board.md](features/24-task-board.md) | Task Board & Activity Feed — agent-as-teammate task management |
+| [features/25-identity-resolution.md](features/25-identity-resolution.md) | Identity resolution — WikiCache / Notion / Chained providers |
+| [features/26-mcp-http-sse.md](features/26-mcp-http-sse.md) | MCP HTTP/SSE transport — Bearer-authed REST + SSE |
+| [features/27-pty-pool-runtime.md](features/27-pty-pool-runtime.md) | Cross-platform PTY pool + worker — drive interactive claude REPL |
+| [features/28-live-forking.md](features/28-live-forking.md) | Live run forking — parallel branches + AI judge (duduclaw-fork) |
+| [features/29-evolution-events.md](features/29-evolution-events.md) | Evolution events — black-box recorder with batch+retry delivery |
 
 ---
 
