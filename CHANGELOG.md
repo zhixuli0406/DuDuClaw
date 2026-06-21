@@ -1,6 +1,33 @@
 # Changelog
 
 
+## [1.22.1] - 2026-06-21 — Core gateway drops the Python runtime dependency
+
+### Changed
+- **Skill vetting is now Rust-native.** The dashboard `skills.vet` path no longer
+  shells out to `python3 -m duduclaw.evolution.run`; it uses
+  `skill_lifecycle::security_scanner::scan_skill` — the same scanner already
+  backing the MCP `skill_security_scan` tool and the sandbox-trial gate, so the
+  dashboard, agents, and lifecycle pipeline share one verdict.
+- **Channel delegate / fallback is now Rust-native.** The `channel_reply`
+  3rd-tier fallback and `agents.delegate` (wait=true) call
+  `direct_api::call_direct_api` (new `call_direct_api_delegate`) instead of the
+  `duduclaw.sdk.chat` Python subprocess.
+- **The core gateway/CLI installed via npm/Homebrew now has no Python runtime
+  dependency.** `pip install duduclaw` is optional — the `duduclaw` PyPI package
+  is a standalone importable library only. Advanced local inference
+  (MLX / LLMLingua-2) still depends on the separate `mlx_lm` / `llmlingua` ML
+  packages, not on `duduclaw`. Docs updated across README (zh/en/ja),
+  ARCHITECTURE, overview, evolution-engine, docker, and feature docs.
+
+### Removed
+- Deleted `gateway/src/evolution.rs` (its sole content was the Python vet
+  bridge), the dead `vet_skill_native` fallback (which used non-compliant
+  unanchored `contains`), and the `call_python_sdk_v2` / `find_python_path`
+  helpers in `channel_reply`.
+
+
+
 ## [1.22.0] - 2026-06-21 — RFC-26 Live Forking · skill-synthesis scheduler · Calm Glass dashboard
 
 Inspired by [vstorm-co/pydantic-deepagents](https://github.com/vstorm-co/pydantic-deepagents),
