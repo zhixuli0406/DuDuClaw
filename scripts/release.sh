@@ -325,7 +325,19 @@ fi
 # --- Git commit + tag ---
 echo ""
 echo "Creating git commit and tag..."
-git add -A Cargo.toml crates/*/Cargo.toml npm/*/package.json pyproject.toml README.md README.en.md README.ja.md CHANGELOG.md
+# Stage exactly what the bump touched. Derive the manifest list from the SAME
+# source of truth used by bump/audit/assert (platform_manifests) so a new
+# publish target can never be bumped-but-not-committed — the historical bug
+# that left python/duduclaw/__init__.py + scripts/install.{sh,ps1} on disk at
+# the new version yet absent from the bump commit. Plus Cargo.lock (rewritten
+# by `cargo check` when workspace crate versions change) and CHANGELOG.md.
+STAGE_FILES=()
+while IFS='|' read -r _kind file; do
+    STAGE_FILES+=("$file")
+done < <(platform_manifests)
+[[ -f Cargo.lock ]] && STAGE_FILES+=("Cargo.lock")
+STAGE_FILES+=("CHANGELOG.md")
+git add -- "${STAGE_FILES[@]}"
 git commit -m "chore: bump v$NEW_VERSION"
 git tag -a "v$NEW_VERSION" -m "Release v$NEW_VERSION"
 
