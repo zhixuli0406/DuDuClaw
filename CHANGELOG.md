@@ -57,6 +57,19 @@ then let an AI judge pick the winner. **Default off**; per-agent opt-in via
 - **Activity-Feed mirroring** — fork resolutions write a `fork_resolved` row into the gateway's
   cross-process `activity` table (`<home>/tasks.db`), surfacing on the dashboard Activity Feed.
 
+### Added (round 4 — cross-branch aggregate pre-emption)
+- **`duduclaw_fork::LiveAggregate`** — a streaming-time companion to `budget::Pool`, shared across a
+  fork's concurrent branches. It tracks every in-flight branch's live `total_cost_usd`; the moment their
+  combined spend crosses the aggregate cap it names the **most-expensive in-flight branch** (deterministic
+  tie-break) so it can be pre-emptively killed — instead of waiting for each branch to hit its own
+  per-branch cap. (5 unit tests.)
+- **Spawner wiring** (`mcp_fork_exec.rs`) — each stream-json cost update runs the pure
+  `stream_budget_decision` (per-branch cap → aggregate `observe`): the priciest over-budget branch
+  self-kills if it is the observer, otherwise the observer `request_budget_kill`s the sibling. The
+  aggregate kill is tagged so the woken branch maps to `BudgetExceeded` (→ `BudgetKilled`), distinct
+  from an operator `terminate_branch` (`Cancelled` → `Terminated`); `LiveAggregate::finish` frees a
+  branch's budget for survivors once it ends. (5 unit tests.) Completes RFC-26 §4.2.
+
 
 ## [1.21.1] - 2026-06-18 — Channel routing: stop bot "identity mixing"
 
