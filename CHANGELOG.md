@@ -1,7 +1,7 @@
 # Changelog
 
 
-## [Unreleased] — RFC-26: Live Run Forking (deep-agents alignment)
+## [1.22.0] - 2026-06-21 — RFC-26 Live Forking · skill-synthesis scheduler · Calm Glass dashboard
 
 Inspired by [vstorm-co/pydantic-deepagents](https://github.com/vstorm-co/pydantic-deepagents),
 this adds **Live Run Forking** — split an in-flight agent task into N competing
@@ -69,6 +69,36 @@ then let an AI judge pick the winner. **Default off**; per-agent opt-in via
   aggregate kill is tagged so the woken branch maps to `BudgetExceeded` (→ `BudgetKilled`), distinct
   from an operator `terminate_branch` (`Cancelled` → `Terminated`); `LiveAggregate::finish` frees a
   branch's budget for survivors once it ends. (5 unit tests.) Completes RFC-26 §4.2.
+
+### Added (skill synthesis — W19-P1)
+- **Periodic auto-run scheduler** (`skill_synthesis_pipeline::scheduler`) — runs the
+  rollout-to-skill pipeline on a fixed interval instead of waiting for a manual
+  `skill_synthesis_run` MCP call. **Off by default**, **dry-run by default even when
+  enabled**, hot-reloaded config (`config.toml [skill_synthesis] auto_run/dry_run/
+  interval_hours/lookback_days/target_agent`), and non-blocking (pipeline errors are
+  captured into the run summary, never abort the loop).
+- **Dashboard config RPCs** — admin-gated `skill_synthesis.get` / `skill_synthesis.update`
+  (validated writes onto `config.toml [skill_synthesis]`); `skill_synthesis_threshold`
+  is a `u32` count (no longer a float — fixes registry scan rejecting `0.7`).
+- **`fetch_episodic_evidence`** with path-traversal rejection + tests.
+
+### Added (dashboard — Calm Glass redesign)
+- **Calm Glass design system** — shared component library (`web/src/components/ui/`:
+  Page / PageHeader / Section / Card / StatCard / Button / Badge / Field / Tabs /
+  EmptyState) + a 6-group sidebar nav model (`layout/nav-model.ts`), applied across
+  every dashboard page. Design spec in `web/DESIGN.md`; design tokens in `index.css`.
+- i18n keys synchronized across `en` / `ja-JP` / `zh-TW`.
+
+### Documentation
+- **Feature docs reorg + trilingual coverage** — 10 new feature deep-dives (20–29:
+  memory-intelligence, governance-layer, durability-framework, autopilot-engine,
+  task-board, identity-resolution, mcp-http-sse, pty-pool-runtime, live-forking,
+  evolution-events) in `en` / `ja-JP` / `zh-TW`; back-translated 16–19 to `ja-JP` /
+  `zh-TW`; `feature-inventory` refreshed `v1.8.14 → v1.22.0`; README indexes updated.
+
+### Housekeeping
+- Removed residual local artifacts (test `.profraw`/coverage, stale 5.6 GB git
+  worktrees) — gitignored cruft only, no repo content affected.
 
 
 ## [1.21.1] - 2026-06-18 — Channel routing: stop bot "identity mixing"
