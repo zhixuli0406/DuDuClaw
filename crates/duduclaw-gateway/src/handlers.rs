@@ -11500,7 +11500,7 @@ mod p1_config_helper_tests {
         let params = json!({ "evolution_advanced": {
             "external_factors": { "user_feedback": true, "peer_signals": false },
             "skill_synthesis_enabled": true,
-            "skill_synthesis_threshold": 0.6,
+            "skill_synthesis_threshold": 3,
             "skill_synthesis_cooldown_hours": 12,
             "curiosity_max_daily": 5,
         }});
@@ -11511,7 +11511,12 @@ mod p1_config_helper_tests {
         assert_eq!(ef.get("user_feedback").unwrap().as_bool(), Some(true));
         assert_eq!(ef.get("peer_signals").unwrap().as_bool(), Some(false));
         assert_eq!(evo.get("skill_synthesis_enabled").unwrap().as_bool(), Some(true));
-        assert_eq!(evo.get("skill_synthesis_threshold").unwrap().as_float(), Some(0.6));
+        // skill_synthesis_threshold is a u32 gap-count, not a unit threshold —
+        // it must serialize as a TOML integer (see apply_evolution_advanced_to_table).
+        assert_eq!(
+            evo.get("skill_synthesis_threshold").unwrap().as_integer(),
+            Some(3)
+        );
         assert_eq!(evo.get("skill_synthesis_cooldown_hours").unwrap().as_integer(), Some(12));
         assert_eq!(evo.get("curiosity_max_daily").unwrap().as_integer(), Some(5));
     }
