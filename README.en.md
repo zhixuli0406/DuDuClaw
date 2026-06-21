@@ -30,7 +30,7 @@ observability. Same architecture standards as DuDuClaw.
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.21.1-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.22.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -117,19 +117,19 @@ infrastructure work.
 
 ---
 
-> 🎉 **v1.21.0 — RFC-25 §5 followups: the non-Claude path is now first-class** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.21.0))
+> 🎉 **v1.22.0 — RFC-26 Live Forking ships · Skill-synthesis scheduler · Calm Glass dashboard** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.22.0))
 >
-> v1.20.0 compiled the multi-runtime abstraction, but the non-Claude (Codex / Gemini / OpenAI-compat) path was still a thin opt-in with documented gaps. v1.21.0 closes all 11 of them so non-Claude agents are first-class, and hardens the release tooling so PyPI can no longer be silently skipped.
+> Three headlines: **RFC-26 Live Forking** completes rounds 1–4 — split an in-flight task into N competing branches that explore different strategies in copy-on-write isolated workspaces and let an AI judge pick the winner; the **Skill-synthesis scheduler** (W19-P1) makes "conversation → skill" extraction run autonomously on an interval; and the **Calm Glass dashboard** rebuilds every page on a shared component library. All three are off by default and opt-in.
 >
-> - **Multi-turn context** — `conversation_history` threaded through the choke-point and consumed by Codex / Gemini / OpenAI-compat (OpenAI-compat uses native multi-turn `messages`); duplicate `ConversationTurn` consolidated
-> - **Cost telemetry / keepalive / pending-tasks** — non-Claude usage recorded to `CostTelemetry` (detached); periodic `Keepalive` on long replies; the Task-Board queue inlined into non-Claude delegation prompts
-> - **Resilience** — per-(home,provider) failover health (3 failures → 60s cooldown → fallback), per-home `RuntimeRegistry` cache, A2A `resolve_target_agent` + AgentRegistry mtime-invalidated cache, single `agent.toml` parse per reply
-> - **Release fix** — `release.sh` multi-platform version sync + drift audit + post-bump assertion + `verify` (queries PyPI/npm); fixes the `pyproject.toml` drift (stuck at 1.18.0) that made CI build a stale wheel and `skip-existing` silently freeze PyPI
+> - **Live Forking** — `duduclaw-fork` engine + 6 MCP tools + cross-process SQLite `ForkStore` + `RotatingBranchExecutor` (a distinct account per branch) + `LiveAggregate` cross-branch budget pre-emption (kills the priciest in-flight branch) + native copy-on-write overlay (`clonefile` / `--reflink`). Default off; enable per agent via `agent.toml [fork] enabled = true`
+> - **Skill-synthesis scheduler** — `config.toml [skill_synthesis] auto_run/dry_run/interval_hours/lookback_days` + dashboard `skill_synthesis.get/update` RPCs; `skill_synthesis_threshold` is back to a `u32` count (fixes the registry scan rejecting `0.7`)
+> - **Calm Glass** — shared `web/src/components/ui/` library + `nav-model.ts` 6-group sidebar + `web/DESIGN.md` spec, with synchronized en/ja/zh i18n
+> - **Docs** — 10 new feature deep-dives (20–29) × en/ja/zh, back-translated 16–19, `feature-inventory` refreshed to v1.22.0
 
 <details>
 <summary><strong>v1.9.4 → v1.20.x cumulative highlights</strong></summary>
 
-- **RFC-26 — Live Run Forking (inspired by [pydantic-deepagents](https://github.com/vstorm-co/pydantic-deepagents))**: split an in-flight task into N competing branches that explore different strategies in copy-on-write isolated workspaces, and let an AI judge pick the winner by `quality·0.4 + test_pass·0.4 + consistency·0.2` (4 merge modes). New `duduclaw-fork` crate + cross-process SQLite `ForkStore` (forks run in the MCP-server process; observable via the gateway `/metrics` endpoint and the dashboard **Forks** page) + 6 MCP tools (`fork_run`/`inspect_branches`/`diff_branches`/`merge_or_select`/`terminate_branch`/`fork_cost`) + a distinct `AccountRotator` account per branch + per-branch/aggregate USD budgets. Parity tools ship alongside: `memory_improve` (reflection proposals), `plan_start` (clarify-first planning), built-in skills (code-review/refactor/test-writer/git-workflow), checkpoint fork/rewind persistence, Task Board atomic claim + cycle detection. Default off; enable per agent via `agent.toml [fork] enabled = true`
+- **v1.21.0** — RFC-25 §5 followups: the non-Claude (Codex / Gemini / OpenAI-compat) path closes all 11 gaps to become first-class (multi-turn context, cost telemetry, keepalive, per-(home,provider) failover backoff); `release.sh` multi-platform version sync + drift audit + post-bump assertion + `verify`, fixing the `skip-existing` silent PyPI freeze
 - **v1.20.0** — RFC-25 Multi-Runtime Unlock + A2A: the "Multi-Runtime four-backend" abstraction was previously orphan, uncompiled source — every execution path hardcoded Claude. v1.20.0 wires it up and routes the LLM-calling subsystems through a single provider-agnostic choke-point (`runtime_dispatch::run_agent_prompt` + a lazily auto-detecting `RuntimeRegistry`); channel reply / GVU / sub-agent delegation route through the choke-point for non-Claude providers (Claude keeps its OAuth-rotation / PTY path, zero regression); ACP `tasks/send` actually runs the target agent and reports Failed / Completed; Phase 0 removed the GVU evolution-model hard-lock (reject → warn)
 
 - **v1.19.0** — Memory Intelligence: the W18/W19-designed memory layer, implemented non-invasively on the live Rust `SqliteMemoryEngine`. **Temporal Memory** (`memories` gains temporal / knowledge-graph columns + `store_temporal` automatic supersession chain + `get_history`/`get_at`; search default-filters to currently-valid memories); **Reflexion Loop** (bridges the existing `MistakeNotebook`: recall injected into the answering prompt + ≥3 same-category mistakes consolidated into a semantic rule); **`memory_fetch_batch`** MCP tool (fetch ≤100 entries by ID, namespace/ownership enforced). `MemoryEntry` unchanged, zero blast radius

@@ -30,7 +30,7 @@ observability. Same architecture standards as DuDuClaw.
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.21.1-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.22.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -117,19 +117,19 @@ cosign verify-blob \
 
 ---
 
-> 🎉 **v1.21.0 — RFC-25 §5 フォローアップ：非 Claude パスが一級市民に**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.21.0)）
+> 🎉 **v1.22.0 — RFC-26 ライブフォーク正式リリース · スキル合成スケジューラ · Calm Glass ダッシュボード**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.22.0)）
 >
-> v1.20.0 はマルチランタイム抽象を配線しましたが、非 Claude（Codex / Gemini / OpenAI-compat）パスは既知の欠落を抱えた薄い opt-in のままでした。v1.21.0 はその 11 件すべてを解消し、非 Claude agent を一級市民にし、さらに PyPI が黙って取りこぼされないよう発版ツールを強化します。
+> 3 つの目玉：**RFC-26 Live Forking** がラウンド 1–4 を完了——実行中のタスクを N 個の競合ブランチに分岐し、それぞれ copy-on-write の隔離ワークスペースで異なる戦略を試行、AI judge が勝者を選定。**スキル合成スケジューラ**（W19-P1）は「会話 → skill」抽出を一定間隔で自律実行。**Calm Glass ダッシュボード**は共有コンポーネントライブラリで全ページを再構築。いずれもデフォルト無効・opt-in です。
 >
-> - **マルチターン文脈** — `conversation_history` を choke-point に通し、Codex / Gemini / OpenAI-compat が消費（OpenAI-compat はネイティブのマルチターン `messages`）；重複した `ConversationTurn` 型を統合
-> - **コスト計測 / keepalive / pending-tasks** — 非 Claude の使用量を `CostTelemetry` に記録（detached）；長い応答で定期 `Keepalive`；非 Claude 委譲のシステムプロンプトに Task-Board キューを inline
-> - **耐障害性** — per-(home,provider) フェイルオーバー健全性（3 連続失敗 → 60 秒 cooldown → fallback）、per-home `RuntimeRegistry` キャッシュ、A2A `resolve_target_agent` + AgentRegistry の mtime 失効キャッシュ、1 応答あたり `agent.toml` を 1 回だけパース
-> - **発版修正** — `release.sh` のマルチプラットフォーム版数同期 + ドリフト監査 + bump 後アサート + `verify`（PyPI/npm を照会）；`pyproject.toml` のドリフト（1.18.0 に固着）→ CI が古い wheel をビルド → `skip-existing` で PyPI が黙って凍結、という問題を修正
+> - **Live Forking** — `duduclaw-fork` エンジン + 6 つの MCP ツール + クロスプロセス SQLite `ForkStore` + `RotatingBranchExecutor`（ブランチごとに独立アカウント）+ `LiveAggregate` のクロスブランチ予算プリエンプション（最も高コストの in-flight ブランチを kill）+ ネイティブ copy-on-write overlay（`clonefile` / `--reflink`）。デフォルト無効、`agent.toml [fork] enabled = true` で有効化
+> - **スキル合成スケジューラ** — `config.toml [skill_synthesis] auto_run/dry_run/interval_hours/lookback_days` + ダッシュボード `skill_synthesis.get/update` RPC；`skill_synthesis_threshold` を `u32` カウントに戻す（registry スキャンが `0.7` を拒否する不具合を修正）
+> - **Calm Glass** — 共有 `web/src/components/ui/` ライブラリ + `nav-model.ts` の 6 グループサイドバー + `web/DESIGN.md` 仕様、en/ja/zh の i18n 同期
+> - **ドキュメント** — 機能詳細 10 本（20–29）× en/ja/zh を新規追加、16–19 を翻訳、`feature-inventory` を v1.22.0 に更新
 
 <details>
 <summary><strong>v1.9.4 → v1.20.x 累積ハイライト</strong></summary>
 
-- **RFC-26 — Live Run Forking（[pydantic-deepagents](https://github.com/vstorm-co/pydantic-deepagents) に着想）**：実行中のタスクを N 個の競合ブランチに分岐し、それぞれ copy-on-write の隔離ワークスペースで異なる戦略を試行、AI judge が `quality·0.4 + test_pass·0.4 + consistency·0.2` で勝者を選定（4 つの merge モード）。新クレート `duduclaw-fork` + クロスプロセス SQLite `ForkStore`（fork は MCP サーバープロセスで実行、gateway `/metrics` とダッシュボード **Forks** ページで観測可能）+ 6 つの MCP ツール（`fork_run`/`inspect_branches`/`diff_branches`/`merge_or_select`/`terminate_branch`/`fork_cost`）+ ブランチごとに `AccountRotator` の独立アカウント + per-branch/aggregate の USD 予算。パリティツールも同梱：`memory_improve`（リフレクション提案）、`plan_start`（先に明確化してから計画）、組み込みスキル（code-review/refactor/test-writer/git-workflow）、checkpoint fork/rewind 永続化、Task Board のアトミック claim + 循環検出。デフォルト無効、`agent.toml [fork] enabled = true` で有効化
+- **v1.21.0** — RFC-25 §5 フォローアップ：非 Claude（Codex / Gemini / OpenAI-compat）パスが 11 件の欠落をすべて解消して一級市民に（マルチターン文脈、コスト計測、keepalive、per-(home,provider) フェイルオーバー退避）；`release.sh` のマルチプラットフォーム版数同期 + ドリフト監査 + bump 後アサート + `verify`、`skip-existing` で PyPI が黙って凍結する問題を修正
 - **v1.20.0** — RFC-25 マルチランタイム解放 + A2A：「Multi-Runtime 四バックエンド」はこれまでコンパイルされない孤立ソースで、すべての実行パスが Claude をハードコードしていました。v1.20.0 はこれを配線し、LLM を呼ぶサブシステムを単一の provider-agnostic な choke-point（`runtime_dispatch::run_agent_prompt` + 遅延自動検出する `RuntimeRegistry`）に通します。channel reply / GVU / サブ agent 委譲は非 Claude provider で choke-point を通り（Claude は OAuth ローテーション / PTY パスを維持、リグレッションなし）；ACP `tasks/send` がターゲット agent を実際に実行し Failed / Completed を報告；Phase 0 で GVU 進化モデルのハードロックを撤廃（reject → warn）
 
 - **v1.19.0** — Memory Intelligence：W18/W19 で設計された記憶層を、現行の Rust `SqliteMemoryEngine` に非侵襲的に実装。**Temporal Memory**（`memories` に時態 / ナレッジグラフ列 + `store_temporal` の自動 supersession チェーン + `get_history`/`get_at`、検索は既定で有効な記憶のみ返す）；**Reflexion Loop**（既存の `MistakeNotebook` をブリッジ：回答プロンプトへのリコール注入 + 同カテゴリ ≥3 件を semantic ルールに統合）；**`memory_fetch_batch`** MCP ツール（ID 一括取得 ≤100、namespace/ownership 隔離）。`MemoryEntry` は不変、影響ゼロ

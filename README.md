@@ -30,7 +30,7 @@ observability. Same architecture standards as DuDuClaw.
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.21.1-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.22.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -114,19 +114,19 @@ cosign verify-blob \
 
 ---
 
-> 🎉 **v1.21.0 — RFC-25 §5 收尾：非 Claude 路徑真正可用**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.21.0)）
+> 🎉 **v1.22.0 — RFC-26 即時分支決戰正式發佈 · Skill 合成排程器 · Calm Glass dashboard**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.22.0)）
 >
-> v1.20.0 把 multi-runtime 抽象接上電，但非 Claude（Codex / Gemini / OpenAI-compat）路徑仍是帶已知缺口的薄 opt-in。v1.21.0 補齊全部 11 項缺口，讓非 Claude agent 成為一等公民，並強化發版工具讓 PyPI 不再被靜默漏掉。
+> 三條主線：**RFC-26 Live Forking** 完成 round 1–4——把進行中的任務分叉成 N 個並行競爭分支、各自在 copy-on-write 隔離工作區嘗試不同策略，由 AI judge 挑出勝者；**Skill 合成排程器**（W19-P1）讓「對話 → skill」萃取自主週期執行；**Calm Glass dashboard** 以共用元件庫重構全頁面。三者皆預設關閉、可漸進啟用。
 >
-> - **多輪上下文** — `conversation_history` 串接 choke-point，Codex / Gemini / OpenAI-compat 全消費（OpenAI-compat 原生多輪 `messages`）；收斂重複的 `ConversationTurn` 型別
-> - **成本遙測 / keepalive / pending-tasks** — 非 Claude 用量進 `CostTelemetry`（detached）；長回應週期 `Keepalive`；非 Claude 派工系統提示含 Task-Board 佇列
-> - **韌性** — per-(home,provider) failover 健康退避（3 連敗 → 60s cooldown → fallback）、per-home `RuntimeRegistry` 快取、A2A `resolve_target_agent` + AgentRegistry mtime 失效快取、每 reply 單次 parse `agent.toml`
-> - **發版修復** — `release.sh` 多平台版本同步 + 漂移偵測 + bump 後 assert + `verify` 查 registry；修好 `pyproject.toml` 漂移（卡 1.18.0）→ CI 建舊 wheel → `skip-existing` 靜默凍住 PyPI 的問題
+> - **Live Forking** — `duduclaw-fork` 引擎 + 6 個 MCP 工具 + 跨程序 SQLite `ForkStore` + `RotatingBranchExecutor`（每分支獨立帳號）+ `LiveAggregate` 跨分支聚合預算搶占（殺最貴的 in-flight 分支）+ native copy-on-write overlay（`clonefile` / `--reflink`）。預設關閉，`agent.toml [fork] enabled = true` 啟用
+> - **Skill 合成排程器** — `config.toml [skill_synthesis] auto_run/dry_run/interval_hours/lookback_days`，dashboard `skill_synthesis.get/update` RPC；`skill_synthesis_threshold` 改回 `u32`（修好 registry 掃描拒絕 `0.7` 的型別錯誤）
+> - **Calm Glass** — `web/src/components/ui/` 共用元件庫 + `nav-model.ts` 六分組側邊欄 + `web/DESIGN.md` 設計規範，三語 i18n 同步
+> - **文件** — 新增 10 篇功能深入文件（20–29）× en/ja/zh、補譯 16–19、`feature-inventory` 更新至 v1.22.0
 
 <details>
 <summary><strong>v1.9.4 → v1.20.x 累積亮點</strong></summary>
 
-- **RFC-26 — Live Run Forking（分支決戰，受 [pydantic-deepagents](https://github.com/vstorm-co/pydantic-deepagents) 啟發）**：把進行中的任務分叉成 N 個並行競爭分支，各自在 copy-on-write 隔離工作區嘗試不同策略，由 AI judge 依 `quality·0.4 + test_pass·0.4 + consistency·0.2` 評分挑出勝者（4 種 merge 模式）。新 crate `duduclaw-fork` + 跨程序 SQLite `ForkStore`（MCP server 執行、gateway `/metrics` 與 dashboard `分支決戰` 頁可觀測）+ 6 個 MCP 工具（`fork_run`/`inspect_branches`/`diff_branches`/`merge_or_select`/`terminate_branch`/`fork_cost`）+ `AccountRotator` 分配每分支獨立帳號 + per-branch/aggregate 預算。附帶 parity 工具：`memory_improve`（反思提案）、`plan_start`（先澄清再規劃）、內建 skill（code-review/refactor/test-writer/git-workflow）、checkpoint fork/rewind 持久化、Task Board 原子 claim + 環路偵測。預設關閉，`agent.toml [fork] enabled = true` 啟用
+- **v1.21.0** — RFC-25 §5 收尾：非 Claude（Codex / Gemini / OpenAI-compat）路徑補齊全部 11 項缺口成為一等公民（多輪上下文、成本遙測、keepalive、per-(home,provider) failover 退避）；`release.sh` 多平台版本同步 + 漂移偵測 + bump 後 assert + `verify` 查 registry，修好 PyPI 被 `skip-existing` 靜默凍版的問題
 - **v1.20.0** — RFC-25 多模型解鎖 + A2A：「Multi-Runtime 四後端」過去是未編譯的孤兒程式碼，每條執行路徑都寫死 Claude。v1.20.0 把它接上電，所有呼叫 LLM 的子系統走單一 provider-agnostic choke-point（`runtime_dispatch::run_agent_prompt` + lazy 自動偵測的 `RuntimeRegistry`）；channel reply / GVU / 子 agent 派工在非 Claude provider 時走 choke-point（Claude 維持 OAuth 輪替 / PTY 路徑，零回歸）；ACP `tasks/send` 改為實際執行目標 agent 並正確回報 Failed / Completed；Phase 0 拆掉 GVU 演化模型硬鎖（reject → warn）
 
 - **v1.19.0** — Memory Intelligence：把 W18/W19 設計但未實作的記憶層非侵入式落地於現行 Rust `SqliteMemoryEngine`。**Temporal Memory**（`memories` 加時態 / 知識圖譜欄位 + `store_temporal` 自動取代鏈 + `get_history`/`get_at`，搜尋預設只回有效記憶）；**Reflexion Loop**（橋接既有 `MistakeNotebook`：召回注入答題 prompt + 同 category ≥3 固化成 semantic 規則）；**`memory_fetch_batch`** MCP 工具（依 ID 批次讀取 ≤100，namespace/ownership 隔離）。`MemoryEntry` 不動，零破壞
