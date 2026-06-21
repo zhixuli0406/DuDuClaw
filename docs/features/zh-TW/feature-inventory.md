@@ -105,7 +105,7 @@
 | GitHub 即時索引 | Search API + 24h 本地快取 + 加權搜尋 |
 | 技能市集 | Web Dashboard 瀏覽、安裝、安全掃描 |
 | 技能自動合成 | 差距累積器 → 從情境記憶合成（Voyager 啟發）→ 沙箱試用（TTL）→ 跨 Agent 畢業 |
-| Python Skill Vetter | 子程序安全掃描候選技能 |
+| Skill 安全掃描器（Rust-native）| `skill_lifecycle::security_scanner` 掃描候選技能，無 Python 依賴 |
 
 ## 本地推論引擎
 

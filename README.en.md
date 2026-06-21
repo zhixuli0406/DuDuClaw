@@ -494,23 +494,29 @@ irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.
 
 > The one-line installer auto-detects the **latest release** and downloads the prebuilt binary for your platform — also compile-free. It only offers a source build if the GitHub download fails (in which case prefer `npm install -g duduclaw`). Pin a specific version with the `DUDUCLAW_VERSION` environment variable.
 
-### Python SDK (library, not a CLI)
+### Python SDK (optional library, not a CLI)
 
-> **Important**: The `duduclaw` package on PyPI is a **pure Python library** (for `import duduclaw`) and ships **no command-line tool**.
-> The DuDuClaw gateway / CLI (the `duduclaw` command) is a **Rust binary** — install it via **npm** or **Homebrew** above.
-> Consequently `pipx install duduclaw` fails (No apps associated with package); this is expected — pipx only installs apps that declare an entry point.
+> **Important**: The core gateway / CLI (the `duduclaw` command) is a **Rust binary** — installing it via **npm** or **Homebrew** above gives you the **complete feature set**. Skill security scanning and channel replies are all handled by Rust-native paths, so **no Python dependency is required**.
+> The `duduclaw` package on PyPI is a **pure Python library** (for `import duduclaw`) and ships **no command-line tool**; consequently `pipx install duduclaw` fails (No apps associated with package) — this is expected.
 
-DuDuClaw's evolution engine (Skill Vetter) and some channel bridges require this Python library:
+`pip install duduclaw` is **optional for core functionality** — only needed when:
+
+- You want to `import duduclaw` in your own Python code (the agents / channels / mcp / memory_eval modules).
+- You run the standalone memory-evaluation tooling (LOCOMO).
+
+> **Advanced local inference (MLX reflections / LLMLingua-2 compression)** is a separate opt-in feature set that depends on ML packages such as `mlx_lm` and `llmlingua` — **not** on the `duduclaw` PyPI package. Install those individually per `inference.toml` when needed.
+
+To install the optional library:
 
 ```bash
 pip install duduclaw
 ```
 
-This command installs the following required dependencies:
+This command installs the following dependencies:
 
 | Package | Minimum version | Purpose |
 |------|---------|------|
-| `anthropic` | ≥ 0.40 | Direct Claude API calls, Skill security scan |
+| `anthropic` | ≥ 0.40 | Direct Claude API calls from your own Python code |
 | `httpx` | ≥ 0.27 | Async HTTP client (account rotation, health checks) |
 | `pyyaml` | ≥ 6.0 | Config file parsing |
 
@@ -549,8 +555,8 @@ pip install duduclaw[dev]
 git clone https://github.com/zhixuli0406/DuDuClaw.git
 cd DuDuClaw
 
-# Install Python dependencies
-pip install duduclaw
+# (Optional) only needed for the importable Python library / memory-eval tooling; the core build does not require it
+# pip install duduclaw
 
 # Build the Dashboard
 cd web && npm ci --legacy-peer-deps && npm run build && cd ..

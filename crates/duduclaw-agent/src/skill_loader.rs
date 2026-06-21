@@ -213,7 +213,7 @@ fn scan_tool_scripts(dir: &Path) -> Vec<String> {
 
 /// Install a skill from a source directory into an agent's SKILLS/ directory.
 ///
-/// [B-1b] Copies the skill file and runs security scan (via `vet_skill`).
+/// [B-1b] Copies the skill file and runs the Rust-native security scan.
 pub async fn install_skill(
     skill_path: &Path,
     agent_skills_dir: &Path,

@@ -494,23 +494,29 @@ irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.
 
 > ワンライナーインストーラーは**最新リリース**を自動検出して対応プラットフォームのプリビルド binary をダウンロードします（こちらもコンパイル不要）。GitHub のダウンロードに失敗した場合のみソースビルドを尋ねます（その際は `npm install -g duduclaw` を推奨）。`DUDUCLAW_VERSION` 環境変数で特定バージョンに固定できます。
 
-### Python SDK（ライブラリ、CLI ではありません）
+### Python SDK（任意のライブラリ、CLI ではありません）
 
-> **重要**：PyPI 上の `duduclaw` は**純粋な Python ライブラリ**（`import duduclaw` 用）であり、**コマンドラインツールは含まれません**。
-> DuDuClaw の gateway / CLI（`duduclaw` コマンド）は **Rust バイナリ**です。上記の **npm** または **Homebrew** でインストールしてください。
-> したがって `pipx install duduclaw` は失敗します（No apps associated with package）。これは想定された動作で、pipx はエントリポイントを持つアプリのみをインストールします。
+> **重要**：コアの gateway / CLI（`duduclaw` コマンド）は **Rust バイナリ**で、上記の **npm** または **Homebrew** でインストールすれば**フル機能**が使えます。Skill セキュリティスキャンとチャネル応答はすべて Rust ネイティブの経路で処理されるため、**Python 依存は不要**です。
+> PyPI 上の `duduclaw` は**純粋な Python ライブラリ**（`import duduclaw` 用）であり、**コマンドラインツールは含まれません**。したがって `pipx install duduclaw` は失敗します（No apps associated with package）。これは想定された動作です。
 
-DuDuClaw の進化エンジン（Skill Vetter）と一部のチャネルブリッジは、この Python ライブラリを必要とします：
+`pip install duduclaw` は**コア機能には任意**で、次の場合のみ必要です：
+
+- 自身の Python コードで `duduclaw` を `import` したいとき（agents / channels / mcp / memory_eval モジュール）。
+- スタンドアロンのメモリ評価ツール（LOCOMO）を実行するとき。
+
+> **高度なローカル推論（MLX リフレクション / LLMLingua-2 圧縮）** は別の opt-in 機能で、`mlx_lm` や `llmlingua` などの ML パッケージに依存します。`duduclaw` の PyPI パッケージ**ではありません**。必要に応じて `inference.toml` に従って個別にインストールしてください。
+
+任意のライブラリをインストールするには：
 
 ```bash
 pip install duduclaw
 ```
 
-このコマンドは以下の必須依存をインストールします：
+このコマンドは以下の依存をインストールします：
 
 | パッケージ | 最低バージョン | 用途 |
 |------|---------|------|
-| `anthropic` | ≥ 0.40 | Claude API 直接呼び出し、Skill セキュリティスキャン |
+| `anthropic` | ≥ 0.40 | 自身の Python コードからの Claude API 直接呼び出し |
 | `httpx` | ≥ 0.27 | 非同期 HTTP クライアント（アカウントローテーション、ヘルスチェック）|
 | `pyyaml` | ≥ 6.0 | 設定ファイルのパース |
 
@@ -549,8 +555,8 @@ pip install duduclaw[dev]
 git clone https://github.com/zhixuli0406/DuDuClaw.git
 cd DuDuClaw
 
-# Python 依存をインストール
-pip install duduclaw
+# （任意）import duduclaw ライブラリやメモリ評価ツールが必要な場合のみ。コアのビルドには不要
+# pip install duduclaw
 
 # Dashboard をビルド
 cd web && npm ci --legacy-peer-deps && npm run build && cd ..

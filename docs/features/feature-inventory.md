@@ -105,7 +105,7 @@
 | GitHub Live Indexing | Search API with 24h local cache, weighted search |
 | Skill Marketplace | Web dashboard browsing, installation, security scanning |
 | Skill Auto-Synthesis | Gap accumulator → synthesize from episodic memory (Voyager-inspired) → sandbox trial with TTL → cross-agent graduation |
-| Python Skill Vetter | Subprocess-based security scanning for candidate skills |
+| Skill Security Scanner (Rust-native) | `skill_lifecycle::security_scanner` scans candidate skills, no Python dependency |
 
 ## Local Inference Engine
 
