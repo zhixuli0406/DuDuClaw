@@ -231,7 +231,7 @@ Weighted ranking:
 
 ### Security Scanning
 
-Before installation, every skill goes through the Python-based **Skill Vetter**:
+Before installation, every skill goes through the Rust-native **Skill security scanner** (`skill_lifecycle::security_scanner`):
 
 ```
 Candidate skill from marketplace

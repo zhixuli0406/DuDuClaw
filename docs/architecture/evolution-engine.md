@@ -855,5 +855,5 @@ peer_signals = false               # Peer Agent 信號
 | Heartbeat Scheduler | `crates/duduclaw-agent/src/heartbeat.rs` |
 | Soul Guard | `crates/duduclaw-security/src/soul_guard.rs` |
 | Contract Loader | `crates/duduclaw-agent/src/contract.rs` |
-| Skill Vetter (Python) | `python/duduclaw/evolution/vetter.py` |
+| Skill Security Scanner (Rust-native) | `crates/duduclaw-gateway/src/skill_lifecycle/security_scanner.rs` |
 | Memory Router | `crates/duduclaw-memory/src/router.rs` |

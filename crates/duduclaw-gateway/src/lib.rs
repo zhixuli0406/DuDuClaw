@@ -54,7 +54,6 @@ pub mod discord;
 pub mod discord_voice;
 pub mod dispatcher;
 pub mod message_queue;
-pub mod evolution;
 pub mod external_factors;
 pub mod handlers;
 pub mod line;

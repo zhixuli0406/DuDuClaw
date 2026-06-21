@@ -3123,10 +3123,10 @@ impl MethodHandler {
         let message_id = uuid::Uuid::new_v4().to_string();
 
         if wait {
-            // Synchronous delegation: spawn Python subprocess and wait
+            // Synchronous delegation: Rust-native Direct API call (no Python).
             let home = self.home_dir.clone();
             let system_prompt = agent.soul.as_deref().unwrap_or("You are a helpful AI agent.").to_string();
-            match crate::channel_reply::call_python_sdk_delegate(prompt, &model, &system_prompt, &home).await {
+            match crate::channel_reply::call_direct_api_delegate(prompt, &model, &system_prompt, &home).await {
                 Ok(response) => WsFrame::ok_response("", json!({
                     "success": true,
                     "message_id": message_id,
@@ -6172,177 +6172,6 @@ impl MethodHandler {
         }
     }
 
-    /// Rust-native security scanner for skill content.
-    /// Returns `{ passed: bool, findings: [...], score: f64 }`.
-    fn vet_skill_native(content: &str) -> Value {
-        let mut findings: Vec<Value> = Vec::new();
-        let content_lower = content.to_lowercase();
-
-        // Category 1: Shell command injection
-        let shell_patterns = [
-            ("system(", "Shell command execution via system()"),
-            ("exec(", "Shell command execution via exec()"),
-            ("subprocess", "Python subprocess invocation"),
-            ("os.popen", "OS pipe command execution"),
-            ("$(", "Shell command substitution"),
-            ("child_process", "Node.js child process execution"),
-            ("spawn(", "Process spawn invocation"),
-        ];
-        // Check for backtick shell execution (separate because of escaping)
-        if content.contains('`') {
-            // Count backtick pairs — heuristic for shell execution in markdown
-            let backtick_count = content.matches('`').count();
-            // Only flag if there are odd backtick usages outside of code blocks
-            // Skip this for markdown code blocks (triple backticks)
-            let triple = content.matches("```").count();
-            let singles = backtick_count - (triple * 3);
-            if singles > 0 && singles % 2 != 0 {
-                findings.push(json!({
-                    "category": "shell_injection",
-                    "severity": "medium",
-                    "description": "Potential shell execution via backticks",
-                }));
-            }
-        }
-        for (pattern, desc) in &shell_patterns {
-            if content_lower.contains(pattern) {
-                findings.push(json!({
-                    "category": "shell_injection",
-                    "severity": "high",
-                    "description": desc,
-                    "pattern": pattern,
-                }));
-            }
-        }
-
-        // Category 2: Network exfiltration
-        let network_patterns = [
-            ("curl ", "Network request via curl"),
-            ("wget ", "Network download via wget"),
-            ("fetch(", "JavaScript fetch API call"),
-            ("http.get", "HTTP GET request"),
-            ("requests.", "Python requests library"),
-            ("urllib", "Python urllib usage"),
-            ("xmlhttprequest", "XMLHttpRequest usage"),
-        ];
-        for (pattern, desc) in &network_patterns {
-            if content_lower.contains(pattern) {
-                findings.push(json!({
-                    "category": "network_exfiltration",
-                    "severity": "high",
-                    "description": desc,
-                    "pattern": pattern,
-                }));
-            }
-        }
-
-        // Category 3: File system dangers
-        let fs_patterns = [
-            ("rm -rf", "Recursive force delete"),
-            ("rmdir", "Directory removal"),
-            ("unlink(", "File deletion via unlink"),
-            ("fs.writefile", "Node.js file write"),
-            ("shutil.rmtree", "Python recursive directory removal"),
-            ("os.remove", "Python file removal"),
-            ("fs.unlinkSync", "Node.js synchronous file deletion"),
-        ];
-        for (pattern, desc) in &fs_patterns {
-            if content_lower.contains(pattern) {
-                findings.push(json!({
-                    "category": "filesystem_danger",
-                    "severity": "critical",
-                    "description": desc,
-                    "pattern": pattern,
-                }));
-            }
-        }
-
-        // Category 4: Prompt injection
-        let injection_patterns = [
-            ("ignore previous", "Prompt injection: ignore previous instructions"),
-            ("disregard", "Prompt injection: disregard instructions"),
-            ("you are now", "Prompt injection: role override"),
-            ("system prompt", "Prompt injection: system prompt reference"),
-            ("forget your instructions", "Prompt injection: instruction override"),
-            ("new persona", "Prompt injection: persona override"),
-        ];
-        for (pattern, desc) in &injection_patterns {
-            if content_lower.contains(pattern) {
-                findings.push(json!({
-                    "category": "prompt_injection",
-                    "severity": "critical",
-                    "description": desc,
-                    "pattern": pattern,
-                }));
-            }
-        }
-
-        // Category 5: Secrets access
-        let secret_patterns = [
-            (".env", "Environment file reference"),
-            ("api_key", "API key reference"),
-            ("secret", "Secret reference"),
-            ("token", "Token reference"),
-            ("credentials", "Credentials reference"),
-            ("private_key", "Private key reference"),
-            ("password", "Password reference"),
-        ];
-        for (pattern, desc) in &secret_patterns {
-            if content_lower.contains(pattern) {
-                // Lower severity — mentioning secrets in documentation is common
-                findings.push(json!({
-                    "category": "secrets_access",
-                    "severity": "medium",
-                    "description": desc,
-                    "pattern": pattern,
-                }));
-            }
-        }
-
-        // Category 6: Obfuscation
-        let obfuscation_patterns = [
-            ("base64", "Base64 encoding/decoding"),
-            ("eval(", "Dynamic code evaluation"),
-            ("atob(", "JavaScript base64 decode"),
-            ("btoa(", "JavaScript base64 encode"),
-            ("fromcharcode", "Character code construction"),
-            ("\\x", "Hex escape sequences"),
-        ];
-        for (pattern, desc) in &obfuscation_patterns {
-            if content_lower.contains(pattern) {
-                findings.push(json!({
-                    "category": "obfuscation",
-                    "severity": "high",
-                    "description": desc,
-                    "pattern": pattern,
-                }));
-            }
-        }
-
-        // Calculate score: start at 100, deduct based on severity
-        let mut score: f64 = 100.0;
-        for finding in &findings {
-            match finding["severity"].as_str().unwrap_or("low") {
-                "critical" => score -= 25.0,
-                "high" => score -= 15.0,
-                "medium" => score -= 5.0,
-                "low" => score -= 2.0,
-                _ => score -= 1.0,
-            }
-        }
-        score = score.max(0.0);
-
-        let has_critical_or_high = findings.iter().any(|f| {
-            matches!(f["severity"].as_str(), Some("critical") | Some("high"))
-        });
-
-        json!({
-            "passed": !has_critical_or_high,
-            "findings": findings,
-            "score": score,
-            "scanner": "native",
-        })
-    }
 
     async fn handle_skills_vet(&self, params: Value) -> WsFrame {
         let url = match params.get("url").and_then(|v| v.as_str()) {
@@ -6383,34 +6212,23 @@ impl MethodHandler {
             .map(|n| n.trim().to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
-        // Try Python vet first, fall back to native scanner
-        let vet_result = match crate::evolution::vet_skill(
-            &self.home_dir,
-            &skill_name,
-            &content,
-            None,
-            None,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                info!("Python vet unavailable ({e}), using native scanner");
-                Self::vet_skill_native(&content)
-            }
-        };
-
-        // Determine passed status
-        let passed = if let Some(p) = vet_result.get("passed").and_then(|v| v.as_bool()) {
-            p
-        } else {
-            // For Python result: check findings for critical/high severity
-            let vet_str = vet_result.to_string();
-            !vet_str.contains("\"severity\": \"critical\"")
-                && !vet_str.contains("\"severity\":\"critical\"")
-                && !vet_str.contains("\"severity\": \"high\"")
-                && !vet_str.contains("\"severity\":\"high\"")
-        };
+        // Rust-native security scan (no Python dependency). The same scanner
+        // backs the MCP `skill_security_scan` tool and the sandbox-trial gate,
+        // so the dashboard, agents, and lifecycle pipeline all share one
+        // verdict. CONTRACT.toml boundaries are not available on this path.
+        let scan = crate::skill_lifecycle::security_scanner::scan_skill(&content, None);
+        let passed = scan.passed;
+        let vet_result = json!({
+            "passed": scan.passed,
+            "risk_level": format!("{:?}", scan.risk_level),
+            "findings": scan.findings.iter().map(|f| json!({
+                "category": format!("{:?}", f.category),
+                "severity": format!("{:?}", f.severity).to_lowercase(),
+                "description": f.description,
+                "line_number": f.line_number,
+                "pattern": f.matched_pattern,
+            })).collect::<Vec<_>>(),
+        });
 
         WsFrame::ok_response("", json!({
             "skill_name": skill_name,

@@ -133,7 +133,7 @@ DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code /
 - **7-stage lifecycle**: Activation → Compression → Extraction → Reconstruction → Distillation → Diagnostician → Gap Analysis.
 - **GitHub live indexing** — Search API with 24h local cache, weighted search.
 - **Skill auto-synthesis** (Phase 3-4): gap accumulator detects repeated domain gaps → synthesizes skills from episodic memory (Voyager-inspired) → sandbox trial with TTL → cross-agent graduation. MCP tools: `skill_security_scan`, `skill_graduate`, `skill_synthesis_status`.
-- **Python Skill Vetter** subprocess for security scanning.
+- **Rust-native Skill security scanner** (`skill_lifecycle::security_scanner`) — no Python subprocess; backs the dashboard vet, the MCP `skill_security_scan` tool, and the sandbox-trial gate.
 
 ### Task & Knowledge
 - **Task Board**: SQLite-backed task management with status/priority/assignment tracking + real-time Activity Feed WebSocket. MCP tools: `tasks.list/create/update/assign`, `activity.list/subscribe`.

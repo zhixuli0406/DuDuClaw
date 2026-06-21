@@ -207,7 +207,7 @@ GitHub Search API
 
 ### 安全掃描
 
-安裝前，每個技能都通過 Python 的 **Skill Vetter** 檢查：
+安裝前，每個技能都通過 Rust-native 的 **Skill 安全掃描器**（`skill_lifecycle::security_scanner`）檢查：
 
 ```
 來自市集的候選技能

@@ -490,23 +490,29 @@ irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.
 
 > 一行安裝腳本會自動偵測**最新 release** 並下載對應平台的預編譯 binary，同樣免編譯。若 GitHub 下載失敗才會詢問是否改用原始碼建構（此時建議改用 `npm install -g duduclaw`）。可用環境變數 `DUDUCLAW_VERSION` 釘選特定版本。
 
-### Python SDK（函式庫，非 CLI）
+### Python SDK（選用函式庫，非 CLI）
 
-> **重要**：PyPI 上的 `duduclaw` 是一個**純 Python 函式庫**（供 `import duduclaw` 使用），**不含任何命令列工具**。
-> DuDuClaw 的 gateway / CLI（`duduclaw` 指令）是 **Rust 二進位**，請改用上面的 **npm** 或 **Homebrew** 安裝。
-> 因此 `pipx install duduclaw` 會失敗（No apps associated with package），這是預期行為——pipx 只裝有進入點的應用。
+> **重要**：核心 gateway / CLI（`duduclaw` 指令）是 **Rust 二進位**，透過 **npm** 或 **Homebrew** 安裝即可獲得**完整功能**——Skill 安全掃描與通道回覆全部由 Rust-native 路徑處理，**不再需要任何 Python 依賴**。
+> PyPI 上的 `duduclaw` 是一個**純 Python 函式庫**（供 `import duduclaw` 使用），**不含任何命令列工具**；因此 `pipx install duduclaw` 會失敗（No apps associated with package），這是預期行為。
 
-DuDuClaw 的進化引擎（Skill Vetter）與部分通道橋接需要這個 Python 函式庫：
+`pip install duduclaw` **對核心功能而言是選用的**，只在下列情境才需要：
+
+- 你想在自己的 Python 程式中 `import duduclaw`（agents / channels / mcp / memory_eval 模組）。
+- 你要跑獨立的記憶評測工具（LOCOMO）。
+
+> **進階本地推論（MLX 反思 / LLMLingua-2 壓縮）** 是另一組獨立 opt-in 功能，依賴的是 `mlx_lm`、`llmlingua` 這類 ML 套件，**而非** `duduclaw` 這個 PyPI 套件。需要時請依 `inference.toml` 個別安裝。
+
+若要安裝這個選用函式庫：
 
 ```bash
 pip install duduclaw
 ```
 
-此命令會安裝以下必要依賴：
+此命令會安裝以下依賴：
 
 | 套件 | 最低版本 | 用途 |
 |------|---------|------|
-| `anthropic` | ≥ 0.40 | Claude API 直接呼叫、Skill 安全掃描 |
+| `anthropic` | ≥ 0.40 | 在自有 Python 程式中直接呼叫 Claude API |
 | `httpx` | ≥ 0.27 | 非同步 HTTP 客戶端（帳號輪替、健康檢查）|
 | `pyyaml` | ≥ 6.0 | 設定檔解析 |
 
@@ -545,8 +551,8 @@ pip install duduclaw[dev]
 git clone https://github.com/zhixuli0406/DuDuClaw.git
 cd DuDuClaw
 
-# 安裝 Python 依賴
-pip install duduclaw
+# （選用）僅在需要 import duduclaw 函式庫或記憶評測工具時安裝；核心建構不需要
+# pip install duduclaw
 
 # 建構 Dashboard
 cd web && npm ci --legacy-peer-deps && npm run build && cd ..
