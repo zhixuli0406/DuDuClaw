@@ -4,6 +4,7 @@ import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { api, type ReliabilitySummary } from '@/lib/api';
 import {
+  Activity,
   ShieldCheck,
   CheckCircle2,
   Puzzle,
@@ -13,6 +14,15 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
+import {
+  Page,
+  PageHeader,
+  Card,
+  Badge,
+  Button,
+  Toolbar,
+  controlClass,
+} from '@/components/ui';
 
 // ── Window options ────────────────────────────────────────────────────────────
 
@@ -59,7 +69,7 @@ function MetricGauge({
       : 'bg-rose-100 dark:bg-rose-900/30';
 
   return (
-    <div className="glass-card rounded-2xl p-5">
+    <Card>
       <div className="mb-3 flex items-start gap-3">
         <div className={cn('rounded-lg p-2', iconBg)}>
           <Icon className={cn('h-5 w-5', textColor)} />
@@ -80,7 +90,7 @@ function MetricGauge({
           style={{ width: `${pct}%` }}
         />
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -88,7 +98,7 @@ function MetricGauge({
 
 function SkeletonGauge() {
   return (
-    <div className="glass-card rounded-2xl p-5">
+    <Card>
       <div className="mb-3 flex items-start gap-3">
         <div className="h-9 w-9 animate-pulse rounded-lg bg-stone-200 dark:bg-stone-700" />
         <div className="flex-1 space-y-1.5">
@@ -98,7 +108,7 @@ function SkeletonGauge() {
         <div className="h-8 w-12 animate-pulse rounded bg-stone-200 dark:bg-stone-700" />
       </div>
       <div className="h-2.5 w-full animate-pulse rounded-full bg-stone-200 dark:bg-stone-700" />
-    </div>
+    </Card>
   );
 }
 
@@ -167,62 +177,61 @@ export function ReliabilityPage() {
   const noData = summary !== null && summary.total_events === 0;
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'reliability.title' })}
-        </h2>
+    <Page>
+      <PageHeader
+        icon={Activity}
+        title={intl.formatMessage({ id: 'nav.reliability' })}
+        subtitle={intl.formatMessage({ id: 'reliability.title' })}
+        actions={
+          <Toolbar>
+            {/* Agent selector */}
+            <select
+              value={selectedAgent}
+              onChange={(e) => setSelectedAgent(e.target.value)}
+              className={cn(controlClass, 'w-auto')}
+            >
+              {agents.map((a) => (
+                <option key={a.name} value={a.name}>
+                  {a.name}
+                </option>
+              ))}
+            </select>
 
-        <div className="flex flex-wrap items-center gap-2">
-          {/* Agent selector */}
-          <select
-            value={selectedAgent}
-            onChange={(e) => setSelectedAgent(e.target.value)}
-            className="rounded-lg border border-stone-200 bg-white px-3 py-1.5 text-sm text-stone-700 focus:outline-none focus:ring-2 focus:ring-amber-500 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-300"
-          >
-            {agents.map((a) => (
-              <option key={a.name} value={a.name}>
-                {a.name}
-              </option>
-            ))}
-          </select>
+            {/* Window selector */}
+            <div className="flex gap-1 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-fill)] p-1">
+              {([7, 14, 30] as WindowDays[]).map((d) => (
+                <button
+                  key={d}
+                  onClick={() => setWindowDays(d)}
+                  className={cn(
+                    'rounded-md px-3 py-1 text-sm font-medium transition-colors',
+                    windowDays === d
+                      ? 'bg-amber-500 text-white shadow-sm'
+                      : 'text-stone-600 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-200',
+                  )}
+                >
+                  {intl.formatMessage({ id: 'reliability.window.days' }, { count: d })}
+                </button>
+              ))}
+            </div>
 
-          {/* Window selector */}
-          <div className="flex gap-1 rounded-lg border border-stone-200 bg-stone-100 p-1 dark:border-stone-700 dark:bg-stone-800">
-            {([7, 14, 30] as WindowDays[]).map((d) => (
-              <button
-                key={d}
-                onClick={() => setWindowDays(d)}
-                className={cn(
-                  'rounded-md px-3 py-1 text-sm font-medium transition-colors',
-                  windowDays === d
-                    ? 'bg-amber-500 text-white shadow-sm'
-                    : 'text-stone-600 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-200',
-                )}
-              >
-                {intl.formatMessage({ id: 'reliability.window.days' }, { count: d })}
-              </button>
-            ))}
-          </div>
-
-          {/* Refresh */}
-          <button
-            onClick={handleRefresh}
-            disabled={refreshing || loading}
-            className="rounded-lg border border-stone-200 bg-white p-1.5 text-stone-500 transition-colors hover:bg-stone-50 hover:text-stone-700 disabled:opacity-50 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-400 dark:hover:bg-stone-800"
-            title={intl.formatMessage({ id: 'common.refresh' })}
-          >
-            <RefreshCw
-              className={cn('h-4 w-4', refreshing && 'animate-spin')}
+            {/* Refresh */}
+            <Button
+              variant="secondary"
+              size="md"
+              icon={RefreshCw}
+              onClick={handleRefresh}
+              disabled={refreshing || loading}
+              title={intl.formatMessage({ id: 'common.refresh' })}
+              className={cn(refreshing && '[&_svg]:animate-spin')}
             />
-          </button>
-        </div>
-      </div>
+          </Toolbar>
+        }
+      />
 
       {/* Metadata row */}
       {summary && !loading && (
-        <div className="flex flex-wrap items-center gap-4 rounded-lg bg-stone-50 px-4 py-2.5 text-sm dark:bg-stone-800/50">
+        <div className="flex flex-wrap items-center gap-4 rounded-lg bg-stone-500/5 px-4 py-2.5 text-sm dark:bg-white/5">
           <span className="text-stone-500 dark:text-stone-400">
             {intl.formatMessage({ id: 'reliability.agent' })}
             {': '}
@@ -300,29 +309,28 @@ export function ReliabilityPage() {
 
       {/* Legend */}
       {!loading && (
-        <div className="flex flex-wrap items-center gap-6 rounded-xl border border-stone-200 bg-white px-5 py-4 dark:border-stone-800 dark:bg-stone-900">
-          <p className="text-sm font-medium text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'reliability.legend.title' })}
-          </p>
-          <div className="flex flex-wrap gap-4 text-xs text-stone-500 dark:text-stone-400">
-            <span className="flex items-center gap-1.5">
-              <span className="inline-block h-2.5 w-2.5 rounded-full bg-emerald-500" />
-              {intl.formatMessage({ id: 'reliability.legend.good' })}
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="inline-block h-2.5 w-2.5 rounded-full bg-amber-500" />
-              {intl.formatMessage({ id: 'reliability.legend.ok' })}
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="inline-block h-2.5 w-2.5 rounded-full bg-rose-500" />
-              {intl.formatMessage({ id: 'reliability.legend.poor' })}
-            </span>
+        <Card>
+          <div className="flex flex-wrap items-center gap-6">
+            <p className="text-sm font-medium text-stone-500 dark:text-stone-400">
+              {intl.formatMessage({ id: 'reliability.legend.title' })}
+            </p>
+            <div className="flex flex-wrap gap-3">
+              <Badge tone="success" dot>
+                {intl.formatMessage({ id: 'reliability.legend.good' })}
+              </Badge>
+              <Badge tone="warning" dot>
+                {intl.formatMessage({ id: 'reliability.legend.ok' })}
+              </Badge>
+              <Badge tone="danger" dot>
+                {intl.formatMessage({ id: 'reliability.legend.poor' })}
+              </Badge>
+            </div>
+            <p className="ml-auto text-xs text-stone-400 dark:text-stone-500">
+              {intl.formatMessage({ id: 'reliability.legend.note' })}
+            </p>
           </div>
-          <p className="ml-auto text-xs text-stone-400 dark:text-stone-500">
-            {intl.formatMessage({ id: 'reliability.legend.note' })}
-          </p>
-        </div>
+        </Card>
       )}
-    </div>
+    </Page>
   );
 }

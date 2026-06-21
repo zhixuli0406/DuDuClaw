@@ -1,7 +1,9 @@
 import { useState, useCallback, useEffect } from 'react';
+import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type ForkSummary, type ForkDetail, type ForkBranch } from '@/lib/api';
 import { GitFork, RefreshCw, Trophy, CircleDot, AlertCircle, CheckCircle2 } from 'lucide-react';
+import { Page, PageHeader, Card, Button, Badge, EmptyState } from '@/components/ui';
 
 // RFC-26 Live Run Forking dashboard. Reads fork state from the cross-process
 // ForkStore via the gateway `fork.*` RPC. Forks execute in the MCP-server
@@ -27,13 +29,14 @@ function BranchCard({
   canResolve: boolean;
   onResolve: (branchId: string) => void;
 }) {
+  const intl = useIntl();
   return (
     <div
       className={cn(
         'flex flex-col rounded-xl border p-4',
         isWinner
           ? 'border-amber-400 bg-amber-50 dark:border-amber-500/50 dark:bg-amber-500/10'
-          : 'border-stone-200 bg-white dark:border-stone-700 dark:bg-stone-800'
+          : 'border-[var(--panel-border)] bg-[var(--panel-fill)]'
       )}
     >
       <div className="flex items-center justify-between gap-2">
@@ -41,7 +44,9 @@ function BranchCard({
           {isWinner && <Trophy className="h-3.5 w-3.5 text-amber-500" />}
           {branch.branch_id.slice(0, 8)}
         </span>
-        <span className={cn('text-xs font-medium', STATE_STYLES[branch.state] ?? 'text-stone-500')}>
+        <span
+          className={cn('text-xs font-medium', STATE_STYLES[branch.state] ?? 'text-stone-500')}
+        >
           {branch.state}
         </span>
       </div>
@@ -50,11 +55,13 @@ function BranchCard({
           {branch.steering}
         </p>
       )}
-      <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-stone-50 p-2 text-xs text-stone-600 dark:bg-stone-900 dark:text-stone-300">
+      <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-stone-500/5 p-2 text-xs text-stone-600 dark:bg-white/5 dark:text-stone-300">
         {branch.output || '(no output yet)'}
       </pre>
       <div className="mt-3 flex items-center justify-between text-xs text-stone-500">
-        <span>${branch.spent_usd.toFixed(4)} / ${branch.budget_usd.toFixed(2)}</span>
+        <span className="tabular-nums">
+          ${branch.spent_usd.toFixed(4)} / ${branch.budget_usd.toFixed(2)}
+        </span>
         {branch.test_exit_code !== null && (
           <span className="flex items-center gap-1">
             {branch.test_exit_code === 0 ? (
@@ -67,18 +74,21 @@ function BranchCard({
         )}
       </div>
       {canResolve && (
-        <button
+        <Button
+          variant="primary"
+          size="sm"
+          className="mt-3"
           onClick={() => onResolve(branch.branch_id)}
-          className="mt-3 rounded-lg bg-amber-500 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-amber-600"
         >
-          Select as winner
-        </button>
+          {intl.formatMessage({ id: 'forks.selectWinner' })}
+        </Button>
       )}
     </div>
   );
 }
 
 export function ForkPage() {
+  const intl = useIntl();
   const [forks, setForks] = useState<ForkSummary[]>([]);
   const [selected, setSelected] = useState<ForkDetail | null>(null);
   const [loading, setLoading] = useState(false);
@@ -125,26 +135,21 @@ export function ForkPage() {
   }, [loadForks]);
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="flex items-center gap-2 text-2xl font-semibold text-stone-900 dark:text-stone-50">
-            <GitFork className="h-6 w-6 text-amber-500" />
-            Live Run Forking
-          </h2>
-          <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
-            Competing branches explored in parallel; pick the winner the judge proposes — or
-            override it.
-          </p>
-        </div>
-        <button
-          onClick={() => void loadForks()}
-          className="flex items-center gap-1.5 rounded-lg border border-stone-200 px-3 py-2 text-sm font-medium text-stone-600 transition-colors hover:bg-stone-50 dark:border-stone-700 dark:text-stone-300 dark:hover:bg-stone-800"
-        >
-          <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
-          Refresh
-        </button>
-      </div>
+    <Page>
+      <PageHeader
+        icon={GitFork}
+        title={intl.formatMessage({ id: 'nav.forks' })}
+        subtitle={intl.formatMessage({ id: 'forks.subtitle' })}
+        actions={
+          <Button
+            variant="secondary"
+            onClick={() => void loadForks()}
+            icon={() => <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />}
+          >
+            {intl.formatMessage({ id: 'common.refresh' })}
+          </Button>
+        }
+      />
 
       {error && (
         <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300">
@@ -156,35 +161,45 @@ export function ForkPage() {
         {/* Fork list */}
         <div className="space-y-2">
           {forks.length === 0 && !loading && (
-            <p className="text-sm text-stone-400">No forks yet. Agents create them via fork_run.</p>
+            <Card>
+              <EmptyState
+                icon={GitFork}
+                title={intl.formatMessage({ id: 'forks.empty.title' })}
+                hint={intl.formatMessage({ id: 'forks.empty.hint' })}
+              />
+            </Card>
           )}
           {forks.map((f) => (
-            <button
+            <Card
               key={f.fork_id}
+              interactive
               onClick={() => void inspect(f.fork_id)}
+              padded={false}
               className={cn(
-                'flex w-full flex-col gap-1 rounded-xl border p-3 text-left transition-colors',
-                selected?.fork_id === f.fork_id
-                  ? 'border-amber-400 bg-amber-50 dark:border-amber-500/50 dark:bg-amber-500/10'
-                  : 'border-stone-200 bg-white hover:bg-stone-50 dark:border-stone-700 dark:bg-stone-800 dark:hover:bg-stone-700/50'
+                selected?.fork_id === f.fork_id &&
+                  'border-amber-400 bg-amber-50 dark:border-amber-500/50 dark:bg-amber-500/10'
               )}
             >
-              <span className="flex items-center justify-between">
-                <span className="font-mono text-xs text-stone-500">{f.fork_id.slice(0, 14)}</span>
-                {f.resolved ? (
-                  <Trophy className="h-3.5 w-3.5 text-amber-500" />
-                ) : (
-                  <CircleDot className="h-3.5 w-3.5 text-amber-500" />
-                )}
-              </span>
-              <span className="text-sm font-medium text-stone-700 dark:text-stone-200">
-                {f.agent_id}
-              </span>
-              <span className="text-xs text-stone-400">
-                {f.merge_mode} · ${f.aggregate_spent_usd.toFixed(4)}
-                {f.promoted && ' · promoted'}
-              </span>
-            </button>
+              <div className="flex flex-col gap-1 p-3 text-left">
+                <span className="flex items-center justify-between">
+                  <span className="font-mono text-xs text-stone-500">
+                    {f.fork_id.slice(0, 14)}
+                  </span>
+                  {f.resolved ? (
+                    <Trophy className="h-3.5 w-3.5 text-amber-500" />
+                  ) : (
+                    <CircleDot className="h-3.5 w-3.5 text-amber-500" />
+                  )}
+                </span>
+                <span className="text-sm font-medium text-stone-700 dark:text-stone-200">
+                  {f.agent_id}
+                </span>
+                <span className="text-xs text-stone-400">
+                  {f.merge_mode} · <span className="tabular-nums">${f.aggregate_spent_usd.toFixed(4)}</span>
+                  {f.promoted && ' · promoted'}
+                </span>
+              </div>
+            </Card>
           ))}
         </div>
 
@@ -192,13 +207,18 @@ export function ForkPage() {
         <div>
           {selected ? (
             <div className="space-y-4">
-              <div className="rounded-xl border border-stone-200 bg-white p-4 dark:border-stone-700 dark:bg-stone-800">
+              <Card>
                 <p className="text-sm text-stone-700 dark:text-stone-200">{selected.prompt}</p>
-                <p className="mt-2 text-xs text-stone-400">
-                  {selected.merge_mode} · {selected.resolved ? 'resolved' : 'open'}
-                  {selected.winner && ` · winner ${selected.winner.slice(0, 8)}`}
+                <p className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-stone-400">
+                  <Badge tone="neutral">{selected.merge_mode}</Badge>
+                  <Badge tone={selected.resolved ? 'success' : 'warning'}>
+                    {selected.resolved ? 'resolved' : 'open'}
+                  </Badge>
+                  {selected.winner && (
+                    <Badge tone="accent">winner {selected.winner.slice(0, 8)}</Badge>
+                  )}
                 </p>
-              </div>
+              </Card>
               <div className="grid gap-4 md:grid-cols-2">
                 {selected.branches.map((b) => (
                   <BranchCard
@@ -212,12 +232,15 @@ export function ForkPage() {
               </div>
             </div>
           ) : (
-            <div className="flex h-48 items-center justify-center rounded-xl border border-dashed border-stone-200 text-sm text-stone-400 dark:border-stone-700">
-              Select a fork to inspect its branches
-            </div>
+            <Card>
+              <EmptyState
+                icon={GitFork}
+                title={intl.formatMessage({ id: 'forks.detail.empty' })}
+              />
+            </Card>
           )}
         </div>
       </div>
-    </div>
+    </Page>
   );
 }

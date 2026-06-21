@@ -14,10 +14,23 @@ import {
   Pause,
   Play,
   Trash2,
-  Search,
   History,
   Radio,
+  FileText,
+  Inbox,
 } from 'lucide-react';
+import {
+  Page,
+  PageHeader,
+  Card,
+  Tabs,
+  Button,
+  Badge,
+  EmptyState,
+  Toolbar,
+  controlClass,
+} from '@/components/ui';
+import type { TabItem } from '@/components/ui';
 
 // ── Shared styles ──────────────────────────────────────────
 
@@ -45,59 +58,31 @@ export function LogsPage() {
   const intl = useIntl();
   const [tab, setTab] = useState<Tab>('history');
 
-  return (
-    <div className="flex h-full flex-col space-y-4">
-      <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-        {intl.formatMessage({ id: 'logs.title' })}
-      </h2>
+  const tabs: TabItem[] = [
+    {
+      id: 'history',
+      label: intl.formatMessage({ id: 'logs.tab.history' }),
+      icon: History,
+    },
+    {
+      id: 'realtime',
+      label: intl.formatMessage({ id: 'logs.tab.realtime' }),
+      icon: Radio,
+    },
+  ];
 
-      {/* Tab bar */}
-      <div className="flex gap-1 rounded-lg bg-stone-100 p-1 dark:bg-stone-800">
-        <TabButton
-          active={tab === 'history'}
-          onClick={() => setTab('history')}
-          icon={<History className="h-4 w-4" />}
-          label={intl.formatMessage({ id: 'logs.tab.history' })}
-        />
-        <TabButton
-          active={tab === 'realtime'}
-          onClick={() => setTab('realtime')}
-          icon={<Radio className="h-4 w-4" />}
-          label={intl.formatMessage({ id: 'logs.tab.realtime' })}
-        />
-      </div>
+  return (
+    <Page wide className="flex h-full flex-col">
+      <PageHeader
+        icon={FileText}
+        title={intl.formatMessage({ id: 'nav.logs' })}
+        subtitle={intl.formatMessage({ id: 'logs.subtitle' })}
+      />
+
+      <Tabs items={tabs} value={tab} onChange={(id) => setTab(id as Tab)} />
 
       {tab === 'history' ? <HistoryTab /> : <RealtimeTab />}
-    </div>
-  );
-}
-
-// ── Tab button ─────────────────────────────────────────────
-
-function TabButton({
-  active,
-  onClick,
-  icon,
-  label,
-}: {
-  readonly active: boolean;
-  readonly onClick: () => void;
-  readonly icon: React.ReactNode;
-  readonly label: string;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={cn(
-        'inline-flex flex-1 items-center justify-center gap-2 rounded-md px-4 py-2 text-sm font-medium transition-colors',
-        active
-          ? 'bg-white text-stone-900 shadow-sm dark:bg-stone-700 dark:text-stone-50'
-          : 'text-stone-500 hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-200',
-      )}
-    >
-      {icon}
-      {label}
-    </button>
+    </Page>
   );
 }
 
@@ -191,21 +176,22 @@ function HistoryTab() {
   const isSourceActive = (src: UnifiedAuditSource) =>
     selectedSources === null || selectedSources.includes(src);
 
+  const totalCount =
+    sourceCounts.security +
+    sourceCounts.tool_call +
+    sourceCounts.channel_failure +
+    sourceCounts.feedback;
+
   return (
-    <div className="flex flex-1 flex-col gap-3 overflow-hidden">
+    <div className="flex flex-1 flex-col gap-4 overflow-hidden">
       {/* Filter bar */}
-      <div className="flex flex-wrap items-center gap-3">
+      <Toolbar>
         <div className="flex flex-wrap items-center gap-1.5">
           <SourceChip
             active={selectedSources === null}
             onClick={() => setSelectedSources(null)}
             label={intl.formatMessage({ id: 'logs.filter.source.all' })}
-            count={
-              sourceCounts.security +
-              sourceCounts.tool_call +
-              sourceCounts.channel_failure +
-              sourceCounts.feedback
-            }
+            count={totalCount}
           />
           {ALL_SOURCES.map((src) => (
             <SourceChip
@@ -221,7 +207,7 @@ function HistoryTab() {
         <select
           value={severityFilter}
           onChange={(e) => setSeverityFilter(e.target.value as SeverityFilter)}
-          className="rounded-lg border border-stone-200 bg-white px-3 py-1.5 text-sm text-stone-700 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-300"
+          className={cn(controlClass, 'w-auto')}
         >
           <option value="all">
             {intl.formatMessage({ id: 'logs.filter.severity.all' })}
@@ -230,15 +216,18 @@ function HistoryTab() {
           <option value="warning">warning</option>
           <option value="critical">critical</option>
         </select>
-      </div>
+      </Toolbar>
 
       {/* Body */}
       {loading ? (
         <HistoryLoadingSkeleton />
       ) : events.length === 0 ? (
-        <div className="flex flex-1 items-center justify-center px-4 text-center text-stone-400">
-          <p>{intl.formatMessage({ id: 'logs.empty.noMatch' })}</p>
-        </div>
+        <Card className="flex-1" bodyClassName="flex h-full items-center justify-center">
+          <EmptyState
+            icon={Inbox}
+            title={intl.formatMessage({ id: 'logs.empty.noMatch' })}
+          />
+        </Card>
       ) : (
         <div className="flex-1 space-y-2 overflow-y-auto pr-1">
           {events.map((evt, i) => {
@@ -275,18 +264,19 @@ function SourceChip({
       onClick={onClick}
       className={cn(
         'inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
         active
-          ? 'border-amber-400 bg-amber-50 text-amber-800 dark:border-amber-500/50 dark:bg-amber-900/20 dark:text-amber-300'
-          : 'border-stone-200 bg-white text-stone-600 hover:bg-stone-50 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-400 dark:hover:bg-stone-700/60',
+          ? 'border-amber-400 bg-amber-500/12 text-amber-800 dark:border-amber-500/50 dark:text-amber-300'
+          : 'border-[var(--panel-border)] bg-[var(--panel-fill)] text-stone-600 hover:bg-[var(--panel-fill-hover)] dark:text-stone-400',
       )}
     >
       <span>{label}</span>
       <span
         className={cn(
-          'rounded-full px-1.5 py-0.5 text-[10px] font-semibold',
+          'rounded-full px-1.5 py-0.5 text-[10px] font-semibold tabular-nums',
           active
             ? 'bg-amber-200 text-amber-900 dark:bg-amber-800/60 dark:text-amber-200'
-            : 'bg-stone-100 text-stone-500 dark:bg-stone-700 dark:text-stone-400',
+            : 'bg-stone-500/12 text-stone-500 dark:text-stone-400',
         )}
       >
         {count}
@@ -301,7 +291,7 @@ function HistoryLoadingSkeleton() {
       {Array.from({ length: 6 }).map((_, i) => (
         <div
           key={i}
-          className="h-16 animate-pulse rounded-xl border border-stone-200 bg-stone-50 dark:border-stone-800 dark:bg-stone-800/50"
+          className="panel h-16 animate-pulse"
         />
       ))}
     </div>
@@ -314,13 +304,6 @@ const severityBorder: Record<UnifiedAuditEvent['severity'], string> = {
   info: 'border-l-emerald-400 dark:border-l-emerald-500',
   warning: 'border-l-amber-400 dark:border-l-amber-500',
   critical: 'border-l-rose-400 dark:border-l-rose-500',
-};
-
-const sourceBadge: Record<UnifiedAuditSource, string> = {
-  security: 'bg-stone-100 text-stone-700 dark:bg-stone-800 dark:text-stone-300',
-  tool_call: 'bg-stone-100 text-stone-700 dark:bg-stone-800 dark:text-stone-300',
-  channel_failure: 'bg-stone-100 text-stone-700 dark:bg-stone-800 dark:text-stone-300',
-  feedback: 'bg-stone-100 text-stone-700 dark:bg-stone-800 dark:text-stone-300',
 };
 
 function AuditRow({
@@ -354,22 +337,14 @@ function AuditRow({
   });
 
   return (
-    <div
-      className={cn(
-        'cursor-pointer rounded-xl border border-l-4 border-stone-200 bg-white p-4 transition-colors hover:bg-stone-50 dark:border-stone-800 dark:bg-stone-900 dark:hover:bg-stone-800/70',
-        severityBorder[event.severity],
-      )}
+    <Card
+      interactive
       onClick={onToggle}
+      className={cn('border-l-4', severityBorder[event.severity])}
+      bodyClassName="p-4"
     >
       <div className="flex flex-wrap items-center gap-2">
-        <span
-          className={cn(
-            'rounded px-1.5 py-0.5 text-[11px] font-medium',
-            sourceBadge[event.source],
-          )}
-        >
-          {sourceLabel}
-        </span>
+        <Badge tone="neutral">{sourceLabel}</Badge>
         <span className="font-mono text-xs text-stone-500 dark:text-stone-400">
           {event.event_type}
         </span>
@@ -390,11 +365,11 @@ function AuditRow({
       )}
 
       {expanded && event.details && Object.keys(event.details).length > 0 && (
-        <pre className="mt-3 overflow-x-auto rounded-lg bg-stone-100 p-3 text-xs text-stone-700 dark:bg-stone-800 dark:text-stone-300">
+        <pre className="mt-3 overflow-x-auto rounded-lg bg-stone-500/8 p-3 text-xs text-stone-700 dark:bg-white/5 dark:text-stone-300">
           {JSON.stringify(event.details, null, 2)}
         </pre>
       )}
-    </div>
+    </Card>
   );
 }
 
@@ -440,14 +415,18 @@ function RealtimeTab() {
   const levels = ['trace', 'debug', 'info', 'warn', 'error'];
 
   return (
-    <>
+    <div className="flex flex-1 flex-col gap-4 overflow-hidden">
       {/* Filter bar */}
-      <div className="flex flex-wrap items-center gap-3">
+      <Toolbar
+        search={filter.keyword}
+        onSearchChange={(v) => setFilter({ keyword: v })}
+        searchPlaceholder="Filter..."
+      >
         {/* Level select */}
         <select
           value={filter.level ?? ''}
           onChange={(e) => setFilter({ level: e.target.value || null })}
-          className="rounded-lg border border-stone-200 bg-white px-3 py-2 text-sm text-stone-700 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-300"
+          className={cn(controlClass, 'w-auto')}
         >
           <option value="">
             {intl.formatMessage({ id: 'logs.filter.all' })}
@@ -459,54 +438,28 @@ function RealtimeTab() {
           ))}
         </select>
 
-        {/* Keyword search */}
-        <div className="relative min-w-[200px] flex-1">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-stone-400" />
-          <input
-            type="text"
-            value={filter.keyword}
-            onChange={(e) => setFilter({ keyword: e.target.value })}
-            placeholder="Filter..."
-            className="w-full rounded-lg border border-stone-200 bg-white py-2 pl-10 pr-4 text-sm text-stone-900 placeholder:text-stone-400 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-50 dark:placeholder:text-stone-500"
-          />
-        </div>
-
-        {/* Pause / Clear buttons */}
-        <button
+        {/* Pause / Resume */}
+        <Button
+          variant={paused ? 'secondary' : 'primary'}
+          size="sm"
+          icon={paused ? Play : Pause}
           onClick={togglePause}
-          className={cn(
-            'inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors',
-            paused
-              ? 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-400'
-              : 'bg-amber-100 text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400',
-          )}
         >
-          {paused ? (
-            <>
-              <Play className="h-3.5 w-3.5" />
-              {intl.formatMessage({ id: 'logs.resume' })}
-            </>
-          ) : (
-            <>
-              <Pause className="h-3.5 w-3.5" />
-              {intl.formatMessage({ id: 'logs.pause' })}
-            </>
-          )}
-        </button>
+          {paused
+            ? intl.formatMessage({ id: 'logs.resume' })
+            : intl.formatMessage({ id: 'logs.pause' })}
+        </Button>
 
-        <button
-          onClick={clear}
-          className="inline-flex items-center gap-1.5 rounded-lg bg-stone-100 px-3 py-2 text-sm font-medium text-stone-600 transition-colors hover:bg-stone-200 dark:bg-stone-800 dark:text-stone-400 dark:hover:bg-stone-700"
-        >
-          <Trash2 className="h-3.5 w-3.5" />
+        {/* Clear */}
+        <Button variant="ghost" size="sm" icon={Trash2} onClick={clear}>
           {intl.formatMessage({ id: 'logs.clear' })}
-        </button>
-      </div>
+        </Button>
+      </Toolbar>
 
       {/* Log entries */}
       <div
         ref={listRef}
-        className="flex-1 overflow-y-auto rounded-xl border border-stone-200 bg-stone-950 p-1 dark:border-stone-800"
+        className="flex-1 overflow-y-auto rounded-xl border border-[var(--panel-border)] bg-stone-950 p-1"
       >
         {filteredEntries.length === 0 ? (
           <div className="flex items-center justify-center py-16 text-stone-500">
@@ -571,7 +524,7 @@ function RealtimeTab() {
           </div>
         )}
       </div>
-    </>
+    </div>
   );
 }
 

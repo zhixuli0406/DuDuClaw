@@ -2,7 +2,9 @@ import { useState, type FormEvent } from 'react';
 import { useNavigate } from 'react-router';
 import { useIntl } from 'react-intl';
 import { useAuthStore } from '@/stores/auth-store';
-import { inputClass, buttonPrimary } from '@/components/shared/Dialog';
+import { Card } from '@/components/ui/Card';
+import { Button } from '@/components/ui/Button';
+import { Field, controlClass } from '@/components/ui/Field';
 
 export function LoginPage() {
   const intl = useIntl();
@@ -50,10 +52,10 @@ export function LoginPage() {
       <div className="app-ambient" aria-hidden="true" />
 
       <div className="page-enter w-full max-w-sm">
-        {/* Logo */}
+        {/* Logo — consistent with the Sidebar brand treatment */}
         <div className="mb-8 text-center">
           <span
-            className="inline-grid h-16 w-16 place-items-center rounded-2xl bg-gradient-to-b from-amber-400 to-amber-500 text-3xl shadow-[0_8px_32px_-8px_rgba(245,158,11,0.7),inset_0_1px_0_0_rgba(255,255,255,0.4)]"
+            className="inline-grid h-16 w-16 place-items-center rounded-2xl bg-gradient-to-b from-amber-400 to-amber-500 text-3xl shadow-[0_4px_16px_-4px_rgba(245,158,11,0.6)]"
             role="img"
             aria-label="paw"
           >
@@ -68,62 +70,53 @@ export function LoginPage() {
         </div>
 
         {/* Login Form */}
-        <form onSubmit={handleSubmit} className="glass-overlay rounded-2xl p-6">
-          {error && (
-            <div className="mb-4 rounded-lg border border-rose-400/30 bg-rose-50/80 px-4 py-3 text-sm text-rose-700 dark:bg-rose-950/50 dark:text-rose-300">
-              {error}
-            </div>
-          )}
+        <Card>
+          <form onSubmit={handleSubmit}>
+            {error && (
+              <div className="mb-4 rounded-lg border border-rose-400/30 bg-rose-50/80 px-4 py-3 text-sm text-rose-700 dark:bg-rose-950/50 dark:text-rose-300">
+                {error}
+              </div>
+            )}
 
-          <div className="space-y-4">
-            <div>
-              <label
-                htmlFor="email"
-                className="block text-sm font-medium text-stone-700 dark:text-stone-300"
-              >
-                {intl.formatMessage({ id: 'login.email' })}
-              </label>
-              <input
-                id="email"
-                type="email"
-                autoComplete="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                className={`mt-1 ${inputClass}`}
-                placeholder="admin@local"
-              />
+            <div className="space-y-4">
+              <Field label={intl.formatMessage({ id: 'login.email' })} htmlFor="email">
+                <input
+                  id="email"
+                  type="email"
+                  autoComplete="email"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  className={controlClass}
+                  placeholder="admin@local"
+                />
+              </Field>
+
+              <Field label={intl.formatMessage({ id: 'login.password' })} htmlFor="password">
+                <input
+                  id="password"
+                  type="password"
+                  autoComplete="current-password"
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className={controlClass}
+                />
+              </Field>
             </div>
 
-            <div>
-              <label
-                htmlFor="password"
-                className="block text-sm font-medium text-stone-700 dark:text-stone-300"
-              >
-                {intl.formatMessage({ id: 'login.password' })}
-              </label>
-              <input
-                id="password"
-                type="password"
-                autoComplete="current-password"
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className={`mt-1 ${inputClass}`}
-              />
-            </div>
-          </div>
-
-          <button
-            type="submit"
-            disabled={loading}
-            className={`mt-6 w-full ${buttonPrimary} py-2.5 disabled:cursor-not-allowed`}
-          >
-            {loading
-              ? intl.formatMessage({ id: 'login.loading' })
-              : intl.formatMessage({ id: 'login.submit' })}
-          </button>
-        </form>
+            <Button
+              type="submit"
+              variant="primary"
+              disabled={loading}
+              className="mt-6 h-10 w-full disabled:cursor-not-allowed"
+            >
+              {loading
+                ? intl.formatMessage({ id: 'login.loading' })
+                : intl.formatMessage({ id: 'login.submit' })}
+            </Button>
+          </form>
+        </Card>
 
         <p className="mt-6 text-center text-xs text-stone-400 dark:text-stone-500">
           {intl.formatMessage({ id: 'login.footer' })}

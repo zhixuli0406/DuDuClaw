@@ -1,40 +1,57 @@
-import { useEffect } from 'react';
+import { useEffect, lazy, Suspense } from 'react';
 import { Routes, Route } from 'react-router';
 import { MainLayout } from './components/layout/MainLayout';
 import { AuthGuard, RoleGuard } from './components/AuthGuard';
 import { LoginPage } from './pages/LoginPage';
-import { DashboardPage } from './pages/DashboardPage';
-import { AgentsPage } from './pages/AgentsPage';
-import { ChannelsPage } from './pages/ChannelsPage';
-import { AccountsPage } from './pages/AccountsPage';
-import { MemoryPage } from './pages/MemoryPage';
-import { SecurityPage } from './pages/SecurityPage';
-import { SettingsPage } from './pages/SettingsPage';
-import { LogsPage } from './pages/LogsPage';
-import { OrgChartPage } from './pages/OrgChartPage';
-import { SkillMarketPage } from './pages/SkillMarketPage';
-import { WebChatPage } from './pages/WebChatPage';
-import { BillingPage } from './pages/BillingPage';
-import { LicensePage } from './pages/LicensePage';
-import { ReportPage } from './pages/ReportPage';
-import { KnowledgeHubPage } from './pages/KnowledgeHubPage';
-import { SharedWikiPage } from './pages/SharedWikiPage';
-import { OnboardWizardPage } from './pages/OnboardWizardPage';
-import { OdooPage } from './pages/OdooPage';
-import { InferencePage } from './pages/InferencePage';
-import { UsersPage } from './pages/UsersPage';
-import { McpPage } from './pages/McpPage';
-import { McpKeysPage } from './pages/McpKeysPage';
-import { TaskBoardPage } from './pages/TaskBoardPage';
-import { ForkPage } from './pages/ForkPage';
-import { MarketplacePage } from './pages/MarketplacePage';
-import { PartnerPortalPage } from './pages/PartnerPortalPage';
-import { ReliabilityPage } from './pages/ReliabilityPage';
-import { WikiTrustPage } from './pages/WikiTrustPage';
-import { GovernancePage } from './pages/GovernancePage';
 import { useConnectionStore } from './stores/connection-store';
 import { useAuthStore } from './stores/auth-store';
 import { ApprovalModal } from './components/ApprovalModal';
+
+// Code-splitting: every authenticated page is lazy-loaded so heavy, page-only
+// dependencies (d3 for WikiGraph/OrgChart, large forms) land in their own route
+// chunk instead of the main bundle. LoginPage stays eager for instant first paint.
+// Named exports are adapted to lazy()'s default-export contract inline.
+const lazyPage = <K extends string>(loader: () => Promise<Record<K, React.ComponentType>>, key: K) =>
+  lazy(() => loader().then((m) => ({ default: m[key] })));
+
+const DashboardPage = lazyPage(() => import('./pages/DashboardPage'), 'DashboardPage');
+const WebChatPage = lazyPage(() => import('./pages/WebChatPage'), 'WebChatPage');
+const AgentsPage = lazyPage(() => import('./pages/AgentsPage'), 'AgentsPage');
+const TaskBoardPage = lazyPage(() => import('./pages/TaskBoardPage'), 'TaskBoardPage');
+const ForkPage = lazyPage(() => import('./pages/ForkPage'), 'ForkPage');
+const SkillMarketPage = lazyPage(() => import('./pages/SkillMarketPage'), 'SkillMarketPage');
+const MarketplacePage = lazyPage(() => import('./pages/MarketplacePage'), 'MarketplacePage');
+const MemoryPage = lazyPage(() => import('./pages/MemoryPage'), 'MemoryPage');
+const KnowledgeHubPage = lazyPage(() => import('./pages/KnowledgeHubPage'), 'KnowledgeHubPage');
+const SharedWikiPage = lazyPage(() => import('./pages/SharedWikiPage'), 'SharedWikiPage');
+const OrgChartPage = lazyPage(() => import('./pages/OrgChartPage'), 'OrgChartPage');
+const PartnerPortalPage = lazyPage(() => import('./pages/PartnerPortalPage'), 'PartnerPortalPage');
+const ReportPage = lazyPage(() => import('./pages/ReportPage'), 'ReportPage');
+const BillingPage = lazyPage(() => import('./pages/BillingPage'), 'BillingPage');
+const LicensePage = lazyPage(() => import('./pages/LicensePage'), 'LicensePage');
+const LogsPage = lazyPage(() => import('./pages/LogsPage'), 'LogsPage');
+const ChannelsPage = lazyPage(() => import('./pages/ChannelsPage'), 'ChannelsPage');
+const AccountsPage = lazyPage(() => import('./pages/AccountsPage'), 'AccountsPage');
+const SecurityPage = lazyPage(() => import('./pages/SecurityPage'), 'SecurityPage');
+const GovernancePage = lazyPage(() => import('./pages/GovernancePage'), 'GovernancePage');
+const ReliabilityPage = lazyPage(() => import('./pages/ReliabilityPage'), 'ReliabilityPage');
+const WikiTrustPage = lazyPage(() => import('./pages/WikiTrustPage'), 'WikiTrustPage');
+const SettingsPage = lazyPage(() => import('./pages/SettingsPage'), 'SettingsPage');
+const McpPage = lazyPage(() => import('./pages/McpPage'), 'McpPage');
+const McpKeysPage = lazyPage(() => import('./pages/McpKeysPage'), 'McpKeysPage');
+const OdooPage = lazyPage(() => import('./pages/OdooPage'), 'OdooPage');
+const InferencePage = lazyPage(() => import('./pages/InferencePage'), 'InferencePage');
+const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
+const OnboardWizardPage = lazyPage(() => import('./pages/OnboardWizardPage'), 'OnboardWizardPage');
+
+/** Lightweight route-transition fallback while a lazy page chunk loads. */
+function PageFallback() {
+  return (
+    <div className="flex h-full items-center justify-center py-20" role="status" aria-live="polite">
+      <span className="h-6 w-6 animate-spin rounded-full border-2 border-amber-500/30 border-t-amber-500" />
+    </div>
+  );
+}
 
 export function App() {
   const connectWithAuth = useConnectionStore((s) => s.connectWithAuth);
@@ -55,52 +72,54 @@ export function App() {
 
   return (
     <>
-    <ApprovalModal />
-    <Routes>
-      <Route path="login" element={<LoginPage />} />
-      <Route path="wizard" element={<OnboardWizardPage />} />
-      <Route element={<AuthGuard />}>
-        <Route element={<MainLayout />}>
-          {/* Open to all authenticated users */}
-          <Route index element={<DashboardPage />} />
-          <Route path="webchat" element={<WebChatPage />} />
-          <Route path="agents" element={<AgentsPage />} />
-          <Route path="tasks" element={<TaskBoardPage />} />
-          <Route path="forks" element={<ForkPage />} />
-          <Route path="skills" element={<SkillMarketPage />} />
-          <Route path="marketplace" element={<MarketplacePage />} />
-          <Route path="memory" element={<MemoryPage />} />
-          <Route path="wiki" element={<KnowledgeHubPage />} />
-          <Route path="shared-wiki" element={<SharedWikiPage />} />
+      <ApprovalModal />
+      <Suspense fallback={<PageFallback />}>
+        <Routes>
+          <Route path="login" element={<LoginPage />} />
+          <Route path="wizard" element={<OnboardWizardPage />} />
+          <Route element={<AuthGuard />}>
+            <Route element={<MainLayout />}>
+              {/* Open to all authenticated users */}
+              <Route index element={<DashboardPage />} />
+              <Route path="webchat" element={<WebChatPage />} />
+              <Route path="agents" element={<AgentsPage />} />
+              <Route path="tasks" element={<TaskBoardPage />} />
+              <Route path="forks" element={<ForkPage />} />
+              <Route path="skills" element={<SkillMarketPage />} />
+              <Route path="marketplace" element={<MarketplacePage />} />
+              <Route path="memory" element={<MemoryPage />} />
+              <Route path="wiki" element={<KnowledgeHubPage />} />
+              <Route path="shared-wiki" element={<SharedWikiPage />} />
 
-          {/* manager+ routes */}
-          <Route element={<RoleGuard minRole="manager" />}>
-            <Route path="org" element={<OrgChartPage />} />
-            <Route path="partner" element={<PartnerPortalPage />} />
-            <Route path="reports" element={<ReportPage />} />
-            <Route path="billing" element={<BillingPage />} />
-            <Route path="license" element={<LicensePage />} />
-            <Route path="logs" element={<LogsPage />} />
-          </Route>
+              {/* manager+ routes */}
+              <Route element={<RoleGuard minRole="manager" />}>
+                <Route path="org" element={<OrgChartPage />} />
+                <Route path="partner" element={<PartnerPortalPage />} />
+                <Route path="reports" element={<ReportPage />} />
+                <Route path="billing" element={<BillingPage />} />
+                <Route path="license" element={<LicensePage />} />
+                <Route path="logs" element={<LogsPage />} />
+              </Route>
 
-          {/* admin-only routes */}
-          <Route element={<RoleGuard minRole="admin" />}>
-            <Route path="channels" element={<ChannelsPage />} />
-            <Route path="accounts" element={<AccountsPage />} />
-            <Route path="security" element={<SecurityPage />} />
-            <Route path="governance" element={<GovernancePage />} />
-            <Route path="reliability" element={<ReliabilityPage />} />
-            <Route path="wiki-trust" element={<WikiTrustPage />} />
-            <Route path="settings" element={<SettingsPage />} />
-            <Route path="mcp" element={<McpPage />} />
-            <Route path="mcp-keys" element={<McpKeysPage />} />
-            <Route path="odoo" element={<OdooPage />} />
-            <Route path="inference" element={<InferencePage />} />
-            <Route path="users" element={<UsersPage />} />
+              {/* admin-only routes */}
+              <Route element={<RoleGuard minRole="admin" />}>
+                <Route path="channels" element={<ChannelsPage />} />
+                <Route path="accounts" element={<AccountsPage />} />
+                <Route path="security" element={<SecurityPage />} />
+                <Route path="governance" element={<GovernancePage />} />
+                <Route path="reliability" element={<ReliabilityPage />} />
+                <Route path="wiki-trust" element={<WikiTrustPage />} />
+                <Route path="settings" element={<SettingsPage />} />
+                <Route path="mcp" element={<McpPage />} />
+                <Route path="mcp-keys" element={<McpKeysPage />} />
+                <Route path="odoo" element={<OdooPage />} />
+                <Route path="inference" element={<InferencePage />} />
+                <Route path="users" element={<UsersPage />} />
+              </Route>
+            </Route>
           </Route>
-        </Route>
-      </Route>
-    </Routes>
+        </Routes>
+      </Suspense>
     </>
   );
 }

@@ -5,6 +5,19 @@ import { api, type MemoryEntry, type SkillInfo, type EvolutionVersion, type KeyF
 import { Link } from 'react-router';
 import { toast, formatError } from '@/lib/toast';
 import {
+  Page,
+  PageHeader,
+  Card,
+  Section,
+  Tabs,
+  Button,
+  Badge,
+  EmptyState,
+  Toolbar,
+  controlClass,
+  type TabItem,
+} from '@/components/ui';
+import {
   Brain,
   Search,
   Tag,
@@ -26,42 +39,28 @@ export function MemoryPage() {
   const intl = useIntl();
   const [activeTab, setActiveTab] = useState<TabId>('memories');
 
-  const tabs: ReadonlyArray<{ id: TabId; label: string }> = [
-    { id: 'memories', label: intl.formatMessage({ id: 'memory.tab.memories' }) },
-    { id: 'insights', label: intl.formatMessage({ id: 'memory.tab.insights' }) },
-    { id: 'skills', label: intl.formatMessage({ id: 'memory.tab.skills' }) },
-    { id: 'evolution', label: intl.formatMessage({ id: 'memory.tab.evolution' }) },
+  const tabs: TabItem[] = [
+    { id: 'memories', label: intl.formatMessage({ id: 'memory.tab.memories' }), icon: Brain },
+    { id: 'insights', label: intl.formatMessage({ id: 'memory.tab.insights' }), icon: Lightbulb },
+    { id: 'skills', label: intl.formatMessage({ id: 'memory.tab.skills' }), icon: Sparkles },
+    { id: 'evolution', label: intl.formatMessage({ id: 'memory.tab.evolution' }), icon: GitBranch },
   ];
 
   return (
-    <div className="space-y-6">
-      <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-        {intl.formatMessage({ id: 'memory.title' })}
-      </h2>
+    <Page wide>
+      <PageHeader
+        icon={Brain}
+        title={intl.formatMessage({ id: 'nav.memory' })}
+        subtitle={intl.formatMessage({ id: 'app.subtitle' })}
+      />
 
-      {/* Tabs */}
-      <div className="flex gap-1 rounded-lg bg-stone-100 p-1 dark:bg-stone-800">
-        {tabs.map((tab) => (
-          <button
-            key={tab.id}
-            onClick={() => setActiveTab(tab.id)}
-            className={cn(
-              'flex-1 rounded-md px-4 py-2 text-sm font-medium transition-colors',
-              activeTab === tab.id
-                ? 'bg-white text-stone-900 shadow-sm dark:bg-stone-700 dark:text-stone-50'
-                : 'text-stone-500 hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-300'
-            )}
-          >
-            {tab.label}
-          </button>
-        ))}
-      </div>
+      <Tabs items={tabs} value={activeTab} onChange={(id) => setActiveTab(id as TabId)} />
 
       {activeTab === 'memories' && <MemoriesTab />}
       {activeTab === 'insights' && <InsightsTab />}
       {activeTab === 'skills' && <SkillsTab />}
       {activeTab === 'evolution' && <EvolutionTab />}
-    </div>
+    </Page>
   );
 }
 
@@ -118,42 +117,32 @@ function MemoriesTab() {
     }
   }, [query, selectedAgent, intl]);
 
-  const selectStyle = 'rounded-lg border border-stone-200 bg-white px-3 py-2.5 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-700 dark:bg-stone-800 dark:text-stone-50';
-
   return (
     <div className="space-y-4">
       {/* Agent selector + Search bar */}
-      <div className="flex gap-2">
+      <Toolbar
+        search={query}
+        onSearchChange={setQuery}
+        onSearchEnter={handleSearch}
+        searchPlaceholder={intl.formatMessage({ id: 'memory.search.placeholder' })}
+      >
         <select
           value={selectedAgent}
           onChange={(e) => { setSelectedAgent(e.target.value); setQuery(''); }}
-          className={selectStyle}
+          className={cn(controlClass, 'w-auto')}
         >
           {agents.map((a) => (
             <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
           ))}
         </select>
-        <div className="relative flex-1">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-stone-400" />
-          <input
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-            placeholder={intl.formatMessage({
-              id: 'memory.search.placeholder',
-            })}
-            className="w-full rounded-lg border border-stone-200 bg-white py-2.5 pl-10 pr-4 text-sm text-stone-900 placeholder:text-stone-400 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-50 dark:placeholder:text-stone-500"
-          />
-        </div>
-        <button
+        <Button
+          variant="primary"
+          icon={Search}
           onClick={handleSearch}
           disabled={loading || !selectedAgent}
-          className="rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
-        >
-          <Search className="h-4 w-4" />
-        </button>
-      </div>
+          aria-label={intl.formatMessage({ id: 'memory.search.placeholder' })}
+        />
+      </Toolbar>
 
       {/* Memory entries */}
       {loading ? (
@@ -161,26 +150,25 @@ function MemoriesTab() {
           {intl.formatMessage({ id: 'common.loading' })}
         </div>
       ) : entries.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-          <Brain className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-          <p className="mb-2 text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'memory.empty.memories' })}
-          </p>
-          <Link
-            to="/agents"
-            className="inline-flex items-center gap-1.5 text-sm font-medium text-amber-600 hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300"
-          >
-            {intl.formatMessage({ id: 'memory.empty.memories.action' })}
-            <ArrowRight className="h-3.5 w-3.5" />
-          </Link>
-        </div>
+        <Card>
+          <EmptyState
+            icon={Brain}
+            title={intl.formatMessage({ id: 'memory.empty.memories' })}
+            action={
+              <Link
+                to="/agents"
+                className="inline-flex items-center gap-1.5 text-sm font-medium text-amber-600 hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300"
+              >
+                {intl.formatMessage({ id: 'memory.empty.memories.action' })}
+                <ArrowRight className="h-3.5 w-3.5" />
+              </Link>
+            }
+          />
+        </Card>
       ) : (
         <div className="space-y-3">
           {entries.map((entry) => (
-            <div
-              key={entry.id}
-              className="glass-card rounded-2xl p-5"
-            >
+            <Card key={entry.id}>
               <div className="mb-2 flex items-center justify-between">
                 <span className="text-xs font-medium text-amber-600 dark:text-amber-400">
                   {entry.agent_id}
@@ -196,17 +184,14 @@ function MemoriesTab() {
               {entry.tags.length > 0 && (
                 <div className="mt-3 flex flex-wrap gap-1.5">
                   {entry.tags.map((tag) => (
-                    <span
-                      key={tag}
-                      className="inline-flex items-center gap-1 rounded-full bg-stone-100 px-2 py-0.5 text-xs text-stone-600 dark:bg-stone-800 dark:text-stone-400"
-                    >
+                    <Badge key={tag} tone="neutral">
                       <Tag className="h-2.5 w-2.5" />
                       {tag}
-                    </span>
+                    </Badge>
                   ))}
                 </div>
               )}
-            </div>
+            </Card>
           ))}
         </div>
       )}
@@ -284,46 +269,41 @@ function SkillsTab() {
           {intl.formatMessage({ id: 'common.loading' })}
         </div>
       ) : skills.length === 0 && !error ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-          <BookOpen className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-          <p className="mb-2 text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'memory.empty.skills' })}
-          </p>
-          <Link
-            to="/skills"
-            className="inline-flex items-center gap-1.5 text-sm font-medium text-amber-600 hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300"
-          >
-            {intl.formatMessage({ id: 'memory.empty.skills.action' })}
-            <ArrowRight className="h-3.5 w-3.5" />
-          </Link>
-        </div>
+        <Card>
+          <EmptyState
+            icon={BookOpen}
+            title={intl.formatMessage({ id: 'memory.empty.skills' })}
+            action={
+              <Link
+                to="/skills"
+                className="inline-flex items-center gap-1.5 text-sm font-medium text-amber-600 hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300"
+              >
+                {intl.formatMessage({ id: 'memory.empty.skills.action' })}
+                <ArrowRight className="h-3.5 w-3.5" />
+              </Link>
+            }
+          />
+        </Card>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {skills.map((skill) => {
             const key = `${skill.agent_id ?? 'global'}:${skill.name}`;
             const isExpanded = expandedSkill === key;
             return (
-              <div
-                key={key}
-                className="glass-card glass-card-hover rounded-2xl p-5"
-              >
+              <Card key={key} interactive>
                 <div className="flex items-start justify-between">
                   <div className="flex items-center gap-3">
-                    <div className="rounded-lg bg-amber-100 p-2 dark:bg-amber-900/30">
-                      <Sparkles className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+                    <div className="rounded-lg bg-amber-500/12 p-2 text-amber-600 dark:text-amber-400">
+                      <Sparkles className="h-4 w-4" />
                     </div>
                     <div>
                       <h3 className="font-semibold text-stone-900 dark:text-stone-50">
                         {skill.name}
                       </h3>
                       {skill.agent_id && (
-                        <p className="text-xs text-stone-500 dark:text-stone-400">
+                        <p className="flex items-center gap-1.5 text-xs text-stone-500 dark:text-stone-400">
                           {skill.agent_id}
-                          {skill.scope && (
-                            <span className="ml-1.5 rounded bg-stone-100 px-1 py-0.5 text-[10px] dark:bg-stone-800">
-                              {skill.scope}
-                            </span>
-                          )}
+                          {skill.scope && <Badge tone="neutral">{skill.scope}</Badge>}
                         </p>
                       )}
                     </div>
@@ -338,21 +318,22 @@ function SkillsTab() {
                       />
                     )}
                     {skill.agent_id && (
-                      <button
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        icon={Eye}
                         onClick={() => handleExpand(skill.agent_id!, skill.name)}
-                        className="rounded p-1 text-stone-400 hover:bg-stone-100 hover:text-stone-600 dark:hover:bg-stone-800 dark:hover:text-stone-300"
-                      >
-                        <Eye className="h-3.5 w-3.5" />
-                      </button>
+                        aria-label={intl.formatMessage({ id: 'memory.tab.skills' })}
+                      />
                     )}
                   </div>
                 </div>
                 {isExpanded && (
-                  <pre className="mt-3 max-h-48 overflow-auto rounded-lg bg-stone-50 p-3 text-xs text-stone-600 dark:bg-stone-800/50 dark:text-stone-400">
+                  <pre className="mt-3 max-h-48 overflow-auto rounded-lg bg-stone-500/5 p-3 text-xs text-stone-600 dark:bg-white/5 dark:text-stone-400">
                     {skillContent[key] ?? intl.formatMessage({ id: 'common.loading' })}
                   </pre>
                 )}
-              </div>
+              </Card>
             );
           })}
         </div>
@@ -417,7 +398,7 @@ function EvolutionTab() {
           'flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border px-4 py-3',
           enabled
             ? 'border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-900/20'
-            : 'border-stone-200 bg-stone-50 dark:border-stone-700 dark:bg-stone-800/50',
+            : 'border-[var(--panel-border)] bg-stone-500/5 dark:bg-white/5',
         )}>
           <div className="flex items-center gap-2">
             <GitBranch className={cn(
@@ -453,22 +434,19 @@ function EvolutionTab() {
           {intl.formatMessage({ id: 'common.loading' })}
         </div>
       ) : agents.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-          <GitBranch className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-          <p className="text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'common.noData' })}
-          </p>
-        </div>
+        <Card>
+          <EmptyState
+            icon={GitBranch}
+            title={intl.formatMessage({ id: 'common.noData' })}
+          />
+        </Card>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {agents.map((agent) => (
-            <div
-              key={agent.agent_id}
-              className="glass-card rounded-2xl p-5"
-            >
+            <Card key={agent.agent_id}>
               <div className="mb-4 flex items-center gap-3">
-                <div className="rounded-lg bg-amber-100 p-2 dark:bg-amber-900/30">
-                  <GitBranch className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+                <div className="rounded-lg bg-amber-500/12 p-2 text-amber-600 dark:text-amber-400">
+                  <GitBranch className="h-4 w-4" />
                 </div>
                 <h3 className="font-semibold text-stone-900 dark:text-stone-50">{agent.agent_id}</h3>
               </div>
@@ -492,42 +470,48 @@ function EvolutionTab() {
                 />
               </div>
 
-              <div className="mt-4 grid grid-cols-3 gap-2 border-t border-stone-100 pt-4 dark:border-stone-800">
+              <div className="mt-4 grid grid-cols-3 gap-2 border-t border-[var(--panel-border)] pt-4">
                 <div className="text-center">
-                  <p className="text-lg font-semibold text-stone-900 dark:text-stone-50">
+                  <p className="text-lg font-semibold tabular-nums text-stone-900 dark:text-stone-50">
                     {agent.max_gvu_generations}
                   </p>
                   <p className="text-[10px] text-stone-400">{intl.formatMessage({ id: 'evolution.maxGenerations' })}</p>
                 </div>
                 <div className="text-center">
-                  <p className="text-lg font-semibold text-stone-900 dark:text-stone-50">
+                  <p className="text-lg font-semibold tabular-nums text-stone-900 dark:text-stone-50">
                     {agent.observation_period_hours}h
                   </p>
                   <p className="text-[10px] text-stone-400">{intl.formatMessage({ id: 'evolution.observationPeriod' })}</p>
                 </div>
                 <div className="text-center">
-                  <p className="text-lg font-semibold text-stone-900 dark:text-stone-50">
+                  <p className="text-lg font-semibold tabular-nums text-stone-900 dark:text-stone-50">
                     {agent.max_silence_hours}h
                   </p>
                   <p className="text-[10px] text-stone-400">{intl.formatMessage({ id: 'evolution.maxSilence' })}</p>
                 </div>
               </div>
-            </div>
+            </Card>
           ))}
         </div>
       )}
 
       {/* SOUL.md evolution history */}
       {!loading && agents.length > 0 && (
-        <div className="space-y-3">
-          <h3 className="flex items-center gap-2 pt-2 text-sm font-semibold text-stone-700 dark:text-stone-300">
-            <GitBranch className="h-4 w-4 text-amber-600 dark:text-amber-400" />
-            {intl.formatMessage({ id: 'evolution.engine' })}
-          </h3>
+        <Section
+          title={
+            <span className="flex items-center gap-2">
+              <GitBranch className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+              {intl.formatMessage({ id: 'evolution.engine' })}
+            </span>
+          }
+        >
           {versions.length === 0 ? (
-            <div className="flex items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-10 text-sm text-stone-500 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-400">
-              {intl.formatMessage({ id: 'evolution.noHistory' })}
-            </div>
+            <Card>
+              <EmptyState
+                icon={GitBranch}
+                title={intl.formatMessage({ id: 'evolution.noHistory' })}
+              />
+            </Card>
           ) : (
             <div className="space-y-2">
               {versions.map((v) => (
@@ -535,7 +519,7 @@ function EvolutionTab() {
               ))}
             </div>
           )}
-        </div>
+        </Section>
       )}
     </div>
   );
@@ -552,10 +536,10 @@ function EvolutionVersionCard({ version }: { version: EvolutionVersion }) {
       default: return version.status;
     }
   })();
-  const statusColor: Record<string, string> = {
-    Confirmed: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
-    RolledBack: 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400',
-    Observing: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
+  const statusTone: Record<string, 'success' | 'danger' | 'warning'> = {
+    Confirmed: 'success',
+    RolledBack: 'danger',
+    Observing: 'warning',
   };
 
   const renderDelta = (pre: number, post: number | undefined, invert = false) => {
@@ -577,18 +561,15 @@ function EvolutionVersionCard({ version }: { version: EvolutionVersion }) {
   };
 
   return (
-    <div className="glass-card rounded-2xl p-4">
+    <Card bodyClassName="p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium text-amber-600 dark:text-amber-400">
             {version.agent_id}
           </span>
-          <span className={cn(
-            'rounded-full px-2 py-0.5 text-[10px] font-medium',
-            statusColor[version.status] ?? 'bg-stone-100 text-stone-600 dark:bg-stone-800 dark:text-stone-400',
-          )}>
+          <Badge tone={statusTone[version.status] ?? 'neutral'}>
             {statusLabel}
-          </span>
+          </Badge>
           <code className="text-[10px] text-stone-400">{version.soul_hash.slice(0, 8)}</code>
         </div>
         <span className="flex items-center gap-1 text-xs text-stone-400">
@@ -601,7 +582,7 @@ function EvolutionVersionCard({ version }: { version: EvolutionVersion }) {
           {version.soul_summary}
         </p>
       )}
-      <div className="mt-3 grid grid-cols-3 gap-2 border-t border-stone-100 pt-3 text-xs dark:border-stone-800">
+      <div className="mt-3 grid grid-cols-3 gap-2 border-t border-[var(--panel-border)] pt-3 text-xs">
         <div>
           <p className="text-[10px] text-stone-400">{intl.formatMessage({ id: 'evolution.metric.feedback' })}</p>
           <p className="font-mono">
@@ -621,7 +602,7 @@ function EvolutionVersionCard({ version }: { version: EvolutionVersion }) {
           </p>
         </div>
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -672,22 +653,20 @@ function InsightsTab() {
     }).finally(() => setLoading(false));
   }, [selectedAgent, intl]);
 
-  const selectStyle = 'rounded-lg border border-stone-200 bg-white px-3 py-2.5 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-700 dark:bg-stone-800 dark:text-stone-50';
-
   return (
     <div className="space-y-4">
       {/* Agent selector */}
-      <div className="flex gap-2">
+      <Toolbar>
         <select
           value={selectedAgent}
           onChange={(e) => setSelectedAgent(e.target.value)}
-          className={selectStyle}
+          className={cn(controlClass, 'w-auto')}
         >
           {agents.map((a) => (
             <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
           ))}
         </select>
-      </div>
+      </Toolbar>
 
       {/* Insight cards */}
       {loading ? (
@@ -695,19 +674,16 @@ function InsightsTab() {
           {intl.formatMessage({ id: 'common.loading' })}
         </div>
       ) : facts.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-          <Lightbulb className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-          <p className="mb-2 text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'memory.empty.insights' })}
-          </p>
-        </div>
+        <Card>
+          <EmptyState
+            icon={Lightbulb}
+            title={intl.formatMessage({ id: 'memory.empty.insights' })}
+          />
+        </Card>
       ) : (
         <div className="space-y-3">
           {facts.map((fact) => (
-            <div
-              key={fact.id}
-              className="glass-card rounded-2xl p-5"
-            >
+            <Card key={fact.id}>
               <div className="mb-2 flex items-start justify-between gap-3">
                 <div className="flex items-center gap-2">
                   <Lightbulb className="h-4 w-4 text-amber-500 dark:text-amber-400" />
@@ -715,12 +691,12 @@ function InsightsTab() {
                     {fact.agent_id}
                   </span>
                   {fact.access_count > 0 && (
-                    <span className="inline-flex items-center rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+                    <Badge tone="accent">
                       {intl.formatMessage(
                         { id: 'memory.insights.accessCount' },
                         { count: fact.access_count },
                       )}
-                    </span>
+                    </Badge>
                   )}
                 </div>
                 <span className="flex shrink-0 items-center gap-1 text-xs text-stone-400 dark:text-stone-500">
@@ -732,7 +708,7 @@ function InsightsTab() {
                 {fact.fact}
               </p>
               {(fact.source_session || fact.channel || fact.chat_id) && (
-                <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1 border-t border-stone-100 pt-2 text-[11px] text-stone-400 dark:border-stone-800 dark:text-stone-500">
+                <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1 border-t border-[var(--panel-border)] pt-2 text-[11px] text-stone-400 dark:text-stone-500">
                   {fact.source_session && (
                     <span>session: <code className="text-stone-500 dark:text-stone-400">{fact.source_session}</code></span>
                   )}
@@ -744,7 +720,7 @@ function InsightsTab() {
                   )}
                 </div>
               )}
-            </div>
+            </Card>
           ))}
         </div>
       )}

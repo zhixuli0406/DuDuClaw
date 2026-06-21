@@ -1126,6 +1126,25 @@ export interface RedactionUpdate {
   tool_egress?: Record<string, RedactionEgressRule | null>;
 }
 
+// ── SKS: global [skill_synthesis] auto-run (W19-P1) ─────────────
+
+/** Skill-synthesis auto-run scheduler config from `skill_synthesis.get`. */
+export interface SkillSynthesisConfig {
+  /** Master switch — when false the scheduler never runs the pipeline. */
+  auto_run: boolean;
+  /** When true, score+log only (no Skill Bank writes). */
+  dry_run: boolean;
+  /** Interval between runs, in hours (>= 1). */
+  interval_hours: number;
+  /** Days of EvolutionEvents JSONL scanned per run (1-30). */
+  lookback_days: number;
+  /** Owner of synthesized skills; empty string = fall back to default_agent. */
+  target_agent: string;
+}
+
+/** Partial update payload for `skill_synthesis.update`. */
+export type SkillSynthesisUpdate = Partial<SkillSynthesisConfig>;
+
 // ── MK: MCP API keys ────────────────────────────────────────────
 
 /** A masked MCP key entry from `mcp_keys.list`. The full cleartext key is
@@ -1801,6 +1820,14 @@ export const api = {
     get: () => client.call('redaction.get') as Promise<RedactionConfig>,
     update: (fields: RedactionUpdate) =>
       client.call('redaction.update', { ...fields }) as Promise<{
+        success: boolean;
+        changes: string[];
+      }>,
+  },
+  skillSynthesis: {
+    get: () => client.call('skill_synthesis.get') as Promise<SkillSynthesisConfig>,
+    update: (fields: SkillSynthesisUpdate) =>
+      client.call('skill_synthesis.update', { ...fields }) as Promise<{
         success: boolean;
         changes: string[];
       }>,

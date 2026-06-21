@@ -4,6 +4,7 @@ import { cn } from '@/lib/utils';
 import { useTasksStore } from '@/stores/tasks-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { Dialog, FormField, inputClass, selectClass } from '@/components/shared/Dialog';
+import { Page, PageHeader, Card, Badge, Button, EmptyState, Toolbar, controlClass } from '@/components/ui';
 import type { TaskInfo, TaskStatus, TaskPriority, TaskCreateParams } from '@/lib/api';
 import type { TaskUpdateParams } from '@/lib/api';
 import {
@@ -22,6 +23,7 @@ import {
   User,
   Calendar,
   Link2,
+  KanbanSquare,
 } from 'lucide-react';
 
 const COLUMNS: ReadonlyArray<{ status: TaskStatus; icon: React.ComponentType<{ className?: string }> }> = [
@@ -38,22 +40,22 @@ const COLUMN_STYLES: Record<TaskStatus, string> = {
   blocked: 'border-t-rose-500',
 };
 
-const PRIORITY_STYLES: Record<TaskPriority, string> = {
-  low: 'text-stone-400',
-  medium: 'text-blue-500',
-  high: 'text-amber-500',
-  urgent: 'text-rose-500',
-};
-
 // ── Priority Badge ──────────────────────────────────────────
+
+const PRIORITY_TONES: Record<TaskPriority, 'neutral' | 'info' | 'warning' | 'danger'> = {
+  low: 'neutral',
+  medium: 'info',
+  high: 'warning',
+  urgent: 'danger',
+};
 
 function PriorityBadge({ priority }: { priority: TaskPriority }) {
   const intl = useIntl();
   return (
-    <span className={cn('inline-flex items-center gap-1 text-xs font-medium', PRIORITY_STYLES[priority])}>
+    <Badge tone={PRIORITY_TONES[priority]}>
       <Flag className="h-3 w-3" />
       {intl.formatMessage({ id: `tasks.priority.${priority}` })}
-    </span>
+    </Badge>
   );
 }
 
@@ -85,7 +87,7 @@ function TaskCard({
     <div
       draggable
       onDragStart={handleDragStart}
-      className="group cursor-grab rounded-lg border border-stone-200 bg-white p-3 shadow-sm transition-shadow hover:shadow-md active:cursor-grabbing dark:border-stone-700 dark:bg-stone-800"
+      className="panel panel-hover group cursor-grab rounded-lg p-3 active:cursor-grabbing"
     >
       <div className="flex items-start justify-between gap-2">
         <div className="flex items-start gap-2">
@@ -117,10 +119,10 @@ function TaskCard({
         <div className="flex items-center gap-2">
           <PriorityBadge priority={task.priority} />
           {task.tags.length > 0 && (
-            <span className="rounded-full bg-stone-100 px-2 py-0.5 text-xs text-stone-500 dark:bg-stone-700 dark:text-stone-400">
+            <Badge tone="neutral">
               {task.tags[0]}
               {task.tags.length > 1 && ` +${task.tags.length - 1}`}
-            </span>
+            </Badge>
           )}
         </div>
         {agent && (
@@ -189,7 +191,7 @@ function KanbanColumn({
   return (
     <div
       className={cn(
-        'flex min-h-[300px] flex-col rounded-xl border-t-4 bg-stone-50 dark:bg-stone-900/50',
+        'panel flex min-h-[300px] flex-col border-t-4',
         COLUMN_STYLES[status],
         isDragOver && 'ring-2 ring-amber-400/50',
       )}
@@ -197,19 +199,17 @@ function KanbanColumn({
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
-      <div className="flex items-center justify-between px-4 py-3">
+      <div className="flex items-center justify-between border-b border-[var(--panel-border)] px-4 py-3">
         <div className="flex items-center gap-2">
           <Icon className="h-4 w-4 text-stone-500 dark:text-stone-400" />
           <h3 className="text-sm font-semibold text-stone-700 dark:text-stone-300">
             {intl.formatMessage({ id: `tasks.column.${status}` })}
           </h3>
-          <span className="rounded-full bg-stone-200 px-2 py-0.5 text-xs font-medium text-stone-600 dark:bg-stone-700 dark:text-stone-400">
-            {tasks.length}
-          </span>
+          <Badge tone="neutral" className="tabular-nums">{tasks.length}</Badge>
         </div>
       </div>
 
-      <div className="flex-1 space-y-2 px-3 pb-3">
+      <div className="flex-1 space-y-2 p-3">
         {tasks.map((task) => (
           <TaskCard key={task.id} task={task} agents={agents} onRemove={onRemove} onSelect={onSelect} />
         ))}
@@ -217,7 +217,9 @@ function KanbanColumn({
           <div
             className={cn(
               'flex items-center justify-center rounded-lg border-2 border-dashed py-8 text-xs text-stone-400 transition-colors dark:text-stone-600',
-              isDragOver ? 'border-amber-400 bg-amber-50/50 dark:bg-amber-900/10' : 'border-stone-200 dark:border-stone-700',
+              isDragOver
+                ? 'border-amber-400 bg-amber-50/50 dark:bg-amber-900/10'
+                : 'border-[var(--panel-border)]',
             )}
           >
             {intl.formatMessage({ id: 'tasks.dropHint' })}
@@ -332,21 +334,18 @@ function CreateTaskDialog({
         </FormField>
 
         <div className="flex justify-end gap-3 pt-2">
-          <button
-            onClick={onClose}
-            className="rounded-lg border border-stone-300 px-4 py-2 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-50 dark:border-stone-600 dark:text-stone-300 dark:hover:bg-stone-800"
-          >
+          <Button variant="secondary" onClick={onClose}>
             {intl.formatMessage({ id: 'agents.delegate.close' })}
-          </button>
-          <button
+          </Button>
+          <Button
+            variant="primary"
             onClick={handleSubmit}
             disabled={submitting || !title.trim()}
-            className="rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
           >
             {submitting
               ? intl.formatMessage({ id: 'agents.delegate.submitting' })
               : intl.formatMessage({ id: 'tasks.create' })}
-          </button>
+          </Button>
         </div>
       </div>
     </Dialog>
@@ -404,35 +403,19 @@ function TaskDetailPanel({
       <div className="fixed inset-0 z-40 bg-black/20 backdrop-blur-sm" onClick={onClose} />
 
       {/* Panel */}
-      <div className="fixed inset-y-0 right-0 z-50 flex w-full max-w-md flex-col border-l border-stone-200 bg-white shadow-2xl dark:border-stone-700 dark:bg-stone-900 animate-in slide-in-from-right duration-200">
+      <div className="glass-overlay fixed inset-y-0 right-0 z-50 flex w-full max-w-md flex-col border-l border-[var(--panel-border)] animate-in slide-in-from-right duration-200">
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-stone-200 px-6 py-4 dark:border-stone-700">
+        <div className="flex items-center justify-between border-b border-[var(--panel-border)] px-6 py-4">
           <h3 className="text-lg font-semibold text-stone-900 dark:text-stone-50">
             {intl.formatMessage({ id: 'tasks.detail' })}
           </h3>
           <div className="flex items-center gap-2">
             {!editing ? (
-              <button
-                onClick={() => setEditing(true)}
-                className="rounded-lg p-1.5 text-stone-400 transition-colors hover:bg-stone-100 hover:text-stone-600 dark:hover:bg-stone-800"
-              >
-                <Pencil className="h-4 w-4" />
-              </button>
+              <Button variant="ghost" size="sm" icon={Pencil} onClick={() => setEditing(true)} />
             ) : (
-              <button
-                onClick={handleSave}
-                disabled={saving}
-                className="rounded-lg p-1.5 text-amber-500 transition-colors hover:bg-amber-50 dark:hover:bg-amber-900/20"
-              >
-                <Save className="h-4 w-4" />
-              </button>
+              <Button variant="ghost" size="sm" icon={Save} onClick={handleSave} disabled={saving} />
             )}
-            <button
-              onClick={onClose}
-              className="rounded-lg p-1.5 text-stone-400 transition-colors hover:bg-stone-100 hover:text-stone-600 dark:hover:bg-stone-800"
-            >
-              <X className="h-4 w-4" />
-            </button>
+            <Button variant="ghost" size="sm" icon={X} onClick={onClose} />
           </div>
         </div>
 
@@ -452,15 +435,19 @@ function TaskDetailPanel({
 
             {/* Status + Priority row */}
             <div className="flex items-center gap-3">
-              <span className={cn(
-                'rounded-full px-2.5 py-1 text-xs font-medium',
-                task.status === 'done' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' :
-                task.status === 'in_progress' ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400' :
-                task.status === 'blocked' ? 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400' :
-                'bg-stone-100 text-stone-600 dark:bg-stone-800 dark:text-stone-400',
-              )}>
+              <Badge
+                tone={
+                  task.status === 'done'
+                    ? 'success'
+                    : task.status === 'in_progress'
+                      ? 'warning'
+                      : task.status === 'blocked'
+                        ? 'danger'
+                        : 'neutral'
+                }
+              >
                 {intl.formatMessage({ id: `tasks.status.${task.status}` })}
-              </span>
+              </Badge>
               {editing ? (
                 <select className={cn(selectClass, 'w-auto')} value={priority} onChange={(e) => setPriority(e.target.value as TaskPriority)}>
                   {(['low', 'medium', 'high', 'urgent'] as const).map((p) => (
@@ -533,16 +520,14 @@ function TaskDetailPanel({
               ) : (
                 <div className="flex flex-wrap gap-1.5">
                   {task.tags.length > 0 ? task.tags.map((tag) => (
-                    <span key={tag} className="rounded-full bg-stone-100 px-2.5 py-0.5 text-xs text-stone-600 dark:bg-stone-800 dark:text-stone-400">
-                      {tag}
-                    </span>
+                    <Badge key={tag} tone="neutral">{tag}</Badge>
                   )) : <span className="text-sm text-stone-400">—</span>}
                 </div>
               )}
             </div>
 
             {/* Metadata section */}
-            <div className="space-y-3 border-t border-stone-200 pt-4 dark:border-stone-700">
+            <div className="space-y-3 border-t border-[var(--panel-border)] pt-4">
               <div className="flex items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
                 <User className="h-3.5 w-3.5" />
                 <span className="font-medium">{intl.formatMessage({ id: 'tasks.detail.createdBy' })}</span>
@@ -647,26 +632,23 @@ export function TaskBoardPage() {
   const tasksByStatus = (status: TaskStatus) => filteredTasks.filter((t) => t.status === status);
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'tasks.title' })}
-        </h2>
-        <button
-          onClick={() => setShowCreateDialog(true)}
-          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600"
-        >
-          <Plus className="h-4 w-4" />
-          {intl.formatMessage({ id: 'tasks.create' })}
-        </button>
-      </div>
+    <Page wide>
+      <PageHeader
+        icon={KanbanSquare}
+        title={intl.formatMessage({ id: 'nav.tasks' })}
+        subtitle={intl.formatMessage({ id: 'tasks.title' })}
+        actions={
+          <Button variant="primary" icon={Plus} onClick={() => setShowCreateDialog(true)}>
+            {intl.formatMessage({ id: 'tasks.create' })}
+          </Button>
+        }
+      />
 
       {/* Filters */}
-      <div className="flex items-center gap-3">
+      <Toolbar>
         <Filter className="h-4 w-4 text-stone-400" />
         <select
-          className={cn(selectClass, 'w-auto min-w-[140px]')}
+          className={cn(controlClass, 'w-auto min-w-[140px]')}
           value={filterAgent ?? ''}
           onChange={(e) => setFilterAgent(e.target.value || null)}
         >
@@ -678,7 +660,7 @@ export function TaskBoardPage() {
           ))}
         </select>
         <select
-          className={cn(selectClass, 'w-auto min-w-[140px]')}
+          className={cn(controlClass, 'w-auto min-w-[140px]')}
           value={filterPriority ?? ''}
           onChange={(e) => setFilterPriority((e.target.value as TaskPriority) || null)}
         >
@@ -689,14 +671,16 @@ export function TaskBoardPage() {
             </option>
           ))}
         </select>
-      </div>
+      </Toolbar>
 
-      {/* Empty hint bar (only when truly empty and loaded) */}
+      {/* Empty hint (only when truly empty and loaded) */}
       {tasks.length === 0 && !loading && (
-        <div className="flex items-center gap-3 rounded-lg border border-dashed border-stone-300 bg-white px-4 py-3 text-sm text-stone-500 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-400">
-          <Clock className="h-4 w-4 flex-shrink-0" />
-          <span>{intl.formatMessage({ id: 'tasks.empty' })}</span>
-        </div>
+        <Card padded={false}>
+          <EmptyState
+            icon={Clock}
+            title={intl.formatMessage({ id: 'tasks.empty' })}
+          />
+        </Card>
       )}
 
       {/* Kanban Board — always 4 columns, matches original Multica design */}
@@ -750,21 +734,15 @@ export function TaskBoardPage() {
             {removeTarget && intl.formatMessage({ id: 'tasks.remove.confirm' }, { title: removeTarget.title })}
           </p>
           <div className="flex justify-end gap-3">
-            <button
-              onClick={() => setRemoveTarget(null)}
-              className="rounded-lg border border-stone-300 px-4 py-2 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-50 dark:border-stone-600 dark:text-stone-300 dark:hover:bg-stone-800"
-            >
+            <Button variant="secondary" onClick={() => setRemoveTarget(null)}>
               {intl.formatMessage({ id: 'agents.delegate.close' })}
-            </button>
-            <button
-              className="rounded-lg bg-rose-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-rose-600"
-              onClick={handleRemoveConfirm}
-            >
+            </Button>
+            <Button variant="danger" onClick={handleRemoveConfirm}>
               {intl.formatMessage({ id: 'tasks.remove' })}
-            </button>
+            </Button>
           </div>
         </div>
       </Dialog>
-    </div>
+    </Page>
   );
 }

@@ -1,10 +1,21 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { cn } from '@/lib/utils';
 import { api, type AgentInfo, type MarketplaceServer } from '@/lib/api';
-import { Dialog, FormField, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { Dialog, FormField, selectClass } from '@/components/shared/Dialog';
 import {
-  Search,
+  Page,
+  PageHeader,
+  Card,
+  Section,
+  Tabs,
+  Button,
+  Badge,
+  EmptyState,
+  Toolbar,
+  type TabItem,
+} from '@/components/ui';
+import {
+  Store,
   Download,
   Check,
   MessageSquare,
@@ -12,6 +23,7 @@ import {
   Globe,
   Package,
   Sparkles,
+  X,
 } from 'lucide-react';
 
 type Category = 'all' | 'featured' | 'browser' | 'data' | 'communication';
@@ -51,76 +63,58 @@ function ServerCard({
   const Icon = iconForCategory(server.category);
 
   return (
-    <div className="glass-card glass-card-hover rounded-2xl p-5">
+    <Card interactive className="flex h-full flex-col">
       <div className="flex items-start gap-3">
-        <div className="rounded-lg bg-amber-100 p-2.5 dark:bg-amber-900/30">
-          <Icon className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-        </div>
-        <div className="flex-1 min-w-0">
+        <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-amber-500/12 text-amber-600 ring-1 ring-inset ring-amber-500/20 dark:bg-amber-400/10 dark:text-amber-400">
+          <Icon className="h-5 w-5" />
+        </span>
+        <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <h4 className="font-medium text-stone-900 dark:text-stone-50 truncate">
+            <h3 className="truncate font-medium text-stone-900 dark:text-stone-50">
               {server.name}
-            </h4>
+            </h3>
             {server.featured && (
-              <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">
+              <Badge tone="accent">
                 <Sparkles className="h-3 w-3" />
                 {intl.formatMessage({ id: 'marketplace.featured' })}
-              </span>
+              </Badge>
             )}
           </div>
-          <div className="flex items-center gap-2 mt-0.5">
-            <span className="text-xs text-stone-500 dark:text-stone-400">
-              {server.author}
-            </span>
-          </div>
+          <p className="mt-0.5 truncate text-xs text-stone-500 dark:text-stone-400">
+            {server.author}
+          </p>
         </div>
       </div>
 
-      <p className="mt-3 text-sm text-stone-600 dark:text-stone-400 line-clamp-2">
+      <p className="mt-3 line-clamp-2 text-sm text-stone-600 dark:text-stone-400">
         {server.description}
       </p>
 
       {server.tags.length > 0 && (
         <div className="mt-3 flex flex-wrap gap-1.5">
           {server.tags.map((tag) => (
-            <span
-              key={tag}
-              className="inline-flex rounded-full bg-stone-100 px-2 py-0.5 text-xs text-stone-600 dark:bg-stone-800 dark:text-stone-400"
-            >
+            <Badge key={tag} tone="neutral">
               {tag}
-            </span>
+            </Badge>
           ))}
         </div>
       )}
 
       <div className="mt-4 flex items-center justify-end">
-        <button
-          onClick={onInstall}
-          disabled={installed}
-          className={cn(
-            'inline-flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-sm font-medium transition-colors',
-            installed
-              ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'
-              : 'bg-amber-500 text-white hover:bg-amber-600',
-          )}
-        >
-          {installed ? (
-            <>
-              <Check className="h-3.5 w-3.5" />
-              {intl.formatMessage({ id: 'marketplace.installed' })}
-              {server.installed_by.length > 1 && (
-                <span className="ml-0.5 opacity-70">({server.installed_by.length})</span>
-              )}
-            </>
-          ) : (
-            <>
-              <Download className="h-3.5 w-3.5" />
-              {intl.formatMessage({ id: 'marketplace.install' })}
-            </>
-          )}
-        </button>
+        {installed ? (
+          <Button variant="secondary" size="sm" icon={Check} disabled>
+            {intl.formatMessage({ id: 'marketplace.installed' })}
+            {server.installed_by.length > 1 && (
+              <span className="ml-0.5 opacity-70">({server.installed_by.length})</span>
+            )}
+          </Button>
+        ) : (
+          <Button variant="primary" size="sm" icon={Download} onClick={onInstall}>
+            {intl.formatMessage({ id: 'marketplace.install' })}
+          </Button>
+        )}
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -216,11 +210,18 @@ export function MarketplacePage() {
     }
   };
 
+  const categoryTabs: TabItem[] = CATEGORIES.map((cat) => ({
+    id: cat,
+    label: intl.formatMessage({ id: `marketplace.categories.${cat}` }),
+  }));
+
   return (
-    <div className="space-y-6">
-      <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-        {intl.formatMessage({ id: 'marketplace.title' })}
-      </h2>
+    <Page wide>
+      <PageHeader
+        icon={Store}
+        title={intl.formatMessage({ id: 'nav.marketplace' })}
+        subtitle={intl.formatMessage({ id: 'marketplace.subtitle' })}
+      />
 
       {/* Install Error Alert */}
       {installError && (
@@ -235,20 +236,7 @@ export function MarketplacePage() {
             className="shrink-0 text-rose-500 hover:text-rose-700 dark:text-rose-400 dark:hover:text-rose-200"
             aria-label="Dismiss"
           >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <line x1="18" y1="6" x2="6" y2="18"></line>
-              <line x1="6" y1="6" x2="18" y2="18"></line>
-            </svg>
+            <X className="h-4 w-4" />
           </button>
         </div>
       )}
@@ -263,35 +251,19 @@ export function MarketplacePage() {
         </div>
       )}
 
-      {/* Search Bar */}
-      <div className="relative">
-        <Search className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-stone-400" />
-        <input
-          type="text"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder={intl.formatMessage({ id: 'marketplace.search' })}
-          className="w-full rounded-xl border border-stone-300 bg-white py-2.5 pl-10 pr-4 text-sm text-stone-900 placeholder:text-stone-400 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50 dark:placeholder:text-stone-500"
-        />
-      </div>
+      {/* Search */}
+      <Toolbar
+        search={query}
+        onSearchChange={setQuery}
+        searchPlaceholder={intl.formatMessage({ id: 'marketplace.search' })}
+      />
 
       {/* Category Tabs */}
-      <div className="flex gap-1 rounded-lg border border-stone-200 bg-stone-100 p-1 dark:border-stone-700 dark:bg-stone-800">
-        {CATEGORIES.map((cat) => (
-          <button
-            key={cat}
-            onClick={() => setCategory(cat)}
-            className={cn(
-              'rounded-md px-4 py-1.5 text-sm font-medium transition-colors',
-              category === cat
-                ? 'bg-amber-500 text-white shadow-sm'
-                : 'text-stone-600 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-200',
-            )}
-          >
-            {intl.formatMessage({ id: `marketplace.categories.${cat}` })}
-          </button>
-        ))}
-      </div>
+      <Tabs
+        items={categoryTabs}
+        value={category}
+        onChange={(id) => setCategory(id as Category)}
+      />
 
       {/* Loading */}
       {loading && (
@@ -302,13 +274,14 @@ export function MarketplacePage() {
 
       {/* Featured Section (only on `all` tab with no search) */}
       {!loading && category === 'all' && !query && featuredServers.length > 0 && (
-        <div>
-          <div className="flex items-center gap-2 mb-4">
-            <Sparkles className="h-5 w-5 text-amber-500" />
-            <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
+        <Section
+          title={
+            <span className="flex items-center gap-2">
+              <Sparkles className="h-4 w-4 text-amber-500" />
               {intl.formatMessage({ id: 'marketplace.featured' })}
-            </h3>
-          </div>
+            </span>
+          }
+        >
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {featuredServers.map((server) => (
               <ServerCard
@@ -319,35 +292,42 @@ export function MarketplacePage() {
               />
             ))}
           </div>
-        </div>
+        </Section>
       )}
 
       {/* All Servers Grid */}
       {!loading && (
-        <div>
-          {(category !== 'all' || query) && (
-            <h3 className="mb-4 text-lg font-medium text-stone-900 dark:text-stone-50">
-              {intl.formatMessage({ id: `marketplace.categories.${category}` })}
-            </h3>
-          )}
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {filtered.map((server) => (
-              <ServerCard
-                key={server.id}
-                server={server}
-                installed={server.installed_by.length > 0}
-                onInstall={() => handleInstall(server.id)}
+        <Section
+          title={
+            category !== 'all' || query
+              ? intl.formatMessage({ id: `marketplace.categories.${category}` })
+              : undefined
+          }
+        >
+          {filtered.length === 0 ? (
+            <Card>
+              <EmptyState
+                icon={Package}
+                title={
+                  servers.length === 0
+                    ? intl.formatMessage({ id: 'marketplace.empty' })
+                    : intl.formatMessage({ id: 'common.noData' })
+                }
               />
-            ))}
-          </div>
-          {filtered.length === 0 && (
-            <p className="py-12 text-center text-stone-400 dark:text-stone-500">
-              {servers.length === 0
-                ? intl.formatMessage({ id: 'marketplace.empty' })
-                : intl.formatMessage({ id: 'common.noData' })}
-            </p>
+            </Card>
+          ) : (
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {filtered.map((server) => (
+                <ServerCard
+                  key={server.id}
+                  server={server}
+                  installed={server.installed_by.length > 0}
+                  onInstall={() => handleInstall(server.id)}
+                />
+              ))}
+            </div>
           )}
-        </div>
+        </Section>
       )}
 
       {/* Install target agent picker */}
@@ -380,22 +360,22 @@ export function MarketplacePage() {
               </select>
             </FormField>
             <div className="flex justify-end gap-2 pt-1">
-              <button onClick={() => setInstallTarget(null)} className={buttonSecondary}>
+              <Button variant="secondary" onClick={() => setInstallTarget(null)}>
                 {intl.formatMessage({ id: 'common.cancel' })}
-              </button>
-              <button
+              </Button>
+              <Button
+                variant="primary"
                 onClick={confirmInstall}
                 disabled={installing || !installAgent}
-                className={buttonPrimary}
               >
                 {installing
                   ? intl.formatMessage({ id: 'common.saving' })
                   : intl.formatMessage({ id: 'marketplace.install' })}
-              </button>
+              </Button>
             </div>
           </div>
         </Dialog>
       )}
-    </div>
+    </Page>
   );
 }

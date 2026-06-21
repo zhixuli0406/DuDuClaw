@@ -4,6 +4,7 @@ import { useConnectionStore } from '@/stores/connection-store';
 import { api, type LicenseSnapshot } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
+import { Page, PageHeader, Card, Section, StatCard, Badge, Button } from '@/components/ui';
 import {
   KeyRound,
   ShieldCheck,
@@ -19,6 +20,7 @@ import {
   Globe,
   Check,
   Minus,
+  Award,
 } from 'lucide-react';
 
 /** Human-readable label for each tier. */
@@ -83,12 +85,14 @@ const COMMERCIAL_FEATURES: ReadonlyArray<{
   },
 ] as const;
 
+type ExpiryTone = 'expired' | 'critical' | 'warning' | 'ok' | 'unknown';
+
 /**
  * Classify the days-until-expiry into a visual urgency bucket. Pure helper so
  * we can exercise it in unit tests without React state.
  */
 export function classifyExpiry(daysUntilExpiry: number | null | undefined): {
-  tone: 'expired' | 'critical' | 'warning' | 'ok' | 'unknown';
+  tone: ExpiryTone;
   labelId: string;
 } {
   if (daysUntilExpiry == null) return { tone: 'unknown', labelId: 'license.expiry.unknown' };
@@ -101,35 +105,23 @@ export function classifyExpiry(daysUntilExpiry: number | null | undefined): {
   return { tone: 'ok', labelId: 'license.expiry.ok' };
 }
 
-function StatusBadge({
-  tone,
-  children,
-}: {
-  readonly tone: 'expired' | 'critical' | 'warning' | 'ok' | 'unknown';
-  readonly children: React.ReactNode;
-}) {
-  const palette = {
-    expired:
-      'bg-rose-100 text-rose-900 border-rose-200 dark:bg-rose-900/30 dark:text-rose-200 dark:border-rose-800/40',
-    critical:
-      'bg-rose-100 text-rose-900 border-rose-200 dark:bg-rose-900/30 dark:text-rose-200 dark:border-rose-800/40',
-    warning:
-      'bg-amber-100 text-amber-900 border-amber-200 dark:bg-amber-900/30 dark:text-amber-200 dark:border-amber-800/40',
-    ok: 'bg-emerald-100 text-emerald-900 border-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-200 dark:border-emerald-800/40',
-    unknown:
-      'bg-stone-100 text-stone-700 border-stone-200 dark:bg-stone-800 dark:text-stone-300 dark:border-stone-700',
-  }[tone];
-  return (
-    <span
-      className={cn(
-        'inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium',
-        palette,
-      )}
-    >
-      {children}
-    </span>
-  );
-}
+/** Map an expiry/phone-home urgency tone onto a Calm Glass Badge tone. */
+const BADGE_TONE: Record<ExpiryTone, 'danger' | 'warning' | 'success' | 'neutral'> = {
+  expired: 'danger',
+  critical: 'danger',
+  warning: 'warning',
+  ok: 'success',
+  unknown: 'neutral',
+};
+
+/** StatCard tone equivalents for the hero metric tiles. */
+const STAT_TONE: Record<ExpiryTone, 'danger' | 'warning' | 'success' | 'neutral'> = {
+  expired: 'danger',
+  critical: 'danger',
+  warning: 'warning',
+  ok: 'success',
+  unknown: 'neutral',
+};
 
 function PhoneHomeIndicator({
   daysSincePhoneHome,
@@ -144,20 +136,20 @@ function PhoneHomeIndicator({
       </span>
     );
   }
-  const tone =
+  const tone: ExpiryTone =
     daysSincePhoneHome <= 7
       ? 'ok'
       : daysSincePhoneHome <= 30
         ? 'warning'
         : 'critical';
   return (
-    <StatusBadge tone={tone}>
+    <Badge tone={BADGE_TONE[tone]}>
       <RefreshCw className="h-3.5 w-3.5" />
       {intl.formatMessage(
         { id: 'license.phoneHome.daysAgo' },
         { days: daysSincePhoneHome },
       )}
-    </StatusBadge>
+    </Badge>
   );
 }
 
@@ -192,80 +184,84 @@ export function LicensePage() {
   const expiryClassification = classifyExpiry(snapshot?.days_until_expiry);
 
   return (
-    <div className="space-y-6 p-6">
-      <header className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold text-stone-900 dark:text-stone-50">
-            {intl.formatMessage({ id: 'license.title' })}
-          </h1>
-          <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'license.subtitle' })}
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={() => {
-            setRefreshing(true);
-            void load();
-          }}
-          disabled={refreshing || loading}
-          className={cn(
-            'inline-flex items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 py-2 text-sm font-medium text-stone-700 hover:bg-stone-50 disabled:opacity-50',
-            'dark:border-stone-700 dark:bg-stone-900 dark:text-stone-200 dark:hover:bg-stone-800',
-          )}
-        >
-          <RefreshCw
-            className={cn('h-4 w-4', refreshing && 'animate-spin')}
-          />
-          {intl.formatMessage({ id: 'license.refresh' })}
-        </button>
-      </header>
+    <Page>
+      <PageHeader
+        icon={KeyRound}
+        title={intl.formatMessage({ id: 'nav.license' })}
+        subtitle={intl.formatMessage({ id: 'license.subtitle' })}
+        actions={
+          <Button
+            variant="secondary"
+            onClick={() => {
+              setRefreshing(true);
+              void load();
+            }}
+            disabled={refreshing || loading}
+            icon={refreshing ? undefined : RefreshCw}
+          >
+            {refreshing && <RefreshCw className="h-4 w-4 animate-spin" />}
+            {intl.formatMessage({ id: 'license.refresh' })}
+          </Button>
+        }
+      />
 
       {loading && !snapshot && (
-        <div className="glass-card rounded-2xl p-8 text-center text-stone-500 dark:text-stone-400">
-          {intl.formatMessage({ id: 'license.loading' })}
-        </div>
+        <Card>
+          <p className="py-8 text-center text-sm text-stone-500 dark:text-stone-400">
+            {intl.formatMessage({ id: 'license.loading' })}
+          </p>
+        </Card>
       )}
 
       {snapshot && (
         <>
-          {/* ── Tier card ───────────────────────────────────── */}
-          <section className="glass-card rounded-2xl p-6">
-            <div className="flex flex-wrap items-start gap-4">
-              <div className="rounded-lg bg-amber-100 p-3 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">
-                <KeyRound className="h-6 w-6" />
-              </div>
-              <div className="min-w-0 flex-1">
-                <p className="text-xs uppercase tracking-wider text-stone-500 dark:text-stone-400">
-                  {intl.formatMessage({ id: 'license.activeTier' })}
-                </p>
-                <h2 className="mt-1 text-2xl font-semibold text-stone-900 dark:text-stone-50">
-                  {TIER_LABELS[snapshot.tier]}
-                </h2>
-                <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
-                  {snapshot.installed
-                    ? intl.formatMessage({ id: 'license.mode.commercial' })
-                    : intl.formatMessage({ id: 'license.mode.opensource' })}
-                </p>
-              </div>
+          {/* ── Hero metrics: tier / expiry / phone-home ────── */}
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <StatCard
+              icon={Award}
+              tone="accent"
+              label={intl.formatMessage({ id: 'license.activeTier' })}
+              value={TIER_LABELS[snapshot.tier]}
+              hint={
+                snapshot.installed
+                  ? intl.formatMessage({ id: 'license.mode.commercial' })
+                  : intl.formatMessage({ id: 'license.mode.opensource' })
+              }
+            />
+            <StatCard
+              icon={Calendar}
+              tone={STAT_TONE[expiryClassification.tone]}
+              label={intl.formatMessage({ id: 'license.expiresAt' })}
+              value={
+                snapshot.days_until_expiry != null
+                  ? intl.formatMessage(
+                      { id: expiryClassification.labelId },
+                      { days: Math.abs(snapshot.days_until_expiry) },
+                    )
+                  : intl.formatMessage({ id: 'license.expiry.unknown' })
+              }
+              hint={
+                snapshot.expires_at
+                  ? new Date(snapshot.expires_at).toLocaleString()
+                  : '—'
+              }
+            />
+            <StatCard
+              icon={RefreshCw}
+              tone="neutral"
+              label={intl.formatMessage({ id: 'license.lastPhoneHome' })}
+              value={<PhoneHomeIndicator daysSincePhoneHome={snapshot.days_since_phone_home} />}
+              hint={
+                snapshot.last_phone_home
+                  ? new Date(snapshot.last_phone_home).toLocaleString()
+                  : '—'
+              }
+            />
+          </div>
 
-              <div className="flex flex-col items-end gap-2">
-                <StatusBadge tone={expiryClassification.tone}>
-                  <Calendar className="h-3.5 w-3.5" />
-                  {snapshot.days_until_expiry != null
-                    ? intl.formatMessage(
-                        { id: expiryClassification.labelId },
-                        { days: Math.abs(snapshot.days_until_expiry) },
-                      )
-                    : intl.formatMessage({ id: 'license.expiry.unknown' })}
-                </StatusBadge>
-                <PhoneHomeIndicator
-                  daysSincePhoneHome={snapshot.days_since_phone_home}
-                />
-              </div>
-            </div>
-
-            <dl className="mt-6 grid grid-cols-1 gap-4 border-t border-stone-200 pt-6 sm:grid-cols-2 dark:border-stone-800">
+          {/* ── License details ─────────────────────────────── */}
+          <Card title={intl.formatMessage({ id: 'license.activeTier' })}>
+            <dl className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <DetailRow
                 label={intl.formatMessage({ id: 'license.customerId' })}
                 value={snapshot.customer_id ?? '—'}
@@ -303,24 +299,24 @@ export function LicensePage() {
                 icon={Fingerprint}
               />
             </dl>
-          </section>
+          </Card>
 
           {/* ── Commercial modules matrix ───────────────────── */}
-          <section className="glass-card rounded-2xl p-6">
-            <h3 className="text-lg font-semibold text-stone-900 dark:text-stone-50">
-              {intl.formatMessage({ id: 'license.modules.title' })}
-            </h3>
-            <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
+          <Card
+            title={intl.formatMessage({ id: 'license.modules.title' })}
+            padded={false}
+          >
+            <p className="border-b border-[var(--panel-border)] px-5 py-3 text-sm text-stone-500 dark:text-stone-400">
               {intl.formatMessage({ id: 'license.modules.subtitle' })}
             </p>
-            <ul className="mt-4 divide-y divide-stone-200 dark:divide-stone-800">
+            <ul className="divide-y divide-[var(--panel-border)]">
               {COMMERCIAL_FEATURES.map(({ key, label, icon: Icon, tiers }) => {
                 const unlocked = tiers.has(snapshot.tier);
                 return (
-                  <li key={key} className="flex items-center gap-3 py-3">
+                  <li key={key} className="flex items-center gap-3 px-5 py-3">
                     <Icon
                       className={cn(
-                        'h-4 w-4',
+                        'h-4 w-4 shrink-0',
                         unlocked
                           ? 'text-emerald-600 dark:text-emerald-400'
                           : 'text-stone-400 dark:text-stone-500',
@@ -337,76 +333,71 @@ export function LicensePage() {
                       {intl.formatMessage({ id: label })}
                     </span>
                     {unlocked ? (
-                      <Check className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                      <Badge tone="success">
+                        <Check className="h-3.5 w-3.5" />
+                      </Badge>
                     ) : (
-                      <Minus className="h-4 w-4 text-stone-400 dark:text-stone-500" />
+                      <Badge tone="neutral">
+                        <Minus className="h-3.5 w-3.5" />
+                      </Badge>
                     )}
                   </li>
                 );
               })}
             </ul>
-          </section>
+          </Card>
 
           {/* ── CTA: upgrade / activate / docs ──────────────── */}
           {!snapshot.installed && (
-            <section className="rounded-xl border border-amber-200 bg-amber-50 p-6 dark:border-amber-900/40 dark:bg-amber-950/20">
-              <h3 className="text-lg font-semibold text-amber-900 dark:text-amber-200">
-                {intl.formatMessage({ id: 'license.cta.opensource.title' })}
-              </h3>
-              <p className="mt-2 text-sm text-amber-800 dark:text-amber-200/80">
-                {intl.formatMessage({ id: 'license.cta.opensource.body' })}
-              </p>
-              <div className="mt-4 flex flex-wrap gap-3">
+            <Section
+              title={intl.formatMessage({ id: 'license.cta.opensource.title' })}
+              description={intl.formatMessage({ id: 'license.cta.opensource.body' })}
+            >
+              <div className="flex flex-wrap gap-3">
                 <a
                   href="https://duduclaw.tw#pricing"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="inline-flex items-center gap-2 rounded-lg bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700"
                 >
-                  {intl.formatMessage({ id: 'license.cta.pricing' })}
-                  <ExternalLink className="h-3.5 w-3.5" />
+                  <Button variant="primary" iconRight={ExternalLink}>
+                    {intl.formatMessage({ id: 'license.cta.pricing' })}
+                  </Button>
                 </a>
                 <a
                   href="https://github.com/zhixuli0406/DuDuClaw#-installation"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="inline-flex items-center gap-2 rounded-lg border border-amber-300 bg-white px-4 py-2 text-sm font-medium text-amber-900 hover:bg-amber-50 dark:border-amber-800/40 dark:bg-stone-900 dark:text-amber-200 dark:hover:bg-stone-800"
                 >
-                  {intl.formatMessage({ id: 'license.cta.docs' })}
-                  <ExternalLink className="h-3.5 w-3.5" />
+                  <Button variant="secondary" iconRight={ExternalLink}>
+                    {intl.formatMessage({ id: 'license.cta.docs' })}
+                  </Button>
                 </a>
               </div>
-            </section>
+            </Section>
           )}
 
           {snapshot.installed && expiryClassification.tone !== 'ok' && (
-            <section className="rounded-xl border border-amber-200 bg-amber-50 p-6 dark:border-amber-900/40 dark:bg-amber-950/20">
-              <h3 className="text-lg font-semibold text-amber-900 dark:text-amber-200">
-                {intl.formatMessage({ id: 'license.cta.renew.title' })}
-              </h3>
-              <p className="mt-2 text-sm text-amber-800 dark:text-amber-200/80">
-                {intl.formatMessage({ id: 'license.cta.renew.body' })}
-              </p>
-              <div className="mt-4 flex flex-wrap gap-3">
+            <Section
+              title={intl.formatMessage({ id: 'license.cta.renew.title' })}
+              description={intl.formatMessage({ id: 'license.cta.renew.body' })}
+            >
+              <div className="flex flex-wrap gap-3">
                 <a
                   href="https://duduclaw.tw#pricing"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="inline-flex items-center gap-2 rounded-lg bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700"
                 >
-                  {intl.formatMessage({ id: 'license.cta.renew.action' })}
-                  <ExternalLink className="h-3.5 w-3.5" />
+                  <Button variant="primary" iconRight={ExternalLink}>
+                    {intl.formatMessage({ id: 'license.cta.renew.action' })}
+                  </Button>
                 </a>
               </div>
-            </section>
+            </Section>
           )}
 
           {/* ── CLI hint ───────────────────────────────────── */}
-          <section className="rounded-xl border border-stone-200 bg-stone-50 p-6 dark:border-stone-700 dark:bg-stone-900/50">
-            <h3 className="text-sm font-semibold uppercase tracking-wider text-stone-600 dark:text-stone-400">
-              {intl.formatMessage({ id: 'license.cli.title' })}
-            </h3>
-            <p className="mt-2 text-sm text-stone-600 dark:text-stone-300">
+          <Card title={intl.formatMessage({ id: 'license.cli.title' })}>
+            <p className="text-sm text-stone-600 dark:text-stone-300">
               {intl.formatMessage({ id: 'license.cli.body' })}
             </p>
             <ul className="mt-3 space-y-1 font-mono text-xs text-stone-700 dark:text-stone-300">
@@ -415,10 +406,10 @@ export function LicensePage() {
               <li>$ duduclaw license refresh</li>
               <li>$ duduclaw license deactivate</li>
             </ul>
-          </section>
+          </Card>
         </>
       )}
-    </div>
+    </Page>
   );
 }
 

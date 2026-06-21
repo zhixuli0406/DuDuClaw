@@ -6,6 +6,20 @@ import { useAgentsStore } from '@/stores/agents-store';
 import { Dialog } from '@/components/shared/Dialog';
 import { toast, formatError } from '@/lib/toast';
 import {
+  Page,
+  PageHeader,
+  Card,
+  Section,
+  Tabs,
+  Toolbar,
+  Button,
+  Badge,
+  EmptyState,
+  Field,
+  controlClass,
+  type TabItem,
+} from '@/components/ui';
+import {
   Search,
   Tag,
   User,
@@ -21,6 +35,7 @@ import {
   Users,
   Sparkles,
   Store,
+  Puzzle,
 } from 'lucide-react';
 
 interface VetResult {
@@ -42,44 +57,26 @@ export function SkillMarketPage() {
   const intl = useIntl();
   const [activeTab, setActiveTab] = useState<SkillTab>('market');
 
-  const tabItems: ReadonlyArray<{ id: SkillTab; label: string; icon: React.ComponentType<{ className?: string }> }> = [
+  const tabItems: TabItem[] = [
     { id: 'market', label: intl.formatMessage({ id: 'skills.tab.market' }), icon: Store },
     { id: 'shared', label: intl.formatMessage({ id: 'skills.tab.shared' }), icon: Users },
     { id: 'mySkills', label: intl.formatMessage({ id: 'skills.tab.mySkills' }), icon: Sparkles },
   ];
 
   return (
-    <div className="space-y-6">
-      <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-        {intl.formatMessage({ id: 'skills.market.title' })}
-      </h2>
+    <Page wide>
+      <PageHeader
+        icon={Puzzle}
+        title={intl.formatMessage({ id: 'nav.skills' })}
+        subtitle={intl.formatMessage({ id: 'skills.market.title' })}
+      />
 
-      {/* Tabs */}
-      <div className="flex gap-1 rounded-lg bg-stone-100 p-1 dark:bg-stone-800">
-        {tabItems.map((tab) => {
-          const TabIcon = tab.icon;
-          return (
-            <button
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
-              className={cn(
-                'flex items-center gap-2 whitespace-nowrap rounded-md px-4 py-2 text-sm font-medium transition-colors',
-                activeTab === tab.id
-                  ? 'bg-white text-stone-900 shadow-sm dark:bg-stone-700 dark:text-stone-50'
-                  : 'text-stone-500 hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-300',
-              )}
-            >
-              <TabIcon className="h-4 w-4" />
-              {tab.label}
-            </button>
-          );
-        })}
-      </div>
+      <Tabs items={tabItems} value={activeTab} onChange={(id) => setActiveTab(id as SkillTab)} />
 
       {activeTab === 'market' && <MarketTab />}
       {activeTab === 'shared' && <SharedSkillsTab />}
       {activeTab === 'mySkills' && <MySkillsTab />}
-    </div>
+    </Page>
   );
 }
 
@@ -120,27 +117,16 @@ function MarketTab() {
       </p>
 
       {/* Search bar */}
-      <div className="flex gap-3">
-        <div className="relative flex-1">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-stone-400" />
-          <input
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-            placeholder={intl.formatMessage({ id: 'skills.market.searchPlaceholder' })}
-            className="w-full rounded-lg border border-stone-200 bg-white py-2.5 pl-10 pr-4 text-sm text-stone-900 placeholder-stone-400 transition-colors focus:border-amber-400 focus:outline-none focus:ring-1 focus:ring-amber-400 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-50"
-          />
-        </div>
-        <button
-          onClick={handleSearch}
-          disabled={loading}
-          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
-        >
-          <Search className="h-4 w-4" />
+      <Toolbar
+        search={query}
+        onSearchChange={setQuery}
+        onSearchEnter={handleSearch}
+        searchPlaceholder={intl.formatMessage({ id: 'skills.market.searchPlaceholder' })}
+      >
+        <Button variant="primary" icon={Search} onClick={handleSearch} disabled={loading}>
           {intl.formatMessage({ id: 'skills.market.search' })}
-        </button>
-      </div>
+        </Button>
+      </Toolbar>
 
       {loading && (
         <div className="py-12 text-center text-stone-400">
@@ -149,12 +135,12 @@ function MarketTab() {
       )}
 
       {!loading && searched && results.length === 0 && (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 py-16 dark:border-stone-700">
-          <Search className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-          <p className="text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'skills.market.noResults' })}
-          </p>
-        </div>
+        <Card>
+          <EmptyState
+            icon={Search}
+            title={intl.formatMessage({ id: 'skills.market.noResults' })}
+          />
+        </Card>
       )}
 
       {!loading && results.length > 0 && (
@@ -166,23 +152,23 @@ function MarketTab() {
       )}
 
       {!searched && (
-        <div>
-          <h3 className="mb-4 text-lg font-medium text-stone-900 dark:text-stone-50">
-            {intl.formatMessage({ id: 'skills.market.categories' })}
-          </h3>
+        <Section title={intl.formatMessage({ id: 'skills.market.categories' })}>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             {['utility', 'communication', 'code', 'data', 'security', 'ai', 'media', 'automation'].map((cat) => (
-              <button
+              <Card
                 key={cat}
+                interactive
+                padded={false}
                 onClick={() => { setQuery(cat); handleSearchQuery(cat); }}
-                className="flex items-center gap-2 rounded-lg border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700 transition-colors hover:border-amber-300 hover:bg-amber-50 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-300 dark:hover:border-amber-600 dark:hover:bg-amber-900/20"
               >
-                <Tag className="h-4 w-4 text-amber-500" />
-                {cat}
-              </button>
+                <span className="flex items-center gap-2 px-4 py-3 text-sm text-stone-700 dark:text-stone-300">
+                  <Tag className="h-4 w-4 text-amber-500" />
+                  {cat}
+                </span>
+              </Card>
             ))}
           </div>
-        </div>
+        </Section>
       )}
 
       {installSkill && <InstallDialog skill={installSkill} onClose={() => setInstallSkill(null)} />}
@@ -249,19 +235,16 @@ function SharedSkillsTab() {
       {loading ? (
         <div className="py-12 text-center text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</div>
       ) : sharedSkills.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-          <Share2 className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-          <p className="text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'skills.shared.empty' })}
-          </p>
-        </div>
+        <Card>
+          <EmptyState
+            icon={Share2}
+            title={intl.formatMessage({ id: 'skills.shared.empty' })}
+          />
+        </Card>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {sharedSkills.map((skill) => (
-            <div
-              key={skill.name}
-              className="glass-card glass-card-hover rounded-2xl p-5"
-            >
+            <Card key={skill.name} interactive>
               <h3 className="font-semibold text-stone-900 dark:text-stone-50">{skill.name}</h3>
               <p className="mt-1 text-sm text-stone-600 dark:text-stone-400">
                 {skill.description || '—'}
@@ -270,9 +253,7 @@ function SharedSkillsTab() {
               {skill.tags.length > 0 && (
                 <div className="mt-3 flex flex-wrap gap-1.5">
                   {skill.tags.map((tag) => (
-                    <span key={tag} className="rounded-full bg-stone-100 px-2 py-0.5 text-xs text-stone-600 dark:bg-stone-800 dark:text-stone-400">
-                      {tag}
-                    </span>
+                    <Badge key={tag} tone="neutral">{tag}</Badge>
                   ))}
                 </div>
               )}
@@ -294,20 +275,20 @@ function SharedSkillsTab() {
                 )}
               </div>
 
-              <div className="mt-4 border-t border-stone-100 pt-3 dark:border-stone-800">
-                <button
+              <div className="mt-4 border-t border-[var(--panel-border)] pt-3">
+                <Button
+                  size="sm"
+                  icon={Download}
                   onClick={() => {
                     setAdoptTarget(skill);
                     setAdoptAgent(agents[0]?.name ?? '');
                     setAdoptSuccess(null);
                   }}
-                  className="inline-flex items-center gap-1 rounded-md bg-amber-100 px-3 py-1.5 text-xs font-medium text-amber-700 transition-colors hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50"
                 >
-                  <Download className="h-3.5 w-3.5" />
                   {intl.formatMessage({ id: 'skills.shared.adopt' })}
-                </button>
+                </Button>
               </div>
-            </div>
+            </Card>
           ))}
         </div>
       )}
@@ -326,7 +307,7 @@ function SharedSkillsTab() {
             <select
               value={adoptAgent}
               onChange={(e) => setAdoptAgent(e.target.value)}
-              className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/20 dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+              className={controlClass}
             >
               {agents.map((a) => (
                 <option key={a.name} value={a.name}>{a.icon || '🤖'} {a.display_name}</option>
@@ -339,19 +320,19 @@ function SharedSkillsTab() {
               </div>
             )}
             <div className="flex justify-end gap-3">
-              <button
+              <Button
+                variant="secondary"
                 onClick={() => { setAdoptTarget(null); setAdoptSuccess(null); }}
-                className="rounded-lg border border-stone-300 px-4 py-2 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-50 dark:border-stone-600 dark:text-stone-300 dark:hover:bg-stone-800"
               >
                 {intl.formatMessage({ id: 'common.cancel' })}
-              </button>
-              <button
+              </Button>
+              <Button
+                variant="primary"
                 onClick={handleAdopt}
                 disabled={!adoptAgent || !!adoptSuccess}
-                className="rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
               >
                 {intl.formatMessage({ id: 'skills.shared.adopt' })}
-              </button>
+              </Button>
             </div>
           </div>
         </Dialog>
@@ -405,46 +386,45 @@ function MySkillsTab() {
   return (
     <div className="space-y-6">
       {/* Agent selector */}
-      <div className="flex items-center gap-3">
-        <label className="text-sm font-medium text-stone-700 dark:text-stone-300">Agent:</label>
-        <select
-          value={selectedAgent}
-          onChange={(e) => setSelectedAgent(e.target.value)}
-          className="rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/20 dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
-        >
-          {agents.map((a) => (
-            <option key={a.name} value={a.name}>{a.icon || '🤖'} {a.display_name}</option>
-          ))}
-        </select>
-      </div>
+      <Toolbar>
+        <Field label="Agent" className="space-y-0">
+          <select
+            value={selectedAgent}
+            onChange={(e) => setSelectedAgent(e.target.value)}
+            className={cn(controlClass, 'w-auto')}
+          >
+            {agents.map((a) => (
+              <option key={a.name} value={a.name}>{a.icon || '🤖'} {a.display_name}</option>
+            ))}
+          </select>
+        </Field>
+      </Toolbar>
 
       {loading ? (
         <div className="py-12 text-center text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</div>
       ) : skills.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-          <Sparkles className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-          <p className="text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'common.noData' })}
-          </p>
-        </div>
+        <Card>
+          <EmptyState
+            icon={Sparkles}
+            title={intl.formatMessage({ id: 'common.noData' })}
+          />
+        </Card>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {skills.map((skill) => (
-            <div
-              key={skill.name}
-              className="glass-card rounded-2xl p-5"
-            >
-              <div className="flex items-start justify-between">
+            <Card key={skill.name}>
+              <div className="flex items-start justify-between gap-2">
                 <h3 className="font-semibold text-stone-900 dark:text-stone-50">{skill.name}</h3>
                 {skill.security_status && (
-                  <span className={cn(
-                    'rounded-full px-2 py-0.5 text-xs font-medium',
-                    skill.security_status === 'pass' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' :
-                    skill.security_status === 'warn' ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400' :
-                    'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400',
-                  )}>
+                  <Badge
+                    tone={
+                      skill.security_status === 'pass' ? 'success' :
+                      skill.security_status === 'warn' ? 'warning' :
+                      'danger'
+                    }
+                  >
                     {skill.security_status}
-                  </span>
+                  </Badge>
                 )}
               </div>
 
@@ -452,25 +432,20 @@ function MySkillsTab() {
                 {skill.content.slice(0, 150)}{skill.content.length > 150 ? '...' : ''}
               </p>
 
-              <div className="mt-4 border-t border-stone-100 pt-3 dark:border-stone-800">
-                <button
+              <div className="mt-4 border-t border-[var(--panel-border)] pt-3">
+                <Button
+                  size="sm"
+                  variant={shareSuccess === skill.name ? 'secondary' : 'primary'}
+                  icon={shareSuccess === skill.name ? CheckCircle : Share2}
                   onClick={() => handleShare(skill.name)}
                   disabled={shareSuccess === skill.name}
-                  className={cn(
-                    'inline-flex items-center gap-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
-                    shareSuccess === skill.name
-                      ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'
-                      : 'bg-blue-100 text-blue-700 hover:bg-blue-200 dark:bg-blue-900/30 dark:text-blue-400 dark:hover:bg-blue-900/50',
-                  )}
                 >
-                  {shareSuccess === skill.name ? (
-                    <><CheckCircle className="h-3.5 w-3.5" /> Shared!</>
-                  ) : (
-                    <><Share2 className="h-3.5 w-3.5" /> {intl.formatMessage({ id: 'skills.shared.share' })}</>
-                  )}
-                </button>
+                  {shareSuccess === skill.name
+                    ? 'Shared!'
+                    : intl.formatMessage({ id: 'skills.shared.share' })}
+                </Button>
               </div>
-            </div>
+            </Card>
           ))}
         </div>
       )}
@@ -487,7 +462,7 @@ function SkillCard({
 }) {
   const intl = useIntl();
   return (
-    <div className="glass-card glass-card-hover rounded-2xl p-5">
+    <Card interactive>
       <div className="mb-3 flex items-start justify-between">
         <h3 className="font-semibold text-stone-900 dark:text-stone-50">
           {skill.name}
@@ -511,17 +486,12 @@ function SkillCard({
       {skill.tags.length > 0 && (
         <div className="mb-3 flex flex-wrap gap-1.5">
           {skill.tags.map((tag) => (
-            <span
-              key={tag}
-              className="inline-flex items-center rounded-full bg-stone-100 px-2 py-0.5 text-xs text-stone-600 dark:bg-stone-800 dark:text-stone-400"
-            >
-              {tag}
-            </span>
+            <Badge key={tag} tone="neutral">{tag}</Badge>
           ))}
         </div>
       )}
 
-      <div className="flex items-center justify-between border-t border-stone-100 pt-3 dark:border-stone-800">
+      <div className="flex items-center justify-between border-t border-[var(--panel-border)] pt-3">
         {skill.author && (
           <span className="flex items-center gap-1 text-xs text-stone-400">
             <User className="h-3 w-3" />
@@ -530,26 +500,26 @@ function SkillCard({
         )}
         <div className="flex items-center gap-2">
           {skill.url && /^https?:\/\//i.test(skill.url) && (
-            <a
-              href={skill.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 rounded-md bg-amber-100 px-2.5 py-1.5 text-xs font-medium text-amber-700 transition-colors hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50"
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={ExternalLink}
+              onClick={() => window.open(skill.url, '_blank', 'noopener,noreferrer')}
             >
-              <ExternalLink className="h-3.5 w-3.5" />
               GitHub
-            </a>
+            </Button>
           )}
-          <button
+          <Button
+            size="sm"
+            variant="primary"
+            icon={Download}
             onClick={onInstall}
-            className="inline-flex items-center gap-1 rounded-md bg-emerald-100 px-2.5 py-1.5 text-xs font-medium text-emerald-700 transition-colors hover:bg-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-400 dark:hover:bg-emerald-900/50"
           >
-            <Download className="h-3.5 w-3.5" />
             {intl.formatMessage({ id: 'skills.market.install' })}
-          </button>
+          </Button>
         </div>
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -636,14 +606,11 @@ function InstallDialog({
         </div>
 
         {/* Scope selector */}
-        <div className="space-y-1.5">
-          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
-            {intl.formatMessage({ id: 'skills.install.scope' })}
-          </label>
+        <Field label={intl.formatMessage({ id: 'skills.install.scope' })}>
           <select
             value={scope}
             onChange={(e) => setScope(e.target.value)}
-            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/20 dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50 dark:focus:border-amber-400"
+            className={controlClass}
           >
             <option value="global">
               {intl.formatMessage({ id: 'skills.install.scopeGlobal' })}
@@ -657,27 +624,21 @@ function InstallDialog({
               </option>
             ))}
           </select>
-        </div>
+        </Field>
 
         {/* Security scan button */}
         <div>
-          <button
+          <Button
+            variant="secondary"
+            icon={scanning ? Loader2 : Shield}
             onClick={handleScan}
             disabled={scanning || !skill.url}
-            className="inline-flex items-center gap-2 rounded-lg border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-50 disabled:opacity-50 dark:border-stone-600 dark:bg-stone-800 dark:text-stone-300 dark:hover:bg-stone-700"
+            className={cn(scanning && '[&>svg]:animate-spin')}
           >
-            {scanning ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                {intl.formatMessage({ id: 'skills.install.scanning' })}
-              </>
-            ) : (
-              <>
-                <Shield className="h-4 w-4" />
-                {intl.formatMessage({ id: 'skills.install.scan' })}
-              </>
-            )}
-          </button>
+            {scanning
+              ? intl.formatMessage({ id: 'skills.install.scanning' })
+              : intl.formatMessage({ id: 'skills.install.scan' })}
+          </Button>
         </div>
 
         {/* Scan results */}
@@ -744,32 +705,23 @@ function InstallDialog({
         )}
 
         {/* Action buttons */}
-        <div className="flex items-center justify-end gap-3 border-t border-stone-200 pt-4 dark:border-stone-700">
-          <button
-            onClick={onClose}
-            className="inline-flex items-center justify-center gap-2 rounded-lg border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-50 dark:border-stone-600 dark:bg-stone-800 dark:text-stone-300 dark:hover:bg-stone-700"
-          >
+        <div className="flex items-center justify-end gap-3 border-t border-[var(--panel-border)] pt-4">
+          <Button variant="secondary" onClick={onClose}>
             {intl.formatMessage({ id: 'common.cancel' })}
-          </button>
+          </Button>
           {!installed && (
-            <button
+            <Button
+              variant="primary"
+              icon={installing ? Loader2 : Download}
               onClick={handleInstall}
               disabled={!scanPassed || installing}
               title={!scanPassed ? intl.formatMessage({ id: 'skills.install.requireScan' }) : undefined}
-              className="inline-flex items-center justify-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
+              className={cn(installing && '[&>svg]:animate-spin')}
             >
-              {installing ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  {intl.formatMessage({ id: 'skills.install.installing' })}
-                </>
-              ) : (
-                <>
-                  <Download className="h-4 w-4" />
-                  {intl.formatMessage({ id: 'skills.install.installBtn' })}
-                </>
-              )}
-            </button>
+              {installing
+                ? intl.formatMessage({ id: 'skills.install.installing' })
+                : intl.formatMessage({ id: 'skills.install.installBtn' })}
+            </Button>
           )}
         </div>
       </div>

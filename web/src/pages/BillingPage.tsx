@@ -9,7 +9,9 @@ import {
   Bot,
   Radio,
   Cpu,
+  Wallet,
 } from 'lucide-react';
+import { Page, PageHeader, Card } from '@/components/ui';
 
 function UsageMeter({
   label,
@@ -40,7 +42,7 @@ function UsageMeter({
           <Icon className="h-4 w-4 text-stone-500 dark:text-stone-400" />
           <span className="text-sm font-medium text-stone-700 dark:text-stone-300">{label}</span>
         </div>
-        <span className="text-sm text-stone-500 dark:text-stone-400">
+        <span className="text-sm tabular-nums text-stone-500 dark:text-stone-400">
           {used.toLocaleString()}
           {' / '}
           {unlimited
@@ -75,16 +77,14 @@ export function BillingPage() {
   }, [connectionState, intl]);
 
   return (
-    <div className="space-y-6">
-      <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-        {intl.formatMessage({ id: 'billing.title' })}
-      </h2>
+    <Page>
+      <PageHeader
+        icon={Wallet}
+        title={intl.formatMessage({ id: 'billing.title' })}
+      />
 
       {/* Usage Meters */}
-      <div className="glass-card rounded-2xl p-6">
-        <h3 className="mb-5 text-lg font-medium text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'billing.usage' })}
-        </h3>
+      <Card title={intl.formatMessage({ id: 'billing.usage' })}>
         <div className="space-y-5">
           <UsageMeter
             label={intl.formatMessage({ id: 'billing.conversations' })}
@@ -115,7 +115,7 @@ export function BillingPage() {
             unlimited={(usage?.inference_hours.limit ?? 0) < 0}
           />
         </div>
-      </div>
-    </div>
+      </Card>
+    </Page>
   );
 }

@@ -12,6 +12,20 @@ import {
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import { toast, formatError } from '@/lib/toast';
 import {
+  Page,
+  PageHeader,
+  Card,
+  Section,
+  StatCard,
+  Tabs,
+  type TabItem,
+  Button,
+  Badge,
+  EmptyState,
+  Toolbar,
+} from '@/components/ui';
+import {
+  Globe,
   BookOpen,
   Search,
   FileText,
@@ -33,43 +47,22 @@ export function SharedWikiPage() {
   const intl = useIntl();
   const [activeTab, setActiveTab] = useState<TabId>('browse');
 
-  const tabs: ReadonlyArray<{ id: TabId; label: string }> = [
-    { id: 'browse', label: intl.formatMessage({ id: 'sharedWiki.tab.browse' }) },
-    { id: 'search', label: intl.formatMessage({ id: 'sharedWiki.tab.search' }) },
-    { id: 'stats', label: intl.formatMessage({ id: 'sharedWiki.tab.stats' }) },
-    { id: 'policy', label: intl.formatMessage({ id: 'sharedWiki.tab.policy' }) },
+  const tabs: TabItem[] = [
+    { id: 'browse', label: intl.formatMessage({ id: 'sharedWiki.tab.browse' }), icon: BookOpen },
+    { id: 'search', label: intl.formatMessage({ id: 'sharedWiki.tab.search' }), icon: Search },
+    { id: 'stats', label: intl.formatMessage({ id: 'sharedWiki.tab.stats' }), icon: BarChart3 },
+    { id: 'policy', label: intl.formatMessage({ id: 'sharedWiki.tab.policy' }), icon: Lock },
   ];
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'sharedWiki.title' })}
-        </h2>
-        <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
-          {intl.formatMessage({ id: 'sharedWiki.subtitle' })}
-        </p>
-      </div>
+    <Page>
+      <PageHeader
+        icon={Globe}
+        title={intl.formatMessage({ id: 'nav.sharedWiki' })}
+        subtitle={intl.formatMessage({ id: 'sharedWiki.subtitle' })}
+      />
 
-      <div role="tablist" className="flex gap-1 rounded-lg bg-stone-100 p-1 dark:bg-stone-800">
-        {tabs.map((tab) => (
-          <button
-            key={tab.id}
-            role="tab"
-            aria-selected={activeTab === tab.id}
-            aria-controls={`shared-wiki-panel-${tab.id}`}
-            onClick={() => setActiveTab(tab.id)}
-            className={cn(
-              'flex-1 rounded-md px-4 py-2 text-sm font-medium transition-colors',
-              activeTab === tab.id
-                ? 'bg-white text-stone-900 shadow-sm dark:bg-stone-700 dark:text-stone-50'
-                : 'text-stone-500 hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-300'
-            )}
-          >
-            {tab.label}
-          </button>
-        ))}
-      </div>
+      <Tabs items={tabs} value={activeTab} onChange={(id) => setActiveTab(id as TabId)} />
 
       <div role="tabpanel" id={`shared-wiki-panel-${activeTab}`}>
         {activeTab === 'browse' && <BrowseTab />}
@@ -77,7 +70,7 @@ export function SharedWikiPage() {
         {activeTab === 'stats' && <StatsTab />}
         {activeTab === 'policy' && <PolicyTab />}
       </div>
-    </div>
+    </Page>
   );
 }
 
@@ -178,22 +171,19 @@ function BrowseTab() {
 
   if (!wikiExists || pages.length === 0) {
     return (
-      <div className="rounded-xl border border-stone-200 bg-stone-50/50 p-8 text-center dark:border-stone-700 dark:bg-stone-800/50">
-        <BookOpen className="mx-auto h-12 w-12 text-stone-300 dark:text-stone-600" />
-        <p className="mt-4 text-stone-500 dark:text-stone-400">
-          {intl.formatMessage({ id: 'sharedWiki.empty' })}
-        </p>
-      </div>
+      <Card>
+        <EmptyState icon={BookOpen} title={intl.formatMessage({ id: 'sharedWiki.empty' })} />
+      </Card>
     );
   }
 
   return (
     <div className="grid grid-cols-12 gap-4">
       {/* Tree sidebar */}
-      <div className="col-span-4 glass-card rounded-2xl p-4">
-        <h3 className="mb-3 text-sm font-medium text-stone-500 dark:text-stone-400">
-          {intl.formatMessage({ id: 'sharedWiki.pages' })} ({pages.length})
-        </h3>
+      <Card
+        className="col-span-4"
+        title={`${intl.formatMessage({ id: 'sharedWiki.pages' })} (${pages.length})`}
+      >
         <div className="max-h-[60vh] overflow-y-auto">
           {tree.map((node) => (
             <TreeItem
@@ -205,26 +195,18 @@ function BrowseTab() {
             />
           ))}
         </div>
-      </div>
+      </Card>
 
       {/* Content viewer */}
-      <div className="col-span-8 glass-card rounded-2xl p-6">
+      <Card className="col-span-8" title={selectedPath || undefined}>
         {selectedPath ? (
-          <div>
-            <h3 className="mb-4 text-lg font-semibold text-stone-900 dark:text-stone-50">
-              {selectedPath}
-            </h3>
-            <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap rounded-lg bg-stone-50 p-4 font-mono text-sm text-stone-800 dark:bg-stone-900 dark:text-stone-200">
-              {pageContent || 'Loading...'}
-            </pre>
-          </div>
+          <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap rounded-lg bg-stone-500/5 p-4 font-mono text-sm text-stone-800 dark:bg-white/5 dark:text-stone-200">
+            {pageContent || 'Loading...'}
+          </pre>
         ) : (
-          <div className="flex h-full items-center justify-center py-16 text-stone-400">
-            <FileText className="mr-2 h-5 w-5" />
-            {intl.formatMessage({ id: 'sharedWiki.selectPage' })}
-          </div>
+          <EmptyState icon={FileText} title={intl.formatMessage({ id: 'sharedWiki.selectPage' })} />
         )}
-      </div>
+      </Card>
     </div>
   );
 }
@@ -249,7 +231,7 @@ function TreeItem({
       <div>
         <button
           onClick={() => setExpanded((prev) => !prev)}
-          className="flex w-full items-center gap-1 rounded px-2 py-1 text-sm text-stone-600 hover:bg-stone-100 dark:text-stone-300 dark:hover:bg-stone-700"
+          className="flex w-full items-center gap-1 rounded-lg px-2 py-1 text-sm text-stone-600 hover:bg-stone-500/8 dark:text-stone-300 dark:hover:bg-white/5"
           style={{ paddingLeft: `${depth * 12 + 8}px` }}
         >
           {expanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
@@ -272,10 +254,10 @@ function TreeItem({
     <button
       onClick={() => onSelect(node.path)}
       className={cn(
-        'flex w-full items-center gap-1.5 rounded px-2 py-1 text-sm transition-colors',
+        'flex w-full items-center gap-1.5 rounded-lg px-2 py-1 text-sm transition-colors',
         selectedPath === node.path
-          ? 'bg-amber-50 text-amber-700 dark:bg-amber-900/20 dark:text-amber-400'
-          : 'text-stone-600 hover:bg-stone-100 dark:text-stone-300 dark:hover:bg-stone-700'
+          ? 'bg-amber-500/12 text-amber-700 dark:text-amber-400'
+          : 'text-stone-600 hover:bg-stone-500/8 dark:text-stone-300 dark:hover:bg-white/5'
       )}
       style={{ paddingLeft: `${depth * 12 + 8}px` }}
     >
@@ -303,57 +285,46 @@ function SearchTab() {
 
   return (
     <div className="space-y-4">
-      <div className="flex gap-2">
-        <div className="relative flex-1">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-stone-400" />
-          <input
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') handleSearch(); }}
-            placeholder={intl.formatMessage({ id: 'sharedWiki.search.placeholder' })}
-            className="w-full rounded-lg border border-stone-200 bg-white py-2.5 pl-10 pr-4 text-sm focus:border-amber-500 focus:outline-none dark:border-stone-700 dark:bg-stone-800 dark:text-stone-50"
-          />
-        </div>
-        <button
+      <Toolbar
+        search={query}
+        onSearchChange={setQuery}
+        onSearchEnter={handleSearch}
+        searchPlaceholder={intl.formatMessage({ id: 'sharedWiki.search.placeholder' })}
+      >
+        <Button
+          variant="primary"
+          icon={Search}
           onClick={handleSearch}
           disabled={searching || !query.trim()}
-          className="rounded-lg bg-amber-500 px-4 py-2.5 text-sm font-medium text-white hover:bg-amber-600 disabled:opacity-50"
-        >
-          <Search className="h-4 w-4" />
-        </button>
-      </div>
+        />
+      </Toolbar>
 
       {hits.length > 0 ? (
         <div className="space-y-3">
           {hits.map((hit) => (
-            <div
-              key={hit.path}
-              className="glass-card rounded-2xl p-4"
-            >
+            <Card key={hit.path}>
               <div className="flex items-center gap-2">
                 <FileText className="h-4 w-4 text-amber-500" />
                 <span className="font-medium text-stone-900 dark:text-stone-50">{hit.title}</span>
                 <span className="text-xs text-stone-400">({hit.path})</span>
-                <span className="ml-auto rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+                <Badge tone="accent" className="ml-auto">
                   {hit.score}
-                </span>
+                </Badge>
               </div>
               {hit.context_lines.length > 0 && (
-                <div className="mt-2 rounded-lg bg-stone-50 p-2 text-xs text-stone-600 dark:bg-stone-900 dark:text-stone-400">
+                <div className="mt-2 rounded-lg bg-stone-500/5 p-2 text-xs text-stone-600 dark:bg-white/5 dark:text-stone-400">
                   {hit.context_lines.map((line, i) => (
                     <div key={i} className="truncate">{line}</div>
                   ))}
                 </div>
               )}
-            </div>
+            </Card>
           ))}
         </div>
       ) : (
-        <div className="py-12 text-center text-stone-400">
-          <Search className="mx-auto h-8 w-8 opacity-30" />
-          <p className="mt-2">{intl.formatMessage({ id: 'sharedWiki.search.empty' })}</p>
-        </div>
+        <Card>
+          <EmptyState icon={Search} title={intl.formatMessage({ id: 'sharedWiki.search.empty' })} />
+        </Card>
       )}
     </div>
   );
@@ -383,10 +354,9 @@ function StatsTab() {
 
   if (!stats?.exists) {
     return (
-      <div className="rounded-xl border border-stone-200 bg-stone-50/50 p-8 text-center dark:border-stone-700 dark:bg-stone-800/50">
-        <BarChart3 className="mx-auto h-12 w-12 text-stone-300 dark:text-stone-600" />
-        <p className="mt-4 text-stone-500">{intl.formatMessage({ id: 'sharedWiki.empty' })}</p>
-      </div>
+      <Card>
+        <EmptyState icon={BarChart3} title={intl.formatMessage({ id: 'sharedWiki.empty' })} />
+      </Card>
     );
   }
 
@@ -396,76 +366,69 @@ function StatsTab() {
   return (
     <div className="space-y-6">
       {/* Summary cards */}
-      <div className="grid grid-cols-3 gap-4">
-        <div className="glass-card rounded-2xl p-4">
-          <div className="flex items-center gap-2 text-stone-500 dark:text-stone-400">
-            <FileText className="h-4 w-4" />
-            <span className="text-sm">{intl.formatMessage({ id: 'sharedWiki.stats.totalPages' })}</span>
-          </div>
-          <p className="mt-1 text-2xl font-semibold text-stone-900 dark:text-stone-50">{stats.total_pages}</p>
-        </div>
-        <div className="glass-card rounded-2xl p-4">
-          <div className="flex items-center gap-2 text-stone-500 dark:text-stone-400">
-            <Users className="h-4 w-4" />
-            <span className="text-sm">{intl.formatMessage({ id: 'sharedWiki.stats.contributors' })}</span>
-          </div>
-          <p className="mt-1 text-2xl font-semibold text-stone-900 dark:text-stone-50">{authorEntries.length}</p>
-        </div>
-        <div className="glass-card rounded-2xl p-4">
-          <div className="flex items-center gap-2 text-stone-500 dark:text-stone-400">
-            <Clock className="h-4 w-4" />
-            <span className="text-sm">Last Updated</span>
-          </div>
-          <p className="mt-1 text-sm font-medium text-stone-900 dark:text-stone-50">
-            {stats.most_recent?.updated
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <StatCard
+          icon={FileText}
+          tone="accent"
+          label={intl.formatMessage({ id: 'sharedWiki.stats.totalPages' })}
+          value={stats.total_pages}
+        />
+        <StatCard
+          icon={Users}
+          tone="neutral"
+          label={intl.formatMessage({ id: 'sharedWiki.stats.contributors' })}
+          value={authorEntries.length}
+        />
+        <StatCard
+          icon={Clock}
+          tone="neutral"
+          label={intl.formatMessage({ id: 'sharedWiki.stats.lastUpdated' })}
+          value={
+            stats.most_recent?.updated
               ? new Date(stats.most_recent.updated).toLocaleDateString()
-              : '—'}
-          </p>
-          {stats.most_recent?.title && (
-            <p className="mt-0.5 truncate text-xs text-stone-400">{stats.most_recent.title}</p>
-          )}
-        </div>
+              : '—'
+          }
+          hint={stats.most_recent?.title ?? undefined}
+        />
       </div>
 
       {/* By author */}
       {authorEntries.length > 0 && (
-        <div className="glass-card rounded-2xl p-4">
-          <h3 className="mb-3 text-sm font-medium text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'sharedWiki.stats.byAuthor' })}
-          </h3>
-          <div className="space-y-2">
-            {authorEntries.map(([author, count]) => (
-              <div key={author} className="flex items-center gap-2">
-                <span className="flex-1 text-sm text-stone-700 dark:text-stone-300">{author}</span>
-                <div className="h-2 flex-1 overflow-hidden rounded-full bg-stone-100 dark:bg-stone-700">
-                  <div
-                    className="h-full rounded-full bg-amber-400"
-                    style={{ width: `${(count / stats.total_pages) * 100}%` }}
-                  />
+        <Section title={intl.formatMessage({ id: 'sharedWiki.stats.byAuthor' })}>
+          <Card>
+            <div className="space-y-2">
+              {authorEntries.map(([author, count]) => (
+                <div key={author} className="flex items-center gap-2">
+                  <span className="flex-1 text-sm text-stone-700 dark:text-stone-300">{author}</span>
+                  <div className="h-2 flex-1 overflow-hidden rounded-full bg-stone-500/10 dark:bg-white/10">
+                    <div
+                      className="h-full rounded-full bg-amber-400"
+                      style={{ width: `${(count / stats.total_pages) * 100}%` }}
+                    />
+                  </div>
+                  <span className="min-w-[2rem] text-right text-sm font-medium tabular-nums text-stone-500">{count}</span>
                 </div>
-                <span className="min-w-[2rem] text-right text-sm font-medium text-stone-500">{count}</span>
-              </div>
-            ))}
-          </div>
-        </div>
+              ))}
+            </div>
+          </Card>
+        </Section>
       )}
 
       {/* By directory */}
       {dirEntries.length > 0 && (
-        <div className="glass-card rounded-2xl p-4">
-          <h3 className="mb-3 text-sm font-medium text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'sharedWiki.stats.byDirectory' })}
-          </h3>
-          <div className="space-y-2">
-            {dirEntries.map(([dir, count]) => (
-              <div key={dir} className="flex items-center gap-2">
-                <Tag className="h-3.5 w-3.5 text-stone-400" />
-                <span className="flex-1 text-sm text-stone-700 dark:text-stone-300">{dir}/</span>
-                <span className="text-sm font-medium text-stone-500">{count}</span>
-              </div>
-            ))}
-          </div>
-        </div>
+        <Section title={intl.formatMessage({ id: 'sharedWiki.stats.byDirectory' })}>
+          <Card>
+            <div className="space-y-2">
+              {dirEntries.map(([dir, count]) => (
+                <div key={dir} className="flex items-center gap-2">
+                  <Tag className="h-3.5 w-3.5 text-stone-400" />
+                  <span className="flex-1 text-sm text-stone-700 dark:text-stone-300">{dir}/</span>
+                  <span className="text-sm font-medium tabular-nums text-stone-500">{count}</span>
+                </div>
+              ))}
+            </div>
+          </Card>
+        </Section>
       )}
     </div>
   );
@@ -473,10 +436,10 @@ function StatsTab() {
 
 // ── Namespace Policy Tab (SCP.2) ──────────────────────────
 
-const SCOPE_MODE_COLORS: Record<WikiScopeMode, string> = {
-  agent_writable: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
-  read_only: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
-  operator_only: 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400',
+const SCOPE_MODE_TONES: Record<WikiScopeMode, 'success' | 'warning' | 'danger'> = {
+  agent_writable: 'success',
+  read_only: 'warning',
+  operator_only: 'danger',
 };
 
 function PolicyTab() {
@@ -513,71 +476,69 @@ function PolicyTab() {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <p className="text-sm text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'scp.desc' })}</p>
-        <button
-          onClick={() => setEditing({ ns: { namespace: '', mode: 'agent_writable', synced_from: null }, isNew: true })}
-          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-amber-600"
-        >
-          <Plus className="h-4 w-4" />
-          {intl.formatMessage({ id: 'scp.add' })}
-        </button>
-      </div>
-
-      <div className="glass-card rounded-2xl p-6">
-        {loading ? (
-          <p className="py-8 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
-        ) : namespaces.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-12">
-            <Lock className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-            <p className="text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'scp.empty' })}</p>
-          </div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-stone-200 dark:border-stone-700">
-                  <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'scp.col.namespace' })}</th>
-                  <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'scp.col.mode' })}</th>
-                  <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'scp.col.syncedFrom' })}</th>
-                  <th className="py-2 text-right font-medium text-stone-500 dark:text-stone-400" />
-                </tr>
-              </thead>
-              <tbody>
-                {namespaces.map((n) => (
-                  <tr key={n.namespace} className="border-b border-stone-100 dark:border-stone-800">
-                    <td className="py-2.5 font-medium text-stone-800 dark:text-stone-200">{n.namespace}/</td>
-                    <td className="py-2.5">
-                      <span className={`inline-flex rounded-full px-2 py-0.5 text-[11px] font-medium ${SCOPE_MODE_COLORS[n.mode]}`}>
-                        {n.mode}
-                      </span>
-                    </td>
-                    <td className="py-2.5 text-xs text-stone-500 dark:text-stone-400">{n.synced_from ?? '—'}</td>
-                    <td className="py-2.5 text-right">
-                      <div className="flex items-center justify-end gap-1">
-                        <button
-                          onClick={() => setEditing({ ns: { ...n }, isNew: false })}
-                          className="rounded p-1.5 text-stone-500 hover:bg-stone-100 hover:text-stone-700 dark:hover:bg-stone-800 dark:hover:text-stone-300"
-                          title={intl.formatMessage({ id: 'common.edit' })}
-                        >
-                          <Pencil className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          onClick={() => handleRemove(n.namespace)}
-                          className="rounded p-1.5 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20"
-                          title={intl.formatMessage({ id: 'common.delete' })}
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
-                    </td>
+      <Section
+        description={intl.formatMessage({ id: 'scp.desc' })}
+        actions={
+          <Button
+            variant="primary"
+            icon={Plus}
+            onClick={() => setEditing({ ns: { namespace: '', mode: 'agent_writable', synced_from: null }, isNew: true })}
+          >
+            {intl.formatMessage({ id: 'scp.add' })}
+          </Button>
+        }
+      >
+        <Card padded={false}>
+          {loading ? (
+            <p className="py-8 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
+          ) : namespaces.length === 0 ? (
+            <EmptyState icon={Lock} title={intl.formatMessage({ id: 'scp.empty' })} />
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-[var(--panel-border)]">
+                    <th className="px-5 py-2.5 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'scp.col.namespace' })}</th>
+                    <th className="px-5 py-2.5 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'scp.col.mode' })}</th>
+                    <th className="px-5 py-2.5 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'scp.col.syncedFrom' })}</th>
+                    <th className="px-5 py-2.5 text-right font-medium text-stone-500 dark:text-stone-400" />
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
+                </thead>
+                <tbody>
+                  {namespaces.map((n) => (
+                    <tr key={n.namespace} className="border-b border-[var(--panel-border)] last:border-0">
+                      <td className="px-5 py-2.5 font-medium text-stone-800 dark:text-stone-200">{n.namespace}/</td>
+                      <td className="px-5 py-2.5">
+                        <Badge tone={SCOPE_MODE_TONES[n.mode]}>{n.mode}</Badge>
+                      </td>
+                      <td className="px-5 py-2.5 text-xs text-stone-500 dark:text-stone-400">{n.synced_from ?? '—'}</td>
+                      <td className="px-5 py-2.5 text-right">
+                        <div className="flex items-center justify-end gap-1">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            icon={Pencil}
+                            onClick={() => setEditing({ ns: { ...n }, isNew: false })}
+                            title={intl.formatMessage({ id: 'common.edit' })}
+                          />
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            icon={Trash2}
+                            onClick={() => handleRemove(n.namespace)}
+                            title={intl.formatMessage({ id: 'common.delete' })}
+                            className="text-rose-500 hover:bg-rose-500/10 hover:text-rose-600"
+                          />
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+      </Section>
 
       {editing && (
         <NamespacePolicyDialog

@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import {
   api,
@@ -10,17 +10,31 @@ import {
   type GovRateResource,
   type GovAction,
 } from '@/lib/api';
-import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { Dialog, FormField, inputClass, selectClass } from '@/components/shared/Dialog';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { toast, formatError } from '@/lib/toast';
 import { Scale, Plus, Trash2, Pencil } from 'lucide-react';
+import {
+  Page,
+  PageHeader,
+  Card,
+  Button,
+  Badge,
+  EmptyState,
+  Tabs,
+  type TabItem,
+} from '@/components/ui';
 
-const TYPE_COLORS: Record<GovPolicyType, string> = {
-  rate: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400',
-  permission: 'bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-400',
-  quota: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
-  lifecycle: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
+type BadgeTone = 'info' | 'accent' | 'warning' | 'success';
+
+const TYPE_TONES: Record<GovPolicyType, BadgeTone> = {
+  rate: 'info',
+  permission: 'accent',
+  quota: 'warning',
+  lifecycle: 'success',
 };
+
+type TypeFilter = 'all' | GovPolicyType;
 
 /** Build a fresh, validation-friendly default policy of the given type. */
 function defaultPolicy(type: GovPolicyType): GovPolicy {
@@ -43,6 +57,7 @@ export function GovernancePage() {
   const [loading, setLoading] = useState(false);
   const [editing, setEditing] = useState<{ policy: GovPolicy; isNew: boolean } | null>(null);
   const [removing, setRemoving] = useState<GovPolicy | null>(null);
+  const [filter, setFilter] = useState<TypeFilter>('all');
 
   const fetchPolicies = useCallback(async () => {
     setLoading(true);
@@ -60,72 +75,87 @@ export function GovernancePage() {
     fetchPolicies();
   }, [fetchPolicies]);
 
+  const tabItems: TabItem[] = useMemo(
+    () => [
+      { id: 'all', label: intl.formatMessage({ id: 'tasks.filter.all' }), badge: policies.length },
+      ...GOV_POLICY_TYPES.map((t) => ({
+        id: t,
+        label: t,
+        badge: policies.filter((p) => p.policy_type === t).length,
+      })),
+    ],
+    [intl, policies]
+  );
+
+  const visiblePolicies = useMemo(
+    () => (filter === 'all' ? policies : policies.filter((p) => p.policy_type === filter)),
+    [filter, policies]
+  );
+
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'gov.title' })}
-        </h2>
-        <button
-          onClick={() => setEditing({ policy: defaultPolicy('rate'), isNew: true })}
-          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600"
-        >
-          <Plus className="h-4 w-4" />
-          {intl.formatMessage({ id: 'gov.add' })}
-        </button>
-      </div>
+    <Page>
+      <PageHeader
+        icon={Scale}
+        title={intl.formatMessage({ id: 'nav.governance' })}
+        subtitle={intl.formatMessage({ id: 'gov.desc' })}
+        actions={
+          <Button
+            variant="primary"
+            icon={Plus}
+            onClick={() => setEditing({ policy: defaultPolicy('rate'), isNew: true })}
+          >
+            {intl.formatMessage({ id: 'gov.add' })}
+          </Button>
+        }
+      />
 
-      <p className="text-sm text-stone-500 dark:text-stone-400">
-        {intl.formatMessage({ id: 'gov.desc' })}
-      </p>
+      <Tabs items={tabItems} value={filter} onChange={(id) => setFilter(id as TypeFilter)} />
 
-      <div className="glass-card rounded-2xl p-6">
+      <Card padded={false}>
         {loading ? (
           <p className="py-8 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
-        ) : policies.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-12">
-            <Scale className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-            <p className="text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'gov.empty' })}</p>
-          </div>
+        ) : visiblePolicies.length === 0 ? (
+          <EmptyState icon={Scale} title={intl.formatMessage({ id: 'gov.empty' })} />
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
-                <tr className="border-b border-stone-200 dark:border-stone-700">
-                  <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'gov.col.id' })}</th>
-                  <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'gov.col.type' })}</th>
-                  <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'gov.col.scope' })}</th>
-                  <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'gov.col.detail' })}</th>
-                  <th className="py-2 text-right font-medium text-stone-500 dark:text-stone-400" />
+                <tr className="border-b border-[var(--panel-border)]">
+                  <th className="px-5 py-2.5 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'gov.col.id' })}</th>
+                  <th className="px-5 py-2.5 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'gov.col.type' })}</th>
+                  <th className="px-5 py-2.5 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'gov.col.scope' })}</th>
+                  <th className="px-5 py-2.5 text-left font-medium text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'gov.col.detail' })}</th>
+                  <th className="px-5 py-2.5 text-right font-medium text-stone-500 dark:text-stone-400" />
                 </tr>
               </thead>
               <tbody>
-                {policies.map((p) => (
-                  <tr key={`${p.scope ?? p.agent_id}:${p.policy_id}`} className="border-b border-stone-100 dark:border-stone-800">
-                    <td className="py-2.5 font-medium text-stone-800 dark:text-stone-200">{p.policy_id}</td>
-                    <td className="py-2.5">
-                      <span className={`inline-flex rounded-full px-2 py-0.5 text-[11px] font-medium ${TYPE_COLORS[p.policy_type]}`}>
-                        {p.policy_type}
-                      </span>
+                {visiblePolicies.map((p) => (
+                  <tr key={`${p.scope ?? p.agent_id}:${p.policy_id}`} className="border-b border-[var(--panel-border)] last:border-0">
+                    <td className="px-5 py-2.5 font-medium text-stone-800 dark:text-stone-200">{p.policy_id}</td>
+                    <td className="px-5 py-2.5">
+                      <Badge tone={TYPE_TONES[p.policy_type]}>{p.policy_type}</Badge>
                     </td>
-                    <td className="py-2.5 text-stone-600 dark:text-stone-400">{p.scope ?? p.agent_id}</td>
-                    <td className="py-2.5 text-xs text-stone-500 dark:text-stone-400">{policyDetail(p)}</td>
-                    <td className="py-2.5 text-right">
+                    <td className="px-5 py-2.5 text-stone-600 dark:text-stone-400">{p.scope ?? p.agent_id}</td>
+                    <td className="px-5 py-2.5 text-xs text-stone-500 dark:text-stone-400">{policyDetail(p)}</td>
+                    <td className="px-5 py-2.5 text-right">
                       <div className="flex items-center justify-end gap-1">
-                        <button
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          icon={Pencil}
                           onClick={() => setEditing({ policy: { ...p }, isNew: false })}
-                          className="rounded p-1.5 text-stone-500 hover:bg-stone-100 hover:text-stone-700 dark:hover:bg-stone-800 dark:hover:text-stone-300"
                           title={intl.formatMessage({ id: 'common.edit' })}
-                        >
-                          <Pencil className="h-3.5 w-3.5" />
-                        </button>
-                        <button
+                          aria-label={intl.formatMessage({ id: 'common.edit' })}
+                        />
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          icon={Trash2}
                           onClick={() => setRemoving(p)}
-                          className="rounded p-1.5 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-900/20"
                           title={intl.formatMessage({ id: 'common.delete' })}
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
+                          aria-label={intl.formatMessage({ id: 'common.delete' })}
+                          className="text-rose-500 hover:bg-rose-500/10 hover:text-rose-600 dark:text-rose-400"
+                        />
                       </div>
                     </td>
                   </tr>
@@ -134,7 +164,7 @@ export function GovernancePage() {
             </table>
           </div>
         )}
-      </div>
+      </Card>
 
       {editing && (
         <PolicyDialog
@@ -150,7 +180,7 @@ export function GovernancePage() {
         onClose={() => setRemoving(null)}
         onRemoved={() => { setRemoving(null); fetchPolicies(); }}
       />
-    </div>
+    </Page>
   );
 }
 
@@ -321,11 +351,11 @@ function PolicyDialog({
         )}
 
         {error && <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>}
-        <div className="flex justify-end gap-3 border-t border-stone-200 pt-4 dark:border-stone-700">
-          <button onClick={onClose} className={buttonSecondary}>{intl.formatMessage({ id: 'common.cancel' })}</button>
-          <button onClick={handleSubmit} disabled={submitting} className={buttonPrimary}>
+        <div className="flex justify-end gap-3 border-t border-[var(--panel-border)] pt-4">
+          <Button variant="secondary" onClick={onClose}>{intl.formatMessage({ id: 'common.cancel' })}</Button>
+          <Button variant="primary" onClick={handleSubmit} disabled={submitting}>
             {submitting ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
-          </button>
+          </Button>
         </div>
       </div>
     </Dialog>
@@ -365,14 +395,10 @@ function RemoveDialog({
         <p className="text-sm text-stone-600 dark:text-stone-400">{intl.formatMessage({ id: 'gov.remove.confirm' })}</p>
         <p className="text-sm font-medium text-stone-900 dark:text-stone-50">{policy.policy_id} ({policy.scope ?? policy.agent_id})</p>
         <div className="flex justify-end gap-3 pt-2">
-          <button onClick={onClose} className={buttonSecondary}>{intl.formatMessage({ id: 'common.cancel' })}</button>
-          <button
-            onClick={handleConfirm}
-            disabled={confirming}
-            className="inline-flex items-center justify-center gap-2 rounded-lg bg-rose-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-rose-600 disabled:opacity-50"
-          >
+          <Button variant="secondary" onClick={onClose}>{intl.formatMessage({ id: 'common.cancel' })}</Button>
+          <Button variant="danger" onClick={handleConfirm} disabled={confirming}>
             {confirming ? intl.formatMessage({ id: 'common.loading' }) : intl.formatMessage({ id: 'common.delete' })}
-          </button>
+          </Button>
         </div>
       </div>
     </Dialog>
