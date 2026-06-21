@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::quality_scorer::{parse_events_from_dir, score_and_filter, ScoredTrajectory, ScorerConfig};
 use crate::evolution_events::emitter::EvolutionEventEmitter;
@@ -389,6 +389,34 @@ async fn graduate_trajectories(
             })
             .collect();
 
+        // ── P1: ground synthesis in the source agent's episodic memory ───────
+        //
+        // Pull real successful-conversation summaries so the synthesized skill
+        // reflects how the agent actually solved the task, not just GVU metrics.
+        // Distinct, non-empty `skill_id`s key an FTS search; absent those we
+        // fall back to the most recent high-importance episodic entries.
+        // Evidence is a best-effort *enrichment* — a missing/unreadable
+        // memory.db yields an empty Vec and synthesis proceeds regardless.
+        let skill_ids: Vec<String> = {
+            let mut set = std::collections::BTreeSet::new();
+            for e in &traj.events {
+                if let Some(sid) = &e.skill_id {
+                    if !sid.trim().is_empty() {
+                        set.insert(sid.clone());
+                    }
+                }
+            }
+            set.into_iter().collect()
+        };
+        let successful_conversations =
+            fetch_episodic_evidence(&config.home_dir, &traj.agent_id, &skill_ids, 5).await;
+        if !successful_conversations.is_empty() {
+            info!(
+                "{span_prefix} episodic evidence: {} conversation summary(ies) grounding synthesis",
+                successful_conversations.len()
+            );
+        }
+
         let synthesis_input = synthesizer::SynthesisInput {
             trigger: crate::skill_lifecycle::gap_accumulator::SynthesisTrigger {
                 agent_id: traj.agent_id.clone(),
@@ -397,7 +425,7 @@ async fn graduate_trajectories(
                 evidence,
                 avg_composite_error: 1.0 - traj.quality_score, // inverse of quality
             },
-            successful_conversations: Vec::new(), // episodic lookup deferred to P1
+            successful_conversations,
             agent_soul: agent_soul.clone(),
             existing_skill_names: used_names.clone(),
         };
@@ -564,6 +592,97 @@ async fn graduate_trajectories(
     );
 
     (graduated, errors)
+}
+
+// ── Episodic evidence retrieval (P1) ─────────────────────────────────────────
+
+/// Best-effort episodic evidence for a trajectory.
+///
+/// Pulls "successful conversation" summaries from the **source** agent's
+/// per-agent `memory.db` so the synthesizer can ground a new skill in real
+/// dialogue rather than bare GVU metrics. Strategy:
+///
+/// 1. If the trajectory's events carry `skill_id`s, FTS-search episodic memory
+///    for conversations mentioning those skills
+///    ([`SqliteMemoryEngine::search_successful_conversations`]).
+/// 2. Otherwise fall back to the most recent high-importance episodic summaries
+///    ([`SqliteMemoryEngine::list_recent`], filtered to the episodic layer).
+///
+/// Episodic evidence is an **enrichment, never a gate**: a missing, empty, or
+/// unreadable `memory.db` returns an empty `Vec` and synthesis proceeds on
+/// trajectory metadata alone. All errors are swallowed (logged at `debug`).
+///
+/// The per-agent DB path mirrors `handlers.rs::agent_memory_db_path`:
+/// `agents/<id>/state/memory.db` preferred, `agents/<id>/memory.db` fallback.
+async fn fetch_episodic_evidence(
+    home_dir: &Path,
+    agent_id: &str,
+    skill_ids: &[String],
+    limit: usize,
+) -> Vec<String> {
+    // Defense in depth: reject path-traversal in agent_id before joining.
+    if agent_id.is_empty()
+        || agent_id.contains("..")
+        || agent_id.contains('/')
+        || agent_id.contains('\\')
+        || agent_id.contains('\0')
+    {
+        return Vec::new();
+    }
+
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    let db_path = {
+        let state_path = agent_dir.join("state").join("memory.db");
+        if state_path.exists() {
+            state_path
+        } else {
+            agent_dir.join("memory.db")
+        }
+    };
+    if !db_path.exists() {
+        return Vec::new();
+    }
+
+    let engine = match duduclaw_memory::SqliteMemoryEngine::new(&db_path) {
+        Ok(e) => e,
+        Err(e) => {
+            debug!(agent = agent_id, "episodic evidence: open memory.db failed: {e}");
+            return Vec::new();
+        }
+    };
+
+    // Strategy 1: skill-keyed FTS search.
+    let mut summaries: Vec<String> = Vec::new();
+    if !skill_ids.is_empty() {
+        let topic = skill_ids.join(" ");
+        match engine
+            .search_successful_conversations(agent_id, &topic, limit)
+            .await
+        {
+            Ok(hits) => summaries = hits,
+            Err(e) => debug!(agent = agent_id, "episodic FTS search failed: {e}"),
+        }
+    }
+
+    // Strategy 2 (fallback): recent high-importance episodic summaries.
+    if summaries.is_empty() {
+        if let Ok(entries) = engine.list_recent(agent_id, limit * 3).await {
+            summaries = entries
+                .into_iter()
+                .filter(|m| {
+                    m.layer == duduclaw_core::types::MemoryLayer::Episodic && m.importance >= 5.0
+                })
+                .map(|m| m.content)
+                .take(limit)
+                .collect();
+        }
+    }
+
+    // Bound each summary so the synthesis prompt stays compact (CJK-safe).
+    summaries
+        .into_iter()
+        .map(|s| duduclaw_core::truncate_chars(&s, 600))
+        .collect()
 }
 
 // ── EvolutionEvent emitter ────────────────────────────────────────────────────
@@ -762,5 +881,62 @@ mod tests {
         let summary = run_result.summary();
         assert!(!summary.contains("DRY RUN"), "Non-dry-run must not show DRY RUN");
         assert!(summary.contains("2 skills graduated"), "Must show graduated count");
+    }
+
+    // ── fetch_episodic_evidence (P1) ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn episodic_evidence_rejects_path_traversal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // A traversal-laden agent_id must short-circuit to empty without touching
+        // the filesystem outside the home dir.
+        let out = fetch_episodic_evidence(dir.path(), "../../etc", &[], 5).await;
+        assert!(out.is_empty(), "path-traversal agent_id must yield no evidence");
+    }
+
+    #[tokio::test]
+    async fn episodic_evidence_missing_db_returns_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // No agents/<id>/memory.db exists → graceful empty, never an error.
+        let out = fetch_episodic_evidence(dir.path(), "ghost-agent", &[], 5).await;
+        assert!(out.is_empty(), "missing memory.db must yield no evidence");
+    }
+
+    #[tokio::test]
+    async fn episodic_evidence_returns_recent_episodic() {
+        use duduclaw_core::types::{MemoryEntry, MemoryLayer};
+        use duduclaw_memory::{SqliteMemoryEngine, TemporalMeta};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent = "evidence-agent";
+        let agent_dir = dir.path().join("agents").join(agent);
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let db_path = agent_dir.join("memory.db");
+
+        // Seed one high-importance episodic memory the fallback path should find.
+        let engine = SqliteMemoryEngine::new(&db_path).unwrap();
+        let entry = MemoryEntry {
+            id: "00000000-0000-0000-0000-000000000001".to_string(),
+            agent_id: agent.to_string(),
+            content: "User asked about refund window; agent explained 30-day policy".to_string(),
+            timestamp: Utc::now(),
+            tags: vec!["conversation_summary".to_string()],
+            embedding: None,
+            layer: MemoryLayer::Episodic,
+            importance: 7.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: "conversation_summary".to_string(),
+        };
+        engine
+            .store_temporal(agent, entry, TemporalMeta::default())
+            .await
+            .unwrap();
+        drop(engine); // release the connection before re-opening in the helper
+
+        // No skill_ids → fallback list_recent path → returns the episodic summary.
+        let out = fetch_episodic_evidence(dir.path(), agent, &[], 5).await;
+        assert_eq!(out.len(), 1, "expected the seeded episodic summary; got {out:?}");
+        assert!(out[0].contains("30-day policy"));
     }
 }

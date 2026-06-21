@@ -8,6 +8,8 @@
 //!
 //! - [`quality_scorer`] — Phase 1: parse JSONL, score trajectories, filter top-20%
 //! - [`pipeline`] — Orchestration: dry-run (Week 1) and full graduation (Week 2+)
+//! - [`scheduler`] — Periodic auto-run (W19-P1): runs the pipeline on an interval,
+//!   gated by `config.toml [skill_synthesis] auto_run`
 //!
 //! ## Quick start (dry-run)
 //!
@@ -26,3 +28,4 @@
 
 pub mod pipeline;
 pub mod quality_scorer;
+pub mod scheduler;

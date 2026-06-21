@@ -380,8 +380,11 @@ fn apply_evolution_advanced_to_table(
     }
 
     // ── 0.0–1.0 thresholds (EVO.2–EVO.3) ──
+    // NOTE: `skill_synthesis_threshold` is NOT here — it is a u32 count of
+    // repeated gap detections (see EvolutionConfig), not a unit threshold.
+    // Writing it as a TOML float made agent.toml fail to deserialize on the
+    // next registry scan, silently dropping the agent from the dashboard.
     for key in &[
-        "skill_synthesis_threshold",
         "skill_graduation_min_lift",
         "skill_recommendation_threshold",
         "curiosity_threshold",
@@ -396,6 +399,7 @@ fn apply_evolution_advanced_to_table(
 
     // ── Unsigned-integer fields (EVO.2–EVO.3) ──
     for key in &[
+        "skill_synthesis_threshold",
         "skill_synthesis_cooldown_hours",
         "skill_trial_ttl",
         "curiosity_max_daily",
@@ -1675,6 +1679,100 @@ fn redaction_table_to_response(table: &toml::Table) -> Value {
     })
 }
 
+/// Parse a config.toml `[skill_synthesis]` section into the
+/// `skill_synthesis.get` response shape. Defaults mirror
+/// `skill_synthesis_pipeline::scheduler::SynthesisScheduleConfig::default()`
+/// (auto_run=false, dry_run=true, interval_hours=24, lookback_days=1).
+fn skill_synthesis_table_to_response(table: &toml::Table) -> Value {
+    let s = table.get("skill_synthesis").and_then(|v| v.as_table());
+    let auto_run = s
+        .and_then(|t| t.get("auto_run"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let dry_run = s
+        .and_then(|t| t.get("dry_run"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let interval_hours = s
+        .and_then(|t| t.get("interval_hours"))
+        .and_then(|v| v.as_integer())
+        .filter(|v| *v >= 1)
+        .unwrap_or(24);
+    let lookback_days = s
+        .and_then(|t| t.get("lookback_days"))
+        .and_then(|v| v.as_integer())
+        .filter(|v| *v >= 1)
+        .map(|v| v.min(30))
+        .unwrap_or(1);
+    let target_agent = s
+        .and_then(|t| t.get("target_agent"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    json!({
+        "auto_run": auto_run,
+        "dry_run": dry_run,
+        "interval_hours": interval_hours,
+        "lookback_days": lookback_days,
+        "target_agent": target_agent,
+    })
+}
+
+/// Validate + apply a `skill_synthesis.update` payload onto a config.toml
+/// table's `[skill_synthesis]` section. Returns the change list. All fields are
+/// optional (partial update). An empty `target_agent` clears the key (the
+/// scheduler then falls back to `[general] default_agent`).
+fn apply_skill_synthesis_to_table(
+    table: &mut toml::Table,
+    params: &Value,
+) -> Result<Vec<String>, String> {
+    let mut changes: Vec<String> = Vec::new();
+    let section = table
+        .entry("skill_synthesis".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| "[skill_synthesis] is not a table".to_string())?;
+
+    if let Some(v) = params.get("auto_run").and_then(|v| v.as_bool()) {
+        section.insert("auto_run".into(), toml::Value::Boolean(v));
+        changes.push(format!("skill_synthesis.auto_run = {v}"));
+    }
+    if let Some(v) = params.get("dry_run").and_then(|v| v.as_bool()) {
+        section.insert("dry_run".into(), toml::Value::Boolean(v));
+        changes.push(format!("skill_synthesis.dry_run = {v}"));
+    }
+    if let Some(v) = params.get("interval_hours").and_then(|v| v.as_u64()) {
+        if v < 1 {
+            return Err("interval_hours must be >= 1".into());
+        }
+        section.insert("interval_hours".into(), toml::Value::Integer(v as i64));
+        changes.push(format!("skill_synthesis.interval_hours = {v}"));
+    }
+    if let Some(v) = params.get("lookback_days").and_then(|v| v.as_u64()) {
+        if !(1..=30).contains(&v) {
+            return Err("lookback_days must be 1-30".into());
+        }
+        section.insert("lookback_days".into(), toml::Value::Integer(v as i64));
+        changes.push(format!("skill_synthesis.lookback_days = {v}"));
+    }
+    if let Some(v) = params.get("target_agent").and_then(|v| v.as_str()) {
+        let t = v.trim();
+        if t.is_empty() {
+            section.remove("target_agent");
+            changes.push("skill_synthesis.target_agent cleared".into());
+        } else if t.contains('/') || t.contains('\\') || t.contains("..") {
+            // Defense in depth: target_agent is later joined into a filesystem
+            // path by the pipeline / scheduler.
+            return Err("target_agent contains invalid characters".into());
+        } else {
+            section.insert("target_agent".into(), toml::Value::String(t.to_string()));
+            changes.push(format!("skill_synthesis.target_agent = \"{t}\""));
+        }
+    }
+
+    Ok(changes)
+}
+
 /// Validate + apply a `killswitch.update` payload onto a KILLSWITCH.toml table.
 /// Returns the change list. Validates numeric ranges across all sub-sections.
 fn apply_killswitch_to_table(table: &mut toml::Table, params: &Value) -> Result<Vec<String>, String> {
@@ -2428,6 +2526,10 @@ impl MethodHandler {
             // ── Redaction / privacy (global config.toml [redaction], RED.1–RED.4) ──
             "redaction.get" => { require_admin!(); self.handle_redaction_get().await }
             "redaction.update" => { require_admin!(); self.handle_redaction_update(params).await }
+
+            // ── Skill synthesis auto-run (global config.toml [skill_synthesis], W19-P1) ──
+            "skill_synthesis.get" => { require_admin!(); self.handle_skill_synthesis_get().await }
+            "skill_synthesis.update" => { require_admin!(); self.handle_skill_synthesis_update(params).await }
 
             // ── Inference (global ~/.duduclaw/inference.toml, INF.1–INF.5) ──
             "inference.get" => { require_admin!(); self.handle_inference_get().await }
@@ -3988,6 +4090,38 @@ impl MethodHandler {
             return WsFrame::error_response("", &e);
         }
         info!(?changes, "redaction.update completed");
+        WsFrame::ok_response("", json!({ "success": true, "changes": changes }))
+    }
+
+    // ── SKS: global [skill_synthesis] in config.toml (W19-P1) ─────────────────
+
+    /// `skill_synthesis.get` — read config.toml `[skill_synthesis]`.
+    /// Response: `{ auto_run, dry_run, interval_hours, lookback_days, target_agent }`.
+    async fn handle_skill_synthesis_get(&self) -> WsFrame {
+        let config_path = self.home_dir.join("config.toml");
+        let table = self.read_config_table(&config_path).await;
+        WsFrame::ok_response("", skill_synthesis_table_to_response(&table))
+    }
+
+    /// `skill_synthesis.update` — atomic write of config.toml `[skill_synthesis]`.
+    /// Params (all optional, partial update): `{ auto_run, dry_run,
+    /// interval_hours (>=1), lookback_days (1-30), target_agent (empty clears) }`.
+    /// Takes effect within one scheduler poll (~30 min) — no restart needed.
+    /// Response: `{ success, changes[] }`.
+    async fn handle_skill_synthesis_update(&self, params: Value) -> WsFrame {
+        let config_path = self.home_dir.join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+        let changes = match apply_skill_synthesis_to_table(&mut table, &params) {
+            Ok(c) => c,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        if changes.is_empty() {
+            return WsFrame::error_response("", "No valid skill_synthesis fields to update");
+        }
+        if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
+            return WsFrame::error_response("", &e);
+        }
+        info!(?changes, "skill_synthesis.update completed");
         WsFrame::ok_response("", json!({ "success": true, "changes": changes }))
     }
 
@@ -10344,6 +10478,12 @@ impl MethodHandler {
     }
 
     fn handle_fork_list(&self, params: Value) -> WsFrame {
+        // No fork has ever been created yet → the store file doesn't exist.
+        // That's an empty list, not an error: return [] so the dashboard shows
+        // its "no forks yet" empty state instead of a scary error banner.
+        if !self.home_dir.join("fork_store.db").exists() {
+            return WsFrame::ok_response("", json!({ "forks": [] }));
+        }
         let store = match self.open_fork_store() {
             Ok(s) => s,
             Err(f) => return f,
@@ -10934,6 +11074,88 @@ fn update_frontmatter_field(content: &str, key: &str, transform: impl Fn(&str) -
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod skill_synthesis_config_tests {
+    use super::*;
+
+    #[test]
+    fn get_returns_safe_defaults_when_absent() {
+        let table = toml::Table::new();
+        let resp = skill_synthesis_table_to_response(&table);
+        assert_eq!(resp["auto_run"], json!(false));
+        assert_eq!(resp["dry_run"], json!(true));
+        assert_eq!(resp["interval_hours"], json!(24));
+        assert_eq!(resp["lookback_days"], json!(1));
+        assert_eq!(resp["target_agent"], json!(""));
+    }
+
+    #[test]
+    fn apply_sets_all_fields_and_roundtrips() {
+        let mut table = toml::Table::new();
+        let params = json!({
+            "auto_run": true,
+            "dry_run": false,
+            "interval_hours": 6,
+            "lookback_days": 3,
+            "target_agent": "agnes",
+        });
+        let changes = apply_skill_synthesis_to_table(&mut table, &params).unwrap();
+        assert_eq!(changes.len(), 5);
+
+        let resp = skill_synthesis_table_to_response(&table);
+        assert_eq!(resp["auto_run"], json!(true));
+        assert_eq!(resp["dry_run"], json!(false));
+        assert_eq!(resp["interval_hours"], json!(6));
+        assert_eq!(resp["lookback_days"], json!(3));
+        assert_eq!(resp["target_agent"], json!("agnes"));
+    }
+
+    #[test]
+    fn apply_rejects_out_of_range_lookback() {
+        let mut table = toml::Table::new();
+        let err = apply_skill_synthesis_to_table(&mut table, &json!({ "lookback_days": 99 }))
+            .unwrap_err();
+        assert!(err.contains("lookback_days"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_rejects_zero_interval() {
+        let mut table = toml::Table::new();
+        let err = apply_skill_synthesis_to_table(&mut table, &json!({ "interval_hours": 0 }))
+            .unwrap_err();
+        assert!(err.contains("interval_hours"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_blank_target_clears_key() {
+        let mut table = toml::Table::new();
+        // Seed an existing value, then clear it.
+        apply_skill_synthesis_to_table(&mut table, &json!({ "target_agent": "agnes" })).unwrap();
+        let changes =
+            apply_skill_synthesis_to_table(&mut table, &json!({ "target_agent": "  " })).unwrap();
+        assert!(changes.iter().any(|c| c.contains("cleared")), "got: {changes:?}");
+        let resp = skill_synthesis_table_to_response(&table);
+        assert_eq!(resp["target_agent"], json!(""));
+    }
+
+    #[test]
+    fn apply_rejects_path_traversal_in_target() {
+        let mut table = toml::Table::new();
+        for bad in ["../etc", "a/b", "a\\b"] {
+            let err = apply_skill_synthesis_to_table(&mut table, &json!({ "target_agent": bad }))
+                .unwrap_err();
+            assert!(err.contains("invalid characters"), "expected reject for {bad}, got: {err}");
+        }
+    }
+
+    #[test]
+    fn apply_empty_params_yields_no_changes() {
+        let mut table = toml::Table::new();
+        let changes = apply_skill_synthesis_to_table(&mut table, &json!({})).unwrap();
+        assert!(changes.is_empty(), "empty params must produce no changes");
+    }
 }
 
 #[cfg(test)]
