@@ -22,6 +22,7 @@ import { toast, formatError } from '@/lib/toast';
 import { ToolApprovalPanel } from '@/components/ToolApprovalPanel';
 import { SessionReplayPanel } from '@/components/SessionReplayPanel';
 import { BrowserAuditPanel } from '@/components/BrowserAuditPanel';
+import { DecisionsPanel } from '@/components/DecisionsPanel';
 import {
   Page,
   PageHeader,
@@ -2226,6 +2227,7 @@ function BrowserTab() {
       <ToolApprovalPanel />
       <SessionReplayPanel />
       <BrowserAuditPanel />
+      <DecisionsPanel />
     </div>
   );
 }

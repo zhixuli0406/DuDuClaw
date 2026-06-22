@@ -2779,6 +2779,17 @@ impl MethodHandler {
                 "note": "All authenticated WS clients receive activity events automatically; no per-client filter is in effect.",
             })),
 
+            // ── Decision Continuity (RFC-24, agent-scoped) ──
+            "decisions.list" => {
+                check_agent_filter!(AccessLevel::Viewer);
+                self.handle_decisions_list(params).await
+            }
+            "decisions.dismiss" => {
+                // Marking a captured decision as a false positive mutates state.
+                check_agent_filter!(AccessLevel::Operator);
+                self.handle_decisions_dismiss(params).await
+            }
+
             // ── Live Run Forking (RFC-26) ───────────────────
             "fork.list" => self.handle_fork_list(params),
             "fork.inspect" => self.handle_fork_inspect(params),
@@ -5479,6 +5490,67 @@ impl MethodHandler {
                 WsFrame::ok_response("", json!({ "entries": rows }))
             }
             Err(e) => WsFrame::error_response("", &format!("Memory browse failed: {e}")),
+        }
+    }
+
+    /// RFC-24: list an agent's currently-open decisions for the Dashboard panel.
+    async fn handle_decisions_list(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).min(50) as usize;
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
+        }
+        let db_path = self.agent_memory_db_path(agent_id);
+        if !db_path.exists() {
+            return WsFrame::ok_response("", json!({ "decisions": [] }));
+        }
+        let engine = match SqliteMemoryEngine::new(&db_path) {
+            Ok(e) => e,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+        };
+        match engine.list_open_decisions(agent_id, limit).await {
+            Ok(decisions) => {
+                let rows: Vec<Value> = decisions
+                    .iter()
+                    .map(|d| {
+                        json!({
+                            "id": d.id,
+                            "question": d.question,
+                            "options": d.options.iter().map(|(k, c)| json!({"key": k, "content": c})).collect::<Vec<_>>(),
+                            "created_at": d.created_at,
+                        })
+                    })
+                    .collect();
+                WsFrame::ok_response("", json!({ "decisions": rows }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("List decisions failed: {e}")),
+        }
+    }
+
+    /// RFC-24: dismiss a wrongly-captured decision (false positive). Closes all
+    /// of its still-valid rows and bumps the `decision_false_positive` counter so
+    /// detector precision can be tracked from real labels.
+    async fn handle_decisions_dismiss(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let decision_id = params.get("decision_id").and_then(|v| v.as_str()).unwrap_or("");
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) || decision_id.is_empty() {
+            return WsFrame::error_response("", "Missing 'agent_id' or 'decision_id'");
+        }
+        let db_path = self.agent_memory_db_path(agent_id);
+        if !db_path.exists() {
+            return WsFrame::error_response("", "No memory db for agent");
+        }
+        let engine = match SqliteMemoryEngine::new(&db_path) {
+            Ok(e) => e,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to open memory db: {e}")),
+        };
+        match engine.dismiss_decision(agent_id, decision_id).await {
+            Ok(true) => {
+                crate::metrics::global_metrics().decision_false_positive();
+                WsFrame::ok_response("", json!({ "dismissed": true, "decision_id": decision_id }))
+            }
+            Ok(false) => WsFrame::error_response("", "Decision not found"),
+            Err(e) => WsFrame::error_response("", &format!("Dismiss failed: {e}")),
         }
     }
 

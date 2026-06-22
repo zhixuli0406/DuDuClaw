@@ -67,6 +67,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [rfc/RFC-21-identity-credential-isolation.md](rfc/RFC-21-identity-credential-isolation.md) | Identity resolution & per-agent credential isolation |
 | [rfc/RFC-21-operator-guide.md](rfc/RFC-21-operator-guide.md) | RFC-21 operator migration playbook |
 | [rfc/RFC-22-multi-agent-coordination-principles.md](rfc/RFC-22-multi-agent-coordination-principles.md) | Multi-agent coordination principles |
+| [rfc/RFC-24-decision-continuity.md](rfc/RFC-24-decision-continuity.md) | Cross-session decision/proposal durability (fixes session-chain breakage) |
 | [rfc/RFC-26-deep-agents-alignment.md](rfc/RFC-26-deep-agents-alignment.md) | Deep-agents / live-forking alignment |
 | [adr/ADR-002-x-duduclaw-capability-negotiation.md](adr/ADR-002-x-duduclaw-capability-negotiation.md) | ACP capability negotiation decision |
 
@@ -75,6 +76,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | Document | Description |
 |----------|-------------|
 | [todo/TODO-agent-honesty.md](todo/TODO-agent-honesty.md) | Agent honesty / anti-hallucination tasks |
+| [todo/TODO-rfc24-decision-continuity.md](todo/TODO-rfc24-decision-continuity.md) | RFC-24 decision-continuity implementation tracking |
 | [todo/TODO-rfc26-live-forking.md](todo/TODO-rfc26-live-forking.md) | RFC-26 live-forking implementation tracking |
 
 ## User & Developer Guides
@@ -107,6 +109,7 @@ docs/                                  # L1 PUBLIC — product & developer docum
 │   ├── RFC-21-identity-credential-isolation.md
 │   ├── RFC-21-operator-guide.md
 │   ├── RFC-22-multi-agent-coordination-principles.md
+│   ├── RFC-24-decision-continuity.md
 │   └── RFC-26-deep-agents-alignment.md
 ├── adr/                               # Architecture Decision Records
 │   └── ADR-002-x-duduclaw-capability-negotiation.md
