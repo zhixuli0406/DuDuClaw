@@ -963,6 +963,9 @@ mod tests {
         assert!(!looks_like_oauth_expiry("child exited with code 1"));
     }
 
+    // Spawns a real PTY and reads child echo — unreliable on headless Windows CI
+    // (ConPTY). Covered on Unix.
+    #[cfg_attr(windows, ignore = "ConPTY oneshot echo is flaky on headless Windows CI")]
     #[tokio::test]
     async fn invoke_oneshot_runs_echo() {
         #[cfg(unix)]

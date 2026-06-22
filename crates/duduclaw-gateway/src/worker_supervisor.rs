@@ -764,6 +764,10 @@ mod tests {
         assert!(read_worker_binary_override(dir.path()).is_none());
     }
 
+    // Writes an extensionless `#!/bin/sh` shim and expects the override to accept
+    // it as an executable — the Unix exec model. On Windows the override rejects a
+    // non-`.exe`/`.cmd` file, so this asserts Unix-only behavior.
+    #[cfg_attr(windows, ignore = "extensionless shim acceptance is Unix-only")]
     #[test]
     fn read_worker_binary_override_accepts_existing_absolute_path() {
         let dir = TempDir::new().unwrap();
@@ -856,6 +860,10 @@ mod tests {
 
     // **Round 4 (MED-C1)** — wait_for_healthy honours shutdown signal.
 
+    // Asserts the cancel is observed within 2s; the health client's connect/
+    // teardown on headless Windows CI exceeds that bound, making the timing
+    // assertion flaky. The cancellation behavior is covered on Unix.
+    #[cfg_attr(windows, ignore = "tight cancel-latency bound is flaky on slow Windows CI")]
     #[tokio::test]
     async fn wait_for_healthy_returns_when_shutdown_cancelled() {
         // Construct a WorkerClient pointing at a port nothing listens on

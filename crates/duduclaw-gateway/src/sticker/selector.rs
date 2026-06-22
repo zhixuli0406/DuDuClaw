@@ -115,7 +115,12 @@ impl StickerSelector {
 
     /// Periodically clean up stale sessions (> 1 hour inactive).
     pub fn cleanup_stale_sessions(&mut self) {
-        let cutoff = Instant::now() - std::time::Duration::from_secs(3600);
+        // `Instant::now() - 1h` panics when uptime < 1h (Windows monotonic clock
+        // underflow). If we can't look back a full hour, nothing is stale yet.
+        let Some(cutoff) = Instant::now().checked_sub(std::time::Duration::from_secs(3600))
+        else {
+            return;
+        };
         self.cooldowns.retain(|_, v| v.last_activity > cutoff);
     }
 }
