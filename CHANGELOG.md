@@ -1,6 +1,37 @@
 # Changelog
 
 
+## [1.23.0] - 2026-06-22 — Decision Continuity (RFC-24): durable cross-session decisions
+
+### Added
+- **Decision Continuity (RFC-24).** When an agent offers the user an enumerated
+  choice ("方案 A/B/C", "Option 1/2"), each option is now persisted into the
+  Temporal Memory **semantic** layer — independent of session turns and untouched
+  by `compress()` — and still-open decisions are re-injected into the next turn's
+  prompt. A later "用方案 C" (new turn / session / process) resolves from durable
+  state instead of being guessed from unrelated history. Opt-in per agent via
+  `agent.toml [memory] decision_continuity = true` (default off).
+  - **Detection** is deterministic and zero-LLM on the main path (方案/選項/Option
+    /bare letter·digit/emoji keycap markers, conservative homogeneity + keyword
+    gates). A suspected-but-unparsable choice (e.g. 甲/乙/丙, ①②) triggers a
+    single background Haiku second-pass; plain prose never does.
+  - **Resolution**: `decision_resolve` / `decision_list` MCP tools, plus
+    auto-resolution when the user references an open option. Resolving supersedes
+    the decision's status, records the choice as a long-lived semantic fact, and
+    expires the option artifacts (fail-closed on unknown id / key / owner).
+  - **Anti-guessing**: referencing a decision with no durable record records an
+    F2 Reflexion learning signal so the agent learns to acknowledge the gap and
+    query rather than fabricate.
+  - **Lifecycle & ops**: per-agent TTL (`[memory] decision_ttl_days`, default 7)
+    self-prunes stale open decisions; Dashboard "待決事項" panel with
+    `decisions.list` / `decisions.dismiss` RPC (dismiss marks a false positive);
+    Prometheus `decision_captured/resolved/expired/false_positive` counters;
+    `scripts/smoke-decision-continuity.sh`.
+  - Design: `docs/rfc/RFC-24-decision-continuity.md`; tracking:
+    `docs/todo/TODO-rfc24-decision-continuity.md`.
+
+
+
 ## [1.22.1] - 2026-06-21 — Core gateway drops the Python runtime dependency
 
 ### Changed
