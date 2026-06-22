@@ -1092,6 +1092,11 @@ mod tests {
         // logic (actual I/O requires tokio runtime, tested in integration).
         assert!(Path::new("../../etc/passwd").is_relative());
         assert!("../../etc/passwd".contains(".."));
+        // Use a platform-absolute path: `/etc/shadow` is NOT absolute on Windows
+        // (`Path::is_absolute()` requires a drive/UNC there).
+        #[cfg(windows)]
+        assert!(Path::new(r"C:\Windows\system32").is_absolute());
+        #[cfg(not(windows))]
         assert!(Path::new("/etc/shadow").is_absolute());
     }
 }

@@ -466,6 +466,9 @@ mod which_claude_tests {
             || Path::new("/usr/local/bin/claude").exists()
     }
 
+    // HOME-rooted discovery fixtures use extensionless shims (Unix exec model);
+    // Windows discovery is extension-aware and covered by the windows_pref_* tests.
+    #[cfg_attr(windows, ignore = "extensionless HOME shim discovery is Unix-only; Windows covered by windows_pref_*")]
     #[test]
     fn discovers_bun_candidate() {
         if host_has_system_claude() {
@@ -479,6 +482,7 @@ mod which_claude_tests {
         assert_eq!(found.as_deref(), Some(claude.to_string_lossy().as_ref()));
     }
 
+    #[cfg_attr(windows, ignore = "extensionless HOME shim discovery is Unix-only")]
     #[test]
     fn discovers_volta_candidate() {
         if host_has_system_claude() {
@@ -492,6 +496,7 @@ mod which_claude_tests {
         assert_eq!(found.as_deref(), Some(claude.to_string_lossy().as_ref()));
     }
 
+    #[cfg_attr(windows, ignore = "extensionless HOME shim discovery is Unix-only")]
     #[test]
     fn discovers_asdf_shim() {
         if host_has_system_claude() {
@@ -505,6 +510,7 @@ mod which_claude_tests {
         assert_eq!(found.as_deref(), Some(claude.to_string_lossy().as_ref()));
     }
 
+    #[cfg_attr(windows, ignore = "extensionless HOME shim discovery is Unix-only")]
     #[test]
     fn discovers_npm_global() {
         if host_has_system_claude() {
@@ -518,6 +524,7 @@ mod which_claude_tests {
         assert_eq!(found.as_deref(), Some(claude.to_string_lossy().as_ref()));
     }
 
+    #[cfg_attr(windows, ignore = "extensionless HOME shim discovery is Unix-only")]
     #[test]
     fn nvm_version_directory_is_scanned() {
         let tmp = tempfile::tempdir().unwrap();
@@ -553,6 +560,7 @@ mod which_claude_tests {
         assert!(found.is_none(), "empty HOME should return None, got {:?}", found);
     }
 
+    #[cfg_attr(windows, ignore = "extensionless HOME shim discovery is Unix-only")]
     #[test]
     fn fixed_candidate_order_bun_beats_npm_global() {
         if host_has_system_claude() {

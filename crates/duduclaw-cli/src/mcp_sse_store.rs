@@ -301,6 +301,10 @@ mod tests {
     }
 
     // ── Test: evict_idle removes stale connections ────────────────────────────
+    // Backdates last_active by 11min via `Instant::now() - 660s`, which panics on
+    // a fresh-boot Windows runner (uptime < 11min → monotonic-clock underflow).
+    // The eviction logic itself is platform-independent and covered on Unix.
+    #[cfg_attr(windows, ignore = "backdated Instant underflows on fresh-boot Windows CI")]
     #[test]
     fn evict_idle_removes_inactive_connections() {
         let store = make_store();
