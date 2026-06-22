@@ -2157,7 +2157,21 @@ fn collect_md_files_inner(base: &Path, dir: &Path, depth: usize) -> Vec<PathBuf>
             let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
             if !RESERVED_FILES.contains(&fname)
                 && let Ok(rel) = path.strip_prefix(base) {
-                    result.push(rel.to_path_buf());
+                    // Normalize to a forward-slash relative id. Windows `read_dir`
+                    // yields `\` components, but wiki page identifiers are
+                    // `/`-delimited and must be stable across platforms (page ids
+                    // flow into search, citations, backlinks, and mermaid export).
+                    // `/`-form paths still join correctly on Windows for fs reads.
+                    let id: PathBuf = rel
+                        .components()
+                        .filter_map(|c| match c {
+                            std::path::Component::Normal(s) => s.to_str(),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("/")
+                        .into();
+                    result.push(id);
                 }
         }
         // Symlinks are silently skipped (neither is_dir nor is_file on DirEntry::file_type)

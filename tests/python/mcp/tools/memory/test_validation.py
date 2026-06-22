@@ -7,7 +7,7 @@ Acceptance criteria (from mcp-memory-endpoints-design.md §6.3–6.5):
     ✅ query > 500 chars → 422
     ✅ limit > 50 → 422
     ✅ Invalid layer → 422
-    ✅ XSS chars in query → HTML-escaped
+    ✅ XSS/special chars in query → preserved verbatim (HC18: plain-text, escape at render)
 
   memory_store:
     ✅ Missing/empty content → 422
@@ -90,13 +90,13 @@ class TestSearchValidation:
         with pytest.raises(ValidationError):
             validate_memory_search_params({"query": 123})
 
-    def test_xss_chars_are_html_escaped(self) -> None:
-        result = validate_memory_search_params(
-            {"query": '<script>alert("xss")</script>'}
-        )
-        assert "<script>" not in result["query"]
-        assert ">" not in result["query"]
-        assert "script" in result["query"]  # content preserved, just escaped
+    def test_query_is_not_html_escaped(self) -> None:
+        # HC18: queries are searched as plain text — NOT HTML-escaped. Escaping at
+        # the validation boundary corrupts natural-language input (e.g. "x < 3 &&
+        # y") and hurts recall; rendering surfaces escape at output time instead.
+        raw = '<script>alert("xss")</script>'
+        result = validate_memory_search_params({"query": raw})
+        assert result["query"] == raw
 
     # ── limit ──────────────────────────────────────────────────────────────────
 
@@ -194,9 +194,12 @@ class TestStoreValidation:
         with pytest.raises(ValidationError, match="content"):
             validate_memory_store_params({"content": "x" * (MAX_CONTENT_LENGTH + 1)})
 
-    def test_content_xss_escaped(self) -> None:
-        result = validate_memory_store_params({"content": '<b>bold</b> & "quoted"'})
-        assert "<b>" not in result["content"]
+    def test_content_is_not_html_escaped(self) -> None:
+        # HC18: content is stored as plain text, preserved verbatim (escaping would
+        # permanently corrupt natural-language memory like "x < 3 && y").
+        raw = '<b>bold</b> & "quoted"'
+        result = validate_memory_store_params({"content": raw})
+        assert result["content"] == raw
 
     # ── layer ──────────────────────────────────────────────────────────────────
 

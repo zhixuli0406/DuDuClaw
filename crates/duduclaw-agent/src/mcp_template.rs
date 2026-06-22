@@ -763,7 +763,16 @@ mod tests {
     /// which we use as a placeholder duduclaw binary in tests — it satisfies
     /// the `exists()` check inside `ensure_duduclaw_absolute_path`.
     fn fake_bin_path() -> std::path::PathBuf {
-        std::path::PathBuf::from("/bin/sh")
+        // Must be absolute *and* existing on the host: `ensure_duduclaw_absolute_path`
+        // early-returns when the resolved bin isn't absolute, and treats a
+        // non-existent command as "needs update". A Unix path like `/bin/sh` is
+        // NOT absolute on Windows (`Path::is_absolute()` requires a drive/UNC),
+        // which silently skipped the migration and failed these tests on Windows.
+        if cfg!(windows) {
+            std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe")
+        } else {
+            std::path::PathBuf::from("/bin/sh")
+        }
     }
 
     /// Scoped `DUDUCLAW_BIN` override. Sets the env on construction, removes it
@@ -785,6 +794,14 @@ mod tests {
 
     static BIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Acquire `BIN_ENV_LOCK`, tolerating poisoning. The guarded data is `()`, so
+    /// if one test panics while holding the lock the others can still serialize on
+    /// it — a single real failure stays a single failure instead of cascading into
+    /// `PoisonError` noise across the whole `DUDUCLAW_BIN` test group.
+    fn lock_bin_env() -> std::sync::MutexGuard<'static, ()> {
+        BIN_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn write_json(path: &std::path::Path, value: &serde_json::Value) {
         let pretty = serde_json::to_string_pretty(value).unwrap();
         std::fs::write(path, pretty).unwrap();
@@ -797,7 +814,7 @@ mod tests {
 
     #[test]
     fn mcp_json_migration_adds_agent_id_env() {
-        let _guard = BIN_ENV_LOCK.lock().unwrap();
+        let _guard = lock_bin_env();
         let _bin = BinEnvOverride::new(&fake_bin_path());
 
         let tmp = TempDir::new().unwrap();
@@ -831,7 +848,7 @@ mod tests {
 
     #[test]
     fn mcp_json_migration_preserves_other_env_vars() {
-        let _guard = BIN_ENV_LOCK.lock().unwrap();
+        let _guard = lock_bin_env();
         let _bin = BinEnvOverride::new(&fake_bin_path());
 
         let tmp = TempDir::new().unwrap();
@@ -864,7 +881,7 @@ mod tests {
 
     #[test]
     fn mcp_json_migration_preserves_other_mcp_servers() {
-        let _guard = BIN_ENV_LOCK.lock().unwrap();
+        let _guard = lock_bin_env();
         let _bin = BinEnvOverride::new(&fake_bin_path());
 
         let tmp = TempDir::new().unwrap();
@@ -909,7 +926,7 @@ mod tests {
 
     #[test]
     fn mcp_json_migration_creates_file_when_absent() {
-        let _guard = BIN_ENV_LOCK.lock().unwrap();
+        let _guard = lock_bin_env();
         let _bin = BinEnvOverride::new(&fake_bin_path());
 
         let tmp = TempDir::new().unwrap();
@@ -928,7 +945,7 @@ mod tests {
 
     #[test]
     fn mcp_json_migration_is_idempotent_once_migrated() {
-        let _guard = BIN_ENV_LOCK.lock().unwrap();
+        let _guard = lock_bin_env();
         let _bin = BinEnvOverride::new(&fake_bin_path());
 
         let tmp = TempDir::new().unwrap();

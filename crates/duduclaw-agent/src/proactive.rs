@@ -87,8 +87,16 @@ impl ProactiveState {
 
     /// Messages sent in the last hour.
     pub fn messages_this_hour(&self) -> u32 {
-        let one_hour_ago = Instant::now() - std::time::Duration::from_secs(3600);
-        self.recent_messages.iter().filter(|t| **t > one_hour_ago).count() as u32
+        // `Instant::now() - 1h` PANICS when process/host uptime is under an hour
+        // (Windows `Instant` is monotonic-from-boot; subtraction overflows). Use
+        // `checked_sub` — if we can't go back a full hour, every recorded message
+        // is necessarily within the window, so count them all.
+        match Instant::now().checked_sub(std::time::Duration::from_secs(3600)) {
+            Some(one_hour_ago) => {
+                self.recent_messages.iter().filter(|t| **t > one_hour_ago).count() as u32
+            }
+            None => self.recent_messages.len() as u32,
+        }
     }
 }
 

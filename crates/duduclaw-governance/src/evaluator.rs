@@ -1015,6 +1015,10 @@ policies:
     }
 
     /// HC11: quota 通過後若 Lifecycle 政策拒絕，必須回滾預留。
+    // Simulates idle via `Instant::now() - 2h`, which underflows (panics) on a
+    // fresh-boot Windows runner (monotonic clock < 2h since boot). The rollback
+    // logic is platform-independent and covered on Unix.
+    #[cfg_attr(windows, ignore = "idle simulation via backdated Instant underflows on fresh-boot Windows CI")]
     #[tokio::test]
     async fn test_quota_reservation_rolled_back_on_lifecycle_deny() {
         let yaml = r#"
