@@ -34,6 +34,23 @@ duduclaw dev --agent my-bot --port 18789
 └── SKILLS/             # Agent 技能目錄
 ```
 
+### 1.3 決策連續性 (Decision Continuity, RFC-24)
+
+當 Agent 向使用者提出列舉式選項（「方案 A/B/C」、「Option 1/2」）後，若使用者
+稍後（甚至跨 session / 重啟 / 壓縮後）回覆「用方案 C」，預設情況下選項內容可能已
+隨對話壓縮而遺失。啟用後，系統會在訊息送出時自動把每個選項存進獨立於對話記憶的
+語意記憶層，並在後續回合注入「待決事項」讓 Agent 正確解析。
+
+`agent.toml` 啟用（預設關閉，per-agent opt-in）：
+
+```toml
+[memory]
+decision_continuity = true
+```
+
+偵測為確定性、零 LLM 成本，且偏保守（寧漏勿錯）；背景擷取失敗不影響回覆送出。
+詳見 [RFC-24](../rfc/RFC-24-decision-continuity.md)。
+
 ---
 
 ## 2. 瀏覽器自動化調試（L1-L5）

@@ -129,6 +129,37 @@ pub fn agent_uses_non_claude(agent_dir: &Path) -> Option<RuntimeType> {
     load_runtime_settings(agent_dir).non_claude_provider()
 }
 
+/// Whether `[memory] decision_continuity` is enabled for this agent (RFC-24).
+///
+/// Opt-in, default `false`. A missing/malformed `agent.toml`, a missing
+/// `[memory]` table, a missing key, or a non-bool value all resolve to `false`
+/// (fail-safe — the feature stays off unless explicitly turned on).
+pub fn decision_continuity_enabled(agent_dir: &Path) -> bool {
+    read_agent_toml(agent_dir)
+        .and_then(|v| {
+            v.get("memory")
+                .and_then(|m| m.get("decision_continuity"))
+                .and_then(|b| b.as_bool())
+        })
+        .unwrap_or(false)
+}
+
+/// TTL in days after which an unanswered open decision is auto-expired (RFC-24
+/// §P3.2). Reads `[memory] decision_ttl_days`; defaults to 7. Non-positive or
+/// malformed values fall back to the default (7) — TTL is always enforced so the
+/// ledger can't grow unbounded.
+pub fn decision_ttl_days(agent_dir: &Path) -> i64 {
+    const DEFAULT_TTL_DAYS: i64 = 7;
+    read_agent_toml(agent_dir)
+        .and_then(|v| {
+            v.get("memory")
+                .and_then(|m| m.get("decision_ttl_days"))
+                .and_then(|n| n.as_integer())
+        })
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_TTL_DAYS)
+}
+
 // ── Global utility config (RFC-25 N2) ───────────────────────────────
 //
 // Background utility tasks (session summarizer, wiki ingest, forced reflection,
@@ -275,6 +306,52 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_agent_toml(dir.path(), "[runtime]\nprovider = \"nonsense\"\n");
         assert_eq!(agent_runtime_provider(dir.path()), RuntimeType::Claude);
+    }
+
+    // ── RFC-24: decision_continuity opt-in ──────────────────────────────
+
+    #[test]
+    fn decision_continuity_defaults_off_when_absent() {
+        let dir = TempDir::new().unwrap();
+        assert!(!decision_continuity_enabled(dir.path()));
+    }
+
+    #[test]
+    fn decision_continuity_reads_true() {
+        let dir = TempDir::new().unwrap();
+        write_agent_toml(dir.path(), "[memory]\ndecision_continuity = true\n");
+        assert!(decision_continuity_enabled(dir.path()));
+    }
+
+    #[test]
+    fn decision_continuity_reads_false() {
+        let dir = TempDir::new().unwrap();
+        write_agent_toml(dir.path(), "[memory]\ndecision_continuity = false\n");
+        assert!(!decision_continuity_enabled(dir.path()));
+    }
+
+    #[test]
+    fn decision_continuity_off_on_malformed_or_wrong_type() {
+        let dir = TempDir::new().unwrap();
+        // Non-bool value → fail-safe off.
+        write_agent_toml(dir.path(), "[memory]\ndecision_continuity = \"yes\"\n");
+        assert!(!decision_continuity_enabled(dir.path()));
+        // Malformed toml → fail-safe off.
+        write_agent_toml(dir.path(), "not valid toml ===");
+        assert!(!decision_continuity_enabled(dir.path()));
+    }
+
+    #[test]
+    fn decision_ttl_defaults_and_overrides() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(decision_ttl_days(dir.path()), 7, "default 7 days");
+        write_agent_toml(dir.path(), "[memory]\ndecision_ttl_days = 30\n");
+        assert_eq!(decision_ttl_days(dir.path()), 30);
+        // Non-positive / malformed → default.
+        write_agent_toml(dir.path(), "[memory]\ndecision_ttl_days = 0\n");
+        assert_eq!(decision_ttl_days(dir.path()), 7);
+        write_agent_toml(dir.path(), "[memory]\ndecision_ttl_days = \"x\"\n");
+        assert_eq!(decision_ttl_days(dir.path()), 7);
     }
 
     #[test]

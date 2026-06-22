@@ -40,6 +40,7 @@ pub mod channel_settings;
 pub mod config_crypto;
 pub mod claude_runner;
 pub mod cost_telemetry;
+pub mod decision_capture;
 pub mod cron_scheduler;
 pub mod cron_store;
 pub mod license_runtime;

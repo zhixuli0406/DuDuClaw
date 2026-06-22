@@ -78,6 +78,37 @@ pub struct TemporalMeta {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// A pending/known decision surfaced from the temporal store (RFC-24).
+///
+/// Reconstructed from the `(decision:<id>, question|option:<key>|status)` triples
+/// written by the decision-capture layer. `options` is sorted by key for stable
+/// rendering; `id` is the short id without the `decision:` prefix.
+#[derive(Debug, Clone, Serialize)]
+pub struct DecisionView {
+    pub id: String,
+    pub question: String,
+    pub options: Vec<(String, String)>,
+    pub created_at: Option<String>,
+}
+
+/// Outcome of [`SqliteMemoryEngine::resolve_decision`] (RFC-24 §4.4). Fail-closed:
+/// every non-`Resolved` variant means nothing was written.
+#[derive(Debug, Clone, Serialize)]
+pub enum DecisionResolveOutcome {
+    /// Decision resolved to the chosen option.
+    Resolved {
+        chosen_key: String,
+        chosen_content: String,
+        question: String,
+    },
+    /// No decision with that id exists for this agent.
+    NotFound,
+    /// The decision was already resolved/expired (carries the current status).
+    AlreadyResolved(String),
+    /// The chosen key is not among the decision's options.
+    UnknownKey { available: Vec<String> },
+}
+
 /// One node in a temporal supersession chain, returned by
 /// [`SqliteMemoryEngine::get_history`] (F1).
 #[derive(Debug, Clone, Serialize)]
@@ -436,6 +467,313 @@ impl SqliteMemoryEngine {
             )
             .unwrap_or(0);
         Ok(n)
+    }
+
+    // ── Decision Continuity (RFC-24) ────────────────────────────────────────
+    //
+    // Decisions ride the temporal/knowledge-graph columns rather than FTS:
+    // `search_layer()` strips `:` from queries, so `subject = "decision:<id>"`
+    // is unreachable via full-text search. These helpers query the structured
+    // columns directly and honour the same currently-valid filter
+    // (`valid_until IS NULL`) used everywhere else.
+
+    /// List the agent's currently-open decisions, newest first (RFC-24).
+    ///
+    /// A decision is "open" when its `(decision:<id>, status)` triple has object
+    /// `open` and is still valid. For each open decision the question text and all
+    /// still-valid option contents are gathered. `limit` caps the number of
+    /// decisions returned (the injection layer keeps this small, e.g. 5).
+    pub async fn list_open_decisions(
+        &self,
+        agent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<DecisionView>> {
+        let conn = self.conn.lock().await;
+
+        // Subjects with a currently-valid status=open row, newest first.
+        let subjects: Vec<(String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT subject, valid_from FROM memories
+                     WHERE agent_id = ?1 AND predicate = 'status' AND object = 'open'
+                       AND valid_until IS NULL AND subject LIKE 'decision:%'
+                     ORDER BY COALESCE(valid_from, timestamp) DESC, created_at DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![agent_id, limit as i64], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                })
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
+            }
+            v
+        };
+
+        let mut out = Vec::new();
+        for (subject, created_at) in subjects {
+            if let Some(view) = Self::read_decision_view(&conn, agent_id, &subject, created_at)? {
+                out.push(view);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch a single decision by its short id (without the `decision:` prefix),
+    /// regardless of open/resolved status, gathering still-valid artifacts (RFC-24).
+    pub async fn get_decision(
+        &self,
+        agent_id: &str,
+        decision_id: &str,
+    ) -> Result<Option<DecisionView>> {
+        let conn = self.conn.lock().await;
+        let subject = format!("decision:{decision_id}");
+        Self::read_decision_view(&conn, agent_id, &subject, None)
+    }
+
+    /// Current valid status object for a decision (`open` / `resolved:<key>` /
+    /// `expired`), or `None` if the decision is unknown (RFC-24).
+    pub async fn decision_status(
+        &self,
+        agent_id: &str,
+        decision_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().await;
+        let subject = format!("decision:{decision_id}");
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT object FROM memories
+                 WHERE agent_id = ?1 AND subject = ?2 AND predicate = 'status'
+                   AND valid_until IS NULL
+                 ORDER BY COALESCE(valid_from, timestamp) DESC LIMIT 1",
+                params![agent_id, subject],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(status)
+    }
+
+    /// Expire all still-valid non-status artifacts (question + options) of a
+    /// decision so they stop being "active" once the decision is resolved (RFC-24).
+    /// The status supersession chain is left intact for history.
+    pub async fn expire_decision_artifacts(
+        &self,
+        agent_id: &str,
+        decision_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
+        let subject = format!("decision:{decision_id}");
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET valid_until = ?1
+             WHERE agent_id = ?2 AND subject = ?3 AND predicate != 'status'
+               AND valid_until IS NULL",
+            params![now, agent_id, subject],
+        )
+        .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Expire this agent's open decisions whose status row is older than
+    /// `ttl_days` (RFC-24 §P3.2). All still-valid rows (status + question +
+    /// options) of each stale decision are closed (`valid_until = now`), so the
+    /// decision drops out of `list_open_decisions` and stops injecting. Returns
+    /// the number of rows expired. A non-positive `ttl_days` is a no-op.
+    pub async fn expire_stale_decisions(&self, agent_id: &str, ttl_days: i64) -> Result<usize> {
+        if ttl_days <= 0 {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().await;
+        let now = Utc::now();
+        let cutoff = (now - chrono::Duration::days(ttl_days)).to_rfc3339();
+        let now_str = now.to_rfc3339();
+        let n = conn
+            .execute(
+                "UPDATE memories SET valid_until = ?1
+                 WHERE agent_id = ?2 AND valid_until IS NULL AND subject LIKE 'decision:%'
+                   AND subject IN (
+                     SELECT subject FROM memories
+                     WHERE agent_id = ?2 AND predicate = 'status' AND object = 'open'
+                       AND valid_until IS NULL
+                       AND COALESCE(valid_from, timestamp) < ?3
+                   )",
+                params![now_str, agent_id, cutoff],
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        Ok(n)
+    }
+
+    /// Dismiss a decision as a false positive (RFC-24 §P3.3): close ALL its
+    /// still-valid rows (status + question + options) so it disappears from
+    /// open-decision queries. Returns `true` if the decision existed (any row
+    /// was closed), `false` if nothing matched.
+    pub async fn dismiss_decision(&self, agent_id: &str, decision_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let subject = format!("decision:{decision_id}");
+        let now = Utc::now().to_rfc3339();
+        let n = conn
+            .execute(
+                "UPDATE memories SET valid_until = ?1
+                 WHERE agent_id = ?2 AND subject = ?3 AND valid_until IS NULL",
+                params![now, agent_id, subject],
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        Ok(n > 0)
+    }
+
+    /// Resolve an open decision to a chosen option (RFC-24 §4.4).
+    ///
+    /// Fail-closed: an unknown decision id, an already-resolved decision, or an
+    /// unknown option key returns the corresponding non-`Resolved` outcome and
+    /// writes nothing. On success it: (1) supersedes the `status` row to
+    /// `resolved:<key>`; (2) expires the question + option artifacts so they stop
+    /// surfacing as open; (3) records the choice as a plain long-lived semantic
+    /// fact so future `search()` can recall "this decision chose X".
+    ///
+    /// Orchestrates the other public helpers (no direct lock held here) to avoid
+    /// re-entrant locking of the connection mutex.
+    pub async fn resolve_decision(
+        &self,
+        agent_id: &str,
+        decision_id: &str,
+        chosen_key: &str,
+    ) -> Result<DecisionResolveOutcome> {
+        // Status gate.
+        match self.decision_status(agent_id, decision_id).await? {
+            None => return Ok(DecisionResolveOutcome::NotFound),
+            Some(s) if s == "open" => {}
+            Some(other) => return Ok(DecisionResolveOutcome::AlreadyResolved(other)),
+        }
+        let Some(view) = self.get_decision(agent_id, decision_id).await? else {
+            return Ok(DecisionResolveOutcome::NotFound);
+        };
+        let Some((_, chosen_content)) =
+            view.options.iter().find(|(k, _)| k == chosen_key).cloned()
+        else {
+            return Ok(DecisionResolveOutcome::UnknownKey {
+                available: view.options.iter().map(|(k, _)| k.clone()).collect(),
+            });
+        };
+
+        let subject = format!("decision:{decision_id}");
+
+        // 1. status → resolved:<key> (supersedes the open status row).
+        self.store_temporal(
+            agent_id,
+            Self::decision_artifact_entry(agent_id, &format!("resolved:{chosen_key}")),
+            TemporalMeta {
+                subject: Some(subject.clone()),
+                predicate: Some("status".to_string()),
+                object: Some(format!("resolved:{chosen_key}")),
+                valid_from: None,
+                valid_until: None,
+                confidence: Some(1.0),
+                metadata: None,
+            },
+        )
+        .await?;
+
+        // 2. Expire question + option artifacts (status excluded by predicate).
+        self.expire_decision_artifacts(agent_id, decision_id).await?;
+
+        // 3. Record the choice as a plain long-lived semantic fact (searchable,
+        //    not a decision artifact — so it never tangles with open-decision
+        //    queries and is not expired above).
+        let fact = format!(
+            "已解決的決策：{} → 選擇 {}：{}",
+            view.question, chosen_key, chosen_content
+        );
+        let mut entry = Self::decision_artifact_entry(agent_id, &fact);
+        entry.tags = vec![
+            "decision".to_string(),
+            "resolved".to_string(),
+            subject.clone(),
+        ];
+        self.store_temporal(agent_id, entry, TemporalMeta::default())
+            .await?;
+
+        Ok(DecisionResolveOutcome::Resolved {
+            chosen_key: chosen_key.to_string(),
+            chosen_content,
+            question: view.question,
+        })
+    }
+
+    /// Build a semantic `MemoryEntry` for a decision artifact / fact row (RFC-24).
+    fn decision_artifact_entry(agent_id: &str, content: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent_id.to_string(),
+            content: content.to_string(),
+            timestamp: Utc::now(),
+            tags: vec!["decision".to_string()],
+            embedding: None,
+            layer: duduclaw_core::types::MemoryLayer::Semantic,
+            importance: 7.0,
+            access_count: 0,
+            last_accessed: None,
+            source_event: "decision_resolve".to_string(),
+        }
+    }
+
+    /// Assemble a [`DecisionView`] from the still-valid triples of one subject.
+    /// Returns `None` when no question text is present (malformed / partial).
+    fn read_decision_view(
+        conn: &Connection,
+        agent_id: &str,
+        subject: &str,
+        created_at: Option<String>,
+    ) -> Result<Option<DecisionView>> {
+        let mut question: Option<String> = None;
+        let mut created = created_at;
+        let mut options: Vec<(String, String)> = Vec::new();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT predicate, object, valid_from FROM memories
+                 WHERE agent_id = ?1 AND subject = ?2 AND valid_until IS NULL
+                   AND object IS NOT NULL",
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![agent_id, subject], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        for r in rows {
+            let (predicate, object, vf) = r.map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            if predicate == "question" {
+                question = Some(object);
+                if created.is_none() {
+                    created = vf;
+                }
+            } else if let Some(key) = predicate.strip_prefix("option:") {
+                options.push((key.to_string(), object));
+            }
+        }
+
+        let Some(question) = question else {
+            return Ok(None);
+        };
+        // Stable ordering by option key (A, B, C / 1, 2, 3).
+        options.sort_by(|a, b| a.0.cmp(&b.0));
+        let id = subject
+            .strip_prefix("decision:")
+            .unwrap_or(subject)
+            .to_string();
+        Ok(Some(DecisionView {
+            id,
+            question,
+            options,
+            created_at: created,
+        }))
     }
 
     /// Search memories filtered by cognitive layer.

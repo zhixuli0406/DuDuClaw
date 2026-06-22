@@ -70,6 +70,16 @@ pub struct MetricsRegistry {
     pub worker_restarts_total: AtomicU64,
     /// Mode gauge — 0 = in-process, 1 = managed worker. Set at boot.
     pub pty_pool_managed_worker_active: AtomicU64,
+
+    // ── Decision Continuity (RFC-24, Phase 3 observability) ──────────
+    /// Decisions captured from outbound enumerated choices.
+    pub decision_captured_total: AtomicU64,
+    /// Decisions resolved to a chosen option (MCP or auto).
+    pub decision_resolved_total: AtomicU64,
+    /// Open decisions auto-expired by TTL.
+    pub decision_expired_total: AtomicU64,
+    /// Captured decisions manually dismissed as false positives (precision signal).
+    pub decision_false_positive_total: AtomicU64,
 }
 
 const DURATION_BOUNDS_MS: [u64; 7] = [100, 250, 500, 1000, 2500, 5000, 10000];
@@ -132,7 +142,28 @@ impl MetricsRegistry {
             worker_health_misses_total: AtomicU64::new(0),
             worker_restarts_total: AtomicU64::new(0),
             pty_pool_managed_worker_active: AtomicU64::new(0),
+            decision_captured_total: AtomicU64::new(0),
+            decision_resolved_total: AtomicU64::new(0),
+            decision_expired_total: AtomicU64::new(0),
+            decision_false_positive_total: AtomicU64::new(0),
         }
+    }
+
+    // ── Decision Continuity helpers (RFC-24) ─────────────────────────
+    pub fn decision_captured(&self) {
+        self.decision_captured_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn decision_resolved(&self) {
+        self.decision_resolved_total.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record `n` decisions expired by TTL (rows → decisions is approximate;
+    /// callers pass the decision count they observed).
+    pub fn decision_expired(&self, n: u64) {
+        self.decision_expired_total.fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn decision_false_positive(&self) {
+        self.decision_false_positive_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     // ── PTY pool helpers (Phase 8 production-rollout observability) ───
@@ -487,6 +518,40 @@ impl MetricsRegistry {
         out.push_str(&format!(
             "duduclaw_worker_restarts_total {}\n",
             self.worker_restarts_total.load(Ordering::Relaxed)
+        ));
+
+        // ── Decision Continuity (RFC-24) ──
+        out.push_str(
+            "# HELP duduclaw_decision_captured_total Decisions captured from outbound enumerated choices.\n",
+        );
+        out.push_str("# TYPE duduclaw_decision_captured_total counter\n");
+        out.push_str(&format!(
+            "duduclaw_decision_captured_total {}\n",
+            self.decision_captured_total.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP duduclaw_decision_resolved_total Decisions resolved to a chosen option.\n",
+        );
+        out.push_str("# TYPE duduclaw_decision_resolved_total counter\n");
+        out.push_str(&format!(
+            "duduclaw_decision_resolved_total {}\n",
+            self.decision_resolved_total.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP duduclaw_decision_expired_total Open decisions auto-expired by TTL.\n",
+        );
+        out.push_str("# TYPE duduclaw_decision_expired_total counter\n");
+        out.push_str(&format!(
+            "duduclaw_decision_expired_total {}\n",
+            self.decision_expired_total.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP duduclaw_decision_false_positive_total Captured decisions dismissed as false positives.\n",
+        );
+        out.push_str("# TYPE duduclaw_decision_false_positive_total counter\n");
+        out.push_str(&format!(
+            "duduclaw_decision_false_positive_total {}\n",
+            self.decision_false_positive_total.load(Ordering::Relaxed)
         ));
 
         out

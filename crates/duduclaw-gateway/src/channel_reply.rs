@@ -1102,6 +1102,38 @@ async fn build_reply_with_session_inner(
             }
         }
 
+        // RFC-24 (F1 injection): surface this agent's still-open decisions so a
+        // later "用方案 C" resolves from durable state, not conversation memory.
+        // Tail placement (near pinned, U-shaped peak attention). Own flag,
+        // independent of the cognitive_memory toggle. !Send → spawn_blocking.
+        if agent_dir
+            .as_deref()
+            .map(crate::runtime_config::decision_continuity_enabled)
+            .unwrap_or(false)
+        {
+            if let Some(db_path) = ctx.memory_db_path.clone() {
+                let aid = agent_id.clone();
+                if let Ok(section) = tokio::task::spawn_blocking(move || {
+                    let engine = duduclaw_memory::SqliteMemoryEngine::new(&db_path).ok()?;
+                    let rt = tokio::runtime::Handle::current();
+                    let s = rt.block_on(crate::decision_capture::build_open_decisions_section(
+                        &engine, &aid,
+                    ));
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s)
+                    }
+                })
+                .await
+                {
+                    if let Some(s) = section {
+                        prompt = format!("{prompt}\n\n{s}");
+                    }
+                }
+            }
+        }
+
         if !compression_summary.is_empty() {
             prompt = format!("{prompt}\n\n## Prior Conversation Summary\n{compression_summary}");
         }
@@ -1616,6 +1648,217 @@ async fn build_reply_with_session_inner(
             .await
         {
             warn!("Failed to save assistant message to session: {e}");
+        }
+
+        // ── RFC-24: Decision Continuity capture (async, non-blocking) ──
+        // When the outbound reply offers an enumerated choice ("方案 A/B/C",
+        // "Option 1/2", a lettered list under a "which one?" question), persist
+        // each option into the temporal/semantic store so a later "用方案 C"
+        // (new turn / session / process, even after compress() destroys the
+        // turn) still resolves from durable state instead of being guessed from
+        // history. Opt-in per agent (`[memory] decision_continuity`); detection
+        // is deterministic and best-effort — any failure here is logged and
+        // never affects reply delivery. Uses ctx.memory_db_path directly (its
+        // own flag, independent of the cognitive_memory toggle).
+        if agent_dir
+            .as_deref()
+            .map(crate::runtime_config::decision_continuity_enabled)
+            .unwrap_or(false)
+        {
+            if let Some(db_path) = ctx.memory_db_path.clone() {
+                let agent_for_dec = agent_id.clone();
+                let source_msg = format!("{session_id}|{reply}");
+                let reply_for_dec = reply.clone();
+                let ttl_days = agent_dir
+                    .as_deref()
+                    .map(crate::runtime_config::decision_ttl_days)
+                    .unwrap_or(7);
+                let util_model = agent_dir
+                    .as_deref()
+                    .map(crate::runtime_config::agent_utility_model)
+                    .unwrap_or_else(|| {
+                        crate::runtime_config::DEFAULT_UTILITY_MODEL.to_string()
+                    });
+                let home_for_dec = ctx.home_dir.clone();
+                let ctx_meta = {
+                    let (ch, cid) = parse_session_id_parts(session_id);
+                    serde_json::json!({ "channel": ch, "chat_id": cid, "session_id": session_id })
+                };
+                tokio::spawn(async move {
+                    // TTL housekeeping always runs (cheap, self-pruning) — !Send engine.
+                    {
+                        let db = db_path.clone();
+                        let a = agent_for_dec.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Ok(engine) = duduclaw_memory::SqliteMemoryEngine::new(&db) {
+                                let rt = tokio::runtime::Handle::current();
+                                if let Ok(n) =
+                                    rt.block_on(engine.expire_stale_decisions(&a, ttl_days))
+                                {
+                                    if n > 0 {
+                                        crate::metrics::global_metrics().decision_expired(n as u64);
+                                    }
+                                }
+                            }
+                        })
+                        .await;
+                    }
+
+                    // P3.1: confident → zero-cost; suspected → one Haiku confirm;
+                    // no-choice → done.
+                    let draft = match crate::decision_capture::classify_outbound(&reply_for_dec) {
+                        crate::decision_capture::DetectionResult::Confident(d) => d,
+                        crate::decision_capture::DetectionResult::Suspected => {
+                            let prompt =
+                                crate::decision_capture::build_extraction_prompt(&reply_for_dec);
+                            match call_claude_cli_lightweight(&prompt, &util_model, &home_for_dec)
+                                .await
+                            {
+                                Ok(out) => {
+                                    match crate::decision_capture::parse_extracted_decision(&out) {
+                                        Some(d) => {
+                                            tracing::info!(
+                                                agent = %agent_for_dec,
+                                                "RFC-24: suspected choice confirmed by Haiku second-pass"
+                                            );
+                                            d
+                                        }
+                                        None => return, // Haiku said not a decision
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "decision capture: Haiku second-pass failed");
+                                    return;
+                                }
+                            }
+                        }
+                        crate::decision_capture::DetectionResult::NoChoice => return,
+                    };
+
+                    let id = crate::decision_capture::decision_id(&agent_for_dec, &source_msg);
+                    // SqliteMemoryEngine is !Send (rusqlite) — persist on a blocking thread.
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let engine = match duduclaw_memory::SqliteMemoryEngine::new(&db_path) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "decision capture: open engine failed");
+                                return;
+                            }
+                        };
+                        let rt = tokio::runtime::Handle::current();
+                        match rt.block_on(crate::decision_capture::persist_decision(
+                            &engine,
+                            &agent_for_dec,
+                            &id,
+                            &draft,
+                            ctx_meta,
+                        )) {
+                            Ok(()) => {
+                                crate::metrics::global_metrics().decision_captured();
+                                tracing::info!(
+                                    agent = %agent_for_dec,
+                                    decision_id = %id,
+                                    options = draft.options.len(),
+                                    "RFC-24: decision captured"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "decision capture: persist failed")
+                            }
+                        }
+                    })
+                    .await;
+                });
+            }
+
+            // RFC-24 §4.4 (P2.2) + §4.5 (P2.3): if THIS user message referenced a
+            // decision ("用方案 C"), either auto-resolve the matching open decision
+            // (so it stops re-injecting) OR — when no open decision matches (the
+            // Agnes failure shape) — record a learning signal so F2 Reflexion
+            // consolidates an anti-guessing rule. Background, best-effort.
+            if let Some(db_path) = ctx.memory_db_path.clone() {
+                let agent_for_res = agent_id.clone();
+                let user_text = sanitized_text.clone();
+                let nb_for_res = ctx.mistake_notebook.clone();
+                let session_for_res = session_id.to_string();
+                tokio::spawn(async move {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let engine = match duduclaw_memory::SqliteMemoryEngine::new(&db_path) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "decision auto-resolve: open engine failed");
+                                return;
+                            }
+                        };
+                        let rt = tokio::runtime::Handle::current();
+                        let open = rt
+                            .block_on(engine.list_open_decisions(&agent_for_res, 20))
+                            .unwrap_or_default();
+
+                        if let Some((id, key)) =
+                            crate::decision_capture::detect_decision_reference(&user_text, &open)
+                        {
+                            match rt.block_on(engine.resolve_decision(&agent_for_res, &id, &key)) {
+                                Ok(duduclaw_memory::DecisionResolveOutcome::Resolved {
+                                    chosen_key,
+                                    ..
+                                }) => {
+                                    crate::metrics::global_metrics().decision_resolved();
+                                    tracing::info!(
+                                        agent = %agent_for_res,
+                                        decision_id = %id,
+                                        chosen = %chosen_key,
+                                        "RFC-24: decision auto-resolved from user reference"
+                                    );
+                                }
+                                Ok(other) => {
+                                    tracing::debug!(?other, "decision auto-resolve: no-op outcome")
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "decision auto-resolve failed")
+                                }
+                            }
+                            return;
+                        }
+
+                        // §4.5: user referenced a decision but NONE is open → the
+                        // Agnes gap. Record a Capability mistake so F2 consolidates
+                        // "don't guess referenced decisions — acknowledge + query".
+                        if open.is_empty()
+                            && crate::decision_capture::mentions_decision_reference(&user_text)
+                        {
+                            if let Some(nb) = nb_for_res {
+                                let entry = crate::gvu::mistake_notebook::build_mistake_entry(
+                                    &agent_for_res,
+                                    &session_for_res,
+                                    crate::gvu::mistake_notebook::MistakeCategory::Capability,
+                                    &user_text,
+                                    "(referenced decision had no durable record)",
+                                    "使用者引用了某個方案/選項，但沒有任何未決決策可對應。\
+                                     不可從歷史記錄模糊比對臆測；應承認缺漏並向使用者確認。",
+                                    None,
+                                );
+                                if let Err(e) = nb.record(&entry) {
+                                    tracing::warn!(error = %e, "decision gap: record mistake failed");
+                                } else {
+                                    let _ = rt.block_on(crate::reflexion::maybe_consolidate(
+                                        &nb,
+                                        &db_path,
+                                        &agent_for_res,
+                                        crate::gvu::mistake_notebook::MistakeCategory::Capability,
+                                        crate::reflexion::DEFAULT_CONSOLIDATE_THRESHOLD,
+                                    ));
+                                    tracing::info!(
+                                        agent = %agent_for_res,
+                                        "RFC-24: recorded decision-gap learning signal (F2)"
+                                    );
+                                }
+                            }
+                        }
+                    })
+                    .await;
+                });
+            }
         }
 
         // ── RL trajectory collection (async, non-blocking) ─────────

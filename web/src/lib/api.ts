@@ -330,6 +330,19 @@ export interface TaskInfo {
   message_id?: string;
 }
 
+// RFC-24 Decision Continuity
+export interface DecisionOption {
+  key: string;
+  content: string;
+}
+
+export interface DecisionInfo {
+  id: string;
+  question: string;
+  options: DecisionOption[];
+  created_at?: string | null;
+}
+
 export interface TaskCreateParams {
   title: string;
   description?: string;
@@ -1734,6 +1747,18 @@ export const api = {
       client.call('tasks.remove', { task_id: taskId }) as Promise<{ success: boolean }>,
     assign: (taskId: string, agentId: string) =>
       client.call('tasks.assign', { task_id: taskId, agent_id: agentId }) as Promise<{ task: TaskInfo }>,
+  },
+  // RFC-24 Decision Continuity — an agent's still-open proposals awaiting a choice.
+  decisions: {
+    list: (agentId: string, limit?: number) =>
+      client.call('decisions.list', { agent_id: agentId, limit }) as Promise<{
+        decisions: DecisionInfo[];
+      }>,
+    dismiss: (agentId: string, decisionId: string) =>
+      client.call('decisions.dismiss', {
+        agent_id: agentId,
+        decision_id: decisionId,
+      }) as Promise<{ dismissed: boolean; decision_id: string }>,
   },
   activity: {
     list: (params?: { agent_id?: string; type?: ActivityType; limit?: number; offset?: number }) =>

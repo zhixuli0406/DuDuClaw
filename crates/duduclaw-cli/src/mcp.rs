@@ -221,6 +221,22 @@ const TOOLS: &[ToolDef] = &[
         description: "Count semantic conflicts — high-importance episodic memories not yet consolidated into semantic knowledge",
         params: &[],
     },
+    // ── Decision Continuity (RFC-24) ────────────────────────────
+    ToolDef {
+        name: "decision_list",
+        description: "List YOUR currently-open decisions (proposals you offered the user that are still awaiting a choice). Read-only. Use to recall what '方案 C' refers to before acting.",
+        params: &[
+            ParamDef { name: "limit", description: "Max decisions to return (default 10, max 50)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "decision_resolve",
+        description: "Resolve one of YOUR open decisions to a chosen option after the user picks (e.g. they reply '用方案 C'). Look up the decision id from the '## 待決事項 (Open Decisions)' section in your prompt. Marks the decision resolved, records the choice as a durable fact, and returns the chosen option's content so you can act on it. You can only resolve your own decisions.",
+        params: &[
+            ParamDef { name: "decision_id", description: "The decision id (the value after 'decision:' in the Open Decisions section)", required: true },
+            ParamDef { name: "chosen_key", description: "The option key the user picked (e.g. 'A', 'C', '1')", required: true },
+        ],
+    },
     // ── Sub-agent management tools ──────────────────────────────
     ToolDef {
         name: "create_agent",
@@ -1645,6 +1661,115 @@ async fn handle_memory_search_by_layer(
             "content": [{"type": "text", "text": format!("Error searching memory by layer: {e}")}],
             "isError": true
         }),
+    }
+}
+
+/// RFC-24: resolve an open decision to a chosen option.
+///
+/// The caller (`agent_id`) can only resolve its own decisions — the engine keys
+/// every decision by `agent_id`, so a foreign id resolves to `NotFound`
+/// (fail-closed). Returns the chosen content on success so the agent can act
+/// immediately without re-reading.
+async fn handle_decision_resolve(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    agent_id: &str,
+) -> Value {
+    let decision_id = params
+        .get("decision_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let chosen_key = params
+        .get("chosen_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if decision_id.is_empty() || chosen_key.is_empty() {
+        return tool_error("Error: decision_id and chosen_key are both required");
+    }
+
+    match memory.resolve_decision(agent_id, decision_id, chosen_key).await {
+        Ok(duduclaw_memory::DecisionResolveOutcome::Resolved {
+            chosen_key,
+            chosen_content,
+            question,
+        }) => serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "已解決決策 [{decision_id}]「{question}」→ 選擇 {chosen_key}：{chosen_content}"
+            )}],
+            "structuredContent": {
+                "ok": true,
+                "decision_id": decision_id,
+                "chosen_key": chosen_key,
+                "chosen_content": chosen_content,
+                "question": question,
+            }
+        }),
+        Ok(duduclaw_memory::DecisionResolveOutcome::NotFound) => serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "找不到決策 [{decision_id}](可能已過期、不存在、或不屬於你)。請勿臆測,改向使用者確認。"
+            )}],
+            "structuredContent": { "ok": false, "error": "not_found", "decision_id": decision_id },
+            "isError": true
+        }),
+        Ok(duduclaw_memory::DecisionResolveOutcome::AlreadyResolved(status)) => serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "決策 [{decision_id}] 已是「{status}」狀態,無需再次解決。"
+            )}],
+            "structuredContent": { "ok": false, "error": "already_resolved", "status": status },
+            "isError": true
+        }),
+        Ok(duduclaw_memory::DecisionResolveOutcome::UnknownKey { available }) => serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "選項 '{chosen_key}' 不在決策 [{decision_id}] 的選項中。可選:{}",
+                available.join(", ")
+            )}],
+            "structuredContent": { "ok": false, "error": "unknown_key", "available": available },
+            "isError": true
+        }),
+        Err(e) => tool_error(&format!("Error resolving decision: {e}")),
+    }
+}
+
+/// RFC-24: list the caller's currently-open decisions (read-only).
+async fn handle_decision_list(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    agent_id: &str,
+) -> Value {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10)
+        .clamp(1, 50) as usize;
+    match memory.list_open_decisions(agent_id, limit).await {
+        Ok(decisions) => {
+            if decisions.is_empty() {
+                return serde_json::json!({
+                    "content": [{"type": "text", "text": "目前沒有未決決策。"}],
+                    "structuredContent": { "decisions": [] }
+                });
+            }
+            let text = decisions
+                .iter()
+                .map(|d| {
+                    let opts = d
+                        .options
+                        .iter()
+                        .map(|(k, c)| format!("  - {k}：{c}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("[decision:{}] {}\n{}", d.id, d.question, opts)
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            serde_json::json!({
+                "content": [{"type": "text", "text": text}],
+                "structuredContent": { "decisions": decisions }
+            })
+        }
+        Err(e) => tool_error(&format!("Error listing decisions: {e}")),
     }
 }
 
@@ -6651,6 +6776,8 @@ pub(crate) async fn handle_tools_call(
         "memory_successful_conversations" => handle_memory_successful_conversations(&arguments, memory, default_agent).await,
         "memory_episodic_pressure" => handle_memory_episodic_pressure(&arguments, memory, default_agent).await,
         "memory_consolidation_status" => handle_memory_consolidation_status(memory, default_agent).await,
+        "decision_list" => handle_decision_list(&arguments, memory, default_agent).await,
+        "decision_resolve" => handle_decision_resolve(&arguments, memory, default_agent).await,
         "memory_improve" => crate::mcp_memory_handlers::handle_memory_improve(&arguments, memory, ns_ctx).await,
         "plan_start" => crate::mcp_planner::handle_plan_start(&arguments, home_dir, default_agent).await,
         "send_to_agent" => handle_send_to_agent(&arguments, home_dir, default_agent).await,
