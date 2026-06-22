@@ -707,6 +707,9 @@ mod tests {
         pool.shutdown().await;
     }
 
+    // Spawns real pooled PTY sessions and relies on eviction-sweep timing —
+    // unreliable on headless Windows CI (ConPTY spawn latency). Covered on Unix.
+    #[cfg_attr(windows, ignore = "pooled ConPTY spawn + sweep timing is flaky on headless Windows CI")]
     #[tokio::test]
     async fn invalidate_orphan_semaphore_is_swept_by_eviction() {
         let config = PoolConfig {

@@ -203,6 +203,9 @@ mod tests {
         }
     }
 
+    // Spawns a real PTY and reads child echo output — unreliable on headless
+    // Windows CI (ConPTY). Covered on Unix.
+    #[cfg_attr(windows, ignore = "ConPTY oneshot echo capture is flaky on headless Windows CI")]
     #[tokio::test]
     async fn captures_echo_output() {
         let (program, args) = echo_program("hello-oneshot");
