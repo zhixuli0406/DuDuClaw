@@ -99,14 +99,14 @@ cosign verify-blob \
 
 ---
 
-> 🎉 **v1.24.0 — Antigravity CLI（`agy`）ランタイム対応 · PtyPool の Claude 固定を解除**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.24.0)）
+> 🎉 **v1.25.0 — ブラウザ優先のオンボーディング + ガイド付きツアー**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.25.0)）
 >
-> Google は 2026-06-18 に個人向け Gemini CLI を廃止し、**Antigravity CLI（`agy`）**へ移行しました。本リリースは `agy` を一級のマルチランタイムバックエンドとして組み込み、PtyPool / cli-worker 層を Claude 固定から解放します——4 つの CLI バックエンドすべてが実際の呼び出しポイントを持ちます。
+> 初回セットアップがターミナルから dashboard へ移行：新規インストールは温かいガイド付きフロー（「👋 最初の Agent を作りましょう」）に直接起動し、最初の Agent 作成後にスキップ可能な主要ページのツアーを案内します。`duduclaw onboard` CLI ウィザードは残しつつソフトに非推奨化。
 >
-> - **Antigravity（`agy`）ランタイム** — `RuntimeType::Antigravity`、ワンショット `agy -p` で駆動（実バイナリに対してエンドツーエンド検証済み）。バイナリ自動解決（PATH → `~/.local/bin/agy`）、システムプロンプト + 履歴をプロンプトに埋め込み（agy に `--system` フラグなし）、CJK セーフな切り詰め、ヒューリスティックなトークン推定；エージェントのディレクトリを agy の `trustedWorkspaces` に事前登録（クロスプロセスロック）し、ヘッドレスのサブプロセスが信頼ダイアログでハングしないようにする
-> - **PtyPool / worker の固定解除** — `CliKind::Antigravity` を追加；`which_codex / which_gemini / which_agy` の探索；`resolve_program` と worker spawn が 4 つの CliKind すべてを解決；`cli_kind_for_provider()` が `[runtime] provider` から種別を導出し、ハードコードされた 2 箇所の `CliKind::Claude` を置き換え
-> - **対話型 REPL は Claude 専用のまま**（設計上）：非 Claude プロバイダはワンショットの `runtime_dispatch` 経路を通る。調査の結果、agy の全画面 alt-screen TUI と system-prompt フラグの欠如により、sentinel プロトコルは不適切かつ不要（`agy -p` で十分）
-> - **互換性** — 旧 `gemini` CLI バックエンドは有料 `GEMINI_API_KEY` / エンタープライズ利用者向けに維持；ドキュメントは development-guide §1.4 と agent.toml テンプレート
+> - **Dashboard 初回ウィザード**（`WelcomePage`）— 3 ステップ：ようこそ → AI バックエンド選択 → Agent 命名。5 つのバックエンド経路がそれぞれ正しい設定に対応：Claude サブスクリプション（OAuth）、Claude API キー、**汎用 API（OpenAI 互換：OpenAI / vLLM / Ollama / llamafile / Exo …）**、ローカルモデル、その他の CLI（Codex / Gemini / Antigravity）
+> - **`FirstRunGate`** — Agent ゼロのインストールは自動的に `/welcome` へ誘導（ループ安全；新しい agents-store `loaded` フラグで一覧解決前のちらつき誤誘導を防止）
+> - **ガイド付きツアー**（`GuidedTour`、軽量自作スポットライト、依存追加なし）— 最初の Agent 作成後に案内し、主要ページを巡回、いつでも `Esc` でスキップ可、ユーザーごとに一度だけ表示（localStorage）、設定から再生可能；サイドバーのリンクに `data-tour` アンカー
+> - **`runtime.detect` RPC + 設定ゼロ起動** — インストール済み CLI（claude / codex / gemini / antigravity）+ Claude OAuth 状態を検出してバックエンドの「検出済み / 未インストール」バッジを駆動；`duduclaw run` は新規インストールで最小 config を自動生成し dashboard に直接起動（「先に `onboard` を実行」のハードストップを廃止）；`agents.create` は従来無視されていた `soul` を反映し、作成時に `[runtime]` を書き込む
 
 
 
@@ -115,8 +115,9 @@ https://github.com/user-attachments/assets/30406ad1-4595-43ce-8c08-dba8f0ca9683
 
 
 <details>
-<summary><strong>v1.9.4 → v1.23.x 累積ハイライト</strong></summary>
+<summary><strong>v1.9.4 → v1.24.x 累積ハイライト</strong></summary>
 
+- **v1.24.0** — Antigravity CLI（`agy`）ランタイム対応 · PtyPool の Claude 固定を解除：`RuntimeType::Antigravity` を追加（ワンショット `agy -p`、バイナリ自動解決、システムプロンプト + 履歴の埋め込み、CJK セーフな切り詰め、`trustedWorkspaces` 事前登録）；`CliKind::Antigravity` を PtyPool / worker spawn に接続、`cli_kind_for_provider()` が `[runtime] provider` から種別を導出；対話型 REPL は Claude 専用のまま（設計上）；旧 `gemini` バックエンドは有料 `GEMINI_API_KEY` / エンタープライズ向けに維持
 - **v1.23.0** — Decision Continuity（RFC-24）：エージェントが列挙式の選択肢（案 A/B/C）を提示した際、各選択肢を Temporal Memory の **semantic** 層に永続化（会話圧縮から独立）し、未決事項をターンごとに再注入；後から「案 C で」（別ターン / セッション / プロセス）と言われても、推測ではなく永続状態から解決。検出は決定論的でゼロ LLM；`[memory] decision_continuity = true` でエージェント単位の opt-in
 - **v1.22.0** — RFC-26 Live Forking（ラウンド 1–4）：実行中のタスクを N 個の競合ブランチに分岐し、それぞれ copy-on-write の隔離ワークスペースで異なる戦略を試行、AI judge が勝者を選定（`duduclaw-fork` + 6 つの MCP ツール + クロスプロセス `ForkStore` + `RotatingBranchExecutor` + `LiveAggregate` 予算プリエンプション）；スキル合成スケジューラ（W19-P1）；共有コンポーネントライブラリで再構築した Calm Glass ダッシュボード。いずれもデフォルト無効
 - **v1.21.0** — RFC-25 §5 フォローアップ：非 Claude（Codex / Gemini / OpenAI-compat）パスが 11 件の欠落をすべて解消して一級市民に（マルチターン文脈、コスト計測、keepalive、per-(home,provider) フェイルオーバー退避）；`release.sh` のマルチプラットフォーム版数同期 + ドリフト監査 + bump 後アサート + `verify`、`skip-existing` で PyPI が黙って凍結する問題を修正
