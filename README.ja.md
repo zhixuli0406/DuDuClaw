@@ -108,13 +108,11 @@ cosign verify-blob \
 > - **対話型 REPL は Claude 専用のまま**（設計上）：非 Claude プロバイダはワンショットの `runtime_dispatch` 経路を通る。調査の結果、agy の全画面 alt-screen TUI と system-prompt フラグの欠如により、sentinel プロトコルは不適切かつ不要（`agy -p` で十分）
 > - **互換性** — 旧 `gemini` CLI バックエンドは有料 `GEMINI_API_KEY` / エンタープライズ利用者向けに維持；ドキュメントは development-guide §1.4 と agent.toml テンプレート
 
-<div align="center">
-  <a href="https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.24.0/duduclaw-launch-v1.24.0.mp4">
-    <img src="docs/assets/brag-poster-v1.24.0.jpg" alt="DuDuClaw v1.24.0 ローンチ動画" width="720">
-  </a>
-  <br/>
-  <sub>▶ <strong>v1.24.0 ローンチ動画</strong>を見る（35 秒）· Antigravity runtime · Decision Continuity · Calm Glass</sub>
-</div>
+
+
+https://github.com/user-attachments/assets/30406ad1-4595-43ce-8c08-dba8f0ca9683
+
+
 
 <details>
 <summary><strong>v1.9.4 → v1.23.x 累積ハイライト</strong></summary>
