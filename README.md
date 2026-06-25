@@ -96,14 +96,14 @@ cosign verify-blob \
 
 ---
 
-> 🎉 **v1.24.0 — Antigravity CLI（`agy`）runtime 正式支援 · PtyPool 解除 Claude 綁定**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.24.0)）
+> 🎉 **v1.25.0 — 瀏覽器優先的首次設定引導 + 全頁面導覽**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.25.0)）
 >
-> Google 於 2026-06-18 退役個人版 Gemini CLI，改推 **Antigravity CLI（`agy`）**。本版把 `agy` 接成一等 multi-runtime 後端，並把 PtyPool / cli-worker 從寫死 Claude 解綁——四種 CLI 後端皆有真正的呼叫點。
+> 首次設定從終端機搬進 dashboard：全新安裝直接開機進入溫暖的引導流程（「👋 開始建立第一個 Agent 吧」），建立第一個 Agent 後再提供可隨時略過的全頁面導覽。`duduclaw onboard` CLI 精靈保留但軟淡出。
 >
-> - **Antigravity（`agy`）runtime** — `RuntimeType::Antigravity`，走 oneshot `agy -p`（已對真實二進位端到端驗證）。二進位自動解析（PATH → `~/.local/bin/agy`）、system prompt + 歷史內嵌（agy 無 `--system` 旗標）、CJK-safe 截斷、token 啟發式估算；自動把 agent 目錄預植進 agy 的 `trustedWorkspaces`（跨程序檔鎖）以免 headless 卡在信任提示
-> - **PtyPool / worker 解綁** — 新增 `CliKind::Antigravity`；`which_codex / which_gemini / which_agy` 探測；`resolve_program` 與 worker spawn 四種 CliKind 全接；`cli_kind_for_provider()` 依 `[runtime] provider` 推導，取代兩處寫死的 `CliKind::Claude`
-> - **互動 REPL 仍維持 Claude-only**（刻意）：非 Claude provider 走 oneshot `runtime_dispatch`。實測顯示 agy 的全螢幕 alt-screen TUI + 無 system-prompt 旗標讓 sentinel 協定既不適合也無必要（`agy -p` 已可用）
-> - **相容性** — 舊 `gemini` CLI 後端保留給付費 `GEMINI_API_KEY` / 企業版用戶；文件見 development-guide §1.4 與 agent.toml 範本
+> - **Dashboard 首次設定精靈**（`WelcomePage`）— 3 步：歡迎 → 選 AI 後端 → 命名 Agent。AI 後端 5 條路徑各自映射到正確設定：Claude 訂閱（OAuth）、Claude API 金鑰、**通用 API（OpenAI 相容：OpenAI / vLLM / Ollama / llamafile / Exo …）**、本地模型、其他 CLI（Codex / Gemini / Antigravity）
+> - **`FirstRunGate`** — 零 Agent 安裝自動導向 `/welcome`（防迴圈；新 agents-store `loaded` 旗標避免清單載入前的閃爍誤導）
+> - **全頁面導覽**（`GuidedTour`，輕量自製 spotlight、零相依）— 建立第一個 Agent 後詢問「要不要帶你逛一圈？」，帶使用者走過重要頁面，隨時可 `Esc` 略過，每位使用者只出現一次（localStorage），可於設定重新導覽；側欄連結帶 `data-tour` 錨點
+> - **`runtime.detect` RPC + 零設定開機** — 偵測已安裝 CLI（claude / codex / gemini / antigravity）+ Claude OAuth 狀態驅動後端「已偵測 / 未安裝」徽章；`duduclaw run` 在全新安裝自動寫最小 config 直接進 dashboard，不再硬擋要求先跑 `onboard`；`agents.create` 修了默默丟棄 `soul` 的既存 bug 並於建立時寫入 `[runtime]`
 
 
 
@@ -112,8 +112,9 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 
 
 <details>
-<summary><strong>v1.9.4 → v1.23.x 累積亮點</strong></summary>
+<summary><strong>v1.9.4 → v1.24.x 累積亮點</strong></summary>
 
+- **v1.24.0** — Antigravity CLI（`agy`）runtime 正式支援 · PtyPool 解除 Claude 綁定：新增 `RuntimeType::Antigravity`（oneshot `agy -p`、二進位自動解析、system prompt + 歷史內嵌、CJK-safe 截斷、預植 `trustedWorkspaces`）；`CliKind::Antigravity` 接上 PtyPool / worker spawn、`cli_kind_for_provider()` 依 `[runtime] provider` 推導；互動 REPL 仍 Claude-only（刻意）；舊 `gemini` 後端保留給付費 `GEMINI_API_KEY` / 企業版
 - **v1.23.0** — Decision Continuity（RFC-24）：當 agent 向使用者提出列舉式選項（方案 A/B/C），每個選項固化進 Temporal Memory 的 semantic 層（獨立於對話壓縮），待決事項回合間重新注入；稍後「用方案 C」（跨回合 / session / 程序）從持久狀態解析而非猜測。偵測確定性、零 LLM；per-agent opt-in `[memory] decision_continuity = true`
 - **v1.22.0** — RFC-26 Live Forking（round 1–4）：把進行中任務分叉成 N 個並行競爭分支、各自在 copy-on-write 隔離工作區嘗試不同策略、AI judge 挑勝者（`duduclaw-fork` + 6 MCP 工具 + 跨程序 `ForkStore` + `RotatingBranchExecutor` + `LiveAggregate` 預算搶占）；Skill 合成排程器（W19-P1）；Calm Glass dashboard 共用元件庫重構。皆預設關閉
 - **v1.21.0** — RFC-25 §5 收尾：非 Claude（Codex / Gemini / OpenAI-compat）路徑補齊全部 11 項缺口成為一等公民（多輪上下文、成本遙測、keepalive、per-(home,provider) failover 退避）；`release.sh` 多平台版本同步 + 漂移偵測 + bump 後 assert + `verify` 查 registry，修好 PyPI 被 `skip-existing` 靜默凍版的問題
