@@ -1,9 +1,20 @@
+import { useEffect } from 'react';
 import { Outlet, useLocation } from 'react-router';
 import { Sidebar } from './Sidebar';
 import { Header } from './Header';
+import { GuidedTour } from '@/components/tour/GuidedTour';
+import { TourPrompt } from '@/components/tour/TourPrompt';
+import { useTourStore } from '@/stores/tour-store';
 
 export function MainLayout() {
   const location = useLocation();
+  const hydrateTour = useTourStore((s) => s.hydrate);
+
+  // Restore the once-per-user tour state once the user id is known.
+  useEffect(() => {
+    hydrateTour();
+  }, [hydrateTour]);
+
   return (
     <div className="flex h-screen overflow-hidden">
       {/* Fixed ambient stage the glass surfaces refract */}
@@ -18,6 +29,8 @@ export function MainLayout() {
           </div>
         </main>
       </div>
+      <TourPrompt />
+      <GuidedTour />
     </div>
   );
 }

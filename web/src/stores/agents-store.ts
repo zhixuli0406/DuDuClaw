@@ -6,6 +6,10 @@ interface AgentsStore {
   readonly agents: ReadonlyArray<AgentDetail>;
   readonly selectedAgentId: string | null;
   readonly loading: boolean;
+  /** True once `fetchAgents` has resolved at least once. Distinguishes
+   *  "never loaded" from "loaded empty" so the first-run gate never redirects
+   *  on the initial empty array before the first list call returns. */
+  readonly loaded: boolean;
   readonly error: string | null;
   fetchAgents: () => Promise<void>;
   selectAgent: (id: string | null) => void;
@@ -32,14 +36,15 @@ export const useAgentsStore = create<AgentsStore>((set, get) => {
     agents: [],
     selectedAgentId: null,
     loading: false,
+    loaded: false,
     error: null,
     fetchAgents: async () => {
       set({ loading: true, error: null });
       try {
         const result = await api.agents.list();
-        set({ agents: result?.agents ?? [], loading: false });
+        set({ agents: result?.agents ?? [], loading: false, loaded: true });
       } catch (e) {
-        set({ error: String(e), loading: false });
+        set({ error: String(e), loading: false, loaded: true });
       }
     },
     selectAgent: (id) => set({ selectedAgentId: id }),

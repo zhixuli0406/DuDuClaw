@@ -910,7 +910,7 @@ export interface AgentOdooOverride {
 
 // ── RT: per-agent [runtime] ─────────────────────────────────────
 
-export type RuntimeProvider = 'claude' | 'codex' | 'gemini' | 'openai_compat';
+export type RuntimeProvider = 'claude' | 'codex' | 'gemini' | 'antigravity' | 'openai_compat';
 
 /** The `runtime` object accepted by `agents.update`. All fields optional —
  *  the backend only writes fields that are present. An empty `fallback`
@@ -921,6 +921,16 @@ export interface AgentRuntime {
   fallback?: string;
   pty_pool_enabled?: boolean;
   worker_managed?: boolean;
+}
+
+/** Result of `runtime.detect` — which AI backends are installed + Claude OAuth. */
+export interface RuntimeDetect {
+  claude_cli: boolean;
+  codex: boolean;
+  gemini: boolean;
+  antigravity: boolean;
+  claude_oauth: boolean;
+  claude_subscription: string | null;
 }
 
 // ── EVO: per-agent advanced [evolution] ─────────────────────────
@@ -1337,6 +1347,9 @@ export const api = {
       role?: string;
       trigger?: string;
       soul?: string;
+      /** Optional `[runtime]` written at create time (e.g. onboarding picks a
+       *  non-Claude backend). Omit ⇒ defaults to Claude. */
+      runtime?: AgentRuntime;
     }) =>
       client.call('agents.create', params) as Promise<{ success: boolean; agent: AgentInfo }>,
     delegate: (agentId: string, prompt: string) =>
@@ -1354,6 +1367,12 @@ export const api = {
       client.call('agents.update', { agent_id: agentId, ...fields }) as Promise<{ success: boolean }>,
     remove: (agentId: string) =>
       client.call('agents.remove', { agent_id: agentId }) as Promise<{ success: boolean }>,
+  },
+  runtime: {
+    /** Detect installed AI runtime CLIs + Claude OAuth — drives the onboarding
+     *  "choose your AI backend" picker. Presence booleans only, no secrets. */
+    detect: () =>
+      client.call('runtime.detect') as Promise<RuntimeDetect>,
   },
   channels: {
     status: () =>

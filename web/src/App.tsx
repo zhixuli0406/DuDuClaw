@@ -2,6 +2,7 @@ import { useEffect, lazy, Suspense } from 'react';
 import { Routes, Route } from 'react-router';
 import { MainLayout } from './components/layout/MainLayout';
 import { AuthGuard, RoleGuard } from './components/AuthGuard';
+import { FirstRunGate } from './components/FirstRunGate';
 import { LoginPage } from './pages/LoginPage';
 import { useConnectionStore } from './stores/connection-store';
 import { useAuthStore } from './stores/auth-store';
@@ -43,6 +44,7 @@ const OdooPage = lazyPage(() => import('./pages/OdooPage'), 'OdooPage');
 const InferencePage = lazyPage(() => import('./pages/InferencePage'), 'InferencePage');
 const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
 const OnboardWizardPage = lazyPage(() => import('./pages/OnboardWizardPage'), 'OnboardWizardPage');
+const WelcomePage = lazyPage(() => import('./pages/WelcomePage'), 'WelcomePage');
 
 /** Lightweight route-transition fallback while a lazy page chunk loads. */
 function PageFallback() {
@@ -79,6 +81,12 @@ export function App() {
           <Route path="wizard" element={<OnboardWizardPage />} />
           <Route element={<AuthGuard />}>
             <Route element={<MainLayout />}>
+              {/* First-run onboarding — mounted OUTSIDE FirstRunGate so the
+                  zero-agent redirect target itself is never gated (no loop). */}
+              <Route path="welcome" element={<WelcomePage />} />
+
+              {/* Everything else requires at least one agent to exist. */}
+              <Route element={<FirstRunGate />}>
               {/* Open to all authenticated users */}
               <Route index element={<DashboardPage />} />
               <Route path="webchat" element={<WebChatPage />} />
@@ -116,6 +124,7 @@ export function App() {
                 <Route path="inference" element={<InferencePage />} />
                 <Route path="users" element={<UsersPage />} />
               </Route>
+              </Route>{/* end FirstRunGate */}
             </Route>
           </Route>
         </Routes>

@@ -91,6 +91,7 @@ export function Sidebar() {
                       key={to}
                       to={to}
                       end={to === '/'}
+                      data-tour={`nav:${to}`}
                       className={({ isActive }) =>
                         cn(
                           'group relative flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',

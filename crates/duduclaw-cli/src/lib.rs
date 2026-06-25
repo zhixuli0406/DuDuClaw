@@ -1398,6 +1398,14 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
 
     let home = duduclaw_home();
 
+    // Soft-deprecation: the dashboard now handles first-run setup. This CLI
+    // wizard stays for headless/advanced use, but most users should just
+    // `duduclaw run` and onboard in the browser.
+    eprintln!(
+        "{}",
+        console::style("ℹ 提示：現在也可以直接 `duduclaw run`，在 dashboard 完成首次設定。").dim()
+    );
+
     // ── Pre-check: detect existing configuration ─────────────
     let config_exists = home.join("config.toml").exists();
     if config_exists {
@@ -2415,16 +2423,8 @@ max_active_skills = 5
 async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
     let home = duduclaw_home();
 
-    // Auto-onboard if config doesn't exist
-    if !home.join("config.toml").exists() {
-        if yes {
-            cmd_onboard(true).await?;
-        } else {
-            println!("No configuration found. Run `duduclaw onboard` first.");
-            return Ok(());
-        }
-    }
-
+    // Resolve bind/port first — they have no dependency on config.toml and the
+    // first-run bootstrap below needs to persist them into the minimal config.
     let bind = std::env::var("DUDUCLAW_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
     if bind.parse::<std::net::IpAddr>().is_err() {
         eprintln!("ERROR: Invalid bind address '{bind}'. Must be a valid IP (e.g. 127.0.0.1 or 0.0.0.0)");
@@ -2437,6 +2437,22 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
     if port == 0 {
         eprintln!("ERROR: Port 0 is not valid for a server. Use a port between 1024-65535.");
         std::process::exit(1);
+    }
+
+    // First run — no config yet. Instead of forcing the terminal `onboard`
+    // wizard, write a minimal valid config and boot straight into the
+    // dashboard, where the browser onboarding flow finishes setup. The gateway
+    // tolerates everything else being absent (defensive reads + default admin).
+    // `--yes` is irrelevant here: it only ever meant "don't prompt", which a
+    // zero-prompt bootstrap already satisfies.
+    let _ = yes;
+    if !home.join("config.toml").exists() {
+        duduclaw_core::write_minimal_config(&home, &bind, port)?;
+        println!(
+            "🐾 First run — created {}",
+            home.join("config.toml").display()
+        );
+        println!("   Finish setup in the dashboard: http://localhost:{port}\n");
     }
 
     println!("🐾 DuDuClaw Server Starting...");

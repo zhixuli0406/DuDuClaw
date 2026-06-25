@@ -4,6 +4,7 @@ import { useSearchParams } from 'react-router';
 import { cn } from '@/lib/utils';
 import { useSystemStore } from '@/stores/system-store';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useTourStore } from '@/stores/tour-store';
 import {
   api,
   type AutopilotRule,
@@ -120,6 +121,7 @@ export function SettingsPage() {
 function GeneralTab() {
   const intl = useIntl();
   const { status } = useSystemStore();
+  const startTour = useTourStore((s) => s.start);
   const [logLevel, setLogLevel] = useState('info');
   const [rotationStrategy, setRotationStrategy] = useState('priority');
   const [saving, setSaving] = useState(false);
@@ -194,6 +196,16 @@ function GeneralTab() {
             <option value="least_cost">Least Cost</option>
             <option value="failover">Failover</option>
           </select>
+        </div>
+
+        {/* Replay the guided tour */}
+        <div className="flex items-center justify-between border-b border-[var(--panel-border)] pb-3 last:border-0">
+          <span className="text-sm text-stone-600 dark:text-stone-400">
+            {intl.formatMessage({ id: 'settings.general.replayTour' })}
+          </span>
+          <Button variant="secondary" onClick={() => startTour()}>
+            {intl.formatMessage({ id: 'settings.general.replayTour.button' })}
+          </Button>
         </div>
 
         {/* Save button */}
