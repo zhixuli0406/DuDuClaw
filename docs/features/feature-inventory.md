@@ -106,6 +106,7 @@
 | GitHub Live Indexing | Search API with 24h local cache, weighted search |
 | Skill Marketplace | Web dashboard browsing, installation, security scanning |
 | Skill Auto-Synthesis | Gap accumulator → synthesize from episodic memory (Voyager-inspired) → sandbox trial with TTL → cross-agent graduation |
+| Skill Synthesis Scheduler (W19-P1, v1.22.0) | Runs the "conversation → skill" extraction autonomously on an interval — `config.toml [skill_synthesis] auto_run / dry_run / interval_hours / lookback_days` + dashboard `skill_synthesis.get/update` RPC; `skill_synthesis_threshold` is a `u32` count (fixed the registry scan rejecting `0.7`) |
 | Skill Security Scanner (Rust-native) | `skill_lifecycle::security_scanner` scans candidate skills, no Python dependency |
 
 ## Local Inference Engine
@@ -333,6 +334,7 @@
 |---------|-------------|
 | 23 Pages | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / KnowledgeHub / Odoo / Login / Users / Analytics / Export |
 | Tech Stack | React 19 + TypeScript + Tailwind CSS 4 + shadcn/ui, warm amber theme |
+| Calm Glass Design System (v1.22.0) | Shared `web/src/components/ui/` component library + `nav-model.ts` 6-group sidebar + `web/DESIGN.md` spec; every page rebuilt on the shared primitives with synchronized en/ja/zh i18n |
 | Real-time Log Streaming | BroadcastLayer tracing → WebSocket push |
 | Memory → Key Insights Tab | `key_facts` cards with access_count badge + timestamp + collapsible source metadata |
 | Memory → Evolution Tab | SOUL.md version history with pre/post metric deltas + status badges |

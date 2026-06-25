@@ -106,6 +106,7 @@
 | GitHub 即時索引 | Search API + 24h 本地快取 + 加權搜尋 |
 | 技能市集 | Web Dashboard 瀏覽、安裝、安全掃描 |
 | 技能自動合成 | 差距累積器 → 從情境記憶合成（Voyager 啟發）→ 沙箱試用（TTL）→ 跨 Agent 畢業 |
+| 技能合成排程器（W19-P1，v1.22.0）| 讓「對話 → skill」萃取依排程自主執行 — `config.toml [skill_synthesis] auto_run / dry_run / interval_hours / lookback_days` + dashboard `skill_synthesis.get/update` RPC；`skill_synthesis_threshold` 為 `u32` 計數（修好 registry 掃描拒絕 `0.7` 的型別錯誤）|
 | Skill 安全掃描器（Rust-native）| `skill_lifecycle::security_scanner` 掃描候選技能，無 Python 依賴 |
 
 ## 本地推論引擎
@@ -333,6 +334,7 @@
 |------|------|
 | 23 頁面 | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / KnowledgeHub / Odoo / Login / Users / Analytics / Export |
 | 技術棧 | React 19 + TypeScript + Tailwind CSS 4 + shadcn/ui，暖色 amber 主題 |
+| Calm Glass 設計系統（v1.22.0）| 共用 `web/src/components/ui/` 元件庫 + `nav-model.ts` 六分組側邊欄 + `web/DESIGN.md` 設計規範；全頁面以共用元件重構，en/ja/zh i18n 同步 |
 | 即時日誌串流 | BroadcastLayer tracing → WebSocket |
 | Memory Key Insights | `key_facts` 卡片 + access_count badge + 時間戳 + 來源 metadata |
 | Memory Evolution | SOUL.md 版本歷史 + 前後度量差異 + 狀態徽章 |
