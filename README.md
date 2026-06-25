@@ -6,24 +6,6 @@
 
 </div>
 
-<div align="center">
-
-### 🛠 Need a custom AI Agent built with the same engineering rigor?
-
-I'm available for freelance work — building **production-grade Agents**
-with multi-LLM routing, MCP integration, RAG, secrets vaults, and full
-observability. Same architecture standards as DuDuClaw.
-
-[**Hire me on Fiverr →**](https://www.fiverr.com/louis_li_0406/build-a-custom-ai-agent-with-claude-openai-or-gemini-for-your-workflow-fbf0)
-&nbsp;·&nbsp;
-[LinkedIn](https://www.linkedin.com/in/zhixuli0406/)
-&nbsp;·&nbsp;
-[Portfolio](https://github.com/zhixuli0406)
-
-</div>
-
----
-
 > **Multi-Runtime AI Agent Platform** — 統一 Claude / Codex / Gemini 三大 CLI，打造你的多通道 AI 助理
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
@@ -114,18 +96,20 @@ cosign verify-blob \
 
 ---
 
-> 🎉 **v1.22.0 — RFC-26 即時分支決戰正式發佈 · Skill 合成排程器 · Calm Glass dashboard**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.22.0)）
+> 🎉 **v1.24.0 — Antigravity CLI（`agy`）runtime 正式支援 · PtyPool 解除 Claude 綁定**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.24.0)）
 >
-> 三條主線：**RFC-26 Live Forking** 完成 round 1–4——把進行中的任務分叉成 N 個並行競爭分支、各自在 copy-on-write 隔離工作區嘗試不同策略，由 AI judge 挑出勝者；**Skill 合成排程器**（W19-P1）讓「對話 → skill」萃取自主週期執行；**Calm Glass dashboard** 以共用元件庫重構全頁面。三者皆預設關閉、可漸進啟用。
+> Google 於 2026-06-18 退役個人版 Gemini CLI，改推 **Antigravity CLI（`agy`）**。本版把 `agy` 接成一等 multi-runtime 後端，並把 PtyPool / cli-worker 從寫死 Claude 解綁——四種 CLI 後端皆有真正的呼叫點。
 >
-> - **Live Forking** — `duduclaw-fork` 引擎 + 6 個 MCP 工具 + 跨程序 SQLite `ForkStore` + `RotatingBranchExecutor`（每分支獨立帳號）+ `LiveAggregate` 跨分支聚合預算搶占（殺最貴的 in-flight 分支）+ native copy-on-write overlay（`clonefile` / `--reflink`）。預設關閉，`agent.toml [fork] enabled = true` 啟用
-> - **Skill 合成排程器** — `config.toml [skill_synthesis] auto_run/dry_run/interval_hours/lookback_days`，dashboard `skill_synthesis.get/update` RPC；`skill_synthesis_threshold` 改回 `u32`（修好 registry 掃描拒絕 `0.7` 的型別錯誤）
-> - **Calm Glass** — `web/src/components/ui/` 共用元件庫 + `nav-model.ts` 六分組側邊欄 + `web/DESIGN.md` 設計規範，三語 i18n 同步
-> - **文件** — 新增 10 篇功能深入文件（20–29）× en/ja/zh、補譯 16–19、`feature-inventory` 更新至 v1.22.0
+> - **Antigravity（`agy`）runtime** — `RuntimeType::Antigravity`，走 oneshot `agy -p`（已對真實二進位端到端驗證）。二進位自動解析（PATH → `~/.local/bin/agy`）、system prompt + 歷史內嵌（agy 無 `--system` 旗標）、CJK-safe 截斷、token 啟發式估算；自動把 agent 目錄預植進 agy 的 `trustedWorkspaces`（跨程序檔鎖）以免 headless 卡在信任提示
+> - **PtyPool / worker 解綁** — 新增 `CliKind::Antigravity`；`which_codex / which_gemini / which_agy` 探測；`resolve_program` 與 worker spawn 四種 CliKind 全接；`cli_kind_for_provider()` 依 `[runtime] provider` 推導，取代兩處寫死的 `CliKind::Claude`
+> - **互動 REPL 仍維持 Claude-only**（刻意）：非 Claude provider 走 oneshot `runtime_dispatch`。實測顯示 agy 的全螢幕 alt-screen TUI + 無 system-prompt 旗標讓 sentinel 協定既不適合也無必要（`agy -p` 已可用）
+> - **相容性** — 舊 `gemini` CLI 後端保留給付費 `GEMINI_API_KEY` / 企業版用戶；文件見 development-guide §1.4 與 agent.toml 範本
 
 <details>
-<summary><strong>v1.9.4 → v1.20.x 累積亮點</strong></summary>
+<summary><strong>v1.9.4 → v1.23.x 累積亮點</strong></summary>
 
+- **v1.23.0** — Decision Continuity（RFC-24）：當 agent 向使用者提出列舉式選項（方案 A/B/C），每個選項固化進 Temporal Memory 的 semantic 層（獨立於對話壓縮），待決事項回合間重新注入；稍後「用方案 C」（跨回合 / session / 程序）從持久狀態解析而非猜測。偵測確定性、零 LLM；per-agent opt-in `[memory] decision_continuity = true`
+- **v1.22.0** — RFC-26 Live Forking（round 1–4）：把進行中任務分叉成 N 個並行競爭分支、各自在 copy-on-write 隔離工作區嘗試不同策略、AI judge 挑勝者（`duduclaw-fork` + 6 MCP 工具 + 跨程序 `ForkStore` + `RotatingBranchExecutor` + `LiveAggregate` 預算搶占）；Skill 合成排程器（W19-P1）；Calm Glass dashboard 共用元件庫重構。皆預設關閉
 - **v1.21.0** — RFC-25 §5 收尾：非 Claude（Codex / Gemini / OpenAI-compat）路徑補齊全部 11 項缺口成為一等公民（多輪上下文、成本遙測、keepalive、per-(home,provider) failover 退避）；`release.sh` 多平台版本同步 + 漂移偵測 + bump 後 assert + `verify` 查 registry，修好 PyPI 被 `skip-existing` 靜默凍版的問題
 - **v1.20.0** — RFC-25 多模型解鎖 + A2A：「Multi-Runtime 四後端」過去是未編譯的孤兒程式碼，每條執行路徑都寫死 Claude。v1.20.0 把它接上電，所有呼叫 LLM 的子系統走單一 provider-agnostic choke-point（`runtime_dispatch::run_agent_prompt` + lazy 自動偵測的 `RuntimeRegistry`）；channel reply / GVU / 子 agent 派工在非 Claude provider 時走 choke-point（Claude 維持 OAuth 輪替 / PTY 路徑，零回歸）；ACP `tasks/send` 改為實際執行目標 agent 並正確回報 Failed / Completed；Phase 0 拆掉 GVU 演化模型硬鎖（reject → warn）
 
