@@ -1,6 +1,6 @@
 # DuDuClaw 完整功能清單
 
-> v1.21.1 | 最後更新：2026-06-21
+> v1.24.0 | 最後更新：2026-06-25
 
 ---
 
@@ -8,7 +8,7 @@
 
 | 功能 | 說明 |
 |------|------|
-| Multi-Runtime AI Agent 平台 | 統一 `AgentRuntime` trait — Claude / Codex / Gemini / OpenAI-compat 四後端自動偵測 |
+| Multi-Runtime AI Agent 平台 | 統一 `AgentRuntime` trait — Claude / Codex / Gemini / Antigravity (`agy`) / OpenAI-compat 五後端自動偵測 |
 | MCP Server（JSON-RPC 2.0） | 透過 stdin/stdout 向 AI Runtime 暴露 80+ 工具；註冊於 `<agent>/.mcp.json`（Claude CLI `-p` 僅讀取專案層級），gateway 啟動時自動建立/修復 |
 | ACP/A2A Server | `duduclaw acp-server` — stdio JSON-RPC 2.0，提供 `agent/discover` / `tasks/send` / `tasks/get` / `tasks/cancel`；輸出 `.well-known/agent.json` AgentCard；支援 Zed / JetBrains / Neovim IDE 整合 |
 | Agent 目錄結構 | `.claude/`、`.mcp.json`、`SOUL.md`、`CLAUDE.md`、`CONTRACT.toml`、`agent.toml`、`wiki/`、`SKILLS/`、`memory/`、`tasks/`、`state/` |
@@ -26,7 +26,8 @@
 |------|------|
 | Claude Runtime | Claude Code SDK (`claude` CLI) + JSONL streaming + `--resume` 原生多輪 |
 | Codex Runtime | OpenAI Codex CLI + `--json` streaming，以 `AGENTS.md` 檔案傳遞 system prompt |
-| Gemini Runtime | Google Gemini CLI + `--output-format stream-json`，以 `GEMINI_SYSTEM_MD` env 傳遞 system prompt，`--approval-mode yolo` |
+| Gemini Runtime | Google Gemini CLI + `--output-format stream-json`，以 `GEMINI_SYSTEM_MD` env 傳遞 system prompt，`--approval-mode yolo`。Google 於 2026-06-18 退役個人版 Gemini CLI 後，保留給付費 `GEMINI_API_KEY` 用戶 |
+| Antigravity Runtime（v1.24.0）| Google Antigravity CLI（`agy`，2026-06-18 Gemini CLI 後繼者），走 oneshot `agy -p --dangerously-skip-permissions --print-timeout 300s`。二進位自動解析（PATH → `~/.local/bin/agy`）；無 `--system` 旗標，故 system prompt + 歷史內嵌進 prompt（CJK-safe）；認證 `ANTIGRAVITY_API_KEY`；自動把 agent 目錄預植進 agy 的 `trustedWorkspaces`（跨程序檔鎖）以免 headless 卡在信任提示；token 用量為估算（print 模式無統計）|
 | OpenAI-compat Runtime | HTTP 端點（MiniMax / DeepSeek 等）REST API |
 | RuntimeRegistry | 自動偵測已安裝 CLI，per-agent `[runtime]` 設定 |
 | Cross-Provider Failover | `FailoverManager` 健康追蹤、冷卻、不可重試錯誤偵測 |
@@ -160,6 +161,7 @@
 | Action Claim Verifier | 工具呼叫聲明的簽章驗證 |
 | 容器沙盒 | Docker (Bollard) / Apple Container / WSL2 — `--network=none`、tmpfs、read-only rootfs、512MB limit |
 | Secret 洩漏掃描 | 20+ 模式（Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/DB URL 等）|
+| 敏感資料遮蔽（RFC-23，v1.14.0）| `duduclaw-redaction` crate — 內部資料（Odoo / shared wiki / file tools）以 `<REDACT:CATEGORY:hash8>` token 取代後才送 LLM，受信邊界（user channel reply、白名單工具 egress）自動還原；AES-256-GCM SQLite vault（per-agent 32-byte key，0o600）、TTL 7d 兩階段 GC、5 個內建 profile、五層 enable/disable resolver、JSONL audit 10MB rotation |
 
 ## 記憶系統
 
@@ -175,6 +177,7 @@
 | Temporal Memory（F1，v1.19.0）| `memories` 經冪等遷移新增時序/知識圖譜欄位（`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`）；`store_temporal()` 對同一 `(agent, subject, predicate)` 自動衝突解析並串接 supersession chain；`search()` 預設僅過濾現行有效列；`get_history()` / `get_at()` 提供鏈與時間點查詢 |
 | Reflexion Loop（F2，v1.19.0）| 橋接既有 `MistakeNotebook` — F2a 將近期未解決錯誤注入作答 prompt（`## Past Mistakes to Avoid`，CJK-safe 比對 + recency fallback）；F2b 將 ≥3 則同 `MistakeCategory` 錯誤整併為一條語意記憶規則（`reflexion.rs`）後標記來源已解決。觸發訊號 = `ErrorCategory` Significant/Critical（MetaCognition 自適應）|
 | `memory_fetch_batch`（F3，v1.19.0）| MCP 工具 + `get_by_ids` 一次以 ID 取回 ≤100 筆（命名空間/擁有權強制，部分命中 → `missing_ids`）|
+| Decision Continuity（RFC-24，v1.23.0）| 當 agent 提出列舉式選項（方案 A/B/C），每個選項固化進 Temporal Memory 的 **semantic** 層（獨立於對話壓縮），待決事項回合間重新注入；稍後「用方案 C」（跨回合 / session / 程序）從持久狀態解析而非猜測。偵測確定性、零 LLM；`decision_resolve` / `decision_list` MCP 工具 + Dashboard 面板 + Prometheus 計數器；per-agent opt-in `[memory] decision_continuity = true`（TTL `decision_ttl_days`，預設 7）|
 
 ## Git Worktree 隔離（v1.6.0）
 
@@ -282,6 +285,7 @@
 | 跨平台 PTY Pool（`duduclaw-cli-runtime`，v1.15.0）| 驅動真正的互動式 `claude` REPL（Win 10 1809+ 用 ConPTY、Unix 經 `portable-pty` 用 openpty），以 sentinel-framed in-band 回應協定 — 因應 Anthropic 對 OAuth 訂閱帳號封鎖 `claude -p`。預設關閉，per-agent 開啟 `[runtime] pty_pool_enabled = true` |
 | Worker Supervisor（`duduclaw-cli-worker`）| 受 `[runtime] worker_managed = true` 閘控的跨程序 worker 子程序；SIGTERM/SIGKILL 接入 gateway 優雅關機序列 |
 | `pty_runtime.rs` 轉接器 | `RuntimeMode::{FreshSpawn, PtyPool}` per-agent 路由，`acquire_and_invoke` 介面；OAuth → 互動式 REPL，API-key → `oneshot_pty_invoke + claude -p` |
+| 解除 Claude 綁定（v1.24.0）| 新增 `CliKind::Antigravity`；`which_codex` / `which_gemini` / `which_agy` 探測（與 `which_claude` 並列）；`resolve_program` + worker `spawn_session_default` 四種 CliKind 全接（不再回 `None`/reject）；`cli_kind_for_provider()` 依 `[runtime] provider` 推導 PtyPool 種別，取代兩處寫死的 `CliKind::Claude`。互動式 REPL 刻意維持 Claude-only（非 Claude provider 走 oneshot `runtime_dispatch`）|
 | Runtime 狀態端點 | `GET /api/runtime/status` 僅 loopback JSON（Phase 8.5）|
 | 可觀測性 | `pty_pool_*` Prometheus 計數器（acquires / cache-hit / spawn / eviction / invoke outcomes / duration histogram）、`worker_health_misses_total`、`worker_restarts_total`、`pty_pool_managed_worker_active` gauge |
 | 優雅 fallback | 所有 PTY 路徑出錯時退回舊版 `tokio::process::Command + claude -p` — worker 缺失 / pool 不健康 / spawn 失敗皆可恢復 |
