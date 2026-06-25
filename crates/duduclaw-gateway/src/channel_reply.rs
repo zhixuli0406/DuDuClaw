@@ -4917,11 +4917,20 @@ async fn invoke_pty_branch(
             "channel_reply: routing OAuth invoke through interactive PTY pool"
         );
         let _ = (system_prompt, home_dir, on_progress, capabilities);
+        // Unbind from hardcoded Claude: derive the PtyPool kind from the agent's
+        // configured provider. This OAuth interactive-REPL path is only reached
+        // for Claude today (non-Claude providers route through `runtime_dispatch`
+        // upstream), so this resolves to Claude in practice — the literal coupling
+        // is removed for when per-CLI REPLs land.
+        let cli_kind = work_dir
+            .map(crate::runtime_config::load_runtime_settings)
+            .and_then(|s| crate::pty_runtime::cli_kind_for_provider(s.provider))
+            .unwrap_or(duduclaw_cli_runtime::CliKind::Claude);
         // Round 4 deferred-cleanup (LOW F-3): use canonical options
         // entry point instead of the 7-positional-arg legacy variant.
         let acquire = crate::pty_runtime::AcquireOptions::new(
             agent_id,
-            duduclaw_cli_runtime::CliKind::Claude,
+            cli_kind,
             false, // bare_mode
         )
         .account_id(account_id.as_deref())

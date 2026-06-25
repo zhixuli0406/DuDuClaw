@@ -43,6 +43,10 @@ pub enum CliKind {
     Claude,
     Codex,
     Gemini,
+    /// Google Antigravity CLI (`agy`) — the 2026-06-18 successor to the personal
+    /// Gemini CLI. Driven via oneshot `agy -p` (no interactive-REPL protocol);
+    /// see `inject_protocol_args`.
+    Antigravity,
 }
 
 impl CliKind {
@@ -51,6 +55,7 @@ impl CliKind {
             CliKind::Claude => "claude",
             CliKind::Codex => "codex",
             CliKind::Gemini => "gemini",
+            CliKind::Antigravity => "antigravity",
         }
     }
 
@@ -59,6 +64,7 @@ impl CliKind {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
             "gemini" => Ok(Self::Gemini),
+            "antigravity" | "agy" => Ok(Self::Antigravity),
             other => Err(SessionError::UnknownCliKind(other.to_string())),
         }
     }
@@ -855,6 +861,13 @@ pub(crate) fn inject_protocol_args(args: &mut Vec<String>, kind: CliKind) {
             // surfaces its own flag conventions; not yet validated against
             // live binaries.
         }
+        CliKind::Antigravity => {
+            // Antigravity (`agy`) exposes NO system-prompt flag (verified against
+            // `agy --help` v1.0.12), so the sentinel bootstrap that Claude gets
+            // via `--append-system-prompt` has no equivalent here. agy is driven
+            // through the oneshot `agy -p` path (no persistent interactive REPL),
+            // which does not need the sentinel protocol — so this is a no-op.
+        }
     }
 }
 
@@ -997,9 +1010,16 @@ mod tests {
 
     #[test]
     fn cli_kind_round_trip() {
-        for k in [CliKind::Claude, CliKind::Codex, CliKind::Gemini] {
+        for k in [
+            CliKind::Claude,
+            CliKind::Codex,
+            CliKind::Gemini,
+            CliKind::Antigravity,
+        ] {
             assert_eq!(CliKind::parse(k.as_str()).unwrap(), k);
         }
+        // `agy` is an accepted alias for antigravity.
+        assert_eq!(CliKind::parse("agy").unwrap(), CliKind::Antigravity);
         assert!(matches!(
             CliKind::parse("nothing"),
             Err(SessionError::UnknownCliKind(_))
@@ -1234,8 +1254,11 @@ mod tests {
     }
 
     #[test]
-    fn inject_protocol_args_is_noop_for_codex_and_gemini() {
-        for kind in [CliKind::Codex, CliKind::Gemini] {
+    fn inject_protocol_args_is_noop_for_non_claude() {
+        // Codex / Gemini lack validated protocol injection; Antigravity has no
+        // system-prompt flag and is driven via oneshot `agy -p`. All three
+        // leave args untouched.
+        for kind in [CliKind::Codex, CliKind::Gemini, CliKind::Antigravity] {
             let mut args = vec!["--existing".to_string()];
             inject_protocol_args(&mut args, kind);
             assert_eq!(args, vec!["--existing".to_string()], "kind={kind:?}");

@@ -256,7 +256,8 @@ fn apply_capabilities_to_table(
 // readonly_project/timeout_ms/max_concurrent.
 
 /// Valid AI runtime providers (mirrors the `AgentRuntime` registry backends).
-const VALID_RUNTIME_PROVIDERS: &[&str] = &["claude", "codex", "gemini", "openai_compat"];
+const VALID_RUNTIME_PROVIDERS: &[&str] =
+    &["claude", "codex", "gemini", "antigravity", "openai_compat"];
 
 /// Validate + write the `[runtime]` section from the `runtime` params object.
 /// Fields: `provider` (enum), `fallback` (string), `pty_pool_enabled` (bool),
