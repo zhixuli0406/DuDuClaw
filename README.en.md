@@ -108,13 +108,11 @@ infrastructure work.
 > - **Interactive REPL stays Claude-only** (by design): non-Claude providers route through the oneshot `runtime_dispatch` path. Recon showed agy's full-screen alt-screen TUI + missing system-prompt flag make the sentinel protocol a poor and unnecessary fit (`agy -p` already works)
 > - **Compatibility** — the legacy `gemini` CLI backend is retained for paid `GEMINI_API_KEY` / enterprise users; docs in development-guide §1.4 and the agent.toml templates
 
-<div align="center">
-  <a href="https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.24.0/duduclaw-launch-v1.24.0.mp4">
-    <img src="docs/assets/brag-poster-v1.24.0.jpg" alt="DuDuClaw v1.24.0 launch video" width="720">
-  </a>
-  <br/>
-  <sub>▶ Watch the <strong>v1.24.0 launch video</strong> (35s) · Antigravity runtime · Decision Continuity · Calm Glass</sub>
-</div>
+
+
+https://github.com/user-attachments/assets/217f56aa-8b46-4c2a-85fa-62ee68c33a4c
+
+
 
 <details>
 <summary><strong>v1.9.4 → v1.23.x cumulative highlights</strong></summary>
