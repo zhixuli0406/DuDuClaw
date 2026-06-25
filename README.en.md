@@ -6,24 +6,6 @@
 
 </div>
 
-<div align="center">
-
-### 🛠 Need a custom AI Agent built with the same engineering rigor?
-
-I'm available for freelance work — building **production-grade Agents**
-with multi-LLM routing, MCP integration, RAG, secrets vaults, and full
-observability. Same architecture standards as DuDuClaw.
-
-[**Hire me on Fiverr →**](https://www.fiverr.com/louis_li_0406/build-a-custom-ai-agent-with-claude-openai-or-gemini-for-your-workflow-fbf0)
-&nbsp;·&nbsp;
-[LinkedIn](https://www.linkedin.com/in/zhixuli0406/)
-&nbsp;·&nbsp;
-[Portfolio](https://github.com/zhixuli0406)
-
-</div>
-
----
-
 > **Multi-Runtime AI Agent Platform** — unifying the three major CLIs (Claude / Codex / Gemini) to build your multi-channel AI assistant
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
@@ -117,18 +99,20 @@ infrastructure work.
 
 ---
 
-> 🎉 **v1.22.0 — RFC-26 Live Forking ships · Skill-synthesis scheduler · Calm Glass dashboard** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.22.0))
+> 🎉 **v1.24.0 — Antigravity CLI (`agy`) runtime · PtyPool unbound from Claude** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.24.0))
 >
-> Three headlines: **RFC-26 Live Forking** completes rounds 1–4 — split an in-flight task into N competing branches that explore different strategies in copy-on-write isolated workspaces and let an AI judge pick the winner; the **Skill-synthesis scheduler** (W19-P1) makes "conversation → skill" extraction run autonomously on an interval; and the **Calm Glass dashboard** rebuilds every page on a shared component library. All three are off by default and opt-in.
+> Google retired the personal-tier Gemini CLI on 2026-06-18 in favour of the **Antigravity CLI (`agy`)**. This release wires `agy` in as a first-class multi-runtime backend and unbinds the PtyPool / cli-worker layer from a hardcoded Claude — all four CLI backends now have real call points.
 >
-> - **Live Forking** — `duduclaw-fork` engine + 6 MCP tools + cross-process SQLite `ForkStore` + `RotatingBranchExecutor` (a distinct account per branch) + `LiveAggregate` cross-branch budget pre-emption (kills the priciest in-flight branch) + native copy-on-write overlay (`clonefile` / `--reflink`). Default off; enable per agent via `agent.toml [fork] enabled = true`
-> - **Skill-synthesis scheduler** — `config.toml [skill_synthesis] auto_run/dry_run/interval_hours/lookback_days` + dashboard `skill_synthesis.get/update` RPCs; `skill_synthesis_threshold` is back to a `u32` count (fixes the registry scan rejecting `0.7`)
-> - **Calm Glass** — shared `web/src/components/ui/` library + `nav-model.ts` 6-group sidebar + `web/DESIGN.md` spec, with synchronized en/ja/zh i18n
-> - **Docs** — 10 new feature deep-dives (20–29) × en/ja/zh, back-translated 16–19, `feature-inventory` refreshed to v1.22.0
+> - **Antigravity (`agy`) runtime** — `RuntimeType::Antigravity`, driven via oneshot `agy -p` (verified end-to-end against the real binary). Binary auto-resolve (PATH → `~/.local/bin/agy`), system prompt + history embedded in the prompt (agy has no `--system` flag), CJK-safe truncation, heuristic token estimation; pre-seeds the agent dir into agy's `trustedWorkspaces` (cross-process lock) so a headless subprocess never hangs on the trust prompt
+> - **PtyPool / worker unbinding** — `CliKind::Antigravity` added; `which_codex / which_gemini / which_agy` discovery; `resolve_program` and the worker spawn resolve all four CliKinds; `cli_kind_for_provider()` derives the kind from `[runtime] provider`, replacing the two hardcoded `CliKind::Claude` sites
+> - **Interactive REPL stays Claude-only** (by design): non-Claude providers route through the oneshot `runtime_dispatch` path. Recon showed agy's full-screen alt-screen TUI + missing system-prompt flag make the sentinel protocol a poor and unnecessary fit (`agy -p` already works)
+> - **Compatibility** — the legacy `gemini` CLI backend is retained for paid `GEMINI_API_KEY` / enterprise users; docs in development-guide §1.4 and the agent.toml templates
 
 <details>
-<summary><strong>v1.9.4 → v1.20.x cumulative highlights</strong></summary>
+<summary><strong>v1.9.4 → v1.23.x cumulative highlights</strong></summary>
 
+- **v1.23.0** — Decision Continuity (RFC-24): when an agent offers the user an enumerated choice (Option A/B/C), each option is persisted into the Temporal Memory **semantic** layer (independent of conversation compression) and open decisions are re-injected each turn; a later "use Option C" (new turn / session / process) resolves from durable state instead of being guessed. Detection is deterministic and zero-LLM; opt-in per agent via `[memory] decision_continuity = true`
+- **v1.22.0** — RFC-26 Live Forking (rounds 1–4): split an in-flight task into N competing branches that explore different strategies in copy-on-write isolated workspaces and let an AI judge pick the winner (`duduclaw-fork` + 6 MCP tools + cross-process `ForkStore` + `RotatingBranchExecutor` + `LiveAggregate` budget pre-emption); the Skill-synthesis scheduler (W19-P1); and the Calm Glass dashboard rebuilt on a shared component library. All off by default
 - **v1.21.0** — RFC-25 §5 followups: the non-Claude (Codex / Gemini / OpenAI-compat) path closes all 11 gaps to become first-class (multi-turn context, cost telemetry, keepalive, per-(home,provider) failover backoff); `release.sh` multi-platform version sync + drift audit + post-bump assertion + `verify`, fixing the `skip-existing` silent PyPI freeze
 - **v1.20.0** — RFC-25 Multi-Runtime Unlock + A2A: the "Multi-Runtime four-backend" abstraction was previously orphan, uncompiled source — every execution path hardcoded Claude. v1.20.0 wires it up and routes the LLM-calling subsystems through a single provider-agnostic choke-point (`runtime_dispatch::run_agent_prompt` + a lazily auto-detecting `RuntimeRegistry`); channel reply / GVU / sub-agent delegation route through the choke-point for non-Claude providers (Claude keeps its OAuth-rotation / PTY path, zero regression); ACP `tasks/send` actually runs the target agent and reports Failed / Completed; Phase 0 removed the GVU evolution-model hard-lock (reject → warn)
 

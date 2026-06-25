@@ -6,24 +6,6 @@
 
 </div>
 
-<div align="center">
-
-### 🛠 Need a custom AI Agent built with the same engineering rigor?
-
-I'm available for freelance work — building **production-grade Agents**
-with multi-LLM routing, MCP integration, RAG, secrets vaults, and full
-observability. Same architecture standards as DuDuClaw.
-
-[**Hire me on Fiverr →**](https://www.fiverr.com/louis_li_0406/build-a-custom-ai-agent-with-claude-openai-or-gemini-for-your-workflow-fbf0)
-&nbsp;·&nbsp;
-[LinkedIn](https://www.linkedin.com/in/zhixuli0406/)
-&nbsp;·&nbsp;
-[Portfolio](https://github.com/zhixuli0406)
-
-</div>
-
----
-
 > **Multi-Runtime AI Agent Platform** — Claude / Codex / Gemini の三大 CLI を統一し、あなたのマルチチャネル AI アシスタントを構築
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
@@ -117,18 +99,20 @@ cosign verify-blob \
 
 ---
 
-> 🎉 **v1.22.0 — RFC-26 ライブフォーク正式リリース · スキル合成スケジューラ · Calm Glass ダッシュボード**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.22.0)）
+> 🎉 **v1.24.0 — Antigravity CLI（`agy`）ランタイム対応 · PtyPool の Claude 固定を解除**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.24.0)）
 >
-> 3 つの目玉：**RFC-26 Live Forking** がラウンド 1–4 を完了——実行中のタスクを N 個の競合ブランチに分岐し、それぞれ copy-on-write の隔離ワークスペースで異なる戦略を試行、AI judge が勝者を選定。**スキル合成スケジューラ**（W19-P1）は「会話 → skill」抽出を一定間隔で自律実行。**Calm Glass ダッシュボード**は共有コンポーネントライブラリで全ページを再構築。いずれもデフォルト無効・opt-in です。
+> Google は 2026-06-18 に個人向け Gemini CLI を廃止し、**Antigravity CLI（`agy`）**へ移行しました。本リリースは `agy` を一級のマルチランタイムバックエンドとして組み込み、PtyPool / cli-worker 層を Claude 固定から解放します——4 つの CLI バックエンドすべてが実際の呼び出しポイントを持ちます。
 >
-> - **Live Forking** — `duduclaw-fork` エンジン + 6 つの MCP ツール + クロスプロセス SQLite `ForkStore` + `RotatingBranchExecutor`（ブランチごとに独立アカウント）+ `LiveAggregate` のクロスブランチ予算プリエンプション（最も高コストの in-flight ブランチを kill）+ ネイティブ copy-on-write overlay（`clonefile` / `--reflink`）。デフォルト無効、`agent.toml [fork] enabled = true` で有効化
-> - **スキル合成スケジューラ** — `config.toml [skill_synthesis] auto_run/dry_run/interval_hours/lookback_days` + ダッシュボード `skill_synthesis.get/update` RPC；`skill_synthesis_threshold` を `u32` カウントに戻す（registry スキャンが `0.7` を拒否する不具合を修正）
-> - **Calm Glass** — 共有 `web/src/components/ui/` ライブラリ + `nav-model.ts` の 6 グループサイドバー + `web/DESIGN.md` 仕様、en/ja/zh の i18n 同期
-> - **ドキュメント** — 機能詳細 10 本（20–29）× en/ja/zh を新規追加、16–19 を翻訳、`feature-inventory` を v1.22.0 に更新
+> - **Antigravity（`agy`）ランタイム** — `RuntimeType::Antigravity`、ワンショット `agy -p` で駆動（実バイナリに対してエンドツーエンド検証済み）。バイナリ自動解決（PATH → `~/.local/bin/agy`）、システムプロンプト + 履歴をプロンプトに埋め込み（agy に `--system` フラグなし）、CJK セーフな切り詰め、ヒューリスティックなトークン推定；エージェントのディレクトリを agy の `trustedWorkspaces` に事前登録（クロスプロセスロック）し、ヘッドレスのサブプロセスが信頼ダイアログでハングしないようにする
+> - **PtyPool / worker の固定解除** — `CliKind::Antigravity` を追加；`which_codex / which_gemini / which_agy` の探索；`resolve_program` と worker spawn が 4 つの CliKind すべてを解決；`cli_kind_for_provider()` が `[runtime] provider` から種別を導出し、ハードコードされた 2 箇所の `CliKind::Claude` を置き換え
+> - **対話型 REPL は Claude 専用のまま**（設計上）：非 Claude プロバイダはワンショットの `runtime_dispatch` 経路を通る。調査の結果、agy の全画面 alt-screen TUI と system-prompt フラグの欠如により、sentinel プロトコルは不適切かつ不要（`agy -p` で十分）
+> - **互換性** — 旧 `gemini` CLI バックエンドは有料 `GEMINI_API_KEY` / エンタープライズ利用者向けに維持；ドキュメントは development-guide §1.4 と agent.toml テンプレート
 
 <details>
-<summary><strong>v1.9.4 → v1.20.x 累積ハイライト</strong></summary>
+<summary><strong>v1.9.4 → v1.23.x 累積ハイライト</strong></summary>
 
+- **v1.23.0** — Decision Continuity（RFC-24）：エージェントが列挙式の選択肢（案 A/B/C）を提示した際、各選択肢を Temporal Memory の **semantic** 層に永続化（会話圧縮から独立）し、未決事項をターンごとに再注入；後から「案 C で」（別ターン / セッション / プロセス）と言われても、推測ではなく永続状態から解決。検出は決定論的でゼロ LLM；`[memory] decision_continuity = true` でエージェント単位の opt-in
+- **v1.22.0** — RFC-26 Live Forking（ラウンド 1–4）：実行中のタスクを N 個の競合ブランチに分岐し、それぞれ copy-on-write の隔離ワークスペースで異なる戦略を試行、AI judge が勝者を選定（`duduclaw-fork` + 6 つの MCP ツール + クロスプロセス `ForkStore` + `RotatingBranchExecutor` + `LiveAggregate` 予算プリエンプション）；スキル合成スケジューラ（W19-P1）；共有コンポーネントライブラリで再構築した Calm Glass ダッシュボード。いずれもデフォルト無効
 - **v1.21.0** — RFC-25 §5 フォローアップ：非 Claude（Codex / Gemini / OpenAI-compat）パスが 11 件の欠落をすべて解消して一級市民に（マルチターン文脈、コスト計測、keepalive、per-(home,provider) フェイルオーバー退避）；`release.sh` のマルチプラットフォーム版数同期 + ドリフト監査 + bump 後アサート + `verify`、`skip-existing` で PyPI が黙って凍結する問題を修正
 - **v1.20.0** — RFC-25 マルチランタイム解放 + A2A：「Multi-Runtime 四バックエンド」はこれまでコンパイルされない孤立ソースで、すべての実行パスが Claude をハードコードしていました。v1.20.0 はこれを配線し、LLM を呼ぶサブシステムを単一の provider-agnostic な choke-point（`runtime_dispatch::run_agent_prompt` + 遅延自動検出する `RuntimeRegistry`）に通します。channel reply / GVU / サブ agent 委譲は非 Claude provider で choke-point を通り（Claude は OAuth ローテーション / PTY パスを維持、リグレッションなし）；ACP `tasks/send` がターゲット agent を実際に実行し Failed / Completed を報告；Phase 0 で GVU 進化モデルのハードロックを撤廃（reject → warn）
 
