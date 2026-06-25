@@ -1,6 +1,6 @@
 # DuDuClaw 全機能一覧
 
-> v1.21.1 | 最終更新：2026-06-21
+> v1.24.0 | 最終更新：2026-06-25
 
 ---
 
@@ -8,7 +8,7 @@
 
 | 機能 | 説明 |
 |------|------|
-| マルチランタイム AI エージェントプラットフォーム | 統一 `AgentRuntime` trait — Claude / Codex / Gemini / OpenAI-compat 4 バックエンド自動検出 |
+| マルチランタイム AI エージェントプラットフォーム | 統一 `AgentRuntime` trait — Claude / Codex / Gemini / Antigravity (`agy`) / OpenAI-compat 5 バックエンド自動検出 |
 | MCP Server（JSON-RPC 2.0）| stdin/stdout 経由で AI Runtime に 80+ ツールを公開。`<agent>/.mcp.json` に登録（Claude CLI `-p` はプロジェクトレベルのみ読取）、起動時に自動生成/修復 |
 | ACP/A2A Server | `duduclaw acp-server` — stdio JSON-RPC 2.0（`agent/discover` / `tasks/send` / `tasks/get` / `tasks/cancel`）、`.well-known/agent.json` AgentCard、Zed / JetBrains / Neovim IDE 統合 |
 | エージェントディレクトリ構造 | `.claude/`, `.mcp.json`, `SOUL.md`, `CLAUDE.md`, `CONTRACT.toml`, `agent.toml`, `wiki/`, `SKILLS/`, `memory/`, `tasks/`, `state/` |
@@ -26,7 +26,8 @@
 |------|------|
 | Claude Runtime | Claude Code SDK (`claude` CLI) + JSONL ストリーミング + `--resume` ネイティブマルチターン |
 | Codex Runtime | OpenAI Codex CLI + `--json` ストリーミング、`AGENTS.md` で system prompt を渡す |
-| Gemini Runtime | Google Gemini CLI + `--output-format stream-json`、`GEMINI_SYSTEM_MD` env で system prompt、`--approval-mode yolo` |
+| Gemini Runtime | Google Gemini CLI + `--output-format stream-json`、`GEMINI_SYSTEM_MD` env で system prompt、`--approval-mode yolo`。Google が 2026-06-18 に個人向け Gemini CLI を廃止後、有料 `GEMINI_API_KEY` 利用者向けに維持 |
+| Antigravity Runtime（v1.24.0）| Google Antigravity CLI（`agy`、2026-06-18 の Gemini CLI 後継）、ワンショット `agy -p --dangerously-skip-permissions --print-timeout 300s` で駆動。バイナリ自動解決（PATH → `~/.local/bin/agy`）；`--system` フラグがないため system prompt + 履歴をプロンプトに埋め込み（CJK セーフ）；認証 `ANTIGRAVITY_API_KEY`；エージェントのディレクトリを agy の `trustedWorkspaces` に事前登録（クロスプロセスロック）し、ヘッドレスの信頼ダイアログでのハングを回避；トークン使用量は推定（print モードは統計なし）|
 | OpenAI 互換 Runtime | HTTP エンドポイント（MiniMax / DeepSeek 等）REST API |
 | RuntimeRegistry | インストール済み CLI の自動検出、per-agent `[runtime]` 設定 |
 | クロスプロバイダーフェイルオーバー | `FailoverManager` ヘルス追跡、クールダウン、再試行不可エラー検出 |
@@ -160,6 +161,7 @@
 | Action Claim Verifier | ツール実行クレームの署名検証 |
 | コンテナサンドボックス | Docker (Bollard) / Apple Container / WSL2 — `--network=none`、tmpfs、read-only rootfs、512MB 上限 |
 | シークレット漏洩スキャナ | 20+ パターン（Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/DB URL 等） |
+| 機密データのリダクション（RFC-23、v1.14.0）| `duduclaw-redaction` crate — 内部データ（Odoo / shared wiki / file tools）を `<REDACT:CATEGORY:hash8>` トークンに置換してから LLM へ送り、信頼境界（user channel reply、許可リストツールの egress）で自動復元；AES-256-GCM SQLite vault（per-agent 32-byte key、0o600）、TTL 7d の 2 段階 GC、5 つの組み込みプロファイル、5 層の enable/disable リゾルバ、JSONL 監査ログ 10MB ローテーション |
 
 ## メモリシステム
 
@@ -175,6 +177,7 @@
 | Temporal Memory（F1、v1.19.0）| `memories` に冪等マイグレーションで時系列/ナレッジグラフ列（`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`）を追加；`store_temporal()` が同一 `(agent, subject, predicate)` を自動コンフリクト解決し supersession chain を連結；`search()` はデフォルトで現行有効行のみフィルタ；`get_history()` / `get_at()` がチェーンとポイントインタイムを提供 |
 | Reflexion Loop（F2、v1.19.0）| 既存 `MistakeNotebook` をブリッジ — F2a は未解決の最近のミスを回答プロンプトに注入（`## Past Mistakes to Avoid`、CJK セーフ照合 + recency フォールバック）；F2b は同一 `MistakeCategory` のミス ≥3 件を 1 つの意味メモリルールに統合（`reflexion.rs`）し元を解決済みに。トリガー = `ErrorCategory` Significant/Critical（MetaCognition 適応） |
 | `memory_fetch_batch`（F3、v1.19.0）| MCP ツール + `get_by_ids` が ≤100 件を ID で一括取得（名前空間/所有権を強制、部分ヒット → `missing_ids`） |
+| Decision Continuity（RFC-24、v1.23.0）| エージェントが列挙式の選択肢（案 A/B/C）を提示した際、各選択肢を Temporal Memory の **semantic** 層に永続化（会話圧縮から独立）し、未決事項をターンごとに再注入；後から「案 C で」（別ターン / セッション / プロセス）と言われても推測ではなく永続状態から解決。検出は決定論的でゼロ LLM；`decision_resolve` / `decision_list` MCP ツール + ダッシュボードパネル + Prometheus カウンタ；`[memory] decision_continuity = true` でエージェント単位の opt-in（TTL `decision_ttl_days`、既定 7）|
 
 ## Git Worktree 分離（v1.6.0）
 
@@ -282,6 +285,7 @@
 | クロスプラットフォーム PTY Pool（`duduclaw-cli-runtime`、v1.15.0）| 本物のインタラクティブ `claude` REPL を駆動（Win 10 1809+ は ConPTY、Unix は `portable-pty` 経由 openpty）、sentinel-framed in-band レスポンスプロトコル — Anthropic が OAuth サブスク口座向けに `claude -p` をブロックした問題に対応。デフォルトオフ、per-agent オプトイン `[runtime] pty_pool_enabled = true` |
 | Worker Supervisor（`duduclaw-cli-worker`）| `[runtime] worker_managed = true` でゲートされる out-of-process worker サブプロセス；SIGTERM/SIGKILL を gateway の優雅シャットダウンに連動 |
 | `pty_runtime.rs` アダプタ | `RuntimeMode::{FreshSpawn, PtyPool}` per-agent ルーティング、`acquire_and_invoke` サーフェス；OAuth → インタラクティブ REPL、API-key → `oneshot_pty_invoke + claude -p` |
+| Claude 固定の解除（v1.24.0）| `CliKind::Antigravity` を追加；`which_codex` / `which_gemini` / `which_agy` の探索（`which_claude` と並列）；`resolve_program` + worker `spawn_session_default` が 4 つの CliKind すべてを解決（`None`/reject なし）；`cli_kind_for_provider()` が `[runtime] provider` から PtyPool の種別を導出し、ハードコードされた 2 箇所の `CliKind::Claude` を置き換え。対話型 REPL は設計上 Claude 専用のまま（非 Claude プロバイダはワンショット `runtime_dispatch` 経路）|
 | Runtime ステータスエンドポイント | `GET /api/runtime/status` loopback 限定 JSON（Phase 8.5）|
 | 可観測性 | `pty_pool_*` Prometheus カウンタ（acquires / cache-hit / spawn / eviction / invoke outcomes / duration histogram）、`worker_health_misses_total`、`worker_restarts_total`、`pty_pool_managed_worker_active` ゲージ |
 | 優雅なフォールバック | 全 PTY パスはエラー時にレガシー `tokio::process::Command + claude -p` へフォールバック — worker 欠如 / pool 不健全 / spawn 失敗は回復可能 |

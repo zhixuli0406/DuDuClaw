@@ -1,6 +1,6 @@
 # DuDuClaw Complete Feature Inventory
 
-> v1.21.1 | Last updated: 2026-06-21
+> v1.24.0 | Last updated: 2026-06-25
 
 ---
 
@@ -8,7 +8,7 @@
 
 | Feature | Description |
 |---------|-------------|
-| Multi-Runtime AI Agent Platform | Unified `AgentRuntime` trait — Claude / Codex / Gemini / OpenAI-compat four backends with auto-detection |
+| Multi-Runtime AI Agent Platform | Unified `AgentRuntime` trait — Claude / Codex / Gemini / Antigravity (`agy`) / OpenAI-compat five backends with auto-detection |
 | MCP Server (JSON-RPC 2.0) | Exposes 80+ tools to AI Runtime via stdin/stdout; registered at `<agent>/.mcp.json` (v1.8.5 — Claude CLI `-p` only reads project-level), gateway auto-creates/repairs on startup |
 | ACP/A2A Server | `duduclaw acp-server` — stdio JSON-RPC 2.0 with `agent/discover` / `tasks/send` / `tasks/get` / `tasks/cancel`; `.well-known/agent.json` AgentCard; IDE integration (Zed / JetBrains / Neovim) |
 | Agent Directory Structure | `.claude/`, `.mcp.json`, `SOUL.md`, `CLAUDE.md`, `CONTRACT.toml`, `agent.toml`, `wiki/`, `SKILLS/`, `memory/`, `tasks/`, `state/` |
@@ -26,7 +26,8 @@
 |---------|-------------|
 | Claude Runtime | Claude Code SDK (`claude` CLI) with JSONL streaming + `--resume` multi-turn |
 | Codex Runtime | OpenAI Codex CLI with `--json` streaming events, `AGENTS.md` file for system prompt |
-| Gemini Runtime | Google Gemini CLI with `--output-format stream-json`, `GEMINI_SYSTEM_MD` env var for system prompt, `--approval-mode yolo` |
+| Gemini Runtime | Google Gemini CLI with `--output-format stream-json`, `GEMINI_SYSTEM_MD` env var for system prompt, `--approval-mode yolo`. Retained for paid `GEMINI_API_KEY` users after Google retired the personal-tier Gemini CLI on 2026-06-18 |
+| Antigravity Runtime (v1.24.0) | Google Antigravity CLI (`agy`, the 2026-06-18 Gemini-CLI successor), driven via oneshot `agy -p --dangerously-skip-permissions --print-timeout 300s`. Binary auto-resolve (PATH → `~/.local/bin/agy`); no `--system` flag so the system prompt + history are embedded in the prompt (CJK-safe); auth `ANTIGRAVITY_API_KEY`; auto-pre-seeds the agent dir into agy's `trustedWorkspaces` (cross-process lock) to avoid a headless trust-prompt hang; token usage estimated (print mode exposes no stats) |
 | OpenAI-compat Runtime | HTTP endpoint (MiniMax / DeepSeek / etc.) via REST API |
 | RuntimeRegistry | Auto-detection of installed CLIs, per-agent `[runtime]` config |
 | Cross-Provider Failover | `FailoverManager` health tracking, cooldown, non-retryable error detection |
@@ -160,6 +161,7 @@
 | Action Claim Verifier | Signature validation for tool execution claims |
 | Container Sandbox | Docker (Bollard) / Apple Container / WSL2 — `--network=none`, tmpfs, read-only rootfs, 512MB limit |
 | Secret Leak Scanner | 20+ patterns (Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/DB URLs) |
+| Sensitive Data Redaction (RFC-23, v1.14.0) | `duduclaw-redaction` crate — internal data (Odoo / shared wiki / file tools) is replaced with `<REDACT:CATEGORY:hash8>` tokens before reaching the LLM and auto-restored at trusted egress (user channel reply, whitelisted tools); AES-256-GCM SQLite vault (per-agent 32-byte key, 0o600), TTL 7d two-phase GC, 5 built-in profiles, five-layer enable/disable resolver, JSONL audit with 10MB rotation |
 
 ## Memory System
 
@@ -175,6 +177,7 @@
 | Temporal Memory (F1, v1.19.0) | `memories` gains temporal/knowledge-graph columns (`valid_from`/`valid_until`/`superseded_by`/`supersedes`/`subject`/`predicate`/`object`/`confidence`/`metadata`) via idempotent migration; `store_temporal()` auto conflict-resolves same `(agent, subject, predicate)` and links supersession chain; `search()` default-filters to currently-valid rows; `get_history()` / `get_at()` expose chain + point-in-time |
 | Reflexion Loop (F2, v1.19.0) | Bridges existing `MistakeNotebook` — F2a injects recent unresolved mistakes into answering prompt (`## Past Mistakes to Avoid`, CJK-safe match + recency fallback); F2b consolidates ≥3 same-`MistakeCategory` mistakes into one semantic memory rule (`reflexion.rs`) then marks sources resolved. Trigger = `ErrorCategory` Significant/Critical (MetaCognition-adaptive) |
 | `memory_fetch_batch` (F3, v1.19.0) | MCP tool + `get_by_ids` fetch ≤100 entries by ID in one call (namespace/ownership enforced, partial hits → `missing_ids`) |
+| Decision Continuity (RFC-24, v1.23.0) | When an agent offers an enumerated choice (Option A/B/C), each option is persisted into the Temporal Memory **semantic** layer (independent of conversation compression) and open decisions are re-injected each turn; a later "use Option C" (new turn / session / process) resolves from durable state instead of being guessed. Deterministic, zero-LLM detection; `decision_resolve` / `decision_list` MCP tools + Dashboard panel + Prometheus counters; per-agent opt-in `[memory] decision_continuity = true` (TTL `decision_ttl_days`, default 7) |
 
 ## Git Worktree Isolation (v1.6.0)
 
@@ -282,6 +285,7 @@
 | Cross-Platform PTY Pool (`duduclaw-cli-runtime`, v1.15.0) | Drives the real interactive `claude` REPL (ConPTY on Win 10 1809+, openpty on Unix via `portable-pty`) with sentinel-framed in-band response protocol — works around Anthropic blocking `claude -p` for OAuth-subscription accounts. Default off, per-agent opt-in `[runtime] pty_pool_enabled = true` |
 | Worker Supervisor (`duduclaw-cli-worker`) | Out-of-process worker subprocess gated by `[runtime] worker_managed = true`; SIGTERM/SIGKILL sequenced into gateway graceful shutdown |
 | `pty_runtime.rs` Adapter | `RuntimeMode::{FreshSpawn, PtyPool}` per-agent routing, `acquire_and_invoke` surface; OAuth → interactive REPL, API-key → `oneshot_pty_invoke + claude -p` |
+| Unbound from Claude (v1.24.0) | `CliKind::Antigravity` added; `which_codex` / `which_gemini` / `which_agy` discovery (alongside `which_claude`); `resolve_program` + worker `spawn_session_default` resolve all four CliKinds (no more `None`/reject); `cli_kind_for_provider()` derives the PtyPool kind from `[runtime] provider`, replacing the two hardcoded `CliKind::Claude` acquire sites. Interactive REPL stays Claude-only by design (non-Claude providers route to the oneshot `runtime_dispatch` path) |
 | Runtime Status Endpoint | `GET /api/runtime/status` loopback-only JSON (Phase 8.5) |
 | Observability | `pty_pool_*` Prometheus counters (acquires / cache-hit / spawn / eviction / invoke outcomes / duration histogram), `worker_health_misses_total`, `worker_restarts_total`, `pty_pool_managed_worker_active` gauge |
 | Graceful Fallback | All PTY paths fall back to legacy `tokio::process::Command + claude -p` on error — missing worker / unhealthy pool / spawn failure is recoverable |
