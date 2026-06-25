@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
+import { useNavigate } from 'react-router';
 import { useAgentsStore } from '@/stores/agents-store';
 import { cn } from '@/lib/utils';
 import {
@@ -49,6 +50,7 @@ function RoleBadge({ role }: { role: string }) {
 
 export function AgentsPage() {
   const intl = useIntl();
+  const navigate = useNavigate();
   const { agents, fetchAgents, pauseAgent, resumeAgent, removeAgent, loading } = useAgentsStore();
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [delegateTarget, setDelegateTarget] = useState<string | null>(null);
@@ -82,6 +84,11 @@ export function AgentsPage() {
           <EmptyState
             icon={Bot}
             title={intl.formatMessage({ id: 'agents.empty' })}
+            action={
+              <Button variant="primary" icon={Plus} onClick={() => navigate('/welcome')}>
+                {intl.formatMessage({ id: 'agents.empty.cta' })}
+              </Button>
+            }
           />
         </Card>
       ) : (

@@ -259,6 +259,48 @@ fn apply_capabilities_to_table(
 const VALID_RUNTIME_PROVIDERS: &[&str] =
     &["claude", "codex", "gemini", "antigravity", "openai_compat"];
 
+/// Detect Claude OAuth availability by reading `~/.claude/.credentials.json`
+/// directly (the OS user home, not `DUDUCLAW_HOME`). Returns
+/// `(has_oauth, subscription_tier)`. Never returns the token itself — only its
+/// presence — so this is safe to expose at viewer level. Mirrors the CLI's
+/// `detect_claude_auth_from_file`; we read the file rather than shelling out to
+/// `claude auth status` to keep the RPC fast and side-effect-free.
+fn detect_claude_oauth() -> (bool, Option<String>) {
+    let home = duduclaw_core::platform::home_dir();
+    if home.is_empty() {
+        return (false, None);
+    }
+    let cred_path = std::path::Path::new(&home)
+        .join(".claude")
+        .join(".credentials.json");
+    let Ok(content) = std::fs::read_to_string(&cred_path) else {
+        return (false, None);
+    };
+    let Ok(json) = serde_json::from_str::<Value>(&content) else {
+        return (false, None);
+    };
+
+    // Two known shapes: `claudeAiOauth` (older) and `oauthAccount` (newer).
+    for key in ["claudeAiOauth", "oauthAccount"] {
+        if let Some(obj) = json.get(key) {
+            let has_token = obj
+                .get("accessToken")
+                .or_else(|| obj.get("token"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|t| !t.is_empty());
+            if has_token {
+                let sub = obj
+                    .get("subscriptionType")
+                    .or_else(|| obj.get("planType"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                return (true, sub);
+            }
+        }
+    }
+    (false, None)
+}
+
 /// Validate + write the `[runtime]` section from the `runtime` params object.
 /// Fields: `provider` (enum), `fallback` (string), `pty_pool_enabled` (bool),
 /// `worker_managed` (bool). (RT.1)
@@ -2656,6 +2698,7 @@ impl MethodHandler {
             "system.doctor" => { require_admin!(); self.handle_system_doctor().await }
             "system.doctor_repair" => { require_admin!(); self.handle_system_doctor_repair().await }
             "models.list" => self.handle_models_list().await,
+            "runtime.detect" => self.handle_runtime_detect().await,
             "system.config" => { require_admin!(); self.handle_system_config().await }
             "system.update_config" => { require_admin!(); self.handle_system_update_config(params).await }
             "system.version" => self.handle_system_version().await,
@@ -2947,6 +2990,7 @@ impl MethodHandler {
                 { "name": "system.doctor", "description": "Health checks" },
                 { "name": "system.doctor_repair", "description": "Health checks with repair hints" },
                 { "name": "models.list", "description": "List available cloud and local models" },
+                { "name": "runtime.detect", "description": "Detect installed AI runtimes (claude/codex/gemini/antigravity) + Claude OAuth" },
                 { "name": "system.config", "description": "View system config" },
                 { "name": "system.update_config", "description": "Update system config (log_level, rotation)" },
                 { "name": "accounts.add", "description": "Add a new account" },
@@ -3026,7 +3070,7 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("Failed to create directory: {e}"));
         }
 
-        let agent_config = toml::toml! {
+        let mut agent_config = toml::toml! {
             [agent]
             name = name
             display_name = display_name
@@ -3073,6 +3117,16 @@ impl MethodHandler {
             skill_auto_activate = false
             skill_security_scan = true
         };
+
+        // Optional `[runtime]` (provider/fallback) from the create params — lets
+        // the dashboard onboarding pick a non-Claude backend at create time
+        // instead of a follow-up update. No `runtime` key ⇒ no-op (existing
+        // callers unaffected). Invalid provider ⇒ fail and clean up the dir.
+        if let Err(e) = apply_runtime_to_table(&mut agent_config, &params) {
+            let _ = tokio::fs::remove_dir_all(&agent_dir).await;
+            return WsFrame::error_response("", &e);
+        }
+
         let agent_toml = toml::to_string_pretty(&agent_config).unwrap_or_default();
 
         // XC.2: atomic write (temp + rename) — mirror the per-agent update path.
@@ -3086,7 +3140,16 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("Failed to commit agent.toml: {e}"));
         }
 
-        let soul = format!("# {display_name}\n\nI am {display_name}, a specialist AI agent.\n");
+        // Honor an optional `soul` param (the agent's persona / system prompt).
+        // Trim + cap defensively; fall back to a stock one-liner when absent.
+        // (Previously this param was silently dropped — see api.ts agents.create.)
+        let soul = params
+            .get("soul")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("# {display_name}\n\n{}\n", duduclaw_core::truncate_chars(s, 8000)))
+            .unwrap_or_else(|| format!("# {display_name}\n\nI am {display_name}, a specialist AI agent.\n"));
         let _ = tokio::fs::write(agent_dir.join("SOUL.md"), &soul).await;
 
         // Install the agent-file-guard PreToolUse hook so this newly-created
@@ -8058,6 +8121,28 @@ impl MethodHandler {
     }
 
     // ── Models ──────────────────────────────────────────────
+
+    /// Detect which AI runtime CLIs are installed and whether Claude OAuth is
+    /// available — drives the dashboard onboarding "choose your AI backend"
+    /// step so we can flag detected vs. not-installed backends. Viewer-level:
+    /// returns only presence booleans + subscription tier, never any secret.
+    async fn handle_runtime_detect(&self) -> WsFrame {
+        let home = &self.home_dir;
+        let claude_cli = duduclaw_core::which_claude_in_home(home).is_some();
+        let codex = duduclaw_core::which_codex_in_home(home).is_some();
+        let gemini = duduclaw_core::which_gemini_in_home(home).is_some();
+        let antigravity = duduclaw_core::which_agy_in_home(home).is_some();
+        let (claude_oauth, claude_subscription) = detect_claude_oauth();
+
+        WsFrame::ok_response("", json!({
+            "claude_cli": claude_cli,
+            "codex": codex,
+            "gemini": gemini,
+            "antigravity": antigravity,
+            "claude_oauth": claude_oauth,
+            "claude_subscription": claude_subscription,
+        }))
+    }
 
     /// List all available models (cloud + local GGUF files).
     async fn handle_models_list(&self) -> WsFrame {
