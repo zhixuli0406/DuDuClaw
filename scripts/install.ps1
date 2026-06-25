@@ -12,7 +12,7 @@ $ErrorActionPreference = "Stop"
 # unreachable. NOTE: never hardcode a version lacking a published Release — a
 # 404 here silently forces an hour-long MSVC + cargo source build.
 $DuDuClawVersion = if ($env:DUDUCLAW_VERSION) { $env:DUDUCLAW_VERSION } else { "" }
-$FallbackVersion = "1.23.0"
+$FallbackVersion = "1.24.0"
 $GitHubRepo = "zhixuli0406/DuDuClaw"
 $InstallDir = if ($env:DUDUCLAW_HOME) { "$env:DUDUCLAW_HOME\bin" } else { "$env:USERPROFILE\.duduclaw\bin" }
 $BinaryName = "duduclaw.exe"
