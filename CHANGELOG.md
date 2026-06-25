@@ -1,6 +1,56 @@
 # Changelog
 
 
+## [1.25.0] - 2026-06-26 — Browser-first onboarding + guided product tour
+
+First-run setup moves out of the terminal and into the dashboard. A fresh
+install now boots straight into a warm, friendly setup flow ("👋 開始建立第一個
+Agent 吧") and, after the first agent is created, offers a skippable guided
+tour of the key pages. The `duduclaw onboard` CLI wizard is kept but
+soft-deprecated.
+
+### Added
+- **Dashboard first-run wizard** (`WelcomePage`, `/welcome`): a 3-step flow —
+  welcome → choose AI backend → name the agent. The AI-backend step covers
+  five paths, each mapped to the right config via existing RPCs:
+  - **Claude subscription** (OAuth) — `inference_mode=hybrid`, shows detected
+    login status.
+  - **Claude API key** — `accounts.add` + `api_mode=direct`.
+  - **Generic API (OpenAI-compatible)** — any OpenAI-compatible endpoint
+    (OpenAI / vLLM / Ollama / llamafile / Exo …) via `runtime=openai_compat` +
+    `inference.update`.
+  - **Local model (offline)** — `inference_mode=local` + `[model.local]`.
+  - **Other CLI** — Codex / Gemini / Antigravity runtime.
+- **`FirstRunGate`**: installs with zero agents are routed to `/welcome`
+  automatically (loop-safe; a new agents-store `loaded` flag prevents a
+  redirect flash before the first agent list resolves).
+- **Guided product tour** (`GuidedTour`, lightweight self-built spotlight, no
+  new deps): offered after the first agent is created, walks the user through
+  the important pages, skippable any time (Esc), shown once per user
+  (localStorage). Replayable from Settings → General. Sidebar links carry
+  `data-tour` anchors.
+- **`runtime.detect` RPC**: reports which AI runtime CLIs are installed
+  (claude / codex / gemini / antigravity) plus Claude OAuth status — presence
+  only, no secrets — driving the backend picker's "detected / not installed"
+  badges.
+- **`duduclaw_core::write_minimal_config`**: writes a bootable minimal
+  `config.toml` (`[general]` + `[gateway]`) atomically.
+- Empty-state CTA on the Agents page ("create your first agent").
+- `welcome.*` / `tour.*` i18n strings across zh-TW / en / ja-JP.
+
+### Changed
+- **Gateway boots without a config**: `duduclaw run` on a fresh install now
+  auto-writes a minimal config and starts straight into the dashboard instead
+  of hard-stopping with "run `duduclaw onboard` first". The CLI `onboard`
+  wizard remains for headless/advanced use but prints a soft-deprecation hint.
+
+### Fixed
+- **`agents.create` now honors the `soul` parameter** (it was silently
+  dropped) and writes the `[runtime]` section at create time, so the dashboard
+  can set an agent's persona and backend in one call.
+
+
+
 ## [1.24.0] - 2026-06-25 — Antigravity CLI (`agy`) runtime; PtyPool unbound from Claude
 
 Google retired the personal-tier Gemini CLI on 2026-06-18 in favour of the
