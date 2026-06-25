@@ -1,6 +1,50 @@
 # Changelog
 
 
+## [1.24.0] - 2026-06-25 — Antigravity CLI (`agy`) runtime; PtyPool unbound from Claude
+
+Google retired the personal-tier Gemini CLI on 2026-06-18 in favour of the
+**Antigravity CLI** (`agy`). This release adds `agy` as a first-class multi-runtime
+backend and unbinds the PtyPool / cli-worker layer from a hardcoded Claude so all
+CLI kinds have real call points.
+
+### Added
+- **Antigravity (`agy`) runtime** (`RuntimeType::Antigravity`, `runtime/antigravity.rs`).
+  Driven via oneshot `agy -p --dangerously-skip-permissions --print-timeout 300s`
+  (`--model` / `--add-dir` when set), verified end-to-end against the real binary.
+  - Binary auto-resolve (PATH → `~/.local/bin/agy`); system prompt + conversation
+    history embedded in the prompt argument (agy has no `--system` flag); CJK-safe
+    truncation; token usage estimated via the shared heuristic (print mode exposes
+    no stats). Auth via `ANTIGRAVITY_API_KEY`; MCP config at
+    `~/.gemini/antigravity-cli/settings.json`.
+  - Pre-seeds the agent dir into agy's `trustedWorkspaces` (under a cross-process
+    lock) so the interactive trust prompt never hangs a headless subprocess.
+  - Registry auto-detection, vision-capability gating, and `[runtime] provider`
+    validation all recognise `antigravity` (alias `agy`).
+- **Per-CLI binary discovery** in `duduclaw-core`: generic `which_cli` /
+  `which_cli_in_home` plus `which_codex` / `which_gemini` / `which_agy`.
+- Docs: `docs/todo/TODO-antigravity-cli-migration.md`, development-guide §1.4
+  (Multi-Runtime), and `[runtime]` examples in all agent.toml templates.
+
+### Changed
+- **PtyPool / cli-worker unbound from Claude.** `CliKind::Antigravity` added;
+  `resolve_program` and the worker's `spawn_session_default` now resolve all four
+  CliKinds (Codex/Gemini/Antigravity no longer return `None`/reject). New
+  `cli_kind_for_provider()` derives the PtyPool kind from the agent's
+  `[runtime] provider`, replacing the two hardcoded `CliKind::Claude` acquire sites
+  (`claude_runner`, `channel_reply`).
+- The interactive PtyPool REPL remains Claude-only by design: non-Claude providers
+  route through the oneshot `runtime_dispatch` path. Reconnaissance showed agy's
+  full-screen alt-screen TUI plus the missing system-prompt flag make the sentinel
+  protocol a poor and unnecessary fit (`agy -p` already works); decision recorded
+  in the migration TODO.
+
+### Notes
+- The legacy `gemini` CLI backend is retained for paid `GEMINI_API_KEY` / enterprise
+  users, whose access continues past the 2026-06-18 personal-tier shutdown.
+
+
+
 ## [1.23.0] - 2026-06-22 — Decision Continuity (RFC-24): durable cross-session decisions
 
 ### Added
