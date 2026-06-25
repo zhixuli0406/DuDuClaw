@@ -105,6 +105,14 @@ cosign verify-blob \
 > - **互動 REPL 仍維持 Claude-only**（刻意）：非 Claude provider 走 oneshot `runtime_dispatch`。實測顯示 agy 的全螢幕 alt-screen TUI + 無 system-prompt 旗標讓 sentinel 協定既不適合也無必要（`agy -p` 已可用）
 > - **相容性** — 舊 `gemini` CLI 後端保留給付費 `GEMINI_API_KEY` / 企業版用戶；文件見 development-guide §1.4 與 agent.toml 範本
 
+<div align="center">
+  <a href="https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.24.0/duduclaw-launch-v1.24.0.mp4">
+    <img src="docs/assets/brag-poster-v1.24.0.jpg" alt="DuDuClaw v1.24.0 發佈影片" width="720">
+  </a>
+  <br/>
+  <sub>▶ 點擊觀看 <strong>v1.24.0 發佈影片</strong>（35 秒）· Antigravity runtime · Decision Continuity · Calm Glass</sub>
+</div>
+
 <details>
 <summary><strong>v1.9.4 → v1.23.x 累積亮點</strong></summary>
 

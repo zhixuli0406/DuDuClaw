@@ -55,3 +55,6 @@ npm/darwin-arm64/bin/
 npm/linux-x64/bin/
 npm/linux-arm64/bin/
 npm/win32-x64/bin/
+
+# Brag launch-video output (heavy mp4s — uploaded to GitHub Releases, not git)
+brag-output*/
