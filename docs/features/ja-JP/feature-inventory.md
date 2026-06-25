@@ -106,6 +106,7 @@
 | GitHub ライブインデックス | Search API + 24h ローカルキャッシュ + 加重検索 |
 | スキルマーケット | Web ダッシュボード、インストール、セキュリティスキャン |
 | スキル自動合成 | ギャップアキュムレーター → エピソード記憶から合成（Voyager 由来）→ サンドボックス試用（TTL） → クロスエージェント卒業 |
+| スキル合成スケジューラ（W19-P1、v1.22.0）| 「会話 → skill」抽出を一定間隔で自律実行 — `config.toml [skill_synthesis] auto_run / dry_run / interval_hours / lookback_days` + ダッシュボード `skill_synthesis.get/update` RPC；`skill_synthesis_threshold` は `u32` カウント（registry スキャンが `0.7` を拒否する不具合を修正）|
 | Skill セキュリティスキャナー（Rust ネイティブ）| `skill_lifecycle::security_scanner` が候補スキルをスキャン、Python 依存なし |
 
 ## ローカル推論エンジン
@@ -333,6 +334,7 @@
 |------|------|
 | 23 ページ | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / KnowledgeHub / Odoo / Login / Users / Analytics / Export |
 | 技術スタック | React 19 + TypeScript + Tailwind CSS 4 + shadcn/ui、暖色 amber テーマ |
+| Calm Glass デザインシステム（v1.22.0）| 共有 `web/src/components/ui/` コンポーネントライブラリ + `nav-model.ts` の 6 グループサイドバー + `web/DESIGN.md` 仕様；全ページを共有プリミティブで再構築、en/ja/zh i18n 同期 |
 | リアルタイムログストリーミング | BroadcastLayer tracing → WebSocket push |
 | Memory Key Insights | `key_facts` カード + access_count バッジ + タイムスタンプ + メタデータ |
 | Memory Evolution | SOUL.md バージョン履歴 + 前後メトリクス差分 + 状態バッジ |
