@@ -27,6 +27,9 @@ pub fn supports_vision(provider: RuntimeType, model_id: &str) -> bool {
     match provider {
         RuntimeType::Claude => m.starts_with("claude"),
         RuntimeType::Gemini => m.starts_with("gemini"),
+        // Antigravity (`agy`) multiplexes Gemini + Claude models; both families
+        // are multimodal. GPT-OSS / other text-only ids fail closed.
+        RuntimeType::Antigravity => m.starts_with("gemini") || m.starts_with("claude"),
         RuntimeType::Codex => {
             m.contains("gpt-4o")
                 || m.contains("gpt-5")

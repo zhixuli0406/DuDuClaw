@@ -51,6 +51,35 @@ decision_continuity = true
 偵測為確定性、零 LLM 成本，且偏保守（寧漏勿錯）；背景擷取失敗不影響回覆送出。
 詳見 [RFC-24](../rfc/RFC-24-decision-continuity.md)。
 
+### 1.4 AI Runtime 後端選擇（Multi-Runtime）
+
+每個 Agent 可獨立選擇驅動它的 AI CLI 後端，透過 `AgentRuntime` trait 抽象。
+`RuntimeRegistry` 在啟動時自動偵測各 CLI 是否安裝並註冊；`agent.toml` 以
+`[runtime] provider` 指定（預設 `claude`），`fallback` 指定後端不可用時的退路。
+
+```toml
+[runtime]
+provider = "antigravity"   # claude | codex | gemini | antigravity | openai_compat
+fallback = "claude"        # 後端偵測不到時改用此後端
+```
+
+| Provider | CLI 二進位 | 認證 | 備註 |
+|----------|-----------|------|------|
+| `claude` | `claude`（永遠可用，核心） | OAuth / API Key 輪替 | 預設後端 |
+| `codex` | `codex` | OpenAI | — |
+| `gemini` | `gemini` | `GEMINI_API_KEY` / OAuth | 個人版 OAuth 於 2026-06-18 停用；付費金鑰仍可用 |
+| `antigravity` | `agy`（`~/.local/bin/agy`） | `ANTIGRAVITY_API_KEY` / OAuth | Gemini CLI 的官方後繼者，多模型（Gemini 3.x + Claude + GPT-OSS） |
+| `openai_compat` | HTTP（無 CLI） | per-provider key | Exo / llamafile / vLLM 等 OpenAI 相容端點 |
+
+**Antigravity（`agy`）特有注意事項**（詳見
+[TODO-antigravity-cli-migration.md](../todo/TODO-antigravity-cli-migration.md)）：
+
+- Agent 目錄會被自動加入 agy 的 `trustedWorkspaces`，避免 headless 下卡在
+  「是否信任此 workspace？」互動提示。
+- print 模式無 JSON 輸出 → token 使用量為 CJK-aware 啟發式估算（非精確值）。
+- 需先在裝有 `agy` 的機器上完成一次互動式登入（OAuth）或設定
+  `ANTIGRAVITY_API_KEY`，Gateway 才能成功呼叫。
+
 ---
 
 ## 2. 瀏覽器自動化調試（L1-L5）

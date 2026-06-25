@@ -3,6 +3,7 @@
 //! The `AgentRuntime` trait abstracts over different CLI-based AI agents.
 //! Each runtime translates its JSONL output format into a unified `RuntimeResponse`.
 
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
@@ -120,6 +121,13 @@ impl RuntimeRegistry {
         if gemini.is_available().await {
             info!("Gemini CLI detected — registering GeminiRuntime");
             runtimes.insert(RuntimeType::Gemini, Box::new(gemini));
+        }
+
+        // Antigravity (`agy`): the 2026-06-18 successor to the personal Gemini CLI.
+        let antigravity = antigravity::AntigravityRuntime::new();
+        if antigravity.is_available().await {
+            info!("Antigravity CLI (agy) detected — registering AntigravityRuntime");
+            runtimes.insert(RuntimeType::Antigravity, Box::new(antigravity));
         }
 
         // OpenAI-compatible: always available if API key is configured

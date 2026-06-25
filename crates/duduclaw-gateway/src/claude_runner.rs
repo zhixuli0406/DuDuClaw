@@ -430,9 +430,17 @@ pub async fn call_claude_for_agent_with_type(
             );
             let deadline = std::time::Duration::from_secs(180);
             // Round 4 deferred-cleanup (LOW F-3): canonical options entry.
+            // Unbind from hardcoded Claude: the PtyPool kind follows the agent's
+            // configured provider. Non-Claude providers are short-circuited to
+            // `runtime_dispatch` above (the `non_claude_provider` guard), so this
+            // resolves to Claude in practice today — but the coupling is gone.
+            let cli_kind = crate::pty_runtime::cli_kind_for_provider(
+                delegation_settings.provider,
+            )
+            .unwrap_or(duduclaw_cli_runtime::CliKind::Claude);
             let acquire = crate::pty_runtime::AcquireOptions::new(
                 agent_id,
-                duduclaw_cli_runtime::CliKind::Claude,
+                cli_kind,
                 cli_bare_mode,
             );
             return crate::pty_runtime::acquire_and_invoke_with(

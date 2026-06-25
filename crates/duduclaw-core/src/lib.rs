@@ -362,6 +362,141 @@ pub fn which_claude_in_home(home: &std::path::Path) -> Option<String> {
     None
 }
 
+// ── Generic CLI discovery (Codex / Gemini / Antigravity) ──────────────
+//
+// `which_claude` carries Claude-specific baggage (native-installer paths,
+// Windows `.exe` > `.cmd` BatBadBut precedence). The other multi-runtime CLIs
+// install through the usual package managers, so a parameterized scan over the
+// common locations is sufficient. PATH is consulted first (the user's explicit
+// env), then a fixed candidate list — mirroring `which_claude`'s launchd-safe
+// discovery so a Finder/launchd-launched gateway finds the binary without an
+// interactive `PATH`.
+
+/// Resolve a CLI `bin` (e.g. `"codex"`, `"gemini"`, `"agy"`) via PATH then a
+/// HOME-rooted candidate scan. Returns the first match that exists on disk.
+pub fn which_cli(bin: &str) -> Option<String> {
+    let lookup_cmd = if cfg!(windows) { "where" } else { "which" };
+    if let Ok(output) = std::process::Command::new(lookup_cmd).arg(bin).output()
+        && output.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && std::path::Path::new(trimmed).exists() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+    which_cli_in_home(std::path::Path::new(&home), bin)
+}
+
+/// HOME-rooted candidate scan for a CLI `bin`. Extracted so tests can drive it
+/// deterministically without depending on the ambient `PATH`.
+pub fn which_cli_in_home(home: &std::path::Path, bin: &str) -> Option<String> {
+    let home_str = home.to_string_lossy();
+
+    #[cfg(not(windows))]
+    let candidates = vec![
+        // Antigravity's official installer target (also a common user-local bin).
+        format!("{home_str}/.local/bin/{bin}"),
+        // Homebrew (Apple Silicon, then Intel / Linux).
+        format!("/opt/homebrew/bin/{bin}"),
+        format!("/usr/local/bin/{bin}"),
+        // Node CLI managers.
+        format!("{home_str}/.bun/bin/{bin}"),
+        format!("{home_str}/.volta/bin/{bin}"),
+        format!("{home_str}/.npm-global/bin/{bin}"),
+        format!("{home_str}/.asdf/shims/{bin}"),
+    ];
+
+    #[cfg(windows)]
+    let candidates = {
+        let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        vec![
+            // Antigravity Windows installer target.
+            format!("{localappdata}\\Antigravity\\{bin}.exe"),
+            // User-local + package-manager .exe shims.
+            format!("{home_str}\\.local\\bin\\{bin}.exe"),
+            format!("{home_str}\\.bun\\bin\\{bin}.exe"),
+            format!("{home_str}\\.volta\\bin\\{bin}.exe"),
+            format!("{home_str}\\scoop\\shims\\{bin}.exe"),
+            // npm / pnpm .cmd shims (resolved at spawn time).
+            format!("{appdata}\\npm\\{bin}.cmd"),
+            format!("{localappdata}\\pnpm\\{bin}.cmd"),
+        ]
+    };
+
+    for path in &candidates {
+        if std::path::Path::new(path).exists() {
+            return Some(path.clone());
+        }
+    }
+    None
+}
+
+/// Resolve the `codex` CLI binary. See [`which_cli`].
+pub fn which_codex() -> Option<String> {
+    which_cli("codex")
+}
+
+/// Resolve the `codex` CLI from a specific HOME. See [`which_cli_in_home`].
+pub fn which_codex_in_home(home: &std::path::Path) -> Option<String> {
+    which_cli_in_home(home, "codex")
+}
+
+/// Resolve the `gemini` CLI binary. See [`which_cli`].
+pub fn which_gemini() -> Option<String> {
+    which_cli("gemini")
+}
+
+/// Resolve the `gemini` CLI from a specific HOME. See [`which_cli_in_home`].
+pub fn which_gemini_in_home(home: &std::path::Path) -> Option<String> {
+    which_cli_in_home(home, "gemini")
+}
+
+/// Resolve the Antigravity `agy` CLI binary. See [`which_cli`].
+pub fn which_agy() -> Option<String> {
+    which_cli("agy")
+}
+
+/// Resolve the `agy` CLI from a specific HOME. See [`which_cli_in_home`].
+pub fn which_agy_in_home(home: &std::path::Path) -> Option<String> {
+    which_cli_in_home(home, "agy")
+}
+
+#[cfg(test)]
+mod which_cli_tests {
+    use super::which_cli_in_home;
+
+    #[test]
+    fn finds_agy_in_local_bin() {
+        let tmp = std::env::temp_dir().join("duduclaw-which-cli-test");
+        let bin_dir = tmp.join(".local").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let agy = bin_dir.join("agy");
+        std::fs::write(&agy, b"#!/bin/sh\n").unwrap();
+        let found = which_cli_in_home(&tmp, "agy");
+        let _ = std::fs::remove_dir_all(&tmp);
+        #[cfg(not(windows))]
+        assert_eq!(found.as_deref(), Some(agy.to_string_lossy().as_ref()));
+        #[cfg(windows)]
+        let _ = found; // Windows scans .exe, not the extensionless stub
+    }
+
+    #[test]
+    fn missing_binary_returns_none() {
+        let tmp = std::env::temp_dir().join("duduclaw-which-cli-empty");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let found = which_cli_in_home(&tmp, "definitely-not-a-cli-xyz");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(found, None);
+    }
+}
+
 #[cfg(test)]
 mod which_claude_tests {
     use super::{pick_windows_preferred, which_claude_in_home};

@@ -875,17 +875,44 @@ async fn spawn_session_for_key(
     PtySession::spawn(opts).await
 }
 
-/// Resolve the CLI binary path for the requested `kind`. Currently only
-/// Claude is wired; Codex / Gemini land in Phase 3.5 alongside their
-/// account-management glue.
+/// Resolve the CLI binary path for the requested `kind`. Each CLI now has its
+/// own discovery helper, so the PtyPool can resolve any of the four runtimes
+/// (not just Claude). A `None` here causes `acquire()` to error, which lets the
+/// caller fall back to fresh-spawn.
+///
+/// NOTE: only Claude has a validated interactive-REPL protocol
+/// (`inject_protocol_args`). Codex / Gemini / Antigravity resolve their binary
+/// here so the pool/worker layer is unbound from Claude, but in practice
+/// non-Claude providers are routed to the oneshot `runtime_dispatch` path
+/// upstream (see `channel_reply` / `claude_runner` non-Claude guards) until
+/// their REPL framing is implemented.
 fn resolve_program(home: &Path, kind: CliKind) -> Option<String> {
     match kind {
         CliKind::Claude => duduclaw_core::which_claude_in_home(home),
-        // TODO Phase 3.5: route to which_codex / which_gemini helpers
-        // (mirrors the multi-runtime registry in CLAUDE.md "Multi-Runtime"
-        //  section). Returning None here causes acquire() to error, which
-        // lets the caller fall back to fresh-spawn.
-        CliKind::Codex | CliKind::Gemini => None,
+        CliKind::Codex => duduclaw_core::which_codex_in_home(home),
+        CliKind::Gemini => duduclaw_core::which_gemini_in_home(home),
+        CliKind::Antigravity => duduclaw_core::which_agy_in_home(home),
+    }
+}
+
+/// Map an agent's `[runtime] provider` to the PtyPool [`CliKind`]. `None` for
+/// `OpenAiCompat` (HTTP endpoint, no CLI binary).
+///
+/// Used to unbind the pool acquire call sites from a hardcoded `CliKind::Claude`
+/// so the kind follows the configured provider. NOTE: today the non-Claude
+/// providers are short-circuited to the oneshot `runtime_dispatch` path upstream
+/// (channel_reply / claude_runner non-Claude guards) before the PtyPool branch,
+/// so in practice this resolves to `Claude` at those sites — but the coupling is
+/// gone, so when a non-Claude interactive REPL is implemented the call sites
+/// already pass the right kind.
+pub fn cli_kind_for_provider(provider: duduclaw_core::types::RuntimeType) -> Option<CliKind> {
+    use duduclaw_core::types::RuntimeType;
+    match provider {
+        RuntimeType::Claude => Some(CliKind::Claude),
+        RuntimeType::Codex => Some(CliKind::Codex),
+        RuntimeType::Gemini => Some(CliKind::Gemini),
+        RuntimeType::Antigravity => Some(CliKind::Antigravity),
+        RuntimeType::OpenAiCompat => None,
     }
 }
 

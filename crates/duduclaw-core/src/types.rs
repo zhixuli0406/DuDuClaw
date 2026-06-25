@@ -165,6 +165,9 @@ pub enum RuntimeType {
     Claude,
     Codex,
     Gemini,
+    /// Google Antigravity CLI (`agy`) — the 2026-06-18 successor to the
+    /// personal-tier Gemini CLI. Same model lineage, distinct binary/flags.
+    Antigravity,
     #[serde(rename = "openai_compat")]
     OpenAiCompat,
 }
@@ -176,6 +179,7 @@ impl RuntimeType {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Gemini => "gemini",
+            Self::Antigravity => "antigravity",
             Self::OpenAiCompat => "openai_compat",
         }
     }
@@ -194,6 +198,7 @@ impl RuntimeType {
             "claude" => Self::Claude,
             "codex" => Self::Codex,
             "gemini" => Self::Gemini,
+            "antigravity" | "agy" => Self::Antigravity,
             "openai_compat" | "openai" | "openai-compat" => Self::OpenAiCompat,
             other => {
                 tracing::warn!(
