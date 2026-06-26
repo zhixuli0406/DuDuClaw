@@ -35,6 +35,12 @@ export type NavItem = {
   label: string;
   /** Minimum role required to see this item. Omit for all roles. */
   minRole?: UserRole;
+  /**
+   * Enterprise-only management surface (multi-seat / compliance / reseller).
+   * Hidden when the active EditionProfile is `personal`. Does NOT gate the
+   * underlying feature — only the dashboard entry point.
+   */
+  enterprise?: boolean;
 };
 
 export type NavGroup = {
@@ -62,7 +68,7 @@ export const navGroups: NavGroup[] = [
       { to: '/agents', icon: Bot, label: 'nav.agents' },
       { to: '/tasks', icon: KanbanSquare, label: 'nav.tasks' },
       { to: '/forks', icon: GitFork, label: 'nav.forks' },
-      { to: '/org', icon: Network, label: 'nav.org', minRole: 'manager' },
+      { to: '/org', icon: Network, label: 'nav.org', minRole: 'manager', enterprise: true },
       { to: '/memory', icon: Brain, label: 'nav.memory' },
     ],
   },
@@ -92,17 +98,17 @@ export const navGroups: NavGroup[] = [
       { to: '/billing', icon: CreditCard, label: 'nav.billing', minRole: 'manager' },
       { to: '/reports', icon: BarChart3, label: 'nav.reports', minRole: 'manager' },
       { to: '/license', icon: KeyRound, label: 'nav.license', minRole: 'manager' },
-      { to: '/partner', icon: Handshake, label: 'nav.partner', minRole: 'manager' },
+      { to: '/partner', icon: Handshake, label: 'nav.partner', minRole: 'manager', enterprise: true },
     ],
   },
   {
     label: 'navGroup.system',
     items: [
       { to: '/security', icon: Shield, label: 'nav.security', minRole: 'admin' },
-      { to: '/governance', icon: Scale, label: 'nav.governance', minRole: 'admin' },
-      { to: '/wiki-trust', icon: Shield, label: 'nav.wikiTrust', minRole: 'admin' },
+      { to: '/governance', icon: Scale, label: 'nav.governance', minRole: 'admin', enterprise: true },
+      { to: '/wiki-trust', icon: Shield, label: 'nav.wikiTrust', minRole: 'admin', enterprise: true },
       { to: '/reliability', icon: Activity, label: 'nav.reliability', minRole: 'admin' },
-      { to: '/users', icon: Users, label: 'nav.users', minRole: 'admin' },
+      { to: '/users', icon: Users, label: 'nav.users', minRole: 'admin', enterprise: true },
       { to: '/logs', icon: FileText, label: 'nav.logs', minRole: 'manager' },
       { to: '/settings', icon: Settings, label: 'nav.settings', minRole: 'admin' },
     ],

@@ -19,6 +19,9 @@ duduclaw-cli-worker = { workspace = true }
 duduclaw-license = { workspace = true }
 thiserror = { workspace = true }
 tokio-util = "0.7"
+# Interactive CLI auth ("Dashboard 一鍵登入") drives each AI CLI's native login
+# command in a PTY. Same crate the cli-runtime uses, so no new transitive deps.
+portable-pty = "0.9"
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 cron = { workspace = true }

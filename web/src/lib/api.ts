@@ -125,12 +125,21 @@ export interface DoctorCheck {
   repair_hint?: string;
 }
 
+/** Product form-factor, orthogonal to the license `edition` string. */
+export type EditionProfile = 'personal' | 'enterprise';
+
 export interface SystemStatus {
   version: string;
   uptime_seconds: number;
   agents_count: number;
   channels_connected: number;
   gateway_address: string;
+  /**
+   * Product form-factor (personal|enterprise). Controls whether the dashboard
+   * shows enterprise management surfaces. Absent on older gateways → treat as
+   * enterprise (show everything) for backward compatibility.
+   */
+  edition_profile?: EditionProfile;
 }
 
 export interface LogEntry {
@@ -1384,6 +1393,33 @@ export const api = {
     remove: (type: string) =>
       client.call('channels.remove', { type }),
   },
+  // Interactive CLI login ("Dashboard 一鍵登入") — drives a CLI's native login
+  // in a PTY on the gateway and streams it back via `auth.cli_login.*` events.
+  auth: {
+    cliLoginStart: (runtime: 'claude' | 'codex' | 'gemini' | 'antigravity') =>
+      client.call('auth.cli_login.start', { runtime }) as Promise<{
+        session_id: string;
+        runtime: string;
+        program: string;
+        remote_safe: boolean;
+        hint: string;
+        status: string;
+      }>,
+    cliLoginInput: (sessionId: string, data: string) =>
+      client.call('auth.cli_login.input', { session_id: sessionId, data }) as Promise<{
+        success: boolean;
+      }>,
+    cliLoginStatus: (sessionId: string) =>
+      client.call('auth.cli_login.status', { session_id: sessionId }) as Promise<{
+        session_id: string;
+        status: 'running' | 'succeeded' | 'failed' | 'exited';
+      }>,
+    cliLoginCancel: (sessionId: string) =>
+      client.call('auth.cli_login.cancel', { session_id: sessionId }) as Promise<{
+        success: boolean;
+      }>,
+  },
+
   accounts: {
     list: () =>
       client.call('accounts.list') as Promise<{ accounts: AccountInfo[] }>,
@@ -1540,7 +1576,12 @@ export const api = {
     doctorRepair: () =>
       client.call('system.doctor_repair'),
     version: () =>
-      client.call('system.version') as Promise<{ version: string; auto_update: boolean; edition: string }>,
+      client.call('system.version') as Promise<{
+        version: string;
+        auto_update: boolean;
+        edition: string;
+        edition_profile?: EditionProfile;
+      }>,
     config: () =>
       client.call('system.config') as Promise<{
         config?: string;

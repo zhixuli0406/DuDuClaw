@@ -57,6 +57,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+# Antigravity CLI (`agy`) — Google's official installer (the 2026-06-18
+# Gemini-CLI successor). Bundled as a first-class runtime alongside
+# claude/codex so the Antigravity backend works out of the box. The installer
+# supports linux amd64/arm64 (glibc); it drops the binary in $HOME/.local/bin,
+# which we relocate to /usr/local/bin so every user (incl. `duduclaw`) resolves
+# it on PATH — matching `duduclaw-core::which_agy`.
+RUN curl -fsSL https://antigravity.google/cli/install.sh | bash && \
+    install -m 0755 "$HOME/.local/bin/agy" /usr/local/bin/agy && \
+    agy --version
+
 # Copy entrypoint
 COPY container/server-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

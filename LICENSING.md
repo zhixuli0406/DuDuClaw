@@ -57,4 +57,4 @@ DuDuClaw 採用 **Apache License 2.0** 開源授權。
 授權相關問題請聯繫：
 
 - GitHub Issues: [DuDuClaw/issues](https://github.com/zhixuli0406/DuDuClaw/issues)
-- Email: （待補）
+- Email: louis.li@dudustudio.monster

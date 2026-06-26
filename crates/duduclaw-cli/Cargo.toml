@@ -21,6 +21,9 @@ duduclaw-odoo = { workspace = true }
 duduclaw-inference = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+# Personal-edition data portability (export/import ~/.duduclaw as .tar.gz).
+tar = "0.4"
+flate2 = "1"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }

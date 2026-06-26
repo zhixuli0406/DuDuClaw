@@ -12,7 +12,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.25.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.26.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -99,14 +99,15 @@ cosign verify-blob \
 
 ---
 
-> 🎉 **v1.25.0 — ブラウザ優先のオンボーディング + ガイド付きツアー**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.25.0)）
+> 🎉 **v1.26.0 — 個人版 / エンタープライズ版 + ワンクリック CLI ログイン**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.26.0)）
 >
-> 初回セットアップがターミナルから dashboard へ移行：新規インストールは温かいガイド付きフロー（「👋 最初の Agent を作りましょう」）に直接起動し、最初の Agent 作成後にスキップ可能な主要ページのツアーを案内します。`duduclaw onboard` CLI ウィザードは残しつつソフトに非推奨化。
+> ライセンス階層と直交する「プロダクト形態」軸（個人版 / エンタープライズ版）を追加。**デフォルト値と UI のみを制御し、コア機能を一切ゲートしません**。さらに全 CLI 向けのワンクリックログインを追加。
 >
-> - **Dashboard 初回ウィザード**（`WelcomePage`）— 3 ステップ：ようこそ → AI バックエンド選択 → Agent 命名。5 つのバックエンド経路がそれぞれ正しい設定に対応：Claude サブスクリプション（OAuth）、Claude API キー、**汎用 API（OpenAI 互換：OpenAI / vLLM / Ollama / llamafile / Exo …）**、ローカルモデル、その他の CLI（Codex / Gemini / Antigravity）
-> - **`FirstRunGate`** — Agent ゼロのインストールは自動的に `/welcome` へ誘導（ループ安全；新しい agents-store `loaded` フラグで一覧解決前のちらつき誤誘導を防止）
-> - **ガイド付きツアー**（`GuidedTour`、軽量自作スポットライト、依存追加なし）— 最初の Agent 作成後に案内し、主要ページを巡回、いつでも `Esc` でスキップ可、ユーザーごとに一度だけ表示（localStorage）、設定から再生可能；サイドバーのリンクに `data-tour` アンカー
-> - **`runtime.detect` RPC + 設定ゼロ起動** — インストール済み CLI（claude / codex / gemini / antigravity）+ Claude OAuth 状態を検出してバックエンドの「検出済み / 未インストール」バッジを駆動；`duduclaw run` は新規インストールで最小 config を自動生成し dashboard に直接起動（「先に `onboard` を実行」のハードストップを廃止）；`agents.create` は従来無視されていた `soul` を反映し、作成時に `[runtime]` を書き込む
+> - **個人版 / エンタープライズ版**（`EditionProfile`）— 個人版（既定）は単一所有者・設定ゼロ、エンタープライズ版はマルチシート / コンプライアンス管理面。優先順位 `DUDUCLAW_EDITION` env > `agent.toml [edition]` > ライセンス階層 > 個人版。dashboard は個人版でエンタープライズ nav（org / users / governance / partner / wiki-trust）を隠し、EditionBadge + 非ブロッキングのソフト上限バナーを表示
+> - **Dashboard ワンクリック CLI ログイン**（`auth.cli_login.*`）— 各 CLI（Claude / Codex / Gemini / Antigravity）のネイティブログインを gateway 上の PTY で駆動し、dashboard ターミナルにストリーム、貼り付けたコードを返送；CLI ごとに `remote_safe`（貼り付け式 vs localhost コールバック）を提示；Claude `setup-token` はエンドツーエンドで検証済み
+> - **Antigravity CLI（`agy`）を内蔵** — server Docker イメージに claude / codex / gemini と並べて同梱し、Antigravity ランタイムをすぐ利用可能
+> - **個人版データ可搬性** — `duduclaw export` / `duduclaw import` が `~/.duduclaw/` を可搬な `.tar.gz`（agents / メモリ / 設定 / ライセンス）にまとめ、マシン間移行やセルフホスト ↔ マネージドの切替に対応
+> - 新ライセンス階層 `PersonalProSelfHost`（NT$490/月）：エンタープライズモジュールなしで業種テンプレート + 優先パッチを解放
 
 
 
@@ -115,8 +116,9 @@ https://github.com/user-attachments/assets/30406ad1-4595-43ce-8c08-dba8f0ca9683
 
 
 <details>
-<summary><strong>v1.9.4 → v1.24.x 累積ハイライト</strong></summary>
+<summary><strong>v1.9.4 → v1.25.x 累積ハイライト</strong></summary>
 
+- **v1.25.0** — ブラウザ優先のオンボーディング：`WelcomePage`（3 ステップ、5 つの AI バックエンド経路）+ `FirstRunGate`（Agent ゼロの誘導）+ ガイド付きツアー `GuidedTour`（依存ゼロのスポットライト）+ `runtime.detect` RPC による設定ゼロ起動
 - **v1.24.0** — Antigravity CLI（`agy`）ランタイム対応 · PtyPool の Claude 固定を解除：`RuntimeType::Antigravity` を追加（ワンショット `agy -p`、バイナリ自動解決、システムプロンプト + 履歴の埋め込み、CJK セーフな切り詰め、`trustedWorkspaces` 事前登録）；`CliKind::Antigravity` を PtyPool / worker spawn に接続、`cli_kind_for_provider()` が `[runtime] provider` から種別を導出；対話型 REPL は Claude 専用のまま（設計上）；旧 `gemini` バックエンドは有料 `GEMINI_API_KEY` / エンタープライズ向けに維持
 - **v1.23.0** — Decision Continuity（RFC-24）：エージェントが列挙式の選択肢（案 A/B/C）を提示した際、各選択肢を Temporal Memory の **semantic** 層に永続化（会話圧縮から独立）し、未決事項をターンごとに再注入；後から「案 C で」（別ターン / セッション / プロセス）と言われても、推測ではなく永続状態から解決。検出は決定論的でゼロ LLM；`[memory] decision_continuity = true` でエージェント単位の opt-in
 - **v1.22.0** — RFC-26 Live Forking（ラウンド 1–4）：実行中のタスクを N 個の競合ブランチに分岐し、それぞれ copy-on-write の隔離ワークスペースで異なる戦略を試行、AI judge が勝者を選定（`duduclaw-fork` + 6 つの MCP ツール + クロスプロセス `ForkStore` + `RotatingBranchExecutor` + `LiveAggregate` 予算プリエンプション）；スキル合成スケジューラ（W19-P1）；共有コンポーネントライブラリで再構築した Calm Glass ダッシュボード。いずれもデフォルト無効

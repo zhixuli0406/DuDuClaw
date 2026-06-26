@@ -22,9 +22,10 @@
 #   Hobby          → Cloud trial (14d)
 #   Solo           → Cloud paid
 #   Studio         → Cloud paid
-#   Business       → Cloud paid
-#   SelfHostPro    → Self-host paid
-#   Oem            → Reserved for Year 2+
+#   Business             → Cloud paid
+#   PersonalProSelfHost  → Self-host paid (personal form factor, NT$490/mo)
+#   SelfHostPro          → Self-host paid (enterprise form factor)
+#   Oem                  → Reserved for Year 2+
 #
 # See `commercial/docs/spec-license-module.md` for full specification.
 # See `commercial/docs/business-plan.md` for pricing rationale.
@@ -150,6 +151,34 @@ license_phone_home_interval_days = 7
 license_grace_period_days = 30
 
 # =============================================================================
+# Personal Pro (Self-Host) — On-prem PERSONAL tier NT$490/mo or NT$4,900/yr
+# The individual-developer self-host tier. Personal form factor.
+# Core is Apache 2.0 → NO max_* limits. Unlocks premium templates + priority
+# patches, but NOT the enterprise modules (evolution params / enterprise
+# dashboard) — those remain Self-Host Pro's differentiator.
+# =============================================================================
+[personal_pro_self_host]
+description = "Personal Pro (Self-Host) — NT$490/mo or NT$4,900/yr (templates + patches)"
+self_host_only = true
+
+max_agents = 0
+max_channels = 0
+max_local_models = 0
+max_messages_per_month = 0
+memory_quota_gb = 0
+
+# Personal-tier value-adds: templates + priority patches + private support.
+premium_templates = true            # ✓ industry SOUL.md templates
+industry_evolution_params = false   # ✗ enterprise-only (Self-Host Pro)
+dashboard_enterprise = false        # ✗ enterprise-only (audit export / ROI)
+priority_security_patch = true      # ✓ immediate vs 30-day OSS delay
+private_discord_support = true      # ✓
+office_hour_hours_per_month = 0
+
+license_phone_home_interval_days = 7
+license_grace_period_days = 30
+
+# =============================================================================
 # Self-Host Pro — On-prem paid tier NT$1,490/mo or NT$14,900/yr
 # Core is Apache 2.0, so NO max_* limits are enforced.
 # License gates only commercial/* modules.
@@ -212,9 +241,10 @@ license_grace_period_days = 60
 #   Hobby       → opensource
 #   Solo        → hobby → opensource
 #   Studio      → solo → hobby → opensource
-#   Business    → studio → solo → hobby → opensource
-#   SelfHostPro → independent (uses its own values, does NOT inherit cloud chain)
-#   Oem         → self_host_pro → opensource
+#   Business            → studio → solo → hobby → opensource
+#   PersonalProSelfHost → independent (own values + opensource base)
+#   SelfHostPro         → independent (uses its own values, does NOT inherit cloud chain)
+#   Oem                 → self_host_pro → opensource
 #
 # When adding a new feature flag:
 #   1. Define it explicitly in `[opensource]` with the conservative default

@@ -211,6 +211,111 @@ impl RuntimeType {
     }
 }
 
+/// Product *form factor* of a DuDuClaw deployment, orthogonal to the license
+/// tier (which controls which `commercial/` modules unlock) and to the
+/// CE/Pro source split.
+///
+/// `EditionProfile` only changes **defaults and UI presentation** — it never
+/// gates a core feature (design rule "畫法 A"). A [`Personal`] deployment hides
+/// the multi-seat / audit-management surfaces by default; an [`Enterprise`]
+/// deployment shows them. Both run the exact same Apache-2.0 core.
+///
+/// The `Personal` profile is also the *unit of tenancy* for managed ("代管")
+/// personal hosting — a managed personal instance is the same artifact a user
+/// could self-host.
+///
+/// Resolution precedence (see [`EditionProfile::resolve`]):
+/// `DUDUCLAW_EDITION` env  >  `agent.toml [edition] profile`  >  license tier
+/// >  default ([`Personal`]).
+///
+/// [`Personal`]: EditionProfile::Personal
+/// [`Enterprise`]: EditionProfile::Enterprise
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EditionProfile {
+    /// Single-owner, zero-config, personal-assistant defaults. The default,
+    /// and the tenancy unit for managed personal hosting.
+    #[default]
+    Personal,
+    /// Multi-seat / compliance / multi-tenant management surfaces enabled.
+    Enterprise,
+}
+
+impl EditionProfile {
+    /// Stable lowercase identifier (matches config + `system.status` JSON).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Personal => "personal",
+            Self::Enterprise => "enterprise",
+        }
+    }
+
+    /// `true` for the single-owner personal form factor.
+    pub fn is_personal(&self) -> bool {
+        matches!(self, Self::Personal)
+    }
+
+    /// Parse from a config string. Unknown / empty values **fail closed** to
+    /// [`EditionProfile::Personal`] (the least-privileged default — no
+    /// enterprise management surfaces) after emitting a `tracing::warn!`.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "personal" | "personal_edition" | "individual" => Self::Personal,
+            "enterprise" | "enterprise_edition" => Self::Enterprise,
+            "" => Self::Personal,
+            other => {
+                tracing::warn!(
+                    edition = %other,
+                    "unknown edition profile in config; defaulting to Personal"
+                );
+                Self::Personal
+            }
+        }
+    }
+
+    /// Derive the *default* edition implied by a license tier's TOML key.
+    ///
+    /// Decoupled from `duduclaw-license` (takes the key as `&str`) so
+    /// `duduclaw-core` carries no license dependency. Business / Enterprise /
+    /// OEM tiers imply [`Enterprise`]; everything else (open-source, hobby,
+    /// solo, studio, self-host-pro) implies [`Personal`].
+    ///
+    /// [`Enterprise`]: EditionProfile::Enterprise
+    /// [`Personal`]: EditionProfile::Personal
+    pub fn from_tier_key(tier_key: &str) -> Self {
+        match tier_key.trim().to_ascii_lowercase().as_str() {
+            "business" | "enterprise" | "oem" => Self::Enterprise,
+            _ => Self::Personal,
+        }
+    }
+
+    /// Resolve the active edition using the documented precedence:
+    /// env override > explicit config > license tier > default.
+    ///
+    /// - `env`: value of `DUDUCLAW_EDITION` (`None` if unset).
+    /// - `config`: value of `agent.toml [edition] profile` (`None` if unset).
+    /// - `tier_key`: the active license tier's TOML key (`None` for open-source).
+    pub fn resolve(env: Option<&str>, config: Option<&str>, tier_key: Option<&str>) -> Self {
+        if let Some(e) = env.map(str::trim).filter(|s| !s.is_empty()) {
+            return Self::parse(e);
+        }
+        if let Some(c) = config.map(str::trim).filter(|s| !s.is_empty()) {
+            return Self::parse(c);
+        }
+        if let Some(t) = tier_key.map(str::trim).filter(|s| !s.is_empty()) {
+            return Self::from_tier_key(t);
+        }
+        Self::Personal
+    }
+
+    /// Convenience wrapper reading `DUDUCLAW_EDITION` from the process env as
+    /// the override layer.
+    pub fn resolve_from_env(config: Option<&str>, tier_key: Option<&str>) -> Self {
+        let env = std::env::var("DUDUCLAW_EDITION").ok();
+        Self::resolve(env.as_deref(), config, tier_key)
+    }
+}
+
 /// Configuration for a local LLM model (per-agent).
 ///
 /// Each agent can independently choose to use a local model, Claude API, or both.
@@ -1700,5 +1805,88 @@ mod tests {
             let s = role.to_string();
             assert_eq!(AgentRole::from_str(&s).unwrap(), role);
         }
+    }
+
+    // ── EditionProfile ────────────────────────────────────────────────
+
+    #[test]
+    fn edition_profile_default_is_personal() {
+        assert_eq!(EditionProfile::default(), EditionProfile::Personal);
+        assert!(EditionProfile::default().is_personal());
+    }
+
+    #[test]
+    fn edition_profile_as_str_roundtrip() {
+        for ed in [EditionProfile::Personal, EditionProfile::Enterprise] {
+            assert_eq!(EditionProfile::parse(ed.as_str()), ed);
+        }
+        assert_eq!(EditionProfile::Personal.as_str(), "personal");
+        assert_eq!(EditionProfile::Enterprise.as_str(), "enterprise");
+    }
+
+    #[test]
+    fn edition_profile_parse_aliases_and_case() {
+        assert_eq!(EditionProfile::parse("PERSONAL"), EditionProfile::Personal);
+        assert_eq!(EditionProfile::parse("  Enterprise  "), EditionProfile::Enterprise);
+        assert_eq!(EditionProfile::parse("individual"), EditionProfile::Personal);
+        assert_eq!(EditionProfile::parse("enterprise_edition"), EditionProfile::Enterprise);
+    }
+
+    #[test]
+    fn edition_profile_unknown_and_empty_fail_closed_to_personal() {
+        assert_eq!(EditionProfile::parse("megacorp"), EditionProfile::Personal);
+        assert_eq!(EditionProfile::parse(""), EditionProfile::Personal);
+        assert_eq!(EditionProfile::parse("   "), EditionProfile::Personal);
+    }
+
+    #[test]
+    fn edition_profile_from_tier_key() {
+        for k in ["business", "enterprise", "oem", "OEM", " Business "] {
+            assert_eq!(EditionProfile::from_tier_key(k), EditionProfile::Enterprise, "{k}");
+        }
+        for k in ["opensource", "hobby", "solo", "studio", "self_host_pro", ""] {
+            assert_eq!(EditionProfile::from_tier_key(k), EditionProfile::Personal, "{k}");
+        }
+    }
+
+    #[test]
+    fn edition_profile_resolve_precedence() {
+        // env wins over everything
+        assert_eq!(
+            EditionProfile::resolve(Some("enterprise"), Some("personal"), Some("solo")),
+            EditionProfile::Enterprise
+        );
+        // config wins over tier when env absent
+        assert_eq!(
+            EditionProfile::resolve(None, Some("enterprise"), Some("solo")),
+            EditionProfile::Enterprise
+        );
+        // tier used when env + config absent
+        assert_eq!(
+            EditionProfile::resolve(None, None, Some("business")),
+            EditionProfile::Enterprise
+        );
+        assert_eq!(
+            EditionProfile::resolve(None, None, Some("studio")),
+            EditionProfile::Personal
+        );
+        // nothing set → default Personal
+        assert_eq!(EditionProfile::resolve(None, None, None), EditionProfile::Personal);
+        // empty strings are treated as unset and fall through
+        assert_eq!(
+            EditionProfile::resolve(Some("  "), Some(""), Some("business")),
+            EditionProfile::Enterprise
+        );
+    }
+
+    #[test]
+    fn edition_profile_serde_roundtrip() {
+        for ed in [EditionProfile::Personal, EditionProfile::Enterprise] {
+            let json = serde_json::to_string(&ed).unwrap();
+            let back: EditionProfile = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, ed);
+        }
+        // lowercase wire format
+        assert_eq!(serde_json::to_string(&EditionProfile::Personal).unwrap(), "\"personal\"");
     }
 }

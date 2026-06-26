@@ -1,0 +1,28 @@
+# Minimal image to smoke-test EditionProfile resolution via real `docker run`.
+# Builds only the open `duduclaw` binary (no dashboard/frontend) and boots the
+# gateway; the boot log prints `edition_profile=<personal|enterprise>` which is
+# what the smoke asserts. See commercial/docs/TODO-personal-edition.md P3.3/P5.5.
+
+FROM rust:slim AS builder
+WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+# duduclaw-memory/-cli use include_str! against templates/wiki/*
+COPY templates/ templates/
+# No default features → skip the embedded dashboard (no frontend build needed).
+RUN cargo build --release --no-default-features -p duduclaw-cli
+
+# Match the builder's glibc (rust:slim is trixie-based → glibc 2.39).
+FROM debian:trixie-slim
+# Runtime needs OpenSSL 3 (binary links libssl.so.3) + CA certs.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -u 1000 duduclaw
+COPY --from=builder /build/target/release/duduclaw /usr/local/bin/duduclaw
+USER duduclaw
+WORKDIR /home/duduclaw
+EXPOSE 18789
+# Gateway auto-writes a minimal config on first run, then boots.
+CMD ["duduclaw", "gateway"]

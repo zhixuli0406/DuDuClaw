@@ -146,6 +146,7 @@ impl FeatureGate {
             LicenseTier::Solo => &["solo", "hobby", "opensource"],
             LicenseTier::Studio => &["studio", "solo", "hobby", "opensource"],
             LicenseTier::Business => &["business", "studio", "solo", "hobby", "opensource"],
+            LicenseTier::PersonalProSelfHost => &["personal_pro_self_host", "opensource"],
             LicenseTier::SelfHostPro => &["self_host_pro", "opensource"],
             LicenseTier::Oem => &["oem", "self_host_pro", "opensource"],
         }

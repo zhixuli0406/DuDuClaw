@@ -56,6 +56,7 @@ pub mod discord_voice;
 pub mod dispatcher;
 pub mod message_queue;
 pub mod external_factors;
+pub mod cli_auth;
 pub mod handlers;
 pub mod line;
 pub mod mcp_oauth;

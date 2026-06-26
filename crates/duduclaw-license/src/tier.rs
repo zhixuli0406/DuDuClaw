@@ -19,7 +19,8 @@ use std::fmt;
 
 /// License tiers in ascending order of capabilities.
 ///
-/// Total ordering: `OpenSource < Hobby < Solo < Studio < Business < SelfHostPro < Oem`.
+/// Total ordering:
+/// `OpenSource < Hobby < Solo < Studio < Business < PersonalProSelfHost < SelfHostPro < Oem`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LicenseTier {
@@ -37,6 +38,12 @@ pub enum LicenseTier {
 
     /// Cloud paid tier — NT$8,900/mo (Odoo + private support).
     Business,
+
+    /// Self-host **Personal** subscription — NT$490/mo or NT$4,900/yr.
+    /// The personal-form-factor self-host tier: unlocks premium templates +
+    /// priority patches for individual developers who self-host. Sits below
+    /// [`SelfHostPro`](Self::SelfHostPro) (the enterprise self-host tier).
+    PersonalProSelfHost,
 
     /// Self-host subscription tier — NT$1,490/mo or NT$14,900/yr.
     SelfHostPro,
@@ -56,6 +63,7 @@ impl LicenseTier {
             Self::Solo => "solo",
             Self::Studio => "studio",
             Self::Business => "business",
+            Self::PersonalProSelfHost => "personal_pro_self_host",
             Self::SelfHostPro => "self_host_pro",
             Self::Oem => "oem",
         }
@@ -70,7 +78,7 @@ impl LicenseTier {
 
     /// Returns `true` if this tier is only valid for self-hosted deployments.
     pub fn is_self_host_only(&self) -> bool {
-        matches!(self, Self::SelfHostPro | Self::Oem)
+        matches!(self, Self::PersonalProSelfHost | Self::SelfHostPro | Self::Oem)
     }
 
     /// Returns `true` if this tier represents a paid commercial subscription.
@@ -201,5 +209,22 @@ mod tests {
     #[test]
     fn default_is_opensource() {
         assert_eq!(LicenseTier::default(), LicenseTier::OpenSource);
+    }
+
+    #[test]
+    fn personal_pro_self_host_classification() {
+        let t = LicenseTier::PersonalProSelfHost;
+        assert_eq!(t.to_string(), "personal_pro_self_host");
+        assert_eq!(t.as_toml_key(), "personal_pro_self_host");
+        assert!(t.is_self_host_only());
+        assert!(!t.is_cloud_only());
+        assert!(t.is_paid());
+        // serde round-trip
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(json, "\"personal_pro_self_host\"");
+        assert_eq!(serde_json::from_str::<LicenseTier>(&json).unwrap(), t);
+        // ordering: a lighter self-host tier than SelfHostPro, above Business
+        assert!(LicenseTier::Business < t);
+        assert!(t < LicenseTier::SelfHostPro);
     }
 }
