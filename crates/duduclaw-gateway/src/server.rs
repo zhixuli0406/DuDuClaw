@@ -86,6 +86,10 @@ pub struct GatewayConfig {
     pub home_dir: std::path::PathBuf,
     /// Plugin extension point. Defaults to [`NullExtension`].
     pub extension: Arc<dyn GatewayExtension>,
+    /// Explicit product form-factor override. `None` means resolve at request
+    /// time from `DUDUCLAW_EDITION` env > license tier > `Personal`. Cloud
+    /// control-plane sets `Some(..)` (or the env var) per managed tenant.
+    pub edition: Option<duduclaw_core::EditionProfile>,
 }
 
 /// Internal shared state for the Axum application.
@@ -109,6 +113,18 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     let home_dir = config.home_dir.clone();
     let extension = config.extension.clone();
+    let edition_override = config.edition;
+    {
+        // Startup-time best-effort resolution for the boot log (license tier
+        // may not be loaded yet; the live value is resolved per-request in
+        // `MethodHandler::resolve_edition_profile`).
+        let boot_edition = duduclaw_core::EditionProfile::resolve(
+            std::env::var("DUDUCLAW_EDITION").ok().as_deref(),
+            edition_override.map(|e| e.as_str()),
+            None,
+        );
+        info!("edition_profile={}", boot_edition.as_str());
+    }
 
     // ── BUG-2 fix: anchor EvolutionEvents audit log to home_dir, not cwd ──
     //
@@ -145,6 +161,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     }
 
     let handler = MethodHandler::with_extension(config.home_dir, extension.clone()).await;
+    handler.set_edition_override(edition_override).await;
 
     // Initialize cost telemetry (must happen before any Claude CLI calls)
     if let Err(e) = crate::cost_telemetry::init_telemetry(&home_dir) {

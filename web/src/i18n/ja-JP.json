@@ -1,6 +1,11 @@
 {
   "app.name": "DuDuClaw",
   "app.subtitle": "AI アシスタントコンソール",
+  "edition.personal": "個人版",
+  "edition.enterprise": "エンタープライズ版",
+  "softLimit.title": "{tier} プランの上限に達しました",
+  "softLimit.body": "引き続きご利用いただけます（お知らせのみ）。アップグレードでエージェントとチャンネルを増やせます。",
+  "softLimit.dismiss": "閉じる",
   "navGroup.overview": "概要",
   "navGroup.agents": "エージェント",
   "navGroup.knowledge": "ナレッジ",

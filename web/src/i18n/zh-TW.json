@@ -1,6 +1,11 @@
 {
   "app.name": "DuDuClaw",
   "app.subtitle": "AI 助理控制台",
+  "edition.personal": "個人版",
+  "edition.enterprise": "企業版",
+  "softLimit.title": "您已達到 {tier} 方案上限",
+  "softLimit.body": "仍可繼續使用，這只是提醒。升級可獲得更多 agent 與頻道。",
+  "softLimit.dismiss": "關閉",
   "navGroup.overview": "總覽",
   "navGroup.agents": "代理",
   "navGroup.knowledge": "知識",

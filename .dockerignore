@@ -1,0 +1,15 @@
+# Build artifacts (315GB+ — must never enter the build context)
+target/
+**/target/
+# VCS + local state
+.git/
+.duduclaw/
+# JS deps (rebuilt inside the frontend stage)
+**/node_modules/
+# Closed / heavy trees not needed by the open image build
+artifacts/
+research/
+commercial/**/target/
+# Scratch / logs
+*.log
+scratchpad/

@@ -87,6 +87,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/development-guide.md](guides/development-guide.md) | Developer setup, agent development, browser automation | Current |
 | [guides/custom-mcp-tool.md](guides/custom-mcp-tool.md) | Extending MCP tools — step-by-step guide | Current |
 | [guides/docker.md](guides/docker.md) | Docker build & run | Current |
+| [guides/personal-edition-portability.md](guides/personal-edition-portability.md) | 個人版資料可攜：自架 ↔ 代管互轉 | Current |
 
 ## API Reference
 

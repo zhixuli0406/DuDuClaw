@@ -7,6 +7,7 @@ import { useSystemStore } from '@/stores/system-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { hasMinRole } from '@/lib/roles';
 import { navGroups, type NavItem } from './nav-model';
+import { EditionBadge } from './EditionBadge';
 
 const COLLAPSE_KEY = 'duduclaw-nav-collapsed';
 
@@ -37,10 +38,17 @@ export function Sidebar() {
     });
   };
 
+  // Personal edition hides enterprise-only management surfaces. An absent
+  // `edition_profile` (older gateway) is treated as enterprise → show all.
+  const isPersonal = status?.edition_profile === 'personal';
+
   const visibleGroups = navGroups
     .map((group) => ({
       ...group,
-      items: group.items.filter((item: NavItem) => hasMinRole(user?.role, item.minRole)),
+      items: group.items.filter(
+        (item: NavItem) =>
+          hasMinRole(user?.role, item.minRole) && !(isPersonal && item.enterprise)
+      ),
     }))
     .filter((group) => group.items.length > 0);
 
@@ -142,9 +150,12 @@ export function Sidebar() {
             </button>
           </div>
         )}
-        <p className="font-mono text-[11px] tracking-wide text-stone-400 dark:text-stone-500">
-          {status?.version ?? 'v0.12.0'}
-        </p>
+        <div className="flex items-center justify-between gap-2">
+          <p className="font-mono text-[11px] tracking-wide text-stone-400 dark:text-stone-500">
+            {status?.version ?? 'v0.12.0'}
+          </p>
+          <EditionBadge />
+        </div>
       </div>
     </aside>
   );

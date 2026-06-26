@@ -2324,7 +2324,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-agent"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -2349,7 +2349,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-auth"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -2369,7 +2369,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-bridge"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "chrono",
  "duduclaw-core",
@@ -2380,7 +2380,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-bus"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "duduclaw-core",
  "serde",
@@ -2391,7 +2391,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-cli"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2417,6 +2417,7 @@ dependencies = [
  "duduclaw-odoo",
  "duduclaw-redaction",
  "duduclaw-security",
+ "flate2",
  "futures-util",
  "hex",
  "http 1.4.0",
@@ -2432,6 +2433,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subtle",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -2446,7 +2448,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-cli-runtime"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -2468,7 +2470,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-cli-worker"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2490,7 +2492,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-container"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "async-trait",
  "bollard",
@@ -2506,7 +2508,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-core"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2527,7 +2529,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-dashboard"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "axum",
  "mime_guess",
@@ -2536,7 +2538,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-desktop"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2550,7 +2552,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-durability"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2571,7 +2573,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-fork"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2588,7 +2590,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-gateway"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2622,6 +2624,7 @@ dependencies = [
  "image",
  "nix 0.29.0",
  "openssl-sys",
+ "portable-pty",
  "reqwest 0.12.28",
  "ring",
  "rusqlite",
@@ -2648,7 +2651,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-governance"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2667,7 +2670,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-identity"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2683,7 +2686,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-inference"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2718,7 +2721,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-license"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2738,7 +2741,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-memory"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2757,7 +2760,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-odoo"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "chrono",
  "duduclaw-core",
@@ -2771,7 +2774,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-redaction"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2794,7 +2797,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-security"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

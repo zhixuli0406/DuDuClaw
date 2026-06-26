@@ -1,6 +1,51 @@
 # Changelog
 
 
+## [1.26.0] - 2026-06-27 — Personal / Enterprise editions + one-click CLI login
+
+Introduces an explicit **product form-factor** dimension (Personal vs
+Enterprise) that is orthogonal to the license tier and **never gates a core
+feature** — it only changes defaults and which management surfaces the
+dashboard shows. Adds a **Dashboard one-click login** for every AI CLI, bundles
+the Antigravity CLI in the server image, and ships personal-edition data
+portability.
+
+### Added
+- **Personal / Enterprise editions** (`EditionProfile` in `duduclaw-core`):
+  - `Personal` (default) = single-owner, zero-config; `Enterprise` = multi-seat
+    / compliance management surfaces. Resolution precedence:
+    `DUDUCLAW_EDITION` env > `agent.toml [edition]` > license tier > `Personal`.
+  - Gateway resolves it per request and returns `edition_profile` on
+    `system.status` / `system.version`.
+  - Dashboard reads it to hide enterprise nav (org / users / governance /
+    partner / wiki-trust) on Personal, shows an **EditionBadge**, and a
+    non-blocking **soft-limit banner** near a plan's agent/channel limit.
+- **`PersonalProSelfHost` license tier** — the individual-developer self-host
+  tier (NT$490/mo or NT$4,900/yr): unlocks premium templates + priority patches
+  without the enterprise modules.
+- **Dashboard one-click CLI login** (`auth.cli_login.*`): drives each CLI's
+  native login (Claude / Codex / Gemini / Antigravity) in a PTY on the gateway,
+  streams the output to a dashboard terminal, and relays the user's pasted code
+  back. Flags `remote_safe` per CLI (paste-back vs localhost-callback). Reachable
+  from the Accounts page. Claude `setup-token` flow verified end-to-end.
+- **Antigravity CLI (`agy`) bundled** in `container/Dockerfile.server` alongside
+  claude / codex / gemini (Google's official installer), so the Antigravity
+  runtime works out of the box.
+- **Personal-edition data portability**: `duduclaw export` / `duduclaw import`
+  package `~/.duduclaw/` as a portable `.tar.gz` (agents / memory / config /
+  license; skips models / logs / backups) to move between machines or switch
+  self-host ↔ managed. Guide: `docs/guides/personal-edition-portability.md`.
+
+### Changed
+- `.dockerignore` added at the repo root (keeps the build context small).
+
+### Tests
+- `duduclaw-core` EditionProfile (7), `duduclaw-license` tier (83),
+  `duduclaw-gateway` cli_auth (6) + full suite, `duduclaw-cli` portability (3);
+  web `tsc` + `vitest` (44). Live `docker run` smoke confirms
+  `edition_profile` resolves from `DUDUCLAW_EDITION` in a real container.
+
+
 ## [1.25.0] - 2026-06-26 — Browser-first onboarding + guided product tour
 
 First-run setup moves out of the terminal and into the dashboard. A fresh

@@ -10,6 +10,7 @@ use duduclaw_agent::AgentRunner;
 use duduclaw_core::error::DuDuClawError;
 use duduclaw_core::types::CheckStatus;
 mod acp;
+mod portability;          // Personal-edition data portability: export/import ~/.duduclaw
 mod mcp;
 pub mod mcp_auth;
 pub mod mcp_auth_strategy;
@@ -299,6 +300,27 @@ enum Commands {
 
     /// Migrate agent.toml to Claude Code format (.claude/settings.local.json)
     Migrate,
+
+    /// Export your personal-edition data (`~/.duduclaw/`) as a portable
+    /// `.tar.gz` (agents, memory, config, license; skips models/logs/backups).
+    /// Use to move between machines or switch self-host ↔ managed.
+    Export {
+        /// Output archive path (default: ./duduclaw-export.tar.gz).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+
+    /// Import a personal-edition `.tar.gz` (produced by `duduclaw export`)
+    /// into `~/.duduclaw/`. Refuses to overwrite an existing populated home
+    /// unless `--force` (existing agents preserved as `agents.pre-import`).
+    Import {
+        /// Path to the `.tar.gz` archive to import.
+        file: PathBuf,
+
+        /// Overwrite an existing populated home (existing data preserved).
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Start DuDuClaw MCP server (for Claude Code integration)
     McpServer,
@@ -873,6 +895,8 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             }
         }
         Commands::Migrate => cmd_migrate().await,
+        Commands::Export { out } => cmd_export_data(out).await,
+        Commands::Import { file, force } => cmd_import_data(file, force).await,
         Commands::McpServer => cmd_mcp_server().await,
         Commands::Mcp(mcp_cmd) => cmd_mcp(mcp_cmd, &duduclaw_home()).await,
         Commands::Wizard => wizard::cmd_wizard(&duduclaw_home()).await,
@@ -1683,7 +1707,7 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
         if has_oauth {
             let sub_label = oauth_sub.as_deref().unwrap_or("unknown");
             println!("  {} 偵測到 Claude {} 登入 — 自動使用，無需額外設定",
-                style("✓").green(), style(sub_label).cyan().bold());
+                console::style("✓").green(), style(sub_label).cyan().bold());
             if !env_key.is_empty() {
                 println!("  {} 同時偵測到 API Key 環境變數（作為備援）", style("✓").green());
             }
@@ -2497,6 +2521,10 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
         auth_token,
         home_dir: home,
         extension: Arc::new(duduclaw_gateway::NullExtension),
+        // Self-host default: resolve form-factor per-request from
+        // DUDUCLAW_EDITION env > license tier > Personal. Cloud control-plane
+        // sets the env var per managed tenant instead.
+        edition: None,
     };
 
     duduclaw_gateway::start_gateway(config).await
@@ -3122,6 +3150,37 @@ async fn cmd_migrate() -> duduclaw_core::error::Result<()> {
     println!("Migrating agents to Claude Code format...");
     println!("Home: {}\n", home.display());
     migrate::migrate(&home).await
+}
+
+/// `duduclaw export` — package `~/.duduclaw/` into a portable `.tar.gz`.
+async fn cmd_export_data(out: Option<PathBuf>) -> duduclaw_core::error::Result<()> {
+    let home = duduclaw_home();
+    let out = out.unwrap_or_else(portability::default_export_path);
+    println!("Exporting personal-edition data...");
+    println!("  Home:    {}", home.display());
+    println!("  Archive: {}", out.display());
+    let n = portability::export_home(&home, &out)?;
+    println!(
+        "{} Exported {n} top-level item(s) (models/logs/backups skipped) → {}",
+        console::style("✓").green(),
+        console::style(out.display()).cyan()
+    );
+    Ok(())
+}
+
+/// `duduclaw import <file>` — restore a personal-edition `.tar.gz` into `~/.duduclaw/`.
+async fn cmd_import_data(file: PathBuf, force: bool) -> duduclaw_core::error::Result<()> {
+    let home = duduclaw_home();
+    println!("Importing personal-edition data...");
+    println!("  Archive: {}", file.display());
+    println!("  Home:    {}", home.display());
+    portability::import_archive(&file, &home, force)?;
+    println!(
+        "{} Imported into {}. Restart with `duduclaw start`.",
+        console::style("✓").green(),
+        console::style(home.display()).cyan()
+    );
+    Ok(())
 }
 
 /// `duduclaw http-server` — Start MCP HTTP/SSE transport server (W20-P1 Phase 2).

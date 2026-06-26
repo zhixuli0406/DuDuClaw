@@ -21,7 +21,7 @@
 
 ### Alternative: Email
 
-Send an email to **security@duduclaw.dev** with:
+Send an email to **louis.li@dudustudio.monster** with:
 
 - **Subject**: `[SECURITY] Brief description`
 - **Description**: Detailed description of the vulnerability

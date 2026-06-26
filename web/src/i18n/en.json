@@ -1,6 +1,11 @@
 {
   "app.name": "DuDuClaw",
   "app.subtitle": "AI Assistant Console",
+  "edition.personal": "Personal",
+  "edition.enterprise": "Enterprise",
+  "softLimit.title": "You've reached your {tier} plan limit",
+  "softLimit.body": "You can keep going — this is just a heads-up. Upgrade for more agents and channels.",
+  "softLimit.dismiss": "Dismiss",
   "navGroup.overview": "Overview",
   "navGroup.agents": "Agents",
   "navGroup.knowledge": "Knowledge",

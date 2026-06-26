@@ -2173,6 +2173,13 @@ pub struct MethodHandler {
     jwt_config: RwLock<Option<Arc<JwtConfig>>>,
     /// Plugin extension point (NullExtension by default).
     extension: Arc<dyn GatewayExtension>,
+    /// Explicit product form-factor override, injected after gateway start by
+    /// the Cloud control-plane. `None` → resolve per-request from
+    /// `DUDUCLAW_EDITION` env > license tier > `Personal`.
+    edition_override: RwLock<Option<duduclaw_core::EditionProfile>>,
+    /// Active interactive CLI-login sessions ("Dashboard 一鍵登入"), keyed by
+    /// session id. Each drives a CLI's native login command in a PTY.
+    cli_auth_sessions: RwLock<std::collections::HashMap<String, Arc<crate::cli_auth::AuthSession>>>,
     /// SQLite-backed cron task store. Injected after gateway starts.
     cron_store: RwLock<Option<Arc<CronStore>>>,
     /// Handle to the running cron scheduler — used to trigger hot reload
@@ -2279,6 +2286,8 @@ impl MethodHandler {
             user_db: RwLock::new(None),
             jwt_config: RwLock::new(None),
             extension,
+            edition_override: RwLock::new(None),
+            cli_auth_sessions: RwLock::new(std::collections::HashMap::new()),
             cron_store: RwLock::new(None),
             cron_scheduler: RwLock::new(None),
             mcp_oauth_pending: RwLock::new(std::collections::HashMap::new()),
@@ -2289,6 +2298,33 @@ impl MethodHandler {
             redaction_manager: RwLock::new(None),
             audit_index: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Inject the explicit edition form-factor override (called once after
+    /// gateway start). `None` keeps per-request resolution from env + tier.
+    pub async fn set_edition_override(&self, edition: Option<duduclaw_core::EditionProfile>) {
+        *self.edition_override.write().await = edition;
+    }
+
+    /// Resolve the active product form-factor ([`EditionProfile`]) at request
+    /// time using the documented precedence: `DUDUCLAW_EDITION` env >
+    /// explicit override > license tier > `Personal`. This is the value the
+    /// dashboard reads to decide whether to show enterprise management
+    /// surfaces. It never gates a core feature.
+    ///
+    /// [`EditionProfile`]: duduclaw_core::EditionProfile
+    async fn resolve_edition_profile(&self) -> duduclaw_core::EditionProfile {
+        let tier_key = match crate::license_runtime::global() {
+            Some(runtime) => Some(runtime.snapshot().await.tier.as_toml_key().to_string()),
+            None => None,
+        };
+        let env = std::env::var("DUDUCLAW_EDITION").ok();
+        let override_ed = *self.edition_override.read().await;
+        duduclaw_core::EditionProfile::resolve(
+            env.as_deref(),
+            override_ed.map(|e| e.as_str()),
+            tier_key.as_deref(),
+        )
     }
 
     /// Lazily open (once) the shared [`AuditEventIndex`] and return it.
@@ -2622,6 +2658,12 @@ impl MethodHandler {
             "accounts.add" => { require_admin!(); self.handle_accounts_add(params).await }
             "accounts.update_budget" => { require_admin!(); self.handle_accounts_update_budget(params).await }
             "accounts.update" => { require_admin!(); self.handle_accounts_update(params).await }
+            // Interactive CLI login ("Dashboard 一鍵登入") — drives the CLI's
+            // native login in a PTY and streams it to the dashboard.
+            "auth.cli_login.start" => { require_admin!(); self.handle_cli_login_start(params).await }
+            "auth.cli_login.input" => { require_admin!(); self.handle_cli_login_input(params).await }
+            "auth.cli_login.status" => { require_admin!(); self.handle_cli_login_status(params).await }
+            "auth.cli_login.cancel" => { require_admin!(); self.handle_cli_login_cancel(params).await }
 
             // ── Memory (agent-scoped, H2 fix) ────────────────
             "memory.search" => {
@@ -6933,6 +6975,123 @@ impl MethodHandler {
         }
     }
 
+    // ── Interactive CLI login ("Dashboard 一鍵登入") ──────────────────────
+    //
+    // Drives each AI CLI's native login command in a PTY, streams output to the
+    // dashboard as `auth.cli_login.output` events, relays input back, and
+    // reports terminal status. See `cli_auth.rs` for the per-CLI registry and
+    // the local-callback-vs-remote feasibility constraint.
+
+    async fn handle_cli_login_start(&self, params: Value) -> WsFrame {
+        let runtime_str = params.get("runtime").and_then(|v| v.as_str()).unwrap_or("");
+        if runtime_str.is_empty() {
+            return WsFrame::error_response("", "runtime is required (claude|codex|gemini|antigravity)");
+        }
+        let runtime = duduclaw_core::types::RuntimeType::parse(runtime_str);
+        let spec = match crate::cli_auth::spec_for(runtime) {
+            Some(s) => s,
+            None => return WsFrame::error_response("", "this runtime has no interactive login (use an API key)"),
+        };
+
+        let session_id = uuid::Uuid::new_v4().simple().to_string();
+        let session = match crate::cli_auth::AuthSession::spawn(
+            session_id.clone(),
+            runtime,
+            std::collections::HashMap::new(),
+        ) {
+            Ok(s) => s,
+            Err(crate::cli_auth::AuthError::NotInstalled) => {
+                return WsFrame::error_response("", &format!("{runtime_str} CLI not installed on this host"));
+            }
+            Err(e) => return WsFrame::error_response("", &format!("failed to start login: {e}")),
+        };
+        let program = session.program.clone();
+
+        self.cli_auth_sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session.clone());
+
+        // Forward PTY output + terminal status to the dashboard event stream.
+        if let Some(tx) = self.event_tx.read().await.clone() {
+            let mut rx = session.subscribe();
+            let sess = session.clone();
+            let sid = session_id.clone();
+            tokio::spawn(async move {
+                use tokio::sync::broadcast::error::RecvError;
+                let emit = |event: &str, payload: Value| {
+                    let frame = WsFrame::Event {
+                        event: event.to_string(),
+                        payload,
+                        seq: None,
+                        state_version: None,
+                    };
+                    let _ = tx.send(serde_json::to_string(&frame).unwrap_or_default());
+                };
+                loop {
+                    match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
+                        Ok(Ok(bytes)) => {
+                            let data = String::from_utf8_lossy(&bytes).to_string();
+                            emit("auth.cli_login.output", json!({"session_id": sid, "data": data}));
+                        }
+                        Ok(Err(RecvError::Lagged(_))) => continue,
+                        Ok(Err(RecvError::Closed)) => break,
+                        Err(_) => {} // timeout → fall through to status check
+                    }
+                    if sess.status().is_terminal() {
+                        emit(
+                            "auth.cli_login.status",
+                            json!({"session_id": sid, "status": sess.status().as_str()}),
+                        );
+                        break;
+                    }
+                }
+            });
+        }
+
+        WsFrame::ok_response("", json!({
+            "session_id": session_id,
+            "runtime": runtime_str,
+            "program": program,
+            "remote_safe": spec.remote_safe,
+            "hint": spec.hint,
+            "status": "running",
+        }))
+    }
+
+    async fn handle_cli_login_input(&self, params: Value) -> WsFrame {
+        let sid = params.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        let data = params.get("data").and_then(|v| v.as_str()).unwrap_or("");
+        let sessions = self.cli_auth_sessions.read().await;
+        let Some(session) = sessions.get(sid) else {
+            return WsFrame::error_response("", "login session not found");
+        };
+        match session.write_input(data.as_bytes()) {
+            Ok(()) => WsFrame::ok_response("", json!({"success": true})),
+            Err(e) => WsFrame::error_response("", &format!("failed to send input: {e}")),
+        }
+    }
+
+    async fn handle_cli_login_status(&self, params: Value) -> WsFrame {
+        let sid = params.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        let sessions = self.cli_auth_sessions.read().await;
+        let Some(session) = sessions.get(sid) else {
+            return WsFrame::error_response("", "login session not found");
+        };
+        WsFrame::ok_response("", json!({
+            "session_id": sid,
+            "status": session.status().as_str(),
+        }))
+    }
+
+    async fn handle_cli_login_cancel(&self, params: Value) -> WsFrame {
+        let sid = params.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(session) = self.cli_auth_sessions.write().await.remove(sid) {
+            session.kill();
+        }
+        WsFrame::ok_response("", json!({"success": true}))
+    }
+
     // ── System ───────────────────────────────────────────────
 
     async fn handle_system_status(&self) -> WsFrame {
@@ -6941,12 +7100,17 @@ impl MethodHandler {
         let channel_map = self.channel_status.read().await;
         let channels_connected = channel_map.values().filter(|s| s.connected).count();
         drop(channel_map);
+        let edition_profile = self.resolve_edition_profile().await;
         WsFrame::ok_response("", json!({
             "version": crate::updater::current_version(),
             "uptime_seconds": uptime,
             "agents_count": reg.list().len(),
             "channels_connected": channels_connected,
             "gateway_address": "localhost:18789",
+            // Product form-factor (personal|enterprise). Orthogonal to the
+            // license `edition` string returned by system.version. The
+            // dashboard reads this to hide/show enterprise management surfaces.
+            "edition_profile": edition_profile.as_str(),
         }))
     }
 
@@ -7027,10 +7191,13 @@ impl MethodHandler {
             }
             None => "community".to_string(),
         };
+        let edition_profile = self.resolve_edition_profile().await;
         WsFrame::ok_response("", json!({
             "version": crate::updater::current_version(),
             "auto_update": crate::updater::auto_update_enabled(&self.home_dir),
             "edition": edition,
+            // Product form-factor (personal|enterprise); see system.status.
+            "edition_profile": edition_profile.as_str(),
         }))
     }
 

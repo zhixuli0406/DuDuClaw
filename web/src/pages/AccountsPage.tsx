@@ -6,9 +6,11 @@ import { toast, formatError } from '@/lib/toast';
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { Page, PageHeader, Card, StatCard, Button, Badge, EmptyState } from '@/components/ui';
+import { CliLoginModal, type LoginRuntime } from '@/components/CliLoginModal';
 import {
   Wallet,
   Plus,
+  LogIn,
   RefreshCw,
   CheckCircle,
   AlertTriangle,
@@ -25,6 +27,8 @@ export function AccountsPage() {
   const [budget, setBudget] = useState<BudgetSummary | null>(null);
   const [loading, setLoading] = useState(false);
   const [showAddDialog, setShowAddDialog] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [loginRuntime, setLoginRuntime] = useState<LoginRuntime | null>(null);
 
   const fetchBudget = useCallback(async () => {
     setLoading(true);
@@ -67,12 +71,50 @@ export function AccountsPage() {
             <Button variant="secondary" icon={RefreshCw} onClick={handleRotate}>
               {intl.formatMessage({ id: 'accounts.rotate' })}
             </Button>
+            <Button variant="secondary" icon={LogIn} onClick={() => setPickerOpen(true)}>
+              一鍵登入
+            </Button>
             <Button variant="primary" icon={Plus} onClick={() => setShowAddDialog(true)}>
               {intl.formatMessage({ id: 'accounts.add' })}
             </Button>
           </>
         }
       />
+
+      {/* CLI picker for one-click login */}
+      <Dialog open={pickerOpen} onClose={() => setPickerOpen(false)} title="選擇要登入的 CLI">
+        <div className="grid grid-cols-2 gap-2">
+          {([
+            ['claude', 'Claude'],
+            ['codex', 'Codex'],
+            ['gemini', 'Gemini'],
+            ['antigravity', 'Antigravity (agy)'],
+          ] as [LoginRuntime, string][]).map(([rt, label]) => (
+            <button
+              key={rt}
+              className={buttonSecondary}
+              onClick={() => {
+                setPickerOpen(false);
+                setLoginRuntime(rt);
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <p className="mt-3 text-xs text-stone-500 dark:text-stone-400">
+          會在伺服器以 PTY 驅動該 CLI 的原生登入流程並串到這裡。Claude 走 setup-token（遠端可用）；其餘走 localhost 回呼（限自架）。
+        </p>
+      </Dialog>
+
+      {loginRuntime && (
+        <CliLoginModal
+          open={loginRuntime !== null}
+          runtime={loginRuntime}
+          onClose={() => setLoginRuntime(null)}
+          onSuccess={fetchBudget}
+        />
+      )}
 
       {/* Budget Summary KPIs */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
