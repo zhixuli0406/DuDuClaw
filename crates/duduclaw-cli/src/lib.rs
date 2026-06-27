@@ -11,6 +11,7 @@ use duduclaw_core::error::DuDuClawError;
 use duduclaw_core::types::CheckStatus;
 mod acp;
 mod portability;          // Personal-edition data portability: export/import ~/.duduclaw
+mod premium_templates;    // Licensed industry templates (commercial/templates-premium), gated by premium_templates feature
 mod mcp;
 pub mod mcp_auth;
 pub mod mcp_auth_strategy;

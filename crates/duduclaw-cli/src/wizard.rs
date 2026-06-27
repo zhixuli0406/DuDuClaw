@@ -10,22 +10,59 @@ use duduclaw_core::error::{DuDuClawError, Result};
 
 // ── Industry definitions ─────────────────────────────────────
 
-const INDUSTRIES: &[&str] = &[
-    "Restaurant",
-    "Manufacturing",
-    "Trading",
-    "Retail",
-    "Other",
+/// Where a selected industry's starter files come from.
+enum TemplateSource {
+    /// A free template directory name under `templates/`.
+    Free(&'static str),
+    /// A premium template's absolute directory (already license-gated).
+    Premium(PathBuf),
+    /// No template — scaffold a minimal agent.toml from scratch.
+    None,
+}
+
+/// One selectable entry in the wizard's industry menu.
+struct IndustryChoice {
+    label: String,
+    source: TemplateSource,
+}
+
+/// Free starter industries that always appear, paired with their template dir.
+const FREE_INDUSTRIES: &[(&str, Option<&str>)] = &[
+    ("Restaurant", Some("restaurant")),
+    ("Manufacturing", Some("manufacturing")),
+    ("Trading", Some("trading")),
+    ("Retail", None),
 ];
 
-/// Map industry selection index to template directory name (if available).
-fn industry_template_dir(index: usize) -> Option<&'static str> {
-    match index {
-        0 => Some("restaurant"),
-        1 => Some("manufacturing"),
-        2 => Some("trading"),
-        _ => None, // Retail and Other have no template yet
+/// Build the ordered industry menu: free industries first, then any premium
+/// industries the active license has unlocked, then a catch-all "Other".
+fn build_industry_choices(
+    premium: &[crate::premium_templates::PremiumIndustry],
+) -> Vec<IndustryChoice> {
+    let mut choices: Vec<IndustryChoice> = FREE_INDUSTRIES
+        .iter()
+        .map(|(label, dir)| IndustryChoice {
+            label: (*label).to_string(),
+            source: match dir {
+                Some(d) => TemplateSource::Free(d),
+                None => TemplateSource::None,
+            },
+        })
+        .collect();
+
+    for p in premium {
+        choices.push(IndustryChoice {
+            label: p.label.clone(),
+            source: TemplateSource::Premium(p.dir.clone()),
+        });
     }
+
+    choices.push(IndustryChoice {
+        label: "Other".to_string(),
+        source: TemplateSource::None,
+    });
+
+    choices
 }
 
 const CHANNELS: &[&str] = &["LINE", "Telegram", "Discord", "Slack"];
@@ -53,13 +90,36 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
     );
 
     // 1. Select industry
+    //
+    // Free starter industries always appear. Premium industries are appended
+    // only when the active license unlocks `premium_templates` AND the closed
+    // `templates-premium/` tree is installed (fail-closed via
+    // `premium_templates::available_premium_industries`). When premium
+    // templates exist on disk but the license is locked, show a one-line
+    // upsell hint instead of silently hiding them.
+    let premium = crate::premium_templates::available_premium_industries();
+    if crate::premium_templates::premium_present_but_locked() {
+        println!(
+            "  {} 進階產業模板（電商／診所／房仲／補教…）需 Pro 授權",
+            style("🔒").dim()
+        );
+        println!(
+            "     {}\n",
+            style("解鎖：duduclaw license activate <key>  ·  https://duduclaw.tw/pricing").dim()
+        );
+    }
+
+    let choices = build_industry_choices(&premium);
+    let choice_labels: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
+
     let industry_idx = Select::new()
         .with_prompt("Select industry")
-        .items(INDUSTRIES)
+        .items(&choice_labels)
         .default(0)
         .interact()
         .map_err(|e| DuDuClawError::Config(format!("Prompt error: {e}")))?;
-    let industry_name = INDUSTRIES[industry_idx];
+    let selected_choice = &choices[industry_idx];
+    let industry_name = selected_choice.label.clone();
 
     // 2. Company name
     let company_name: String = Input::new()
@@ -120,7 +180,7 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
 
     // 8. Show summary and confirm
     println!("\n  {}", style("── Summary ──────────────────────").dim());
-    println!("  Industry:    {}", style(industry_name).cyan());
+    println!("  Industry:    {}", style(&industry_name).cyan());
     println!("  Company:     {}", style(&company_name).cyan());
     println!("  Contact:     {}", style(&contact_name).cyan());
     println!("  Channel:     {}", style(channel_name).cyan());
@@ -167,11 +227,14 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
         ))
     })?;
 
-    // Copy template files if the industry has a template
-    let template_dir = industry_template_dir(industry_idx).map(|dir| {
-        // Resolve templates/ relative to the binary or project root
-        find_templates_dir().join(dir)
-    });
+    // Copy template files if the industry has a template. Free templates
+    // resolve under `templates/`; premium ones carry their own absolute path
+    // (already license-gated when the choice list was built).
+    let template_dir: Option<PathBuf> = match &selected_choice.source {
+        TemplateSource::Free(dir) => Some(find_templates_dir().join(dir)),
+        TemplateSource::Premium(path) => Some(path.clone()),
+        TemplateSource::None => None,
+    };
 
     if let Some(ref tpl_dir) = template_dir
         && tpl_dir.exists() {
@@ -208,7 +271,7 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
     // Ensure SOUL.md exists
     let soul_path = agent_dir.join("SOUL.md");
     if !soul_path.exists() {
-        let soul_content = generate_soul_md(&company_name, &contact_name, industry_name);
+        let soul_content = generate_soul_md(&company_name, &contact_name, &industry_name);
         tokio::fs::write(&soul_path, soul_content)
             .await
             .map_err(|e| DuDuClawError::Agent(format!("Failed to write SOUL.md: {e}")))?;

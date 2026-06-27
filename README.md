@@ -12,7 +12,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.26.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.27.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -96,15 +96,14 @@ cosign verify-blob \
 
 ---
 
-> 🎉 **v1.26.0 — 個人版 / 企業版形態 + Dashboard 一鍵 CLI 登入**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.26.0)）
+> 🎉 **v1.27.0 — 進階產業模板（Pro）+ wizard 授權解鎖**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.27.0)）
 >
-> 新增與 license tier 正交的「產品形態」維度（個人版 / 企業版），**只控制預設值與 UI、不 gate 任何核心功能**；並加上跨所有 CLI 的一鍵登入。
+> 新增 4 個經法規查證的台灣 SMB 產業模板，並補上缺失的「解鎖」載入流程 —— 讓 `premium_templates` 授權真正在 wizard 中現身；**fail-closed**，公開 OSS binary 與未授權使用者永遠拿不到閉源內容。
 >
-> - **個人版 / 企業版**（`EditionProfile`）— 個人版（預設）單人零設定、企業版多席 / 合規管理面；解析優先序 `DUDUCLAW_EDITION` env > `agent.toml [edition]` > license tier > 個人版。Dashboard 依此隱藏企業 nav（org / users / governance / partner / wiki-trust）+ EditionBadge + 非阻擋軟上限提示
-> - **Dashboard 一鍵 CLI 登入**（`auth.cli_login.*`）— 在 gateway 以 PTY 驅動各 CLI（Claude / Codex / Gemini / Antigravity）原生登入、串到 dashboard 終端、貼碼回填；標記 `remote_safe`（貼碼式 vs localhost 回呼）；Claude `setup-token` 已端到端驗證
-> - **Antigravity CLI（`agy`）內建** server Docker image，與 claude / codex / gemini 並列，Antigravity runtime 開箱即用
-> - **個人版資料可攜** — `duduclaw export` / `duduclaw import` 打包 `~/.duduclaw/` 為 `.tar.gz`（agents / 記憶 / 設定 / 授權），自架 ↔ 代管互轉
-> - 新增 `PersonalProSelfHost` 自架個人版授權層（NT$490/月）：解鎖產業模板 + 優先補丁，不含企業模組
+> - **進階產業模板**（Pro / Studio / SelfHostPro / PersonalProSelfHost / OEM）— 電商 / 醫美·牙醫 / 房仲 / 補教，每個含完整套件（SOUL.md + 法遵強化 CONTRACT.toml + 調校 agent.toml + FAQ.json + 術語/SOP/合規 wiki），合規論述均引用台灣法條（消保法 / 醫療法 / 不動產經紀業管理條例 / 補習及進修教育法）。閉源、僅隨授權版出貨
+> - **授權解鎖載入**（`premium_templates` 模組）— `premium_unlocked` / `find_premium_templates_dir` / `available_premium_industries` / `resolve_premium_template`；fail-closed：無授權 / 過期 / OpenSource / 無模板樹 / 不安全 slug 一律鎖定，slug 在碰檔案前先防路徑穿越
+> - **wizard 進階產業** — `duduclaw wizard` 將已解鎖產業插入選單；模板存在但未授權時顯示一行 `🔒 … 需 Pro 授權` upsell 引導
+> - `priority_security_patch` 維持為支援 SLA 加值（僅 tier 顯示）、非程式 gate，刻意如此
 
 
 
@@ -113,8 +112,9 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 
 
 <details>
-<summary><strong>v1.9.4 → v1.25.x 累積亮點</strong></summary>
+<summary><strong>v1.9.4 → v1.26.x 累積亮點</strong></summary>
 
+- **v1.26.0** — 個人版 / 企業版形態（`EditionProfile`，與 license tier 正交、不 gate 核心功能）+ Dashboard 一鍵 CLI 登入（PTY 驅動 Claude/Codex/Gemini/Antigravity 原生登入、貼碼回填、`remote_safe` 分類）+ Antigravity CLI 內建 server image + 個人版資料可攜（`export`/`import`）+ `PersonalProSelfHost` 自架個人版授權層（NT$490/月）
 - **v1.25.0** — 瀏覽器優先的首次設定引導：`WelcomePage`（3 步，5 條 AI 後端路徑）+ `FirstRunGate` 零 Agent 導向 + 全頁面導覽 `GuidedTour`（零相依 spotlight）+ `runtime.detect` RPC 零設定開機
 - **v1.24.0** — Antigravity CLI（`agy`）runtime 正式支援 · PtyPool 解除 Claude 綁定：新增 `RuntimeType::Antigravity`（oneshot `agy -p`、二進位自動解析、system prompt + 歷史內嵌、CJK-safe 截斷、預植 `trustedWorkspaces`）；`CliKind::Antigravity` 接上 PtyPool / worker spawn、`cli_kind_for_provider()` 依 `[runtime] provider` 推導；互動 REPL 仍 Claude-only（刻意）；舊 `gemini` 後端保留給付費 `GEMINI_API_KEY` / 企業版
 - **v1.23.0** — Decision Continuity（RFC-24）：當 agent 向使用者提出列舉式選項（方案 A/B/C），每個選項固化進 Temporal Memory 的 semantic 層（獨立於對話壓縮），待決事項回合間重新注入；稍後「用方案 C」（跨回合 / session / 程序）從持久狀態解析而非猜測。偵測確定性、零 LLM；per-agent opt-in `[memory] decision_continuity = true`
