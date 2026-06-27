@@ -1,6 +1,29 @@
 # Changelog
 
 
+## [1.29.0] - 2026-06-27 — Cloud-tier agent/channel caps
+
+Enforces the per-tier `max_agents` / `max_channels` from `features.toml` that
+were declared but never actually applied — so the free/entry tiers (Hobby
+1 agent/1 channel, Solo 1/2, Studio 3/5) now hold. **Self-host is never
+capped** (Apache 2.0 promise); the limit only applies to managed Cloud tenants.
+
+### Added
+- **Cloud-tier resource caps** — `agents.create` and `channels.add` reject once
+  the active tier's cap is reached, with an upgrade message. Gated on
+  `DUDUCLAW_DEPLOYMENT=cloud` (set only inside managed tenant containers); a
+  self-hosted deployment (the default) is never limited, and `max_* = 0` in
+  `features.toml` also means unlimited.
+- **Soft-limit banner** now shows concrete usage (`Agents X/Y · Channels A/B`)
+  and an upgrade CTA when a personal cloud tenant reaches its plan limit —
+  non-blocking, dismissible.
+- `license_runtime::cap_exceeded()` pure helper + `is_self_host_deployment()`
+  exposed for the gateway to query.
+
+### Notes
+- The free-tier limit text mirrors `features.toml`; the gate is enforced
+  server-side regardless of the dashboard hint.
+
 ## [1.28.0] - 2026-06-27 — Partner (NFR) licenses + license self-service
 
 Adds a free **Partner (NFR — Not For Resale)** license path and closes the
