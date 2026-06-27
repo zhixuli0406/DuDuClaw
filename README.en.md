@@ -12,7 +12,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.28.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.29.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -99,15 +99,13 @@ infrastructure work.
 
 ---
 
-> 🎉 **v1.28.0 — Partner (NFR) licenses + license self-service** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.28.0))
+> 🎉 **v1.29.0 — Cloud-tier agent/channel caps (self-host never limited)** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.29.0))
 >
-> Adds a free **Partner (NFR — Not For Resale)** license path and closes the remaining license-acquisition gaps: emailed keys on every issuance, machine re-binding, remote subscription status, and deployment-mode enforcement. The managed/Cloud purchase flow was already end-to-end; this makes the self-host and partner paths first-class.
+> Enforces the per-tier `max_agents` / `max_channels` from `features.toml` that were declared but never applied (Hobby 1 agent/1 channel, Solo 1/2, Studio 3/5). **Self-host is never capped** (Apache 2.0 promise); the limit only applies to managed Cloud tenants.
 >
-> - **Partner (NFR) tier** — a free, self-host, non-resellable grant for integration / channel partners. Unlocks the same commercial modules as Self-Host Pro **except** white-label / redistribution. Independently revocable; never sold through checkout (price 0)
-> - **Partner code redemption** (free path) — `POST /v1/partner/redeem` (atomic one-use reservation + `max_uses` + best-effort email); `POST /v1/partner/codes` (admin) mints codes. CLI: `duduclaw license redeem <code>`
-> - **CLI self-service** — `duduclaw license redeem / rebind / subscriptions` (redeem a free code, move a license to this machine, check remote renewal status)
-> - **Closed gaps** — `/v1/license/issue` emails the key when an `email` is supplied; `/v1/license/rebind` re-signs for a new fingerprint (ownership proven by the current one); `/v1/license/status` (self) + `/v1/license/subscriptions` (admin)
-> - **Deployment-mode binding (M51)** — the gateway enforces tier ↔ deployment via `DUDUCLAW_DEPLOYMENT` (cloud vs self-host, default self-host); mismatches fail-closed to OpenSource
+> - **Cloud-tier resource caps** — `agents.create` / `channels.add` reject once the active tier's cap is reached, with an upgrade message. Gated on `DUDUCLAW_DEPLOYMENT=cloud` (set only inside managed tenant containers); self-host (default) is never limited, and `max_* = 0` also means unlimited
+> - **Soft-limit banner** now shows concrete usage (`Agents X/Y · Channels A/B`) + an upgrade CTA when a personal cloud tenant reaches its plan limit — non-blocking, dismissible
+> - `license_runtime::cap_exceeded()` pure helper + `is_self_host_deployment()` exposed to the gateway
 
 
 
@@ -116,8 +114,9 @@ https://github.com/user-attachments/assets/217f56aa-8b46-4c2a-85fa-62ee68c33a4c
 
 
 <details>
-<summary><strong>v1.9.4 → v1.27.x cumulative highlights</strong></summary>
+<summary><strong>v1.9.4 → v1.28.x cumulative highlights</strong></summary>
 
+- **v1.28.0** — Partner (NFR) licenses + license self-service: a free, non-resellable Partner tier (unlocks Self-Host Pro modules) + self-serve partner-code redemption (`POST /v1/partner/redeem`) + CLI `redeem/rebind/subscriptions` + emailed key on issuance + machine rebind + deployment-mode binding (M51, `DUDUCLAW_DEPLOYMENT` cloud/self-host, fail-closed)
 - **v1.27.0** — Premium industry templates (`ecommerce` / `clinic` / `realestate` / `education`, each a full closed-source kit with cited Taiwan statutes) + license-gated `premium_templates` unlock (fail-closed; the public OSS binary never receives the closed content) + wizard premium-industry menu with upsell hint
 - **v1.26.0** — Personal / Enterprise editions (`EditionProfile`, orthogonal to the license tier, never gates core features) + Dashboard one-click CLI login (PTY-driven native login for Claude/Codex/Gemini/Antigravity with paste-back + `remote_safe` classification) + Antigravity CLI bundled in the server image + personal-edition data portability (`export`/`import`) + `PersonalProSelfHost` self-host license tier (NT$490/mo)
 - **v1.25.0** — Browser-first onboarding: `WelcomePage` (3 steps, 5 AI-backend paths) + `FirstRunGate` zero-agent routing + guided product tour `GuidedTour` (zero-dep spotlight) + `runtime.detect` RPC zero-config boot

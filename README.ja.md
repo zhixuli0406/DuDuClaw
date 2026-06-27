@@ -12,7 +12,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.28.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.29.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -99,15 +99,13 @@ cosign verify-blob \
 
 ---
 
-> 🎉 **v1.28.0 — パートナー（NFR）ライセンス + ライセンスセルフサービス**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.28.0)）
+> 🎉 **v1.29.0 — Cloud プランのエージェント/チャンネル上限（セルフホストは無制限）**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.29.0)）
 >
-> 無料の **Partner（NFR — Not For Resale）** ライセンス経路を追加し、残るライセンス取得ギャップを解消：発行ごとの自動メール送付、マシン再バインド、リモートのサブスク状態、デプロイモード強制。マネージド/Cloud 購入フローは既に E2E でしたが、本版でセルフホストとパートナー経路も一級市民になりました。
+> `features.toml` で宣言されつつ未適用だった tier ごとの `max_agents` / `max_channels` を実際に適用（Hobby 1 エージェント/1 チャンネル、Solo 1/2、Studio 3/5）。**セルフホストは決して制限されません**（Apache 2.0 の約束）。制限はマネージド Cloud テナントのみに適用。
 >
-> - **Partner（NFR）tier** — 統合/チャネルパートナー向けの無料セルフホストライセンス。Self-Host Pro と同等のモジュールを解放（**ホワイトラベル/再配布は除く**）。独立して失効可能、チェックアウトで販売されない（価格 0）
-> - **パートナーコード引換**（無料経路）— `POST /v1/partner/redeem`（アトミックな 1 回予約 + `max_uses` + ベストエフォートのメール）、`POST /v1/partner/codes`（管理者発行）。CLI：`duduclaw license redeem <code>`
-> - **CLI セルフサービス** — `duduclaw license redeem / rebind / subscriptions`（無料コード引換・本機へ移行・リモート更新状態）
-> - **ギャップ解消** — `/v1/license/issue` は email 指定で Key を自動送付；`/v1/license/rebind` は新フィンガープリントで再署名（現フィンガープリントで所有を証明）；`/v1/license/status`（本人）+ `/v1/license/subscriptions`（管理者）
-> - **デプロイモードバインド（M51）** — gateway が `DUDUCLAW_DEPLOYMENT`（cloud / セルフホスト、既定セルフホスト）で tier↔デプロイを強制。不一致は fail-closed で OpenSource に降格
+> - **Cloud プラン資源上限** — `agents.create` / `channels.add` は上限到達時に拒否しアップグレードを案内。`DUDUCLAW_DEPLOYMENT=cloud`（マネージドテナントコンテナにのみ注入）で判定し、セルフホスト（既定）は常に無制限、`max_*=0` も無制限
+> - **ソフト上限バナー** — 個人 Cloud テナントが上限に達すると、具体的な使用量（`Agents X/Y · Channels A/B`）+ アップグレード CTA を表示（非ブロッキング・閉じられる）
+> - `license_runtime::cap_exceeded()` 純関数 + `is_self_host_deployment()` を gateway に公開
 
 
 
@@ -116,8 +114,9 @@ https://github.com/user-attachments/assets/30406ad1-4595-43ce-8c08-dba8f0ca9683
 
 
 <details>
-<summary><strong>v1.9.4 → v1.27.x 累積ハイライト</strong></summary>
+<summary><strong>v1.9.4 → v1.28.x 累積ハイライト</strong></summary>
 
+- **v1.28.0** — パートナー（NFR）ライセンス + セルフサービス：無料・再販不可の Partner tier（Self-Host Pro 同等モジュールを解放）+ パートナーコード自助引換（`POST /v1/partner/redeem`）+ CLI `redeem/rebind/subscriptions` + 発行時の Key 自動送付 + マシン再バインド + デプロイモードバインド（M51、`DUDUCLAW_DEPLOYMENT` cloud/セルフホスト、fail-closed）
 - **v1.27.0** — 業種テンプレート（Pro）：EC / 美容医療・歯科 / 不動産仲介 / 学習塾の 4 種（SOUL + 法令強化 CONTRACT + agent.toml + FAQ + 用語集/SOP/コンプライアンス wiki、クローズドソース、台湾法令引用）+ `premium_templates` ライセンス解放ロード（fail-closed、公開 OSS バイナリは受け取らない）+ wizard 業種メニューとアップセル案内
 - **v1.26.0** — 個人版 / エンタープライズ版（`EditionProfile`、ライセンス階層と直交・コア機能を非ゲート）+ Dashboard ワンクリック CLI ログイン（Claude/Codex/Gemini/Antigravity のネイティブログインを PTY 駆動・貼付返送・`remote_safe` 分類）+ Antigravity CLI を server イメージに内蔵 + 個人版データ可搬性（`export`/`import`）+ `PersonalProSelfHost` セルフホスト個人版ライセンス階層（NT$490/月）
 - **v1.25.0** — ブラウザ優先のオンボーディング：`WelcomePage`（3 ステップ、5 つの AI バックエンド経路）+ `FirstRunGate`（Agent ゼロの誘導）+ ガイド付きツアー `GuidedTour`（依存ゼロのスポットライト）+ `runtime.detect` RPC による設定ゼロ起動

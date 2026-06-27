@@ -34,7 +34,9 @@ export function SoftLimitBanner() {
     };
   }, []);
 
-  const sl = softLimitStatus(tier, agents.length, status?.channels_connected ?? 0);
+  const agentCount = agents.length;
+  const channelCount = status?.channels_connected ?? 0;
+  const sl = softLimitStatus(tier, agentCount, channelCount);
   if (!sl || !sl.anyOver || dismissed) return null;
 
   return (
@@ -47,9 +49,28 @@ export function SoftLimitBanner() {
             { tier: sl.tier }
           )}
         </p>
+        <p className="mt-0.5 tabular-nums text-amber-700/90 dark:text-amber-300/90">
+          {intl.formatMessage(
+            { id: 'softLimit.usage' },
+            {
+              agents: agentCount,
+              maxAgents: sl.limit.agents,
+              channels: channelCount,
+              maxChannels: sl.limit.channels,
+            }
+          )}
+        </p>
         <p className="mt-0.5 text-amber-700/90 dark:text-amber-300/90">
           {intl.formatMessage({ id: 'softLimit.body' })}
         </p>
+        <a
+          href="https://duduclaw.tw/pricing"
+          target="_blank"
+          rel="noreferrer"
+          className="mt-1.5 inline-block font-medium text-amber-700 underline underline-offset-2 hover:text-amber-900 dark:text-amber-300 dark:hover:text-amber-100"
+        >
+          {intl.formatMessage({ id: 'softLimit.upgrade' })}
+        </a>
       </div>
       <button
         onClick={() => setDismissed(true)}

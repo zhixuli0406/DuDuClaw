@@ -12,7 +12,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.28.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.29.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -96,15 +96,13 @@ cosign verify-blob \
 
 ---
 
-> 🎉 **v1.28.0 — 合作夥伴（NFR）免費授權 + License 自助服務**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.28.0)）
+> 🎉 **v1.29.0 — Cloud 方案 agent/通道上限強制（自架不受限）**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.29.0)）
 >
-> 新增免付費的 **Partner（NFR，不可轉售）** 授權路徑，並補齊剩餘的取得缺口：每次簽發都自動寄送 Key、換機重綁、遠端訂閱查詢、部署模式綁定。代管/Cloud 購買流程本來就已端到端；本版讓自架與夥伴路徑也成為一等公民。
+> 把 `features.toml` 裡「宣告了卻從未生效」的每方案 `max_agents` / `max_channels` 真正接上（Hobby 1 agent/1 通道、Solo 1/2、Studio 3/5）。**自架永不受限**（Apache 2.0 承諾），限制只套用在代管 Cloud 租戶。
 >
-> - **Partner（NFR）tier** — 給整合/通路夥伴的免費自架授權，解鎖等同 Self-Host Pro 的模組（**不含**白標/轉售），可獨立撤銷、永不經結帳售出
-> - **夥伴碼自助兌換** — `POST /v1/partner/redeem`（原子單次扣用 + `max_uses` + 自動寄信）、`POST /v1/partner/codes`（管理員鑄碼）；CLI：`duduclaw license redeem <code>`
-> - **CLI 自助服務** — `duduclaw license redeem / rebind / subscriptions`（兌換免費碼、把授權搬到本機、查遠端續約狀態）
-> - **缺口補齊** — `/v1/license/issue` 帶 email 即自動寄 Key（不再人工寄）；`/v1/license/rebind` 換機重簽（以當前指紋證明擁有）；`/v1/license/status`（本人）+ `/v1/license/subscriptions`（管理員）
-> - **部署模式綁定（M51）** — gateway 依 `DUDUCLAW_DEPLOYMENT`（cloud / 自架，預設自架）強制 tier↔部署：cloud-only 授權不得在自架機生效，反之亦然，fail-closed 降回 OpenSource
+> - **Cloud 方案資源上限** — `agents.create` / `channels.add` 達上限即擋並提示升級；以 `DUDUCLAW_DEPLOYMENT=cloud`（僅注入代管租戶容器）為閘，自架（預設）一律放行、`max_*=0` 亦代表無限
+> - **軟上限提示** — 個人 Cloud 租戶接近上限時，dashboard 顯示具體用量（`Agent X/Y · 通道 A/B`）+ 升級 CTA，非阻擋、可關閉
+> - `license_runtime::cap_exceeded()` 純函式 + `is_self_host_deployment()` 對 gateway 公開
 
 
 
@@ -113,8 +111,9 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 
 
 <details>
-<summary><strong>v1.9.4 → v1.27.x 累積亮點</strong></summary>
+<summary><strong>v1.9.4 → v1.28.x 累積亮點</strong></summary>
 
+- **v1.28.0** — 合作夥伴（NFR）免費授權 + License 自助服務：免付費 Partner tier（不可轉售、解鎖等同 Self-Host Pro 模組）+ 夥伴碼自助兌換（`POST /v1/partner/redeem`）+ CLI `redeem/rebind/subscriptions` + 簽發自動寄 Key + 換機重簽 + 部署模式綁定（M51，`DUDUCLAW_DEPLOYMENT` cloud/自架，fail-closed）
 - **v1.27.0** — 進階產業模板（Pro）：電商 / 醫美·牙醫 / 房仲 / 補教 4 個法規查證版模（SOUL + 法遵 CONTRACT + agent.toml + FAQ + 術語/SOP/合規 wiki，閉源）+ `premium_templates` 授權解鎖載入（fail-closed，公開 OSS binary 拿不到）+ wizard 進階產業選單與 upsell 引導
 - **v1.26.0** — 個人版 / 企業版形態（`EditionProfile`，與 license tier 正交、不 gate 核心功能）+ Dashboard 一鍵 CLI 登入（PTY 驅動 Claude/Codex/Gemini/Antigravity 原生登入、貼碼回填、`remote_safe` 分類）+ Antigravity CLI 內建 server image + 個人版資料可攜（`export`/`import`）+ `PersonalProSelfHost` 自架個人版授權層（NT$490/月）
 - **v1.25.0** — 瀏覽器優先的首次設定引導：`WelcomePage`（3 步，5 條 AI 後端路徑）+ `FirstRunGate` 零 Agent 導向 + 全頁面導覽 `GuidedTour`（零相依 spotlight）+ `runtime.detect` RPC 零設定開機
