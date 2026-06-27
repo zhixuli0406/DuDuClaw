@@ -428,11 +428,18 @@ async fn load_and_validate(
 ///     downloaded binary. The managed tenant image is responsible for setting
 ///     `DUDUCLAW_DEPLOYMENT=cloud` (injected by the tenant provisioner), so the
 ///     default never mis-classifies a legitimate self-host install.
-fn is_self_host_deployment() -> bool {
+pub fn is_self_host_deployment() -> bool {
     match std::env::var("DUDUCLAW_DEPLOYMENT") {
         Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "cloud" | "managed"),
         Err(_) => true,
     }
+}
+
+/// Pure cap check used by the Cloud resource limits (agents / channels).
+/// `max == 0` means unlimited (the features.toml convention), so it never
+/// caps. Otherwise the cap is reached once `current >= max`.
+pub fn cap_exceeded(max: usize, current: usize) -> bool {
+    max != 0 && current >= max
 }
 
 // ── Phone-home loop ───────────────────────────────────────────
@@ -1101,6 +1108,20 @@ mod tests {
                 "{tier} should be accepted on self-host"
             );
         }
+    }
+
+    #[test]
+    fn cap_exceeded_semantics() {
+        // 0 = unlimited → never capped.
+        assert!(!cap_exceeded(0, 0));
+        assert!(!cap_exceeded(0, 1_000));
+        // Hobby: max 1 → first is allowed, second is capped.
+        assert!(!cap_exceeded(1, 0));
+        assert!(cap_exceeded(1, 1));
+        // Studio: max 3.
+        assert!(!cap_exceeded(3, 2));
+        assert!(cap_exceeded(3, 3));
+        assert!(cap_exceeded(3, 4));
     }
 
     #[test]

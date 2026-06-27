@@ -3077,6 +3077,65 @@ impl MethodHandler {
         }
     }
 
+    /// Cloud-tier resource cap. Returns `Some(message)` when the active tier
+    /// caps this resource, the deployment is Cloud (`DUDUCLAW_DEPLOYMENT=cloud`,
+    /// injected into managed tenant containers), and the cap is already
+    /// reached. Self-hosted deployments (Apache 2.0) are NEVER capped; a
+    /// `max` of 0 in features.toml means unlimited.
+    async fn tier_limit_message(&self, kind: &str, current: usize) -> Option<String> {
+        // Apache 2.0 promise: never limit self-host. Default deployment is
+        // self-host, so the limit only ever bites managed Cloud tenants.
+        if crate::license_runtime::is_self_host_deployment() {
+            return None;
+        }
+        let rt = crate::license_runtime::global()?;
+        let tier = rt.current_tier().await;
+        let gate = rt.feature_gate();
+        let max = match kind {
+            "agent" => gate.max_agents(tier),
+            "channel" => gate.max_channels(tier),
+            _ => 0,
+        };
+        if !crate::license_runtime::cap_exceeded(max, current) {
+            return None;
+        }
+        let noun = if kind == "agent" { "Agent" } else { "通道" };
+        Some(format!(
+            "您的方案（{tier}）最多可建立 {max} 個{noun}。\
+             請升級方案以新增更多：https://duduclaw.tw/pricing"
+        ))
+    }
+
+    /// Count configured channels across global config.toml + every agent's
+    /// `[channels]` section. Mirrors `handle_channels_status`'s enumeration so
+    /// the cap counts exactly what the dashboard shows.
+    async fn count_configured_channels(&self) -> usize {
+        let mut n = 0usize;
+        let config_path = self.home_dir.join("config.toml");
+        if let Ok(content) = tokio::fs::read_to_string(&config_path).await
+            && let Ok(config) = content.parse::<toml::Table>()
+            && let Some(ch) = config.get("channels").and_then(|v| v.as_table())
+        {
+            for key in ["line_channel_token", "telegram_bot_token", "discord_bot_token"] {
+                if ch.get(key).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
+                    n += 1;
+                }
+            }
+        }
+        let reg = self.registry.read().await;
+        for agent in reg.list() {
+            if let Some(ch) = &agent.config.channels {
+                if ch.discord.as_ref().is_some_and(|d| !d.bot_token.is_empty()
+                    || d.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())) { n += 1; }
+                if ch.telegram.as_ref().is_some_and(|t| !t.bot_token.is_empty()
+                    || t.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())) { n += 1; }
+                if ch.slack.as_ref().is_some_and(|s| !s.bot_token.is_empty()
+                    || s.bot_token_enc.as_ref().is_some_and(|e| !e.is_empty())) { n += 1; }
+            }
+        }
+        n
+    }
+
     async fn handle_agents_create(&self, params: Value) -> WsFrame {
         let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let display_name = params.get("display_name").and_then(|v| v.as_str()).unwrap_or(name);
@@ -3089,6 +3148,12 @@ impl MethodHandler {
         }
         if !is_valid_agent_id(name) {
             return WsFrame::error_response("", "Agent name must be lowercase alphanumeric with hyphens, max 64 chars");
+        }
+
+        // Cloud-tier agent cap (self-host is never capped — Apache 2.0).
+        let agent_count = self.registry.read().await.list().len();
+        if let Some(msg) = self.tier_limit_message("agent", agent_count).await {
+            return WsFrame::error_response("", &msg);
         }
 
         // If creating as main, demote the current main agent first
@@ -4958,6 +5023,12 @@ impl MethodHandler {
 
         if token.is_empty() {
             return WsFrame::error_response("", "Missing 'config.token' parameter");
+        }
+
+        // Cloud-tier channel cap (self-host is never capped — Apache 2.0).
+        let channel_count = self.count_configured_channels().await;
+        if let Some(msg) = self.tier_limit_message("channel", channel_count).await {
+            return WsFrame::error_response("", &msg);
         }
 
         // Per-agent channel: write to agent.toml [channels.{platform}]
