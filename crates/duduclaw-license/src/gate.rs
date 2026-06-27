@@ -146,6 +146,9 @@ impl FeatureGate {
             LicenseTier::Solo => &["solo", "hobby", "opensource"],
             LicenseTier::Studio => &["studio", "solo", "hobby", "opensource"],
             LicenseTier::Business => &["business", "studio", "solo", "hobby", "opensource"],
+            // Partner (NFR) is an independent self-host grant — its own values
+            // over the opensource base, never the cloud chain.
+            LicenseTier::Partner => &["partner", "opensource"],
             LicenseTier::PersonalProSelfHost => &["personal_pro_self_host", "opensource"],
             LicenseTier::SelfHostPro => &["self_host_pro", "opensource"],
             LicenseTier::Oem => &["oem", "self_host_pro", "opensource"],

@@ -446,6 +446,7 @@
   "license.cta.renew.action": "前往續期",
   "license.cli.title": "用 CLI 管理 License",
   "license.cli.body": "License 完整管理也可以透過命令列：",
+  "license.cli.selfService": "自助服務（合作夥伴免費兌換 · 換機 · 訂閱狀態）：",
   "reports.title": "分析報表",
   "reports.conversations": "對話數",
   "reports.messages": "訊息數",

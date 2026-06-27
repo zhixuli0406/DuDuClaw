@@ -1,6 +1,46 @@
 # Changelog
 
 
+## [1.28.0] - 2026-06-27 — Partner (NFR) licenses + license self-service
+
+Adds a free **Partner (NFR — Not For Resale)** license path and closes the
+remaining license-acquisition gaps: emailed keys for every issuance, machine
+re-binding, remote subscription status, and deployment-mode enforcement. The
+managed/Cloud purchase flow was already end-to-end; this release makes the
+self-host and partner paths first-class.
+
+### Added
+- **Partner (NFR) tier** (`LicenseTier::Partner`, `[partner]` in
+  `features.toml`) — a free, self-host, non-resellable grant for integration /
+  channel partners. Unlocks the same commercial modules as Self-Host Pro
+  **except** white-label / redistribution. Independently revocable; never sold
+  through checkout (price 0).
+- **Partner code redemption** (free path) — `POST /v1/partner/redeem` exchanges
+  a code + machine fingerprint for a signed partner license (atomic one-use
+  reservation, `max_uses` enforced, best-effort email); `POST /v1/partner/codes`
+  (admin) mints codes. CLI: `duduclaw license redeem <code>`.
+- **CLI self-service** — `duduclaw license redeem` / `rebind` / `subscriptions`
+  (redeem a free partner code, move a license to this machine, check remote
+  renewal status).
+- **License key email on every issuance** (Gap) — `POST /v1/license/issue` now
+  emails the key when an `email` is supplied (previously only the PayUni
+  webhook did), so admin / self-host issuance no longer needs a manual send.
+- **Self-service machine rebind** (Gap) — `POST /v1/license/rebind` re-signs a
+  license for a new fingerprint, ownership proven by the current fingerprint
+  (atomic, no operator round-trip).
+- **Remote subscription status** (Gap) — `POST /v1/license/status` (self, by
+  fingerprint) + `GET /v1/license/subscriptions` (admin, by customer).
+- **Deployment-mode binding** (M51) — the gateway now enforces tier ↔
+  deployment via `DUDUCLAW_DEPLOYMENT` (`cloud` vs self-host, default
+  self-host): cloud-only tiers are refused on self-host and vice-versa,
+  fail-closed to OpenSource.
+
+### Notes
+- Self-host paid checkout (PersonalProSelfHost / SelfHostPro) and the PayUni
+  **sandbox toggle** were already wired; only live sandbox e2e remains, gated
+  on a PayUni merchant account.
+- `keygen` learns `--tier partner` / `--tier personal_pro_self_host`.
+
 ## [1.27.0] - 2026-06-27 — Industry templates (Pro) + license-gated wizard unlock
 
 Ships four research-backed **premium industry templates** for Taiwan SMB

@@ -377,7 +377,23 @@ async fn load_and_validate(
     let grace = gate.grace_period_days(license.tier);
 
     match license.validate(&current_fp, phone_home, grace) {
-        Ok(()) => Some(license),
+        Ok(()) => {
+            // M51: enforce tier ↔ deployment-mode binding. A cloud-only tier
+            // (Solo/Studio/…) must not be honoured on a self-host binary, and a
+            // self-host-only tier (Partner/PersonalProSelfHost/SelfHostPro/Oem)
+            // must not be honoured in Cloud. Fail-closed: a mismatch downgrades
+            // to OpenSource rather than silently granting features.
+            let is_self_host = is_self_host_deployment();
+            if let Err(e) = license.validate_tier_deployment_binding(is_self_host) {
+                warn!(
+                    error = %e,
+                    deployment = if is_self_host { "self_host" } else { "cloud" },
+                    "license tier does not match deployment mode; running in OpenSource mode"
+                );
+                return None;
+            }
+            Some(license)
+        }
         Err(LicenseError::Expired) => {
             warn!("installed license is expired; running in OpenSource mode");
             None
@@ -400,6 +416,22 @@ async fn load_and_validate(
             warn!(error = %e, "license validation failed; running in OpenSource mode");
             None
         }
+    }
+}
+
+/// Resolve the deployment mode (M51 signal).
+///
+/// Read from `DUDUCLAW_DEPLOYMENT`:
+///   - `cloud` → managed / Cloud control-plane deployment (`false`)
+///   - `self_host` / `self-host` / `selfhost` / `on_prem` / `onprem` → `true`
+///   - unset / anything else → **self-host** (`true`), the safe default for a
+///     downloaded binary. The managed tenant image is responsible for setting
+///     `DUDUCLAW_DEPLOYMENT=cloud` (injected by the tenant provisioner), so the
+///     default never mis-classifies a legitimate self-host install.
+fn is_self_host_deployment() -> bool {
+    match std::env::var("DUDUCLAW_DEPLOYMENT") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "cloud" | "managed"),
+        Err(_) => true,
     }
 }
 
@@ -1039,6 +1071,36 @@ mod tests {
 
         let res = accept_refreshed_license(&registry, &lic, &fp, 7, 14);
         assert!(res.is_err(), "license signed by an untrusted key must be rejected");
+    }
+
+    #[test]
+    fn deployment_binding_rejects_cloud_tier_on_self_host() {
+        // A cloud-only tier must be refused on a self-host deployment …
+        let cloud = fake_license(LicenseTier::Studio, "fp");
+        assert!(cloud.validate_tier_deployment_binding(true).is_err());
+        // … and accepted in Cloud.
+        assert!(cloud.validate_tier_deployment_binding(false).is_ok());
+    }
+
+    #[test]
+    fn deployment_binding_rejects_self_host_tier_in_cloud() {
+        // Self-host-only tiers (incl. the new Partner NFR) must be refused in
+        // Cloud and accepted on self-host.
+        for tier in [
+            LicenseTier::Partner,
+            LicenseTier::PersonalProSelfHost,
+            LicenseTier::SelfHostPro,
+        ] {
+            let lic = fake_license(tier, "fp");
+            assert!(
+                lic.validate_tier_deployment_binding(false).is_err(),
+                "{tier} should be rejected in Cloud"
+            );
+            assert!(
+                lic.validate_tier_deployment_binding(true).is_ok(),
+                "{tier} should be accepted on self-host"
+            );
+        }
     }
 
     #[test]

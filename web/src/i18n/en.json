@@ -447,6 +447,7 @@
   "license.cta.renew.action": "Renew now",
   "license.cli.title": "Manage your license from the CLI",
   "license.cli.body": "Everything on this page is also available through the command line:",
+  "license.cli.selfService": "Self-service (free partner redeem · machine rebind · subscription status):",
   "reports.title": "Reports & Analytics",
   "reports.conversations": "Conversations",
   "reports.messages": "Messages",

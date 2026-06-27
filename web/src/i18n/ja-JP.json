@@ -447,6 +447,7 @@
   "license.cta.renew.action": "更新する",
   "license.cli.title": "CLI でライセンスを管理",
   "license.cli.body": "この画面のすべての操作はコマンドラインからも実行できます：",
+  "license.cli.selfService": "セルフサービス（パートナー無料引換 · マシン移行 · サブスク状態）：",
   "reports.title": "ROI 分析",
   "reports.conversations": "総会話数",
   "reports.messages": "メッセージ数",

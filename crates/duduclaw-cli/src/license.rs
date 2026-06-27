@@ -76,6 +76,27 @@ pub enum LicenseCommands {
     /// Does not delete any other DuDuClaw data.
     Deactivate,
 
+    /// Redeem a partner (NFR) code for a FREE license and activate it on
+    /// this machine. The free partner path — no payment.
+    Redeem {
+        /// Partner redemption code (e.g. `PARTNER-XXXXXXXX`).
+        code: String,
+        /// Optional partner / customer identifier recorded with the license.
+        #[arg(long)]
+        customer_id: Option<String>,
+        /// Optional email to ALSO receive the License Key by mail.
+        #[arg(long)]
+        email: Option<String>,
+    },
+
+    /// Move the installed license to THIS machine (re-sign for the current
+    /// fingerprint). Run after copying `license.json` from the old machine.
+    Rebind,
+
+    /// Show this machine's subscription status from the control-plane
+    /// (tier / status / days until renewal).
+    Subscriptions,
+
     /// Print this machine's fingerprint, for issuing a new license.
     Fingerprint,
 }
@@ -90,8 +111,196 @@ pub async fn run(cmd: LicenseCommands) -> Result<()> {
         LicenseCommands::Export { base64 } => cmd_export(base64).await,
         LicenseCommands::Import { path } => cmd_import(&path).await,
         LicenseCommands::Deactivate => cmd_deactivate().await,
+        LicenseCommands::Redeem {
+            code,
+            customer_id,
+            email,
+        } => cmd_redeem(&code, customer_id, email).await,
+        LicenseCommands::Rebind => cmd_rebind().await,
+        LicenseCommands::Subscriptions => cmd_subscriptions().await,
         LicenseCommands::Fingerprint => cmd_fingerprint().await,
     }
+}
+
+/// Resolve the control-plane base URL (override with `DUDUCLAW_CONTROL_URL`).
+fn control_url() -> String {
+    std::env::var("DUDUCLAW_CONTROL_URL").unwrap_or_else(|_| DEFAULT_CONTROL_URL.to_string())
+}
+
+fn http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| DuDuClawError::License(format!("build http client: {e}")))
+}
+
+/// Extract a signed `License` from a `{ "license": {...} }` control-plane
+/// response and install it locally (shared by redeem + rebind).
+fn install_license_from_envelope(envelope: &serde_json::Value) -> Result<License> {
+    let value = envelope
+        .get("license")
+        .ok_or_else(|| DuDuClawError::License("response missing 'license'".into()))?;
+    let license: License = serde_json::from_value(value.clone())
+        .map_err(|e| DuDuClawError::License(format!("parse license: {e}")))?;
+    save_default(&license).map_err(|e| DuDuClawError::License(format!("save license: {e}")))?;
+    Ok(license)
+}
+
+/// Read a control-plane error body into a friendly message.
+async fn control_error(resp: reqwest::Response) -> DuDuClawError {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let msg = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
+        .unwrap_or_else(|| body.chars().take(200).collect());
+    DuDuClawError::License(format!("control-plane returned HTTP {status}: {msg}"))
+}
+
+// ── redeem (partner / free) ───────────────────────────────────
+
+async fn cmd_redeem(
+    code: &str,
+    customer_id: Option<String>,
+    email: Option<String>,
+) -> Result<()> {
+    let fingerprint = generate_fingerprint();
+    let endpoint = format!("{}/v1/partner/redeem", control_url().trim_end_matches('/'));
+    let body = serde_json::json!({
+        "code": code,
+        "machine_fingerprint": fingerprint,
+        "customer_id": customer_id,
+        "email": email,
+    });
+
+    println!("→ Redeeming partner code at {endpoint} ...");
+    let resp = http_client()?
+        .post(&endpoint)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| DuDuClawError::License(format!("control-plane unreachable: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(control_error(resp).await);
+    }
+
+    let envelope: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| DuDuClawError::License(format!("parse redeem response: {e}")))?;
+    let license = install_license_from_envelope(&envelope)?;
+
+    println!("✓ Partner license activated (free)");
+    println!("  Tier:     {}", license.tier);
+    println!(
+        "  Expires:  {} ({} days)",
+        license.expires_at,
+        license.days_until_expiry()
+    );
+    println!("  Run `duduclaw license status` to see unlocked modules.");
+    Ok(())
+}
+
+// ── rebind (move to this machine) ─────────────────────────────
+
+async fn cmd_rebind() -> Result<()> {
+    let installed = match load_default() {
+        Ok(l) => l,
+        Err(LicenseError::FileNotFound(_)) => {
+            return Err(DuDuClawError::License(
+                "no license installed — copy license.json from the old machine \
+                 (or `duduclaw license import <file>`) first, then run rebind"
+                    .into(),
+            ));
+        }
+        Err(e) => return Err(DuDuClawError::License(format!("read license: {e}"))),
+    };
+
+    let new_fp = generate_fingerprint();
+    if installed.machine_fingerprint == new_fp {
+        println!("License is already bound to this machine — nothing to rebind.");
+        return Ok(());
+    }
+
+    let endpoint = format!("{}/v1/license/rebind", control_url().trim_end_matches('/'));
+    let body = serde_json::json!({
+        "subscription_id": installed.subscription_id,
+        "old_fingerprint": installed.machine_fingerprint,
+        "new_fingerprint": new_fp,
+    });
+
+    println!("→ Rebinding license to this machine at {endpoint} ...");
+    let resp = http_client()?
+        .post(&endpoint)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| DuDuClawError::License(format!("control-plane unreachable: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(control_error(resp).await);
+    }
+
+    let envelope: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| DuDuClawError::License(format!("parse rebind response: {e}")))?;
+    let license = install_license_from_envelope(&envelope)?;
+
+    println!("✓ License rebound to this machine");
+    println!("  Tier:     {}", license.tier);
+    println!("  Machine:  {new_fp}");
+    Ok(())
+}
+
+// ── subscriptions (remote status) ─────────────────────────────
+
+async fn cmd_subscriptions() -> Result<()> {
+    let installed = match load_default() {
+        Ok(l) => l,
+        Err(LicenseError::FileNotFound(_)) => {
+            println!("No license installed — nothing to look up.");
+            return Ok(());
+        }
+        Err(e) => return Err(DuDuClawError::License(format!("read license: {e}"))),
+    };
+
+    let endpoint = format!("{}/v1/license/status", control_url().trim_end_matches('/'));
+    let body = serde_json::json!({
+        "subscription_id": installed.subscription_id,
+        "machine_fingerprint": installed.machine_fingerprint,
+    });
+
+    let resp = http_client()?
+        .post(&endpoint)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| DuDuClawError::License(format!("control-plane unreachable: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(control_error(resp).await);
+    }
+
+    let s: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| DuDuClawError::License(format!("parse status response: {e}")))?;
+
+    let get = |k: &str| s.get(k).and_then(|v| v.as_str()).unwrap_or("?").to_string();
+    println!("Subscription:     {}", get("subscription_id"));
+    println!("Tier:             {}", get("tier"));
+    println!("Status:           {}", get("status"));
+    println!("Expires:          {}", get("expires_at"));
+    if let Some(days) = s.get("days_until_expiry").and_then(|v| v.as_i64()) {
+        if days < 0 {
+            println!("Renewal:          ⚠️  expired {} days ago", -days);
+        } else {
+            println!("Renewal:          {days} days remaining");
+        }
+    }
+    Ok(())
 }
 
 // ── activate ──────────────────────────────────────────────────
