@@ -1,8 +1,9 @@
 # Build artifacts (315GB+ — must never enter the build context)
 target/
 **/target/
-# VCS + local state
+# VCS + local state (root AND nested, e.g. commercial/.git)
 .git/
+**/.git/
 .duduclaw/
 # JS deps (rebuilt inside the frontend stage)
 **/node_modules/
