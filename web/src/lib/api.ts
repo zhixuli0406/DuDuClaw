@@ -624,6 +624,8 @@ export interface LicenseSnapshot {
     | 'solo'
     | 'studio'
     | 'business'
+    | 'partner'
+    | 'personal_pro_self_host'
     | 'self_host_pro'
     | 'oem';
   /** Always one of two stable strings — useful for UI conditionals. */

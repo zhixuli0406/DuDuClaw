@@ -20,7 +20,7 @@ use std::fmt;
 /// License tiers in ascending order of capabilities.
 ///
 /// Total ordering:
-/// `OpenSource < Hobby < Solo < Studio < Business < PersonalProSelfHost < SelfHostPro < Oem`.
+/// `OpenSource < Hobby < Solo < Studio < Business < Partner < PersonalProSelfHost < SelfHostPro < Oem`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LicenseTier {
@@ -38,6 +38,15 @@ pub enum LicenseTier {
 
     /// Cloud paid tier — NT$8,900/mo (Odoo + private support).
     Business,
+
+    /// **Partner (NFR — Not For Resale)** — a *free* self-host license granted
+    /// to integration / channel partners for their own use, demos, and
+    /// evaluation. Unlocks the same commercial value-add modules as
+    /// [`SelfHostPro`](Self::SelfHostPro) **except** white-label /
+    /// redistribution (a partner may use, not resell, the product). Price is
+    /// always 0; it is issued via partner-code redemption or admin issuance,
+    /// never through the paid checkout flow, and is independently revocable.
+    Partner,
 
     /// Self-host **Personal** subscription — NT$490/mo or NT$4,900/yr.
     /// The personal-form-factor self-host tier: unlocks premium templates +
@@ -63,6 +72,7 @@ impl LicenseTier {
             Self::Solo => "solo",
             Self::Studio => "studio",
             Self::Business => "business",
+            Self::Partner => "partner",
             Self::PersonalProSelfHost => "personal_pro_self_host",
             Self::SelfHostPro => "self_host_pro",
             Self::Oem => "oem",
@@ -78,12 +88,26 @@ impl LicenseTier {
 
     /// Returns `true` if this tier is only valid for self-hosted deployments.
     pub fn is_self_host_only(&self) -> bool {
-        matches!(self, Self::PersonalProSelfHost | Self::SelfHostPro | Self::Oem)
+        matches!(
+            self,
+            Self::Partner | Self::PersonalProSelfHost | Self::SelfHostPro | Self::Oem
+        )
     }
 
     /// Returns `true` if this tier represents a paid commercial subscription.
+    ///
+    /// `Partner` is a free NFR grant, so it is **not** paid.
     pub fn is_paid(&self) -> bool {
-        !matches!(self, Self::OpenSource | Self::Hobby)
+        !matches!(self, Self::OpenSource | Self::Hobby | Self::Partner)
+    }
+
+    /// Returns `true` for the Partner (NFR — Not For Resale) tier.
+    ///
+    /// Used by reporting / CRL / provisioning to treat partner grants
+    /// distinctly from paid self-host customers (free, non-resellable,
+    /// independently revocable).
+    pub fn is_partner(&self) -> bool {
+        matches!(self, Self::Partner)
     }
 }
 
@@ -109,6 +133,8 @@ mod tests {
         assert!(LicenseTier::Hobby < LicenseTier::Solo);
         assert!(LicenseTier::Solo < LicenseTier::Studio);
         assert!(LicenseTier::Studio < LicenseTier::Business);
+        assert!(LicenseTier::Business < LicenseTier::Partner);
+        assert!(LicenseTier::Partner < LicenseTier::PersonalProSelfHost);
         assert!(LicenseTier::Business < LicenseTier::SelfHostPro);
         assert!(LicenseTier::SelfHostPro < LicenseTier::Oem);
         assert!(LicenseTier::OpenSource < LicenseTier::Oem);
@@ -196,9 +222,26 @@ mod tests {
     }
 
     #[test]
+    fn partner_classification() {
+        let t = LicenseTier::Partner;
+        assert_eq!(t.to_string(), "partner");
+        assert_eq!(t.as_toml_key(), "partner");
+        assert!(t.is_self_host_only());
+        assert!(!t.is_cloud_only());
+        assert!(!t.is_paid(), "partner is a free NFR grant");
+        assert!(t.is_partner());
+        assert!(!LicenseTier::SelfHostPro.is_partner());
+        // serde round-trip
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(json, "\"partner\"");
+        assert_eq!(serde_json::from_str::<LicenseTier>(&json).unwrap(), t);
+    }
+
+    #[test]
     fn paid_classification() {
         assert!(!LicenseTier::OpenSource.is_paid());
         assert!(!LicenseTier::Hobby.is_paid());
+        assert!(!LicenseTier::Partner.is_paid());
         assert!(LicenseTier::Solo.is_paid());
         assert!(LicenseTier::Studio.is_paid());
         assert!(LicenseTier::Business.is_paid());

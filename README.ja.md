@@ -12,7 +12,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.27.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.28.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -99,14 +99,15 @@ cosign verify-blob \
 
 ---
 
-> 🎉 **v1.27.0 — 業種テンプレート（Pro）+ ライセンスゲート付き wizard 解放**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.27.0)）
+> 🎉 **v1.28.0 — パートナー（NFR）ライセンス + ライセンスセルフサービス**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.28.0)）
 >
-> 法規を調査した台湾 SMB 向けの業種テンプレート 4 種を同梱し、これまで欠けていた「解放」ロードフローを実装 —— `premium_templates` ライセンス機能が wizard に実際に現れるようにしました。**fail-closed** のため、公開 OSS バイナリと未ライセンスユーザーはクローズドコンテンツを決して受け取りません。
+> 無料の **Partner（NFR — Not For Resale）** ライセンス経路を追加し、残るライセンス取得ギャップを解消：発行ごとの自動メール送付、マシン再バインド、リモートのサブスク状態、デプロイモード強制。マネージド/Cloud 購入フローは既に E2E でしたが、本版でセルフホストとパートナー経路も一級市民になりました。
 >
-> - **業種テンプレート（Pro）**（Pro / Studio / SelfHostPro / PersonalProSelfHost / OEM）— EC / 美容医療・歯科 / 不動産仲介 / 学習塾。各々フルキット（SOUL.md + 法令強化 CONTRACT.toml + 業種別チューニング agent.toml + FAQ.json + 用語集 / SOP / コンプライアンス wiki）を備え、台湾の法令を引用。クローズドソースでライセンス版のみ同梱
-> - **ライセンスゲート付き解放**（`premium_templates` モジュール）— `premium_unlocked` / `find_premium_templates_dir` / `available_premium_industries` / `resolve_premium_template`；fail-closed：ライセンス無 / 期限切れ / OpenSource / テンプレート無 / 不正な slug はすべて *locked*、slug はファイル操作前にパストラバーサル検証
-> - **wizard 業種追加** — `duduclaw wizard` が解放済み業種をメニューに追加。テンプレートはあるがライセンスが無い場合は 1 行のアップセル案内を表示
-> - `priority_security_patch` はサポート SLA の付加価値（tier 表示のみ）であり、コードゲートではない（意図的）
+> - **Partner（NFR）tier** — 統合/チャネルパートナー向けの無料セルフホストライセンス。Self-Host Pro と同等のモジュールを解放（**ホワイトラベル/再配布は除く**）。独立して失効可能、チェックアウトで販売されない（価格 0）
+> - **パートナーコード引換**（無料経路）— `POST /v1/partner/redeem`（アトミックな 1 回予約 + `max_uses` + ベストエフォートのメール）、`POST /v1/partner/codes`（管理者発行）。CLI：`duduclaw license redeem <code>`
+> - **CLI セルフサービス** — `duduclaw license redeem / rebind / subscriptions`（無料コード引換・本機へ移行・リモート更新状態）
+> - **ギャップ解消** — `/v1/license/issue` は email 指定で Key を自動送付；`/v1/license/rebind` は新フィンガープリントで再署名（現フィンガープリントで所有を証明）；`/v1/license/status`（本人）+ `/v1/license/subscriptions`（管理者）
+> - **デプロイモードバインド（M51）** — gateway が `DUDUCLAW_DEPLOYMENT`（cloud / セルフホスト、既定セルフホスト）で tier↔デプロイを強制。不一致は fail-closed で OpenSource に降格
 
 
 
@@ -115,8 +116,9 @@ https://github.com/user-attachments/assets/30406ad1-4595-43ce-8c08-dba8f0ca9683
 
 
 <details>
-<summary><strong>v1.9.4 → v1.26.x 累積ハイライト</strong></summary>
+<summary><strong>v1.9.4 → v1.27.x 累積ハイライト</strong></summary>
 
+- **v1.27.0** — 業種テンプレート（Pro）：EC / 美容医療・歯科 / 不動産仲介 / 学習塾の 4 種（SOUL + 法令強化 CONTRACT + agent.toml + FAQ + 用語集/SOP/コンプライアンス wiki、クローズドソース、台湾法令引用）+ `premium_templates` ライセンス解放ロード（fail-closed、公開 OSS バイナリは受け取らない）+ wizard 業種メニューとアップセル案内
 - **v1.26.0** — 個人版 / エンタープライズ版（`EditionProfile`、ライセンス階層と直交・コア機能を非ゲート）+ Dashboard ワンクリック CLI ログイン（Claude/Codex/Gemini/Antigravity のネイティブログインを PTY 駆動・貼付返送・`remote_safe` 分類）+ Antigravity CLI を server イメージに内蔵 + 個人版データ可搬性（`export`/`import`）+ `PersonalProSelfHost` セルフホスト個人版ライセンス階層（NT$490/月）
 - **v1.25.0** — ブラウザ優先のオンボーディング：`WelcomePage`（3 ステップ、5 つの AI バックエンド経路）+ `FirstRunGate`（Agent ゼロの誘導）+ ガイド付きツアー `GuidedTour`（依存ゼロのスポットライト）+ `runtime.detect` RPC による設定ゼロ起動
 - **v1.24.0** — Antigravity CLI（`agy`）ランタイム対応 · PtyPool の Claude 固定を解除：`RuntimeType::Antigravity` を追加（ワンショット `agy -p`、バイナリ自動解決、システムプロンプト + 履歴の埋め込み、CJK セーフな切り詰め、`trustedWorkspaces` 事前登録）；`CliKind::Antigravity` を PtyPool / worker spawn に接続、`cli_kind_for_provider()` が `[runtime] provider` から種別を導出；対話型 REPL は Claude 専用のまま（設計上）；旧 `gemini` バックエンドは有料 `GEMINI_API_KEY` / エンタープライズ向けに維持

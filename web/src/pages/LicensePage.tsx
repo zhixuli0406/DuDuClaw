@@ -30,6 +30,8 @@ const TIER_LABELS: Record<LicenseSnapshot['tier'], string> = {
   solo: 'Solo',
   studio: 'Studio',
   business: 'Business',
+  partner: 'Partner (NFR)',
+  personal_pro_self_host: 'Personal Pro',
   self_host_pro: 'Self-Host Pro',
   oem: 'OEM',
 };
@@ -45,37 +47,56 @@ const COMMERCIAL_FEATURES: ReadonlyArray<{
     key: 'premium_templates',
     label: 'license.feature.premiumTemplates',
     icon: Sparkles,
-    tiers: new Set(['studio', 'business', 'self_host_pro', 'oem']),
+    tiers: new Set([
+      'studio',
+      'business',
+      'partner',
+      'personal_pro_self_host',
+      'self_host_pro',
+      'oem',
+    ]),
   },
   {
     key: 'industry_evolution_params',
     label: 'license.feature.evolutionParams',
     icon: FileBarChart2,
-    tiers: new Set(['business', 'self_host_pro', 'oem']),
+    tiers: new Set(['business', 'partner', 'self_host_pro', 'oem']),
   },
   {
     key: 'dashboard_enterprise',
     label: 'license.feature.dashboardEnterprise',
     icon: Database,
-    tiers: new Set(['business', 'self_host_pro', 'oem']),
+    tiers: new Set(['business', 'partner', 'self_host_pro', 'oem']),
   },
   {
     key: 'priority_security_patch',
     label: 'license.feature.prioritySecurityPatch',
     icon: ShieldCheck,
-    tiers: new Set(['business', 'self_host_pro', 'oem']),
+    tiers: new Set([
+      'business',
+      'partner',
+      'personal_pro_self_host',
+      'self_host_pro',
+      'oem',
+    ]),
   },
   {
     key: 'private_discord_support',
     label: 'license.feature.privateDiscord',
     icon: MessagesSquare,
-    tiers: new Set(['business', 'self_host_pro', 'oem']),
+    tiers: new Set([
+      'business',
+      'partner',
+      'personal_pro_self_host',
+      'self_host_pro',
+      'oem',
+    ]),
   },
   {
     key: 'odoo_integration_supported',
     label: 'license.feature.odoo',
     icon: Building2,
-    tiers: new Set(['business']),
+    tiers: new Set(['business', 'partner']),
   },
   {
     key: 'white_label',
@@ -405,6 +426,18 @@ export function LicensePage() {
               <li>$ duduclaw license activate &lt;key&gt;</li>
               <li>$ duduclaw license refresh</li>
               <li>$ duduclaw license deactivate</li>
+            </ul>
+
+            <p className="mt-4 text-sm font-medium text-stone-700 dark:text-stone-300">
+              {intl.formatMessage({ id: 'license.cli.selfService' })}
+            </p>
+            <ul className="mt-2 space-y-1 font-mono text-xs text-stone-700 dark:text-stone-300">
+              {/* Free partner (NFR) path — redeem a code, no payment. */}
+              <li>$ duduclaw license redeem &lt;PARTNER-CODE&gt;</li>
+              {/* Self-service machine migration (re-sign for this machine). */}
+              <li>$ duduclaw license rebind</li>
+              {/* Remote subscription / renewal status from the control-plane. */}
+              <li>$ duduclaw license subscriptions</li>
             </ul>
           </Card>
         </>

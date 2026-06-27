@@ -12,7 +12,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.27.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.28.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -99,14 +99,15 @@ infrastructure work.
 
 ---
 
-> 🎉 **v1.27.0 — Industry templates (Pro) + license-gated wizard unlock** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.27.0))
+> 🎉 **v1.28.0 — Partner (NFR) licenses + license self-service** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.28.0))
 >
-> Ships four research-backed premium industry templates for Taiwan SMB verticals and wires the previously-missing **"unlock" path** so the `premium_templates` license feature actually surfaces them in the setup wizard — **fail-closed**, so the public OSS binary and unlicensed users never receive the closed content.
+> Adds a free **Partner (NFR — Not For Resale)** license path and closes the remaining license-acquisition gaps: emailed keys on every issuance, machine re-binding, remote subscription status, and deployment-mode enforcement. The managed/Cloud purchase flow was already end-to-end; this makes the self-host and partner paths first-class.
 >
-> - **Premium industry templates** (Pro / Studio / SelfHostPro / PersonalProSelfHost / OEM) — `ecommerce` / `clinic` / `realestate` / `education`, each a full kit (SOUL.md + compliance-hardened CONTRACT.toml + vertical-tuned agent.toml + FAQ.json + glossary / SOP / compliance wiki) with cited Taiwan statutes. Closed-source; shipped only in licensed builds
-> - **License-gated template unlock** (`premium_templates` module) — `premium_unlocked` / `find_premium_templates_dir` / `available_premium_industries` / `resolve_premium_template`; fail-closed: a missing / expired license, the OpenSource tier, an absent tree, or an unsafe slug all resolve to *locked*; the slug is validated against path traversal before any filesystem access
-> - **Wizard premium industries** — `duduclaw wizard` appends unlocked premium verticals to the menu and shows a one-line upsell hint when the templates are present on disk but the license is locked
-> - `priority_security_patch` stays a support-SLA value-add (tier display only), not a code gate, by design
+> - **Partner (NFR) tier** — a free, self-host, non-resellable grant for integration / channel partners. Unlocks the same commercial modules as Self-Host Pro **except** white-label / redistribution. Independently revocable; never sold through checkout (price 0)
+> - **Partner code redemption** (free path) — `POST /v1/partner/redeem` (atomic one-use reservation + `max_uses` + best-effort email); `POST /v1/partner/codes` (admin) mints codes. CLI: `duduclaw license redeem <code>`
+> - **CLI self-service** — `duduclaw license redeem / rebind / subscriptions` (redeem a free code, move a license to this machine, check remote renewal status)
+> - **Closed gaps** — `/v1/license/issue` emails the key when an `email` is supplied; `/v1/license/rebind` re-signs for a new fingerprint (ownership proven by the current one); `/v1/license/status` (self) + `/v1/license/subscriptions` (admin)
+> - **Deployment-mode binding (M51)** — the gateway enforces tier ↔ deployment via `DUDUCLAW_DEPLOYMENT` (cloud vs self-host, default self-host); mismatches fail-closed to OpenSource
 
 
 
@@ -115,8 +116,9 @@ https://github.com/user-attachments/assets/217f56aa-8b46-4c2a-85fa-62ee68c33a4c
 
 
 <details>
-<summary><strong>v1.9.4 → v1.26.x cumulative highlights</strong></summary>
+<summary><strong>v1.9.4 → v1.27.x cumulative highlights</strong></summary>
 
+- **v1.27.0** — Premium industry templates (`ecommerce` / `clinic` / `realestate` / `education`, each a full closed-source kit with cited Taiwan statutes) + license-gated `premium_templates` unlock (fail-closed; the public OSS binary never receives the closed content) + wizard premium-industry menu with upsell hint
 - **v1.26.0** — Personal / Enterprise editions (`EditionProfile`, orthogonal to the license tier, never gates core features) + Dashboard one-click CLI login (PTY-driven native login for Claude/Codex/Gemini/Antigravity with paste-back + `remote_safe` classification) + Antigravity CLI bundled in the server image + personal-edition data portability (`export`/`import`) + `PersonalProSelfHost` self-host license tier (NT$490/mo)
 - **v1.25.0** — Browser-first onboarding: `WelcomePage` (3 steps, 5 AI-backend paths) + `FirstRunGate` zero-agent routing + guided product tour `GuidedTour` (zero-dep spotlight) + `runtime.detect` RPC zero-config boot
 - **v1.24.0** — Antigravity CLI (`agy`) runtime · PtyPool unbound from Claude: adds `RuntimeType::Antigravity` (oneshot `agy -p`, binary auto-resolve, system prompt + history embedded, CJK-safe truncation, pre-seeded `trustedWorkspaces`); `CliKind::Antigravity` wired into PtyPool / worker spawn, `cli_kind_for_provider()` derives the kind from `[runtime] provider`; interactive REPL stays Claude-only (by design); the legacy `gemini` backend is retained for paid `GEMINI_API_KEY` / enterprise
