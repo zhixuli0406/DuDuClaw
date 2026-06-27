@@ -12,7 +12,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.26.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.27.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -99,15 +99,14 @@ infrastructure work.
 
 ---
 
-> 🎉 **v1.26.0 — Personal / Enterprise editions + one-click CLI login** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.26.0))
+> 🎉 **v1.27.0 — Industry templates (Pro) + license-gated wizard unlock** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.27.0))
 >
-> Adds a product **form-factor** dimension (Personal vs Enterprise) that is orthogonal to the license tier and **never gates a core feature** — it only changes defaults and which management surfaces the dashboard shows. Plus a one-click login for every AI CLI.
+> Ships four research-backed premium industry templates for Taiwan SMB verticals and wires the previously-missing **"unlock" path** so the `premium_templates` license feature actually surfaces them in the setup wizard — **fail-closed**, so the public OSS binary and unlicensed users never receive the closed content.
 >
-> - **Personal / Enterprise editions** (`EditionProfile`) — Personal (default) is single-owner / zero-config; Enterprise enables multi-seat / compliance surfaces. Precedence: `DUDUCLAW_EDITION` env > `agent.toml [edition]` > license tier > Personal. The dashboard hides enterprise nav (org / users / governance / partner / wiki-trust) on Personal, shows an EditionBadge + a non-blocking soft-limit banner
-> - **Dashboard one-click CLI login** (`auth.cli_login.*`) — drives each CLI's native login (Claude / Codex / Gemini / Antigravity) in a PTY on the gateway, streams it to a dashboard terminal, and relays the pasted code back; flags `remote_safe` per CLI (paste-back vs localhost-callback); Claude `setup-token` verified end-to-end
-> - **Antigravity CLI (`agy`) bundled** in the server Docker image alongside claude / codex / gemini, so the Antigravity runtime works out of the box
-> - **Personal-edition data portability** — `duduclaw export` / `duduclaw import` package `~/.duduclaw/` as a portable `.tar.gz` (agents / memory / config / license) to move machines or switch self-host ↔ managed
-> - New `PersonalProSelfHost` license tier (NT$490/mo): premium templates + priority patches, without the enterprise modules
+> - **Premium industry templates** (Pro / Studio / SelfHostPro / PersonalProSelfHost / OEM) — `ecommerce` / `clinic` / `realestate` / `education`, each a full kit (SOUL.md + compliance-hardened CONTRACT.toml + vertical-tuned agent.toml + FAQ.json + glossary / SOP / compliance wiki) with cited Taiwan statutes. Closed-source; shipped only in licensed builds
+> - **License-gated template unlock** (`premium_templates` module) — `premium_unlocked` / `find_premium_templates_dir` / `available_premium_industries` / `resolve_premium_template`; fail-closed: a missing / expired license, the OpenSource tier, an absent tree, or an unsafe slug all resolve to *locked*; the slug is validated against path traversal before any filesystem access
+> - **Wizard premium industries** — `duduclaw wizard` appends unlocked premium verticals to the menu and shows a one-line upsell hint when the templates are present on disk but the license is locked
+> - `priority_security_patch` stays a support-SLA value-add (tier display only), not a code gate, by design
 
 
 
@@ -116,8 +115,9 @@ https://github.com/user-attachments/assets/217f56aa-8b46-4c2a-85fa-62ee68c33a4c
 
 
 <details>
-<summary><strong>v1.9.4 → v1.25.x cumulative highlights</strong></summary>
+<summary><strong>v1.9.4 → v1.26.x cumulative highlights</strong></summary>
 
+- **v1.26.0** — Personal / Enterprise editions (`EditionProfile`, orthogonal to the license tier, never gates core features) + Dashboard one-click CLI login (PTY-driven native login for Claude/Codex/Gemini/Antigravity with paste-back + `remote_safe` classification) + Antigravity CLI bundled in the server image + personal-edition data portability (`export`/`import`) + `PersonalProSelfHost` self-host license tier (NT$490/mo)
 - **v1.25.0** — Browser-first onboarding: `WelcomePage` (3 steps, 5 AI-backend paths) + `FirstRunGate` zero-agent routing + guided product tour `GuidedTour` (zero-dep spotlight) + `runtime.detect` RPC zero-config boot
 - **v1.24.0** — Antigravity CLI (`agy`) runtime · PtyPool unbound from Claude: adds `RuntimeType::Antigravity` (oneshot `agy -p`, binary auto-resolve, system prompt + history embedded, CJK-safe truncation, pre-seeded `trustedWorkspaces`); `CliKind::Antigravity` wired into PtyPool / worker spawn, `cli_kind_for_provider()` derives the kind from `[runtime] provider`; interactive REPL stays Claude-only (by design); the legacy `gemini` backend is retained for paid `GEMINI_API_KEY` / enterprise
 - **v1.23.0** — Decision Continuity (RFC-24): when an agent offers the user an enumerated choice (Option A/B/C), each option is persisted into the Temporal Memory **semantic** layer (independent of conversation compression) and open decisions are re-injected each turn; a later "use Option C" (new turn / session / process) resolves from durable state instead of being guessed. Detection is deterministic and zero-LLM; opt-in per agent via `[memory] decision_continuity = true`

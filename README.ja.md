@@ -12,7 +12,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.26.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.27.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -99,15 +99,14 @@ cosign verify-blob \
 
 ---
 
-> 🎉 **v1.26.0 — 個人版 / エンタープライズ版 + ワンクリック CLI ログイン**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.26.0)）
+> 🎉 **v1.27.0 — 業種テンプレート（Pro）+ ライセンスゲート付き wizard 解放**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.27.0)）
 >
-> ライセンス階層と直交する「プロダクト形態」軸（個人版 / エンタープライズ版）を追加。**デフォルト値と UI のみを制御し、コア機能を一切ゲートしません**。さらに全 CLI 向けのワンクリックログインを追加。
+> 法規を調査した台湾 SMB 向けの業種テンプレート 4 種を同梱し、これまで欠けていた「解放」ロードフローを実装 —— `premium_templates` ライセンス機能が wizard に実際に現れるようにしました。**fail-closed** のため、公開 OSS バイナリと未ライセンスユーザーはクローズドコンテンツを決して受け取りません。
 >
-> - **個人版 / エンタープライズ版**（`EditionProfile`）— 個人版（既定）は単一所有者・設定ゼロ、エンタープライズ版はマルチシート / コンプライアンス管理面。優先順位 `DUDUCLAW_EDITION` env > `agent.toml [edition]` > ライセンス階層 > 個人版。dashboard は個人版でエンタープライズ nav（org / users / governance / partner / wiki-trust）を隠し、EditionBadge + 非ブロッキングのソフト上限バナーを表示
-> - **Dashboard ワンクリック CLI ログイン**（`auth.cli_login.*`）— 各 CLI（Claude / Codex / Gemini / Antigravity）のネイティブログインを gateway 上の PTY で駆動し、dashboard ターミナルにストリーム、貼り付けたコードを返送；CLI ごとに `remote_safe`（貼り付け式 vs localhost コールバック）を提示；Claude `setup-token` はエンドツーエンドで検証済み
-> - **Antigravity CLI（`agy`）を内蔵** — server Docker イメージに claude / codex / gemini と並べて同梱し、Antigravity ランタイムをすぐ利用可能
-> - **個人版データ可搬性** — `duduclaw export` / `duduclaw import` が `~/.duduclaw/` を可搬な `.tar.gz`（agents / メモリ / 設定 / ライセンス）にまとめ、マシン間移行やセルフホスト ↔ マネージドの切替に対応
-> - 新ライセンス階層 `PersonalProSelfHost`（NT$490/月）：エンタープライズモジュールなしで業種テンプレート + 優先パッチを解放
+> - **業種テンプレート（Pro）**（Pro / Studio / SelfHostPro / PersonalProSelfHost / OEM）— EC / 美容医療・歯科 / 不動産仲介 / 学習塾。各々フルキット（SOUL.md + 法令強化 CONTRACT.toml + 業種別チューニング agent.toml + FAQ.json + 用語集 / SOP / コンプライアンス wiki）を備え、台湾の法令を引用。クローズドソースでライセンス版のみ同梱
+> - **ライセンスゲート付き解放**（`premium_templates` モジュール）— `premium_unlocked` / `find_premium_templates_dir` / `available_premium_industries` / `resolve_premium_template`；fail-closed：ライセンス無 / 期限切れ / OpenSource / テンプレート無 / 不正な slug はすべて *locked*、slug はファイル操作前にパストラバーサル検証
+> - **wizard 業種追加** — `duduclaw wizard` が解放済み業種をメニューに追加。テンプレートはあるがライセンスが無い場合は 1 行のアップセル案内を表示
+> - `priority_security_patch` はサポート SLA の付加価値（tier 表示のみ）であり、コードゲートではない（意図的）
 
 
 
@@ -116,8 +115,9 @@ https://github.com/user-attachments/assets/30406ad1-4595-43ce-8c08-dba8f0ca9683
 
 
 <details>
-<summary><strong>v1.9.4 → v1.25.x 累積ハイライト</strong></summary>
+<summary><strong>v1.9.4 → v1.26.x 累積ハイライト</strong></summary>
 
+- **v1.26.0** — 個人版 / エンタープライズ版（`EditionProfile`、ライセンス階層と直交・コア機能を非ゲート）+ Dashboard ワンクリック CLI ログイン（Claude/Codex/Gemini/Antigravity のネイティブログインを PTY 駆動・貼付返送・`remote_safe` 分類）+ Antigravity CLI を server イメージに内蔵 + 個人版データ可搬性（`export`/`import`）+ `PersonalProSelfHost` セルフホスト個人版ライセンス階層（NT$490/月）
 - **v1.25.0** — ブラウザ優先のオンボーディング：`WelcomePage`（3 ステップ、5 つの AI バックエンド経路）+ `FirstRunGate`（Agent ゼロの誘導）+ ガイド付きツアー `GuidedTour`（依存ゼロのスポットライト）+ `runtime.detect` RPC による設定ゼロ起動
 - **v1.24.0** — Antigravity CLI（`agy`）ランタイム対応 · PtyPool の Claude 固定を解除：`RuntimeType::Antigravity` を追加（ワンショット `agy -p`、バイナリ自動解決、システムプロンプト + 履歴の埋め込み、CJK セーフな切り詰め、`trustedWorkspaces` 事前登録）；`CliKind::Antigravity` を PtyPool / worker spawn に接続、`cli_kind_for_provider()` が `[runtime] provider` から種別を導出；対話型 REPL は Claude 専用のまま（設計上）；旧 `gemini` バックエンドは有料 `GEMINI_API_KEY` / エンタープライズ向けに維持
 - **v1.23.0** — Decision Continuity（RFC-24）：エージェントが列挙式の選択肢（案 A/B/C）を提示した際、各選択肢を Temporal Memory の **semantic** 層に永続化（会話圧縮から独立）し、未決事項をターンごとに再注入；後から「案 C で」（別ターン / セッション / プロセス）と言われても、推測ではなく永続状態から解決。検出は決定論的でゼロ LLM；`[memory] decision_continuity = true` でエージェント単位の opt-in
