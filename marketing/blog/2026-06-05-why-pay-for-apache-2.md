@@ -183,10 +183,10 @@ Anti-tamper 防得了沒誠意的人，防不了想 crack 的人。
    duduclaw start
    ```
 2. 跑得順了再評估要不要訂閱。
-3. 想訂閱請來 [duduclaw.tw](https://duduclaw.tw)，
+3. 想訂閱請來 [duduclaw.dudustudio.monster](https://duduclaw.dudustudio.monster)，
    或直接 LINE OA [@duduclaw](https://line.me/R/ti/p/@duduclaw)。
 
-問題、批評、想罵我都可以寄到 hello@duduclaw.tw。
+問題、批評、想罵我都可以寄到 info@dudustudio.monster。
 
 —— zhixuli
 2026-06-05 於台北
@@ -196,6 +196,6 @@ Anti-tamper 防得了沒誠意的人，防不了想 crack 的人。
 **相關連結**
 
 - 開源 repo：[github.com/zhixuli0406/DuDuClaw](https://github.com/zhixuli0406/DuDuClaw)
-- 完整定價：[duduclaw.tw#pricing](https://duduclaw.tw#pricing)
+- 完整定價：[duduclaw.dudustudio.monster#pricing](https://duduclaw.dudustudio.monster#pricing)
 - 商業模式背後的思考：[Solo-Founder Business Plan v2.0](https://github.com/zhixuli0406/DuDuClaw/blob/main/commercial/docs/business-plan.md)（僅內部，公開版本 2026 Q3）
 - PayUni 整合筆記：[PayUni reverse-engineered](https://github.com/zhixuli0406/DuDuClaw/blob/main/commercial/docs/payuni-integration-notes.md)（同上）

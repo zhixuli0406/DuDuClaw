@@ -1,6 +1,21 @@
 # Changelog
 
 
+## [1.29.1] - 2026-06-28 — Fix placeholder domain
+
+Replaces the never-registered placeholder `duduclaw.tw` with the real deployed
+domains.
+
+### Fixed
+- **`DEFAULT_CONTROL_URL`** (CLI + gateway) → `https://api.duduclaw.dudustudio.monster`.
+  `duduclaw license refresh / redeem / rebind` and the gateway phone-home now
+  reach the real control-plane by default (still overridable via
+  `DUDUCLAW_CONTROL_URL`).
+- Dashboard pricing links + upsell strings (premium templates / wizard /
+  tier-limit message) → `https://duduclaw.dudustudio.monster#pricing`.
+- Contacts: security SOP → `louis.li@dudustudio.monster`; support / refund →
+  `info@dudustudio.monster`. Marketing drafts point at the real domain.
+
 ## [1.29.0] - 2026-06-27 — Cloud-tier agent/channel caps
 
 Enforces the per-tier `max_agents` / `max_channels` from `features.toml` that

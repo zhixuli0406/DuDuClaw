@@ -167,7 +167,7 @@ Roast the design. I'd rather hear it now than after the next 50 paying customers
 > verifies a license, parses memory, drives an agent. The closed-source
 > layer is the issuer side (signing key, control-plane, premium SOUL.md
 > templates I built from 100+ real conversations). I wrote up the trade-off
-> here: https://duduclaw.tw/blog/why-pay-for-apache-2
+> here: https://duduclaw.dudustudio.monster/blog/why-pay-for-apache-2
 
 ### "When are you raising?"
 
