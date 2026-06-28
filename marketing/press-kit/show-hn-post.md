@@ -36,7 +36,7 @@ Hi HN — I'm a solo developer in Taiwan. DuDuClaw is a Rust-based AI agent plat
 
 The plumbing around these two: SQLite memory engine with 3D-weighted retrieval (Generative Agents-style), Ed25519-signed license with grace-period state machine + signed CRL, AES-256-GCM redaction pipeline (RFC-23) so internal data gets <REDACT> tokens before leaving trusted boundaries, container sandbox for agent isolation, multi-OAuth account rotation with rate-limit/billing-aware cooldowns, Odoo ERP bridge with 15 MCP tools, and local inference via llama.cpp / mistral.rs / Exo P2P clusters.
 
-Apache 2.0 core. Closed-source commercial layer ships separate (license, premium templates, dashboard enterprise, CRL signing infra). I wrote a separate post on why the bottom-of-stack stays open: https://duduclaw.tw/blog/why-pay-for-apache-2
+Apache 2.0 core. Closed-source commercial layer ships separate (license, premium templates, dashboard enterprise, CRL signing infra). I wrote a separate post on why the bottom-of-stack stays open: https://duduclaw.dudustudio.monster/blog/why-pay-for-apache-2
 
 GitHub: https://github.com/zhixuli0406/DuDuClaw
 
@@ -73,7 +73,7 @@ Word count: ~480 EN, well under the 1200 limit.
 > I'm running this as a solo founder, no funding, no investors. The Apache 2.0
 > core is my honest commitment to customers: if I disappear tomorrow, the
 > NT$1,490/month they're paying me today doesn't trap them in a dead product.
-> I wrote up the business reasoning here: https://duduclaw.tw/blog/why-pay-for-apache-2
+> I wrote up the business reasoning here: https://duduclaw.dudustudio.monster/blog/why-pay-for-apache-2
 
 ---
 
