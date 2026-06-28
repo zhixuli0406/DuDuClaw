@@ -1,8 +1,53 @@
-import { useEffect, useRef, useState } from 'react';
-import { AlertTriangle, CheckCircle2, XCircle, Loader2, SendHorizonal } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  XCircle,
+  Loader2,
+  SendHorizonal,
+  ExternalLink,
+} from 'lucide-react';
 import { api } from '@/lib/api';
 import { client } from '@/lib/ws-client';
 import { Dialog, inputClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+
+/* eslint-disable no-control-regex */
+/**
+ * Strip ANSI / VT escape sequences from raw PTY output so the streamed CLI login
+ * transcript is human-readable instead of a wall of escape codes. The login CLIs
+ * render with a full-screen Ink TUI; this won't perfectly reconstruct the redraw,
+ * but it removes the garbage so the prompt + result text are legible.
+ */
+function stripAnsi(s: string): string {
+  return (
+    s
+      // CSI sequences: ESC [ … final byte
+      .replace(/\[[0-9;?=>!]*[A-Za-z@]/g, '')
+      // OSC sequences: ESC ] … (BEL or ESC \ terminator)
+      .replace(/\][\s\S]*?(?:|\\)/g, '')
+      // charset selection: ESC ( / ) / # / % X
+      .replace(/[()#%][0-9A-Za-z]/g, '')
+      // misc single-char escapes: ESC =, ESC >, ESC 7/8, ESC M …
+      .replace(/[=>NODEHM78]/g, '')
+      // bell, backspace, vertical tab, form feed
+      .replace(/[]/g, '')
+  );
+}
+/* eslint-enable no-control-regex */
+
+/**
+ * Pull the OAuth authorize URL out of the (ANSI-stripped) login output so the
+ * dashboard can render it as a one-click link — many users don't realise the URL
+ * is buried in the terminal output. The gateway widens the PTY so the URL stays
+ * on a single line, making this a clean single-match extraction.
+ */
+function extractAuthUrl(clean: string): string | null {
+  const urls = clean.match(/https?:\/\/[^\s"'<>)\]]+/g);
+  if (!urls) return null;
+  const oauth = urls.find((u) => /oauth|authorize|auth\.|\/cai\//i.test(u));
+  const pick = oauth ?? urls.reduce((a, b) => (b.length > a.length ? b : a));
+  return pick.replace(/[.,)\]]+$/, ''); // drop trailing punctuation the TUI may append
+}
 
 export type LoginRuntime = 'claude' | 'codex' | 'gemini' | 'antigravity';
 
@@ -38,6 +83,10 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
   const [errMsg, setErrMsg] = useState<string | null>(null);
   const outRef = useRef<HTMLPreElement>(null);
   const sidRef = useRef<string | null>(null);
+
+  // Derive a readable transcript + the one-click auth URL from the raw stream.
+  const clean = useMemo(() => stripAnsi(output), [output]);
+  const authUrl = useMemo(() => extractAuthUrl(clean), [clean]);
 
   // Start the login session when the modal opens.
   useEffect(() => {
@@ -90,7 +139,7 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
   // Auto-scroll the terminal.
   useEffect(() => {
     if (outRef.current) outRef.current.scrollTop = outRef.current.scrollHeight;
-  }, [output]);
+  }, [clean]);
 
   const sendInput = async () => {
     if (!sidRef.current || status !== 'running') return;
@@ -148,15 +197,32 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
           </div>
         )}
         {hint && <p className="text-xs text-stone-500 dark:text-stone-400">{hint}</p>}
-        {program && (
-          <p className="font-mono text-[11px] text-stone-400">$ {program} …</p>
+
+        {/* One-click auth link — surfaces the URL buried in the CLI output. */}
+        {authUrl && status === 'running' && (
+          <div className="space-y-1.5 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+            <p className="text-xs font-medium text-stone-600 dark:text-stone-300">
+              ① 點此開啟授權網址 → 完成授權後複製驗證碼 → ② 貼到下方按 Enter
+            </p>
+            <a
+              href={authUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-3 py-2 text-sm font-medium text-white transition hover:bg-amber-600"
+            >
+              <ExternalLink className="h-4 w-4" /> 開啟授權網址
+            </a>
+            <p className="select-all break-all font-mono text-[10px] text-stone-400">{authUrl}</p>
+          </div>
         )}
+
+        {program && <p className="font-mono text-[11px] text-stone-400">$ {program} …</p>}
 
         <pre
           ref={outRef}
-          className="h-64 overflow-auto rounded-lg border border-stone-300/50 bg-stone-950/90 p-3 font-mono text-[12px] leading-relaxed text-stone-100 dark:border-white/10"
+          className="h-48 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-stone-300/50 bg-stone-950/90 p-3 font-mono text-[12px] leading-relaxed text-stone-100 dark:border-white/10"
         >
-          {output || '啟動登入程序中…'}
+          {clean.trim() || '啟動登入程序中…'}
         </pre>
 
         <div className="flex items-center gap-2">

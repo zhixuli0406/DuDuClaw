@@ -62,7 +62,12 @@ pub fn spec_for(runtime: RuntimeType) -> Option<CliAuthSpec> {
         RuntimeType::Claude => Some(CliAuthSpec {
             runtime,
             login_args: v(&["setup-token"]),
-            success_markers: v(&["successfully", "authenticated", "logged in", "token saved", "you can now"]),
+            // Broad, case-insensitive (tail is lowercased): `claude setup-token`
+            // confirms with phrasings like "Success!", "Token has been saved",
+            // "credentials saved", "you can now use" — narrow markers like
+            // "successfully" / "token saved" miss those and leave the dashboard
+            // spinning forever after a valid paste-back.
+            success_markers: v(&["success", "authenticated", "logged in", "saved", "you can now"]),
             failure_markers: v(&["authentication failed", "login failed", "invalid code", "access denied", "token expired"]),
             // `claude setup-token` is the headless long-lived-token flow (paste-back).
             remote_safe: true,
@@ -209,8 +214,13 @@ impl AuthSession {
         let program = resolve_program(runtime).ok_or(AuthError::NotInstalled)?;
 
         let pty_system = native_pty_system();
+        // Wide terminal on purpose: the CLIs render with an Ink TUI that hard-wraps
+        // long strings at the column width. An OAuth authorize URL (~350-420 chars
+        // with code_challenge/state) wrapped across rows can't be reliably
+        // reassembled for the "open this link" button in the dashboard. 600 cols
+        // keeps the URL on a single line so the frontend can extract it cleanly.
         let pair = pty_system
-            .openpty(PtySize { rows: 30, cols: 120, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize { rows: 40, cols: 600, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| AuthError::Pty(e.to_string()))?;
 
         let mut cmd = CommandBuilder::new(&program);
