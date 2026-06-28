@@ -401,7 +401,7 @@ fn print_opensource_status() {
     println!("  duduclaw license activate <key>");
     println!();
     println!("To get a license:");
-    println!("  https://duduclaw.tw/pricing");
+    println!("  https://duduclaw.dudustudio.monster#pricing");
 }
 
 fn print_status(license: &License) -> Result<()> {
@@ -486,7 +486,7 @@ fn print_status(license: &License) -> Result<()> {
 // ── refresh ────────────────────────────────────────────────────
 
 /// Default control-plane URL. Overridable via `DUDUCLAW_CONTROL_URL` env var.
-const DEFAULT_CONTROL_URL: &str = "https://api.duduclaw.tw";
+const DEFAULT_CONTROL_URL: &str = "https://api.duduclaw.dudustudio.monster";
 
 async fn cmd_refresh() -> Result<()> {
     let license = match load_default() {

@@ -64,7 +64,7 @@ export function SoftLimitBanner() {
           {intl.formatMessage({ id: 'softLimit.body' })}
         </p>
         <a
-          href="https://duduclaw.tw/pricing"
+          href="https://duduclaw.dudustudio.monster#pricing"
           target="_blank"
           rel="noreferrer"
           className="mt-1.5 inline-block font-medium text-amber-700 underline underline-offset-2 hover:text-amber-900 dark:text-amber-300 dark:hover:text-amber-100"

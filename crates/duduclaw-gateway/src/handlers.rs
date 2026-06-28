@@ -3102,7 +3102,7 @@ impl MethodHandler {
         let noun = if kind == "agent" { "Agent" } else { "通道" };
         Some(format!(
             "您的方案（{tier}）最多可建立 {max} 個{noun}。\
-             請升級方案以新增更多：https://duduclaw.tw/pricing"
+             請升級方案以新增更多：https://duduclaw.dudustudio.monster#pricing"
         ))
     }
 

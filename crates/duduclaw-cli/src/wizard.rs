@@ -105,7 +105,7 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
         );
         println!(
             "     {}\n",
-            style("解鎖：duduclaw license activate <key>  ·  https://duduclaw.tw/pricing").dim()
+            style("解鎖：duduclaw license activate <key>  ·  https://duduclaw.dudustudio.monster#pricing").dim()
         );
     }
 
