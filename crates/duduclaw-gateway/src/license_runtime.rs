@@ -36,7 +36,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 /// Default fall-back when `DUDUCLAW_CONTROL_URL` is unset.
-const DEFAULT_CONTROL_URL: &str = "https://api.duduclaw.tw";
+const DEFAULT_CONTROL_URL: &str = "https://api.duduclaw.dudustudio.monster";
 
 /// L7: process-wide cache for the machine fingerprint. `generate_fingerprint`
 /// enumerates the hostname + MAC addresses on every call, which is wasteful on

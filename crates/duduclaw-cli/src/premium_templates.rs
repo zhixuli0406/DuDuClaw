@@ -223,7 +223,7 @@ pub fn resolve_premium_template(slug: &str) -> Result<PathBuf> {
         return Err(DuDuClawError::License(format!(
             "premium template '{slug}' requires a Pro license. \
              Activate one with `duduclaw license activate <key>` \
-             (see https://duduclaw.tw/pricing)."
+             (see https://duduclaw.dudustudio.monster#pricing)."
         )));
     }
     let base = find_premium_templates_dir().ok_or_else(|| {

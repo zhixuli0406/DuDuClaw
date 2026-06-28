@@ -376,7 +376,7 @@ export function LicensePage() {
             >
               <div className="flex flex-wrap gap-3">
                 <a
-                  href="https://duduclaw.tw#pricing"
+                  href="https://duduclaw.dudustudio.monster#pricing"
                   target="_blank"
                   rel="noopener noreferrer"
                 >
@@ -404,7 +404,7 @@ export function LicensePage() {
             >
               <div className="flex flex-wrap gap-3">
                 <a
-                  href="https://duduclaw.tw#pricing"
+                  href="https://duduclaw.dudustudio.monster#pricing"
                   target="_blank"
                   rel="noopener noreferrer"
                 >
