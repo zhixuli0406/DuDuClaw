@@ -3,7 +3,7 @@
 //! Mounts a `/webhook/line` POST endpoint on the Axum router to receive
 //! messages from LINE, validates signatures, and sends replies.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use duduclaw_core::truncate_bytes;
@@ -112,8 +112,10 @@ struct LineBotInfo {
 
 #[derive(Clone)]
 pub struct LineState {
-    token: String,
-    secret: String,
+    // The token/secret are NOT baked in — they're read from config on every
+    // request so a dashboard config change takes effect without a gateway
+    // restart (the `/webhook/line` route is always mounted).
+    home_dir: PathBuf,
     ctx: Arc<ReplyContext>,
     http: reqwest::Client,
     channel_status: ChannelStatusMap,
@@ -122,39 +124,71 @@ pub struct LineState {
 
 // ── Public API ──────────────────────────────────────────────
 
-/// Initialize LINE bot and return an Axum Router with the webhook endpoint.
-///
-/// Returns `None` if LINE is not configured.
-pub async fn start_line_bot(
-    home_dir: &Path,
-    ctx: Arc<ReplyContext>,
-) -> Option<Router> {
-    let (token, secret) = read_line_config(home_dir).await?;
-    if token.is_empty() {
-        return None;
-    }
-    // HS2 fix: an empty channel secret makes `verify_signature` accept any
-    // request — `HmacSha256::new_from_slice(b"")` succeeds and an attacker can
-    // compute `base64(HMAC(key="", body))`. Refuse to start the LINE bot
-    // without a secret (matches WhatsApp/Feishu fail-closed behavior).
-    if secret.is_empty() {
-        warn!(
-            "LINE bot NOT started: channel access token is set but \
-             line_channel_secret is empty — webhook signature verification \
-             would accept forged requests. Configure the channel secret."
-        );
-        return None;
-    }
-
+/// Mount the LINE webhook endpoint. The route is ALWAYS mounted (even when LINE
+/// is not yet configured) and the handler reads the token/secret from config on
+/// every request — so configuring or changing LINE in the dashboard takes effect
+/// immediately, with no gateway restart. A best-effort token check runs now to
+/// set the initial channel status.
+pub async fn start_line_bot(home_dir: &Path, ctx: Arc<ReplyContext>) -> Router {
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .ok()?;
+        .unwrap_or_default();
 
-    let channel_status = ctx.channel_status.clone();
-    let event_tx = ctx.event_tx.clone();
+    // Initial status (best-effort) so the dashboard reflects an already-configured
+    // LINE channel without waiting for the first webhook.
+    verify_line_status(home_dir, &http, &ctx.channel_status, &ctx.event_tx).await;
 
-    // Verify token
+    let state = LineState {
+        home_dir: home_dir.to_path_buf(),
+        channel_status: ctx.channel_status.clone(),
+        event_tx: ctx.event_tx.clone(),
+        http,
+        ctx,
+    };
+
+    info!("   LINE webhook endpoint mounted: /webhook/line (token read per request — no restart needed on config change)");
+    Router::new()
+        .route("/webhook/line", post(line_webhook_handler))
+        .with_state(state)
+}
+
+/// Re-check the configured LINE token and update the channel status. Called on
+/// startup and whenever the dashboard saves LINE config (hot reload), so the
+/// "connected" indicator updates live instead of staying on "連線中".
+pub async fn refresh_line_status(home_dir: &Path, ctx: Arc<ReplyContext>) {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+    verify_line_status(home_dir, &http, &ctx.channel_status, &ctx.event_tx).await;
+}
+
+/// Read the current LINE config and ping the LINE API to set the channel status.
+/// Marks disconnected (with a reason) when not configured / token invalid.
+async fn verify_line_status(
+    home_dir: &Path,
+    http: &reqwest::Client,
+    channel_status: &ChannelStatusMap,
+    event_tx: &tokio::sync::broadcast::Sender<String>,
+) {
+    let (token, secret) = match read_line_config(home_dir).await {
+        Some(pair) => pair,
+        None => {
+            set_channel_connected(channel_status, "line", false, Some("not configured".into()), Some(event_tx)).await;
+            return;
+        }
+    };
+    if token.is_empty() {
+        set_channel_connected(channel_status, "line", false, Some("not configured".into()), Some(event_tx)).await;
+        return;
+    }
+    // HS2: an empty secret would make signature verification accept forged
+    // requests; surface it as not-connected so the operator fixes it.
+    if secret.is_empty() {
+        set_channel_connected(channel_status, "line", false, Some("channel secret missing".into()), Some(event_tx)).await;
+        return;
+    }
     match http
         .get(format!("{LINE_API}/info"))
         .header("Authorization", format!("Bearer {token}"))
@@ -168,30 +202,18 @@ pub async fn start_line_bot(
             } else {
                 info!("💬 LINE bot token verified");
             }
-            set_channel_connected(&channel_status, "line", true, None, Some(&event_tx)).await;
+            set_channel_connected(channel_status, "line", true, None, Some(event_tx)).await;
         }
         Ok(resp) => {
             let msg = format!("token invalid (HTTP {})", resp.status());
             warn!("LINE bot {msg}");
-            set_channel_connected(&channel_status, "line", false, Some(msg), Some(&event_tx)).await;
-            return None;
+            set_channel_connected(channel_status, "line", false, Some(msg), Some(event_tx)).await;
         }
         Err(e) => {
-            warn!("LINE connection failed: {e}");
-            set_channel_connected(&channel_status, "line", false, Some(e.to_string()), Some(&event_tx)).await;
-            return None;
+            warn!("LINE connection check failed: {e}");
+            set_channel_connected(channel_status, "line", false, Some(e.to_string()), Some(event_tx)).await;
         }
     }
-
-    let state = LineState { token, secret, ctx, http, channel_status, event_tx };
-
-    let router = Router::new()
-        .route("/webhook/line", post(line_webhook_handler))
-        .with_state(state);
-
-    info!("   LINE webhook endpoint: /webhook/line");
-    info!("   ⚠ 請在 LINE Developer Console 設定 Webhook URL: https://your-domain:18789/webhook/line");
-    Some(router)
 }
 
 // ── Webhook handler ─────────────────────────────────────────
@@ -201,6 +223,17 @@ async fn line_webhook_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
+    // Load the current LINE credentials per request — config changes apply live.
+    let (token, secret) = match read_line_config(&state.home_dir).await {
+        Some((t, s)) if !t.is_empty() && !s.is_empty() => (t, s),
+        _ => {
+            // Not configured (or missing secret). Accept so LINE's "Verify" still
+            // gets a 200, but process nothing — fail closed (no secret ⇒ can't and
+            // won't validate/handle events).
+            return StatusCode::OK;
+        }
+    };
+
     // Validate signature
     let signature = match headers.get("x-line-signature").and_then(|v| v.to_str().ok()) {
         Some(sig) => sig.to_string(),
@@ -210,7 +243,7 @@ async fn line_webhook_handler(
         }
     };
 
-    if !verify_signature(&state.secret, &body, &signature) {
+    if !verify_signature(&secret, &body, &signature) {
         warn!("LINE webhook: invalid signature");
         return StatusCode::UNAUTHORIZED;
     }
@@ -284,7 +317,7 @@ async fn line_webhook_handler(
                         crate::media::download_url(&state.http, url, None, crate::media::MAX_FILE_SIZE as usize).await.ok()
                     } else {
                         // LINE-hosted — download via Content API
-                        download_line_content(&state.http, &state.token, msg_id).await.ok()
+                        download_line_content(&state.http, &token, msg_id).await.ok()
                     };
 
                     if let Some(data) = content_data {
@@ -329,7 +362,7 @@ async fn line_webhook_handler(
                 .and_then(|s| s.user_id.clone());
             let on_progress: Option<crate::channel_reply::ProgressCallback> = if let Some(uid) = user_id_for_push {
                 let push_http = state.http.clone();
-                let push_token = state.token.clone();
+                let push_token = token.clone();
                 let last_progress = Arc::new(std::sync::Mutex::new(std::time::Instant::now()
                     .checked_sub(std::time::Duration::from_secs(120))
                     .unwrap_or_else(std::time::Instant::now)));
@@ -388,9 +421,9 @@ async fn line_webhook_handler(
             // Try Reply API first; if it fails (e.g. reply token expired after
             // long AI processing), fall back to Push API which doesn't require
             // a reply token but counts against the monthly message quota.
-            if !send_reply_rich(&state.http, &state.token, reply_token, messages.clone()).await {
+            if !send_reply_rich(&state.http, &token, reply_token, messages.clone()).await {
                 warn!("LINE: reply API failed — falling back to push API for {sender}");
-                push_message_rich(&state.http, &state.token, sender, messages).await;
+                push_message_rich(&state.http, &token, sender, messages).await;
             }
         }
     }

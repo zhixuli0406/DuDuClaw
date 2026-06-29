@@ -1088,10 +1088,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/.well-known/mcp-server.json", get(well_known_mcp_server_card))
         .route("/.well-known/agent.json", get(well_known_agent_card));
 
-    // Mount LINE webhook endpoint
-    if let Some(line) = line_router {
-        app = app.merge(line);
-    }
+    // Mount LINE webhook endpoint (always — the handler reads config per request)
+    app = app.merge(line_router);
 
     // Merge plugin extension routes (if any)
     if let Some(extra) = extension.extra_routes() {

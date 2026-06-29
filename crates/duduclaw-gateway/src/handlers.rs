@@ -5388,9 +5388,12 @@ impl MethodHandler {
             "telegram" => crate::telegram::start_telegram_bot(&home, ctx).await,
             "discord" => crate::discord::start_discord_bot(&home, ctx).await,
             "line" => {
-                // LINE uses webhook (axum router), not a background task.
-                // Updating config is enough; the webhook handler reads token on each request.
-                info!("LINE channel updated (webhook-based, no background task needed)");
+                // LINE uses a webhook (axum route is always mounted) — no background
+                // task. The handler reads the token per request, so saving config is
+                // enough; just refresh the connection status so the dashboard flips
+                // from "連線中" to connected immediately.
+                crate::line::refresh_line_status(&home, ctx.clone()).await;
+                info!("LINE channel updated; status refreshed (webhook always mounted)");
                 return true;
             }
             _ => None,
