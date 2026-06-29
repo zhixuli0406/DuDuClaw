@@ -151,13 +151,46 @@ impl AuthStatus {
     }
 }
 
-/// Pure marker scanner over a (lowercased) rolling output tail. Failure wins
-/// over success when both are present in the same window. `None` ⇒ keep running.
-pub fn scan_outcome(tail_lower: &str, spec: &CliAuthSpec) -> Option<AuthStatus> {
-    if spec.failure_markers.iter().any(|m| tail_lower.contains(m.as_str())) {
+/// Normalize CLI output for marker matching: strip ANSI/VT escape sequences,
+/// lowercase, and drop ALL whitespace. The login CLIs render with a full-screen
+/// Ink TUI that positions each word with cursor-control escapes rather than
+/// literal spaces — so in the raw stream "Invalid code" arrives as
+/// `Invalid<ESC>[…code`, and a multi-word marker like "invalid code" never
+/// appears as contiguous text. Normalizing both sides (here + the markers) makes
+/// substring matching robust against the TUI's redraw. Without this, every
+/// multi-word marker silently fails and the dashboard spins on "進行中" forever.
+fn normalize_for_match(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // Skip the escape sequence up to its terminator (CSI letter / OSC BEL).
+            while let Some(&n) = chars.peek() {
+                chars.next();
+                if n.is_ascii_alphabetic() || n == '~' || n == '\u{7}' {
+                    break;
+                }
+            }
+        } else if !c.is_whitespace() && c != '\u{7}' && c != '\u{8}' {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
+}
+
+/// Pure marker scanner over a rolling raw output tail (ANSI included). Both the
+/// tail and the markers are normalized (ANSI-stripped, whitespace-removed) before
+/// matching — see [`normalize_for_match`]. Failure wins over success when both
+/// are present in the same window. `None` ⇒ keep running.
+pub fn scan_outcome(tail: &str, spec: &CliAuthSpec) -> Option<AuthStatus> {
+    let hay = normalize_for_match(tail);
+    let norm = |m: &str| -> String {
+        m.chars().filter(|c| !c.is_whitespace()).flat_map(|c| c.to_lowercase()).collect()
+    };
+    if spec.failure_markers.iter().any(|m| hay.contains(&norm(m))) {
         return Some(AuthStatus::Failed);
     }
-    if spec.success_markers.iter().any(|m| tail_lower.contains(m.as_str())) {
+    if spec.success_markers.iter().any(|m| hay.contains(&norm(m))) {
         return Some(AuthStatus::Succeeded);
     }
     None
@@ -266,9 +299,12 @@ impl AuthSession {
                         Ok(n) => {
                             let chunk = &buf[..n];
                             let _ = tx.send(chunk.to_vec());
-                            tail.push_str(&String::from_utf8_lossy(chunk).to_lowercase());
-                            if tail.len() > 8192 {
-                                let cut = tail.len() - 4096;
+                            // Keep the RAW tail (ANSI included) — scan_outcome
+                            // normalizes it. A larger window survives the TUI's
+                            // escape-heavy redraws between meaningful words.
+                            tail.push_str(&String::from_utf8_lossy(chunk));
+                            if tail.len() > 16384 {
+                                let cut = tail.len() - 8192;
                                 tail.drain(..cut);
                             }
                             if status.load(Ordering::Relaxed) == ST_RUNNING {
@@ -366,6 +402,22 @@ mod tests {
         assert_eq!(scan_outcome("…you can now use claude", &spec), Some(AuthStatus::Succeeded));
         assert_eq!(scan_outcome("error: invalid code", &spec), Some(AuthStatus::Failed));
         assert_eq!(scan_outcome("visit https://… to authorize", &spec), None);
+    }
+
+    #[test]
+    fn scan_outcome_matches_through_ink_tui_escapes() {
+        // The real failure case: Ink positions each word with cursor escapes, so
+        // "Invalid code" arrives with escapes between the words. The scanner must
+        // still flag it (regression: pre-normalization this matched nothing and
+        // the dashboard span on "進行中" forever).
+        let spec = spec_for(RuntimeType::Claude).unwrap();
+        let tui_invalid = "OAuth error: \u{1b}[31mInvalid\u{1b}[2G\u{1b}[Kcode\u{1b}[0m. Press Enter to try.";
+        assert_eq!(scan_outcome(tui_invalid, &spec), Some(AuthStatus::Failed));
+        let tui_ok = "Login \u{1b}[32msuccess\u{1b}[0mful! Token \u{1b}[1msaved\u{1b}[0m.";
+        assert_eq!(scan_outcome(tui_ok, &spec), Some(AuthStatus::Succeeded));
+        // The authorize URL/prompt must NOT trip either outcome.
+        let prompt = "Browser didn't open? \u{1b}[2GUse the url below\n\u{1b}[3Ghttps://claude.com/cai/oauth/authorize?code=true&scope=user:inference\nPaste code here if prompted >";
+        assert_eq!(scan_outcome(prompt, &spec), None);
     }
 
     #[test]
