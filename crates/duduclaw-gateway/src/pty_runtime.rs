@@ -887,11 +887,18 @@ async fn spawn_session_for_key(
 /// upstream (see `channel_reply` / `claude_runner` non-Claude guards) until
 /// their REPL framing is implemented.
 fn resolve_program(home: &Path, kind: CliKind) -> Option<String> {
+    // Try the HOME-rooted candidate list first, then fall back to a PATH lookup
+    // (`which_*`). The in-home list is a curated set (Homebrew, nvm, ~/.local,
+    // ~/.claude/bin, …) and deliberately does NOT include system locations like
+    // `/usr/bin` — where the Docker image installs the CLIs (npm global). Without
+    // the PATH fallback the PTY/OAuth reply path fails with "binary not found"
+    // even though `which claude` resolves fine (which is why one-click login,
+    // which uses the PATH-aware resolver, worked but channel replies didn't).
     match kind {
-        CliKind::Claude => duduclaw_core::which_claude_in_home(home),
-        CliKind::Codex => duduclaw_core::which_codex_in_home(home),
-        CliKind::Gemini => duduclaw_core::which_gemini_in_home(home),
-        CliKind::Antigravity => duduclaw_core::which_agy_in_home(home),
+        CliKind::Claude => duduclaw_core::which_claude_in_home(home).or_else(duduclaw_core::which_claude),
+        CliKind::Codex => duduclaw_core::which_codex_in_home(home).or_else(duduclaw_core::which_codex),
+        CliKind::Gemini => duduclaw_core::which_gemini_in_home(home).or_else(duduclaw_core::which_gemini),
+        CliKind::Antigravity => duduclaw_core::which_agy_in_home(home).or_else(duduclaw_core::which_agy),
     }
 }
 
