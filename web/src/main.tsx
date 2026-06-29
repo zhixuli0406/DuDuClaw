@@ -16,13 +16,16 @@ applyTheme(useThemeStore.getState().theme);
 function Root() {
   const locale = useLocaleStore((s) => s.locale);
   return (
-    <ToastProvider>
-      <IntlProvider locale={locale} messages={messages[locale]} defaultLocale="zh-TW">
+    // IntlProvider must wrap ToastProvider: ToastItem calls useIntl(), so the
+    // toast viewport has to live inside the intl context or it throws
+    // "Could not find required `intl` object" the first time a toast renders.
+    <IntlProvider locale={locale} messages={messages[locale]} defaultLocale="zh-TW">
+      <ToastProvider>
         <BrowserRouter>
           <App />
         </BrowserRouter>
-      </IntlProvider>
-    </ToastProvider>
+      </ToastProvider>
+    </IntlProvider>
   );
 }
 
