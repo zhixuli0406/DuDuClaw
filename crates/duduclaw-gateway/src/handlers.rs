@@ -5037,8 +5037,13 @@ impl MethodHandler {
             return WsFrame::error_response("", &msg);
         }
 
-        // Per-agent channel: write to agent.toml [channels.{platform}]
-        if !agent_name.is_empty() {
+        // Per-agent channel: write to agent.toml [channels.{platform}]. Only the
+        // token-exclusive channels can be bound per agent; LINE/WhatsApp/Feishu are
+        // single global webhook endpoints, so when an agent is selected for them we
+        // fall through to the global path and bind the agent as `default_agent`
+        // (below) instead of erroring out — otherwise the save silently fails and
+        // nothing is persisted.
+        if !agent_name.is_empty() && matches!(channel_type, "discord" | "telegram" | "slack") {
             let (token_field, secret_field) = match channel_type {
                 "discord" => ("bot_token", None),
                 "telegram" => ("bot_token", None),
@@ -5175,12 +5180,28 @@ impl MethodHandler {
             }
         }
 
+        // Webhook/global channels (LINE/WhatsApp/Feishu) are a single endpoint and
+        // can't bind a token per agent; if the user picked an agent, record it as
+        // the global `default_agent` so incoming messages route to it.
+        if !agent_name.is_empty() {
+            if let Some(general) = table
+                .entry("general")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+            {
+                general.insert(
+                    "default_agent".to_string(),
+                    toml::Value::String(agent_name.to_string()),
+                );
+            }
+        }
+
         // XC.2: atomic write (temp + rename), mirroring the per-agent path.
         if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
             return WsFrame::error_response("", &e);
         }
 
-        info!(channel_type, "Channel config saved");
+        info!(channel_type, agent = agent_name, "Channel config saved");
 
         // Hot-start: launch the channel bot immediately without gateway restart
         let hot_started = self.hot_start_channel(channel_type).await;
