@@ -72,6 +72,42 @@ fn file_mtime(p: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
+/// Strip ANSI/VT escapes but PRESERVE case and other characters — used to
+/// recover the long-lived OAuth token from the TUI output (case-sensitive,
+/// unlike marker matching).
+fn strip_ansi_keep_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            while let Some(&n) = chars.peek() {
+                chars.next();
+                if n.is_ascii_alphabetic() || n == '~' || n == '\u{7}' {
+                    break;
+                }
+            }
+        } else if c != '\u{7}' && c != '\u{8}' {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Extract a long-lived auth token (`sk-ant-…`) from CLI output. `claude
+/// setup-token` PRINTS the token once (`export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-…`)
+/// and never persists it — so the one-click-login flow must scrape it here to
+/// register an account. The PTY is wide (600 cols) so the token stays on one
+/// line; ANSI is stripped first, then we take the contiguous token-char run.
+pub fn extract_oauth_token(raw: &str) -> Option<String> {
+    let clean = strip_ansi_keep_case(raw);
+    let idx = clean.find("sk-ant-")?;
+    let tok: String = clean[idx..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    (tok.len() >= 24).then_some(tok)
+}
+
 /// Redact token-like runs (e.g. `sk-ant-oat01-…`) from normalized PTY text
 /// before it is logged. The success screen may echo the long-lived token.
 fn redact_for_log(s: &str) -> String {
@@ -269,6 +305,9 @@ pub struct AuthSession {
     child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
     // Master is retained so the PTY stays open for the session's lifetime.
     _master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
+    // Long-lived OAuth token scraped from the output (`claude setup-token` prints
+    // it once and never persists it). Used to register an account on success.
+    token: Arc<Mutex<Option<String>>>,
 }
 
 impl AuthSession {
@@ -319,6 +358,7 @@ impl AuthSession {
 
         let (output_tx, _rx) = broadcast::channel::<Vec<u8>>(1024);
         let status = Arc::new(AtomicU8::new(ST_RUNNING));
+        let token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         // Success-file watcher: the most reliable signal that login succeeded is
         // the CLI writing its credentials file — independent of the TUI's success
@@ -353,6 +393,7 @@ impl AuthSession {
             let status = status.clone();
             let spec = spec.clone();
             let log_id = id.clone();
+            let token_store = token.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
                 let mut tail = String::new();
@@ -366,6 +407,12 @@ impl AuthSession {
                             if tail.len() > 16384 {
                                 let cut = tail.len() - 8192;
                                 tail.drain(..cut);
+                            }
+                            // Scrape the long-lived OAuth token (printed once by
+                            // `setup-token`). Re-extract each chunk so a token that
+                            // arrives split across reads converges to the full value.
+                            if let Some(t) = extract_oauth_token(&tail) {
+                                *token_store.lock().unwrap() = Some(t);
                             }
                             // Diagnostic: log a redacted, normalized snapshot of the
                             // tail end so the live transcript is inspectable from the
@@ -406,7 +453,13 @@ impl AuthSession {
             writer: Mutex::new(writer),
             child: Mutex::new(child),
             _master: Mutex::new(pair.master),
+            token,
         }))
+    }
+
+    /// The long-lived OAuth token scraped from the login output, if any.
+    pub fn captured_token(&self) -> Option<String> {
+        self.token.lock().unwrap().clone()
     }
 
     /// Subscribe to the raw output byte stream.
@@ -486,6 +539,20 @@ mod tests {
         // The authorize URL/prompt must NOT trip either outcome.
         let prompt = "Browser didn't open? \u{1b}[2GUse the url below\n\u{1b}[3Ghttps://claude.com/cai/oauth/authorize?code=true&scope=user:inference\nPaste code here if prompted >";
         assert_eq!(scan_outcome(prompt, &spec), None);
+    }
+
+    #[test]
+    fn extract_oauth_token_from_setup_token_output() {
+        // `claude setup-token` success line, with TUI escapes sprinkled in.
+        let out = "Success! \u{1b}[1mStore this token securely.\u{1b}[0m\nexport CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-AbC123_def-456GHI\nYou won't be able to see it again.";
+        assert_eq!(
+            extract_oauth_token(out).as_deref(),
+            Some("sk-ant-oat01-AbC123_def-456GHI")
+        );
+        // No token in the prompt/URL phase.
+        assert_eq!(extract_oauth_token("Paste code here >").as_deref(), None);
+        // Too-short junk isn't mistaken for a token.
+        assert_eq!(extract_oauth_token("sk-ant-x").as_deref(), None);
     }
 
     #[test]

@@ -880,6 +880,16 @@ pub async fn get_rotator_cached(home_dir: &Path) -> Result<std::sync::Arc<duducl
     get_rotator(home_dir).await
 }
 
+/// Drop the cached `AccountRotator` so the next `get_rotator_cached` rebuilds
+/// from the current `config.toml`. Call after mutating accounts (e.g. a
+/// one-click login that just added an OAuth token) so the dashboard reflects it
+/// immediately instead of after the 5-minute TTL.
+pub async fn invalidate_rotator_cache() {
+    if let Some(cache) = ROTATOR_CACHE.get() {
+        *cache.write().await = None;
+    }
+}
+
 async fn get_rotator(home_dir: &Path) -> Result<std::sync::Arc<duduclaw_agent::account_rotator::AccountRotator>, String> {
     let cache = ROTATOR_CACHE.get_or_init(|| tokio::sync::RwLock::new(None));
     let ttl = std::time::Duration::from_secs(300); // 5 min cache

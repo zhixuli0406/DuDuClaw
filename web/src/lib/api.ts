@@ -1420,6 +1420,14 @@ export const api = {
       client.call('auth.cli_login.cancel', { session_id: sessionId }) as Promise<{
         success: boolean;
       }>,
+    // Register the account a successful one-click login produced (scrapes the
+    // long-lived OAuth token the CLI printed and writes it to config).
+    cliLoginFinalize: (sessionId: string) =>
+      client.call('auth.cli_login.finalize', { session_id: sessionId }) as Promise<{
+        registered: boolean;
+        account_id?: string;
+        reason?: string;
+      }>,
   },
 
   accounts: {
