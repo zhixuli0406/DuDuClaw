@@ -81,6 +81,7 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
   const [program, setProgram] = useState('');
   const [input, setInput] = useState('');
   const [errMsg, setErrMsg] = useState<string | null>(null);
+  const [registerMsg, setRegisterMsg] = useState<string | null>(null);
   const outRef = useRef<HTMLPreElement>(null);
   const sidRef = useRef<string | null>(null);
 
@@ -95,6 +96,7 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
     setOutput('');
     setStatus('running');
     setErrMsg(null);
+    setRegisterMsg(null);
     setInput('');
     sidRef.current = null;
     api.auth
@@ -128,7 +130,28 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
       const pl = p as { session_id: string; status: 'succeeded' | 'failed' | 'exited' };
       if (pl.session_id !== sidRef.current) return;
       setStatus(pl.status);
-      if (pl.status === 'succeeded') onSuccess?.();
+      if (pl.status === 'succeeded') {
+        const sid = sidRef.current;
+        // Register the account the login produced (the CLI only PRINTS its token),
+        // then refresh the parent so it appears in the account list.
+        if (sid) {
+          api.auth
+            .cliLoginFinalize(sid)
+            .then((r) =>
+              setRegisterMsg(
+                r.registered
+                  ? '帳號已加入'
+                  : `登入成功，但未自動加入帳號${r.reason ? `（${r.reason}）` : ''}`,
+              ),
+            )
+            .catch((e: unknown) =>
+              setRegisterMsg(`帳號註冊失敗：${e instanceof Error ? e.message : String(e)}`),
+            )
+            .finally(() => onSuccess?.());
+        } else {
+          onSuccess?.();
+        }
+      }
     });
     return () => {
       offOut();
@@ -250,6 +273,10 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
             <SendHorizonal className="h-4 w-4" />
           </button>
         </div>
+
+        {registerMsg && status === 'succeeded' && (
+          <p className="text-xs text-stone-500 dark:text-stone-400">{registerMsg}</p>
+        )}
 
         <div className="flex items-center justify-between pt-1">
           <StatusBadge />

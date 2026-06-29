@@ -2664,6 +2664,7 @@ impl MethodHandler {
             "auth.cli_login.input" => { require_admin!(); self.handle_cli_login_input(params).await }
             "auth.cli_login.status" => { require_admin!(); self.handle_cli_login_status(params).await }
             "auth.cli_login.cancel" => { require_admin!(); self.handle_cli_login_cancel(params).await }
+            "auth.cli_login.finalize" => { require_admin!(); self.handle_cli_login_finalize(params).await }
 
             // ── Memory (agent-scoped, H2 fix) ────────────────
             "memory.search" => {
@@ -7204,6 +7205,58 @@ impl MethodHandler {
             session.kill();
         }
         WsFrame::ok_response("", json!({"success": true}))
+    }
+
+    /// Register the account produced by a successful one-click login. `claude
+    /// setup-token` only PRINTS its long-lived token (never persists it), so the
+    /// PTY session scrapes it; this turns that token into a real `[[accounts]]`
+    /// entry and refreshes the rotator so it shows up immediately. Idempotent-ish:
+    /// each call makes a uniquely-named account. No-op (not an error) when the
+    /// session didn't succeed or no token was captured.
+    async fn handle_cli_login_finalize(&self, params: Value) -> WsFrame {
+        let sid = params.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        let session = {
+            let sessions = self.cli_auth_sessions.read().await;
+            match sessions.get(sid) {
+                Some(s) => s.clone(),
+                None => return WsFrame::error_response("", "login session not found"),
+            }
+        };
+        if session.status() != crate::cli_auth::AuthStatus::Succeeded {
+            return WsFrame::ok_response("", json!({"registered": false, "reason": "login not succeeded"}));
+        }
+        let Some(token) = session.captured_token() else {
+            // Success without a scrapeable token (e.g. localhost-callback CLIs that
+            // persist to their own store). Nothing to register here.
+            return WsFrame::ok_response("", json!({"registered": false, "reason": "no token captured"}));
+        };
+
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let runtime_key = session.runtime.as_str();
+        let id = format!("{runtime_key}-oauth-{secs}");
+
+        let add = json!({
+            "id": id,
+            "type": "oauth",
+            "key": token,
+            "priority": 1,
+            "monthly_budget_cents": 0,
+        });
+        let res = self.handle_accounts_add(add).await;
+        // Drop the cached rotator so accounts.list / budget_summary rebuild from
+        // the just-written config and surface the new account immediately.
+        crate::claude_runner::invalidate_rotator_cache().await;
+
+        match res {
+            WsFrame::Response { ok: true, .. } => {
+                tracing::info!(target: "cli_auth", session = %sid, account = %id, "one-click login: account registered");
+                WsFrame::ok_response("", json!({"registered": true, "account_id": id}))
+            }
+            other => other, // propagate the accounts.add error verbatim
+        }
     }
 
     // ── System ───────────────────────────────────────────────
