@@ -7138,9 +7138,14 @@ impl MethodHandler {
     async fn handle_cli_login_input(&self, params: Value) -> WsFrame {
         let sid = params.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
         let data = params.get("data").and_then(|v| v.as_str()).unwrap_or("");
-        let sessions = self.cli_auth_sessions.read().await;
-        let Some(session) = sessions.get(sid) else {
-            return WsFrame::error_response("", "login session not found");
+        // Clone the Arc and drop the map lock — we sleep between writes below and
+        // must not hold the registry lock across the await.
+        let session = {
+            let sessions = self.cli_auth_sessions.read().await;
+            match sessions.get(sid) {
+                Some(s) => s.clone(),
+                None => return WsFrame::error_response("", "login session not found"),
+            }
         };
         tracing::info!(
             target: "cli_auth",
@@ -7150,7 +7155,32 @@ impl MethodHandler {
             ends_lf = data.ends_with('\n'),
             "cli_login input received"
         );
-        match session.write_input(data.as_bytes()) {
+
+        // The login CLIs use an Ink masked-input prompt. A long pasted code that
+        // arrives in the SAME write as its trailing Enter is treated as one paste
+        // and the CR is swallowed into the field — the code never submits and the
+        // dashboard spins forever (confirmed by PTY probe: code+CR together does
+        // nothing; code, then a SEPARATE CR after a brief pause, submits). So
+        // split: write the body, let Ink commit the paste, then send Enter (CR)
+        // as a distinct keystroke. LF does not submit, so normalize the
+        // terminator to CR.
+        let body_and_term = match data.strip_suffix('\r').or_else(|| data.strip_suffix('\n')) {
+            Some(body) => Some((body, "\r")),
+            None => None,
+        };
+        let write_res = match body_and_term {
+            Some((body, term)) => {
+                let r1 = if body.is_empty() { Ok(()) } else { session.write_input(body.as_bytes()) };
+                if r1.is_ok() {
+                    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                    session.write_input(term.as_bytes())
+                } else {
+                    r1
+                }
+            }
+            None => session.write_input(data.as_bytes()),
+        };
+        match write_res {
             Ok(()) => WsFrame::ok_response("", json!({"success": true})),
             Err(e) => WsFrame::error_response("", &format!("failed to send input: {e}")),
         }
