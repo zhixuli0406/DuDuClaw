@@ -2816,6 +2816,11 @@ impl MethodHandler {
             "users.unbind_agent" => { require_admin!(); self.handle_users_unbind_agent(params, ctx).await }
             "users.offboard" => { require_admin!(); self.handle_users_offboard(params, ctx).await }
             "users.me" => self.handle_users_me(ctx).await,
+            // Self-service: any logged-in user changes their OWN password. Not
+            // admin-gated on purpose — it only ever mutates the caller's account,
+            // and it's the sole password path in the single-owner edition (the
+            // multi-user Users page is hidden there).
+            "users.change_password" => self.handle_users_change_password(params, ctx).await,
             "users.audit_log" => { require_admin!(); self.handle_users_audit_log(params).await }
 
             "mcp.list" => { require_admin!(); self.handle_mcp_list().await }
@@ -9921,6 +9926,56 @@ impl MethodHandler {
                 },
                 "bindings": [],
             })),
+        }
+    }
+
+    /// Self-service password change for the logged-in user. Available in every
+    /// edition: the personal/single-owner edition hides the multi-user Users
+    /// page, so this is the only way the sole admin can rotate their own
+    /// password. No admin role required — it only ever mutates the caller's own
+    /// account (identified by `ctx.user_id`). Verifies the current password
+    /// first; on success `update_user` also clears any `must_change_password`.
+    async fn handle_users_change_password(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let db = match self.user_db.read().await.as_ref() {
+            Some(db) => db.clone(),
+            None => return WsFrame::error_response("", "user system not initialized"),
+        };
+
+        let current = params.get("current_password").and_then(|v| v.as_str()).unwrap_or("");
+        let new_password = match params.get("new_password").and_then(|v| v.as_str()) {
+            Some(p) => p,
+            None => return WsFrame::error_response("", "new_password is required"),
+        };
+        if new_password.len() < 8 {
+            return WsFrame::error_response("", "new password must be at least 8 characters");
+        }
+        if new_password.len() > 1024 {
+            return WsFrame::error_response("", "new password too long");
+        }
+
+        // Resolve the caller's own account; the stored email is needed to verify
+        // the current password.
+        let user = match db.get_user(&ctx.user_id) {
+            Ok(Some(u)) => u,
+            _ => return WsFrame::error_response("", "user not found"),
+        };
+
+        // Verify the current password (timing-safe inside verify_password).
+        if db.verify_password(&user.email, current).is_err() {
+            let _ = db.log_action(Some(&ctx.user_id), "password.change_failed", Some(&ctx.user_id), None, None);
+            return WsFrame::error_response("", "current password is incorrect");
+        }
+
+        if current == new_password {
+            return WsFrame::error_response("", "new password must differ from the current one");
+        }
+
+        match db.update_user(&ctx.user_id, None, None, Some(new_password)) {
+            Ok(()) => {
+                let _ = db.log_action(Some(&ctx.user_id), "password.change", Some(&ctx.user_id), None, None);
+                WsFrame::ok_response("", json!({"status": "changed"}))
+            }
+            Err(e) => WsFrame::error_response("", &format!("failed to change password: {e}")),
         }
     }
 
