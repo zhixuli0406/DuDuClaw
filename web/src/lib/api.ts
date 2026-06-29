@@ -2004,6 +2004,13 @@ export const api = {
       }>,
     me: () =>
       client.call('users.me') as Promise<{ user: UserInfo; bindings: UserAgentBinding[] }>,
+    // Self-service: the logged-in user changes their OWN password (works in the
+    // single-owner edition where the Users page is hidden).
+    changePassword: (currentPassword: string, newPassword: string) =>
+      client.call('users.change_password', {
+        current_password: currentPassword,
+        new_password: newPassword,
+      }) as Promise<{ status: string }>,
     auditLog: (params?: { user_id?: string; action?: string; limit?: number }) =>
       client.call('users.audit_log', params ?? {}) as Promise<{ entries: AuditEntry[] }>,
   },
