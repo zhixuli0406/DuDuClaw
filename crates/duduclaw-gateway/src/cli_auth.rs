@@ -25,8 +25,10 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use tokio::sync::broadcast;
@@ -49,10 +51,37 @@ pub struct CliAuthSpec {
     pub remote_safe: bool,
     /// Short zh-TW hint shown in the dashboard.
     pub hint: &'static str,
+    /// Path (relative to `$HOME`) of the credentials file the CLI writes on a
+    /// successful login. When set, a watcher thread marks the session
+    /// `Succeeded` the moment this file is created/updated — a deterministic
+    /// signal that does NOT depend on scraping the TUI's success wording (which
+    /// changes across CLI versions and can be silent). `None` ⇒ marker-only.
+    pub success_file: Option<&'static str>,
 }
 
 fn v(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
+}
+
+/// Resolve `$HOME/<rel>` for the success-file watcher.
+fn home_join(rel: &str) -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(rel))
+}
+
+fn file_mtime(p: &std::path::Path) -> Option<SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+/// Redact token-like runs (e.g. `sk-ant-oat01-…`) from normalized PTY text
+/// before it is logged. The success screen may echo the long-lived token.
+fn redact_for_log(s: &str) -> String {
+    let mut out = s.to_string();
+    while let Some(i) = out.find("sk-ant") {
+        let tail = &out[i + 6..];
+        let n = tail.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').count();
+        out.replace_range(i..i + 6 + n, "<redacted-token>");
+    }
+    out
 }
 
 /// Login spec for a runtime, or `None` for runtimes with no interactive login
@@ -72,6 +101,10 @@ pub fn spec_for(runtime: RuntimeType) -> Option<CliAuthSpec> {
             // `claude setup-token` is the headless long-lived-token flow (paste-back).
             remote_safe: true,
             hint: "在開啟的網址完成授權後，把驗證碼貼回下方並按 Enter。",
+            // Claude Code writes the OAuth token here on success (Linux headless).
+            // Watching it is the reliable success signal — the TUI's success text
+            // is escape-laden and version-dependent, and may not print at all.
+            success_file: Some(".claude/.credentials.json"),
         }),
         RuntimeType::Codex => Some(CliAuthSpec {
             runtime,
@@ -81,6 +114,7 @@ pub fn spec_for(runtime: RuntimeType) -> Option<CliAuthSpec> {
             // codex login uses a localhost callback.
             remote_safe: false,
             hint: "於同機瀏覽器完成 OpenAI 登入（localhost 回呼）。遠端請改用 API key。",
+            success_file: Some(".codex/auth.json"),
         }),
         RuntimeType::Gemini => Some(CliAuthSpec {
             runtime,
@@ -89,6 +123,7 @@ pub fn spec_for(runtime: RuntimeType) -> Option<CliAuthSpec> {
             failure_markers: v(&["login failed", "authentication failed", "invalid"]),
             remote_safe: false,
             hint: "於同機瀏覽器完成 Google 登入（localhost 回呼）。",
+            success_file: Some(".gemini/oauth_creds.json"),
         }),
         RuntimeType::Antigravity => Some(CliAuthSpec {
             runtime,
@@ -98,6 +133,7 @@ pub fn spec_for(runtime: RuntimeType) -> Option<CliAuthSpec> {
             // agy uses an oauth-callback (antigravity.google/oauth-callback).
             remote_safe: false,
             hint: "於同機瀏覽器完成 Antigravity 登入。遠端請改用 ANTIGRAVITY_API_KEY。",
+            success_file: None,
         }),
         RuntimeType::OpenAiCompat => None,
     }
@@ -284,12 +320,39 @@ impl AuthSession {
         let (output_tx, _rx) = broadcast::channel::<Vec<u8>>(1024);
         let status = Arc::new(AtomicU8::new(ST_RUNNING));
 
-        // Reader thread: blocking PTY read → broadcast bytes + scan a rolling
-        // lowercased tail for success/failure markers.
+        // Success-file watcher: the most reliable signal that login succeeded is
+        // the CLI writing its credentials file — independent of the TUI's success
+        // wording (escape-laden, version-dependent, sometimes silent). Polls for
+        // the file to appear/advance past its baseline mtime, up to ~10 min.
+        if let Some(path) = spec.success_file.and_then(home_join) {
+            let status_w = status.clone();
+            let baseline = file_mtime(&path);
+            let log_id = id.clone();
+            std::thread::spawn(move || {
+                for _ in 0..600 {
+                    std::thread::sleep(Duration::from_secs(1));
+                    if status_w.load(Ordering::Relaxed) != ST_RUNNING {
+                        return;
+                    }
+                    if let Some(m) = file_mtime(&path) {
+                        let advanced = baseline.map(|b| m > b).unwrap_or(true);
+                        if advanced {
+                            status_w.store(ST_SUCCEEDED, Ordering::Relaxed);
+                            tracing::info!(target: "cli_auth", session = %log_id, file = %path.display(), "login success: credentials file written");
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+
+        // Reader thread: blocking PTY read → broadcast bytes + scan a rolling RAW
+        // tail (scan_outcome normalizes ANSI/whitespace before matching markers).
         {
             let tx = output_tx.clone();
             let status = status.clone();
             let spec = spec.clone();
+            let log_id = id.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
                 let mut tail = String::new();
@@ -299,14 +362,17 @@ impl AuthSession {
                         Ok(n) => {
                             let chunk = &buf[..n];
                             let _ = tx.send(chunk.to_vec());
-                            // Keep the RAW tail (ANSI included) — scan_outcome
-                            // normalizes it. A larger window survives the TUI's
-                            // escape-heavy redraws between meaningful words.
                             tail.push_str(&String::from_utf8_lossy(chunk));
                             if tail.len() > 16384 {
                                 let cut = tail.len() - 8192;
                                 tail.drain(..cut);
                             }
+                            // Diagnostic: log a redacted, normalized snapshot of the
+                            // tail end so the live transcript is inspectable from the
+                            // gateway log when a login gets stuck.
+                            let snap = normalize_for_match(&String::from_utf8_lossy(chunk));
+                            let snap: String = snap.chars().rev().take(160).collect::<Vec<_>>().into_iter().rev().collect();
+                            tracing::info!(target: "cli_auth", session = %log_id, bytes = n, snap = %redact_for_log(&snap), "pty output");
                             if status.load(Ordering::Relaxed) == ST_RUNNING {
                                 if let Some(o) = scan_outcome(&tail, &spec) {
                                     let code = match o {
@@ -315,6 +381,7 @@ impl AuthSession {
                                         _ => ST_RUNNING,
                                     };
                                     status.store(code, Ordering::Relaxed);
+                                    tracing::info!(target: "cli_auth", session = %log_id, outcome = ?o, "marker matched");
                                 }
                             }
                         }
@@ -325,6 +392,7 @@ impl AuthSession {
                 if status.load(Ordering::Relaxed) == ST_RUNNING {
                     status.store(ST_EXITED, Ordering::Relaxed);
                 }
+                tracing::info!(target: "cli_auth", session = %log_id, final_status = ?AuthStatus::from_u8(status.load(Ordering::Relaxed)), "pty reader exited");
             });
         }
 

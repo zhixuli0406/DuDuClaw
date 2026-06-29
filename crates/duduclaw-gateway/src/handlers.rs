@@ -7142,6 +7142,14 @@ impl MethodHandler {
         let Some(session) = sessions.get(sid) else {
             return WsFrame::error_response("", "login session not found");
         };
+        tracing::info!(
+            target: "cli_auth",
+            session = %sid,
+            bytes = data.len(),
+            ends_cr = data.ends_with('\r'),
+            ends_lf = data.ends_with('\n'),
+            "cli_login input received"
+        );
         match session.write_input(data.as_bytes()) {
             Ok(()) => WsFrame::ok_response("", json!({"success": true})),
             Err(e) => WsFrame::error_response("", &format!("failed to send input: {e}")),
