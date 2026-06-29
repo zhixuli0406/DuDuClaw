@@ -1,0 +1,56 @@
+# Used by `gcloud builds submit` to decide what gets uploaded as the build
+# context. Mirrors .gitignore so NOTHING confidential (commercial/, secrets,
+# *.key, *.db, .env) is ever sent to Cloud Build, plus excludes heavy dirs and
+# the .git history. The server image's frontend dist is rebuilt inside the
+# Dockerfile (frontend-builder stage), so excluding it here is correct.
+.git/
+
+# ── mirrored from .gitignore ──
+/target
+**/*.rs.bk
+*.pdb
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.env
+.env.*
+*.key
+*.pem
+*.db
+*.db-shm
+*.db-wal
+.venv/
+node_modules/
+crates/duduclaw-dashboard/dist/
+
+# Internal tooling — never ship
+tools/license-keygen/
+.claude/
+
+# Commercial closed-source modules — MUST NOT leave this machine
+commercial/
+
+# Coverage / profiling
+.coverage
+**/.coverage
+*.profraw
+**/*.profraw
+
+# Researcher notes / spikes / release artifacts
+/research/
+/python/spikes/
+artifacts/
+/uv.lock
+
+# Pre-built per-platform binaries (published via npm, not needed for the image)
+npm/darwin-x64/bin/
+npm/darwin-arm64/bin/
+npm/linux-x64/bin/
+npm/linux-arm64/bin/
+npm/win32-x64/bin/
+
+# Heavy media
+brag-output*/
