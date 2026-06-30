@@ -54,11 +54,11 @@
     "linux": {
       "deb": { "depends": ["libwebkit2gtk-4.1-0"] }
     },
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": false
   },
   "plugins": {
     "updater": {
-      "active": true,
+      "active": false,
       "endpoints": [
         "https://github.com/zhixuli0406/DuDuClaw/releases/latest/download/latest.json"
       ],

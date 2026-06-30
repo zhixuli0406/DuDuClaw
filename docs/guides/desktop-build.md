@@ -133,9 +133,23 @@ Ordered roughly by when you hit them. All are resolved in the repo; this is the
    re-embedded on the next build (otherwise the old icon stays baked in — and
    macOS may still cache it: `sudo rm -rf /Library/Caches/com.apple.iconservices.store && killall Dock`).
 
-## Still gated (not yet run here)
+10. **`cargo tauri build` ends with "A public key has been found, but no private
+    key".** The `.app`/`.dmg` are already built — only the updater-artifact
+    signing step fails. Auto-update is **off** until keys exist
+    (`plugins.updater.active = false`, `bundle.createUpdaterArtifacts = false`);
+    [desktop-unblock.md](./desktop-unblock.md) 關卡 E flips both back on after
+    `cargo tauri signer generate`.
 
-`cargo tauri build` produces unsigned local artifacts fine. Signing /
-notarization / auto-update need real Apple + Windows certificates and updater
-keys — see [desktop-release.md](./desktop-release.md) and
+11. **The DMG shows a `.VolumeIcon.icns` file.** That's the disk image's volume
+    icon (DMG chrome), a dotfile — **normal users with default Finder don't see
+    it**; it appears only if you've enabled "show hidden files"
+    (`defaults write com.apple.finder AppleShowAllFiles`). It is *not* bundled
+    into `DuDuClaw.app`. A polished installer (custom background + window layout)
+    would be a separate `bundle.macOS.dmg` enhancement.
+
+## Verified working (2026-07, macOS arm64)
+
+`cargo tauri build` produces a working unsigned `DuDuClaw.app` + `.dmg` locally.
+Signing / notarization / auto-update need real Apple + Windows certificates and
+updater keys — see [desktop-release.md](./desktop-release.md) and
 [desktop-unblock.md](./desktop-unblock.md).

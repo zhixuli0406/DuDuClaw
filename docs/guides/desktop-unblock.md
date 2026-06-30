@@ -77,7 +77,7 @@ open "target/release/bundle/macos/DuDuClaw.app"
 ## 關卡 E — 產生 Tauri 自動更新簽章金鑰(免費,先做)
 
 **擋住的項目**:D4.4(更新 pubkey 佔位字串)。
-**為什麼擋住**:`tauri.conf.json > plugins.updater.pubkey` 目前是 `REPLACE_WITH_...` 佔位;updater 必須有金鑰對才會驗章。
+**為什麼擋住**:`tauri.conf.json > plugins.updater.pubkey` 目前是 `REPLACE_WITH_...` 佔位;updater 必須有金鑰對才會驗章。在金鑰備妥前,updater 已**整個關閉**(`plugins.updater.active = false` 且 `bundle.createUpdaterArtifacts = false`),否則本機 `cargo tauri build` 會在最後簽 updater artifact 時報 `A public key has been found, but no private key`。
 
 ### 步驟
 ```bash
@@ -85,10 +85,11 @@ cargo tauri signer generate -w ~/.tauri/duduclaw-updater.key
 # 終端會印出 public key,並把私鑰寫到 ~/.tauri/duduclaw-updater.key
 ```
 1. 把 **public key** 貼進 [src-tauri/tauri.conf.json](../../src-tauri/tauri.conf.json) 的 `plugins.updater.pubkey`。
-2. 把**私鑰內容**與密碼設成 GitHub repo secrets:
+2. **同檔把 updater 開回來**:`plugins.updater.active = true`、`bundle.createUpdaterArtifacts = true`。
+3. 把**私鑰內容**與密碼設成 GitHub repo secrets:
    - `TAURI_SIGNING_PRIVATE_KEY`(私鑰檔內容)
    - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
-3. **私鑰永不入庫**;遺失會導致已發佈的客戶端無法再收到更新,務必備份到密碼管理器。
+4. **私鑰永不入庫**;遺失會導致已發佈的客戶端無法再收到更新,務必備份到密碼管理器。
 
 **驗收(D4.4 一半)**:CI release 後產物含 `latest.json` 且帶簽章欄位。端到端「舊版→更新」需先有兩個已簽章 release(見關卡 B 後再做)。
 
