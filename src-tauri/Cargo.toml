@@ -28,6 +28,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Transitive pin (not used directly): time 0.3.52 changed the public
+# `Parsable::parse` signature (a breaking change within 0.3.x), which fails to
+# compile against cookie 0.18.1 pulled in by tauri/wry. Hold time at 0.3.51 until
+# tauri ships a cookie that targets the new API. Remove once that lands.
+time = "=0.3.51"
 
 [features]
 # Bundle artifacts use this; keep parity with Tauri's default template.
