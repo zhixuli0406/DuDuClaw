@@ -15,7 +15,14 @@ export default defineConfig({
     },
   },
   server: {
+    // Bind IPv4 127.0.0.1 explicitly so the Tauri desktop shell's dev poller
+    // (which waits on http://127.0.0.1:5173) matches — the Vite default
+    // "localhost" can resolve to IPv6 ::1 and leave Tauri waiting forever.
+    // strictPort fails loudly instead of silently moving off 5173 (which would
+    // break tauri.conf.json devUrl). Use `npm run dev -- --host` to expose on LAN.
+    host: '127.0.0.1',
     port: 5173,
+    strictPort: true,
     proxy: {
       '/ws': {
         target: gatewayWs,
