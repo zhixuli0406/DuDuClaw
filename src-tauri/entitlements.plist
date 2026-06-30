@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened Runtime entitlements for the DuDuClaw desktop app (TODO §D3.1).
+
+  DuDuClaw spawns child processes (the gateway sidecar, Claude CLI, containers,
+  local inference) and makes outbound network calls. Under a signed + hardened
+  build these entitlements keep the macOS sandbox from blocking that work.
+  JIT / unsigned-executable-memory are needed by some bundled JS/WebKit and by
+  llama.cpp-style JITed kernels; trim to the minimum your build actually needs.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+    <!-- Computer Use (enigo/xcap) needs these system grants; the OS still
+         prompts the user the first time (§D3.2). -->
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+</dict>
+</plist>

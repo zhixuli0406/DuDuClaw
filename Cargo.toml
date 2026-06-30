@@ -3,6 +3,9 @@ resolver = "2"
 exclude = [
     "tools/license-keygen",
     "commercial/duduclaw-license",
+    # Desktop app shell (Tauri 2). Its own lockfile/target and heavy GUI deps;
+    # built via `cargo tauri build` from src-tauri/, not the main workspace.
+    "src-tauri",
 ]
 members = [
     "crates/duduclaw-core",

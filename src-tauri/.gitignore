@@ -1,0 +1,12 @@
+# Tauri build artifacts
+/target
+/gen
+
+# Generated app icons (regenerate with `cargo tauri icon`)
+/icons/*.png
+/icons/*.icns
+/icons/*.ico
+
+# Staged sidecar binaries (build artifacts) — keep the README only
+/binaries/*
+!/binaries/README.md

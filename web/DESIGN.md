@@ -27,6 +27,10 @@ Defined in `src/index.css` (`@theme` + CSS vars). Use utilities, never hardcode 
 - **Neutral:** `stone-50…950` (cool graphite OKLCH ramp). Text: `stone-900/100`,
   secondary `stone-500/400`, hairline `stone-200/white-8`.
 - **Accent:** `amber-500` (primary), `amber-400` (dark-mode active). Use sparingly.
+  - **Launcher exception:** the workspace launcher grid (`components/workspace/`)
+    is the *only* place a wider colour set is allowed, and *only* on tile icons
+    (`launcher-model.ts` `ACCENT_CLASS`, a fixed 8-hue palette). Everything else
+    stays amber-over-graphite — no rainbow on controls, text, or borders.
 - **Semantic:** success=`emerald`, warning=`amber`, error=`rose`, info=`sky`.
 - **Radius:** card `rounded-xl` (0.75rem), control `rounded-lg`, pill `rounded-full` (badges only).
 - **Spacing rhythm:** page `px-0` inside `<Page>` (max-w-[1200px] mx-auto), section gap
@@ -64,6 +68,21 @@ Compose pages from these — do NOT re-style raw `<div>`s per page.
 Icons: **lucide-react**, 18px (`h-[1.125rem]`) default. (We keep Lucide — the
 `minimalist-ui` skill bans it, but our brand is icon-forward; we instead apply its
 whitespace/flat/restraint principles.)
+
+## 4b. Shell modes (workspace ⇄ dashboard)
+
+Two top-level shells, switched by `ModeToggle` (Header) and persisted in
+`stores/ui-mode-store.ts`:
+
+- **workspace** — Genspark-style consumer surface (`pages/WorkspacePage.tsx`):
+  one centred prompt bar (`components/workspace/PromptBar.tsx`, reusing the
+  `/ws/chat` pipeline), the Claw value hero, and the launcher grid. The sidebar
+  collapses to a narrow icon rail. Default on the `personal` edition.
+- **dashboard** — the full Calm Glass console (everything below). Default on
+  enterprise / when a preference was already chosen.
+
+The index route (`/`) renders either shell via `App.tsx`'s `HomeRoute`. Role and
+edition gating is shared with the launcher via `lib/nav-visibility.ts`.
 
 ## 5. Navigation IA (6 groups)
 
