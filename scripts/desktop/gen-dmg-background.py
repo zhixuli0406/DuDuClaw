@@ -10,7 +10,12 @@ opaque 2x (1320x800) canvas that lines up with the Tauri DMG layout
 """
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-W, H = 1320, 800            # 2x of the 660x400 dmg window (retina-crisp)
+# Finder places the DMG background at its NATIVE pixel size and does NOT scale it
+# to the window — so the PNG must equal the window size in points (660x400), or
+# only its top-left corner shows. We draw at 2x and downscale for crisp text.
+OUT_W, OUT_H = 660, 400     # must match bundle.macOS.dmg windowSize
+SS = 2                      # supersample factor
+W, H = OUT_W * SS, OUT_H * SS
 STONE = (28, 25, 23)        # #1c1917 — app surface-dark
 AMBER = (245, 158, 11)      # #f59e0b
 WHITE = (250, 250, 249)     # #fafaf9
@@ -64,5 +69,6 @@ d.polygon([(788, 324), (820, 340), (788, 356)], fill=AMBER)
 
 centered(724, "您的 AI 員工 · 跑在自己的機器上,資料不出機", foot, FOOT)
 
-img.convert("RGB").save("src-tauri/dmg/background.png")
-print("wrote src-tauri/dmg/background.png", img.size)
+out = img.convert("RGB").resize((OUT_W, OUT_H), Image.LANCZOS)
+out.save("src-tauri/dmg/background.png")
+print("wrote src-tauri/dmg/background.png", out.size)
