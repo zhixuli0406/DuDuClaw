@@ -10,27 +10,42 @@ embedded dashboard in a native window (Tauri 2). It runs the gateway as a
 ## Prerequisites
 
 ```bash
-# Tauri CLI
+# Tauri CLI — needs rustc >= 1.77. If `cargo install` errors with
+# "requires rustc 1.77.2 or newer", your rustup default toolchain is too old:
+#   rustup default stable && rustup update stable
 cargo install tauri-cli --version "^2"
 # Node (for the web build) — already required by the dashboard
 # macOS: Xcode CLT;  Linux: libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 ```
 
-Generate the app icons once (needs a ≥1024² source PNG):
+Generate the app icons once. The brand source `web/public/paw-1024.png` is
+committed; the generated icon set under `src-tauri/icons/` is gitignored
+(regenerate, don't commit):
 
 ```bash
-cd src-tauri && cargo tauri icon ../web/public/paw-1024.png
+scripts/desktop/gen-icons.sh           # cargo tauri icon, with a macOS sips fallback
+# or directly:  cd src-tauri && cargo tauri icon ../web/public/paw-1024.png
 ```
 
 ## Dev (hot-reload UI)
 
 ```bash
-cd src-tauri
-cargo tauri dev
+# Stage the gateway sidecar FIRST — `tauri dev` resolves it next to the dev
+# binary (src-tauri/target/debug/), not from binaries/. Without this the app
+# can't spawn the gateway and the UI can't reach /api (ECONNREFUSED).
+cargo build --release -p duduclaw-cli --bin duduclaw   # from the REPO ROOT
+scripts/desktop/stage-sidecar.sh                        # copies into binaries/ + target/{debug,release}/
+
+cd src-tauri && cargo tauri dev
 ```
 
-`beforeDevCommand` starts Vite; the window points at `127.0.0.1:5173`. The
-gateway sidecar is spawned by the app on launch (see below).
+In **dev** the window stays on the Vite dev server (`127.0.0.1:5173`) for live
+HMR; Vite proxies `/ws` + `/api` to the gateway. The app still spawns the
+gateway sidecar on launch and shows the window only once it's ready. In
+**release** the window points at the gateway's embedded dashboard instead
+(`#[cfg]` split in `main.rs`). So a web edit shows instantly in dev, but to see
+it through the *embedded* path you must rebuild the dist + re-embed (the gateway
+serves `crates/duduclaw-dashboard/dist` via `rust_embed`, baked at compile time).
 
 ## Production build (unsigned, local)
 
@@ -68,8 +83,57 @@ If you already run the gateway via launchd, the desktop app **attaches** to it
 first. The single-instance lock + pidfile (`~/.duduclaw/desktop-sidecar.pid`)
 prevent two app-spawned sidecars.
 
-## Known limitation (this checkout)
+## First-build gotchas (verified 2026-07 on macOS arm64)
 
-`cargo tauri dev/build` requires the Tauri toolchain + a display and was **not**
-run in the authoring environment. Signing/notarization requires real
-certificates — see [desktop-release.md](./desktop-release.md).
+Ordered roughly by when you hit them. All are resolved in the repo; this is the
+"why" so a clean machine doesn't re-debug.
+
+1. **`cargo install tauri-cli` fails: "requires rustc 1.77.2 or newer".**
+   Your rustup *default* toolchain is stale even if a newer one is installed.
+   `rustup default stable && rustup update stable`. (`cargo`/`rustc` on PATH may
+   be a separate Homebrew copy — the failing one is the rustup shim.)
+
+2. **Run cargo gateway commands from the REPO ROOT, not `src-tauri/`.**
+   `src-tauri` is its own excluded workspace, so `cargo build -p duduclaw-cli`
+   there errors with "package ID … did not match any packages". Only
+   `cargo tauri dev/build` runs inside `src-tauri/`.
+
+3. **`cargo metadata`/`tauri dev` can't parse the manifest: missing `lib.rs`.**
+   The mobile-template `[lib]` was removed — `src-tauri` is a binary crate
+   (`src/main.rs`). Don't re-add `[lib]` without a matching `src/lib.rs`.
+
+4. **`beforeDevCommand` / `beforeBuildCommand` run from the app root** (parent of
+   `src-tauri`), so the frontend hooks are `cd web && …`, not `cd ../web`.
+
+5. **Vite "Waiting for frontend dev server …" forever.** Vite must bind IPv4
+   `127.0.0.1` (not the default `localhost`/`::1`) to match the Tauri poller and
+   the proxy target — pinned in `web/vite.config.ts` (`host: '127.0.0.1'`,
+   `strictPort`, and the gateway proxy default `http://127.0.0.1:18789`).
+
+6. **Compile error in `cookie 0.18.1` (`Parsable::parse` arity).** `time 0.3.52`
+   broke the API within 0.3.x; held at `time = "=0.3.51"` in `src-tauri/Cargo.toml`.
+   Remove once tauri/wry ship a cookie targeting the new `time`.
+
+7. **Build script: "Permission core:webview:allow-navigate not found".** That
+   permission doesn't exist in Tauri 2 (`navigate()` is a Rust API, not gated).
+   Keep it out of `capabilities/default.json`.
+
+8. **Login shows ECONNREFUSED / gateway never starts in dev.** The sidecar is
+   resolved *next to the running exe*; `tauri dev` runs from
+   `src-tauri/target/debug/`, so the binary must be staged there — `stage-sidecar.sh`
+   now copies into `target/{debug,release}/` as well as `binaries/`. After a
+   `cargo clean`, re-run `stage-sidecar.sh`.
+
+9. **Icon shows a white fringe.** The source must have clean transparent corners
+   (don't rasterize an SVG via `qlmanage`, which mattes onto white). Regenerated
+   `paw-1024.png` is a full-bleed amber square with a supersampled rounded alpha
+   mask. `build.rs` emits `rerun-if-changed=icons`, so a regenerated icon set is
+   re-embedded on the next build (otherwise the old icon stays baked in — and
+   macOS may still cache it: `sudo rm -rf /Library/Caches/com.apple.iconservices.store && killall Dock`).
+
+## Still gated (not yet run here)
+
+`cargo tauri build` produces unsigned local artifacts fine. Signing /
+notarization / auto-update need real Apple + Windows certificates and updater
+keys — see [desktop-release.md](./desktop-release.md) and
+[desktop-unblock.md](./desktop-unblock.md).
