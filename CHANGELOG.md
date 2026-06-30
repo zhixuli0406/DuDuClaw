@@ -1,6 +1,21 @@
 # Changelog
 
 
+## [1.30.1] - 2026-06-30 — LINE replies actually send
+
+### Fixed
+- **LINE webhook reply delivery**: `line_webhook_handler` processed each event
+  inline and only returned 200 after the model reply was generated and sent.
+  LINE times out a slow webhook response and the `reply_token` is short-lived, so
+  when LINE disconnected the handler future (and the in-flight reply) was
+  cancelled — the bot was read but never replied ("已讀沒回應"). The reply now runs
+  in a detached task and the webhook returns 200 immediately.
+
+> Operational note: the interactive-REPL PTY path (`[runtime] pty_pool_enabled =
+> true`) can hang on its boot/sentinel dance in a headless container; OAuth
+> **setup-token** accounts are reliably served by the legacy `claude -p` path
+> (`pty_pool_enabled = false`), which is the recommended setting for them.
+
 ## [1.30.0] - 2026-06-30 — One-click login → working agent, end to end
 
 Makes the dashboard **Claude 一鍵登入** flow actually produce a usable account,

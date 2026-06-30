@@ -260,7 +260,11 @@ async fn line_webhook_handler(
     // Update last_event timestamp on each webhook call
     set_channel_connected(&state.channel_status, "line", true, None, Some(&state.event_tx)).await;
 
-    // Process events
+    // Process events in a DETACHED task so the webhook returns 200 immediately.
+    // LINE times out a slow webhook response and the reply_token is short-lived;
+    // blocking the 200 on a multi-second model reply gets the handler future (and
+    // the in-flight reply) cancelled when LINE disconnects → "已讀沒回應".
+    tokio::spawn(async move {
     for event in webhook.events {
         if event.event_type != "message" {
             continue;
@@ -427,6 +431,7 @@ async fn line_webhook_handler(
             }
         }
     }
+    });
 
     StatusCode::OK
 }
