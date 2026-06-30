@@ -69,9 +69,25 @@ fn main() {
                     tracing::warn!("gateway did not become ready in time");
                 }
                 if let Some(win) = handle2.get_webview_window("main") {
-                    let url = format!("http://{}:{}/", lifecycle::DEFAULT_HOST, port);
-                    if let Ok(parsed) = url.parse() {
-                        let _ = win.navigate(parsed);
+                    // Debug (`cargo tauri dev`): the window already loaded the
+                    // Vite dev server (devUrl :5173), which serves the live web
+                    // app with HMR and proxies /ws + /api to the gateway. Stay on
+                    // it so web edits hot-reload — do NOT navigate to the gateway's
+                    // embedded (compile-time) dist, which would mask local changes.
+                    #[cfg(debug_assertions)]
+                    {
+                        tracing::info!(
+                            "dev: webview stays on Vite devUrl; gateway/backend on port {port}"
+                        );
+                    }
+                    // Release: the bundled webview must be pointed at the gateway's
+                    // embedded dashboard served over loopback.
+                    #[cfg(not(debug_assertions))]
+                    {
+                        let url = format!("http://{}:{}/", lifecycle::DEFAULT_HOST, port);
+                        if let Ok(parsed) = url.parse() {
+                            let _ = win.navigate(parsed);
+                        }
                     }
                     let _ = win.show();
                     let _ = win.set_focus();
