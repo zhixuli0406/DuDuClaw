@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type MemoryEntry, type SkillInfo, type EvolutionVersion, type KeyFactEntry } from '@/lib/api';
+import { parsePredictionMemory, toPercent, type PredictionMemory } from '@/lib/memory-format';
 import { Link } from 'react-router';
 import { toast, formatError } from '@/lib/toast';
 import {
@@ -31,6 +32,7 @@ import {
   Eye,
   ArrowRight,
   Lightbulb,
+  Activity,
 } from 'lucide-react';
 
 type TabId = 'memories' | 'skills' | 'evolution' | 'insights';
@@ -167,35 +169,98 @@ function MemoriesTab() {
         </Card>
       ) : (
         <div className="space-y-3">
-          {entries.map((entry) => (
-            <Card key={entry.id}>
-              <div className="mb-2 flex items-center justify-between">
-                <span className="text-xs font-medium text-amber-600 dark:text-amber-400">
-                  {entry.agent_id}
-                </span>
-                <span className="flex items-center gap-1 text-xs text-stone-400 dark:text-stone-500">
-                  <Clock className="h-3 w-3" />
-                  {new Date(entry.timestamp).toLocaleString()}
-                </span>
-              </div>
-              <p className="text-sm text-stone-700 dark:text-stone-300 whitespace-pre-wrap">
-                {entry.content}
-              </p>
-              {entry.tags.length > 0 && (
-                <div className="mt-3 flex flex-wrap gap-1.5">
-                  {entry.tags.map((tag) => (
-                    <Badge key={tag} tone="neutral">
-                      <Tag className="h-2.5 w-2.5" />
-                      {tag}
-                    </Badge>
-                  ))}
+          {entries.map((entry) => {
+            const prediction = parsePredictionMemory(entry.content);
+            if (prediction) {
+              return <PredictionMemoryCard key={entry.id} entry={entry} data={prediction} />;
+            }
+            return (
+              <Card key={entry.id}>
+                <div className="mb-2 flex items-center justify-between">
+                  <span className="text-xs font-medium text-amber-600 dark:text-amber-400">
+                    {entry.agent_id}
+                  </span>
+                  <span className="flex items-center gap-1 text-xs text-stone-400 dark:text-stone-500">
+                    <Clock className="h-3 w-3" />
+                    {new Date(entry.timestamp).toLocaleString()}
+                  </span>
                 </div>
-              )}
-            </Card>
-          ))}
+                <p className="text-sm text-stone-700 dark:text-stone-300 whitespace-pre-wrap">
+                  {entry.content}
+                </p>
+                {entry.tags.length > 0 && (
+                  <div className="mt-3 flex flex-wrap gap-1.5">
+                    {entry.tags.map((tag) => (
+                      <Badge key={tag} tone="neutral">
+                        <Tag className="h-2.5 w-2.5" />
+                        {tag}
+                      </Badge>
+                    ))}
+                  </div>
+                )}
+              </Card>
+            );
+          })}
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * Renders a prediction-deviation episodic memory as a human-readable "learning
+ * signal" card instead of the raw English telemetry string (which users can't
+ * parse). See {@link parsePredictionMemory}.
+ */
+function PredictionMemoryCard({ entry, data }: { entry: MemoryEntry; data: PredictionMemory }) {
+  const intl = useIntl();
+  const expectedPct = toPercent(data.expected);
+  const actualPct = toPercent(data.inferred);
+  const lower = data.inferred < data.expected;
+
+  return (
+    <Card>
+      <div className="mb-2 flex items-center justify-between">
+        <span className="flex items-center gap-1.5 text-xs font-medium text-amber-600 dark:text-amber-400">
+          <Activity className="h-3.5 w-3.5" />
+          {entry.agent_id}
+          <span className="text-stone-400 dark:text-stone-500">
+            · {intl.formatMessage({ id: 'memory.prediction.label' })}
+          </span>
+        </span>
+        <span className="flex items-center gap-1 text-xs text-stone-400 dark:text-stone-500">
+          <Clock className="h-3 w-3" />
+          {new Date(entry.timestamp).toLocaleString()}
+        </span>
+      </div>
+      <p className="text-sm text-stone-700 dark:text-stone-300">
+        {intl.formatMessage({ id: 'memory.prediction.satisfaction' })}{' '}
+        <span className="text-stone-500 dark:text-stone-400 tabular-nums">{expectedPct}%</span>
+        <ArrowRight className="mx-1 inline h-3 w-3 text-stone-400" />
+        <span
+          className={cn(
+            'font-medium tabular-nums',
+            lower ? 'text-rose-600 dark:text-rose-400' : 'text-emerald-600 dark:text-emerald-400',
+          )}
+        >
+          {actualPct}%
+        </span>
+      </p>
+      <div className="mt-2.5 flex flex-wrap gap-1.5">
+        <Badge tone="neutral">
+          {intl.formatMessage({ id: 'memory.prediction.surprise' }, { value: toPercent(data.surprise) })}
+        </Badge>
+        {data.corrected && (
+          <Badge tone="warning">{intl.formatMessage({ id: 'memory.prediction.corrected' })}</Badge>
+        )}
+        {data.followUp && (
+          <Badge tone="accent">{intl.formatMessage({ id: 'memory.prediction.followUp' })}</Badge>
+        )}
+      </div>
+      <p className="mt-2.5 text-xs text-stone-400 dark:text-stone-500">
+        {intl.formatMessage({ id: 'memory.prediction.note' })}
+      </p>
+    </Card>
   );
 }
 
