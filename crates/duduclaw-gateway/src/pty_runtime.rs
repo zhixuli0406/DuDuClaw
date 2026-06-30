@@ -464,6 +464,40 @@ pub async fn acquire_and_invoke_for_account_with_model(
 /// Internal acquire-and-invoke that additionally carries the resolved
 /// per-account credential `env` (HS14). All public variants funnel here.
 #[allow(clippy::too_many_arguments)]
+/// Side-channel for per-account credential env (`CLAUDE_CODE_OAUTH_TOKEN`,
+/// `CLAUDE_CONFIG_DIR`, …), keyed by `account_id`. The in-process pool's spawn
+/// factory only receives the `AgentKey` (no env), so the caller stashes the
+/// account env here right before `acquire()` and [`spawn_session_for_key`] reads
+/// it back when it spawns a fresh session. This closes the HIGH-2 deferred gap:
+/// without it the spawned CLI ran under whatever ambient OAuth lived in
+/// `~/.claude/`, so a registered setup-token account never authenticated and the
+/// agent answered every message with "暫時無法回應" (401). Keyed by account_id (not
+/// the full cache key) because the env is identical across that account's
+/// sessions and stable over time; idempotent overwrite, no removal needed.
+static ACCOUNT_SPAWN_ENV: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, HashMap<String, String>>>,
+> = std::sync::OnceLock::new();
+
+fn account_spawn_env() -> &'static std::sync::Mutex<HashMap<String, HashMap<String, String>>> {
+    ACCOUNT_SPAWN_ENV.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Remember the resolved per-account env so the next spawn for `account_id`
+/// injects it. No-op for the empty env (e.g. ambient/no-account invokes).
+fn stash_account_env(account_id: &str, env: &HashMap<String, String>) {
+    if env.is_empty() {
+        return;
+    }
+    if let Ok(mut map) = account_spawn_env().lock() {
+        map.insert(account_id.to_string(), env.clone());
+    }
+}
+
+/// Look up the stashed env for `account_id` (used by the spawn factory).
+fn lookup_account_env(account_id: &str) -> Option<HashMap<String, String>> {
+    account_spawn_env().lock().ok().and_then(|m| m.get(account_id).cloned())
+}
+
 async fn acquire_and_invoke_inner(
     agent_id: &str,
     cli_kind: CliKind,
@@ -482,6 +516,12 @@ async fn acquire_and_invoke_inner(
             client, agent_id, cli_kind, bare_mode, account_id, model, env, prompt, deadline,
         )
         .await;
+    }
+
+    // In-process pool path: the spawn factory only gets the AgentKey, so stash
+    // the per-account credential env where spawn_session_for_key can read it.
+    if let Some(aid) = account_id {
+        stash_account_env(aid, env);
     }
 
     // Phase 8 metrics: classify this acquire as spawn vs cache-hit.
@@ -811,18 +851,6 @@ async fn spawn_session_for_key(
         extra_args.push(m.clone());
     }
 
-    // **Round 2 review note (HIGH-2 — DEFERRED)**: `key.account_id`
-    // currently affects only the pool's cache_key — the spawned CLI
-    // uses whatever ambient OAuth lives in `~/.claude/` / keychain.
-    // True per-account auth isolation requires injecting account-
-    // specific env (`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`)
-    // at spawn time. The gateway has access to that via
-    // `claude_runner::get_rotator_cached(home_dir)` but plumbing it
-    // through the spawn factory needs either a task-local for the
-    // env_vars or a side-channel DashMap. Tracked separately;
-    // operators of multi-OAuth-account setups should not rely on PTY
-    // pool to rotate accounts until this lands.
-    let _account_id_for_future_env_injection = &key.account_id;
     if matches!(key.cli_kind, CliKind::Claude) && key.bare_mode {
         // Mirror the #15 TODO-runtime-health-fixes BARE_MODE behaviour: --bare
         // bypasses CLAUDE.md auto-discovery at the cost of OAuth. Callers using
@@ -833,6 +861,31 @@ async fn spawn_session_for_key(
     let mut env = HashMap::new();
     env.insert("NO_COLOR".to_string(), "1".to_string());
     env.insert("TERM".to_string(), "xterm-256color".to_string());
+
+    // HIGH-2 (now implemented): inject the per-account credential env
+    // (`CLAUDE_CODE_OAUTH_TOKEN` / `CLAUDE_CONFIG_DIR` / `ANTHROPIC_API_KEY`)
+    // the caller stashed for this account, so the spawned CLI authenticates as
+    // the rotator-selected account instead of whatever ambient OAuth happens to
+    // be in `~/.claude/`. Without this an OAuth setup-token account never
+    // authenticates (401) and the agent can't reply.
+    if let Some(aid) = key.account_id.as_deref() {
+        if let Some(account_env) = lookup_account_env(aid) {
+            let injected: Vec<String> = account_env.keys().cloned().collect();
+            env.extend(account_env);
+            tracing::info!(
+                target: "pty_runtime",
+                account_id = %aid,
+                vars = ?injected,
+                "spawn: injected per-account credential env"
+            );
+        } else {
+            tracing::warn!(
+                target: "pty_runtime",
+                account_id = %aid,
+                "spawn: no per-account env stashed — CLI will use ambient credentials"
+            );
+        }
+    }
 
     // **Round 2 review fix (HIGH-3)**: set `cwd` to the agent's
     // directory so `claude` can auto-discover the agent's per-folder
@@ -928,6 +981,20 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn account_env_stash_roundtrip() {
+        // The per-account spawn env survives stash → lookup so the spawn factory
+        // can inject CLAUDE_CODE_OAUTH_TOKEN for the rotator-selected account.
+        let mut env = HashMap::new();
+        env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "sk-ant-oat01-xyz".to_string());
+        stash_account_env("acct-test-roundtrip", &env);
+        let got = lookup_account_env("acct-test-roundtrip").expect("env stashed");
+        assert_eq!(got.get("CLAUDE_CODE_OAUTH_TOKEN").map(String::as_str), Some("sk-ant-oat01-xyz"));
+        // Empty env is a no-op (ambient/no-account invokes don't pollute the map).
+        stash_account_env("acct-test-empty", &HashMap::new());
+        assert!(lookup_account_env("acct-test-empty").is_none());
+    }
 
     #[test]
     fn is_enabled_returns_false_for_missing_file() {

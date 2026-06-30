@@ -1,6 +1,52 @@
 # Changelog
 
 
+## [1.30.0] - 2026-06-30 — One-click login → working agent, end to end
+
+Makes the dashboard **Claude 一鍵登入** flow actually produce a usable account,
+and fixes the LINE channel + per-account PTY auth so an agent can reply.
+
+### Fixed
+- **One-click login UX** (`cli_auth`): the OAuth authorize URL is surfaced as a
+  clickable button (PTY widened to 600 cols so it stays on one line); the ANSI
+  console is de-garbled; the pasted code is submitted by sending Enter as a
+  **separate** keystroke after the paste (Ink swallowed a CR that arrived in the
+  same write, so the code never submitted); success/failure are detected through
+  the Ink TUI's escape-separated words.
+- **OAuth token capture**: `claude setup-token` only prints its long-lived token
+  once — it's now scraped and registered as an account. The ANSI parser was
+  rewritten to a correct CSI/OSC state machine (CSI ends on a 0x40–0x7E byte, not
+  "the first letter"); the old one dropped a character from the token
+  (`sk-ant-oat01-…` → `sk-ant-at01-…`), producing a 401 on every reply.
+- **PTY binary resolution**: the PTY/OAuth reply path now falls back to a PATH
+  lookup (`which_claude`), not just the HOME candidate list — the Docker image
+  installs the CLI in `/usr/bin`, which the curated list omitted ("binary not
+  found").
+- **PTY pool per-account auth (HIGH-2, was deferred)**: the in-process pool now
+  injects the rotator-resolved per-account credential env
+  (`CLAUDE_CODE_OAUTH_TOKEN` / `CLAUDE_CONFIG_DIR` / `ANTHROPIC_API_KEY`) at spawn
+  time via an account-keyed side-channel. Previously the spawned CLI used
+  whatever ambient OAuth lived in `~/.claude/`, so a registered account never
+  authenticated.
+- **LINE channel save**: choosing an agent no longer makes the save fail —
+  LINE/WhatsApp/Feishu are single global webhook endpoints, so they persist to
+  the global `[channels]` and bind the selected agent as `[general] default_agent`
+  instead of erroring "Per-agent channels not supported for: line".
+- **LINE webhook live**: `/webhook/line` is now **always mounted** and the handler
+  reads the token/secret per request, so configuring LINE in the dashboard takes
+  effect with no gateway restart (previously: 405 on Verify + status stuck on
+  "連線中"). Status refreshes live on save.
+- **Account list refresh**: a one-click login invalidates the rotator cache so the
+  new account shows immediately instead of after the 5-minute TTL.
+- **Self-service password change**: a new "帳號安全" Settings tab lets the
+  single-owner edition rotate the dashboard admin password from the UI.
+
+### Ops
+- `commercial/gateway-vm`: `CLOUD_BUILD=1 ./deploy.sh` builds the image remotely
+  (no local Docker); the VM deploy prunes old images afterwards to stop the 30GB
+  boot disk filling (which crash-looped the gateway with SQLite "disk I/O error").
+- Repo-root `.gcloudignore` keeps the Cloud Build context to source only.
+
 ## [1.29.1] - 2026-06-28 — Fix placeholder domain
 
 Replaces the never-registered placeholder `duduclaw.tw` with the real deployed
