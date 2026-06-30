@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "cd web && npm run dev",
     "devUrl": "http://127.0.0.1:5173",
-    "beforeBuildCommand": "cd ../web && npm run build",
+    "beforeBuildCommand": "cd web && npm run build",
     "frontendDist": "../crates/duduclaw-dashboard/dist"
   },
   "app": {
