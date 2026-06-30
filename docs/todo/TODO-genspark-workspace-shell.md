@@ -208,7 +208,7 @@
 > [docs/guides/desktop-unblock.md](../guides/desktop-unblock.md) —— 每個 `[ ]`/`[~]` 項都有對應的關卡、指令與驗收方式。
 
 ### D0 骨架(本機自用,不簽章)  🔴
-- [~] 🔴 新目錄 `src-tauri/`(Tauri 2):`tauri.conf.json`、`Cargo.toml`、`build.rs`、`src/main.rs`。WebView 在 setup 後 `navigate` 到 `http://127.0.0.1:<port>`(dev `devUrl` 指向 Vite)。
+- [~] 🔴 新目錄 `src-tauri/`(Tauri 2):`tauri.conf.json`、`Cargo.toml`、`build.rs`、`src/main.rs`。**Release**:WebView 在 setup 後 `navigate` 到 `http://127.0.0.1:<port>`(gateway embedded dist)。**Dev(debug build)**:WebView 停在 Vite `devUrl :5173`(live 工作空間 + HMR,proxy `/ws` `/api` 到 gateway),`#[cfg(debug_assertions)]` 不 navigate —— 避免 embedded(編譯時)dist 蓋掉本機改動;sidecar 仍 spawn 提供後端。
 - [~] 🔴 sidecar 設定:release `duduclaw` 以 `externalBin: ["binaries/duduclaw"]` 註冊;App 啟動 → spawn `duduclaw run --yes`(完整 server = gateway + dashboard + channels;**非** `gateway`,也**沒有** `start` 子命令 —— 後者是 launchd 時代的筆誤,已修),退出 → `stop()` 終止。
 - [~] 🟡 視窗:預設 1280×840 / 最小 960×640、置中、深色 `#1c1917` 背景、`visible:false` 直到 ready 才 `show()`(防白閃)。
 - [x] 📝 `docs/guides/desktop-build.md`:本機 `tauri dev` / `tauri build` / 圖示生成 / 生命週期說明。

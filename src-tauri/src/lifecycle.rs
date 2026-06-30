@@ -165,12 +165,6 @@ pub fn plan_gateway_with(mode: DesktopMode, host: &str, known: &[u16], preferred
     decide_plan(mode, known, preferred, |p| is_listening(host, p))
 }
 
-/// Back-compat entry point: [`DesktopMode::Auto`] over just the preferred port.
-/// Prefer [`plan_gateway_with`], which also scans `known_ports()`.
-pub fn plan_gateway(host: &str, preferred: u16) -> GatewayPlan {
-    plan_gateway_with(DesktopMode::Auto, host, &[preferred], preferred)
-}
-
 /// Pure decision core (§D1/§D2.2): generic over the liveness probe so the whole
 /// attach-vs-spawn matrix is unit-testable without opening sockets.
 ///
@@ -208,7 +202,10 @@ pub fn decide_plan<F: Fn(u16) -> bool>(
 }
 
 /// The health endpoint to poll for readiness / liveness (§D2.5). The gateway's
-/// dashboard server answers `/healthz` without auth.
+/// dashboard server answers `/healthz` without auth. Retained as the canonical
+/// readiness URL (and unit-tested); `wait_until_ready` currently uses a cheaper
+/// TCP probe, so this is not yet called from the binary path.
+#[allow(dead_code)]
 pub fn health_url(host: &str, port: u16) -> String {
     format!("http://{host}:{port}/healthz")
 }
