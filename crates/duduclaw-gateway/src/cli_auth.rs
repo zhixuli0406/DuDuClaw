@@ -72,19 +72,51 @@ fn file_mtime(p: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
-/// Strip ANSI/VT escapes but PRESERVE case and other characters — used to
-/// recover the long-lived OAuth token from the TUI output (case-sensitive,
-/// unlike marker matching).
+/// Strip ANSI/VT escape sequences, preserving every non-escape character (case
+/// included). Correctly consumes:
+///   - CSI: ESC `[` (params 0x30-0x3F)* (intermediates 0x20-0x2F)* final 0x40-0x7E
+///   - OSC: ESC `]` … (BEL, or ST = `ESC \`)
+///   - other 2-char escapes: ESC <byte>
+///
+/// A previous version stopped a CSI at "the first ASCII letter", which OVER-RUNS
+/// when the final byte is not a letter (cursor ops ending in `@`, `` ` ``, etc.):
+/// it then ate the following character. That silently dropped a char from scraped
+/// OAuth tokens (`sk-ant-oat01-…` → `sk-ant-at01-…`), yielding an invalid token
+/// and a 401 when the agent tried to reply.
 fn strip_ansi_keep_case(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\u{1b}' {
-            while let Some(&n) = chars.peek() {
-                chars.next();
-                if n.is_ascii_alphabetic() || n == '~' || n == '\u{7}' {
-                    break;
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next(); // consume '['
+                    // params/intermediates, then exactly one final byte 0x40-0x7E
+                    while let Some(&n) = chars.peek() {
+                        chars.next();
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
                 }
+                Some(']') => {
+                    chars.next(); // consume ']'
+                    while let Some(n) = chars.next() {
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next(); // 2-char escape: ESC <byte>
+                }
+                None => {}
             }
         } else if c != '\u{7}' && c != '\u{8}' {
             out.push(c);
@@ -232,22 +264,11 @@ impl AuthStatus {
 /// substring matching robust against the TUI's redraw. Without this, every
 /// multi-word marker silently fails and the dashboard spins on "進行中" forever.
 fn normalize_for_match(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            // Skip the escape sequence up to its terminator (CSI letter / OSC BEL).
-            while let Some(&n) = chars.peek() {
-                chars.next();
-                if n.is_ascii_alphabetic() || n == '~' || n == '\u{7}' {
-                    break;
-                }
-            }
-        } else if !c.is_whitespace() && c != '\u{7}' && c != '\u{8}' {
-            out.extend(c.to_lowercase());
-        }
-    }
-    out
+    strip_ansi_keep_case(s)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
 }
 
 /// Pure marker scanner over a rolling raw output tail (ANSI included). Both the
@@ -553,6 +574,25 @@ mod tests {
         assert_eq!(extract_oauth_token("Paste code here >").as_deref(), None);
         // Too-short junk isn't mistaken for a token.
         assert_eq!(extract_oauth_token("sk-ant-x").as_deref(), None);
+    }
+
+    #[test]
+    fn extract_oauth_token_survives_non_letter_csi_final() {
+        // Regression: a CSI ending in a NON-letter final byte (here `@` = 0x40)
+        // right before the token must not eat the next char. The old "stop at the
+        // first ASCII letter" stripper dropped the 'o' (`oat01` → `at01`),
+        // producing an invalid token → 401 on reply.
+        let out = "export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-\u{1b}[1@oat01-AbC_def-123XyZ456ghiJKLmno";
+        assert_eq!(
+            extract_oauth_token(out).as_deref(),
+            Some("sk-ant-oat01-AbC_def-123XyZ456ghiJKLmno")
+        );
+        // Cursor-position CSI (final 'G') mid-token also must not drop a char.
+        let out2 = "sk-ant-oat\u{1b}[5G01-ZZZZZZZZZZZZZZZZZZZZZZ";
+        assert_eq!(
+            extract_oauth_token(out2).as_deref(),
+            Some("sk-ant-oat01-ZZZZZZZZZZZZZZZZZZZZZZ")
+        );
     }
 
     #[test]
