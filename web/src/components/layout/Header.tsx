@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { ModeToggle } from './ModeToggle';
 
 function LanguageMenu() {
   const intl = useIntl();
@@ -178,6 +179,9 @@ export function Header() {
           <div className={cn('h-2 w-2 rounded-full', stateColor[connectionState] ?? 'bg-stone-400')} />
           <span>{stateLabel}</span>
         </button>
+
+        {/* Simple ⇄ Advanced shell switch */}
+        <ModeToggle />
 
         {/* Language Switcher */}
         <LanguageMenu />

@@ -1,109 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { useChatStore, type ChatMessage, type PendingAttachment } from '@/stores/chat-store';
+import { useChatStore, type PendingAttachment } from '@/stores/chat-store';
 import { cn } from '@/lib/utils';
-import { Send, RotateCcw, Loader2, Paperclip, X, Eye, EyeOff, FileText, Image as ImageIcon } from 'lucide-react';
+import { Send, RotateCcw, Loader2, Paperclip, Eye, EyeOff } from 'lucide-react';
 import { toast } from '@/lib/toast';
 import { Button, Badge } from '@/components/ui';
-
-/** 20 MB — must match the backend `media::MAX_FILE_SIZE` guard. */
-const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
-
-function isImageMime(mime: string): boolean {
-  return mime.startsWith('image/');
-}
-
-/** Read a File into a base64 string (without the data: URI prefix). */
-function readFileAsBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result as string;
-      const comma = result.indexOf(',');
-      resolve(comma >= 0 ? result.slice(comma + 1) : result);
-    };
-    reader.onerror = () => reject(reader.error ?? new Error('read failed'));
-    reader.readAsDataURL(file);
-  });
-}
-
-function AttachmentChip({
-  name,
-  mime,
-  onRemove,
-}: {
-  name: string;
-  mime: string;
-  onRemove?: () => void;
-}) {
-  const Icon = isImageMime(mime) ? ImageIcon : FileText;
-  return (
-    <span className="inline-flex max-w-[12rem] items-center gap-1.5 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-fill)] px-2 py-1 text-xs text-stone-700 dark:text-stone-200">
-      <Icon className="h-3.5 w-3.5 flex-shrink-0" />
-      <span className="truncate">{name}</span>
-      {onRemove && (
-        <button
-          onClick={onRemove}
-          className="flex-shrink-0 rounded p-0.5 text-stone-400 transition-colors hover:bg-stone-500/10 hover:text-stone-600 dark:hover:bg-white/5 dark:hover:text-stone-300"
-          aria-label="Remove attachment"
-        >
-          <X className="h-3 w-3" />
-        </button>
-      )}
-    </span>
-  );
-}
-
-function MessageBubble({ message }: { message: ChatMessage }) {
-  const isUser = message.role === 'user';
-  const isSystem = message.role === 'system';
-
-  return (
-    <div
-      className={cn(
-        'flex w-full',
-        isUser ? 'justify-end' : 'justify-start'
-      )}
-    >
-      <div
-        className={cn(
-          'max-w-[80%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed',
-          isUser
-            ? 'bg-amber-500 text-white'
-            : isSystem
-              ? 'bg-rose-500/10 text-rose-700 ring-1 ring-inset ring-rose-500/20 dark:text-rose-400'
-              : 'border border-[var(--panel-border)] bg-[var(--panel-fill)] text-stone-800 dark:text-stone-200'
-        )}
-      >
-        {message.attachments && message.attachments.length > 0 && (
-          <div className="mb-2 flex flex-wrap gap-1.5">
-            {message.attachments.map((a, i) => (
-              <AttachmentChip key={i} name={a.name} mime={a.mime} />
-            ))}
-          </div>
-        )}
-        {message.content && (
-          <div className="whitespace-pre-wrap break-words">{message.content}</div>
-        )}
-        {message.tokens != null && message.tokens > 0 && (
-          <div className="mt-1 text-xs opacity-50 tabular-nums">{message.tokens} tokens</div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function TypingIndicator() {
-  return (
-    <div className="flex justify-start">
-      <div className="flex items-center gap-1 rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-fill)] px-4 py-3">
-        <span className="h-2 w-2 animate-bounce rounded-full bg-stone-400 [animation-delay:0ms]" />
-        <span className="h-2 w-2 animate-bounce rounded-full bg-stone-400 [animation-delay:150ms]" />
-        <span className="h-2 w-2 animate-bounce rounded-full bg-stone-400 [animation-delay:300ms]" />
-      </div>
-    </div>
-  );
-}
+import { AttachmentChip, MessageBubble, TypingIndicator } from '@/components/chat';
+import { isImageMime, readAttachment } from '@/lib/attachments';
 
 export function WebChatPage() {
   const intl = useIntl();
@@ -164,23 +67,21 @@ export function WebChatPage() {
     if (!fileList || fileList.length === 0) return;
     const next: PendingAttachment[] = [];
     for (const file of Array.from(fileList)) {
-      if (file.size > MAX_ATTACHMENT_BYTES) {
+      const result = await readAttachment(file);
+      if (result.ok) {
+        next.push(result.attachment);
+      } else if (result.reason === 'too-large') {
         toast.error(
           intl.formatMessage(
             { id: 'webchat.attachTooLarge', defaultMessage: '{name} 超過 20MB 上限' },
-            { name: file.name },
+            { name: result.name },
           ),
         );
-        continue;
-      }
-      try {
-        const dataBase64 = await readFileAsBase64(file);
-        next.push({ name: file.name, mime: file.type || 'application/octet-stream', dataBase64 });
-      } catch {
+      } else {
         toast.error(
           intl.formatMessage(
             { id: 'webchat.attachReadFailed', defaultMessage: '無法讀取 {name}' },
-            { name: file.name },
+            { name: result.name },
           ),
         );
       }

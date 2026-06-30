@@ -1,0 +1,69 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DuDuClaw",
+  "version": "1.30.1",
+  "identifier": "ai.duduclaw.desktop",
+  "build": {
+    "beforeDevCommand": "cd ../web && npm run dev",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeBuildCommand": "cd ../web && npm run build",
+    "frontendDist": "../crates/duduclaw-dashboard/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "DuDuClaw",
+        "width": 1280,
+        "height": 840,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "backgroundColor": "#1c1917",
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg", "msi", "appimage", "deb"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Productivity",
+    "shortDescription": "Your self-hosted AI employee",
+    "longDescription": "DuDuClaw — a multi-runtime AI agent platform that runs on your own machine. Your data never leaves.",
+    "externalBin": ["binaries/duduclaw"],
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "hardenedRuntime": true,
+      "entitlements": "entitlements.plist",
+      "signingIdentity": null
+    },
+    "windows": {
+      "wix": { "language": "en-US" }
+    },
+    "linux": {
+      "deb": { "depends": ["libwebkit2gtk-4.1-0"] }
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/zhixuli0406/DuDuClaw/releases/latest/download/latest.json"
+      ],
+      "dialog": true,
+      "pubkey": "REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY"
+    }
+  }
+}

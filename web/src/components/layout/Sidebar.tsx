@@ -1,10 +1,20 @@
 import { useState } from 'react';
-import { NavLink } from 'react-router';
+import { NavLink, useNavigate } from 'react-router';
 import { useIntl } from 'react-intl';
-import { ChevronDown, LogOut } from 'lucide-react';
+import {
+  ChevronDown,
+  LogOut,
+  Home,
+  MessageCircle,
+  Puzzle,
+  KanbanSquare,
+  BookOpen,
+  LayoutGrid,
+} from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useSystemStore } from '@/stores/system-store';
 import { useAuthStore } from '@/stores/auth-store';
+import { useUiModeStore } from '@/stores/ui-mode-store';
 import { hasMinRole } from '@/lib/roles';
 import { navGroups, type NavItem } from './nav-model';
 import { EditionBadge } from './EditionBadge';
@@ -19,12 +29,112 @@ function loadCollapsed(): Record<string, boolean> {
   }
 }
 
+function Logo({ compact }: { compact?: boolean }) {
+  const intl = useIntl();
+  return (
+    <div className={cn('flex items-center gap-3 px-5 py-5', compact && 'justify-center px-0')}>
+      <span
+        className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-gradient-to-b from-amber-400 to-amber-500 text-lg shadow-[0_4px_16px_-4px_rgba(245,158,11,0.6)]"
+        role="img"
+        aria-label="paw"
+      >
+        🐾
+      </span>
+      {!compact && (
+        <div className="min-w-0">
+          <h1 className="truncate text-base font-semibold tracking-tight text-stone-900 dark:text-stone-50">
+            DuDuClaw
+          </h1>
+          <p className="truncate text-xs text-stone-500 dark:text-stone-400">
+            {intl.formatMessage({ id: 'app.subtitle' })}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Narrow icon rail shown in workspace mode (TODO-genspark-workspace-shell §P5.2)
+ * — the Genspark-style slim nav. A curated subset of existing routes; the last
+ * item flips back to the full dashboard. Role-gating still applies.
+ */
+function WorkspaceRail() {
+  const intl = useIntl();
+  const navigate = useNavigate();
+  const user = useAuthStore((s) => s.user);
+  const logout = useAuthStore((s) => s.logout);
+  const setMode = useUiModeStore((s) => s.setMode);
+
+  const items: ReadonlyArray<{ to: string; icon: typeof Home; label: string }> = [
+    { to: '/workspace', icon: Home, label: 'nav.home' },
+    { to: '/webchat', icon: MessageCircle, label: 'launcher.claw.label' },
+    { to: '/skills', icon: Puzzle, label: 'nav.skills' },
+    { to: '/tasks', icon: KanbanSquare, label: 'nav.tasks' },
+    { to: '/wiki', icon: BookOpen, label: 'nav.wiki' },
+  ];
+
+  const goDashboard = () => {
+    setMode('dashboard');
+    navigate('/');
+  };
+
+  return (
+    <aside className="glass-chrome relative z-40 flex w-16 flex-col items-center border-r border-stone-300/40 dark:border-white/8">
+      <Logo compact />
+      <nav className="flex flex-1 flex-col items-center gap-1 pt-2">
+        {items.map(({ to, icon: Icon, label }) => (
+          <NavLink
+            key={to}
+            to={to}
+            title={intl.formatMessage({ id: label })}
+            className={({ isActive }) =>
+              cn(
+                'grid h-10 w-10 place-items-center rounded-xl transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
+                isActive
+                  ? 'bg-amber-500/12 text-amber-700 ring-1 ring-inset ring-amber-500/25 dark:bg-amber-400/10 dark:text-amber-300'
+                  : 'text-stone-500 hover:bg-stone-500/8 hover:text-stone-900 dark:text-stone-400 dark:hover:bg-white/5 dark:hover:text-stone-200'
+              )
+            }
+          >
+            <Icon className="h-[1.125rem] w-[1.125rem]" />
+            <span className="sr-only">{intl.formatMessage({ id: label })}</span>
+          </NavLink>
+        ))}
+
+        <button
+          onClick={goDashboard}
+          title={intl.formatMessage({ id: 'mode.dashboard' })}
+          aria-label={intl.formatMessage({ id: 'mode.dashboard' })}
+          className="mt-1 grid h-10 w-10 place-items-center rounded-xl text-stone-500 transition-colors hover:bg-stone-500/8 hover:text-stone-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40 dark:text-stone-400 dark:hover:bg-white/5 dark:hover:text-stone-200"
+        >
+          <LayoutGrid className="h-[1.125rem] w-[1.125rem]" />
+        </button>
+      </nav>
+
+      {user && (
+        <button
+          onClick={logout}
+          title={intl.formatMessage({ id: 'auth.logout' })}
+          aria-label={intl.formatMessage({ id: 'auth.logout' })}
+          className="mb-3 grid h-10 w-10 place-items-center rounded-xl text-stone-400 transition-colors hover:bg-stone-500/10 hover:text-stone-600 dark:hover:text-stone-300"
+        >
+          <LogOut className="h-4 w-4" />
+        </button>
+      )}
+    </aside>
+  );
+}
+
 export function Sidebar() {
   const intl = useIntl();
   const status = useSystemStore((s) => s.status);
   const user = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
+  const mode = useUiModeStore((s) => s.mode);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(loadCollapsed);
+
+  if (mode === 'workspace') return <WorkspaceRail />;
 
   const toggle = (label: string) => {
     setCollapsed((prev) => {
@@ -55,23 +165,7 @@ export function Sidebar() {
   return (
     <aside className="glass-chrome relative z-40 flex w-60 flex-col border-r border-stone-300/40 dark:border-white/8">
       {/* Logo */}
-      <div className="flex items-center gap-3 px-5 py-5">
-        <span
-          className="grid h-9 w-9 place-items-center rounded-xl bg-gradient-to-b from-amber-400 to-amber-500 text-lg shadow-[0_4px_16px_-4px_rgba(245,158,11,0.6)]"
-          role="img"
-          aria-label="paw"
-        >
-          🐾
-        </span>
-        <div className="min-w-0">
-          <h1 className="truncate text-base font-semibold tracking-tight text-stone-900 dark:text-stone-50">
-            DuDuClaw
-          </h1>
-          <p className="truncate text-xs text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'app.subtitle' })}
-          </p>
-        </div>
-      </div>
+      <Logo />
 
       {/* Grouped navigation */}
       <nav className="flex-1 space-y-1 overflow-y-auto px-3 pb-3">

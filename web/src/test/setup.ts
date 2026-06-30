@@ -28,3 +28,28 @@ vi.stubGlobal(
     readyState: 1,
   }))
 );
+
+// This jsdom build exposes a `localStorage` whose methods are absent/throwing,
+// which is why production code guards every access in try/catch and why tests
+// that exercise persistence would otherwise fail. Install a deterministic
+// in-memory Storage so persistence-dependent tests run reliably.
+function createMemoryStorage(): Storage {
+  let store: Record<string, string> = {};
+  return {
+    getItem: (k: string) => (k in store ? store[k] : null),
+    setItem: (k: string, v: string) => {
+      store[k] = String(v);
+    },
+    removeItem: (k: string) => {
+      delete store[k];
+    },
+    clear: () => {
+      store = {};
+    },
+    key: (i: number) => Object.keys(store)[i] ?? null,
+    get length() {
+      return Object.keys(store).length;
+    },
+  } as Storage;
+}
+vi.stubGlobal('localStorage', createMemoryStorage());

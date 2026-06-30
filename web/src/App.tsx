@@ -6,6 +6,7 @@ import { FirstRunGate } from './components/FirstRunGate';
 import { LoginPage } from './pages/LoginPage';
 import { useConnectionStore } from './stores/connection-store';
 import { useAuthStore } from './stores/auth-store';
+import { useUiModeStore } from './stores/ui-mode-store';
 import { ApprovalModal } from './components/ApprovalModal';
 
 // Code-splitting: every authenticated page is lazy-loaded so heavy, page-only
@@ -16,6 +17,7 @@ const lazyPage = <K extends string>(loader: () => Promise<Record<K, React.Compon
   lazy(() => loader().then((m) => ({ default: m[key] })));
 
 const DashboardPage = lazyPage(() => import('./pages/DashboardPage'), 'DashboardPage');
+const WorkspacePage = lazyPage(() => import('./pages/WorkspacePage'), 'WorkspacePage');
 const WebChatPage = lazyPage(() => import('./pages/WebChatPage'), 'WebChatPage');
 const AgentsPage = lazyPage(() => import('./pages/AgentsPage'), 'AgentsPage');
 const TaskBoardPage = lazyPage(() => import('./pages/TaskBoardPage'), 'TaskBoardPage');
@@ -55,6 +57,16 @@ function PageFallback() {
   );
 }
 
+/**
+ * The index route renders the workspace or the dashboard depending on the
+ * active shell mode (TODO-genspark-workspace-shell §P0.3). Rendering in place
+ * (rather than redirecting) avoids a flash and keeps the URL at `/`.
+ */
+function HomeRoute() {
+  const mode = useUiModeStore((s) => s.mode);
+  return mode === 'workspace' ? <WorkspacePage /> : <DashboardPage />;
+}
+
 export function App() {
   const connectWithAuth = useConnectionStore((s) => s.connectWithAuth);
   const disconnect = useConnectionStore((s) => s.disconnect);
@@ -88,7 +100,8 @@ export function App() {
               {/* Everything else requires at least one agent to exist. */}
               <Route element={<FirstRunGate />}>
               {/* Open to all authenticated users */}
-              <Route index element={<DashboardPage />} />
+              <Route index element={<HomeRoute />} />
+              <Route path="workspace" element={<WorkspacePage />} />
               <Route path="webchat" element={<WebChatPage />} />
               <Route path="agents" element={<AgentsPage />} />
               <Route path="tasks" element={<TaskBoardPage />} />

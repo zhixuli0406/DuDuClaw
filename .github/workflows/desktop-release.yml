@@ -1,0 +1,127 @@
+# Desktop app release pipeline (TODO §D4.5).
+# Builds the Tauri shell on macOS / Windows / Linux, signs + notarizes, and
+# publishes installers + the updater manifest (latest.json) to a GitHub release.
+#
+# Required repo secrets (Settings → Secrets → Actions):
+#   TAURI_SIGNING_PRIVATE_KEY            updater private key (tauri signer)
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   its password
+#   APPLE_SIGNING_IDENTITY / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
+#   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD   (Developer ID .p12, base64)
+#   WINDOWS_CERT_PFX_BASE64 / WINDOWS_CERT_PASSWORD
+name: desktop-release
+
+on:
+  push:
+    tags: ["desktop-v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Linux deps (WebKitGTK)
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build web dashboard
+        run: cd web && npm ci && npm run build
+
+      - name: Build & stage gateway sidecar
+        shell: bash
+        run: |
+          cargo build --release -p duduclaw-cli --bin duduclaw --target ${{ matrix.target }}
+          mkdir -p src-tauri/binaries
+          EXT=""; [[ "${{ matrix.target }}" == *windows* ]] && EXT=".exe"
+          cp "target/${{ matrix.target }}/release/duduclaw${EXT}" \
+             "src-tauri/binaries/duduclaw-${{ matrix.target }}${EXT}"
+
+      - name: Import Apple certificate
+        if: matrix.os == 'macos-latest'
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Build, sign & release (tauri-action)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS notarization (handled by tauri-action when these are present)
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: src-tauri
+          args: --target ${{ matrix.target }}
+          tagName: ${{ github.ref_name }}
+          releaseName: "DuDuClaw Desktop ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false
+          # tauri-action emits latest.json (updater manifest) when the updater
+          # is configured — published alongside the installers (§D4.4).
+          includeUpdaterJson: true
+
+      # Windows signing — preferred: Azure Trusted Signing (cloud, ~US$10/mo,
+      # no hardware token). See docs/guides/desktop-unblock.md 關卡 C 路徑 1.
+      - name: Sign Windows installer (Azure Trusted Signing)
+        if: matrix.os == 'windows-latest' && vars.WINDOWS_SIGN_METHOD == 'azure'
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
+          files-folder: src-tauri/target
+          files-folder-filter: msi,exe
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Fallback: legacy .pfx (only for old stock / HSM-exported temp certs).
+      # Enabled when repo var WINDOWS_SIGN_METHOD is unset or 'pfx'.
+      - name: Sign Windows installer (legacy .pfx)
+        if: matrix.os == 'windows-latest' && vars.WINDOWS_SIGN_METHOD != 'azure'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CERT_PFX_BASE64) {
+            Write-Host "No Windows signing configured — skipping (set WINDOWS_SIGN_METHOD=azure or provide a .pfx)."
+            exit 0
+          }
+          Get-ChildItem -Recurse -Filter *.msi src-tauri/target |
+            ForEach-Object { ./scripts/desktop/sign-windows.ps1 -Artifact $_.FullName }
