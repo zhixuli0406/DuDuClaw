@@ -10,9 +10,9 @@ authors = ["DuDuClaw Contributors"]
 # the desktop shell carries heavy GUI deps and its own lockfile.
 [workspace]
 
-[lib]
-name = "duduclaw_desktop_app_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Desktop-only: a plain binary crate (src/main.rs). No `[lib]` — the mobile-ready
+# staticlib/cdylib template needs a src/lib.rs we don't ship (iOS/Android are out
+# of scope; their generated icons are pruned too).
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

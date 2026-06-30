@@ -209,7 +209,7 @@
 
 ### D0 骨架(本機自用,不簽章)  🔴
 - [~] 🔴 新目錄 `src-tauri/`(Tauri 2):`tauri.conf.json`、`Cargo.toml`、`build.rs`、`src/main.rs`。WebView 在 setup 後 `navigate` 到 `http://127.0.0.1:<port>`(dev `devUrl` 指向 Vite)。
-- [~] 🔴 sidecar 設定:release `duduclaw` 以 `externalBin: ["binaries/duduclaw"]` 註冊;App 啟動 → spawn `duduclaw start`(非 `gateway`,以含 channels/heartbeat),退出 → `stop()` 終止。
+- [~] 🔴 sidecar 設定:release `duduclaw` 以 `externalBin: ["binaries/duduclaw"]` 註冊;App 啟動 → spawn `duduclaw run --yes`(完整 server = gateway + dashboard + channels;**非** `gateway`,也**沒有** `start` 子命令 —— 後者是 launchd 時代的筆誤,已修),退出 → `stop()` 終止。
 - [~] 🟡 視窗:預設 1280×840 / 最小 960×640、置中、深色 `#1c1917` 背景、`visible:false` 直到 ready 才 `show()`(防白閃)。
 - [x] 📝 `docs/guides/desktop-build.md`:本機 `tauri dev` / `tauri build` / 圖示生成 / 生命週期說明。
 - [x] 📝 `scripts/desktop/gen-icons.sh`:`cargo tauri icon` 主路徑 + macOS `sips`/`iconutil` 降級(產 PNG + `.icns`;`.ico` 仍需 Tauri CLI/ImageMagick,腳本明確告警)。**仍缺品牌 raster 來源** `web/public/paw-1024.png`(需提供 ≥1024² 方形 PNG)。
