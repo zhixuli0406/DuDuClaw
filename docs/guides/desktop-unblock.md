@@ -62,7 +62,7 @@ open "target/release/bundle/macos/DuDuClaw.app"
 | TODO 項 | 怎麼驗 |
 | --- | --- |
 | **D0 🧪** | `cargo tauri dev` 起得來、視窗顯示登入頁、送一句 chat 有回應 |
-| **D1 🧪** | (a) 先確保沒有 launchd/CLI gateway → 開 App,應**自啟 sidecar**;(b) 先 `duduclaw start` 佔住 18789 → 開 App,應**附掛不重啟**(Activity Monitor 只看到一個 `duduclaw`) |
+| **D1 🧪** | (a) 先確保沒有 launchd/CLI gateway → 開 App,應**自啟 sidecar**;(b) 先 `duduclaw run` 佔住 18789 → 開 App,應**附掛不重啟**(Activity Monitor 只看到一個 `duduclaw`) |
 | **D2.1 🧪** | 連續開兩次 App → 只聚焦同一視窗、只有一個 `duduclaw` 進程 |
 | **D2.3 🧪** | 正常退出後 `ps aux | grep duduclaw` 無殘留;`kill -9` App 後重開,應回收舊 pidfile(`~/.duduclaw/desktop-sidecar.pid`)指向的孤兒 |
 | **D2.4 🧪** | 託盤圖示顯示狀態;選單 Start/Stop 能驅動 sidecar;關窗縮回託盤不退出 |

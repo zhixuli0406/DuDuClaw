@@ -128,7 +128,10 @@ impl SidecarManager {
             .shell()
             .sidecar("duduclaw")
             .map_err(|e| format!("sidecar lookup failed: {e}"))?
-            .args(["start"])
+            // `run --yes`: start the full server (gateway + dashboard + channels)
+            // non-interactively. There is no `start` subcommand — that was the
+            // launchd-era typo; the CLI entry point is `duduclaw run`.
+            .args(["run", "--yes"])
             .env("DUDUCLAW_PORT", port.to_string())
             .env("PATH", lifecycle::augmented_path());
 
