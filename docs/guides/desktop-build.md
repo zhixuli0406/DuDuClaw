@@ -102,8 +102,11 @@ Ordered roughly by when you hit them. All are resolved in the repo; this is the
    The mobile-template `[lib]` was removed — `src-tauri` is a binary crate
    (`src/main.rs`). Don't re-add `[lib]` without a matching `src/lib.rs`.
 
-4. **`beforeDevCommand` / `beforeBuildCommand` run from the app root** (parent of
-   `src-tauri`), so the frontend hooks are `cd web && …`, not `cd ../web`.
+4. **The frontend hooks run from *different* cwds for dev vs build.**
+   `tauri dev` runs `beforeDevCommand` from the repo root (`cd web && npm run dev`),
+   but `tauri build` runs `beforeBuildCommand` from `src-tauri/` (`cd ../web && npm
+   run build`). The two commands are intentionally asymmetric — don't "fix" one to
+   match the other.
 
 5. **Vite "Waiting for frontend dev server …" forever.** Vite must bind IPv4
    `127.0.0.1` (not the default `localhost`/`::1`) to match the Tauri poller and
