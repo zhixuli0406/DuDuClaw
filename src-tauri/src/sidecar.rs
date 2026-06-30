@@ -103,7 +103,14 @@ impl SidecarManager {
         }
         self.reclaim_orphan();
 
-        let plan = lifecycle::plan_gateway(lifecycle::DEFAULT_HOST, lifecycle::configured_port());
+        // Honor the operator's mode override (§D1) and probe every known port
+        // (env / config.toml / default) before spawning, so a non-default
+        // config.toml port can't make us double-spawn over an existing gateway
+        // (§D2.2).
+        let mode = lifecycle::desktop_mode();
+        let known = lifecycle::known_ports();
+        let preferred = lifecycle::configured_port();
+        let plan = lifecycle::plan_gateway_with(mode, lifecycle::DEFAULT_HOST, &known, preferred);
         match plan {
             lifecycle::GatewayPlan::Attach { port } => {
                 tracing::info!("attaching to existing gateway on port {port}");

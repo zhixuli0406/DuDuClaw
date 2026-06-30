@@ -14,13 +14,63 @@ use std::time::Duration;
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 18789;
 
-/// Resolve the configured port: `DUDUCLAW_PORT` if set & valid, else default.
+/// Resolve the configured port with the full priority chain (§D2.2):
+/// `DUDUCLAW_PORT` env (if set & non-privileged) > `~/.duduclaw/config.toml`
+/// `[gateway] port` > [`DEFAULT_PORT`]. This mirrors the operator's persisted
+/// intent: the CLI writes the chosen port into `config.toml` on first run, so an
+/// attached/spawned sidecar should respect it when the env var is absent.
 pub fn configured_port() -> u16 {
-    std::env::var("DUDUCLAW_PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .filter(|p| *p >= 1024)
-        .unwrap_or(DEFAULT_PORT)
+    resolve_preferred_port_from(std::env::var("DUDUCLAW_PORT").ok().as_deref(), config_port())
+}
+
+/// Pure resolver for [`configured_port`] — split out so the priority chain is
+/// unit-testable without touching the environment or filesystem.
+pub fn resolve_preferred_port_from(env: Option<&str>, config: Option<u16>) -> u16 {
+    if let Some(p) = env.and_then(|v| v.parse::<u16>().ok()).filter(|p| *p >= 1024) {
+        return p;
+    }
+    if let Some(p) = config.filter(|p| *p >= 1024) {
+        return p;
+    }
+    DEFAULT_PORT
+}
+
+/// Read `[gateway] port` from `~/.duduclaw/config.toml`, if present and valid.
+/// Defensive (every failure → `None`) and dependency-free so `lifecycle.rs`
+/// stays compilable under a bare `rustc --test` (no `toml` crate).
+pub fn config_port() -> Option<u16> {
+    let path = duduclaw_home().join("config.toml");
+    let text = std::fs::read_to_string(path).ok()?;
+    config_port_from_str(&text)
+}
+
+/// Extract `[gateway] port = N` from raw `config.toml` text. A minimal, fail-safe
+/// line scanner: tracks the current `[section]` header, returns the first `port`
+/// integer found inside `[gateway]`. Ignores comments and inline `#` tails.
+/// Returns `None` on anything it doesn't understand (never panics).
+pub fn config_port_from_str(text: &str) -> Option<u16> {
+    let mut in_gateway = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(section) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_gateway = section.trim().eq_ignore_ascii_case("gateway");
+            continue;
+        }
+        if !in_gateway {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            if key.trim().eq_ignore_ascii_case("port") {
+                // Strip an inline comment and surrounding whitespace/quotes.
+                let v = value.split('#').next().unwrap_or("").trim().trim_matches('"');
+                return v.parse::<u16>().ok().filter(|p| *p >= 1024);
+            }
+        }
+    }
+    None
 }
 
 /// Ordered candidate ports to try when the preferred one is busy: the preferred
@@ -54,20 +104,107 @@ pub enum GatewayPlan {
     Spawn { port: u16 },
 }
 
-/// Decide whether to attach to an existing gateway or spawn a sidecar, and on
-/// which port. The preferred (configured) port is checked first: if it's live
-/// we attach; otherwise we pick the first free candidate to spawn on.
-pub fn plan_gateway(host: &str, preferred: u16) -> GatewayPlan {
-    if is_listening(host, preferred) {
-        return GatewayPlan::Attach { port: preferred };
+/// Operator override for how the desktop shell relates to a gateway (§D1).
+/// Replaces the unbuilt settings-panel toggle with a testable env override —
+/// a settings UI can later just write `DUDUCLAW_DESKTOP_MODE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopMode {
+    /// Attach to an existing gateway if one is found, else spawn one (default).
+    Auto,
+    /// Never spawn — always attach to the externally-managed gateway (e.g.
+    /// launchd / CLI). Avoids double-instance when the user runs their own.
+    Attach,
+    /// Always spawn a self-contained sidecar, ignoring any existing gateway.
+    Spawn,
+}
+
+/// Resolve the desktop mode from `DUDUCLAW_DESKTOP_MODE` (case-insensitive),
+/// defaulting to [`DesktopMode::Auto`] on absent / unrecognized values.
+pub fn desktop_mode() -> DesktopMode {
+    desktop_mode_from(std::env::var("DUDUCLAW_DESKTOP_MODE").ok().as_deref())
+}
+
+/// Pure parser for [`desktop_mode`] — unit-testable without the environment.
+pub fn desktop_mode_from(value: Option<&str>) -> DesktopMode {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("attach") => DesktopMode::Attach,
+        Some("spawn") => DesktopMode::Spawn,
+        _ => DesktopMode::Auto,
     }
-    for port in candidate_ports(preferred) {
-        if !is_listening(host, port) {
-            return GatewayPlan::Spawn { port };
+}
+
+/// The ordered, de-duplicated set of ports an externally-managed gateway might
+/// already be serving on — used by attach-detection so config.toml pointing at a
+/// non-default port can't make us miss (and double-spawn over) a gateway running
+/// on the default. Order: env override, then config.toml, then [`DEFAULT_PORT`].
+pub fn known_ports_from(env: Option<u16>, config: Option<u16>) -> Vec<u16> {
+    let mut v = Vec::new();
+    let mut push = |p: Option<u16>| {
+        if let Some(p) = p.filter(|p| *p >= 1024) {
+            if !v.contains(&p) {
+                v.push(p);
+            }
         }
+    };
+    push(env);
+    push(config);
+    push(Some(DEFAULT_PORT));
+    v
+}
+
+/// Read the live known-port set from the environment + config.toml.
+pub fn known_ports() -> Vec<u16> {
+    let env = std::env::var("DUDUCLAW_PORT").ok().and_then(|v| v.parse::<u16>().ok());
+    known_ports_from(env, config_port())
+}
+
+/// Decide whether to attach or spawn, honoring [`DesktopMode`] and probing every
+/// known port for an existing gateway before spawning. Thin wrapper over
+/// [`decide_plan`] with the real [`is_listening`] probe.
+pub fn plan_gateway_with(mode: DesktopMode, host: &str, known: &[u16], preferred: u16) -> GatewayPlan {
+    decide_plan(mode, known, preferred, |p| is_listening(host, p))
+}
+
+/// Back-compat entry point: [`DesktopMode::Auto`] over just the preferred port.
+/// Prefer [`plan_gateway_with`], which also scans `known_ports()`.
+pub fn plan_gateway(host: &str, preferred: u16) -> GatewayPlan {
+    plan_gateway_with(DesktopMode::Auto, host, &[preferred], preferred)
+}
+
+/// Pure decision core (§D1/§D2.2): generic over the liveness probe so the whole
+/// attach-vs-spawn matrix is unit-testable without opening sockets.
+///
+/// - `Attach`: attach to the first live known port; if none is up, still
+///   `Attach { preferred }` (trust the external manager to bring it up — never
+///   spawn a competing instance).
+/// - `Spawn`: always spawn on the first free candidate of `preferred`.
+/// - `Auto`: attach to the first live known port, else spawn on the first free
+///   candidate of `preferred`.
+pub fn decide_plan<F: Fn(u16) -> bool>(
+    mode: DesktopMode,
+    known: &[u16],
+    preferred: u16,
+    is_live: F,
+) -> GatewayPlan {
+    let first_live = || known.iter().copied().find(|p| is_live(*p));
+    let spawn_free = || {
+        candidate_ports(preferred)
+            .into_iter()
+            .find(|p| !is_live(*p))
+            .map(|port| GatewayPlan::Spawn { port })
+            // Every candidate busy but none is "our" gateway — fall back.
+            .unwrap_or(GatewayPlan::Spawn { port: preferred })
+    };
+    match mode {
+        DesktopMode::Spawn => spawn_free(),
+        DesktopMode::Attach => GatewayPlan::Attach {
+            port: first_live().unwrap_or(preferred),
+        },
+        DesktopMode::Auto => match first_live() {
+            Some(port) => GatewayPlan::Attach { port },
+            None => spawn_free(),
+        },
     }
-    // Extremely unlikely: every candidate busy but none is "our" gateway.
-    GatewayPlan::Spawn { port: preferred }
 }
 
 /// The health endpoint to poll for readiness / liveness (§D2.5). The gateway's
@@ -165,21 +302,123 @@ mod tests {
 
     #[test]
     fn configured_port_defaults_when_unset() {
-        // Snapshot + restore to avoid cross-test contamination.
-        let prev = std::env::var("DUDUCLAW_PORT").ok();
+        // Snapshot + restore to avoid cross-test contamination. Point
+        // DUDUCLAW_HOME at an empty temp dir so config_port() is None and the
+        // test stays deterministic regardless of the developer's real config.
+        let prev_port = std::env::var("DUDUCLAW_PORT").ok();
+        let prev_home = std::env::var("DUDUCLAW_HOME").ok();
+        let empty = std::env::temp_dir().join(format!("ddc-lc-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).unwrap();
+        std::env::set_var("DUDUCLAW_HOME", &empty);
+
         std::env::remove_var("DUDUCLAW_PORT");
         assert_eq!(configured_port(), DEFAULT_PORT);
         std::env::set_var("DUDUCLAW_PORT", "12345");
         assert_eq!(configured_port(), 12345);
-        // Privileged / invalid → default.
+        // Privileged / invalid → default (no config.toml present).
         std::env::set_var("DUDUCLAW_PORT", "80");
         assert_eq!(configured_port(), DEFAULT_PORT);
         std::env::set_var("DUDUCLAW_PORT", "not-a-port");
         assert_eq!(configured_port(), DEFAULT_PORT);
-        match prev {
+
+        let _ = std::fs::remove_dir_all(&empty);
+        match prev_port {
             Some(v) => std::env::set_var("DUDUCLAW_PORT", v),
             None => std::env::remove_var("DUDUCLAW_PORT"),
         }
+        match prev_home {
+            Some(v) => std::env::set_var("DUDUCLAW_HOME", v),
+            None => std::env::remove_var("DUDUCLAW_HOME"),
+        }
+    }
+
+    #[test]
+    fn resolve_preferred_port_priority_env_over_config_over_default() {
+        // env wins when valid.
+        assert_eq!(resolve_preferred_port_from(Some("18900"), Some(18950)), 18900);
+        // env invalid/privileged → fall to config.
+        assert_eq!(resolve_preferred_port_from(Some("80"), Some(18950)), 18950);
+        assert_eq!(resolve_preferred_port_from(Some("nope"), Some(18950)), 18950);
+        // no env, config present.
+        assert_eq!(resolve_preferred_port_from(None, Some(18950)), 18950);
+        // privileged config ignored → default.
+        assert_eq!(resolve_preferred_port_from(None, Some(80)), DEFAULT_PORT);
+        // nothing → default.
+        assert_eq!(resolve_preferred_port_from(None, None), DEFAULT_PORT);
+    }
+
+    #[test]
+    fn config_port_parses_gateway_section_only() {
+        let cfg = "[general]\nport = 9999\n\n[gateway]\nbind = \"127.0.0.1\"\nport = 18950\n";
+        assert_eq!(config_port_from_str(cfg), Some(18950));
+        // port outside [gateway] is ignored.
+        assert_eq!(config_port_from_str("[general]\nport = 9999\n"), None);
+        // inline comment + quotes tolerated.
+        assert_eq!(config_port_from_str("[gateway]\nport = 18950 # chosen\n"), Some(18950));
+        assert_eq!(config_port_from_str("[gateway]\nport = \"18950\"\n"), Some(18950));
+        // privileged / garbage → None.
+        assert_eq!(config_port_from_str("[gateway]\nport = 80\n"), None);
+        assert_eq!(config_port_from_str("[gateway]\nport = wat\n"), None);
+        assert_eq!(config_port_from_str(""), None);
+    }
+
+    #[test]
+    fn desktop_mode_parses_case_insensitive_with_safe_default() {
+        assert_eq!(desktop_mode_from(Some("attach")), DesktopMode::Attach);
+        assert_eq!(desktop_mode_from(Some("  SPAWN ")), DesktopMode::Spawn);
+        assert_eq!(desktop_mode_from(Some("Auto")), DesktopMode::Auto);
+        assert_eq!(desktop_mode_from(Some("garbage")), DesktopMode::Auto);
+        assert_eq!(desktop_mode_from(None), DesktopMode::Auto);
+    }
+
+    #[test]
+    fn known_ports_ordered_deduped_and_filtered() {
+        // env, config, default — order preserved, dupes/privileged dropped.
+        assert_eq!(known_ports_from(Some(18900), Some(18950)), vec![18900, 18950, DEFAULT_PORT]);
+        // config == default collapses.
+        assert_eq!(known_ports_from(None, Some(DEFAULT_PORT)), vec![DEFAULT_PORT]);
+        // privileged env ignored.
+        assert_eq!(known_ports_from(Some(80), None), vec![DEFAULT_PORT]);
+        // env == config collapses but keeps default.
+        assert_eq!(known_ports_from(Some(18900), Some(18900)), vec![18900, DEFAULT_PORT]);
+    }
+
+    #[test]
+    fn decide_plan_auto_attaches_to_any_live_known_port() {
+        // config points at 18950 but the live gateway is on the default 18789;
+        // Auto must attach to 18789, NOT spawn a competing instance over 18950.
+        let known = vec![18950u16, DEFAULT_PORT];
+        let plan = decide_plan(DesktopMode::Auto, &known, 18950, |p| p == DEFAULT_PORT);
+        assert_eq!(plan, GatewayPlan::Attach { port: DEFAULT_PORT });
+    }
+
+    #[test]
+    fn decide_plan_auto_spawns_first_free_when_nothing_live() {
+        // Nothing live anywhere → spawn on the first free candidate of preferred.
+        let known = vec![18950u16, DEFAULT_PORT];
+        let plan = decide_plan(DesktopMode::Auto, &known, 18950, |_| false);
+        assert_eq!(plan, GatewayPlan::Spawn { port: 18950 });
+        // Preferred busy by a non-gateway → next free candidate.
+        let plan = decide_plan(DesktopMode::Auto, &[], 18950, |p| p == 18950);
+        assert_eq!(plan, GatewayPlan::Spawn { port: 18951 });
+    }
+
+    #[test]
+    fn decide_plan_attach_never_spawns() {
+        // Attach mode with a live known port → attach to it.
+        let plan = decide_plan(DesktopMode::Attach, &[DEFAULT_PORT], 18950, |p| p == DEFAULT_PORT);
+        assert_eq!(plan, GatewayPlan::Attach { port: DEFAULT_PORT });
+        // Attach mode with nothing live → still attach to preferred, never spawn.
+        let plan = decide_plan(DesktopMode::Attach, &[DEFAULT_PORT], 18950, |_| false);
+        assert_eq!(plan, GatewayPlan::Attach { port: 18950 });
+    }
+
+    #[test]
+    fn decide_plan_spawn_ignores_existing_gateway() {
+        // Spawn mode ignores a live known port and spawns on a free candidate.
+        let plan = decide_plan(DesktopMode::Spawn, &[DEFAULT_PORT], 18950, |p| p == DEFAULT_PORT);
+        assert_eq!(plan, GatewayPlan::Spawn { port: 18950 });
     }
 
     #[test]
