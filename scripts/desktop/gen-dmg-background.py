@@ -10,12 +10,14 @@ opaque 2x (1320x800) canvas that lines up with the Tauri DMG layout
 """
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-# Finder places the DMG background at its NATIVE pixel size and does NOT scale it
-# to the window — so the PNG must equal the window size in points (660x400), or
-# only its top-left corner shows. We draw at 2x and downscale for crisp text.
-OUT_W, OUT_H = 660, 400     # must match bundle.macOS.dmg windowSize
-SS = 2                      # supersample factor
-W, H = OUT_W * SS, OUT_H * SS
+# macOS sizes the DMG background by the image's *point* size = pixels / (dpi/72).
+# We ship a 2x (1320x800) image tagged 144 DPI, so it occupies 660x400 POINTS
+# and exactly fills a 660x400-point window — crisp on Retina, correct on non-
+# Retina. (A 72-DPI 1320px image would be read as 1320 pt and overflow; a 660px
+# image would under-cover a Retina window.) Keep WINDOW_PT == bundle windowSize.
+WINDOW_PT = (660, 400)      # must match bundle.macOS.dmg windowSize
+DPI = 144                   # 2x
+W, H = WINDOW_PT[0] * DPI // 72, WINDOW_PT[1] * DPI // 72
 STONE = (28, 25, 23)        # #1c1917 — app surface-dark
 AMBER = (245, 158, 11)      # #f59e0b
 WHITE = (250, 250, 249)     # #fafaf9
@@ -69,6 +71,7 @@ d.polygon([(788, 324), (820, 340), (788, 356)], fill=AMBER)
 
 centered(724, "您的 AI 員工 · 跑在自己的機器上,資料不出機", foot, FOOT)
 
-out = img.convert("RGB").resize((OUT_W, OUT_H), Image.LANCZOS)
-out.save("src-tauri/dmg/background.png")
-print("wrote src-tauri/dmg/background.png", out.size)
+out = img.convert("RGB")
+out.save("src-tauri/dmg/background.png", dpi=(DPI, DPI))
+print(f"wrote src-tauri/dmg/background.png {out.size}px @ {DPI}dpi "
+      f"= {WINDOW_PT[0]}x{WINDOW_PT[1]}pt")
