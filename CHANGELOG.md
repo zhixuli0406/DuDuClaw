@@ -1,6 +1,45 @@
 # Changelog
 
 
+## [1.31.0] - 2026-06-30 — Workspace shell + desktop lifecycle hardening
+
+Ships the **Genspark-style 工作空間 (Workspace) 外殼** — a consumer-grade landing
+layer (central prompt bar + capability launcher grid + "Claw, your first AI
+employee" entry) layered on top of the existing Calm Glass power-user dashboard,
+with a simple ⇄ advanced mode toggle. The full power dashboard is untouched and
+remains the default for enterprise / existing users. No backend RPC / WS protocol
+change — the workspace is purely a new frontend assembly over the existing
+`/ws/chat` + stores. See `docs/todo/TODO-genspark-workspace-shell.md`.
+
+Also lands the **Tauri 2 desktop scaffold** (Phase D) — a native window that wraps
+the `duduclaw` gateway as a sidecar — and this release hardens its lifecycle.
+
+### Added
+- **Workspace shell (web)**: `WorkspacePage` (Hero + PromptBar + LauncherGrid),
+  reusable `chat/` components (`MessageBubble` / `TypingIndicator`) shared with
+  WebChat, `AgentModelPicker` / `ConnectorChips`, the Claw value-prop section, a
+  `ui-mode-store` (workspace/dashboard, persisted, personal-edition default), and
+  a Header `ModeToggle`. Full zh-TW / en / ja-JP i18n, a11y, and unit tests.
+- **Desktop mode override (§D1)**: `DUDUCLAW_DESKTOP_MODE=auto|attach|spawn`
+  controls whether the desktop shell attaches to an externally-managed gateway
+  (launchd / CLI), always spawns its own sidecar, or auto-decides (default).
+  Replaces the unbuilt settings-panel toggle with a testable env override.
+- **`scripts/desktop/gen-icons.sh`**: generates the app icon set via
+  `cargo tauri icon`, with a `sips` / `iconutil` fallback on macOS (PNGs + .icns;
+  warns that the Windows `.ico` still needs the Tauri CLI / ImageMagick).
+
+### Fixed / Changed
+- **config.toml port priority (§D2.2)**: the desktop sidecar now resolves the
+  gateway port as `DUDUCLAW_PORT` env > `~/.duduclaw/config.toml [gateway] port` >
+  default `18789`, respecting the operator's persisted choice when the env var is
+  absent.
+- **Double-instance avoidance (§D1/§D2.2)**: attach-detection now probes *every*
+  known port (env / config.toml / default), so a non-default `config.toml` port
+  can no longer make the desktop app miss — and double-spawn over — a gateway
+  already running on the default port. The whole attach-vs-spawn decision matrix
+  is unit-tested via an injectable liveness probe (`decide_plan`).
+
+
 ## [1.30.1] - 2026-06-30 — LINE replies actually send
 
 ### Fixed

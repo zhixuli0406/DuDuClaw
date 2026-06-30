@@ -212,11 +212,12 @@
 - [~] 🔴 sidecar 設定:release `duduclaw` 以 `externalBin: ["binaries/duduclaw"]` 註冊;App 啟動 → spawn `duduclaw start`(非 `gateway`,以含 channels/heartbeat),退出 → `stop()` 終止。
 - [~] 🟡 視窗:預設 1280×840 / 最小 960×640、置中、深色 `#1c1917` 背景、`visible:false` 直到 ready 才 `show()`(防白閃)。
 - [x] 📝 `docs/guides/desktop-build.md`:本機 `tauri dev` / `tauri build` / 圖示生成 / 生命週期說明。
+- [x] 📝 `scripts/desktop/gen-icons.sh`:`cargo tauri icon` 主路徑 + macOS `sips`/`iconutil` 降級(產 PNG + `.icns`;`.ico` 仍需 Tauri CLI/ImageMagick,腳本明確告警)。**仍缺品牌 raster 來源** `web/public/paw-1024.png`(需提供 ≥1024² 方形 PNG)。
 - [ ] 🧪 冒煙:`tauri dev` 起得來、WebView 顯示登入頁、可送一句 chat(**阻塞:無工具鏈/顯示器**)。
 
 ### D1 與既有啟動方式互斥  🔴
 - [~] 🔴 偵測既有 launchd / CLI gateway(`lifecycle::plan_gateway` → `is_listening` port 探測);**已在跑 → `Attach` 不重啟**,否則 `Spawn`。避免雙實例。
-- [~] 🔴 自啟 sidecar vs 附掛既有 gateway:目前為**自動判定**(已在跑則附掛)。設定面板手動切換**尚未做**(以註記取代)。
+- [x] 🔴 自啟 sidecar vs 附掛既有 gateway:**自動判定**(已在跑則附掛)+ `DUDUCLAW_DESKTOP_MODE=auto|attach|spawn` 環境變數**手動覆寫**(`lifecycle::desktop_mode` / `decide_plan`,`rustc --test` 驗證;設定面板可後續只寫此變數)。
 - [x] 📝 於 `docs/guides/desktop-build.md`「Relationship to launchd」說明取代 / 並存。
 - [ ] 🧪 兩情境端到端(無既有 → 自啟;有既有 → 附掛)(**阻塞:需執行**)。
 
@@ -231,8 +232,8 @@
 
 #### D2.2 Port 衝突處理
 - [x] 🔴 port 選擇邏輯:`configured_port` + `candidate_ports`(18789..=18797)+ `plan_gateway` 擇空 port;`rustc --test` 已驗證(4 測試)。實際 port 在 setup 後傳給 WebView `navigate`(不寫死)。
-- [~] 🟡 port 來源:`DUDUCLAW_PORT` 環境變數 > 預設 18789。**`config.toml` 優先序未接**(目前 env+default;以註記取代)。
-- [x] 🧪 `candidate_ports` / `configured_port` 單元測試(含 u16 溢位、非法值 fail-safe)已通過。
+- [x] 🟡 port 來源:`DUDUCLAW_PORT` 環境變數 > **`config.toml [gateway] port`** > 預設 18789(`lifecycle::configured_port` / `resolve_preferred_port_from` / `config_port_from_str`,依賴無關的 line scanner,fail-safe)。**雙實例修正**:attach 偵測掃描所有已知 port(env/config/default),非預設 config port 不再誤開第二個 gateway。
+- [x] 🧪 `candidate_ports` / `configured_port` / `resolve_preferred_port_from` / `config_port_from_str` / `known_ports_from` / `decide_plan`(attach-vs-spawn 全矩陣,可注入 liveness probe)單元測試(含 u16 溢位、非法值、雙實例情境 fail-safe)已通過 — `rustc --test` 14 測試全綠。
 
 #### D2.3 優雅關閉
 - [~] 🔴 `RunEvent::ExitRequested` + tray quit → `SidecarManager::stop()` → `child.kill()`(gateway 收訊號 flush);**附掛模式不殺**外部 gateway。
