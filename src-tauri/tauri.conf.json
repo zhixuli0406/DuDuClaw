@@ -46,7 +46,7 @@
       "minimumSystemVersion": "11.0",
       "hardenedRuntime": true,
       "entitlements": "entitlements.plist",
-      "signingIdentity": null,
+      "signingIdentity": "Developer ID Application: Dudu Technology Ltd. (7469HYQ6HH)",
       "dmg": {
         "background": "dmg/background.png",
         "windowSize": { "width": 660, "height": 400 },

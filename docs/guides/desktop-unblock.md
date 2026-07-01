@@ -98,26 +98,31 @@ cargo tauri signer generate -w ~/.tauri/duduclaw-updater.key
 ## 關卡 B — Apple Developer ID 簽章 + 公證(macOS 發佈)
 
 **擋住的項目**:D3.1 🧪、D3.2 🧪、D4.1、D4.4(mac 端到端)、D5 簽章/乾淨機。
-**為什麼擋住**:需要 **Apple Developer Program 帳號($99/年)** 才能取得 Developer ID 憑證,且公證要連 Apple 伺服器。我無法代取憑證。
+
+> **現況(2026-07 實測 Keychain)**:**簽章已解鎖** —— 本機有一張**有效**的
+> `Developer ID Application: Dudu Technology Ltd. (7469HYQ6HH)`(到 2031-03,私鑰在
+> Keychain,`codesign` 實測通過),且已寫進
+> [tauri.conf.json](../../src-tauri/tauri.conf.json) `bundle.macOS.signingIdentity`,
+> 所以 `cargo tauri build` 會自動簽章(免帶 env)。**剩下只差公證**:建立
+> app-specific password(B.1 第 4 步)並帶 `APPLE_ID` / `APPLE_PASSWORD` /
+> `APPLE_TEAM_ID=7469HYQ6HH` 即可,再到第二台乾淨機驗 D4.1 / D5。
 
 ### B.1 取得憑證與認證資訊
-1. 加入 [Apple Developer Program](https://developer.apple.com/programs/)($99/年)。
-2. 在 Keychain Access → Certificate Assistant 產生 CSR,到 developer.apple.com 申請
-   **Developer ID Application** 憑證,下載並雙擊匯入 Keychain。
-3. 匯出成 `.p12`(含私鑰),記下密碼。
-4. 建立 **app-specific password**:appleid.apple.com → 登入與安全性 → App 專用密碼。
-5. 記下 **Team ID**(10 碼,developer.apple.com → Membership)。
+1. ✅ 已有 Apple Developer Program 帳號 + Developer ID 憑證(Team ID `7469HYQ6HH`)。
+2. ✅ **Developer ID Application** 憑證已在 Keychain 且有效(見上「現況」)。
+3. (CI 用)匯出成 `.p12`(含私鑰),記下密碼。
+4. ⬜ 建立 **app-specific password**:appleid.apple.com → 登入與安全性 → App 專用密碼。（公證唯一還缺的一步）
+5. ✅ **Team ID** = `7469HYQ6HH`。
 
 ### B.2 本機簽章 + 公證(手動驗一次)
 ```bash
-cd src-tauri && cargo tauri build          # 先產出 .dmg/.app
-# 設定環境變數(勿寫進檔案)
-export APPLE_SIGNING_IDENTITY="Developer ID Application: <你的名字> (<TEAMID>)"
+# signingIdentity 已在 tauri.conf.json,build 會自動簽章。公證再帶下面三個 env:
 export APPLE_ID="you@example.com"
-export APPLE_PASSWORD="<app-specific-password>"
-export APPLE_TEAM_ID="<TEAMID>"
-# 用內附腳本簽章 + 公證 + 釘選
-../scripts/desktop/sign-notarize-macos.sh "target/release/bundle/dmg/DuDuClaw_1.30.1_aarch64.dmg"
+export APPLE_PASSWORD="<app-specific-password>"   # B.1 第 4 步
+export APPLE_TEAM_ID="7469HYQ6HH"
+cd src-tauri && cargo tauri build          # 簽章 + 公證 + staple(env 齊全時)
+# 或先 build 再用內附腳本單獨簽章 + 公證 + 釘選:
+../scripts/desktop/sign-notarize-macos.sh "target/release/bundle/dmg/DuDuClaw_1.31.0_aarch64.dmg"
 ```
 > 腳本已用 [src-tauri/entitlements.plist](../../src-tauri/entitlements.plist) 的 hardened runtime entitlements。
 
