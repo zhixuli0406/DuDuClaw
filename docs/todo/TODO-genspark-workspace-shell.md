@@ -281,10 +281,10 @@
 
 ### D4 簽章 · 公證 · 發佈(發佈門檻,八成工時在此)  🔴📝
 
-#### D4.1 macOS 簽章 + 公證
+#### D4.1 macOS 簽章 + 公證  ✅ 已驗證(2026-07-01,tag `desktop-v1.31.0`)
 - [x] 📝 `scripts/desktop/sign-notarize-macos.sh`(codesign hardened + `notarytool` + `stapler`)+ CI `apple-actions/import-codesign-certs` 注入,憑證僅走 secrets。
-- [ ] 🔴 實際取得 **Apple Developer ID 憑證**並執行簽章 / 公證(**阻塞:需你提供憑證**)。
-- [ ] 🧪 乾淨機器下載不被 Gatekeeper 攔(**阻塞:需簽章 + 第二台機**)。
+- [x] 🔴 Developer ID 憑證(`Dudu Technology Ltd. 7469HYQ6HH`,到 2031-03)+ 6 個 Apple CI secrets 已設;CI `desktop-release.yml` 對 mac arm64/x86_64 **自動簽章 + 公證 + staple 成功**。
+- [x] 🧪 乾淨機驗收:實測下載的 `DuDuClaw_1.31.0_aarch64.dmg` → `codesign` = Developer ID + hardened runtime;`stapler validate` = *The validate action worked!*;`spctl -a` = **accepted, source=Notarized Developer ID**(即從未裝過此憑證的 Mac 也不被 Gatekeeper 攔)。
 
 #### D4.2 Windows 簽章
 - [x] 📝 `scripts/desktop/sign-windows.ps1`(signtool SHA256 + timestamp)+ CI 步驟。
@@ -292,26 +292,26 @@
 - [ ] 🧪 SmartScreen 不擋(**阻塞**)。
 
 #### D4.3 Linux 打包
-- [~] 🟡 `bundle.targets` 含 `appimage`/`deb`;CI 安裝 WebKitGTK 依賴。
-- [ ] 🧪 主流發行版可執行(**阻塞:需執行**)。
+- [x] 🟡 `bundle.targets` 含 `appimage`/`deb`;CI 安裝 WebKitGTK 依賴 —— `desktop-v1.31.0` run 產出 `DuDuClaw_1.31.0_amd64.AppImage` + `.deb`。
+- [ ] 🧪 主流發行版可執行(**待在 Linux 上實跑驗證**)。
 
 #### D4.4 自動更新
 - [~] 🔴 `tauri-plugin-updater` + `plugins.updater`(endpoint=GitHub latest.json、`createUpdaterArtifacts:true`);`pubkey` 待生成填入。
 - [x] 📝 更新流程 / 版本一致性 / 簽章驗證寫入 `docs/guides/desktop-release.md`。
 - [ ] 🧪 端到端更新 + 驗章拒絕不符(**阻塞:需簽章金鑰 + 發佈**)。
 
-#### D4.5 發佈管線(CI)
-- [x] 🔴📝 `.github/workflows/desktop-release.yml`:四 target matrix(mac arm/intel、win、linux)、build sidecar、tauri-action、Windows 簽章步驟;YAML 語法已驗證。
-- [x] 🟡 版本對齊:`tauri.conf.json` version 與 workspace `1.30.1` 一致(文件規範維持同步)。
+#### D4.5 發佈管線(CI)  ✅ 已跑通(`desktop-v1.31.0`,4/4 leg 綠)
+- [x] 🔴📝 `.github/workflows/desktop-release.yml`:四 target matrix(mac arm/intel、win、linux)、build sidecar、tauri-action、Windows 簽章步驟 —— **實跑成功**,7 個產物上傳 draft release。
+- [x] 🟡 版本對齊:`tauri.conf.json` version 與 workspace `1.31.0` 一致。
 - [x] 📝 `docs/guides/desktop-release.md`:金鑰生成、憑證輪替、release checklist。
 
 ---
 
 ### D5 驗收門檻  🔴🧪
-- [ ] 🔴🧪 本機 `tauri build` 產出可執行 App + 自啟 sidecar + 可送 chat(**阻塞:無工具鏈/顯示器**)。
-- [x] 🔴🧪 生命週期**純邏輯**驗收:單實例回收路徑、port 退避、PATH 增強、home/pidfile 路徑 —— `rustc --test` 6 測試全綠(整合行為仍待執行驗證)。
-- [ ] 🔴 簽章後乾淨機器無 Gatekeeper/SmartScreen 攔截(**阻塞:需憑證 + 第二台機**)。
-- [ ] 🔴 自動更新端到端通過(**阻塞:需金鑰 + 發佈**)。
+- [x] 🔴🧪 本機 `cargo tauri dev` 起得來、自動 spawn gateway(`run --yes`)、WebView 停 Vite、登入成功、工作空間可切換(2026-07-01 實跑)。`cargo tauri build` 產出簽章公證的 `.app`/`.dmg`。
+- [x] 🔴🧪 生命週期**純邏輯**驗收:單實例回收路徑、port 優先序(env>config>default)、雙實例防護、PATH 增強、home/pidfile 路徑 —— `rustc --test` **14 測試全綠**。
+- [x] 🔴 簽章後乾淨機**無 Gatekeeper 攔截**(mac 已驗:`spctl -a` = accepted / Notarized Developer ID)。Windows SmartScreen 待補 Authenticode 憑證。
+- [ ] 🔴 自動更新端到端通過(updater 目前關閉;需金鑰 + 發佈,見關卡 E)。
 - [ ] 📝 截圖桌面 App(light/dark)對照 Genspark 做 critique(**阻塞:需 GUI build**)。
 
 ---
