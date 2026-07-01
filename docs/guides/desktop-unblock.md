@@ -136,12 +136,12 @@ cd src-tauri && cargo tauri build          # 簽章 + 公證 + staple(env 齊全
 | `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` | 同上 |
 
 ### B.4 逐項驗收
-| TODO 項 | 怎麼驗 |
-| --- | --- |
-| **D4.1 🧪** | 把簽章+公證後的 `.dmg` 傳到**另一台從未裝過你憑證的 Mac**,雙擊 → **不**跳「來自未識別開發者」 |
-| **D3.1 🧪** | 簽章+hardened 後開 App,sidecar 仍能 spawn CLI / 連網(在 chat 觸發需網路的動作) |
-| **D3.2 🧪** | 首次用 Computer Use → 系統跳 Accessibility / Screen Recording 授權框,授權後截圖/模擬輸入可動 |
-| **D5 簽章/乾淨機** | 同 D4.1,且 `spctl -a -vvv DuDuClaw.app` 回 `accepted` |
+| TODO 項 | 怎麼驗 | 狀態 |
+| --- | --- | --- |
+| **D4.1 🧪** | 把簽章+公證後的 `.dmg` 傳到**另一台從未裝過你憑證的 Mac**,雙擊 → **不**跳「來自未識別開發者」 | ✅ **已驗**(2026-07-01,`desktop-v1.31.0`):`stapler validate` = *worked*、`spctl -a` = accepted / Notarized Developer ID |
+| **D3.1 🧪** | 簽章+hardened 後開 App,sidecar 仍能 spawn CLI / 連網(在 chat 觸發需網路的動作) | ⬜ 待在簽章版 App 內實跑 |
+| **D3.2 🧪** | 首次用 Computer Use → 系統跳 Accessibility / Screen Recording 授權框,授權後截圖/模擬輸入可動 | ⬜ 待驗 |
+| **D5 簽章/乾淨機** | 同 D4.1,且 `spctl -a -vvv DuDuClaw.app` 回 `accepted` | ✅ **已驗**:`spctl -a -vvv` = `accepted, source=Notarized Developer ID` |
 
 ---
 
