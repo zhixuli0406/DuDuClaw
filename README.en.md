@@ -488,6 +488,34 @@ irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.
 
 > The one-line installer auto-detects the **latest release** and downloads the prebuilt binary for your platform — also compile-free. It only offers a source build if the GitHub download fails (in which case prefer `npm install -g duduclaw`). Pin a specific version with the `DUDUCLAW_VERSION` environment variable.
 
+### Desktop app
+
+Besides the CLI, a native **desktop app** (Tauri) is available — it auto-starts the local gateway on launch, with a one-click Workspace (simple) ⇄ Dashboard (advanced) toggle. Download the build for your platform from [**Releases**](https://github.com/zhixuli0406/DuDuClaw/releases):
+
+| Platform | File | Notes |
+|------|------|------|
+| macOS (Apple Silicon) | `DuDuClaw_*_aarch64.dmg` | ✅ Signed + Apple-notarized, opens with no warning |
+| macOS (Intel) | `DuDuClaw_*_x64.dmg` | ✅ Signed + Apple-notarized, opens with no warning |
+| Windows (x64) | `DuDuClaw_*_x64_en-US.msi` | ⚠️ Unsigned — see below |
+| Linux | `*_amd64.AppImage` / `*_amd64.deb` | Unsigned (not required) |
+
+> The desktop app **shares** `~/.duduclaw` with the CLI (same config / SQLite / wiki); if a gateway is already running it attaches instead of starting a second one.
+
+#### ⚠️ Windows: SmartScreen "Unknown publisher" warning — how to run it
+
+The Windows installer is **not yet code-signed with an Authenticode certificate**, so **Microsoft Defender SmartScreen will warn** ("Windows protected your PC" / "Unknown publisher"). **This is not malware — it's just unsigned.** To run it:
+
+1. Double-click the `.msi` → the blue SmartScreen dialog appears
+2. Click **"More info"**
+3. Click **"Run anyway"**
+
+**To avoid the warning entirely**, two options with no signing concerns:
+
+- Use the CLI instead: `npm install -g duduclaw` (full-featured, includes the dashboard)
+- Wait for a signed build: a Windows Authenticode certificate is being evaluated (cloud signing; see [`docs/guides/desktop-unblock.md`](docs/guides/desktop-unblock.md) gate C)
+
+> **macOS has no such issue** — it's Developer ID signed + Apple-notarized, so a clean machine opens it with no warning (`spctl -a` returns `accepted / Notarized Developer ID`).
+
 ### Python SDK (optional library, not a CLI)
 
 > **Important**: The core gateway / CLI (the `duduclaw` command) is a **Rust binary** — installing it via **npm** or **Homebrew** above gives you the **complete feature set**. Skill security scanning and channel replies are all handled by Rust-native paths, so **no Python dependency is required**.

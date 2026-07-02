@@ -484,6 +484,34 @@ irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.
 
 > 一行安裝腳本會自動偵測**最新 release** 並下載對應平台的預編譯 binary，同樣免編譯。若 GitHub 下載失敗才會詢問是否改用原始碼建構（此時建議改用 `npm install -g duduclaw`）。可用環境變數 `DUDUCLAW_VERSION` 釘選特定版本。
 
+### 桌面應用程式（Desktop App）
+
+除了 CLI，也提供**原生桌面版**（Tauri）——啟動時自動拉起本機 gateway，工作空間（簡易）⇄ 進階儀表板一鍵切換。到 [**Releases**](https://github.com/zhixuli0406/DuDuClaw/releases) 下載對應平台：
+
+| 平台 | 檔案 | 說明 |
+|------|------|------|
+| macOS (Apple Silicon) | `DuDuClaw_*_aarch64.dmg` | ✅ 已簽章 + Apple 公證，直接開 |
+| macOS (Intel) | `DuDuClaw_*_x64.dmg` | ✅ 已簽章 + Apple 公證，直接開 |
+| Windows (x64) | `DuDuClaw_*_x64_en-US.msi` | ⚠️ 未簽章 — 見下方 |
+| Linux | `*_amd64.AppImage` / `*_amd64.deb` | 免簽 |
+
+> 桌面版與 CLI **共用** `~/.duduclaw`（同一份設定 / SQLite / wiki）；偵測到已在跑的 gateway 會自動附掛，不會重開第二個。
+
+#### ⚠️ Windows：SmartScreen「不明的發行者」警告 — 如何執行
+
+Windows 安裝檔目前**尚未購買 Authenticode 程式碼簽章憑證**，因此 **Microsoft Defender SmartScreen 會示警**（「Windows 已保護您的電腦」/「Unknown publisher」）。**這不是病毒，只是還沒程式碼簽章**。執行步驟：
+
+1. 雙擊 `.msi` → 出現藍色 SmartScreen 視窗
+2. 點 **「更多資訊 / More info」**
+3. 點 **「仍要執行 / Run anyway」**
+
+**若你不想看到任何警告**，兩個免簽章顧慮的替代方案：
+
+- 改用 CLI 版：`npm install -g duduclaw`（功能完整，含 dashboard，不受此影響）
+- 等待簽章版：Windows Authenticode 憑證評估中（雲端簽章方案，見 [`docs/guides/desktop-unblock.md`](docs/guides/desktop-unblock.md) 關卡 C）
+
+> **macOS 版無此問題** —— 已 Developer ID 簽章 + Apple 公證，乾淨機器雙擊**不會有任何警告**（`spctl -a` 回 `accepted / Notarized Developer ID`）。
+
 ### Python SDK（選用函式庫，非 CLI）
 
 > **重要**：核心 gateway / CLI（`duduclaw` 指令）是 **Rust 二進位**，透過 **npm** 或 **Homebrew** 安裝即可獲得**完整功能**——Skill 安全掃描與通道回覆全部由 Rust-native 路徑處理，**不再需要任何 Python 依賴**。
