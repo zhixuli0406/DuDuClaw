@@ -488,6 +488,34 @@ irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.
 
 > ワンライナーインストーラーは**最新リリース**を自動検出して対応プラットフォームのプリビルド binary をダウンロードします（こちらもコンパイル不要）。GitHub のダウンロードに失敗した場合のみソースビルドを尋ねます（その際は `npm install -g duduclaw` を推奨）。`DUDUCLAW_VERSION` 環境変数で特定バージョンに固定できます。
 
+### デスクトップアプリ
+
+CLI に加えて、ネイティブ**デスクトップアプリ**（Tauri）も提供しています —— 起動時にローカル gateway を自動起動し、ワークスペース（シンプル）⇄ ダッシュボード（詳細）をワンクリックで切り替えられます。[**Releases**](https://github.com/zhixuli0406/DuDuClaw/releases) からお使いのプラットフォーム向けをダウンロードしてください：
+
+| プラットフォーム | ファイル | 備考 |
+|------|------|------|
+| macOS (Apple Silicon) | `DuDuClaw_*_aarch64.dmg` | ✅ 署名 + Apple 公証済み、警告なしで起動 |
+| macOS (Intel) | `DuDuClaw_*_x64.dmg` | ✅ 署名 + Apple 公証済み、警告なしで起動 |
+| Windows (x64) | `DuDuClaw_*_x64_en-US.msi` | ⚠️ 未署名 — 下記参照 |
+| Linux | `*_amd64.AppImage` / `*_amd64.deb` | 署名不要 |
+
+> デスクトップアプリは CLI と `~/.duduclaw` を**共有**します（同じ設定 / SQLite / wiki）。既に gateway が起動している場合は、2つ目を起動せずにアタッチします。
+
+#### ⚠️ Windows：SmartScreen「不明な発行元」の警告 — 実行方法
+
+Windows インストーラーは**まだ Authenticode 証明書でコード署名されていない**ため、**Microsoft Defender SmartScreen が警告**を表示します（「Windows によって PC が保護されました」/「不明な発行元」）。**これはマルウェアではなく、単に未署名なだけです。** 実行手順：
+
+1. `.msi` をダブルクリック → 青い SmartScreen ダイアログが表示される
+2. **「詳細情報 / More info」**をクリック
+3. **「実行 / Run anyway」**をクリック
+
+**警告を完全に回避する**には、署名の懸念がない2つの選択肢：
+
+- CLI 版を使う：`npm install -g duduclaw`（フル機能、ダッシュボード込み）
+- 署名版を待つ：Windows Authenticode 証明書を検討中（クラウド署名。[`docs/guides/desktop-unblock.md`](docs/guides/desktop-unblock.md) 関門 C 参照）
+
+> **macOS にこの問題はありません** —— Developer ID 署名 + Apple 公証済みのため、クリーンなマシンでも警告なしで開けます（`spctl -a` が `accepted / Notarized Developer ID` を返す）。
+
 ### Python SDK（任意のライブラリ、CLI ではありません）
 
 > **重要**：コアの gateway / CLI（`duduclaw` コマンド）は **Rust バイナリ**で、上記の **npm** または **Homebrew** でインストールすれば**フル機能**が使えます。Skill セキュリティスキャンとチャネル応答はすべて Rust ネイティブの経路で処理されるため、**Python 依存は不要**です。
