@@ -1,6 +1,6 @@
 [package]
 name = "duduclaw-desktop-app"
-version = "1.31.0"
+version = "1.32.0"
 description = "DuDuClaw desktop shell (Tauri 2) — wraps the gateway + dashboard in a native window"
 edition = "2021"
 license = "Apache-2.0"
