@@ -11,5 +11,6 @@ export { Tabs, type TabItem } from './Tabs';
 export { Button } from './Button';
 export { Badge } from './Badge';
 export { EmptyState } from './EmptyState';
+export { Skeleton, SkeletonList } from './Skeleton';
 export { Toolbar } from './Toolbar';
 export { Field, controlClass } from './Field';

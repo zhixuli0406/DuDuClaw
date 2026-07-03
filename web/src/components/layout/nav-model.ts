@@ -33,6 +33,12 @@ export type NavItem = {
   icon: typeof LayoutDashboard;
   /** i18n message id for the item label. */
   label: string;
+  /**
+   * i18n message id for a one-line description shown under the label in the
+   * sidebar (and as a subtitle in the command palette). By convention this is
+   * `${label}.desc`. Keeps the nav self-explanatory — no guessing from icons.
+   */
+  desc: string;
   /** Minimum role required to see this item. Omit for all roles. */
   minRole?: UserRole;
   /**
@@ -58,59 +64,59 @@ export const navGroups: NavGroup[] = [
   {
     label: 'navGroup.overview',
     items: [
-      { to: '/', icon: LayoutDashboard, label: 'nav.dashboard' },
-      { to: '/webchat', icon: MessageCircle, label: 'nav.webchat' },
+      { to: '/', icon: LayoutDashboard, label: 'nav.dashboard', desc: 'nav.dashboard.desc' },
+      { to: '/webchat', icon: MessageCircle, label: 'nav.webchat', desc: 'nav.webchat.desc' },
     ],
   },
   {
     label: 'navGroup.agents',
     items: [
-      { to: '/agents', icon: Bot, label: 'nav.agents' },
-      { to: '/tasks', icon: KanbanSquare, label: 'nav.tasks' },
-      { to: '/forks', icon: GitFork, label: 'nav.forks' },
-      { to: '/org', icon: Network, label: 'nav.org', minRole: 'manager', enterprise: true },
-      { to: '/memory', icon: Brain, label: 'nav.memory' },
+      { to: '/agents', icon: Bot, label: 'nav.agents', desc: 'nav.agents.desc' },
+      { to: '/tasks', icon: KanbanSquare, label: 'nav.tasks', desc: 'nav.tasks.desc' },
+      { to: '/forks', icon: GitFork, label: 'nav.forks', desc: 'nav.forks.desc' },
+      { to: '/org', icon: Network, label: 'nav.org', desc: 'nav.org.desc', minRole: 'manager', enterprise: true },
+      { to: '/memory', icon: Brain, label: 'nav.memory', desc: 'nav.memory.desc' },
     ],
   },
   {
     label: 'navGroup.knowledge',
     items: [
-      { to: '/wiki', icon: BookOpen, label: 'nav.wiki' },
-      { to: '/shared-wiki', icon: Globe, label: 'nav.sharedWiki' },
-      { to: '/skills', icon: Puzzle, label: 'nav.skills' },
-      { to: '/marketplace', icon: Store, label: 'nav.marketplace' },
+      { to: '/wiki', icon: BookOpen, label: 'nav.wiki', desc: 'nav.wiki.desc' },
+      { to: '/shared-wiki', icon: Globe, label: 'nav.sharedWiki', desc: 'nav.sharedWiki.desc' },
+      { to: '/skills', icon: Puzzle, label: 'nav.skills', desc: 'nav.skills.desc' },
+      { to: '/marketplace', icon: Store, label: 'nav.marketplace', desc: 'nav.marketplace.desc' },
     ],
   },
   {
     label: 'navGroup.integrations',
     items: [
-      { to: '/channels', icon: Radio, label: 'nav.channels', minRole: 'admin' },
-      { to: '/mcp', icon: Plug, label: 'nav.mcp', minRole: 'admin' },
-      { to: '/mcp-keys', icon: KeyRound, label: 'nav.mcpKeys', minRole: 'admin' },
-      { to: '/odoo', icon: Building2, label: 'nav.odoo', minRole: 'admin' },
-      { to: '/inference', icon: Cpu, label: 'nav.inference', minRole: 'admin' },
+      { to: '/channels', icon: Radio, label: 'nav.channels', desc: 'nav.channels.desc', minRole: 'admin' },
+      { to: '/mcp', icon: Plug, label: 'nav.mcp', desc: 'nav.mcp.desc', minRole: 'admin' },
+      { to: '/mcp-keys', icon: KeyRound, label: 'nav.mcpKeys', desc: 'nav.mcpKeys.desc', minRole: 'admin' },
+      { to: '/odoo', icon: Building2, label: 'nav.odoo', desc: 'nav.odoo.desc', minRole: 'admin' },
+      { to: '/inference', icon: Cpu, label: 'nav.inference', desc: 'nav.inference.desc', minRole: 'admin' },
     ],
   },
   {
     label: 'navGroup.operations',
     items: [
-      { to: '/accounts', icon: Wallet, label: 'nav.accounts', minRole: 'admin' },
-      { to: '/billing', icon: CreditCard, label: 'nav.billing', minRole: 'manager' },
-      { to: '/reports', icon: BarChart3, label: 'nav.reports', minRole: 'manager' },
-      { to: '/license', icon: KeyRound, label: 'nav.license', minRole: 'manager' },
-      { to: '/partner', icon: Handshake, label: 'nav.partner', minRole: 'manager', enterprise: true },
+      { to: '/accounts', icon: Wallet, label: 'nav.accounts', desc: 'nav.accounts.desc', minRole: 'admin' },
+      { to: '/billing', icon: CreditCard, label: 'nav.billing', desc: 'nav.billing.desc', minRole: 'manager' },
+      { to: '/reports', icon: BarChart3, label: 'nav.reports', desc: 'nav.reports.desc', minRole: 'manager' },
+      { to: '/license', icon: KeyRound, label: 'nav.license', desc: 'nav.license.desc', minRole: 'manager' },
+      { to: '/partner', icon: Handshake, label: 'nav.partner', desc: 'nav.partner.desc', minRole: 'manager', enterprise: true },
     ],
   },
   {
     label: 'navGroup.system',
     items: [
-      { to: '/security', icon: Shield, label: 'nav.security', minRole: 'admin' },
-      { to: '/governance', icon: Scale, label: 'nav.governance', minRole: 'admin', enterprise: true },
-      { to: '/wiki-trust', icon: Shield, label: 'nav.wikiTrust', minRole: 'admin', enterprise: true },
-      { to: '/reliability', icon: Activity, label: 'nav.reliability', minRole: 'admin' },
-      { to: '/users', icon: Users, label: 'nav.users', minRole: 'admin', enterprise: true },
-      { to: '/logs', icon: FileText, label: 'nav.logs', minRole: 'manager' },
-      { to: '/settings', icon: Settings, label: 'nav.settings', minRole: 'admin' },
+      { to: '/security', icon: Shield, label: 'nav.security', desc: 'nav.security.desc', minRole: 'admin' },
+      { to: '/governance', icon: Scale, label: 'nav.governance', desc: 'nav.governance.desc', minRole: 'admin', enterprise: true },
+      { to: '/wiki-trust', icon: Shield, label: 'nav.wikiTrust', desc: 'nav.wikiTrust.desc', minRole: 'admin', enterprise: true },
+      { to: '/reliability', icon: Activity, label: 'nav.reliability', desc: 'nav.reliability.desc', minRole: 'admin' },
+      { to: '/users', icon: Users, label: 'nav.users', desc: 'nav.users.desc', minRole: 'admin', enterprise: true },
+      { to: '/logs', icon: FileText, label: 'nav.logs', desc: 'nav.logs.desc', minRole: 'manager' },
+      { to: '/settings', icon: Settings, label: 'nav.settings', desc: 'nav.settings.desc', minRole: 'admin' },
     ],
   },
 ];

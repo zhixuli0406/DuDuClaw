@@ -62,8 +62,13 @@ Compose pages from these — do NOT re-style raw `<div>`s per page.
 - `Button` — variants `primary | secondary | ghost | danger`, sizes `sm | md`.
 - `Badge` — status pill, tones `neutral|success|warning|danger|info|accent`.
 - `EmptyState` — icon + title + hint + optional action.
+- `Skeleton` / `SkeletonList` — loading placeholders (prefer over a bare spinner
+  for list/table surfaces; `role="status" aria-busy`, reduced-motion safe).
 - `Toolbar` — search + filters row above lists.
 - `Field` — label + control + help/error (forms).
+
+`Button` also takes `pending` — swaps the leading icon for a spinner, disables,
+and sets `aria-busy`; use it on every async submit instead of a hand-rolled state.
 
 Icons: **lucide-react**, 18px (`h-[1.125rem]`) default. (We keep Lucide — the
 `minimalist-ui` skill bans it, but our brand is icon-forward; we instead apply its
@@ -83,6 +88,19 @@ Two top-level shells, switched by `ModeToggle` (Header) and persisted in
 
 The index route (`/`) renders either shell via `App.tsx`'s `HomeRoute`. Role and
 edition gating is shared with the launcher via `lib/nav-visibility.ts`.
+
+**Command palette (⌘K / Ctrl+K).** `components/CommandPalette.tsx` (mounted once in
+`MainLayout`) is the primary way to move through the 37-page console — the
+Raycast-aligned answer to "nav that requires scrolling-and-hunting". It fuzzy-matches
+(`lib/fuzzy.ts`, dependency-free, CJK-safe, Latin aliases from each `nav.*` id) across
+every role/edition-gated nav route plus quick actions (theme, language, shell mode,
+logout). Empty query surfaces recently-visited routes (`stores/command-palette-store.ts`,
+persisted MRU). ARIA combobox+listbox, arrow/Enter/Esc keyboard nav. The Header shows a
+`Search… ⌘K` trigger for discoverability.
+
+**Mobile shell.** Below `md` the dashboard sidebar is an off-canvas drawer
+(`stores/sidebar-store.ts`), toggled by a Header hamburger and dismissed on
+navigation or backdrop tap; at `md`+ it is a static column (no behavior change).
 
 ## 5. Navigation IA (6 groups)
 
