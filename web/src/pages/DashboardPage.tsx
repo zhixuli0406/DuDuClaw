@@ -32,7 +32,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
-import { Page, PageHeader, Card, StatCard, Badge } from '@/components/ui';
+import { Page, PageHeader, Card, StatCard, Badge, SkeletonList } from '@/components/ui';
 
 // ── Task Board mini-preview (4-column Kanban summary) ────────
 
@@ -108,10 +108,7 @@ function TasksPreviewCard() {
               </div>
               <div className="space-y-1.5">
                 {notYetLoaded ? (
-                  <>
-                    <div className="h-6 animate-pulse rounded bg-stone-500/15" />
-                    <div className="h-6 animate-pulse rounded bg-stone-500/15" />
-                  </>
+                  <SkeletonList rows={2} rowClassName="h-6" />
                 ) : (
                   <>
                     {colTasks.map((t) => (

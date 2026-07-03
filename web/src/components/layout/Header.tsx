@@ -14,10 +14,42 @@ import {
   X,
   Languages,
   Check,
+  Search,
+  Menu,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { ModeToggle } from './ModeToggle';
+import { useCommandPaletteStore } from '@/stores/command-palette-store';
+import { useSidebarStore } from '@/stores/sidebar-store';
+import { useUiModeStore } from '@/stores/ui-mode-store';
+
+/** Best-effort platform hint for the ⌘K vs Ctrl+K affordance. */
+function isMacLike(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  const src = `${navigator.platform ?? ''} ${navigator.userAgent ?? ''}`;
+  return /Mac|iPhone|iPad|iPod/i.test(src);
+}
+
+function CommandTrigger() {
+  const intl = useIntl();
+  const openPalette = useCommandPaletteStore((s) => s.openPalette);
+  const modKey = isMacLike() ? '⌘' : 'Ctrl';
+  return (
+    <button
+      onClick={openPalette}
+      aria-label={intl.formatMessage({ id: 'cmdk.title' })}
+      title={intl.formatMessage({ id: 'cmdk.title' })}
+      className="flex items-center gap-2 rounded-lg border border-stone-300/50 px-2.5 py-1.5 text-sm text-stone-500 transition-colors hover:border-stone-400/60 hover:bg-stone-500/5 hover:text-stone-700 dark:border-white/10 dark:text-stone-400 dark:hover:bg-white/5 dark:hover:text-stone-200"
+    >
+      <Search className="h-4 w-4 shrink-0" />
+      <span className="hidden sm:inline">{intl.formatMessage({ id: 'cmdk.trigger' })}</span>
+      <kbd className="hidden items-center gap-0.5 rounded border border-stone-300/60 px-1 py-0.5 text-[10px] font-medium text-stone-400 sm:inline-flex dark:border-white/10">
+        {modKey}K
+      </kbd>
+    </button>
+  );
+}
 
 function LanguageMenu() {
   const intl = useIntl();
@@ -87,6 +119,24 @@ function LanguageMenu() {
   );
 }
 
+function MobileMenuButton() {
+  const intl = useIntl();
+  const mode = useUiModeStore((s) => s.mode);
+  const toggleMobile = useSidebarStore((s) => s.toggleMobile);
+  // The workspace rail is already slim; only the dashboard sidebar needs a drawer.
+  if (mode === 'workspace') return null;
+  return (
+    <button
+      onClick={toggleMobile}
+      aria-label={intl.formatMessage({ id: 'header.menu' })}
+      title={intl.formatMessage({ id: 'header.menu' })}
+      className="-ml-1 rounded-lg p-2 text-stone-500 hover:bg-stone-500/10 hover:text-stone-700 md:hidden dark:text-stone-400 dark:hover:text-stone-200"
+    >
+      <Menu className="h-5 w-5" />
+    </button>
+  );
+}
+
 export function Header() {
   const intl = useIntl();
   const navigate = useNavigate();
@@ -123,7 +173,10 @@ export function Header() {
   const ThemeIcon = theme === 'light' ? Sun : theme === 'dark' ? Moon : Monitor;
 
   return (
-    <header className="glass-chrome relative z-40 flex h-14 items-center justify-between border-b border-stone-300/40 px-6 dark:border-white/8">
+    <header className="glass-chrome relative z-40 flex h-14 items-center justify-between border-b border-stone-300/40 px-4 md:px-6 dark:border-white/8">
+      {/* Mobile nav drawer toggle (hidden at md+) */}
+      <MobileMenuButton />
+
       {/* Connection error banner */}
       {connectionState === 'disconnected' && connectionError && (
         <div className="flex items-center gap-2 text-xs text-rose-600 dark:text-rose-400">
@@ -166,6 +219,9 @@ export function Header() {
       {(connectionState !== 'disconnected' || !connectionError) && !(updateNotification?.available && !updateDismissed && connectionState !== 'disconnected') && <div />}
 
       <div className="flex items-center gap-2">
+        {/* Command palette trigger (⌘K) */}
+        <CommandTrigger />
+
         {/* Connection Status */}
         <button
           onClick={connectionState === 'disconnected' ? () => reconnect() : undefined}

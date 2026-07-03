@@ -15,6 +15,7 @@ import { cn } from '@/lib/utils';
 import { useSystemStore } from '@/stores/system-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useUiModeStore } from '@/stores/ui-mode-store';
+import { useSidebarStore } from '@/stores/sidebar-store';
 import { hasMinRole } from '@/lib/roles';
 import { navGroups, type NavItem } from './nav-model';
 import { EditionBadge } from './EditionBadge';
@@ -132,6 +133,7 @@ export function Sidebar() {
   const user = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
   const mode = useUiModeStore((s) => s.mode);
+  const mobileOpen = useSidebarStore((s) => s.mobileOpen);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(loadCollapsed);
 
   if (mode === 'workspace') return <WorkspaceRail />;
@@ -163,7 +165,14 @@ export function Sidebar() {
     .filter((group) => group.items.length > 0);
 
   return (
-    <aside className="glass-chrome relative z-40 flex w-60 flex-col border-r border-stone-300/40 dark:border-white/8">
+    <aside
+      className={cn(
+        'glass-chrome z-50 flex w-60 shrink-0 flex-col border-r border-stone-300/40 dark:border-white/8',
+        // Off-canvas drawer below md; static column at md+.
+        'fixed inset-y-0 left-0 transition-transform duration-200 md:static md:z-40 md:translate-x-0',
+        mobileOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-full md:shadow-none'
+      )}
+    >
       {/* Logo */}
       <Logo />
 
@@ -188,7 +197,7 @@ export function Sidebar() {
               </button>
               {!isCollapsed && (
                 <div className="mt-0.5 space-y-0.5">
-                  {group.items.map(({ to, icon: Icon, label }) => (
+                  {group.items.map(({ to, icon: Icon, label, desc }) => (
                     <NavLink
                       key={to}
                       to={to}
@@ -196,7 +205,7 @@ export function Sidebar() {
                       data-tour={`nav:${to}`}
                       className={({ isActive }) =>
                         cn(
-                          'group relative flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
+                          'group relative flex items-start gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40',
                           isActive
                             ? 'bg-amber-500/12 text-amber-700 ring-1 ring-inset ring-amber-500/25 dark:bg-amber-400/10 dark:text-amber-300 dark:ring-amber-400/20'
                             : 'text-stone-600 hover:bg-stone-500/8 hover:text-stone-900 dark:text-stone-400 dark:hover:bg-white/5 dark:hover:text-stone-200'
@@ -212,8 +221,18 @@ export function Sidebar() {
                             )}
                             aria-hidden="true"
                           />
-                          <Icon className="h-[1.125rem] w-[1.125rem] shrink-0" />
-                          <span className="truncate">{intl.formatMessage({ id: label })}</span>
+                          <Icon className="mt-0.5 h-[1.125rem] w-[1.125rem] shrink-0" />
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate leading-tight">
+                              {intl.formatMessage({ id: label })}
+                            </span>
+                            <span
+                              className="mt-0.5 block truncate text-[11px] font-normal leading-tight text-stone-400 dark:text-stone-500"
+                              title={intl.formatMessage({ id: desc })}
+                            >
+                              {intl.formatMessage({ id: desc })}
+                            </span>
+                          </span>
                         </>
                       )}
                     </NavLink>

@@ -1,4 +1,5 @@
 import type { ButtonHTMLAttributes, ComponentType, ReactNode } from 'react';
+import { Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 type Variant = 'primary' | 'secondary' | 'ghost' | 'danger';
@@ -32,6 +33,8 @@ export function Button({
   size = 'md',
   icon: Icon,
   iconRight: IconRight,
+  pending = false,
+  disabled,
   children,
   className,
   ...props
@@ -40,6 +43,8 @@ export function Button({
   size?: Size;
   icon?: ComponentType<{ className?: string }>;
   iconRight?: ComponentType<{ className?: string }>;
+  /** In-flight state: swaps the leading icon for a spinner, disables + aria-busy. */
+  pending?: boolean;
   children?: ReactNode;
 }) {
   const iconOnly = !children;
@@ -52,9 +57,15 @@ export function Button({
         iconOnly && (size === 'sm' ? 'w-8 px-0' : 'w-9 px-0'),
         className
       )}
+      disabled={disabled || pending}
+      aria-busy={pending || undefined}
       {...props}
     >
-      {Icon && <Icon className="h-4 w-4 shrink-0" />}
+      {pending ? (
+        <Loader2 className="h-4 w-4 shrink-0 animate-spin" aria-hidden="true" />
+      ) : (
+        Icon && <Icon className="h-4 w-4 shrink-0" />
+      )}
       {children}
       {IconRight && <IconRight className="h-4 w-4 shrink-0" />}
     </button>
