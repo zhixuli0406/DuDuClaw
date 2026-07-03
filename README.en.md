@@ -12,7 +12,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.30.1-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.32.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -99,13 +99,14 @@ infrastructure work.
 
 ---
 
-> 🎉 **v1.29.0 — Cloud-tier agent/channel caps (self-host never limited)** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.29.0))
+> 🎉 **v1.32.0 — Dashboard UX: command palette, self-explanatory nav, mobile shell** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.32.0))
 >
-> Enforces the per-tier `max_agents` / `max_channels` from `features.toml` that were declared but never applied (Hobby 1 agent/1 channel, Solo 1/2, Studio 3/5). **Self-host is never capped** (Apache 2.0 promise); the limit only applies to managed Cloud tenants.
+> A deep UX pass on the Calm Glass dashboard, driven by a full-page UX audit. Frontend-only; no backend RPC / WS protocol change.
 >
-> - **Cloud-tier resource caps** — `agents.create` / `channels.add` reject once the active tier's cap is reached, with an upgrade message. Gated on `DUDUCLAW_DEPLOYMENT=cloud` (set only inside managed tenant containers); self-host (default) is never limited, and `max_* = 0` also means unlimited
-> - **Soft-limit banner** now shows concrete usage (`Agents X/Y · Channels A/B`) + an upgrade CTA when a personal cloud tenant reaches its plan limit — non-blocking, dismissible
-> - `license_runtime::cap_exceeded()` pure helper + `is_self_host_deployment()` exposed to the gateway
+> - **Command palette (⌘K / Ctrl+K)** — dependency-free fuzzy search (CJK-safe, Latin aliases, searchable page descriptions) that jumps across all 37 role/edition-gated pages plus quick actions (switch theme / language / workspace⇄dashboard / logout); empty query surfaces recent routes; full ARIA combobox + keyboard nav; a `Search… ⌘K` trigger in the Header
+> - **Self-explanatory sidebar** — every nav item shows a one-line description under its label (also a searchable subtitle in the palette) so functions are clear without guessing from the icon (27 items × 3 locales)
+> - **Mobile shell** — below `md` the sidebar becomes an off-canvas drawer (hamburger + backdrop, closes on navigation); static column at `md`+
+> - **Shared loading primitives** — `Skeleton` / `SkeletonList` + a `Button` `pending` state (spinner + disabled + `aria-busy`)
 
 
 
@@ -114,8 +115,11 @@ https://github.com/user-attachments/assets/217f56aa-8b46-4c2a-85fa-62ee68c33a4c
 
 
 <details>
-<summary><strong>v1.9.4 → v1.28.x cumulative highlights</strong></summary>
+<summary><strong>v1.9.4 → v1.31.x cumulative highlights</strong></summary>
 
+- **v1.31.0** — Genspark-style Workspace shell (central prompt bar + capability launcher + "Claw, your first AI employee") layered over the Calm Glass power dashboard with a simple ⇄ advanced mode toggle; Tauri 2 desktop shell (Phase D) — a native window wrapping the gateway as a sidecar — with lifecycle hardening (`DUDUCLAW_DESKTOP_MODE`, config.toml port priority, double-spawn-avoiding attach detection)
+- **v1.30.0** — Per-account OAuth env injection into the PTY pool; LINE replies sent from a detached task
+- **v1.29.0** — Cloud-tier agent/channel caps: wires up the per-tier `max_agents` / `max_channels` from `features.toml` (Hobby 1/1, Solo 1/2, Studio 3/5); **self-host never capped** (Apache 2.0 promise); soft-limit banner + upgrade CTA; `license_runtime::cap_exceeded()` pure gate
 - **v1.28.0** — Partner (NFR) licenses + license self-service: a free, non-resellable Partner tier (unlocks Self-Host Pro modules) + self-serve partner-code redemption (`POST /v1/partner/redeem`) + CLI `redeem/rebind/subscriptions` + emailed key on issuance + machine rebind + deployment-mode binding (M51, `DUDUCLAW_DEPLOYMENT` cloud/self-host, fail-closed)
 - **v1.27.0** — Premium industry templates (`ecommerce` / `clinic` / `realestate` / `education`, each a full closed-source kit with cited Taiwan statutes) + license-gated `premium_templates` unlock (fail-closed; the public OSS binary never receives the closed content) + wizard premium-industry menu with upsell hint
 - **v1.26.0** — Personal / Enterprise editions (`EditionProfile`, orthogonal to the license tier, never gates core features) + Dashboard one-click CLI login (PTY-driven native login for Claude/Codex/Gemini/Antigravity with paste-back + `remote_safe` classification) + Antigravity CLI bundled in the server image + personal-edition data portability (`export`/`import`) + `PersonalProSelfHost` self-host license tier (NT$490/mo)

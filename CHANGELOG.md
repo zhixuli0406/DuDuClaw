@@ -1,6 +1,46 @@
 # Changelog
 
 
+## [1.32.0] - 2026-07-03 — Dashboard UX: command palette, self-explanatory nav, mobile shell
+
+A deep UX pass on the Calm Glass dashboard, driven by a full-page UX audit. The
+headline is a **command palette (⌘K / Ctrl+K)** — the Raycast-aligned answer to
+moving through a 37-page console without scrolling-and-hunting — plus a nav that
+explains itself and a shell that finally works on a phone. Frontend-only; no
+backend RPC / WS protocol change.
+
+### Added
+- **Command palette (⌘K / Ctrl+K)** — `components/CommandPalette.tsx`, mounted
+  once in `MainLayout`. Dependency-free fuzzy search (`lib/fuzzy.ts`, CJK-safe,
+  Latin aliases derived from each `nav.*` id + the localized description) across
+  every role/edition-gated nav route plus quick actions (switch theme, language,
+  workspace⇄dashboard shell, logout). Empty query surfaces recently-visited
+  routes (`stores/command-palette-store.ts`, persisted MRU). ARIA
+  combobox+listbox, arrow/Enter/Esc keyboard nav, match highlighting. The Header
+  gains a discoverable `Search… ⌘K` trigger (⌘ on macOS, Ctrl elsewhere).
+- **Self-explanatory sidebar** — every nav item now shows a one-line description
+  under its label (and as a searchable subtitle in the palette) so functions are
+  clear without guessing from the icon. `NavItem.desc` added to `nav-model.ts`
+  for all 27 items, localized in zh-TW / en / ja-JP.
+- **Shared loading primitives** — `ui/Skeleton.tsx` (`Skeleton` / `SkeletonList`,
+  `role="status" aria-busy`, reduced-motion safe), applied to the Dashboard task
+  columns in place of an ad-hoc pulse; and a `Button` `pending` prop (swaps the
+  leading icon for a spinner, disables, sets `aria-busy`) for async submits.
+
+### Changed
+- **Mobile shell** — below `md` the dashboard sidebar is now an off-canvas drawer
+  (`stores/sidebar-store.ts`) toggled by a Header hamburger and dismissed on
+  navigation or backdrop tap; at `md`+ it stays a static column (no change on
+  desktop). Header padding tightens to `px-4` on small screens.
+- **DESIGN.md** documents the command palette, mobile drawer, `Skeleton`, and
+  `Button.pending` as first-class patterns of the Calm Glass system.
+
+### Testing
+- `tsc -b` clean, `vite build` green, **98 web unit tests pass** (+18 new: 13 for
+  the fuzzy matcher, 5 for the palette store's MRU de-dup/cap/persist).
+
+
+
 ## [1.31.0] - 2026-06-30 — Workspace shell + desktop lifecycle hardening
 
 Ships the **Genspark-style 工作空間 (Workspace) 外殼** — a consumer-grade landing

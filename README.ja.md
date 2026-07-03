@@ -12,7 +12,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.30.1-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.32.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -99,13 +99,14 @@ cosign verify-blob \
 
 ---
 
-> 🎉 **v1.29.0 — Cloud プランのエージェント/チャンネル上限（セルフホストは無制限）**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.29.0)）
+> 🎉 **v1.32.0 — ダッシュボード UX：コマンドパレット・自己説明するナビ・モバイル対応**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.32.0)）
 >
-> `features.toml` で宣言されつつ未適用だった tier ごとの `max_agents` / `max_channels` を実際に適用（Hobby 1 エージェント/1 チャンネル、Solo 1/2、Studio 3/5）。**セルフホストは決して制限されません**（Apache 2.0 の約束）。制限はマネージド Cloud テナントのみに適用。
+> 全ページ UX 監査を起点に、Calm Glass ダッシュボードを深く磨き込み。フロントエンドのみで、バックエンド RPC / WS プロトコル変更なし。
 >
-> - **Cloud プラン資源上限** — `agents.create` / `channels.add` は上限到達時に拒否しアップグレードを案内。`DUDUCLAW_DEPLOYMENT=cloud`（マネージドテナントコンテナにのみ注入）で判定し、セルフホスト（既定）は常に無制限、`max_*=0` も無制限
-> - **ソフト上限バナー** — 個人 Cloud テナントが上限に達すると、具体的な使用量（`Agents X/Y · Channels A/B`）+ アップグレード CTA を表示（非ブロッキング・閉じられる）
-> - `license_runtime::cap_exceeded()` 純関数 + `is_self_host_deployment()` を gateway に公開
+> - **コマンドパレット（⌘K / Ctrl+K）** — 依存ゼロのファジー検索（CJK 対応、Latin エイリアス、ページ説明も検索可）で 37 ページ（ロール/エディション制御）へ即ジャンプ + クイックアクション（テーマ / 言語 / ワークスペース⇄詳細 / ログアウト）；空クエリで最近訪れたページを表示；完全な ARIA combobox とキーボード操作；Header に `検索… ⌘K` ボタン
+> - **自己説明するサイドバー** — 各ナビ項目にラベル下の 1 行説明（パレットでは検索可能なサブタイトル）を追加し、アイコンから推測せずに機能が分かる（27 項目 × 3 言語）
+> - **モバイル対応** — `md` 未満ではサイドバーがオフキャンバスのドロワー（ハンバーガー + 背景、遷移で自動クローズ）、`md` 以上は静的カラム
+> - **共有ローディング要素** — `Skeleton` / `SkeletonList` + `Button` の `pending` 状態（スピナー + 無効化 + `aria-busy`）
 
 
 
@@ -114,8 +115,11 @@ https://github.com/user-attachments/assets/30406ad1-4595-43ce-8c08-dba8f0ca9683
 
 
 <details>
-<summary><strong>v1.9.4 → v1.28.x 累積ハイライト</strong></summary>
+<summary><strong>v1.9.4 → v1.31.x 累積ハイライト</strong></summary>
 
+- **v1.31.0** — Genspark 風のワークスペース外殻（中央プロンプトバー + 能力ランチャー +「Claw、あなたの最初の AI 社員」）を Calm Glass 詳細ダッシュボードの上に重ね、シンプルな ⇄ 詳細モード切替；Tauri 2 デスクトップ外殻（Phase D）— gateway を sidecar として包むネイティブウィンドウ — とライフサイクル硬化（`DUDUCLAW_DESKTOP_MODE`、config.toml ポート優先、二重起動を防ぐ attach 検出）
+- **v1.30.0** — アカウントごとの OAuth 環境を PTY プールに注入；LINE 返信を detached タスクから送信
+- **v1.29.0** — Cloud プランのエージェント/チャンネル上限：`features.toml` の tier ごとの `max_agents` / `max_channels` を実際に適用（Hobby 1/1、Solo 1/2、Studio 3/5）；**セルフホストは無制限**（Apache 2.0 の約束）；ソフト上限バナー + アップグレード CTA；`license_runtime::cap_exceeded()` 純関数ゲート
 - **v1.28.0** — パートナー（NFR）ライセンス + セルフサービス：無料・再販不可の Partner tier（Self-Host Pro 同等モジュールを解放）+ パートナーコード自助引換（`POST /v1/partner/redeem`）+ CLI `redeem/rebind/subscriptions` + 発行時の Key 自動送付 + マシン再バインド + デプロイモードバインド（M51、`DUDUCLAW_DEPLOYMENT` cloud/セルフホスト、fail-closed）
 - **v1.27.0** — 業種テンプレート（Pro）：EC / 美容医療・歯科 / 不動産仲介 / 学習塾の 4 種（SOUL + 法令強化 CONTRACT + agent.toml + FAQ + 用語集/SOP/コンプライアンス wiki、クローズドソース、台湾法令引用）+ `premium_templates` ライセンス解放ロード（fail-closed、公開 OSS バイナリは受け取らない）+ wizard 業種メニューとアップセル案内
 - **v1.26.0** — 個人版 / エンタープライズ版（`EditionProfile`、ライセンス階層と直交・コア機能を非ゲート）+ Dashboard ワンクリック CLI ログイン（Claude/Codex/Gemini/Antigravity のネイティブログインを PTY 駆動・貼付返送・`remote_safe` 分類）+ Antigravity CLI を server イメージに内蔵 + 個人版データ可搬性（`export`/`import`）+ `PersonalProSelfHost` セルフホスト個人版ライセンス階層（NT$490/月）
