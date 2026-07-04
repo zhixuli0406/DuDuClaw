@@ -6,15 +6,9 @@ fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Get the DuDuClaw home directory.
+/// Get the DuDuClaw home directory (canonical `DUDUCLAW_HOME`-aware resolver).
 fn get_duduclaw_home() -> std::path::PathBuf {
-    if let Ok(home) = std::env::var("DUDUCLAW_HOME") {
-        return std::path::PathBuf::from(home);
-    }
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_default();
-    std::path::PathBuf::from(home).join(".duduclaw")
+    duduclaw_core::duduclaw_home()
 }
 
 /// Maximum payload size for bus queue entries (1 MB).

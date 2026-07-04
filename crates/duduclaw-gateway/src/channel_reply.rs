@@ -132,17 +132,10 @@ fn maybe_compress_history(
 /// 0 (= disabled) on any failure, preserving v1.12.x behaviour for
 /// agents that haven't opted in.
 fn read_agent_budget_tokens(agent_id: &str) -> u64 {
-    // Resolve the agent dir from the gateway's home dir at runtime.
-    // We avoid threading `home_dir` through this hot path by going via
-    // the well-known DUDUCLAW_HOME / ~/.duduclaw convention used
-    // everywhere else in the codebase.
-    let home = std::env::var("DUDUCLAW_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .unwrap_or_default()
-                .join(".duduclaw")
-        });
+    // Resolve the agent dir from the gateway's home dir at runtime, via the
+    // canonical DUDUCLAW_HOME resolver (single source of truth for the state
+    // root) so this hot path can never drift back to a hardcoded ~/.duduclaw.
+    let home = duduclaw_core::duduclaw_home();
     let agent_dir = home.join("agents").join(agent_id);
     crate::prompt_audit::read_max_input_tokens(&agent_dir).unwrap_or(0)
 }
