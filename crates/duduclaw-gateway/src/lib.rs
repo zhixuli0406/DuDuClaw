@@ -87,7 +87,6 @@ pub mod session_summarizer_task;
 pub mod skill_lifecycle;
 pub mod server;
 pub mod session;
-pub mod sticker;
 pub mod task_spec;
 pub mod telegram;
 pub mod channel_sender;
@@ -107,10 +106,8 @@ pub mod wiki_trust_federation;
 pub mod worktree;
 
 // ── Hermes-learnings modules (Phase 3, 4, 6) ──
-pub mod compression;
 pub mod rl;
 pub mod skill_extraction;
-pub mod tool_classifier;
 
 // ── Sprint N P0: EvolutionEvents JSONL audit log ──
 pub mod evolution_events;

@@ -11,19 +11,15 @@ members = [
     "crates/duduclaw-core",
     "crates/duduclaw-auth",
     "crates/duduclaw-gateway",
-    "crates/duduclaw-bus",
     "crates/duduclaw-security",
     "crates/duduclaw-memory",
     "crates/duduclaw-container",
     "crates/duduclaw-agent",
-    "crates/duduclaw-bridge",
     "crates/duduclaw-cli",
     "crates/duduclaw-dashboard",
     "crates/duduclaw-odoo",
     "crates/duduclaw-inference",
     "crates/duduclaw-desktop",
-    "crates/duduclaw-governance",
-    "crates/duduclaw-durability",
     "crates/duduclaw-identity",
     "crates/duduclaw-redaction",
     "crates/duduclaw-cli-runtime",
@@ -98,13 +94,11 @@ reqwest = { version = "0.12", features = ["json"] }
 duduclaw-core = { path = "crates/duduclaw-core" }
 duduclaw-inference = { path = "crates/duduclaw-inference", default-features = false }
 duduclaw-gateway = { path = "crates/duduclaw-gateway", default-features = false }
-duduclaw-bus = { path = "crates/duduclaw-bus" }
 duduclaw-security = { path = "crates/duduclaw-security" }
 duduclaw-memory = { path = "crates/duduclaw-memory" }
 duduclaw-container = { path = "crates/duduclaw-container" }
 duduclaw-agent = { path = "crates/duduclaw-agent" }
 duduclaw-fork = { path = "crates/duduclaw-fork" }
-duduclaw-bridge = { path = "crates/duduclaw-bridge" }
 duduclaw-dashboard = { path = "crates/duduclaw-dashboard" }
 duduclaw-auth = { path = "crates/duduclaw-auth" }
 duduclaw-odoo = { path = "crates/duduclaw-odoo" }

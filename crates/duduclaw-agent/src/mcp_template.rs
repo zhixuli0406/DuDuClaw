@@ -246,43 +246,6 @@ pub fn ensure_global_mcp_server() -> Result<bool, String> {
     Ok(true)
 }
 
-/// Remove the `duduclaw` entry from a per-agent `.mcp.json` (migrated to global).
-///
-/// Preserves other server entries (playwright, browserbase, etc.).
-/// Deletes the file entirely if no servers remain.
-///
-/// Returns `Ok(true)` if changed, `Ok(false)` if nothing to do.
-pub fn remove_duduclaw_from_agent_mcp(agent_dir: &Path) -> Result<bool, String> {
-    let path = agent_dir.join(".mcp.json");
-    if !path.exists() {
-        return Ok(false);
-    }
-
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-    let mut config: McpConfig = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
-
-    if config.mcp_servers.remove("duduclaw").is_none() {
-        return Ok(false); // No duduclaw entry
-    }
-
-    if config.mcp_servers.is_empty() {
-        // No servers left — remove the file
-        std::fs::remove_file(&path)
-            .map_err(|e| format!("Failed to remove {}: {e}", path.display()))?;
-        info!(path = %path.display(), "Removed empty .mcp.json (duduclaw migrated to global)");
-    } else {
-        // Write back without duduclaw entry
-        let json = serde_json::to_string_pretty(&config)
-            .map_err(|e| format!("Failed to serialize: {e}"))?;
-        std::fs::write(&path, json)
-            .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
-        info!(path = %path.display(), "Removed duduclaw from per-agent .mcp.json (migrated to global)");
-    }
-    Ok(true)
-}
-
 /// Legacy per-agent `.mcp.json` fixup — kept for backwards compatibility.
 ///
 /// Prefer `ensure_global_mcp_server()` for new installations.

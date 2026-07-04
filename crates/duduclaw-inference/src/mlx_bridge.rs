@@ -165,27 +165,6 @@ impl MlxBridge {
 
         Ok(stdout)
     }
-
-    /// Run an evolution reflection using local MLX model.
-    pub async fn run_evolution_reflection(
-        &self,
-        reflection_type: &str,
-        agent_soul: &str,
-        context: &str,
-    ) -> Result<String> {
-        let system_prompt = format!(
-            "You are an evolution engine performing a {reflection_type} reflection.\n\
-             Your task is to analyze the agent's recent behavior and suggest improvements.\n\n\
-             # Agent Soul\n{agent_soul}"
-        );
-
-        let user_prompt = format!(
-            "Perform a {reflection_type} reflection on the following context:\n\n{context}\n\n\
-             Respond in JSON format with keys: status, insights, suggestions"
-        );
-
-        self.generate(&system_prompt, &user_prompt).await
-    }
 }
 
 /// Python script that reads JSON from stdin — no string interpolation.

@@ -356,25 +356,6 @@ impl InferenceEngine {
         self.manager.current_mode().await
     }
 
-    /// Run an evolution reflection using local MLX model (Apple Silicon only).
-    ///
-    /// Returns `Ok(Some(response))` if MLX handled it locally,
-    /// `Ok(None)` if MLX is not available and caller should use Claude API.
-    pub async fn mlx_evolution_reflection(
-        &self,
-        reflection_type: &str,
-        agent_soul: &str,
-        context: &str,
-    ) -> Result<Option<String>> {
-        let mlx = match &self.mlx {
-            Some(m) if m.is_available().await => m,
-            _ => return Ok(None),
-        };
-
-        let result = mlx.run_evolution_reflection(reflection_type, agent_soul, context).await?;
-        Ok(Some(result))
-    }
-
     /// Check if MLX bridge is available for evolution.
     pub async fn mlx_available(&self) -> bool {
         match &self.mlx {
