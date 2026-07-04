@@ -51,6 +51,10 @@ pub struct RetrievalWeights {
     pub w_importance: f64,
     /// Weight for FTS relevance dimension (default 0.40).
     pub w_fts: f64,
+    /// Weight for the HippoRAG-lite graph dimension (normalized Personalized
+    /// PageRank mass over the SPO triple graph, arXiv:2405.14831; default 0.15).
+    /// Only applied when the query seeds at least one graph entity.
+    pub w_graph: f64,
 }
 
 impl Default for RetrievalWeights {
@@ -62,6 +66,7 @@ impl Default for RetrievalWeights {
             w_recency: 0.25,
             w_importance: 0.35,
             w_fts: 0.40,
+            w_graph: 0.15,
         }
     }
 }
@@ -254,6 +259,48 @@ impl SqliteMemoryEngine {
         }
     }
 
+    /// Fetch one row by id with the same agent-isolation + temporal-validity
+    /// filters as `search()`. Used to materialize graph-only candidates
+    /// (HippoRAG-lite) while the caller already holds the connection lock.
+    fn fetch_valid_entry(
+        conn: &Connection,
+        agent_id: &str,
+        memory_id: &str,
+        now_rfc: &str,
+    ) -> Result<Option<MemoryEntry>> {
+        let sql = format!(
+            "SELECT {cols} FROM memories AS m
+             WHERE m.id = ?1 AND m.agent_id = ?2
+               AND (m.valid_until IS NULL OR m.valid_until > ?3)
+             LIMIT 1",
+            cols = Self::SELECT_COLS
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let mut rows = stmt
+            .query_map(params![memory_id, agent_id, now_rfc], Self::row_to_entry)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        match rows.next() {
+            Some(row) => Ok(Some(row.map_err(|e| DuDuClawError::Memory(e.to_string()))?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Recency + importance portion of the Generative-Agents score (shared by
+    /// the FTS path and the graph-only append path so both use identical math).
+    fn base_relevance_score(entry: &MemoryEntry, now: DateTime<Utc>, w: &RetrievalWeights) -> f64 {
+        let days_since_access = now
+            .signed_duration_since(entry.last_accessed.unwrap_or(entry.timestamp))
+            .num_seconds()
+            .max(0) as f64
+            / 86_400.0;
+        let recency =
+            ebbinghaus_retrievability(days_since_access, entry.access_count, entry.importance, w);
+        let importance = entry.importance / 10.0;
+        w.w_recency * recency + w.w_importance * importance
+    }
+
     /// Fetch multiple memory entries by ID for a single agent in one query (F3).
     ///
     /// Ownership is enforced identically to [`get_by_id`]: only entries owned by
@@ -305,6 +352,139 @@ impl SqliteMemoryEngine {
             entries.push(row.map_err(|e| DuDuClawError::Memory(e.to_string()))?);
         }
         Ok(entries)
+    }
+
+    /// Read the metadata JSON blob for a single entry (ownership enforced).
+    ///
+    /// Returns `Ok(None)` when the id does not exist or belongs to another
+    /// agent. A malformed stored blob degrades to `{}` rather than erroring so
+    /// one corrupt row cannot wedge callers that iterate many entries.
+    pub async fn get_metadata(
+        &self,
+        agent_id: &str,
+        memory_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare("SELECT metadata FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1")
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let mut rows = stmt
+            .query_map(params![memory_id, agent_id], |r| r.get::<_, String>(0))
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        match rows.next() {
+            Some(row) => {
+                let raw = row.map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+                Ok(Some(
+                    serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({})),
+                ))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Overwrite the metadata JSON blob for a single entry (ownership enforced).
+    ///
+    /// Returns `Ok(true)` when a row was updated, `Ok(false)` when the id does
+    /// not exist or belongs to another agent.
+    pub async fn update_metadata(
+        &self,
+        agent_id: &str,
+        memory_id: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE memories SET metadata = ?1 WHERE id = ?2 AND agent_id = ?3",
+                params![metadata.to_string(), memory_id, agent_id],
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        Ok(n > 0)
+    }
+
+    /// List currently-valid entries with a given `source_event`, newest first,
+    /// each paired with its metadata JSON blob.
+    ///
+    /// Used by the rule-lifecycle layer to enumerate consolidated reflexion
+    /// rules together with their `rule_stats` counters in one query.
+    pub async fn list_valid_by_source_event(
+        &self,
+        agent_id: &str,
+        source_event: &str,
+        limit: usize,
+    ) -> Result<Vec<(MemoryEntry, serde_json::Value)>> {
+        let conn = self.conn.lock().await;
+        let now_rfc = Utc::now().to_rfc3339();
+        let sql = format!(
+            "SELECT {cols}, m.metadata FROM memories AS m
+             WHERE m.agent_id = ?1 AND m.source_event = ?2
+               AND (m.valid_until IS NULL OR m.valid_until > ?3)
+             ORDER BY m.timestamp DESC LIMIT ?4",
+            cols = Self::SELECT_COLS
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                params![agent_id, source_event, now_rfc, limit as i64],
+                |row| {
+                    let entry = Self::row_to_entry(row)?;
+                    let raw: String = row.get(10)?;
+                    Ok((entry, raw))
+                },
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (entry, raw) = row.map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            let meta = serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
+            out.push((entry, meta));
+        }
+        Ok(out)
+    }
+
+    /// Set an entry's importance and append `tag` to its tags in one update
+    /// (ownership enforced, idempotent — the tag is not duplicated).
+    ///
+    /// Returns `Ok(true)` when a row was updated.
+    pub async fn set_importance_and_add_tag(
+        &self,
+        agent_id: &str,
+        memory_id: &str,
+        importance: f64,
+        tag: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let existing: Option<String> = {
+            let mut stmt = conn
+                .prepare("SELECT tags FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1")
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            let mut rows = stmt
+                .query_map(params![memory_id, agent_id], |r| r.get::<_, String>(0))
+                .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+            match rows.next() {
+                Some(row) => Some(row.map_err(|e| DuDuClawError::Memory(e.to_string()))?),
+                None => None,
+            }
+        };
+        let Some(tags_json) = existing else {
+            return Ok(false);
+        };
+        let mut tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        if !tags.iter().any(|t| t == tag) {
+            tags.push(tag.to_string());
+        }
+        let new_tags =
+            serde_json::to_string(&tags).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let n = conn
+            .execute(
+                "UPDATE memories SET importance = ?1, tags = ?2 WHERE id = ?3 AND agent_id = ?4",
+                params![importance, new_tags, memory_id, agent_id],
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        Ok(n > 0)
     }
 
     /// Store a memory with temporal / knowledge-graph metadata and automatic
@@ -1234,6 +1414,20 @@ impl MemoryEngine for SqliteMemoryEngine {
             candidates.push(entry);
         }
 
+        // ── HippoRAG-lite graph ranking (arXiv:2405.14831, zero LLM cost) ──
+        // Fail-safe: zero triples (cheap COUNT gate), a query seeding no graph
+        // entity, or any error all yield `None`, leaving the FTS-only result
+        // byte-identical to before.
+        let graph_ranked = match crate::graph_rank::graph_rank_scores(
+            &conn, agent_id, query, &now_rfc,
+        ) {
+            Ok(ranked) => ranked,
+            Err(e) => {
+                tracing::warn!("graph ranking skipped: {e}");
+                None
+            }
+        };
+
         // Post-retrieval re-ranking by recency + importance + FTS position.
         // Generative Agents (arXiv 2304.03442) three-dimensional weighting.
         let now = Utc::now();
@@ -1242,26 +1436,40 @@ impl MemoryEngine for SqliteMemoryEngine {
             .into_iter()
             .enumerate()
             .map(|(rank_pos, entry)| {
-                let days_since_access = now
-                    .signed_duration_since(
-                        entry.last_accessed.unwrap_or(entry.timestamp)
-                    )
-                    .num_seconds()
-                    .max(0) as f64
-                    / 86_400.0;
-                let recency = ebbinghaus_retrievability(
-                    days_since_access,
-                    entry.access_count,
-                    entry.importance,
-                    w,
-                );
-                let importance = entry.importance / 10.0;
                 let fts_rank = 1.0 / (1.0 + rank_pos as f64);
-
-                let score = w.w_recency * recency + w.w_importance * importance + w.w_fts * fts_rank;
+                let score = Self::base_relevance_score(&entry, now, w) + w.w_fts * fts_rank;
                 (score, entry)
             })
             .collect();
+
+        // Blend graph mass into FTS candidates and append graph-only hits.
+        if let Some(ranked) = &graph_ranked {
+            let ppr: std::collections::HashMap<&str, f64> =
+                ranked.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+            let fts_ids: std::collections::HashSet<String> =
+                scored.iter().map(|(_, e)| e.id.clone()).collect();
+
+            for (score, entry) in scored.iter_mut() {
+                if let Some(g) = ppr.get(entry.id.as_str()) {
+                    *score += w.w_graph * g;
+                }
+            }
+
+            // Up to MAX_GRAPH_APPENDS memories FTS missed but PPR ranked in
+            // its top TOP_GRAPH_CANDIDATES — fetched with the same agent
+            // isolation + temporal validity filters as the FTS query.
+            let appends = ranked
+                .iter()
+                .take(crate::graph_rank::TOP_GRAPH_CANDIDATES)
+                .filter(|(id, _)| !fts_ids.contains(id))
+                .take(crate::graph_rank::MAX_GRAPH_APPENDS);
+            for (id, g) in appends {
+                if let Some(entry) = Self::fetch_valid_entry(&conn, agent_id, id, &now_rfc)? {
+                    let score = Self::base_relevance_score(&entry, now, w) + w.w_graph * g;
+                    scored.push((score, entry));
+                }
+            }
+        }
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let results: Vec<MemoryEntry> = scored.into_iter().take(limit).map(|(_, e)| e).collect();
@@ -1963,6 +2171,182 @@ mod tests {
             .unwrap();
         let n = engine.count_active_with_tag(agent, "reflexion").await.unwrap();
         assert_eq!(n, 3);
+    }
+
+    // ── HippoRAG-lite graph ranking tests (arXiv:2405.14831) ────────────────────
+
+    /// Two-hop retrieval: FTS on "alice" only matches the alice→bob memory,
+    /// but the bob→project-x memory must surface via the graph walk.
+    #[tokio::test]
+    async fn graph_two_hop_retrieval_surfaces_indirect_memory() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "graph-agent";
+
+        engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "alice reports to bob", vec![]),
+                triple_meta("alice", "reports_to", "bob"),
+            )
+            .await
+            .unwrap();
+        engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "bob leads the big initiative", vec![]),
+                triple_meta("bob", "leads", "project-x"),
+            )
+            .await
+            .unwrap();
+
+        let results = engine.search(agent, "alice", 10).await.unwrap();
+        assert!(
+            results.iter().any(|e| e.content.contains("big initiative")),
+            "two-hop memory must surface via graph even though FTS on 'alice' misses it"
+        );
+        assert!(
+            results.iter().any(|e| e.content.contains("reports to bob")),
+            "the direct FTS hit must still be present"
+        );
+    }
+
+    /// Superseded facts must be excluded from the graph: only the currently
+    /// valid replacement may surface, never the superseded original.
+    #[tokio::test]
+    async fn graph_excludes_superseded_facts() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "graph-supersede";
+
+        engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "alice reports to bob", vec![]),
+                triple_meta("alice", "reports_to", "bob"),
+            )
+            .await
+            .unwrap();
+        // Old fact, later superseded — its content never FTS-matches "alice",
+        // so it could only leak through the graph.
+        engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "bob leads codename zeta", vec![]),
+                triple_meta("bob", "leads", "project-x"),
+            )
+            .await
+            .unwrap();
+        engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "bob leads codename omega", vec![]),
+                triple_meta("bob", "leads", "project-y"),
+            )
+            .await
+            .unwrap();
+
+        let results = engine.search(agent, "alice", 10).await.unwrap();
+        assert!(
+            !results.iter().any(|e| e.content.contains("zeta")),
+            "superseded fact must not enter the graph"
+        );
+        assert!(
+            results.iter().any(|e| e.content.contains("omega")),
+            "the currently-valid replacement should surface via the graph"
+        );
+    }
+
+    /// Agent isolation: agent A's triples never leak into agent B's search,
+    /// even when agent B has its own (unrelated) triples so the COUNT gate
+    /// does not short-circuit.
+    #[tokio::test]
+    async fn graph_agent_isolation() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+
+        engine
+            .store_temporal(
+                "agent-a",
+                make_entry("agent-a", "alice reports to bob", vec![]),
+                triple_meta("alice", "reports_to", "bob"),
+            )
+            .await
+            .unwrap();
+        engine
+            .store_temporal(
+                "agent-a",
+                make_entry("agent-a", "bob leads project-x", vec![]),
+                triple_meta("bob", "leads", "project-x"),
+            )
+            .await
+            .unwrap();
+
+        engine
+            .store_temporal(
+                "agent-b",
+                make_entry("agent-b", "carol likes tea", vec![]),
+                triple_meta("carol", "likes", "tea"),
+            )
+            .await
+            .unwrap();
+        engine
+            .store("agent-b", make_entry("agent-b", "alice said hello", vec![]))
+            .await
+            .unwrap();
+
+        let results = engine.search("agent-b", "alice", 10).await.unwrap();
+        assert!(!results.is_empty());
+        assert!(
+            results.iter().all(|e| e.agent_id == "agent-b"),
+            "only agent-b memories may be returned"
+        );
+        assert!(
+            !results.iter().any(|e| e.content.contains("project-x")),
+            "agent-a's graph must never leak into agent-b's search"
+        );
+    }
+
+    /// A query that seeds no graph entity must return results identical to an
+    /// engine that has no triples at all (fail-safe FTS-only behavior).
+    #[tokio::test]
+    async fn graph_no_seed_query_identical_to_fts_only() {
+        let plain_engine = SqliteMemoryEngine::in_memory().unwrap();
+        let graph_engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "graph-noseed";
+
+        // Same plain memories (same ids/timestamps) in both engines.
+        let base = Utc::now() - Duration::days(3);
+        for (i, content) in [
+            "zebra habitat in the savanna",
+            "zebra stripes are unique",
+            "lions hunt zebra at dawn",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut e = make_entry(agent, content, vec![]);
+            e.id = format!("shared-{i}");
+            e.timestamp = base + Duration::hours(i as i64);
+            plain_engine.store(agent, e.clone()).await.unwrap();
+            graph_engine.store(agent, e).await.unwrap();
+        }
+        // Extra triples in the graph engine whose entities never appear in
+        // the query and whose content never FTS-matches it.
+        graph_engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "alice reports to bob", vec![]),
+                triple_meta("alice", "reports_to", "bob"),
+            )
+            .await
+            .unwrap();
+
+        let expected = plain_engine.search(agent, "zebra habitat", 10).await.unwrap();
+        let actual = graph_engine.search(agent, "zebra habitat", 10).await.unwrap();
+        let expected_ids: Vec<&str> = expected.iter().map(|e| e.id.as_str()).collect();
+        let actual_ids: Vec<&str> = actual.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            actual_ids, expected_ids,
+            "no-seed query must be identical to FTS-only ranking"
+        );
     }
 
     // ── HC8: search_facts FTS5 sanitization ─────────────────────────────────────
