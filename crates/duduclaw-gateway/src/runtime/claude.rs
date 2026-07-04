@@ -39,8 +39,11 @@ impl AgentRuntime for ClaudeRuntime {
             &self.home_dir,
             context.agent_dir.as_deref(), // work_dir
             None,                         // on_progress
-            None,                         // capabilities
-            None,                         // session_id (history folded into prompt)
+            // W1: forward the agent's capability restrictions so the Claude CLI
+            // spawn applies --allowedTools / --disallowedTools (previously
+            // dropped on the dispatch path — a silent enforcement gap).
+            context.capabilities.as_ref(),
+            None, // session_id (history folded into prompt)
             &[],                          // conversation_history (threaded by caller for now)
         )
         .await?;
