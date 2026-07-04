@@ -12,11 +12,10 @@ base64 = { workspace = true }
 # Cross-platform input simulation (mouse + keyboard)
 enigo = { version = "0.3", features = ["serde"] }
 
-# Cross-platform screen capture
-xcap = "0.9"
-
-# Image encoding (PNG)
-image = { version = "0.25", default-features = false, features = ["png"] }
+# Screen capture shells out to the OS-native tool (screencapture / PowerShell /
+# grim|scrot|maim|import) — see `capture.rs`. This drops the `xcap` crate, whose
+# Linux X11/Wayland backends pulled a build-time `quick-xml < 0.41`
+# (RUSTSEC-2026-0194/0195). The tools emit PNG directly, so no `image` re-encode.
 
 # Global input event listener (optional — for user activity detection)
 rdev = { version = "0.5", optional = true }

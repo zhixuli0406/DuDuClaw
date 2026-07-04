@@ -461,33 +461,14 @@ impl ComputerUseOrchestrator {
         Ok(base64::engine::general_purpose::STANDARD.encode(&read.stdout))
     }
 
-    /// L5b: capture screenshot from the host display via `xcap`.
+    /// L5b: capture screenshot from the host display via the OS-native tool.
     #[cfg(feature = "desktop")]
     async fn capture_screenshot_native(&self) -> Result<String, ComputerUseError> {
         let result = tokio::task::spawn_blocking(|| -> Result<String, String> {
-            let monitors = xcap::Monitor::all()
-                .map_err(|e| format!("No monitors: {e}"))?;
-            let monitor = monitors
-                .iter()
-                .find(|m| m.is_primary().unwrap_or(false))
-                .or(monitors.first())
-                .ok_or_else(|| "No monitor found".to_string())?;
-            let img = monitor
-                .capture_image()
-                .map_err(|e| format!("Capture failed: {e}"))?;
-
-            let mut buf = Vec::new();
-            let encoder = image::codecs::png::PngEncoder::new(&mut buf);
-            image::ImageEncoder::write_image(
-                encoder,
-                img.as_raw(),
-                img.width(),
-                img.height(),
-                image::ExtendedColorType::Rgba8,
-            )
-            .map_err(|e| format!("PNG encode: {e}"))?;
-
-            Ok(base64::engine::general_purpose::STANDARD.encode(&buf))
+            // Shell out to the platform screenshot tool (no `xcap`); it already
+            // emits PNG, so we only base64-encode the bytes.
+            let png = duduclaw_desktop::capture_primary_monitor_png()?;
+            Ok(base64::engine::general_purpose::STANDARD.encode(&png))
         })
         .await
         .map_err(|e| ComputerUseError::ApiError(format!("spawn_blocking: {e}")))?;
@@ -499,7 +480,7 @@ impl ComputerUseOrchestrator {
     #[cfg(not(feature = "desktop"))]
     async fn capture_screenshot_native(&self) -> Result<String, ComputerUseError> {
         Err(ComputerUseError::ApiError(
-            "Native screenshot requires the 'desktop' feature (enigo + xcap)".into(),
+            "Native screenshot requires the 'desktop' feature".into(),
         ))
     }
 
@@ -712,7 +693,7 @@ impl ComputerUseOrchestrator {
     /// Query the active window title (for risk detection).
     ///
     /// L5a: `docker exec xdotool getactivewindow getwindowname`
-    /// L5b: `xcap::Window` or platform-specific API
+    /// L5b: platform-specific active-window API
     pub async fn get_active_window_title(&self) -> Option<String> {
         match self.config.execution_mode {
             ComputerUseMode::Native => {
