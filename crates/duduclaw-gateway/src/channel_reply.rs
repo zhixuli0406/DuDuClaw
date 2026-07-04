@@ -1043,6 +1043,9 @@ async fn build_reply_with_session_inner(
 
     // Inject key facts + pinned instructions + compression summary into system prompt.
     // Order: key facts (middle) → compression summary → pinned (tail, highest attention).
+    // Consolidated-rule ids injected this turn (ACE/ExpeL lifecycle) — settled
+    // against the prediction outcome in the spawned task below.
+    let mut injected_rule_ids: Vec<String> = Vec::new();
     let full_system_prompt = {
         let mut prompt = system_prompt;
 
@@ -1092,6 +1095,26 @@ async fn build_reply_with_session_inner(
                     .collect::<Vec<_>>()
                     .join("\n");
                 prompt = format!("{prompt}\n\n## Past Mistakes to Avoid\n{section}");
+            }
+        }
+
+        // F2a extension (ACE/ExpeL rule lifecycle): inject consolidated
+        // reflexion rules ranked by net helpful−harmful score. Retired rules
+        // are filtered out inside the selector; the injected ids are settled
+        // against this turn's prediction outcome below. !Send → spawn_blocking.
+        if let Some(db_path) = cognitive_memory_db.clone() {
+            let aid = agent_id.clone();
+            if let Ok(Some((section, ids))) = tokio::task::spawn_blocking(move || {
+                crate::prediction::rule_lifecycle::build_rules_section_blocking(
+                    &db_path,
+                    &aid,
+                    crate::prediction::rule_lifecycle::INJECTION_LIMIT,
+                )
+            })
+            .await
+            {
+                prompt = format!("{prompt}\n\n## Learned Rules (from past mistakes)\n{section}");
+                injected_rule_ids = ids;
             }
         }
 
@@ -2014,6 +2037,7 @@ async fn build_reply_with_session_inner(
             let sandbox_for_pred = ctx.sandbox_store.clone();
             let notebook_for_pred = ctx.mistake_notebook.clone();
             let memory_db_path_for_pred = cognitive_memory_db.clone();
+            let injected_rule_ids_for_pred = injected_rule_ids.clone();
             let ext_factors_cfg = external_factors_config.clone();
             let evolution_emitter_for_pred = ctx.evolution_emitter.clone();
 
@@ -2073,6 +2097,19 @@ async fn build_reply_with_session_inner(
                 if let Some(ref outcome) = conv_outcome {
                     let meta = pe.metacognition.lock().await;
                     error.apply_outcome(outcome, &meta.thresholds);
+                }
+
+                // ACE/ExpeL rule lifecycle: credit/blame the consolidated
+                // rules injected into this turn's prompt using the settled
+                // error category; net-zero rules are retired. Detached —
+                // must run after apply_outcome so the category is final.
+                if let Some(ref dbp) = memory_db_path_for_pred {
+                    crate::prediction::rule_lifecycle::settle_detached(
+                        dbp.clone(),
+                        agent_id_for_pred.clone(),
+                        injected_rule_ids_for_pred.clone(),
+                        error.category,
+                    );
                 }
 
                 // ── Wiki RL trust feedback (Phase 2) ───────────────────
