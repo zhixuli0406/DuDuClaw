@@ -2,6 +2,7 @@ pub mod decay;
 pub mod embedding;
 pub mod engine;
 pub mod feedback;
+pub mod graph_rank;
 pub mod import;
 pub mod janitor;
 pub mod router;
