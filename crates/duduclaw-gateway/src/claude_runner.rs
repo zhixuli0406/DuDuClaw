@@ -672,8 +672,9 @@ async fn try_direct_api(
 
     // TODO: pass conversation_history from the caller to enable multi-turn
     // for the Direct API fallback path (currently stateless).
-    let response = crate::direct_api::call_direct_api_with_dynamic(
-        &api_key, model, system_prompt, dynamic_system_suffix, prompt, &[],
+    let scope = format!("{agent_id}:{model}");
+    let response = crate::direct_api::call_direct_api_attributed(
+        Some(&scope), &api_key, model, system_prompt, dynamic_system_suffix, prompt, &[],
     ).await?;
 
     // Record telemetry
