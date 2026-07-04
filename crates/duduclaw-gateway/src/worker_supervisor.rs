@@ -652,14 +652,6 @@ pub async fn spawn_if_enabled(
     Ok(Some(WorkerSupervisorHandle::spawn(config).await?))
 }
 
-// Silence unused-warning on `tokio::sync::oneshot` (kept for future
-// expansion to "request immediate health check" channels).
-#[allow(dead_code)]
-fn _unused_imports() -> oneshot::Sender<()> {
-    let (tx, _rx) = oneshot::channel();
-    tx
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -263,15 +263,6 @@ pub fn default_pipeline() -> &'static [(
     ]
 }
 
-/// Suspend the current task for a short duration — exposed for stage
-/// implementations that need to yield (e.g. summarizer waiting on
-/// async I/O). Currently unused; kept here so future stages don't
-/// have to thread a runtime handle.
-#[allow(dead_code)]
-async fn yield_briefly() {
-    tokio::time::sleep(Duration::from_millis(0)).await;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
