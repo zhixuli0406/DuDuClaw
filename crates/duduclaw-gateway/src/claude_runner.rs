@@ -1422,6 +1422,14 @@ fn prepare_claude_cmd(
         cmd.env("DUDUCLAW_BROWSER_VIA_BASH", "1");
     }
 
+    // CACHE_SPLIT_MARKER is a Direct-API-only layering hint — strip it here.
+    let system_prompt_cli: std::borrow::Cow<'_, str> =
+        if system_prompt.contains(crate::direct_api::CACHE_SPLIT_MARKER) {
+            std::borrow::Cow::Owned(system_prompt.replace(crate::direct_api::CACHE_SPLIT_MARKER, ""))
+        } else {
+            std::borrow::Cow::Borrowed(system_prompt)
+        };
+    let system_prompt = system_prompt_cli.as_ref();
     let prompt_guard = if !system_prompt.is_empty() {
         match tempfile::NamedTempFile::new() {
             Ok(mut f) => {
