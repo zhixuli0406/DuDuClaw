@@ -2272,6 +2272,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "duduclaw-llm"
+version = "1.32.0"
+dependencies = [
+ "async-trait",
+ "duduclaw-core",
+ "futures-util",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+]
+
+[[package]]
 name = "duduclaw-memory"
 version = "1.32.0"
 dependencies = [
