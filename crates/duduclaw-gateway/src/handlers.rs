@@ -8495,17 +8495,46 @@ impl MethodHandler {
     async fn handle_models_list(&self) -> WsFrame {
         let mut models = Vec::new();
 
-        // Cloud models (always available)
-        for (id, label) in [
-            ("claude-opus-4-6", "Claude Opus 4.6"),
-            ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
-            ("claude-haiku-4-5", "Claude Haiku 4.5"),
+        // Cloud models — suggestions follow the runtimes actually installed
+        // on this machine, not just Claude.
+        for (id, label, provider) in [
+            ("claude-opus-4-6", "Claude Opus 4.6", "claude"),
+            ("claude-sonnet-4-6", "Claude Sonnet 4.6", "claude"),
+            ("claude-haiku-4-5", "Claude Haiku 4.5", "claude"),
         ] {
             models.push(json!({
                 "id": id,
                 "label": label,
                 "type": "cloud",
+                "provider": provider,
             }));
+        }
+        if duduclaw_core::which_codex().is_some() {
+            for (id, label) in [
+                ("gpt-5.5", "GPT-5.5"),
+                ("gpt-5.4", "GPT-5.4"),
+                ("gpt-5.4-mini", "GPT-5.4 mini"),
+            ] {
+                models.push(json!({
+                    "id": id,
+                    "label": label,
+                    "type": "cloud",
+                    "provider": "codex",
+                }));
+            }
+        }
+        if duduclaw_core::which_gemini().is_some() || duduclaw_core::which_agy().is_some() {
+            for (id, label) in [
+                ("gemini-3.1-pro", "Gemini 3.1 Pro"),
+                ("gemini-3.5-flash", "Gemini 3.5 Flash"),
+            ] {
+                models.push(json!({
+                    "id": id,
+                    "label": label,
+                    "type": "cloud",
+                    "provider": "gemini",
+                }));
+            }
         }
 
         // Local models: scan ~/.duduclaw/models/ for GGUF files

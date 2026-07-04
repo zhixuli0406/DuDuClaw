@@ -96,7 +96,7 @@ impl SessionManager {
                 summary TEXT DEFAULT '',
                 total_tokens INTEGER DEFAULT 0,
                 last_active TEXT NOT NULL,
-                model TEXT DEFAULT 'claude-sonnet-4-6',
+                model TEXT DEFAULT 'auto',
                 created_at TEXT NOT NULL
             );
 
@@ -163,7 +163,7 @@ impl SessionManager {
         // Atomic upsert: INSERT OR IGNORE is a no-op if the row already exists.
         conn.execute(
             "INSERT OR IGNORE INTO sessions (id, agent_id, summary, total_tokens, last_active, model, created_at)
-             VALUES (?1, ?2, '', 0, ?3, 'claude-sonnet-4-6', ?3)",
+             VALUES (?1, ?2, '', 0, ?3, 'auto', ?3)",
             params![session_id, agent_id, now],
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
