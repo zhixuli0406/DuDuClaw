@@ -469,7 +469,7 @@ pub struct CapabilitiesConfig {
 
     /// Computer use execution mode.
     /// - `container` (default): L5a — run inside Docker/Apple Container with Xvfb.
-    /// - `native`: L5b — directly control the host desktop (enigo + xcap).
+    /// - `native`: L5b — directly control the host desktop (enigo + OS screen capture).
     /// - `auto`: choose based on agent trust level and task requirements.
     #[serde(default)]
     pub computer_use_mode: ComputerUseMode,
