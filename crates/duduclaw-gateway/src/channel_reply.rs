@@ -2888,6 +2888,32 @@ pub(crate) fn classify_cli_failure(err: &str) -> FailureReason {
     FailureReason::Unknown
 }
 
+/// Summarized-failure retry hint (context decontamination, arXiv:2605.08563).
+///
+/// Returns a one-line deterministic hint for *model-behavior* failures where
+/// re-sending the identical prompt tends to reproduce the identical failure.
+/// Infra failures (rate limit / billing / auth / spawn / missing binary)
+/// return `None`: the model did nothing wrong, so the retry prompt must stay
+/// byte-identical to preserve the prompt cache. Zero LLM cost — the summary
+/// is synthesized from the failure class, never from raw stderr (which could
+/// carry prompt-injection payloads).
+pub(crate) fn retry_hint_for(err: &str) -> Option<String> {
+    match classify_cli_failure(err) {
+        FailureReason::Timeout => Some(
+            "A previous attempt at this exact request timed out before completing. \
+             Do not repeat the same approach: answer more directly, keep tool use \
+             to a minimum, and prefer a shorter response."
+                .to_string(),
+        ),
+        FailureReason::EmptyResponse => Some(
+            "A previous attempt at this exact request ended without producing any \
+             text. Reply with a direct textual answer."
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
 /// Build a zh-TW user-facing message for a classified failure.
 ///
 /// Messages directly tell the user *why* CLI failed (rate limit, billing, etc.)
@@ -3264,13 +3290,16 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
-            move |env_vars| {
+            move |env_vars, retry_hint| {
                 let n = call_count_cloned.fetch_add(1, Ordering::SeqCst);
                 // First attempt: simulate rate limit.
                 // Second attempt: return success with a distinctive body.
                 async move {
                     // Sanity: env_vars should contain OAuth token for the selected account.
                     assert!(env_vars.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
+                    // Rate limit is an infra failure — retry must NOT get a hint
+                    // (prompt stays byte-identical, cache preserved).
+                    assert!(retry_hint.is_none(), "no hint expected after rate limit");
                     if n == 0 {
                         Err("Error 429 rate limit reached".to_string())
                     } else {
@@ -3294,6 +3323,54 @@ mod rotation_tests {
         assert_eq!(second.total_requests, 1, "second account should have one success recorded");
     }
 
+    /// Scenario: summarized-failure retry (arXiv:2605.08563).
+    ///
+    /// First attempt hits a model-behavior failure (hard timeout); the retry
+    /// on the second account must receive a deterministic one-line hint so it
+    /// doesn't silently re-run the identical prompt into the identical failure.
+    #[tokio::test]
+    async fn retry_after_timeout_carries_failure_summary() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("first", 1)).await;
+        rotator.push_account_for_test(fake_oauth_account("second", 2)).await;
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_cloned = call_count.clone();
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            move |_env_vars, retry_hint| {
+                let n = call_count_cloned.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        assert!(retry_hint.is_none(), "first attempt must have no hint");
+                        Err("claude CLI hard timeout (1800s, no output)".to_string())
+                    } else {
+                        let hint = retry_hint.expect("retry after timeout must carry a hint");
+                        assert!(hint.contains("timed out"), "hint should describe the failure: {hint}");
+                        Ok("recovered".to_string())
+                    }
+                }
+            },
+            100,
+        )
+        .await;
+
+        assert_eq!(result.as_deref(), Ok("recovered"));
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    /// retry_hint_for: model-behavior failures get hints, infra failures don't.
+    #[test]
+    fn retry_hint_only_for_model_behavior_failures() {
+        assert!(retry_hint_for("claude CLI hard timeout (1800s, no output)").is_some());
+        assert!(retry_hint_for("claude CLI empty response").is_some());
+        assert!(retry_hint_for("Error 429 rate limit reached").is_none());
+        assert!(retry_hint_for("HTTP 402 insufficient_quota credit balance").is_none());
+        assert!(retry_hint_for("Not logged in · Please run /login").is_none());
+        assert!(retry_hint_for("claude CLI not found in PATH").is_none());
+    }
+
     /// Scenario: both accounts fail with the same error.
     ///
     /// Verifies:
@@ -3308,7 +3385,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
-            |_env_vars| async move {
+            |_env_vars, _retry_hint| async move {
                 Err::<String, _>("claude CLI hard timeout (1800s, no output)".to_string())
             },
             100,
@@ -3334,7 +3411,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
-            |_env_vars| async move {
+            |_env_vars, _retry_hint| async move {
                 Err::<String, _>("HTTP 402 insufficient_quota credit balance".to_string())
             },
             100,
@@ -3363,7 +3440,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
-            move |_env_vars| {
+            move |_env_vars, _retry_hint| {
                 attempts_cloned.fetch_add(1, Ordering::SeqCst);
                 async move { Ok::<String, String>("OK".to_string()) }
             },
@@ -3392,7 +3469,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
-            |_env_vars| async move {
+            |_env_vars, _retry_hint| async move {
                 Err::<String, _>("Error 429 rate limit: usage limit exceeded".to_string())
             },
             50,
@@ -3433,7 +3510,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
-            |_env_vars| async move {
+            |_env_vars, _retry_hint| async move {
                 Err::<String, _>(
                     "claude CLI stream error: Not logged in · Please run /login".to_string(),
                 )
@@ -3467,7 +3544,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
-            |_env_vars| async move { Ok::<String, String>("never called".to_string()) },
+            |_env_vars, _retry_hint| async move { Ok::<String, String>("never called".to_string()) },
             100,
         )
         .await;
@@ -3739,7 +3816,7 @@ pub(crate) async fn call_claude_cli_rotated(
     // turn, no log noise, no cost duplication.
     let input_len = user_message.len();
     let history_clone = conversation_history.to_vec();
-    rotate_cli_spawn(&rotator, move |env_vars| {
+    rotate_cli_spawn(&rotator, move |env_vars, retry_hint| {
         let model = model.to_string();
         let system_prompt = system_prompt.to_string();
         let home_dir = home_dir.to_path_buf();
@@ -3749,11 +3826,16 @@ pub(crate) async fn call_claude_cli_rotated(
         let history = history_clone.clone();
         let user_message_owned = user_message.to_string();
         async move {
-            let effective_prompt = if history.is_empty() {
+            let mut effective_prompt = if history.is_empty() {
                 user_message_owned
             } else {
                 format_history_as_prompt(&history, &user_message_owned)
             };
+            // Summarized-failure retry: one-line hint appended to the user
+            // message (never the system prompt — keeps its cache prefix stable).
+            if let Some(hint) = retry_hint {
+                effective_prompt = format!("{effective_prompt}\n\n<retry_context>{hint}</retry_context>");
+            }
             spawn_claude_cli_with_env(
                 &effective_prompt, &model, &system_prompt, &home_dir,
                 work_dir.as_deref(), on_progress, capabilities.as_ref(),
@@ -3767,10 +3849,18 @@ pub(crate) async fn call_claude_cli_rotated(
 ///
 /// Iterates `rotator.select()` up to `rotator.count()` times. For each
 /// selected account, calls the provided `spawn` closure with the env-var
-/// map. On success, records cost telemetry and returns. On failure,
-/// classifies the error and feeds it back to the rotator (`on_billing_exhausted`,
-/// `on_rate_limited`, or `on_error`). Returns the last error when all
-/// accounts are exhausted.
+/// map and an optional retry hint. On success, records cost telemetry and
+/// returns. On failure, classifies the error and feeds it back to the
+/// rotator (`on_billing_exhausted`, `on_rate_limited`, or `on_error`).
+/// Returns the last error when all accounts are exhausted.
+///
+/// The retry hint implements summarized-failure retry (context
+/// decontamination, arXiv:2605.08563): after a *model-behavior* failure
+/// (timeout / empty response) the next attempt gets a one-line deterministic
+/// summary to steer it away from the failed approach, instead of silently
+/// re-running the byte-identical prompt. Infra failures (rate limit,
+/// billing, auth, spawn) pass `None` so the prompt stays unchanged and
+/// prompt-cache friendly.
 ///
 /// `input_size_hint` is used for rough API-key cost accounting when the
 /// spawn closure doesn't extract token usage from the CLI stream.
@@ -3780,12 +3870,13 @@ pub(crate) async fn rotate_cli_spawn<F, Fut>(
     input_size_hint: usize,
 ) -> Result<String, String>
 where
-    F: Fn(std::collections::HashMap<String, String>) -> Fut,
+    F: Fn(std::collections::HashMap<String, String>, Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
 {
     let account_count = rotator.count().await;
     let max_attempts = account_count.max(1);
     let mut last_error = String::new();
+    let mut retry_hint: Option<String> = None;
 
     for attempt in 0..max_attempts {
         let Some(selected) = rotator.select().await else {
@@ -3793,7 +3884,7 @@ where
         };
         info!(account = %selected.id, attempt, "Channel CLI attempt");
 
-        match spawn(selected.env_vars.clone()).await {
+        match spawn(selected.env_vars.clone(), retry_hint.clone()).await {
             Ok(text) => {
                 // Channel calls don't extract token usage from streams, so cost
                 // is 0 (OAuth subscription) or a rough estimate (API key).
@@ -3817,6 +3908,7 @@ where
                     warn!(account = %selected.id, error = %e, "Account CLI attempt failed");
                     rotator.on_error(&selected.id).await;
                 }
+                retry_hint = retry_hint_for(&e);
             }
         }
     }
@@ -4838,7 +4930,7 @@ pub(crate) async fn call_claude_cli_pty_rotated(
     let history_clone = conversation_history.to_vec();
     rotate_cli_spawn(
         &rotator,
-        move |env_vars| {
+        move |env_vars, retry_hint| {
             let model = model.to_string();
             let system_prompt = system_prompt.to_string();
             let home_dir = home_dir.to_path_buf();
@@ -4848,11 +4940,16 @@ pub(crate) async fn call_claude_cli_pty_rotated(
             let history = history_clone.clone();
             let user_message_owned = user_message.to_string();
             async move {
-                let effective_prompt = if history.is_empty() {
+                let mut effective_prompt = if history.is_empty() {
                     user_message_owned
                 } else {
                     format_history_as_prompt(&history, &user_message_owned)
                 };
+                // Summarized-failure retry (see rotate_cli_spawn docs).
+                if let Some(hint) = retry_hint {
+                    effective_prompt =
+                        format!("{effective_prompt}\n\n<retry_context>{hint}</retry_context>");
+                }
                 invoke_pty_branch(
                     &effective_prompt,
                     &model,
