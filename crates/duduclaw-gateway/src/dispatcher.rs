@@ -994,7 +994,11 @@ async fn dispatch_sandboxed(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     let denied_tools = capabilities.disallowed_tools();
-    let result = sandbox::run_sandboxed_with_env(
+    // W1.7: the in-container argv follows the agent's `[runtime] provider`
+    // flag dialect (claude default; codex/gemini/agy per their CLIs).
+    let runtime = crate::runtime_config::agent_runtime_provider(&agent_dir);
+    let result = sandbox::run_sandboxed_for_runtime(
+        runtime,
         &agent_dir,
         prompt,
         &model,
