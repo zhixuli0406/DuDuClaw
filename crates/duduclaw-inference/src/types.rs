@@ -128,6 +128,12 @@ pub struct GenerationParams {
     /// Context window size
     #[serde(default = "default_context_size")]
     pub context_size: u32,
+    /// Request per-token logprobs from the backend (OpenAI-compat `logprobs: true`).
+    /// Used by the calibrated cascade router for post-hoc confidence. Backends
+    /// that cannot return logprobs simply leave `InferenceResponse::mean_logprob`
+    /// as `None` (fail-safe).
+    #[serde(default)]
+    pub capture_logprobs: bool,
 }
 
 fn default_max_tokens() -> u32 {
@@ -155,6 +161,7 @@ impl Default for GenerationParams {
             stop: Vec::new(),
             gpu_layers: default_gpu_layers(),
             context_size: default_context_size(),
+            capture_logprobs: false,
         }
     }
 }
@@ -189,6 +196,11 @@ pub struct InferenceResponse {
     pub backend: BackendType,
     /// Which model was used
     pub model_id: String,
+    /// Mean per-token logprob of the generated text, when the backend returned
+    /// logprobs (see [`GenerationParams::capture_logprobs`]). `None` when the
+    /// server did not return logprobs — post-hoc confidence is then skipped.
+    #[serde(default)]
+    pub mean_logprob: Option<f32>,
 }
 
 /// Hardware information detected on the system.

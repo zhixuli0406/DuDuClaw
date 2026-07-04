@@ -212,6 +212,9 @@ impl InferenceBackend for MistralRsBackend {
                     tokens_per_second: tps,
                     backend: BackendType::MistralRs,
                     model_id,
+                    // mistral.rs core does not expose per-token logprobs here;
+                    // post-hoc cascade confidence stays off for this backend.
+                    mean_logprob: None,
                 })
             }
             Response::InternalError(e) => {

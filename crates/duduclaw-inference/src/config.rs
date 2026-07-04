@@ -320,6 +320,38 @@ pub struct RouterConfig {
     /// Keywords that stay at LocalFast tier (simple queries).
     #[serde(default)]
     pub fast_keywords: Vec<String>,
+
+    /// Enable post-hoc (cascade) confidence: after a local tier answers, the
+    /// mean token logprob is Platt-scaled into an acceptance probability and
+    /// low-confidence answers escalate to the next tier instead of being
+    /// returned. Zero LLM cost — the logprob signal comes with the response.
+    /// (Cascade Routing arXiv:2410.10347; UCCI arXiv:2605.18796)
+    #[serde(default)]
+    pub post_hoc_enabled: bool,
+
+    /// Platt scaling slope: g = sigmoid(alpha * p̄ + beta), p̄ = exp(mean logprob).
+    #[serde(default = "default_post_hoc_alpha")]
+    pub post_hoc_alpha: f32,
+
+    /// Platt scaling intercept.
+    #[serde(default = "default_post_hoc_beta")]
+    pub post_hoc_beta: f32,
+
+    /// Acceptance threshold on g: below this the answer escalates.
+    #[serde(default = "default_post_hoc_accept_threshold")]
+    pub post_hoc_accept_threshold: f32,
+}
+
+fn default_post_hoc_alpha() -> f32 {
+    4.0
+}
+
+fn default_post_hoc_beta() -> f32 {
+    -2.0
+}
+
+fn default_post_hoc_accept_threshold() -> f32 {
+    0.5
 }
 
 impl Default for RouterConfig {
@@ -367,6 +399,10 @@ impl Default for RouterConfig {
                 "轉換".to_string(),
                 "改寫".to_string(),
             ],
+            post_hoc_enabled: false,
+            post_hoc_alpha: default_post_hoc_alpha(),
+            post_hoc_beta: default_post_hoc_beta(),
+            post_hoc_accept_threshold: default_post_hoc_accept_threshold(),
         }
     }
 }
@@ -414,6 +450,13 @@ impl InferenceConfig {
             && router.enabled && router.fast_threshold <= router.strong_threshold {
                 return Err(InferenceError::Config(
                     "router.fast_threshold must be > router.strong_threshold".to_string(),
+                ));
+            }
+        if let Some(ref router) = self.router
+            && router.post_hoc_enabled
+            && !(0.0..=1.0).contains(&router.post_hoc_accept_threshold) {
+                return Err(InferenceError::Config(
+                    "router.post_hoc_accept_threshold must be within [0.0, 1.0]".to_string(),
                 ));
             }
         Ok(())
