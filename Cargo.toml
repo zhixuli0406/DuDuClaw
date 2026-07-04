@@ -26,6 +26,7 @@ members = [
     "crates/duduclaw-cli-worker",
     "crates/duduclaw-license",
     "crates/duduclaw-fork",
+    "crates/duduclaw-llm",
 ]
 
 [workspace.package]
@@ -108,3 +109,4 @@ duduclaw-redaction = { path = "crates/duduclaw-redaction" }
 duduclaw-cli-runtime = { path = "crates/duduclaw-cli-runtime" }
 duduclaw-cli-worker = { path = "crates/duduclaw-cli-worker" }
 duduclaw-license = { path = "crates/duduclaw-license" }
+duduclaw-llm = { path = "crates/duduclaw-llm" }
