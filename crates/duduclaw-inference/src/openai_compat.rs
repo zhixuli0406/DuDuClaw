@@ -41,12 +41,11 @@ pub struct OpenAiCompatBackend {
     prefix_hash: Option<String>,
 }
 
-/// Resolve the standard DuDuClaw home dir (`~/.duduclaw`).
-///
-/// `dirs` is not a dependency of this crate, so we derive it from the same
-/// `HOME` / `USERPROFILE` env vars used by [`crate::util::expand_tilde`].
+/// Resolve the DuDuClaw home dir, honouring `DUDUCLAW_HOME` (multi-instance
+/// isolation). Delegates to the canonical [`duduclaw_core::duduclaw_home`] so
+/// this crate can't drift back to a hardcoded `~/.duduclaw`.
 fn default_duduclaw_home() -> std::path::PathBuf {
-    crate::util::expand_tilde("~/.duduclaw")
+    duduclaw_core::duduclaw_home()
 }
 
 impl OpenAiCompatBackend {

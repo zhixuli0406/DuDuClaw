@@ -181,19 +181,42 @@ pub fn ensure_global_mcp_server() -> Result<bool, String> {
         serde_json::json!({})
     };
 
-    // Check current state
-    let current_cmd = settings
-        .get("mcpServers")
-        .and_then(|s| s.get("duduclaw"))
-        .and_then(|d| d.get("command"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
+    // The registration key is namespaced per instance (`duduclaw` by default,
+    // `duduclaw-<instance>` when DUDUCLAW_INSTANCE is set) so that several
+    // instances sharing this `~/.claude/settings.json` don't overwrite each
+    // other (multi-instance isolation — Plan A).
+    let key = duduclaw_core::mcp_server_key();
 
-    if current_cmd == abs_str {
-        return Ok(false); // Already correct
+    // Build the desired launch spec, carrying THIS instance's env into it so the
+    // Claude-CLI-spawned `duduclaw mcp-server` connects to this instance's state
+    // root / port even when several entries coexist. Only non-empty overrides
+    // are written, keeping the single-instance spec byte-identical to before.
+    let mut desired = serde_json::json!({
+        "command": abs_str,
+        "args": ["mcp-server"],
+    });
+    let mut env = serde_json::Map::new();
+    for var in ["DUDUCLAW_HOME", "DUDUCLAW_PORT", "DUDUCLAW_INSTANCE"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.trim().is_empty() {
+                env.insert(var.to_string(), serde_json::Value::String(v));
+            }
+        }
+    }
+    if !env.is_empty() {
+        desired
+            .as_object_mut()
+            .expect("desired is an object")
+            .insert("env".to_string(), serde_json::Value::Object(env));
     }
 
-    // Upsert mcpServers.duduclaw
+    // Idempotent: skip the write only when the existing entry already equals the
+    // desired one (command + args + env).
+    if settings.get("mcpServers").and_then(|s| s.get(&key)) == Some(&desired) {
+        return Ok(false);
+    }
+
+    // Upsert mcpServers.<key>
     let mcp_servers = settings
         .as_object_mut()
         .ok_or("settings.json is not a JSON object")?
@@ -203,10 +226,7 @@ pub fn ensure_global_mcp_server() -> Result<bool, String> {
     mcp_servers
         .as_object_mut()
         .ok_or("mcpServers is not a JSON object")?
-        .insert("duduclaw".to_string(), serde_json::json!({
-            "command": abs_str,
-            "args": ["mcp-server"]
-        }));
+        .insert(key.clone(), desired);
 
     // Write back atomically
     let json = serde_json::to_string_pretty(&settings)
@@ -219,6 +239,7 @@ pub fn ensure_global_mcp_server() -> Result<bool, String> {
 
     info!(
         path = %settings_path.display(),
+        key = %key,
         command = %abs_str,
         "Registered duduclaw MCP server in global Claude settings"
     );
