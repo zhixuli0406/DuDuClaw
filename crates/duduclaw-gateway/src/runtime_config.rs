@@ -89,10 +89,62 @@ pub fn load_runtime_settings(agent_dir: &Path) -> RuntimeSettings {
         .and_then(|s| s.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| DEFAULT_UTILITY_MODEL.to_string());
+
+    // Provider↔model sanity check: `preferred = "gpt-5"` with the default
+    // Claude provider used to route silently into the Claude CLI and fail at
+    // the Anthropic API. Warn once per (agent, model) so the misconfiguration
+    // is visible without spamming the hot reply path.
+    if let Some(preferred) = v
+        .get("model")
+        .and_then(|m| m.get("preferred"))
+        .and_then(|s| s.as_str())
+    {
+        if !model_matches_provider(preferred, provider) {
+            warn_mismatch_once(agent_dir, preferred, provider);
+        }
+    }
+
     RuntimeSettings {
         provider,
         fallback,
         utility_model,
+    }
+}
+
+/// Conservative provider↔model compatibility check by model-id naming family.
+/// Only flags *confident* mismatches; unknown families and `openai_compat`
+/// (which proxies arbitrary models) always pass.
+pub fn model_matches_provider(model: &str, provider: RuntimeType) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    // Accept the qualified "provider/model" form — take the model part.
+    let m = m.rsplit('/').next().unwrap_or(&m);
+    let is_claude = m.starts_with("claude");
+    let is_openai = m.starts_with("gpt-") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("codex");
+    let is_gemini = m.starts_with("gemini");
+    match provider {
+        RuntimeType::Claude => !(is_openai || is_gemini),
+        RuntimeType::Codex => !(is_claude || is_gemini),
+        RuntimeType::Gemini | RuntimeType::Antigravity => !(is_claude || is_openai),
+        RuntimeType::OpenAiCompat => true,
+    }
+}
+
+fn warn_mismatch_once(agent_dir: &Path, model: &str, provider: RuntimeType) {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let key = format!("{}|{model}", agent_dir.display());
+    let warned = WARNED.get_or_init(Default::default);
+    if let Ok(mut set) = warned.lock() {
+        if set.insert(key) {
+            tracing::warn!(
+                agent_dir = %agent_dir.display(),
+                model,
+                provider = provider.as_str(),
+                "[model] preferred does not match [runtime] provider — requests will \
+                 likely fail at the provider API; set [runtime] provider to the \
+                 runtime that serves this model"
+            );
+        }
     }
 }
 
@@ -463,5 +515,23 @@ mod tests {
         let spec = resolve_utility(home.path(), None);
         assert_eq!(spec.provider, RuntimeType::Claude);
         assert_eq!(spec.model, DEFAULT_UTILITY_MODEL);
+    }
+
+    #[test]
+    fn model_provider_mismatch_detection() {
+        use RuntimeType::*;
+        // Confident mismatches
+        assert!(!model_matches_provider("gpt-5", Claude));
+        assert!(!model_matches_provider("gemini-3.1-pro", Claude));
+        assert!(!model_matches_provider("claude-sonnet-4-6", Codex));
+        assert!(!model_matches_provider("gpt-5.4", Gemini));
+        // Correct pairings
+        assert!(model_matches_provider("claude-haiku-4-5", Claude));
+        assert!(model_matches_provider("gpt-5.4-mini", Codex));
+        assert!(model_matches_provider("gemini-3.5-flash", Antigravity));
+        // Qualified form + unknown families + compat always pass
+        assert!(model_matches_provider("anthropic/claude-sonnet-5", Claude));
+        assert!(model_matches_provider("deepseek-v3.2", Claude));
+        assert!(model_matches_provider("claude-sonnet-4-6", OpenAiCompat));
     }
 }
