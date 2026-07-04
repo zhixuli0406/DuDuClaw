@@ -90,9 +90,7 @@ impl Default for PipelineConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("data/evolution/events"));
 
-        let home_dir = std::env::var("HOME")
-            .map(|h: String| PathBuf::from(&h).join(".duduclaw"))
-            .unwrap_or_else(|_| PathBuf::from("~/.duduclaw"));
+        let home_dir = duduclaw_core::duduclaw_home();
 
         Self {
             events_dir,

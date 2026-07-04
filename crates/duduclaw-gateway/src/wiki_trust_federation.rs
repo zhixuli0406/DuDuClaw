@@ -221,7 +221,7 @@ pub async fn run_federation_cycle(
     let state_path = cfg
         .state_path
         .clone()
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".duduclaw/wiki_trust_federation.json"));
+        .unwrap_or_else(|| duduclaw_core::duduclaw_home().join("wiki_trust_federation.json"));
     let mut state = FederationState::load(&state_path);
 
     let client = reqwest::Client::builder()

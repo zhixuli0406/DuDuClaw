@@ -17,6 +17,62 @@ pub fn home_dir() -> String {
         .unwrap_or_default()
 }
 
+/// Resolve the DuDuClaw state root, honouring the `DUDUCLAW_HOME` override.
+///
+/// Precedence: `$DUDUCLAW_HOME` (verbatim, when non-empty) → `<home_dir()>/.duduclaw`.
+///
+/// This is the **single source of truth** for the per-instance state root
+/// (config, SQLite DBs, `bus_queue.jsonl`, models, shared wiki, secrets, cron).
+/// Every subsystem MUST resolve its paths through here so that two instances
+/// launched with distinct `DUDUCLAW_HOME` values on one machine never collide
+/// on `~/.duduclaw` (multi-instance isolation — Plan A).
+pub fn duduclaw_home() -> std::path::PathBuf {
+    if let Ok(custom) = std::env::var("DUDUCLAW_HOME") {
+        if !custom.trim().is_empty() {
+            return std::path::PathBuf::from(custom);
+        }
+    }
+    std::path::PathBuf::from(home_dir()).join(".duduclaw")
+}
+
+/// The optional per-instance name from `DUDUCLAW_INSTANCE`, sanitized to
+/// `[a-z0-9-]` (invalid chars → `-`, ends trimmed, capped at 40 chars).
+///
+/// Used to namespace host-shared registrations (e.g. the global MCP server key
+/// in `~/.claude/settings.json`) so two instances on one machine under distinct
+/// `DUDUCLAW_HOME` roots don't overwrite each other. Returns `None` when unset,
+/// empty, or all-invalid — the single-instance default.
+pub fn duduclaw_instance() -> Option<String> {
+    sanitize_instance(&std::env::var("DUDUCLAW_INSTANCE").ok()?)
+}
+
+/// Pure sanitizer for an instance name (see [`duduclaw_instance`]). Split out so
+/// the normalization rules are unit-testable without touching process env.
+fn sanitize_instance(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let trimmed = cleaned.trim_matches('-');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(40).collect())
+    }
+}
+
+/// The `mcpServers` key for this instance's global MCP registration:
+/// `"duduclaw"` by default, or `"duduclaw-<instance>"` when `DUDUCLAW_INSTANCE`
+/// is set. Centralized so the writer and any future reader agree on the name.
+pub fn mcp_server_key() -> String {
+    match duduclaw_instance() {
+        Some(name) => format!("duduclaw-{name}"),
+        None => "duduclaw".to_string(),
+    }
+}
+
 /// Return the Python 3 command name for the current platform.
 ///
 /// On Windows, Python is often installed as `python` (the Microsoft Store
@@ -702,6 +758,72 @@ mod sys {
 // parsing (`parse_shim_target`) and static data (`known_target_subpaths`)
 // without touching the filesystem or invoking any Windows APIs, so the
 // host can be macOS or Linux.
+#[cfg(test)]
+mod home_tests {
+    use super::{duduclaw_home, duduclaw_instance, mcp_server_key, sanitize_instance};
+    use std::sync::Mutex;
+
+    // Serialize the few env-mutating tests so they don't race each other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn sanitize_lowercases_and_replaces_invalid_chars() {
+        assert_eq!(sanitize_instance("Work"), Some("work".to_string()));
+        assert_eq!(sanitize_instance("team A/B"), Some("team-a-b".to_string()));
+        assert_eq!(sanitize_instance("café☕"), Some("caf".to_string()));
+    }
+
+    #[test]
+    fn sanitize_trims_edge_dashes_and_rejects_empty() {
+        assert_eq!(sanitize_instance("  -_-  "), None);
+        assert_eq!(sanitize_instance(""), None);
+        assert_eq!(sanitize_instance("--work--"), Some("work".to_string()));
+    }
+
+    #[test]
+    fn sanitize_caps_length_at_40() {
+        let long = "a".repeat(100);
+        assert_eq!(sanitize_instance(&long).unwrap().len(), 40);
+    }
+
+    // `std::env::set_var`/`remove_var` are `unsafe` on edition 2024; these tests
+    // serialize via ENV_LOCK and restore the prior value, so the process-global
+    // mutation is confined and reverted.
+    #[test]
+    fn duduclaw_home_prefers_env_override() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("DUDUCLAW_HOME").ok();
+        unsafe { std::env::set_var("DUDUCLAW_HOME", "/tmp/dd-instance-x") };
+        assert_eq!(duduclaw_home(), std::path::PathBuf::from("/tmp/dd-instance-x"));
+        // Empty override falls back to <home>/.duduclaw (not literal empty).
+        unsafe { std::env::set_var("DUDUCLAW_HOME", "   ") };
+        assert!(duduclaw_home().ends_with(".duduclaw"));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DUDUCLAW_HOME", v),
+                None => std::env::remove_var("DUDUCLAW_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_key_is_namespaced_by_instance() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("DUDUCLAW_INSTANCE").ok();
+        unsafe { std::env::remove_var("DUDUCLAW_INSTANCE") };
+        assert_eq!(mcp_server_key(), "duduclaw");
+        assert_eq!(duduclaw_instance(), None);
+        unsafe { std::env::set_var("DUDUCLAW_INSTANCE", "Work-1") };
+        assert_eq!(mcp_server_key(), "duduclaw-work-1");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DUDUCLAW_INSTANCE", v),
+                None => std::env::remove_var("DUDUCLAW_INSTANCE"),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod shim_parser_tests {
     use super::{ShimKind, known_target_subpaths, parse_shim_target};
