@@ -1055,15 +1055,27 @@ async fn build_reply_with_session_inner(
         if let Some(db_path) = cognitive_memory_db.clone() {
             let aid = agent_id.clone();
             let query = sanitized_text.clone();
-            if let Ok(facts_text) = tokio::task::spawn_blocking(move || {
+            if let Ok(facts) = tokio::task::spawn_blocking(move || {
                 let engine = duduclaw_memory::SqliteMemoryEngine::new(&db_path).ok()?;
                 let rt = tokio::runtime::Handle::current();
                 let facts = rt.block_on(engine.search_facts(&aid, &query, 3)).ok()?;
                 if facts.is_empty() { return None; }
-                Some(facts.iter().map(|f| format!("- {}", f.fact)).collect::<Vec<_>>().join("\n"))
+                Some(facts.iter().map(|f| f.fact.clone()).collect::<Vec<String>>())
             }).await {
-                if let Some(ft) = facts_text {
-                    prompt = format!("{prompt}\n\n## Key Facts About This User\n{ft}");
+                if let Some(facts) = facts {
+                    // Wiki/memory dedup: the base prompt already carries the
+                    // injected wiki pages — a fact whose text is already in
+                    // there would be sent twice. Wiki wins (curated, trust-
+                    // scored, citation-tracked); the duplicate fact is dropped.
+                    let kept = filter_facts_not_in_prompt(&facts, &prompt);
+                    if !kept.is_empty() {
+                        let ft = kept
+                            .iter()
+                            .map(|f| format!("- {f}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        prompt = format!("{prompt}\n\n## Key Facts About This User\n{ft}");
+                    }
                 }
             }
         }
@@ -2741,20 +2753,25 @@ async fn build_reply_with_session_inner(
             });
         }
 
-        // ── Wiki ingest (async, non-blocking) ────────────────────
+        // ── Conversation distill (async, non-blocking) ───────────
+        // Auto-distilled facts go to the MEMORY system (temporal supersession),
+        // never to the curated wiki — see wiki_ingest.rs module docs.
         {
-            let user_text_for_wiki = sanitized_text.clone();
-            let reply_for_wiki = reply.clone();
-            let agent_id_for_wiki = agent_id.clone();
-            let session_for_wiki = session_id.to_string();
-            let home_for_wiki = ctx.home_dir.clone();
+            let user_text_for_distill = sanitized_text.clone();
+            let reply_for_distill = reply.clone();
+            let agent_id_for_distill = agent_id.clone();
+            let home_for_distill = ctx.home_dir.clone();
+            let memory_db_for_distill = ctx
+                .memory_db_path
+                .clone()
+                .unwrap_or_else(|| ctx.home_dir.join("memory.db"));
             tokio::spawn(async move {
                 crate::wiki_ingest::run_ingest(
-                    &user_text_for_wiki,
-                    &reply_for_wiki,
-                    &agent_id_for_wiki,
-                    &session_for_wiki,
-                    &home_for_wiki,
+                    &user_text_for_distill,
+                    &reply_for_distill,
+                    &agent_id_for_distill,
+                    &home_for_distill,
+                    &memory_db_for_distill,
                 ).await;
             });
         }
@@ -2878,6 +2895,33 @@ pub(crate) enum FailureReason {
     NoAccounts,
     /// Fallback — unrecognized error string.
     Unknown,
+}
+
+/// Lowercase + collapse all whitespace runs to a single space, so
+/// containment checks are robust to formatting differences between a
+/// wiki page and an extracted fact. CJK-safe (no byte slicing).
+fn normalize_for_dedup(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Wiki/memory injection dedup: keep only facts whose normalized text is
+/// NOT already present in the (normalized) prompt built so far — the
+/// prompt already contains the injected wiki pages, so a contained fact
+/// would be pure duplication. Trivially short facts (< 6 chars) are kept
+/// as-is: containment matches on them are too noisy to trust.
+fn filter_facts_not_in_prompt(facts: &[String], prompt: &str) -> Vec<String> {
+    let normalized_prompt = normalize_for_dedup(prompt);
+    facts
+        .iter()
+        .filter(|f| {
+            let nf = normalize_for_dedup(f);
+            nf.chars().count() < 6 || !normalized_prompt.contains(&nf)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Classify an error string produced by `call_claude_cli_rotated` or the Direct API fallback.
@@ -3385,6 +3429,29 @@ mod rotation_tests {
 
         assert_eq!(result.as_deref(), Ok("recovered"));
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    /// Wiki/memory injection dedup: facts already present in the prompt
+    /// (e.g. via an injected wiki page) are dropped; wiki wins.
+    #[test]
+    fn facts_already_in_wiki_section_are_deduped() {
+        let prompt = "## Wiki Knowledge\n### Wiki — Core\n\n阿明住在台北，喜歡  黑咖啡。\nDeploys go through CI only.\n";
+        let facts = vec![
+            "阿明住在台北，喜歡 黑咖啡。".to_string(), // whitespace-variant duplicate → dropped
+            "阿明的生日是三月".to_string(),            // novel → kept
+            "deploys go through ci only.".to_string(),  // case-variant duplicate → dropped
+            "ok".to_string(),                           // too short to trust containment → kept
+        ];
+        let kept = filter_facts_not_in_prompt(&facts, prompt);
+        assert_eq!(kept, vec!["阿明的生日是三月".to_string(), "ok".to_string()]);
+    }
+
+    #[test]
+    fn normalize_for_dedup_collapses_whitespace_and_case() {
+        assert_eq!(
+            normalize_for_dedup("  Hello\n\tWORLD  台北 "),
+            "hello world 台北"
+        );
     }
 
     /// retry_hint_for: model-behavior failures get hints, infra failures don't.
@@ -4071,6 +4138,14 @@ async fn spawn_claude_cli_with_env(
     }
 
     // Pass system prompt via temp file to avoid exposure in /proc/PID/cmdline (BE-C1)
+    // CACHE_SPLIT_MARKER is a Direct-API-only layering hint — strip it here.
+    let system_prompt_cli: std::borrow::Cow<'_, str> =
+        if system_prompt.contains(crate::direct_api::CACHE_SPLIT_MARKER) {
+            std::borrow::Cow::Owned(system_prompt.replace(crate::direct_api::CACHE_SPLIT_MARKER, ""))
+        } else {
+            std::borrow::Cow::Borrowed(system_prompt)
+        };
+    let system_prompt = system_prompt_cli.as_ref();
     let _prompt_guard: Option<tempfile::TempPath> = if !system_prompt.is_empty() {
         match tempfile::NamedTempFile::new() {
             Ok(mut f) => {
@@ -4756,11 +4831,18 @@ async fn spawn_claude_cli_pty_with_env(
     }
 
     // Pass system prompt via temp file (matches legacy path; cmdline-safe).
-    let prompt_guard: Option<tempfile::TempPath> = if !system_prompt.is_empty() {
+    // CACHE_SPLIT_MARKER is a Direct-API-only layering hint — strip it here.
+    let system_prompt_cli: std::borrow::Cow<'_, str> =
+        if system_prompt.contains(crate::direct_api::CACHE_SPLIT_MARKER) {
+            std::borrow::Cow::Owned(system_prompt.replace(crate::direct_api::CACHE_SPLIT_MARKER, ""))
+        } else {
+            std::borrow::Cow::Borrowed(system_prompt)
+        };
+    let prompt_guard: Option<tempfile::TempPath> = if !system_prompt_cli.is_empty() {
         match tempfile::NamedTempFile::new() {
             Ok(mut f) => {
                 use std::io::Write;
-                let _ = f.write_all(system_prompt.as_bytes());
+                let _ = f.write_all(system_prompt_cli.as_bytes());
                 Some(f.into_temp_path())
             }
             Err(_) => None,
@@ -5538,26 +5620,36 @@ fn build_system_prompt(
                         }
                     },
                 );
+            // Session-stable selection: pin the kept-page set per
+            // (agent, session) so the wiki section bytes don't churn
+            // every turn and break the prompt-cache prefix. Falls back
+            // to per-turn ranking when no session identity is known.
+            let cache_key = citation_ctx.map(|(agent_id, conv_id, session_id)| {
+                format!("{agent_id}:{}", session_id.unwrap_or(conv_id))
+            });
             let wiki_ctx = crate::ranked_wiki_injection::ranked_wiki_injection(
                 &store,
                 query,
                 6000,
                 citation_context,
+                cache_key.as_deref(),
             );
             // The helper returns "" on error or no pages — wrap the
             // non-empty case identically to before so prompt shape
             // stays stable for prompt-cache hits.
-            let result: Result<String, duduclaw_core::error::DuDuClawError> = Ok(wiki_ctx);
-            match result {
-                Ok(wiki_ctx) if !wiki_ctx.is_empty() => {
-                    let s = format!("## Wiki Knowledge\n{}", wiki_ctx.trim_end());
-                    audit.push(crate::prompt_audit::PromptSection::new("wiki", &s));
-                    parts.push(s);
-                }
-                Ok(_) => {} // no L0/L1 pages
-                Err(e) => {
-                    tracing::warn!("Wiki injection failed: {e}");
-                }
+            if !wiki_ctx.is_empty() {
+                // CACHE_SPLIT_MARKER: on the Direct API path the wiki
+                // section starts a second cached system block, so a wiki
+                // change invalidates only this block, not the static
+                // SOUL/skills/team prefix. CLI spawn paths strip the
+                // marker before writing the system-prompt file.
+                let s = format!(
+                    "{}\n## Wiki Knowledge\n{}",
+                    crate::direct_api::CACHE_SPLIT_MARKER,
+                    wiki_ctx.trim_end()
+                );
+                audit.push(crate::prompt_audit::PromptSection::new("wiki", &s));
+                parts.push(s);
             }
         }
     }
