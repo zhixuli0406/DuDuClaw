@@ -121,7 +121,6 @@
   "voice.enabled": "[EN] Enabled",
   "voice.disabled": "[EN] Disabled",
   "voice.provider.whisperApi": "[EN] Whisper API (Cloud)",
-  "voice.provider.sensevoice": "[EN] SenseVoice (Local)",
   "voice.provider.edgeTts": "[EN] Edge TTS (Free)",
   "voice.provider.minimax": "[EN] MiniMax T2A",
   "voice.provider.openaiTts": "[EN] OpenAI TTS",

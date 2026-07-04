@@ -8769,7 +8769,7 @@ impl MethodHandler {
         // block so the early-return below stays correct for mixed payloads.
         let config_toml_changes = changes.len();
         if let Some(voice) = params.get("voice").and_then(|v| v.as_object()) {
-            const VALID_ASR: &[&str] = &["auto", "whisper-api", "whisper-local", "sensevoice"];
+            const VALID_ASR: &[&str] = &["auto", "whisper-api", "whisper-local"];
             const VALID_TTS: &[&str] = &["auto", "edge-tts", "minimax", "openai-tts", "piper"];
 
             let inference_path = self.home_dir.join("inference.toml");

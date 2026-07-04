@@ -50,12 +50,6 @@ pub struct InferenceConfig {
     /// MLX bridge settings (Apple Silicon evolution)
     pub mlx: Option<crate::mlx_bridge::MlxConfig>,
 
-    /// LLMLingua-2 prompt compression settings
-    pub llmlingua: Option<crate::compression::llmlingua::LlmLinguaConfig>,
-
-    /// StreamingLLM session window settings
-    pub streaming_llm: Option<crate::compression::streaming_llm::StreamingLlmConfig>,
-
     /// Voice / ASR / TTS settings
     pub voice: Option<VoiceConfig>,
 
@@ -110,7 +104,7 @@ impl Default for EmbeddingConfig {
 /// Configured in `inference.toml` under `[voice]`:
 /// ```toml
 /// [voice]
-/// asr_provider = "auto"       # "auto" | "whisper-api" | "whisper-local" | "sensevoice"
+/// asr_provider = "auto"       # "auto" | "whisper-api" | "whisper-local"
 /// tts_provider = "auto"       # "auto" | "edge-tts" | "minimax" | "openai-tts" | "piper"
 /// asr_language = "zh"         # BCP-47 language hint
 /// tts_voice = ""              # Empty = auto-detect from text content
@@ -119,7 +113,7 @@ impl Default for EmbeddingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VoiceConfig {
-    /// ASR provider selection: "auto", "whisper-api", "whisper-local", "sensevoice"
+    /// ASR provider selection: "auto", "whisper-api", "whisper-local"
     pub asr_provider: String,
     /// TTS provider selection: "auto", "edge-tts", "minimax", "openai-tts", "piper"
     pub tts_provider: String,
@@ -145,7 +139,7 @@ impl Default for VoiceConfig {
 
 impl VoiceConfig {
     /// Allowed ASR provider values.
-    const VALID_ASR_PROVIDERS: &[&str] = &["auto", "whisper-api", "whisper-local", "sensevoice"];
+    const VALID_ASR_PROVIDERS: &[&str] = &["auto", "whisper-api", "whisper-local"];
     /// Allowed TTS provider values.
     const VALID_TTS_PROVIDERS: &[&str] = &["auto", "edge-tts", "minimax", "openai-tts", "piper"];
 
@@ -185,8 +179,6 @@ impl Default for InferenceConfig {
             exo: None,
             llamafile: None,
             mlx: None,
-            llmlingua: None,
-            streaming_llm: None,
             voice: None,
             embedding: None,
         }

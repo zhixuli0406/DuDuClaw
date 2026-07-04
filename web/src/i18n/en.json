@@ -116,7 +116,6 @@
   "voice.enabled": "Enabled",
   "voice.disabled": "Disabled",
   "voice.provider.whisperApi": "Whisper API (Cloud)",
-  "voice.provider.sensevoice": "SenseVoice (Local)",
   "voice.provider.edgeTts": "Edge TTS (Free)",
   "voice.provider.minimax": "MiniMax T2A",
   "voice.provider.openaiTts": "OpenAI TTS",
