@@ -1,45 +1,4 @@
-//! Tests for the ACP module — reverse-RPC types and Agent Card generation.
-
-#[test]
-fn test_reverse_rpc_types() {
-    use super::types::*;
-
-    // Test FsReadFileParams serialization
-    let params = FsReadFileParams {
-        path: "/tmp/test.txt".to_string(),
-    };
-    let json = serde_json::to_value(&params).unwrap();
-    assert_eq!(json["path"], "/tmp/test.txt");
-
-    // Test FsReadFileResult
-    let result = FsReadFileResult {
-        content: "hello world".to_string(),
-    };
-    let json = serde_json::to_value(&result).unwrap();
-    assert_eq!(json["content"], "hello world");
-
-    // Test FsWriteFileParams
-    let params = FsWriteFileParams {
-        path: "/tmp/output.txt".to_string(),
-        content: "new content".to_string(),
-    };
-    let json = serde_json::to_value(&params).unwrap();
-    assert_eq!(json["path"], "/tmp/output.txt");
-    assert_eq!(json["content"], "new content");
-
-    // Test RequestPermissionParams
-    let params = RequestPermissionParams {
-        tool_name: "Bash".to_string(),
-        description: "Run git status".to_string(),
-    };
-    let json = serde_json::to_value(&params).unwrap();
-    assert_eq!(json["tool_name"], "Bash");
-
-    // Test RequestPermissionResult
-    let result = RequestPermissionResult { granted: true };
-    let json = serde_json::to_value(&result).unwrap();
-    assert!(json["granted"].as_bool().unwrap());
-}
+//! Tests for the ACP module — Agent Card generation and A2A task lifecycle.
 
 #[test]
 fn test_agent_card_well_known_structure() {

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 #![allow(clippy::empty_line_after_doc_comments)]
 #![allow(clippy::format_in_format_args)]
 #![allow(clippy::ptr_arg)]
@@ -21,7 +20,6 @@ pub mod mcp_planner;             // RFC-26 P6.1: clarify-first Plan Mode
 pub mod builtin_skills;          // RFC-26 P6.3: bundled SKILL.md set
 pub mod mcp_refresh;             // v1.16.0: refresh-token credential type
 pub mod mcp_dispatch;          // W20-P1 Phase 2A: transport-agnostic dispatcher
-pub(crate) mod mcp_http_auth;  // W20-P1 Phase 2B: HTTP Bearer auth extractor
 pub(crate) mod mcp_http_errors; // W20-P1 Phase 2B: JSON-RPC ↔ HTTP status mapping
 pub mod mcp_http_server;       // W20-P1 Phase 2B: Axum HTTP/SSE server
 pub mod mcp_headers;           // W22-P0 ADR-002: capability registry + x-duduclaw header builder
@@ -249,17 +247,6 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
-}
-
-impl Cli {
-    /// Parse `--redact` into the typed `CliFlag` enum from the redaction crate.
-    fn redact_flag(&self) -> duduclaw_redaction::CliFlag {
-        match self.redact.as_deref() {
-            Some("on" | "true" | "1") => duduclaw_redaction::CliFlag::On,
-            Some("off" | "false" | "0") => duduclaw_redaction::CliFlag::Off,
-            _ => duduclaw_redaction::CliFlag::Unset,
-        }
-    }
 }
 
 #[derive(Subcommand)]

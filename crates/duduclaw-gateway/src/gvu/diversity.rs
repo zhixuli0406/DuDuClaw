@@ -8,7 +8,7 @@
 //! - Padmakumar et al. (ICLR 2024) "Does Writing with LMs Reduce Content Diversity?"
 //! - Quality-Diversity algorithms (MAP-Elites, QDAIF)
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

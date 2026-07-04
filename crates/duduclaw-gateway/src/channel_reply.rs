@@ -2876,9 +2876,6 @@ pub(crate) enum FailureReason {
     EmptyResponse,
     /// No rotator accounts configured.
     NoAccounts,
-    /// CLI failed but local model replied successfully.
-    /// Contains the original CLI error for user transparency.
-    LocalModelFallback(String),
     /// Fallback — unrecognized error string.
     Unknown,
 }
@@ -2993,13 +2990,6 @@ pub(crate) fn format_fallback_message(agent_name: &str, reason: FailureReason) -
             "{agent_name} 目前沒有可用的 Claude 帳號。\n\
              請先到儀表板設定 OAuth 或 API Key。"
         ),
-        FailureReason::LocalModelFallback(ref cli_err) => {
-            let reason_hint = classify_cli_error_hint(cli_err);
-            format!(
-                "⚠️ Claude CLI 暫時不可用（{reason_hint}），本次由本地模型代為回應。\n\
-                 系統會在背景自動偵測 CLI 恢復，屆時將自動切回 Claude。"
-            )
-        }
         FailureReason::Unknown => format!(
             "{agent_name} 暫時無法回應。\n\
              請稍後再試，或查看 ~/.duduclaw/debug.log 取得詳細原因。"

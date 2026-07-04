@@ -17,7 +17,6 @@
 //! not via a Dashboard.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;

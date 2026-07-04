@@ -575,21 +575,6 @@ fn token_check_backoff_secs(streak: u32) -> u64 {
 pub(crate) const INVALID_SESSION_WINDOW_HOURS: i64 = 24;
 pub(crate) const INVALID_SESSION_ALERT_THRESHOLD: usize = 5;
 
-/// Count how many timestamps in `history` fall within `window` of `now`.
-///
-/// Pure helper so the threshold semantics are unit-testable without
-/// reaching into the Discord gateway loop. Out-of-order entries are
-/// tolerated; callers should still trim old entries on the hot path to
-/// keep the slice small.
-pub(crate) fn count_within_window(
-    history: &[chrono::DateTime<chrono::Utc>],
-    now: chrono::DateTime<chrono::Utc>,
-    window: chrono::Duration,
-) -> usize {
-    let cutoff = now - window;
-    history.iter().filter(|t| **t >= cutoff).count()
-}
-
 /// Compute the reconnect delay for an invalid-session event with jitter.
 ///
 /// Discord docs require 1–5 s, with jitter encouraged so a million bots
@@ -2027,36 +2012,7 @@ mod backoff_tests {
 
 #[cfg(test)]
 mod invalid_session_tests {
-    use super::{count_within_window, invalid_session_jitter_ms};
-    use chrono::{Duration, TimeZone, Utc};
-
-    #[test]
-    fn count_only_includes_entries_within_window() {
-        let now = Utc.with_ymd_and_hms(2026, 5, 9, 12, 0, 0).unwrap();
-        let history = vec![
-            now - Duration::hours(25), // outside window
-            now - Duration::hours(23), // inside
-            now - Duration::hours(1),  // inside
-            now,                       // inside (boundary)
-        ];
-        assert_eq!(count_within_window(&history, now, Duration::hours(24)), 3);
-    }
-
-    #[test]
-    fn count_zero_when_history_empty() {
-        let now = Utc::now();
-        assert_eq!(count_within_window(&[], now, Duration::hours(24)), 0);
-    }
-
-    #[test]
-    fn count_zero_when_all_entries_expired() {
-        let now = Utc.with_ymd_and_hms(2026, 5, 9, 12, 0, 0).unwrap();
-        let history = vec![
-            now - Duration::hours(48),
-            now - Duration::hours(36),
-        ];
-        assert_eq!(count_within_window(&history, now, Duration::hours(24)), 0);
-    }
+    use super::invalid_session_jitter_ms;
 
     #[test]
     fn jitter_stays_within_discord_spec_1_to_5s() {

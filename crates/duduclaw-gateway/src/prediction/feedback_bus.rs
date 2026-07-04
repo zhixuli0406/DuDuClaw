@@ -205,7 +205,7 @@ impl TrustFeedbackBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use duduclaw_memory::feedback::{TrustSignal, WikiCitation};
+    use duduclaw_memory::feedback::WikiCitation;
 
     fn dummy_error(composite: f64) -> PredictionError {
         use chrono::Utc;

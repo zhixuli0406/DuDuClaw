@@ -195,7 +195,6 @@ impl McpDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
     use crate::mcp_auth::{Principal, Scope};
     use crate::mcp_namespace::NamespaceContext;
 

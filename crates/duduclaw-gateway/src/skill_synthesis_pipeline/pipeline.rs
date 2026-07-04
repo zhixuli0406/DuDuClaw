@@ -32,13 +32,11 @@
 //! interrupted by synthesis pipeline failures.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use chrono::Utc;
 use tracing::{debug, info, warn};
 
 use super::quality_scorer::{parse_events_from_dir, score_and_filter, ScoredTrajectory, ScorerConfig};
-use crate::evolution_events::emitter::EvolutionEventEmitter;
 use crate::evolution_events::schema::{AuditEvent, AuditEventType, Outcome};
 
 // ── Config ─────────────────────────────────────────────────────────────────────

@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use super::mistake_notebook::{MistakeEntry, MistakeNotebook};
+use super::mistake_notebook::MistakeEntry;
 use super::proposal::EvolutionProposal;
 use super::text_gradient::TextGradient;
 use super::updater::apply_patch_to_soul;
