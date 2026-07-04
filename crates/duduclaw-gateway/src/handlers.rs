@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::autopilot_store::{AutopilotStore, AutopilotRuleRow, AutopilotHistoryRow};
+use crate::autopilot_store::{AutopilotStore, AutopilotRuleRow};
 use crate::cron_scheduler::CronScheduler;
 use crate::cron_store::{CronStore, CronTaskRow};
 use crate::extension::GatewayExtension;
@@ -5568,17 +5568,6 @@ impl MethodHandler {
                 std::sync::Arc::new(rotator)
             }
         }
-    }
-
-    /// Get total spent cents across all accounts (MCP-L5).
-    ///
-    /// Note: AccountRotator tracks spend per-account (API key), not per-agent.
-    /// Per-agent tracking requires adding a usage ledger — this returns the
-    /// aggregate across all accounts as an honest approximation.
-    async fn get_total_spent(&self) -> u64 {
-        let rotator = self.cached_rotator().await;
-        let accounts = rotator.status().await;
-        accounts.iter().map(|a| a.spent_this_month).sum()
     }
 
     /// Real month-to-date spend in **cents** across all agents, sourced from

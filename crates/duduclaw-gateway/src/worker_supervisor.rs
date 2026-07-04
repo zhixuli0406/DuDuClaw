@@ -29,7 +29,7 @@ use std::time::Duration;
 use duduclaw_cli_worker::{TokenStore, WorkerClient};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 

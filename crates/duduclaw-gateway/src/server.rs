@@ -69,7 +69,7 @@ fn reset_login_rate_limit(ip: IpAddr, email: &str) {
 }
 
 use crate::auth::AuthManager;
-use crate::extension::{GatewayExtension, NullExtension};
+use crate::extension::GatewayExtension;
 use crate::handlers::MethodHandler;
 use crate::protocol::WsFrame;
 
@@ -1147,26 +1147,9 @@ struct LoginRequest {
     password: String,
 }
 
-#[derive(serde::Serialize)]
-struct LoginResponse {
-    access_token: String,
-    refresh_token: String,
-    user: duduclaw_auth::User,
-}
-
 #[derive(serde::Deserialize)]
 struct RefreshRequest {
     refresh_token: String,
-}
-
-#[derive(serde::Serialize)]
-struct TokenResponse {
-    access_token: String,
-}
-
-#[derive(serde::Serialize)]
-struct ErrorResponse {
-    error: String,
 }
 
 /// POST /api/login — Authenticate with email + password, return JWT tokens.

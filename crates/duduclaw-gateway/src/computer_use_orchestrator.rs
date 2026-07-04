@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::channel_sender::ChannelSender;

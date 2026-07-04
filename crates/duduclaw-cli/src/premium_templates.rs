@@ -17,7 +17,6 @@
 
 use std::path::{Path, PathBuf};
 
-use duduclaw_core::error::{DuDuClawError, Result};
 use duduclaw_license::{
     load_default, FeatureGate, LicenseError, LicenseTier, EMBEDDED_FEATURES_TOML,
 };
@@ -208,39 +207,6 @@ pub fn premium_present_but_locked() -> bool {
         .unwrap_or(false)
 }
 
-/// Resolve a premium template directory by slug, enforcing the license gate.
-///
-/// Fail-closed: returns an actionable error (not a silent fallback) when the
-/// feature is locked, the tree is absent, the slug is unsafe, or the named
-/// template does not exist.
-pub fn resolve_premium_template(slug: &str) -> Result<PathBuf> {
-    if !is_safe_slug(slug) {
-        return Err(DuDuClawError::Agent(format!(
-            "invalid premium template name '{slug}'"
-        )));
-    }
-    if !premium_unlocked() {
-        return Err(DuDuClawError::License(format!(
-            "premium template '{slug}' requires a Pro license. \
-             Activate one with `duduclaw license activate <key>` \
-             (see https://duduclaw.dudustudio.monster#pricing)."
-        )));
-    }
-    let base = find_premium_templates_dir().ok_or_else(|| {
-        DuDuClawError::Agent(
-            "premium templates are not installed on this machine".into(),
-        )
-    })?;
-    let dir = base.join(slug);
-    if !dir.join("SOUL.md").is_file() {
-        return Err(DuDuClawError::Agent(format!(
-            "premium template '{slug}' not found under {}",
-            base.display()
-        )));
-    }
-    Ok(dir)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,11 +282,5 @@ mod tests {
         assert_eq!(found[0].slug, "foo-pro");
 
         let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn resolve_rejects_unsafe_slug_before_touching_fs() {
-        let err = resolve_premium_template("../secrets").unwrap_err();
-        assert!(matches!(err, DuDuClawError::Agent(_)));
     }
 }

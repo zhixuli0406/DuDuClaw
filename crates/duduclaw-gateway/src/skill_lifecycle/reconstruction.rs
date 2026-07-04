@@ -10,7 +10,6 @@ use tracing::{debug, info};
 use duduclaw_memory::wiki::WikiStore;
 
 use super::compression::CompressedSkill;
-use super::relevance;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -64,8 +63,6 @@ const DEFAULT_TTL: u32 = 10;
 /// Maximum wiki pages to include in a reconstruction.
 const MAX_RECONSTRUCTION_PAGES: usize = 5;
 
-/// Minimum relevance score for a wiki page to be included.
-const MIN_RELEVANCE: f64 = 0.1;
 
 // ---------------------------------------------------------------------------
 // Reconstruction

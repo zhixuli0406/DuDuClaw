@@ -5,7 +5,6 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;

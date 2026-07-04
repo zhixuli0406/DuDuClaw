@@ -8,8 +8,6 @@ use std::path::Path;
 use duduclaw_core::error::{DuDuClawError, Result};
 use duduclaw_core::truncate_bytes;
 use duduclaw_memory::SqliteMemoryEngine;
-use duduclaw_core::traits::MemoryEngine;
-use duduclaw_core::types::MemoryEntry;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{info, warn};
@@ -1475,130 +1473,6 @@ fn extract_search_results(html: &str) -> String {
             .map(|(i, r)| format!("{}. {}", i + 1, r))
             .collect::<Vec<_>>()
             .join("\n\n")
-    }
-}
-
-async fn handle_memory_search(
-    params: &Value,
-    memory: &SqliteMemoryEngine,
-    agent_id: &str,
-) -> Value {
-    let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
-    if query.is_empty() {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": "Error: query is required"}],
-            "isError": true
-        });
-    }
-
-    match memory.search(agent_id, query, 10).await {
-        Ok(entries) => {
-            if entries.is_empty() {
-                serde_json::json!({
-                    "content": [{"type": "text", "text": "No memories found."}]
-                })
-            } else {
-                let text = entries
-                    .iter()
-                    .map(|e| format!("[{}] {}", e.timestamp.format("%Y-%m-%d %H:%M"), e.content))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                serde_json::json!({
-                    "content": [{"type": "text", "text": text}]
-                })
-            }
-        }
-        Err(e) => serde_json::json!({
-            "content": [{"type": "text", "text": format!("Error searching memory: {e}")}],
-            "isError": true
-        }),
-    }
-}
-
-async fn handle_memory_store(
-    params: &Value,
-    memory: &SqliteMemoryEngine,
-    agent_id: &str,
-) -> Value {
-    let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    if content.is_empty() {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": "Error: content is required"}],
-            "isError": true
-        });
-    }
-
-    let tags_str = params.get("tags").and_then(|v| v.as_str()).unwrap_or("");
-    let tags: Vec<String> = if tags_str.is_empty() {
-        Vec::new()
-    } else {
-        tags_str.split(',').map(|s| s.trim().to_string()).collect()
-    };
-
-    let classification = duduclaw_memory::classify(content, "user_input");
-    let entry_id = uuid::Uuid::new_v4().to_string();
-    let entry = MemoryEntry {
-        id: entry_id.clone(),
-        agent_id: agent_id.to_string(),
-        content: content.to_string(),
-        timestamp: chrono::Utc::now(),
-        tags,
-        embedding: None,
-        layer: classification.layer,
-        importance: classification.importance,
-        access_count: 0,
-        last_accessed: None,
-        source_event: "mcp_memory_store".to_string(),
-    };
-
-    match memory.store(agent_id, entry).await {
-        // BUG-MCP-001 fix: include memory_id so callers can retrieve the entry
-        // via memory_read without needing a secondary search.
-        Ok(()) => serde_json::json!({
-            "content": [{"type": "text", "text": format!("Memory stored successfully. memory_id: {entry_id}")}],
-            "memory_id": entry_id
-        }),
-        Err(e) => serde_json::json!({
-            "content": [{"type": "text", "text": format!("Error storing memory: {e}")}],
-            "isError": true
-        }),
-    }
-}
-
-// ── memory_read ───────────────────────────────────────────────────────────────
-// W19-P0 M1: Read a single memory entry by its UUID.
-// Uses get_by_id for O(1) point lookup (agent ownership enforced in SQL).
-// Namespace isolation: get_by_id filters by agent_id, so cross-agent reads
-// are rejected at the DB layer — callers outside the owning namespace always
-// receive isError.
-async fn handle_memory_read(
-    params: &Value,
-    memory: &SqliteMemoryEngine,
-    agent_id: &str,
-) -> Value {
-    let memory_id = match params.get("memory_id").and_then(|v| v.as_str()) {
-        Some(id) if !id.is_empty() => id,
-        _ => return tool_error("Missing required parameter: memory_id"),
-    };
-
-    match memory.get_by_id(agent_id, memory_id).await {
-        Ok(Some(entry)) => {
-            let payload = serde_json::json!({
-                "memory_id": entry.id,
-                "content": entry.content,
-                "layer": format!("{:?}", entry.layer),
-                "tags": entry.tags,
-                "created_at": entry.timestamp.to_rfc3339(),
-            });
-            serde_json::json!({
-                "content": [{ "type": "text", "text": payload.to_string() }]
-            })
-        }
-        Ok(None) => serde_json::json!({
-            "content": [{ "type": "text", "text": format!("Memory not found or access denied: {memory_id}") }],
-            "isError": true
-        }),
-        Err(e) => tool_error(&format!("Error reading memory: {e}")),
     }
 }
 
@@ -5932,7 +5806,6 @@ async fn handle_skill_synthesis_run(params: &Value, home_dir: &Path, default_age
 struct DelegationContext {
     depth: u8,
     origin: Option<String>,
-    sender: Option<String>,
 }
 
 impl DelegationContext {
@@ -5946,18 +5819,10 @@ impl DelegationContext {
         let origin = std::env::var(duduclaw_core::ENV_DELEGATION_ORIGIN)
             .ok()
             .filter(|s| !s.is_empty());
-        let sender = std::env::var(duduclaw_core::ENV_DELEGATION_SENDER)
-            .ok()
-            .filter(|s| !s.is_empty());
-        Self { depth, origin, sender }
+        Self { depth, origin }
     }
 }
 
-/// Read delegation context from environment (production entry point).
-fn read_delegation_env() -> (u8, Option<String>, Option<String>) {
-    let ctx = DelegationContext::from_env();
-    (ctx.depth, ctx.origin, ctx.sender)
-}
 
 /// Check whether `sender` is allowed to delegate to `target` under the
 /// supervisor pattern.  Allowed directions:
@@ -8860,28 +8725,6 @@ async fn handle_skill_extract(args: &Value, home_dir: &Path, default_agent: &str
     }
 }
 
-// ── Helpers ────────────────────────────────────────────────────
-
-/// Truncate a `String` safely at a UTF-8 char boundary.
-///
-/// Returns `true` if the string was actually truncated.
-/// Plain `String::truncate(n)` panics when `n` falls inside a multi-byte
-/// character (common with CJK text). This finds the largest valid boundary
-/// at or below `max_bytes`.
-fn safe_truncate(s: &mut String, max_bytes: usize) -> bool {
-    if s.len() <= max_bytes {
-        return false;
-    }
-    // Find the largest char boundary <= max_bytes
-    let boundary = (0..=max_bytes)
-        .rev()
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(0);
-    s.truncate(boundary);
-    s.push_str("\n...[truncated]");
-    true
-}
-
 // ── execute_program handler ─────────────────────────────────────
 
 async fn handle_execute_program(args: &Value) -> Value {
@@ -10110,16 +9953,14 @@ high_context = true
     #[test]
     fn delegation_context_fields() {
         // Test DelegationContext construction directly — no env var mutation needed.
-        let ctx = DelegationContext { depth: 3, origin: Some("main".into()), sender: Some("worker".into()) };
+        let ctx = DelegationContext { depth: 3, origin: Some("main".into()) };
         assert_eq!(ctx.depth, 3);
         assert_eq!(ctx.origin.as_deref(), Some("main"));
-        assert_eq!(ctx.sender.as_deref(), Some("worker"));
 
         // Default-like: depth 0, no origin/sender
-        let ctx0 = DelegationContext { depth: 0, origin: None, sender: None };
+        let ctx0 = DelegationContext { depth: 0, origin: None };
         assert_eq!(ctx0.depth, 0);
         assert!(ctx0.origin.is_none());
-        assert!(ctx0.sender.is_none());
     }
 
     // Mutex to serialize env-var-mutating tests (env is process-global).
@@ -10145,7 +9986,6 @@ high_context = true
         clear_delegation_env();
         assert_eq!(ctx.depth, 3);
         assert_eq!(ctx.origin.as_deref(), Some("main-agent"));
-        assert_eq!(ctx.sender.as_deref(), Some("researcher"));
     }
 
     #[test]
@@ -10155,7 +9995,6 @@ high_context = true
         let ctx = DelegationContext::from_env();
         assert_eq!(ctx.depth, 0);
         assert!(ctx.origin.is_none());
-        assert!(ctx.sender.is_none());
     }
 
     #[test]
@@ -10170,7 +10009,6 @@ high_context = true
         clear_delegation_env();
         assert_eq!(ctx.depth, 0);
         assert!(ctx.origin.is_none(), "Empty string should filter to None");
-        assert!(ctx.sender.is_none(), "Empty string should filter to None");
     }
 
     #[test]
@@ -10208,7 +10046,7 @@ high_context = true
         create_test_agent(&agents_dir, "main", "");
         create_test_agent(&agents_dir, "worker", "main");
 
-        let ctx = DelegationContext { depth: 2, origin: Some("main".into()), sender: Some("main".into()) };
+        let ctx = DelegationContext { depth: 2, origin: Some("main".into()) };
         let params = serde_json::json!({ "agent_id": "worker", "prompt": "do something" });
         let result = send_to_agent_with_ctx(&params, home, "main", ctx).await;
 
@@ -10256,7 +10094,7 @@ high_context = true
         create_test_agent(&agents_dir, "worker", "main");
 
         // depth=4 → outgoing=5 >= MAX(5) → rejected
-        let ctx = DelegationContext { depth: 4, origin: Some("main".into()), sender: Some("researcher".into()) };
+        let ctx = DelegationContext { depth: 4, origin: Some("main".into()) };
         let params = serde_json::json!({ "agent_id": "worker", "prompt": "do something" });
         let result = send_to_agent_with_ctx(&params, home, "main", ctx).await;
 
@@ -10288,7 +10126,7 @@ high_context = true
         create_test_agent(&agents_dir, "worker", "main");
 
         // Happy path at depth 0 → outgoing 1. Succeeds.
-        let ctx = DelegationContext { depth: 0, origin: None, sender: None };
+        let ctx = DelegationContext { depth: 0, origin: None };
         let params = serde_json::json!({ "agent_id": "worker", "prompt": "hi" });
         let result = send_to_agent_with_ctx(&params, home, "main", ctx).await;
         let text = result["content"][0]["text"].as_str().unwrap();
@@ -10320,7 +10158,7 @@ high_context = true
         create_test_agent(&agents_dir, "main", "");
         create_test_agent(&agents_dir, "worker", "main");
 
-        let ctx = DelegationContext { depth: 1, origin: Some("root-agent".into()), sender: Some("main".into()) };
+        let ctx = DelegationContext { depth: 1, origin: Some("root-agent".into()) };
         let params = serde_json::json!({ "agent_id": "worker", "task": "background work" });
         let result = spawn_agent_with_ctx(&params, home, "main", ctx).await;
 
@@ -10347,7 +10185,7 @@ high_context = true
         create_test_agent(&agents_dir, "worker", "main");
 
         // No origin/sender set — simulates first delegation (no dispatcher context)
-        let ctx = DelegationContext { depth: 0, origin: None, sender: None };
+        let ctx = DelegationContext { depth: 0, origin: None };
         let params = serde_json::json!({ "agent_id": "worker", "prompt": "first delegation" });
         let result = send_to_agent_with_ctx(&params, home, "main", ctx).await;
 

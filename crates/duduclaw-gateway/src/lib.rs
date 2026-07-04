@@ -1,6 +1,4 @@
 #![recursion_limit = "256"]
-#![allow(dead_code)]
-#![allow(unused_imports)]
 #![allow(unused_mut)]
 #![allow(unused_variables)]
 #![allow(clippy::collapsible_if)]

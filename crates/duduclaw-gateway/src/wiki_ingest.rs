@@ -9,7 +9,7 @@
 //!   LocalFast — FAQ updates, simple entity mentions
 //!   CloudApi  — new domain knowledge, contradictions, complex patterns
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use chrono::Utc;
 use tracing::{debug, info, warn};
