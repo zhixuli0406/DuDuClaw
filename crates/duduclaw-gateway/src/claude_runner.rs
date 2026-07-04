@@ -652,8 +652,139 @@ pub(crate) fn is_rate_limit_error(error: &str) -> bool {
         || lower.contains("capacity limit")
 }
 
-/// Try calling the Anthropic Messages API directly (bypassing Claude CLI).
+/// Where a Direct-API request for a model is served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DirectApiRoute {
+    /// api.anthropic.com via `crate::direct_api` (ANTHROPIC key, layered
+    /// cache breakpoints + invalidation attribution) — the pre-existing path.
+    LegacyAnthropic,
+    /// A duduclaw-llm provider client, keyed by registry provider id
+    /// ("openai", "gemini", "deepseek", ...).
+    LlmProvider(String),
+}
+
+/// Pure routing decision: registry-known non-Anthropic models go to the
+/// matching duduclaw-llm provider; Anthropic models AND unknown models keep
+/// the legacy path (unknown → legacy preserves pre-multi-provider behavior
+/// exactly, including its failure mode).
+fn direct_api_route(model: &str) -> DirectApiRoute {
+    match crate::cost_telemetry::model_registry().get(model) {
+        Some(info) if info.provider != "anthropic" => {
+            DirectApiRoute::LlmProvider(info.provider.clone())
+        }
+        _ => DirectApiRoute::LegacyAnthropic,
+    }
+}
+
+/// Build a duduclaw-llm provider client for `provider_id`, resolving the API
+/// key from the provider's standard env vars. No key → Err, so callers fall
+/// back to the CLI/rotation path exactly like the legacy "no API key" case.
+fn build_llm_provider(
+    provider_id: &str,
+) -> Result<Box<dyn duduclaw_llm::ChatProvider>, String> {
+    let key = duduclaw_llm::resolve_env_key(provider_id).ok_or_else(|| {
+        format!(
+            "no API key for provider {provider_id} — set its standard env var \
+             (e.g. OPENAI_API_KEY / GEMINI_API_KEY / DEEPSEEK_API_KEY)"
+        )
+    })?;
+    let auth = duduclaw_llm::ApiAuth::new(key);
+    match provider_id {
+        "openai" => Ok(Box::new(duduclaw_llm::providers::OpenAiProvider::new(auth))),
+        "gemini" | "google" => Ok(Box::new(duduclaw_llm::providers::GeminiProvider::new(auth))),
+        other => duduclaw_llm::providers::OpenAiCompatProvider::from_preset(other, auth)
+            .map(|p| Box::new(p) as Box<dyn duduclaw_llm::ChatProvider>)
+            // Fail closed: no preset → no guessed base URL.
+            .ok_or_else(|| format!("no direct-API preset for provider {other}")),
+    }
+}
+
+/// Build the normalized ChatRequest for a non-Anthropic direct call.
 ///
+/// The system prompt splits on `CACHE_SPLIT_MARKER` — duduclaw-llm re-exports
+/// the identical constant as `direct_api.rs` (test-pinned below) — so the
+/// marker never reaches the wire. Providers with explicit caching get
+/// `Explicit` hints per block; others get plain blocks (their implicit prefix
+/// caching ignores hints). `dynamic_system_suffix` lands as a final uncached
+/// block so the static prefix stays cache-stable, mirroring the legacy path.
+fn build_llm_chat_request(
+    model: &str,
+    supports_caching: bool,
+    system_prompt: &str,
+    dynamic_system_suffix: Option<&str>,
+    prompt: &str,
+) -> duduclaw_llm::ChatRequest {
+    use duduclaw_llm::{ChatMessage, ChatRequest, SystemBlock, CACHE_SPLIT_MARKER};
+
+    let mut req = ChatRequest::new(model);
+    for segment in system_prompt.split(CACHE_SPLIT_MARKER) {
+        let text = segment.trim();
+        if text.is_empty() {
+            continue;
+        }
+        req.system.push(if supports_caching {
+            SystemBlock::cached(text)
+        } else {
+            SystemBlock::uncached(text)
+        });
+    }
+    if let Some(suffix) = dynamic_system_suffix {
+        let text = suffix.trim();
+        if !text.is_empty() {
+            req.system.push(SystemBlock::uncached(text));
+        }
+    }
+    req.messages.push(ChatMessage::user(prompt));
+    // ChatRequest::new defaults to 4096 == direct_api::DEFAULT_MAX_TOKENS;
+    // pinned explicitly so the two paths can't drift apart silently.
+    req.max_tokens = 4096;
+    req
+}
+
+/// Direct API call through a duduclaw-llm provider (non-Anthropic models).
+async fn try_llm_provider_api(
+    agent_id: &str,
+    prompt: &str,
+    model: &str,
+    system_prompt: &str,
+    dynamic_system_suffix: Option<&str>,
+    request_type: crate::cost_telemetry::RequestType,
+    provider_id: &str,
+) -> Result<String, String> {
+    let provider = build_llm_provider(provider_id)?;
+    let supports_caching = crate::cost_telemetry::model_registry()
+        .supports(model, duduclaw_llm::Feature::Caching);
+    let req =
+        build_llm_chat_request(model, supports_caching, system_prompt, dynamic_system_suffix, prompt);
+
+    info!(provider = provider_id, model, "Trying Direct API via duduclaw-llm provider");
+    let resp = provider
+        .complete(&req)
+        .await
+        .map_err(|e| format!("{provider_id} direct API error: {e}"))?;
+
+    // Reasoning fold: TokenUsage has no reasoning field, and NormalizedUsage
+    // guarantees `output_tokens + reasoning_tokens` == total billable output
+    // (providers that report reasoning inside output set reasoning to 0), so
+    // folding here bills reasoning exactly once at the output rate.
+    let usage = crate::cost_telemetry::TokenUsage {
+        input_tokens: resp.usage.input_tokens,
+        cache_read_tokens: resp.usage.cache_read_tokens,
+        cache_creation_tokens: resp.usage.cache_write_tokens,
+        output_tokens: resp.usage.output_tokens + resp.usage.reasoning_tokens,
+    };
+    if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
+        telemetry.record(agent_id, request_type, model, &usage).await;
+    }
+
+    Ok(resp.text())
+}
+
+/// Try calling the model's provider API directly (bypassing Claude CLI).
+///
+/// Anthropic (and registry-unknown) models keep the original
+/// `crate::direct_api` path with its cache attribution; registry-known
+/// non-Anthropic models route through the matching duduclaw-llm provider.
 /// Only works with API key accounts (not OAuth). If no API key is available,
 /// returns an error so the caller can fall back to CLI.
 async fn try_direct_api(
@@ -665,6 +796,14 @@ async fn try_direct_api(
     dynamic_system_suffix: Option<&str>,
     request_type: crate::cost_telemetry::RequestType,
 ) -> Result<String, String> {
+    if let DirectApiRoute::LlmProvider(provider_id) = direct_api_route(model) {
+        return try_llm_provider_api(
+            agent_id, prompt, model, system_prompt, dynamic_system_suffix,
+            request_type, &provider_id,
+        )
+        .await;
+    }
+
     let api_key = get_api_key(home_dir).await;
     if api_key.is_empty() {
         return Err("No API key available for Direct API (OAuth accounts require CLI path)".to_string());
@@ -1050,7 +1189,9 @@ async fn call_with_rotation(
                     if selected.auth_method == duduclaw_agent::account_rotator::AuthMethod::OAuth {
                         0
                     } else {
-                        usage.estimated_cost_millicents() // same unit as monthly_budget_cents
+                        // Registry-aware (falls back to legacy Sonnet rates for
+                        // unknown models) — same unit as monthly_budget_cents.
+                        crate::cost_telemetry::cost_for(model, usage)
                     }
                 } else if selected.auth_method == duduclaw_agent::account_rotator::AuthMethod::OAuth {
                     0
@@ -1520,4 +1661,100 @@ async fn call_claude_with_env(
     }
 
     call_claude_streaming(&mut cmd, None).await
+}
+
+// ---------------------------------------------------------------------------
+// Tests — Direct-API multi-provider routing (W2)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod direct_api_routing_tests {
+    use super::*;
+    use duduclaw_llm::{CacheHint, ContentPart, Role};
+
+    #[test]
+    fn route_decision_table() {
+        // Anthropic models (registry-known) → legacy path.
+        assert_eq!(direct_api_route("claude-sonnet-5"), DirectApiRoute::LegacyAnthropic);
+        assert_eq!(
+            direct_api_route("anthropic/claude-haiku-4-5"),
+            DirectApiRoute::LegacyAnthropic
+        );
+        // Registry-unknown claude id → legacy path (behavior-compatible).
+        assert_eq!(direct_api_route("claude-sonnet-4-6"), DirectApiRoute::LegacyAnthropic);
+        // Known non-Anthropic models → their duduclaw-llm provider.
+        assert_eq!(
+            direct_api_route("gpt-5.4"),
+            DirectApiRoute::LlmProvider("openai".to_string())
+        );
+        assert_eq!(
+            direct_api_route("gemini-3.1-pro"),
+            DirectApiRoute::LlmProvider("gemini".to_string())
+        );
+        assert_eq!(
+            direct_api_route("deepseek-v3.2"),
+            DirectApiRoute::LlmProvider("deepseek".to_string())
+        );
+        assert_eq!(
+            direct_api_route("deepseek/deepseek-v3.2"),
+            DirectApiRoute::LlmProvider("deepseek".to_string())
+        );
+        // Unknown model → legacy path (fail-safe, unchanged failure mode).
+        assert_eq!(direct_api_route("unknown-model"), DirectApiRoute::LegacyAnthropic);
+    }
+
+    /// The two marker constants MUST stay byte-identical — prompt assemblers
+    /// write the gateway constant, the llm path splits on the crate constant.
+    #[test]
+    fn cache_split_markers_stay_in_sync() {
+        assert_eq!(duduclaw_llm::CACHE_SPLIT_MARKER, crate::direct_api::CACHE_SPLIT_MARKER);
+    }
+
+    #[test]
+    fn chat_request_splits_marker_into_cached_blocks_plus_uncached_suffix() {
+        let system = format!(
+            "# Static\nsoul\n{}\n# Semi\nwiki\n",
+            duduclaw_llm::CACHE_SPLIT_MARKER
+        );
+        let req = build_llm_chat_request(
+            "gemini-3.1-pro",
+            true,
+            &system,
+            Some("## Pending Tasks\n- t1"),
+            "hello",
+        );
+        assert_eq!(req.model, "gemini-3.1-pro");
+        assert_eq!(req.max_tokens, 4096);
+        // 2 split blocks (Explicit) + 1 uncached dynamic suffix.
+        assert_eq!(req.system.len(), 3);
+        assert_eq!(req.system[0].text, "# Static\nsoul");
+        assert_eq!(req.system[0].cache, CacheHint::Explicit);
+        assert_eq!(req.system[1].text, "# Semi\nwiki");
+        assert_eq!(req.system[1].cache, CacheHint::Explicit);
+        assert_eq!(req.system[2].text, "## Pending Tasks\n- t1");
+        assert_eq!(req.system[2].cache, CacheHint::None);
+        // The marker text never survives into any block.
+        assert!(req.system.iter().all(|b| !b.text.contains("cache-split")));
+        // Single user message carrying the prompt; no tools.
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, Role::User);
+        assert_eq!(req.messages[0].parts, vec![ContentPart::Text("hello".to_string())]);
+        assert!(req.tools.is_empty());
+    }
+
+    #[test]
+    fn chat_request_without_caching_strips_marker_and_leaves_blocks_uncached() {
+        let system = format!("A{}B", duduclaw_llm::CACHE_SPLIT_MARKER);
+        let req = build_llm_chat_request("qwen3.7-max", false, &system, None, "hi");
+        assert_eq!(req.system.len(), 2);
+        assert!(req.system.iter().all(|b| b.cache == CacheHint::None));
+        assert!(req.system.iter().all(|b| !b.text.contains("cache-split")));
+    }
+
+    #[test]
+    fn chat_request_empty_system_and_blank_suffix_produce_no_blocks() {
+        let req = build_llm_chat_request("deepseek-v3.2", true, "", Some("   "), "hi");
+        assert!(req.system.is_empty());
+        assert_eq!(req.messages.len(), 1);
+    }
 }
