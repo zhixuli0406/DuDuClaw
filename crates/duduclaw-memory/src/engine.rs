@@ -31,11 +31,20 @@ pub struct KeyFact {
 /// Configurable weights for the Generative Agents 3D retrieval re-ranking.
 ///
 /// Adjustable per-engine instance. Defaults tuned for agents with daily conversations.
+///
+/// The recency dimension uses Ebbinghaus retrievability `R = exp(-t / S)`
+/// (MemoryBank, arXiv:2305.10250) where stability `S` grows with access
+/// reinforcement and importance — see [`ebbinghaus_retrievability`].
 #[derive(Debug, Clone)]
 pub struct RetrievalWeights {
-    /// Recency decay base (default 0.995). Higher = slower decay.
-    /// 0.99 → 7-day half-life; 0.995 → 14-day half-life; 0.999 → 69-day half-life.
-    pub recency_decay: f64,
+    /// Base stability in days for an importance-5, never-reinforced memory
+    /// (default 14.0 — matches the previous ~14-day recency half-life intent).
+    pub base_stability_days: f64,
+    /// Reinforcement gain: how strongly repeated accesses slow forgetting
+    /// (default 0.6; stability multiplier is `1 + k·ln(1 + access_count)`).
+    pub reinforce_k: f64,
+    /// Upper bound on stability in days (default 365.0).
+    pub max_stability_days: f64,
     /// Weight for recency dimension (default 0.25).
     pub w_recency: f64,
     /// Weight for importance dimension (default 0.35).
@@ -47,12 +56,36 @@ pub struct RetrievalWeights {
 impl Default for RetrievalWeights {
     fn default() -> Self {
         Self {
-            recency_decay: 0.995,  // ~14-day half-life (better differentiation in 0-48h window)
+            base_stability_days: 14.0,
+            reinforce_k: 0.6,
+            max_stability_days: 365.0,
             w_recency: 0.25,
             w_importance: 0.35,
             w_fts: 0.40,
         }
     }
+}
+
+/// Ebbinghaus retrievability `R = exp(-t / S)` (MemoryBank, arXiv:2305.10250).
+///
+/// `t` is days since the memory was last recalled (falling back to creation
+/// time for never-accessed entries). Stability `S` grows logarithmically with
+/// reinforcement (`access_count`) and scales with importance, so memories that
+/// keep being recalled — or matter more — are forgotten more slowly:
+///
+/// `S = base · (1 + k·ln(1 + access_count)) · clamp(importance / 5, 0.2, 2.0)`
+pub fn ebbinghaus_retrievability(
+    days_since_access: f64,
+    access_count: u32,
+    importance: f64,
+    w: &RetrievalWeights,
+) -> f64 {
+    let stability = (w.base_stability_days
+        * (1.0 + w.reinforce_k * (1.0 + access_count as f64).ln())
+        * (importance / 5.0).clamp(0.2, 2.0))
+    .min(w.max_stability_days)
+    .max(f64::EPSILON);
+    (-days_since_access.max(0.0) / stability).exp()
 }
 
 /// Optional temporal / knowledge-graph metadata for a memory write (F1, v1.19.0).
@@ -1209,13 +1242,19 @@ impl MemoryEngine for SqliteMemoryEngine {
             .into_iter()
             .enumerate()
             .map(|(rank_pos, entry)| {
-                let hours_ago = now
+                let days_since_access = now
                     .signed_duration_since(
                         entry.last_accessed.unwrap_or(entry.timestamp)
                     )
-                    .num_hours()
-                    .max(0) as f64;
-                let recency = w.recency_decay.powf(hours_ago);
+                    .num_seconds()
+                    .max(0) as f64
+                    / 86_400.0;
+                let recency = ebbinghaus_retrievability(
+                    days_since_access,
+                    entry.access_count,
+                    entry.importance,
+                    w,
+                );
                 let importance = entry.importance / 10.0;
                 let fts_rank = 1.0 / (1.0 + rank_pos as f64);
 
@@ -1550,6 +1589,48 @@ mod tests {
             last_accessed: None,
             source_event: String::new(),
         }
+    }
+
+    #[test]
+    fn retrievability_reinforcement_slows_forgetting() {
+        let w = RetrievalWeights::default();
+        // Same age + importance: more recalls → higher retrievability.
+        let unreinforced = ebbinghaus_retrievability(30.0, 0, 5.0, &w);
+        let reinforced = ebbinghaus_retrievability(30.0, 20, 5.0, &w);
+        assert!(reinforced > unreinforced);
+
+        // Higher importance → slower forgetting.
+        let low_imp = ebbinghaus_retrievability(30.0, 0, 2.0, &w);
+        let high_imp = ebbinghaus_retrievability(30.0, 0, 8.0, &w);
+        assert!(high_imp > low_imp);
+
+        // Fresh memory is fully retrievable; bounds hold everywhere.
+        assert!((ebbinghaus_retrievability(0.0, 0, 5.0, &w) - 1.0).abs() < 1e-9);
+        let r = ebbinghaus_retrievability(10_000.0, 0, 0.0, &w);
+        assert!((0.0..=1.0).contains(&r));
+    }
+
+    #[tokio::test]
+    async fn search_ranks_reinforced_memory_higher() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "rank-agent";
+        let old = Utc::now() - Duration::days(40);
+
+        // Two equally old, equally important matches — one recalled often
+        // and recently, one never recalled. The reinforced one must rank first.
+        let mut stale = make_entry(agent, "project deadline is friday", vec![]);
+        stale.timestamp = old;
+        let mut reinforced = make_entry(agent, "project deadline moved to monday", vec![]);
+        reinforced.timestamp = old;
+        reinforced.access_count = 25;
+        reinforced.last_accessed = Some(Utc::now() - Duration::hours(2));
+
+        engine.store(agent, stale).await.unwrap();
+        engine.store(agent, reinforced).await.unwrap();
+
+        let results = engine.search(agent, "deadline", 10).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].content.contains("monday"));
     }
 
     #[tokio::test]
