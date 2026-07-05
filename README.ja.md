@@ -12,7 +12,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.32.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.33.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -99,14 +99,15 @@ cosign verify-blob \
 
 ---
 
-> 🎉 **v1.32.0 — ダッシュボード UX：コマンドパレット・自己説明するナビ・モバイル対応**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.32.0)）
+> 🎉 **v1.33.0 — モデル非依存コア + AI ハーネス基盤**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.33.0)）
 >
-> 全ページ UX 監査を起点に、Calm Glass ダッシュボードを深く磨き込み。フロントエンドのみで、バックエンド RPC / WS プロトコル変更なし。
+> まず徹底的なスリム化（孤児コード・冗長 1.9 万行を削除）、その上で「Multi-Runtime」をテキストシェルから真のモデル非依存プラットフォームへ昇格し、2026 年のハーネス標準装備を実装。
 >
-> - **コマンドパレット（⌘K / Ctrl+K）** — 依存ゼロのファジー検索（CJK 対応、Latin エイリアス、ページ説明も検索可）で 37 ページ（ロール/エディション制御）へ即ジャンプ + クイックアクション（テーマ / 言語 / ワークスペース⇄詳細 / ログアウト）；空クエリで最近訪れたページを表示；完全な ARIA combobox とキーボード操作；Header に `検索… ⌘K` ボタン
-> - **自己説明するサイドバー** — 各ナビ項目にラベル下の 1 行説明（パレットでは検索可能なサブタイトル）を追加し、アイコンから推測せずに機能が分かる（27 項目 × 3 言語）
-> - **モバイル対応** — `md` 未満ではサイドバーがオフキャンバスのドロワー（ハンバーガー + 背景、遷移で自動クローズ）、`md` 以上は静的カラム
-> - **共有ローディング要素** — `Skeleton` / `SkeletonList` + `Button` の `pending` 状態（スピナー + 無効化 + `aria-busy`）
+> - **`duduclaw-llm` 統一プロバイダ層** — Anthropic Messages / OpenAI Responses / Gemini ネイティブ / OpenAI-compat の 4 プロトコルを単一の正規化インターフェースで：真の SSE、ツール呼び出し正規化、15 モデルの価格レジストリ（price cliff + キャッシュ料金、非 Anthropic モデルの最大 30 倍の課金誤差を修正）、プロバイダ横断フォールバックチェーン（`[model] fallbacks`）+ プロバイダ非依存アカウントローテーション
+> - **非 Claude ランタイムの対等化** — fail-closed なケーパビリティ強制（`--full-auto`/`yolo` 全開を廃止）、PTY プールへのツール制限注入、codex/gemini/agy ネイティブ設定への MCP 自動登録、プロバイダ対応スキャフォールド（AGENTS.md / GEMINI.md）
+> - **MCP クライアント + ツールループ** — direct-API とローカル推論パスでも MCP ツール全面が利用可能に；ローカルモデル（llamafile/Exo/vLLM）がツール付き一級バックエンドに、`inference_mode = "local"` がチャネル応答で有効化
+> - **ハーネス基盤** — OTel GenAI トレーシング（OTLP 直結 + 認証ヘッダ）、`duduclaw eval` 行動回帰スイート、汎用 HITL ApprovalBroker（TTL 失効＝拒否）、A2A v1.0 Agent Card + 実 `message/send`、任意の OS キーチェーン
+> - **記憶／ルーティング研究改善** — Ebbinghaus 忘却曲線、HippoRAG-lite グラフ検索、ACE/ExpeL ルールライフサイクル、較正カスケードルーティング、要約付きリトライ、階層キャッシュブレークポイント + 無効化帰属、wiki↔記憶の単一所有権境界
 
 
 
@@ -115,8 +116,9 @@ https://github.com/user-attachments/assets/30406ad1-4595-43ce-8c08-dba8f0ca9683
 
 
 <details>
-<summary><strong>v1.9.4 → v1.31.x 累積ハイライト</strong></summary>
+<summary><strong>v1.9.4 → v1.32.x 累積ハイライト</strong></summary>
 
+- **v1.32.0** — ダッシュボード UX：コマンドパレット（⌘K）・自己説明ナビ・モバイル対応・共有ローディング要素（フロントエンドのみ）
 - **v1.31.0** — Genspark 風のワークスペース外殻（中央プロンプトバー + 能力ランチャー +「Claw、あなたの最初の AI 社員」）を Calm Glass 詳細ダッシュボードの上に重ね、シンプルな ⇄ 詳細モード切替；Tauri 2 デスクトップ外殻（Phase D）— gateway を sidecar として包むネイティブウィンドウ — とライフサイクル硬化（`DUDUCLAW_DESKTOP_MODE`、config.toml ポート優先、二重起動を防ぐ attach 検出）
 - **v1.30.0** — アカウントごとの OAuth 環境を PTY プールに注入；LINE 返信を detached タスクから送信
 - **v1.29.0** — Cloud プランのエージェント/チャンネル上限：`features.toml` の tier ごとの `max_agents` / `max_channels` を実際に適用（Hobby 1/1、Solo 1/2、Studio 3/5）；**セルフホストは無制限**（Apache 2.0 の約束）；ソフト上限バナー + アップグレード CTA；`license_runtime::cap_exceeded()` 純関数ゲート
