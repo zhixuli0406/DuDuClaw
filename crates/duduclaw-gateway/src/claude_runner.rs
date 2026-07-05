@@ -280,6 +280,23 @@ pub async fn call_claude_for_agent(
 ///
 /// Delegation context (depth, origin, sender) is read from the [`DELEGATION_ENV`]
 /// task-local — set by the dispatcher before calling this function.
+// OTel GenAI semconv (Development): root `invoke_agent` span for one
+// dispatcher agent run (sub-agent delegation / cron / bus tasks). Attribute
+// names centralized in `crate::otel`; model + usage are resolved mid-flight
+// and recorded post-hoc (usage in `call_claude_streaming` / the chat spans).
+#[tracing::instrument(
+    name = "invoke_agent",
+    skip_all,
+    fields(
+        gen_ai.operation.name = "invoke_agent",
+        gen_ai.system = "anthropic",
+        gen_ai.provider.name = "anthropic",
+        gen_ai.agent.name = %agent_id,
+        gen_ai.request.model = tracing::field::Empty,
+        gen_ai.usage.input_tokens = tracing::field::Empty,
+        gen_ai.usage.output_tokens = tracing::field::Empty,
+    )
+)]
 pub async fn call_claude_for_agent_with_type(
     home_dir: &Path,
     registry: &Arc<RwLock<AgentRegistry>>,
@@ -319,6 +336,9 @@ pub async fn call_claude_for_agent_with_type(
     let system_prompt = build_system_prompt(agent, citation_ref);
     let agent_name = agent.config.agent.name.clone();
     let claude_model = agent.config.model.preferred.clone();
+    // OTel: record the resolved model on the `invoke_agent` span.
+    tracing::Span::current()
+        .record(crate::otel::attrs::REQUEST_MODEL, claude_model.as_str());
     let fallback_model = agent.config.model.fallback.clone();
     let local_config = agent.config.model.local.clone();
     let api_mode = agent.config.model.api_mode.clone();
@@ -742,6 +762,21 @@ fn build_llm_chat_request(
 }
 
 /// Direct API call through a duduclaw-llm provider (non-Anthropic models).
+// OTel GenAI: `chat` span for one non-Anthropic Direct-API model call
+// (attribute names centralized in `crate::otel`; usage recorded post-hoc).
+#[tracing::instrument(
+    name = "chat",
+    skip_all,
+    fields(
+        gen_ai.operation.name = "chat",
+        gen_ai.system = %provider_id,
+        gen_ai.provider.name = %provider_id,
+        gen_ai.agent.name = %agent_id,
+        gen_ai.request.model = %model,
+        gen_ai.usage.input_tokens = tracing::field::Empty,
+        gen_ai.usage.output_tokens = tracing::field::Empty,
+    )
+)]
 async fn try_llm_provider_api(
     agent_id: &str,
     prompt: &str,
@@ -773,6 +808,12 @@ async fn try_llm_provider_api(
         cache_creation_tokens: resp.usage.cache_write_tokens,
         output_tokens: resp.usage.output_tokens + resp.usage.reasoning_tokens,
     };
+    // OTel: record usage on the `chat` span.
+    {
+        let span = tracing::Span::current();
+        span.record(crate::otel::attrs::USAGE_INPUT_TOKENS, usage.input_tokens);
+        span.record(crate::otel::attrs::USAGE_OUTPUT_TOKENS, usage.output_tokens);
+    }
     if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
         telemetry.record(agent_id, request_type, model, &usage).await;
     }
@@ -787,6 +828,21 @@ async fn try_llm_provider_api(
 /// non-Anthropic models route through the matching duduclaw-llm provider.
 /// Only works with API key accounts (not OAuth). If no API key is available,
 /// returns an error so the caller can fall back to CLI.
+// OTel GenAI: `chat` span for one Anthropic Direct-API model call. The
+// LlmProvider route below nests its own `chat` span with the real provider.
+#[tracing::instrument(
+    name = "chat",
+    skip_all,
+    fields(
+        gen_ai.operation.name = "chat",
+        gen_ai.system = "anthropic",
+        gen_ai.provider.name = "anthropic",
+        gen_ai.agent.name = %agent_id,
+        gen_ai.request.model = %model,
+        gen_ai.usage.input_tokens = tracing::field::Empty,
+        gen_ai.usage.output_tokens = tracing::field::Empty,
+    )
+)]
 async fn try_direct_api(
     home_dir: &Path,
     agent_id: &str,
@@ -818,6 +874,10 @@ async fn try_direct_api(
 
     // Record telemetry
     if let Some(ref usage) = response.usage {
+        // OTel: record usage on the `chat` span.
+        let span = tracing::Span::current();
+        span.record(crate::otel::attrs::USAGE_INPUT_TOKENS, usage.input_tokens);
+        span.record(crate::otel::attrs::USAGE_OUTPUT_TOKENS, usage.output_tokens);
         if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
             telemetry.record(agent_id, request_type, model, usage).await;
         }
@@ -1435,6 +1495,15 @@ async fn call_claude_streaming(
     let result_text = result_text.trim().to_string();
     if result_text.is_empty() {
         return Err("Empty response from claude CLI".to_string());
+    }
+
+    // OTel GenAI: post-hoc usage recording onto the active `invoke_agent`
+    // span (declared Empty at the instrumented dispatcher entry — see
+    // `crate::otel`). No-op when the span is disabled or lacks the fields.
+    if let Some(usage) = token_usage.as_ref() {
+        let span = tracing::Span::current();
+        span.record(crate::otel::attrs::USAGE_INPUT_TOKENS, usage.input_tokens);
+        span.record(crate::otel::attrs::USAGE_OUTPUT_TOKENS, usage.output_tokens);
     }
 
     Ok(ClaudeResponse { text: result_text, usage: token_usage })

@@ -79,3 +79,7 @@ axum = { workspace = true }
 # every HTTP path except `/health` and `/ws` returned 404).
 default = ["dashboard"]
 dashboard = ["duduclaw-gateway/dashboard"]
+# OpenTelemetry GenAI tracing + OTLP export — pass-through to the gateway's
+# feature (see duduclaw-gateway/src/otel.rs). Default OFF: without it the
+# gateway's `otel::try_init_layer` is a no-op stub and no otel deps compile.
+otel = ["duduclaw-gateway/otel"]

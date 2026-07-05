@@ -86,8 +86,10 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/deployment-guide.md](guides/deployment-guide.md) | Production deployment (Tailscale/ngrok/Docker/systemd) | Current |
 | [guides/development-guide.md](guides/development-guide.md) | Developer setup, agent development, browser automation | Current |
 | [guides/custom-mcp-tool.md](guides/custom-mcp-tool.md) | Extending MCP tools — step-by-step guide | Current |
+| [guides/evals.md](guides/evals.md) | Agent behavior evals / regression suite (`duduclaw eval`), CI gate, GVU yardstick | Current |
 | [guides/docker.md](guides/docker.md) | Docker build & run | Current |
 | [guides/multi-instance.md](guides/multi-instance.md) | Running multiple instances on one machine (DUDUCLAW_HOME / PORT / INSTANCE) | Current |
+| [guides/observability.md](guides/observability.md) | OpenTelemetry GenAI tracing + OTLP export (`--features otel`, `[telemetry]` config) | Current |
 | [guides/personal-edition-portability.md](guides/personal-edition-portability.md) | 個人版資料可攜：自架 ↔ 代管互轉 | Current |
 
 ## API Reference
@@ -130,6 +132,8 @@ docs/                                  # L1 PUBLIC — product & developer docum
 │   ├── deployment-guide.md
 │   ├── development-guide.md
 │   ├── custom-mcp-tool.md
+│   ├── evals.md
+│   ├── observability.md
 │   └── docker.md
 └── api/
     ├── README.md                      # WebSocket RPC protocol

@@ -541,6 +541,24 @@ pub async fn build_reply_with_session(
 ///
 /// When `agent_override` is `Some(name)`, the named agent is looked up directly.
 /// When `None`, the default agent resolution logic (config.toml → main_agent) is used.
+// OTel GenAI semconv (Development): root `invoke_agent` span for one channel
+// turn. Attribute names are centralized in `crate::otel` (tracing macros need
+// literal field names, so the dotted literals here mirror those consts).
+// Agent/model/usage are resolved mid-flight, so they are declared Empty and
+// `Span::record`ed post-hoc (usage in `spawn_claude_cli_with_env`).
+#[tracing::instrument(
+    name = "invoke_agent",
+    skip_all,
+    fields(
+        gen_ai.operation.name = "invoke_agent",
+        gen_ai.system = tracing::field::Empty,
+        gen_ai.provider.name = tracing::field::Empty,
+        gen_ai.agent.name = tracing::field::Empty,
+        gen_ai.request.model = tracing::field::Empty,
+        gen_ai.usage.input_tokens = tracing::field::Empty,
+        gen_ai.usage.output_tokens = tracing::field::Empty,
+    )
+)]
 async fn build_reply_with_session_inner(
     text: &str,
     ctx: &ReplyContext,
@@ -613,6 +631,16 @@ async fn build_reply_with_session_inner(
         .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
 
     let agent_id = agent.map(|a| a.config.agent.name.clone()).unwrap_or_default();
+    // OTel: record resolved agent/model on the `invoke_agent` span. The
+    // channel-reply path is Claude-first (rotator/CLI/Direct API); a routed
+    // non-Claude call carries its own provider on the nested `chat` span.
+    {
+        let span = tracing::Span::current();
+        span.record(crate::otel::attrs::SYSTEM, "anthropic");
+        span.record(crate::otel::attrs::PROVIDER_NAME, "anthropic");
+        span.record(crate::otel::attrs::AGENT_NAME, agent_id.as_str());
+        span.record(crate::otel::attrs::REQUEST_MODEL, model.as_str());
+    }
     let agent_dir = agent.map(|a| a.dir.clone());
     let capabilities = agent.map(|a| a.config.capabilities.clone());
     let skill_token_budget = agent
@@ -3322,6 +3350,7 @@ mod rotation_tests {
         Account {
             id: id.to_string(),
             auth_method: AuthMethod::OAuth,
+            provider: "anthropic".to_string(),
             priority,
             monthly_budget_cents: 0,
             tags: vec![],
@@ -4519,6 +4548,15 @@ async fn spawn_claude_cli_with_env(
     let result_text = result_text.trim().to_string();
     if result_text.is_empty() {
         return Err(format!("Empty response from claude CLI ({diag})"));
+    }
+
+    // OTel GenAI: post-hoc usage recording onto the active `invoke_agent`
+    // span (fields declared Empty at the instrumented entry — see
+    // `crate::otel`). No-op when the span is disabled or lacks the fields.
+    if let Some(usage) = token_usage.as_ref() {
+        let span = tracing::Span::current();
+        span.record(crate::otel::attrs::USAGE_INPUT_TOKENS, usage.input_tokens);
+        span.record(crate::otel::attrs::USAGE_OUTPUT_TOKENS, usage.output_tokens);
     }
 
     // RFC-22 P1-7: record cost_telemetry for the channel reply. Skipped when
