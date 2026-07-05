@@ -1,0 +1,18 @@
+# Replay-ready regression example: the recorded transcript is committed next
+# to this file, so it runs anywhere with zero credentials:
+#
+#   duduclaw eval evals/examples/greeting-replay.toml --replay
+
+[case]
+name = "greeting-replay"
+agent = "example-agent"
+prompt = "Say hello to the team and open a task for tomorrow's standup."
+transcript = "greeting-replay.transcript.jsonl"
+
+[expect]
+must_use_tools = ["tasks_create"]
+must_not_use_tools = ["Bash"]
+output_contains = ["standup"]
+output_regex = "(?i)hello"
+min_text_blocks = 1
+max_tool_calls = 3

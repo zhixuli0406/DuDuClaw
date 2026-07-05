@@ -287,6 +287,13 @@ pub struct AutopilotEngine {
     /// Per-rule circuit breaker state.
     /// Mutex never held across `.await` (pure in-memory map operations).
     circuit: tokio::sync::Mutex<std::collections::HashMap<String, CircuitState>>,
+    /// Optional HITL approval broker. When present, a rule whose action
+    /// JSON carries `require_approval = true` requests human approval and
+    /// SKIPS immediate execution (fail-closed). Defaults to `None` — the
+    /// gate is opt-in via [`AutopilotEngine::with_approval_broker`] so
+    /// existing `new()` callers are unaffected. Re-dispatch on approval is
+    /// a follow-up (dashboard/channel decide → re-enqueue the payload).
+    approval_broker: Option<Arc<crate::approval::ApprovalBroker>>,
 }
 
 impl AutopilotEngine {
@@ -304,7 +311,19 @@ impl AutopilotEngine {
             message_queue,
             event_rx,
             circuit: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            approval_broker: None,
         }
+    }
+
+    /// Opt into the HITL approval gate (additive; leaves `new()` callers
+    /// unchanged). Rules with `require_approval = true` will request human
+    /// approval instead of dispatching immediately.
+    pub fn with_approval_broker(
+        mut self,
+        broker: Arc<crate::approval::ApprovalBroker>,
+    ) -> Self {
+        self.approval_broker = Some(broker);
+        self
     }
 
     /// Three-state circuit breaker.
@@ -529,6 +548,39 @@ impl AutopilotEngine {
         fields: &serde_json::Map<String, Value>,
     ) -> Result<(), String> {
         let action_type = action.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // ── HITL approval gate ────────────────────────────────
+        // If the rule opts into human approval AND a broker is wired,
+        // record a pending approval carrying the exact action+fields to
+        // re-dispatch, then SKIP immediate execution (fail-closed: the
+        // action does not run until a human approves via dashboard/channel
+        // → re-enqueue). Without a broker the flag is a no-op (documented).
+        if crate::approval::rule_requires_approval(action) {
+            if let Some(broker) = &self.approval_broker {
+                let payload = serde_json::json!({
+                    "action": action,
+                    "fields": fields,
+                    "rule_id": rule_id,
+                    "rule_name": rule_name,
+                });
+                let summary = format!(
+                    "Autopilot 規則「{rule_name}」請求核准以執行 {action_type} 動作"
+                );
+                let id = broker
+                    .request("autopilot", "autopilot_action", &summary, payload,
+                             crate::approval::DEFAULT_TTL_SECONDS)
+                    .await?;
+                info!(
+                    approval_id = %id,
+                    rule = %rule_name,
+                    rule_id = %rule_id,
+                    action_type,
+                    "autopilot: action gated on human approval — skipping immediate execution"
+                );
+                return Ok(());
+            }
+        }
+
         match action_type {
             "delegate" => self.action_delegate(action, fields).await,
             "notify" => self.action_notify(action, fields).await,

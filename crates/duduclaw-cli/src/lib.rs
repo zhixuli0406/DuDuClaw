@@ -9,6 +9,7 @@ use duduclaw_agent::AgentRunner;
 use duduclaw_core::error::DuDuClawError;
 use duduclaw_core::types::CheckStatus;
 mod acp;
+mod eval;                 // Harness-level agent behavior eval / regression suite (`duduclaw eval`)
 mod portability;          // Personal-edition data portability: export/import ~/.duduclaw
 mod premium_templates;    // Licensed industry templates (commercial/templates-premium), gated by premium_templates feature
 mod mcp;
@@ -329,6 +330,45 @@ enum Commands {
     Test {
         /// Agent name to test
         name: String,
+    },
+
+    /// Run harness-level agent behavior eval suites (`evals/<suite>/<case>.toml`).
+    ///
+    /// Each case sends one prompt to an agent through the same CLI harness
+    /// invocation the gateway uses, parses the stream-json transcript, and
+    /// checks deterministic `[expect]` assertions (tool usage, output text)
+    /// plus an optional `[judge]` LLM rubric. Exit code is non-zero when any
+    /// case fails, so CI can gate on it.
+    ///
+    /// Examples:
+    ///     duduclaw eval                                 # ./evals, live
+    ///     duduclaw eval evals/support --record          # refresh baselines
+    ///     duduclaw eval evals/support --replay          # offline regression
+    ///     duduclaw eval evals --replay --report out.json
+    Eval {
+        /// Case file or suite directory (default: ./evals)
+        path: Option<PathBuf>,
+
+        /// Only run cases whose `[case] name` contains this substring
+        #[arg(long)]
+        filter: Option<String>,
+
+        /// Replay recorded `*.transcript.jsonl` files instead of live runs
+        /// (offline, zero credentials — regression mode)
+        #[arg(long, conflicts_with = "record")]
+        replay: bool,
+
+        /// Record live transcripts next to each case for future --replay
+        #[arg(long)]
+        record: bool,
+
+        /// Skip the LLM judge even when a case enables it
+        #[arg(long)]
+        no_judge: bool,
+
+        /// Write a JSON report to this path
+        #[arg(long)]
+        report: Option<PathBuf>,
     },
 
     /// Manually re-forward a completed delegation response (v1.8.21+).
@@ -790,11 +830,26 @@ pub async fn entry_point() {
     // stderr via `try_init`, but that silently no-ops once the global
     // subscriber is already installed (here). Routing to stderr from the
     // start is the only reliable fix. CLI-H7.
+    // Optional OpenTelemetry GenAI tracing (build feature "otel"; runtime
+    // opt-in via `config.toml [telemetry] otlp_endpoint`). `init` installs the
+    // OTLP exporter — it MUST run before `subscriber_layer()` is built, since
+    // the bridge layer needs the installed provider's tracer. Without the
+    // feature both calls are no-op stubs; `Option<Layer>` composes as a
+    // pass-through, so the subscriber stack is identical when disabled.
+    // Fail-safe: exporter init errors warn to stderr and disable export —
+    // never block startup. The guard is held to the end of `entry_point` so
+    // buffered spans flush on process exit. (`start_gateway` also calls
+    // `init`; it no-ops because this one already installed the provider.)
+    // NOTE: exported GenAI spans are INFO-level, so they obey the same
+    // `env_filter` as everything else — set log level `info` (tier 1 or 2
+    // above) when enabling telemetry. See docs/guides/observability.md.
+    let _otel_guard = duduclaw_gateway::otel::init(&duduclaw_home());
     tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(non_blocking))
         .with(duduclaw_gateway::log::BroadcastLayer)
+        .with(duduclaw_gateway::otel::subscriber_layer())
         .init();
 
     let cli = Cli::parse();
@@ -901,6 +956,27 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Mcp(mcp_cmd) => cmd_mcp(mcp_cmd, &duduclaw_home()).await,
         Commands::Wizard => wizard::cmd_wizard(&duduclaw_home()).await,
         Commands::Test { name } => cmd_test_agent(&name).await,
+        Commands::Eval {
+            path,
+            filter,
+            replay,
+            record,
+            no_judge,
+            report,
+        } => {
+            eval::cmd_eval(
+                &duduclaw_home(),
+                eval::EvalOptions {
+                    path,
+                    filter,
+                    replay,
+                    record,
+                    no_judge,
+                    report,
+                },
+            )
+            .await
+        }
         Commands::Reforward { message_id, dry_run } => {
             cmd_reforward(&message_id, dry_run, &duduclaw_home()).await
         }

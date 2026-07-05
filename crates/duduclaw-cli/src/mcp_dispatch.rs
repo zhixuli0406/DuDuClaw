@@ -95,6 +95,21 @@ impl McpDispatcher {
     /// 5. **Tool dispatch** — delegates to `crate::mcp::handle_tools_call`.
     ///
     /// Returns a JSON-RPC `result` or `error` Value.
+    // OTel GenAI semconv (Development): `execute_tool` span for one MCP tool
+    // dispatch. Attribute names centralized in `duduclaw_gateway::otel::attrs`
+    // (tracing macros need literal field names — these literals mirror the
+    // consts there). Outcome fields are recorded via `otel::record_tool_outcome`
+    // on pipeline rejection / JSON-RPC error result / success.
+    #[tracing::instrument(
+        name = "execute_tool",
+        skip_all,
+        fields(
+            gen_ai.operation.name = "execute_tool",
+            gen_ai.tool.name = tracing::field::Empty,
+            gen_ai.tool.outcome = tracing::field::Empty,
+            error.type = tracing::field::Empty,
+        )
+    )]
     pub async fn dispatch_tool_call(
         &self,
         principal: &Principal,
@@ -103,6 +118,7 @@ impl McpDispatcher {
         id: &Value,
     ) -> Value {
         let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        tracing::Span::current().record(duduclaw_gateway::otel::attrs::TOOL_NAME, tool_name);
 
         // ── 0. External whitelist enforcement ────────────────────────────────
         // (review BLOCKER R2 / security N-1) `tools/list` already filters
@@ -117,6 +133,7 @@ impl McpDispatcher {
                 tool = %tool_name,
                 "External client attempted to call non-whitelisted tool"
             );
+            duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
             return jsonrpc_error(
                 id,
                 -32601,
@@ -129,6 +146,7 @@ impl McpDispatcher {
             if !principal.scopes.contains(&required)
                 && !principal.scopes.contains(&Scope::Admin)
             {
+                duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
                 return jsonrpc_error(
                     id,
                     -32003,
@@ -150,6 +168,7 @@ impl McpDispatcher {
             OpType::Read
         };
         if let Err(e) = self.rate_limiter.check(&principal.client_id, op_type) {
+            duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
             return jsonrpc_error(id, -32029, &format!("Rate limited: {e}"));
         }
 
@@ -173,7 +192,7 @@ impl McpDispatcher {
 
         // ── 4. Tool dispatch ─────────────────────────────────────────────────
         let caller_is_admin = principal.scopes.contains(&Scope::Admin);
-        crate::mcp::handle_tools_call(
+        let result = crate::mcp::handle_tools_call(
             id,
             &params_owned,
             &self.home_dir,
@@ -186,7 +205,13 @@ impl McpDispatcher {
             &principal.client_id,
             caller_is_admin,
         )
-        .await
+        .await;
+        // OTel: record ok/error outcome on the `execute_tool` span.
+        duduclaw_gateway::otel::record_tool_outcome(
+            &tracing::Span::current(),
+            result.get("error").is_none(),
+        );
+        result
     }
 }
 

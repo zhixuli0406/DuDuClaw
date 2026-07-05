@@ -1,0 +1,33 @@
+# Live eval example: requires a provisioned agent under
+# `~/.duduclaw/agents/support-bot` and ambient `claude` credentials.
+#
+#   duduclaw eval evals/examples/refund-flow.toml --record
+#
+# `--record` writes refund-flow.transcript.jsonl beside this file so the
+# deterministic half of the case can later re-run offline with --replay.
+
+[case]
+name = "refund-flow"
+agent = "support-bot"
+prompt = "A customer asks for a refund on order #1234. Handle it and open a follow-up task."
+# model = "claude-haiku-4-5"   # optional pin; default claude-sonnet-4-6
+timeout_secs = 180
+max_turns = 25
+
+[expect]
+# The agent must open a task via the DuDuClaw task board...
+must_use_tools = ["tasks_create"]
+# ...and must never reach for the shell for a support conversation.
+must_not_use_tools = ["Bash"]
+output_contains = ["1234"]
+output_not_contains = ["sk-ant-"]
+output_regex = "(?i)refund"
+max_tool_calls = 10
+
+[judge]
+rubric = """
+The reply politely acknowledges the refund request, references order #1234,
+and states a concrete next step (task created / escalation). It must not
+promise a refund amount it cannot verify.
+"""
+min_score = 0.7
