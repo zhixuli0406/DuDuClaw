@@ -31,11 +31,26 @@ pub enum AuthMethod {
     OAuth,
 }
 
+/// Default provider for an account when `[[accounts]] provider` is absent.
+///
+/// Historically the rotator was Anthropic-only, so every existing config
+/// (which never specified `provider`) must continue to behave as an Anthropic
+/// account. This default preserves that byte-identical behavior.
+fn default_provider() -> String {
+    "anthropic".to_string()
+}
+
 /// An account that can be used for Claude CLI invocations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,
     pub auth_method: AuthMethod,
+    /// LLM provider this account authenticates against ("anthropic", "openai",
+    /// "gemini", "deepseek", ...). Absent in config → "anthropic" for
+    /// back-compat. Rotation/budget/cooldown are all applied *within* a
+    /// provider's pool via [`AccountRotator::select_for_provider`].
+    #[serde(default = "default_provider")]
+    pub provider: String,
     pub priority: u32,
     pub monthly_budget_cents: u64,
     #[serde(default)]
@@ -131,11 +146,18 @@ impl Account {
     }
 }
 
-/// Environment variables to set when invoking `claude` CLI for a given account.
+/// Environment variables to set when invoking a CLI/subprocess for a given
+/// account, plus enough metadata for a direct-API caller (e.g. `duduclaw-llm`)
+/// to authenticate without spawning a subprocess.
 #[derive(Debug, Clone)]
 pub struct AccountEnv {
     pub id: String,
     pub auth_method: AuthMethod,
+    /// Provider this selection belongs to ("anthropic", "openai", ...).
+    pub provider: String,
+    /// Raw API key for direct-API callers. `Some` for API-key accounts (any
+    /// provider); `None` for OAuth accounts (which have no static key).
+    pub raw_key: Option<String>,
     /// Env vars to set on the subprocess
     pub env_vars: HashMap<String, String>,
 }
@@ -219,9 +241,15 @@ impl AccountRotator {
                     if auth_type == "api_key" {
                         let api_key = resolve_api_key(home_dir, acc_table).await;
                         if api_key.is_empty() { continue; }
+                        let provider = acc_table
+                            .get("provider")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("anthropic")
+                            .to_string();
                         loaded.push(Account {
                             id: id.to_string(),
                             auth_method: AuthMethod::ApiKey,
+                            provider,
                             priority: acc_table.get("priority").and_then(|v| v.as_integer()).unwrap_or(10) as u32,
                             monthly_budget_cents: acc_table.get("monthly_budget_cents").and_then(|v| v.as_integer()).unwrap_or(5000) as u64,
                             tags: Vec::new(),
@@ -283,6 +311,8 @@ impl AccountRotator {
                         loaded.push(Account {
                             id: id.to_string(),
                             auth_method: AuthMethod::OAuth,
+                            // OAuth is a Claude.ai subscription mechanism — always Anthropic.
+                            provider: "anthropic".to_string(),
                             priority: acc_table.get("priority").and_then(|v| v.as_integer()).unwrap_or(5) as u32,
                             monthly_budget_cents: 0,
                             tags: Vec::new(),
@@ -327,6 +357,7 @@ impl AccountRotator {
                     loaded.push(Account {
                         id: "main".to_string(),
                         auth_method: AuthMethod::ApiKey,
+                        provider: "anthropic".to_string(),
                         priority: 1,
                         monthly_budget_cents: 10000,
                         tags: Vec::new(),
@@ -354,6 +385,7 @@ impl AccountRotator {
                     loaded.push(Account {
                         id: "env".to_string(),
                         auth_method: AuthMethod::ApiKey,
+                        provider: "anthropic".to_string(),
                         priority: 99,
                         monthly_budget_cents: 10000,
                         tags: Vec::new(),
@@ -410,13 +442,40 @@ impl AccountRotator {
         Ok(count)
     }
 
-    /// Select the best available account and return env vars for claude CLI.
+    /// Select the best available Anthropic account and return env vars for the
+    /// `claude` CLI.
+    ///
+    /// Back-compat shim: identical to `select_for_provider("anthropic")`. Every
+    /// pre-existing caller (gateway channel reply, claude_runner, agent runner,
+    /// fork `RotatorProvider`) keeps working byte-for-byte.
     pub async fn select(&self) -> Option<AccountEnv> {
+        self.select_for_provider("anthropic").await
+    }
+
+    /// Select the best available account *for a specific provider* and return
+    /// its env vars + raw key.
+    ///
+    /// Only accounts whose `provider` matches are considered; health, cooldown,
+    /// budget, and the rotation strategy are all applied *within* that provider
+    /// pool. If the config declares no accounts for `provider`, a single
+    /// ephemeral account is synthesized from the provider's standard env var
+    /// (e.g. `OPENAI_API_KEY`) so a user with just that env var still rotates
+    /// (trivially) through the same machinery.
+    pub async fn select_for_provider(&self, provider: &str) -> Option<AccountEnv> {
         let accounts = self.accounts.read().await;
-        let available: Vec<&Account> = accounts.iter().filter(|a| a.is_available()).collect();
+        let has_any_for_provider = accounts.iter().any(|a| a.provider == provider);
+        let available: Vec<&Account> = accounts
+            .iter()
+            .filter(|a| a.provider == provider && a.is_available())
+            .collect();
 
         if available.is_empty() {
-            warn!("No available accounts for rotation");
+            if !has_any_for_provider {
+                // No configured accounts for this provider → env-var fallback.
+                drop(accounts);
+                return env_fallback_account_env(provider);
+            }
+            warn!(provider, "No available accounts for rotation");
             return None;
         }
 
@@ -458,57 +517,14 @@ impl AccountRotator {
         };
 
         selected.map(|a| {
-            let mut env_vars = HashMap::new();
-
-            match a.auth_method {
-                AuthMethod::ApiKey => {
-                    env_vars.insert("ANTHROPIC_API_KEY".to_string(), a.api_key.clone());
-                }
-                AuthMethod::OAuth => {
-                    if let Some(ref token) = a.oauth_token {
-                        // setup-token account: inject token via env var
-                        env_vars.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone());
-                    } else if let Some(dir) = &a.credentials_dir {
-                        // OS keychain account: only set CLAUDE_CONFIG_DIR when it differs
-                        // from the default `~/.claude`.
-                        //
-                        // CRITICAL: setting `CLAUDE_CONFIG_DIR=~/.claude` explicitly —
-                        // even with the SAME value as the default — makes `claude` CLI
-                        // stop looking at the OS keychain for credentials, producing
-                        // "Not logged in · Please run /login" for every call. The CLI
-                        // only uses the keychain when no `CLAUDE_CONFIG_DIR` is set.
-                        //
-                        // Leave the env var unset for the default session so claude
-                        // CLI picks up keychain auth normally. Non-default profile
-                        // directories (e.g. `~/.claude/profiles/work`) still get the
-                        // env var because they need explicit pointing.
-                        let is_default_home = dirs::home_dir()
-                            .map(|h| h.join(".claude"))
-                            .is_some_and(|default_dir| default_dir == *dir);
-                        if !is_default_home {
-                            env_vars.insert(
-                                "CLAUDE_CONFIG_DIR".to_string(),
-                                dir.to_string_lossy().to_string(),
-                            );
-                        }
-                    }
-                    // Ensure API key doesn't override OAuth
-                    env_vars.insert("ANTHROPIC_API_KEY".to_string(), String::new());
-                }
-            }
-
             info!(
                 account = %a.id,
+                provider = %a.provider,
                 method = ?a.auth_method,
                 email = %a.email,
                 "Account selected for rotation"
             );
-
-            AccountEnv {
-                id: a.id.clone(),
-                auth_method: a.auth_method.clone(),
-                env_vars,
-            }
+            build_account_env(a)
         })
     }
 
@@ -740,6 +756,7 @@ fn detect_default_oauth_session() -> Option<Account> {
     Some(Account {
         id: "oauth-default".to_string(),
         auth_method: AuthMethod::OAuth,
+        provider: "anthropic".to_string(),
         priority: 1, // OAuth preferred over API key
         monthly_budget_cents: 0,
         tags: Vec::new(),
@@ -852,6 +869,131 @@ async fn resolve_api_key(home_dir: &Path, table: &toml::Table) -> String {
     String::new()
 }
 
+// ── Provider env-var map ────────────────────────────────────
+
+/// Standard environment-variable name(s) for a provider's API key.
+///
+/// Mirrors `duduclaw_llm::resolve_env_key` (the agent crate must NOT depend on
+/// `duduclaw-llm`, so the map is inlined here). The FIRST name is the canonical
+/// one emitted onto a subprocess; the remaining names are accepted aliases when
+/// *reading* an env-var fallback value. Unknown providers → empty slice.
+fn provider_env_key_names(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "anthropic" => &["ANTHROPIC_API_KEY"],
+        "openai" => &["OPENAI_API_KEY"],
+        "gemini" | "google" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "deepseek" => &["DEEPSEEK_API_KEY"],
+        "minimax" => &["MINIMAX_API_KEY"],
+        "groq" => &["GROQ_API_KEY"],
+        "together" => &["TOGETHER_API_KEY"],
+        "mistral" => &["MISTRAL_API_KEY"],
+        "openrouter" => &["OPENROUTER_API_KEY"],
+        "xai" => &["XAI_API_KEY"],
+        "qwen" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
+        _ => &[],
+    }
+}
+
+/// Build the subprocess env vars + direct-API metadata for a selected account.
+///
+/// Anthropic emission is unchanged from the original inline logic (API key vs.
+/// OAuth token vs. keychain `CLAUDE_CONFIG_DIR`). Non-Anthropic providers emit
+/// the provider's canonical key env var instead, and every API-key account
+/// additionally exposes its raw key on `AccountEnv.raw_key`.
+fn build_account_env(a: &Account) -> AccountEnv {
+    let mut env_vars = HashMap::new();
+    let mut raw_key = None;
+
+    if a.provider == "anthropic" {
+        match a.auth_method {
+            AuthMethod::ApiKey => {
+                env_vars.insert("ANTHROPIC_API_KEY".to_string(), a.api_key.clone());
+                if !a.api_key.is_empty() {
+                    raw_key = Some(a.api_key.clone());
+                }
+            }
+            AuthMethod::OAuth => {
+                if let Some(ref token) = a.oauth_token {
+                    // setup-token account: inject token via env var
+                    env_vars.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone());
+                } else if let Some(dir) = &a.credentials_dir {
+                    // OS keychain account: only set CLAUDE_CONFIG_DIR when it differs
+                    // from the default `~/.claude`.
+                    //
+                    // CRITICAL: setting `CLAUDE_CONFIG_DIR=~/.claude` explicitly —
+                    // even with the SAME value as the default — makes `claude` CLI
+                    // stop looking at the OS keychain for credentials, producing
+                    // "Not logged in · Please run /login" for every call. The CLI
+                    // only uses the keychain when no `CLAUDE_CONFIG_DIR` is set.
+                    //
+                    // Leave the env var unset for the default session so claude
+                    // CLI picks up keychain auth normally. Non-default profile
+                    // directories (e.g. `~/.claude/profiles/work`) still get the
+                    // env var because they need explicit pointing.
+                    let is_default_home = dirs::home_dir()
+                        .map(|h| h.join(".claude"))
+                        .is_some_and(|default_dir| default_dir == *dir);
+                    if !is_default_home {
+                        env_vars.insert(
+                            "CLAUDE_CONFIG_DIR".to_string(),
+                            dir.to_string_lossy().to_string(),
+                        );
+                    }
+                }
+                // Ensure API key doesn't override OAuth
+                env_vars.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+            }
+        }
+    } else {
+        // Non-Anthropic providers are API-key only. Emit the provider's canonical
+        // env var so a subprocess sees the right variable, and expose the raw key.
+        if let Some(name) = provider_env_key_names(&a.provider).first() {
+            env_vars.insert((*name).to_string(), a.api_key.clone());
+        }
+        if !a.api_key.is_empty() {
+            raw_key = Some(a.api_key.clone());
+        }
+    }
+
+    AccountEnv {
+        id: a.id.clone(),
+        auth_method: a.auth_method.clone(),
+        provider: a.provider.clone(),
+        raw_key,
+        env_vars,
+    }
+}
+
+/// Synthesize a single ephemeral API-key selection from a provider's standard
+/// env var, used when the config declares no accounts for that provider.
+///
+/// Returns `None` when the provider is unknown or its env var is unset/empty.
+/// The ephemeral id (`<provider>-env`) intentionally does not correspond to any
+/// stored account, so `on_success`/`on_error` for it are harmless no-ops — the
+/// single ephemeral account has no persistent budget/cooldown state to track.
+fn env_fallback_account_env(provider: &str) -> Option<AccountEnv> {
+    let names = provider_env_key_names(provider);
+    let emit_name = *names.first()?;
+    let key = names
+        .iter()
+        .filter_map(|n| std::env::var(n).ok())
+        .find(|v| !v.is_empty())?;
+
+    let mut env_vars = HashMap::new();
+    env_vars.insert(emit_name.to_string(), key.clone());
+    info!(
+        provider,
+        "No configured accounts for provider — using ephemeral env-var account"
+    );
+    Some(AccountEnv {
+        id: format!("{provider}-env"),
+        auth_method: AuthMethod::ApiKey,
+        provider: provider.to_string(),
+        raw_key: Some(key),
+        env_vars,
+    })
+}
+
 /// Create a rotator from config.toml rotation settings.
 pub fn create_from_config(config: &toml::Table) -> AccountRotator {
     let rotation = config.get("rotation").and_then(|v| v.as_table());
@@ -868,6 +1010,7 @@ mod select_env_tests {
         Account {
             id: "test".to_string(),
             auth_method: AuthMethod::OAuth,
+            provider: "anthropic".to_string(),
             priority: 1,
             monthly_budget_cents: 0,
             tags: vec![],
@@ -944,6 +1087,7 @@ mod select_env_tests {
         Account {
             id: id.to_string(),
             auth_method: AuthMethod::OAuth,
+            provider: "anthropic".to_string(),
             priority: 1,
             monthly_budget_cents: 0,
             tags: vec![],
@@ -991,5 +1135,191 @@ mod select_env_tests {
             "LeastCost should rotate across all three equal-cost OAuth accounts, \
              not repeatedly pick the first; saw {seen:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod provider_rotation_tests {
+    use super::*;
+
+    /// Build an available API-key account for a given provider.
+    fn api_account(id: &str, provider: &str, key: &str) -> Account {
+        Account {
+            id: id.to_string(),
+            auth_method: AuthMethod::ApiKey,
+            provider: provider.to_string(),
+            priority: 10,
+            monthly_budget_cents: 5000,
+            tags: vec![],
+            profile: String::new(),
+            email: String::new(),
+            subscription: String::new(),
+            label: id.to_string(),
+            expires_at: None,
+            api_key: key.to_string(),
+            oauth_token: None,
+            credentials_dir: None,
+            is_healthy: true,
+            consecutive_errors: 0,
+            spent_this_month: 0,
+            cooldown_until: None,
+            last_used: None,
+            total_requests: 0,
+        }
+    }
+
+    /// An account parsed WITHOUT a `provider` field must default to "anthropic"
+    /// so existing configs behave byte-identically.
+    #[test]
+    fn absent_provider_defaults_to_anthropic() {
+        let toml_src = r#"
+            id = "a"
+            type = "api_key"
+            api_key = "sk-test"
+        "#;
+        let table: toml::Table = toml_src.parse().unwrap();
+        // Round-trip the default via serde: an Account deserialized from a table
+        // missing `provider` gets the default.
+        #[derive(serde::Deserialize)]
+        struct Probe {
+            #[serde(default = "default_provider")]
+            provider: String,
+        }
+        let p: Probe = table.clone().try_into().unwrap();
+        assert_eq!(p.provider, "anthropic");
+    }
+
+    /// A `provider = "openai"` field is parsed and preserved.
+    #[test]
+    fn present_provider_is_parsed() {
+        let toml_src = r#"
+            provider = "openai"
+        "#;
+        let table: toml::Table = toml_src.parse().unwrap();
+        #[derive(serde::Deserialize)]
+        struct Probe {
+            #[serde(default = "default_provider")]
+            provider: String,
+        }
+        let p: Probe = table.try_into().unwrap();
+        assert_eq!(p.provider, "openai");
+    }
+
+    /// `select_for_provider` only considers accounts of the requested provider.
+    #[tokio::test]
+    async fn select_for_provider_filters_by_provider() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator
+            .push_account_for_test(api_account("anthropic-1", "anthropic", "sk-ant"))
+            .await;
+        rotator
+            .push_account_for_test(api_account("openai-1", "openai", "sk-openai"))
+            .await;
+
+        let sel = rotator
+            .select_for_provider("openai")
+            .await
+            .expect("should select the openai account");
+        assert_eq!(sel.id, "openai-1");
+        assert_eq!(sel.provider, "openai");
+        // The openai account emits OPENAI_API_KEY (not ANTHROPIC_API_KEY).
+        assert_eq!(
+            sel.env_vars.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-openai")
+        );
+        assert!(!sel.env_vars.contains_key("ANTHROPIC_API_KEY"));
+        // Raw key is exposed for direct-API callers.
+        assert_eq!(sel.raw_key.as_deref(), Some("sk-openai"));
+    }
+
+    /// Back-compat: `select()` == `select_for_provider("anthropic")` and emits
+    /// the unchanged ANTHROPIC_API_KEY var for an anthropic API-key account.
+    #[tokio::test]
+    async fn select_is_anthropic_back_compat() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator
+            .push_account_for_test(api_account("anthropic-1", "anthropic", "sk-ant"))
+            .await;
+        rotator
+            .push_account_for_test(api_account("openai-1", "openai", "sk-openai"))
+            .await;
+
+        let sel = rotator.select().await.expect("should select anthropic");
+        assert_eq!(sel.id, "anthropic-1");
+        assert_eq!(sel.provider, "anthropic");
+        assert_eq!(
+            sel.env_vars.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-ant")
+        );
+        assert!(!sel.env_vars.contains_key("OPENAI_API_KEY"));
+    }
+
+    /// When a provider has configured accounts that are all unavailable,
+    /// selection returns None (does NOT fall through to env-var fallback).
+    #[tokio::test]
+    async fn unavailable_configured_accounts_do_not_env_fallback() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        // Budget-exhausted API key → unavailable, but still "configured".
+        let mut acc = api_account("openai-1", "openai", "sk-openai");
+        acc.monthly_budget_cents = 100;
+        acc.spent_this_month = 200;
+        rotator.push_account_for_test(acc).await;
+
+        assert!(rotator.select_for_provider("openai").await.is_none());
+    }
+
+    /// env-var fallback synthesizes exactly one ephemeral account when the
+    /// config declares no accounts for the requested provider.
+    #[tokio::test]
+    async fn env_var_fallback_synthesizes_single_account() {
+        // groq is not referenced by any other test in this crate, so mutating
+        // its env var here is isolated within this test binary.
+        unsafe { std::env::set_var("GROQ_API_KEY", "gsk-test") };
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+
+        let sel = rotator
+            .select_for_provider("groq")
+            .await
+            .expect("env var fallback should synthesize an account");
+        assert_eq!(sel.id, "groq-env");
+        assert_eq!(sel.provider, "groq");
+        assert_eq!(
+            sel.env_vars.get("GROQ_API_KEY").map(String::as_str),
+            Some("gsk-test")
+        );
+        assert_eq!(sel.raw_key.as_deref(), Some("gsk-test"));
+
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
+    }
+
+    /// Unknown provider with no env var → no fallback, returns None.
+    #[tokio::test]
+    async fn unknown_provider_with_no_env_returns_none() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        assert!(rotator
+            .select_for_provider("not-a-real-provider")
+            .await
+            .is_none());
+    }
+
+    /// Gemini env-var fallback accepts the GOOGLE_API_KEY alias but always
+    /// emits the canonical GEMINI_API_KEY name.
+    #[tokio::test]
+    async fn gemini_alias_env_emits_canonical_name() {
+        unsafe { std::env::set_var("GOOGLE_API_KEY", "goog-test") };
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+
+        let sel = rotator
+            .select_for_provider("gemini")
+            .await
+            .expect("GOOGLE_API_KEY alias should satisfy gemini fallback");
+        assert_eq!(
+            sel.env_vars.get("GEMINI_API_KEY").map(String::as_str),
+            Some("goog-test"),
+            "canonical GEMINI_API_KEY must be emitted even when read via alias"
+        );
+        assert!(!sel.env_vars.contains_key("GOOGLE_API_KEY"));
+
+        unsafe { std::env::remove_var("GOOGLE_API_KEY") };
     }
 }

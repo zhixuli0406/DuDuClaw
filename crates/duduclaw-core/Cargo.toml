@@ -17,8 +17,26 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 fs2 = "0.4"
 
+[features]
+default = []
+# Optional OS keychain storage for the master secret (see src/keychain.rs).
+# NOT in default features — keeps the default build free of native credential
+# store dependencies. Enable per-platform with `--features keychain`.
+keychain = ["dep:keyring"]
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# `keyring` platform backends are selected per-target so enabling the `keychain`
+# feature compiles only the backend that matches the build host.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", optional = true, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", optional = true, features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", optional = true, features = ["sync-secret-service"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
