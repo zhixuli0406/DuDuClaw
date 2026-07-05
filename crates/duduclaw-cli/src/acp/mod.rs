@@ -4,6 +4,7 @@
 //! plus an ACP server that generates `.well-known` discovery cards.
 
 pub mod handlers;
+pub mod message_send;
 pub mod server;
 pub mod types;
 

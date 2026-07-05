@@ -1688,7 +1688,6 @@ function VoiceTab() {
             <option value="auto">Auto</option>
             <option value="whisper-api">{intl.formatMessage({ id: 'voice.provider.whisperApi' })}</option>
             <option value="whisper-local">Whisper Local</option>
-            <option value="sensevoice">{intl.formatMessage({ id: 'voice.provider.sensevoice' })}</option>
           </select>
         </Field>
 

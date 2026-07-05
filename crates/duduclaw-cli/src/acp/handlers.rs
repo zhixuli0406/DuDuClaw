@@ -73,6 +73,31 @@ async fn resolve_target_agent(
     reg.get(context_id).map(|a| a.config.agent.name.clone())
 }
 
+/// Resolve a `message/send` target for the A2A bus bridge (same semantics as
+/// [`resolve_target_agent`], packaged with JSON-RPC error codes).
+///
+/// Errors: registry scan failure → `-32603` (internal); unknown target agent
+/// → `-32602` (invalid params).
+pub(crate) async fn resolve_send_target(
+    home_dir: &Path,
+    context_id: &str,
+) -> Result<String, (i64, String)> {
+    let registry = shared_agent_registry(home_dir)
+        .await
+        .map_err(|e| (-32603i64, format!("ACP: {e}")))?;
+    resolve_target_agent(&registry, context_id)
+        .await
+        .ok_or_else(|| {
+            (
+                -32602i64,
+                format!(
+                    "unknown target agent '{context_id}' (no such agent, and no Main-role \
+                     agent for 'default')"
+                ),
+            )
+        })
+}
+
 /// Execute an A2A/ACP prompt by routing to the target agent through the
 /// gateway's provider-agnostic dispatch (RFC-25 Phase 2 choke-point).
 ///

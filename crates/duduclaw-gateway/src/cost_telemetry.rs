@@ -10,11 +10,12 @@
 //!
 //! Reference: <https://cablate.com/articles/reverse-engineer-claude-agent-sdk-hidden-token-cost/>
 
+use duduclaw_llm::{ModelRegistry, NormalizedUsage};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -61,17 +62,30 @@ impl TokenUsage {
     ///
     /// Anthropic doubles input pricing when input exceeds 200K tokens.
     /// We warn at 180K to allow time for compression.
+    ///
+    /// Legacy model-agnostic check — prefer [`near_price_cliff_for`], which
+    /// derives the threshold from the model registry and only falls back to
+    /// the fixed 180K for unknown models.
     pub fn is_near_price_cliff(&self) -> bool {
         self.total_input() > 180_000
     }
 
-    /// Estimated cost in millicents (0.001 cent) for API key usage.
+    /// Estimated cost for API key usage — LEGACY Sonnet-only fallback.
     ///
     /// Pricing (Sonnet 4.6 baseline):
     /// - Input: $3/M tokens ($6/M above 200K)
     /// - Cache read: $0.30/M tokens
     /// - Cache creation: $3.75/M tokens
     /// - Output: $15/M tokens ($22.50/M above 200K input)
+    ///
+    /// Unit note: the constants below are cents-per-MTok, so the returned
+    /// value (and every stored `cost_millicents` row) has historically been
+    /// in CENTS despite the name — `monthly_budget_cents` and the dashboard
+    /// (÷100 → dollars) both rely on that scale. [`cost_for`] keeps registry
+    /// results on the same scale for comparability.
+    ///
+    /// Prefer [`cost_for`], which prices known models from the registry and
+    /// only routes unknown models here (behavior-compatible fallback).
     pub fn estimated_cost_millicents(&self) -> u64 {
         let above_200k = self.total_input() > 200_000;
 
@@ -107,6 +121,110 @@ impl TokenUsage {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Model registry — per-model pricing (duduclaw-llm)
+// ---------------------------------------------------------------------------
+
+static MODEL_REGISTRY: std::sync::OnceLock<ModelRegistry> = std::sync::OnceLock::new();
+
+/// Build the pricing registry: vendored seed + optional user override.
+fn build_model_registry(override_path: Option<&Path>) -> ModelRegistry {
+    let mut registry = ModelRegistry::vendored();
+    if let Some(path) = override_path {
+        match registry.load_override(path) {
+            Ok(0) => {}
+            Ok(n) => info!(merged = n, ?path, "model pricing override merged"),
+            Err(e) => warn!(
+                error = %e, ?path,
+                "model pricing override failed to load — using vendored table"
+            ),
+        }
+    }
+    registry
+}
+
+/// Global model/pricing registry. `init_telemetry` seeds it with the
+/// `~/.duduclaw/models.toml` override; if something reads pricing before
+/// startup init (tests, early callers) it lazily falls back to the vendored
+/// seed only.
+pub(crate) fn model_registry() -> &'static ModelRegistry {
+    MODEL_REGISTRY.get_or_init(|| build_model_registry(None))
+}
+
+/// Map gateway [`TokenUsage`] onto the registry's [`NormalizedUsage`].
+///
+/// `reasoning_tokens` is 0 by construction: `TokenUsage` has no reasoning
+/// field, so multi-provider callers (claude_runner W2 path) fold provider
+/// reasoning tokens into `output_tokens` BEFORE recording — reasoning bills
+/// at the output rate either way, so the fold is cost-neutral.
+fn to_normalized(usage: &TokenUsage) -> NormalizedUsage {
+    NormalizedUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_creation_tokens,
+        reasoning_tokens: 0,
+    }
+}
+
+/// Cost of `usage` for `model`, in the legacy telemetry unit (cents —
+/// see [`TokenUsage::estimated_cost_millicents`] unit note).
+///
+/// - Model known to the registry → duduclaw-llm cost math (per-model rates,
+///   price cliffs, cache read/write pricing). The registry returns true
+///   millicents ($1/MTok = 100_000), converted ÷1000 (rounded) to stay on
+///   the same scale as historical rows and `monthly_budget_cents`.
+/// - Unknown model → legacy hardcoded Sonnet constants, byte-for-byte the
+///   pre-registry behavior (debug-logged once per model id).
+pub fn cost_for(model: &str, usage: &TokenUsage) -> u64 {
+    let registry = model_registry();
+    match registry.get(model) {
+        Some(info) => {
+            let true_millicents = registry.cost_millicents(&to_normalized(usage), info);
+            (true_millicents + 500) / 1000
+        }
+        None => {
+            log_unknown_model_once(model);
+            usage.estimated_cost_millicents()
+        }
+    }
+}
+
+/// Model-aware price-cliff proximity check.
+///
+/// - Registry model WITH a cliff → warn above 90% of its threshold
+///   (Anthropic/Gemini 200K → 180K, matching the legacy margin).
+/// - Registry model WITHOUT a cliff (e.g. DeepSeek) → never near a cliff.
+/// - Unknown model → legacy fixed 180K check.
+pub fn near_price_cliff_for(model: &str, usage: &TokenUsage) -> bool {
+    match model_registry().get(model) {
+        Some(info) => match info.price_cliff {
+            Some(cliff) => {
+                let warn_at = cliff.threshold_tokens - cliff.threshold_tokens / 10;
+                usage.total_input() > warn_at
+            }
+            None => false,
+        },
+        None => usage.is_near_price_cliff(),
+    }
+}
+
+/// Debug-log an unknown model id exactly once per process (avoids flooding
+/// the log on every request for the same unregistered model).
+fn log_unknown_model_once(model: &str) {
+    static LOGGED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let set = LOGGED.get_or_init(Default::default);
+    if let Ok(mut guard) = set.lock() {
+        if guard.insert(model.to_string()) {
+            debug!(
+                model,
+                "model not in pricing registry — falling back to legacy Sonnet rates"
+            );
+        }
     }
 }
 
@@ -299,7 +417,7 @@ impl CostTelemetry {
     ) {
         let now = chrono::Utc::now().to_rfc3339();
         let efficiency = usage.cache_efficiency();
-        let cost = usage.estimated_cost_millicents();
+        let cost = cost_for(model, usage);
         let cache_hit_rate = usage.cache_efficiency();
         let cache_savings = usage.cache_savings_millicents();
 
@@ -341,11 +459,12 @@ impl CostTelemetry {
             );
         }
 
-        if usage.is_near_price_cliff() {
+        if near_price_cliff_for(model, usage) {
             warn!(
                 agent_id,
+                model,
                 total_input = usage.total_input(),
-                "Approaching 200K token price cliff — input pricing will double"
+                "Approaching long-context price cliff — input pricing will increase"
             );
             // #6.3 (2026-05-09): turn the warn into an actionable event.
             // Mark the agent for compression-mode routing on the next
@@ -612,6 +731,11 @@ static TELEMETRY: std::sync::OnceLock<CostTelemetry> = std::sync::OnceLock::new(
 
 /// Initialize the global telemetry singleton. Call once at startup.
 pub fn init_telemetry(home_dir: &Path) -> Result<(), String> {
+    // Seed the pricing registry with the user override while home_dir is in
+    // hand. Ignore "already set" — a lazy vendored-only init may have run
+    // first, and the OnceLock keeps whichever won (both share the seed).
+    let _ = MODEL_REGISTRY.set(build_model_registry(Some(&home_dir.join("models.toml"))));
+
     let db_path = home_dir.join("cost_telemetry.db");
     let telemetry = CostTelemetry::new(&db_path)?;
     TELEMETRY
@@ -946,6 +1070,99 @@ mod tests {
         // All agents
         let all = telemetry.all_agents_summary(1).await.unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    // ── W1: registry-based per-model pricing ────────────────────────────────
+
+    /// Known Anthropic model: registry math must land on the same value as
+    /// the legacy Sonnet constants for sub-cliff usage (rates are identical;
+    /// per-component vs. total rounding can differ by ≤1 on non-round token
+    /// counts, so the fixture uses round numbers).
+    #[test]
+    fn cost_for_known_anthropic_matches_legacy_sub_cliff() {
+        let usage = TokenUsage {
+            input_tokens: 100_000,       // $0.30 → 30
+            cache_read_tokens: 50_000,   // $0.015 → 1.5
+            cache_creation_tokens: 10_000, // $0.0375 → 3.75
+            output_tokens: 100_000,      // $1.50 → 150
+        };
+        // total_input = 160K < 200K cliff on both paths.
+        let legacy = usage.estimated_cost_millicents();
+        let registry = cost_for("claude-sonnet-5", &usage);
+        // Legacy rounds per component: 30 + 2 + 4 + 150 = 186.
+        assert_eq!(legacy, 186);
+        // Registry totals in true millicents then converts: 185_250 → 185.
+        assert_eq!(registry, 185);
+        // Same scale, within per-component rounding slack.
+        assert!(legacy.abs_diff(registry) <= 2, "legacy={legacy} registry={registry}");
+
+        // Exact equality on a fixture where per-component rounding is clean.
+        let clean = TokenUsage {
+            input_tokens: 100_000,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 100_000,
+        };
+        assert_eq!(cost_for("claude-sonnet-5", &clean), clean.estimated_cost_millicents());
+        assert_eq!(cost_for("claude-sonnet-5", &clean), 180);
+    }
+
+    /// DeepSeek usage must bill at DeepSeek rates, not the old hardcoded
+    /// Sonnet assumption (~30x cheaper at these rates).
+    #[test]
+    fn cost_for_deepseek_prices_at_deepseek_rates() {
+        let usage = TokenUsage {
+            input_tokens: 100_000,  // $0.23/MTok → 2_300 true mc
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 100_000, // $0.34/MTok → 3_400 true mc
+        };
+        let deepseek = cost_for("deepseek-v3.2", &usage);
+        assert_eq!(deepseek, 6); // 5_700 true mc → 6 legacy units
+        // Qualified id resolves to the same entry.
+        assert_eq!(cost_for("deepseek/deepseek-v3.2", &usage), deepseek);
+        // Old behavior would have charged Sonnet rates (180).
+        let old_assumption = usage.estimated_cost_millicents();
+        assert_eq!(old_assumption, 180);
+        assert!(deepseek * 20 < old_assumption);
+    }
+
+    /// Unknown model → byte-for-byte the legacy Sonnet fallback.
+    #[test]
+    fn cost_for_unknown_model_falls_back_to_legacy() {
+        let usage = TokenUsage {
+            input_tokens: 123_456,
+            cache_read_tokens: 11_111,
+            cache_creation_tokens: 22_222,
+            output_tokens: 7_890,
+        };
+        assert_eq!(
+            cost_for("totally-unknown-model", &usage),
+            usage.estimated_cost_millicents()
+        );
+        // Above-cliff legacy doubling must survive the fallback too.
+        let big = TokenUsage { input_tokens: 300_000, ..Default::default() };
+        assert_eq!(
+            cost_for("totally-unknown-model", &big),
+            big.estimated_cost_millicents()
+        );
+    }
+
+    /// Cliff threshold derives from the registry when the model is known.
+    #[test]
+    fn near_price_cliff_uses_registry_threshold() {
+        let big = TokenUsage { input_tokens: 185_000, ..Default::default() };
+        let small = TokenUsage { input_tokens: 170_000, ..Default::default() };
+        // Anthropic 200K cliff → warn above 180K.
+        assert!(near_price_cliff_for("claude-sonnet-5", &big));
+        assert!(!near_price_cliff_for("claude-sonnet-5", &small));
+        // Gemini Pro also carries a 200K cliff.
+        assert!(near_price_cliff_for("gemini-3.1-pro", &big));
+        // Registry model WITHOUT a cliff never warns.
+        assert!(!near_price_cliff_for("deepseek-v3.2", &big));
+        // Unknown model keeps the legacy fixed 180K margin.
+        assert!(near_price_cliff_for("totally-unknown-model", &big));
+        assert!(!near_price_cliff_for("totally-unknown-model", &small));
     }
 
     // ── #6.3: cost-pressure flag + evolution_event emission ─────────────────

@@ -1,6 +1,4 @@
 #![recursion_limit = "256"]
-#![allow(dead_code)]
-#![allow(unused_imports)]
 #![allow(unused_mut)]
 #![allow(unused_variables)]
 #![allow(clippy::collapsible_if)]
@@ -48,6 +46,7 @@ pub mod task_store;
 pub mod partner_store;
 pub mod autopilot_store;
 pub mod autopilot_engine;
+pub mod approval;
 pub mod events_store;
 pub mod direct_api;
 pub mod delegation;
@@ -59,6 +58,7 @@ pub mod external_factors;
 pub mod cli_auth;
 pub mod handlers;
 pub mod line;
+pub mod local_llm;
 pub mod mcp_oauth;
 pub mod media;
 pub mod model_capabilities;
@@ -66,6 +66,7 @@ pub mod tts;
 pub mod lifecycle_flush;
 pub mod log;
 pub mod metrics;
+pub mod otel;
 pub mod failover;
 pub mod gvu;
 pub mod prediction;
@@ -87,7 +88,6 @@ pub mod session_summarizer_task;
 pub mod skill_lifecycle;
 pub mod server;
 pub mod session;
-pub mod sticker;
 pub mod task_spec;
 pub mod telegram;
 pub mod channel_sender;
@@ -107,10 +107,8 @@ pub mod wiki_trust_federation;
 pub mod worktree;
 
 // ── Hermes-learnings modules (Phase 3, 4, 6) ──
-pub mod compression;
 pub mod rl;
 pub mod skill_extraction;
-pub mod tool_classifier;
 
 // ── Sprint N P0: EvolutionEvents JSONL audit log ──
 pub mod evolution_events;

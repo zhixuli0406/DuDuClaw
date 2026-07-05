@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn decide_tool_call_denies_unknown_tools() {
         let tmp = TempDir::new().unwrap();
-        let mut cfg = cfg_with("general");
+        let cfg = cfg_with("general");
         // No tool_egress entry → default deny.
         let m = RedactionManager::open(cfg, paths(&tmp)).unwrap();
         let pipe = m.pipeline("agnes", Some("s1".into())).unwrap();

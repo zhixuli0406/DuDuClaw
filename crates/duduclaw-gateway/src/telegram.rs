@@ -127,17 +127,9 @@ struct TgEntity {
 }
 
 #[derive(Debug, Deserialize)]
-struct TgCallbackQuery {
-    id: String,
-    data: Option<String>,
-    message: Option<TgMessage>,
-}
-
-#[derive(Debug, Deserialize)]
 struct TgUpdate {
     update_id: i64,
     message: Option<TgMessage>,
-    callback_query: Option<TgCallbackQuery>,
 }
 
 #[derive(Debug, Serialize)]
@@ -723,65 +715,6 @@ async fn handle_command(
         _ => {} // Unknown command — ignore
     }
 }
-
-/// Handle callback queries from inline keyboard buttons.
-async fn handle_callback_query(
-    client: &reqwest::Client,
-    api_base: &str,
-    cb: &TgCallbackQuery,
-    ctx: &Arc<ReplyContext>,
-) {
-    let cb_data = cb.data.as_deref().unwrap_or("");
-    let chat_id = match cb.message.as_ref().map(|m| m.chat.id) {
-        Some(id) => id,
-        None => {
-            // No message context (e.g. inline mode) — just answer the callback
-            let _ = client
-                .post(format!("{api_base}/answerCallbackQuery"))
-                .json(&json!({ "callback_query_id": cb.id }))
-                .send()
-                .await;
-            return;
-        }
-    };
-    let thread_id = cb.message.as_ref().and_then(|m| m.message_thread_id);
-
-    // Parse callback data: "duduclaw:{action}"
-    if let Some(action) = cb_data.strip_prefix("duduclaw:") {
-        match action {
-            "new_session" => {
-                let session_id = if let Some(tid) = thread_id {
-                    format!("telegram:{chat_id}:{tid}")
-                } else {
-                    format!("telegram:{chat_id}")
-                };
-                let msg = format!("已開始新的工作階段。先前的：`{session_id}`");
-                send_reply(client, api_base, chat_id, &msg, thread_id, None, None).await;
-            }
-            "voice_toggle" => {
-                let session_key = format!("telegram:{chat_id}");
-                let mut sessions = ctx.voice_sessions.lock().await;
-                let msg = if sessions.contains(&session_key) {
-                    sessions.remove(&session_key);
-                    "🔇 已關閉語音模式"
-                } else {
-                    sessions.insert(session_key);
-                    "🎤 已開啟語音模式"
-                };
-                send_reply(client, api_base, chat_id, msg, thread_id, None, None).await;
-            }
-            _ => {}
-        }
-    }
-
-    // Answer the callback query to dismiss the loading state
-    let _ = client
-        .post(format!("{api_base}/answerCallbackQuery"))
-        .json(&json!({ "callback_query_id": cb.id }))
-        .send()
-        .await;
-}
-
 
 // ── Helpers ─────────────────────────────────────────────────
 

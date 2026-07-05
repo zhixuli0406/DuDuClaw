@@ -1,0 +1,56 @@
+[package]
+name = "duduclaw-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Provider-agnostic LLM completion layer — the API-level twin of the
+# CLI-level `AgentRuntime` trait.
+#
+# Normalizes Anthropic Messages / OpenAI Responses / Gemini generateContent /
+# OpenAI-compatible chat-completions behind one `ChatProvider` trait, with a
+# vendored `ModelRegistry` (context windows, millicent pricing, capability
+# flags) and a cooldown-aware `FallbackRouter`.
+#
+# Absorbs the behavior of `duduclaw-gateway/src/direct_api.rs` (layered
+# cache breakpoints, "system_and_3" history breakpoint) and will eventually
+# subsume the two near-duplicate OpenAI-compat clients in gateway/inference.
+
+[lints]
+workspace = true
+
+[features]
+# The stdio-child MCP client (`mcp_client.rs`) and its `ToolRegistry`.
+# Adds NO new dependencies — the child-process transport rides the workspace
+# `tokio` "full" feature (process + io-util + time + sync), already a dep.
+# On by default; `--no-default-features` drops the module while the
+# provider-agnostic `tool_loop` (and its `ToolExecutor` trait) stays compiled.
+default = ["mcp-client"]
+mcp-client = []
+
+[dependencies]
+duduclaw-core = { workspace = true }
+
+# Async runtime + trait
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# HTTP + streaming (`stream` adds bytes_stream for SSE; additive feature)
+reqwest = { workspace = true, features = ["stream"] }
+futures-util = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["full", "test-util"] }

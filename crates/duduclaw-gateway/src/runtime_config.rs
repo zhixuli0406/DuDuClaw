@@ -89,10 +89,62 @@ pub fn load_runtime_settings(agent_dir: &Path) -> RuntimeSettings {
         .and_then(|s| s.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| DEFAULT_UTILITY_MODEL.to_string());
+
+    // Provider↔model sanity check: `preferred = "gpt-5"` with the default
+    // Claude provider used to route silently into the Claude CLI and fail at
+    // the Anthropic API. Warn once per (agent, model) so the misconfiguration
+    // is visible without spamming the hot reply path.
+    if let Some(preferred) = v
+        .get("model")
+        .and_then(|m| m.get("preferred"))
+        .and_then(|s| s.as_str())
+    {
+        if !model_matches_provider(preferred, provider) {
+            warn_mismatch_once(agent_dir, preferred, provider);
+        }
+    }
+
     RuntimeSettings {
         provider,
         fallback,
         utility_model,
+    }
+}
+
+/// Conservative provider↔model compatibility check by model-id naming family.
+/// Only flags *confident* mismatches; unknown families and `openai_compat`
+/// (which proxies arbitrary models) always pass.
+pub fn model_matches_provider(model: &str, provider: RuntimeType) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    // Accept the qualified "provider/model" form — take the model part.
+    let m = m.rsplit('/').next().unwrap_or(&m);
+    let is_claude = m.starts_with("claude");
+    let is_openai = m.starts_with("gpt-") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("codex");
+    let is_gemini = m.starts_with("gemini");
+    match provider {
+        RuntimeType::Claude => !(is_openai || is_gemini),
+        RuntimeType::Codex => !(is_claude || is_gemini),
+        RuntimeType::Gemini | RuntimeType::Antigravity => !(is_claude || is_openai),
+        RuntimeType::OpenAiCompat => true,
+    }
+}
+
+fn warn_mismatch_once(agent_dir: &Path, model: &str, provider: RuntimeType) {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let key = format!("{}|{model}", agent_dir.display());
+    let warned = WARNED.get_or_init(Default::default);
+    if let Ok(mut set) = warned.lock() {
+        if set.insert(key) {
+            tracing::warn!(
+                agent_dir = %agent_dir.display(),
+                model,
+                provider = provider.as_str(),
+                "[model] preferred does not match [runtime] provider — requests will \
+                 likely fail at the provider API; set [runtime] provider to the \
+                 runtime that serves this model"
+            );
+        }
     }
 }
 
@@ -110,6 +162,32 @@ pub fn agent_utility_model(agent_dir: &Path) -> String {
 /// Single-field convenience over [`load_runtime_settings`].
 pub fn agent_runtime_provider(agent_dir: &Path) -> RuntimeType {
     load_runtime_settings(agent_dir).provider
+}
+
+/// Cross-provider direct-API fallback chain from `agent.toml [model] fallbacks`
+/// (W3/G1). A list of qualified model ids (`"openai/gpt-5.4"`,
+/// `"compat:deepseek/deepseek-v3.2"`, ...) tried in order after the preferred
+/// model on the Direct-API path.
+///
+/// Blanks are dropped and each entry is trimmed. A missing/malformed file, a
+/// missing `[model]` table, a missing key, or a non-array value all resolve to
+/// an empty vec — which the Direct-API path treats as "no chain" and keeps its
+/// existing single-shot behavior byte-identically (fail-safe).
+pub fn agent_model_fallbacks(agent_dir: &Path) -> Vec<String> {
+    read_agent_toml(agent_dir)
+        .and_then(|v| {
+            v.get("model")
+                .and_then(|m| m.get("fallbacks"))
+                .and_then(|f| f.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+        })
+        .unwrap_or_default()
 }
 
 /// Resolve the agent's runtime fallback provider (`[runtime] fallback`).
@@ -308,6 +386,44 @@ mod tests {
         assert_eq!(agent_runtime_provider(dir.path()), RuntimeType::Claude);
     }
 
+    // ── W3/G1: [model] fallbacks chain ──────────────────────────────────
+
+    #[test]
+    fn model_fallbacks_empty_when_absent() {
+        let dir = TempDir::new().unwrap();
+        assert!(agent_model_fallbacks(dir.path()).is_empty());
+        // Present [model] table but no `fallbacks` key → still empty.
+        write_agent_toml(dir.path(), "[model]\nutility = \"claude-haiku-4-5\"\n");
+        assert!(agent_model_fallbacks(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn model_fallbacks_parsed_trimmed_and_blanks_dropped() {
+        let dir = TempDir::new().unwrap();
+        write_agent_toml(
+            dir.path(),
+            "[model]\nfallbacks = [\"openai/gpt-5.4\", \" compat:deepseek/deepseek-v3.2 \", \"\"]\n",
+        );
+        assert_eq!(
+            agent_model_fallbacks(dir.path()),
+            vec![
+                "openai/gpt-5.4".to_string(),
+                "compat:deepseek/deepseek-v3.2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn model_fallbacks_empty_on_malformed_or_wrong_type() {
+        let dir = TempDir::new().unwrap();
+        // Wrong type (string, not array) → empty.
+        write_agent_toml(dir.path(), "[model]\nfallbacks = \"openai/gpt-5.4\"\n");
+        assert!(agent_model_fallbacks(dir.path()).is_empty());
+        // Malformed toml → empty.
+        write_agent_toml(dir.path(), "not valid toml ===");
+        assert!(agent_model_fallbacks(dir.path()).is_empty());
+    }
+
     // ── RFC-24: decision_continuity opt-in ──────────────────────────────
 
     #[test]
@@ -463,5 +579,23 @@ mod tests {
         let spec = resolve_utility(home.path(), None);
         assert_eq!(spec.provider, RuntimeType::Claude);
         assert_eq!(spec.model, DEFAULT_UTILITY_MODEL);
+    }
+
+    #[test]
+    fn model_provider_mismatch_detection() {
+        use RuntimeType::*;
+        // Confident mismatches
+        assert!(!model_matches_provider("gpt-5", Claude));
+        assert!(!model_matches_provider("gemini-3.1-pro", Claude));
+        assert!(!model_matches_provider("claude-sonnet-4-6", Codex));
+        assert!(!model_matches_provider("gpt-5.4", Gemini));
+        // Correct pairings
+        assert!(model_matches_provider("claude-haiku-4-5", Claude));
+        assert!(model_matches_provider("gpt-5.4-mini", Codex));
+        assert!(model_matches_provider("gemini-3.5-flash", Antigravity));
+        // Qualified form + unknown families + compat always pass
+        assert!(model_matches_provider("anthropic/claude-sonnet-5", Claude));
+        assert!(model_matches_provider("deepseek-v3.2", Claude));
+        assert!(model_matches_provider("claude-sonnet-4-6", OpenAiCompat));
     }
 }

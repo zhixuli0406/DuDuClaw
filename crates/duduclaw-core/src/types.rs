@@ -469,7 +469,7 @@ pub struct CapabilitiesConfig {
 
     /// Computer use execution mode.
     /// - `container` (default): L5a — run inside Docker/Apple Container with Xvfb.
-    /// - `native`: L5b — directly control the host desktop (enigo + xcap).
+    /// - `native`: L5b — directly control the host desktop (enigo + OS screen capture).
     /// - `auto`: choose based on agent trust level and task requirements.
     #[serde(default)]
     pub computer_use_mode: ComputerUseMode,
@@ -641,6 +641,97 @@ impl CapabilitiesConfig {
         allowed.dedup();
         allowed
     }
+
+    /// Whether this config carries per-tool restrictions (an explicit allowlist
+    /// or denylist). Runtimes that can only enforce a coarse sandbox mode
+    /// (Codex / Gemini) use this to warn operators that enforcement is
+    /// best-effort — the per-tool granularity does not survive the mapping.
+    pub fn has_tool_restrictions(&self) -> bool {
+        !self.allowed_tools.is_empty() || !self.denied_tools.is_empty()
+    }
+
+    /// Whether write-capable tools (Bash / Write / Edit / MultiEdit /
+    /// NotebookEdit) are permitted by this config.
+    ///
+    /// Token-anchored matching only (never substring, per the 2026-06 review
+    /// conventions): an entry matches when its base name — the part before an
+    /// optional `(` qualifier, e.g. `Bash(git:*)` → `Bash` — equals the tool
+    /// name case-insensitively.
+    ///
+    /// - Allowlist mode (`allowed_tools` non-empty): a write tool must appear
+    ///   in the allowlist (bare or qualified) and not be bare-denied.
+    /// - Denylist mode: write tools are allowed unless EVERY write tool is
+    ///   bare-denied (a qualified deny such as `Bash(rm:*)` does not count as
+    ///   fully denying Bash).
+    pub fn write_tools_allowed(&self) -> bool {
+        const WRITE_TOOLS: [&str; 5] = ["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"];
+        fn base(entry: &str) -> &str {
+            entry.split('(').next().unwrap_or(entry).trim()
+        }
+        let bare_denied =
+            |tool: &str| self.denied_tools.iter().any(|d| d.trim().eq_ignore_ascii_case(tool));
+        if !self.allowed_tools.is_empty() {
+            WRITE_TOOLS.iter().any(|tool| {
+                !bare_denied(tool)
+                    && self
+                        .allowed_tools
+                        .iter()
+                        .any(|a| base(a).eq_ignore_ascii_case(tool))
+            })
+        } else {
+            WRITE_TOOLS.iter().any(|tool| !bare_denied(tool))
+        }
+    }
+
+    /// Map this capability config to the coarse [`SandboxLevel`] used by
+    /// runtimes whose CLIs expose a sandbox mode instead of per-tool lists
+    /// (Codex `--sandbox`, Gemini `--sandbox`).
+    ///
+    /// - `computer_use = true` (explicit full-desktop grant) → [`SandboxLevel::FullAccess`]
+    /// - no write-capable tools allowed AND no `browser_via_bash` → [`SandboxLevel::ReadOnly`]
+    /// - otherwise → [`SandboxLevel::WorkspaceWrite`] (deny-by-default middle ground)
+    pub fn sandbox_level(&self) -> SandboxLevel {
+        if self.computer_use {
+            return SandboxLevel::FullAccess;
+        }
+        if !self.browser_via_bash && !self.write_tools_allowed() {
+            return SandboxLevel::ReadOnly;
+        }
+        SandboxLevel::WorkspaceWrite
+    }
+}
+
+/// Coarse sandbox level for CLI runtimes that cannot enforce per-tool
+/// allow/deny lists (Codex / Gemini). Derived from [`CapabilitiesConfig`] via
+/// [`CapabilitiesConfig::sandbox_level`] / [`sandbox_level_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxLevel {
+    /// Model may read but not mutate the workspace.
+    ReadOnly,
+    /// Model may mutate the workspace only (default).
+    WorkspaceWrite,
+    /// Full host access — ONLY when capabilities explicitly grant `computer_use`.
+    FullAccess,
+}
+
+impl SandboxLevel {
+    /// Codex CLI `--sandbox` value.
+    pub fn as_codex_flag(&self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::FullAccess => "danger-full-access",
+        }
+    }
+}
+
+/// [`SandboxLevel`] for an optional capabilities config. `None` (capability-less
+/// legacy callers) keeps the historical workspace-write behaviour — the old
+/// `--full-auto` / default approval modes implied workspace-scoped writes.
+pub fn sandbox_level_for(caps: Option<&CapabilitiesConfig>) -> SandboxLevel {
+    caps.map(CapabilitiesConfig::sandbox_level)
+        .unwrap_or(SandboxLevel::WorkspaceWrite)
 }
 
 /// Evolution / self-improvement configuration.
@@ -975,6 +1066,103 @@ impl StagnationDetectionConfig {
 }
 
 // ── Tests — StagnationDetectionConfig ────────────────────────────────────────
+
+#[cfg(test)]
+mod sandbox_level_tests {
+    use super::*;
+
+    fn caps(
+        computer_use: bool,
+        browser_via_bash: bool,
+        allowed: &[&str],
+        denied: &[&str],
+    ) -> CapabilitiesConfig {
+        CapabilitiesConfig {
+            computer_use,
+            browser_via_bash,
+            allowed_tools: allowed.iter().map(|s| s.to_string()).collect(),
+            denied_tools: denied.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_caps_are_workspace_write() {
+        assert_eq!(
+            CapabilitiesConfig::default().sandbox_level(),
+            SandboxLevel::WorkspaceWrite
+        );
+    }
+
+    #[test]
+    fn none_caps_keep_legacy_workspace_write() {
+        assert_eq!(sandbox_level_for(None), SandboxLevel::WorkspaceWrite);
+    }
+
+    #[test]
+    fn computer_use_grant_is_full_access() {
+        assert_eq!(
+            caps(true, false, &[], &[]).sandbox_level(),
+            SandboxLevel::FullAccess
+        );
+    }
+
+    #[test]
+    fn read_only_allowlist_maps_to_read_only() {
+        assert_eq!(
+            caps(false, false, &["Read", "Grep"], &[]).sandbox_level(),
+            SandboxLevel::ReadOnly
+        );
+    }
+
+    #[test]
+    fn write_tools_matching_is_token_anchored_not_substring() {
+        // `Bash(git:*)` counts as a (scoped) Bash grant…
+        assert!(caps(false, false, &["Bash(git:*)"], &[]).write_tools_allowed());
+        // …but a tool merely *containing* a write-tool name must not.
+        assert!(!caps(false, false, &["NotWriteTool"], &[]).write_tools_allowed());
+        assert!(!caps(false, false, &["Bashful"], &[]).write_tools_allowed());
+    }
+
+    #[test]
+    fn denylist_mode_requires_all_write_tools_bare_denied() {
+        assert!(caps(false, false, &[], &["Bash"]).write_tools_allowed());
+        assert!(
+            !caps(
+                false,
+                false,
+                &[],
+                &["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"]
+            )
+            .write_tools_allowed()
+        );
+        // Qualified deny does not fully deny the base tool.
+        assert!(
+            caps(
+                false,
+                false,
+                &[],
+                &["Bash(rm:*)", "Write", "Edit", "MultiEdit", "NotebookEdit"]
+            )
+            .write_tools_allowed()
+        );
+    }
+
+    #[test]
+    fn browser_via_bash_prevents_read_only() {
+        assert_eq!(
+            caps(false, true, &["Read"], &[]).sandbox_level(),
+            SandboxLevel::WorkspaceWrite
+        );
+    }
+
+    #[test]
+    fn codex_flag_values() {
+        assert_eq!(SandboxLevel::ReadOnly.as_codex_flag(), "read-only");
+        assert_eq!(SandboxLevel::WorkspaceWrite.as_codex_flag(), "workspace-write");
+        assert_eq!(SandboxLevel::FullAccess.as_codex_flag(), "danger-full-access");
+    }
+}
 
 #[cfg(test)]
 mod stagnation_tests {

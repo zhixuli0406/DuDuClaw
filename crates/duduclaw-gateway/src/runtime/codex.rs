@@ -9,11 +9,59 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
+
+use duduclaw_core::types::{sandbox_level_for, CapabilitiesConfig};
 
 use super::{AgentRuntime, RuntimeContext, RuntimeResponse};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
+
+/// Derive Codex CLI sandbox/approval flags from the agent's capabilities.
+///
+/// Replaces the former blanket `--full-auto` (which unconditionally implied
+/// `workspace-write` + no approvals, ignoring `CapabilitiesConfig` entirely).
+/// Non-interactive `codex exec` requires an approval policy, so we always pass
+/// `--ask-for-approval never` and scope the blast radius via `--sandbox`:
+/// - restrictive caps (no write tools, no browser/computer use) → `read-only`
+/// - default / `None` caps → `workspace-write` (same write scope `--full-auto` granted)
+/// - explicit `computer_use = true` grant → `danger-full-access`
+fn sandbox_args(caps: Option<&CapabilitiesConfig>) -> Vec<String> {
+    let level = sandbox_level_for(caps);
+    vec![
+        "--ask-for-approval".to_string(),
+        "never".to_string(),
+        "--sandbox".to_string(),
+        level.as_codex_flag().to_string(),
+    ]
+}
+
+/// `-c` config-override args registering the duduclaw MCP server for THIS
+/// invocation. Codex only reads MCP servers from `$CODEX_HOME/config.toml`;
+/// redirecting `CODEX_HOME` at the agent dir would orphan the user's
+/// `~/.codex/auth.json` (breaking ChatGPT-plan OAuth), so per-invocation
+/// `--config` overrides are the safe way to guarantee registration.
+fn mcp_override_args(agent_id: &str) -> Vec<String> {
+    let Some(def) = super::duduclaw_mcp_server_json(agent_id) else {
+        return Vec::new();
+    };
+    let mut args = Vec::new();
+    if let Some(command) = def.get("command").and_then(|c| c.as_str()) {
+        args.push("-c".to_string());
+        args.push(format!("mcp_servers.duduclaw.command={command}"));
+    }
+    args.push("-c".to_string());
+    args.push(r#"mcp_servers.duduclaw.args=["mcp-server"]"#.to_string());
+    if let Some(env) = def.get("env").and_then(|e| e.as_object()) {
+        for (k, v) in env {
+            if let Some(val) = v.as_str() {
+                args.push("-c".to_string());
+                args.push(format!("mcp_servers.duduclaw.env.{k}={val}"));
+            }
+        }
+    }
+    args
+}
 
 /// Runtime that delegates to the OpenAI Codex CLI.
 pub struct CodexRuntime {
@@ -61,7 +109,9 @@ impl AgentRuntime for CodexRuntime {
     ) -> Result<RuntimeResponse, String> {
         info!(agent = %context.agent_id, "CodexRuntime: executing via codex exec --json");
 
-        // Limit system_prompt to 64KB to avoid ARG_MAX issues
+        // Limit system_prompt to 64KB to avoid ARG_MAX issues.
+        // Char-boundary-safe truncation (never raw byte-index slicing on
+        // potentially CJK/emoji content — 2026-06 review convention #1).
         const MAX_SYSTEM_PROMPT_BYTES: usize = 65536;
         let system_prompt: &str = if context.system_prompt.len() > MAX_SYSTEM_PROMPT_BYTES {
             tracing::warn!(
@@ -69,7 +119,7 @@ impl AgentRuntime for CodexRuntime {
                 original_len = context.system_prompt.len(),
                 "system_prompt truncated to 64KB"
             );
-            &context.system_prompt[..MAX_SYSTEM_PROMPT_BYTES]
+            duduclaw_core::truncate_bytes(&context.system_prompt, MAX_SYSTEM_PROMPT_BYTES)
         } else {
             &context.system_prompt
         };
@@ -81,10 +131,42 @@ impl AgentRuntime for CodexRuntime {
             prompt.to_string()
         };
 
+        // W1 (capability enforcement): derive sandbox/approval flags from the
+        // agent's capabilities instead of the former blanket `--full-auto`.
+        let caps = context.capabilities.as_ref();
+        let level = sandbox_level_for(caps);
+        if let Some(c) = caps {
+            if c.has_tool_restrictions() {
+                warn!(
+                    runtime = "codex",
+                    agent = %context.agent_id,
+                    sandbox = level.as_codex_flag(),
+                    "capability enforcement is best-effort on this runtime — \
+                     per-tool allow/deny lists collapse to a coarse --sandbox level"
+                );
+            }
+        }
+
+        // W2 (MCP wiring): register the duduclaw MCP server before spawning.
+        // 1) Per-invocation `-c` overrides — effective regardless of CODEX_HOME.
+        // 2) Best-effort per-agent `.codex/config.toml` for operators who run
+        //    codex manually in the agent dir with CODEX_HOME pointed there.
+        //    Warn-not-fatal: MCP registration failing must not block the reply.
+        if let Some(ref dir) = context.agent_dir {
+            if let Err(e) = Self::ensure_duduclaw_mcp_config(dir, &context.agent_id) {
+                warn!(
+                    runtime = "codex",
+                    agent = %context.agent_id,
+                    error = %e,
+                    "failed to write per-agent codex MCP config — continuing without it"
+                );
+            }
+        }
+
         let mut cmd = tokio::process::Command::new(&self.codex_path);
-        cmd.arg("exec")
-            .arg("--json")
-            .arg("--full-auto");
+        cmd.arg("exec").arg("--json");
+        cmd.args(sandbox_args(caps));
+        cmd.args(mcp_override_args(&context.agent_id));
 
         // Pass system prompt via AGENTS.md in working directory.
         // Codex exec has no --instructions flag; it reads from AGENTS.md.
@@ -223,40 +305,101 @@ impl CodexRuntime {
 // ── MCP config ──────────────────────────────────────────────────
 
 impl CodexRuntime {
-    /// Write MCP server configuration to the agent's codex config.
-    pub fn write_mcp_config(agent_dir: &std::path::Path, servers: &std::collections::HashMap<String, serde_json::Value>) -> Result<(), String> {
-        let config_path = agent_dir.join(".codex").join("config.toml");
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    /// Render `[mcp_servers]` TOML deterministically (sorted server names and
+    /// keys — a `HashMap` iteration order would make the idempotence check in
+    /// [`Self::write_mcp_config`] flap between runs).
+    fn render_mcp_toml(servers: &std::collections::HashMap<String, serde_json::Value>) -> String {
+        fn toml_string(s: &str) -> String {
+            format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
         }
         let mut content = String::from("[mcp_servers]\n");
-        for (name, config) in servers {
+        let mut names: Vec<&String> = servers.keys().collect();
+        names.sort();
+        for name in names {
+            let config = &servers[name];
             if name.contains('.') {
-                content.push_str(&format!("[mcp_servers.\"{}\"]\n", name));
+                content.push_str(&format!("[mcp_servers.{}]\n", toml_string(name)));
             } else {
                 content.push_str(&format!("[mcp_servers.{name}]\n"));
             }
-            if let Some(obj) = config.as_object() {
-                for (k, v) in obj {
-                    let toml_val = match v {
-                        serde_json::Value::String(s) => format!("{k} = \"{}\"\n", s.replace('\\', "\\\\").replace('"', "\\\"")),
-                        serde_json::Value::Array(arr) => {
-                            let items: Vec<String> = arr.iter().map(|item| {
+            let Some(obj) = config.as_object() else { continue };
+            let mut keys: Vec<&String> = obj.keys().collect();
+            keys.sort();
+            for k in keys {
+                let v = &obj[k.as_str()];
+                let toml_val = match v {
+                    serde_json::Value::String(s) => format!("{k} = {}\n", toml_string(s)),
+                    serde_json::Value::Array(arr) => {
+                        let items: Vec<String> = arr
+                            .iter()
+                            .map(|item| {
                                 if let Some(s) = item.as_str() {
-                                    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+                                    toml_string(s)
                                 } else {
                                     item.to_string()
                                 }
-                            }).collect();
-                            format!("{k} = [{}]\n", items.join(", "))
-                        }
-                        _ => format!("{k} = {v}\n"),
-                    };
-                    content.push_str(&toml_val);
-                }
+                            })
+                            .collect();
+                        format!("{k} = [{}]\n", items.join(", "))
+                    }
+                    serde_json::Value::Object(env) => {
+                        // Inline table (used for the `env` map).
+                        let mut env_keys: Vec<&String> = env.keys().collect();
+                        env_keys.sort();
+                        let pairs: Vec<String> = env_keys
+                            .iter()
+                            .filter_map(|ek| {
+                                env[ek.as_str()]
+                                    .as_str()
+                                    .map(|ev| format!("{ek} = {}", toml_string(ev)))
+                            })
+                            .collect();
+                        format!("{k} = {{ {} }}\n", pairs.join(", "))
+                    }
+                    _ => format!("{k} = {v}\n"),
+                };
+                content.push_str(&toml_val);
             }
         }
-        std::fs::write(&config_path, content).map_err(|e| e.to_string())
+        content
+    }
+
+    /// Write MCP server configuration to the agent's codex config
+    /// (`<agent_dir>/.codex/config.toml`). Idempotent: skips the write when the
+    /// file already holds exactly the desired content. Returns `Ok(true)` when
+    /// written, `Ok(false)` when already up to date.
+    pub fn write_mcp_config(
+        agent_dir: &std::path::Path,
+        servers: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bool, String> {
+        let config_path = agent_dir.join(".codex").join("config.toml");
+        let content = Self::render_mcp_toml(servers);
+        if let Ok(existing) = std::fs::read_to_string(&config_path) {
+            if existing == content {
+                return Ok(false);
+            }
+        }
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&config_path, content).map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    /// W2: ensure the duduclaw MCP server (absolute binary + `mcp-server` arg +
+    /// `DUDUCLAW_AGENT_ID` env) is registered in the agent's codex config.
+    /// Called from [`AgentRuntime::execute`] before every spawn — cheap
+    /// check-before-write keeps it idempotent.
+    pub fn ensure_duduclaw_mcp_config(
+        agent_dir: &std::path::Path,
+        agent_id: &str,
+    ) -> Result<bool, String> {
+        let Some(def) = super::duduclaw_mcp_server_json(agent_id) else {
+            return Err("duduclaw binary did not resolve to an absolute path".to_string());
+        };
+        let mut servers = std::collections::HashMap::new();
+        servers.insert("duduclaw".to_string(), def);
+        Self::write_mcp_config(agent_dir, &servers)
     }
 }
 
@@ -274,6 +417,121 @@ mod tests {
         let usage: CodexUsage = serde_json::from_value(event.extra.get("usage").unwrap().clone()).unwrap();
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 50);
+    }
+
+    fn caps(
+        computer_use: bool,
+        browser_via_bash: bool,
+        allowed: &[&str],
+        denied: &[&str],
+    ) -> CapabilitiesConfig {
+        CapabilitiesConfig {
+            computer_use,
+            browser_via_bash,
+            allowed_tools: allowed.iter().map(|s| s.to_string()).collect(),
+            denied_tools: denied.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sandbox_args_default_caps_is_workspace_write() {
+        // Default caps (empty allowlist ⇒ full default toolset incl. Bash/Write)
+        // keep the write scope --full-auto used to grant — workspace-write.
+        let c = caps(false, false, &[], &[]);
+        let args = sandbox_args(Some(&c));
+        assert_eq!(
+            args,
+            vec!["--ask-for-approval", "never", "--sandbox", "workspace-write"]
+        );
+    }
+
+    #[test]
+    fn sandbox_args_none_caps_keeps_legacy_workspace_write() {
+        let args = sandbox_args(None);
+        assert_eq!(
+            args,
+            vec!["--ask-for-approval", "never", "--sandbox", "workspace-write"]
+        );
+    }
+
+    #[test]
+    fn sandbox_args_read_only_when_allowlist_has_no_write_tools() {
+        let c = caps(false, false, &["Read", "Grep", "WebSearch"], &[]);
+        let args = sandbox_args(Some(&c));
+        assert_eq!(args[3], "read-only");
+    }
+
+    #[test]
+    fn sandbox_args_read_only_when_all_write_tools_denied() {
+        let c = caps(
+            false,
+            false,
+            &[],
+            &["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"],
+        );
+        assert_eq!(sandbox_args(Some(&c))[3], "read-only");
+    }
+
+    #[test]
+    fn sandbox_args_full_access_only_on_explicit_computer_use() {
+        let c = caps(true, false, &[], &[]);
+        assert_eq!(sandbox_args(Some(&c))[3], "danger-full-access");
+    }
+
+    #[test]
+    fn sandbox_args_browser_via_bash_forces_workspace_write() {
+        // A read-only allowlist + browser_via_bash still needs bash → not read-only.
+        let c = caps(false, true, &["Read"], &[]);
+        assert_eq!(sandbox_args(Some(&c))[3], "workspace-write");
+    }
+
+    #[test]
+    fn sandbox_args_qualified_bash_allow_counts_as_write() {
+        // `Bash(git:*)` is an anchored token grant of (scoped) Bash — must not
+        // collapse to read-only, but must never escalate past workspace-write.
+        let c = caps(false, false, &["Read", "Bash(git:*)"], &[]);
+        assert_eq!(sandbox_args(Some(&c))[3], "workspace-write");
+    }
+
+    #[test]
+    fn mcp_config_write_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "duduclaw".to_string(),
+            serde_json::json!({
+                "command": "/usr/local/bin/duduclaw",
+                "args": ["mcp-server"],
+                "env": { "DUDUCLAW_AGENT_ID": "agnes" },
+            }),
+        );
+        assert!(CodexRuntime::write_mcp_config(dir.path(), &servers).unwrap());
+        // Second call: identical content → no write reported.
+        assert!(!CodexRuntime::write_mcp_config(dir.path(), &servers).unwrap());
+
+        let content =
+            std::fs::read_to_string(dir.path().join(".codex").join("config.toml")).unwrap();
+        assert!(content.contains("[mcp_servers.duduclaw]"));
+        assert!(content.contains("command = \"/usr/local/bin/duduclaw\""));
+        assert!(content.contains("args = [\"mcp-server\"]"));
+        assert!(content.contains("DUDUCLAW_AGENT_ID = \"agnes\""));
+    }
+
+    #[test]
+    fn mcp_override_args_carry_agent_id_env() {
+        // resolve_duduclaw_bin falls back to current_exe (absolute in tests),
+        // so overrides should materialize with the agent-id env override.
+        let args = mcp_override_args("agnes");
+        if args.is_empty() {
+            return; // binary not resolvable to an absolute path in this env
+        }
+        assert!(args.iter().any(|a| a == r#"mcp_servers.duduclaw.args=["mcp-server"]"#));
+        assert!(
+            args.iter()
+                .any(|a| a == "mcp_servers.duduclaw.env.DUDUCLAW_AGENT_ID=agnes"),
+            "agent id env override missing: {args:?}"
+        );
     }
 
     #[test]

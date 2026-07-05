@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod text_gradient_tests {
-    use crate::gvu::text_gradient::{GradientSeverity, TextGradient};
+    use crate::gvu::text_gradient::TextGradient;
 
     #[test]
     fn blocking_gradient_format() {

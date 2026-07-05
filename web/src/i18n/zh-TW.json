@@ -115,7 +115,6 @@
   "voice.enabled": "已啟用",
   "voice.disabled": "已停用",
   "voice.provider.whisperApi": "Whisper API（雲端）",
-  "voice.provider.sensevoice": "SenseVoice（本地）",
   "voice.provider.edgeTts": "Edge TTS（免費）",
   "voice.provider.minimax": "MiniMax T2A",
   "voice.provider.openaiTts": "OpenAI TTS",

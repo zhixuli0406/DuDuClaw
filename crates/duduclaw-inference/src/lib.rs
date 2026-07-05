@@ -16,8 +16,8 @@
 //! **Compression** module provides three strategies:
 //!   Meta-Token (lossless) / LLMLingua-2 (lossy) / StreamingLLM (KV-cache)
 
+pub mod adapter;
 pub mod backend;
-pub mod compression;
 pub mod config;
 pub mod engine;
 pub mod error;
@@ -36,18 +36,10 @@ pub mod openai_compat;
 pub mod router;
 pub mod types;
 pub mod util;
-pub mod asr;
-pub mod asr_router;
-pub mod audio_decode;
 pub mod embedding;
-pub mod deepgram;
-#[cfg(feature = "onnx")]
-pub mod sensevoice;
-pub mod livekit_voice;
-pub mod realtime_voice;
-pub mod vad;
 pub mod whisper;
 
+pub use adapter::CompatEndpoint;
 pub use backend::InferenceBackend;
 pub use config::InferenceConfig;
 pub use engine::InferenceEngine;

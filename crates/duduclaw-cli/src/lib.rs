@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 #![allow(clippy::empty_line_after_doc_comments)]
 #![allow(clippy::format_in_format_args)]
 #![allow(clippy::ptr_arg)]
@@ -10,6 +9,7 @@ use duduclaw_agent::AgentRunner;
 use duduclaw_core::error::DuDuClawError;
 use duduclaw_core::types::CheckStatus;
 mod acp;
+mod eval;                 // Harness-level agent behavior eval / regression suite (`duduclaw eval`)
 mod portability;          // Personal-edition data portability: export/import ~/.duduclaw
 mod premium_templates;    // Licensed industry templates (commercial/templates-premium), gated by premium_templates feature
 mod mcp;
@@ -21,7 +21,6 @@ pub mod mcp_planner;             // RFC-26 P6.1: clarify-first Plan Mode
 pub mod builtin_skills;          // RFC-26 P6.3: bundled SKILL.md set
 pub mod mcp_refresh;             // v1.16.0: refresh-token credential type
 pub mod mcp_dispatch;          // W20-P1 Phase 2A: transport-agnostic dispatcher
-pub(crate) mod mcp_http_auth;  // W20-P1 Phase 2B: HTTP Bearer auth extractor
 pub(crate) mod mcp_http_errors; // W20-P1 Phase 2B: JSON-RPC ↔ HTTP status mapping
 pub mod mcp_http_server;       // W20-P1 Phase 2B: Axum HTTP/SSE server
 pub mod mcp_headers;           // W22-P0 ADR-002: capability registry + x-duduclaw header builder
@@ -251,17 +250,6 @@ struct Cli {
     command: Commands,
 }
 
-impl Cli {
-    /// Parse `--redact` into the typed `CliFlag` enum from the redaction crate.
-    fn redact_flag(&self) -> duduclaw_redaction::CliFlag {
-        match self.redact.as_deref() {
-            Some("on" | "true" | "1") => duduclaw_redaction::CliFlag::On,
-            Some("off" | "false" | "0") => duduclaw_redaction::CliFlag::Off,
-            _ => duduclaw_redaction::CliFlag::Unset,
-        }
-    }
-}
-
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize DuDuClaw environment and configuration
@@ -342,6 +330,45 @@ enum Commands {
     Test {
         /// Agent name to test
         name: String,
+    },
+
+    /// Run harness-level agent behavior eval suites (`evals/<suite>/<case>.toml`).
+    ///
+    /// Each case sends one prompt to an agent through the same CLI harness
+    /// invocation the gateway uses, parses the stream-json transcript, and
+    /// checks deterministic `[expect]` assertions (tool usage, output text)
+    /// plus an optional `[judge]` LLM rubric. Exit code is non-zero when any
+    /// case fails, so CI can gate on it.
+    ///
+    /// Examples:
+    ///     duduclaw eval                                 # ./evals, live
+    ///     duduclaw eval evals/support --record          # refresh baselines
+    ///     duduclaw eval evals/support --replay          # offline regression
+    ///     duduclaw eval evals --replay --report out.json
+    Eval {
+        /// Case file or suite directory (default: ./evals)
+        path: Option<PathBuf>,
+
+        /// Only run cases whose `[case] name` contains this substring
+        #[arg(long)]
+        filter: Option<String>,
+
+        /// Replay recorded `*.transcript.jsonl` files instead of live runs
+        /// (offline, zero credentials — regression mode)
+        #[arg(long, conflicts_with = "record")]
+        replay: bool,
+
+        /// Record live transcripts next to each case for future --replay
+        #[arg(long)]
+        record: bool,
+
+        /// Skip the LLM judge even when a case enables it
+        #[arg(long)]
+        no_judge: bool,
+
+        /// Write a JSON report to this path
+        #[arg(long)]
+        report: Option<PathBuf>,
     },
 
     /// Manually re-forward a completed delegation response (v1.8.21+).
@@ -522,6 +549,14 @@ enum AgentCommands {
         /// `@<display_name>` (following the existing agnes convention).
         #[arg(long)]
         trigger: Option<String>,
+
+        /// AI runtime provider for this agent: `claude` (default), `codex`,
+        /// `gemini`, `antigravity`, or `openai_compat`. Written to
+        /// `agent.toml [runtime] provider` and used to scaffold the
+        /// provider's context file (AGENTS.md for codex, GEMINI.md for
+        /// gemini; CLAUDE.md is always written for compatibility).
+        #[arg(long)]
+        runtime: Option<String>,
     },
 
     /// Inspect agent details
@@ -795,11 +830,26 @@ pub async fn entry_point() {
     // stderr via `try_init`, but that silently no-ops once the global
     // subscriber is already installed (here). Routing to stderr from the
     // start is the only reliable fix. CLI-H7.
+    // Optional OpenTelemetry GenAI tracing (build feature "otel"; runtime
+    // opt-in via `config.toml [telemetry] otlp_endpoint`). `init` installs the
+    // OTLP exporter — it MUST run before `subscriber_layer()` is built, since
+    // the bridge layer needs the installed provider's tracer. Without the
+    // feature both calls are no-op stubs; `Option<Layer>` composes as a
+    // pass-through, so the subscriber stack is identical when disabled.
+    // Fail-safe: exporter init errors warn to stderr and disable export —
+    // never block startup. The guard is held to the end of `entry_point` so
+    // buffered spans flush on process exit. (`start_gateway` also calls
+    // `init`; it no-ops because this one already installed the provider.)
+    // NOTE: exported GenAI spans are INFO-level, so they obey the same
+    // `env_filter` as everything else — set log level `info` (tier 1 or 2
+    // above) when enabling telemetry. See docs/guides/observability.md.
+    let _otel_guard = duduclaw_gateway::otel::init(&duduclaw_home());
     tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(non_blocking))
         .with(duduclaw_gateway::log::BroadcastLayer)
+        .with(duduclaw_gateway::otel::subscriber_layer())
         .init();
 
     let cli = Cli::parse();
@@ -876,7 +926,11 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
                 reports_to,
                 icon,
                 trigger,
-            }) => cmd_agent_create(&name, display_name, role, reports_to, icon, trigger).await,
+                runtime,
+            }) => {
+                cmd_agent_create(&name, display_name, role, reports_to, icon, trigger, runtime)
+                    .await
+            }
             Some(AgentCommands::Inspect { agent }) => cmd_agent_inspect(&agent).await,
             Some(AgentCommands::Pause { agent }) => cmd_agent_set_status(&agent, "paused").await,
             Some(AgentCommands::Resume { agent }) => cmd_agent_set_status(&agent, "active").await,
@@ -902,6 +956,27 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Mcp(mcp_cmd) => cmd_mcp(mcp_cmd, &duduclaw_home()).await,
         Commands::Wizard => wizard::cmd_wizard(&duduclaw_home()).await,
         Commands::Test { name } => cmd_test_agent(&name).await,
+        Commands::Eval {
+            path,
+            filter,
+            replay,
+            record,
+            no_judge,
+            report,
+        } => {
+            eval::cmd_eval(
+                &duduclaw_home(),
+                eval::EvalOptions {
+                    path,
+                    filter,
+                    replay,
+                    record,
+                    no_judge,
+                    report,
+                },
+            )
+            .await
+        }
         Commands::Reforward { message_id, dry_run } => {
             cmd_reforward(&message_id, dry_run, &duduclaw_home()).await
         }
@@ -2910,6 +2985,47 @@ async fn cmd_doctor() -> duduclaw_core::error::Result<()> {
 }
 
 /// `duduclaw agent create <name>` - Create a new agent from template.
+/// Strictly parse a `--runtime` provider value. Unlike
+/// `RuntimeType::parse` (which silently defaults typos to Claude for config
+/// reads), CLI input fails closed with an error so a misspelled provider
+/// never scaffolds the wrong runtime.
+fn parse_runtime_provider_strict(
+    s: &str,
+) -> Result<duduclaw_core::types::RuntimeType, String> {
+    use duduclaw_core::types::RuntimeType;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "claude" => Ok(RuntimeType::Claude),
+        "codex" => Ok(RuntimeType::Codex),
+        "gemini" => Ok(RuntimeType::Gemini),
+        "antigravity" | "agy" => Ok(RuntimeType::Antigravity),
+        "openai_compat" | "openai" | "openai-compat" => Ok(RuntimeType::OpenAiCompat),
+        other => Err(format!(
+            "unknown runtime provider '{other}' — expected one of: \
+             claude, codex, gemini, antigravity, openai_compat"
+        )),
+    }
+}
+
+/// Context-file names the provider's CLI reads for agent-directory context.
+///
+/// CLAUDE.md is always scaffolded (Claude Code compatibility is a project
+/// invariant, and `agy` shares the Claude-context lineage); Codex reads the
+/// AGENTS.md convention and Gemini CLI reads GEMINI.md, so those providers
+/// get the same content under their own filename.
+fn provider_context_filenames(
+    provider: duduclaw_core::types::RuntimeType,
+) -> &'static [&'static str] {
+    use duduclaw_core::types::RuntimeType;
+    match provider {
+        RuntimeType::Codex => &["CLAUDE.md", "AGENTS.md"],
+        RuntimeType::Gemini => &["CLAUDE.md", "GEMINI.md"],
+        RuntimeType::Claude | RuntimeType::Antigravity | RuntimeType::OpenAiCompat => {
+            &["CLAUDE.md"]
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn cmd_agent_create(
     name: &str,
     display_name_opt: Option<String>,
@@ -2917,12 +3033,21 @@ async fn cmd_agent_create(
     reports_to_opt: Option<String>,
     icon_opt: Option<String>,
     trigger_opt: Option<String>,
+    runtime_opt: Option<String>,
 ) -> duduclaw_core::error::Result<()> {
     use console::style;
     use std::str::FromStr;
 
     let home = duduclaw_home();
     let agent_name = name.to_lowercase().replace(' ', "-");
+
+    // Resolve the runtime provider first (fail-closed on typos) so we never
+    // scaffold a directory for a provider that doesn't exist.
+    let provider = match runtime_opt.as_deref() {
+        Some(v) => parse_runtime_provider_strict(v)
+            .map_err(|e| DuDuClawError::Agent(format!("--runtime: {e}")))?,
+        None => duduclaw_core::types::RuntimeType::Claude,
+    };
 
     if !is_valid_agent_id(&agent_name) {
         return Err(DuDuClawError::Agent(format!(
@@ -2972,6 +3097,14 @@ async fn cmd_agent_create(
         })?;
     }
 
+    // `[runtime]` section: only written when the operator chose a non-default
+    // provider — default (Claude) scaffolds stay byte-identical to before.
+    let runtime_section = if provider == duduclaw_core::types::RuntimeType::Claude {
+        String::new()
+    } else {
+        format!("\n[runtime]\nprovider = \"{}\"\n", provider.as_str())
+    };
+
     // agent.toml
     let agent_toml = format!(
         r#"[agent]
@@ -2982,7 +3115,7 @@ status = "active"
 trigger = "{trigger}"
 reports_to = "{reports_to}"
 icon = "{icon}"
-
+{runtime_section}
 [model]
 preferred = "claude-sonnet-4-6"
 fallback = "claude-haiku-4-5"
@@ -3041,16 +3174,21 @@ skill_security_scan = true
         .await
         .map_err(|e| DuDuClawError::Agent(format!("Failed to write SOUL.md: {e}")))?;
 
-    // CLAUDE.md — helps Claude Code sessions pick up context
+    // Provider context files — one template, rendered under each filename the
+    // configured runtime's CLI reads (W3): CLAUDE.md always (Claude Code
+    // compatibility invariant; agy shares the lineage), plus AGENTS.md for
+    // codex and GEMINI.md for gemini.
     let wiki_guide = include_str!("../../../templates/wiki/CLAUDE_WIKI.md");
-    let claude_md = format!(
+    let context_md = format!(
         "# {display_name}\n\nAgent managed by DuDuClaw v{}.\n\n{}\n",
         duduclaw_gateway::updater::current_version(),
         wiki_guide,
     );
-    tokio::fs::write(agent_dir.join("CLAUDE.md"), &claude_md)
-        .await
-        .ok();
+    for filename in provider_context_filenames(provider) {
+        tokio::fs::write(agent_dir.join(filename), &context_md)
+            .await
+            .ok();
+    }
 
     // .mcp.json — wires the duduclaw MCP server into the agent's Claude
     // Code session so that create_agent / spawn_agent / list_agents /
@@ -3063,12 +3201,15 @@ skill_security_scan = true
     let mcp_bin = duduclaw_core::resolve_duduclaw_bin()
         .to_string_lossy()
         .into_owned();
+    // DUDUCLAW_AGENT_ID lets the MCP subprocess self-identify; without it
+    // every call falls back to `default_agent` and supervisor-relation
+    // authorization breaks (mirrors mcp_template::ensure_duduclaw_absolute_path).
     let mcp_json = serde_json::json!({
         "mcpServers": {
             "duduclaw": {
                 "command": mcp_bin,
                 "args": ["mcp-server"],
-                "env": {}
+                "env": { "DUDUCLAW_AGENT_ID": agent_name.clone() }
             }
         }
     });
@@ -3661,6 +3802,53 @@ async fn cmd_update(auto_yes: bool) -> duduclaw_core::error::Result<()> {
     } else {
         // [R3:L1] Return error so CLI exits with non-zero code
         Err(DuDuClawError::Gateway(format!("Update failed: {}", result.message)))
+    }
+}
+
+#[cfg(test)]
+mod agent_scaffold_tests {
+    use super::*;
+    use duduclaw_core::types::RuntimeType;
+
+    #[test]
+    fn context_filenames_per_provider() {
+        assert_eq!(provider_context_filenames(RuntimeType::Claude), &["CLAUDE.md"]);
+        assert_eq!(
+            provider_context_filenames(RuntimeType::Codex),
+            &["CLAUDE.md", "AGENTS.md"]
+        );
+        assert_eq!(
+            provider_context_filenames(RuntimeType::Gemini),
+            &["CLAUDE.md", "GEMINI.md"]
+        );
+        // agy reads the Claude-context lineage — no extra file.
+        assert_eq!(
+            provider_context_filenames(RuntimeType::Antigravity),
+            &["CLAUDE.md"]
+        );
+        assert_eq!(
+            provider_context_filenames(RuntimeType::OpenAiCompat),
+            &["CLAUDE.md"]
+        );
+    }
+
+    #[test]
+    fn runtime_provider_parse_is_strict() {
+        assert_eq!(
+            parse_runtime_provider_strict("codex").unwrap(),
+            RuntimeType::Codex
+        );
+        assert_eq!(
+            parse_runtime_provider_strict("Gemini").unwrap(),
+            RuntimeType::Gemini
+        );
+        assert_eq!(
+            parse_runtime_provider_strict("agy").unwrap(),
+            RuntimeType::Antigravity
+        );
+        // Fail-closed: typos must error, never silently scaffold Claude.
+        assert!(parse_runtime_provider_strict("claudee").is_err());
+        assert!(parse_runtime_provider_strict("").is_err());
     }
 }
 

@@ -425,7 +425,7 @@ is_external = true
         // Ensure the env var is absent by using a non-existent var name variant.
         // We cannot safely call remove_var here without a global lock, so we
         // test only the credential=None + empty-registry path (no env var lookup).
-        let empty_dir = TempDir::new().unwrap();
+        let _empty_dir = TempDir::new().unwrap();
 
         let strategy = ApiKeyAuthStrategy;
         let ctx = AuthContext {

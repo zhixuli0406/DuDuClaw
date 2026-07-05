@@ -75,7 +75,12 @@ pub async fn maybe_consolidate(
         valid_from: None,
         valid_until: None,
         confidence: Some(0.9),
-        metadata: Some(serde_json::json!({ "source_mistake_ids": source_ids })),
+        // `rule_stats` seeds the ACE/ExpeL lifecycle counters (initial
+        // importance = 2) settled per-turn by `prediction::rule_lifecycle`.
+        metadata: Some(serde_json::json!({
+            "source_mistake_ids": source_ids,
+            "rule_stats": crate::prediction::rule_lifecycle::RuleStats::initial(),
+        })),
     };
 
     let semantic_id = engine
@@ -176,6 +181,36 @@ mod tests {
         assert_eq!(results.len(), 1, "one consolidated semantic rule");
         assert_eq!(results[0].layer, MemoryLayer::Semantic);
         assert_eq!(results[0].source_event, "reflexion_consolidation");
+    }
+
+    #[tokio::test]
+    async fn consolidated_rule_seeds_lifecycle_counters() {
+        use crate::prediction::rule_lifecycle::RuleStats;
+
+        let dir = TempDir::new().unwrap();
+        let nb = MistakeNotebook::new(&dir.path().join("mistakes.db"));
+        let mem_path = dir.path().join("memory.db");
+        record_n(&nb, "agent-d", MistakeCategory::Factual, 3);
+
+        let semantic_id =
+            maybe_consolidate(&nb, &mem_path, "agent-d", MistakeCategory::Factual, 3)
+                .await
+                .unwrap()
+                .expect("must consolidate");
+
+        let engine = SqliteMemoryEngine::new(&mem_path).unwrap();
+        let meta = engine
+            .get_metadata("agent-d", &semantic_id)
+            .await
+            .unwrap()
+            .expect("rule metadata present");
+        assert_eq!(
+            RuleStats::from_metadata(&meta),
+            RuleStats::initial(),
+            "F2b must seed helpful=2, harmful=0 (ExpeL initial importance)"
+        );
+        // Source-mistake provenance still stored alongside the counters.
+        assert!(meta["source_mistake_ids"].as_array().is_some_and(|a| a.len() == 3));
     }
 
     #[tokio::test]

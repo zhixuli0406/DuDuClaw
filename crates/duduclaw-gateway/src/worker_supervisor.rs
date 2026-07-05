@@ -29,7 +29,7 @@ use std::time::Duration;
 use duduclaw_cli_worker::{TokenStore, WorkerClient};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -650,14 +650,6 @@ pub async fn spawn_if_enabled(
         config.binary_override = Some(override_path);
     }
     Ok(Some(WorkerSupervisorHandle::spawn(config).await?))
-}
-
-// Silence unused-warning on `tokio::sync::oneshot` (kept for future
-// expansion to "request immediate health check" channels).
-#[allow(dead_code)]
-fn _unused_imports() -> oneshot::Sender<()> {
-    let (tx, _rx) = oneshot::channel();
-    tx
 }
 
 #[cfg(test)]

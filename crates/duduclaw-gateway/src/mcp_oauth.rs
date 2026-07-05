@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::info;
 
 /// OAuth provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,7 +1,8 @@
 //! Native desktop control for DuDuClaw L5b Computer Use.
 //!
 //! Provides cross-platform mouse, keyboard, and screenshot capabilities
-//! using `enigo` (input simulation) and `xcap` (screen capture).
+//! using `enigo` (input simulation) and OS-native screen-capture tools
+//! (see `capture.rs`).
 //!
 //! This crate powers the L5b (native) path, where the AI agent directly
 //! controls the host machine's desktop — as opposed to L5a (container)
@@ -17,9 +18,11 @@
 //! - Implementing emergency stop (user activity detection via `rdev`)
 
 pub mod activity_monitor;
+pub mod capture;
 pub mod controller;
 
 pub use activity_monitor::ActivityMonitor;
+pub use capture::capture_primary_monitor_png;
 pub use controller::{
     DesktopController, DesktopError, MouseButton, NativeDesktopController, ScrollDirection,
     parse_enigo_key,

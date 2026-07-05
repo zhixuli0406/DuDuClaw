@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","session_id":"00000000-0000-0000-0000-000000000000"}
+{"type":"assistant","message":{"stop_reason":null,"content":[{"type":"thinking","thinking":"I should open the standup task first."}]}}
+{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"mcp__duduclaw__tasks_create","input":{"title":"Tomorrow's standup","priority":"normal"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","content":"task created: #42"}]}}
+{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"Hello team! I've opened task #42 for tomorrow's standup — see you there."}]}}
+{"type":"result","subtype":"success","is_error":false,"result":"Hello team! I've opened task #42 for tomorrow's standup — see you there.","usage":{"input_tokens":120,"output_tokens":45}}

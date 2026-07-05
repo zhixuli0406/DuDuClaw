@@ -9,7 +9,7 @@
 //! - ToolLibGen (2025.10): multi-agent tool construction with review agent
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
 
 use super::gap_accumulator::SynthesisTrigger;
 
