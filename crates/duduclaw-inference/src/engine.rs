@@ -392,6 +392,47 @@ impl InferenceEngine {
         self.router.as_ref().is_some_and(|r| r.is_enabled())
     }
 
+    /// Snapshot of the active OpenAI-compatible HTTP endpoint, if the current
+    /// backend is HTTP-based: an `InferenceManager`-discovered server
+    /// (Exo / llamafile — takes precedence, mirroring [`Self::init`]) or a
+    /// configured `[openai_compat]` server. `None` for in-process backends
+    /// (llama.cpp / mistral.rs) and when local inference is disabled.
+    ///
+    /// External adapters (the gateway's `LocalChatProvider`) use this to point
+    /// a tool-calling-capable OpenAI-compat client at the same server.
+    pub async fn compat_endpoint(&self) -> Option<crate::adapter::CompatEndpoint> {
+        let manager_url = self.manager.get_api_base_url().await;
+        let manager_model = self.manager.get_model().await;
+        let config_compat = self
+            .config
+            .openai_compat
+            .as_ref()
+            .map(|c| (c.base_url.as_str(), c.model.as_str()));
+        let (base_url, model, source) = crate::adapter::resolve_compat_endpoint(
+            self.config.enabled,
+            manager_url,
+            manager_model,
+            config_compat,
+        )?;
+        // Only the configured endpoint may carry a key; manager-discovered
+        // llamafile/Exo servers are keyless local processes.
+        let api_key = match source {
+            crate::adapter::CompatSource::Config => self
+                .config
+                .openai_compat
+                .as_ref()
+                .and_then(|c| c.resolved_api_key(&self.home_dir)),
+            crate::adapter::CompatSource::Manager => None,
+        };
+        Some(crate::adapter::CompatEndpoint { base_url, model, api_key })
+    }
+
+    /// Whether the operator allows an external adapter to run tool calling
+    /// against the local endpoint (`[router] local_tools`, default `true`).
+    pub fn local_tools_enabled(&self) -> bool {
+        crate::adapter::local_tools_enabled(&self.config)
+    }
+
     /// Get the active backend.
     async fn get_backend(&self) -> Result<Arc<dyn InferenceBackend>> {
         self.backend

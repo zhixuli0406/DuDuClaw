@@ -31,11 +31,18 @@ otlp_endpoint = "http://127.0.0.1:4317"
 service_name = "duduclaw"
 # Optional head-sampling ratio in [0.0, 1.0] (default 1.0 = keep everything).
 sample_ratio = 1.0
+# Optional auth headers sent with every export request (gRPC metadata) — lets
+# DuDuClaw talk directly to authenticated OTLP backends, no relay collector
+# needed. Keys are normalized to lowercase; invalid entries are skipped with a
+# warning (fail-safe, never blocks boot).
+otlp_headers = { authorization = "Basic <base64(user:token)>", "x-api-key" = "yyy" }
 ```
 
 - **Transport is OTLP/gRPC** (tonic, TLS via webpki roots for `https` collectors). `otlp_protocol = "http/protobuf"` is parsed for forward-compat but currently falls back to gRPC with a warning.
-- Env override: `OTEL_EXPORTER_OTLP_ENDPOINT` beats (and can substitute for) `otlp_endpoint`, so an `otel` build can be pointed at a collector without editing config.
-- Custom auth headers are not (yet) supported on the exporter — for backends that require them (e.g. Langfuse, Grafana Cloud), run a local [OTel Collector](https://opentelemetry.io/docs/collector/) and let it add the credentials (examples below).
+- Env overrides (both standard OTLP conventions):
+  - `OTEL_EXPORTER_OTLP_ENDPOINT` beats (and can substitute for) `otlp_endpoint`.
+  - `OTEL_EXPORTER_OTLP_HEADERS` — comma-separated `key=value` pairs, merged **over** `otlp_headers` (env wins per-key). Values may be percent-encoded, e.g. `Authorization=Basic%20<base64>`. Handy for keeping credentials out of `config.toml`.
+- Header validity: keys must be lowercase-able ASCII from `[a-z0-9_.-]` without the reserved gRPC `-bin` suffix; values must be visible ASCII. Anything else is skipped with a stderr warning — a bad header never panics or aborts export of the rest.
 - Fail-safe: exporter init failure logs a warning to stderr and disables export — it never blocks gateway startup.
 
 > **Log level matters.** The GenAI spans are INFO-level and obey the global
@@ -64,7 +71,34 @@ docker run --rm -p 16686:16686 -p 4317:4317 jaegertracing/all-in-one:latest
 # config.toml → otlp_endpoint = "http://127.0.0.1:4317", then open http://localhost:16686
 ```
 
-### Grafana (Tempo / Alloy)
+### Authenticated OTLP/gRPC backends — direct, no collector
+
+With `otlp_headers`, DuDuClaw exports **directly** to any backend that accepts
+OTLP/gRPC with auth headers (Honeycomb, Dash0, self-hosted Tempo/Mimir behind
+an auth proxy, ...) — the local OTel Collector relay is optional for these:
+
+```toml
+[telemetry]
+otlp_endpoint = "https://api.honeycomb.io:443"
+otlp_headers = { "x-honeycomb-team" = "<api-key>" }
+```
+
+Or Basic auth (self-hosted Grafana Tempo behind basic-auth, gRPC-capable
+gateways):
+
+```toml
+[telemetry]
+otlp_endpoint = "https://tempo.example.com:4317"
+otlp_headers = { authorization = "Basic <base64(user:token)>" }
+```
+
+Prefer env for the credential (merges over config, env wins per-key):
+
+```bash
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20<base64(user:token)>"
+```
+
+### Grafana (local Tempo / Alloy)
 
 Point at the collector's OTLP gRPC port:
 
@@ -73,7 +107,10 @@ Point at the collector's OTLP gRPC port:
 otlp_endpoint = "http://127.0.0.1:4317"
 ```
 
-For Grafana Cloud (needs Basic auth), relay through a local OTel Collector:
+A local Alloy/Collector can also relay to Grafana Cloud — with `otlp_headers`
+it now injects the credential itself, but the relay is still what converts
+transport, because Grafana Cloud's managed OTLP gateway ingests **OTLP/HTTP
+only** (DuDuClaw's exporter speaks OTLP/gRPC):
 
 ```yaml
 # otel-collector.yaml
@@ -92,7 +129,9 @@ service:
 
 ### Langfuse
 
-Langfuse ingests OTLP over HTTP with Basic auth — same relay pattern:
+Langfuse Cloud's OTLP endpoint (`/api/public/otel`) likewise ingests
+**OTLP/HTTP only**, so keep the minimal gRPC→HTTP relay (auth can live on
+either side; simplest to keep it in the relay):
 
 ```yaml
 exporters:
@@ -102,6 +141,11 @@ exporters:
 ```
 
 DuDuClaw then targets the local collector (`otlp_endpoint = "http://127.0.0.1:4317"`).
+
+> **gRPC vs HTTP backends.** `otlp_headers` removes the *auth* reason for a
+> relay collector; a relay is only still needed where the backend refuses
+> OTLP/gRPC entirely (Grafana Cloud's managed gateway, Langfuse Cloud). If a
+> backend exposes a gRPC ingest endpoint, go direct.
 
 ## Notes
 

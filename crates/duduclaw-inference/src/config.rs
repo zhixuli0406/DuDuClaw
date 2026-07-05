@@ -340,6 +340,16 @@ pub struct RouterConfig {
     /// Acceptance threshold on g: below this the answer escalates.
     #[serde(default = "default_post_hoc_accept_threshold")]
     pub post_hoc_accept_threshold: f32,
+
+    /// Allow the embedding host (gateway) to run its MCP tool loop against
+    /// the local OpenAI-compatible endpoint. Absent (`None`) defaults to
+    /// **enabled** when the active backend is OpenAI-compat — most local
+    /// servers (llamafile, vLLM, SGLang, Ollama) handle OpenAI tool JSON.
+    /// Small models may still emit malformed tool calls; the gateway's tool
+    /// loop feeds those back to the model fail-soft rather than aborting.
+    /// Set `local_tools = false` to force bare completions.
+    #[serde(default)]
+    pub local_tools: Option<bool>,
 }
 
 fn default_post_hoc_alpha() -> f32 {
@@ -403,6 +413,7 @@ impl Default for RouterConfig {
             post_hoc_alpha: default_post_hoc_alpha(),
             post_hoc_beta: default_post_hoc_beta(),
             post_hoc_accept_threshold: default_post_hoc_accept_threshold(),
+            local_tools: None,
         }
     }
 }

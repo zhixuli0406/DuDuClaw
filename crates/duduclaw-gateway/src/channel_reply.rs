@@ -1507,6 +1507,49 @@ async fn build_reply_with_session_inner(
     };
     let is_channel_session = duduclaw_core::SUPPORTED_CHANNEL_TYPES.iter()
         .any(|t| session_id.starts_with(&format!("{t}:")));
+
+    // ── 0. inference_mode = "local" → local inference FIRST ─────────
+    //
+    // Long-standing gap: `[general] inference_mode` (config.toml) was only
+    // honored by the dispatcher path; the user-facing channel reply always
+    // went CLI-first. When the operator pins mode "local", prefer local
+    // inference FIRST here too, keeping the Claude CLI as the fallback.
+    // Absent / "hybrid" / "claude" ⇒ behavior unchanged (config-gated).
+    //
+    // The agent's `[model] local.model` (agent.toml) is resolved once here
+    // and shared with the step-2 fallback below.
+    let local_model_id = agent_dir.as_ref().and_then(|d| {
+        let toml_path = d.join("agent.toml");
+        let content = std::fs::read_to_string(&toml_path).ok()?;
+        let table: toml::Table = content.parse().ok()?;
+        table.get("model")?.as_table()?
+            .get("local")?.as_table()?
+            .get("model")?.as_str().map(|s| s.to_string())
+    });
+    let inference_mode = crate::claude_runner::get_inference_mode(&ctx.home_dir).await;
+    let mut local_attempted_first = false;
+    let mut local_first_reply: Option<String> = None;
+    if local_inference_first(&inference_mode) {
+        local_attempted_first = true;
+        match crate::claude_runner::try_local_inference(
+            &ctx.home_dir, &sanitized_text, &full_system_prompt, local_model_id.as_deref(),
+            Some(&agent_id), capabilities.as_ref(),
+        ).await {
+            Ok(local_reply) => {
+                info!(
+                    "Replied via local model ({} chars, inference_mode=local — CLI skipped)",
+                    local_reply.len()
+                );
+                local_first_reply = Some(local_reply);
+            }
+            Err(e) if e == "ROUTER_ESCALATE_TO_CLOUD" => {
+                info!("inference_mode=local: router escalated to cloud → falling back to Claude CLI");
+            }
+            Err(e) => {
+                warn!("inference_mode=local but local inference failed → falling back to Claude CLI: {e}");
+            }
+        }
+    }
     // (review B2) Make `turn_id` and `session_id` available to sub-agent
     // dispatchers via tokio task-locals. Any wiki RAG triggered by the
     // dispatcher inherits these so citations land in the right tracker
@@ -1521,14 +1564,21 @@ async fn build_reply_with_session_inner(
     // path checks for non-empty before calling cost_telemetry.
     let cli_future = crate::claude_runner::CHANNEL_REPLY_AGENT_ID
         .scope(agent_id.clone(), cli_future);
-    let reply = if is_channel_session {
-        crate::claude_runner::REPLY_CHANNEL.scope(session_id.to_string(), cli_future).await
-    } else {
-        cli_future.await
+    let local_first_answered = local_first_reply.is_some();
+    let reply = match local_first_reply {
+        // Local-first already answered (inference_mode=local): skip the CLI
+        // entirely — the unconsumed cli_future is lazy and simply drops.
+        Some(local_reply) => Ok(local_reply),
+        None if is_channel_session => {
+            crate::claude_runner::REPLY_CHANNEL.scope(session_id.to_string(), cli_future).await
+        }
+        None => cli_future.await,
     };
     let reply = match reply {
         Ok(reply) => {
-            info!("Claude replied via Claude Code SDK ({} chars)", reply.len());
+            if !local_first_answered {
+                info!("Claude replied via Claude Code SDK ({} chars)", reply.len());
+            }
             Some(reply)
         }
         Err(e) => {
@@ -1546,18 +1596,15 @@ async fn build_reply_with_session_inner(
     // 2. Fallback: Local model inference (if configured)
     let reply = match reply {
         Some(r) => Some(r),
+        None if local_attempted_first => {
+            // inference_mode=local already tried (and failed) local FIRST —
+            // don't retry the same engine; proceed to the Direct API fallback.
+            None
+        }
         None => {
-            // Resolve agent's local model config (if any)
-            let local_model_id = agent_dir.as_ref().and_then(|d| {
-                let toml_path = d.join("agent.toml");
-                let content = std::fs::read_to_string(&toml_path).ok()?;
-                let table: toml::Table = content.parse().ok()?;
-                table.get("model")?.as_table()?
-                    .get("local")?.as_table()?
-                    .get("model")?.as_str().map(|s| s.to_string())
-            });
             match crate::claude_runner::try_local_inference(
                 &ctx.home_dir, &sanitized_text, &full_system_prompt, local_model_id.as_deref(),
+                Some(&agent_id), capabilities.as_ref(),
             ).await {
                 Ok(local_reply) => {
                     info!("Replied via local model ({} chars)", local_reply.len());
@@ -3069,6 +3116,17 @@ pub(crate) fn format_fallback_message(agent_name: &str, reason: FailureReason) -
     }
 }
 
+/// Pure routing decision: does `[general] inference_mode` (config.toml)
+/// prefer local inference FIRST on the channel-reply path?
+///
+/// Exact token equality — never a substring check (2026-06 conventions) —
+/// and case-sensitive to match the dispatcher's `match mode.as_str()` arms,
+/// so both paths agree on what "local" means. Anything else ("hybrid",
+/// "claude", absent/empty, typos) keeps the CLI-first behavior unchanged.
+fn local_inference_first(inference_mode: &str) -> bool {
+    inference_mode == "local"
+}
+
 /// Translate a raw CLI error into a short zh-TW hint for the user.
 fn classify_cli_error_hint(err: &str) -> &'static str {
     let reason = classify_cli_failure(err);
@@ -3082,6 +3140,29 @@ fn classify_cli_error_hint(err: &str) -> &'static str {
         FailureReason::NoAccounts => "無可用帳號",
         FailureReason::SpawnError => "程序啟動失敗",
         _ => "連線異常",
+    }
+}
+
+#[cfg(test)]
+mod local_first_tests {
+    use super::local_inference_first;
+
+    /// Table-driven: only the exact "local" token flips the channel path to
+    /// local-first; every other mode keeps CLI-first behavior unchanged.
+    #[test]
+    fn inference_mode_routing_decision() {
+        for (mode, expected) in [
+            ("local", true),
+            ("hybrid", false),
+            ("claude", false),
+            ("", false),
+            ("LOCAL", false),       // case-sensitive, like the dispatcher match
+            ("local-only", false),  // token equality, never substring
+            (" local", false),      // raw config value, no trimming surprises
+            ("cloud", false),
+        ] {
+            assert_eq!(local_inference_first(mode), expected, "mode = {mode:?}");
+        }
     }
 }
 

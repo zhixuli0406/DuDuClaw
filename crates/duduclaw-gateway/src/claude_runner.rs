@@ -487,7 +487,10 @@ pub async fn call_claude_for_agent_with_type(
         "local" => {
             // Force local inference regardless of per-agent prefer_local
             let model_id = local_config.as_ref().map(|c| c.model.as_str());
-            return call_local_inference(home_dir, prompt, &system_prompt_inlined, model_id)
+            return call_local_inference(
+                home_dir, prompt, &system_prompt_inlined, model_id,
+                Some(agent_id), Some(&capabilities),
+            )
                 .await
                 .map_err(|e| format!(
                     "Agent '{agent_name}' is in local-only mode but inference failed: {e}. \
@@ -556,7 +559,10 @@ pub async fn call_claude_for_agent_with_type(
                 else if local.use_router { "router-driven" }
                 else { "prefer-local" };
             info!(agent = %agent_name, local_model = %local.model, reason, "Trying local offload");
-            match call_local_inference(home_dir, prompt, &system_prompt_inlined, Some(&local.model)).await {
+            match call_local_inference(
+                home_dir, prompt, &system_prompt_inlined, Some(&local.model),
+                Some(agent_id), Some(&capabilities),
+            ).await {
                 Ok(response) => {
                     info!(agent = %agent_name, "Query served by local model (cost saved)");
                     return Ok(response);
@@ -861,7 +867,7 @@ fn tool_base_name(entry: &str) -> &str {
 /// whose base name is bare-denied is dropped, and when an explicit
 /// `allowed_tools` allowlist is set only tools named there survive. `None`
 /// capabilities ⇒ all tools offered.
-fn filter_tool_defs(
+pub(crate) fn filter_tool_defs(
     defs: Vec<duduclaw_llm::ToolDef>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Vec<duduclaw_llm::ToolDef> {
@@ -890,7 +896,7 @@ fn filter_tool_defs(
 /// the tool loop (G2). Fail-safe: any resolve/spawn/handshake/list failure logs
 /// a warning and returns `None`, so the caller degrades to a tools-less answer
 /// rather than failing the whole reply.
-async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_llm::ToolRegistry> {
+pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_llm::ToolRegistry> {
     let bin = duduclaw_core::resolve_duduclaw_bin();
     if !bin.is_absolute() {
         warn!("MCP tool loop disabled — duduclaw binary did not resolve to an absolute path");
@@ -1376,7 +1382,7 @@ async fn try_direct_api_chain(
 /// Cached inference_mode — avoids reading config.toml on every call (P1-3).
 static INFERENCE_MODE_CACHE: std::sync::OnceLock<tokio::sync::RwLock<Option<(std::time::Instant, String)>>> = std::sync::OnceLock::new();
 
-async fn get_inference_mode(home_dir: &Path) -> String {
+pub(crate) async fn get_inference_mode(home_dir: &Path) -> String {
     let cache = INFERENCE_MODE_CACHE.get_or_init(|| tokio::sync::RwLock::new(None));
     let ttl = std::time::Duration::from_secs(300); // 5 min
 
@@ -1493,14 +1499,19 @@ async fn get_inference_engine(home_dir: &std::path::Path) -> Option<std::sync::A
 /// If the confidence router is enabled, it may decide to escalate to Cloud API
 /// (returns `Err` with a special marker so the caller knows to try Cloud).
 ///
-/// Public wrapper for channel_reply fallback chain.
+/// Public wrapper for channel_reply fallback chain. `agent_id` + `capabilities`
+/// enable the MCP tool loop against tools-capable local backends (OpenAI-compat
+/// endpoints with `[router] local_tools` enabled) — pass `None` to force the
+/// legacy bare completion.
 pub async fn try_local_inference(
     home_dir: &std::path::Path,
     prompt: &str,
     system_prompt: &str,
     model_id: Option<&str>,
+    agent_id: Option<&str>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
-    call_local_inference(home_dir, prompt, system_prompt, model_id).await
+    call_local_inference(home_dir, prompt, system_prompt, model_id, agent_id, capabilities).await
 }
 
 async fn call_local_inference(
@@ -1508,10 +1519,35 @@ async fn call_local_inference(
     prompt: &str,
     system_prompt: &str,
     model_id: Option<&str>,
+    agent_id: Option<&str>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
     let engine = get_inference_engine(home_dir)
         .await
         .ok_or_else(|| "Local inference engine not available".to_string())?;
+
+    // ── MCP tool loop (G2-local) ──────────────────────────────────
+    // When the active backend is an OpenAI-compatible HTTP endpoint and
+    // `[router] local_tools` allows it, drive the tool loop through the
+    // LocalChatProvider adapter so local replies gain the MCP tool surface.
+    // The ex-ante router check runs FIRST so complex queries still escalate
+    // to the SDK/cloud exactly as the bare path below would; any tool-loop
+    // failure falls through to the bare completion (fail-safe — the reply
+    // path never breaks because of tools).
+    if let Some(aid) = agent_id.filter(|a| !a.trim().is_empty()) {
+        let router_escalates = engine.router_enabled()
+            && engine.route(system_prompt, prompt).tier
+                == duduclaw_inference::router::RoutingTier::CloudApi;
+        if !router_escalates {
+            if let Some(text) = crate::local_llm::try_local_tool_loop(
+                &engine, prompt, system_prompt, model_id, aid, capabilities,
+            )
+            .await
+            {
+                return Ok(text);
+            }
+        }
+    }
 
     let request = duduclaw_inference::InferenceRequest {
         system_prompt: system_prompt.to_string(),

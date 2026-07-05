@@ -82,6 +82,9 @@ opentelemetry = { version = "0.32", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"], optional = true }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "grpc-tonic", "tls-webpki-roots"], optional = true }
 tracing-opentelemetry = { version = "0.33", default-features = false, optional = true }
+# Already in the otel tree via opentelemetry-otlp's grpc-tonic transport; named
+# directly only for tonic::metadata::MetadataKey (non-panicking header insert).
+tonic = { version = "0.14", default-features = false, optional = true }
 
 [features]
 default = ["dashboard", "desktop"]
@@ -100,6 +103,7 @@ otel = [
     "dep:opentelemetry_sdk",
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
+    "dep:tonic",
 ]
 
 [dev-dependencies]
