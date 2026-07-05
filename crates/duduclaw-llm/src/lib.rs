@@ -34,7 +34,11 @@ mod provider;
 mod registry;
 mod router;
 mod sse;
+mod tool_loop;
 mod types;
+
+#[cfg(feature = "mcp-client")]
+mod mcp_client;
 
 pub mod providers;
 
@@ -44,6 +48,16 @@ pub use registry::{Feature, ModelCaps, ModelInfo, ModelRegistry, PriceCliff};
 pub use router::{
     cooldown_for, CandidateOutcome, FallbackRouter, BILLING_COOLDOWN, GENERIC_COOLDOWN,
     RATE_LIMIT_COOLDOWN,
+};
+pub use tool_loop::{
+    run_tool_loop, ToolExecutor, ToolOutcome, DEFAULT_MAX_TOOL_ITERS, MAX_ITERS_STOP,
+};
+
+#[cfg(feature = "mcp-client")]
+pub use mcp_client::{
+    build_initialize_request, build_initialized_notification, build_tools_call_request,
+    build_tools_list_request, parse_tool_call_result, parse_tools_list_response, McpClient,
+    McpError, McpToolDef, ToolCallResult, ToolRegistry, DEFAULT_MCP_TIMEOUT,
 };
 pub use types::{
     estimate_tokens, CacheHint, ChatMessage, ChatRequest, ChatResponse, ContentPart,
