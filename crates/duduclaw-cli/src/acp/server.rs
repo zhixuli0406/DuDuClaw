@@ -10,6 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{info, warn};
 
 use super::handlers::{A2ATaskManager, handle_prompt_with_agent};
+use super::message_send::BusTaskIndex;
 
 // The `.well-known` discovery surface below is the card-serving API for an HTTP
 // front door. The live route currently lives in `duduclaw-gateway` (which serves
@@ -127,7 +128,10 @@ impl AcpServer {
             url: url.to_string(),
             version: duduclaw_gateway::updater::current_version().to_string(),
             capabilities: AgentCapabilities {
-                streaming: true,
+                // Honest capabilities: `message/stream` and push notifications
+                // are answered with A2A UnsupportedOperationError (-32004), so
+                // the card must not advertise them.
+                streaming: false,
                 push_notifications: false,
                 state_transition_history: true,
             },
@@ -201,7 +205,7 @@ pub fn resolve_well_known_card(path: &str) -> Option<AgentCard> {
 
 // ── JSON-RPC helpers ────────────────────────────────────────
 
-fn jsonrpc_response(id: &Value, result: Value) -> Value {
+pub(crate) fn jsonrpc_response(id: &Value, result: Value) -> Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -209,7 +213,7 @@ fn jsonrpc_response(id: &Value, result: Value) -> Value {
     })
 }
 
-fn jsonrpc_error(id: &Value, code: i64, message: &str) -> Value {
+pub(crate) fn jsonrpc_error(id: &Value, code: i64, message: &str) -> Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -244,31 +248,18 @@ pub(crate) fn handle_agent_discover(id: &Value) -> Value {
     jsonrpc_response(id, serde_json::to_value(card).unwrap_or(Value::Null))
 }
 
-/// Handle A2A v1.0 `message/send` — **STUB** (returns a spec-shaped error).
-///
-/// A2A v1.0 promotes `message/send` to the primary task-submission RPC
-/// (superseding `tasks/send`). The full implementation is intentionally
-/// deferred this pass because it reuses the file-based IPC bus and is a larger
-/// lift. Until then we return the A2A-spec `UnsupportedOperationError`
-/// (`-32004`) so clients receive a well-formed, machine-parseable response
-/// rather than a generic "method not found".
-///
-/// Planned `bus_queue` wiring (follow-up):
-///   1. Validate `params.message` (A2A `Message` object) and resolve the
-///      target agent from `params.message.contextId` (as `tasks/send` does).
-///   2. Append a delegation record to `<home>/agents/<ctx>/bus_queue.jsonl`
-///      under `duduclaw_core::with_file_lock` (cross-process append safety),
-///      mirroring the internal AgentDispatcher delegation format.
-///   3. Return an A2A `Task { state: Working, .. }` envelope; the existing
-///      `AgentDispatcher` consumes the queue and drives execution, and the
-///      client polls progress via `tasks/get`.
-/// This reuses the SAME pipeline as channel/MCP task submission — single
-/// source of truth, unified Activity-feed observability.
-pub(crate) fn handle_message_send(id: &Value) -> Value {
+/// Handle methods that are A2A-spec'd but deliberately unsupported —
+/// `message/stream`, `tasks/resubscribe`, and push-notification config. The
+/// agent card advertises `streaming: false` / `pushNotifications: false`, and
+/// these return the spec-shaped `UnsupportedOperationError` (`-32004`) so
+/// clients get a machine-parseable answer instead of a bare method-not-found.
+pub(crate) fn handle_unsupported_operation(id: &Value, method: &str) -> Value {
     jsonrpc_error(
         id,
         -32004,
-        "message/send is not yet implemented (A2A v1.0 stub); use tasks/send until the bus_queue bridge lands",
+        &format!(
+            "{method} is not supported (see agent card capabilities); use message/send + tasks/get"
+        ),
     )
 }
 
@@ -345,21 +336,43 @@ pub(crate) async fn handle_tasks_send(
 }
 
 /// Handle `tasks/get` — retrieves a task by ID.
-pub(crate) fn handle_tasks_get(id: &Value, params: &Value, task_manager: &A2ATaskManager) -> Value {
-    let task_id = match params.get("task_id").and_then(|v| v.as_str()) {
+///
+/// Two task populations are served:
+/// - **`tasks/send` tasks** (in-memory `A2ATaskManager`) — legacy
+///   `{ "task": … }` envelope, unchanged.
+/// - **`message/send` bus tasks** ([`BusTaskIndex`]) — spec-shaped A2A `Task`
+///   with a best-effort state probed from `bus_queue.jsonl` (mapping table
+///   documented in [`super::message_send`]).
+///
+/// Accepts the A2A v1.0 param name `id` as well as the legacy `task_id`.
+pub(crate) async fn handle_tasks_get(
+    id: &Value,
+    params: &Value,
+    task_manager: &A2ATaskManager,
+    bus_index: &BusTaskIndex,
+    home_dir: &std::path::Path,
+) -> Value {
+    let task_id = match params
+        .get("task_id")
+        .or_else(|| params.get("id"))
+        .and_then(|v| v.as_str())
+    {
         Some(tid) => tid,
         None => {
-            return jsonrpc_error(id, -32602, "Missing required parameter: task_id");
+            return jsonrpc_error(id, -32602, "Missing required parameter: task_id (or id)");
         }
     };
 
-    match task_manager.get_task(task_id) {
-        Some(task) => {
-            let task_json = serde_json::to_value(task).unwrap_or(Value::Null);
-            jsonrpc_response(id, serde_json::json!({ "task": task_json }))
-        }
-        None => jsonrpc_error(id, -32001, &format!("Task not found: {task_id}")),
+    if let Some(task) = task_manager.get_task(task_id) {
+        let task_json = serde_json::to_value(task).unwrap_or(Value::Null);
+        return jsonrpc_response(id, serde_json::json!({ "task": task_json }));
     }
+
+    if let Some(record) = bus_index.get(task_id) {
+        return super::message_send::handle_bus_task_get(id, task_id, record, home_dir).await;
+    }
+
+    jsonrpc_error(id, -32001, &format!("Task not found: {task_id}"))
 }
 
 /// Handle `tasks/cancel` — cancels a task by ID.
@@ -388,14 +401,20 @@ fn handle_tasks_cancel(id: &Value, params: &Value, task_manager: &mut A2ATaskMan
 ///
 /// Supported methods:
 /// - `agent/discover` — returns the A2A v1.0 agent card
-/// - `tasks/send` — creates and executes a task, returns result with artifacts
-/// - `tasks/get` — retrieves task status by ID
+/// - `message/send` — A2A v1.0 primary submission RPC; enqueues a bus task for
+///   the target agent and returns `Task { state: "submitted" }` (async
+///   execution via the gateway AgentDispatcher)
+/// - `tasks/send` — creates and executes a task inline, returns result with artifacts
+/// - `tasks/get` — retrieves task status by ID (in-memory tasks + best-effort
+///   bus-task probe)
 /// - `tasks/cancel` — cancels a task by ID
-/// - `message/send` — A2A v1.0 stub (returns `UnsupportedOperationError`)
+/// - `message/stream` / `tasks/resubscribe` / `tasks/pushNotificationConfig/*`
+///   — spec-shaped `UnsupportedOperationError` (-32004)
 pub async fn run_acp_server(home_dir: &Path) -> Result<()> {
     info!("Starting DuDuClaw ACP server (A2A protocol over stdio)");
 
     let mut task_manager = A2ATaskManager::new();
+    let mut bus_index = BusTaskIndex::default();
 
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -438,9 +457,18 @@ pub async fn run_acp_server(home_dir: &Path) -> Result<()> {
 
         let response = match method {
             "agent/discover" => handle_agent_discover(&id),
-            "message/send" => handle_message_send(&id),
+            "message/send" => {
+                super::message_send::handle_message_send(&id, &params, home_dir, &mut bus_index)
+                    .await
+            }
+            "message/stream"
+            | "tasks/resubscribe"
+            | "tasks/pushNotificationConfig/set"
+            | "tasks/pushNotificationConfig/get" => handle_unsupported_operation(&id, method),
             "tasks/send" => handle_tasks_send(&id, &params, &mut task_manager, home_dir).await,
-            "tasks/get" => handle_tasks_get(&id, &params, &task_manager),
+            "tasks/get" => {
+                handle_tasks_get(&id, &params, &task_manager, &bus_index, home_dir).await
+            }
             "tasks/cancel" => handle_tasks_cancel(&id, &params, &mut task_manager),
             _ => jsonrpc_error(&id, -32601, &format!("Method not found: {method}")),
         };

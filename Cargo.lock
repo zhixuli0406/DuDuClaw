@@ -2221,6 +2221,7 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "tokio-util",
  "toml 0.8.23",
+ "tonic",
  "tracing",
  "tracing-appender",
  "tracing-opentelemetry",

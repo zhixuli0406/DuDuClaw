@@ -58,6 +58,7 @@ pub mod external_factors;
 pub mod cli_auth;
 pub mod handlers;
 pub mod line;
+pub mod local_llm;
 pub mod mcp_oauth;
 pub mod media;
 pub mod model_capabilities;

@@ -58,6 +58,7 @@
 //!      `duduclaw-cli/src/mcp_dispatch.rs::McpDispatcher::dispatch_tool_call`
 //!      (all MCP transports).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Centralised GenAI semantic-convention attribute keys.
@@ -137,6 +138,12 @@ pub struct TelemetryConfig {
     pub service_name: String,
     /// Head sampling ratio in `[0.0, 1.0]` (default `1.0` = sample everything).
     pub sample_ratio: f64,
+    /// Extra headers sent with every OTLP export request (gRPC metadata), e.g.
+    /// `Authorization` for Langfuse / Grafana Cloud. Keys are normalized to
+    /// lowercase ASCII (tonic metadata requirement); invalid entries are
+    /// skipped with a warning at parse time, never a panic. Sources, later
+    /// wins per-key: `[telemetry] otlp_headers` table ← `OTEL_EXPORTER_OTLP_HEADERS`.
+    pub otlp_headers: BTreeMap<String, String>,
 }
 
 const DEFAULT_SERVICE_NAME: &str = "duduclaw";
@@ -185,13 +192,149 @@ impl TelemetryConfig {
             .unwrap_or(DEFAULT_SAMPLE_RATIO)
             .clamp(0.0, 1.0);
 
+        let otlp_headers = parse_otlp_headers_toml(table);
+
         Some(Self {
             otlp_endpoint: endpoint.to_string(),
             otlp_protocol: protocol,
             service_name,
             sample_ratio,
+            otlp_headers,
         })
     }
+}
+
+// ── OTLP export headers (auth for Langfuse / Grafana Cloud / …) ─────────────
+//
+// All helpers below are pure and always compiled (unit-testable without the
+// `otel` feature). They enforce tonic gRPC metadata constraints up front so
+// the feature-gated exporter code can insert keys without a panic path:
+// tonic ASCII metadata keys must be lowercase, drawn from a restricted
+// charset, and must not use the reserved `-bin` (binary metadata) suffix;
+// values must be visible ASCII (space allowed).
+
+/// Normalize a header key for tonic gRPC metadata: trim + lowercase, then
+/// validate against the safe charset `[a-z0-9_.-]`. Returns `None` (⇒ caller
+/// skips + warns) for empty keys, non-ASCII / out-of-charset keys, and the
+/// reserved `-bin` suffix — inserting any of those via `MetadataMap::insert`
+/// would panic, and telemetry must never take the process down.
+pub fn normalize_otlp_header_key(raw: &str) -> Option<String> {
+    let key = raw.trim().to_ascii_lowercase();
+    if key.is_empty() || key.ends_with("-bin") {
+        return None;
+    }
+    let valid = key
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.'));
+    valid.then_some(key)
+}
+
+/// A header value is exportable iff it is visible ASCII (space allowed) —
+/// the `tonic` ASCII `MetadataValue` / `http::HeaderValue` rule. Non-ASCII
+/// (or control chars) ⇒ skip + warn, never panic.
+pub fn otlp_header_value_ok(value: &str) -> bool {
+    value.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
+/// Parse the `[telemetry] otlp_headers` TOML table. Fail-safe: an absent key
+/// yields an empty map; a malformed value (not a table / non-string entries /
+/// invalid keys or values) warns and skips the offending part — telemetry
+/// config problems must never abort boot.
+fn parse_otlp_headers_toml(telemetry_table: &toml::Value) -> BTreeMap<String, String> {
+    let mut headers = BTreeMap::new();
+    let Some(raw) = telemetry_table.get("otlp_headers") else {
+        return headers; // absent ⇒ empty, the common case
+    };
+    let Some(table) = raw.as_table() else {
+        eprintln!(
+            "[duduclaw] [telemetry] otlp_headers must be a table of string values \
+             (e.g. otlp_headers = {{ authorization = \"Basic …\" }}); ignoring"
+        );
+        return headers;
+    };
+    for (key, value) in table {
+        let Some(value) = value.as_str() else {
+            eprintln!("[duduclaw] [telemetry] otlp_headers.{key}: value must be a string; skipped");
+            continue;
+        };
+        insert_otlp_header(&mut headers, key, value, "config.toml [telemetry] otlp_headers");
+    }
+    headers
+}
+
+/// Parse the standard `OTEL_EXPORTER_OTLP_HEADERS` env var: comma-separated
+/// `key=value` pairs (W3C baggage convention). Values may be percent-encoded
+/// (e.g. `Authorization=Basic%20xxx`); decode is attempted and falls back to
+/// the raw value on malformed escapes — mirroring upstream opentelemetry-otlp.
+/// Invalid pairs are skipped with a warning, never a panic.
+pub fn parse_otlp_headers_env(raw: &str) -> BTreeMap<String, String> {
+    let mut headers = BTreeMap::new();
+    for pair in raw.split_terminator(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let Some((key, value)) = pair.split_once('=') else {
+            eprintln!("[duduclaw] OTEL_EXPORTER_OTLP_HEADERS: entry without '='; skipped");
+            continue;
+        };
+        let value = percent_decode(value.trim()).unwrap_or_else(|| value.trim().to_string());
+        insert_otlp_header(&mut headers, key, &value, "OTEL_EXPORTER_OTLP_HEADERS");
+    }
+    headers
+}
+
+/// Shared validate-then-insert step for both header sources. Warns and skips
+/// on invalid key/value; on success stores the normalized (lowercase) key.
+fn insert_otlp_header(headers: &mut BTreeMap<String, String>, key: &str, value: &str, source: &str) {
+    let Some(key) = normalize_otlp_header_key(key) else {
+        eprintln!(
+            "[duduclaw] {source}: header key {key:?} is not a valid gRPC metadata key \
+             (need lowercase ASCII [a-z0-9_.-], no '-bin' suffix); skipped"
+        );
+        return;
+    };
+    if !otlp_header_value_ok(value) {
+        eprintln!(
+            "[duduclaw] {source}: header {key:?} value contains non-ASCII or control \
+             characters; skipped"
+        );
+        return;
+    }
+    headers.insert(key, value.to_string());
+}
+
+/// Merge env headers over config headers (env wins per-key, the standard
+/// OTLP precedence). `env_raw` is the raw `OTEL_EXPORTER_OTLP_HEADERS` value.
+pub fn merge_otlp_headers(
+    config: &BTreeMap<String, String>,
+    env_raw: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut merged = config.clone();
+    if let Some(raw) = env_raw {
+        merged.extend(parse_otlp_headers_env(raw));
+    }
+    merged
+}
+
+/// Minimal `%XX` percent-decoder for env header values. Returns `None` on any
+/// malformed escape (truncated / non-hex / invalid UTF-8) so the caller can
+/// fall back to the raw string — same contract as upstream opentelemetry-otlp.
+fn percent_decode(value: &str) -> Option<String> {
+    if !value.contains('%') {
+        return Some(value.to_string());
+    }
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3)?;
+            let hex = std::str::from_utf8(hex).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 // ── GenAI span helpers (pure `tracing`, always compiled) ─────────────────────
@@ -295,6 +438,7 @@ mod exporter {
     /// `entry_point` follow-up) run inside `#[tokio::main]`.
     pub fn install(cfg: &TelemetryConfig) -> Result<OtelGuard, Box<dyn std::error::Error>> {
         use opentelemetry_otlp::WithExportConfig; // brings `.with_endpoint` into scope
+        use opentelemetry_otlp::WithTonicConfig; // brings `.with_metadata` into scope
         use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
         use opentelemetry_sdk::Resource;
 
@@ -312,9 +456,30 @@ mod exporter {
             );
         }
 
+        // Auth headers (Langfuse / Grafana Cloud / any authenticated OTLP
+        // ingest) ride as tonic gRPC metadata. Keys were already normalized to
+        // lowercase + validated at parse time (see `normalize_otlp_header_key`);
+        // key/value construction here still goes through the Result-returning
+        // tonic APIs (never the panicking `&'static str` insert) — a rejected
+        // entry is skipped with a warning, telemetry must never abort boot.
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        for (key, value) in &cfg.otlp_headers {
+            let parsed_key =
+                tonic::metadata::MetadataKey::<tonic::metadata::Ascii>::from_bytes(key.as_bytes());
+            match (parsed_key, value.parse::<tonic::metadata::MetadataValue<_>>()) {
+                (Ok(k), Ok(v)) => {
+                    metadata.insert(k, v);
+                }
+                _ => eprintln!(
+                    "[duduclaw] [telemetry] otlp header {key:?} rejected by tonic; skipped"
+                ),
+            }
+        }
+
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
             .with_endpoint(cfg.otlp_endpoint.clone())
+            .with_metadata(metadata)
             .build()?;
 
         let resource = Resource::builder()
@@ -359,7 +524,7 @@ pub fn init(home_dir: &Path) -> Option<OtelGuard> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let cfg = match (TelemetryConfig::from_home(home_dir), env_endpoint) {
+    let mut cfg = match (TelemetryConfig::from_home(home_dir), env_endpoint) {
         (Some(mut cfg), Some(endpoint)) => {
             cfg.otlp_endpoint = endpoint;
             cfg
@@ -370,17 +535,23 @@ pub fn init(home_dir: &Path) -> Option<OtelGuard> {
             otlp_protocol: OtlpProtocol::Grpc,
             service_name: DEFAULT_SERVICE_NAME.to_string(),
             sample_ratio: DEFAULT_SAMPLE_RATIO,
+            otlp_headers: BTreeMap::new(),
         },
         (None, None) => return None,
     };
+    // Standard OTLP header env: OTEL_EXPORTER_OTLP_HEADERS ("k=v,k2=v2",
+    // values may be percent-encoded) merges over `[telemetry] otlp_headers`
+    // — env wins per-key, matching the endpoint override precedence above.
+    let env_headers = std::env::var("OTEL_EXPORTER_OTLP_HEADERS").ok();
+    cfg.otlp_headers = merge_otlp_headers(&cfg.otlp_headers, env_headers.as_deref());
     match exporter::install(&cfg) {
         Ok(guard) => {
             // `init` runs before the tracing subscriber is installed
             // (entry_point), so a tracing::info! here would be lost — mirror
             // the "[duduclaw] effective log level" stderr pattern instead.
             eprintln!(
-                "[duduclaw] OpenTelemetry OTLP GenAI tracing enabled → {} (service {}, sample {})",
-                cfg.otlp_endpoint, cfg.service_name, cfg.sample_ratio
+                "[duduclaw] OpenTelemetry OTLP GenAI tracing enabled → {} (service {}, sample {}, {} auth header(s))",
+                cfg.otlp_endpoint, cfg.service_name, cfg.sample_ratio, cfg.otlp_headers.len()
             );
             Some(guard)
         }
@@ -447,6 +618,7 @@ mod tests {
         assert_eq!(cfg.otlp_protocol, OtlpProtocol::Grpc);
         assert_eq!(cfg.service_name, "duduclaw");
         assert_eq!(cfg.sample_ratio, 1.0);
+        assert!(cfg.otlp_headers.is_empty(), "absent otlp_headers ⇒ empty map");
     }
 
     #[test]
@@ -523,6 +695,111 @@ mod tests {
         assert_eq!(attrs::ERROR_TYPE, "error.type");
         assert_eq!(attrs::OP_INVOKE_AGENT, "invoke_agent");
         assert_eq!(attrs::OP_EXECUTE_TOOL, "execute_tool");
+    }
+
+    // ── OTLP header parsing / merging ────────────────────────────────────
+
+    #[test]
+    fn parse_otlp_headers_from_toml_valid() {
+        let raw = "[telemetry]\n\
+            otlp_endpoint = \"https://cloud.langfuse.com/api/public/otel\"\n\
+            otlp_headers = { Authorization = \"Basic cGstbGY6c2stbGY=\", \"x-api-key\" = \"yyy\" }\n";
+        let cfg = TelemetryConfig::parse(raw).unwrap();
+        // Keys are normalized to lowercase for tonic metadata.
+        assert_eq!(
+            cfg.otlp_headers.get("authorization").map(String::as_str),
+            Some("Basic cGstbGY6c2stbGY=")
+        );
+        assert_eq!(cfg.otlp_headers.get("x-api-key").map(String::as_str), Some("yyy"));
+        assert_eq!(cfg.otlp_headers.len(), 2);
+    }
+
+    #[test]
+    fn parse_otlp_headers_malformed_is_failsafe() {
+        // Not a table ⇒ warn + empty, install still proceeds.
+        let cfg = TelemetryConfig::parse(
+            "[telemetry]\notlp_endpoint = \"h\"\notlp_headers = \"authorization=Basic x\"\n",
+        )
+        .unwrap();
+        assert!(cfg.otlp_headers.is_empty());
+
+        // Non-string value ⇒ that entry skipped, valid siblings kept.
+        let cfg = TelemetryConfig::parse(
+            "[telemetry]\notlp_endpoint = \"h\"\notlp_headers = { a = 1, b = \"ok\" }\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.otlp_headers.get("b").map(String::as_str), Some("ok"));
+        assert_eq!(cfg.otlp_headers.len(), 1);
+
+        // Non-ASCII value ⇒ skipped (tonic ASCII metadata rule).
+        let cfg = TelemetryConfig::parse(
+            "[telemetry]\notlp_endpoint = \"h\"\notlp_headers = { a = \"中文\", b = \"ok\" }\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.otlp_headers.len(), 1);
+        assert!(cfg.otlp_headers.contains_key("b"));
+    }
+
+    #[test]
+    fn env_headers_parse_and_percent_decode() {
+        let h = parse_otlp_headers_env("Authorization=Basic%20cGs=,x-api-key = yyy ,");
+        // Percent-encoded space decoded (Langfuse/Grafana docs use %20).
+        assert_eq!(h.get("authorization").map(String::as_str), Some("Basic cGs="));
+        assert_eq!(h.get("x-api-key").map(String::as_str), Some("yyy"));
+        assert_eq!(h.len(), 2);
+
+        // Malformed escape falls back to the raw value (upstream contract).
+        let h = parse_otlp_headers_env("k=a%zzb");
+        assert_eq!(h.get("k").map(String::as_str), Some("a%zzb"));
+
+        // Entries without '=' are skipped, never a panic.
+        let h = parse_otlp_headers_env("no-equals-sign, ,k=v");
+        assert_eq!(h.len(), 1);
+        assert_eq!(h.get("k").map(String::as_str), Some("v"));
+
+        // Value keeps everything after the FIRST '=' (base64 padding safe).
+        let h = parse_otlp_headers_env("authorization=Basic dGVzdA==");
+        assert_eq!(h.get("authorization").map(String::as_str), Some("Basic dGVzdA=="));
+    }
+
+    #[test]
+    fn env_headers_merge_over_config() {
+        let mut config = BTreeMap::new();
+        config.insert("authorization".to_string(), "from-config".to_string());
+        config.insert("x-keep".to_string(), "kept".to_string());
+
+        // Env wins per-key; config-only keys survive.
+        let merged = merge_otlp_headers(&config, Some("Authorization=from-env,x-new=n"));
+        assert_eq!(merged.get("authorization").map(String::as_str), Some("from-env"));
+        assert_eq!(merged.get("x-keep").map(String::as_str), Some("kept"));
+        assert_eq!(merged.get("x-new").map(String::as_str), Some("n"));
+        assert_eq!(merged.len(), 3);
+
+        // No env ⇒ config unchanged.
+        assert_eq!(merge_otlp_headers(&config, None), config);
+    }
+
+    #[test]
+    fn header_key_normalization_and_skip_rules() {
+        // Uppercase is normalized, not rejected.
+        assert_eq!(normalize_otlp_header_key("Authorization").as_deref(), Some("authorization"));
+        assert_eq!(normalize_otlp_header_key("  X-API-Key "), Some("x-api-key".to_string()));
+        assert_eq!(normalize_otlp_header_key("a1_b.c-d").as_deref(), Some("a1_b.c-d"));
+        // Empty / whitespace-only ⇒ skip.
+        assert_eq!(normalize_otlp_header_key(""), None);
+        assert_eq!(normalize_otlp_header_key("   "), None);
+        // Chars outside [a-z0-9_.-] ⇒ skip (would panic in tonic's &str insert).
+        assert_eq!(normalize_otlp_header_key("bad key"), None);
+        assert_eq!(normalize_otlp_header_key("k@y"), None);
+        assert_eq!(normalize_otlp_header_key("中文"), None);
+        // Reserved gRPC binary-metadata suffix ⇒ skip (needs Binary values).
+        assert_eq!(normalize_otlp_header_key("trace-bin"), None);
+
+        // Value rule: visible ASCII + space only.
+        assert!(otlp_header_value_ok("Basic abc123== xyz"));
+        assert!(!otlp_header_value_ok("naïve"));
+        assert!(!otlp_header_value_ok("tab\tchar"));
+        assert!(!otlp_header_value_ok("nl\n"));
     }
 
     #[test]

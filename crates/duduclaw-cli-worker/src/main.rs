@@ -183,6 +183,11 @@ mod tests {
     }
 
     #[test]
+    // SAFETY justification for the allow: Rust 2024 makes `env::set_var` /
+    // `remove_var` unsafe (process-global, not thread-safe); this test-only
+    // mutation is confined to HOME with save/restore, and no safe std
+    // alternative exists for env mutation.
+    #[allow(unsafe_code)]
     fn expand_home_errors_when_home_unresolvable() {
         // **Review fix (L20)**: a `~/`-prefixed path with no resolvable
         // HOME must error, not silently return the literal `~` path.

@@ -16,6 +16,7 @@
 //! **Compression** module provides three strategies:
 //!   Meta-Token (lossless) / LLMLingua-2 (lossy) / StreamingLLM (KV-cache)
 
+pub mod adapter;
 pub mod backend;
 pub mod config;
 pub mod engine;
@@ -38,6 +39,7 @@ pub mod util;
 pub mod embedding;
 pub mod whisper;
 
+pub use adapter::CompatEndpoint;
 pub use backend::InferenceBackend;
 pub use config::InferenceConfig;
 pub use engine::InferenceEngine;
