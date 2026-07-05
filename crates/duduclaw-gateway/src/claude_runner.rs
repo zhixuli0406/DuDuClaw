@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use duduclaw_agent::registry::AgentRegistry;
+// Trait must be in scope to call `.complete()` / `.stream()` on providers.
+use duduclaw_llm::ChatProvider as _;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -622,10 +624,33 @@ pub async fn call_claude_for_agent_with_type(
     // Only reached when: api_mode="direct", or api_mode="auto" + all OAuth rate-limited.
     // Pass tasks_suffix as a separate uncached block so the static system
     // prefix stays cacheable.
+
+    // G1: when the agent configures `[model] fallbacks`, run the cross-provider
+    // fallback chain (preferred → fallbacks). Absent/empty ⇒ fall through to the
+    // byte-identical single-shot path below.
+    let model_fallbacks = crate::runtime_config::agent_model_fallbacks(&agent_dir);
+    if !model_fallbacks.is_empty() {
+        info!(
+            agent = %agent_name,
+            model = %claude_model,
+            fallbacks = ?model_fallbacks,
+            "Trying Direct API cross-provider fallback chain"
+        );
+        return try_direct_api_chain(
+            home_dir, agent_id, prompt, &claude_model, &model_fallbacks,
+            &system_prompt, tasks_suffix.as_deref(), request_type, Some(&capabilities),
+        )
+        .await;
+    }
+
+    // Rotator threaded into the single-shot path so a non-Anthropic preferred
+    // model uses provider-aware rotation (G3); the Anthropic legacy body ignores
+    // it, staying byte-identical for Claude agents.
+    let direct_rotator = get_rotator(home_dir).await.ok();
     info!(agent = %agent_name, model = %claude_model, "Trying Direct API (API Key fallback)");
     match try_direct_api(
         home_dir, agent_id, prompt, &claude_model, &system_prompt,
-        tasks_suffix.as_deref(), request_type,
+        tasks_suffix.as_deref(), request_type, direct_rotator.as_deref(), Some(&capabilities),
     ).await {
         Ok(text) => Ok(text),
         Err(ref e) if is_llm_fallback_error(e) && should_attempt_model_fallback(&claude_model, &fallback_model) => {
@@ -638,7 +663,7 @@ pub async fn call_claude_for_agent_with_type(
             emit_llm_fallback_audit(home_dir, agent_id, &claude_model, &fallback_model, e).await;
             try_direct_api(
                 home_dir, agent_id, prompt, &fallback_model, &system_prompt,
-                tasks_suffix.as_deref(), request_type,
+                tasks_suffix.as_deref(), request_type, direct_rotator.as_deref(), Some(&capabilities),
             ).await
             .map_err(|fe| format_fallback_error_message(&claude_model, e, &fallback_model, &fe))
         }
@@ -696,19 +721,14 @@ fn direct_api_route(model: &str) -> DirectApiRoute {
     }
 }
 
-/// Build a duduclaw-llm provider client for `provider_id`, resolving the API
-/// key from the provider's standard env vars. No key → Err, so callers fall
-/// back to the CLI/rotation path exactly like the legacy "no API key" case.
-fn build_llm_provider(
+/// Build a duduclaw-llm provider client for `provider_id` from an explicit API
+/// key. Fail-closed: an unknown compat provider with no preset → Err (no
+/// guessed base URL).
+fn build_llm_provider_with_key(
     provider_id: &str,
+    key: &str,
 ) -> Result<Box<dyn duduclaw_llm::ChatProvider>, String> {
-    let key = duduclaw_llm::resolve_env_key(provider_id).ok_or_else(|| {
-        format!(
-            "no API key for provider {provider_id} — set its standard env var \
-             (e.g. OPENAI_API_KEY / GEMINI_API_KEY / DEEPSEEK_API_KEY)"
-        )
-    })?;
-    let auth = duduclaw_llm::ApiAuth::new(key);
+    let auth = duduclaw_llm::ApiAuth::new(key.to_string());
     match provider_id {
         "openai" => Ok(Box::new(duduclaw_llm::providers::OpenAiProvider::new(auth))),
         "gemini" | "google" => Ok(Box::new(duduclaw_llm::providers::GeminiProvider::new(auth))),
@@ -761,9 +781,201 @@ fn build_llm_chat_request(
     req
 }
 
-/// Direct API call through a duduclaw-llm provider (non-Anthropic models).
-// OTel GenAI: `chat` span for one non-Anthropic Direct-API model call
-// (attribute names centralized in `crate::otel`; usage recorded post-hoc).
+/// A [`ChatProvider`] decorator that records token-usage telemetry after every
+/// `complete()` — so a multi-round [`duduclaw_llm::run_tool_loop`] bills each
+/// provider round-trip (G2 cost guard), not just the final response — and
+/// accumulates the total cost for the rotator's per-account budget (G3).
+struct RecordingProvider {
+    inner: Box<dyn duduclaw_llm::ChatProvider>,
+    agent_id: String,
+    request_type: crate::cost_telemetry::RequestType,
+    cost_acc: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl duduclaw_llm::ChatProvider for RecordingProvider {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    async fn complete(
+        &self,
+        req: &duduclaw_llm::ChatRequest,
+    ) -> Result<duduclaw_llm::ChatResponse, duduclaw_llm::LlmError> {
+        let resp = self.inner.complete(req).await?;
+        // Reasoning fold: bill reasoning exactly once at the output rate
+        // (mirrors the legacy single-shot mapping).
+        let usage = crate::cost_telemetry::TokenUsage {
+            input_tokens: resp.usage.input_tokens,
+            cache_read_tokens: resp.usage.cache_read_tokens,
+            cache_creation_tokens: resp.usage.cache_write_tokens,
+            output_tokens: resp.usage.output_tokens + resp.usage.reasoning_tokens,
+        };
+        self.cost_acc.fetch_add(
+            crate::cost_telemetry::cost_for(&resp.model_used, &usage),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
+            telemetry
+                .record(&self.agent_id, self.request_type, &resp.model_used, &usage)
+                .await;
+        }
+        Ok(resp)
+    }
+
+    async fn stream(
+        &self,
+        req: &duduclaw_llm::ChatRequest,
+    ) -> Result<
+        futures_util::stream::BoxStream<'static, Result<duduclaw_llm::StreamEvent, duduclaw_llm::LlmError>>,
+        duduclaw_llm::LlmError,
+    > {
+        self.inner.stream(req).await
+    }
+}
+
+/// Env for the duduclaw MCP server subprocess — mirrors
+/// `runtime::duduclaw_mcp_server_json` (self-identify via `DUDUCLAW_AGENT_ID` +
+/// the multi-instance overrides) so the API-path tool loop reaches the same MCP
+/// tools the CLI backends do.
+fn mcp_client_envs(agent_id: &str) -> Vec<(String, String)> {
+    let mut envs = vec![(duduclaw_core::ENV_AGENT_ID.to_string(), agent_id.to_string())];
+    for var in ["DUDUCLAW_HOME", "DUDUCLAW_PORT", "DUDUCLAW_INSTANCE"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.trim().is_empty() {
+                envs.push((var.to_string(), v));
+            }
+        }
+    }
+    envs
+}
+
+/// Base tool name — the part before an optional `(` qualifier (e.g.
+/// `Bash(git:*)` → `Bash`), trimmed. Token-anchored (never substring), per the
+/// 2026-06 review conventions.
+fn tool_base_name(entry: &str) -> &str {
+    entry.split('(').next().unwrap_or(entry).trim()
+}
+
+/// Filter MCP tool defs by the agent's capabilities (G2, fail-closed): a tool
+/// whose base name is bare-denied is dropped, and when an explicit
+/// `allowed_tools` allowlist is set only tools named there survive. `None`
+/// capabilities ⇒ all tools offered.
+fn filter_tool_defs(
+    defs: Vec<duduclaw_llm::ToolDef>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+) -> Vec<duduclaw_llm::ToolDef> {
+    let Some(caps) = capabilities else {
+        return defs;
+    };
+    let denied = caps.disallowed_tools();
+    let allowed = caps.allowed_tools();
+    defs.into_iter()
+        .filter(|d| {
+            let name = tool_base_name(&d.name);
+            if denied.iter().any(|x| tool_base_name(x).eq_ignore_ascii_case(name)) {
+                return false;
+            }
+            if !allowed.is_empty()
+                && !allowed.iter().any(|x| tool_base_name(x).eq_ignore_ascii_case(name))
+            {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+/// Spawn the duduclaw MCP server and build a [`duduclaw_llm::ToolRegistry`] for
+/// the tool loop (G2). Fail-safe: any resolve/spawn/handshake/list failure logs
+/// a warning and returns `None`, so the caller degrades to a tools-less answer
+/// rather than failing the whole reply.
+async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_llm::ToolRegistry> {
+    let bin = duduclaw_core::resolve_duduclaw_bin();
+    if !bin.is_absolute() {
+        warn!("MCP tool loop disabled — duduclaw binary did not resolve to an absolute path");
+        return None;
+    }
+    let envs = mcp_client_envs(agent_id);
+    let client = match duduclaw_llm::McpClient::connect(
+        &bin.to_string_lossy(),
+        &["mcp-server".to_string()],
+        &envs,
+        duduclaw_llm::DEFAULT_MCP_TIMEOUT,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "MCP server spawn failed — Direct-API reply will be tools-less");
+            return None;
+        }
+    };
+    match duduclaw_llm::ToolRegistry::from_clients(vec![client]).await {
+        Ok(reg) => Some(reg),
+        Err(e) => {
+            warn!(error = %e, "MCP tools/list failed — Direct-API reply will be tools-less");
+            None
+        }
+    }
+}
+
+/// Where a direct-API key came from — the pure output of [`choose_key_source`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeySource {
+    /// A rotator account (budget/cooldown tracked) — carries its id + key.
+    Rotator { account_id: String, key: String },
+    /// A provider env var (no usable rotator account matched).
+    Env { key: String },
+}
+
+/// Pure decision (G3): prefer a rotator-selected account's key, else the env
+/// key. `rotator_pick` is `(account_id, raw_key)` from
+/// [`duduclaw_agent::account_rotator::AccountRotator::select_for_provider`];
+/// `raw_key = None` marks an OAuth account (no static key), which non-Anthropic
+/// providers can't use → treated as no rotator key, so we fall back to env.
+fn choose_key_source(
+    rotator_pick: Option<(String, Option<String>)>,
+    env_key: Option<String>,
+) -> Option<KeySource> {
+    match rotator_pick {
+        Some((account_id, Some(key))) => Some(KeySource::Rotator { account_id, key }),
+        _ => env_key.map(|key| KeySource::Env { key }),
+    }
+}
+
+/// Resolve a direct-API key for `provider` via the rotator (G3), falling back
+/// to the provider's env var. `select_for_provider` itself already env-fallbacks
+/// (synthesizing a harmless `<provider>-env` ephemeral account), so threading a
+/// rotator both rotates real `[[accounts]]` and covers the env-only case; the
+/// direct `resolve_env_key` branch only matters when no rotator is available.
+async fn resolve_provider_key(
+    provider: &str,
+    rotator: Option<&duduclaw_agent::account_rotator::AccountRotator>,
+) -> Result<KeySource, String> {
+    let rotator_pick = match rotator {
+        Some(r) => r
+            .select_for_provider(provider)
+            .await
+            .map(|env| (env.id, env.raw_key)),
+        None => None,
+    };
+    let env_key = duduclaw_llm::resolve_env_key(provider);
+    choose_key_source(rotator_pick, env_key).ok_or_else(|| {
+        format!(
+            "no API key for provider {provider} — add an [[accounts]] entry or set \
+             its standard env var (e.g. OPENAI_API_KEY / GEMINI_API_KEY / DEEPSEEK_API_KEY)"
+        )
+    })
+}
+
+/// Direct-API call through a duduclaw-llm provider (non-Anthropic models) with
+/// provider-aware rotation (G3) and the MCP tool loop (G2).
+///
+/// Returns a [`ChainError`] so the fallback chain can classify failover vs.
+/// terminal from the typed [`duduclaw_llm::LlmError`] (auth/invalid ⇒ terminal;
+/// rate-limit/billing/timeout/5xx ⇒ failover).
+// OTel GenAI: `chat` span for one non-Anthropic Direct-API model call.
 #[tracing::instrument(
     name = "chat",
     skip_all,
@@ -777,6 +989,101 @@ fn build_llm_chat_request(
         gen_ai.usage.output_tokens = tracing::field::Empty,
     )
 )]
+async fn run_llm_provider(
+    agent_id: &str,
+    prompt: &str,
+    model: &str,
+    system_prompt: &str,
+    dynamic_system_suffix: Option<&str>,
+    request_type: crate::cost_telemetry::RequestType,
+    provider_id: &str,
+    rotator: Option<&duduclaw_agent::account_rotator::AccountRotator>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+) -> Result<String, ChainError> {
+    // G3: resolve the key (rotator → env). A missing key is terminal for this
+    // candidate — nothing to retry with on the same provider.
+    let key_source = match resolve_provider_key(provider_id, rotator).await {
+        Ok(k) => k,
+        Err(e) => return Err(ChainError { message: e, failover: false }),
+    };
+    let (account_id, key) = match key_source {
+        KeySource::Rotator { account_id, key } => (Some(account_id), key),
+        KeySource::Env { key } => (None, key),
+    };
+
+    let base_provider = match build_llm_provider_with_key(provider_id, &key) {
+        Ok(p) => p,
+        Err(e) => return Err(ChainError { message: e, failover: false }),
+    };
+
+    let supports_caching = crate::cost_telemetry::model_registry()
+        .supports(model, duduclaw_llm::Feature::Caching);
+    let mut req =
+        build_llm_chat_request(model, supports_caching, system_prompt, dynamic_system_suffix, prompt);
+
+    let cost_acc = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let provider = RecordingProvider {
+        inner: base_provider,
+        agent_id: agent_id.to_string(),
+        request_type,
+        cost_acc: cost_acc.clone(),
+    };
+
+    // G2: MCP tool registry (fail-safe → tools-less bare completion).
+    let registry = build_mcp_tool_registry(agent_id).await;
+    info!(
+        provider = provider_id,
+        model,
+        tools = registry.is_some(),
+        "Direct API via duduclaw-llm provider"
+    );
+
+    let outcome: Result<duduclaw_llm::ChatResponse, duduclaw_llm::LlmError> = match &registry {
+        Some(reg) => {
+            // Fail-closed capability filter — never advertise a denied tool.
+            req.tools = filter_tool_defs(reg.tool_defs(), capabilities);
+            duduclaw_llm::run_tool_loop(&provider, req, reg, duduclaw_llm::DEFAULT_MAX_TOOL_ITERS)
+                .await
+        }
+        None => provider.complete(&req).await,
+    };
+
+    match outcome {
+        Ok(resp) => {
+            {
+                let span = tracing::Span::current();
+                span.record(crate::otel::attrs::USAGE_INPUT_TOKENS, resp.usage.input_tokens);
+                span.record(
+                    crate::otel::attrs::USAGE_OUTPUT_TOKENS,
+                    resp.usage.output_tokens + resp.usage.reasoning_tokens,
+                );
+            }
+            if let (Some(r), Some(id)) = (rotator, &account_id) {
+                r.on_success(id, cost_acc.load(std::sync::atomic::Ordering::Relaxed))
+                    .await;
+            }
+            Ok(resp.text())
+        }
+        Err(e) => {
+            let failover = llm_err_is_chain_failover(&e);
+            if let (Some(r), Some(id)) = (rotator, &account_id) {
+                match &e {
+                    duduclaw_llm::LlmError::Billing => r.on_billing_exhausted(id).await,
+                    duduclaw_llm::LlmError::RateLimited { .. } => r.on_rate_limited(id).await,
+                    _ => r.on_error(id).await,
+                }
+            }
+            Err(ChainError {
+                message: format!("{provider_id} direct API error: {e}"),
+                failover,
+            })
+        }
+    }
+}
+
+/// Single-shot Direct-API call through a duduclaw-llm provider (non-Anthropic),
+/// stringly-typed for the legacy call sites. Thin wrapper over
+/// [`run_llm_provider`] with rotation + tools.
 async fn try_llm_provider_api(
     agent_id: &str,
     prompt: &str,
@@ -785,49 +1092,25 @@ async fn try_llm_provider_api(
     dynamic_system_suffix: Option<&str>,
     request_type: crate::cost_telemetry::RequestType,
     provider_id: &str,
+    rotator: Option<&duduclaw_agent::account_rotator::AccountRotator>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
-    let provider = build_llm_provider(provider_id)?;
-    let supports_caching = crate::cost_telemetry::model_registry()
-        .supports(model, duduclaw_llm::Feature::Caching);
-    let req =
-        build_llm_chat_request(model, supports_caching, system_prompt, dynamic_system_suffix, prompt);
-
-    info!(provider = provider_id, model, "Trying Direct API via duduclaw-llm provider");
-    let resp = provider
-        .complete(&req)
-        .await
-        .map_err(|e| format!("{provider_id} direct API error: {e}"))?;
-
-    // Reasoning fold: TokenUsage has no reasoning field, and NormalizedUsage
-    // guarantees `output_tokens + reasoning_tokens` == total billable output
-    // (providers that report reasoning inside output set reasoning to 0), so
-    // folding here bills reasoning exactly once at the output rate.
-    let usage = crate::cost_telemetry::TokenUsage {
-        input_tokens: resp.usage.input_tokens,
-        cache_read_tokens: resp.usage.cache_read_tokens,
-        cache_creation_tokens: resp.usage.cache_write_tokens,
-        output_tokens: resp.usage.output_tokens + resp.usage.reasoning_tokens,
-    };
-    // OTel: record usage on the `chat` span.
-    {
-        let span = tracing::Span::current();
-        span.record(crate::otel::attrs::USAGE_INPUT_TOKENS, usage.input_tokens);
-        span.record(crate::otel::attrs::USAGE_OUTPUT_TOKENS, usage.output_tokens);
-    }
-    if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
-        telemetry.record(agent_id, request_type, model, &usage).await;
-    }
-
-    Ok(resp.text())
+    run_llm_provider(
+        agent_id, prompt, model, system_prompt, dynamic_system_suffix, request_type,
+        provider_id, rotator, capabilities,
+    )
+    .await
+    .map_err(|ce| ce.message)
 }
 
 /// Try calling the model's provider API directly (bypassing Claude CLI).
 ///
 /// Anthropic (and registry-unknown) models keep the original
 /// `crate::direct_api` path with its cache attribution; registry-known
-/// non-Anthropic models route through the matching duduclaw-llm provider.
-/// Only works with API key accounts (not OAuth). If no API key is available,
-/// returns an error so the caller can fall back to CLI.
+/// non-Anthropic models route through the matching duduclaw-llm provider
+/// (with rotation + MCP tools). Only works with API-key accounts (not OAuth for
+/// Anthropic). If no API key is available, returns an error so the caller can
+/// fall back to CLI.
 // OTel GenAI: `chat` span for one Anthropic Direct-API model call. The
 // LlmProvider route below nests its own `chat` span with the real provider.
 #[tracing::instrument(
@@ -851,11 +1134,13 @@ async fn try_direct_api(
     system_prompt: &str,
     dynamic_system_suffix: Option<&str>,
     request_type: crate::cost_telemetry::RequestType,
+    rotator: Option<&duduclaw_agent::account_rotator::AccountRotator>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
     if let DirectApiRoute::LlmProvider(provider_id) = direct_api_route(model) {
         return try_llm_provider_api(
             agent_id, prompt, model, system_prompt, dynamic_system_suffix,
-            request_type, &provider_id,
+            request_type, &provider_id, rotator, capabilities,
         )
         .await;
     }
@@ -884,6 +1169,208 @@ async fn try_direct_api(
     }
 
     Ok(response.text)
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Cross-provider Direct-API fallback chain (W3/G1)
+//
+// When an agent configures `[model] fallbacks = [...]`, a rate-limited/failed
+// provider on the Direct-API path fails over to the next candidate instead of
+// giving up. Absent/empty config ⇒ the single-shot `try_direct_api` path stays
+// byte-identical. Anthropic candidates keep the legacy `direct_api.rs` handler
+// (cache attribution); non-Anthropic candidates route through the duduclaw-llm
+// providers (rotation + MCP tools) via `run_llm_provider`.
+// ══════════════════════════════════════════════════════════════════════
+
+/// A dispatch failure classified for the fallback chain: `failover` means
+/// advance to the next candidate; otherwise the error is terminal (auth /
+/// invalid request) and short-circuits the whole chain.
+struct ChainError {
+    message: String,
+    failover: bool,
+}
+
+/// Classify a stringly Direct-API error (from the Anthropic legacy path) as
+/// failover-class (rate limit / billing / 5xx / timeout / overloaded) vs.
+/// terminal (auth / invalid). Terminal short-circuits the chain.
+fn is_chain_failover(err: &str) -> bool {
+    is_rate_limit_error(err) || is_billing_error(err) || is_llm_fallback_error(err)
+}
+
+/// Classify a typed [`duduclaw_llm::LlmError`] for the chain: rate-limit,
+/// billing, timeout, network, and 5xx are failover-class; auth, invalid
+/// request, content-filter, parse, and context-window are terminal.
+fn llm_err_is_chain_failover(e: &duduclaw_llm::LlmError) -> bool {
+    use duduclaw_llm::LlmError as E;
+    match e {
+        E::RateLimited { .. } | E::Timeout | E::Network(_) | E::Billing => true,
+        E::Http { status, .. } => *status >= 500,
+        _ => false,
+    }
+}
+
+/// Resolve `(provider_id, bare_model)` for a (possibly qualified, possibly
+/// `compat:`-prefixed) candidate model id. Registry-known models resolve to
+/// their true provider; otherwise a `provider/model` prefix is honoured; a bare
+/// id with no `compat:` hint defaults to `anthropic` (the pre-multi-provider
+/// assumption).
+fn provider_and_bare(model: &str) -> (String, String) {
+    let (is_compat_hint, rest) = match model.trim().strip_prefix("compat:") {
+        Some(r) => (true, r.trim()),
+        None => (false, model.trim()),
+    };
+    if let Some(info) = crate::cost_telemetry::model_registry().get(rest) {
+        let (_p, bare) = duduclaw_llm::split_model_id(rest);
+        return (info.provider.clone(), bare.to_string());
+    }
+    let (prov, bare) = duduclaw_llm::split_model_id(rest);
+    match prov {
+        Some(p) => (p.to_string(), bare.to_string()),
+        None if is_compat_hint => ("openai_compat".to_string(), bare.to_string()),
+        None => ("anthropic".to_string(), bare.to_string()),
+    }
+}
+
+/// Ordered viable Direct-API candidates (pure): the preferred model first, then
+/// the configured fallbacks (dedup, blanks dropped), skipping any candidate
+/// whose provider has no resolvable key. The key check is injected so this is
+/// unit-testable offline.
+fn order_direct_api_candidates(
+    preferred: &str,
+    fallbacks: &[String],
+    provider_has_key: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in std::iter::once(preferred).chain(fallbacks.iter().map(String::as_str)) {
+        let m = raw.trim();
+        if m.is_empty() || !seen.insert(m.to_string()) {
+            continue;
+        }
+        let (provider, _bare) = provider_and_bare(m);
+        if provider_has_key(&provider) {
+            out.push(m.to_string());
+        }
+    }
+    out
+}
+
+/// Drive the fallback chain: try each candidate via `dispatch`, advancing on a
+/// failover-class error and short-circuiting on a terminal one. Returns the
+/// first success, the terminal error, or (after exhausting the chain) the last
+/// failover error. Generic over the dispatch closure so it is unit-testable
+/// offline (no HTTP / process).
+async fn drive_direct_api_chain<F, Fut>(
+    candidates: &[String],
+    dispatch: F,
+) -> Result<String, String>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, ChainError>>,
+{
+    let mut last = String::new();
+    for model in candidates {
+        match dispatch(model.clone()).await {
+            Ok(text) => return Ok(text),
+            Err(ce) if ce.failover => {
+                warn!(model = %model, error = %ce.message, "Direct-API candidate failed over — advancing");
+                last = ce.message;
+            }
+            Err(ce) => return Err(ce.message),
+        }
+    }
+    if last.is_empty() {
+        last = "no viable Direct-API candidates".to_string();
+    }
+    Err(format!(
+        "all Direct-API fallback candidates exhausted; last error: {last}"
+    ))
+}
+
+/// Whether a provider has a resolvable Direct-API key right now. Anthropic uses
+/// the legacy key source (`get_api_key`: env or config); other providers use
+/// the rotator (which itself env-fallbacks).
+async fn candidate_provider_has_key(
+    provider: &str,
+    home_dir: &Path,
+    rotator: Option<&duduclaw_agent::account_rotator::AccountRotator>,
+) -> bool {
+    if provider == "anthropic" {
+        return !get_api_key(home_dir).await.is_empty();
+    }
+    resolve_provider_key(provider, rotator).await.is_ok()
+}
+
+/// Cross-provider Direct-API fallback chain (G1). Orders `preferred` + the
+/// configured `fallbacks`, then tries each — Anthropic via the legacy handler,
+/// others via `run_llm_provider` — advancing on failover and short-circuiting
+/// on terminal errors.
+#[allow(clippy::too_many_arguments)]
+async fn try_direct_api_chain(
+    home_dir: &Path,
+    agent_id: &str,
+    prompt: &str,
+    preferred_model: &str,
+    fallbacks: &[String],
+    system_prompt: &str,
+    dynamic_system_suffix: Option<&str>,
+    request_type: crate::cost_telemetry::RequestType,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+) -> Result<String, String> {
+    // Rotator is best-effort: if it can't be built we still resolve keys via env.
+    let rotator = get_rotator(home_dir).await.ok();
+
+    // Which providers among the candidates have a resolvable key? Computed async
+    // once, then candidate ordering is a pure sync filter.
+    let mut providers_with_keys = std::collections::HashSet::new();
+    for raw in std::iter::once(preferred_model).chain(fallbacks.iter().map(String::as_str)) {
+        let (provider, _bare) = provider_and_bare(raw.trim());
+        if providers_with_keys.contains(&provider) {
+            continue;
+        }
+        if candidate_provider_has_key(&provider, home_dir, rotator.as_deref()).await {
+            providers_with_keys.insert(provider);
+        }
+    }
+
+    let candidates = order_direct_api_candidates(preferred_model, fallbacks, |p| {
+        providers_with_keys.contains(p)
+    });
+    if candidates.is_empty() {
+        // Fail-safe: nothing resolvable — fall back to the single-shot legacy
+        // attempt on the preferred model so its own "no key" error surfaces.
+        return try_direct_api(
+            home_dir, agent_id, prompt, preferred_model, system_prompt,
+            dynamic_system_suffix, request_type, rotator.as_deref(), capabilities,
+        )
+        .await;
+    }
+
+    let rotator_ref = rotator.as_deref();
+    drive_direct_api_chain(&candidates, |model| async move {
+        let (provider, bare) = provider_and_bare(&model);
+        if provider == "anthropic" {
+            match try_direct_api(
+                home_dir, agent_id, prompt, &bare, system_prompt,
+                dynamic_system_suffix, request_type, rotator_ref, capabilities,
+            )
+            .await
+            {
+                Ok(t) => Ok(t),
+                Err(e) => {
+                    let failover = is_chain_failover(&e);
+                    Err(ChainError { message: e, failover })
+                }
+            }
+        } else {
+            run_llm_provider(
+                agent_id, prompt, &bare, system_prompt, dynamic_system_suffix,
+                request_type, &provider, rotator_ref, capabilities,
+            )
+            .await
+        }
+    })
+    .await
 }
 
 /// Cached inference_mode — avoids reading config.toml on every call (P1-3).
@@ -1825,5 +2312,255 @@ mod direct_api_routing_tests {
         let req = build_llm_chat_request("deepseek-v3.2", true, "", Some("   "), "hi");
         assert!(req.system.is_empty());
         assert_eq!(req.messages.len(), 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — cross-provider Direct-API fallback chain + tool/rotation wiring
+// (W3/G1/G2/G3). All offline: pure fns + a mock dispatch closure, no HTTP/proc.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn td(name: &str) -> duduclaw_llm::ToolDef {
+        duduclaw_llm::ToolDef {
+            name: name.into(),
+            description: String::new(),
+            input_schema: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    // ── G1: provider resolution + candidate ordering ────────────────────
+
+    #[test]
+    fn provider_and_bare_resolution() {
+        assert_eq!(
+            provider_and_bare("claude-haiku-4-5"),
+            ("anthropic".to_string(), "claude-haiku-4-5".to_string())
+        );
+        assert_eq!(
+            provider_and_bare("gpt-5.4"),
+            ("openai".to_string(), "gpt-5.4".to_string())
+        );
+        assert_eq!(
+            provider_and_bare("openai/gpt-5.4"),
+            ("openai".to_string(), "gpt-5.4".to_string())
+        );
+        // `compat:` hint + registry-known model resolves to its true provider.
+        assert_eq!(
+            provider_and_bare("compat:deepseek/deepseek-v3.2"),
+            ("deepseek".to_string(), "deepseek-v3.2".to_string())
+        );
+        // Unknown bare id, no hint → anthropic default (pre-multi-provider).
+        assert_eq!(
+            provider_and_bare("some-unknown-model"),
+            ("anthropic".to_string(), "some-unknown-model".to_string())
+        );
+        // Unknown qualified compat provider is honoured by prefix.
+        assert_eq!(
+            provider_and_bare("compat:myproxy/foo"),
+            ("myproxy".to_string(), "foo".to_string())
+        );
+        // `compat:` bare (no slash) → openai_compat family.
+        assert_eq!(
+            provider_and_bare("compat:foo"),
+            ("openai_compat".to_string(), "foo".to_string())
+        );
+    }
+
+    #[test]
+    fn order_candidates_preferred_first_dedup_skip_keyless() {
+        let fallbacks = vec![
+            "openai/gpt-5.4".to_string(),
+            "claude-sonnet-5".to_string(),
+            "gemini/gemini-3.1-pro".to_string(), // no key → skipped
+            "openai/gpt-5.4".to_string(),        // exact dup → dropped
+            "  ".to_string(),                    // blank → dropped
+        ];
+        let has_key = |p: &str| matches!(p, "anthropic" | "openai");
+        let out = order_direct_api_candidates("claude-haiku-4-5", &fallbacks, has_key);
+        assert_eq!(
+            out,
+            vec![
+                "claude-haiku-4-5".to_string(),
+                "openai/gpt-5.4".to_string(),
+                "claude-sonnet-5".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn order_candidates_all_keyless_is_empty() {
+        let out =
+            order_direct_api_candidates("gpt-5.4", &["gemini/gemini-3.1-pro".to_string()], |_| false);
+        assert!(out.is_empty());
+    }
+
+    // ── G1: failover classification ─────────────────────────────────────
+
+    #[test]
+    fn chain_failover_classification_strings() {
+        assert!(is_chain_failover("HTTP 429 rate limit"));
+        assert!(is_chain_failover("insufficient credit balance"));
+        assert!(is_chain_failover("service unavailable http 503"));
+        assert!(is_chain_failover("model overloaded"));
+        // Terminal — auth / invalid never fail over.
+        assert!(!is_chain_failover("authentication failed: invalid api key"));
+        assert!(!is_chain_failover("invalid request: bad schema"));
+    }
+
+    #[test]
+    fn chain_failover_classification_typed() {
+        use duduclaw_llm::LlmError as E;
+        assert!(llm_err_is_chain_failover(&E::RateLimited { retry_after: None }));
+        assert!(llm_err_is_chain_failover(&E::Billing));
+        assert!(llm_err_is_chain_failover(&E::Timeout));
+        assert!(llm_err_is_chain_failover(&E::Network("reset".into())));
+        assert!(llm_err_is_chain_failover(&E::Http { status: 503, body_snippet: "x".into() }));
+        // Terminal.
+        assert!(!llm_err_is_chain_failover(&E::Auth));
+        assert!(!llm_err_is_chain_failover(&E::InvalidRequest("bad".into())));
+        assert!(!llm_err_is_chain_failover(&E::ContentFilter));
+        assert!(!llm_err_is_chain_failover(&E::ContextWindowExceeded));
+        assert!(!llm_err_is_chain_failover(&E::Http { status: 400, body_snippet: "x".into() }));
+    }
+
+    // ── G1: chain driver (failover advances / terminal short-circuits) ──
+
+    #[tokio::test]
+    async fn chain_failover_advances_then_succeeds() {
+        let candidates = vec!["a".to_string(), "b".to_string()];
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let result = drive_direct_api_chain(&candidates, move |m| {
+            let calls = seen.clone();
+            async move {
+                calls.lock().unwrap().push(m.clone());
+                if m == "a" {
+                    Err(ChainError { message: "rate limit".into(), failover: true })
+                } else {
+                    Ok("answer from b".to_string())
+                }
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), "answer from b");
+        assert_eq!(*calls.lock().unwrap(), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn chain_terminal_short_circuits() {
+        let candidates = vec!["a".to_string(), "b".to_string()];
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let result = drive_direct_api_chain(&candidates, move |m| {
+            let calls = seen.clone();
+            async move {
+                calls.lock().unwrap().push(m.clone());
+                Err(ChainError { message: format!("auth error on {m}"), failover: false })
+            }
+        })
+        .await;
+        assert!(result.unwrap_err().contains("auth error on a"));
+        // The second candidate must never be tried.
+        assert_eq!(*calls.lock().unwrap(), vec!["a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn chain_exhaustion_returns_last_failover() {
+        let candidates = vec!["a".to_string(), "b".to_string()];
+        let result = drive_direct_api_chain(&candidates, |m| async move {
+            Err::<String, _>(ChainError { message: format!("timeout {m}"), failover: true })
+        })
+        .await;
+        let err = result.unwrap_err();
+        assert!(err.contains("exhausted"), "got: {err}");
+        assert!(err.contains("timeout b"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn chain_first_candidate_success_short_circuits() {
+        let candidates = vec!["a".to_string(), "b".to_string()];
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = calls.clone();
+        let result = drive_direct_api_chain(&candidates, move |_m| {
+            let calls = seen.clone();
+            async move {
+                *calls.lock().unwrap() += 1;
+                Ok("ok".to_string())
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), "ok");
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    // ── G2: capability filtering + MCP env ──────────────────────────────
+
+    #[test]
+    fn tool_defs_filtered_by_capabilities() {
+        use duduclaw_core::types::CapabilitiesConfig;
+        let defs = vec![td("memory_search"), td("tasks_list"), td("computer")];
+
+        // No capabilities → all offered.
+        assert_eq!(filter_tool_defs(defs.clone(), None).len(), 3);
+
+        // Deny-by-default: computer_use=false bare-denies "computer".
+        let caps = CapabilitiesConfig::default();
+        let out = filter_tool_defs(defs.clone(), Some(&caps));
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|d| d.name != "computer"));
+
+        // Explicit denylist excludes a named MCP tool.
+        let caps2 = CapabilitiesConfig {
+            denied_tools: vec!["tasks_list".into()],
+            ..Default::default()
+        };
+        let out = filter_tool_defs(defs.clone(), Some(&caps2));
+        assert!(out.iter().all(|d| d.name != "tasks_list" && d.name != "computer"));
+
+        // Allowlist mode: only listed tools survive (fail-closed).
+        let caps3 = CapabilitiesConfig {
+            allowed_tools: vec!["memory_search".into()],
+            ..Default::default()
+        };
+        let out = filter_tool_defs(defs, Some(&caps3));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "memory_search");
+    }
+
+    #[test]
+    fn mcp_envs_carry_agent_id() {
+        let envs = mcp_client_envs("agnes");
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == duduclaw_core::ENV_AGENT_ID && v == "agnes"));
+    }
+
+    // ── G3: rotation-vs-env key selection ───────────────────────────────
+
+    #[test]
+    fn key_source_prefers_rotator_then_env() {
+        // Rotator account with a real key → Rotator.
+        assert_eq!(
+            choose_key_source(Some(("acct-1".into(), Some("sk-1".into()))), Some("env-key".into())),
+            Some(KeySource::Rotator { account_id: "acct-1".into(), key: "sk-1".into() })
+        );
+        // Rotator OAuth account (no raw key) → env fallback.
+        assert_eq!(
+            choose_key_source(Some(("oauth-1".into(), None)), Some("env-key".into())),
+            Some(KeySource::Env { key: "env-key".into() })
+        );
+        // No rotator pick + env present → Env.
+        assert_eq!(
+            choose_key_source(None, Some("env-key".into())),
+            Some(KeySource::Env { key: "env-key".into() })
+        );
+        // Nothing usable → None.
+        assert_eq!(choose_key_source(None, None), None);
+        assert_eq!(choose_key_source(Some(("oauth".into(), None)), None), None);
     }
 }

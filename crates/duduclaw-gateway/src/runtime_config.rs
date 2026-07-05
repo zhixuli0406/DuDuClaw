@@ -164,6 +164,32 @@ pub fn agent_runtime_provider(agent_dir: &Path) -> RuntimeType {
     load_runtime_settings(agent_dir).provider
 }
 
+/// Cross-provider direct-API fallback chain from `agent.toml [model] fallbacks`
+/// (W3/G1). A list of qualified model ids (`"openai/gpt-5.4"`,
+/// `"compat:deepseek/deepseek-v3.2"`, ...) tried in order after the preferred
+/// model on the Direct-API path.
+///
+/// Blanks are dropped and each entry is trimmed. A missing/malformed file, a
+/// missing `[model]` table, a missing key, or a non-array value all resolve to
+/// an empty vec — which the Direct-API path treats as "no chain" and keeps its
+/// existing single-shot behavior byte-identically (fail-safe).
+pub fn agent_model_fallbacks(agent_dir: &Path) -> Vec<String> {
+    read_agent_toml(agent_dir)
+        .and_then(|v| {
+            v.get("model")
+                .and_then(|m| m.get("fallbacks"))
+                .and_then(|f| f.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+        })
+        .unwrap_or_default()
+}
+
 /// Resolve the agent's runtime fallback provider (`[runtime] fallback`).
 /// `None` when unset. Single-field convenience over [`load_runtime_settings`].
 pub fn agent_runtime_fallback(agent_dir: &Path) -> Option<RuntimeType> {
@@ -358,6 +384,44 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_agent_toml(dir.path(), "[runtime]\nprovider = \"nonsense\"\n");
         assert_eq!(agent_runtime_provider(dir.path()), RuntimeType::Claude);
+    }
+
+    // ── W3/G1: [model] fallbacks chain ──────────────────────────────────
+
+    #[test]
+    fn model_fallbacks_empty_when_absent() {
+        let dir = TempDir::new().unwrap();
+        assert!(agent_model_fallbacks(dir.path()).is_empty());
+        // Present [model] table but no `fallbacks` key → still empty.
+        write_agent_toml(dir.path(), "[model]\nutility = \"claude-haiku-4-5\"\n");
+        assert!(agent_model_fallbacks(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn model_fallbacks_parsed_trimmed_and_blanks_dropped() {
+        let dir = TempDir::new().unwrap();
+        write_agent_toml(
+            dir.path(),
+            "[model]\nfallbacks = [\"openai/gpt-5.4\", \" compat:deepseek/deepseek-v3.2 \", \"\"]\n",
+        );
+        assert_eq!(
+            agent_model_fallbacks(dir.path()),
+            vec![
+                "openai/gpt-5.4".to_string(),
+                "compat:deepseek/deepseek-v3.2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn model_fallbacks_empty_on_malformed_or_wrong_type() {
+        let dir = TempDir::new().unwrap();
+        // Wrong type (string, not array) → empty.
+        write_agent_toml(dir.path(), "[model]\nfallbacks = \"openai/gpt-5.4\"\n");
+        assert!(agent_model_fallbacks(dir.path()).is_empty());
+        // Malformed toml → empty.
+        write_agent_toml(dir.path(), "not valid toml ===");
+        assert!(agent_model_fallbacks(dir.path()).is_empty());
     }
 
     // ── RFC-24: decision_continuity opt-in ──────────────────────────────
