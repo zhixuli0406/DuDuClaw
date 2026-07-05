@@ -187,7 +187,19 @@ impl EvalCaseFile {
 /// arbitrary files as its "transcript").
 fn validate_relative_path(p: &str) -> Result<(), String> {
     let path = Path::new(p);
-    if path.is_absolute() {
+    // `Path::is_absolute` is host-specific ("/etc/passwd" is NOT absolute on
+    // Windows). Case files are portable artifacts, so reject every platform's
+    // absolute form regardless of the host we happen to validate on.
+    if path.is_absolute()
+        || p.starts_with('/')
+        || p.starts_with('\\')
+        || Path::new(p).components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::Prefix(_) | std::path::Component::RootDir
+            )
+        })
+    {
         return Err("absolute paths are not allowed".into());
     }
     let escapes = path
