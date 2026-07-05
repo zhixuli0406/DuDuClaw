@@ -7,9 +7,11 @@
 //! `functionCall` part is surfaced as a `Reasoning { text: "" }` part
 //! immediately before the `ToolCall`) and re-attached on request build.
 //!
-//! Streaming: **buffered in v1** — `complete()` then a single `Done` event
-//! (Gemini's `streamGenerateContent` uses chunked JSON arrays, not
-//! line-based SSE; real streaming is a later wave).
+//! Streaming: **real SSE** via `streamGenerateContent?alt=sse` — each SSE data
+//! line is a partial `GenerateContentResponse`; text parts stream as deltas,
+//! `functionCall` parts arrive whole (Gemini never fragments tool args) with
+//! their `thoughtSignature` captured into a `Reasoning` carrier, and
+//! `usageMetadata` / `finishReason` land on the final chunk.
 
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
@@ -17,7 +19,8 @@ use serde_json::{json, Value};
 
 use crate::error::{classify_http, classify_transport, snippet, LlmError};
 use crate::http::{http_client, retry_after_of};
-use crate::provider::{buffered_stream, split_model_id, ApiAuth, ChatProvider};
+use crate::provider::{split_model_id, ApiAuth, ChatProvider};
+use crate::sse::{drive_sse, sse_data, SseParser};
 use crate::types::{
     ChatRequest, ChatResponse, ContentPart, NormalizedUsage, ReasoningHint, Role, StopReason,
     StreamEvent, ToolChoice,
@@ -37,6 +40,12 @@ impl GeminiProvider {
     fn generate_url(&self, model: &str) -> String {
         let base = self.auth.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
         format!("{}/models/{model}:generateContent", base.trim_end_matches('/'))
+    }
+
+    fn stream_url(&self, model: &str) -> String {
+        let base = self.auth.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
+        // `?alt=sse` switches the chunked-JSON stream to line-based SSE.
+        format!("{}/models/{model}:streamGenerateContent?alt=sse", base.trim_end_matches('/'))
     }
 }
 
@@ -206,18 +215,8 @@ pub(crate) fn parse_response(body: &Value) -> Result<ChatResponse, LlmError> {
     }
 
     let stop = match candidate.get("finishReason").and_then(Value::as_str) {
-        None | Some("STOP") => {
-            if has_tool_call {
-                StopReason::ToolUse
-            } else {
-                StopReason::EndTurn
-            }
-        }
-        Some("MAX_TOKENS") => StopReason::MaxTokens,
-        Some("SAFETY") | Some("PROHIBITED_CONTENT") | Some("BLOCKLIST") | Some("SPII") => {
-            StopReason::ContentFilter
-        }
-        Some(other) => StopReason::Other(other.to_string()),
+        None => natural_stop(has_tool_call),
+        Some(raw) => map_finish_reason(raw).unwrap_or_else(|| natural_stop(has_tool_call)),
     };
 
     let usage = body.get("usageMetadata").map(parse_usage).unwrap_or_default();
@@ -245,6 +244,171 @@ fn parse_usage(u: &Value) -> NormalizedUsage {
         // Gemini reports thinking tokens OUTSIDE candidatesTokenCount →
         // billed as output on top (see NormalizedUsage docs).
         reasoning_tokens: g("thoughtsTokenCount"),
+    }
+}
+
+/// Map a Gemini `finishReason` to a normalized [`StopReason`]. `STOP` (the
+/// natural stop) returns `None` because whether it resolves to `EndTurn` or
+/// `ToolUse` depends on the presence of a tool call in the response.
+fn map_finish_reason(raw: &str) -> Option<StopReason> {
+    match raw {
+        "STOP" => None,
+        "MAX_TOKENS" => Some(StopReason::MaxTokens),
+        "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "SPII" => Some(StopReason::ContentFilter),
+        other => Some(StopReason::Other(other.to_string())),
+    }
+}
+
+/// The stop reason for a natural completion — `ToolUse` when a tool call is
+/// present, otherwise `EndTurn`.
+fn natural_stop(has_tool_call: bool) -> StopReason {
+    if has_tool_call {
+        StopReason::ToolUse
+    } else {
+        StopReason::EndTurn
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSE streaming parser (streamGenerateContent?alt=sse chunks → StreamEvent)
+// ---------------------------------------------------------------------------
+
+/// Streaming state machine for `streamGenerateContent?alt=sse`. Each SSE data
+/// line is a partial `GenerateContentResponse`; text parts stream as deltas
+/// (merged into a single `Text`/`Reasoning` part), `functionCall` parts arrive
+/// whole with their `thoughtSignature` preserved as a `Reasoning` carrier, and
+/// `usageMetadata` / `finishReason` land on the final chunk. Gemini emits no
+/// `[DONE]` sentinel, so termination is driven by `finishReason` or EOF.
+#[derive(Default)]
+pub(crate) struct GeminiSse {
+    parts: Vec<ContentPart>,
+    tool_count: usize,
+    usage: NormalizedUsage,
+    /// Set from a non-`STOP` finishReason; `None` defers to `natural_stop`.
+    stop: Option<StopReason>,
+    model: String,
+    finished: bool,
+    error: Option<LlmError>,
+}
+
+impl GeminiSse {
+    fn handle_chunk(&mut self, chunk: &Value, out: &mut Vec<StreamEvent>) {
+        if let Some(m) = chunk.get("modelVersion").and_then(Value::as_str) {
+            if self.model.is_empty() {
+                self.model = m.to_string();
+            }
+        }
+        if let Some(u) = chunk.get("usageMetadata") {
+            self.usage = parse_usage(u);
+        }
+        // Prompt-level block with no candidates → content-filter error.
+        if let Some(reason) = chunk.pointer("/promptFeedback/blockReason").and_then(Value::as_str) {
+            let no_candidates =
+                chunk.get("candidates").and_then(Value::as_array).map_or(true, |c| c.is_empty());
+            if no_candidates {
+                tracing::debug!(block_reason = reason, "gemini stream prompt blocked");
+                self.error = Some(LlmError::ContentFilter);
+                self.finished = true;
+                return;
+            }
+        }
+        let Some(candidate) = chunk.pointer("/candidates/0") else { return };
+        for part in candidate
+            .pointer("/content/parts")
+            .and_then(Value::as_array)
+            .unwrap_or(&Vec::new())
+        {
+            let signature = part.get("thoughtSignature").and_then(Value::as_str).map(String::from);
+            if let Some(fc) = part.get("functionCall") {
+                let name = fc.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+                let args = fc.get("args").cloned().unwrap_or(json!({}));
+                // Preserve a functionCall-attached signature as an empty
+                // Reasoning carrier before the ToolCall (see module docs).
+                if let Some(sig) = signature {
+                    self.parts
+                        .push(ContentPart::Reasoning { text: String::new(), signature: Some(sig) });
+                }
+                let index = self.tool_count;
+                self.tool_count += 1;
+                out.push(StreamEvent::ToolCallStart {
+                    index,
+                    id: name.clone(),
+                    name: name.clone(),
+                });
+                // Gemini sends whole args → emit as a single fragment.
+                out.push(StreamEvent::ToolCallDelta { index, args_fragment: args.to_string() });
+                self.parts.push(ContentPart::ToolCall { id: name.clone(), name, args });
+            } else if let Some(text) = part.get("text").and_then(Value::as_str) {
+                if part.get("thought").and_then(Value::as_bool).unwrap_or(false) {
+                    out.push(StreamEvent::ReasoningDelta(text.to_string()));
+                    self.push_reasoning(text, signature);
+                } else {
+                    out.push(StreamEvent::TextDelta(text.to_string()));
+                    self.push_text(text);
+                }
+            }
+        }
+        if let Some(fr) = candidate.get("finishReason").and_then(Value::as_str) {
+            self.stop = map_finish_reason(fr);
+            self.finished = true;
+        }
+    }
+
+    /// Append a text delta, merging into the trailing `Text` part if present.
+    fn push_text(&mut self, t: &str) {
+        if let Some(ContentPart::Text(buf)) = self.parts.last_mut() {
+            buf.push_str(t);
+        } else {
+            self.parts.push(ContentPart::Text(t.to_string()));
+        }
+    }
+
+    /// Append a thought-text delta, merging into the trailing `Reasoning` part.
+    fn push_reasoning(&mut self, t: &str, signature: Option<String>) {
+        if let Some(ContentPart::Reasoning { text, signature: sig }) = self.parts.last_mut() {
+            text.push_str(t);
+            if signature.is_some() {
+                *sig = signature;
+            }
+        } else {
+            self.parts.push(ContentPart::Reasoning { text: t.to_string(), signature });
+        }
+    }
+}
+
+impl SseParser for GeminiSse {
+    fn on_line(&mut self, line: &str, out: &mut Vec<StreamEvent>) {
+        let Some(data) = sse_data(line) else { return };
+        if data.is_empty() {
+            return;
+        }
+        // Gemini does not emit `[DONE]`, but tolerate it defensively.
+        if data == "[DONE]" {
+            self.finished = true;
+            return;
+        }
+        if let Ok(chunk) = serde_json::from_str::<Value>(data) {
+            self.handle_chunk(&chunk, out);
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.finished
+    }
+
+    fn finalize(&mut self) -> Result<StreamEvent, LlmError> {
+        if let Some(e) = self.error.take() {
+            return Err(e);
+        }
+        let has_tool = self.parts.iter().any(|p| matches!(p, ContentPart::ToolCall { .. }));
+        let stop = self.stop.take().unwrap_or_else(|| natural_stop(has_tool));
+        Ok(StreamEvent::Done(ChatResponse {
+            parts: std::mem::take(&mut self.parts),
+            stop,
+            usage: self.usage,
+            model_used: std::mem::take(&mut self.model),
+            provider: "gemini".to_string(),
+        }))
     }
 }
 
@@ -282,13 +446,29 @@ impl ChatProvider for GeminiProvider {
         parse_response(&parsed)
     }
 
-    /// v1: buffered — complete() then a single `Done` event.
+    /// Real SSE — `streamGenerateContent?alt=sse` partial responses.
     async fn stream(
         &self,
         req: &ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
-        let resp = self.complete(req).await?;
-        Ok(buffered_stream(resp))
+        let (_, bare_model) = split_model_id(&req.model);
+        let body = build_request_body(req);
+        let response = http_client()
+            .post(self.stream_url(bare_model))
+            .header("x-goog-api-key", &self.auth.api_key)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| classify_transport(&e))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = retry_after_of(response.headers());
+            let text = response.text().await.unwrap_or_default();
+            return Err(classify_http(status.as_u16(), &text, retry_after));
+        }
+        Ok(drive_sse(response, GeminiSse::default()))
     }
 }
 
@@ -479,5 +659,88 @@ mod tests {
     #[test]
     fn parse_missing_candidates_is_parse_error() {
         assert!(matches!(parse_response(&json!({})), Err(LlmError::Parse(_))));
+    }
+
+    // ── SSE streaming (streamGenerateContent?alt=sse chunks) ──
+
+    #[test]
+    fn sse_text_deltas_and_final_usage() {
+        let mut p = GeminiSse::default();
+        let mut out = Vec::new();
+        for line in [
+            r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hel"}]}}],"modelVersion":"gemini-3.1-pro"}"#,
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"lo"}]}}]}"#,
+            r#"data: {"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1000,"cachedContentTokenCount":600,"candidatesTokenCount":40,"thoughtsTokenCount":25}}"#,
+        ] {
+            p.on_line(line, &mut out);
+        }
+        assert!(p.finished());
+        assert_eq!(out[0], StreamEvent::TextDelta("Hel".into()));
+        assert_eq!(out[1], StreamEvent::TextDelta("lo".into()));
+        let StreamEvent::Done(resp) = p.finalize().unwrap() else { panic!() };
+        // Consecutive text deltas merge into one Text part.
+        assert_eq!(resp.text(), "Hello");
+        assert_eq!(resp.stop, StopReason::EndTurn);
+        assert_eq!(resp.usage.input_tokens, 400);
+        assert_eq!(resp.usage.cache_read_tokens, 600);
+        assert_eq!(resp.usage.output_tokens, 40);
+        assert_eq!(resp.usage.reasoning_tokens, 25);
+        assert_eq!(resp.model_used, "gemini-3.1-pro");
+    }
+
+    #[test]
+    fn sse_function_call_captures_thought_signature() {
+        let mut p = GeminiSse::default();
+        let mut out = Vec::new();
+        p.on_line(
+            r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"search","args":{"q":"x"}},"thoughtSignature":"SIG=="}]},"finishReason":"STOP"}]}"#,
+            &mut out,
+        );
+        assert!(p.finished());
+        assert!(matches!(&out[0], StreamEvent::ToolCallStart { id, name, .. } if id == "search" && name == "search"));
+        assert!(matches!(&out[1], StreamEvent::ToolCallDelta { args_fragment, .. } if args_fragment.contains("\"q\"")));
+        let StreamEvent::Done(resp) = p.finalize().unwrap() else { panic!() };
+        assert_eq!(resp.stop, StopReason::ToolUse);
+        // Signature carrier precedes the ToolCall (round-trips via build_request_body).
+        assert!(matches!(&resp.parts[0],
+            ContentPart::Reasoning { text, signature } if text.is_empty() && signature.as_deref() == Some("SIG==")));
+        assert_eq!(resp.tool_calls()[0].1, "search");
+        assert_eq!(resp.tool_calls()[0].2, &json!({"q": "x"}));
+    }
+
+    #[test]
+    fn sse_thought_text_becomes_reasoning_delta() {
+        let mut p = GeminiSse::default();
+        let mut out = Vec::new();
+        p.on_line(
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"planning","thought":true},{"text":"answer"}]},"finishReason":"STOP"}]}"#,
+            &mut out,
+        );
+        assert_eq!(out[0], StreamEvent::ReasoningDelta("planning".into()));
+        assert_eq!(out[1], StreamEvent::TextDelta("answer".into()));
+        let StreamEvent::Done(resp) = p.finalize().unwrap() else { panic!() };
+        assert!(matches!(&resp.parts[0], ContentPart::Reasoning { text, .. } if text == "planning"));
+        assert_eq!(resp.text(), "answer");
+    }
+
+    #[test]
+    fn sse_max_tokens_and_prompt_block() {
+        // Non-STOP finishReason maps directly.
+        let mut p = GeminiSse::default();
+        let mut out = Vec::new();
+        p.on_line(
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"MAX_TOKENS"}]}"#,
+            &mut out,
+        );
+        let StreamEvent::Done(resp) = p.finalize().unwrap() else { panic!() };
+        assert_eq!(resp.stop, StopReason::MaxTokens);
+        assert_eq!(resp.text(), "partial");
+
+        // Prompt-level block with no candidates → content-filter error.
+        let mut p = GeminiSse::default();
+        let mut out = Vec::new();
+        p.on_line(r#"data: {"promptFeedback":{"blockReason":"SAFETY"}}"#, &mut out);
+        assert!(p.finished());
+        assert_eq!(p.finalize(), Err(LlmError::ContentFilter));
     }
 }
