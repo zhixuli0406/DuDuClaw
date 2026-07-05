@@ -26,11 +26,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 use tracing::{info, warn, debug};
 
-use crate::channel_reply::ReplyContext;
 
 /// Discord voice channel session state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

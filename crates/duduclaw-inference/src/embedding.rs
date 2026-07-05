@@ -314,7 +314,6 @@ mod onnx_impl {
             // ~5ms (BGE-small-zh), we accept the brief blocking. For models >100ms,
             // consider Arc<Self> + spawn_blocking.
             //
-            // Note: this is the same pattern used by sensevoice.rs in this crate.
             self.embed_sync(text)
         }
 

@@ -20,7 +20,7 @@ use sha2::Sha256;
 use tracing::{error, info, warn};
 
 use crate::channel_format;
-use crate::channel_reply::{ChannelStatusMap, ReplyContext, build_reply_with_progress, build_reply_with_session, set_channel_connected};
+use crate::channel_reply::{ChannelStatusMap, ReplyContext, build_reply_with_session, set_channel_connected};
 use crate::channel_settings::keys;
 
 const LINE_API: &str = "https://api.line.me/v2/bot";

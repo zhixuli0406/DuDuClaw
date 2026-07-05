@@ -41,7 +41,6 @@
 //! - **Meta-token LTSC**: a separate, opt-in `[compression]` config
 //!   knob since it costs decode time on the agent side. Deferred.
 
-use std::time::Duration;
 
 use tracing::{info, warn};
 
@@ -261,15 +260,6 @@ pub fn default_pipeline() -> &'static [(
         ("drop_oldest_tool_echoes", drop_oldest_tool_echoes),
         ("bisect_and_summarize", bisect_and_summarize),
     ]
-}
-
-/// Suspend the current task for a short duration — exposed for stage
-/// implementations that need to yield (e.g. summarizer waiting on
-/// async I/O). Currently unused; kept here so future stages don't
-/// have to thread a runtime handle.
-#[allow(dead_code)]
-async fn yield_briefly() {
-    tokio::time::sleep(Duration::from_millis(0)).await;
 }
 
 #[cfg(test)]

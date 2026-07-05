@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::oneshot;
 
 use duduclaw_core::error::{DuDuClawError, Result};
 
@@ -89,7 +88,6 @@ if not defined DUDUCLAW_PTC_SOCKET (
 pub struct PtcRpcServer {
     socket_path: PathBuf,
     call_count: Arc<AtomicU64>,
-    shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
 impl PtcRpcServer {
@@ -100,7 +98,6 @@ impl PtcRpcServer {
         Self {
             socket_path,
             call_count: Arc::new(AtomicU64::new(0)),
-            shutdown_tx: None,
         }
     }
 
@@ -114,19 +111,6 @@ impl PtcRpcServer {
         self.call_count.load(Ordering::Relaxed)
     }
 
-    /// Explicitly stop the RPC server and clean up the socket file.
-    ///
-    /// Note: The server also stops automatically via the oneshot shutdown channel
-    /// and the Drop trait, but this method provides explicit control.
-    pub fn stop(&mut self) {
-        // Send shutdown signal if the channel is still open
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-        // Remove the socket file to prevent new connections
-        let _ = std::fs::remove_file(&self.socket_path);
-        tracing::debug!(path = %self.socket_path.display(), "PTC RPC server stopped");
-    }
 }
 
 impl Drop for PtcRpcServer {
@@ -533,33 +517,6 @@ mod tests {
         let server = PtcRpcServer::new(path.clone());
         assert_eq!(server.socket_path(), path.as_path());
         assert_eq!(server.call_count(), 0);
-    }
-
-    #[test]
-    fn test_rpc_server_stop_cleans_socket() {
-        let tmp = std::env::temp_dir().join("ptc_test_stop.sock");
-        // Create a dummy file to simulate the socket
-        let _ = std::fs::write(&tmp, b"");
-        assert!(tmp.exists());
-
-        let mut server = PtcRpcServer::new(tmp.clone());
-        server.stop();
-
-        // Socket file should be removed
-        assert!(!tmp.exists());
-    }
-
-    #[test]
-    fn test_rpc_server_stop_sends_shutdown() {
-        let tmp = std::env::temp_dir().join("ptc_test_shutdown.sock");
-        let (tx, mut rx) = oneshot::channel();
-        let mut server = PtcRpcServer::new(tmp);
-        server.shutdown_tx = Some(tx);
-
-        server.stop();
-
-        // The receiver should have gotten the signal (channel closed with value)
-        assert!(rx.try_recv().is_ok());
     }
 
     #[test]

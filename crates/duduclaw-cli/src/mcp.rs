@@ -8,8 +8,6 @@ use std::path::Path;
 use duduclaw_core::error::{DuDuClawError, Result};
 use duduclaw_core::truncate_bytes;
 use duduclaw_memory::SqliteMemoryEngine;
-use duduclaw_core::traits::MemoryEngine;
-use duduclaw_core::types::MemoryEntry;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{info, warn};
@@ -539,22 +537,6 @@ const TOOLS: &[ToolDef] = &[
         name: "llamafile_list",
         description: "List available llamafile executables in ~/.duduclaw/llamafiles/",
         params: &[],
-    },
-    // ── Compression tools ──────────────────────────────────────────
-    ToolDef {
-        name: "compress_text",
-        description: "Compress text using the specified strategy. Strategies: 'meta_token' (lossless, best for JSON/code/templates), 'llmlingua' (lossy 2-5x, best for natural language), 'streaming_llm' (session window management), 'auto' (auto-select based on content type). Default: 'meta_token'.",
-        params: &[
-            ParamDef { name: "text", description: "Text to compress", required: true },
-            ParamDef { name: "strategy", description: "Compression strategy: meta_token | llmlingua | streaming_llm | auto (default: meta_token)", required: false },
-        ],
-    },
-    ToolDef {
-        name: "decompress_text",
-        description: "Decompress a Meta-Token compressed string back to the original text (lossless).",
-        params: &[
-            ParamDef { name: "text", description: "Compressed text to decompress", required: true },
-        ],
     },
     // ── Model registry tools ────────────────────────────────────────
     ToolDef {
@@ -1491,130 +1473,6 @@ fn extract_search_results(html: &str) -> String {
             .map(|(i, r)| format!("{}. {}", i + 1, r))
             .collect::<Vec<_>>()
             .join("\n\n")
-    }
-}
-
-async fn handle_memory_search(
-    params: &Value,
-    memory: &SqliteMemoryEngine,
-    agent_id: &str,
-) -> Value {
-    let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
-    if query.is_empty() {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": "Error: query is required"}],
-            "isError": true
-        });
-    }
-
-    match memory.search(agent_id, query, 10).await {
-        Ok(entries) => {
-            if entries.is_empty() {
-                serde_json::json!({
-                    "content": [{"type": "text", "text": "No memories found."}]
-                })
-            } else {
-                let text = entries
-                    .iter()
-                    .map(|e| format!("[{}] {}", e.timestamp.format("%Y-%m-%d %H:%M"), e.content))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                serde_json::json!({
-                    "content": [{"type": "text", "text": text}]
-                })
-            }
-        }
-        Err(e) => serde_json::json!({
-            "content": [{"type": "text", "text": format!("Error searching memory: {e}")}],
-            "isError": true
-        }),
-    }
-}
-
-async fn handle_memory_store(
-    params: &Value,
-    memory: &SqliteMemoryEngine,
-    agent_id: &str,
-) -> Value {
-    let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    if content.is_empty() {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": "Error: content is required"}],
-            "isError": true
-        });
-    }
-
-    let tags_str = params.get("tags").and_then(|v| v.as_str()).unwrap_or("");
-    let tags: Vec<String> = if tags_str.is_empty() {
-        Vec::new()
-    } else {
-        tags_str.split(',').map(|s| s.trim().to_string()).collect()
-    };
-
-    let classification = duduclaw_memory::classify(content, "user_input");
-    let entry_id = uuid::Uuid::new_v4().to_string();
-    let entry = MemoryEntry {
-        id: entry_id.clone(),
-        agent_id: agent_id.to_string(),
-        content: content.to_string(),
-        timestamp: chrono::Utc::now(),
-        tags,
-        embedding: None,
-        layer: classification.layer,
-        importance: classification.importance,
-        access_count: 0,
-        last_accessed: None,
-        source_event: "mcp_memory_store".to_string(),
-    };
-
-    match memory.store(agent_id, entry).await {
-        // BUG-MCP-001 fix: include memory_id so callers can retrieve the entry
-        // via memory_read without needing a secondary search.
-        Ok(()) => serde_json::json!({
-            "content": [{"type": "text", "text": format!("Memory stored successfully. memory_id: {entry_id}")}],
-            "memory_id": entry_id
-        }),
-        Err(e) => serde_json::json!({
-            "content": [{"type": "text", "text": format!("Error storing memory: {e}")}],
-            "isError": true
-        }),
-    }
-}
-
-// ── memory_read ───────────────────────────────────────────────────────────────
-// W19-P0 M1: Read a single memory entry by its UUID.
-// Uses get_by_id for O(1) point lookup (agent ownership enforced in SQL).
-// Namespace isolation: get_by_id filters by agent_id, so cross-agent reads
-// are rejected at the DB layer — callers outside the owning namespace always
-// receive isError.
-async fn handle_memory_read(
-    params: &Value,
-    memory: &SqliteMemoryEngine,
-    agent_id: &str,
-) -> Value {
-    let memory_id = match params.get("memory_id").and_then(|v| v.as_str()) {
-        Some(id) if !id.is_empty() => id,
-        _ => return tool_error("Missing required parameter: memory_id"),
-    };
-
-    match memory.get_by_id(agent_id, memory_id).await {
-        Ok(Some(entry)) => {
-            let payload = serde_json::json!({
-                "memory_id": entry.id,
-                "content": entry.content,
-                "layer": format!("{:?}", entry.layer),
-                "tags": entry.tags,
-                "created_at": entry.timestamp.to_rfc3339(),
-            });
-            serde_json::json!({
-                "content": [{ "type": "text", "text": payload.to_string() }]
-            })
-        }
-        Ok(None) => serde_json::json!({
-            "content": [{ "type": "text", "text": format!("Memory not found or access denied: {memory_id}") }],
-            "isError": true
-        }),
-        Err(e) => tool_error(&format!("Error reading memory: {e}")),
     }
 }
 
@@ -4539,21 +4397,7 @@ async fn handle_model_list(home_dir: &Path) -> Value {
         });
     }
 
-    // Check StreamingLLM config for KV cache compression
-    let config = engine.config();
-    let streaming_llm = config.streaming_llm.as_ref().filter(|s| s.enabled);
-    let effective_ctx: Option<u32> = streaming_llm.map(|s| {
-        (s.sink_size + s.window_size).try_into().unwrap_or(u32::MAX)
-    });
-
     let mut text = format!("Available models ({}):\n", models.len());
-
-    if let Some(slm) = streaming_llm {
-        text.push_str(&format!(
-            "\nStreamingLLM: ON (sink={}, window={}, effective ctx={})\n",
-            slm.sink_size, slm.window_size, slm.sink_size + slm.window_size
-        ));
-    }
 
     text.push_str("\n  (KV cache estimates are approximate lower bounds for typical GQA models)");
 
@@ -4564,15 +4408,6 @@ async fn handle_model_list(home_dir: &Path) -> Value {
 
         let kv_info = if m.kv_cache_mb == 0 {
             format!("total ~{}MB", m.estimated_memory_mb)
-        } else if let Some(eff_ctx) = effective_ctx {
-            let compressed_kv = duduclaw_inference::ModelInfo::estimate_kv_cache_mb(
-                &m.parameter_count, eff_ctx,
-            );
-            let compressed_total = m.estimated_memory_mb + compressed_kv;
-            format!(
-                "KV ~{}→~{}MB, total ~{}→~{}MB",
-                m.kv_cache_mb, compressed_kv, total_mb, compressed_total
-            )
         } else {
             format!("KV ~{}MB, total ~{}MB", m.kv_cache_mb, total_mb)
         };
@@ -4867,216 +4702,6 @@ async fn handle_model_recommend(_home_dir: &Path) -> Value {
     }
 
     serde_json::json!({"content": [{"type": "text", "text": text}]})
-}
-
-// ── Compression handlers ────────────────────────────────────
-
-async fn handle_compress_text(params: &Value) -> Value {
-    let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
-    if text.is_empty() {
-        return serde_json::json!({
-            "isError": true,
-            "content": [{"type": "text", "text": "text is required"}]
-        });
-    }
-
-    let strategy = params
-        .get("strategy")
-        .and_then(|v| v.as_str())
-        .unwrap_or("meta_token");
-
-    match strategy {
-        "meta_token" => compress_with_meta_token(text),
-        "llmlingua" => compress_with_llmlingua(text).await,
-        "streaming_llm" => compress_with_streaming_llm(text),
-        "auto" => compress_auto(text).await,
-        other => serde_json::json!({
-            "isError": true,
-            "content": [{"type": "text", "text": format!(
-                "Unknown strategy '{other}'. Valid options: meta_token, llmlingua, streaming_llm, auto"
-            )}]
-        }),
-    }
-}
-
-/// Meta-Token lossless compression (best for JSON, code, templates).
-fn compress_with_meta_token(text: &str) -> Value {
-    let (compressed, stats) = duduclaw_inference::compression::meta_token::compress(text);
-
-    let result = format!(
-        "Compression Result (Meta-Token, lossless):\n\
-         \n  Original: {} chars\
-         \n  Compressed: {} chars\
-         \n  Ratio: {:.2}x\
-         \n  Savings: {:.1}%\n\n{}",
-        stats.original_len,
-        stats.compressed_len,
-        stats.ratio,
-        (1.0 - 1.0 / stats.ratio) * 100.0,
-        if stats.ratio > 1.05 {
-            format!("Compressed text:\n{compressed}")
-        } else {
-            "No significant compression achieved (text has little repetition).".to_string()
-        }
-    );
-
-    serde_json::json!({
-        "content": [{"type": "text", "text": result}]
-    })
-}
-
-/// LLMLingua-2 lossy compression (best for natural language).
-async fn compress_with_llmlingua(text: &str) -> Value {
-    let config = duduclaw_inference::compression::llmlingua::LlmLinguaConfig {
-        enabled: true,
-        ..Default::default()
-    };
-    let compressor = duduclaw_inference::compression::llmlingua::LlmLinguaCompressor::new(config);
-
-    if !compressor.is_available().await {
-        return serde_json::json!({
-            "isError": true,
-            "content": [{"type": "text", "text":
-                "LLMLingua-2 is not available. Install with: pip install llmlingua\n\
-                 Falling back to meta_token is recommended."}]
-        });
-    }
-
-    match compressor.compress(text).await {
-        Ok((compressed, stats)) => {
-            let result = format!(
-                "Compression Result (LLMLingua-2, lossy):\n\
-                 \n  Original: {} chars\
-                 \n  Compressed: {} chars\
-                 \n  Ratio: {:.2}x\
-                 \n  Savings: {:.1}%\n\n\
-                 Compressed text:\n{compressed}",
-                stats.original_len,
-                stats.compressed_len,
-                stats.ratio,
-                (1.0 - 1.0 / stats.ratio) * 100.0,
-            );
-            serde_json::json!({
-                "content": [{"type": "text", "text": result}]
-            })
-        }
-        Err(e) => serde_json::json!({
-            "isError": true,
-            "content": [{"type": "text", "text": format!("LLMLingua compression failed: {e}")}]
-        }),
-    }
-}
-
-/// StreamingLLM session window compression (attention sink + sliding window).
-fn compress_with_streaming_llm(text: &str) -> Value {
-    let config = duduclaw_inference::compression::streaming_llm::StreamingLlmConfig {
-        enabled: true,
-        ..Default::default()
-    };
-    let mut window = duduclaw_inference::compression::streaming_llm::StreamingWindow::new(config);
-
-    // Split text into lines and push as user messages to simulate session
-    for line in text.lines() {
-        if !line.trim().is_empty() {
-            window.push("user", line);
-        }
-    }
-
-    let stats = window.stats();
-    let retained: Vec<String> = window
-        .formatted_messages()
-        .into_iter()
-        .map(|(_role, content)| content)
-        .collect();
-    let compressed = retained.join("\n");
-
-    let result = format!(
-        "Compression Result (StreamingLLM, window):\n\
-         \n  Original estimate: {} tokens\
-         \n  Window: {} tokens\
-         \n  Messages retained: {}\
-         \n  Messages evicted: {}\
-         \n  Ratio: {:.2}x\n\n\
-         Windowed text:\n{compressed}",
-        stats.original_len,
-        stats.compressed_len,
-        window.message_count(),
-        window.evicted_count(),
-        stats.ratio,
-    );
-
-    serde_json::json!({
-        "content": [{"type": "text", "text": result}]
-    })
-}
-
-/// Auto-select compression strategy based on content type.
-/// - Structured data (JSON, code) → Meta-Token (lossless)
-/// - Natural language → LLMLingua (lossy, higher ratio)
-async fn compress_auto(text: &str) -> Value {
-    let is_structured = detect_structured_content(text);
-
-    if is_structured {
-        compress_with_meta_token(text)
-    } else {
-        // Try LLMLingua for natural language; fall back to Meta-Token if unavailable
-        let config = duduclaw_inference::compression::llmlingua::LlmLinguaConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        let compressor =
-            duduclaw_inference::compression::llmlingua::LlmLinguaCompressor::new(config);
-
-        if compressor.is_available().await {
-            compress_with_llmlingua(text).await
-        } else {
-            compress_with_meta_token(text)
-        }
-    }
-}
-
-/// Detect whether text is structured (JSON, code) vs natural language.
-fn detect_structured_content(text: &str) -> bool {
-    let trimmed = text.trim();
-
-    // JSON detection
-    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
-        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
-    {
-        return true;
-    }
-
-    // Code detection heuristics: high density of code-like tokens
-    let code_indicators = [
-        "fn ", "pub ", "let ", "const ", "impl ", "struct ", // Rust
-        "function ", "var ", "import ", "export ", "class ",  // JS/TS
-        "def ", "self.", "elif ", "__init__",                  // Python
-        "func ", "package ", "type ", "interface ",            // Go
-        "<?", "?>", "<%", "%>",                                // Template
-    ];
-    let indicator_count = code_indicators
-        .iter()
-        .filter(|ind| trimmed.contains(**ind))
-        .count();
-
-    // If 3+ code indicators found, treat as structured
-    indicator_count >= 3
-}
-
-async fn handle_decompress_text(params: &Value) -> Value {
-    let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
-    if text.is_empty() {
-        return serde_json::json!({
-            "isError": true,
-            "content": [{"type": "text", "text": "text is required"}]
-        });
-    }
-
-    let decompressed = duduclaw_inference::compression::meta_token::decompress(text);
-
-    serde_json::json!({
-        "content": [{"type": "text", "text": decompressed}]
-    })
 }
 
 // ── Cost telemetry handlers ─────────────────────────────────
@@ -6181,7 +5806,6 @@ async fn handle_skill_synthesis_run(params: &Value, home_dir: &Path, default_age
 struct DelegationContext {
     depth: u8,
     origin: Option<String>,
-    sender: Option<String>,
 }
 
 impl DelegationContext {
@@ -6195,18 +5819,10 @@ impl DelegationContext {
         let origin = std::env::var(duduclaw_core::ENV_DELEGATION_ORIGIN)
             .ok()
             .filter(|s| !s.is_empty());
-        let sender = std::env::var(duduclaw_core::ENV_DELEGATION_SENDER)
-            .ok()
-            .filter(|s| !s.is_empty());
-        Self { depth, origin, sender }
+        Self { depth, origin }
     }
 }
 
-/// Read delegation context from environment (production entry point).
-fn read_delegation_env() -> (u8, Option<String>, Option<String>) {
-    let ctx = DelegationContext::from_env();
-    (ctx.depth, ctx.origin, ctx.sender)
-}
 
 /// Check whether `sender` is allowed to delegate to `target` under the
 /// supervisor pattern.  Allowed directions:
@@ -6827,13 +6443,10 @@ pub(crate) async fn handle_tools_call(
         "llamafile_start" => handle_llamafile_start(&arguments, home_dir).await,
         "llamafile_stop" => handle_llamafile_stop(home_dir).await,
         "llamafile_list" => handle_llamafile_list(home_dir).await,
-        // Compression tools
         // Model registry tools
         "model_search" => handle_model_search(&arguments, home_dir).await,
         "model_download" => handle_model_download(&arguments, home_dir).await,
         "model_recommend" => handle_model_recommend(home_dir).await,
-        "compress_text" => handle_compress_text(&arguments).await,
-        "decompress_text" => handle_decompress_text(&arguments).await,
         // Cost telemetry tools
         "cost_summary" => handle_cost_summary(&arguments, home_dir).await,
         "cost_agents" => handle_cost_agents(&arguments, home_dir).await,
@@ -9112,28 +8725,6 @@ async fn handle_skill_extract(args: &Value, home_dir: &Path, default_agent: &str
     }
 }
 
-// ── Helpers ────────────────────────────────────────────────────
-
-/// Truncate a `String` safely at a UTF-8 char boundary.
-///
-/// Returns `true` if the string was actually truncated.
-/// Plain `String::truncate(n)` panics when `n` falls inside a multi-byte
-/// character (common with CJK text). This finds the largest valid boundary
-/// at or below `max_bytes`.
-fn safe_truncate(s: &mut String, max_bytes: usize) -> bool {
-    if s.len() <= max_bytes {
-        return false;
-    }
-    // Find the largest char boundary <= max_bytes
-    let boundary = (0..=max_bytes)
-        .rev()
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(0);
-    s.truncate(boundary);
-    s.push_str("\n...[truncated]");
-    true
-}
-
 // ── execute_program handler ─────────────────────────────────────
 
 async fn handle_execute_program(args: &Value) -> Value {
@@ -10362,16 +9953,14 @@ high_context = true
     #[test]
     fn delegation_context_fields() {
         // Test DelegationContext construction directly — no env var mutation needed.
-        let ctx = DelegationContext { depth: 3, origin: Some("main".into()), sender: Some("worker".into()) };
+        let ctx = DelegationContext { depth: 3, origin: Some("main".into()) };
         assert_eq!(ctx.depth, 3);
         assert_eq!(ctx.origin.as_deref(), Some("main"));
-        assert_eq!(ctx.sender.as_deref(), Some("worker"));
 
         // Default-like: depth 0, no origin/sender
-        let ctx0 = DelegationContext { depth: 0, origin: None, sender: None };
+        let ctx0 = DelegationContext { depth: 0, origin: None };
         assert_eq!(ctx0.depth, 0);
         assert!(ctx0.origin.is_none());
-        assert!(ctx0.sender.is_none());
     }
 
     // Mutex to serialize env-var-mutating tests (env is process-global).
@@ -10397,7 +9986,6 @@ high_context = true
         clear_delegation_env();
         assert_eq!(ctx.depth, 3);
         assert_eq!(ctx.origin.as_deref(), Some("main-agent"));
-        assert_eq!(ctx.sender.as_deref(), Some("researcher"));
     }
 
     #[test]
@@ -10407,7 +9995,6 @@ high_context = true
         let ctx = DelegationContext::from_env();
         assert_eq!(ctx.depth, 0);
         assert!(ctx.origin.is_none());
-        assert!(ctx.sender.is_none());
     }
 
     #[test]
@@ -10422,7 +10009,6 @@ high_context = true
         clear_delegation_env();
         assert_eq!(ctx.depth, 0);
         assert!(ctx.origin.is_none(), "Empty string should filter to None");
-        assert!(ctx.sender.is_none(), "Empty string should filter to None");
     }
 
     #[test]
@@ -10460,7 +10046,7 @@ high_context = true
         create_test_agent(&agents_dir, "main", "");
         create_test_agent(&agents_dir, "worker", "main");
 
-        let ctx = DelegationContext { depth: 2, origin: Some("main".into()), sender: Some("main".into()) };
+        let ctx = DelegationContext { depth: 2, origin: Some("main".into()) };
         let params = serde_json::json!({ "agent_id": "worker", "prompt": "do something" });
         let result = send_to_agent_with_ctx(&params, home, "main", ctx).await;
 
@@ -10508,7 +10094,7 @@ high_context = true
         create_test_agent(&agents_dir, "worker", "main");
 
         // depth=4 → outgoing=5 >= MAX(5) → rejected
-        let ctx = DelegationContext { depth: 4, origin: Some("main".into()), sender: Some("researcher".into()) };
+        let ctx = DelegationContext { depth: 4, origin: Some("main".into()) };
         let params = serde_json::json!({ "agent_id": "worker", "prompt": "do something" });
         let result = send_to_agent_with_ctx(&params, home, "main", ctx).await;
 
@@ -10540,7 +10126,7 @@ high_context = true
         create_test_agent(&agents_dir, "worker", "main");
 
         // Happy path at depth 0 → outgoing 1. Succeeds.
-        let ctx = DelegationContext { depth: 0, origin: None, sender: None };
+        let ctx = DelegationContext { depth: 0, origin: None };
         let params = serde_json::json!({ "agent_id": "worker", "prompt": "hi" });
         let result = send_to_agent_with_ctx(&params, home, "main", ctx).await;
         let text = result["content"][0]["text"].as_str().unwrap();
@@ -10572,7 +10158,7 @@ high_context = true
         create_test_agent(&agents_dir, "main", "");
         create_test_agent(&agents_dir, "worker", "main");
 
-        let ctx = DelegationContext { depth: 1, origin: Some("root-agent".into()), sender: Some("main".into()) };
+        let ctx = DelegationContext { depth: 1, origin: Some("root-agent".into()) };
         let params = serde_json::json!({ "agent_id": "worker", "task": "background work" });
         let result = spawn_agent_with_ctx(&params, home, "main", ctx).await;
 
@@ -10599,7 +10185,7 @@ high_context = true
         create_test_agent(&agents_dir, "worker", "main");
 
         // No origin/sender set — simulates first delegation (no dispatcher context)
-        let ctx = DelegationContext { depth: 0, origin: None, sender: None };
+        let ctx = DelegationContext { depth: 0, origin: None };
         let params = serde_json::json!({ "agent_id": "worker", "prompt": "first delegation" });
         let result = send_to_agent_with_ctx(&params, home, "main", ctx).await;
 

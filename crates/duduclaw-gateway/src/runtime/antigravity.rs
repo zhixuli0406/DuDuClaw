@@ -171,6 +171,34 @@ impl AgentRuntime for AntigravityRuntime {
     ) -> Result<RuntimeResponse, String> {
         info!(agent = %context.agent_id, "AntigravityRuntime: executing via agy -p");
 
+        // W1: agy exposes NO sandbox / approval-policy / tool-list flags
+        // (verified against `agy --help` v1.0.12 — see module docs), so the
+        // agent's CapabilitiesConfig cannot be enforced on this runtime at
+        // all. Surface that loudly once per spawn so operators aren't
+        // silently unprotected.
+        if context.capabilities.is_some() {
+            tracing::warn!(
+                runtime = "antigravity",
+                agent = %context.agent_id,
+                "capability enforcement unavailable on this runtime — agy has no \
+                 sandbox/approval flags; spawning with --dangerously-skip-permissions"
+            );
+        }
+
+        // W2 (MCP wiring): register the duduclaw MCP server in the agent's
+        // antigravity settings before spawning. Idempotent merge;
+        // warn-not-fatal — registration failing must not block the reply.
+        if let Some(ref dir) = context.agent_dir {
+            if let Err(e) = Self::ensure_duduclaw_mcp_config(dir, &context.agent_id).await {
+                tracing::warn!(
+                    runtime = "antigravity",
+                    agent = %context.agent_id,
+                    error = %e,
+                    "failed to write antigravity MCP settings — continuing without it"
+                );
+            }
+        }
+
         let payload = build_prompt(context, prompt);
 
         let mut cmd = tokio::process::Command::new(&self.agy_path);
@@ -294,10 +322,14 @@ impl AntigravityRuntime {
     /// If `agent_dir` is provided, writes to
     /// `agent_dir/.gemini/antigravity-cli/settings.json` for per-agent isolation.
     /// Otherwise writes to the global `~/.gemini/antigravity-cli/settings.json`.
+    ///
+    /// Merges per server name (other `mcpServers` entries and unrelated settings —
+    /// e.g. `trustedWorkspaces` — are preserved) and is idempotent: returns
+    /// `Ok(false)` without writing when every requested entry already matches.
     pub async fn write_mcp_config(
         agent_dir: Option<&std::path::Path>,
         servers: &std::collections::HashMap<String, serde_json::Value>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let settings_path = if let Some(dir) = agent_dir {
             dir.join(".gemini").join("antigravity-cli").join("settings.json")
         } else {
@@ -307,23 +339,58 @@ impl AntigravityRuntime {
                 .join("antigravity-cli")
                 .join("settings.json")
         };
-        if let Some(parent) = settings_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
-        }
         let existing = tokio::fs::read_to_string(&settings_path)
             .await
             .unwrap_or_else(|_| "{}".to_string());
         let mut settings: serde_json::Value =
             serde_json::from_str(&existing).unwrap_or(serde_json::json!({}));
-        settings["mcpServers"] = serde_json::Value::Object(
-            servers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-        );
+        if !settings.is_object() {
+            settings = serde_json::json!({});
+        }
+        let mcp = settings
+            .as_object_mut()
+            .expect("settings is an object — normalized above")
+            .entry("mcpServers")
+            .or_insert(serde_json::json!({}));
+        if !mcp.is_object() {
+            *mcp = serde_json::json!({});
+        }
+        let map = mcp.as_object_mut().expect("mcpServers normalized to object");
+        let mut changed = false;
+        for (name, def) in servers {
+            if map.get(name) != Some(def) {
+                map.insert(name.clone(), def.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(false);
+        }
+        if let Some(parent) = settings_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+        }
         tokio::fs::write(
             &settings_path,
             serde_json::to_string_pretty(&settings).unwrap_or_default(),
         )
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    /// W2: ensure the duduclaw MCP server (absolute binary + `mcp-server` arg +
+    /// `DUDUCLAW_AGENT_ID` env) is registered in the agent's antigravity
+    /// settings. Called before every spawn; idempotent.
+    pub async fn ensure_duduclaw_mcp_config(
+        agent_dir: &std::path::Path,
+        agent_id: &str,
+    ) -> Result<bool, String> {
+        let Some(def) = super::duduclaw_mcp_server_json(agent_id) else {
+            return Err("duduclaw binary did not resolve to an absolute path".to_string());
+        };
+        let mut servers = std::collections::HashMap::new();
+        servers.insert("duduclaw".to_string(), def);
+        Self::write_mcp_config(Some(agent_dir), &servers).await
     }
 }
 
@@ -344,6 +411,7 @@ mod tests {
             agent_id: "test".to_string(),
             preferred_provider: None,
             conversation_history: vec![],
+            capabilities: None,
         }
     }
 
@@ -418,6 +486,7 @@ mod tests {
             agent_id: "e2e".to_string(),
             preferred_provider: None,
             conversation_history: vec![],
+            capabilities: None,
         };
         let resp = rt
             .execute("Reply with exactly: PONG", &c)

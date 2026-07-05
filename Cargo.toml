@@ -11,29 +11,26 @@ members = [
     "crates/duduclaw-core",
     "crates/duduclaw-auth",
     "crates/duduclaw-gateway",
-    "crates/duduclaw-bus",
     "crates/duduclaw-security",
     "crates/duduclaw-memory",
     "crates/duduclaw-container",
     "crates/duduclaw-agent",
-    "crates/duduclaw-bridge",
     "crates/duduclaw-cli",
     "crates/duduclaw-dashboard",
     "crates/duduclaw-odoo",
     "crates/duduclaw-inference",
     "crates/duduclaw-desktop",
-    "crates/duduclaw-governance",
-    "crates/duduclaw-durability",
     "crates/duduclaw-identity",
     "crates/duduclaw-redaction",
     "crates/duduclaw-cli-runtime",
     "crates/duduclaw-cli-worker",
     "crates/duduclaw-license",
     "crates/duduclaw-fork",
+    "crates/duduclaw-llm",
 ]
 
 [workspace.package]
-version = "1.32.0"
+version = "1.33.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["DuDuClaw Contributors"]
@@ -98,13 +95,11 @@ reqwest = { version = "0.12", features = ["json"] }
 duduclaw-core = { path = "crates/duduclaw-core" }
 duduclaw-inference = { path = "crates/duduclaw-inference", default-features = false }
 duduclaw-gateway = { path = "crates/duduclaw-gateway", default-features = false }
-duduclaw-bus = { path = "crates/duduclaw-bus" }
 duduclaw-security = { path = "crates/duduclaw-security" }
 duduclaw-memory = { path = "crates/duduclaw-memory" }
 duduclaw-container = { path = "crates/duduclaw-container" }
 duduclaw-agent = { path = "crates/duduclaw-agent" }
 duduclaw-fork = { path = "crates/duduclaw-fork" }
-duduclaw-bridge = { path = "crates/duduclaw-bridge" }
 duduclaw-dashboard = { path = "crates/duduclaw-dashboard" }
 duduclaw-auth = { path = "crates/duduclaw-auth" }
 duduclaw-odoo = { path = "crates/duduclaw-odoo" }
@@ -114,3 +109,4 @@ duduclaw-redaction = { path = "crates/duduclaw-redaction" }
 duduclaw-cli-runtime = { path = "crates/duduclaw-cli-runtime" }
 duduclaw-cli-worker = { path = "crates/duduclaw-cli-worker" }
 duduclaw-license = { path = "crates/duduclaw-license" }
+duduclaw-llm = { path = "crates/duduclaw-llm" }

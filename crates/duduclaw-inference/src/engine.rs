@@ -187,27 +187,89 @@ impl InferenceEngine {
     ///
     /// Returns `Ok(Some(response))` if handled locally,
     /// `Ok(None)` if the router decided to escalate to Cloud API.
+    ///
+    /// **Calibrated cascade** (when `router.post_hoc_enabled`): after a local
+    /// tier answers, the mean token logprob is Platt-scaled into an acceptance
+    /// probability `g`; a rejected answer escalates LocalFast → LocalStrong →
+    /// Cloud API instead of being returned. When post-hoc is disabled or the
+    /// backend returns no logprobs, behaviour is identical to the legacy path.
     pub async fn route_and_generate(
         &self,
         request: &InferenceRequest,
     ) -> Result<Option<InferenceResponse>> {
         let decision = self.route(&request.system_prompt, &request.user_prompt);
 
-        match decision.tier {
-            RoutingTier::CloudApi => {
+        let mut tier = decision.tier;
+        let mut model_id = decision.model_id;
+
+        loop {
+            if tier == RoutingTier::CloudApi {
                 info!(reason = %decision.reason, "Escalating to Cloud API");
-                Ok(None) // Caller should fall back to Claude API
+                return Ok(None); // Caller should fall back to Claude API
             }
-            RoutingTier::LocalFast | RoutingTier::LocalStrong => {
-                // Override model_id with the router's decision
-                let mut routed_request = request.clone();
-                if let Some(ref model_id) = decision.model_id {
-                    routed_request.model_id = Some(model_id.clone());
-                }
-                let response = self.generate(&routed_request).await?;
-                Ok(Some(response))
+
+            // Override model_id with the router's decision
+            let mut routed_request = request.clone();
+            if self.post_hoc_enabled() {
+                routed_request.params.capture_logprobs = true;
             }
+            if let Some(ref id) = model_id {
+                routed_request.model_id = Some(id.clone());
+            }
+            let response = self.generate(&routed_request).await?;
+
+            let Some(assessment) = self.assess_response(&response) else {
+                // Post-hoc disabled or no logprobs from the server — accept
+                // the answer exactly as before (fail-safe).
+                return Ok(Some(response));
+            };
+            if assessment.accepted {
+                info!(
+                    tier = %tier,
+                    p_bar = format!("{:.3}", assessment.p_bar),
+                    g = format!("{:.3}", assessment.g),
+                    "Post-hoc confidence accepted local answer"
+                );
+                return Ok(Some(response));
+            }
+
+            // Low confidence — escalate to the next tier.
+            let router = self.router.as_ref().expect("assess_response implies router");
+            let next = router.next_tier(tier).unwrap_or(RoutingTier::CloudApi);
+            info!(
+                from = %tier,
+                to = %next,
+                p_bar = format!("{:.3}", assessment.p_bar),
+                g = format!("{:.3}", assessment.g),
+                threshold = router.config().post_hoc_accept_threshold,
+                "Post-hoc confidence below threshold, escalating"
+            );
+            tier = next;
+            model_id = match next {
+                RoutingTier::LocalStrong => router.config().strong_model.clone(),
+                _ => None,
+            };
         }
+    }
+
+    /// Post-hoc (cascade) confidence of a generated response: `(p̄, g, accepted)`
+    /// via [`crate::router::PostHocAssessment::as_tuple`]. Returns `None` when
+    /// no router is configured, post-hoc is disabled, or the backend returned
+    /// no logprobs — callers should then treat the answer as accepted.
+    ///
+    /// Exposed so the gateway can log calibration inputs alongside outcomes.
+    pub fn assess_response(
+        &self,
+        response: &InferenceResponse,
+    ) -> Option<crate::router::PostHocAssessment> {
+        self.router.as_ref()?.evaluate_post_hoc(response.mean_logprob)
+    }
+
+    /// Whether post-hoc (cascade) confidence checking is active.
+    pub fn post_hoc_enabled(&self) -> bool {
+        self.router
+            .as_ref()
+            .is_some_and(|r| r.config().post_hoc_enabled)
     }
 
     /// Get the routing decision for a query (without generating).
@@ -219,6 +281,7 @@ impl InferenceEngine {
                 confidence: 0.5,
                 reason: "No router configured".to_string(),
                 model_id: self.config.default_model.clone(),
+                post_hoc: None,
             },
         }
     }
@@ -329,6 +392,47 @@ impl InferenceEngine {
         self.router.as_ref().is_some_and(|r| r.is_enabled())
     }
 
+    /// Snapshot of the active OpenAI-compatible HTTP endpoint, if the current
+    /// backend is HTTP-based: an `InferenceManager`-discovered server
+    /// (Exo / llamafile — takes precedence, mirroring [`Self::init`]) or a
+    /// configured `[openai_compat]` server. `None` for in-process backends
+    /// (llama.cpp / mistral.rs) and when local inference is disabled.
+    ///
+    /// External adapters (the gateway's `LocalChatProvider`) use this to point
+    /// a tool-calling-capable OpenAI-compat client at the same server.
+    pub async fn compat_endpoint(&self) -> Option<crate::adapter::CompatEndpoint> {
+        let manager_url = self.manager.get_api_base_url().await;
+        let manager_model = self.manager.get_model().await;
+        let config_compat = self
+            .config
+            .openai_compat
+            .as_ref()
+            .map(|c| (c.base_url.as_str(), c.model.as_str()));
+        let (base_url, model, source) = crate::adapter::resolve_compat_endpoint(
+            self.config.enabled,
+            manager_url,
+            manager_model,
+            config_compat,
+        )?;
+        // Only the configured endpoint may carry a key; manager-discovered
+        // llamafile/Exo servers are keyless local processes.
+        let api_key = match source {
+            crate::adapter::CompatSource::Config => self
+                .config
+                .openai_compat
+                .as_ref()
+                .and_then(|c| c.resolved_api_key(&self.home_dir)),
+            crate::adapter::CompatSource::Manager => None,
+        };
+        Some(crate::adapter::CompatEndpoint { base_url, model, api_key })
+    }
+
+    /// Whether the operator allows an external adapter to run tool calling
+    /// against the local endpoint (`[router] local_tools`, default `true`).
+    pub fn local_tools_enabled(&self) -> bool {
+        crate::adapter::local_tools_enabled(&self.config)
+    }
+
     /// Get the active backend.
     async fn get_backend(&self) -> Result<Arc<dyn InferenceBackend>> {
         self.backend
@@ -354,25 +458,6 @@ impl InferenceEngine {
     /// Get the current inference mode (Exo / llamafile / direct / cloud).
     pub async fn current_mode(&self) -> InferenceMode {
         self.manager.current_mode().await
-    }
-
-    /// Run an evolution reflection using local MLX model (Apple Silicon only).
-    ///
-    /// Returns `Ok(Some(response))` if MLX handled it locally,
-    /// `Ok(None)` if MLX is not available and caller should use Claude API.
-    pub async fn mlx_evolution_reflection(
-        &self,
-        reflection_type: &str,
-        agent_soul: &str,
-        context: &str,
-    ) -> Result<Option<String>> {
-        let mlx = match &self.mlx {
-            Some(m) if m.is_available().await => m,
-            _ => return Ok(None),
-        };
-
-        let result = mlx.run_evolution_reflection(reflection_type, agent_soul, context).await?;
-        Ok(Some(result))
     }
 
     /// Check if MLX bridge is available for evolution.
@@ -500,5 +585,249 @@ mod tests {
 
         assert!(matches!(err, InferenceError::ModelNotFound { .. }));
         assert!(!backend.load_called.load(Ordering::SeqCst));
+    }
+
+    // ── Calibrated cascade (post-hoc confidence) tests ─────────────────
+
+    /// Stub backend that returns a configurable mean_logprob per model id and
+    /// records which models were asked to generate.
+    struct CascadeStub {
+        /// model id → mean_logprob returned by generate()
+        logprobs: std::collections::HashMap<String, Option<f32>>,
+        calls: std::sync::Mutex<Vec<String>>,
+        capture_flags: std::sync::Mutex<Vec<bool>>,
+        loaded: RwLock<Option<ModelInfo>>,
+    }
+
+    impl CascadeStub {
+        fn new(logprobs: &[(&str, Option<f32>)]) -> Self {
+            Self {
+                logprobs: logprobs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), *v))
+                    .collect(),
+                calls: std::sync::Mutex::new(Vec::new()),
+                capture_flags: std::sync::Mutex::new(Vec::new()),
+                loaded: RwLock::new(None),
+            }
+        }
+
+        fn stub_info(id: &str) -> ModelInfo {
+            ModelInfo {
+                id: id.to_string(),
+                path: id.to_string(),
+                architecture: "stub".to_string(),
+                parameter_count: "0".to_string(),
+                quantization: "none".to_string(),
+                file_size_bytes: 0,
+                estimated_memory_mb: 0,
+                kv_cache_mb: 0,
+                is_loaded: true,
+                context_length: 4096,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl InferenceBackend for CascadeStub {
+        fn name(&self) -> &str {
+            "cascade-stub"
+        }
+
+        fn requires_local_file(&self) -> bool {
+            false
+        }
+
+        async fn load_model(
+            &self,
+            model_path: &str,
+            _params: &GenerationParams,
+        ) -> Result<ModelInfo> {
+            let info = Self::stub_info(model_path);
+            *self.loaded.write().await = Some(info.clone());
+            Ok(info)
+        }
+
+        async fn unload_model(&self) -> Result<()> {
+            *self.loaded.write().await = None;
+            Ok(())
+        }
+
+        async fn loaded_model(&self) -> Option<ModelInfo> {
+            self.loaded.read().await.clone()
+        }
+
+        async fn generate(&self, request: &InferenceRequest) -> Result<InferenceResponse> {
+            let model = request.model_id.clone().unwrap_or_default();
+            self.calls.lock().unwrap().push(model.clone());
+            self.capture_flags
+                .lock()
+                .unwrap()
+                .push(request.params.capture_logprobs);
+            let mean_logprob = self.logprobs.get(&model).copied().flatten();
+            Ok(InferenceResponse {
+                text: format!("answer from {model}"),
+                tokens_generated: 2,
+                tokens_prompt: 2,
+                generation_time_ms: 1,
+                tokens_per_second: 0.0,
+                backend: BackendType::OpenAiCompat,
+                model_id: model,
+                mean_logprob,
+            })
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    /// Build an engine with a [router] section written to inference.toml.
+    async fn cascade_engine(tmp: &TempDir, post_hoc_enabled: bool) -> InferenceEngine {
+        let toml = format!(
+            r#"
+enabled = true
+
+[router]
+enabled = true
+fast_threshold = 0.7
+strong_threshold = 0.35
+fast_model = "fast-model"
+strong_model = "strong-model"
+post_hoc_enabled = {post_hoc_enabled}
+"#
+        );
+        tokio::fs::write(tmp.path().join("inference.toml"), toml)
+            .await
+            .expect("write inference.toml");
+        InferenceEngine::new(tmp.path()).await
+    }
+
+    /// A prompt that the ex-ante router sends to LocalFast ("hello" keyword).
+    fn fast_request() -> InferenceRequest {
+        InferenceRequest {
+            system_prompt: String::new(),
+            user_prompt: "hello, how are you?".to_string(),
+            params: GenerationParams::default(),
+            model_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cascade_low_confidence_escalates_fast_to_strong() {
+        let tmp = TempDir::new().expect("tempdir");
+        let engine = cascade_engine(&tmp, true).await;
+        // fast tier answers with very low p̄ → rejected; strong tier is confident.
+        let backend = Arc::new(CascadeStub::new(&[
+            ("fast-model", Some(-4.0)),
+            ("strong-model", Some(-0.05)),
+        ]));
+        engine.set_backend_for_test(backend.clone()).await;
+
+        let response = engine
+            .route_and_generate(&fast_request())
+            .await
+            .expect("generate ok")
+            .expect("answered locally");
+
+        assert_eq!(response.model_id, "strong-model");
+        assert_eq!(
+            *backend.calls.lock().unwrap(),
+            vec!["fast-model".to_string(), "strong-model".to_string()]
+        );
+        // Post-hoc mode must request logprobs from the backend.
+        assert!(backend.capture_flags.lock().unwrap().iter().all(|&f| f));
+        // Calibration inputs are exposed for logging.
+        let (p_bar, g, accepted) = engine
+            .assess_response(&response)
+            .expect("assessment")
+            .as_tuple();
+        assert!(accepted);
+        assert!(p_bar > 0.9);
+        assert!(g >= 0.5);
+    }
+
+    #[tokio::test]
+    async fn cascade_strong_low_confidence_signals_cloud_escalation() {
+        let tmp = TempDir::new().expect("tempdir");
+        let engine = cascade_engine(&tmp, true).await;
+        // Both local tiers answer with low confidence → Ok(None) cloud signal.
+        let backend = Arc::new(CascadeStub::new(&[
+            ("fast-model", Some(-4.0)),
+            ("strong-model", Some(-4.0)),
+        ]));
+        engine.set_backend_for_test(backend.clone()).await;
+
+        let out = engine
+            .route_and_generate(&fast_request())
+            .await
+            .expect("generate ok");
+
+        assert!(out.is_none(), "low-confidence strong answer must escalate to cloud");
+        assert_eq!(
+            *backend.calls.lock().unwrap(),
+            vec!["fast-model".to_string(), "strong-model".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn cascade_high_confidence_accepts_first_answer() {
+        let tmp = TempDir::new().expect("tempdir");
+        let engine = cascade_engine(&tmp, true).await;
+        let backend = Arc::new(CascadeStub::new(&[("fast-model", Some(-0.05))]));
+        engine.set_backend_for_test(backend.clone()).await;
+
+        let response = engine
+            .route_and_generate(&fast_request())
+            .await
+            .expect("generate ok")
+            .expect("answered locally");
+
+        assert_eq!(response.model_id, "fast-model");
+        assert_eq!(backend.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cascade_disabled_behaves_like_legacy_router() {
+        // Regression guard: post_hoc_enabled = false → the (low-confidence)
+        // first answer is returned exactly as before, no logprobs requested.
+        let tmp = TempDir::new().expect("tempdir");
+        let engine = cascade_engine(&tmp, false).await;
+        let backend = Arc::new(CascadeStub::new(&[("fast-model", Some(-4.0))]));
+        engine.set_backend_for_test(backend.clone()).await;
+
+        let response = engine
+            .route_and_generate(&fast_request())
+            .await
+            .expect("generate ok")
+            .expect("answered locally");
+
+        assert_eq!(response.model_id, "fast-model");
+        assert_eq!(backend.calls.lock().unwrap().len(), 1);
+        assert!(
+            backend.capture_flags.lock().unwrap().iter().all(|&f| !f),
+            "legacy path must not request logprobs"
+        );
+        assert!(engine.assess_response(&response).is_none());
+    }
+
+    #[tokio::test]
+    async fn cascade_without_logprobs_is_fail_safe() {
+        // Post-hoc enabled but the server returns no logprobs → accept the
+        // answer as today (no escalation, no error).
+        let tmp = TempDir::new().expect("tempdir");
+        let engine = cascade_engine(&tmp, true).await;
+        let backend = Arc::new(CascadeStub::new(&[("fast-model", None)]));
+        engine.set_backend_for_test(backend.clone()).await;
+
+        let response = engine
+            .route_and_generate(&fast_request())
+            .await
+            .expect("generate ok")
+            .expect("answered locally");
+
+        assert_eq!(response.model_id, "fast-model");
+        assert_eq!(backend.calls.lock().unwrap().len(), 1);
+        assert!(engine.assess_response(&response).is_none());
     }
 }

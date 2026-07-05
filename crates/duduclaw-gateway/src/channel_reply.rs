@@ -541,6 +541,24 @@ pub async fn build_reply_with_session(
 ///
 /// When `agent_override` is `Some(name)`, the named agent is looked up directly.
 /// When `None`, the default agent resolution logic (config.toml → main_agent) is used.
+// OTel GenAI semconv (Development): root `invoke_agent` span for one channel
+// turn. Attribute names are centralized in `crate::otel` (tracing macros need
+// literal field names, so the dotted literals here mirror those consts).
+// Agent/model/usage are resolved mid-flight, so they are declared Empty and
+// `Span::record`ed post-hoc (usage in `spawn_claude_cli_with_env`).
+#[tracing::instrument(
+    name = "invoke_agent",
+    skip_all,
+    fields(
+        gen_ai.operation.name = "invoke_agent",
+        gen_ai.system = tracing::field::Empty,
+        gen_ai.provider.name = tracing::field::Empty,
+        gen_ai.agent.name = tracing::field::Empty,
+        gen_ai.request.model = tracing::field::Empty,
+        gen_ai.usage.input_tokens = tracing::field::Empty,
+        gen_ai.usage.output_tokens = tracing::field::Empty,
+    )
+)]
 async fn build_reply_with_session_inner(
     text: &str,
     ctx: &ReplyContext,
@@ -613,6 +631,16 @@ async fn build_reply_with_session_inner(
         .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
 
     let agent_id = agent.map(|a| a.config.agent.name.clone()).unwrap_or_default();
+    // OTel: record resolved agent/model on the `invoke_agent` span. The
+    // channel-reply path is Claude-first (rotator/CLI/Direct API); a routed
+    // non-Claude call carries its own provider on the nested `chat` span.
+    {
+        let span = tracing::Span::current();
+        span.record(crate::otel::attrs::SYSTEM, "anthropic");
+        span.record(crate::otel::attrs::PROVIDER_NAME, "anthropic");
+        span.record(crate::otel::attrs::AGENT_NAME, agent_id.as_str());
+        span.record(crate::otel::attrs::REQUEST_MODEL, model.as_str());
+    }
     let agent_dir = agent.map(|a| a.dir.clone());
     let capabilities = agent.map(|a| a.config.capabilities.clone());
     let skill_token_budget = agent
@@ -1043,6 +1071,9 @@ async fn build_reply_with_session_inner(
 
     // Inject key facts + pinned instructions + compression summary into system prompt.
     // Order: key facts (middle) → compression summary → pinned (tail, highest attention).
+    // Consolidated-rule ids injected this turn (ACE/ExpeL lifecycle) — settled
+    // against the prediction outcome in the spawned task below.
+    let mut injected_rule_ids: Vec<String> = Vec::new();
     let full_system_prompt = {
         let mut prompt = system_prompt;
 
@@ -1052,15 +1083,27 @@ async fn build_reply_with_session_inner(
         if let Some(db_path) = cognitive_memory_db.clone() {
             let aid = agent_id.clone();
             let query = sanitized_text.clone();
-            if let Ok(facts_text) = tokio::task::spawn_blocking(move || {
+            if let Ok(facts) = tokio::task::spawn_blocking(move || {
                 let engine = duduclaw_memory::SqliteMemoryEngine::new(&db_path).ok()?;
                 let rt = tokio::runtime::Handle::current();
                 let facts = rt.block_on(engine.search_facts(&aid, &query, 3)).ok()?;
                 if facts.is_empty() { return None; }
-                Some(facts.iter().map(|f| format!("- {}", f.fact)).collect::<Vec<_>>().join("\n"))
+                Some(facts.iter().map(|f| f.fact.clone()).collect::<Vec<String>>())
             }).await {
-                if let Some(ft) = facts_text {
-                    prompt = format!("{prompt}\n\n## Key Facts About This User\n{ft}");
+                if let Some(facts) = facts {
+                    // Wiki/memory dedup: the base prompt already carries the
+                    // injected wiki pages — a fact whose text is already in
+                    // there would be sent twice. Wiki wins (curated, trust-
+                    // scored, citation-tracked); the duplicate fact is dropped.
+                    let kept = filter_facts_not_in_prompt(&facts, &prompt);
+                    if !kept.is_empty() {
+                        let ft = kept
+                            .iter()
+                            .map(|f| format!("- {f}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        prompt = format!("{prompt}\n\n## Key Facts About This User\n{ft}");
+                    }
                 }
             }
         }
@@ -1092,6 +1135,26 @@ async fn build_reply_with_session_inner(
                     .collect::<Vec<_>>()
                     .join("\n");
                 prompt = format!("{prompt}\n\n## Past Mistakes to Avoid\n{section}");
+            }
+        }
+
+        // F2a extension (ACE/ExpeL rule lifecycle): inject consolidated
+        // reflexion rules ranked by net helpful−harmful score. Retired rules
+        // are filtered out inside the selector; the injected ids are settled
+        // against this turn's prediction outcome below. !Send → spawn_blocking.
+        if let Some(db_path) = cognitive_memory_db.clone() {
+            let aid = agent_id.clone();
+            if let Ok(Some((section, ids))) = tokio::task::spawn_blocking(move || {
+                crate::prediction::rule_lifecycle::build_rules_section_blocking(
+                    &db_path,
+                    &aid,
+                    crate::prediction::rule_lifecycle::INJECTION_LIMIT,
+                )
+            })
+            .await
+            {
+                prompt = format!("{prompt}\n\n## Learned Rules (from past mistakes)\n{section}");
+                injected_rule_ids = ids;
             }
         }
 
@@ -1444,6 +1507,49 @@ async fn build_reply_with_session_inner(
     };
     let is_channel_session = duduclaw_core::SUPPORTED_CHANNEL_TYPES.iter()
         .any(|t| session_id.starts_with(&format!("{t}:")));
+
+    // ── 0. inference_mode = "local" → local inference FIRST ─────────
+    //
+    // Long-standing gap: `[general] inference_mode` (config.toml) was only
+    // honored by the dispatcher path; the user-facing channel reply always
+    // went CLI-first. When the operator pins mode "local", prefer local
+    // inference FIRST here too, keeping the Claude CLI as the fallback.
+    // Absent / "hybrid" / "claude" ⇒ behavior unchanged (config-gated).
+    //
+    // The agent's `[model] local.model` (agent.toml) is resolved once here
+    // and shared with the step-2 fallback below.
+    let local_model_id = agent_dir.as_ref().and_then(|d| {
+        let toml_path = d.join("agent.toml");
+        let content = std::fs::read_to_string(&toml_path).ok()?;
+        let table: toml::Table = content.parse().ok()?;
+        table.get("model")?.as_table()?
+            .get("local")?.as_table()?
+            .get("model")?.as_str().map(|s| s.to_string())
+    });
+    let inference_mode = crate::claude_runner::get_inference_mode(&ctx.home_dir).await;
+    let mut local_attempted_first = false;
+    let mut local_first_reply: Option<String> = None;
+    if local_inference_first(&inference_mode) {
+        local_attempted_first = true;
+        match crate::claude_runner::try_local_inference(
+            &ctx.home_dir, &sanitized_text, &full_system_prompt, local_model_id.as_deref(),
+            Some(&agent_id), capabilities.as_ref(),
+        ).await {
+            Ok(local_reply) => {
+                info!(
+                    "Replied via local model ({} chars, inference_mode=local — CLI skipped)",
+                    local_reply.len()
+                );
+                local_first_reply = Some(local_reply);
+            }
+            Err(e) if e == "ROUTER_ESCALATE_TO_CLOUD" => {
+                info!("inference_mode=local: router escalated to cloud → falling back to Claude CLI");
+            }
+            Err(e) => {
+                warn!("inference_mode=local but local inference failed → falling back to Claude CLI: {e}");
+            }
+        }
+    }
     // (review B2) Make `turn_id` and `session_id` available to sub-agent
     // dispatchers via tokio task-locals. Any wiki RAG triggered by the
     // dispatcher inherits these so citations land in the right tracker
@@ -1458,14 +1564,21 @@ async fn build_reply_with_session_inner(
     // path checks for non-empty before calling cost_telemetry.
     let cli_future = crate::claude_runner::CHANNEL_REPLY_AGENT_ID
         .scope(agent_id.clone(), cli_future);
-    let reply = if is_channel_session {
-        crate::claude_runner::REPLY_CHANNEL.scope(session_id.to_string(), cli_future).await
-    } else {
-        cli_future.await
+    let local_first_answered = local_first_reply.is_some();
+    let reply = match local_first_reply {
+        // Local-first already answered (inference_mode=local): skip the CLI
+        // entirely — the unconsumed cli_future is lazy and simply drops.
+        Some(local_reply) => Ok(local_reply),
+        None if is_channel_session => {
+            crate::claude_runner::REPLY_CHANNEL.scope(session_id.to_string(), cli_future).await
+        }
+        None => cli_future.await,
     };
     let reply = match reply {
         Ok(reply) => {
-            info!("Claude replied via Claude Code SDK ({} chars)", reply.len());
+            if !local_first_answered {
+                info!("Claude replied via Claude Code SDK ({} chars)", reply.len());
+            }
             Some(reply)
         }
         Err(e) => {
@@ -1483,18 +1596,15 @@ async fn build_reply_with_session_inner(
     // 2. Fallback: Local model inference (if configured)
     let reply = match reply {
         Some(r) => Some(r),
+        None if local_attempted_first => {
+            // inference_mode=local already tried (and failed) local FIRST —
+            // don't retry the same engine; proceed to the Direct API fallback.
+            None
+        }
         None => {
-            // Resolve agent's local model config (if any)
-            let local_model_id = agent_dir.as_ref().and_then(|d| {
-                let toml_path = d.join("agent.toml");
-                let content = std::fs::read_to_string(&toml_path).ok()?;
-                let table: toml::Table = content.parse().ok()?;
-                table.get("model")?.as_table()?
-                    .get("local")?.as_table()?
-                    .get("model")?.as_str().map(|s| s.to_string())
-            });
             match crate::claude_runner::try_local_inference(
                 &ctx.home_dir, &sanitized_text, &full_system_prompt, local_model_id.as_deref(),
+                Some(&agent_id), capabilities.as_ref(),
             ).await {
                 Ok(local_reply) => {
                     info!("Replied via local model ({} chars)", local_reply.len());
@@ -2014,6 +2124,7 @@ async fn build_reply_with_session_inner(
             let sandbox_for_pred = ctx.sandbox_store.clone();
             let notebook_for_pred = ctx.mistake_notebook.clone();
             let memory_db_path_for_pred = cognitive_memory_db.clone();
+            let injected_rule_ids_for_pred = injected_rule_ids.clone();
             let ext_factors_cfg = external_factors_config.clone();
             let evolution_emitter_for_pred = ctx.evolution_emitter.clone();
 
@@ -2073,6 +2184,19 @@ async fn build_reply_with_session_inner(
                 if let Some(ref outcome) = conv_outcome {
                     let meta = pe.metacognition.lock().await;
                     error.apply_outcome(outcome, &meta.thresholds);
+                }
+
+                // ACE/ExpeL rule lifecycle: credit/blame the consolidated
+                // rules injected into this turn's prompt using the settled
+                // error category; net-zero rules are retired. Detached —
+                // must run after apply_outcome so the category is final.
+                if let Some(ref dbp) = memory_db_path_for_pred {
+                    crate::prediction::rule_lifecycle::settle_detached(
+                        dbp.clone(),
+                        agent_id_for_pred.clone(),
+                        injected_rule_ids_for_pred.clone(),
+                        error.category,
+                    );
                 }
 
                 // ── Wiki RL trust feedback (Phase 2) ───────────────────
@@ -2704,20 +2828,25 @@ async fn build_reply_with_session_inner(
             });
         }
 
-        // ── Wiki ingest (async, non-blocking) ────────────────────
+        // ── Conversation distill (async, non-blocking) ───────────
+        // Auto-distilled facts go to the MEMORY system (temporal supersession),
+        // never to the curated wiki — see wiki_ingest.rs module docs.
         {
-            let user_text_for_wiki = sanitized_text.clone();
-            let reply_for_wiki = reply.clone();
-            let agent_id_for_wiki = agent_id.clone();
-            let session_for_wiki = session_id.to_string();
-            let home_for_wiki = ctx.home_dir.clone();
+            let user_text_for_distill = sanitized_text.clone();
+            let reply_for_distill = reply.clone();
+            let agent_id_for_distill = agent_id.clone();
+            let home_for_distill = ctx.home_dir.clone();
+            let memory_db_for_distill = ctx
+                .memory_db_path
+                .clone()
+                .unwrap_or_else(|| ctx.home_dir.join("memory.db"));
             tokio::spawn(async move {
                 crate::wiki_ingest::run_ingest(
-                    &user_text_for_wiki,
-                    &reply_for_wiki,
-                    &agent_id_for_wiki,
-                    &session_for_wiki,
-                    &home_for_wiki,
+                    &user_text_for_distill,
+                    &reply_for_distill,
+                    &agent_id_for_distill,
+                    &home_for_distill,
+                    &memory_db_for_distill,
                 ).await;
             });
         }
@@ -2839,11 +2968,35 @@ pub(crate) enum FailureReason {
     EmptyResponse,
     /// No rotator accounts configured.
     NoAccounts,
-    /// CLI failed but local model replied successfully.
-    /// Contains the original CLI error for user transparency.
-    LocalModelFallback(String),
     /// Fallback — unrecognized error string.
     Unknown,
+}
+
+/// Lowercase + collapse all whitespace runs to a single space, so
+/// containment checks are robust to formatting differences between a
+/// wiki page and an extracted fact. CJK-safe (no byte slicing).
+fn normalize_for_dedup(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Wiki/memory injection dedup: keep only facts whose normalized text is
+/// NOT already present in the (normalized) prompt built so far — the
+/// prompt already contains the injected wiki pages, so a contained fact
+/// would be pure duplication. Trivially short facts (< 6 chars) are kept
+/// as-is: containment matches on them are too noisy to trust.
+fn filter_facts_not_in_prompt(facts: &[String], prompt: &str) -> Vec<String> {
+    let normalized_prompt = normalize_for_dedup(prompt);
+    facts
+        .iter()
+        .filter(|f| {
+            let nf = normalize_for_dedup(f);
+            nf.chars().count() < 6 || !normalized_prompt.contains(&nf)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Classify an error string produced by `call_claude_cli_rotated` or the Direct API fallback.
@@ -2888,6 +3041,32 @@ pub(crate) fn classify_cli_failure(err: &str) -> FailureReason {
     FailureReason::Unknown
 }
 
+/// Summarized-failure retry hint (context decontamination, arXiv:2605.08563).
+///
+/// Returns a one-line deterministic hint for *model-behavior* failures where
+/// re-sending the identical prompt tends to reproduce the identical failure.
+/// Infra failures (rate limit / billing / auth / spawn / missing binary)
+/// return `None`: the model did nothing wrong, so the retry prompt must stay
+/// byte-identical to preserve the prompt cache. Zero LLM cost — the summary
+/// is synthesized from the failure class, never from raw stderr (which could
+/// carry prompt-injection payloads).
+pub(crate) fn retry_hint_for(err: &str) -> Option<String> {
+    match classify_cli_failure(err) {
+        FailureReason::Timeout => Some(
+            "A previous attempt at this exact request timed out before completing. \
+             Do not repeat the same approach: answer more directly, keep tool use \
+             to a minimum, and prefer a shorter response."
+                .to_string(),
+        ),
+        FailureReason::EmptyResponse => Some(
+            "A previous attempt at this exact request ended without producing any \
+             text. Reply with a direct textual answer."
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
 /// Build a zh-TW user-facing message for a classified failure.
 ///
 /// Messages directly tell the user *why* CLI failed (rate limit, billing, etc.)
@@ -2930,18 +3109,22 @@ pub(crate) fn format_fallback_message(agent_name: &str, reason: FailureReason) -
             "{agent_name} 目前沒有可用的 Claude 帳號。\n\
              請先到儀表板設定 OAuth 或 API Key。"
         ),
-        FailureReason::LocalModelFallback(ref cli_err) => {
-            let reason_hint = classify_cli_error_hint(cli_err);
-            format!(
-                "⚠️ Claude CLI 暫時不可用（{reason_hint}），本次由本地模型代為回應。\n\
-                 系統會在背景自動偵測 CLI 恢復，屆時將自動切回 Claude。"
-            )
-        }
         FailureReason::Unknown => format!(
             "{agent_name} 暫時無法回應。\n\
              請稍後再試，或查看 ~/.duduclaw/debug.log 取得詳細原因。"
         ),
     }
+}
+
+/// Pure routing decision: does `[general] inference_mode` (config.toml)
+/// prefer local inference FIRST on the channel-reply path?
+///
+/// Exact token equality — never a substring check (2026-06 conventions) —
+/// and case-sensitive to match the dispatcher's `match mode.as_str()` arms,
+/// so both paths agree on what "local" means. Anything else ("hybrid",
+/// "claude", absent/empty, typos) keeps the CLI-first behavior unchanged.
+fn local_inference_first(inference_mode: &str) -> bool {
+    inference_mode == "local"
 }
 
 /// Translate a raw CLI error into a short zh-TW hint for the user.
@@ -2957,6 +3140,29 @@ fn classify_cli_error_hint(err: &str) -> &'static str {
         FailureReason::NoAccounts => "無可用帳號",
         FailureReason::SpawnError => "程序啟動失敗",
         _ => "連線異常",
+    }
+}
+
+#[cfg(test)]
+mod local_first_tests {
+    use super::local_inference_first;
+
+    /// Table-driven: only the exact "local" token flips the channel path to
+    /// local-first; every other mode keeps CLI-first behavior unchanged.
+    #[test]
+    fn inference_mode_routing_decision() {
+        for (mode, expected) in [
+            ("local", true),
+            ("hybrid", false),
+            ("claude", false),
+            ("", false),
+            ("LOCAL", false),       // case-sensitive, like the dispatcher match
+            ("local-only", false),  // token equality, never substring
+            (" local", false),      // raw config value, no trimming surprises
+            ("cloud", false),
+        ] {
+            assert_eq!(local_inference_first(mode), expected, "mode = {mode:?}");
+        }
     }
 }
 
@@ -3225,6 +3431,7 @@ mod rotation_tests {
         Account {
             id: id.to_string(),
             auth_method: AuthMethod::OAuth,
+            provider: "anthropic".to_string(),
             priority,
             monthly_budget_cents: 0,
             tags: vec![],
@@ -3264,13 +3471,16 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
-            move |env_vars| {
+            move |env_vars, retry_hint| {
                 let n = call_count_cloned.fetch_add(1, Ordering::SeqCst);
                 // First attempt: simulate rate limit.
                 // Second attempt: return success with a distinctive body.
                 async move {
                     // Sanity: env_vars should contain OAuth token for the selected account.
                     assert!(env_vars.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
+                    // Rate limit is an infra failure — retry must NOT get a hint
+                    // (prompt stays byte-identical, cache preserved).
+                    assert!(retry_hint.is_none(), "no hint expected after rate limit");
                     if n == 0 {
                         Err("Error 429 rate limit reached".to_string())
                     } else {
@@ -3294,6 +3504,77 @@ mod rotation_tests {
         assert_eq!(second.total_requests, 1, "second account should have one success recorded");
     }
 
+    /// Scenario: summarized-failure retry (arXiv:2605.08563).
+    ///
+    /// First attempt hits a model-behavior failure (hard timeout); the retry
+    /// on the second account must receive a deterministic one-line hint so it
+    /// doesn't silently re-run the identical prompt into the identical failure.
+    #[tokio::test]
+    async fn retry_after_timeout_carries_failure_summary() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("first", 1)).await;
+        rotator.push_account_for_test(fake_oauth_account("second", 2)).await;
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_cloned = call_count.clone();
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            move |_env_vars, retry_hint| {
+                let n = call_count_cloned.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        assert!(retry_hint.is_none(), "first attempt must have no hint");
+                        Err("claude CLI hard timeout (1800s, no output)".to_string())
+                    } else {
+                        let hint = retry_hint.expect("retry after timeout must carry a hint");
+                        assert!(hint.contains("timed out"), "hint should describe the failure: {hint}");
+                        Ok("recovered".to_string())
+                    }
+                }
+            },
+            100,
+        )
+        .await;
+
+        assert_eq!(result.as_deref(), Ok("recovered"));
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    /// Wiki/memory injection dedup: facts already present in the prompt
+    /// (e.g. via an injected wiki page) are dropped; wiki wins.
+    #[test]
+    fn facts_already_in_wiki_section_are_deduped() {
+        let prompt = "## Wiki Knowledge\n### Wiki — Core\n\n阿明住在台北，喜歡  黑咖啡。\nDeploys go through CI only.\n";
+        let facts = vec![
+            "阿明住在台北，喜歡 黑咖啡。".to_string(), // whitespace-variant duplicate → dropped
+            "阿明的生日是三月".to_string(),            // novel → kept
+            "deploys go through ci only.".to_string(),  // case-variant duplicate → dropped
+            "ok".to_string(),                           // too short to trust containment → kept
+        ];
+        let kept = filter_facts_not_in_prompt(&facts, prompt);
+        assert_eq!(kept, vec!["阿明的生日是三月".to_string(), "ok".to_string()]);
+    }
+
+    #[test]
+    fn normalize_for_dedup_collapses_whitespace_and_case() {
+        assert_eq!(
+            normalize_for_dedup("  Hello\n\tWORLD  台北 "),
+            "hello world 台北"
+        );
+    }
+
+    /// retry_hint_for: model-behavior failures get hints, infra failures don't.
+    #[test]
+    fn retry_hint_only_for_model_behavior_failures() {
+        assert!(retry_hint_for("claude CLI hard timeout (1800s, no output)").is_some());
+        assert!(retry_hint_for("claude CLI empty response").is_some());
+        assert!(retry_hint_for("Error 429 rate limit reached").is_none());
+        assert!(retry_hint_for("HTTP 402 insufficient_quota credit balance").is_none());
+        assert!(retry_hint_for("Not logged in · Please run /login").is_none());
+        assert!(retry_hint_for("claude CLI not found in PATH").is_none());
+    }
+
     /// Scenario: both accounts fail with the same error.
     ///
     /// Verifies:
@@ -3308,7 +3589,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
-            |_env_vars| async move {
+            |_env_vars, _retry_hint| async move {
                 Err::<String, _>("claude CLI hard timeout (1800s, no output)".to_string())
             },
             100,
@@ -3334,7 +3615,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
-            |_env_vars| async move {
+            |_env_vars, _retry_hint| async move {
                 Err::<String, _>("HTTP 402 insufficient_quota credit balance".to_string())
             },
             100,
@@ -3363,7 +3644,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
-            move |_env_vars| {
+            move |_env_vars, _retry_hint| {
                 attempts_cloned.fetch_add(1, Ordering::SeqCst);
                 async move { Ok::<String, String>("OK".to_string()) }
             },
@@ -3392,7 +3673,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
-            |_env_vars| async move {
+            |_env_vars, _retry_hint| async move {
                 Err::<String, _>("Error 429 rate limit: usage limit exceeded".to_string())
             },
             50,
@@ -3433,7 +3714,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
-            |_env_vars| async move {
+            |_env_vars, _retry_hint| async move {
                 Err::<String, _>(
                     "claude CLI stream error: Not logged in · Please run /login".to_string(),
                 )
@@ -3467,7 +3748,7 @@ mod rotation_tests {
 
         let result = rotate_cli_spawn(
             &rotator,
-            |_env_vars| async move { Ok::<String, String>("never called".to_string()) },
+            |_env_vars, _retry_hint| async move { Ok::<String, String>("never called".to_string()) },
             100,
         )
         .await;
@@ -3739,7 +4020,7 @@ pub(crate) async fn call_claude_cli_rotated(
     // turn, no log noise, no cost duplication.
     let input_len = user_message.len();
     let history_clone = conversation_history.to_vec();
-    rotate_cli_spawn(&rotator, move |env_vars| {
+    rotate_cli_spawn(&rotator, move |env_vars, retry_hint| {
         let model = model.to_string();
         let system_prompt = system_prompt.to_string();
         let home_dir = home_dir.to_path_buf();
@@ -3749,11 +4030,16 @@ pub(crate) async fn call_claude_cli_rotated(
         let history = history_clone.clone();
         let user_message_owned = user_message.to_string();
         async move {
-            let effective_prompt = if history.is_empty() {
+            let mut effective_prompt = if history.is_empty() {
                 user_message_owned
             } else {
                 format_history_as_prompt(&history, &user_message_owned)
             };
+            // Summarized-failure retry: one-line hint appended to the user
+            // message (never the system prompt — keeps its cache prefix stable).
+            if let Some(hint) = retry_hint {
+                effective_prompt = format!("{effective_prompt}\n\n<retry_context>{hint}</retry_context>");
+            }
             spawn_claude_cli_with_env(
                 &effective_prompt, &model, &system_prompt, &home_dir,
                 work_dir.as_deref(), on_progress, capabilities.as_ref(),
@@ -3767,10 +4053,18 @@ pub(crate) async fn call_claude_cli_rotated(
 ///
 /// Iterates `rotator.select()` up to `rotator.count()` times. For each
 /// selected account, calls the provided `spawn` closure with the env-var
-/// map. On success, records cost telemetry and returns. On failure,
-/// classifies the error and feeds it back to the rotator (`on_billing_exhausted`,
-/// `on_rate_limited`, or `on_error`). Returns the last error when all
-/// accounts are exhausted.
+/// map and an optional retry hint. On success, records cost telemetry and
+/// returns. On failure, classifies the error and feeds it back to the
+/// rotator (`on_billing_exhausted`, `on_rate_limited`, or `on_error`).
+/// Returns the last error when all accounts are exhausted.
+///
+/// The retry hint implements summarized-failure retry (context
+/// decontamination, arXiv:2605.08563): after a *model-behavior* failure
+/// (timeout / empty response) the next attempt gets a one-line deterministic
+/// summary to steer it away from the failed approach, instead of silently
+/// re-running the byte-identical prompt. Infra failures (rate limit,
+/// billing, auth, spawn) pass `None` so the prompt stays unchanged and
+/// prompt-cache friendly.
 ///
 /// `input_size_hint` is used for rough API-key cost accounting when the
 /// spawn closure doesn't extract token usage from the CLI stream.
@@ -3780,12 +4074,13 @@ pub(crate) async fn rotate_cli_spawn<F, Fut>(
     input_size_hint: usize,
 ) -> Result<String, String>
 where
-    F: Fn(std::collections::HashMap<String, String>) -> Fut,
+    F: Fn(std::collections::HashMap<String, String>, Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
 {
     let account_count = rotator.count().await;
     let max_attempts = account_count.max(1);
     let mut last_error = String::new();
+    let mut retry_hint: Option<String> = None;
 
     for attempt in 0..max_attempts {
         let Some(selected) = rotator.select().await else {
@@ -3793,7 +4088,7 @@ where
         };
         info!(account = %selected.id, attempt, "Channel CLI attempt");
 
-        match spawn(selected.env_vars.clone()).await {
+        match spawn(selected.env_vars.clone(), retry_hint.clone()).await {
             Ok(text) => {
                 // Channel calls don't extract token usage from streams, so cost
                 // is 0 (OAuth subscription) or a rough estimate (API key).
@@ -3817,6 +4112,7 @@ where
                     warn!(account = %selected.id, error = %e, "Account CLI attempt failed");
                     rotator.on_error(&selected.id).await;
                 }
+                retry_hint = retry_hint_for(&e);
             }
         }
     }
@@ -3952,6 +4248,14 @@ async fn spawn_claude_cli_with_env(
     }
 
     // Pass system prompt via temp file to avoid exposure in /proc/PID/cmdline (BE-C1)
+    // CACHE_SPLIT_MARKER is a Direct-API-only layering hint — strip it here.
+    let system_prompt_cli: std::borrow::Cow<'_, str> =
+        if system_prompt.contains(crate::direct_api::CACHE_SPLIT_MARKER) {
+            std::borrow::Cow::Owned(system_prompt.replace(crate::direct_api::CACHE_SPLIT_MARKER, ""))
+        } else {
+            std::borrow::Cow::Borrowed(system_prompt)
+        };
+    let system_prompt = system_prompt_cli.as_ref();
     let _prompt_guard: Option<tempfile::TempPath> = if !system_prompt.is_empty() {
         match tempfile::NamedTempFile::new() {
             Ok(mut f) => {
@@ -4327,6 +4631,15 @@ async fn spawn_claude_cli_with_env(
         return Err(format!("Empty response from claude CLI ({diag})"));
     }
 
+    // OTel GenAI: post-hoc usage recording onto the active `invoke_agent`
+    // span (fields declared Empty at the instrumented entry — see
+    // `crate::otel`). No-op when the span is disabled or lacks the fields.
+    if let Some(usage) = token_usage.as_ref() {
+        let span = tracing::Span::current();
+        span.record(crate::otel::attrs::USAGE_INPUT_TOKENS, usage.input_tokens);
+        span.record(crate::otel::attrs::USAGE_OUTPUT_TOKENS, usage.output_tokens);
+    }
+
     // RFC-22 P1-7: record cost_telemetry for the channel reply. Skipped when
     // the task_local agent_id is unset (e.g. invoked outside channel_reply,
     // such as the dispatch path which already records via claude_runner).
@@ -4637,11 +4950,18 @@ async fn spawn_claude_cli_pty_with_env(
     }
 
     // Pass system prompt via temp file (matches legacy path; cmdline-safe).
-    let prompt_guard: Option<tempfile::TempPath> = if !system_prompt.is_empty() {
+    // CACHE_SPLIT_MARKER is a Direct-API-only layering hint — strip it here.
+    let system_prompt_cli: std::borrow::Cow<'_, str> =
+        if system_prompt.contains(crate::direct_api::CACHE_SPLIT_MARKER) {
+            std::borrow::Cow::Owned(system_prompt.replace(crate::direct_api::CACHE_SPLIT_MARKER, ""))
+        } else {
+            std::borrow::Cow::Borrowed(system_prompt)
+        };
+    let prompt_guard: Option<tempfile::TempPath> = if !system_prompt_cli.is_empty() {
         match tempfile::NamedTempFile::new() {
             Ok(mut f) => {
                 use std::io::Write;
-                let _ = f.write_all(system_prompt.as_bytes());
+                let _ = f.write_all(system_prompt_cli.as_bytes());
                 Some(f.into_temp_path())
             }
             Err(_) => None,
@@ -4838,7 +5158,7 @@ pub(crate) async fn call_claude_cli_pty_rotated(
     let history_clone = conversation_history.to_vec();
     rotate_cli_spawn(
         &rotator,
-        move |env_vars| {
+        move |env_vars, retry_hint| {
             let model = model.to_string();
             let system_prompt = system_prompt.to_string();
             let home_dir = home_dir.to_path_buf();
@@ -4848,11 +5168,16 @@ pub(crate) async fn call_claude_cli_pty_rotated(
             let history = history_clone.clone();
             let user_message_owned = user_message.to_string();
             async move {
-                let effective_prompt = if history.is_empty() {
+                let mut effective_prompt = if history.is_empty() {
                     user_message_owned
                 } else {
                     format_history_as_prompt(&history, &user_message_owned)
                 };
+                // Summarized-failure retry (see rotate_cli_spawn docs).
+                if let Some(hint) = retry_hint {
+                    effective_prompt =
+                        format!("{effective_prompt}\n\n<retry_context>{hint}</retry_context>");
+                }
                 invoke_pty_branch(
                     &effective_prompt,
                     &model,
@@ -5414,26 +5739,36 @@ fn build_system_prompt(
                         }
                     },
                 );
+            // Session-stable selection: pin the kept-page set per
+            // (agent, session) so the wiki section bytes don't churn
+            // every turn and break the prompt-cache prefix. Falls back
+            // to per-turn ranking when no session identity is known.
+            let cache_key = citation_ctx.map(|(agent_id, conv_id, session_id)| {
+                format!("{agent_id}:{}", session_id.unwrap_or(conv_id))
+            });
             let wiki_ctx = crate::ranked_wiki_injection::ranked_wiki_injection(
                 &store,
                 query,
                 6000,
                 citation_context,
+                cache_key.as_deref(),
             );
             // The helper returns "" on error or no pages — wrap the
             // non-empty case identically to before so prompt shape
             // stays stable for prompt-cache hits.
-            let result: Result<String, duduclaw_core::error::DuDuClawError> = Ok(wiki_ctx);
-            match result {
-                Ok(wiki_ctx) if !wiki_ctx.is_empty() => {
-                    let s = format!("## Wiki Knowledge\n{}", wiki_ctx.trim_end());
-                    audit.push(crate::prompt_audit::PromptSection::new("wiki", &s));
-                    parts.push(s);
-                }
-                Ok(_) => {} // no L0/L1 pages
-                Err(e) => {
-                    tracing::warn!("Wiki injection failed: {e}");
-                }
+            if !wiki_ctx.is_empty() {
+                // CACHE_SPLIT_MARKER: on the Direct API path the wiki
+                // section starts a second cached system block, so a wiki
+                // change invalidates only this block, not the static
+                // SOUL/skills/team prefix. CLI spawn paths strip the
+                // marker before writing the system-prompt file.
+                let s = format!(
+                    "{}\n## Wiki Knowledge\n{}",
+                    crate::direct_api::CACHE_SPLIT_MARKER,
+                    wiki_ctx.trim_end()
+                );
+                audit.push(crate::prompt_audit::PromptSection::new("wiki", &s));
+                parts.push(s);
             }
         }
     }

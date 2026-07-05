@@ -57,6 +57,15 @@ pub struct RuntimeContext {
     /// Conversation history for multi-turn context (chronological, newest last).
     /// Excludes the current user message. Empty on first turn.
     pub conversation_history: Vec<ConversationTurn>,
+    /// Agent capability restrictions (`agent.toml [capabilities]`).
+    ///
+    /// `Some` when the caller resolved an agent directory — runtimes MUST
+    /// translate these into their CLI's enforcement flags (Claude
+    /// `--allowedTools`/`--disallowedTools`, Codex `--sandbox`, Gemini
+    /// `--approval-mode`/`--sandbox`) and emit a structured `warn!` when the
+    /// CLI cannot fully honor them. `None` (agent-less utility calls) keeps
+    /// each runtime's legacy behavior.
+    pub capabilities: Option<duduclaw_core::types::CapabilitiesConfig>,
 }
 
 /// Streaming chunk from a runtime execution.
@@ -178,6 +187,84 @@ impl RuntimeRegistry {
 
 // ── Helpers ─────────────────────────────────────────────────────
 
+/// Load `agent.toml [capabilities]` for an agent directory.
+///
+/// Returns `None` only when `agent.toml` itself is missing (synthetic /
+/// test agent ids) — callers then keep their legacy capability-less
+/// behavior. When the file exists but `[capabilities]` is absent OR fails
+/// to deserialize, this returns `Some(CapabilitiesConfig::default())`
+/// (deny-by-default: `computer_use = false`, `browser_via_bash = false`)
+/// with a warn on the malformed case — security gates fail closed.
+pub fn load_agent_capabilities(
+    agent_dir: &Path,
+) -> Option<duduclaw_core::types::CapabilitiesConfig> {
+    let path = agent_dir.join("agent.toml");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let parsed = match text.parse::<toml::Value>() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                agent_dir = %agent_dir.display(),
+                error = %e,
+                "agent.toml parse failed — applying default (deny-by-default) capabilities"
+            );
+            return Some(duduclaw_core::types::CapabilitiesConfig::default());
+        }
+    };
+    let caps = match parsed.get("capabilities") {
+        None => duduclaw_core::types::CapabilitiesConfig::default(),
+        Some(section) => match section.clone().try_into() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    agent_dir = %agent_dir.display(),
+                    error = %e,
+                    "[capabilities] section malformed — applying default (deny-by-default) capabilities"
+                );
+                duduclaw_core::types::CapabilitiesConfig::default()
+            }
+        },
+    };
+    Some(caps)
+}
+
+/// Build the `duduclaw` MCP server definition for a non-Claude CLI's native
+/// MCP config (Codex `config.toml [mcp_servers]`, Gemini/Antigravity
+/// `settings.json mcpServers`). Mirrors
+/// `duduclaw_agent::mcp_template::ensure_duduclaw_absolute_path` for Claude:
+/// absolute `duduclaw` binary + `mcp-server` arg + `DUDUCLAW_AGENT_ID` env
+/// (the MCP subprocess self-identifies through it — without it every call
+/// falls back to `default_agent` and supervisor authorization breaks), plus
+/// this instance's `DUDUCLAW_HOME` / `DUDUCLAW_PORT` / `DUDUCLAW_INSTANCE`
+/// overrides when set (multi-instance isolation, Plan A).
+///
+/// Returns `None` when the duduclaw binary cannot be resolved to an absolute
+/// path — registering a PATH-relative command would break for CLI subprocesses
+/// launched without PATH inheritance.
+pub fn duduclaw_mcp_server_json(agent_id: &str) -> Option<serde_json::Value> {
+    let bin = duduclaw_core::resolve_duduclaw_bin();
+    if !bin.is_absolute() {
+        return None;
+    }
+    let mut env = serde_json::Map::new();
+    env.insert(
+        duduclaw_core::ENV_AGENT_ID.to_string(),
+        serde_json::Value::String(agent_id.to_string()),
+    );
+    for var in ["DUDUCLAW_HOME", "DUDUCLAW_PORT", "DUDUCLAW_INSTANCE"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.trim().is_empty() {
+                env.insert(var.to_string(), serde_json::Value::String(v));
+            }
+        }
+    }
+    Some(serde_json::json!({
+        "command": bin.to_string_lossy(),
+        "args": ["mcp-server"],
+        "env": serde_json::Value::Object(env),
+    }))
+}
+
 /// Format conversation history as an XML-delimited prompt prefix.
 ///
 /// Used by CLI-based runtimes (Gemini, Codex) that lack native multi-turn
@@ -227,5 +314,60 @@ mod tests {
 
         let parsed: RuntimeType = serde_json::from_str::<RuntimeType>(r#""gemini""#).unwrap();
         assert_eq!(parsed, RuntimeType::Gemini);
+    }
+
+    #[test]
+    fn load_capabilities_none_when_agent_toml_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_agent_capabilities(dir.path()).is_none());
+    }
+
+    #[test]
+    fn load_capabilities_defaults_when_section_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("agent.toml"), "[agent]\nname = \"x\"\n").unwrap();
+        let caps = load_agent_capabilities(dir.path()).expect("file exists");
+        assert!(!caps.computer_use, "deny-by-default");
+        assert!(!caps.browser_via_bash);
+        assert!(caps.allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn load_capabilities_parses_section() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            "[capabilities]\ncomputer_use = true\nallowed_tools = [\"Read\"]\n",
+        )
+        .unwrap();
+        let caps = load_agent_capabilities(dir.path()).unwrap();
+        assert!(caps.computer_use);
+        assert_eq!(caps.allowed_tools, vec!["Read".to_string()]);
+    }
+
+    #[test]
+    fn load_capabilities_fails_closed_on_malformed_section() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            // computer_use has the wrong type — the section must fail closed
+            // to the deny-by-default config, not silently grant anything.
+            "[capabilities]\ncomputer_use = \"yes please\"\n",
+        )
+        .unwrap();
+        let caps = load_agent_capabilities(dir.path()).unwrap();
+        assert!(!caps.computer_use, "malformed section must fail closed");
+    }
+
+    #[test]
+    fn duduclaw_mcp_server_json_carries_agent_id() {
+        // resolve_duduclaw_bin falls back to current_exe (absolute under
+        // cargo test); when unresolvable this correctly yields None.
+        let Some(def) = duduclaw_mcp_server_json("agnes") else {
+            return;
+        };
+        assert_eq!(def["args"][0], "mcp-server");
+        assert_eq!(def["env"][duduclaw_core::ENV_AGENT_ID], "agnes");
+        assert!(std::path::Path::new(def["command"].as_str().unwrap()).is_absolute());
     }
 }

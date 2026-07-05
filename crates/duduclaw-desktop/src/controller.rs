@@ -86,7 +86,7 @@ pub trait DesktopController {
     ) -> Result<(), DesktopError>;
 }
 
-/// Native desktop controller using `enigo` + `xcap`.
+/// Native desktop controller using `enigo` (input) + OS-native screen capture.
 ///
 /// Directly controls the host machine's display. Requires:
 /// - macOS: Accessibility API permission (System Settings → Privacy → Accessibility)
@@ -112,33 +112,8 @@ impl NativeDesktopController {
 
 impl DesktopController for NativeDesktopController {
     fn screenshot(&self) -> Result<Vec<u8>, DesktopError> {
-        let monitors = xcap::Monitor::all()
-            .map_err(|e| DesktopError::ScreenshotFailed(format!("No monitors: {e}")))?;
-
-        // Find primary monitor, falling back to the first available
-        let monitor = monitors
-            .iter()
-            .find(|m| m.is_primary().unwrap_or(false))
-            .or(monitors.first())
-            .ok_or_else(|| DesktopError::ScreenshotFailed("No monitor found".into()))?;
-
-        let rgba_image = monitor
-            .capture_image()
-            .map_err(|e| DesktopError::ScreenshotFailed(format!("Capture failed: {e}")))?;
-
-        // Encode to PNG
-        let mut buf = Vec::new();
-        let encoder = image::codecs::png::PngEncoder::new(&mut buf);
-        image::ImageEncoder::write_image(
-            encoder,
-            rgba_image.as_raw(),
-            rgba_image.width(),
-            rgba_image.height(),
-            image::ExtendedColorType::Rgba8,
-        )
-        .map_err(|e| DesktopError::ScreenshotFailed(format!("PNG encode: {e}")))?;
-
-        Ok(buf)
+        // Capture the primary monitor as PNG via the OS-native tool (no `xcap`).
+        crate::capture::capture_primary_monitor_png().map_err(DesktopError::ScreenshotFailed)
     }
 
     fn mouse_move(&mut self, x: i32, y: i32) -> Result<(), DesktopError> {

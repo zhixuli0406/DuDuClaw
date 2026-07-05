@@ -104,6 +104,10 @@ struct ChatRequest {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     stop: Vec<String>,
+    /// Request per-token logprobs (supported by llama.cpp server, vLLM, SGLang).
+    /// Omitted entirely when not requested so legacy servers see an unchanged body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -121,6 +125,32 @@ struct ChatResponse {
 #[derive(Deserialize)]
 struct ChatChoice {
     message: ChatMessage,
+    /// Present when the request set `logprobs: true` and the server supports it.
+    #[serde(default)]
+    logprobs: Option<ChoiceLogprobs>,
+}
+
+#[derive(Deserialize)]
+struct ChoiceLogprobs {
+    #[serde(default)]
+    content: Option<Vec<TokenLogprob>>,
+}
+
+#[derive(Deserialize)]
+struct TokenLogprob {
+    logprob: f64,
+}
+
+/// Mean per-token logprob of a choice, `None` when the server returned no
+/// logprobs (or an empty token list) — post-hoc confidence then stays off
+/// (fail-safe: identical behaviour to a server without logprob support).
+fn mean_logprob_of(choice: &ChatChoice) -> Option<f32> {
+    let tokens = choice.logprobs.as_ref()?.content.as_deref()?;
+    if tokens.is_empty() {
+        return None;
+    }
+    let sum: f64 = tokens.iter().map(|t| t.logprob).sum();
+    Some((sum / tokens.len() as f64) as f32)
 }
 
 #[derive(Deserialize)]
@@ -193,6 +223,7 @@ impl InferenceBackend for OpenAiCompatBackend {
             temperature: Some(request.params.temperature),
             top_p: Some(request.params.top_p),
             stop: request.params.stop.clone(),
+            logprobs: request.params.capture_logprobs.then_some(true),
         };
 
         let url = &self.chat_url;
@@ -218,11 +249,11 @@ impl InferenceBackend for OpenAiCompatBackend {
             .await
             .map_err(|e| InferenceError::Http(format!("Failed to parse response: {e}")))?;
 
-        let text = chat_resp
-            .choices
-            .first()
+        let first_choice = chat_resp.choices.first();
+        let text = first_choice
             .map(|c| c.message.content.clone())
             .unwrap_or_default();
+        let mean_logprob = first_choice.and_then(mean_logprob_of);
 
         let elapsed = start.elapsed();
         let usage = chat_resp.usage.unwrap_or(ChatUsage {
@@ -244,6 +275,7 @@ impl InferenceBackend for OpenAiCompatBackend {
             tokens_per_second: tps,
             backend: BackendType::OpenAiCompat,
             model_id: model.to_string(),
+            mean_logprob,
         })
     }
 
@@ -254,5 +286,69 @@ impl InferenceBackend for OpenAiCompatBackend {
             req = req.bearer_auth(key);
         }
         matches!(req.send().await, Ok(r) if r.status().is_success())
+    }
+}
+
+#[cfg(test)]
+mod logprob_tests {
+    use super::*;
+
+    #[test]
+    fn mean_logprob_parsed_from_openai_response() {
+        let json = r#"{
+            "choices": [{
+                "message": {"role": "assistant", "content": "hi"},
+                "logprobs": {"content": [
+                    {"token": "h", "logprob": -0.2},
+                    {"token": "i", "logprob": -0.4}
+                ]}
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2}
+        }"#;
+        let resp: ChatResponse = serde_json::from_str(json).expect("parse");
+        let mean = mean_logprob_of(resp.choices.first().unwrap()).expect("mean");
+        assert!((mean - (-0.3)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn missing_logprobs_yields_none() {
+        // Server that ignores the logprobs field (fail-safe path).
+        let json = r#"{
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+            "usage": null
+        }"#;
+        let resp: ChatResponse = serde_json::from_str(json).expect("parse");
+        assert!(mean_logprob_of(resp.choices.first().unwrap()).is_none());
+    }
+
+    #[test]
+    fn empty_logprob_content_yields_none() {
+        let json = r#"{
+            "choices": [{
+                "message": {"role": "assistant", "content": ""},
+                "logprobs": {"content": []}
+            }]
+        }"#;
+        let resp: ChatResponse = serde_json::from_str(json).expect("parse");
+        assert!(mean_logprob_of(resp.choices.first().unwrap()).is_none());
+    }
+
+    #[test]
+    fn logprobs_field_omitted_from_request_when_not_captured() {
+        let body = ChatRequest {
+            model: "m".into(),
+            messages: vec![],
+            max_tokens: Some(10),
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            stop: vec![],
+            logprobs: None,
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(!json.contains("logprobs"), "legacy request body must be unchanged: {json}");
+
+        let body = ChatRequest { logprobs: Some(true), ..body };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains("\"logprobs\":true"));
     }
 }

@@ -418,7 +418,6 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
-    use crate::prediction::user_model::RunningStats;
 
     fn make_sandboxed(name: &str, ttl: u32) -> SandboxedSkill {
         SandboxedSkill {

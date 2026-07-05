@@ -858,6 +858,35 @@ async fn spawn_session_for_key(
         extra_args.push("--bare".to_string());
     }
 
+    // W1 (capability enforcement): PTY-pooled sessions previously received NO
+    // tool restrictions — `CapabilitiesConfig` never reached the interactive
+    // spawn, so an operator's allow/deny lists were silently unenforced in
+    // pool mode. Sessions are keyed per agent, so the agent's capabilities can
+    // ride the spawn config: load them from `<home>/agents/<agent_id>/agent.toml`
+    // at spawn time (config changes picked up on the next fresh spawn, same
+    // cadence as model/account keying). `None` (agent.toml missing — synthetic
+    // test ids) keeps the legacy capability-less args.
+    let agent_dir = home.join("agents").join(&key.agent_id);
+    if let Some(caps) = crate::runtime::load_agent_capabilities(&agent_dir) {
+        let cap_args = capability_extra_args(key.cli_kind, &caps);
+        if matches!(key.cli_kind, CliKind::Antigravity) {
+            warn!(
+                runtime = "antigravity",
+                agent_id = %key.agent_id,
+                "capability enforcement unavailable on this runtime — agy exposes no \
+                 sandbox/approval/tool-list flags"
+            );
+        } else if caps.has_tool_restrictions() && !matches!(key.cli_kind, CliKind::Claude) {
+            warn!(
+                runtime = key.cli_kind.as_str(),
+                agent_id = %key.agent_id,
+                "capability enforcement is best-effort on this runtime — per-tool \
+                 allow/deny lists collapse to coarse sandbox/approval flags"
+            );
+        }
+        extra_args.extend(cap_args);
+    }
+
     let mut env = HashMap::new();
     env.insert("NO_COLOR".to_string(), "1".to_string());
     env.insert("TERM".to_string(), "xterm-256color".to_string());
@@ -928,6 +957,58 @@ async fn spawn_session_for_key(
     PtySession::spawn(opts).await
 }
 
+/// W1 (capability enforcement): translate an agent's `CapabilitiesConfig`
+/// into the interactive-CLI flag dialect for `kind`.
+///
+/// - Claude: `--allowedTools` / `--disallowedTools` CSVs — mirrors the legacy
+///   fresh-spawn flag construction in `channel_reply` (HS12: a non-empty
+///   `allowed_tools()` puts Claude Code into allowlist mode).
+/// - Codex: `--ask-for-approval never` + `--sandbox <level>` (coarse mapping,
+///   caller warns best-effort).
+/// - Gemini: `--approval-mode auto_edit|yolo` (+ `--sandbox` when read-only).
+/// - Antigravity: no flags exist — returns empty; caller emits the
+///   "enforcement unavailable" warn.
+pub(crate) fn capability_extra_args(
+    kind: CliKind,
+    caps: &duduclaw_core::types::CapabilitiesConfig,
+) -> Vec<String> {
+    use duduclaw_core::types::SandboxLevel;
+    let mut args = Vec::new();
+    match kind {
+        CliKind::Claude => {
+            let allowed = caps.allowed_tools();
+            if !allowed.is_empty() {
+                args.push("--allowedTools".to_string());
+                args.push(allowed.join(","));
+            }
+            let denied = caps.disallowed_tools();
+            if !denied.is_empty() {
+                args.push("--disallowedTools".to_string());
+                args.push(denied.join(","));
+            }
+        }
+        CliKind::Codex => {
+            let level = caps.sandbox_level();
+            args.push("--ask-for-approval".to_string());
+            args.push("never".to_string());
+            args.push("--sandbox".to_string());
+            args.push(level.as_codex_flag().to_string());
+        }
+        CliKind::Gemini => {
+            let level = caps.sandbox_level();
+            args.push("--approval-mode".to_string());
+            args.push(
+                if level == SandboxLevel::FullAccess { "yolo" } else { "auto_edit" }.to_string(),
+            );
+            if level == SandboxLevel::ReadOnly {
+                args.push("--sandbox".to_string());
+            }
+        }
+        CliKind::Antigravity => {}
+    }
+    args
+}
+
 /// Resolve the CLI binary path for the requested `kind`. Each CLI now has its
 /// own discovery helper, so the PtyPool can resolve any of the four runtimes
 /// (not just Claude). A `None` here causes `acquire()` to error, which lets the
@@ -994,6 +1075,62 @@ mod tests {
         // Empty env is a no-op (ambient/no-account invokes don't pollute the map).
         stash_account_env("acct-test-empty", &HashMap::new());
         assert!(lookup_account_env("acct-test-empty").is_none());
+    }
+
+    // W1 — capability → interactive-CLI flag translation.
+
+    #[test]
+    fn capability_args_claude_maps_allow_and_deny_lists() {
+        let caps = duduclaw_core::types::CapabilitiesConfig {
+            allowed_tools: vec!["Read".to_string(), "Grep".to_string()],
+            denied_tools: vec!["WebSearch".to_string()],
+            ..Default::default()
+        };
+        let args = capability_extra_args(CliKind::Claude, &caps);
+        assert_eq!(
+            args,
+            vec![
+                "--allowedTools",
+                "Grep,Read",
+                "--disallowedTools",
+                "WebSearch,computer"
+            ]
+        );
+    }
+
+    #[test]
+    fn capability_args_claude_default_denies_computer_only() {
+        // Default caps: no allowlist, computer denied (deny-by-default) —
+        // mirrors the legacy fresh-spawn behaviour in channel_reply.
+        let caps = duduclaw_core::types::CapabilitiesConfig::default();
+        let args = capability_extra_args(CliKind::Claude, &caps);
+        assert_eq!(args, vec!["--disallowedTools", "computer"]);
+    }
+
+    #[test]
+    fn capability_args_codex_default_is_workspace_write_never_approval() {
+        let caps = duduclaw_core::types::CapabilitiesConfig::default();
+        let args = capability_extra_args(CliKind::Codex, &caps);
+        assert_eq!(
+            args,
+            vec!["--ask-for-approval", "never", "--sandbox", "workspace-write"]
+        );
+    }
+
+    #[test]
+    fn capability_args_gemini_read_only_adds_sandbox() {
+        let caps = duduclaw_core::types::CapabilitiesConfig {
+            allowed_tools: vec!["Read".to_string()],
+            ..Default::default()
+        };
+        let args = capability_extra_args(CliKind::Gemini, &caps);
+        assert_eq!(args, vec!["--approval-mode", "auto_edit", "--sandbox"]);
+    }
+
+    #[test]
+    fn capability_args_antigravity_is_empty_no_flags_exist() {
+        let caps = duduclaw_core::types::CapabilitiesConfig::default();
+        assert!(capability_extra_args(CliKind::Antigravity, &caps).is_empty());
     }
 
     #[test]

@@ -102,6 +102,23 @@ pub struct AgentPrompt<'a> {
 /// Execute a prompt through the agent's configured runtime provider.
 ///
 /// Selection order: `provider_override` → `[runtime] provider` → `[runtime] fallback` → Claude.
+// OTel GenAI semconv (Development): `chat` span for one model call through
+// the multi-runtime choke-point. Attribute names centralized in `crate::otel`.
+// Provider / effective model / usage are known only after failover resolution,
+// so they are declared Empty and `Span::record`ed below.
+#[tracing::instrument(
+    name = "chat",
+    skip_all,
+    fields(
+        gen_ai.operation.name = "chat",
+        gen_ai.system = tracing::field::Empty,
+        gen_ai.provider.name = tracing::field::Empty,
+        gen_ai.agent.name = %req.agent_id,
+        gen_ai.request.model = %req.model,
+        gen_ai.usage.input_tokens = tracing::field::Empty,
+        gen_ai.usage.output_tokens = tracing::field::Empty,
+    )
+)]
 pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, String> {
     // Reuse caller-provided settings when present (RFC-25 L7 followup — avoids a
     // second agent.toml read on paths that already parsed it to decide routing);
@@ -134,6 +151,12 @@ pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, S
         agent_id: req.agent_id.to_string(),
         preferred_provider: None,
         conversation_history: req.conversation_history.to_vec(),
+        // Capability enforcement (W1): resolved from `agent.toml [capabilities]`
+        // so every runtime (Claude AND non-Claude) receives the agent's tool
+        // restrictions. `None` only for agent-less utility calls (no agent_dir).
+        capabilities: req
+            .agent_dir
+            .and_then(crate::runtime::load_agent_capabilities),
     };
 
     // RFC-25 R1: route through the FailoverManager so provider health is tracked
@@ -143,6 +166,17 @@ pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, S
     let resp = failover(req.home_dir)
         .execute_with_failover(reg, &provider, fallback.as_ref(), req.prompt, &ctx)
         .await?;
+    // OTel: record the provider that actually answered (post-failover) and
+    // usage on the `chat` span (see `crate::otel`). `gen_ai.request.model`
+    // stays the *requested* model per semconv; `resp.model_used` may differ
+    // on failover and is already visible via cost telemetry.
+    {
+        let span = tracing::Span::current();
+        span.record(crate::otel::attrs::SYSTEM, resp.runtime_name.as_str());
+        span.record(crate::otel::attrs::PROVIDER_NAME, resp.runtime_name.as_str());
+        span.record(crate::otel::attrs::USAGE_INPUT_TOKENS, resp.input_tokens);
+        span.record(crate::otel::attrs::USAGE_OUTPUT_TOKENS, resp.output_tokens);
+    }
     // RFC-25 A3: record token usage so non-Claude (Codex/Gemini/OpenAI) calls are
     // visible to CostTelemetry / 200K price-cliff warnings / adaptive routing.
     // Best-effort and detached: telemetry is a SQLite write under a mutex, so it

@@ -1,0 +1,169 @@
+# Vendored model registry seed — 2026-07 public list prices.
+#
+# Prices are stored as INTEGER millicents per million tokens (MTok):
+#   $1.00/MTok = 100 cents = 100_000 millicents → input_mc = 100000
+# A cache rate of 0 means "not separately priced" — cost math falls back to
+# the input rate for those tokens (see ModelRegistry::cost_millicents).
+#
+# Operators can override / extend this table via ~/.duduclaw/models.toml
+# (same schema, merged by ModelRegistry::load_override; later entries win).
+
+# ── Anthropic ────────────────────────────────────────────────────
+
+[[models]]
+id = "claude-fable-5"
+provider = "anthropic"
+context_window = 1000000
+max_output_tokens = 128000
+input_mc = 1000000       # $10 / MTok
+output_mc = 5000000      # $50 / MTok
+cache_read_mc = 100000   # $1 / MTok
+cache_write_mc = 1250000 # $12.50 / MTok
+caps = { tools = true, vision = true, caching = true, reasoning = true, structured = true }
+
+[[models]]
+id = "claude-opus-4-8"
+provider = "anthropic"
+context_window = 1000000
+max_output_tokens = 128000
+input_mc = 500000        # $5 / MTok
+output_mc = 2500000      # $25 / MTok
+cache_read_mc = 50000    # $0.50 / MTok
+cache_write_mc = 625000  # $6.25 / MTok
+caps = { tools = true, vision = true, caching = true, reasoning = true, structured = true }
+
+[[models]]
+id = "claude-sonnet-5"
+provider = "anthropic"
+context_window = 1000000
+max_output_tokens = 128000
+input_mc = 300000        # $3 / MTok
+output_mc = 1500000      # $15 / MTok
+cache_read_mc = 30000    # $0.30 / MTok
+cache_write_mc = 375000  # $3.75 / MTok
+price_cliff = { threshold_tokens = 200000, input_mult = 2.0, output_mult = 1.0 }
+caps = { tools = true, vision = true, caching = true, reasoning = true, structured = true }
+
+[[models]]
+id = "claude-haiku-4-5"
+provider = "anthropic"
+context_window = 200000
+max_output_tokens = 64000
+input_mc = 100000        # $1 / MTok
+output_mc = 500000       # $5 / MTok
+cache_read_mc = 10000    # $0.10 / MTok
+cache_write_mc = 125000  # $1.25 / MTok
+caps = { tools = true, vision = true, caching = true, reasoning = true, structured = true }
+
+# ── OpenAI ───────────────────────────────────────────────────────
+
+[[models]]
+id = "gpt-5.5"
+provider = "openai"
+context_window = 400000
+max_output_tokens = 128000
+input_mc = 500000        # $5 / MTok
+output_mc = 3000000      # $30 / MTok
+cache_read_mc = 50000    # $0.50 / MTok
+caps = { tools = true, vision = true, caching = true, reasoning = true, structured = true }
+
+[[models]]
+id = "gpt-5.4"
+provider = "openai"
+context_window = 400000
+max_output_tokens = 128000
+input_mc = 250000        # $2.50 / MTok
+output_mc = 1500000      # $15 / MTok
+cache_read_mc = 25000    # $0.25 / MTok
+caps = { tools = true, vision = true, caching = true, reasoning = true, structured = true }
+
+[[models]]
+id = "gpt-5.4-mini"
+provider = "openai"
+context_window = 400000
+max_output_tokens = 128000
+input_mc = 75000         # $0.75 / MTok
+output_mc = 450000       # $4.50 / MTok
+cache_read_mc = 8000     # $0.08 / MTok
+caps = { tools = true, vision = true, caching = true, reasoning = true, structured = true }
+
+[[models]]
+id = "gpt-5-mini"
+provider = "openai"
+context_window = 400000
+max_output_tokens = 128000
+input_mc = 25000         # $0.25 / MTok
+output_mc = 200000       # $2 / MTok
+cache_read_mc = 3000     # $0.03 / MTok
+caps = { tools = true, vision = true, caching = true, reasoning = true, structured = true }
+
+# ── Gemini ───────────────────────────────────────────────────────
+
+[[models]]
+id = "gemini-3.1-pro"
+provider = "gemini"
+context_window = 1000000
+max_output_tokens = 65536
+input_mc = 200000        # $2 / MTok
+output_mc = 1200000      # $12 / MTok
+cache_read_mc = 20000    # $0.20 / MTok
+price_cliff = { threshold_tokens = 200000, input_mult = 2.0, output_mult = 1.5 }
+caps = { tools = true, vision = true, caching = true, reasoning = true, structured = true }
+
+[[models]]
+id = "gemini-3.5-flash"
+provider = "gemini"
+context_window = 1000000
+max_output_tokens = 65536
+input_mc = 150000        # $1.50 / MTok
+output_mc = 900000       # $9 / MTok
+cache_read_mc = 15000    # $0.15 / MTok
+caps = { tools = true, vision = true, caching = true, reasoning = true, structured = true }
+
+[[models]]
+id = "gemini-3-flash-preview"
+provider = "gemini"
+context_window = 1000000
+max_output_tokens = 65536
+input_mc = 50000         # $0.50 / MTok
+output_mc = 300000       # $3 / MTok
+caps = { tools = true, vision = true, caching = false, reasoning = true, structured = true }
+
+# ── OpenAI-compatible providers ──────────────────────────────────
+
+[[models]]
+id = "deepseek-v3.2"
+provider = "deepseek"
+context_window = 128000
+max_output_tokens = 8192
+input_mc = 23000         # $0.23 / MTok
+output_mc = 34000        # $0.34 / MTok
+caps = { tools = true, vision = false, caching = true, reasoning = true, structured = true }
+
+[[models]]
+id = "qwen3.7-max"
+provider = "qwen"
+context_window = 256000
+max_output_tokens = 32768
+input_mc = 125000        # $1.25 / MTok
+output_mc = 375000       # $3.75 / MTok
+caps = { tools = true, vision = false, caching = false, reasoning = false, structured = true }
+
+[[models]]
+id = "grok-4.1-fast"
+provider = "xai"
+context_window = 2000000
+max_output_tokens = 32768
+input_mc = 20000         # $0.20 / MTok
+output_mc = 50000        # $0.50 / MTok
+cache_read_mc = 5000     # $0.05 / MTok
+caps = { tools = true, vision = true, caching = true, reasoning = true, structured = true }
+
+[[models]]
+id = "mistral-small-3"
+provider = "mistral"
+context_window = 128000
+max_output_tokens = 8192
+input_mc = 10000         # $0.10 / MTok
+output_mc = 30000        # $0.30 / MTok
+caps = { tools = true, vision = false, caching = false, reasoning = false, structured = true }

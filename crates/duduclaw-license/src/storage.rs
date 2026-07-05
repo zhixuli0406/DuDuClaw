@@ -239,6 +239,11 @@ mod tests {
     }
 
     #[test]
+    // SAFETY justification for the allow: Rust 2024 makes `env::set_var` /
+    // `remove_var` unsafe (process-global, not thread-safe); this test-only
+    // mutation is confined to DUDUCLAW_HOME with save/restore, and no safe
+    // std alternative exists for env mutation.
+    #[allow(unsafe_code)]
     fn license_dir_respects_env_override() {
         let tmp = TempDir::new().unwrap();
         let custom = tmp.path().to_path_buf();

@@ -1,5 +1,102 @@
 # Changelog
 
+## [1.33.0] - 2026-07-05 — Model-agnostic core + AI harness infrastructure
+
+The largest structural release to date, in three movements: a deep prune
+(−19k lines of provably-orphaned code), a research-driven upgrade pass over
+memory/routing, and the promotion of "Multi-Runtime" from a text shell into a
+genuinely model-agnostic platform with 2026 harness table stakes. Net diff vs
+v1.32.0 is roughly line-neutral (+20k/−21k) — redundancy traded for
+infrastructure. 53 test suites green, zero workspace warnings.
+
+### Added
+- **`duduclaw-llm` crate — unified provider layer**: one normalized
+  `ChatRequest`/`ContentPart`/`StreamEvent`/`NormalizedUsage` shape over four
+  native protocols — Anthropic Messages (layered `cache_control`, thinking
+  replay), OpenAI **Responses API**, Gemini `generateContent`
+  (`thoughtSignature` echoed verbatim), OpenAI-compat chat/completions
+  (8 presets + local llamafile/vLLM/Ollama). Real SSE on all four. Ten-way
+  `LlmError` classification, `ModelRegistry` with vendored 2026 prices
+  (millicents/MTok, price cliffs, cache rates, `~/.duduclaw/models.toml`
+  override), `FallbackRouter` with per-(provider,model) cooldowns and
+  context-window-aware candidate filtering.
+- **MCP client + agentic tool loop** (`duduclaw-llm`): stdio JSON-RPC MCP
+  client + provider-agnostic `run_tool_loop`, so the direct-API and
+  local-inference paths finally get the full MCP tool surface (previously
+  CLI-backends-only). Local models (llamafile/Exo/vLLM) become first-class
+  tooled backends via a gateway `LocalChatProvider` adapter;
+  `inference_mode = "local"` is now honored on the channel-reply path
+  (local-first with CLI fallback).
+- **Cross-provider fallback + rotation on the hot path**: `agent.toml
+  [model] fallbacks = ["openai/gpt-5.4", "compat:deepseek/…"]` failover
+  chain; `AccountRotator` generalized with per-account `provider` —
+  multi-account, budget and cooldown machinery now applies to
+  openai/gemini/deepseek/… (env-var fallback when unconfigured); optional
+  OS-keychain master-key storage (`keychain` feature).
+- **Harness infrastructure**: OpenTelemetry GenAI tracing
+  (`invoke_agent`/`chat`/`execute_tool` spans per `gen_ai.*` semconv,
+  OTLP/gRPC export with auth headers, opt-in `otel` feature, default OFF);
+  `duduclaw eval` behavioral regression suite (golden-task TOML, live +
+  replay modes, deterministic tool/regex assertions + optional LLM judge,
+  CI-gateable); universal HITL `ApprovalBroker` (SQLite, TTL expiry = deny,
+  wired into autopilot `require_approval`); A2A v1.0 Agent Card
+  (`/.well-known/agent-card.json`) with a real `message/send` that enqueues
+  onto the dispatcher bus and honest `submitted`/`working`/`completed`
+  states.
+- **Memory/routing research upgrades** (2024–2026 literature pass):
+  Ebbinghaus retrievability (`R = exp(-t/S)`) for retrieval ranking and
+  decay; HippoRAG-lite Personalized PageRank over the v1.19 SPO triple
+  graph (multi-hop recall, supersession-aware); ACE/ExpeL rule lifecycle
+  (helpful/harmful counters, net-zero rules retired); calibrated cascade
+  routing (post-hoc logprob acceptance, opt-in); summarized-failure retry
+  (context decontamination on Timeout/EmptyResponse); layered Direct-API
+  cache breakpoints (`CACHE_SPLIT_MARKER`) + per-block invalidation
+  attribution.
+- **Non-Claude runtime parity**: `RuntimeContext` carries
+  `CapabilitiesConfig`; codex/gemini spawn with capability-derived sandbox
+  flags (no more blanket `--full-auto`/`yolo`); PTY-pooled sessions inject
+  per-agent `--allowedTools`/`--disallowedTools` (previously zero
+  restrictions reached the pool); codex/gemini/agy auto-register the
+  duduclaw MCP server in their native configs; `agent create --runtime`
+  scaffolds AGENTS.md/GEMINI.md and rejects typo'd providers.
+- **Wiki ↔ memory boundary**: conversation distillation now persists to
+  temporal memory (supersession) instead of wiki pages; session-stable wiki
+  injection (15-min pinned selection, prompt-cache friendly); wiki/memory
+  injection dedup (wiki wins); `.scope.toml` `knowledge_owner =
+  "wiki"|"memory"` deterministic conflict arbitration.
+
+### Changed
+- CostTelemetry prices per model via the registry — non-Anthropic usage was
+  previously billed at hardcoded Claude Sonnet rates (DeepSeek overbilled
+  ~30×); price-cliff warnings now model-aware.
+- `try_direct_api` routes by registry-resolved provider (OpenAI → Responses,
+  Gemini → native, compat presets); Anthropic path byte-identical.
+- Dashboard model suggestions follow installed runtimes; provider↔model
+  mismatch (`preferred = "gpt-5"` on the Claude path) warns once with
+  guidance.
+
+### Removed (deep prune, −19k lines)
+- Orphaned crates never linked by any binary: `duduclaw-governance`,
+  `duduclaw-durability`, `duduclaw-bus`, `duduclaw-bridge`.
+- Unwired gateway modules (AFM compression, stale `tool_classifier`,
+  `experiment/`, `sticker/`), the three-strategy inference compressor
+  (Meta-Token/LLMLingua-2/StreamingLLM — duplicated the live
+  `prompt_compression.rs` pipeline; `compress_text`/`decompress_text` MCP
+  tools retired), and the unwired voice subsystem (asr/vad/deepgram/
+  sensevoice/livekit; `whisper.rs` + `embedding.rs` kept) — drops
+  symphonia/livekit/tokio-tungstenite deps.
+- Both crate-wide `#![allow(dead_code)]` suppressions; everything the
+  compiler then surfaced (−1.3k lines) plus the 8 remaining pre-existing
+  warnings — the workspace now builds with **zero warnings** including
+  `--all-targets`.
+
+### Security
+- Fixed: non-Claude runtimes ran with zero tool-capability enforcement
+  (blanket permission-bypass flags + PTY pool passing no restrictions).
+  Capability enforcement is now fail-closed across every runtime path, with
+  structured warnings where a CLI offers no enforcement mechanism
+  (antigravity).
+
 
 ## [1.32.0] - 2026-07-03 — Dashboard UX: command palette, self-explanatory nav, mobile shell
 

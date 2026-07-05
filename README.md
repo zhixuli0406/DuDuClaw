@@ -12,7 +12,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.32.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.33.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 
@@ -96,14 +96,15 @@ cosign verify-blob \
 
 ---
 
-> 🎉 **v1.32.0 — Dashboard UX：命令面板、會說明自己的側邊欄、行動版外殼**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.32.0)）
+> 🎉 **v1.33.0 — 模型無關核心 + AI Harness 基礎建設**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.33.0)）
 >
-> 以一次全頁面 UX 稽核為基礎，對 Calm Glass dashboard 做深度打磨。純前端，無後端 RPC / WS 協定變更。
+> 先深度精簡（移除 1.9 萬行孤兒碼與冗餘），再把「Multi-Runtime」從文字外殼升級為真正模型無關的平台，並補齊 2026 AI harness 底線。
 >
-> - **命令面板（⌘K / Ctrl+K）** — 零相依模糊搜尋（CJK-safe、Latin 別名、含頁面說明可搜）跳轉全部 37 個受角色/版本控管的頁面，加上快速動作（切主題 / 語言 / 工作空間⇄進階 / 登出）；空查詢顯示最近造訪；完整 ARIA combobox 與鍵盤操作；Header 有 `搜尋… ⌘K` 提示鈕
-> - **會說明自己的側邊欄** — 每個導航項目標題下方多一行功能說明（命令面板也顯示為可搜尋副標），功能一看就懂、不用猜圖示（27 項 × 三語系）
-> - **行動版外殼** — `md` 以下側邊欄改為 off-canvas 抽屜（漢堡鈕 + 背景遮罩，換頁自動關），`md`+ 維持靜態欄
-> - **共用載入元件** — `Skeleton` / `SkeletonList` 骨架 + `Button` `pending`（spinner + 停用 + `aria-busy`）
+> - **`duduclaw-llm` 統一供應層** — Anthropic Messages / OpenAI Responses / Gemini 原生 / OpenAI-compat 四協定單一正規化介面：真 SSE、工具呼叫正規化、15 模型計價 registry（price cliff + cache 費率，修正非 Anthropic 模型最高 30 倍計價誤差）、跨供應商 fallback 鏈（`[model] fallbacks`）+ 供應商無關帳號輪換
+> - **非 Claude runtime 對等** — capabilities fail-closed 執法（廢除 `--full-auto`/`yolo` 全開）、PTY pool 注入工具管制、MCP server 自動註冊進 codex/gemini/agy 原生設定、provider-aware 鷹架（AGENTS.md / GEMINI.md）
+> - **MCP client + tool-loop** — direct-API 與本地推理路徑也拿得到完整 MCP 工具面；本地模型（llamafile/Exo/vLLM）成為一等有工具後端，`inference_mode = "local"` 在 channel 回覆路徑生效
+> - **Harness 基礎建設** — OTel GenAI tracing（OTLP 直連 + auth headers）、`duduclaw eval` 行為回歸套件、通用 HITL ApprovalBroker（TTL 過期＝拒絕）、A2A v1.0 Agent Card + 真 `message/send`、選配 OS keychain
+> - **記憶／路由論文改進** — Ebbinghaus 遺忘曲線、HippoRAG-lite 圖檢索、ACE/ExpeL 規則生命週期、校準式串接路由、摘要式重試、分層快取斷點 + 失效歸因、wiki↔記憶單一所有權邊界
 
 
 
@@ -112,8 +113,9 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 
 
 <details>
-<summary><strong>v1.9.4 → v1.31.x 累積亮點</strong></summary>
+<summary><strong>v1.9.4 → v1.32.x 累積亮點</strong></summary>
 
+- **v1.32.0** — Dashboard UX：命令面板（⌘K）、會說明自己的側邊欄、行動版外殼、共用載入元件（純前端）
 - **v1.31.0** — Genspark 風格工作空間外殼（中央 prompt bar + 能力啟動器 + 「Claw，你的第一位 AI 員工」）疊在 Calm Glass 進階 dashboard 之上、簡易⇄進階模式切換；Tauri 2 桌面外殼（Phase D）把 gateway 包成 sidecar 的原生視窗 + 生命週期硬化（`DUDUCLAW_DESKTOP_MODE`、config.toml port 優先序、避免雙開的 attach 偵測）
 - **v1.30.0** — 每帳號 OAuth 環境注入 PTY pool；LINE 回覆改由 detached task 送出
 - **v1.29.0** — Cloud 方案 agent/通道上限強制：把 `features.toml` 每方案 `max_agents` / `max_channels` 真正接上（Hobby 1/1、Solo 1/2、Studio 3/5），**自架永不受限**（Apache 2.0 承諾）；軟上限提示 + 升級 CTA；`license_runtime::cap_exceeded()` 純函式閘控

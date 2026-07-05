@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::Mutex;
-use tracing::{error, warn};
+use tracing::error;
 
 use super::schema::{validate, AuditEvent};
 
@@ -376,7 +376,6 @@ mod tests {
     use std::sync::Arc;
 
     use tempfile::TempDir;
-    use tokio::io::AsyncReadExt as _;
 
     use super::*;
     use crate::evolution_events::schema::{AuditEventType, Outcome};
