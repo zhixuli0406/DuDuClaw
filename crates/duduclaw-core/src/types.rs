@@ -498,6 +498,87 @@ pub struct CapabilitiesConfig {
     /// `["agnes", "bob"]` = only these agents can read.
     #[serde(default = "default_wiki_visible_to")]
     pub wiki_visible_to: Vec<String>,
+
+    /// Parameter-level static tool policy (Progent-style tool+arg matcher).
+    /// Consumed by the PolicyKernel reference monitor (`duduclaw-security`).
+    /// Empty (default) → the kernel abstains and other layers (scope check,
+    /// injection scan, `denied_tools`) still apply — backward compatible.
+    /// Non-empty → strict allowlist semantics: `forbid` rules win over `allow`,
+    /// and a tool call matching no `allow` rule is denied (fail-closed, I5).
+    #[serde(default)]
+    pub policy: Vec<ToolPolicy>,
+
+    /// Opt-in native OS process sandbox (`duduclaw-sandbox`): when `true`, the
+    /// spawned agent CLI subprocess is confined by a native OS primitive
+    /// (macOS Seatbelt / Linux Landlock) derived from [`Self::sandbox_level`],
+    /// on top of any CLI-flag sandboxing. Default `false`. When enabled and the
+    /// primitive cannot confine (unsupported OS / kernel), the spawn is refused
+    /// rather than run unconfined (fail-closed, I5).
+    #[serde(default)]
+    pub native_sandbox: bool,
+}
+
+/// Effect of a [`ToolPolicy`] rule.
+///
+/// Precedence when multiple rules match one call (most restrictive wins):
+/// `Forbid` > `Ask` > `Allow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyEffect {
+    /// Permit the call when this rule matches.
+    Allow,
+    /// Block the call when this rule matches (checked before `Ask`/`Allow`).
+    Forbid,
+    /// Escalate the call to a human approval (ApprovalBroker) before it runs.
+    Ask,
+}
+
+/// Comparison operator for an [`ArgCondition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArgOp {
+    /// Exact string equality against the stringified argument value.
+    Equals,
+    /// Substring containment (operator's explicit choice; not a security
+    /// allowlist match — use `equals` for identity decisions).
+    Contains,
+    /// Prefix match against the stringified argument value.
+    StartsWith,
+}
+
+/// A single argument condition within a [`ToolPolicy`]. All conditions in a
+/// rule's `when` list must match (logical AND) for the rule to apply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ArgCondition {
+    /// Top-level key within the tool's `arguments` object.
+    pub arg: String,
+    /// Comparison operator.
+    pub op: ArgOp,
+    /// Value to compare the (stringified) argument against.
+    pub value: String,
+}
+
+/// A parameter-level tool policy rule (Progent-style tool+arg matcher).
+///
+/// Example `agent.toml`:
+/// ```toml
+/// [[capabilities.policy]]
+/// tool = "shell_exec"
+/// effect = "forbid"
+/// when = [{ arg = "command", op = "contains", value = "rm -rf" }]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ToolPolicy {
+    /// Canonical (`fs_write` / `shell_exec` / `mcp_call`) or runtime tool name
+    /// this rule applies to. `"*"` matches any tool.
+    pub tool: String,
+    /// Whether a match allows or forbids the call.
+    pub effect: PolicyEffect,
+    /// Argument conditions (logical AND). Empty → matches any arguments.
+    #[serde(default)]
+    pub when: Vec<ArgCondition>,
 }
 
 /// Computer use execution mode.
@@ -570,6 +651,8 @@ impl Default for CapabilitiesConfig {
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             wiki_visible_to: default_wiki_visible_to(),
+            policy: Vec::new(),
+            native_sandbox: false,
         }
     }
 }
@@ -1917,6 +2000,47 @@ pub struct DoctorCheck {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn capabilities_without_policy_parses_backward_compat() {
+        // A pre-P1-3 agent.toml [capabilities] block with no `policy` key must
+        // still parse, with `policy` defaulting to empty.
+        let toml_src = r#"
+            computer_use = false
+            browser_via_bash = true
+            allowed_tools = ["Read", "Grep"]
+        "#;
+        let caps: CapabilitiesConfig = toml::from_str(toml_src).unwrap();
+        assert!(caps.policy.is_empty());
+        assert!(caps.browser_via_bash);
+    }
+
+    #[test]
+    fn capabilities_policy_parses_to_tool_policy_vec() {
+        let toml_src = r#"
+            [[policy]]
+            tool = "shell_exec"
+            effect = "forbid"
+            when = [{ arg = "command", op = "contains", value = "rm -rf" }]
+
+            [[policy]]
+            tool = "mcp_call"
+            effect = "ask"
+
+            [[policy]]
+            tool = "*"
+            effect = "allow"
+        "#;
+        let caps: CapabilitiesConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(caps.policy.len(), 3);
+        assert_eq!(caps.policy[0].tool, "shell_exec");
+        assert_eq!(caps.policy[0].effect, PolicyEffect::Forbid);
+        assert_eq!(caps.policy[0].when.len(), 1);
+        assert_eq!(caps.policy[0].when[0].op, ArgOp::Contains);
+        assert_eq!(caps.policy[1].effect, PolicyEffect::Ask);
+        assert!(caps.policy[1].when.is_empty());
+        assert_eq!(caps.policy[2].effect, PolicyEffect::Allow);
+    }
 
     #[test]
     fn agent_role_roundtrip_via_serde_json() {
