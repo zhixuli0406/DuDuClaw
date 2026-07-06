@@ -109,6 +109,60 @@ fn host_and_has_port(authority: &str) -> (&str, bool) {
     }
 }
 
+/// Validate a single egress-allowlist host entry (I10 canonicalization).
+///
+/// Accepts a bare hostname (`example.com`) or a single leading-wildcard glob
+/// (`*.example.com`). Rejects, fail-closed, anything that could smuggle a
+/// second target or bypass host-level matching:
+///   - empty / whitespace-only
+///   - control or bypass bytes: NUL, `%` (percent-encoding), CR, LF, spaces, tabs
+///   - `/`, `@`, `?`, `#`, `:` (path / userinfo / query / fragment / port —
+///     an allowlist entry is a bare host, never a URL or `host:port`)
+///   - IPv4 / IPv6 literals (DNS-rebinding and IP-literal egress bypass — a
+///     literal is not a resolvable *domain* and must go through the proxy layer)
+///   - a `*` anywhere except a single leading `*.`
+///
+/// This is the assembly-time gate for `ALLOWED_DOMAINS`; the shell filter
+/// applies an equivalent regex as defense-in-depth.
+pub fn is_valid_egress_host(entry: &str) -> bool {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return false;
+    }
+    // Reject control / bypass bytes outright.
+    if entry
+        .bytes()
+        .any(|b| b == 0 || b == b'%' || b == b'\r' || b == b'\n' || b == b' ' || b == b'\t')
+    {
+        return false;
+    }
+    // Reject URL-structural characters — an allowlist entry is a bare host.
+    if entry.contains(['/', '@', '?', '#', ':', '\\']) {
+        return false;
+    }
+    // Normalize an optional single leading-wildcard glob.
+    let host = match entry.strip_prefix("*.") {
+        Some(rest) => rest,
+        None => entry,
+    };
+    // No further `*` allowed (only one leading `*.` glob is legal).
+    if host.contains('*') || host.is_empty() {
+        return false;
+    }
+    // Reject IPv4 literals (all labels numeric, 4 of them).
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() == 4 && labels.iter().all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit())) {
+        return false;
+    }
+    // Each label: ASCII alphanumeric or hyphen, non-empty, not hyphen-edged.
+    labels.iter().all(|l| {
+        !l.is_empty()
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +222,52 @@ mod tests {
         assert!(origin_host_matches("http://[::1]:8080", &["[::1]"]));
         assert!(!origin_host_matches("", &["localhost"]));
         assert!(!origin_host_matches("http://", &["localhost"]));
+    }
+
+    // ── is_valid_egress_host (P0-4 / I10) ─────────────────────────────────────
+
+    #[test]
+    fn egress_host_accepts_plain_and_glob() {
+        assert!(is_valid_egress_host("example.com"));
+        assert!(is_valid_egress_host("api.example.co.uk"));
+        assert!(is_valid_egress_host("*.gov.tw"));
+        assert!(is_valid_egress_host(" example.com ")); // trimmed
+        assert!(is_valid_egress_host("xn--fsq.example")); // punycode label
+    }
+
+    #[test]
+    fn egress_host_rejects_control_and_bypass_bytes() {
+        assert!(!is_valid_egress_host(""));
+        assert!(!is_valid_egress_host("   "));
+        assert!(!is_valid_egress_host("exa\0mple.com")); // NUL
+        assert!(!is_valid_egress_host("example%2ecom")); // percent-encoding
+        assert!(!is_valid_egress_host("example.com\r\nevil.com")); // CRLF injection
+        assert!(!is_valid_egress_host("exa mple.com")); // space
+    }
+
+    #[test]
+    fn egress_host_rejects_url_structure() {
+        assert!(!is_valid_egress_host("example.com/path"));
+        assert!(!is_valid_egress_host("user@example.com"));
+        assert!(!is_valid_egress_host("example.com:8080")); // port
+        assert!(!is_valid_egress_host("http://example.com"));
+        assert!(!is_valid_egress_host("example.com?q=1"));
+    }
+
+    #[test]
+    fn egress_host_rejects_ip_literals() {
+        assert!(!is_valid_egress_host("127.0.0.1"));
+        assert!(!is_valid_egress_host("10.0.0.1"));
+        assert!(!is_valid_egress_host("::1")); // contains ':' → rejected earlier
+        assert!(!is_valid_egress_host("[::1]"));
+    }
+
+    #[test]
+    fn egress_host_rejects_bad_glob() {
+        assert!(!is_valid_egress_host("*")); // no host after glob
+        assert!(!is_valid_egress_host("*.")); // empty remainder
+        assert!(!is_valid_egress_host("a.*.com")); // interior wildcard
+        assert!(!is_valid_egress_host("**.com")); // double wildcard
+        assert!(!is_valid_egress_host("-bad.com")); // hyphen-edged label
     }
 }
