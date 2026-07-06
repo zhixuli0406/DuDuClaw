@@ -1,0 +1,24 @@
+[package]
+name = "duduclaw-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Native OS process confinement (macOS Seatbelt / Linux Landlock) for spawned agent CLI subprocesses."
+
+[dependencies]
+duduclaw-core = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Unix (macOS + Linux) need libc for the post-fork `pre_exec` confinement path.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Landlock is Linux-only. Gate it to the linux target so `cargo build` on macOS /
+# Windows never tries to compile it (keeps the local dev build green).
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
