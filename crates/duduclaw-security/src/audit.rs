@@ -185,6 +185,20 @@ pub fn log_injection_detected(
     append_audit_event(home_dir, &event);
 }
 
+/// Log a CONTRACT.toml `must_not` violation that blocked an outgoing reply (P2-3).
+pub fn log_contract_violation(home_dir: &Path, agent_id: &str, violated_rules: &[String]) {
+    let event = AuditEvent::new(
+        "contract_violation",
+        agent_id,
+        Severity::Critical,
+        serde_json::json!({
+            "violated_rules": violated_rules,
+            "action": "reply_blocked",
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
 /// Log a skill quarantine event.
 pub fn log_skill_quarantined(home_dir: &Path, agent_id: &str, skill_name: &str, reason: &str) {
     let event = AuditEvent::new(
@@ -382,6 +396,35 @@ pub fn log_tool_hallucination(
             "claimed_action": claimed_action,
             "expected_tool": expected_tool,
             "explanation": "Agent claimed to perform an action without calling the corresponding MCP tool",
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
+/// Log an OS ground-truth reconciliation discrepancy (P3-3).
+///
+/// `unaccounted_count` = observed OS events (writes outside the workspace roots
+/// or outbound connections) with no tool call to explain them — a possible
+/// sandbox escape / hidden side effect. `missing_count` = successful tool calls
+/// that claimed a footprint-leaving effect yet left no observed footprint — a
+/// possible false success. Always Critical: any discrepancy is worth forensic
+/// attention.
+pub fn log_os_discrepancy(
+    home_dir: &Path,
+    agent_id: &str,
+    unaccounted_count: usize,
+    missing_count: usize,
+) {
+    let event = AuditEvent::new(
+        "os_reconcile_discrepancy",
+        agent_id,
+        Severity::Critical,
+        serde_json::json!({
+            "unaccounted_count": unaccounted_count,
+            "missing_count": missing_count,
+            "explanation": "OS ground-truth reconciliation found agent side effects \
+                            with no matching tool call (unaccounted) and/or tool calls \
+                            with no matching OS footprint (missing)",
         }),
     );
     append_audit_event(home_dir, &event);
