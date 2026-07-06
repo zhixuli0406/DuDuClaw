@@ -99,15 +99,16 @@ infrastructure work.
 
 ---
 
-> 🎉 **v1.33.0 — Model-agnostic core + AI harness infrastructure** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.33.0))
+> 🎉 **v1.34.0 — Runtime-agnostic security reference monitor** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.34.0))
 >
-> A deep prune first (−19k lines of orphaned/redundant code), then "Multi-Runtime" grows from a text shell into a genuinely model-agnostic platform, plus the 2026 harness table stakes.
+> Moves the security boundary off prompts/hooks/config and onto deterministic choke points and OS primitives. The MCP dispatch path becomes a true reference monitor (complete mediation + tamper-proof + verifiable), so every runtime (Claude / Codex / Gemini / Antigravity + the direct-API and local-inference tool loops) is governed by the same zero-LLM policy. Every control is fail-closed and (where opt-in) backward compatible. New `duduclaw-sandbox` crate; ~90 new tests, zero workspace warnings.
 >
-> - **`duduclaw-llm` unified provider layer** — one normalized interface over four native protocols (Anthropic Messages / OpenAI Responses / Gemini native / OpenAI-compat): real SSE, normalized tool calling, a 15-model pricing registry (price cliffs + cache rates; fixes up to 30× cost mis-billing on non-Anthropic models), cross-provider fallback chains (`[model] fallbacks`) + provider-agnostic account rotation
-> - **Non-Claude runtime parity** — fail-closed capability enforcement (no more blanket `--full-auto`/`yolo`), PTY-pool tool restrictions, automatic MCP registration into codex/gemini/agy native configs, provider-aware scaffolding (AGENTS.md / GEMINI.md)
-> - **MCP client + tool loop** — the direct-API and local-inference paths now get the full MCP tool surface; local models (llamafile/Exo/vLLM) become first-class tooled backends, `inference_mode = "local"` honored on channel replies
-> - **Harness infrastructure** — OTel GenAI tracing (direct OTLP + auth headers), `duduclaw eval` behavioral regression suite, universal HITL ApprovalBroker (TTL expiry = deny), A2A v1.0 Agent Card + real `message/send`, optional OS keychain
-> - **Memory/routing research upgrades** — Ebbinghaus forgetting curve, HippoRAG-lite graph retrieval, ACE/ExpeL rule lifecycle, calibrated cascade routing, summarized-failure retry, layered cache breakpoints + invalidation attribution, wiki↔memory single-owner boundary
+> - **PolicyKernel reference monitor** — deterministic, zero-LLM `evaluate()` over a parameter-level static tool policy (`agent.toml [capabilities] policy`, Progent-style tool+arg matcher); canonical `fs_write`/`shell_exec`/`mcp_call` families give one rule uniform reach across runtimes; precedence Forbid > Ask > Allow > default-deny; empty policy abstains (backward compatible). Wired into MCP dispatch (Ask → ApprovalBroker, TTL expiry = deny) and the direct-API/local tool loop (`PolicyExecutor`)
+> - **Egress "secret in-use" convergence** — `<REDACT:…>` tokens restored only for whitelisted tools, everything else denied (`-32007`), results re-redacted; pushed down from the stdio serve loop to the shared choke point so stdio / HTTP / SSE are covered uniformly
+> - **Native OS process sandbox** — new `duduclaw-sandbox` crate (opt-in `[capabilities] native_sandbox`) confines the spawned agent CLI via macOS Seatbelt (live-verified) / Linux Landlock, derived from `SandboxLevel`; fail-closed when required but unavailable
+> - **Origin-bound memory trust** — temporal memories gain `origin`/`origin_trust`/`derived_from`; a derived fact's trust is clamped to ≤ min(source trusts) — non-malleable, can't be laundered upward by re-derivation; distilled conversational facts are marked lowest-trust and down-weighted in search
+> - **CONTRACT.toml runtime enforcement** — `must_not` boundaries validated on the final user-facing reply bytes (after secret restoration); violations blocked and audited
+> - **SecurityPosture state machine + OS ground-truth reconciliation** — {Green,Yellow,Red} escalate-fast / decay-slow; `os_reconcile` computes a pure two-way diff of tool-call claims vs observed OS effects (macOS `eslogger` parser, Linux eBPF staged)
 
 
 
@@ -116,8 +117,9 @@ https://github.com/user-attachments/assets/217f56aa-8b46-4c2a-85fa-62ee68c33a4c
 
 
 <details>
-<summary><strong>v1.9.4 → v1.32.x cumulative highlights</strong></summary>
+<summary><strong>v1.9.4 → v1.33.0 cumulative highlights</strong></summary>
 
+- **v1.33.0** — Model-agnostic core + AI harness infrastructure: `duduclaw-llm` unified provider layer (one normalized interface over Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat + 15-model pricing registry + cross-provider fallback + provider-agnostic account rotation), non-Claude runtime parity (fail-closed capabilities + PTY-pool tool restrictions + auto MCP registration into codex/gemini/agy), MCP client + tool loop bringing the full tool surface to direct-API/local paths, OTel GenAI tracing + `duduclaw eval` + universal HITL ApprovalBroker + A2A v1.0, memory/routing research upgrades (Ebbinghaus / HippoRAG-lite / ACE-ExpeL / calibrated cascade routing / wiki↔memory boundary)
 - **v1.32.0** — Dashboard UX: command palette (⌘K), self-explanatory sidebar, mobile shell, shared loading primitives (frontend-only)
 - **v1.31.0** — Genspark-style Workspace shell (central prompt bar + capability launcher + "Claw, your first AI employee") layered over the Calm Glass power dashboard with a simple ⇄ advanced mode toggle; Tauri 2 desktop shell (Phase D) — a native window wrapping the gateway as a sidecar — with lifecycle hardening (`DUDUCLAW_DESKTOP_MODE`, config.toml port priority, double-spawn-avoiding attach detection)
 - **v1.30.0** — Per-account OAuth env injection into the PTY pool; LINE replies sent from a detached task

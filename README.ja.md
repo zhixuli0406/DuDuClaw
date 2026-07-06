@@ -99,15 +99,16 @@ cosign verify-blob \
 
 ---
 
-> 🎉 **v1.33.0 — モデル非依存コア + AI ハーネス基盤**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.33.0)）
+> 🎉 **v1.34.0 — ランタイム非依存のセキュリティ Reference Monitor**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.34.0)）
 >
-> まず徹底的なスリム化（孤児コード・冗長 1.9 万行を削除）、その上で「Multi-Runtime」をテキストシェルから真のモデル非依存プラットフォームへ昇格し、2026 年のハーネス標準装備を実装。
+> セキュリティ境界を prompt／hook／config から、決定論的なチョークポイントと OS プリミティブへ移動。MCP dispatch が真の reference monitor（完全仲介 + 改竄不可 + 検証可能）となり、すべてのランタイム（Claude／Codex／Gemini／Antigravity + direct-API／ローカル推論のツールループ）が同一のゼロ LLM ポリシーで統治される。各制御は fail-closed で、opt-in のものは後方互換。新 crate `duduclaw-sandbox`、新規テスト約 90 件、ワークスペース警告ゼロ。
 >
-> - **`duduclaw-llm` 統一プロバイダ層** — Anthropic Messages / OpenAI Responses / Gemini ネイティブ / OpenAI-compat の 4 プロトコルを単一の正規化インターフェースで：真の SSE、ツール呼び出し正規化、15 モデルの価格レジストリ（price cliff + キャッシュ料金、非 Anthropic モデルの最大 30 倍の課金誤差を修正）、プロバイダ横断フォールバックチェーン（`[model] fallbacks`）+ プロバイダ非依存アカウントローテーション
-> - **非 Claude ランタイムの対等化** — fail-closed なケーパビリティ強制（`--full-auto`/`yolo` 全開を廃止）、PTY プールへのツール制限注入、codex/gemini/agy ネイティブ設定への MCP 自動登録、プロバイダ対応スキャフォールド（AGENTS.md / GEMINI.md）
-> - **MCP クライアント + ツールループ** — direct-API とローカル推論パスでも MCP ツール全面が利用可能に；ローカルモデル（llamafile/Exo/vLLM）がツール付き一級バックエンドに、`inference_mode = "local"` がチャネル応答で有効化
-> - **ハーネス基盤** — OTel GenAI トレーシング（OTLP 直結 + 認証ヘッダ）、`duduclaw eval` 行動回帰スイート、汎用 HITL ApprovalBroker（TTL 失効＝拒否）、A2A v1.0 Agent Card + 実 `message/send`、任意の OS キーチェーン
-> - **記憶／ルーティング研究改善** — Ebbinghaus 忘却曲線、HippoRAG-lite グラフ検索、ACE/ExpeL ルールライフサイクル、較正カスケードルーティング、要約付きリトライ、階層キャッシュブレークポイント + 無効化帰属、wiki↔記憶の単一所有権境界
+> - **PolicyKernel reference monitor** — 決定論的・ゼロ LLM の `evaluate()` がパラメータ単位の静的ツールポリシー（`agent.toml [capabilities] policy`、Progent 式 tool+arg マッチャ）を評価；正規化された `fs_write`／`shell_exec`／`mcp_call` ファミリで 1 つのルールがランタイム横断で等価に効く；優先順位 Forbid > Ask > Allow > 既定拒否；空ポリシーは棄権（後方互換）。MCP dispatch（Ask → ApprovalBroker、TTL 失効＝拒否）と direct-API／ローカルのツールループ（`PolicyExecutor`）に接続
+> - **Egress「secret in-use」の収束** — `<REDACT:…>` トークンはホワイトリストのツールのみ復元、それ以外は拒否（`-32007`）、結果は再マスク；stdio serve loop から共有チョークポイントへ押し下げ、stdio／HTTP／SSE を一律にカバー
+> - **ネイティブ OS プロセスサンドボックス** — 新 crate `duduclaw-sandbox`（opt-in `[capabilities] native_sandbox`）が spawn した agent CLI を macOS Seatbelt（実機検証済み）／Linux Landlock で `SandboxLevel` に応じて封じ込め；要求されたのに利用不可なら fail-closed
+> - **記憶の origin-bound 信頼** — 時間記憶に `origin`／`origin_trust`／`derived_from` を追加；派生事実の信頼は ≤ min(ソース信頼) にクランプされ、再派生で信頼を昇格（ロンダリング）できない；蒸留された会話事実は最低信頼として検索で減点
+> - **CONTRACT.toml の実行時強制** — `must_not` 境界を、ユーザーへ送出する最終応答バイト列（秘密復元後）で検証；違反はブロックして監査記録
+> - **SecurityPosture ステートマシン + OS グラウンドトゥルース照合** — {Green,Yellow,Red} の escalate-fast／decay-slow；`os_reconcile` が「ツールの主張 vs 観測された OS 効果」の純粋な双方向差分を計算（macOS `eslogger` パーサ、Linux eBPF は段階的）
 
 
 
@@ -116,8 +117,9 @@ https://github.com/user-attachments/assets/30406ad1-4595-43ce-8c08-dba8f0ca9683
 
 
 <details>
-<summary><strong>v1.9.4 → v1.32.x 累積ハイライト</strong></summary>
+<summary><strong>v1.9.4 → v1.33.0 累積ハイライト</strong></summary>
 
+- **v1.33.0** — モデル非依存コア + AI ハーネス基盤：`duduclaw-llm` 統一プロバイダ層（Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat の 4 プロトコルを単一正規化 + 15 モデル価格レジストリ + プロバイダ横断フォールバック + プロバイダ非依存アカウントローテーション）、非 Claude ランタイム対等化（fail-closed ケーパビリティ + PTY プールツール制限 + codex/gemini/agy への MCP 自動登録）、direct-API／ローカルパスに全ツール面をもたらす MCP クライアント + ツールループ、OTel GenAI トレーシング + `duduclaw eval` + 汎用 HITL ApprovalBroker + A2A v1.0、記憶／ルーティング研究改善（Ebbinghaus / HippoRAG-lite / ACE-ExpeL / 較正カスケードルーティング / wiki↔記憶境界）
 - **v1.32.0** — ダッシュボード UX：コマンドパレット（⌘K）・自己説明ナビ・モバイル対応・共有ローディング要素（フロントエンドのみ）
 - **v1.31.0** — Genspark 風のワークスペース外殻（中央プロンプトバー + 能力ランチャー +「Claw、あなたの最初の AI 社員」）を Calm Glass 詳細ダッシュボードの上に重ね、シンプルな ⇄ 詳細モード切替；Tauri 2 デスクトップ外殻（Phase D）— gateway を sidecar として包むネイティブウィンドウ — とライフサイクル硬化（`DUDUCLAW_DESKTOP_MODE`、config.toml ポート優先、二重起動を防ぐ attach 検出）
 - **v1.30.0** — アカウントごとの OAuth 環境を PTY プールに注入；LINE 返信を detached タスクから送信

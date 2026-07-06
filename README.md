@@ -96,15 +96,16 @@ cosign verify-blob \
 
 ---
 
-> 🎉 **v1.33.0 — 模型無關核心 + AI Harness 基礎建設**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.33.0)）
+> 🎉 **v1.34.0 — Runtime-Agnostic 安全 Reference Monitor**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.34.0)）
 >
-> 先深度精簡（移除 1.9 萬行孤兒碼與冗餘），再把「Multi-Runtime」從文字外殼升級為真正模型無關的平台，並補齊 2026 AI harness 底線。
+> 把安全邊界從 prompt／hook／config 移到確定性 choke point 與 OS 原語。MCP dispatch 成為真正的 reference monitor（完整仲介 + 防竄改 + 可驗證），所有 runtime（Claude／Codex／Gemini／Antigravity + direct-API／本地推理 tool loop）都受同一套零 LLM 政策治理。每項控制 fail-closed、opt-in 者向後相容。新增 crate `duduclaw-sandbox`，約 90 個新測試、零 workspace warning。
 >
-> - **`duduclaw-llm` 統一供應層** — Anthropic Messages / OpenAI Responses / Gemini 原生 / OpenAI-compat 四協定單一正規化介面：真 SSE、工具呼叫正規化、15 模型計價 registry（price cliff + cache 費率，修正非 Anthropic 模型最高 30 倍計價誤差）、跨供應商 fallback 鏈（`[model] fallbacks`）+ 供應商無關帳號輪換
-> - **非 Claude runtime 對等** — capabilities fail-closed 執法（廢除 `--full-auto`/`yolo` 全開）、PTY pool 注入工具管制、MCP server 自動註冊進 codex/gemini/agy 原生設定、provider-aware 鷹架（AGENTS.md / GEMINI.md）
-> - **MCP client + tool-loop** — direct-API 與本地推理路徑也拿得到完整 MCP 工具面；本地模型（llamafile/Exo/vLLM）成為一等有工具後端，`inference_mode = "local"` 在 channel 回覆路徑生效
-> - **Harness 基礎建設** — OTel GenAI tracing（OTLP 直連 + auth headers）、`duduclaw eval` 行為回歸套件、通用 HITL ApprovalBroker（TTL 過期＝拒絕）、A2A v1.0 Agent Card + 真 `message/send`、選配 OS keychain
-> - **記憶／路由論文改進** — Ebbinghaus 遺忘曲線、HippoRAG-lite 圖檢索、ACE/ExpeL 規則生命週期、校準式串接路由、摘要式重試、分層快取斷點 + 失效歸因、wiki↔記憶單一所有權邊界
+> - **PolicyKernel reference monitor** — 確定性、零 LLM 的 `evaluate()` 跑參數級靜態工具政策（`agent.toml [capabilities] policy`，Progent 式 tool+arg matcher）；canonical `fs_write`／`shell_exec`／`mcp_call` 家族讓一條規則跨 runtime 等效；Forbid > Ask > Allow > 預設拒；空政策棄權（向後相容）。接進 MCP dispatch（Ask → ApprovalBroker，TTL 過期＝拒）與 direct-API／本地 tool loop（`PolicyExecutor`）
+> - **Egress「secret in-use」收斂** — `<REDACT:…>` token 只對白名單工具還原、其餘拒（`-32007`）、結果再遮蔽；從 stdio 下推到共用 choke point，stdio／HTTP／SSE 三 transport 一致覆蓋
+> - **原生 OS 沙箱** — 新 crate `duduclaw-sandbox`（opt-in `[capabilities] native_sandbox`）以 macOS Seatbelt（活體驗證）／Linux Landlock 依 `SandboxLevel` 圍堵 spawn 出的 agent CLI；要求但不可用時 fail-closed
+> - **記憶 origin-bound 信任** — 時態記憶新增 `origin`／`origin_trust`／`derived_from`；衍生事實信任 clamp 到 ≤ min(來源)，不可經再衍生洗白提升；蒸餾對話事實標最低信任、搜尋據此降權
+> - **CONTRACT 執行期驗證** — `must_not` 邊界在最終送出的回覆 bytes（secret 還原之後）上驗證，違反即攔並寫 audit
+> - **SecurityPosture 狀態機 + OS 對帳** — {Green,Yellow,Red} escalate-fast／decay-slow；`os_reconcile` 對「工具宣稱 vs 觀測到的 OS 效果」做純雙向差集（macOS `eslogger` 解析器、Linux eBPF 分階段）
 
 
 
@@ -113,8 +114,9 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 
 
 <details>
-<summary><strong>v1.9.4 → v1.32.x 累積亮點</strong></summary>
+<summary><strong>v1.9.4 → v1.33.0 累積亮點</strong></summary>
 
+- **v1.33.0** — 模型無關核心 + AI Harness 基礎建設：`duduclaw-llm` 統一供應層（Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat 四協定單一正規化 + 15 模型計價 registry + 跨供應商 fallback + 供應商無關帳號輪換）、非 Claude runtime 對等（capabilities fail-closed + PTY pool 工具管制 + MCP 自動註冊進 codex/gemini/agy）、MCP client + tool-loop 讓 direct-API／本地路徑拿到完整工具面、OTel GenAI tracing + `duduclaw eval` + 通用 HITL ApprovalBroker + A2A v1.0、記憶／路由論文改進（Ebbinghaus / HippoRAG-lite / ACE-ExpeL / 校準式串接路由 / wiki↔記憶邊界）
 - **v1.32.0** — Dashboard UX：命令面板（⌘K）、會說明自己的側邊欄、行動版外殼、共用載入元件（純前端）
 - **v1.31.0** — Genspark 風格工作空間外殼（中央 prompt bar + 能力啟動器 + 「Claw，你的第一位 AI 員工」）疊在 Calm Glass 進階 dashboard 之上、簡易⇄進階模式切換；Tauri 2 桌面外殼（Phase D）把 gateway 包成 sidecar 的原生視窗 + 生命週期硬化（`DUDUCLAW_DESKTOP_MODE`、config.toml port 優先序、避免雙開的 attach 偵測）
 - **v1.30.0** — 每帳號 OAuth 環境注入 PTY pool；LINE 回覆改由 detached task 送出
