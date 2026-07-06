@@ -14,8 +14,8 @@
 
 use crate::{Availability, Confinement, LandlockPlan, NativeSandbox, SandboxError, SandboxSpec};
 use landlock::{
-    path_beneath_rules, Access, AccessFs, AccessNet, CompatLevel, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, ABI,
+    path_beneath_rules, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset,
+    RulesetAttr, RulesetCreatedAttr, ABI,
 };
 use std::process::Command;
 
