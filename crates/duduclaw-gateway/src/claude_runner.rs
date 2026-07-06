@@ -1048,7 +1048,13 @@ async fn run_llm_provider(
         Some(reg) => {
             // Fail-closed capability filter — never advertise a denied tool.
             req.tools = filter_tool_defs(reg.tool_defs(), capabilities);
-            duduclaw_llm::run_tool_loop(&provider, req, reg, duduclaw_llm::DEFAULT_MAX_TOOL_ITERS)
+            // P1-4: enforce the agent's static PolicyKernel policy on the
+            // direct-API tool loop too (complete mediation, I3). Empty policy →
+            // kernel abstains (passthrough).
+            let empty_policy: Vec<duduclaw_core::types::ToolPolicy> = Vec::new();
+            let policy = capabilities.map(|c| c.policy.as_slice()).unwrap_or(&empty_policy);
+            let guarded = duduclaw_llm::PolicyExecutor::new(reg, policy, agent_id);
+            duduclaw_llm::run_tool_loop(&provider, req, &guarded, duduclaw_llm::DEFAULT_MAX_TOOL_ITERS)
                 .await
         }
         None => provider.complete(&req).await,
@@ -2251,6 +2257,14 @@ async fn call_claude_with_env(
             cmd.env(key, value);
         }
     }
+
+    // Native OS sandbox (opt-in via `[capabilities] native_sandbox`). Layered on
+    // top of the `--allowedTools`/`--disallowedTools` restrictions; fail-closed
+    // if required but unavailable. NOTE: when enabled, the claude CLI is confined
+    // to write only within the agent workspace (+ temp) — operators enabling this
+    // for the claude runtime should ensure the agent does not need to write
+    // outside its workspace (e.g. `~/.claude`).
+    crate::runtime::apply_native_sandbox(&mut cmd, capabilities, work_dir, "claude")?;
 
     call_claude_streaming(&mut cmd, None).await
 }

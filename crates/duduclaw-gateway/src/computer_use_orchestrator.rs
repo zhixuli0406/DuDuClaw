@@ -311,8 +311,19 @@ impl ComputerUseOrchestrator {
         args.extend(["--memory".to_string(), "512m".to_string()]);
         args.extend(["--pids-limit".to_string(), "100".to_string()]);
 
-        // Network isolation
-        if !self.config.network_access {
+        // P0-4: validate the egress allowlist up front (I10). Entries failing
+        // canonicalization (control bytes, `%`, CRLF, IP-literals, URL
+        // structure, bad globs) are dropped rather than smuggled into
+        // `ALLOWED_DOMAINS`.
+        let valid_domains = valid_egress_domains(&self.config.allowed_domains);
+        for d in &self.config.allowed_domains {
+            if !valid_domains.contains(d) {
+                tracing::warn!(domain = %d, "dropping invalid egress allowlist entry (fail-closed)");
+            }
+        }
+
+        // Network isolation — fail-closed (I5): see `should_isolate_network`.
+        if should_isolate_network(self.config.network_access, &valid_domains) {
             args.push("--network=none".to_string());
         }
 
@@ -324,11 +335,13 @@ impl ComputerUseOrchestrator {
             "DISPLAY=:99".to_string(),
         ]);
 
-        // Domain filtering (if network is allowed)
-        if self.config.network_access && !self.config.allowed_domains.is_empty() {
+        // Domain filtering (only when network is allowed AND a valid allowlist
+        // survived validation). When empty, the `--network=none` branch above
+        // already denied all egress, so no env var is needed.
+        if self.config.network_access && !valid_domains.is_empty() {
             args.extend([
                 "-e".to_string(),
-                format!("ALLOWED_DOMAINS={}", self.config.allowed_domains.join(",")),
+                format!("ALLOWED_DOMAINS={}", valid_domains.join(",")),
             ]);
         }
 
@@ -1160,6 +1173,25 @@ fn validate_image_name(name: &str) -> Result<(), ComputerUseError> {
     Ok(())
 }
 
+/// Filter an egress allowlist down to canonically-valid host entries (P0-4 / I10).
+///
+/// Invalid entries (control bytes, `%`, CRLF, IP-literals, URL structure, bad
+/// globs) are dropped — this is the assembly-time gate before `ALLOWED_DOMAINS`
+/// is handed to the container.
+fn valid_egress_domains(raw: &[String]) -> Vec<String> {
+    raw.iter()
+        .filter(|d| duduclaw_core::is_valid_egress_host(d))
+        .cloned()
+        .collect()
+}
+
+/// Fail-closed network decision (P0-4 / I5): isolate the container whenever
+/// isolation is requested OR network is enabled but no *valid* domain survived.
+/// An empty (or all-invalid) allowlist must never mean "unrestricted egress".
+fn should_isolate_network(network_access: bool, valid_domains: &[String]) -> bool {
+    !network_access || valid_domains.is_empty()
+}
+
 /// Validate xdotool key string — only alphanumeric, `+`, `_`, `-` allowed.
 fn validate_xdotool_key(key: &str) -> bool {
     !key.is_empty()
@@ -1396,6 +1428,40 @@ mod tests {
         assert!(validate_image_name("ubuntu --privileged").is_err());
         assert!(validate_image_name("image; rm -rf /").is_err());
         assert!(validate_image_name("").is_err());
+    }
+
+    // ── P0-4: egress allowlist validation + fail-closed network decision ──────
+
+    #[test]
+    fn valid_egress_domains_filters_invalid() {
+        let raw = vec![
+            "example.com".to_string(),
+            "*.gov.tw".to_string(),
+            "127.0.0.1".to_string(),   // IP-literal → dropped
+            "evil.com/path".to_string(), // URL structure → dropped
+            "exa%2ecom".to_string(),   // percent-encoding → dropped
+        ];
+        let ok = valid_egress_domains(&raw);
+        assert_eq!(ok, vec!["example.com".to_string(), "*.gov.tw".to_string()]);
+    }
+
+    #[test]
+    fn isolate_network_when_disabled() {
+        assert!(should_isolate_network(false, &["example.com".to_string()]));
+    }
+
+    #[test]
+    fn isolate_network_when_allowlist_empty_even_if_enabled() {
+        // The fail-open case the P0-4 fix closes: network on, no valid domain.
+        assert!(should_isolate_network(true, &[]));
+        // All-invalid entries collapse to empty → still isolate.
+        let valid = valid_egress_domains(&["999.999.999.999".to_string(), "a b".to_string()]);
+        assert!(should_isolate_network(true, &valid));
+    }
+
+    #[test]
+    fn allow_network_when_valid_domains_present() {
+        assert!(!should_isolate_network(true, &["example.com".to_string()]));
     }
 
     #[test]

@@ -296,11 +296,137 @@ pub fn format_history_as_prompt(history: &[ConversationTurn], current_message: &
     buf
 }
 
+// ── Native OS sandbox wiring ────────────────────────────────────
+
+/// Apply the opt-in native OS sandbox (`duduclaw-sandbox`) to a to-be-spawned
+/// agent CLI command, in place, just before spawn.
+///
+/// No-op unless the agent's `[capabilities] native_sandbox = true`. When
+/// enabled, the child is confined by a native OS primitive (macOS Seatbelt /
+/// Linux Landlock) scoped by [`sandbox_level_for`] + the agent directory, on top
+/// of the CLI-flag sandbox. **Fail-closed** (I5): if confinement is required but
+/// cannot be applied (refused, unsupported OS/kernel, missing agent dir, or an
+/// error), this returns `Err` and the caller MUST NOT spawn.
+///
+/// `agent_dir` is the workspace root that becomes the writable scope for
+/// `WorkspaceWrite`. `runtime_name` is used only for structured logging.
+pub(crate) fn apply_native_sandbox(
+    cmd: &mut tokio::process::Command,
+    caps: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    agent_dir: Option<&Path>,
+    runtime_name: &str,
+) -> Result<(), String> {
+    use duduclaw_core::types::sandbox_level_for;
+    use duduclaw_sandbox::{platform_sandbox, Confinement, SandboxSpec};
+
+    let want = caps.map(|c| c.native_sandbox).unwrap_or(false);
+    if !want {
+        return Ok(());
+    }
+
+    // A required sandbox with no workspace root cannot be scoped → fail-closed.
+    let Some(dir) = agent_dir else {
+        return Err(format!(
+            "native_sandbox required for runtime '{runtime_name}' but no agent directory is set — refusing to spawn"
+        ));
+    };
+
+    let level = sandbox_level_for(caps);
+    let spec = SandboxSpec::from_level(level, dir);
+    let sandbox = platform_sandbox();
+
+    match sandbox.confine(cmd.as_std_mut(), &spec) {
+        Ok(Confinement::Applied) => {
+            info!(
+                runtime = runtime_name,
+                ?level,
+                availability = ?sandbox.availability(),
+                "native OS sandbox applied to agent subprocess"
+            );
+            Ok(())
+        }
+        Ok(Confinement::Skipped) => {
+            // FullAccess grant — intentional, no confinement.
+            info!(
+                runtime = runtime_name,
+                "native OS sandbox skipped (FullAccess capability grant)"
+            );
+            Ok(())
+        }
+        Ok(Confinement::Refused) => Err(format!(
+            "native_sandbox required for runtime '{runtime_name}' but the platform primitive refused (availability: {:?}) — refusing to spawn (fail-closed)",
+            sandbox.availability()
+        )),
+        Err(e) => Err(format!(
+            "native_sandbox required for runtime '{runtime_name}' but confinement failed: {e} — refusing to spawn (fail-closed)"
+        )),
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use duduclaw_core::types::CapabilitiesConfig;
+
+    #[test]
+    fn native_sandbox_noop_when_disabled() {
+        // Default caps → native_sandbox = false → helper is a no-op success even
+        // with a valid agent dir.
+        let caps = CapabilitiesConfig::default();
+        let mut cmd = tokio::process::Command::new("true");
+        assert!(
+            apply_native_sandbox(&mut cmd, Some(&caps), Some(Path::new("/tmp")), "test").is_ok()
+        );
+    }
+
+    #[test]
+    fn native_sandbox_noop_when_caps_absent() {
+        let mut cmd = tokio::process::Command::new("true");
+        assert!(apply_native_sandbox(&mut cmd, None, Some(Path::new("/tmp")), "test").is_ok());
+    }
+
+    #[test]
+    fn native_sandbox_fail_closed_without_agent_dir() {
+        // Required sandbox but no workspace root to scope → refuse (fail-closed).
+        let caps = CapabilitiesConfig {
+            native_sandbox: true,
+            ..Default::default()
+        };
+        let mut cmd = tokio::process::Command::new("true");
+        assert!(apply_native_sandbox(&mut cmd, Some(&caps), None, "test").is_err());
+    }
+
+    #[test]
+    fn native_sandbox_skipped_on_full_access() {
+        // computer_use grants FullAccess → SandboxSpec is unconfined → confine
+        // returns Skipped → helper returns Ok (intentional escape hatch).
+        let caps = CapabilitiesConfig {
+            native_sandbox: true,
+            computer_use: true,
+            ..Default::default()
+        };
+        let mut cmd = tokio::process::Command::new("true");
+        assert!(
+            apply_native_sandbox(&mut cmd, Some(&caps), Some(Path::new("/tmp")), "test").is_ok()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_sandbox_applies_on_macos() {
+        // On this macOS box the Seatbelt primitive is Enforcing → a required
+        // sandbox with a workspace root confines successfully.
+        let caps = CapabilitiesConfig {
+            native_sandbox: true,
+            ..Default::default()
+        };
+        let mut cmd = tokio::process::Command::new("true");
+        assert!(
+            apply_native_sandbox(&mut cmd, Some(&caps), Some(Path::new("/tmp")), "test").is_ok()
+        );
+    }
 
     #[test]
     fn test_runtime_type_default() {

@@ -153,6 +153,14 @@ pub const DISTILL_TAG: &str = "conversation-distill";
 /// Importance for auto-distilled knowledge — moderate, decays normally.
 const DISTILL_IMPORTANCE: f64 = 5.0;
 
+/// Provenance origin for auto-distilled conversational knowledge (P2-2).
+pub const DISTILL_ORIGIN: &str = "channel";
+
+/// Trust for auto-distilled facts (P2-2 / I8): the LOWEST tier. Conversational
+/// distillation is unverified, unattributed model output — a fact derived from
+/// it can never outrank a curated wiki page or a user-attributed memory.
+pub const DISTILL_ORIGIN_TRUST: f64 = 0.3;
+
 /// Maximum number of facts persisted per ingest pass.
 const MAX_FACTS_PER_INGEST: usize = 20;
 
@@ -527,16 +535,23 @@ pub(crate) async fn store_facts(
             continue;
         }
 
+        // P2-2 / I8: every distilled fact is marked origin="channel" at the
+        // lowest trust tier, so downstream derivation/search can never launder
+        // unverified conversational output above curated knowledge.
         let meta = match fact.triple() {
             Some((s, p, o)) => TemporalMeta {
                 subject: Some(truncate_chars(s, MAX_TRIPLE_PART_CHARS)),
                 predicate: Some(truncate_chars(p, MAX_TRIPLE_PART_CHARS)),
                 object: Some(truncate_chars(o, MAX_TRIPLE_PART_CHARS)),
                 confidence: Some(fact.confidence.unwrap_or(0.6).clamp(0.0, 1.0)),
+                origin: Some(DISTILL_ORIGIN.to_string()),
+                origin_trust: Some(DISTILL_ORIGIN_TRUST),
                 ..TemporalMeta::default()
             },
             None => TemporalMeta {
                 confidence: Some(fact.confidence.unwrap_or(0.6).clamp(0.0, 1.0)),
+                origin: Some(DISTILL_ORIGIN.to_string()),
+                origin_trust: Some(DISTILL_ORIGIN_TRUST),
                 ..TemporalMeta::default()
             },
         };
@@ -740,6 +755,34 @@ mod tests {
         assert_eq!(entry.importance, DISTILL_IMPORTANCE);
         assert!(entry.tags.contains(&DISTILL_TAG.to_string()));
         assert_eq!(entry.source_event, DISTILL_SOURCE_EVENT);
+
+        // P2-2 / I8: distilled facts carry the lowest trust tier.
+        let trust = engine.get_origin_trust(agent, &entry.id).await.unwrap();
+        assert_eq!(trust, Some(DISTILL_ORIGIN_TRUST), "distilled fact must be lowest-trust");
+    }
+
+    #[tokio::test]
+    async fn distilled_triple_is_lowest_trust() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "agnes";
+        let (stored, _) = store_facts(
+            &engine,
+            agent,
+            &[fact(Some(("user:alice", "prefers_language", "python")), "Alice prefers Python.")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored, 1);
+
+        let entries = engine
+            .list_valid_by_source_event(agent, DISTILL_SOURCE_EVENT, 10)
+            .await
+            .unwrap();
+        let (entry, _) = &entries[0];
+        assert_eq!(
+            engine.get_origin_trust(agent, &entry.id).await.unwrap(),
+            Some(DISTILL_ORIGIN_TRUST)
+        );
     }
 
     #[tokio::test]
