@@ -3357,6 +3357,19 @@ async fn cmd_http_server(
 
     let default_agent = mcp::get_default_agent(&home).await;
 
+    // P2-4: initialise the RFC-23 egress layer for the HTTP/SSE transport too.
+    // `None` ⇒ redaction not enabled in config.toml (zero-overhead skip). An
+    // init failure logs and continues WITHOUT redaction (matches the stdio
+    // path's behaviour). Built before `default_agent` is moved into `new`.
+    let redaction_layer =
+        match crate::mcp_redaction::McpRedactionLayer::try_init(&home, &default_agent) {
+            Ok(opt) => opt,
+            Err(e) => {
+                tracing::error!(error = %e, "MCP redaction layer failed to init — HTTP server continuing WITHOUT redaction");
+                None
+            }
+        };
+
     let dispatcher = crate::mcp_dispatch::McpDispatcher::new(
         home.clone(),
         http,
@@ -3365,7 +3378,8 @@ async fn cmd_http_server(
         Arc::new(crate::odoo_pool::OdooConnectorPool::default()),
         crate::mcp_rate_limit::RateLimiter::new(),
         crate::mcp_memory_quota::DailyQuota::new(),
-    );
+    )
+    .with_redaction(redaction_layer.map(Arc::new));
 
     let cfg = crate::mcp_http_server::HttpServerConfig {
         bind: bind_addr,
