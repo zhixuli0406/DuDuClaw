@@ -87,84 +87,24 @@ impl McpRedactionLayer {
     /// in place. Tokens hit the shared vault keyed on
     /// `(self.agent_id, self.session_id)` so the channel-reply layer can
     /// restore them when this turn's final text reaches the user.
+    ///
+    /// Thin wrapper over the free function [`redact_tool_result_with`] with
+    /// this layer's env-derived agent / session — the stdio serve loop path.
+    /// `McpDispatcher` calls the free function directly with the authenticated
+    /// `principal.client_id`, so both transports share one implementation
+    /// (P2-4: egress pushed to a single choke point, no logic fork).
     pub fn redact_tool_result(&self, tool_name: &str, value: &mut Value) {
-        let source = Source::ToolResult {
-            tool_name: tool_name.to_string(),
-        };
-        walk_strings(value, &mut |s| {
-            // Only run through the pipeline if it actually has potential PII —
-            // very cheap pre-filter, the engine itself is the source of truth.
-            if s.is_empty() {
-                return;
-            }
-            let pipeline = match self
-                .manager
-                .pipeline(&self.agent_id, Some(self.session_id.clone()))
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "duduclaw_cli::mcp_redaction",
-                        error = %e,
-                        agent = %self.agent_id,
-                        "redact_tool_result: pipeline build failed; passthrough"
-                    );
-                    return;
-                }
-            };
-            match pipeline.redact(s, &source) {
-                Ok(out) => {
-                    if !out.tokens_written.is_empty() {
-                        *s = out.redacted_text;
-                    }
-                }
-                Err(e) => {
-                    // Fail-closed: replace text with an explicit placeholder
-                    // so the LLM cannot see raw PII on a vault write failure.
-                    tracing::error!(
-                        target: "duduclaw_cli::mcp_redaction",
-                        error = %e,
-                        agent = %self.agent_id,
-                        "redact_tool_result: redact failed; emitting placeholder"
-                    );
-                    *s = "[redaction failed — value withheld]".to_string();
-                }
-            }
-        });
+        redact_tool_result_with(&self.manager, tool_name, value, &self.agent_id, &self.session_id);
     }
 
     /// Decide what to do with a tool call whose arguments may contain
     /// `<REDACT:...>` tokens.
+    ///
+    /// Thin wrapper over the free function [`decide_tool_args_with`] with this
+    /// layer's env-derived agent / session (see [`Self::redact_tool_result`]
+    /// for why the two paths share one implementation).
     pub fn decide_tool_args(&self, tool_name: &str, args: &Value) -> EgressDecision {
-        // C3 fix: build a Caller so the egress path enforces each token's
-        // RestoreScope. An MCP tool call is made by the agent (not the channel
-        // end-user), so it is never `owner`; Owner-scoped PII therefore will not
-        // be exfiltrated to external tools. Operators grant an agent the scopes
-        // a tool legitimately needs via `DUDUCLAW_REDACTION_SCOPES`
-        // (comma-separated, e.g. `FinanceRead`); `RedactionAdmin` bypasses all.
-        let scopes: Vec<String> = std::env::var("DUDUCLAW_REDACTION_SCOPES")
-            .ok()
-            .map(|raw| {
-                raw.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let caller = duduclaw_redaction::Caller::agent(self.agent_id.clone(), scopes);
-        self.manager
-            .decide_tool_call(tool_name, args, &self.agent_id, Some(&self.session_id), &caller)
-            .unwrap_or_else(|e| {
-                tracing::error!(
-                    target: "duduclaw_cli::mcp_redaction",
-                    error = %e,
-                    "decide_tool_args failed; denying"
-                );
-                EgressDecision::Deny {
-                    reason: format!("redaction error: {e}"),
-                    tokens_seen: 0,
-                }
-            })
+        decide_tool_args_with(&self.manager, tool_name, args, &self.agent_id, &self.session_id)
     }
 
     /// Quick scan: does any string in this Value contain a token-shaped
@@ -178,6 +118,117 @@ impl McpRedactionLayer {
             _ => false,
         }
     }
+}
+
+/// Read the operator-granted redaction scopes from the environment.
+///
+/// `DUDUCLAW_REDACTION_SCOPES` is comma-separated (e.g. `FinanceRead,CrmRead`).
+/// Empty / unset ⇒ no extra scopes. `RedactionAdmin` bypasses every per-token
+/// `RestoreScope`. Kept as env (not per-call) because it is an operator policy
+/// knob, identical whether the call arrives over stdio or HTTP/SSE.
+fn redaction_scopes_from_env() -> Vec<String> {
+    std::env::var("DUDUCLAW_REDACTION_SCOPES")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Egress decision for a tool call whose arguments may carry `<REDACT:...>`
+/// tokens — the pure form that takes an explicit `(manager, agent_id,
+/// session_id)` instead of reading them off a [`McpRedactionLayer`].
+///
+/// Shared by the stdio serve loop (via [`McpRedactionLayer::decide_tool_args`],
+/// which passes its env-derived identity) and by `McpDispatcher` (which passes
+/// the authenticated `principal.client_id` — more accurate than the env var).
+/// Fail-closed (I5): a redaction error resolves to `Deny`, never a silent
+/// passthrough.
+///
+/// C3: the caller is always modelled as the *agent*, never the channel
+/// end-user (`owner`), so Owner-scoped PII is never exfiltrated to external
+/// tools. Operators widen this via `DUDUCLAW_REDACTION_SCOPES`.
+pub fn decide_tool_args_with(
+    manager: &RedactionManager,
+    tool_name: &str,
+    args: &Value,
+    agent_id: &str,
+    session_id: &str,
+) -> EgressDecision {
+    let caller = duduclaw_redaction::Caller::agent(agent_id.to_string(), redaction_scopes_from_env());
+    manager
+        .decide_tool_call(tool_name, args, agent_id, Some(session_id), &caller)
+        .unwrap_or_else(|e| {
+            tracing::error!(
+                target: "duduclaw_cli::mcp_redaction",
+                error = %e,
+                "decide_tool_args failed; denying"
+            );
+            EgressDecision::Deny {
+                reason: format!("redaction error: {e}"),
+                tokens_seen: 0,
+            }
+        })
+}
+
+/// Redact every string leaf of a tool-call result — the pure form taking an
+/// explicit `(manager, agent_id, session_id)`.
+///
+/// Shared by the stdio serve loop (via [`McpRedactionLayer::redact_tool_result`])
+/// and `McpDispatcher`. Vault writes are keyed on `(agent_id, session_id)` so
+/// the channel-reply layer can restore the same tokens later. Fail-closed: a
+/// vault-write failure replaces the value with an explicit placeholder rather
+/// than leaking raw PII to the model.
+pub fn redact_tool_result_with(
+    manager: &RedactionManager,
+    tool_name: &str,
+    value: &mut Value,
+    agent_id: &str,
+    session_id: &str,
+) {
+    let source = Source::ToolResult {
+        tool_name: tool_name.to_string(),
+    };
+    walk_strings(value, &mut |s| {
+        // Only run through the pipeline if it actually has potential PII —
+        // very cheap pre-filter, the engine itself is the source of truth.
+        if s.is_empty() {
+            return;
+        }
+        let pipeline = match manager.pipeline(agent_id, Some(session_id.to_string())) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    target: "duduclaw_cli::mcp_redaction",
+                    error = %e,
+                    agent = %agent_id,
+                    "redact_tool_result: pipeline build failed; passthrough"
+                );
+                return;
+            }
+        };
+        match pipeline.redact(s, &source) {
+            Ok(out) => {
+                if !out.tokens_written.is_empty() {
+                    *s = out.redacted_text;
+                }
+            }
+            Err(e) => {
+                // Fail-closed: replace text with an explicit placeholder
+                // so the LLM cannot see raw PII on a vault write failure.
+                tracing::error!(
+                    target: "duduclaw_cli::mcp_redaction",
+                    error = %e,
+                    agent = %agent_id,
+                    "redact_tool_result: redact failed; emitting placeholder"
+                );
+                *s = "[redaction failed — value withheld]".to_string();
+            }
+        }
+    });
 }
 
 /// Recursive in-place walk over every string leaf of a `serde_json::Value`.

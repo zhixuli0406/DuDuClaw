@@ -6128,6 +6128,13 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
         }
     };
 
+    // P2-4: attach the egress layer to the dispatcher so the "secret in-use"
+    // decision + result redaction run inside the shared choke point
+    // (`dispatch_tool_call`) for every transport — stdio (here), HTTP and SSE.
+    // Previously this was wrapped manually around the stdio call only, leaving
+    // HTTP/SSE uncovered. `None` ⇒ redaction disabled (zero-overhead skip).
+    let dispatcher = dispatcher.with_redaction(redaction_layer.map(std::sync::Arc::new));
+
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
@@ -6172,58 +6179,13 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
             "initialize" => handle_initialize(&id, &request),
             "tools/list" => handle_tools_list(&id, principal.is_external),
             "tools/call" => {
-                // W20-P1 Phase 2A: delegate to McpDispatcher (scope → rate-limit → ns-inject → dispatch)
-                let mut params = request.get("params").cloned().unwrap_or(Value::Null);
-
-                // RFC-23 egress: if the LLM passed `<REDACT:...>` tokens in
-                // `arguments`, decide whether the tool is whitelisted for
-                // restoration. Result Allow → replace args with restored.
-                // Deny → return JSON-RPC error without invoking the tool.
-                let tool_name_for_egress = params
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let mut egress_denial: Option<Value> = None;
-                if let Some(ref layer) = redaction_layer
-                    && let Some(args) = params.get("arguments")
-                    && crate::mcp_redaction::McpRedactionLayer::args_contain_tokens(args)
-                {
-                    match layer.decide_tool_args(&tool_name_for_egress, args) {
-                        duduclaw_redaction::EgressDecision::Allow { args: restored, .. } => {
-                            if let Some(obj) = params.as_object_mut() {
-                                obj.insert("arguments".to_string(), restored);
-                            }
-                        }
-                        duduclaw_redaction::EgressDecision::Passthrough(_) => {
-                            // Leave args verbatim (token strings).
-                        }
-                        duduclaw_redaction::EgressDecision::Deny { reason, tokens_seen } => {
-                            egress_denial = Some(crate::mcp_redaction::egress_deny_response(
-                                &id,
-                                &tool_name_for_egress,
-                                &reason,
-                                tokens_seen,
-                            ));
-                        }
-                    }
-                }
-
-                if let Some(deny) = egress_denial {
-                    deny
-                } else {
-                    let mut resp = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
-                    // RFC-23 outgoing: redact the result Value so the LLM
-                    // never sees raw internal data. The vault holds the
-                    // (token → original) mapping for the channel-reply
-                    // restore step.
-                    if let Some(ref layer) = redaction_layer
-                        && let Some(result) = resp.get_mut("result")
-                    {
-                        layer.redact_tool_result(&tool_name_for_egress, result);
-                    }
-                    resp
-                }
+                // W20-P1 Phase 2A + P2-4: delegate to McpDispatcher, which now
+                // enforces the full pipeline — including RFC-23 egress ("secret
+                // in-use") arg-restoration and result redaction — inside the one
+                // shared choke point. The former manual egress wrapping around
+                // this call was removed so stdio / HTTP / SSE stay identical.
+                let params = request.get("params").cloned().unwrap_or(Value::Null);
+                dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await
             }
             "notifications/initialized" => {
                 // This is a notification (no id expected in response), skip
