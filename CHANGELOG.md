@@ -1,5 +1,57 @@
 # Changelog
 
+
+## [1.34.0] - 2026-07-06 — Runtime-agnostic security reference monitor
+
+Moves the security boundary off prompts/hooks/config and onto deterministic
+choke points and OS primitives. The MCP dispatch path becomes a true reference
+monitor (complete mediation, tamper-proof, verifiable) so every runtime —
+Claude / Codex / Gemini / Antigravity, plus the direct-API and local-inference
+tool loops — is governed by the same zero-LLM policy. Every new control is
+fail-closed and (where opt-in) backward compatible. New `duduclaw-sandbox`
+crate; ~90 new tests, zero workspace warnings.
+
+### Added
+- **PolicyKernel reference monitor** (`duduclaw-security`): deterministic,
+  zero-LLM `evaluate()` over a parameter-level static tool policy
+  (`agent.toml [capabilities] policy`, Progent-style tool+arg matcher). Canonical
+  `fs_write`/`shell_exec`/`mcp_call` families give one rule uniform reach across
+  runtimes; precedence Forbid > Ask > Allow > default-deny; empty policy abstains
+  (backward compatible). Wired into MCP dispatch (Ask → ApprovalBroker,
+  TTL-expiry = deny) and the direct-API/local tool loop (`PolicyExecutor`).
+- **Egress "secret in-use"** at the shared MCP choke point: `<REDACT:…>` tokens
+  restored only for whitelisted tools, everything else denied (`-32007`), results
+  re-redacted — now covering stdio **and** HTTP/SSE transports uniformly.
+- **Native OS process sandbox** (`duduclaw-sandbox`, opt-in
+  `[capabilities] native_sandbox`): confines the spawned agent CLI via macOS
+  Seatbelt (live-verified) / Linux Landlock, derived from `SandboxLevel`;
+  fail-closed when required but unavailable.
+- **Origin-bound memory trust** (`duduclaw-memory`): temporal memories gain
+  `origin`/`origin_trust`/`derived_from`; a derived fact's trust is clamped to
+  ≤ min(source trusts) — non-malleable, can't be laundered upward. Distilled
+  conversational facts are marked lowest-trust; search down-weights accordingly.
+- **CONTRACT.toml runtime enforcement**: `must_not` boundaries validated on the
+  final user-facing reply bytes (after secret restoration); violations blocked
+  and audited.
+- **SecurityPosture** state machine ({Green,Yellow,Red}, escalate-fast /
+  decay-slow) + **OS ground-truth reconciliation** (`os_reconcile`: pure
+  two-way diff of tool-call claims vs observed OS effects; macOS `eslogger`
+  parser; Linux eBPF staged).
+
+### Changed
+- MCP dispatch pipeline now runs injection scan → PolicyKernel → egress at one
+  shared choke point, so HTTP/SSE get the same enforcement as stdio.
+- Antigravity spawn derives `--sandbox` / `--dangerously-skip-permissions` from
+  `SandboxLevel` (never both) instead of unconditional skip-permissions.
+
+### Fixed
+- Egress domain filtering is fail-closed: an empty/invalid allowlist now denies
+  all egress (`--network=none` / deny-all) instead of leaving the network
+  unfiltered; allowlist entries are canonicalized (reject control bytes, `%`,
+  CRLF, IP-literals).
+- Inbound prompt-injection blocks on the channel reply path are now audited.
+
+
 ## [1.33.0] - 2026-07-05 — Model-agnostic core + AI harness infrastructure
 
 The largest structural release to date, in three movements: a deep prune
