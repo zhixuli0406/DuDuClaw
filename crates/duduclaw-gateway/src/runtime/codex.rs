@@ -205,6 +205,10 @@ impl AgentRuntime for CodexRuntime {
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
+        // Native OS sandbox (opt-in). Layered on top of the CLI `--sandbox`
+        // flag; fail-closed if required but unavailable.
+        super::apply_native_sandbox(&mut cmd, caps, context.agent_dir.as_deref(), "codex")?;
+
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             cmd.output(),

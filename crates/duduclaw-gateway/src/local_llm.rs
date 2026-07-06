@@ -272,10 +272,18 @@ pub(crate) async fn try_local_tool_loop(
     req.messages.push(ChatMessage::user(prompt));
     req.tools = tools;
 
+    // P1-4: enforce the agent's static PolicyKernel policy on this local
+    // tool-loop path (complete mediation, I3). Empty policy → the kernel
+    // abstains (passthrough). Wrapping the registry keeps `run_tool_loop`
+    // untouched.
+    let empty_policy: Vec<duduclaw_core::types::ToolPolicy> = Vec::new();
+    let policy = capabilities.map(|c| c.policy.as_slice()).unwrap_or(&empty_policy);
+    let guarded = duduclaw_llm::PolicyExecutor::new(&registry, policy, agent_id);
+
     match duduclaw_llm::run_tool_loop(
         &provider,
         req,
-        &registry,
+        &guarded,
         duduclaw_llm::DEFAULT_MAX_TOOL_ITERS,
     )
     .await

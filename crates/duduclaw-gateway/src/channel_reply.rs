@@ -469,6 +469,32 @@ async fn restore_for_channel(
         })
 }
 
+/// zh-TW canned reply used when a response is blocked by a CONTRACT.toml
+/// `must_not` boundary (P2-3). Deliberately generic — never echoes the
+/// violating content.
+const CONTRACT_BLOCK_MESSAGE: &str = "⚠️ 這則回覆因違反行為契約邊界而被攔截，未送出。";
+
+/// P2-3: enforce CONTRACT.toml `must_not` boundaries on the FINAL user-facing
+/// bytes (I9 — validate the artifact that actually takes effect, i.e. AFTER
+/// secret restoration in `restore_for_channel`). D-6 = block: a violating reply
+/// is replaced with a safe refusal and audited to `security_audit.jsonl`, never
+/// sent. Empty `must_not` (or no CONTRACT.toml) → passthrough (no overhead).
+async fn enforce_contract(final_text: String, home_dir: &std::path::Path, agent_id: &str) -> String {
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    let contract = duduclaw_agent::contract::load_contract(&agent_dir);
+    if contract.boundaries.must_not.is_empty() {
+        return final_text;
+    }
+    let result = duduclaw_agent::contract::validate_response(&contract, &final_text);
+    if result.passed {
+        return final_text;
+    }
+    let rules: Vec<String> = result.violations.iter().map(|v| v.rule.clone()).collect();
+    warn!(agent = %agent_id, ?rules, "CONTRACT must_not violation — blocking outgoing reply");
+    duduclaw_security::audit::log_contract_violation(home_dir, agent_id, &rules);
+    CONTRACT_BLOCK_MESSAGE.to_string()
+}
+
 /// Best-effort agent-id resolution for outer restore wrappers — mirrors
 /// the order used by `build_reply_with_session_inner` but without the
 /// trigger-word matcher (the wrapper only needs *some* agent id to pick
@@ -516,7 +542,8 @@ pub async fn build_reply_for_agent(
 ) -> String {
     let raw =
         build_reply_with_session_inner(text, ctx, Some(agent_name), session_id, user_id, on_progress).await;
-    restore_for_channel(raw, ctx, agent_name, session_id).await
+    let restored = restore_for_channel(raw, ctx, agent_name, session_id).await;
+    enforce_contract(restored, &ctx.home_dir, agent_name).await
 }
 
 /// Build a reply with session tracking and optional progress streaming.
@@ -534,7 +561,8 @@ pub async fn build_reply_with_session(
     let raw =
         build_reply_with_session_inner(text, ctx, None, session_id, user_id, on_progress).await;
     let agent_id = resolve_agent_for_restore(ctx, session_id).await;
-    restore_for_channel(raw, ctx, &agent_id, session_id).await
+    let restored = restore_for_channel(raw, ctx, &agent_id, session_id).await;
+    enforce_contract(restored, &ctx.home_dir, &agent_id).await
 }
 
 /// Inner implementation shared by both default-agent and explicit-agent paths.
@@ -856,9 +884,14 @@ async fn build_reply_with_session_inner(
     }
 
     // ── L3: Prompt injection scan (existing) ──
-    let scan = duduclaw_security::input_guard::scan_input(
+    // P0-2: use the audit-emitting variant so a blocked inbound injection
+    // leaves a forensic trail in `security_audit.jsonl` (via
+    // `log_injection_detected`) instead of being dropped silently.
+    let scan = duduclaw_security::input_guard::scan_input_with_audit(
         text,
         duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
+        &ctx.home_dir,
+        &agent_id,
     );
     if scan.blocked {
         warn!(
@@ -3163,6 +3196,59 @@ mod local_first_tests {
         ] {
             assert_eq!(local_inference_first(mode), expected, "mode = {mode:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod contract_enforcement_tests {
+    use super::enforce_contract;
+
+    fn write_contract(home: &std::path::Path, agent: &str, must_not: &str) {
+        let dir = home.join("agents").join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("CONTRACT.toml"),
+            format!("[boundaries]\nmust_not = [\"{must_not}\"]\n"),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn violating_reply_is_blocked_and_audited() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_contract(tmp.path(), "agnes", "reveal api keys");
+
+        let out = enforce_contract(
+            "Here, I will reveal api keys: sk-xyz".to_string(),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+
+        assert!(out.contains("行為契約邊界"), "must return the block message, got: {out}");
+        assert!(!out.contains("sk-xyz"), "violating content must not survive");
+
+        let log = std::fs::read_to_string(tmp.path().join("security_audit.jsonl")).unwrap();
+        assert!(log.contains("contract_violation"), "block must be audited");
+    }
+
+    #[tokio::test]
+    async fn benign_reply_passes_through_unchanged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_contract(tmp.path(), "agnes", "reveal api keys");
+
+        let reply = "The deployment finished successfully.".to_string();
+        let out = enforce_contract(reply.clone(), tmp.path(), "agnes").await;
+        assert_eq!(out, reply);
+    }
+
+    #[tokio::test]
+    async fn no_contract_file_passes_through() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No agents/ghost/CONTRACT.toml written.
+        let reply = "anything at all".to_string();
+        let out = enforce_contract(reply.clone(), tmp.path(), "ghost").await;
+        assert_eq!(out, reply);
     }
 }
 

@@ -81,6 +81,7 @@ pub async fn maybe_consolidate(
             "source_mistake_ids": source_ids,
             "rule_stats": crate::prediction::rule_lifecycle::RuleStats::initial(),
         })),
+        ..Default::default()
     };
 
     let semantic_id = engine

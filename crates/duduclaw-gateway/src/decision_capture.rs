@@ -414,6 +414,7 @@ async fn write_triple(
         valid_until: None,
         confidence: Some(1.0),
         metadata: Some(ctx_meta.clone()),
+        ..Default::default()
     };
     engine
         .store_temporal(agent_id, entry, meta)
@@ -1158,6 +1159,7 @@ mod tests {
                         valid_until: None,
                         confidence: Some(1.0),
                         metadata: None,
+                        ..Default::default()
                     },
                 )
                 .await

@@ -19,7 +19,10 @@
 //!     must be the LAST flag — it consumes the next argv token as the prompt, so
 //!     any flag after `-p` is swallowed as the prompt. All other flags go first.
 //!   - `--dangerously-skip-permissions` auto-approves all tool permission
-//!     requests without prompting — required since a subprocess has no TTY.
+//!     requests without prompting. As of 2026-07-06 this is NO LONGER emitted
+//!     unconditionally: `agy --help` confirms a `--sandbox` flag exists, so the
+//!     runtime now derives confinement from `CapabilitiesConfig` (see
+//!     `sandbox_args`) — skip-permissions only on an explicit FullAccess grant.
 //!   - `--model <id>` selects the session model; `--add-dir <path>` adds a
 //!     workspace dir (we point it at the agent home so `agy` does not silently
 //!     create a default `~/.gemini/antigravity-cli/scratch/` workspace).
@@ -34,7 +37,30 @@
 use async_trait::async_trait;
 use tracing::info;
 
+use duduclaw_core::types::{sandbox_level_for, CapabilitiesConfig, SandboxLevel};
+
 use super::{AgentRuntime, RuntimeContext, RuntimeResponse};
+
+/// Derive agy sandbox / permission flags from the agent's capabilities.
+///
+/// agy exposes exactly two relevant flags (verified via real `agy --help`,
+/// 2026-07-06 — supersedes the stale v1.0.12 "no sandbox flags" note):
+///   - `--sandbox`                      Run in a sandbox with terminal restrictions enabled
+///   - `--dangerously-skip-permissions` Auto-approve all tool permission requests
+///
+/// Mapping mirrors the codex/gemini `SandboxLevel` enforcement:
+///   - `ReadOnly` / `WorkspaceWrite`          → `--sandbox` (confine blast radius)
+///   - `FullAccess` (explicit `computer_use`) → `--dangerously-skip-permissions`
+///
+/// HARD RULE (upstream issue #36): never emit both. Combining `--sandbox` with
+/// `--dangerously-skip-permissions` auto-approves attempts to escape the
+/// sandbox, defeating the confinement.
+fn sandbox_args(caps: Option<&CapabilitiesConfig>) -> Vec<String> {
+    match sandbox_level_for(caps) {
+        SandboxLevel::FullAccess => vec!["--dangerously-skip-permissions".to_string()],
+        SandboxLevel::ReadOnly | SandboxLevel::WorkspaceWrite => vec!["--sandbox".to_string()],
+    }
+}
 
 /// Hard backstop on the whole subprocess. Kept a notch above `PRINT_TIMEOUT`
 /// (agy's own print-mode wait) so agy self-bounds first and this only fires if
@@ -171,19 +197,18 @@ impl AgentRuntime for AntigravityRuntime {
     ) -> Result<RuntimeResponse, String> {
         info!(agent = %context.agent_id, "AntigravityRuntime: executing via agy -p");
 
-        // W1: agy exposes NO sandbox / approval-policy / tool-list flags
-        // (verified against `agy --help` v1.0.12 — see module docs), so the
-        // agent's CapabilitiesConfig cannot be enforced on this runtime at
-        // all. Surface that loudly once per spawn so operators aren't
-        // silently unprotected.
-        if context.capabilities.is_some() {
-            tracing::warn!(
-                runtime = "antigravity",
-                agent = %context.agent_id,
-                "capability enforcement unavailable on this runtime — agy has no \
-                 sandbox/approval flags; spawning with --dangerously-skip-permissions"
-            );
-        }
+        // P0-3: agy DOES expose `--sandbox` (verified via real `agy --help`,
+        // 2026-07-06 — the old v1.0.12 "no sandbox flags" claim is obsolete).
+        // Derive the confinement flags from the agent's CapabilitiesConfig so
+        // this runtime enforces SandboxLevel just like codex/gemini, instead of
+        // unconditionally auto-approving every tool call.
+        let sb_args = sandbox_args(context.capabilities.as_ref());
+        info!(
+            runtime = "antigravity",
+            agent = %context.agent_id,
+            sandbox_flags = ?sb_args,
+            "antigravity sandbox flags derived from capabilities"
+        );
 
         // W2 (MCP wiring): register the duduclaw MCP server in the agent's
         // antigravity settings before spawning. Idempotent merge;
@@ -209,11 +234,14 @@ impl AgentRuntime for AntigravityRuntime {
         // as the prompt and the real payload is dropped (the cause of agy
         // "answering" about whatever flag followed `-p`).
         //
-        // `--dangerously-skip-permissions` auto-approves tool calls (a subprocess
-        // has no TTY to confirm at). `--print-timeout` bounds agy's own wait.
-        cmd.arg("--dangerously-skip-permissions")
-            .arg("--print-timeout")
-            .arg(PRINT_TIMEOUT);
+        // Capability-derived sandbox/permission flags (see `sandbox_args`):
+        // `--sandbox` for restricted levels, `--dangerously-skip-permissions`
+        // only on an explicit FullAccess grant — never both. `--print-timeout`
+        // bounds agy's own wait. All flags MUST precede `-p <payload>`.
+        for a in &sb_args {
+            cmd.arg(a);
+        }
+        cmd.arg("--print-timeout").arg(PRINT_TIMEOUT);
 
         // Set model if specified (agy uses `--model`, not `-m`).
         if !context.model.is_empty() {
@@ -249,6 +277,16 @@ impl AgentRuntime for AntigravityRuntime {
 
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+
+        // Native OS sandbox (opt-in). agy has no CLI sandbox flags, so this OS
+        // floor is the only enforceable confinement on this runtime; fail-closed
+        // if required but unavailable.
+        super::apply_native_sandbox(
+            &mut cmd,
+            context.capabilities.as_ref(),
+            context.agent_dir.as_deref(),
+            "antigravity",
+        )?;
 
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
@@ -412,6 +450,60 @@ mod tests {
             preferred_provider: None,
             conversation_history: vec![],
             capabilities: None,
+        }
+    }
+
+    // ── P0-3: capability-derived sandbox/permission flags ─────────────────────
+
+    fn caps(computer_use: bool, browser_via_bash: bool, allowed: &[&str], denied: &[&str]) -> CapabilitiesConfig {
+        CapabilitiesConfig {
+            computer_use,
+            browser_via_bash,
+            allowed_tools: allowed.iter().map(|s| s.to_string()).collect(),
+            denied_tools: denied.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sandbox_args_none_caps_is_sandbox() {
+        // None caps ⇒ WorkspaceWrite ⇒ confine, not auto-approve.
+        assert_eq!(sandbox_args(None), vec!["--sandbox"]);
+    }
+
+    #[test]
+    fn sandbox_args_default_caps_is_sandbox() {
+        let c = caps(false, false, &[], &[]);
+        assert_eq!(sandbox_args(Some(&c)), vec!["--sandbox"]);
+    }
+
+    #[test]
+    fn sandbox_args_read_only_is_sandbox() {
+        let c = caps(false, false, &["Read", "Grep"], &[]);
+        assert_eq!(sandbox_args(Some(&c)), vec!["--sandbox"]);
+    }
+
+    #[test]
+    fn sandbox_args_full_access_is_skip_permissions_only() {
+        let c = caps(true, false, &[], &[]);
+        assert_eq!(sandbox_args(Some(&c)), vec!["--dangerously-skip-permissions"]);
+    }
+
+    #[test]
+    fn sandbox_args_never_emits_both_flags() {
+        // HARD RULE (issue #36): the two flags are mutually exclusive in every level.
+        for c in [
+            sandbox_args(None),
+            sandbox_args(Some(&caps(false, false, &[], &[]))),
+            sandbox_args(Some(&caps(false, false, &["Read"], &[]))),
+            sandbox_args(Some(&caps(true, false, &[], &[]))),
+        ] {
+            let has_sandbox = c.iter().any(|a| a == "--sandbox");
+            let has_skip = c.iter().any(|a| a == "--dangerously-skip-permissions");
+            assert!(
+                !(has_sandbox && has_skip),
+                "--sandbox and --dangerously-skip-permissions must never coexist: {c:?}"
+            );
         }
     }
 
