@@ -2,7 +2,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -114,6 +114,16 @@ pub struct TemporalMeta {
     pub confidence: Option<f64>,
     /// JSON metadata blob (e.g. source mistake ids for reflexion consolidation).
     pub metadata: Option<serde_json::Value>,
+    /// P2-1 provenance: where this fact originated ("channel"/"user"/"distill"…).
+    pub origin: Option<String>,
+    /// P2-1: 0.0–1.0 trust of the origin. Defaults to 1.0 (self/authoritative)
+    /// when `None`. Clamped to `[0,1]` and to ≤ min(source trusts) on store.
+    pub origin_trust: Option<f64>,
+    /// P2-1: source memory ids this fact was derived from. When set, the stored
+    /// `origin_trust` is clamped to ≤ the minimum trust across these sources
+    /// (I8: trust is non-malleable — re-derivation/summarization can never
+    /// launder a low-trust fact into a higher-trust one).
+    pub derived_from: Option<Vec<String>>,
 }
 
 /// A pending/known decision surfaced from the temporal store (RFC-24).
@@ -513,6 +523,37 @@ impl SqliteMemoryEngine {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "{}".to_string());
 
+        // ── P2-1: origin-bound trust (I8, non-malleable) ─────────────────────
+        // Start from the caller's declared trust, clamped to [0,1]. If the fact
+        // is derived from source memories, clamp further to ≤ the MINIMUM trust
+        // across those sources — a derived/summarized fact can never be more
+        // trusted than its least-trusted input.
+        let mut origin_trust = meta.origin_trust.unwrap_or(1.0).clamp(0.0, 1.0);
+        let derived_from_json = match &meta.derived_from {
+            Some(sources) if !sources.is_empty() => {
+                let mut min_source: f64 = 1.0;
+                for sid in sources {
+                    let t: Option<f64> = conn
+                        .query_row(
+                            "SELECT origin_trust FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1",
+                            params![sid, agent_id],
+                            |r| r.get::<_, f64>(0),
+                        )
+                        .optional()
+                        .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+                    // An unknown source id contributes trust 0.0 (fail-closed):
+                    // we cannot vouch for a source we cannot find.
+                    min_source = min_source.min(t.unwrap_or(0.0));
+                }
+                origin_trust = origin_trust.min(min_source);
+                Some(
+                    serde_json::to_string(sources)
+                        .map_err(|e| DuDuClawError::Memory(e.to_string()))?,
+                )
+            }
+            _ => None,
+        };
+
         // ── Conflict resolution: only when a full triple is supplied ──────────
         let mut supersedes: Option<String> = None;
         if let (Some(subj), Some(pred)) = (meta.subject.as_ref(), meta.predicate.as_ref()) {
@@ -565,14 +606,16 @@ impl SqliteMemoryEngine {
                 (id, agent_id, content, timestamp, tags, layer, importance, access_count,
                  last_accessed, source_event,
                  valid_from, valid_until, superseded_by, supersedes,
-                 subject, predicate, object, confidence, metadata)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                 subject, predicate, object, confidence, metadata,
+                 origin, origin_trust, derived_from)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
             params![
                 entry.id, agent_id, entry.content, timestamp_str, tags_json,
                 entry.layer.as_str(), entry.importance, entry.access_count,
                 last_accessed_str, entry.source_event,
                 valid_from, valid_until, Option::<String>::None, supersedes,
-                meta.subject, meta.predicate, meta.object, confidence, metadata
+                meta.subject, meta.predicate, meta.object, confidence, metadata,
+                meta.origin, origin_trust, derived_from_json
             ],
         )
         .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
@@ -585,6 +628,19 @@ impl SqliteMemoryEngine {
 
         info!(agent_id, entry_id = %entry.id, "temporal memory stored");
         Ok(entry.id)
+    }
+
+    /// Read back the stored `origin_trust` for a memory id (P2-1). Returns
+    /// `None` when the id is not found for this agent.
+    pub async fn get_origin_trust(&self, agent_id: &str, memory_id: &str) -> Result<Option<f64>> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT origin_trust FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1",
+            params![memory_id, agent_id],
+            |r| r.get::<_, f64>(0),
+        )
+        .optional()
+        .map_err(|e| DuDuClawError::Memory(e.to_string()))
     }
 
     /// Return the full supersession chain for a `(subject, predicate)` pair,
@@ -885,6 +941,7 @@ impl SqliteMemoryEngine {
                 valid_until: None,
                 confidence: Some(1.0),
                 metadata: None,
+                ..Default::default()
             },
         )
         .await?;
@@ -1246,6 +1303,15 @@ impl SqliteMemoryEngine {
             "ALTER TABLE memories ADD COLUMN object TEXT",
             "ALTER TABLE memories ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0",
             "ALTER TABLE memories ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'",
+            // ── P2-1 origin-bound provenance (I8: trust non-malleable) ──
+            // `origin` = where the fact came from ("channel"/"user"/"distill"/…);
+            // `origin_trust` = 0..1 trust of that origin (default 1.0 = self /
+            // authoritative); `derived_from` = JSON array of source memory ids.
+            // A derived fact's `origin_trust` is clamped to ≤ min(source trusts)
+            // in `store_temporal`, so trust cannot be laundered upward.
+            "ALTER TABLE memories ADD COLUMN origin TEXT",
+            "ALTER TABLE memories ADD COLUMN origin_trust REAL NOT NULL DEFAULT 1.0",
+            "ALTER TABLE memories ADD COLUMN derived_from TEXT",
         ];
         for sql in &migrations {
             match conn.execute_batch(sql) {
@@ -1469,6 +1535,25 @@ impl MemoryEngine for SqliteMemoryEngine {
                     scored.push((score, entry));
                 }
             }
+        }
+
+        // P2-1: cap low-trust memories in the ranking (I8). Multiply each score
+        // by its `origin_trust` (default 1.0 → existing rows unchanged; only
+        // distilled/channel facts with trust < 1.0 are pushed down). A
+        // multiplier, not a filter, so nothing is silently hidden — a low-trust
+        // fact can still surface if little else competes.
+        for (score, entry) in scored.iter_mut() {
+            let trust: f64 = conn
+                .query_row(
+                    "SELECT origin_trust FROM memories WHERE id = ?1 AND agent_id = ?2 LIMIT 1",
+                    params![entry.id, agent_id],
+                    |r| r.get::<_, f64>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .unwrap_or(1.0);
+            *score *= trust.clamp(0.0, 1.0);
         }
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -2152,6 +2237,101 @@ mod tests {
             .unwrap();
         let results = engine.search(agent, "qwerty", 10).await.unwrap();
         assert_eq!(results.len(), 1, "legacy NULL-valid_until rows remain visible");
+    }
+
+    // ── P2-1: origin-bound trust (I8, non-malleable) ────────────────────────────
+
+    /// A plain store defaults origin_trust to 1.0 (backward compatible).
+    #[tokio::test]
+    async fn origin_trust_defaults_to_one() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "trust-default";
+        let e = make_entry(agent, "x", vec![]);
+        let id = engine.store_temporal(agent, e, TemporalMeta::default()).await.unwrap();
+        assert_eq!(engine.get_origin_trust(agent, &id).await.unwrap(), Some(1.0));
+    }
+
+    /// A declared low origin_trust is stored and clamped to [0,1].
+    #[tokio::test]
+    async fn origin_trust_stored_and_clamped() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "trust-store";
+        let e = make_entry(agent, "channel fact", vec![]);
+        let meta = TemporalMeta {
+            origin: Some("channel".into()),
+            origin_trust: Some(0.3),
+            ..Default::default()
+        };
+        let id = engine.store_temporal(agent, e, meta).await.unwrap();
+        assert_eq!(engine.get_origin_trust(agent, &id).await.unwrap(), Some(0.3));
+
+        // Above-range trust is clamped to 1.0.
+        let e2 = make_entry(agent, "y", vec![]);
+        let id2 = engine
+            .store_temporal(agent, e2, TemporalMeta { origin_trust: Some(5.0), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(engine.get_origin_trust(agent, &id2).await.unwrap(), Some(1.0));
+    }
+
+    /// A derived fact can never be more trusted than its least-trusted source.
+    #[tokio::test]
+    async fn derived_fact_inherits_min_source_trust() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "trust-derive";
+
+        // Two sources: trust 0.8 and 0.2.
+        let hi = engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "hi src", vec![]),
+                TemporalMeta { origin_trust: Some(0.8), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        let lo = engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "lo src", vec![]),
+                TemporalMeta { origin_trust: Some(0.2), ..Default::default() },
+            )
+            .await
+            .unwrap();
+
+        // Derived fact declares trust 0.9 but must be clamped to min(sources)=0.2.
+        let derived = engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "derived", vec![]),
+                TemporalMeta {
+                    origin_trust: Some(0.9),
+                    derived_from: Some(vec![hi.clone(), lo.clone()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.get_origin_trust(agent, &derived).await.unwrap(), Some(0.2));
+    }
+
+    /// An unknown source id contributes trust 0.0 (fail-closed): can't vouch for it.
+    #[tokio::test]
+    async fn derived_from_unknown_source_is_fail_closed() {
+        let engine = SqliteMemoryEngine::in_memory().unwrap();
+        let agent = "trust-unknown";
+        let derived = engine
+            .store_temporal(
+                agent,
+                make_entry(agent, "derived from ghost", vec![]),
+                TemporalMeta {
+                    origin_trust: Some(1.0),
+                    derived_from: Some(vec!["does-not-exist".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.get_origin_trust(agent, &derived).await.unwrap(), Some(0.0));
     }
 
     /// count_active_with_tag counts only valid rows whose tags contain the tag.
