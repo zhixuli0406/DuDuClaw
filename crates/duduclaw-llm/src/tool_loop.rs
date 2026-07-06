@@ -154,6 +154,64 @@ pub async fn run_tool_loop(
 }
 
 // ---------------------------------------------------------------------------
+// PolicyKernel enforcement decorator (P1-4)
+// ---------------------------------------------------------------------------
+
+/// A [`ToolExecutor`] decorator that runs the PolicyKernel reference monitor
+/// before delegating to the inner executor — bringing the direct-API and
+/// local-inference tool-loop under the same deterministic policy as the MCP
+/// dispatch path (invariant I3, complete mediation).
+///
+/// Behaviour per [`policy_kernel::Decision`]:
+/// - `Allow` → delegate unchanged.
+/// - `AllowRewritten(args)` → delegate with the rewritten arguments.
+/// - `Deny` → do NOT dispatch; return an `is_error` [`ToolOutcome`] so the model
+///   sees the refusal and can react (the loop keeps going, I5 fail-closed).
+/// - `Ask` → this path has no interactive approver (no ApprovalBroker wired),
+///   so an escalation is treated as a refusal (fail-closed) with an explanatory
+///   error outcome.
+///
+/// The inner `run_tool_loop` body is untouched: pass a `PolicyExecutor` as the
+/// `&dyn ToolExecutor`.
+pub struct PolicyExecutor<'a> {
+    inner: &'a dyn ToolExecutor,
+    policy: &'a [duduclaw_core::types::ToolPolicy],
+    agent_id: &'a str,
+}
+
+impl<'a> PolicyExecutor<'a> {
+    pub fn new(
+        inner: &'a dyn ToolExecutor,
+        policy: &'a [duduclaw_core::types::ToolPolicy],
+        agent_id: &'a str,
+    ) -> Self {
+        Self { inner, policy, agent_id }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for PolicyExecutor<'_> {
+    fn defs(&self) -> Vec<ToolDef> {
+        self.inner.defs()
+    }
+
+    async fn call(&self, name: &str, args: Value) -> Result<ToolOutcome, String> {
+        use duduclaw_security::policy_kernel::{evaluate, Decision, ToolCallEvent};
+        let event = ToolCallEvent { tool_name: name, arguments: &args, agent_id: self.agent_id };
+        match evaluate(&event, self.policy) {
+            Decision::Allow => self.inner.call(name, args).await,
+            Decision::AllowRewritten(new_args) => self.inner.call(name, new_args).await,
+            Decision::Deny { reason } => {
+                Ok(ToolOutcome::error(format!("blocked by policy: {reason}")))
+            }
+            Decision::Ask { risk } => Ok(ToolOutcome::error(format!(
+                "blocked by policy (approval required, no interactive approver on this path): {risk}"
+            ))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests — offline, mock provider + mock executor, no processes / HTTP.
 // ---------------------------------------------------------------------------
 
@@ -409,5 +467,80 @@ mod tests {
         assert_eq!(resp.stop, StopReason::ToolUse);
         assert_eq!(exec.call_count(), 0);
         assert_eq!(provider.calls(), 1);
+    }
+
+    // ── P1-4: PolicyExecutor decorator ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn policy_executor_denies_forbidden_tool_without_calling_inner() {
+        use duduclaw_core::types::{PolicyEffect, ToolPolicy};
+        let inner = MockExecutor::new(MockBehavior::Ok("should not run".into()));
+        let policy = vec![ToolPolicy {
+            tool: "search".into(),
+            effect: PolicyEffect::Forbid,
+            when: vec![],
+        }];
+        let guarded = PolicyExecutor::new(&inner, &policy, "agent-x");
+
+        let out = guarded.call("search", serde_json::json!({"q": "x"})).await.unwrap();
+        assert!(out.is_error, "forbidden tool must return an error outcome");
+        assert!(out.content.contains("blocked by policy"), "got: {}", out.content);
+        assert_eq!(inner.call_count(), 0, "forbidden tool must not reach inner");
+    }
+
+    #[tokio::test]
+    async fn policy_executor_passes_allowed_tool_through() {
+        use duduclaw_core::types::ToolPolicy;
+        let inner = MockExecutor::new(MockBehavior::Ok("ran".into()));
+        // Empty policy → kernel abstains → passthrough.
+        let policy: Vec<ToolPolicy> = vec![];
+        let guarded = PolicyExecutor::new(&inner, &policy, "agent-x");
+
+        let out = guarded.call("search", serde_json::json!({"q": "x"})).await.unwrap();
+        assert!(!out.is_error);
+        assert_eq!(out.content, "ran");
+        assert_eq!(inner.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn policy_executor_ask_is_fail_closed_refusal() {
+        use duduclaw_core::types::{PolicyEffect, ToolPolicy};
+        let inner = MockExecutor::new(MockBehavior::Ok("should not run".into()));
+        let policy = vec![ToolPolicy {
+            tool: "search".into(),
+            effect: PolicyEffect::Ask,
+            when: vec![],
+        }];
+        let guarded = PolicyExecutor::new(&inner, &policy, "agent-x");
+
+        let out = guarded.call("search", serde_json::json!({"q": "x"})).await.unwrap();
+        assert!(out.is_error, "Ask with no approver must fail closed");
+        assert!(out.content.contains("approval required"), "got: {}", out.content);
+        assert_eq!(inner.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn policy_executor_integrates_with_run_tool_loop() {
+        use duduclaw_core::types::{PolicyEffect, ToolPolicy};
+        // Model asks for `search`, policy forbids it → the loop feeds an error
+        // result back and the model then ends the turn. Inner never runs.
+        let provider = ScriptedProvider::new(vec![
+            tool_use_resp("call-1", "search"),
+            final_resp("ok, I won't use that tool"),
+        ]);
+        let inner = MockExecutor::new(MockBehavior::Ok("secret".into()));
+        let policy = vec![ToolPolicy {
+            tool: "search".into(),
+            effect: PolicyEffect::Forbid,
+            when: vec![],
+        }];
+        let guarded = PolicyExecutor::new(&inner, &policy, "agent-x");
+        let req = ChatRequest::new("m");
+
+        let resp = run_tool_loop(&provider, req, &guarded, DEFAULT_MAX_TOOL_ITERS)
+            .await
+            .unwrap();
+        assert_eq!(resp.text(), "ok, I won't use that tool");
+        assert_eq!(inner.call_count(), 0, "forbidden tool must never dispatch");
     }
 }

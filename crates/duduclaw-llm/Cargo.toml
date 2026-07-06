@@ -31,6 +31,9 @@ mcp-client = []
 
 [dependencies]
 duduclaw-core = { workspace = true }
+# PolicyKernel reference monitor (P1-4). No cycle: duduclaw-security depends
+# only on duduclaw-core, never on duduclaw-llm.
+duduclaw-security = { workspace = true }
 
 # Async runtime + trait
 tokio = { workspace = true }

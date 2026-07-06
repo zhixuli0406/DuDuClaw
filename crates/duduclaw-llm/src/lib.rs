@@ -50,7 +50,8 @@ pub use router::{
     RATE_LIMIT_COOLDOWN,
 };
 pub use tool_loop::{
-    run_tool_loop, ToolExecutor, ToolOutcome, DEFAULT_MAX_TOOL_ITERS, MAX_ITERS_STOP,
+    run_tool_loop, PolicyExecutor, ToolExecutor, ToolOutcome, DEFAULT_MAX_TOOL_ITERS,
+    MAX_ITERS_STOP,
 };
 
 #[cfg(feature = "mcp-client")]
