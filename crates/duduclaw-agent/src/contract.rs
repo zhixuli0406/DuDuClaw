@@ -238,3 +238,50 @@ pub fn contract_to_prompt(contract: &Contract) -> String {
 
     lines.join("\n")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contract_with(must_not: &[&str]) -> Contract {
+        Contract {
+            boundaries: Boundaries {
+                must_not: must_not.iter().map(|s| s.to_string()).collect(),
+                must_always: vec![],
+                max_tool_calls_per_turn: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn passes_when_no_rules() {
+        let r = validate_response(&Contract::default(), "anything at all");
+        assert!(r.passed);
+        assert!(r.violations.is_empty());
+    }
+
+    #[test]
+    fn substring_must_not_violation_detected_case_insensitive() {
+        let c = contract_with(&["reveal api keys"]);
+        let r = validate_response(&c, "Sure, let me REVEAL API KEYS for you: sk-123");
+        assert!(!r.passed);
+        assert_eq!(r.violations.len(), 1);
+        assert_eq!(r.violations[0].rule, "reveal api keys");
+        assert_eq!(r.violations[0].category, "must_not");
+    }
+
+    #[test]
+    fn benign_response_passes() {
+        let c = contract_with(&["reveal api keys", "execute rm -rf"]);
+        let r = validate_response(&c, "The weather is nice and I can help you plan.");
+        assert!(r.passed);
+    }
+
+    #[test]
+    fn glob_must_not_violation_detected() {
+        // A glob rule matches via the regex path.
+        let c = contract_with(&["delete * database"]);
+        let r = validate_response(&c, "I will delete the production database now.");
+        assert!(!r.passed, "glob rule should match");
+    }
+}
