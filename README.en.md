@@ -6,489 +6,85 @@
 
 </div>
 
-> **Multi-Runtime AI Agent Platform** — unifying the three major CLIs (Claude / Codex / Gemini) to build your multi-channel AI assistant
+DuDuClaw connects AI command-line tools like Claude Code, Codex, and Gemini to nine messaging platforms (Telegram, LINE, Discord, and more), turning them into an always-on AI assistant that remembers you and improves itself over time.
+
+All you need is one Rust binary. Channel routing, conversation memory, multi-account rotation, behavioral guardrails, local inference, and a web dashboard are built in; swap the AI brain whenever you like, and your config and memory stay on your own machine. The core is Apache 2.0.
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
-[![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
-[![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-1.34.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
----
+https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 
-## 🔒 Trust & Security
+## Table of contents
 
-This is an open-source project — here's full transparency on what you're installing.
-
-### Why is a "new" npm package already at version 1.21+?
-
-DuDuClaw had several months of intensive development in a private repository (400+ commits) before
-going public. See the [git log](https://github.com/zhixuli0406/DuDuClaw/commits/main) for full history.
-
-### What's inside the npm package?
-
-- A small JS wrapper that only invokes the platform-specific Rust binary
-- The platform binary ships via npm `optionalDependencies` (`@duduclaw/<platform>`) —
-  **no postinstall script downloads and executes external code from arbitrary URLs**
-- `postinstall` only checks that the platform package is present (see
-  [`npm/duduclaw/scripts/install.js`](npm/duduclaw/scripts/install.js)) — it downloads and executes nothing
-- GitHub Release binaries ship with SHA-256 checksums
-
-### Building from source (if you don't trust the prebuilt binary)
-
-```bash
-git clone https://github.com/zhixuli0406/DuDuClaw
-cd DuDuClaw
-cargo build --release
-```
-
-### Binary verification
-
-Every release ships with SHA-256 checksums and a keyless [cosign](https://github.com/sigstore/cosign) signature:
-
-```bash
-# Download from Releases
-wget https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.21.1/duduclaw-darwin-arm64.tar.gz
-
-# Verify SHA-256 (against the .sha256 file in the release)
-shasum -a 256 -c duduclaw-darwin-arm64.tar.gz.sha256
-
-# Verify the cosign signature
-cosign verify-blob \
-  --certificate duduclaw-darwin-arm64.tar.gz.pem \
-  --signature duduclaw-darwin-arm64.tar.gz.sig \
-  --certificate-identity-regexp "https://github.com/zhixuli0406/DuDuClaw" \
-  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  duduclaw-darwin-arm64.tar.gz
-```
-
-### Supply chain transparency
-
-- **License**: Apache 2.0
-- **Maintainer**: 嘟嘟數位科技有限公司 (Taiwan-registered company, 統編 94139082)
-- **Public commit history**: github.com/zhixuli0406/DuDuClaw
-- **CI/CD**: All releases are built via GitHub Actions
-- **No telemetry**: zero phone-home calls
-- **No API key collection**: all secrets stay on your machine via an AES-256-GCM vault
-- **No privileged escalation**: runs entirely in user space
-
-To report a vulnerability, see [SECURITY.md](SECURITY.md).
-
----
-
-## Why DuDuClaw vs Using Native Claude / GPT / Gemini CLIs?
-
-The native CLIs are great if you're using one LLM occasionally as a person.
-But once you need to ship to production, you'll quickly end up rebuilding what DuDuClaw already
-provides:
-
-| Need | Native CLIs | DuDuClaw |
-|---|---|---|
-| Multi-LLM auto-fallback | Manual restart | Built-in (4 strategies) |
-| Context preserved across LLM switches | Lost | Preserved |
-| Tools shared across LLMs | Rewrite per LLM | Write once, share |
-| Production hardening (DLQ/retry/observability) | Build yourself | Built-in |
-| Multi-channel (Telegram/LINE/Discord/...) | CLI only | 7 channels |
-| Secrets / audit / PII redaction | Build yourself | Built-in |
-
-If you're solo using `claude` or `gemini` occasionally — stick with native.
-If you're building **production multi-LLM Agent systems** — DuDuClaw saves you 3 months of
-infrastructure work.
-
----
-
-> 🎉 **v1.34.0 — Runtime-agnostic security reference monitor** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.34.0))
->
-> Moves the security boundary off prompts/hooks/config and onto deterministic choke points and OS primitives. The MCP dispatch path becomes a true reference monitor (complete mediation + tamper-proof + verifiable), so every runtime (Claude / Codex / Gemini / Antigravity + the direct-API and local-inference tool loops) is governed by the same zero-LLM policy. Every control is fail-closed and (where opt-in) backward compatible. New `duduclaw-sandbox` crate; ~90 new tests, zero workspace warnings.
->
-> - **PolicyKernel reference monitor** — deterministic, zero-LLM `evaluate()` over a parameter-level static tool policy (`agent.toml [capabilities] policy`, Progent-style tool+arg matcher); canonical `fs_write`/`shell_exec`/`mcp_call` families give one rule uniform reach across runtimes; precedence Forbid > Ask > Allow > default-deny; empty policy abstains (backward compatible). Wired into MCP dispatch (Ask → ApprovalBroker, TTL expiry = deny) and the direct-API/local tool loop (`PolicyExecutor`)
-> - **Egress "secret in-use" convergence** — `<REDACT:…>` tokens restored only for whitelisted tools, everything else denied (`-32007`), results re-redacted; pushed down from the stdio serve loop to the shared choke point so stdio / HTTP / SSE are covered uniformly
-> - **Native OS process sandbox** — new `duduclaw-sandbox` crate (opt-in `[capabilities] native_sandbox`) confines the spawned agent CLI via macOS Seatbelt (live-verified) / Linux Landlock, derived from `SandboxLevel`; fail-closed when required but unavailable
-> - **Origin-bound memory trust** — temporal memories gain `origin`/`origin_trust`/`derived_from`; a derived fact's trust is clamped to ≤ min(source trusts) — non-malleable, can't be laundered upward by re-derivation; distilled conversational facts are marked lowest-trust and down-weighted in search
-> - **CONTRACT.toml runtime enforcement** — `must_not` boundaries validated on the final user-facing reply bytes (after secret restoration); violations blocked and audited
-> - **SecurityPosture state machine + OS ground-truth reconciliation** — {Green,Yellow,Red} escalate-fast / decay-slow; `os_reconcile` computes a pure two-way diff of tool-call claims vs observed OS effects (macOS `eslogger` parser, Linux eBPF staged)
-
-
-
-https://github.com/user-attachments/assets/217f56aa-8b46-4c2a-85fa-62ee68c33a4c
-
-
-
-<details>
-<summary><strong>v1.9.4 → v1.33.0 cumulative highlights</strong></summary>
-
-- **v1.33.0** — Model-agnostic core + AI harness infrastructure: `duduclaw-llm` unified provider layer (one normalized interface over Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat + 15-model pricing registry + cross-provider fallback + provider-agnostic account rotation), non-Claude runtime parity (fail-closed capabilities + PTY-pool tool restrictions + auto MCP registration into codex/gemini/agy), MCP client + tool loop bringing the full tool surface to direct-API/local paths, OTel GenAI tracing + `duduclaw eval` + universal HITL ApprovalBroker + A2A v1.0, memory/routing research upgrades (Ebbinghaus / HippoRAG-lite / ACE-ExpeL / calibrated cascade routing / wiki↔memory boundary)
-- **v1.32.0** — Dashboard UX: command palette (⌘K), self-explanatory sidebar, mobile shell, shared loading primitives (frontend-only)
-- **v1.31.0** — Genspark-style Workspace shell (central prompt bar + capability launcher + "Claw, your first AI employee") layered over the Calm Glass power dashboard with a simple ⇄ advanced mode toggle; Tauri 2 desktop shell (Phase D) — a native window wrapping the gateway as a sidecar — with lifecycle hardening (`DUDUCLAW_DESKTOP_MODE`, config.toml port priority, double-spawn-avoiding attach detection)
-- **v1.30.0** — Per-account OAuth env injection into the PTY pool; LINE replies sent from a detached task
-- **v1.29.0** — Cloud-tier agent/channel caps: wires up the per-tier `max_agents` / `max_channels` from `features.toml` (Hobby 1/1, Solo 1/2, Studio 3/5); **self-host never capped** (Apache 2.0 promise); soft-limit banner + upgrade CTA; `license_runtime::cap_exceeded()` pure gate
-- **v1.28.0** — Partner (NFR) licenses + license self-service: a free, non-resellable Partner tier (unlocks Self-Host Pro modules) + self-serve partner-code redemption (`POST /v1/partner/redeem`) + CLI `redeem/rebind/subscriptions` + emailed key on issuance + machine rebind + deployment-mode binding (M51, `DUDUCLAW_DEPLOYMENT` cloud/self-host, fail-closed)
-- **v1.27.0** — Premium industry templates (`ecommerce` / `clinic` / `realestate` / `education`, each a full closed-source kit with cited Taiwan statutes) + license-gated `premium_templates` unlock (fail-closed; the public OSS binary never receives the closed content) + wizard premium-industry menu with upsell hint
-- **v1.26.0** — Personal / Enterprise editions (`EditionProfile`, orthogonal to the license tier, never gates core features) + Dashboard one-click CLI login (PTY-driven native login for Claude/Codex/Gemini/Antigravity with paste-back + `remote_safe` classification) + Antigravity CLI bundled in the server image + personal-edition data portability (`export`/`import`) + `PersonalProSelfHost` self-host license tier (NT$490/mo)
-- **v1.25.0** — Browser-first onboarding: `WelcomePage` (3 steps, 5 AI-backend paths) + `FirstRunGate` zero-agent routing + guided product tour `GuidedTour` (zero-dep spotlight) + `runtime.detect` RPC zero-config boot
-- **v1.24.0** — Antigravity CLI (`agy`) runtime · PtyPool unbound from Claude: adds `RuntimeType::Antigravity` (oneshot `agy -p`, binary auto-resolve, system prompt + history embedded, CJK-safe truncation, pre-seeded `trustedWorkspaces`); `CliKind::Antigravity` wired into PtyPool / worker spawn, `cli_kind_for_provider()` derives the kind from `[runtime] provider`; interactive REPL stays Claude-only (by design); the legacy `gemini` backend is retained for paid `GEMINI_API_KEY` / enterprise
-- **v1.23.0** — Decision Continuity (RFC-24): when an agent offers the user an enumerated choice (Option A/B/C), each option is persisted into the Temporal Memory **semantic** layer (independent of conversation compression) and open decisions are re-injected each turn; a later "use Option C" (new turn / session / process) resolves from durable state instead of being guessed. Detection is deterministic and zero-LLM; opt-in per agent via `[memory] decision_continuity = true`
-- **v1.22.0** — RFC-26 Live Forking (rounds 1–4): split an in-flight task into N competing branches that explore different strategies in copy-on-write isolated workspaces and let an AI judge pick the winner (`duduclaw-fork` + 6 MCP tools + cross-process `ForkStore` + `RotatingBranchExecutor` + `LiveAggregate` budget pre-emption); the Skill-synthesis scheduler (W19-P1); and the Calm Glass dashboard rebuilt on a shared component library. All off by default
-- **v1.21.0** — RFC-25 §5 followups: the non-Claude (Codex / Gemini / OpenAI-compat) path closes all 11 gaps to become first-class (multi-turn context, cost telemetry, keepalive, per-(home,provider) failover backoff); `release.sh` multi-platform version sync + drift audit + post-bump assertion + `verify`, fixing the `skip-existing` silent PyPI freeze
-- **v1.20.0** — RFC-25 Multi-Runtime Unlock + A2A: the "Multi-Runtime four-backend" abstraction was previously orphan, uncompiled source — every execution path hardcoded Claude. v1.20.0 wires it up and routes the LLM-calling subsystems through a single provider-agnostic choke-point (`runtime_dispatch::run_agent_prompt` + a lazily auto-detecting `RuntimeRegistry`); channel reply / GVU / sub-agent delegation route through the choke-point for non-Claude providers (Claude keeps its OAuth-rotation / PTY path, zero regression); ACP `tasks/send` actually runs the target agent and reports Failed / Completed; Phase 0 removed the GVU evolution-model hard-lock (reject → warn)
-
-- **v1.19.0** — Memory Intelligence: the W18/W19-designed memory layer, implemented non-invasively on the live Rust `SqliteMemoryEngine`. **Temporal Memory** (`memories` gains temporal / knowledge-graph columns + `store_temporal` automatic supersession chain + `get_history`/`get_at`; search default-filters to currently-valid memories); **Reflexion Loop** (bridges the existing `MistakeNotebook`: recall injected into the answering prompt + ≥3 same-category mistakes consolidated into a semantic rule); **`memory_fetch_batch`** MCP tool (fetch ≤100 entries by ID, namespace/ownership enforced). `MemoryEntry` unchanged, zero blast radius
-- **v1.18.0** — Dashboard budget/usage correctness: reads from the persistent `CostTelemetry` ledger (replacing the in-memory counter that reset to zero on rebuild), fixes the `cost_millicents` unit misnomer, implements `marketplace.install`, fills settings-persistence gaps, plus a round of frontend runtime-bug cleanup + 88 i18n keys
-
-- **v1.17.0** — RFC-24 License v2.0 (Open Core foundation): new crate `duduclaw-license` (verification-only client, signing keys stay in `commercial/duduclaw-license`), a 7-tier inheritance chain `OpenSource` / `Hobby` / `Solo` / `Studio` / `Business` / `SelfHostPro` / `Oem`, an Ed25519 trust registry seeded from `DUDUCLAW_LICENSE_PUBKEY_<ID>` env (empty registry fail-safe falls back to OpenSource). The Apache 2.0 core is **available without restriction**; paid subscriptions unlock the `commercial/*` value-add modules
-- **v1.16.0** — MCP Refresh Tokens + GVU `SoulPatchOp::Consolidate`: new module `mcp_refresh` provides long-lived credentials backed by `~/.duduclaw/mcp_tokens.db` (`ddc_refresh_<env>_<64hex>`, 90 days, revocable, hash-only storage), solving the silent disconnect-without-retry after Claude Desktop auth-fail; GVU adds a `SoulPatchOp::Consolidate` variant carrying a "shrink invariant" so SOUL.md can self-trigger consolidation as it approaches the 150-line / 8KB hard cap
-- **v1.15.2** — `agent_update_soul` trust-backdoor patch: previously writing SOUL.md did not call `soul_guard::accept_soul_change` to update the integrity hash, so every legitimate call left permanent stored-vs-current drift; and the entire call chain didn't write to `tool_calls.jsonl`, making the backdoor completely invisible to post-hoc analysis. v1.15.2 fills in the audit row (logging success + all four rejection paths, with a 16-char hash prefix) and syncs the fingerprint after every write
-- **v1.15.1** — GVU SOUL.md unbounded-growth fix: agnes/SOUL.md bloated from 61 to 592 lines over 5 GVU cycles. Three layers of defense: (1) `strip_proposal_meta` strips meta sections like `## 診斷` / `## rationale` / `## expected_improvement` on the legacy path; (2) `SOUL_MAX_LINES = 150` / `SOUL_MAX_BYTES = 8KB` hard caps independent of the ASI content-weight threshold; (3) added a structured `SoulPatch { section, op, content }` and `apply_patch_to_soul`, wiring the full Generator→Verifier→Updater chain
-- **v1.15.0** — Cross-Platform PTY Pool + Worker: Anthropic's official alternative path after it blocked `claude -p` for OAuth-subscription accounts. New crate `duduclaw-cli-runtime` (`portable-pty` ConPTY/openpty cross-platform + sentinel-framed in-band protocol + `PtyPool` semaphore + idle eviction + supervisor + restart policy) and `duduclaw-cli-worker` (localhost JSON-RPC + Bearer + `/healthz`, gateway can run it in-process or out-of-process); `channel_reply` routes OAuth via the REPL and API keys via `oneshot_pty_invoke + claude -p`; Phase 8 `pty_pool_*` Prometheus metrics; all failures fall back to legacy `tokio::process::Command`. Off by default; enable with `agent.toml [runtime] pty_pool_enabled = true`
-- **v1.14.0** — RFC-23 Sensitive Data Redaction: new crate `duduclaw-redaction`. Internal data (Odoo / shared wiki / file tools) is replaced with `<REDACT:CATEGORY:hash8>` tokens before being sent to the LLM, and automatically restored at trusted boundaries (user channel reply, whitelisted tool egress); AES-256-GCM encrypted SQLite vault (per-agent 32-byte key, 0o600 permissions) + a two-phase TTL 7d GC (mark→purge after 30 days) + 5 built-in profiles + a five-layer enable/disable resolver + JSONL audit with 10MB rotation
-- **v1.13.1** — Odoo Test-Before-Save: the `odoo.test` RPC accepts inline params so the Dashboard "Test connection" button hits Odoo with the current form values without saving first; leaving the inline credential blank falls back to the stored key; the same SSRF / HTTPS / db-name validation chain applies, and `scrub_odoo_error()` truncates to 240 chars to prevent HTML error-page leakage
-- **v1.13.0** — Runtime-health overhaul (16 issues / two rounds of fixes): restored GVU/SOUL self-evolution, added the `[prompt] mode = "minimal"` Anthropic Skills-style system prompt, the `[budget] max_input_tokens` compression pipeline, an async session summarizer, TF-IDF wiki relevance ranking, and the `duduclaw lifecycle flush` quarterly hot/cold-separation CLI
-- **v1.12.x** — W22-P0 ADR-002 `x-duduclaw` capability negotiation (HTTP 422 early failure) + ADR-004 Secret Manager + RFC-22 multi-agent coordination fixes (agnes faking sub-agent responses / autopilot mass mis-triggering / channel-path token not logged) + the `duduclaw weekly-report` subcommand
-- **v1.11.0** — RFC-21 ([Issue #21](https://github.com/zhixuli0406/DuDuClaw/issues/21)): `duduclaw-identity` crate (IdentityProvider trait + Wiki/Notion/Chained three implementations) + Odoo per-agent credential isolation (`OdooConnectorPool` replaces the global admin singleton) + shared wiki `.scope.toml` SoT namespace policy
-- **v1.10.0** — Wiki RL Trust Feedback: `WikiTrustStore` per-agent SQLite trust, `CitationTracker` two-level LRU + bounded-time eviction to prevent DoS, `WikiJanitor` daily pass (auto-marking corrected / archive / frontmatter sync) + sub-agent turn_id propagation + multi-process flock + atomic batch upsert
-- **v1.9.4** — `duduclaw-durability` five persistence mechanisms (idempotency / retry / circuit breaker / checkpoint / DLQ) + `duduclaw-governance` PolicyRegistry + MCP HTTP/SSE Transport + LOCOMO memory evaluation system (daily 03:00 UTC eval + 200 golden QA) + LLM Fallback + Discord RESUME + Web ReliabilityPage
-
-</details>
-
----
-
-## Table of Contents
-
-- [What is DuDuClaw?](#what)
-- [Core Features](#features)
+- [Why DuDuClaw?](#why)
+- [Architecture at a glance](#architecture)
+- [Install](#install)
+- [Quick start](#quickstart)
+- [Feature overview](#features)
+- [CLI commands](#cli)
+- [Trust and security](#trust)
 - [Comparison](#comparison)
-- [Agent Directory Structure](#directory)
-- [Security Hooks](#security)
-- [Installation](#install)
-- [CLI Commands](#cli)
-- [Project Structure](#structure)
-- [Technical Decisions](#tech)
-- [Testing](#testing)
 - [Documentation](#docs)
 - [License](#license)
 
----
+<a id="why"></a>
 
-<a id="what"></a>
+## Why DuDuClaw?
 
-## What is DuDuClaw?
+If you run `claude` or `gemini` in a terminal now and then, the native CLIs are all you need. The moment you want an AI staffing your LINE official account, covering your team's Discord, or running several agents with different jobs, you end up building a whole infrastructure layer yourself. DuDuClaw ships that layer:
 
-DuDuClaw is a **Multi-Runtime AI Agent platform** — it supports the three major CLIs (**Claude Code / Codex / Gemini**) as AI backends simultaneously, with seamless switching and auto-detection via a unified `AgentRuntime` trait.
+| Need | Native CLI | DuDuClaw |
+|---|---|---|
+| Telegram / LINE / Discord access | Terminal only | 9 channels, per-agent bot tokens |
+| Multi-LLM failover | Manual restart | 4 rotation strategies + cross-provider failover |
+| Context survives switching LLMs | Lost | Preserved |
+| Conversation memory and knowledge base | Single session | SQLite temporal memory + layered wiki, auto-injected |
+| Tools shared across LLMs | Rewrite per vendor | Write MCP tools once, use on all 5 backends |
+| Guardrails / audit / secret management | Build it yourself | Policy kernel + OS sandbox + AES-256-GCM built in |
 
-It is not tied to any single AI provider; instead, it gives your AI Agent the complete infrastructure of messaging channels, memory, self-evolution, local inference, and account management.
+<a id="architecture"></a>
 
-Core concepts:
+## Architecture at a glance
 
-- **Multi-Runtime** — the `AgentRuntime` trait unifies four backends (Claude / Codex / Gemini / OpenAI-compat), `RuntimeRegistry` auto-detects, and configuration is per-agent
-- **Plumbing = DuDuClaw** — responsible for channel routing, session management, memory search, account rotation, local inference, and other infrastructure
-- **Bridge = MCP Protocol** — `duduclaw mcp-server` acts as an MCP Server, exposing channel and memory tools to the AI Runtime
+The AI runtime is the brain, DuDuClaw is the plumbing, and MCP (JSON-RPC 2.0) is the bridge:
 
 ```
-AI Runtime (brain) — Claude CLI / Codex CLI / Gemini CLI / OpenAI-compat
+AI Runtime (brain) — Claude Code / Codex / Gemini / Antigravity / OpenAI-compat
   ↕ MCP Protocol (JSON-RPC 2.0, stdin/stdout)
 DuDuClaw (plumbing)
-  ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu / WebChat
-  ├─ Multi-Runtime — Claude / Codex / Gemini / OpenAI-compat auto-detection + per-agent config
-  ├─ Session Memory Stack — native --resume + Instruction Pinning + Snowball Recap + Key-Fact Accumulator
-  ├─ MCP Server — 80+ tools (messaging, memory, Agent, Skill, inference, tasks, knowledge base, ERP), per-agent registration
+  ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu
+  │                    / Google Chat / Microsoft Teams / WebChat
+  ├─ Multi-Runtime — 5 backends, auto-detected, configured per agent
+  ├─ Session Memory — native --resume + temporal memory + key facts + layered wiki
+  ├─ MCP Server — 80+ tools (channels, memory, agents, skills, tasks, wiki, ERP)
   ├─ Evolution Engine — GVU² dual-loop evolution + prediction-driven + MistakeNotebook
-  ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / MLX / ONNX
-  ├─ Voice Pipeline — ASR (SenseVoice / Whisper) + TTS (Piper / MiniMax) + VAD (Silero)
-  ├─ Account Rotator — multi-OAuth + API Key rotation, budget tracking, health checks, Cross-Provider Failover
-  ├─ Browser Automation — 5-layer auto-routing (API Fetch → Scrape → Headless → Sandbox → Computer Use)
-  ├─ Worktree Isolation — Git worktree L0 sandbox, atomic merge, cap of 5 per Agent
-  ├─ Wiki Knowledge Layer — L0-L3 four-tier knowledge architecture + trust weighting + FTS5 + auto-injection
-  ├─ ACP/A2A Server — `duduclaw acp-server` stdio JSON-RPC 2.0, Zed/JetBrains/Neovim integration
-  └─ Web Dashboard — React 19 SPA (23 pages), embedded in the binary via rust-embed
+  ├─ Security — PolicyKernel reference monitor + OS sandbox + redaction vault
+  ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / MLX
+  ├─ Account Rotator — OAuth + API key rotation, budgets, health checks
+  └─ Web Dashboard — React 19 SPA (24 pages), embedded via rust-embed
 ```
 
----
-
-<a id="features"></a>
-
-## Core Features
-
-### Channels & Messaging
-
-| Feature | Description |
-|------|------|
-| **Seven-channel support** | Telegram (long polling), LINE (webhook), Discord (Gateway WebSocket, op 6 RESUME + stall watchdog + 1-5s jitter), Slack (Socket Mode), WhatsApp (Cloud API), Feishu (Open Platform v2), WebChat (WebSocket) |
-| **Per-Agent Bot** | Each Agent can have its own Bot Token, with multiple Agents running in parallel on the same platform |
-| **Channel hot-start/stop** | Adding/removing channels in the Dashboard takes effect immediately, no gateway restart needed |
-| **WebChat** | Built-in `/ws/chat` WebSocket endpoint, real-time conversation in the React frontend |
-| **Generic Webhook** | `POST /webhook/{agent_id}` + HMAC-SHA256 signature verification |
-| **Media Pipeline** | Automatic image resizing (max 1568px) + MIME detection + Vision integration |
-| **Sticker system** | LINE sticker catalog + emotion detection + Discord emoji equivalence mapping |
-
-### AI Execution & Inference
-
-| Feature | Description |
-|------|------|
-| **MCP Server architecture** | `duduclaw mcp-server` provides 80+ tools covering messaging, memory, Agent management, inference, scheduling, the Skill marketplace, the task board, the shared knowledge base, and Odoo ERP. Registered in each agent directory's `.mcp.json` (Claude CLI `-p --dangerously-skip-permissions` only reads project-level settings), auto-created/repaired at gateway startup |
-| **MCP Refresh Tokens** (v1.16.0) | Long-lived credentials backed by `~/.duduclaw/mcp_tokens.db` — token form `ddc_refresh_<env>_<64hex>`, 90-day lifespan, individually revocable, hash-only storage (the original token never lands on disk); `authenticate_from_env` routes credentials by prefix, the legacy `ddc_<env>_<32hex>` is fully preserved; the new CLI `duduclaw mcp { issue-refresh-token \| revoke-token \| list-tokens }` solves the pain of Claude Desktop silently disconnecting without retry after an auth-fail |
-| **Multi-Runtime** | The `AgentRuntime` trait — four backends (Claude / Codex / Gemini / OpenAI-compat), `RuntimeRegistry` auto-detection, per-agent config |
-| **Local inference engine** | Unified `InferenceBackend` trait — llama.cpp (Metal/CUDA/Vulkan) / mistral.rs (ISQ + PagedAttention) / Exo P2P cluster / llamafile / MLX (Apple Silicon) / OpenAI-compat HTTP |
-| **Three-tier confidence routing** | LocalFast → LocalStrong → CloudAPI, auto-routed via heuristic confidence scoring, with CJK-aware token estimation |
-| **InferenceManager** | Multi-mode auto-switching: Exo P2P → llamafile → Direct backend → OpenAI-compat → Cloud API, periodic health checks + automatic failover |
-| **Native multi-turn Session** | Claude CLI `--resume` with a SHA-256 deterministic session ID + history-in-prompt fallback (auto-retry on account rotation/stale session); Hermes-style turn trimming (>800 chars, CJK-safe); Direct API "system_and_3" breakpoint cache strategy |
-| **Session memory stack** | Instruction Pinning (Haiku extracts the core task from the first message → injected at the tail of the session prompt) + Snowball Recap (a zero-cost `<task_recap>` prepended each turn) + P2 Key-Fact Accumulator (2-4 facts per turn → FTS5 index → top-3 injection, only 100-150 tokens vs MemGPT's 6,500 tokens, −87%) |
-| **Claude CLI lightweight path** | `call_claude_cli_lightweight()` handles metadata tasks (compression, instruction/key-fact extraction) with `--effort medium --max-turns 1 --no-session-persistence --tools ""`, saving 25-40% in cost |
-| **Claude CLI stabilization flags** | `--strict-mcp-config` (MCP isolation) + `--exclude-dynamic-system-prompt-sections` (cross-turn prompt stability, 10-15% token savings); `--bare` was removed in v1.8.11 because it broke the OAuth keychain |
-| **Direct API** | Bypasses the CLI to call the Anthropic Messages API directly, reaching a 95%+ cache hit rate with `cache_control: ephemeral` |
-| **Token compression** | Meta-Token (BPE-like 27-47%), LLMLingua-2 (2-5x lossy), StreamingLLM (infinite-length conversation) |
-| **Cross-Provider Failover** | `FailoverManager` health tracking, cooldown, non-retryable error detection |
-| **Cross-Platform PTY Pool** (v1.15.0) | An interactive REPL channel dedicated to OAuth accounts — cross-platform `portable-pty` (ConPTY on Win 10 1809+, openpty on Unix) + a sentinel-framed in-band response protocol (no scrollback scraping / no sidecar) + per-agent semaphore + idle eviction + health-check supervisor + restart policy. Off by default; enabled per-agent via `agent.toml [runtime] pty_pool_enabled = true`; an optional out-of-process mode (`worker_managed = true`) moves the pool to the `duduclaw-cli-worker` subprocess communicating over localhost JSON-RPC |
-| **PTY Pool Observability** | Phase 8 production-rollout metrics — `pty_pool_*` Prometheus counters (acquires / cache-hit / spawn / three eviction reasons / 4 invoke outcomes / duration histogram) + `worker_health_misses_total` + `worker_restarts_total` + the `pty_pool_managed_worker_active` mode gauge + the `GET /api/runtime/status` JSON endpoint (loopback-only) |
-| **Browser automation** | 5-layer routing (API Fetch → Static Scrape → Headless Playwright → Sandbox Container → Computer Use), deny-by-default |
-
-### Voice & Multimedia
-
-| Feature | Description |
-|------|------|
-| **ASR speech recognition** | ONNX SenseVoice (local) + Whisper.cpp (local) + OpenAI Whisper API |
-| **TTS speech synthesis** | ONNX Piper (local) + MiniMax T2A |
-| **VAD voice activity detection** | ONNX Silero VAD |
-| **Discord voice channel** | Songbird integration, Discord voice conversation |
-| **LiveKit voice room** | WebRTC multi-Agent voice conferencing |
-| **ONNX embeddings** | BERT WordPiece tokenizer + ONNX Runtime vector embeddings |
-
-### Agent Orchestration & Evolution
-
-| Feature | Description |
-|------|------|
-| **Sub-Agent orchestration** | `create_agent` / `spawn_agent` / `list_agents` MCP tools + `reports_to` org hierarchy + D3.js architecture chart; the system prompt auto-injects a "## Your Team" sub-Agent roster + long report messages are auto-paginated (Discord 1900 / Telegram 4000 / LINE 4900 / Slack 3900 byte budget, labeled `📨 **agent** 的回報 (1/N)`) |
-| **Cross-system prompt injection** | CLAUDE.md + CONTRACT.toml (must_not/must_always) + SOUL.md + Wiki L0+L1 + key_facts top-3 + pinned_instructions are injected consistently across the CLI/channel/dispatcher paths, with behavior aligned across the four Claude/Codex/Gemini/OpenAI runtimes |
-| **Orphan response recovery** | On dispatcher startup, `reconcile_orphan_responses` scans `bus_queue.jsonl` and atomically replays `agent_response` callbacks left over after crash/Ctrl+C/hotswap |
-| **GVU² dual-loop evolution** | Outer loop (Behavioral GVU — SOUL.md evolution) + inner loop (Task GVU — real-time task retry), with MistakeNotebook as cross-loop memory |
-| **Prediction-driven evolution** | Active Inference + Dual Process Theory, ~90% of conversations at zero LLM cost; MetaCognition self-calibrates thresholds every 100 predictions |
-| **4+2 layer verification** | L1-Format / L2-Metrics / **L2.5-MistakeRegression** / L3-LLMJudge / **L3.5-SandboxCanary** / L4-Safety, the first 4 layers at zero cost |
-| **Adaptive Depth** | MetaCognition drives GVU iteration depth (3-7 rounds), auto-adjusted based on historical success rate |
-| **Deferred GVU** | gradient accumulation + delayed retry (up to 3 deferrals, 9-21 effective iterations over a 72h span) |
-| **ConversationOutcome** | Zero-LLM conversation outcome detection (TaskType / Satisfaction / Completion), bilingual zh-TW + en |
-| **SOUL.md versioning** | 24h observation period + auto-rollback, atomic write (SHA-256 fingerprint) |
-| **`SoulPatchOp::Consolidate`** (v1.16.0) | The structured patch path adds a "shrink invariant" variant — semantically equivalent to `Replace`, but `apply_patch_to_soul` rejects new content that isn't shorter than the existing body, so the LLM can self-trigger consolidation as SOUL.md approaches the 150-line / 8KB hard cap |
-| **`agent_update_soul` trust chain** (v1.15.2) | After writing, automatically `soul_guard::accept_soul_change` syncs the integrity fingerprint + both success and all four rejection paths are written to `tool_calls.jsonl` (16-char hash prefix), patching the stored-vs-current drift and the backdoor-invisibility problem |
-| **Agent-as-Evaluator** | An independent Evaluator Agent (Haiku for cost control) performs adversarial verification with a structured JSON verdict |
-| **DelegationEnvelope** | Structured handoff protocol — context / constraints / task_chain / expected_output, backward-compatible with the Raw payload |
-| **TaskSpec workflow** | Multi-step task planning — dependency-aware scheduling / auto-retry (3x) / replan (up to 2x) / persistence |
-| **Orchestrator template** | 5-step planning strategy (Analyze → Decompose → Delegate → Evaluate → Synthesize) + complexity routing |
-| **Skill lifecycle** | 7-stage management — Activation → Compression → Extraction → Reconstruction → Distillation → Diagnostician → Gap Analysis |
-| **Skill auto-synthesis** | Detect repeated domain gaps → synthesize new Skills from episodic memory → sandbox trial (TTL-managed) → cross-Agent graduation |
-| **Task Board** | SQLite task management — status/priority/assignment tracking + real-time Activity Feed (WebSocket push) |
-| **Autopilot rule engine** | Automated task delegation, notification, and Skill triggering — supports task creation/status change/channel message/idle detection/Cron schedule |
-| **Shared knowledge base** | `~/.duduclaw/shared/wiki/` cross-Agent shared knowledge (SOPs, policies, product specs) + author attribution |
-| **Wiki knowledge tiering** | Vault-for-LLM inspired — L0 Identity / L1 Core (auto-injected into every conversation) / L2 Context (updated daily) / L3 Deep (searched on demand), each page carrying a `trust` (0.0-1.0) weight; FTS5 unicode61 tokenizer supports CJK full-text search; `wiki_dedup` detects duplicate pages, `wiki_graph` outputs a Mermaid knowledge graph |
-| **Wiki auto-injection** | `build_system_prompt()` automatically injects L0+L1 pages into WIKI_CONTEXT; covers all three system-prompt assembly paths (CLI interaction, channel reply, dispatcher/cron), consistent across the four Claude/Codex/Gemini/OpenAI runtimes |
-| **Git Worktree L0 isolation** | An independent worktree workspace per task (cheaper than a container sandbox), atomic merge (dry-run pre-check + global `Mutex`), friendly `wt/{agent_id}/{adjective}-{noun}` branch names; cap of 5 per agent, 20 globally; Snap workflow: create → execute → inspect → merge/cleanup |
-| **ACP/A2A Protocol Server** | `duduclaw acp-server` provides a stdio JSON-RPC 2.0 server (`agent/discover` / `tasks/send` / `tasks/get` / `tasks/cancel`), compatible with the Agent Client Protocol, supporting Zed / JetBrains / Neovim IDE integration; outputs a `.well-known/agent.json` AgentCard |
-| **Reminder scheduling** | One-time reminders (relative time `5m`/`2h`/`1d` or ISO 8601 absolute time), `direct` static message or `agent_callback` wake-up mode |
-
-### Reliability & Governance (added in v1.9.x)
-
-| Feature | Description |
-|------|------|
-| **`duduclaw-durability` crate** | Five persistence mechanisms — idempotency key management, exponential-backoff retry (jitter), three-state circuit breaker (Closed/Open/HalfOpen), checkpoint resume, Dead Letter Queue for terminal-failure messages |
-| **`duduclaw-governance` crate** | PolicyRegistry + 4 PolicyTypes (Rate/Permission/Quota/Lifecycle) + quota_manager (soft/hard quotas) + error_codes (standardized QUOTA_EXCEEDED / POLICY_DENIED) + YAML hot reload + audit log |
-| **LLM Fallback** | Auto-switches to a fallback model on primary-model timeout/503/429/overloaded; the pure functions `is_llm_fallback_error` / `should_attempt_model_fallback`, with the hard deadline uniformly returning a hard-timeout error to trigger fallback |
-| **Evolution Events system** | 30+ event schemas, an async emitter (batch + retry), a query interface, reliability mechanisms; HTTP endpoints exposed on the gateway, visualized in the Web ReliabilityPage |
-| **MCP HTTP/SSE Transport** (W20-P1/P2) | `duduclaw http-server --bind 127.0.0.1:8765` — `POST /mcp/v1/call` (single JSON-RPC tool call) + `GET /mcp/v1/stream` (SSE long-lived event stream) + `POST /mcp/v1/stream/call` (async + SSE push) + Bearer auth + token bucket rate limit |
-| **Memory MCP scope enforcement** | The `memory:read` / `memory:write` scopes are checked at the execute() entry point of `store/read/search`, patching the pre-v1.9.3 auth gap where any valid API Key could bypass scope |
-| **LOCOMO memory evaluation** | `memory_eval/` — retrieval_accuracy / retention_rate / locomo_integrity_check + cron_runner (daily 03:00 UTC) + a 5-minute smoke_test P0 + a 200-entry golden QA gold set |
-
-### Security
-
-| Feature | Description |
-|------|------|
-| **Claude Code Security Hooks** | Three-phase progressive defense — Layer 1 blacklist (<50ms) → Layer 2 obfuscation detection (YELLOW+) → Layer 3 Haiku AI judgment (RED only) |
-| **Threat-level state machine** | GREEN → YELLOW → RED with auto-escalation/degradation, dropping one level after 24h with no events |
-| **SOUL.md drift detection** | Real-time SHA-256 fingerprint comparison |
-| **Prompt Injection scanning** | 6 rule categories, XML delimiter tags for injection resistance; as of v1.34.0 it also runs at the **MCP dispatch choke point** (all runtimes) and on the channel reply path, with blocks written to `security_audit.jsonl` |
-| **Secret leak scanning** | 20+ patterns (Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/DB URL, etc.) |
-| **Sensitive file protection** | Read/Write/Edit three-way protection of `secret.key`, `.env*`, `SOUL.md`, `CONTRACT.toml` |
-| **Behavioral contracts** | `CONTRACT.toml` defines `must_not` / `must_always` boundaries + `duduclaw test` red-team testing (9 scenarios); as of v1.34.0 `must_not` is **enforced at runtime on the final user-facing reply bytes** (after secret restoration) — violations are blocked and audited |
-| **Unified multi-source audit log** | `audit.unified_log` merges 4 JSONL streams (`security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl`) into a unified envelope (timestamp / source / event_type / agent_id / severity / summary / details); the Logs page supports source filtering, a severity dropdown, and live/historical tabs |
-| **JSONL audit log** | Async writes, format-compatible with the Rust `AuditEvent` schema |
-| **CJK-Safe string slicing** | The new `truncate_bytes` / `truncate_chars` module replaces 31 instances of `s[..s.len().min(N)]` byte-index slicing (fixing the v1.8.11 multi-byte codepoint panic) |
-| **Per-Agent key isolation** | AES-256-GCM encrypted storage, keys invisible between agents |
-| **Container sandbox** | Docker / Apple Container (`--network=none`, tmpfs, read-only rootfs, 512MB limit); a **native OS sandbox** (no container runtime) is also available, see below |
-| **Browser automation** | 5-layer routing (API Fetch → Static Scrape → Headless → Sandbox → Computer Use), deny-by-default |
-
-### Security Reference Monitor (new in v1.34.0)
-
-Moves the security boundary off prompts/hooks/config and onto **deterministic choke points and OS primitives**: MCP dispatch becomes a true reference monitor (complete mediation + tamper-proof + verifiable), so every runtime (Claude / Codex / Gemini / Antigravity + the direct-API and local-inference tool loops) is governed by the same zero-LLM policy. Every control is fail-closed and (where opt-in) backward compatible.
-
-| Feature | Description |
-|---------|-------------|
-| **PolicyKernel** | Deterministic, zero-LLM `evaluate()` over a parameter-level static tool policy (`agent.toml [capabilities] policy`, Progent-style tool+arg matcher); canonical `fs_write`/`shell_exec`/`mcp_call` families give one rule uniform reach across runtimes; precedence Forbid > Ask > Allow > default-deny; empty policy abstains (backward compatible). Wired into MCP dispatch (`Ask` → ApprovalBroker, TTL expiry = deny) and the direct-API/local tool loop (`PolicyExecutor`), uniform across stdio / HTTP / SSE |
-| **Egress "secret in-use"** | When tool arguments contain `<REDACT:…>` tokens, real values are restored only for whitelisted tools, everything else denied (`-32007`), and tool results re-redacted; pushed down from the stdio serve loop to the shared dispatch choke point so all three transports are covered (reuses the `duduclaw-redaction` vault) |
-| **Native OS sandbox** | New `duduclaw-sandbox` crate (opt-in `[capabilities] native_sandbox`) confines the spawned agent CLI subprocess via **macOS Seatbelt** (`sandbox-exec` profile, live-verified) / **Linux Landlock**, derived from `SandboxLevel` (filesystem-write confinement); fail-closed when required but unavailable; layered on top of the CLI-flag sandbox (Windows is a stub) |
-| **Origin-bound memory trust** | Temporal memories gain `origin`/`origin_trust`/`derived_from`; a derived fact's trust is clamped to ≤ min(source trusts; unknown source = 0) — **cannot be laundered upward by re-derivation**; distilled conversational facts are marked lowest-trust and down-weighted in search |
-| **CONTRACT runtime enforcement** | `must_not` boundaries validated on the final user-facing reply bytes (after secret restoration); violations blocked and written to a `contract_violation` audit event |
-| **SecurityPosture state machine** | `{Green,Yellow,Red}` escalate-fast / decay-slow, driven by audit-event counts + an escalation floor (N-deny-in-T escalates; quiet windows decay one level at a time) |
-| **OS ground-truth reconciliation** | `os_reconcile` computes a pure two-way deterministic diff of what tools claimed to do vs the observed OS effects (unaccounted side effects / missing footprints); macOS `eslogger` parser, Linux eBPF staged |
-
-### Accounts & Cost
-
-| Feature | Description |
-|------|------|
-| **Dual-mode account rotation** | OAuth subscription (Pro/Team/Max) + API Key hybrid — 4 strategies (Priority/LeastCost/Failover/RoundRobin) |
-| **Health tracking** | Rate-limit cooldown (2min), billing-exhaustion cooldown (24h), token-expiry tracking (30d/7d warnings) |
-| **Cost telemetry** | SQLite token tracking, cache efficiency analysis, 200K price-cliff warning, adaptive routing (auto-switch to local when cache efficiency <30%) |
-| **Claude CLI binary probing** | `which_claude()` / `which_claude_in_home()` scan Homebrew (Intel + Apple Silicon) / Bun / Volta / npm-global / `.claude/bin` / `.local/bin` / asdf shims / NVM version directories, fixing the binary-not-found issue at launchd startup |
-| **Structured failure classification** | The `FailureReason` enum (RateLimited / Billing / Timeout / BinaryMissing / SpawnError / EmptyResponse / NoAccounts / Unknown) + category-specific zh-TW messages + `channel_failures.jsonl` audit records |
-
-### Integrations & Extensions
-
-| Feature | Description |
-|------|------|
-| **Odoo ERP integration** | `duduclaw-odoo` middleware — 15 MCP tools (CRM/Sales/Inventory/Accounting/generic search-report), supporting CE/EE, with EditionGate auto-detection. The Dashboard settings page supports **test-before-save** (v1.13.1, falls back to the stored key when the credential is left blank) + **per-agent credential isolation** (v1.11.0, `OdooConnectorPool` replaces the global admin singleton) |
-| **Skill marketplace** | GitHub Search API live indexing + 24h local cache + security scan + Dashboard marketplace page |
-| **Prometheus metrics** | `GET /metrics` — requests, tokens, duration histogram, channel status |
-| **CronScheduler** | `cron_tasks.jsonl` + cron expressions, scheduled tasks fired automatically |
-| **ONNX embeddings** | BERT WordPiece tokenizer + ONNX Runtime vector embeddings, with semantic search support |
-| **Experiment Logger** | Trajectory recording, supporting RL/RLHF offline analysis |
-| **Memory Decay scheduling** | Background `run_decay` every 24h: low-importance + 30+ days → archive; 90+ days archived → permanent deletion |
-| **RL Trajectory Collector** | Writes to `~/.duduclaw/rl_trajectories.jsonl` during channel interactions; the `duduclaw rl` CLI provides export/stats/reward functions, with a composite reward (outcome×0.7 + efficiency×0.2 + overlong×0.1) |
-| **Marketplace RPC** | `marketplace.list` serves a real MCP catalog (Playwright, Browserbase, Filesystem, GitHub, Slack, Postgres, SQLite, Memory, Fetch, Brave Search), mergeable with user-defined entries via `~/.duduclaw/marketplace.json` |
-| **Partner Portal** | SQLite `PartnerStore` (`~/.duduclaw/partner.db`) + 7 RPCs (profile/stats/customers CRUD) + sales statistics |
-
-### Web Dashboard
-
-| Feature | Description |
-|------|------|
-| **Tech stack** | React 19 + TypeScript + Tailwind CSS 4 + shadcn/ui, warm amber color scheme |
-| **24 pages** | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / KnowledgeHub / Odoo / Login / Users / Analytics / Export / **Reliability** (added in v1.9.4) |
-| **Reliability dashboard** | circuit breaker status / retry stats / DLQ queue depth / real-time evolution events data; the `/reliability` route, integrating the `getEvolutionEvents` / `getReliabilityStats` / `getDlqItems` APIs |
-| **Real-time logs** | BroadcastLayer tracing → WebSocket push, WS heartbeat ping/pong (server 30s / client 25s) + 60s idle close |
-| **Logs history page rewrite** | Source-filter chips (All / Security / Tool calls / Channel failures / Feedback) + live entry-count + severity dropdown + severity-colored left border (emerald/amber/rose) + click-to-expand JSON details |
-| **Memory page Key Insights** | The fourth tab presents the structured insights accumulated by the P2 Key-Fact Accumulator (the `key_facts` table) + `access_count` badge + timestamp + source metadata |
-| **Memory page evolution history** | SOUL.md version history + before/after metric diffs (positive feedback / prediction error / user corrections) + status badges (Confirmed / RolledBack / Observing) |
-| **Toast notification system** | Module-scoped event bus, max-5 queue, auto-dismiss, warm stone/amber/emerald/rose variants, respects `prefers-reduced-motion` |
-| **Org chart** | D3.js interactive Agent hierarchy visualization |
-| **Light/dark toggle** | Follows system preference, supports manual toggle |
-| **Internationalization** | zh-TW / en / ja-JP trilingual support (600+ translation keys) |
-| **Skill Market three tabs** | Marketplace / Shared Skills / My Skills three-tab architecture + Skill adoption flow |
-| **Autopilot settings** | Automation rule creation/management/monitoring + history review |
-| **Session Replay** | Conversation replay component, supports timeline view |
-
----
-
-<a id="comparison"></a>
-
-## Comparison
-
-| | **DuDuClaw** | **OpenClaw** | **IronClaw** | **Moltis** | **Dify** |
-|---|---|---|---|---|---|
-| Language | Rust | TypeScript | Rust | Rust | Python |
-| Channels | 7 | 25+ | 8 | 5 | 0 (API) |
-| Multi-Runtime | **4 backends (Claude/Codex/Gemini/OpenAI)** | - | - | - | Multi-LLM |
-| MCP Server | **80+ tools** | - | - | - | - |
-| Self-evolution engine | **GVU² dual-loop** | - | - | - | - |
-| Local inference | **6 backends + three-tier confidence routing** | - | - | - | - |
-| Voice (ASR/TTS) | **4 ASR + 4 TTS providers** | - | - | - | - |
-| Token compression | **3 strategies** | - | - | - | - |
-| Browser automation | **5-layer routing** | - | - | - | - |
-| Cost telemetry | **Cache efficiency analysis** | - | Basic | Basic | Basic |
-| Behavioral contracts | **CONTRACT.toml + red team** | - | WASM sandbox | - | - |
-| ERP integration | **Odoo 15 tools** | - | - | - | - |
-| Security audit | **Three-layer defense + Hooks** | CVE-2026-25253 | WASM | Basic | Medium |
-| License | **Apache 2.0 (Open Core)** | MIT | Open source | Open source | $59+/month |
-
----
-
-<a id="directory"></a>
-
-## Agent Directory Structure
-
-Each Agent is a folder, fully compatible with the Claude Code structure:
-
-```
-~/.duduclaw/agents/
-├── dudu/                    # Main Agent
-│   ├── .claude/             # Claude Code settings
-│   │   └── settings.local.json
-│   ├── .mcp.json            # MCP Server config (DuDuClaw platform tools + agent-specific MCP such as Playwright)
-│   │                        # auto-created/repaired at gateway startup; Claude CLI `-p` mode only reads this file
-│   ├── SOUL.md              # Persona definition (SHA-256 protected)
-│   ├── CLAUDE.md            # Claude Code guidance (includes the CLAUDE_WIKI template)
-│   ├── CONTRACT.toml        # Behavioral contract (must_not / must_always), auto-injected into the system prompt
-│   ├── agent.toml           # DuDuClaw config (model, budget, heartbeat, runtime, capabilities)
-│   ├── SKILLS/              # Skill set (can be auto-generated by the evolution engine)
-│   ├── wiki/                # Wiki knowledge base (L0-L3 tiering + trust weighting + FTS5)
-│   ├── memory/              # Daily notes + memory.db (prediction error) + key_facts table
-│   ├── tasks/               # TaskSpec workflow persistence (JSON)
-│   └── state/               # Runtime state (SQLite: sessions.pinned_instructions, etc.)
-│
-└── coder/                   # Another Agent
-    └── ...
-```
-
-Use `duduclaw migrate` to automatically convert a legacy `agent.toml` to the Claude Code-compatible format.
-
----
-
-<a id="security"></a>
-
-## Security Hooks
-
-> **v1.34.0 positioning**: as of v1.34.0 the primary security boundary is the [Security Reference Monitor](#security-reference-monitor-new-in-v1340) (a deterministic MCP dispatch choke point + OS primitives, covering all runtimes). The Claude Code Hook layer below is downgraded to an **optional semantic intercept** for CLI-native tools (bash/edit that bypass MCP), with an OS sandbox as the backstop beneath it.
-
-DuDuClaw builds a three-phase progressive defense on top of Claude Code's Hook system:
-
-```
-                    ┌─────────────────────────────────────┐
-  SessionStart ──→  │ session-init.sh                     │  Key permission verification + environment init
-                    └─────────────────────────────────────┘
-                    ┌─────────────────────────────────────┐
-  UserPrompt   ──→  │ inject-contract.sh                  │  CONTRACT.toml rule injection
-                    └─────────────────────────────────────┘
-                    ┌─────────────────────────────────────┐
-  PreToolUse   ──→  │ bash-gate.sh (Bash)                 │  Layer 1: blacklist (<50ms)
-     (Bash)         │   ├─ Layer 2: obfuscation detect (YELLOW+)    │  Layer 2: base64/eval/exfiltration
-                    │   └─ Layer 3: Haiku AI (RED only)   │  Layer 3: AI safety judgment
-                    └─────────────────────────────────────┘
-                    ┌─────────────────────────────────────┐
-  PreToolUse   ──→  │ file-protect.sh → ai-review.sh     │  Sensitive file protection + AI review
-  (Write|Edit|Read) └─────────────────────────────────────┘
-                    ┌─────────────────────────────────────┐
-  PostToolUse  ──→  │ secret-scanner.sh → audit-logger.sh │  Secret scan → async audit
-                    └─────────────────────────────────────┘
-                    ┌─────────────────────────────────────┐
-  Stop         ──→  │ threat-eval.sh                      │  Threat-level re-evaluation
-                    └─────────────────────────────────────┘
-                    ┌─────────────────────────────────────┐
-  ConfigChange ──→  │ config-guard.sh                     │  Config tampering detection
-                    └─────────────────────────────────────┘
-```
-
-### Threat-level state machine
-
-| Level | Trigger | Defense behavior |
-|------|---------|---------|
-| **GREEN** (default) | Normal operation | Layer 1 blacklist + file protection + Secret scan |
-| **YELLOW** | ≥ 2 interceptions within 1 hour | +Layer 2 obfuscation detection + external network restriction |
-| **RED** | Injection/eval attack detected | +Layer 3 Haiku AI judgment of all commands + AI file review |
-
-Degradation: automatically drops one level after 24 hours with no events (RED→YELLOW→GREEN).
-
----
+Full design in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 <a id="install"></a>
 
-## Installation
+## Install
 
-### npm (recommended, all platforms incl. Windows)
+### npm (recommended, all platforms including Windows)
+
+The only prerequisite is [Node.js](https://nodejs.org/) 20+:
 
 ```bash
 npm install -g duduclaw
 ```
 
-After installation it automatically downloads the **precompiled binary** for your platform (supports macOS ARM64/x64, Linux x64/ARM64, Windows x64) — **no compiler, no Rust, no MSVC Build Tools required**. Windows users only need [Node.js](https://nodejs.org/) installed first; that is the only prerequisite.
+This installs a prebuilt binary for your platform (macOS ARM64/x64, Linux x64/ARM64, Windows x64). No compiler, no Rust.
 
-> **⚠️ If installation asks you to install Rust / MSVC Build Tools (~2GB) and compile (~1.5h), you're on the wrong path.**
-> That's the "[Build from source](#build-from-source)" path, only needed by contributors who modify the code. For normal use, always use `npm install -g duduclaw` above (or Homebrew / one-line install below) — it downloads the official prebuilt binary directly.
+> ⚠️ If the install asks you for Rust / MSVC Build Tools and a 1.5-hour compile, you took a wrong turn. That path is "build from source" for contributors; regular users should use the npm command above.
 
 ### Homebrew (macOS / Linux)
 
@@ -498,321 +94,170 @@ brew install zhixuli0406/tap/duduclaw
 
 ### One-line install
 
-**macOS / Linux:**
-
 ```bash
+# macOS / Linux
 curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | sh
 ```
 
-**Windows (PowerShell):**
-
 ```powershell
+# Windows (PowerShell)
 irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.ps1 | iex
 ```
 
-> The one-line installer auto-detects the **latest release** and downloads the prebuilt binary for your platform — also compile-free. It only offers a source build if the GitHub download fails (in which case prefer `npm install -g duduclaw`). Pin a specific version with the `DUDUCLAW_VERSION` environment variable.
-
 ### Desktop app
 
-Besides the CLI, a native **desktop app** (Tauri) is available — it auto-starts the local gateway on launch, with a one-click Workspace (simple) ⇄ Dashboard (advanced) toggle. Download the build for your platform from [**Releases**](https://github.com/zhixuli0406/DuDuClaw/releases):
+A native Tauri desktop build that starts the local gateway on launch and shares `~/.duduclaw` with the CLI. Download from [Releases](https://github.com/zhixuli0406/DuDuClaw/releases):
 
 | Platform | File | Notes |
-|------|------|------|
-| macOS (Apple Silicon) | `DuDuClaw_*_aarch64.dmg` | ✅ Signed + Apple-notarized, opens with no warning |
-| macOS (Intel) | `DuDuClaw_*_x64.dmg` | ✅ Signed + Apple-notarized, opens with no warning |
-| Windows (x64) | `DuDuClaw_*_x64_en-US.msi` | ⚠️ Unsigned — see below |
-| Linux | `*_amd64.AppImage` / `*_amd64.deb` | Unsigned (not required) |
+|----------|------|-------|
+| macOS (Apple Silicon / Intel) | `DuDuClaw_*.dmg` | Signed + Apple notarized, opens cleanly |
+| Windows x64 | `DuDuClaw_*_x64_en-US.msi` | No Authenticode certificate yet, so SmartScreen warns; click "More info" then "Run anyway", or use the CLI build instead |
+| Linux | `*_amd64.AppImage` / `.deb` | No signing needed |
 
-> The desktop app **shares** `~/.duduclaw` with the CLI (same config / SQLite / wiki); if a gateway is already running it attaches instead of starting a second one.
+### Build from source
 
-#### ⚠️ Windows: SmartScreen "Unknown publisher" warning — how to run it
+Prerequisites: [Rust](https://rustup.rs/) 1.85+, [Node.js](https://nodejs.org/) 20+.
 
-The Windows installer is **not yet code-signed with an Authenticode certificate**, so **Microsoft Defender SmartScreen will warn** ("Windows protected your PC" / "Unknown publisher"). **This is not malware — it's just unsigned.** To run it:
+```bash
+git clone https://github.com/zhixuli0406/DuDuClaw.git
+cd DuDuClaw
+cd web && npm ci --legacy-peer-deps && npm run build && cd ..
+cargo build --release -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard
+./target/release/duduclaw run
+```
 
-1. Double-click the `.msi` → the blue SmartScreen dialog appears
-2. Click **"More info"**
-3. Click **"Run anyway"**
+### Python SDK (optional library)
 
-**To avoid the warning entirely**, two options with no signing concerns:
-
-- Use the CLI instead: `npm install -g duduclaw` (full-featured, includes the dashboard)
-- Wait for a signed build: a Windows Authenticode certificate is being evaluated (cloud signing; see [`docs/guides/desktop-unblock.md`](docs/guides/desktop-unblock.md) gate C)
-
-> **macOS has no such issue** — it's Developer ID signed + Apple-notarized, so a clean machine opens it with no warning (`spctl -a` returns `accepted / Notarized Developer ID`).
-
-### Python SDK (optional library, not a CLI)
-
-> **Important**: The core gateway / CLI (the `duduclaw` command) is a **Rust binary** — installing it via **npm** or **Homebrew** above gives you the **complete feature set**. Skill security scanning and channel replies are all handled by Rust-native paths, so **no Python dependency is required**.
-> The `duduclaw` package on PyPI is a **pure Python library** (for `import duduclaw`) and ships **no command-line tool**; consequently `pipx install duduclaw` fails (No apps associated with package) — this is expected.
-
-`pip install duduclaw` is **optional for core functionality** — only needed when:
-
-- You want to `import duduclaw` in your own Python code (the agents / channels / mcp / memory_eval modules).
-- You run the standalone memory-evaluation tooling (LOCOMO).
-
-> **Advanced local inference (MLX reflections / LLMLingua-2 compression)** is a separate opt-in feature set that depends on ML packages such as `mlx_lm` and `llmlingua` — **not** on the `duduclaw` PyPI package. Install those individually per `inference.toml` when needed.
-
-To install the optional library:
+The core gateway/CLI is a Rust binary and needs no Python. The `duduclaw` package on PyPI is a pure library for `import duduclaw` (agents / channels / mcp / memory_eval modules) with no command-line entry point, which is why `pipx install duduclaw` fails by design. If you need it:
 
 ```bash
 pip install duduclaw
 ```
 
-This command installs the following dependencies:
+<a id="quickstart"></a>
 
-| Package | Minimum version | Purpose |
-|------|---------|------|
-| `anthropic` | ≥ 0.40 | Direct Claude API calls from your own Python code |
-| `httpx` | ≥ 0.27 | Async HTTP client (account rotation, health checks) |
-| `pyyaml` | ≥ 6.0 | Config file parsing |
+## Quick start
 
-#### macOS (Homebrew Python) / other externally-managed environments
-
-If the system reports `error: externally-managed-environment` ([PEP 668](https://peps.python.org/pep-0668/)), installing into the system Python is blocked. Use a virtual environment instead:
+You still need an AI brain, any one of these (you can also set it up later in the browser wizard): install and log in to [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), or [Gemini CLI](https://github.com/google-gemini/gemini-cli); or bring an API key; or use a local GGUF model.
 
 ```bash
-# venv
-python3 -m venv .venv && source .venv/bin/activate
-pip install --upgrade duduclaw
+# 1. Start everything (gateway + channels + scheduler + dispatcher)
+duduclaw run
 
-# or use uv (already adopted by this project, much faster)
-uv venv && uv pip install --upgrade duduclaw
+# 2. Open the dashboard
+open http://localhost:18789
 ```
 
-Verify the installed version:
+The first visit walks you through a three-step wizard: pick an AI backend, create your first agent, then chat with it in the built-in WebChat. Later, paste a bot token on the Channels page to put the same agent on Telegram, LINE, Discord, and the rest, without restarting.
 
-```python
-import duduclaw
-print(duduclaw.__version__)   # reflects the actually installed PyPI version
-```
-
-> `__version__` is read dynamically from the installed package metadata (`pyproject.toml`) via `importlib.metadata`; a source checkout (not pip-installed) falls back to a built-in string, kept in sync with the other platform versions by `scripts/release.sh`'s drift guard.
-
-For development environments, additionally install:
+Useful next steps:
 
 ```bash
-pip install duduclaw[dev]
-# Includes: pytest>=8, pytest-asyncio>=0.24, ruff>=0.8
+duduclaw agent create      # create more agents (industry templates available)
+duduclaw status            # system health snapshot
+duduclaw update            # check for and install updates
+duduclaw service install   # start on boot (launchd / systemd)
 ```
 
-### Build from source
+<a id="features"></a>
 
-```bash
-git clone https://github.com/zhixuli0406/DuDuClaw.git
-cd DuDuClaw
+## Feature overview
 
-# (Optional) only needed for the importable Python library / memory-eval tooling; the core build does not require it
-# pip install duduclaw
+| Area | What's built in | Read more |
+|------|-----------------|-----------|
+| Channels | 9 channels (Telegram / LINE / Discord / Slack / WhatsApp / Feishu / Google Chat / Teams / WebChat), per-agent bots, hot start/stop, platform-native formatting, typing indicators, live task-progress boards | [docs/features](docs/features/README.md) |
+| Multi-runtime | Claude / Codex / Gemini / Antigravity / OpenAI-compat, auto-detected, per-agent config, context survives backend switches | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| MCP server | 80+ tools: channels, memory, agent orchestration, skill market, task board, shared wiki, Odoo ERP; stdio and HTTP/SSE transports | [docs/api](docs/api/README.md) |
+| Memory | SQLite temporal memory (fact supersession chains), Ebbinghaus retention, knowledge-graph retrieval, cross-agent shared wiki | [docs/features](docs/features/README.md) |
+| Self-evolution | GVU² dual loop + prediction-driven (about 90% of conversations cost zero LLM calls), SOUL.md versioning with 24h observation and auto-rollback | [evolution-engine.md](docs/architecture/evolution-engine.md) |
+| Security | PolicyKernel reference monitor (zero-LLM, fail-closed), macOS Seatbelt / Linux Landlock sandbox, secret redaction vault, CONTRACT.toml behavioral contracts + red-team CLI | [SECURITY.md](SECURITY.md) |
+| Accounts and cost | OAuth + API key rotation (4 strategies), rate-limit and billing cooldowns, cost telemetry with cache-efficiency analytics | [docs/features](docs/features/README.md) |
+| Local inference | llama.cpp (Metal/CUDA/Vulkan), mistral.rs, Exo P2P, llamafile, MLX, with three-tier confidence routing | [docs/features](docs/features/README.md) |
+| Voice | ASR (SenseVoice / Whisper), TTS (Piper / MiniMax), VAD, Discord voice channels, LiveKit rooms | [docs/features](docs/features/README.md) |
+| Auto-update | One click from the dashboard or unattended (`auto_update = true`); SHA-256 + Ed25519 verification, in-place restart, open tabs reload themselves | [deployment-guide.md](docs/guides/deployment-guide.md) |
+| Web dashboard | React 19 SPA, 24 pages, embedded in the binary; zh-TW / en / ja | [docs/features](docs/features/README.md) |
+| ERP | Odoo bridge with 15 MCP tools (CRM / sales / inventory / accounting), per-agent credential isolation | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
 
-# Build the Dashboard
-cd web && npm ci --legacy-peer-deps && npm run build && cd ..
-
-# Build the Rust binary (with Dashboard)
-cargo build --release -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard
-
-# First-time setup
-./target/release/duduclaw onboard
-
-# Start
-./target/release/duduclaw run
-```
-
-> **Prerequisites**: [Rust](https://rustup.rs/) 1.85+, [Python](https://www.python.org/) 3.9+, [Node.js](https://nodejs.org/) 20+, and at least one AI CLI: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli) (one or more)
-
----
+Full feature list in [docs/features/feature-inventory.md](docs/features/feature-inventory.md); version history in [CHANGELOG.md](CHANGELOG.md).
 
 <a id="cli"></a>
 
-## CLI Commands
+## CLI commands
 
 ```
-duduclaw onboard             # Interactive first-time setup
-duduclaw run                 # One-click start (gateway + channels + heartbeat + cron + dispatcher)
-duduclaw migrate             # Convert agent.toml to Claude Code format
-duduclaw mcp-server          # Start the MCP Server (for the AI Runtime, stdio JSON-RPC 2.0)
-duduclaw http-server         # Start the MCP HTTP/SSE Transport (Bearer auth, default 127.0.0.1:8765)
-duduclaw acp-server          # Start the ACP/A2A Server (IDE integration: Zed/JetBrains/Neovim)
-duduclaw gateway             # Start only the WebSocket gateway server
-
-duduclaw agent               # CLI interactive conversation
-duduclaw agent list          # List all Agents
-duduclaw agent create        # Create a new Agent (industry template optional)
-duduclaw agent inspect       # View Agent details
-duduclaw agent pause         # Pause an Agent
-duduclaw agent resume        # Resume an Agent
-duduclaw agent edit          # Edit Agent settings
-duduclaw agent remove        # Remove an Agent
-
-duduclaw test <agent>        # Red-team security test (9 built-in scenarios + JSON report)
-duduclaw status              # System health snapshot
-duduclaw doctor              # Health diagnostics
-duduclaw wizard              # Interactive industry-template setup
-duduclaw evolution finalize  # One-shot recovery of overdue SOUL.md observation windows (--dry-run / --agent <id>)
-
-duduclaw rl export           # Export RL trajectory (~/.duduclaw/rl_trajectories.jsonl)
-duduclaw rl stats            # Per-Agent trajectory statistics
-duduclaw rl reward           # Compute composite reward (outcome×0.7 + efficiency×0.2 + overlong×0.1)
-
-duduclaw service install     # Install as a system service
-duduclaw service start/stop  # Start/stop the system service
-duduclaw service status      # Service status
-duduclaw service logs        # Service logs
-duduclaw service uninstall   # Remove the system service
-
-duduclaw license activate    # Activate license
-duduclaw license status      # License status
-duduclaw license verify      # Verify license
-duduclaw update              # Check for and install updates
-duduclaw version             # Version info
+duduclaw run                 # start everything (gateway + channels + heartbeat + cron + dispatcher)
+duduclaw agent               # interactive chat in the terminal
+duduclaw agent create        # create an agent (industry templates available)
+duduclaw agent list          # list agents
+duduclaw status              # system health snapshot
+duduclaw doctor              # diagnostics
+duduclaw test <agent>        # red-team security test (9 built-in scenarios)
+duduclaw update              # check for and install updates
+duduclaw service install     # install as a system service (launchd / systemd)
+duduclaw mcp-server          # start the MCP server (stdio JSON-RPC 2.0)
+duduclaw acp-server          # start the ACP/A2A server (Zed / JetBrains / Neovim)
 ```
 
----
+Run `duduclaw --help` for the full list; developer topics are in the [development guide](docs/guides/development-guide.md).
 
-<a id="structure"></a>
+<a id="trust"></a>
 
-## Project Structure
+## Trust and security
 
-```
-DuDuClaw/
-├── crates/                         # Rust crates (20)
-│   ├── duduclaw-core/              # Shared types, traits (Channel, MemoryEngine), error definitions
-│   ├── duduclaw-agent/             # Agent registry, heartbeat, budget, contract, skill loader/registry
-│   ├── duduclaw-auth/              # Multi-user auth (Argon2 passwords, JWT, ACL role permissions)
-│   ├── duduclaw-security/          # AES-256-GCM, SOUL guard, input guard, audit, key vault
-│   ├── duduclaw-container/         # Docker / Apple Container / WSL2 sandbox execution
-│   ├── duduclaw-memory/            # SQLite + FTS5 full-text search + vector embeddings + eval batch query API
-│   ├── duduclaw-inference/         # Local inference engine (llama.cpp / mistral.rs / ONNX / Exo / llamafile)
-│   ├── duduclaw-gateway/           # Axum server, 7 channels, session, GVU², prediction, cron, dispatcher, LLM fallback, evolution events, PTY pool integration
-│   ├── duduclaw-bus/               # tokio broadcast + mpsc message routing
-│   ├── duduclaw-bridge/            # PyO3 Rust↔Python bridge layer
-│   ├── duduclaw-odoo/              # Odoo ERP middleware (JSON-RPC, CE/EE, 15 MCP tools)
-│   ├── duduclaw-cli/               # clap CLI entry + MCP server (stdio + HTTP/SSE) + migrate + test
-│   ├── duduclaw-dashboard/         # rust-embed embedded React SPA
-│   ├── duduclaw-desktop/           # Desktop wrapper (macOS/Windows/Linux)
-│   ├── duduclaw-durability/        # Durability framework (idempotency / retry / circuit breaker / checkpoint / DLQ) — added in v1.9.4
-│   ├── duduclaw-governance/        # PolicyRegistry / quota_manager / error_codes / audit / approval — added in v1.9.4
-│   ├── duduclaw-identity/          # IdentityProvider trait + Wiki/Notion/Chained three implementations — added in v1.11.0
-│   ├── duduclaw-redaction/         # Source-aware redaction + reversible vault (AES-256-GCM) + 5 profiles + JSONL audit — added in v1.14.0
-│   ├── duduclaw-cli-runtime/       # Cross-platform PTY pool runtime (portable-pty / sentinel-framed) — added in v1.15.0
-│   └── duduclaw-cli-worker/        # Standalone PTY pool worker subprocess (localhost JSON-RPC + Bearer token) — added in v1.15.0
-│
-├── python/duduclaw/                # Python extension layer
-│   ├── channels/                   # LINE / Telegram / Discord channel plugins
-│   ├── sdk/                        # Claude Code SDK chat + multi-account rotation
-│   ├── evolution/                  # Skill Vetter security scan
-│   ├── tools/                      # Agent dynamic management tools
-│   ├── agents/                     # capability manifest + capability-based router + memory_resolver (v1.9.4)
-│   ├── mcp/                        # MCP API Key auth (with key masking) + memory tools (store/read/search/namespace/quota)
-│   └── memory_eval/                # LOCOMO memory evaluation (retrieval/retention + cron + 200 golden QA) — added in v1.9.4
-│
-├── npm/                            # npm published packages
-│   ├── duduclaw/                   # Main package (platform-agnostic wrapper + postinstall binary download)
-│   ├── darwin-arm64/               # macOS Apple Silicon precompiled binary
-│   ├── darwin-x64/                 # macOS Intel precompiled binary
-│   ├── linux-x64/                  # Linux x86-64 precompiled binary
-│   ├── linux-arm64/                # Linux ARM64 precompiled binary
-│   └── win32-x64/                  # Windows x64 precompiled binary
-│
-├── web/                            # React Dashboard
-│   └── src/
-│       ├── components/             # UI components (OrgChart, ApprovalModal, SessionReplay)
-│       ├── pages/                  # 24 pages (including ReliabilityPage added in v1.9.4)
-│       ├── stores/                 # Zustand state management (8 stores)
-│       ├── lib/                    # API client (WebSocket JSON-RPC + evolution events / reliability HTTP)
-│       └── i18n/                   # zh-TW / en / ja-JP
-│
-├── templates/                      # Industry templates + Agent role templates
-│   ├── restaurant/                 # Restaurant (customer service, reservations, FAQ, proactive push)
-│   ├── manufacturing/              # Manufacturing (equipment monitoring, SOP, anomaly alerts)
-│   ├── trading/                    # Trading (quotes, orders, inventory, price lists)
-│   ├── evaluator/                  # Evaluator Agent (adversarial verification)
-│   ├── orchestrator/               # Orchestrator Agent (task orchestration)
-│   └── wiki/                       # Wiki knowledge base template
-│
-├── .claude/                        # Claude Code Hook security system
-│   ├── settings.local.json         # Hook config (6 events × 10 scripts)
-│   └── hooks/                      # Three-phase progressive defense scripts
-│
-├── docs/                           # Public documentation
-│   ├── spec/                       # Format specs (SOUL.md / CONTRACT.toml)
-│   ├── api/                        # WebSocket RPC + OpenAPI spec
-│   ├── guides/                     # Development guides (custom MCP tools, etc.)
-│   └── *.md                        # Architecture, deployment, evolution engine, etc.
-│
-├── ARCHITECTURE.md                 # Complete architecture design document
-└── CLAUDE.md                       # AI collaboration design context
-```
+What you install is fully transparent:
 
----
+- **What's in the npm package**: a small JS wrapper plus platform binaries (`@duduclaw/<platform>` optionalDependencies). `postinstall` only checks that the platform package is present ([`install.js`](npm/duduclaw/scripts/install.js)); nothing is downloaded from arbitrary URLs or executed
+- **No telemetry**: zero phone-home connections; all secrets stay on your machine, encrypted with AES-256-GCM
+- **No privilege escalation**: runs entirely in user space
+- **Maintainer**: DuDu Digital Technology Co., Ltd. (registered in Taiwan, tax ID 94139082)
 
-<a id="tech"></a>
-
-## Technical Decisions
-
-| Item | Choice | Rationale |
-|------|------|------|
-| AI conversation | **Multi-Runtime (Claude / Codex / Gemini CLI)** | Not tied to a single provider; auto-detection + per-agent config |
-| Core language | **Rust** | Memory safety, high performance, single-binary deployment |
-| Extension language | **Python (PyO3)** | Claude Code SDK integration, channel-plugin flexibility |
-| Frontend framework | **React 19 + TypeScript** | Real-time data updates, mature ecosystem |
-| UI style | **shadcn/ui + Tailwind CSS 4** | Warm, customizable, good performance |
-| Database | **SQLite + FTS5** | Zero dependency, embedded, full-text search |
-| Tool protocol | **MCP (Model Context Protocol)** | Native Claude Code support, stdin/stdout JSON-RPC |
-| Local inference | **ONNX Runtime + llama.cpp** | Cross-platform, Metal/CUDA/Vulkan GPU acceleration |
-| Speech recognition | **SenseVoice + Whisper.cpp** | Multilingual, local offline, zero API cost |
-| Real-time communication | **WebRTC (LiveKit)** | Low-latency voice, multi-party conferencing |
-
----
-
-<a id="testing"></a>
-
-## Testing
+Every release asset ships with three kinds of verification: a SHA-256 checksum, a [cosign](https://github.com/sigstore/cosign) keyless signature, and a minisign Ed25519 signature (the built-in auto-updater enforces this one and refuses unsigned or tampered releases):
 
 ```bash
-# Rust tests
-cargo test --workspace --exclude duduclaw-bridge
+# SHA-256
+shasum -a 256 -c duduclaw-darwin-arm64.tar.gz.sha256
 
-# Python tests
-pip install pytest pytest-asyncio ruff
-ruff check python/
-pytest tests/python/ -v
-
-# Frontend type checking
-cd web && npx tsc --noEmit
+# minisign (the same public key is pinned inside the binary)
+minisign -Vm duduclaw-darwin-arm64.tar.gz \
+  -P RWTh5pOpk0YmdBgm3VyB2bzxFtajNLXr7zFDhbcc75TgM8YfeV+NSzXh
 ```
 
----
+Don't trust prebuilt binaries? [Building from source](#install) takes three commands. Report vulnerabilities via [SECURITY.md](SECURITY.md).
+
+> Why does a "new" package start at version 1.3x? DuDuClaw spent months in a private repo (400+ commits) before going public; the full history is in the [git log](https://github.com/zhixuli0406/DuDuClaw/commits/main).
+
+<a id="comparison"></a>
+
+## Comparison
+
+| | DuDuClaw | OpenClaw | IronClaw | Dify |
+|---|---|---|---|---|
+| Language | Rust | TypeScript | Rust | Python |
+| Channels | 9 | 25+ | 8 | 0 (API) |
+| Multi-runtime | 5 backends | single | single | multi-LLM |
+| MCP server | 80+ tools | no | no | no |
+| Self-evolution engine | GVU² dual loop | no | no | no |
+| Local inference | 6 backends + confidence routing | no | no | no |
+| Behavioral contracts | CONTRACT.toml + red team | no | WASM sandbox | no |
+| License | Apache 2.0 (open core) | MIT | open source | $59+/mo |
 
 <a id="docs"></a>
 
 ## Documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — Complete system architecture design
-- [CLAUDE.md](CLAUDE.md) — AI collaboration design context and principles
-- [CHANGELOG.md](CHANGELOG.md) — Version change log
-- [docs/features/README.md](docs/features/README.md) — Detailed feature breakdown (19 articles, with zh-TW / ja-JP translations)
-- [docs/features/feature-inventory.md](docs/features/feature-inventory.md) — Complete feature inventory
-- [docs/spec/soul-md-spec.md](docs/spec/soul-md-spec.md) — SOUL.md format spec v1.0
-- [docs/spec/contract-toml-spec.md](docs/spec/contract-toml-spec.md) — CONTRACT.toml format spec v1.0
-- [docs/api/README.md](docs/api/README.md) — WebSocket RPC protocol + JSON-RPC 2.0 interface
-- [docs/architecture/evolution-engine.md](docs/architecture/evolution-engine.md) — Evolution Engine v2 design document
-- [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md) — Production deployment guide
-- [docs/guides/development-guide.md](docs/guides/development-guide.md) — Developer setup and Agent development
-- [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md) — Custom MCP tool tutorial
-
----
+- [ARCHITECTURE.md](ARCHITECTURE.md): full system architecture
+- [docs/README.md](docs/README.md): public docs index (architecture / RFC / ADR / specs / guides)
+- [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md): production deployment (Tailscale / Docker / systemd / auto-update / monitoring)
+- [docs/guides/development-guide.md](docs/guides/development-guide.md): dev environment and agent development
+- [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md): writing custom MCP tools
+- [docs/spec](docs/spec/soul-md-spec.md): SOUL.md and CONTRACT.toml format specs
+- [CHANGELOG.md](CHANGELOG.md): version history
 
 <a id="license"></a>
 
 ## License
 
-**Open Core model** — the core code is licensed under [Apache License 2.0](LICENSE), completely free to use, modify, and distribute.
-
-Commercial value-add modules (the `commercial/` directory) are closed-source and paid, including: industry templates, evolution parameter sets, the enterprise dashboard, and license verification.
-
-See [LICENSING.md](LICENSING.md) for details.
-
----
+Open core: the core is [Apache License 2.0](LICENSE), free to use, modify, and distribute. Commercial add-on modules (`commercial/`) are closed source and paid, covering industry templates, the enterprise dashboard, and license verification. See [LICENSING.md](LICENSING.md).
 
 <p align="center">
   🐾 Built with louis.li

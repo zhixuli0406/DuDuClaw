@@ -6,491 +6,87 @@
 
 </div>
 
-> **Multi-Runtime AI Agent Platform** — Claude / Codex / Gemini の三大 CLI を統一し、あなたのマルチチャネル AI アシスタントを構築
+DuDuClaw は、Claude Code・Codex・Gemini などの AI コマンドラインツールを Telegram・LINE・Discord をはじめとする 9 つのメッセージングプラットフォームにつなぎ、あなたを覚えて自ら成長する 24 時間稼働の AI アシスタントに変えます。
+
+必要なのは Rust バイナリ 1 つだけ。チャネルルーティング、会話メモリ、マルチアカウントローテーション、行動ガードレール、ローカル推論、Web ダッシュボードをすべて内蔵。AI の頭脳はいつでも好きなベンダーに切り替えられ、設定とメモリは自分のマシンに残ります。コアは Apache 2.0 ライセンスです。
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
-[![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
-[![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-1.34.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
----
-
-## 🔒 信頼性とセキュリティ（Trust & Security）
-
-これはオープンソースプロジェクトです — インストールする内容を完全に透明化します。
-
-### なぜ「新しい」npm パッケージがすでに version 1.21+ なのか？
-
-DuDuClaw は公開前に、プライベートリポジトリで数か月の集中開発（400+ commits）を経ています。
-完全な履歴は [git log](https://github.com/zhixuli0406/DuDuClaw/commits/main) を参照してください。
-
-### npm パッケージの中身は？
-
-- 対応プラットフォームの Rust バイナリを呼び出すだけの小さな JS ラッパー
-- プラットフォームバイナリは npm `optionalDependencies`（`@duduclaw/<platform>`）で配布 —
-  **任意の URL から外部コードをダウンロードして実行する postinstall は存在しません**
-- `postinstall` はプラットフォームパッケージの有無を確認するだけ
-  （[`npm/duduclaw/scripts/install.js`](npm/duduclaw/scripts/install.js) 参照）— 何もダウンロード・実行しません
-- GitHub Releases のバイナリはすべて SHA-256 チェックサム付き
-
-### プリビルドバイナリを信頼しない場合はソースからビルド
-
-```bash
-git clone https://github.com/zhixuli0406/DuDuClaw
-cd DuDuClaw
-cargo build --release
-```
-
-### バイナリの検証
-
-各リリースには SHA-256 チェックサムと [cosign](https://github.com/sigstore/cosign) keyless 署名が付属します：
-
-```bash
-# Releases からダウンロード
-wget https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.21.1/duduclaw-darwin-arm64.tar.gz
-
-# SHA-256 を検証（リリース内の .sha256 ファイルと照合）
-shasum -a 256 -c duduclaw-darwin-arm64.tar.gz.sha256
-
-# cosign 署名を検証
-cosign verify-blob \
-  --certificate duduclaw-darwin-arm64.tar.gz.pem \
-  --signature duduclaw-darwin-arm64.tar.gz.sig \
-  --certificate-identity-regexp "https://github.com/zhixuli0406/DuDuClaw" \
-  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  duduclaw-darwin-arm64.tar.gz
-```
-
-### サプライチェーンの透明性
-
-- **ライセンス**：Apache 2.0
-- **メンテナー**：嘟嘟數位科技有限公司（台湾登記法人、統一番号 94139082）
-- **公開 commit 履歴**：github.com/zhixuli0406/DuDuClaw
-- **CI/CD**：すべてのリリースは GitHub Actions でビルド
-- **テレメトリなし**：phone-home 通信はゼロ
-- **API キーを収集しない**：すべての秘密情報は AES-256-GCM で自分のマシンに保管
-- **権限昇格なし**：完全に user space で動作
-
-脆弱性の報告は [SECURITY.md](SECURITY.md) を参照してください。
-
----
-
-## なぜネイティブの Claude / GPT / Gemini CLI ではなく DuDuClaw なのか？
-
-ネイティブ CLI は、個人として単一の LLM をたまに使う分には十分優秀です。
-しかし本番環境へ投入する段階になると、DuDuClaw がすでに提供しているものを自分で作り直す羽目に
-なります：
-
-| 必要なもの | ネイティブ CLI | DuDuClaw |
-|---|---|---|
-| マルチ LLM 自動フォールバック | 手動で再起動 | 標準搭載（4 戦略） |
-| LLM 切り替え時のコンテキスト保持 | 失われる | 保持される |
-| LLM 横断のツール共有 | LLM ごとに書き直し | 一度書けば共有 |
-| 本番ハードニング（DLQ／リトライ／可観測性） | 自前で構築 | 標準搭載 |
-| マルチチャネル（Telegram／LINE／Discord／…） | CLI のみ | 7 チャネル |
-| シークレット／監査／PII マスキング | 自前で構築 | 標準搭載 |
-
-`claude` や `gemini` を一人でたまに使うだけなら — ネイティブのままで十分です。
-**本番のマルチ LLM Agent システム**を構築するなら — DuDuClaw が 3 か月分のインフラ構築を肩代わり
-します。
-
----
-
-> 🎉 **v1.34.0 — ランタイム非依存のセキュリティ Reference Monitor**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.34.0)）
->
-> セキュリティ境界を prompt／hook／config から、決定論的なチョークポイントと OS プリミティブへ移動。MCP dispatch が真の reference monitor（完全仲介 + 改竄不可 + 検証可能）となり、すべてのランタイム（Claude／Codex／Gemini／Antigravity + direct-API／ローカル推論のツールループ）が同一のゼロ LLM ポリシーで統治される。各制御は fail-closed で、opt-in のものは後方互換。新 crate `duduclaw-sandbox`、新規テスト約 90 件、ワークスペース警告ゼロ。
->
-> - **PolicyKernel reference monitor** — 決定論的・ゼロ LLM の `evaluate()` がパラメータ単位の静的ツールポリシー（`agent.toml [capabilities] policy`、Progent 式 tool+arg マッチャ）を評価；正規化された `fs_write`／`shell_exec`／`mcp_call` ファミリで 1 つのルールがランタイム横断で等価に効く；優先順位 Forbid > Ask > Allow > 既定拒否；空ポリシーは棄権（後方互換）。MCP dispatch（Ask → ApprovalBroker、TTL 失効＝拒否）と direct-API／ローカルのツールループ（`PolicyExecutor`）に接続
-> - **Egress「secret in-use」の収束** — `<REDACT:…>` トークンはホワイトリストのツールのみ復元、それ以外は拒否（`-32007`）、結果は再マスク；stdio serve loop から共有チョークポイントへ押し下げ、stdio／HTTP／SSE を一律にカバー
-> - **ネイティブ OS プロセスサンドボックス** — 新 crate `duduclaw-sandbox`（opt-in `[capabilities] native_sandbox`）が spawn した agent CLI を macOS Seatbelt（実機検証済み）／Linux Landlock で `SandboxLevel` に応じて封じ込め；要求されたのに利用不可なら fail-closed
-> - **記憶の origin-bound 信頼** — 時間記憶に `origin`／`origin_trust`／`derived_from` を追加；派生事実の信頼は ≤ min(ソース信頼) にクランプされ、再派生で信頼を昇格（ロンダリング）できない；蒸留された会話事実は最低信頼として検索で減点
-> - **CONTRACT.toml の実行時強制** — `must_not` 境界を、ユーザーへ送出する最終応答バイト列（秘密復元後）で検証；違反はブロックして監査記録
-> - **SecurityPosture ステートマシン + OS グラウンドトゥルース照合** — {Green,Yellow,Red} の escalate-fast／decay-slow；`os_reconcile` が「ツールの主張 vs 観測された OS 効果」の純粋な双方向差分を計算（macOS `eslogger` パーサ、Linux eBPF は段階的）
-
-
-
-https://github.com/user-attachments/assets/30406ad1-4595-43ce-8c08-dba8f0ca9683
-
-
-
-<details>
-<summary><strong>v1.9.4 → v1.33.0 累積ハイライト</strong></summary>
-
-- **v1.33.0** — モデル非依存コア + AI ハーネス基盤：`duduclaw-llm` 統一プロバイダ層（Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat の 4 プロトコルを単一正規化 + 15 モデル価格レジストリ + プロバイダ横断フォールバック + プロバイダ非依存アカウントローテーション）、非 Claude ランタイム対等化（fail-closed ケーパビリティ + PTY プールツール制限 + codex/gemini/agy への MCP 自動登録）、direct-API／ローカルパスに全ツール面をもたらす MCP クライアント + ツールループ、OTel GenAI トレーシング + `duduclaw eval` + 汎用 HITL ApprovalBroker + A2A v1.0、記憶／ルーティング研究改善（Ebbinghaus / HippoRAG-lite / ACE-ExpeL / 較正カスケードルーティング / wiki↔記憶境界）
-- **v1.32.0** — ダッシュボード UX：コマンドパレット（⌘K）・自己説明ナビ・モバイル対応・共有ローディング要素（フロントエンドのみ）
-- **v1.31.0** — Genspark 風のワークスペース外殻（中央プロンプトバー + 能力ランチャー +「Claw、あなたの最初の AI 社員」）を Calm Glass 詳細ダッシュボードの上に重ね、シンプルな ⇄ 詳細モード切替；Tauri 2 デスクトップ外殻（Phase D）— gateway を sidecar として包むネイティブウィンドウ — とライフサイクル硬化（`DUDUCLAW_DESKTOP_MODE`、config.toml ポート優先、二重起動を防ぐ attach 検出）
-- **v1.30.0** — アカウントごとの OAuth 環境を PTY プールに注入；LINE 返信を detached タスクから送信
-- **v1.29.0** — Cloud プランのエージェント/チャンネル上限：`features.toml` の tier ごとの `max_agents` / `max_channels` を実際に適用（Hobby 1/1、Solo 1/2、Studio 3/5）；**セルフホストは無制限**（Apache 2.0 の約束）；ソフト上限バナー + アップグレード CTA；`license_runtime::cap_exceeded()` 純関数ゲート
-- **v1.28.0** — パートナー（NFR）ライセンス + セルフサービス：無料・再販不可の Partner tier（Self-Host Pro 同等モジュールを解放）+ パートナーコード自助引換（`POST /v1/partner/redeem`）+ CLI `redeem/rebind/subscriptions` + 発行時の Key 自動送付 + マシン再バインド + デプロイモードバインド（M51、`DUDUCLAW_DEPLOYMENT` cloud/セルフホスト、fail-closed）
-- **v1.27.0** — 業種テンプレート（Pro）：EC / 美容医療・歯科 / 不動産仲介 / 学習塾の 4 種（SOUL + 法令強化 CONTRACT + agent.toml + FAQ + 用語集/SOP/コンプライアンス wiki、クローズドソース、台湾法令引用）+ `premium_templates` ライセンス解放ロード（fail-closed、公開 OSS バイナリは受け取らない）+ wizard 業種メニューとアップセル案内
-- **v1.26.0** — 個人版 / エンタープライズ版（`EditionProfile`、ライセンス階層と直交・コア機能を非ゲート）+ Dashboard ワンクリック CLI ログイン（Claude/Codex/Gemini/Antigravity のネイティブログインを PTY 駆動・貼付返送・`remote_safe` 分類）+ Antigravity CLI を server イメージに内蔵 + 個人版データ可搬性（`export`/`import`）+ `PersonalProSelfHost` セルフホスト個人版ライセンス階層（NT$490/月）
-- **v1.25.0** — ブラウザ優先のオンボーディング：`WelcomePage`（3 ステップ、5 つの AI バックエンド経路）+ `FirstRunGate`（Agent ゼロの誘導）+ ガイド付きツアー `GuidedTour`（依存ゼロのスポットライト）+ `runtime.detect` RPC による設定ゼロ起動
-- **v1.24.0** — Antigravity CLI（`agy`）ランタイム対応 · PtyPool の Claude 固定を解除：`RuntimeType::Antigravity` を追加（ワンショット `agy -p`、バイナリ自動解決、システムプロンプト + 履歴の埋め込み、CJK セーフな切り詰め、`trustedWorkspaces` 事前登録）；`CliKind::Antigravity` を PtyPool / worker spawn に接続、`cli_kind_for_provider()` が `[runtime] provider` から種別を導出；対話型 REPL は Claude 専用のまま（設計上）；旧 `gemini` バックエンドは有料 `GEMINI_API_KEY` / エンタープライズ向けに維持
-- **v1.23.0** — Decision Continuity（RFC-24）：エージェントが列挙式の選択肢（案 A/B/C）を提示した際、各選択肢を Temporal Memory の **semantic** 層に永続化（会話圧縮から独立）し、未決事項をターンごとに再注入；後から「案 C で」（別ターン / セッション / プロセス）と言われても、推測ではなく永続状態から解決。検出は決定論的でゼロ LLM；`[memory] decision_continuity = true` でエージェント単位の opt-in
-- **v1.22.0** — RFC-26 Live Forking（ラウンド 1–4）：実行中のタスクを N 個の競合ブランチに分岐し、それぞれ copy-on-write の隔離ワークスペースで異なる戦略を試行、AI judge が勝者を選定（`duduclaw-fork` + 6 つの MCP ツール + クロスプロセス `ForkStore` + `RotatingBranchExecutor` + `LiveAggregate` 予算プリエンプション）；スキル合成スケジューラ（W19-P1）；共有コンポーネントライブラリで再構築した Calm Glass ダッシュボード。いずれもデフォルト無効
-- **v1.21.0** — RFC-25 §5 フォローアップ：非 Claude（Codex / Gemini / OpenAI-compat）パスが 11 件の欠落をすべて解消して一級市民に（マルチターン文脈、コスト計測、keepalive、per-(home,provider) フェイルオーバー退避）；`release.sh` のマルチプラットフォーム版数同期 + ドリフト監査 + bump 後アサート + `verify`、`skip-existing` で PyPI が黙って凍結する問題を修正
-- **v1.20.0** — RFC-25 マルチランタイム解放 + A2A：「Multi-Runtime 四バックエンド」はこれまでコンパイルされない孤立ソースで、すべての実行パスが Claude をハードコードしていました。v1.20.0 はこれを配線し、LLM を呼ぶサブシステムを単一の provider-agnostic な choke-point（`runtime_dispatch::run_agent_prompt` + 遅延自動検出する `RuntimeRegistry`）に通します。channel reply / GVU / サブ agent 委譲は非 Claude provider で choke-point を通り（Claude は OAuth ローテーション / PTY パスを維持、リグレッションなし）；ACP `tasks/send` がターゲット agent を実際に実行し Failed / Completed を報告；Phase 0 で GVU 進化モデルのハードロックを撤廃（reject → warn）
-
-- **v1.19.0** — Memory Intelligence：W18/W19 で設計された記憶層を、現行の Rust `SqliteMemoryEngine` に非侵襲的に実装。**Temporal Memory**（`memories` に時態 / ナレッジグラフ列 + `store_temporal` の自動 supersession チェーン + `get_history`/`get_at`、検索は既定で有効な記憶のみ返す）；**Reflexion Loop**（既存の `MistakeNotebook` をブリッジ：回答プロンプトへのリコール注入 + 同カテゴリ ≥3 件を semantic ルールに統合）；**`memory_fetch_batch`** MCP ツール（ID 一括取得 ≤100、namespace/ownership 隔離）。`MemoryEntry` は不変、影響ゼロ
-- **v1.18.0** — Dashboard 予算／使用量の正確化：永続化された `CostTelemetry` 台帳から読む（再構築でゼロに戻るメモリカウンタを置換）、`cost_millicents` の単位誤称を修正、`marketplace.install` を実装、設定永続化の穴埋め、フロントエンドの runtime バグ掃除 + 88 個の i18n キー
-
-- **v1.17.0** — RFC-24 License v2.0（Open Core 基盤）：新 crate `duduclaw-license`（verification-only クライアント、署名鍵は `commercial/duduclaw-license` に保持）、7 つの tier 継承チェーン `OpenSource` / `Hobby` / `Solo` / `Studio` / `Business` / `SelfHostPro` / `Oem`、Ed25519 trust registry は `DUDUCLAW_LICENSE_PUBKEY_<ID>` env でシード化（空の registry は fail-safe で OpenSource に退避）。Apache 2.0 コアは**無制限で利用可能**、有料サブスクリプションが `commercial/*` 付加価値モジュールをアンロック
-- **v1.16.0** — MCP Refresh Tokens + GVU `SoulPatchOp::Consolidate`：新モジュール `mcp_refresh` は `~/.duduclaw/mcp_tokens.db` を後ろ盾とする長寿命クレデンシャル（`ddc_refresh_<env>_<64hex>`、90 日、失効可能、hash のみ保存）で、Claude Desktop が auth-fail 後にサイレント切断してリトライしない問題を解決；GVU には「縮小不変式」を伴う `SoulPatchOp::Consolidate` バリアントを追加し、SOUL.md が 150 行／8KB のハードリミットに近づいたとき自己トリガーで統合できるようにした
-- **v1.15.2** — `agent_update_soul` 信頼バックドアの封鎖：従来は SOUL.md を書き込んだ後に `soul_guard::accept_soul_change` を呼んで完全性 hash を更新しておらず、正当な呼び出しのたびに永続的な stored-vs-current drift が残っていました；さらに呼び出しチェーン全体が `tool_calls.jsonl` に書かず、バックドアが事後分析から完全に不可視でした。v1.15.2 は audit row を補完し（成功 + 4 種類の拒否パスすべてを記録、hash プレフィックス 16 文字）、書き込みのたびに fingerprint を同期します
-- **v1.15.1** — GVU SOUL.md 無制限成長の修正：agnes/SOUL.md が 5 回の GVU cycle で 61 行から 592 行に膨張。3 層防御：(1) `strip_proposal_meta` が legacy パスで `## 診斷` / `## rationale` / `## expected_improvement` などの meta セクションを除去；(2) `SOUL_MAX_LINES = 150` / `SOUL_MAX_BYTES = 8KB` のハードリミットを ASI コンテンツ重み閾値とは独立に設定；(3) structured な `SoulPatch { section, op, content }` と `apply_patch_to_soul` を追加し、Generator→Verifier→Updater 全チェーンを通した
-- **v1.15.0** — Cross-Platform PTY Pool + Worker：Anthropic が OAuth サブスクリプションアカウントの `claude -p` をブロックした後の公式代替パス。新 crate `duduclaw-cli-runtime`（`portable-pty` ConPTY/openpty クロスプラットフォーム + sentinel-framed in-band プロトコル + `PtyPool` semaphore + idle eviction + supervisor + restart policy）と `duduclaw-cli-worker`（localhost JSON-RPC + Bearer + `/healthz`、gateway は in-process または out-of-process を選択可能）；`channel_reply` は OAuth を REPL へ / API-key を `oneshot_pty_invoke + claude -p` へ；Phase 8 `pty_pool_*` Prometheus メトリクス；すべての失敗は legacy `tokio::process::Command` に fallback。デフォルトはオフ、`agent.toml [runtime] pty_pool_enabled = true` で有効化
-- **v1.14.0** — RFC-23 Sensitive Data Redaction：新 crate `duduclaw-redaction`、内部データ（Odoo / shared wiki / file tools）を `<REDACT:CATEGORY:hash8>` token に置換してから LLM に送り、信頼境界（user channel reply、whitelist ツール egress）で自動復元；AES-256-GCM 暗号化 SQLite vault（per-agent 32-byte key、0o600 権限）+ TTL 7d 二段階 GC（mark→30 日後 purge）+ 5 個の組み込み profile + 5 層 enable/disable resolver + JSONL audit 10MB rotation
-- **v1.13.1** — Odoo Test-Before-Save：`odoo.test` RPC は inline params を受け取り、Dashboard の「接続テスト」はフォームの現在値で直接 Odoo を叩き、先に保存する必要がない；inline credential を空にすると保存済みの鍵に fallback；同じ SSRF / HTTPS / db-name 検証チェーン、`scrub_odoo_error()` は 240 文字で切り詰めて HTML エラーページの漏洩を防ぐ
-- **v1.13.0** — Runtime-health overhaul（16 件の issue / 2 ラウンドの修正）：GVU/SOUL 自己進化の復旧、`[prompt] mode = "minimal"` Anthropic Skills スタイルのシステムプロンプト追加、`[budget] max_input_tokens` 圧縮パイプライン、async session summarizer、TF-IDF wiki 関連性ランキング、`duduclaw lifecycle flush` 四半期コールド／ホット分離 CLI
-- **v1.12.x** — W22-P0 ADR-002 `x-duduclaw` capability negotiation（HTTP 422 早期失敗）+ ADR-004 Secret Manager + RFC-22 マルチ agent 協調修正（agnes が偽の子 agent 応答を捏造 / autopilot の大量誤トリガー / channel パスの token 未記録）+ `duduclaw weekly-report` サブコマンド
-- **v1.11.0** — RFC-21（[Issue #21](https://github.com/zhixuli0406/DuDuClaw/issues/21)）：`duduclaw-identity` crate（IdentityProvider trait + Wiki/Notion/Chained の 3 実装）+ Odoo per-agent 認証分離（`OdooConnectorPool` がグローバル admin シングルトンを置換）+ shared wiki `.scope.toml` SoT 名前空間ポリシー
-- **v1.10.0** — Wiki RL Trust Feedback：`WikiTrustStore` per-agent SQLite trust、`CitationTracker` 二段 LRU + bounded-time eviction で DoS 防止、`WikiJanitor` 毎日 pass（自動で corrected / archive マーキング / frontmatter 同期）+ sub-agent turn_id の貫通 + multi-process flock + atomic batch upsert
-- **v1.9.4** — `duduclaw-durability` 五大持続性機構（idempotency / retry / circuit breaker / checkpoint / DLQ）+ `duduclaw-governance` PolicyRegistry + MCP HTTP/SSE Transport + LOCOMO 記憶評価システム（毎日 03:00 UTC 評価 + 200 件の golden QA）+ LLM Fallback + Discord RESUME + Web ReliabilityPage
-
-</details>
-
----
+https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 
 ## 目次
 
-- [DuDuClaw とは？](#what)
-- [主要機能](#features)
-- [競合比較](#comparison)
-- [エージェントディレクトリ構造](#directory)
-- [Security Hooks](#security)
+- [なぜ DuDuClaw なのか](#why)
+- [アーキテクチャ概要](#architecture)
 - [インストール](#install)
+- [クイックスタート](#quickstart)
+- [機能一覧](#features)
 - [CLI コマンド](#cli)
-- [プロジェクト構造](#structure)
-- [技術選定](#tech)
-- [テスト](#testing)
+- [信頼とセキュリティ](#trust)
+- [他製品との比較](#comparison)
 - [ドキュメント](#docs)
 - [ライセンス](#license)
 
----
+<a id="why"></a>
 
-<a id="what"></a>
+## なぜ DuDuClaw なのか
 
-## DuDuClaw とは？
+ターミナルでときどき `claude` や `gemini` を使うだけなら、純正 CLI で十分です。しかし LINE 公式アカウントに AI を常駐させたい、チームの Discord を任せたい、役割の違う複数エージェントを同時に動かしたい、となった瞬間、インフラ層を丸ごと自作する羽目になります。DuDuClaw はその層を最初から提供します:
 
-DuDuClaw は **Multi-Runtime AI Agent プラットフォーム**です——**Claude Code / Codex / Gemini** の三大 CLI を同時に AI バックエンドとしてサポートし、統一された `AgentRuntime` trait によりシームレスな切り替えと自動検出を実現します。
+| ニーズ | 純正 CLI | DuDuClaw |
+|---|---|---|
+| Telegram / LINE / Discord 対応 | ターミナルのみ | 9 チャネル、エージェントごとの bot token |
+| マルチ LLM フェイルオーバー | 手動再起動 | 4 種のローテーション戦略 + クロスプロバイダ failover |
+| LLM 切替時のコンテキスト | 消失 | 完全保持 |
+| 会話メモリと知識ベース | 単発セッション | SQLite 時系列メモリ + 階層 wiki を自動注入 |
+| ツールの LLM 間共有 | ベンダーごとに書き直し | MCP ツールを一度書けば 5 バックエンドで共用 |
+| ガードレール / 監査 / 秘密情報管理 | 自作 | ポリシーカーネル + OS サンドボックス + AES-256-GCM 内蔵 |
 
-特定の単一 AI プロバイダーに縛られず、あなたの AI Agent に通信チャネル、記憶、自己進化、ローカル推論、アカウント管理といった完全なインフラを接続します。
+<a id="architecture"></a>
 
-コアコンセプト：
+## アーキテクチャ概要
 
-- **Multi-Runtime** — `AgentRuntime` trait が Claude / Codex / Gemini / OpenAI-compat の 4 バックエンドを統一、`RuntimeRegistry` が自動検出、per-agent 設定
-- **Plumbing = DuDuClaw** — チャネルルーティング、session 管理、記憶検索、アカウントローテーション、ローカル推論などのインフラを担当
-- **ブリッジ = MCP Protocol** — `duduclaw mcp-server` が MCP Server として、チャネルと記憶ツールを AI Runtime に公開
+AI ランタイムが頭脳、DuDuClaw が配管、その間を MCP(JSON-RPC 2.0)がつなぎます:
 
 ```
-AI Runtime (brain) — Claude CLI / Codex CLI / Gemini CLI / OpenAI-compat
+AI Runtime (brain) — Claude Code / Codex / Gemini / Antigravity / OpenAI-compat
   ↕ MCP Protocol (JSON-RPC 2.0, stdin/stdout)
 DuDuClaw (plumbing)
-  ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu / WebChat
-  ├─ Multi-Runtime — Claude / Codex / Gemini / OpenAI-compat 自動検出 + per-agent 設定
-  ├─ Session Memory Stack — ネイティブ --resume + Instruction Pinning + Snowball Recap + Key-Fact Accumulator
-  ├─ MCP Server — 80+ ツール（通信、記憶、Agent、Skill、推論、タスク、ナレッジベース、ERP）、per-agent 登録
-  ├─ Evolution Engine — GVU² デュアルループ進化 + 予測駆動 + MistakeNotebook
-  ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / MLX / ONNX
-  ├─ Voice Pipeline — ASR (SenseVoice / Whisper) + TTS (Piper / MiniMax) + VAD (Silero)
-  ├─ Account Rotator — 複数 OAuth + API Key ローテーション、予算追跡、ヘルスチェック、Cross-Provider Failover
-  ├─ Browser Automation — 5 層自動ルーティング（API Fetch → Scrape → Headless → Sandbox → Computer Use）
-  ├─ Worktree Isolation — Git worktree L0 サンドボックス、アトミックマージ、Agent ごと 5 個上限
-  ├─ Wiki Knowledge Layer — L0-L3 四層ナレッジ構造 + 信頼重み + FTS5 + 自動注入
-  ├─ ACP/A2A Server — `duduclaw acp-server` stdio JSON-RPC 2.0、Zed/JetBrains/Neovim 統合
-  └─ Web Dashboard — React 19 SPA（23 ページ）、rust-embed で binary に組み込み
+  ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu
+  │                    / Google Chat / Microsoft Teams / WebChat
+  ├─ Multi-Runtime — 5 バックエンド自動検出、エージェントごとに設定
+  ├─ Session Memory — ネイティブ --resume + 時系列メモリ + key facts + 階層 wiki
+  ├─ MCP Server — 80+ ツール(チャネル、メモリ、エージェント、スキル、タスク、wiki、ERP)
+  ├─ Evolution Engine — GVU² 二重ループ進化 + 予測駆動 + MistakeNotebook
+  ├─ Security — PolicyKernel reference monitor + OS サンドボックス + redaction vault
+  ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / MLX
+  ├─ Account Rotator — OAuth + API キーのローテーション、予算追跡、ヘルスチェック
+  └─ Web Dashboard — React 19 SPA(24 ページ)、rust-embed でバイナリに内蔵
 ```
 
----
-
-<a id="features"></a>
-
-## 主要機能
-
-### チャネルとメッセージング
-
-| 機能 | 説明 |
-|------|------|
-| **七チャネル対応** | Telegram（long polling）、LINE（webhook）、Discord（Gateway WebSocket、op 6 RESUME + stall watchdog + 1-5s jitter）、Slack（Socket Mode）、WhatsApp（Cloud API）、Feishu（Open Platform v2）、WebChat（WebSocket）|
-| **Per-Agent Bot** | 各 Agent が独立した Bot Token を持つことができ、同一プラットフォーム上で複数 Agent を並行運用 |
-| **チャネルのホット起動／停止** | Dashboard でのチャネル追加／削除が即座に反映され、gateway の再起動不要 |
-| **WebChat** | 組み込みの `/ws/chat` WebSocket エンドポイント、React フロントエンドでリアルタイム対話 |
-| **Generic Webhook** | `POST /webhook/{agent_id}` + HMAC-SHA256 署名検証 |
-| **Media Pipeline** | 画像の自動リサイズ（max 1568px）+ MIME 検出 + Vision 統合 |
-| **Sticker システム** | LINE スタンプカタログ + 感情検出 + Discord emoji への等価マッピング |
-
-### AI 実行と推論
-
-| 機能 | 説明 |
-|------|------|
-| **MCP Server アーキテクチャ** | `duduclaw mcp-server` は 80+ ツールを提供し、通信、記憶、Agent 管理、推論、スケジューリング、Skill マーケット、タスクボード、共有ナレッジベース、Odoo ERP をカバー。各 agent ディレクトリの `.mcp.json` に登録（Claude CLI `-p --dangerously-skip-permissions` はプロジェクトレベルの設定のみ読み取る）、gateway 起動時に自動で作成／修復 |
-| **MCP Refresh Tokens**（v1.16.0）| `~/.duduclaw/mcp_tokens.db` を後ろ盾とする長寿命クレデンシャル — token 形式 `ddc_refresh_<env>_<64hex>`、寿命 90 日、個別失効可能、hash のみ保存（元の token は決して残らない）；`authenticate_from_env` は prefix でクレデンシャルをルーティングし、旧版 `ddc_<env>_<32hex>` を完全保持；新 CLI `duduclaw mcp { issue-refresh-token \| revoke-token \| list-tokens }` で Claude Desktop が auth-fail 後にサイレント切断してリトライしない痛点を解決 |
-| **Multi-Runtime** | `AgentRuntime` trait — Claude / Codex / Gemini / OpenAI-compat の 4 バックエンド、`RuntimeRegistry` 自動検出、per-agent 設定 |
-| **ローカル推論エンジン** | 統一 `InferenceBackend` trait — llama.cpp（Metal/CUDA/Vulkan）/ mistral.rs（ISQ + PagedAttention）/ Exo P2P クラスタ / llamafile / MLX（Apple Silicon）/ OpenAI-compat HTTP |
-| **三層信頼度ルーティング** | LocalFast → LocalStrong → CloudAPI、ヒューリスティックな信頼度スコアに基づき自動分流、CJK-aware token estimation |
-| **InferenceManager** | マルチモード自動切替：Exo P2P → llamafile → Direct backend → OpenAI-compat → Cloud API、周期的ヘルスチェック + 自動 failover |
-| **ネイティブ多輪 Session** | Claude CLI `--resume` と SHA-256 決定論的 session ID + history-in-prompt fallback（アカウントローテーション／stale session で自動リトライ）；Hermes スタイルの turn trimming（>800 chars, CJK-safe）；Direct API "system_and_3" ブレークポイントキャッシュ戦略 |
-| **Session 記憶スタック** | Instruction Pinning（初回メッセージで Haiku がコアタスクを抽出 → session prompt 末尾に注入）+ Snowball Recap（毎輪 `<task_recap>` を前置するゼロコストの振り返り）+ P2 Key-Fact Accumulator（毎輪 2-4 件の事実 → FTS5 索引 → top-3 を注入、わずか 100-150 tokens vs MemGPT 6,500 tokens、−87%）|
-| **Claude CLI 軽量パス** | `call_claude_cli_lightweight()` は `--effort medium --max-turns 1 --no-session-persistence --tools ""` で metadata タスク（圧縮、instruction/key-fact 抽出）を処理、25-40% のコスト削減 |
-| **Claude CLI 安定化フラグ** | `--strict-mcp-config`（MCP 分離）+ `--exclude-dynamic-system-prompt-sections`（輪をまたぐ prompt 安定化、10-15% token 削減）、`--bare` は OAuth キーチェーンを壊すため v1.8.11 で削除 |
-| **Direct API** | CLI を迂回して Anthropic Messages API を直接呼び出し、`cache_control: ephemeral` で 95%+ のキャッシュヒット率 |
-| **Token 圧縮** | Meta-Token（BPE-like 27-47%）、LLMLingua-2（2-5x 有損）、StreamingLLM（無限長対話）|
-| **Cross-Provider Failover** | `FailoverManager` ヘルス追跡、クールダウン、リトライ不能エラー検出 |
-| **Cross-Platform PTY Pool**（v1.15.0）| OAuth アカウント専用のインタラクティブ REPL チャネル — クロスプラットフォーム `portable-pty`（ConPTY on Win 10 1809+、openpty on Unix）+ sentinel-framed in-band 応答プロトコル（scrollback scraping なし / sidecar なし）+ per-agent semaphore + idle eviction + health-check supervisor + restart policy。デフォルトはオフ、per-agent `agent.toml [runtime] pty_pool_enabled = true` で有効化；out-of-process モード（`worker_managed = true`）を選択して pool を `duduclaw-cli-worker` 子プロセスに移し localhost JSON-RPC で通信することも可能 |
-| **PTY Pool Observability** | Phase 8 production-rollout メトリクス — `pty_pool_*` Prometheus counters（acquires / cache-hit / spawn / 3 種類の eviction 理由 / 4 種類の invoke outcome / duration histogram）+ `worker_health_misses_total` + `worker_restarts_total` + `pty_pool_managed_worker_active` モード gauge + `GET /api/runtime/status` JSON エンドポイント（loopback-only） |
-| **Browser 自動化** | 5 層ルーティング（API Fetch → Static Scrape → Headless Playwright → Sandbox Container → Computer Use）、deny-by-default |
-
-### 音声とマルチメディア
-
-| 機能 | 説明 |
-|------|------|
-| **ASR 音声認識** | ONNX SenseVoice（ローカル）+ Whisper.cpp（ローカル）+ OpenAI Whisper API |
-| **TTS 音声合成** | ONNX Piper（ローカル）+ MiniMax T2A |
-| **VAD 音声活動検出** | ONNX Silero VAD |
-| **Discord 音声チャンネル** | Songbird 統合、Discord 音声対話 |
-| **LiveKit 音声ルーム** | WebRTC マルチ Agent 音声会議 |
-| **ONNX 埋め込み** | BERT WordPiece tokenizer + ONNX Runtime ベクトル埋め込み |
-
-### エージェントのオーケストレーションと進化
-
-| 機能 | 説明 |
-|------|------|
-| **Sub-Agent オーケストレーション** | `create_agent` / `spawn_agent` / `list_agents` MCP ツール + `reports_to` 組織階層 + D3.js アーキテクチャ図；system prompt に "## Your Team" 子 Agent 名簿を自動注入 + 長い報告メッセージの自動ページ分割（Discord 1900 / Telegram 4000 / LINE 4900 / Slack 3900 byte budget、ラベル `📨 **agent** 的回報 (1/N)`）|
-| **クロスシステム prompt 注入** | CLAUDE.md + CONTRACT.toml（must_not/must_always）+ SOUL.md + Wiki L0+L1 + key_facts top-3 + pinned_instructions を CLI/channel/dispatcher の 3 パスで一貫注入、Claude/Codex/Gemini/OpenAI の 4 runtime で挙動を整合 |
-| **孤児レスポンスの復旧** | dispatcher 起動時に `reconcile_orphan_responses` が `bus_queue.jsonl` をスキャンし、crash/Ctrl+C/hotswap 後に残留した `agent_response` callback をアトミックに再生 |
-| **GVU² デュアルループ進化** | 外ループ（Behavioral GVU — SOUL.md 進化）+ 内ループ（Task GVU — 即時タスクリトライ）、MistakeNotebook がループ間で記憶を共有 |
-| **予測駆動進化** | Active Inference + Dual Process Theory、~90% の対話がゼロ LLM コスト；MetaCognition が 100 予測ごとに閾値を自己校正 |
-| **4+2 層検証** | L1-Format / L2-Metrics / **L2.5-MistakeRegression** / L3-LLMJudge / **L3.5-SandboxCanary** / L4-Safety、最初の 4 層はゼロコスト |
-| **Adaptive Depth** | MetaCognition 駆動の GVU 反復深度（3-7 輪）、過去の成功率に応じて自動調整 |
-| **Deferred GVU** | gradient 蓄積 + 遅延リトライ（最大 3 回 deferral、72h スパンで 9-21 輪の有効反復）|
-| **ConversationOutcome** | ゼロ LLM の対話結果検出（TaskType / Satisfaction / Completion）、zh-TW + en バイリンガル |
-| **SOUL.md バージョン管理** | 24h 観察期間 + 自動ロールバック、atomic write（SHA-256 fingerprint）|
-| **`SoulPatchOp::Consolidate`**（v1.16.0）| structured patch path に「縮小不変式」バリアントを追加 — 意味的には `Replace` と等価だが `apply_patch_to_soul` は新コンテンツが既存本文より短くない場合に拒否し、LLM は SOUL.md が 150 行 / 8KB のハードリミットに近づいたとき自己トリガーで統合できる |
-| **`agent_update_soul` 信頼チェーン**（v1.15.2）| 書き込み後に自動で `soul_guard::accept_soul_change` を呼び完全性 fingerprint を同期 + 成功/4 種類の拒否パスすべてを `tool_calls.jsonl` に記録（hash プレフィックス 16 文字）、stored-vs-current drift とバックドアの不可視性問題を封鎖 |
-| **Agent-as-Evaluator** | 独立した Evaluator Agent（Haiku でコスト制御）が敵対的検証を行い、構造化 JSON verdict を返す |
-| **DelegationEnvelope** | 構造化された引き継ぎプロトコル — context / constraints / task_chain / expected_output、Raw payload と後方互換 |
-| **TaskSpec ワークフロー** | 多段階タスク計画 — dependency-aware scheduling / auto-retry（3x）/ replan（最大 2 回）/ persistence |
-| **Orchestrator テンプレート** | 5 ステップ計画戦略（Analyze → Decompose → Delegate → Evaluate → Synthesize）+ 複雑度ルーティング |
-| **Skill ライフサイクル** | 7 段階管理 — Activation → Compression → Extraction → Reconstruction → Distillation → Diagnostician → Gap Analysis |
-| **Skill 自動合成** | 繰り返される領域ギャップを検出 → 状況記憶から新 Skill を合成 → サンドボックス試用（TTL 管理）→ Agent 間で卒業昇格 |
-| **Task Board** | SQLite タスク管理 — ステータス/優先度/割り当て追跡 + リアルタイム Activity Feed（WebSocket プッシュ）|
-| **Autopilot ルールエンジン** | タスク委譲、通知、Skill トリガーの自動化 — タスク作成/ステータス変更/チャネルメッセージ/アイドル検出/Cron スケジュールに対応 |
-| **共有ナレッジベース** | `~/.duduclaw/shared/wiki/` で Agent 間の知識（SOP、ポリシー、製品仕様）を共有 + 作者帰属 |
-| **Wiki ナレッジ階層** | Vault-for-LLM に着想 — L0 Identity / L1 Core（毎回の対話に自動注入）/ L2 Context（毎日更新）/ L3 Deep（オンデマンド検索）、各ページに `trust` (0.0-1.0) 重みを付与；FTS5 unicode61 tokenizer が CJK 全文検索をサポート；`wiki_dedup` が重複ページを検出、`wiki_graph` が Mermaid ナレッジグラフを出力 |
-| **Wiki 自動注入** | `build_system_prompt()` が L0+L1 ページを WIKI_CONTEXT に自動注入；CLI 対話、チャネル返信、dispatcher/cron の 3 つのシステム prompt 組み立てパスをカバー、Claude/Codex/Gemini/OpenAI の 4 runtime で一貫 |
-| **Git Worktree L0 分離** | タスクごとに独立した worktree 作業領域（コンテナサンドボックスより安価）、atomic merge（dry-run pre-check + global `Mutex`）、`wt/{agent_id}/{adjective}-{noun}` のフレンドリーなブランチ名；agent ごと上限 5 個、グローバル 20 個；Snap workflow：create → execute → inspect → merge/cleanup |
-| **ACP/A2A Protocol Server** | `duduclaw acp-server` が stdio JSON-RPC 2.0 サーバー（`agent/discover` / `tasks/send` / `tasks/get` / `tasks/cancel`）を提供、Agent Client Protocol と互換、Zed / JetBrains / Neovim IDE 統合をサポート；`.well-known/agent.json` AgentCard を出力 |
-| **Reminder スケジューリング** | 一回限りのリマインダー（相対時間 `5m`/`2h`/`1d` または ISO 8601 絶対時間）、`direct` 静的メッセージまたは `agent_callback` 起床モード |
-
-### 信頼性とガバナンス（v1.9.x で追加）
-
-| 機能 | 説明 |
-|------|------|
-| **`duduclaw-durability` crate** | 五大持続性機構 — idempotency key 管理、指数バックオフリトライ（jitter）、三態サーキットブレーカー（Closed/Open/HalfOpen）、checkpoint レジューム、Dead Letter Queue 終態失敗メッセージ処理 |
-| **`duduclaw-governance` crate** | PolicyRegistry + 4 種類の PolicyType（Rate/Permission/Quota/Lifecycle）+ quota_manager（soft/hard クォータ）+ error_codes（QUOTA_EXCEEDED / POLICY_DENIED の標準化）+ YAML ホットリロード + audit log |
-| **LLM Fallback** | 主モデルが timeout/503/429/overloaded のとき自動で fallback モデルに切替、`is_llm_fallback_error` / `should_attempt_model_fallback` は純関数、hard deadline は統一して hard timeout エラーを返し fallback をトリガー |
-| **Evolution Events システム** | 30+ event schema、async emitter（batch + retry）、query インターフェース、reliability 機構；HTTP endpoint を gateway に公開、Web ReliabilityPage で可視化 |
-| **MCP HTTP/SSE Transport**（W20-P1/P2）| `duduclaw http-server --bind 127.0.0.1:8765` — `POST /mcp/v1/call`（単発 JSON-RPC ツール呼び出し）+ `GET /mcp/v1/stream`（SSE ロングコネクションイベントストリーム）+ `POST /mcp/v1/stream/call`（async + SSE push）+ Bearer 認証 + token bucket rate limit |
-| **記憶 MCP scope 強制検証** | `memory:read` / `memory:write` scope を `store/read/search` の execute() エントリポイントでチェックし、v1.9.3 以前は任意の有効な API Key が scope を回避できた認証欠陥を修正 |
-| **LOCOMO 記憶評価** | `memory_eval/` — retrieval_accuracy / retention_rate / locomo_integrity_check + cron_runner（毎日 03:00 UTC）+ 5 分の smoke_test P0 + 200 件の golden QA ゴールデンセット |
-
-### セキュリティ
-
-| 機能 | 説明 |
-|------|------|
-| **Claude Code Security Hooks** | 三層プログレッシブ防御 — Layer 1 ブラックリスト（<50ms）→ Layer 2 難読化検出（YELLOW+）→ Layer 3 Haiku AI 判定（RED only）|
-| **脅威レベル状態機械** | GREEN → YELLOW → RED の自動昇降格、24h イベントなしで 1 レベル降格 |
-| **SOUL.md ドリフト検出** | SHA-256 fingerprint のリアルタイム比較 |
-| **Prompt Injection スキャン** | 6 カテゴリのルール、XML 区切りタグで注入防止；v1.34.0 からは **MCP dispatch チョークポイント**（全ランタイム）とチャネル応答パスでも実行され、ブロックは `security_audit.jsonl` に記録 |
-| **Secret 漏洩スキャン** | 20+ パターン（Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/DB URL など）|
-| **機微ファイル保護** | Read/Write/Edit の 3 方向で `secret.key`、`.env*`、`SOUL.md`、`CONTRACT.toml` を保護 |
-| **行動契約** | `CONTRACT.toml` が `must_not` / `must_always` 境界を定義 + `duduclaw test` レッドチームテスト（9 シナリオ）；v1.34.0 からは **`must_not` をユーザーへ送出する最終応答バイト列（秘密復元後）で実行時検証**、違反はブロックして監査記録 |
-| **統一マルチソース監査ログ** | `audit.unified_log` が 4 つの JSONL（`security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl`）を統一エンベロープ（timestamp / source / event_type / agent_id / severity / summary / details）にマージ、Logs ページはソースフィルタ、重大度ドロップダウン、リアルタイムと履歴のタブ分割をサポート |
-| **JSONL 監査ログ** | async 書き込み、Rust `AuditEvent` schema と互換のフォーマット |
-| **CJK-Safe 文字列スライス** | `truncate_bytes` / `truncate_chars` の新モジュールが 31 箇所の `s[..s.len().min(N)]` byte-index スライスを置換（v1.8.11 のマルチバイト codepoint panic を修正）|
-| **Per-Agent 鍵分離** | AES-256-GCM 暗号化保存、agent 間で鍵は互いに不可視 |
-| **コンテナサンドボックス** | Docker / Apple Container（`--network=none`、tmpfs、read-only rootfs、512MB limit）；**ネイティブ OS サンドボックス**（コンテナランタイム不要）も利用可能、下記参照 |
-| **Browser 自動化** | 5 層ルーティング（API Fetch → Static Scrape → Headless → Sandbox → Computer Use）、deny-by-default |
-
-### セキュリティ Reference Monitor（v1.34.0 新規）
-
-セキュリティ境界を prompt／hook／config から**決定論的なチョークポイントと OS プリミティブ**へ移動：MCP dispatch が真の reference monitor（完全仲介 + 改竄不可 + 検証可能）となり、すべてのランタイム（Claude／Codex／Gemini／Antigravity + direct-API／ローカル推論のツールループ）が同一のゼロ LLM ポリシーで統治される。各制御は fail-closed で、opt-in のものは後方互換。
-
-| 機能 | 説明 |
-|------|------|
-| **PolicyKernel** | 決定論的・ゼロ LLM の `evaluate()` がパラメータ単位の静的ツールポリシー（`agent.toml [capabilities] policy`、Progent 式 tool+arg マッチャ）を評価；正規化された `fs_write`／`shell_exec`／`mcp_call` ファミリで 1 つのルールがランタイム横断で等価に効く；優先順位 Forbid > Ask > Allow > 既定拒否；空ポリシーは棄権（後方互換）。MCP dispatch（`Ask` → ApprovalBroker、TTL 失効＝拒否）と direct-API／ローカルのツールループ（`PolicyExecutor`）に接続、stdio／HTTP／SSE で一律 |
-| **Egress「secret in-use」** | ツール引数に `<REDACT:…>` トークンがある場合、ホワイトリストのツールのみ実値を復元、それ以外は拒否（`-32007`）、結果は再マスク；stdio serve loop から共有 dispatch チョークポイントへ押し下げ、3 トランスポートを一律にカバー（`duduclaw-redaction` vault を再利用）|
-| **ネイティブ OS サンドボックス** | 新 crate `duduclaw-sandbox`（opt-in `[capabilities] native_sandbox`）が spawn した agent CLI 子プロセスを **macOS Seatbelt**（`sandbox-exec` プロファイル、実機検証済み）／**Linux Landlock** で `SandboxLevel` に応じて封じ込め（ファイル書き込みの封じ込め）；要求されたのに利用不可なら fail-closed；CLI フラグ式サンドボックスと多層で重畳（Windows は stub）|
-| **記憶の origin-bound 信頼** | 時間記憶に `origin`／`origin_trust`／`derived_from` を追加；派生事実の信頼は ≤ min(ソース信頼；未知ソース＝0) にクランプ、**再派生で信頼を昇格（ロンダリング）できない**；蒸留された会話事実は最低信頼として検索で減点 |
-| **CONTRACT 実行時強制** | `must_not` 境界を最終応答バイト列（秘密復元後）で検証、違反はブロックして `contract_violation` 監査記録 |
-| **SecurityPosture ステートマシン** | `{Green,Yellow,Red}` の escalate-fast／decay-slow、監査イベント数 + escalation floor が信号源（N-deny-in-T で昇格、静穏区間で 1 段ずつ減衰）|
-| **OS グラウンドトゥルース照合** | `os_reconcile` が「ツールの主張 vs 観測された OS 効果」の純粋な双方向決定論的差分（unaccounted な副作用 / missing なフットプリント）を計算；macOS `eslogger` パーサ、Linux eBPF は段階的 |
-
-### アカウントとコスト
-
-| 機能 | 説明 |
-|------|------|
-| **デュアルモードアカウントローテーション** | OAuth サブスクリプション（Pro/Team/Max）+ API Key ハイブリッド — 4 戦略（Priority/LeastCost/Failover/RoundRobin）|
-| **ヘルス追跡** | Rate limit クールダウン（2min）、課金枯渇クールダウン（24h）、Token 失効追跡（30d/7d 事前警告）|
-| **コストテレメトリ** | SQLite token 追跡、キャッシュ効率分析、200K 価格クリフ警告、適応的ルーティング（キャッシュ効率 <30% で自動的にローカルへ切替）|
-| **Claude CLI バイナリ探索** | `which_claude()` / `which_claude_in_home()` が Homebrew（Intel + Apple Silicon）/ Bun / Volta / npm-global / `.claude/bin` / `.local/bin` / asdf shims / NVM バージョンディレクトリをスキャンし、launchd 起動時に binary が見つからない問題を修正 |
-| **構造化失敗分類** | `FailureReason` 列挙（RateLimited / Billing / Timeout / BinaryMissing / SpawnError / EmptyResponse / NoAccounts / Unknown）+ 分類された zh-TW メッセージ + `channel_failures.jsonl` 監査記録 |
-
-### 統合と拡張
-
-| 機能 | 説明 |
-|------|------|
-| **Odoo ERP 統合** | `duduclaw-odoo` ミドルウェア — 15 個の MCP ツール（CRM/販売/在庫/会計/汎用検索レポート）、CE/EE をサポート、EditionGate 自動検出。Dashboard 設定ページは**テストしてから保存**をサポート（v1.13.1、credential を空にすると保存済みの鍵に fallback）+ **per-agent 認証分離**（v1.11.0、`OdooConnectorPool` がグローバル admin シングルトンを置換）|
-| **Skill マーケット** | GitHub Search API リアルタイム索引 + 24h ローカルキャッシュ + セキュリティスキャン + Dashboard マーケットページ |
-| **Prometheus メトリクス** | `GET /metrics` — requests、tokens、duration histogram、channel status |
-| **CronScheduler** | `cron_tasks.jsonl` + cron 式、定時タスクの自動トリガー |
-| **ONNX 埋め込み** | BERT WordPiece tokenizer + ONNX Runtime ベクトル埋め込み、セマンティック検索対応 |
-| **Experiment Logger** | Trajectory recording、RL/RLHF オフライン分析をサポート |
-| **Memory Decay スケジューリング** | 24h ごとにバックグラウンドで `run_decay` を実行：低重要度 + 30 日以上をアーカイブ → 封存 90 日以上を永久削除 |
-| **RL Trajectory Collector** | チャネル対話中に `~/.duduclaw/rl_trajectories.jsonl` へ書き込み、`duduclaw rl` CLI が export/stats/reward 機能を提供、複合報酬（outcome×0.7 + efficiency×0.2 + overlong×0.1）|
-| **Marketplace RPC** | `marketplace.list` が実在の MCP カタログ（Playwright, Browserbase, Filesystem, GitHub, Slack, Postgres, SQLite, Memory, Fetch, Brave Search）を提供、`~/.duduclaw/marketplace.json` でユーザー定義をマージ可能 |
-| **Partner Portal** | SQLite `PartnerStore`（`~/.duduclaw/partner.db`）+ 7 RPCs（profile/stats/customers CRUD）+ 販売統計 |
-
-### Web ダッシュボード
-
-| 機能 | 説明 |
-|------|------|
-| **技術スタック** | React 19 + TypeScript + Tailwind CSS 4 + shadcn/ui、温かみのある amber カラー |
-| **24 個のページ** | Dashboard / Agents / Channels / Accounts / Memory / Security / Settings / OrgChart / SkillMarket / Logs / WebChat / OnboardWizard / Billing / License / Report / PartnerPortal / Marketplace / KnowledgeHub / Odoo / Login / Users / Analytics / Export / **Reliability**（v1.9.4 で追加）|
-| **Reliability ダッシュボード** | circuit breaker 状態 / retry 統計 / DLQ キュー深度 / evolution events リアルタイムデータ；`/reliability` ルート、`getEvolutionEvents` / `getReliabilityStats` / `getDlqItems` API を統合 |
-| **リアルタイムログ** | BroadcastLayer tracing → WebSocket プッシュ、WS ハートビート ping/pong（server 30s / client 25s）+ 60s アイドルでクローズ |
-| **Logs 履歴ページの書き直し** | ソースフィルタ chips（すべて / セキュリティ / ツール呼び出し / チャネル失敗 / フィードバック）+ リアルタイム件数カウント + 重大度ドロップダウン + 重大度で着色した左枠（emerald/amber/rose）+ クリックで JSON 詳細を展開 |
-| **Memory ページ Key Insights** | 4 番目のタブが P2 Key-Fact Accumulator の蓄積した構造化インサイト（`key_facts` テーブル）+ `access_count` badge + タイムスタンプ + ソース metadata を表示 |
-| **Memory ページ進化履歴** | SOUL.md バージョン履歴 + 前/後メトリクスの差分（positive feedback / prediction error / user corrections）+ ステータスバッジ（Confirmed / RolledBack / Observing）|
-| **Toast 通知システム** | モジュールスコープのイベントバス、max-5 queue、自動クローズ、暖色系 stone/amber/emerald/rose バリアント、`prefers-reduced-motion` を尊重 |
-| **組織アーキテクチャ図** | D3.js インタラクティブな Agent 階層の可視化 |
-| **ダーク／ライト切替** | システム設定に追従、手動切替もサポート |
-| **国際化** | zh-TW / en / ja-JP 三言語対応（600+ 翻訳キー）|
-| **Skill Market 三タブ** | Marketplace / Shared Skills / My Skills の三タブ構成 + Skill 採用フロー |
-| **Autopilot 設定** | 自動化ルールの作成/管理/監視 + 履歴記録の閲覧 |
-| **Session Replay** | 対話リプレイコンポーネント、タイムライン表示をサポート |
-
----
-
-<a id="comparison"></a>
-
-## 競合比較
-
-| | **DuDuClaw** | **OpenClaw** | **IronClaw** | **Moltis** | **Dify** |
-|---|---|---|---|---|---|
-| 言語 | Rust | TypeScript | Rust | Rust | Python |
-| チャネル | 7 | 25+ | 8 | 5 | 0 (API) |
-| Multi-Runtime | **4 バックエンド（Claude/Codex/Gemini/OpenAI）** | - | - | - | 複数 LLM |
-| MCP Server | **80+ ツール** | - | - | - | - |
-| 自己進化エンジン | **GVU² デュアルループ** | - | - | - | - |
-| ローカル推論 | **6 バックエンド + 三層信頼度ルーティング** | - | - | - | - |
-| 音声 (ASR/TTS) | **4 ASR + 4 TTS provider** | - | - | - | - |
-| Token 圧縮 | **3 種類の戦略** | - | - | - | - |
-| Browser 自動化 | **5 層ルーティング** | - | - | - | - |
-| コストテレメトリ | **キャッシュ効率分析** | - | 基本 | 基本 | 基本 |
-| 行動契約 | **CONTRACT.toml + レッドチーム** | - | WASM サンドボックス | - | - |
-| ERP 統合 | **Odoo 15 ツール** | - | - | - | - |
-| セキュリティ監査 | **三層防御 + Hooks** | CVE-2026-25253 | WASM | 基本 | 中程度 |
-| ライセンス | **Apache 2.0 (Open Core)** | MIT | オープンソース | オープンソース | $59+/月 |
-
----
-
-<a id="directory"></a>
-
-## エージェントディレクトリ構造
-
-各 Agent は 1 つのフォルダであり、その構造は Claude Code と完全に互換です：
-
-```
-~/.duduclaw/agents/
-├── dudu/                    # メイン Agent
-│   ├── .claude/             # Claude Code 設定
-│   │   └── settings.local.json
-│   ├── .mcp.json            # MCP Server 設定（DuDuClaw platform tools + Playwright などの agent 専用 MCP）
-│   │                        # gateway 起動時に自動で作成/修復；Claude CLI `-p` モードはこのファイルのみ読む
-│   ├── SOUL.md              # 人格定義（SHA-256 保護）
-│   ├── CLAUDE.md            # Claude Code ガイドライン（CLAUDE_WIKI テンプレートを含む）
-│   ├── CONTRACT.toml        # 行動契約（must_not / must_always）、system prompt に自動注入
-│   ├── agent.toml           # DuDuClaw 設定（モデル、予算、ハートビート、runtime、capabilities）
-│   ├── SKILLS/              # スキルセット（進化エンジンが自動生成可能）
-│   ├── wiki/                # Wiki ナレッジベース（L0-L3 階層 + trust 重み + FTS5）
-│   ├── memory/              # 日次ノート + memory.db（予測偏差）+ key_facts テーブル
-│   ├── tasks/               # TaskSpec ワークフロー永続化（JSON）
-│   └── state/               # ランタイム状態（SQLite：sessions.pinned_instructions など）
-│
-└── coder/                   # 別の Agent
-    └── ...
-```
-
-`duduclaw migrate` を使うと、旧版の `agent.toml` を Claude Code 互換フォーマットに自動変換できます。
-
----
-
-<a id="security"></a>
-
-## Security Hooks
-
-> **v1.34.0 の位置づけ**：v1.34.0 以降、主要なセキュリティ境界は [セキュリティ Reference Monitor](#セキュリティ-reference-monitorv1340-新規)（決定論的な MCP dispatch チョークポイント + OS プリミティブ、全ランタイムをカバー）です。以下の Claude Code Hook レイヤは、MCP を経由しない CLI ネイティブツール（bash/edit）向けの**任意のセマンティック傍受**へと降格され、その下には OS サンドボックスがバックストップとして存在します。
-
-DuDuClaw は Claude Code の Hook システムの上に三層プログレッシブ防御を構築しています：
-
-```
-                    ┌─────────────────────────────────────┐
-  SessionStart ──→  │ session-init.sh                     │  鍵権限検証 + 環境初期化
-                    └─────────────────────────────────────┘
-                    ┌─────────────────────────────────────┐
-  UserPrompt   ──→  │ inject-contract.sh                  │  CONTRACT.toml ルール注入
-                    └─────────────────────────────────────┘
-                    ┌─────────────────────────────────────┐
-  PreToolUse   ──→  │ bash-gate.sh (Bash)                 │  Layer 1: ブラックリスト (<50ms)
-     (Bash)         │   ├─ Layer 2: 混淆偵測 (YELLOW+)    │  Layer 2: base64/eval/外滲
-                    │   └─ Layer 3: Haiku AI (RED only)   │  Layer 3: AI セキュリティ判定
-                    └─────────────────────────────────────┘
-                    ┌─────────────────────────────────────┐
-  PreToolUse   ──→  │ file-protect.sh → ai-review.sh     │  機微ファイル保護 + AI 審査
-  (Write|Edit|Read) └─────────────────────────────────────┘
-                    ┌─────────────────────────────────────┐
-  PostToolUse  ──→  │ secret-scanner.sh → audit-logger.sh │  Secret スキャン → async 監査
-                    └─────────────────────────────────────┘
-                    ┌─────────────────────────────────────┐
-  Stop         ──→  │ threat-eval.sh                      │  脅威レベルの再評価
-                    └─────────────────────────────────────┘
-                    ┌─────────────────────────────────────┐
-  ConfigChange ──→  │ config-guard.sh                     │  設定改竄検出
-                    └─────────────────────────────────────┘
-```
-
-### 脅威レベル状態機械
-
-| レベル | トリガー条件 | 防御動作 |
-|------|---------|---------|
-| **GREEN** (デフォルト) | 通常操作 | Layer 1 ブラックリスト + ファイル保護 + Secret スキャン |
-| **YELLOW** | 1 時間以内に ≥ 2 回の遮断 | +Layer 2 難読化検出 + 外部ネットワーク制限 |
-| **RED** | 注入/eval 攻撃を検出 | +Layer 3 Haiku AI が全コマンドを判定 + AI ファイル審査 |
-
-降格：24 時間イベントなしで自動的に 1 レベル降格（RED→YELLOW→GREEN）。
-
----
+全体設計は [ARCHITECTURE.md](ARCHITECTURE.md) を参照してください。
 
 <a id="install"></a>
 
 ## インストール
 
-### npm（推奨・Windows を含む全プラットフォーム）
+### npm(推奨、Windows 含む全プラットフォーム)
+
+前提条件は [Node.js](https://nodejs.org/) 20+ のみ:
 
 ```bash
 npm install -g duduclaw
 ```
 
-インストール完了後、対応プラットフォームの**プリコンパイル済み binary** が自動でダウンロードされます（macOS ARM64/x64、Linux x64/ARM64、Windows x64 をサポート）。**コンパイラ・Rust・MSVC Build Tools は一切不要**です。Windows ユーザーは事前に [Node.js](https://nodejs.org/) を入れるだけで、これが唯一の前提条件です。
+プラットフォームに対応するビルド済みバイナリ(macOS ARM64/x64、Linux x64/ARM64、Windows x64)が自動で入ります。コンパイラも Rust も不要です。
 
-> **⚠️ インストール中に Rust / MSVC Build Tools（~2GB）のインストールとコンパイル（約 1.5 時間）を求められたら、それは間違った経路です。**
-> それは「[ソースからビルド](#ソースからビルド)」経路で、コードを変更する開発者のみが必要とします。通常利用では必ず上記の `npm install -g duduclaw`（または下記の Homebrew / ワンライナー）を使ってください。公式のプリビルド binary を直接ダウンロードします。
+> ⚠️ インストール中に Rust / MSVC Build Tools の導入と 1.5 時間のコンパイルを求められたら、それは間違ったルートです。「ソースからビルド」はコントリビュータ向け。通常利用は上の npm コマンドを使ってください。
 
-### Homebrew（macOS / Linux）
+### Homebrew(macOS / Linux)
 
 ```bash
 brew install zhixuli0406/tap/duduclaw
@@ -498,321 +94,170 @@ brew install zhixuli0406/tap/duduclaw
 
 ### ワンライナーインストール
 
-**macOS / Linux：**
-
 ```bash
+# macOS / Linux
 curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | sh
 ```
 
-**Windows（PowerShell）：**
-
 ```powershell
+# Windows (PowerShell)
 irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.ps1 | iex
 ```
 
-> ワンライナーインストーラーは**最新リリース**を自動検出して対応プラットフォームのプリビルド binary をダウンロードします（こちらもコンパイル不要）。GitHub のダウンロードに失敗した場合のみソースビルドを尋ねます（その際は `npm install -g duduclaw` を推奨）。`DUDUCLAW_VERSION` 環境変数で特定バージョンに固定できます。
-
 ### デスクトップアプリ
 
-CLI に加えて、ネイティブ**デスクトップアプリ**（Tauri）も提供しています —— 起動時にローカル gateway を自動起動し、ワークスペース（シンプル）⇄ ダッシュボード（詳細）をワンクリックで切り替えられます。[**Releases**](https://github.com/zhixuli0406/DuDuClaw/releases) からお使いのプラットフォーム向けをダウンロードしてください：
+Tauri 製のネイティブデスクトップ版。起動時にローカル gateway を自動で立ち上げ、CLI と `~/.duduclaw` を共有します。[Releases](https://github.com/zhixuli0406/DuDuClaw/releases) からダウンロード:
 
 | プラットフォーム | ファイル | 備考 |
 |------|------|------|
-| macOS (Apple Silicon) | `DuDuClaw_*_aarch64.dmg` | ✅ 署名 + Apple 公証済み、警告なしで起動 |
-| macOS (Intel) | `DuDuClaw_*_x64.dmg` | ✅ 署名 + Apple 公証済み、警告なしで起動 |
-| Windows (x64) | `DuDuClaw_*_x64_en-US.msi` | ⚠️ 未署名 — 下記参照 |
-| Linux | `*_amd64.AppImage` / `*_amd64.deb` | 署名不要 |
+| macOS(Apple Silicon / Intel) | `DuDuClaw_*.dmg` | 署名 + Apple 公証済み、そのまま開けます |
+| Windows x64 | `DuDuClaw_*_x64_en-US.msi` | Authenticode 証明書は未購入のため SmartScreen が警告します。「詳細情報」→「実行」で起動、気になる場合は CLI 版を |
+| Linux | `*_amd64.AppImage` / `.deb` | 署名不要 |
 
-> デスクトップアプリは CLI と `~/.duduclaw` を**共有**します（同じ設定 / SQLite / wiki）。既に gateway が起動している場合は、2つ目を起動せずにアタッチします。
+### ソースからビルド
 
-#### ⚠️ Windows：SmartScreen「不明な発行元」の警告 — 実行方法
+前提条件:[Rust](https://rustup.rs/) 1.85+、[Node.js](https://nodejs.org/) 20+。
 
-Windows インストーラーは**まだ Authenticode 証明書でコード署名されていない**ため、**Microsoft Defender SmartScreen が警告**を表示します（「Windows によって PC が保護されました」/「不明な発行元」）。**これはマルウェアではなく、単に未署名なだけです。** 実行手順：
+```bash
+git clone https://github.com/zhixuli0406/DuDuClaw.git
+cd DuDuClaw
+cd web && npm ci --legacy-peer-deps && npm run build && cd ..
+cargo build --release -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard
+./target/release/duduclaw run
+```
 
-1. `.msi` をダブルクリック → 青い SmartScreen ダイアログが表示される
-2. **「詳細情報 / More info」**をクリック
-3. **「実行 / Run anyway」**をクリック
+### Python SDK(任意のライブラリ)
 
-**警告を完全に回避する**には、署名の懸念がない2つの選択肢：
-
-- CLI 版を使う：`npm install -g duduclaw`（フル機能、ダッシュボード込み）
-- 署名版を待つ：Windows Authenticode 証明書を検討中（クラウド署名。[`docs/guides/desktop-unblock.md`](docs/guides/desktop-unblock.md) 関門 C 参照）
-
-> **macOS にこの問題はありません** —— Developer ID 署名 + Apple 公証済みのため、クリーンなマシンでも警告なしで開けます（`spctl -a` が `accepted / Notarized Developer ID` を返す）。
-
-### Python SDK（任意のライブラリ、CLI ではありません）
-
-> **重要**：コアの gateway / CLI（`duduclaw` コマンド）は **Rust バイナリ**で、上記の **npm** または **Homebrew** でインストールすれば**フル機能**が使えます。Skill セキュリティスキャンとチャネル応答はすべて Rust ネイティブの経路で処理されるため、**Python 依存は不要**です。
-> PyPI 上の `duduclaw` は**純粋な Python ライブラリ**（`import duduclaw` 用）であり、**コマンドラインツールは含まれません**。したがって `pipx install duduclaw` は失敗します（No apps associated with package）。これは想定された動作です。
-
-`pip install duduclaw` は**コア機能には任意**で、次の場合のみ必要です：
-
-- 自身の Python コードで `duduclaw` を `import` したいとき（agents / channels / mcp / memory_eval モジュール）。
-- スタンドアロンのメモリ評価ツール（LOCOMO）を実行するとき。
-
-> **高度なローカル推論（MLX リフレクション / LLMLingua-2 圧縮）** は別の opt-in 機能で、`mlx_lm` や `llmlingua` などの ML パッケージに依存します。`duduclaw` の PyPI パッケージ**ではありません**。必要に応じて `inference.toml` に従って個別にインストールしてください。
-
-任意のライブラリをインストールするには：
+コアの gateway / CLI は Rust バイナリで、Python は不要です。PyPI の `duduclaw` は `import duduclaw` 用の純粋なライブラリ(agents / channels / mcp / memory_eval モジュール)で、コマンドラインツールを含みません。そのため `pipx install duduclaw` が失敗するのは想定どおりです。必要な場合:
 
 ```bash
 pip install duduclaw
 ```
 
-このコマンドは以下の依存をインストールします：
+<a id="quickstart"></a>
 
-| パッケージ | 最低バージョン | 用途 |
-|------|---------|------|
-| `anthropic` | ≥ 0.40 | 自身の Python コードからの Claude API 直接呼び出し |
-| `httpx` | ≥ 0.27 | 非同期 HTTP クライアント（アカウントローテーション、ヘルスチェック）|
-| `pyyaml` | ≥ 6.0 | 設定ファイルのパース |
+## クイックスタート
 
-#### macOS（Homebrew Python）／その他の externally-managed 環境
-
-`error: externally-managed-environment`（[PEP 668](https://peps.python.org/pep-0668/)）と表示される場合、システム Python への直接インストールは禁止されています。仮想環境を使用してください：
+AI の頭脳が 1 つ必要です(ブラウザのセットアップウィザードで後から設定も可能):[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli) のいずれかを入れてログインする、API キーを用意する、ローカル GGUF モデルを使う、のどれかを選んでください。
 
 ```bash
-# venv
-python3 -m venv .venv && source .venv/bin/activate
-pip install --upgrade duduclaw
+# 1. まとめて起動(gateway + チャネル + スケジューラ + dispatcher)
+duduclaw run
 
-# または uv を使用（本プロジェクトで採用済み、より高速）
-uv venv && uv pip install --upgrade duduclaw
+# 2. ダッシュボードを開く
+open http://localhost:18789
 ```
 
-インストール済みバージョンの確認：
+初回アクセスでは 3 ステップのウィザードが案内します:AI バックエンドを選ぶ → 最初のエージェントを作る → 内蔵 WebChat でそのまま会話。あとは Channels ページに bot token を貼れば、同じエージェントを再起動なしで Telegram・LINE・Discord などに接続できます。
 
-```python
-import duduclaw
-print(duduclaw.__version__)   # 実際にインストールされた PyPI バージョンを反映
-```
-
-> `__version__` は `importlib.metadata` 経由でインストール済みパッケージのメタデータ（`pyproject.toml`）から動的に読み込まれます。ソースチェックアウト（pip 未インストール）では組み込み文字列にフォールバックし、`scripts/release.sh` のドリフトガードによって他プラットフォームのバージョンと同期されます。
-
-開発環境では追加でインストール：
+よく使う次の一歩:
 
 ```bash
-pip install duduclaw[dev]
-# 含む：pytest>=8, pytest-asyncio>=0.24, ruff>=0.8
+duduclaw agent create      # エージェントを追加(業種テンプレートあり)
+duduclaw status            # システムヘルスのスナップショット
+duduclaw update            # アップデートの確認とインストール
+duduclaw service install   # 起動時に自動開始(launchd / systemd)
 ```
 
-### ソースからビルド
+<a id="features"></a>
 
-```bash
-git clone https://github.com/zhixuli0406/DuDuClaw.git
-cd DuDuClaw
+## 機能一覧
 
-# （任意）import duduclaw ライブラリやメモリ評価ツールが必要な場合のみ。コアのビルドには不要
-# pip install duduclaw
+| 領域 | 内蔵機能 | 詳細 |
+|------|----------|------|
+| チャネル | 9 チャネル(Telegram / LINE / Discord / Slack / WhatsApp / Feishu / Google Chat / Teams / WebChat)、エージェントごとの bot、ホット起動/停止、プラットフォーム最適レンダリング、入力中インジケータ、長時間タスクの進捗ボード | [docs/features](docs/features/README.md) |
+| マルチランタイム | Claude / Codex / Gemini / Antigravity / OpenAI-compat の 5 バックエンド、自動検出、エージェントごとの設定、切替時もコンテキスト保持 | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| MCP サーバー | 80+ ツール:チャネル、メモリ、エージェント編成、スキルマーケット、タスクボード、共有 wiki、Odoo ERP。stdio と HTTP/SSE の両トランスポート | [docs/api](docs/api/README.md) |
+| メモリ | SQLite 時系列メモリ(事実の置換チェーン)、エビングハウス保持曲線、知識グラフ検索、エージェント横断の共有 wiki | [docs/features](docs/features/README.md) |
+| 自己進化 | GVU² 二重ループ + 予測駆動(会話の約 90% は LLM コストゼロ)、SOUL.md バージョン管理 + 24 時間観察期間つき自動ロールバック | [evolution-engine.md](docs/architecture/evolution-engine.md) |
+| セキュリティ | PolicyKernel reference monitor(LLM 不使用、fail-closed)、macOS Seatbelt / Linux Landlock サンドボックス、secret redaction vault、CONTRACT.toml 行動契約 + レッドチーム CLI | [SECURITY.md](SECURITY.md) |
+| アカウントとコスト | OAuth + API キーのローテーション(4 戦略)、レート制限 / 課金クールダウン、キャッシュ効率分析つきコストテレメトリ | [docs/features](docs/features/README.md) |
+| ローカル推論 | llama.cpp(Metal/CUDA/Vulkan)/ mistral.rs / Exo P2P / llamafile / MLX、3 段階の信頼度ルーティング | [docs/features](docs/features/README.md) |
+| 音声 | ASR(SenseVoice / Whisper)+ TTS(Piper / MiniMax)+ VAD、Discord ボイスチャンネルと LiveKit ルーム | [docs/features](docs/features/README.md) |
+| 自動アップデート | ダッシュボードからワンクリック、または無人更新(`auto_update = true`)。SHA-256 + Ed25519 の二重検証後にその場で再起動、開いているタブは自動リロード | [deployment-guide.md](docs/guides/deployment-guide.md) |
+| Web ダッシュボード | React 19 SPA 24 ページ、バイナリに内蔵で追加デプロイ不要。zh-TW / en / ja 対応 | [docs/features](docs/features/README.md) |
+| ERP 連携 | Odoo ブリッジ 15 MCP ツール(CRM / 販売 / 在庫 / 会計)、エージェントごとの認証分離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
 
-# Dashboard をビルド
-cd web && npm ci --legacy-peer-deps && npm run build && cd ..
-
-# Rust binary をビルド（Dashboard を含む）
-cargo build --release -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard
-
-# 初回設定
-./target/release/duduclaw onboard
-
-# 起動
-./target/release/duduclaw run
-```
-
-> **前提要件**：[Rust](https://rustup.rs/) 1.85+、[Python](https://www.python.org/) 3.9+、[Node.js](https://nodejs.org/) 20+、および少なくとも 1 つの AI CLI：[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)（いずれか 1 つまたは複数）
-
----
+全機能リストは [docs/features/feature-inventory.md](docs/features/feature-inventory.md)、バージョン履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。
 
 <a id="cli"></a>
 
 ## CLI コマンド
 
 ```
-duduclaw onboard             # インタラクティブな初回設定
-duduclaw run                 # ワンクリック起動（gateway + channels + heartbeat + cron + dispatcher）
-duduclaw migrate             # agent.toml を Claude Code フォーマットに変換
-duduclaw mcp-server          # MCP Server を起動（AI Runtime 用、stdio JSON-RPC 2.0）
-duduclaw http-server         # MCP HTTP/SSE Transport を起動（Bearer 認証、デフォルト 127.0.0.1:8765）
-duduclaw acp-server          # ACP/A2A Server を起動（IDE 統合：Zed/JetBrains/Neovim）
-duduclaw gateway             # WebSocket gateway server のみ起動
-
-duduclaw agent               # CLI インタラクティブ対話
-duduclaw agent list          # すべての Agent を一覧表示
-duduclaw agent create        # 新規 Agent を作成（業種テンプレート指定可能）
-duduclaw agent inspect       # Agent 詳細を表示
-duduclaw agent pause         # Agent を一時停止
-duduclaw agent resume        # Agent を再開
-duduclaw agent edit          # Agent 設定を編集
-duduclaw agent remove        # Agent を削除
-
-duduclaw test <agent>        # レッドチームセキュリティテスト（9 個の組み込みシナリオ + JSON レポート）
-duduclaw status              # システムヘルススナップショット
+duduclaw run                 # まとめて起動(gateway + channels + heartbeat + cron + dispatcher)
+duduclaw agent               # ターミナルで対話
+duduclaw agent create        # エージェント作成(業種テンプレートあり)
+duduclaw agent list          # エージェント一覧
+duduclaw status              # システムヘルスのスナップショット
 duduclaw doctor              # ヘルス診断
-duduclaw wizard              # 業種テンプレートのインタラクティブ設定
-duduclaw evolution finalize  # 期限切れの SOUL.md 観察ウィンドウを一括回収（--dry-run / --agent <id>）
-
-duduclaw rl export           # RL trajectory をエクスポート（~/.duduclaw/rl_trajectories.jsonl）
-duduclaw rl stats            # Agent ごとの trajectory 統計
-duduclaw rl reward           # 複合報酬を計算（outcome×0.7 + efficiency×0.2 + overlong×0.1）
-
-duduclaw service install     # システムサービスとしてインストール
-duduclaw service start/stop  # システムサービスの起動／停止
-duduclaw service status      # サービス状態
-duduclaw service logs        # サービスログ
-duduclaw service uninstall   # システムサービスを削除
-
-duduclaw license activate    # ライセンスを有効化
-duduclaw license status      # ライセンス状態
-duduclaw license verify      # ライセンスを検証
-duduclaw update              # 更新の確認とインストール
-duduclaw version             # バージョン情報
+duduclaw test <agent>        # レッドチームセキュリティテスト(内蔵 9 シナリオ)
+duduclaw update              # アップデートの確認とインストール
+duduclaw service install     # システムサービスとして登録(launchd / systemd)
+duduclaw mcp-server          # MCP サーバー起動(stdio JSON-RPC 2.0)
+duduclaw acp-server          # ACP/A2A サーバー起動(Zed / JetBrains / Neovim 連携)
 ```
 
----
+全コマンドは `duduclaw --help` で確認できます。開発者向けは[開発ガイド](docs/guides/development-guide.md)へ。
 
-<a id="structure"></a>
+<a id="trust"></a>
 
-## プロジェクト構造
+## 信頼とセキュリティ
 
-```
-DuDuClaw/
-├── crates/                         # Rust crates (20 個)
-│   ├── duduclaw-core/              # 共有型、traits (Channel, MemoryEngine)、エラー定義
-│   ├── duduclaw-agent/             # Agent 登録、ハートビート、予算、契約、skill loader/registry
-│   ├── duduclaw-auth/              # マルチユーザー認証（Argon2 パスワード、JWT、ACL ロール権限）
-│   ├── duduclaw-security/          # AES-256-GCM、SOUL guard、input guard、audit、key vault
-│   ├── duduclaw-container/         # Docker / Apple Container / WSL2 サンドボックス実行
-│   ├── duduclaw-memory/            # SQLite + FTS5 全文検索 + ベクトル埋め込み + 評価 batch query API
-│   ├── duduclaw-inference/         # ローカル推論エンジン（llama.cpp / mistral.rs / ONNX / Exo / llamafile）
-│   ├── duduclaw-gateway/           # Axum サーバー、7 チャネル、session、GVU²、prediction、cron、dispatcher、LLM fallback、evolution events、PTY pool 統合
-│   ├── duduclaw-bus/               # tokio broadcast + mpsc メッセージルーティング
-│   ├── duduclaw-bridge/            # PyO3 Rust↔Python ブリッジ層
-│   ├── duduclaw-odoo/              # Odoo ERP ミドルウェア (JSON-RPC, CE/EE, 15 MCP tools)
-│   ├── duduclaw-cli/               # clap CLI エントリ + MCP server (stdio + HTTP/SSE) + migrate + test
-│   ├── duduclaw-dashboard/         # rust-embed で React SPA を組み込み
-│   ├── duduclaw-desktop/           # デスクトップ wrapper（macOS/Windows/Linux）
-│   ├── duduclaw-durability/        # 持続性フレームワーク（idempotency / retry / circuit breaker / checkpoint / DLQ）— v1.9.4 で追加
-│   ├── duduclaw-governance/        # PolicyRegistry / quota_manager / error_codes / audit / approval — v1.9.4 で追加
-│   ├── duduclaw-identity/          # IdentityProvider trait + Wiki/Notion/Chained の 3 実装 — v1.11.0 で追加
-│   ├── duduclaw-redaction/         # ソース感知 redaction + 復元可能 vault（AES-256-GCM）+ 5 profile + JSONL audit — v1.14.0 で追加
-│   ├── duduclaw-cli-runtime/       # クロスプラットフォーム PTY pool runtime（portable-pty / sentinel-framed）— v1.15.0 で追加
-│   └── duduclaw-cli-worker/        # standalone PTY pool worker subprocess（localhost JSON-RPC + Bearer token）— v1.15.0 で追加
-│
-├── python/duduclaw/                # Python 拡張層
-│   ├── channels/                   # LINE / Telegram / Discord チャネルプラグイン
-│   ├── sdk/                        # Claude Code SDK chat + マルチアカウントローテーション
-│   ├── evolution/                  # Skill Vetter セキュリティスキャン
-│   ├── tools/                      # Agent 動的管理ツール
-│   ├── agents/                     # capability manifest + capability-based router + memory_resolver（v1.9.4）
-│   ├── mcp/                        # MCP API Key auth（key masking を含む）+ memory tools（store/read/search/namespace/quota）
-│   └── memory_eval/                # LOCOMO 記憶評価（retrieval/retention + cron + 200 件の golden QA）— v1.9.4 で追加
-│
-├── npm/                            # npm 配布パッケージ
-│   ├── duduclaw/                   # メインパッケージ（プラットフォーム非依存 wrapper + postinstall binary ダウンロード）
-│   ├── darwin-arm64/               # macOS Apple Silicon プリコンパイル binary
-│   ├── darwin-x64/                 # macOS Intel プリコンパイル binary
-│   ├── linux-x64/                  # Linux x86-64 プリコンパイル binary
-│   ├── linux-arm64/                # Linux ARM64 プリコンパイル binary
-│   └── win32-x64/                  # Windows x64 プリコンパイル binary
-│
-├── web/                            # React Dashboard
-│   └── src/
-│       ├── components/             # UI コンポーネント (OrgChart, ApprovalModal, SessionReplay)
-│       ├── pages/                  # 24 個のページ（ReliabilityPage v1.9.4 で追加を含む）
-│       ├── stores/                 # Zustand 状態管理 (8 stores)
-│       ├── lib/                    # API client (WebSocket JSON-RPC + evolution events / reliability HTTP)
-│       └── i18n/                   # zh-TW / en / ja-JP
-│
-├── templates/                      # 業種テンプレート + Agent 役割テンプレート
-│   ├── restaurant/                 # 飲食業（カスタマーサポート、予約、FAQ、能動的プッシュ）
-│   ├── manufacturing/              # 製造業（設備監視、SOP、異常アラート）
-│   ├── trading/                    # 貿易業（見積、注文、在庫、価格表）
-│   ├── evaluator/                  # Evaluator Agent（敵対的検証）
-│   ├── orchestrator/               # Orchestrator Agent（タスクオーケストレーション）
-│   └── wiki/                       # Wiki ナレッジベーステンプレート
-│
-├── .claude/                        # Claude Code Hook セキュリティシステム
-│   ├── settings.local.json         # Hook 設定（6 イベント × 10 スクリプト）
-│   └── hooks/                      # 三層プログレッシブ防御スクリプト
-│
-├── docs/                           # 公開ドキュメント
-│   ├── spec/                       # フォーマット仕様（SOUL.md / CONTRACT.toml）
-│   ├── api/                        # WebSocket RPC + OpenAPI spec
-│   ├── guides/                     # 開発ガイド（カスタム MCP ツールなど）
-│   └── *.md                        # アーキテクチャ、デプロイ、進化エンジンなど
-│
-├── ARCHITECTURE.md                 # 完全なアーキテクチャ設計ドキュメント
-└── CLAUDE.md                       # AI コラボレーション設計コンテキスト
-```
+インストールする中身は完全に透明です:
 
----
+- **npm パッケージの中身**:小さな JS ラッパーとプラットフォームバイナリ(`@duduclaw/<platform>` optionalDependencies)。`postinstall` はプラットフォームパッケージの存在確認のみ([`install.js`](npm/duduclaw/scripts/install.js))。任意の URL からのダウンロードや実行は一切ありません
+- **テレメトリなし**:phone-home 通信ゼロ。すべての秘密情報は AES-256-GCM で暗号化され、あなたのマシンに残ります
+- **特権昇格なし**:完全にユーザー空間で動作
+- **メンテナ**:嘟嘟數位科技有限公司(台湾登記企業、統一編号 94139082)
 
-<a id="tech"></a>
-
-## 技術選定
-
-| 項目 | 選択 | 理由 |
-|------|------|------|
-| AI 対話 | **Multi-Runtime（Claude / Codex / Gemini CLI）** | 単一プロバイダーに縛られない、自動検出 + per-agent 設定 |
-| コア言語 | **Rust** | メモリ安全、高性能、単一 binary デプロイ |
-| 拡張言語 | **Python (PyO3)** | Claude Code SDK 統合、チャネルプラグインの柔軟性 |
-| フロントエンドフレームワーク | **React 19 + TypeScript** | リアルタイムデータ更新、成熟したエコシステム |
-| UI スタイル | **shadcn/ui + Tailwind CSS 4** | 温かみがありカスタマイズ可能、性能良好 |
-| データベース | **SQLite + FTS5** | 依存ゼロ、組み込み型、全文検索 |
-| ツールプロトコル | **MCP (Model Context Protocol)** | Claude Code ネイティブサポート、stdin/stdout JSON-RPC |
-| ローカル推論 | **ONNX Runtime + llama.cpp** | クロスプラットフォーム、Metal/CUDA/Vulkan GPU 加速 |
-| 音声認識 | **SenseVoice + Whisper.cpp** | 多言語、ローカルオフライン、ゼロ API コスト |
-| リアルタイム通信 | **WebRTC (LiveKit)** | 低遅延音声、多人数会議 |
-
----
-
-<a id="testing"></a>
-
-## テスト
+各リリース資産には 3 種類の検証手段が付属します:SHA-256 チェックサム、[cosign](https://github.com/sigstore/cosign) keyless 署名、minisign Ed25519 署名(内蔵オートアップデータはこの署名を必須とし、未署名・改竄されたリリースを拒否します):
 
 ```bash
-# Rust テスト
-cargo test --workspace --exclude duduclaw-bridge
+# SHA-256
+shasum -a 256 -c duduclaw-darwin-arm64.tar.gz.sha256
 
-# Python テスト
-pip install pytest pytest-asyncio ruff
-ruff check python/
-pytest tests/python/ -v
-
-# フロントエンド型チェック
-cd web && npx tsc --noEmit
+# minisign(同じ公開鍵がバイナリにも埋め込まれています)
+minisign -Vm duduclaw-darwin-arm64.tar.gz \
+  -P RWTh5pOpk0YmdBgm3VyB2bzxFtajNLXr7zFDhbcc75TgM8YfeV+NSzXh
 ```
 
----
+ビルド済みバイナリを信頼しない場合は、[ソースからのビルド](#install)が 3 コマンドで済みます。脆弱性の報告は [SECURITY.md](SECURITY.md) へ。
+
+> なぜ「新しい」パッケージがバージョン 1.3x から始まるのか?DuDuClaw は公開前にプライベートリポジトリで数か月開発されました(400+ コミット)。全履歴は [git log](https://github.com/zhixuli0406/DuDuClaw/commits/main) にあります。
+
+<a id="comparison"></a>
+
+## 他製品との比較
+
+| | DuDuClaw | OpenClaw | IronClaw | Dify |
+|---|---|---|---|---|
+| 言語 | Rust | TypeScript | Rust | Python |
+| チャネル | 9 | 25+ | 8 | 0(API)|
+| マルチランタイム | 5 バックエンド | 単一 | 単一 | マルチ LLM |
+| MCP サーバー | 80+ ツール | なし | なし | なし |
+| 自己進化エンジン | GVU² 二重ループ | なし | なし | なし |
+| ローカル推論 | 6 バックエンド + 信頼度ルーティング | なし | なし | なし |
+| 行動契約 | CONTRACT.toml + レッドチーム | なし | WASM サンドボックス | なし |
+| ライセンス | Apache 2.0(オープンコア)| MIT | オープンソース | $59+/月 |
 
 <a id="docs"></a>
 
 ## ドキュメント
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — 完全なシステムアーキテクチャ設計
-- [CLAUDE.md](CLAUDE.md) — AI コラボレーション設計コンテキストと原則
-- [CHANGELOG.md](CHANGELOG.md) — バージョン変更履歴
-- [docs/features/README.md](docs/features/README.md) — 機能の詳細解説（19 篇、zh-TW / ja-JP 翻訳を含む）
-- [docs/features/feature-inventory.md](docs/features/feature-inventory.md) — 完全な機能一覧
-- [docs/spec/soul-md-spec.md](docs/spec/soul-md-spec.md) — SOUL.md フォーマット仕様 v1.0
-- [docs/spec/contract-toml-spec.md](docs/spec/contract-toml-spec.md) — CONTRACT.toml フォーマット仕様 v1.0
-- [docs/api/README.md](docs/api/README.md) — WebSocket RPC プロトコル + JSON-RPC 2.0 インターフェース
-- [docs/architecture/evolution-engine.md](docs/architecture/evolution-engine.md) — Evolution Engine v2 設計ドキュメント
-- [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md) — 本番環境デプロイガイド
-- [docs/guides/development-guide.md](docs/guides/development-guide.md) — 開発者設定と Agent 開発
-- [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md) — カスタム MCP ツールのチュートリアル
-
----
+- [ARCHITECTURE.md](ARCHITECTURE.md):システムアーキテクチャ全体
+- [docs/README.md](docs/README.md):公開ドキュメント索引(アーキテクチャ / RFC / ADR / 仕様 / ガイド)
+- [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md):本番デプロイ(Tailscale / Docker / systemd / 自動アップデート / 監視)
+- [docs/guides/development-guide.md](docs/guides/development-guide.md):開発環境とエージェント開発
+- [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md):カスタム MCP ツールの作り方
+- [docs/spec](docs/spec/soul-md-spec.md):SOUL.md / CONTRACT.toml フォーマット仕様
+- [CHANGELOG.md](CHANGELOG.md):バージョン履歴
 
 <a id="license"></a>
 
 ## ライセンス
 
-**Open Core モデル** — コアコードは [Apache License 2.0](LICENSE) を採用し、完全に自由に使用、修正、配布できます。
-
-商業付加価値モジュール（`commercial/` ディレクトリ）はクローズドソースの有料で、以下を含みます：業種テンプレート、進化パラメータセット、エンタープライズダッシュボード、ライセンス検証。
-
-詳細は [LICENSING.md](LICENSING.md) を参照。
-
----
+オープンコアモデル:コアは [Apache License 2.0](LICENSE) で、自由に使用・改変・再配布できます。商用アドオンモジュール(`commercial/`)はクローズドソースの有償で、業種テンプレート、エンタープライズダッシュボード、ライセンス検証を含みます。詳細は [LICENSING.md](LICENSING.md)。
 
 <p align="center">
   🐾 Built with louis.li
