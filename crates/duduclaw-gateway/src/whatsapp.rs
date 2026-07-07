@@ -51,6 +51,10 @@ struct ChangeValue {
 
 #[derive(Debug, Deserialize)]
 struct WaMessage {
+    /// WhatsApp message id (wamid) — used for the typing indicator /
+    /// read-receipt API.
+    #[serde(default)]
+    id: String,
     from: String,
     #[serde(rename = "type")]
     msg_type: String,
@@ -323,9 +327,51 @@ async fn receive_webhook(
                         }
                     }
 
+                    // Typing indicator + read receipt (shows ≤25s or until
+                    // the reply arrives; one-shot — tied to the inbound wamid).
+                    if !msg.id.is_empty() {
+                        crate::channel_typing::whatsapp_typing_once(
+                            &state.http, &state.access_token, &phone_id, &msg.id,
+                        )
+                        .await;
+                    }
+
+                    // Progress callback — WhatsApp has no message-edit API and
+                    // progress texts consume conversation quota, so only the
+                    // meaningful TodoUpdate board is forwarded (throttled 60s).
+                    let progress_http = state.http.clone();
+                    let progress_token = state.access_token.clone();
+                    let progress_phone = phone_id.clone();
+                    let progress_to = sender.clone();
+                    let last_progress = Arc::new(std::sync::Mutex::new(
+                        std::time::Instant::now()
+                            .checked_sub(std::time::Duration::from_secs(120))
+                            .unwrap_or_else(std::time::Instant::now),
+                    ));
+                    let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
+                        if !matches!(event, crate::channel_reply::ProgressEvent::TodoUpdate { .. }) {
+                            return;
+                        }
+                        {
+                            let mut last = last_progress.lock().unwrap_or_else(|e| e.into_inner());
+                            if last.elapsed().as_secs() < 60 {
+                                return;
+                            }
+                            *last = std::time::Instant::now();
+                        }
+                        let msg_text = event.to_display();
+                        let c = progress_http.clone();
+                        let t = progress_token.clone();
+                        let p = progress_phone.clone();
+                        let to = progress_to.clone();
+                        tokio::spawn(async move {
+                            send_text(&c, &t, &p, &to, &msg_text).await;
+                        });
+                    });
+
                     let session_id = format!("whatsapp:{sender}");
                     let reply = build_reply_with_session(
-                        &input_text, &state.ctx, &session_id, sender, None,
+                        &input_text, &state.ctx, &session_id, sender, Some(on_progress),
                     ).await;
 
                     // Guard: don't send empty replies
@@ -334,7 +380,12 @@ async fn receive_webhook(
                         continue;
                     }
 
-                    send_text(&state.http, &state.access_token, &phone_id, sender, &reply).await;
+                    // Markdown → WhatsApp formatting (*bold*, ~strike~,
+                    // tables → monospace blocks), chunked under the 4096 cap.
+                    let formatted = crate::markdown_render::to_whatsapp_text(&reply);
+                    for chunk in crate::channel_format::split_text(&formatted, 4000) {
+                        send_text(&state.http, &state.access_token, &phone_id, sender, &chunk).await;
+                    }
                 }
             }
         }

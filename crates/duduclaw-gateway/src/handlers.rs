@@ -5116,6 +5116,10 @@ impl MethodHandler {
             "slack" => ("slack_bot_token", Some("slack_app_token")),
             "whatsapp" => ("whatsapp_access_token", Some("whatsapp_phone_number_id")),
             "feishu" => ("feishu_app_id", Some("feishu_app_secret")),
+            // token = service-account JSON key; secret = Cloud project number
+            "googlechat" => ("googlechat_service_account_json", Some("googlechat_project_number")),
+            // token = client secret; secret = Microsoft App ID
+            "teams" => ("teams_app_password", Some("teams_app_id")),
             _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
         };
 
@@ -5125,8 +5129,13 @@ impl MethodHandler {
 
         // XC.3: `whatsapp_phone_number_id` is NOT a secret — it must be stored as
         // plaintext (consistent with the per-agent `agents.update` path, which
-        // does not encrypt it). All other secret_key fields ARE encrypted.
-        let secret_is_plain = secret_key == Some("whatsapp_phone_number_id");
+        // does not encrypt it). Google Chat's project number and Teams' App ID
+        // are likewise identifiers, not secrets. All other secret_key fields
+        // ARE encrypted.
+        let secret_is_plain = matches!(
+            secret_key,
+            Some("whatsapp_phone_number_id") | Some("googlechat_project_number") | Some("teams_app_id")
+        );
 
         let config_path = self.home_dir.join("config.toml");
         let mut table = self.read_config_table(&config_path).await;
@@ -5163,6 +5172,7 @@ impl MethodHandler {
         let extra_secret_fields: &[&str] = match channel_type {
             "whatsapp" => &["whatsapp_verify_token", "whatsapp_app_secret"],
             "feishu" => &["feishu_verification_token"],
+            "teams" => &["teams_tenant_id"],
             _ => &[],
         };
         for field in extra_secret_fields {
@@ -5252,6 +5262,11 @@ impl MethodHandler {
             "line" => "line_channel_token",
             "telegram" => "telegram_bot_token",
             "discord" => "discord_bot_token",
+            "slack" => "slack_bot_token",
+            "whatsapp" => "whatsapp_access_token",
+            "feishu" => "feishu_app_id",
+            "googlechat" => "googlechat_service_account_json",
+            "teams" => "teams_app_password",
             _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
         };
 
@@ -5317,7 +5332,23 @@ impl MethodHandler {
             "line" => "line_channel_token",
             "telegram" => "telegram_bot_token",
             "discord" => "discord_bot_token",
+            "slack" => "slack_bot_token",
+            "whatsapp" => "whatsapp_access_token",
+            "feishu" => "feishu_app_id",
+            "googlechat" => "googlechat_service_account_json",
+            "teams" => "teams_app_password",
             _ => return WsFrame::error_response("", &format!("Unknown channel type: {channel_type}")),
+        };
+
+        // Companion fields cleared alongside the primary token.
+        let companion_fields: &[&str] = match channel_type {
+            "line" => &["line_channel_secret"],
+            "slack" => &["slack_app_token"],
+            "whatsapp" => &["whatsapp_phone_number_id", "whatsapp_verify_token", "whatsapp_app_secret"],
+            "feishu" => &["feishu_app_secret", "feishu_verification_token"],
+            "googlechat" => &["googlechat_project_number"],
+            "teams" => &["teams_app_id", "teams_tenant_id"],
+            _ => &[],
         };
 
         let config_path = self.home_dir.join("config.toml");
@@ -5328,10 +5359,9 @@ impl MethodHandler {
             // Also clear the encrypted version
             let enc_key = format!("{token_key}_enc");
             channels.insert(enc_key, toml::Value::String(String::new()));
-            // Also clear secret for LINE
-            if channel_type == "line" {
-                channels.insert("line_channel_secret".to_string(), toml::Value::String(String::new()));
-                channels.insert("line_channel_secret_enc".to_string(), toml::Value::String(String::new()));
+            for field in companion_fields {
+                channels.insert((*field).to_string(), toml::Value::String(String::new()));
+                channels.insert(format!("{field}_enc"), toml::Value::String(String::new()));
             }
         }
 
@@ -5395,6 +5425,16 @@ impl MethodHandler {
                 crate::line::refresh_line_status(&home, ctx.clone()).await;
                 info!("LINE channel updated; status refreshed (webhook always mounted)");
                 return true;
+            }
+            "whatsapp" | "feishu" | "googlechat" | "teams" => {
+                // These webhook routers are mounted at boot with their config
+                // baked into router state — a gateway restart is required for
+                // a first-time setup to take effect.
+                info!(
+                    channel_type,
+                    "Webhook channel config saved — restart the gateway to (re)mount the endpoint"
+                );
+                return false;
             }
             _ => None,
         };

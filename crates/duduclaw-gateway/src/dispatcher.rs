@@ -2263,8 +2263,20 @@ fn validate_channel_id(channel_type: &str, id: &str) -> Result<(), String> {
     if id.is_empty() {
         return Err("channel_id is empty".into());
     }
-    // All channel IDs should be alphanumeric (with optional hyphens/underscores/dots for Slack timestamps)
-    let valid = id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.');
+    // All channel IDs should be alphanumeric (with optional hyphens/underscores/dots
+    // for Slack timestamps). Google Chat space names contain '/'
+    // ("spaces/AAAA…"); Teams conversation ids contain ':' '@' ';' '='
+    // ("19:xxx@thread.tacv2;messageid=123").
+    let valid = match channel_type {
+        "googlechat" => {
+            id.starts_with("spaces/")
+                && id.chars().all(|c| c.is_alphanumeric() || c == '/' || c == '-' || c == '_')
+        }
+        "teams" => id.chars().all(|c| {
+            c.is_alphanumeric() || matches!(c, ':' | '@' | ';' | '=' | '-' | '_' | '.')
+        }),
+        _ => id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.'),
+    };
     if !valid {
         return Err(format!("channel_id contains invalid characters for {channel_type}: {id}"));
     }
@@ -2324,6 +2336,8 @@ async fn forward_to_channel(
         "discord" => 1900,
         "line" => 4900,
         "slack" => 3900,
+        "googlechat" => 3800,
+        "teams" => 6900,
         _ => 3900,
     };
     // Sanitize response text — strip internal paths and system markers before channel delivery
@@ -2483,10 +2497,100 @@ async fn forward_to_channel(
                 if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
             }
         }
-        "whatsapp" | "feishu" => {
-            // These channels use webhook-based APIs that require more complex setup.
-            // Log as unsupported for now — the callback is consumed to prevent orphans.
-            warn!(channel = %channel_type, "Delegation callback forwarding not yet implemented for this channel");
+        "whatsapp" => {
+            let config_table = config.as_table().ok_or("config.toml is not a table")?;
+            let token = crate::config_crypto::decrypt_config_field(
+                config_table, "channels", "whatsapp_access_token", home_dir,
+            )
+            .unwrap_or_default();
+            let phone_id = config_table
+                .get("channels")
+                .and_then(|c| c.get("whatsapp_phone_number_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if token.is_empty() || phone_id.is_empty() {
+                return Err("whatsapp_access_token / whatsapp_phone_number_id not configured".into());
+            }
+            let url = format!("https://graph.facebook.com/v20.0/{phone_id}/messages");
+            for (i, body) in chunks.iter().enumerate() {
+                let text = crate::markdown_render::to_whatsapp_text(body);
+                let resp = http.post(&url)
+                    .bearer_auth(&token)
+                    .json(&serde_json::json!({
+                        "messaging_product": "whatsapp",
+                        "to": channel_id,
+                        "type": "text",
+                        "text": { "body": text }
+                    }))
+                    .send().await
+                    .map_err(|e| format!("whatsapp send chunk {}/{}: {e}", i + 1, total))?;
+                if !resp.status().is_success() {
+                    return Err(format!("WhatsApp API returned {} on chunk {}/{}", resp.status(), i + 1, total));
+                }
+                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
+            }
+        }
+        "feishu" => {
+            let config_table = config.as_table().ok_or("config.toml is not a table")?;
+            let app_id = crate::config_crypto::decrypt_config_field(
+                config_table, "channels", "feishu_app_id", home_dir,
+            )
+            .unwrap_or_default();
+            let app_secret = crate::config_crypto::decrypt_config_field(
+                config_table, "channels", "feishu_app_secret", home_dir,
+            )
+            .unwrap_or_default();
+            if app_id.is_empty() || app_secret.is_empty() {
+                return Err("feishu_app_id / feishu_app_secret not configured".into());
+            }
+            // Tenant access token (short-lived; fetched per forward — the
+            // forward path is low-frequency).
+            let token_resp = http
+                .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
+                .json(&serde_json::json!({ "app_id": app_id, "app_secret": app_secret }))
+                .send().await
+                .map_err(|e| format!("feishu token: {e}"))?;
+            let token_body: serde_json::Value = token_resp.json().await
+                .map_err(|e| format!("feishu token parse: {e}"))?;
+            let token = token_body
+                .get("tenant_access_token")
+                .and_then(|v| v.as_str())
+                .ok_or("feishu: no tenant_access_token in response")?
+                .to_string();
+            for (i, body) in chunks.iter().enumerate() {
+                let content = serde_json::json!({ "text": body }).to_string();
+                let resp = http
+                    .post("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .json(&serde_json::json!({
+                        "receive_id": channel_id,
+                        "msg_type": "text",
+                        "content": content,
+                    }))
+                    .send().await
+                    .map_err(|e| format!("feishu send chunk {}/{}: {e}", i + 1, total))?;
+                if !resp.status().is_success() {
+                    return Err(format!("Feishu API returned {} on chunk {}/{}", resp.status(), i + 1, total));
+                }
+                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
+            }
+        }
+        "googlechat" => {
+            for (i, body) in chunks.iter().enumerate() {
+                crate::googlechat::send_text_to_space(home_dir, channel_id, body)
+                    .await
+                    .map_err(|e| format!("googlechat send chunk {}/{}: {e}", i + 1, total))?;
+                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
+            }
+        }
+        "teams" => {
+            for (i, body) in chunks.iter().enumerate() {
+                crate::msteams::send_text_to_conversation(home_dir, channel_id, body)
+                    .await
+                    .map_err(|e| format!("teams send chunk {}/{}: {e}", i + 1, total))?;
+                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
+            }
         }
         other => {
             return Err(format!("unsupported channel type for forwarding: {other}"));
@@ -2593,6 +2697,26 @@ fn get_config_token(config: &toml::Value, enc_key: &str, plain_key: &str, home_d
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_channel_id_googlechat_and_teams() {
+        // Google Chat: real space names pass; traversal / injection rejected.
+        assert!(validate_channel_id("googlechat", "spaces/AAAAxG7iso0").is_ok());
+        assert!(validate_channel_id("googlechat", "spaces/../etc").is_err());
+        assert!(validate_channel_id("googlechat", "notspaces/AAAA").is_err());
+        assert!(validate_channel_id("googlechat", "spaces/a?x=1").is_err());
+
+        // Teams: conversation ids with ':' '@' ';' '=' pass; others rejected.
+        assert!(validate_channel_id("teams", "19:abc123@thread.tacv2;messageid=1750000").is_ok());
+        assert!(validate_channel_id("teams", "a:1qhNLqpUtmuI6U35gzjmR").is_ok());
+        assert!(validate_channel_id("teams", "a:1/../../etc").is_err());
+        assert!(validate_channel_id("teams", "a:1?x=1").is_err());
+
+        // Existing channels keep the strict charset.
+        assert!(validate_channel_id("telegram", "-1001234567890").is_ok());
+        assert!(validate_channel_id("slack", "C0123.4567").is_ok());
+        assert!(validate_channel_id("slack", "C01/23").is_err());
+    }
 
     #[test]
     fn bus_message_deserializes_without_delegation_fields() {

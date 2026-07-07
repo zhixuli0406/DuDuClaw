@@ -400,11 +400,79 @@ async fn handle_event(
     } else {
         format!("slack:group:{channel}")
     };
+
+    // AI-app "is thinking…" status (auto-clears when the app replies;
+    // fails soft on workspaces without the assistant feature).
+    let status_guard = crate::channel_typing::slack_status(
+        http.clone(),
+        bot_token.to_string(),
+        channel.to_string(),
+        thread_ts.clone().unwrap_or_else(|| ts.to_string()),
+    );
+
+    // Progress callback — post interim status into the thread, edit-in-place
+    // via chat.update. TodoUpdate bypasses the 30s throttle.
+    let progress_http = http.clone();
+    let progress_token = bot_token.to_string();
+    let progress_channel = channel.to_string();
+    let progress_thread = thread_ts.clone().unwrap_or_else(|| ts.to_string());
+    let progress_msg_ts: Arc<tokio::sync::Mutex<Option<String>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let progress_msg_cleanup = progress_msg_ts.clone();
+    let last_progress = Arc::new(std::sync::Mutex::new(
+        std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(60))
+            .unwrap_or_else(std::time::Instant::now),
+    ));
+    let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
+        let is_todo = matches!(event, crate::channel_reply::ProgressEvent::TodoUpdate { .. });
+        {
+            let mut last = last_progress.lock().unwrap_or_else(|e| e.into_inner());
+            if !is_todo && last.elapsed().as_secs() < 30 {
+                return;
+            }
+            *last = std::time::Instant::now();
+        }
+        let msg_text = event.to_display();
+        let c = progress_http.clone();
+        let t = progress_token.clone();
+        let ch = progress_channel.clone();
+        let th = progress_thread.clone();
+        let msg_ts = progress_msg_ts.clone();
+        tokio::spawn(async move {
+            let mut guard = msg_ts.lock().await;
+            match guard.as_deref() {
+                Some(existing_ts) => {
+                    let _ = c
+                        .post(format!("{SLACK_API}/chat.update"))
+                        .header("Authorization", format!("Bearer {t}"))
+                        .json(&json!({ "channel": ch, "ts": existing_ts, "text": msg_text }))
+                        .send()
+                        .await;
+                }
+                None => {
+                    *guard = post_message_returning_ts(&c, &t, &ch, &msg_text, Some(&th)).await;
+                }
+            }
+        });
+    });
+
     let reply = if let Some(agent) = agent_name {
-        build_reply_for_agent(text, ctx, agent, &session_id, user, None).await
+        build_reply_for_agent(text, ctx, agent, &session_id, user, Some(on_progress)).await
     } else {
-        build_reply_with_session(text, ctx, &session_id, user, None).await
+        build_reply_with_session(text, ctx, &session_id, user, Some(on_progress)).await
     };
+    drop(status_guard);
+
+    // Remove the interim progress message — the final reply supersedes it.
+    if let Some(pts) = progress_msg_cleanup.lock().await.take() {
+        let _ = http
+            .post(format!("{SLACK_API}/chat.delete"))
+            .header("Authorization", format!("Bearer {bot_token}"))
+            .json(&json!({ "channel": channel, "ts": pts }))
+            .send()
+            .await;
+    }
 
     // Guard: don't send empty replies
     if reply.trim().is_empty() {
@@ -413,23 +481,110 @@ async fn handle_event(
     }
 
     // Mention the sender in group channels so they get notified
-    let reply = if !is_dm {
-        format!("<@{user}> {}", to_slack_mrkdwn(&reply))
-    } else {
-        to_slack_mrkdwn(&reply)
-    };
+    let mention = if !is_dm { Some(user) } else { None };
 
-    // Split long messages (Slack limit: 4000 chars)
+    // Split long messages (Slack limit: 4000 chars per section; the native
+    // markdown block takes 12000)
     let reply_thread = thread_ts.as_deref().or(Some(ts));
-    if reply.len() > 3900 {
-        for chunk in split_message(&reply, 3900) {
-            send_message(http, bot_token, channel, chunk, reply_thread).await;
-        }
-    } else {
-        send_message(http, bot_token, channel, &reply, reply_thread).await;
-    }
+    send_markdown_message(http, bot_token, channel, &reply, reply_thread, mention).await;
 
     remove_reaction_add_done(http, bot_token, channel, ts).await;
+}
+
+/// chat.postMessage returning the created message `ts` (for later edits).
+async fn post_message_returning_ts(
+    http: &reqwest::Client,
+    token: &str,
+    channel: &str,
+    text: &str,
+    thread_ts: Option<&str>,
+) -> Option<String> {
+    let mut body = json!({ "channel": channel, "text": text });
+    if let Some(th) = thread_ts {
+        body["thread_ts"] = json!(th);
+    }
+    let resp = http
+        .post(format!("{SLACK_API}/chat.postMessage"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&body)
+        .send()
+        .await
+        .ok()?;
+    let data: serde_json::Value = resp.json().await.ok()?;
+    if data.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    data.get("ts").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// Send an AI reply using Slack's native `markdown` block (standard
+/// markdown incl. tables, headers, fenced code — released 2025-02). Falls
+/// back to classic mrkdwn text when the workspace rejects the block.
+async fn send_markdown_message(
+    http: &reqwest::Client,
+    token: &str,
+    channel: &str,
+    markdown: &str,
+    thread_ts: Option<&str>,
+    mention_user: Option<&str>,
+) {
+    // Cumulative cap across markdown blocks is 12000 chars — chunk into
+    // separate messages under that.
+    const MARKDOWN_BLOCK_CAP: usize = 11500;
+    let chunks = channel_format::split_text(markdown, MARKDOWN_BLOCK_CAP);
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let mut blocks = vec![];
+        if i == 0 {
+            if let Some(uid) = mention_user {
+                blocks.push(json!({
+                    "type": "section",
+                    "text": { "type": "mrkdwn", "text": format!("<@{uid}>") }
+                }));
+            }
+        }
+        blocks.push(json!({ "type": "markdown", "text": chunk }));
+
+        // Fallback text keeps notifications readable if blocks fail to render.
+        let fallback = channel_format::truncate_chars(&to_slack_mrkdwn(chunk), 3000);
+        let mut body = json!({ "channel": channel, "blocks": blocks, "text": fallback });
+        if let Some(th) = thread_ts {
+            body["thread_ts"] = json!(th);
+        }
+
+        let ok = match http
+            .post(format!("{SLACK_API}/chat.postMessage"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) => resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|d| d.get("ok").and_then(|v| v.as_bool()))
+                .unwrap_or(false),
+            Err(e) => {
+                error!("Slack send error: {e}");
+                false
+            }
+        };
+
+        if !ok {
+            // Workspace/API rejected the markdown block — degrade to the
+            // classic mrkdwn text path so nothing is dropped.
+            warn!("Slack: markdown block rejected — falling back to mrkdwn text");
+            let plain = if i == 0 && mention_user.is_some() {
+                format!("<@{}> {}", mention_user.unwrap(), to_slack_mrkdwn(chunk))
+            } else {
+                to_slack_mrkdwn(chunk)
+            };
+            for piece in split_message(&plain, 3900) {
+                send_message(http, token, channel, piece, thread_ts).await;
+            }
+        }
+    }
 }
 
 async fn send_message(

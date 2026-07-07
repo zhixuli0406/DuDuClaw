@@ -49,6 +49,11 @@ pub enum ChatMessage {
     /// Server → Client: assistant response chunk (streaming).
     #[serde(rename = "assistant_chunk")]
     AssistantChunk { content: String },
+    /// Server → Client: interim progress while a long task runs (tool
+    /// activity / TODO task board). Purely informational; superseded by
+    /// `assistant_done`.
+    #[serde(rename = "progress")]
+    Progress { content: String },
     /// Server → Client: assistant finished responding.
     #[serde(rename = "assistant_done")]
     AssistantDone {
@@ -356,10 +361,30 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     }
                                 }
 
-                                // Build AI reply
-                                let reply = crate::channel_reply::build_reply_with_session(
-                                    &full_content, &state.ctx, sid, &user_id, None,
-                                ).await;
+                                // Build AI reply, interleaving progress events
+                                // (tool activity / TODO board) onto the socket
+                                // while the task runs.
+                                let (ptx, mut prx) =
+                                    tokio::sync::mpsc::unbounded_channel::<String>();
+                                let on_progress: crate::channel_reply::ProgressCallback =
+                                    Box::new(move |event| {
+                                        let _ = ptx.send(event.to_display());
+                                    });
+                                let work = crate::channel_reply::build_reply_with_session(
+                                    &full_content, &state.ctx, sid, &user_id, Some(on_progress),
+                                );
+                                tokio::pin!(work);
+                                let reply = loop {
+                                    tokio::select! {
+                                        r = &mut work => break r,
+                                        Some(p) = prx.recv() => {
+                                            let msg = ChatMessage::Progress { content: p };
+                                            if let Ok(json) = serde_json::to_string(&msg) {
+                                                let _ = sink.send(Message::Text(json.into())).await;
+                                            }
+                                        }
+                                    }
+                                };
 
                                 // Guard: don't send empty replies
                                 if reply.trim().is_empty() {

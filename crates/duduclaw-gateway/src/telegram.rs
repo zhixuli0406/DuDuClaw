@@ -563,31 +563,55 @@ async fn poll_loop(
                     format!("telegram:{chat_id}")
                 };
 
-                // Progress callback
+                // Progress callback — edit-in-place: the first event posts a
+                // status message, later events edit it (no channel spam).
+                // TodoUpdate events bypass the 30s throttle so the task board
+                // always reflects the latest state.
                 let progress_client = client.clone();
                 let progress_api = api_base.clone();
                 let progress_chat_id = chat_id;
                 let progress_thread_id = thread_id;
+                let progress_msg_id: Arc<tokio::sync::Mutex<Option<i64>>> =
+                    Arc::new(tokio::sync::Mutex::new(None));
+                let progress_msg_cleanup = progress_msg_id.clone();
                 let last_progress = Arc::new(std::sync::Mutex::new(
                     std::time::Instant::now()
                         .checked_sub(std::time::Duration::from_secs(60))
                         .unwrap_or_else(std::time::Instant::now),
                 ));
                 let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
-                    let mut last = last_progress.lock().unwrap_or_else(|e| e.into_inner());
-                    if last.elapsed().as_secs() < 30 {
-                        return;
+                    let is_todo = matches!(event, crate::channel_reply::ProgressEvent::TodoUpdate { .. });
+                    {
+                        let mut last = last_progress.lock().unwrap_or_else(|e| e.into_inner());
+                        if !is_todo && last.elapsed().as_secs() < 30 {
+                            return;
+                        }
+                        *last = std::time::Instant::now();
                     }
-                    *last = std::time::Instant::now();
-                    drop(last);
 
                     let msg_text = event.to_display();
                     let c = progress_client.clone();
                     let api = progress_api.clone();
+                    let msg_id = progress_msg_id.clone();
                     tokio::spawn(async move {
-                        send_reply(&c, &api, progress_chat_id, &msg_text, progress_thread_id, None, None).await;
+                        let mut id_guard = msg_id.lock().await;
+                        match *id_guard {
+                            Some(mid) => edit_progress_message(&c, &api, progress_chat_id, mid, &msg_text).await,
+                            None => {
+                                *id_guard = send_progress_message(&c, &api, progress_chat_id, &msg_text, progress_thread_id).await;
+                            }
+                        }
                     });
                 });
+
+                // Typing indicator while the reply is generated (RAII —
+                // stops on drop, including panic/early-continue paths).
+                let typing_guard = crate::channel_typing::telegram_typing(
+                    client.clone(),
+                    api_base.clone(),
+                    chat_id,
+                    thread_id,
+                );
 
                 let user_id = msg.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default();
                 let reply = if let Some(ref agent) = agent_name {
@@ -595,6 +619,14 @@ async fn poll_loop(
                 } else {
                     build_reply_with_session(&input_text, &ctx, &session_id, &user_id, Some(on_progress)).await
                 };
+                drop(typing_guard);
+
+                // Remove the interim progress/task-board message — the final
+                // reply supersedes it.
+                if let Some(mid) = progress_msg_cleanup.lock().await.take() {
+                    let del_body = json!({ "chat_id": chat_id, "message_id": mid });
+                    let _ = client.post(format!("{api_base}/deleteMessage")).json(&del_body).send().await;
+                }
 
                 // Guard: don't send empty replies (Telegram rejects empty text)
                 if reply.trim().is_empty() {
@@ -617,12 +649,12 @@ async fn poll_loop(
                         }
                         Err(e) => {
                             warn!("TTS synthesis failed, falling back to text: {e}");
-                            send_reply(&client, &api_base, chat_id, &reply, thread_id, msg_id, Some(channel_format::telegram_conversation_buttons())).await;
+                            send_reply_markdown(&client, &api_base, chat_id, &reply, thread_id, msg_id, Some(channel_format::telegram_conversation_buttons())).await;
                         }
                     }
                 } else {
                     // Send with inline keyboard buttons
-                    send_reply(&client, &api_base, chat_id, &reply, thread_id, msg_id, Some(channel_format::telegram_conversation_buttons())).await;
+                    send_reply_markdown(&client, &api_base, chat_id, &reply, thread_id, msg_id, Some(channel_format::telegram_conversation_buttons())).await;
                 }
             }
         }
@@ -657,12 +689,19 @@ async fn handle_command(
             } else {
                 format!("telegram:{chat_id}")
             };
+            let typing_guard = crate::channel_typing::telegram_typing(
+                client.clone(),
+                api_base.to_string(),
+                chat_id,
+                thread_id,
+            );
             let reply = if let Some(agent) = agent_name {
                 build_reply_for_agent(args, ctx, agent, &session_id, scope_id, None).await
             } else {
                 build_reply_with_session(args, ctx, &session_id, scope_id, None).await
             };
-            send_reply(client, api_base, chat_id, &reply, thread_id, None, Some(channel_format::telegram_conversation_buttons())).await;
+            drop(typing_guard);
+            send_reply_markdown(client, api_base, chat_id, &reply, thread_id, None, Some(channel_format::telegram_conversation_buttons())).await;
         }
         "/status" => {
             let agent_info = {
@@ -928,6 +967,129 @@ async fn send_voice(client: &reqwest::Client, api_base: &str, chat_id: i64, audi
             }
         }
         Err(e) => error!("Telegram sendAudio error: {e}"),
+    }
+}
+
+/// Send an interim progress message; returns its message_id for later edits.
+async fn send_progress_message(
+    client: &reqwest::Client,
+    api_base: &str,
+    chat_id: i64,
+    text: &str,
+    message_thread_id: Option<i64>,
+) -> Option<i64> {
+    let mut body = json!({ "chat_id": chat_id, "text": text });
+    if let Some(tid) = message_thread_id {
+        body["message_thread_id"] = json!(tid);
+    }
+    let resp = client.post(format!("{api_base}/sendMessage")).json(&body).send().await.ok()?;
+    let data: TgResponse<serde_json::Value> = resp.json().await.ok()?;
+    if !data.ok {
+        return None;
+    }
+    data.result?.get("message_id").and_then(|v| v.as_i64())
+}
+
+/// Edit an interim progress message in place (best-effort).
+async fn edit_progress_message(
+    client: &reqwest::Client,
+    api_base: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) {
+    let body = json!({ "chat_id": chat_id, "message_id": message_id, "text": text });
+    let _ = client.post(format!("{api_base}/editMessageText")).json(&body).send().await;
+}
+
+/// Source-markdown chunk budget for HTML-rendered replies. HTML escaping
+/// and tags inflate the text, so chunk well under Telegram's 4096-char
+/// post-parse limit.
+const TG_MARKDOWN_CHUNK: usize = 3400;
+
+/// Send an AI reply: markdown → Telegram HTML (tables → <pre>, code fences
+/// → <pre><code>, headings → bold). Each chunk falls back to plain text if
+/// Telegram rejects the HTML entities.
+async fn send_reply_markdown(
+    client: &reqwest::Client,
+    api_base: &str,
+    chat_id: i64,
+    markdown: &str,
+    message_thread_id: Option<i64>,
+    reply_to_message_id: Option<i64>,
+    reply_markup: Option<serde_json::Value>,
+) {
+    let chunks = channel_format::split_text(markdown, TG_MARKDOWN_CHUNK);
+    let last = chunks.len().saturating_sub(1);
+    for (i, chunk) in chunks.iter().enumerate() {
+        let html = crate::markdown_render::to_telegram_html(chunk);
+        let reply_params = if i == 0 {
+            reply_to_message_id.map(|mid| json!({ "message_id": mid }))
+        } else {
+            None
+        };
+        let markup = if i == last { reply_markup.clone() } else { None };
+
+        // Oversized after rendering (pathological escaping) → plain chunk.
+        if html.chars().count() > channel_format::limits::TELEGRAM_MESSAGE {
+            send_message_once(client, api_base, chat_id, chunk, None, message_thread_id, reply_params, markup).await;
+            continue;
+        }
+
+        let ok = send_message_once(
+            client, api_base, chat_id, &html, Some("HTML"), message_thread_id,
+            reply_params.clone(), markup.clone(),
+        )
+        .await;
+        if !ok {
+            // HTML parse rejected — resend the raw chunk as plain text so
+            // the reply is never silently dropped.
+            warn!("Telegram: HTML parse failed — falling back to plain text");
+            send_message_once(client, api_base, chat_id, chunk, None, message_thread_id, None, markup).await;
+        }
+    }
+}
+
+/// POST a single sendMessage. Returns `true` on success (`ok: true`).
+#[allow(clippy::too_many_arguments)]
+async fn send_message_once(
+    client: &reqwest::Client,
+    api_base: &str,
+    chat_id: i64,
+    text: &str,
+    parse_mode: Option<&str>,
+    message_thread_id: Option<i64>,
+    reply_parameters: Option<serde_json::Value>,
+    reply_markup: Option<serde_json::Value>,
+) -> bool {
+    let body = SendMessage {
+        chat_id,
+        text: text.to_string(),
+        parse_mode: parse_mode.map(|s| s.to_string()),
+        message_thread_id,
+        reply_parameters,
+        reply_markup,
+    };
+    match client.post(format!("{api_base}/sendMessage")).json(&body).send().await {
+        Ok(resp) => match resp.json::<TgResponse<serde_json::Value>>().await {
+            Ok(data) => {
+                if !data.ok {
+                    error!(
+                        "Telegram send failed: {}",
+                        data.description.unwrap_or_default()
+                    );
+                }
+                data.ok
+            }
+            Err(e) => {
+                error!("Telegram send parse error: {e}");
+                false
+            }
+        },
+        Err(e) => {
+            error!("Telegram send error: {e}");
+            false
+        }
     }
 }
 

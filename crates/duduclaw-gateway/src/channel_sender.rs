@@ -795,7 +795,113 @@ impl ChannelSender for FeishuSender {
 }
 
 // ===========================================================================
-// 7. WebChat (WebSocket)
+// 7. Google Chat
+// ===========================================================================
+
+/// Google Chat sender — REST `spaces.messages.create` with service-account
+/// auth (credentials read from global config; the space must already
+/// contain the Chat app).
+pub struct GoogleChatSender {
+    pub(crate) home_dir: std::path::PathBuf,
+    /// Space resource name (`spaces/AAAA…`).
+    pub(crate) space: String,
+    /// Requesting user's Chat id (`users/…`) for confirmation scoping.
+    pub(crate) user_id: String,
+}
+
+/// Create a Google Chat sender (dedicated constructor — needs `home_dir`
+/// for service-account credentials, which `ChannelTarget` doesn't carry).
+pub fn create_googlechat_sender(
+    home_dir: std::path::PathBuf,
+    space: String,
+    user_id: String,
+) -> Box<dyn ChannelSender> {
+    Box::new(GoogleChatSender { home_dir, space, user_id })
+}
+
+#[async_trait]
+impl ChannelSender for GoogleChatSender {
+    async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
+        crate::googlechat::send_text_to_space(&self.home_dir, &self.space, text)
+            .await
+            .map_err(ChannelSendError)
+    }
+
+    async fn send_photo(&self, png_data: &[u8], caption: &str) -> Result<(), ChannelSendError> {
+        // Chat attachment upload needs a multi-step media API; deliver the
+        // caption + a size note (fail-soft, consistent with LINE's fallback).
+        let msg = format!(
+            "{caption}\n(📸 截圖已擷取，共 {} KB — Google Chat 附件上傳尚未支援)",
+            png_data.len() / 1024
+        );
+        self.send_text(&msg).await
+    }
+
+    async fn request_confirmation(
+        &self, prompt: &str, screenshot: Option<&[u8]>, timeout_secs: u64,
+    ) -> Result<bool, ChannelSendError> {
+        if let Some(png) = screenshot { self.send_photo(png, prompt).await?; }
+        else { self.send_text(prompt).await?; }
+        let key = if self.user_id.is_empty() { &self.space } else { &self.user_id };
+        wait_for_confirmation(key, timeout_secs).await
+    }
+
+    fn channel_type(&self) -> &'static str { "googlechat" }
+}
+
+// ===========================================================================
+// 8. Microsoft Teams
+// ===========================================================================
+
+/// Teams sender — Bot Connector proactive send into a previously-seen
+/// conversation (uses the persisted conversation reference for serviceUrl).
+pub struct TeamsSender {
+    pub(crate) home_dir: std::path::PathBuf,
+    pub(crate) conversation_id: String,
+    /// Requesting user's Teams id (`29:…`) for confirmation scoping.
+    pub(crate) user_id: String,
+}
+
+/// Create a Teams sender (dedicated constructor — needs `home_dir` for
+/// app credentials + the conversation reference store).
+pub fn create_teams_sender(
+    home_dir: std::path::PathBuf,
+    conversation_id: String,
+    user_id: String,
+) -> Box<dyn ChannelSender> {
+    Box::new(TeamsSender { home_dir, conversation_id, user_id })
+}
+
+#[async_trait]
+impl ChannelSender for TeamsSender {
+    async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
+        crate::msteams::send_text_to_conversation(&self.home_dir, &self.conversation_id, text)
+            .await
+            .map_err(ChannelSendError)
+    }
+
+    async fn send_photo(&self, png_data: &[u8], caption: &str) -> Result<(), ChannelSendError> {
+        let msg = format!(
+            "{caption}\n(📸 截圖已擷取，共 {} KB — Teams 圖片附件上傳尚未支援)",
+            png_data.len() / 1024
+        );
+        self.send_text(&msg).await
+    }
+
+    async fn request_confirmation(
+        &self, prompt: &str, screenshot: Option<&[u8]>, timeout_secs: u64,
+    ) -> Result<bool, ChannelSendError> {
+        if let Some(png) = screenshot { self.send_photo(png, prompt).await?; }
+        else { self.send_text(prompt).await?; }
+        let key = if self.user_id.is_empty() { &self.conversation_id } else { &self.user_id };
+        wait_for_confirmation(key, timeout_secs).await
+    }
+
+    fn channel_type(&self) -> &'static str { "teams" }
+}
+
+// ===========================================================================
+// 9. WebChat (WebSocket)
 // ===========================================================================
 
 /// WebChat sender — sends JSON messages over the WebSocket broadcast channel.

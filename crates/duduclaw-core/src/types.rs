@@ -1375,6 +1375,8 @@ pub struct ChannelsConfig {
     pub slack: Option<SlackChannelConfig>,
     pub whatsapp: Option<WhatsAppChannelConfig>,
     pub feishu: Option<FeishuChannelConfig>,
+    pub googlechat: Option<GoogleChatChannelConfig>,
+    pub teams: Option<TeamsChannelConfig>,
 }
 
 /// Per-agent Discord channel settings.
@@ -1477,6 +1479,44 @@ pub struct FeishuChannelConfig {
     pub app_secret: String,
     pub app_secret_enc: Option<String>,
     pub verification_token: String,
+}
+
+
+/// Per-agent Google Chat channel settings.
+///
+/// The Chat app is configured in the Google Cloud console with an HTTP
+/// endpoint URL pointing at `POST /webhook/googlechat`. Inbound requests
+/// carry a JWT issued by `chat@system.gserviceaccount.com` whose audience
+/// is the Cloud **project number**. Outbound (async) sends authenticate
+/// with a service-account key (scope `chat.bot`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+#[derive(Default)]
+pub struct GoogleChatChannelConfig {
+    /// Google Cloud project number (JWT audience for inbound verification).
+    pub project_number: String,
+    /// Service-account JSON key (full JSON content, encrypted at rest).
+    pub service_account_json: String,
+    pub service_account_json_enc: Option<String>,
+}
+
+
+/// Per-agent Microsoft Teams channel settings.
+///
+/// Requires an Azure Bot resource whose messaging endpoint points at
+/// `POST /webhook/teams`. Single-tenant registrations (the current Azure
+/// default) must set `tenant_id`; multi-tenant bots may leave it empty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+#[derive(Default)]
+pub struct TeamsChannelConfig {
+    /// Microsoft App ID (Entra application / bot ID).
+    pub app_id: String,
+    /// Client secret for the app registration.
+    pub app_password: String,
+    pub app_password_enc: Option<String>,
+    /// Entra tenant ID (required for single-tenant bots; empty = multi-tenant).
+    pub tenant_id: String,
 }
 
 

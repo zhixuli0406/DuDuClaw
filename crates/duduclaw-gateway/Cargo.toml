@@ -42,6 +42,7 @@ rusqlite = { workspace = true }
 hmac = "0.12"
 sha2 = "0.10"
 base64 = { workspace = true }
+jsonwebtoken = "9"
 ring = { workspace = true }
 futures-util = { workspace = true }
 tempfile = "3"
