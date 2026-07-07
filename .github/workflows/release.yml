@@ -105,7 +105,9 @@ jobs:
           cd _pkg
           7z a ../${{ matrix.artifact }}.zip duduclaw.exe python
           cd ..
-          Get-FileHash ${{ matrix.artifact }}.zip -Algorithm SHA256 | Format-List Hash > ${{ matrix.artifact }}.zip.sha256
+          # Standard "hash  filename" layout so the in-app updater can parse it
+          $hash = (Get-FileHash ${{ matrix.artifact }}.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.artifact }}.zip" | Out-File -Encoding ascii ${{ matrix.artifact }}.zip.sha256
           Remove-Item -Recurse -Force _pkg
 
       - name: Sign archive with cosign (Windows)
@@ -134,6 +136,28 @@ jobs:
         with:
           merge-multiple: true
 
+      # The in-app updater (crates/duduclaw-gateway/src/updater.rs) REQUIRES a
+      # valid .minisig for every archive — an unsigned release cannot be
+      # installed via self-update, so fail the release instead of shipping one.
+      - name: Sign release assets with minisign (Ed25519)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::MINISIGN_SECRET_KEY secret is not set — release assets must be signed for self-update to work"
+            exit 1
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          for f in duduclaw-*.tar.gz duduclaw-*.zip; do
+            [ -f "$f" ] || continue
+            minisign -S -s /tmp/minisign.key -m "$f" -t "duduclaw $TAG $f" -x "$f.minisig"
+          done
+          rm -f /tmp/minisign.key
+          ls -l duduclaw-*.minisig
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -143,6 +167,7 @@ jobs:
             duduclaw-*.tar.gz
             duduclaw-*.zip
             duduclaw-*.sha256
+            duduclaw-*.minisig
             duduclaw-*.sig
             duduclaw-*.pem
 

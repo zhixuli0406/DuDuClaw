@@ -1,5 +1,38 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **True auto-update with in-process restart**: after a self-update installs
+  (dashboard "Install update" button or the 6-hourly checker with
+  `[gateway] auto_update = true`), the gateway now re-execs the new binary
+  after graceful shutdown (`platform::self_restart()` — `execv` on Unix keeps
+  the same PID so launchd/systemd supervision is undisturbed; Windows spawns a
+  detached replacement). Works for unsupervised foreground runs (npm wrapper,
+  `duduclaw run`) too — previously the process just exited and stayed down.
+- **minisign Ed25519 release signatures**: every release asset is signed in CI
+  (`MINISIGN_SECRET_KEY`) and the updater verifies the `.minisig` against a
+  public key pinned in the binary — hard fail-closed; a compromised GitHub
+  release without a valid signature can no longer install. SHA-256 sidecar
+  check retained as defense in depth.
+- Dashboard: `system.update_installed` is now broadcast on manual installs
+  too; all tabs show a "restarting" banner and auto-reload once the updated
+  gateway is back, so the new embedded dashboard assets load automatically.
+- `InstallMethod::Npm` detection (binary under `node_modules/`) — self-update
+  supported; npm registry metadata goes stale until the next `npm i -g`.
+
+### Fixed
+- Updater never matched real release assets: `platform_asset_suffix()` looked
+  for `arm64-apple-darwin.tar.gz`-style names while CI publishes
+  `duduclaw-darwin-arm64.tar.gz` — update checks always reported "no download
+  for this platform".
+- Windows `.sha256` sidecar was written in PowerShell `Format-List` layout the
+  updater could not parse; CI now writes standard `hash  filename` and the
+  parser tolerates both.
+- systemd unit template: `Restart=on-failure` → `Restart=always` (self-update
+  exits 0 after graceful shutdown, which `on-failure` would not relaunch).
+- Linux: re-exec path is pinned before the binary is replaced
+  (`/proc/self/exe` reads `… (deleted)` after the update swaps the file).
 
 ## [1.34.0] - 2026-07-06 — Runtime-agnostic security reference monitor
 

@@ -571,6 +571,61 @@ pub fn self_interrupt() {
     sys::self_interrupt();
 }
 
+// ── Self-restart (auto-update) ───────────────────────────────
+
+/// Set when a self-update has been installed and the process should
+/// re-exec into the new binary after graceful shutdown completes.
+static RESTART_AFTER_SHUTDOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Mark the process for re-exec after the graceful shutdown sequence.
+///
+/// Also captures `executable_path()` immediately: on Linux,
+/// `/proc/self/exe` grows a ` (deleted)` suffix once the on-disk binary
+/// has been replaced, so the path must be pinned before/at update time.
+pub fn request_restart_after_shutdown() {
+    let _ = executable_path();
+    RESTART_AFTER_SHUTDOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether `request_restart_after_shutdown` was called.
+pub fn restart_requested() -> bool {
+    RESTART_AFTER_SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Path of the binary this process was started from, captured once per
+/// process. Self-update replaces the file at this path in place, so the
+/// same path is valid for re-exec after an update.
+pub fn executable_path() -> std::path::PathBuf {
+    static EXE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    EXE.get_or_init(|| {
+        let p = std::env::current_exe().unwrap_or_default();
+        // Linux: /proc/self/exe reads "…/duduclaw (deleted)" if the
+        // running inode was already unlinked by an update — strip it so
+        // re-exec targets the freshly installed binary at the same path.
+        let s = p.to_string_lossy();
+        match s.strip_suffix(" (deleted)") {
+            Some(stripped) => std::path::PathBuf::from(stripped),
+            None => p,
+        }
+    })
+    .clone()
+}
+
+/// Replace the current process with a fresh instance of the binary at
+/// `executable_path()`, preserving argv and environment.
+///
+/// Unix: `execv` keeps the same PID, so launchd `KeepAlive` and systemd
+/// `Type=simple` continue tracking the service across the restart.
+/// Windows: no exec equivalent — spawns a child process and exits 0.
+///
+/// Returns only on failure.
+pub fn self_restart() -> std::io::Error {
+    let exe = executable_path();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    sys::self_restart(&exe, &args)
+}
+
 // ── Unix implementation ──────────────────────────────────────
 
 #[cfg(unix)]
@@ -642,6 +697,14 @@ mod sys {
 
     pub fn self_interrupt() {
         unsafe { libc::kill(libc::getpid(), libc::SIGINT); }
+    }
+
+    pub fn self_restart(exe: &Path, args: &[std::ffi::OsString]) -> std::io::Error {
+        use std::os::unix::process::CommandExt;
+        // exec() replaces the process image and never returns on success.
+        // Rust-opened fds are CLOEXEC by default, so the listener port is
+        // released before the new image binds it again.
+        std::process::Command::new(exe).args(args).exec()
     }
 }
 
@@ -749,6 +812,22 @@ mod sys {
         use windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent;
         // CTRL_C_EVENT = 0
         unsafe { GenerateConsoleCtrlEvent(0, 0); }
+    }
+
+    pub fn self_restart(exe: &Path, args: &[std::ffi::OsString]) -> std::io::Error {
+        use std::os::windows::process::CommandExt;
+        // Windows has no exec(): spawn a replacement in a new process
+        // group (so a Ctrl+C aimed at the dying parent doesn't take the
+        // child down with it) and exit cleanly.
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        match std::process::Command::new(exe)
+            .args(args)
+            .creation_flags(CREATE_NEW_PROCESS_GROUP)
+            .spawn()
+        {
+            Ok(_) => std::process::exit(0),
+            Err(e) => e,
+        }
     }
 }
 

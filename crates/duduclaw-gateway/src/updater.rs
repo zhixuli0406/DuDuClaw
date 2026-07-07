@@ -1,6 +1,9 @@
 //! Self-update module: check GitHub releases, download, verify, and replace the running binary.
 //!
 //! Security hardening (code review round 1 + round 2):
+//! - [S1] minisign Ed25519 signature verification (hard-fail if `.minisig`
+//!   asset is missing or invalid) — public key pinned in the binary, so a
+//!   compromised GitHub release without a valid signature cannot install
 //! - [C1] SHA-256 checksum verification (hard-fail if unavailable) [R2:NH2]
 //! - [C2] AtomicBool concurrency lock — only one update at a time
 //! - [C3] Windows .zip extraction with `duduclaw.exe` target
@@ -23,6 +26,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 
 const GITHUB_REPO: &str = "zhixuli0406/DuDuClaw";
+
+/// minisign Ed25519 public key for release-asset signature verification. [S1]
+///
+/// Every release asset must ship a `<asset>.minisig` signed by the matching
+/// secret key (CI `MINISIGN_SECRET_KEY` secret / `~/.minisign/duduclaw-release.key`).
+/// Rotating the key requires shipping a release signed by the OLD key that
+/// contains the NEW key here.
+const UPDATE_PUBKEY: &str = "RWTh5pOpk0YmdBgm3VyB2bzxFtajNLXr7zFDhbcc75TgM8YfeV+NSzXh";
 /// Current version: prefers build-time `DUDUCLAW_VERSION` env (set by Pro build script),
 /// then runtime `DUDUCLAW_VERSION` env, finally falls back to this crate's `CARGO_PKG_VERSION`.
 pub fn current_version() -> &'static str {
@@ -102,6 +113,12 @@ pub struct UpdateInfo {
 #[serde(rename_all = "snake_case")]
 pub enum InstallMethod {
     Homebrew,
+    /// Installed via `npm i -g duduclaw` — binary lives inside the
+    /// platform sub-package (`@duduclaw/<platform>`). Self-update replaces
+    /// that binary in place; the npm registry metadata goes stale until
+    /// the user runs `npm i -g duduclaw` again (harmless — next npm
+    /// install just overwrites with the same or newer version).
+    Npm,
     Standalone,
     Source,
     Unknown,
@@ -130,10 +147,10 @@ pub fn brew_formula_name() -> &'static str {
 }
 
 pub fn detect_install_method() -> InstallMethod {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(_) => return InstallMethod::Unknown,
-    };
+    let exe = duduclaw_core::platform::executable_path();
+    if exe.as_os_str().is_empty() {
+        return InstallMethod::Unknown;
+    }
     let exe_str = exe.to_string_lossy();
 
     if exe_str.contains("/Cellar/duduclaw/")
@@ -141,6 +158,9 @@ pub fn detect_install_method() -> InstallMethod {
         || exe_str.contains("/linuxbrew/")
     {
         return InstallMethod::Homebrew;
+    }
+    if exe_str.contains("/node_modules/") || exe_str.contains("\\node_modules\\") {
+        return InstallMethod::Npm;
     }
     if exe_str.contains("/.cargo/bin/") {
         return InstallMethod::Source;
@@ -177,17 +197,20 @@ fn is_newer(current: &str, latest: &str) -> bool {
 // Platform detection
 // ---------------------------------------------------------------------------
 
+/// Asset name suffix matching `.github/workflows/release.yml` artifacts
+/// (e.g. `duduclaw-darwin-arm64.tar.gz`). Must stay in sync with the CI
+/// matrix `artifact:` names.
 fn platform_asset_suffix() -> &'static str {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    { "arm64-apple-darwin.tar.gz" }
+    { "darwin-arm64.tar.gz" }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    { "x64-apple-darwin.tar.gz" }
+    { "darwin-x64.tar.gz" }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    { "x64-unknown-linux-gnu.tar.gz" }
+    { "linux-x64.tar.gz" }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    { "arm64-unknown-linux-gnu.tar.gz" }
+    { "linux-arm64.tar.gz" }
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    { "x64-pc-windows-msvc.zip" }
+    { "windows-x64.zip" }
     #[cfg(not(any(
         all(target_os = "macos", target_arch = "aarch64"),
         all(target_os = "macos", target_arch = "x86_64"),
@@ -216,6 +239,33 @@ pub fn is_valid_download_url(url: &str) -> bool {
     url.starts_with(&prefix)
         && !url.contains("..")
         && url.len() < 512
+}
+
+// ---------------------------------------------------------------------------
+// Ed25519 signature verification [S1] — minisign format, pinned public key
+// ---------------------------------------------------------------------------
+
+/// Verify a minisign signature (`.minisig` file content) over `data`
+/// against the pinned [`UPDATE_PUBKEY`]. Fails closed: any parse or
+/// verification error rejects the update. Legacy (non-prehashed)
+/// signatures are rejected — CI signs with modern minisign (`ED` alg).
+fn verify_minisign_signature(data: &[u8], sig_text: &str) -> Result<(), String> {
+    let pk = minisign_verify::PublicKey::from_base64(UPDATE_PUBKEY)
+        .map_err(|e| format!("Embedded update public key is invalid: {e}"))?;
+    let sig = minisign_verify::Signature::decode(sig_text)
+        .map_err(|e| format!("Signature file has invalid format: {e}"))?;
+    pk.verify(data, &sig, false)
+        .map_err(|e| format!("Ed25519 signature verification FAILED — refusing update: {e}"))
+}
+
+/// Extract the first 64-char hex token from a checksum sidecar file.
+/// Tolerates `shasum -a 256` ("<hash>  <file>"), BSD tag format, and
+/// PowerShell `Format-List` ("Hash : <HASH>") layouts.
+fn extract_sha256_token(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_ascii_hexdigit()))
+        .find(|t| t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|t| t.to_lowercase())
 }
 
 // ---------------------------------------------------------------------------
@@ -335,8 +385,13 @@ pub async fn apply_update(download_url: &str, checksum_url: &str) -> Result<Appl
         return Err(format!("Rejected unsafe checksum URL: {checksum_url}"));
     }
 
-    let current_exe = std::env::current_exe()
-        .map_err(|e| format!("Cannot determine current binary path: {e}"))?;
+    // Pinned at first access — stays valid for the post-shutdown re-exec
+    // even after the on-disk binary is replaced (Linux /proc/self/exe
+    // would otherwise read "… (deleted)").
+    let current_exe = duduclaw_core::platform::executable_path();
+    if current_exe.as_os_str().is_empty() {
+        return Err("Cannot determine current binary path".into());
+    }
     let exe_dir = current_exe
         .parent()
         .ok_or("Cannot determine binary directory")?;
@@ -421,22 +476,48 @@ pub async fn apply_update(download_url: &str, checksum_url: &str) -> Result<Appl
         .await
         .map_err(|e| format!("Failed to read checksum: {e}"))?;
 
-    let expected = checksum_text
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
+    // Scan tokens for the first 64-char hex digest so both `shasum`
+    // ("<hash>  <file>") and PowerShell `Format-List` ("Hash : <HASH>")
+    // sidecar formats parse.
+    let expected = extract_sha256_token(&checksum_text)
+        .ok_or_else(|| "Checksum file has invalid format (no SHA-256 digest found)".to_string())?;
     let computed = format!("{:x}", Sha256::digest(&bytes));
 
-    if expected.len() < 64 {
-        return Err(format!("Checksum file has invalid format (got {} chars)", expected.len()));
-    }
     if computed != expected {
         return Err(format!(
             "SHA-256 checksum mismatch!\n  Expected: {expected}\n  Computed: {computed}"
         ));
     }
     info!("SHA-256 checksum verified");
+
+    // [S1] minisign Ed25519 signature verification — HARD FAIL.
+    // The public key is pinned in the binary, so this holds even if the
+    // GitHub release (and its .sha256 sidecar) is attacker-controlled.
+    let signature_url = format!("{download_url}.minisig");
+    if !is_valid_download_url(&signature_url) {
+        return Err(format!("Rejected unsafe signature URL: {signature_url}"));
+    }
+    info!("Verifying Ed25519 signature...");
+    let sig_resp = client
+        .get(&signature_url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch signature file: {e}"))?;
+
+    if !sig_resp.status().is_success() {
+        return Err(format!(
+            "Signature file unavailable (HTTP {}) — refusing unsigned update",
+            sig_resp.status()
+        ));
+    }
+
+    let sig_text = sig_resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read signature: {e}"))?;
+
+    verify_minisign_signature(&bytes, &sig_text)?;
+    info!("Ed25519 signature verified");
 
     // Extract binary
     info!("Extracting binary...");
@@ -774,6 +855,51 @@ mod tests {
     fn test_detect_install_method() {
         let method = detect_install_method();
         let _serialized = serde_json::to_string(&method).unwrap();
+    }
+
+    // Real minisign signature over the exact bytes b"FAKE_BINARY", signed
+    // with the DuDuClaw release key that matches UPDATE_PUBKEY.
+    const TEST_SIG: &str = "untrusted comment: signature from minisign secret key\n\
+RUTh5pOpk0YmdButYZG9tlcekzhpZGpz83+E62dF1rtB5NtAoxXBenf0jZrluKejtL1R5cHtL60+75EzvH/EorwGHcc2aZlwkwQ=\n\
+trusted comment: duduclaw test\n\
+mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx2JdFAQ==\n";
+
+    #[test]
+    fn test_minisign_verify_valid() {
+        assert!(verify_minisign_signature(b"FAKE_BINARY", TEST_SIG).is_ok());
+    }
+
+    #[test]
+    fn test_minisign_verify_tampered_data() {
+        let err = verify_minisign_signature(b"FAKE_BINARY_TAMPERED", TEST_SIG).unwrap_err();
+        assert!(err.contains("FAILED"));
+    }
+
+    #[test]
+    fn test_minisign_verify_garbage_signature() {
+        assert!(verify_minisign_signature(b"FAKE_BINARY", "not a signature").is_err());
+    }
+
+    #[test]
+    fn test_extract_sha256_token_shasum_format() {
+        let digest = "a".repeat(64);
+        let text = format!("{digest}  duduclaw-darwin-arm64.tar.gz\n");
+        assert_eq!(extract_sha256_token(&text), Some(digest));
+    }
+
+    #[test]
+    fn test_extract_sha256_token_powershell_format() {
+        // `Get-FileHash | Format-List Hash` output shape
+        let text = format!("\nHash : {}\n\n", "AB".repeat(32));
+        assert_eq!(extract_sha256_token(&text), Some("ab".repeat(32)));
+    }
+
+    #[test]
+    fn test_extract_sha256_token_rejects_garbage() {
+        assert_eq!(extract_sha256_token("no digest here"), None);
+        assert_eq!(extract_sha256_token(&"z".repeat(64)), None);
+        // Too short
+        assert_eq!(extract_sha256_token(&"a".repeat(63)), None);
     }
 
     #[test]
