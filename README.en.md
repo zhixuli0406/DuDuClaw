@@ -304,16 +304,30 @@ DuDuClaw (plumbing)
 | **Claude Code Security Hooks** | Three-phase progressive defense — Layer 1 blacklist (<50ms) → Layer 2 obfuscation detection (YELLOW+) → Layer 3 Haiku AI judgment (RED only) |
 | **Threat-level state machine** | GREEN → YELLOW → RED with auto-escalation/degradation, dropping one level after 24h with no events |
 | **SOUL.md drift detection** | Real-time SHA-256 fingerprint comparison |
-| **Prompt Injection scanning** | 6 rule categories, XML delimiter tags for injection resistance |
+| **Prompt Injection scanning** | 6 rule categories, XML delimiter tags for injection resistance; as of v1.34.0 it also runs at the **MCP dispatch choke point** (all runtimes) and on the channel reply path, with blocks written to `security_audit.jsonl` |
 | **Secret leak scanning** | 20+ patterns (Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/DB URL, etc.) |
 | **Sensitive file protection** | Read/Write/Edit three-way protection of `secret.key`, `.env*`, `SOUL.md`, `CONTRACT.toml` |
-| **Behavioral contracts** | `CONTRACT.toml` defines `must_not` / `must_always` boundaries + `duduclaw test` red-team testing (9 scenarios) |
+| **Behavioral contracts** | `CONTRACT.toml` defines `must_not` / `must_always` boundaries + `duduclaw test` red-team testing (9 scenarios); as of v1.34.0 `must_not` is **enforced at runtime on the final user-facing reply bytes** (after secret restoration) — violations are blocked and audited |
 | **Unified multi-source audit log** | `audit.unified_log` merges 4 JSONL streams (`security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl`) into a unified envelope (timestamp / source / event_type / agent_id / severity / summary / details); the Logs page supports source filtering, a severity dropdown, and live/historical tabs |
 | **JSONL audit log** | Async writes, format-compatible with the Rust `AuditEvent` schema |
 | **CJK-Safe string slicing** | The new `truncate_bytes` / `truncate_chars` module replaces 31 instances of `s[..s.len().min(N)]` byte-index slicing (fixing the v1.8.11 multi-byte codepoint panic) |
 | **Per-Agent key isolation** | AES-256-GCM encrypted storage, keys invisible between agents |
-| **Container sandbox** | Docker / Apple Container (`--network=none`, tmpfs, read-only rootfs, 512MB limit) |
+| **Container sandbox** | Docker / Apple Container (`--network=none`, tmpfs, read-only rootfs, 512MB limit); a **native OS sandbox** (no container runtime) is also available, see below |
 | **Browser automation** | 5-layer routing (API Fetch → Static Scrape → Headless → Sandbox → Computer Use), deny-by-default |
+
+### Security Reference Monitor (new in v1.34.0)
+
+Moves the security boundary off prompts/hooks/config and onto **deterministic choke points and OS primitives**: MCP dispatch becomes a true reference monitor (complete mediation + tamper-proof + verifiable), so every runtime (Claude / Codex / Gemini / Antigravity + the direct-API and local-inference tool loops) is governed by the same zero-LLM policy. Every control is fail-closed and (where opt-in) backward compatible.
+
+| Feature | Description |
+|---------|-------------|
+| **PolicyKernel** | Deterministic, zero-LLM `evaluate()` over a parameter-level static tool policy (`agent.toml [capabilities] policy`, Progent-style tool+arg matcher); canonical `fs_write`/`shell_exec`/`mcp_call` families give one rule uniform reach across runtimes; precedence Forbid > Ask > Allow > default-deny; empty policy abstains (backward compatible). Wired into MCP dispatch (`Ask` → ApprovalBroker, TTL expiry = deny) and the direct-API/local tool loop (`PolicyExecutor`), uniform across stdio / HTTP / SSE |
+| **Egress "secret in-use"** | When tool arguments contain `<REDACT:…>` tokens, real values are restored only for whitelisted tools, everything else denied (`-32007`), and tool results re-redacted; pushed down from the stdio serve loop to the shared dispatch choke point so all three transports are covered (reuses the `duduclaw-redaction` vault) |
+| **Native OS sandbox** | New `duduclaw-sandbox` crate (opt-in `[capabilities] native_sandbox`) confines the spawned agent CLI subprocess via **macOS Seatbelt** (`sandbox-exec` profile, live-verified) / **Linux Landlock**, derived from `SandboxLevel` (filesystem-write confinement); fail-closed when required but unavailable; layered on top of the CLI-flag sandbox (Windows is a stub) |
+| **Origin-bound memory trust** | Temporal memories gain `origin`/`origin_trust`/`derived_from`; a derived fact's trust is clamped to ≤ min(source trusts; unknown source = 0) — **cannot be laundered upward by re-derivation**; distilled conversational facts are marked lowest-trust and down-weighted in search |
+| **CONTRACT runtime enforcement** | `must_not` boundaries validated on the final user-facing reply bytes (after secret restoration); violations blocked and written to a `contract_violation` audit event |
+| **SecurityPosture state machine** | `{Green,Yellow,Red}` escalate-fast / decay-slow, driven by audit-event counts + an escalation floor (N-deny-in-T escalates; quiet windows decay one level at a time) |
+| **OS ground-truth reconciliation** | `os_reconcile` computes a pure two-way deterministic diff of what tools claimed to do vs the observed OS effects (unaccounted side effects / missing footprints); macOS `eslogger` parser, Linux eBPF staged |
 
 ### Accounts & Cost
 
@@ -418,6 +432,8 @@ Use `duduclaw migrate` to automatically convert a legacy `agent.toml` to the Cla
 <a id="security"></a>
 
 ## Security Hooks
+
+> **v1.34.0 positioning**: as of v1.34.0 the primary security boundary is the [Security Reference Monitor](#security-reference-monitor-new-in-v1340) (a deterministic MCP dispatch choke point + OS primitives, covering all runtimes). The Claude Code Hook layer below is downgraded to an **optional semantic intercept** for CLI-native tools (bash/edit that bypass MCP), with an OS sandbox as the backstop beneath it.
 
 DuDuClaw builds a three-phase progressive defense on top of Claude Code's Hook system:
 
