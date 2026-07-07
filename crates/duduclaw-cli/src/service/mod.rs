@@ -52,7 +52,9 @@ User=duduclaw
 Group=duduclaw
 ExecStart={exe} run --yes
 ExecStop=/bin/kill -SIGTERM $MAINPID
-Restart=on-failure
+# `always` (not `on-failure`): self-update exits 0 after graceful shutdown
+# and relies on the supervisor to relaunch if in-process re-exec fails.
+Restart=always
 RestartSec=10
 
 [Install]

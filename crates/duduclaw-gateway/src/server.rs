@@ -876,9 +876,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
                                     if result.needs_restart {
                                         // Graceful shutdown after 3s to let WebSocket
-                                        // clients receive the notification
+                                        // clients receive the notification. The
+                                        // restart flag makes the post-shutdown hook
+                                        // re-exec the new binary (works with or
+                                        // without launchd/systemd supervision).
                                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                                         info!("Auto-update: restarting for v{}", info.latest_version);
+                                        duduclaw_core::platform::request_restart_after_shutdown();
                                         duduclaw_core::platform::self_interrupt();
                                     }
                                 }
@@ -1150,6 +1154,21 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         })
         .await
         .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(e.to_string()))?;
+
+    // Self-update installed a new binary during this run: re-exec into it
+    // now that the graceful shutdown sequence (prediction flush → worker
+    // supervisor SIGTERM chain → axum drain) has completed. exec() keeps
+    // the PID on Unix, so launchd/systemd supervision is undisturbed; it
+    // also covers unsupervised foreground runs (npm wrapper, `duduclaw run`).
+    if duduclaw_core::platform::restart_requested() {
+        info!("Update installed — re-executing new binary...");
+        let err = duduclaw_core::platform::self_restart();
+        // self_restart only returns on failure.
+        tracing::error!(
+            error = %err,
+            "Self-restart failed — exiting; if running under launchd/systemd the supervisor will relaunch"
+        );
+    }
 
     Ok(())
 }

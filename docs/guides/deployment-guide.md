@@ -248,7 +248,44 @@ systemctl --user enable duduclaw
 
 ---
 
-## 8. Prometheus + Grafana Monitoring
+## 8. Auto-Update
+
+The gateway checks GitHub Releases every 6 hours and the dashboard
+(Settings → Update) has a manual **Check / Install** flow. Both paths share
+the same pipeline:
+
+1. Download the platform asset (`duduclaw-<platform>.tar.gz` / `.zip`)
+2. Verify the SHA-256 sidecar **and** the minisign Ed25519 signature
+   (`<asset>.minisig`, public key pinned in the binary — unsigned or
+   tampered releases are rejected, no override)
+3. Verify the new binary executes (`duduclaw version`), then atomically
+   swap it in place (backup + rename, auto-rollback on failure)
+4. Graceful shutdown, then **re-exec the new binary in-process** — the PID
+   is preserved on macOS/Linux, so launchd/systemd keep supervising, and
+   unsupervised foreground runs (npm wrapper, `duduclaw run`) restart too
+5. Open dashboard tabs show a restart banner and reload automatically
+
+Enable unattended updates:
+
+```toml
+# ~/.duduclaw/config.toml
+[gateway]
+auto_update = true   # default: false — dashboard notification only
+```
+
+Or `DUDUCLAW_AUTO_UPDATE=1` (env wins over config).
+
+Notes by install method:
+
+| Install method | Behavior |
+|----------------|----------|
+| Standalone / npm | Self-update in place (npm registry metadata goes stale until the next `npm i -g duduclaw`, harmless) |
+| Homebrew | Self-update refuses; run `brew upgrade duduclaw` |
+| Source (`cargo`/`target/`) | Self-update allowed but a rebuild will overwrite |
+
+---
+
+## 9. Prometheus + Grafana Monitoring
 
 ### Prometheus scrape config
 
@@ -274,45 +311,6 @@ scrape_configs:
 | `duduclaw_failover_total` | Counter | Provider failover events |
 | `duduclaw_budget_remaining_cents` | Gauge | Remaining budget per account |
 
----
-
-## Quick Reference
-
-| Method | URL | Use Case |
-|--------|-----|----------|
-| Local only | `http://localhost:18789` | Development |
-| Tailscale | `https://xxx.ts.net` | Home server, LINE webhook |
-| ngrok | `https://xxx.ngrok-free.app` | Quick demo |
-| Cloudflare | `https://duduclaw.yourdomain.com` | Production |
-| Docker | `docker compose up -d` | Server deployment |
-| Service | `duduclaw service install` | Auto-start on boot |
-
-## 8. Prometheus + Grafana Monitoring
-
-### Prometheus Configuration
-
-```yaml
-# prometheus.yml
-scrape_configs:
-  - job_name: 'duduclaw'
-    static_configs:
-      - targets: ['localhost:18789']
-    metrics_path: '/metrics'
-    scrape_interval: 30s
-```
-
-### Available Metrics
-
-| Metric | Type | Labels |
-|--------|------|--------|
-| `duduclaw_requests_total` | Counter | -- |
-| `duduclaw_tokens_total` | Counter | `type` (input/output/cache_read) |
-| `duduclaw_request_duration_seconds` | Histogram | bucket boundaries: 0.1s -- 10s |
-| `duduclaw_active_sessions` | Gauge | -- |
-| `duduclaw_channel_connected` | Gauge | `channel` |
-| `duduclaw_failover_total` | Counter | -- |
-| `duduclaw_budget_remaining_cents` | Gauge | `account` |
-
 ### Grafana Dashboard
 
 Import the following JSON into Grafana (Dashboards > Import):
@@ -332,9 +330,22 @@ Import the following JSON into Grafana (Dashboards > Import):
 }
 ```
 
-### Quick Start
+### Monitoring Quick Start
 
 ```bash
 # docker-compose with monitoring
 docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
 ```
+
+---
+
+## Quick Reference
+
+| Method | URL | Use Case |
+|--------|-----|----------|
+| Local only | `http://localhost:18789` | Development |
+| Tailscale | `https://xxx.ts.net` | Home server, LINE webhook |
+| ngrok | `https://xxx.ngrok-free.app` | Quick demo |
+| Cloudflare | `https://duduclaw.yourdomain.com` | Production |
+| Docker | `docker compose up -d` | Server deployment |
+| Service | `duduclaw service install` | Auto-start on boot |

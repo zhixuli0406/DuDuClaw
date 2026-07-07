@@ -7494,9 +7494,25 @@ impl MethodHandler {
                 *self.pending_update.write().await = None;
 
                 if result.needs_restart {
+                    // Broadcast to ALL dashboard tabs (not just the RPC caller)
+                    // so every client can wait out the restart and reload.
+                    if let Some(tx) = self.event_tx.read().await.clone() {
+                        let frame = WsFrame::Event {
+                            event: "system.update_installed".to_string(),
+                            payload: json!({
+                                "version": pending.version,
+                                "needs_restart": true,
+                                "message": result.message,
+                            }),
+                            seq: None,
+                            state_version: None,
+                        };
+                        let _ = tx.send(serde_json::to_string(&frame).unwrap_or_default());
+                    }
                     tokio::spawn(async {
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        tracing::info!("Shutting down for update — raising SIGINT for graceful shutdown");
+                        tracing::info!("Shutting down for update — will re-exec new binary after graceful shutdown");
+                        duduclaw_core::platform::request_restart_after_shutdown();
                         duduclaw_core::platform::self_interrupt();
                     });
                 }

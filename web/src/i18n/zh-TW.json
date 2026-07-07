@@ -565,6 +565,7 @@
   "settings.update.autoUpdate": "自動更新",
   "settings.update.autoUpdate.desc": "偵測到新版本時自動下載、安裝並重新啟動（Pro 專屬功能）。",
   "update.notification": "新版本 v{version} 已推出！",
+  "update.restarting": "更新已安裝，正在重新啟動 Gateway，完成後將自動重新載入…",
   "update.viewDetails": "查看詳情",
   "update.dismiss": "稍後再說",
   "common.save": "儲存",

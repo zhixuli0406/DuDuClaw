@@ -566,6 +566,7 @@
   "settings.update.autoUpdate": "Auto Update",
   "settings.update.autoUpdate.desc": "Automatically download, install, and restart when a new version is detected (Pro only).",
   "update.notification": "New version v{version} is available!",
+  "update.restarting": "Update installed — restarting the gateway, this page will reload automatically…",
   "update.viewDetails": "View Details",
   "update.dismiss": "Dismiss",
   "common.save": "Save",

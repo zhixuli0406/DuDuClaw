@@ -551,6 +551,7 @@
   "settings.update.autoUpdate": "[EN] Auto Update",
   "settings.update.autoUpdate.desc": "[EN] Automatically download, install, and restart when a new version is detected (Pro only).",
   "update.notification": "新バージョン v{version} が利用可能です！",
+  "update.restarting": "アップデートをインストールしました。Gateway を再起動中です。完了後に自動で再読み込みします…",
   "update.viewDetails": "詳細を見る",
   "update.dismiss": "後で",
   "common.save": "保存",

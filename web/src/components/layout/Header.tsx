@@ -149,6 +149,7 @@ export function Header() {
   );
   const updateNotification = useUpdateStore((s) => s.notification);
   const updateDismissed = useUpdateStore((s) => s.dismissed);
+  const updateRestarting = useUpdateStore((s) => s.restarting);
   const dismissUpdate = useUpdateStore((s) => s.dismiss);
   const checkUpdate = useUpdateStore((s) => s.checkNow);
   const theme = useThemeStore((s) => s.theme);
@@ -190,8 +191,17 @@ export function Header() {
           </button>
         </div>
       )}
+      {/* Update restart-in-progress banner */}
+      {updateRestarting && (
+        <div className="flex items-center gap-2 rounded-lg border border-emerald-300/40 bg-emerald-100/50 px-3 py-1.5 backdrop-blur-sm dark:border-emerald-700/40 dark:bg-emerald-900/25">
+          <RefreshCw className="h-4 w-4 shrink-0 animate-spin text-emerald-600 dark:text-emerald-400" />
+          <span className="text-xs text-emerald-700 dark:text-emerald-400">
+            {intl.formatMessage({ id: 'update.restarting' })}
+          </span>
+        </div>
+      )}
       {/* Update notification banner */}
-      {updateNotification?.available && !updateDismissed && connectionState !== 'disconnected' && (
+      {updateNotification?.available && !updateDismissed && !updateRestarting && connectionState !== 'disconnected' && (
         <div className="flex items-center gap-2 rounded-lg border border-amber-300/40 bg-amber-100/50 px-3 py-1.5 backdrop-blur-sm dark:border-amber-700/40 dark:bg-amber-900/25">
           <ArrowUpCircle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
           <span className="text-xs text-amber-700 dark:text-amber-400">
