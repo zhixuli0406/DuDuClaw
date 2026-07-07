@@ -87,6 +87,9 @@ pub fn to_discord_message(text: &str, agent_name: Option<&str>, error: bool) -> 
 /// This splits the embeds across as many messages as needed so nothing is lost.
 /// Each returned `Value` is a complete message body ready to POST.
 pub fn to_discord_messages(text: &str, agent_name: Option<&str>, error: bool) -> Vec<Value> {
+    // Discord renders standard markdown natively EXCEPT pipe tables —
+    // downgrade those to monospace code fences (no-op when no table).
+    let text = &crate::markdown_render::preprocess_discord_markdown(text);
     let color = if error { ERROR_COLOR } else { DUDUCLAW_COLOR };
     let footer_text = agent_name
         .map(|n| format!("DuDuClaw \u{00b7} {n}"))
@@ -150,7 +153,12 @@ pub fn to_discord_messages(text: &str, agent_name: Option<&str>, error: bool) ->
 // ── LINE formatting ────────────────────────────────────────────
 
 /// Format a reply as a LINE Flex Message (card-style).
+///
+/// LINE renders no markup at all, so markdown is first converted to
+/// readable plain text (headings → 【】, tables → key-value records,
+/// emphasis stripped).
 pub fn to_line_flex_message(text: &str, agent_name: Option<&str>) -> Value {
+    let text = &crate::markdown_render::to_line_plain(text);
     let footer_text = agent_name
         .map(|n| format!("DuDuClaw \u{00b7} {n}"))
         .unwrap_or_else(|| "DuDuClaw".to_string());

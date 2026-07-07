@@ -73,7 +73,7 @@ pub const ENV_TRUST_SESSION_ID: &str = "DUDUCLAW_SESSION_ID";
 /// Channel types supported for delegation callback forwarding.
 /// Used by both the MCP `send_to_agent` tool and the channel_reply session filter.
 pub const SUPPORTED_CHANNEL_TYPES: &[&str] = &[
-    "telegram", "line", "discord", "slack", "whatsapp", "feishu",
+    "telegram", "line", "discord", "slack", "whatsapp", "feishu", "googlechat", "teams",
 ];
 
 /// Resolve the absolute path to the current DuDuClaw binary.

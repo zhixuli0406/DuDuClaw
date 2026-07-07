@@ -250,7 +250,7 @@ fn strip_feishu_mentions(text: &str) -> String {
     result.trim().to_string()
 }
 
-async fn handle_message(event: &serde_json::Value, state: &FeishuState) {
+async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
     let message = match event.get("message") {
         Some(m) => m,
         None => return,
@@ -302,8 +302,35 @@ async fn handle_message(event: &serde_json::Value, state: &FeishuState) {
         }
     }
 
+    // Progress callback — Feishu has no typing API; forward tool-progress
+    // and the TodoUpdate task board as text messages (throttled 45s;
+    // TodoUpdate bypasses the throttle).
+    let progress_chat = chat_id.to_string();
+    let progress_state = state.clone();
+    let last_progress = std::sync::Arc::new(std::sync::Mutex::new(
+        std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(120))
+            .unwrap_or_else(std::time::Instant::now),
+    ));
+    let on_progress: crate::channel_reply::ProgressCallback = Box::new(move |event| {
+        let is_todo = matches!(event, crate::channel_reply::ProgressEvent::TodoUpdate { .. });
+        {
+            let mut last = last_progress.lock().unwrap_or_else(|e| e.into_inner());
+            if !is_todo && last.elapsed().as_secs() < 45 {
+                return;
+            }
+            *last = std::time::Instant::now();
+        }
+        let msg_text = event.to_display();
+        let st = progress_state.clone();
+        let ch = progress_chat.clone();
+        tokio::spawn(async move {
+            send_message(&st, &ch, &msg_text).await;
+        });
+    });
+
     let session_id = format!("feishu:{chat_id}");
-    let reply = build_reply_with_session(&text, &state.ctx, &session_id, sender, None).await;
+    let reply = build_reply_with_session(&text, &state.ctx, &session_id, sender, Some(on_progress)).await;
 
     // Guard: don't send empty replies
     if reply.trim().is_empty() {
@@ -311,13 +338,106 @@ async fn handle_message(event: &serde_json::Value, state: &FeishuState) {
         return;
     }
 
-    // Reply to the original message so the sender gets a threaded notification
-    if !msg_id.is_empty() {
-        reply_message(state, msg_id, &reply).await;
+    // Rich reply: interactive Card 2.0 markdown (tables/code render
+    // natively). Oversized or rejected cards fall back to plain text.
+    // Reply to the original message so the sender gets a threaded
+    // notification when possible.
+    let sent_as_card = if reply.len() <= FEISHU_CARD_BYTE_CAP {
+        let card = build_feishu_card(&reply).to_string();
+        if !msg_id.is_empty() {
+            send_feishu_payload(state, FeishuTarget::Reply(msg_id), "interactive", &card).await
+        } else {
+            send_feishu_payload(state, FeishuTarget::Chat(chat_id), "interactive", &card).await
+        }
     } else {
-        send_message(state, chat_id, &reply).await;
+        false
+    };
+
+    if !sent_as_card {
+        if !msg_id.is_empty() {
+            reply_message(state, msg_id, &reply).await;
+        } else {
+            send_message(state, chat_id, &reply).await;
+        }
     }
 }
+
+/// Where to deliver a Feishu message.
+enum FeishuTarget<'a> {
+    /// Threaded reply to a message id.
+    Reply(&'a str),
+    /// Direct send to a chat id.
+    Chat(&'a str),
+}
+
+/// Send a raw Feishu message payload (`msg_type` + pre-serialised
+/// `content`). Returns `true` on HTTP+API success.
+async fn send_feishu_payload(
+    state: &FeishuState,
+    target: FeishuTarget<'_>,
+    msg_type: &str,
+    content: &str,
+) -> bool {
+    let token = match state.get_token().await {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Feishu token error: {e}");
+            return false;
+        }
+    };
+    let (url, body) = match target {
+        FeishuTarget::Reply(mid) => (
+            format!("{FEISHU_API}/im/v1/messages/{mid}/reply"),
+            serde_json::json!({ "msg_type": msg_type, "content": content }),
+        ),
+        FeishuTarget::Chat(cid) => (
+            format!("{FEISHU_API}/im/v1/messages?receive_id_type=chat_id"),
+            serde_json::json!({ "receive_id": cid, "msg_type": msg_type, "content": content }),
+        ),
+    };
+    match state
+        .http
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            // Feishu wraps errors in 200 bodies with a non-zero `code`.
+            match resp.json::<serde_json::Value>().await {
+                Ok(v) => v.get("code").and_then(|c| c.as_i64()).unwrap_or(0) == 0,
+                Err(_) => true,
+            }
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            warn!("Feishu card send failed ({status}): {}", truncate_bytes(&text, 200));
+            false
+        }
+        Err(e) => {
+            warn!("Feishu card send error: {e}");
+            false
+        }
+    }
+}
+
+/// Card 2.0 payload with a `markdown` element — Feishu cards render
+/// near-CommonMark natively, including tables and fenced code blocks.
+fn build_feishu_card(markdown: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "body": {
+            "elements": [{ "tag": "markdown", "content": markdown }]
+        }
+    })
+}
+
+/// Feishu interactive-card size ceiling is ~30 KB; leave headroom for the
+/// card scaffolding.
+const FEISHU_CARD_BYTE_CAP: usize = 25_000;
 
 async fn send_message(state: &FeishuState, chat_id: &str, text: &str) {
     let token = match state.get_token().await {

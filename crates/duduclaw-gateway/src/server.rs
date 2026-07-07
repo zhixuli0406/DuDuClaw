@@ -542,9 +542,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     for (label, h) in crate::discord::start_discord_bots(&home_dir, reply_ctx.clone()).await {
         handler.register_channel_handle(&label, h).await;
     }
-    // Webhook channels (LINE, WhatsApp, Feishu) — global only for now
-    // Per-agent webhook routing requires multi-path routers (TODO-per-agent-channels.md)
+    // Webhook channels (LINE, WhatsApp, Feishu, Google Chat, Teams) — global
+    // only for now. Per-agent webhook routing requires multi-path routers
+    // (TODO-per-agent-channels.md)
     let line_router = crate::line::start_line_bot(&home_dir, reply_ctx.clone()).await;
+    let whatsapp_router = crate::whatsapp::start_whatsapp_webhook(&home_dir, reply_ctx.clone()).await;
+    let feishu_router = crate::feishu::start_feishu_webhook(&home_dir, reply_ctx.clone()).await;
+    let googlechat_router = crate::googlechat::start_googlechat_webhook(&home_dir, reply_ctx.clone()).await;
+    let teams_router = crate::msteams::start_teams_webhook(&home_dir, reply_ctx.clone()).await;
     let webchat_ctx = reply_ctx.clone();
 
     // Start unified heartbeat scheduler (per-agent: evolution + cron + monitoring)
@@ -1090,6 +1095,19 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     // Mount LINE webhook endpoint (always — the handler reads config per request)
     app = app.merge(line_router);
+    // Mount configured webhook channels (each returns None when unconfigured)
+    if let Some(r) = whatsapp_router {
+        app = app.merge(r);
+    }
+    if let Some(r) = feishu_router {
+        app = app.merge(r);
+    }
+    if let Some(r) = googlechat_router {
+        app = app.merge(r);
+    }
+    if let Some(r) = teams_router {
+        app = app.merge(r);
+    }
 
     // Merge plugin extension routes (if any)
     if let Some(extra) = extension.extra_routes() {

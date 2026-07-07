@@ -91,6 +91,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/multi-instance.md](guides/multi-instance.md) | Running multiple instances on one machine (DUDUCLAW_HOME / PORT / INSTANCE) | Current |
 | [guides/observability.md](guides/observability.md) | OpenTelemetry GenAI tracing + OTLP export (`--features otel`, `[telemetry]` config) | Current |
 | [guides/personal-edition-portability.md](guides/personal-edition-portability.md) | 個人版資料可攜：自架 ↔ 代管互轉 | Current |
+| [guides/channels-googlechat-teams.md](guides/channels-googlechat-teams.md) | Google Chat & Microsoft Teams channel setup + per-channel formatting/typing matrix | Current |
 
 ## API Reference
 

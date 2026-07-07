@@ -1331,6 +1331,22 @@ async fn build_reply_with_session_inner(
                         ch_id.to_string(),
                         ctx.event_tx.clone(),
                     )
+                } else if ch_type == "googlechat" {
+                    // Space name may contain '/', which the generic split handles;
+                    // credentials come from config via home_dir.
+                    crate::channel_sender::create_googlechat_sender(
+                        ctx.home_dir.clone(),
+                        session_id.strip_prefix("googlechat:").unwrap_or(ch_id).to_string(),
+                        user_id.to_string(),
+                    )
+                } else if let Some(conv_id) = session_id.strip_prefix("teams:") {
+                    // Teams conversation ids contain ':' — take the full
+                    // remainder, not the colon-split second segment.
+                    crate::channel_sender::create_teams_sender(
+                        ctx.home_dir.clone(),
+                        conv_id.to_string(),
+                        user_id.to_string(),
+                    )
                 } else {
                     // Look up the channel token from config
                     let token = crate::config_crypto::read_encrypted_config_field(
@@ -3866,6 +3882,50 @@ pub enum ProgressEvent {
         /// Optional file path or search pattern extracted from tool input.
         detail: Option<String>,
     },
+    /// Claude updated its task list (parsed from a `TodoWrite` tool_use block).
+    /// Carries the full list so channels can render/edit a progress board.
+    TodoUpdate { todos: Vec<TodoItem> },
+}
+
+/// One entry of the agent's live task list (mirrors the Claude CLI
+/// `TodoWrite` input shape: `content` / `status` / `activeForm`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TodoItem {
+    pub content: String,
+    /// "pending" | "in_progress" | "completed" (unknown values render as pending).
+    pub status: String,
+    /// Present-tense label shown while the item is in progress.
+    pub active_form: Option<String>,
+}
+
+/// Parse the `todos` array out of a `TodoWrite` tool_use block's `input`.
+/// Returns `None` when the shape is unrecognised (fail-soft: caller falls
+/// back to a generic ToolUse event).
+pub(crate) fn parse_todo_write_input(input: &serde_json::Value) -> Option<Vec<TodoItem>> {
+    let items = input.get("todos")?.as_array()?;
+    let todos: Vec<TodoItem> = items
+        .iter()
+        .filter_map(|it| {
+            let content = it.get("content")?.as_str()?.trim();
+            if content.is_empty() {
+                return None;
+            }
+            Some(TodoItem {
+                content: content.to_string(),
+                status: it
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("pending")
+                    .to_string(),
+                active_form: it
+                    .get("activeForm")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            })
+        })
+        .collect();
+    if todos.is_empty() { None } else { Some(todos) }
 }
 
 impl ProgressEvent {
@@ -3888,8 +3948,44 @@ impl ProgressEvent {
                     None => format!("⏳ {action}…"),
                 }
             }
+            Self::TodoUpdate { todos } => render_todo_list(todos),
         }
     }
+}
+
+/// Max todo items rendered in a channel progress message (rest summarised).
+const TODO_RENDER_CAP: usize = 12;
+/// Max chars per rendered todo line (CJK-safe truncation).
+const TODO_ITEM_CHAR_CAP: usize = 60;
+
+/// Render a todo list as a compact, channel-friendly progress board.
+///
+/// Plain-text/emoji only — every channel renders this correctly without
+/// platform-specific markup (bold etc. is added by the per-channel
+/// formatting layer downstream where supported).
+pub(crate) fn render_todo_list(todos: &[TodoItem]) -> String {
+    let done = todos.iter().filter(|t| t.status == "completed").count();
+    let total = todos.len();
+    let mut out = format!("📋 任務進度({done}/{total} 完成)");
+    for item in todos.iter().take(TODO_RENDER_CAP) {
+        let (icon, label) = match item.status.as_str() {
+            "completed" => ("✅", item.content.as_str()),
+            "in_progress" => (
+                "🔄",
+                item.active_form.as_deref().unwrap_or(item.content.as_str()),
+            ),
+            _ => ("⬜", item.content.as_str()),
+        };
+        let label = crate::channel_format::truncate_chars(label, TODO_ITEM_CHAR_CAP);
+        out.push('\n');
+        out.push_str(icon);
+        out.push(' ');
+        out.push_str(&label);
+    }
+    if total > TODO_RENDER_CAP {
+        out.push_str(&format!("\n… 及其他 {} 項", total - TODO_RENDER_CAP));
+    }
+    out
 }
 
 /// Callback type for sending progress events to the channel.
@@ -3897,6 +3993,66 @@ impl ProgressEvent {
 /// The callback is `Send + Sync` so it can be invoked from the streaming loop.
 /// Implementations should be lightweight (just enqueue a message send).
 pub type ProgressCallback = Box<dyn Fn(ProgressEvent) + Send + Sync>;
+
+#[cfg(test)]
+mod todo_progress_tests {
+    use super::*;
+
+    #[test]
+    fn parse_todo_write_input_valid() {
+        let input = serde_json::json!({
+            "todos": [
+                { "content": "研究 API", "status": "completed", "activeForm": "研究中" },
+                { "content": "實作轉換", "status": "in_progress", "activeForm": "實作中" },
+                { "content": "寫測試", "status": "pending" }
+            ]
+        });
+        let todos = parse_todo_write_input(&input).expect("should parse");
+        assert_eq!(todos.len(), 3);
+        assert_eq!(todos[0].status, "completed");
+        assert_eq!(todos[1].active_form.as_deref(), Some("實作中"));
+        assert!(todos[2].active_form.is_none());
+    }
+
+    #[test]
+    fn parse_todo_write_input_rejects_garbage() {
+        assert!(parse_todo_write_input(&serde_json::json!({})).is_none());
+        assert!(parse_todo_write_input(&serde_json::json!({"todos": []})).is_none());
+        assert!(parse_todo_write_input(&serde_json::json!({"todos": [{"status": "pending"}]})).is_none());
+        assert!(parse_todo_write_input(&serde_json::json!({"todos": "not-an-array"})).is_none());
+    }
+
+    #[test]
+    fn render_todo_list_board() {
+        let todos = vec![
+            TodoItem { content: "完成的".into(), status: "completed".into(), active_form: None },
+            TodoItem { content: "進行的".into(), status: "in_progress".into(), active_form: Some("進行中".into()) },
+            TodoItem { content: "待辦的".into(), status: "pending".into(), active_form: None },
+        ];
+        let board = render_todo_list(&todos);
+        assert!(board.contains("1/3 完成"));
+        assert!(board.contains("✅ 完成的"));
+        assert!(board.contains("🔄 進行中")); // in_progress uses activeForm
+        assert!(board.contains("⬜ 待辦的"));
+    }
+
+    #[test]
+    fn render_todo_list_caps_items() {
+        let todos: Vec<TodoItem> = (0..20)
+            .map(|i| TodoItem { content: format!("item{i}"), status: "pending".into(), active_form: None })
+            .collect();
+        let board = render_todo_list(&todos);
+        assert!(board.contains("及其他 8 項"));
+    }
+
+    #[test]
+    fn todo_update_display_via_event() {
+        let event = ProgressEvent::TodoUpdate {
+            todos: vec![TodoItem { content: "x".into(), status: "pending".into(), active_form: None }],
+        };
+        assert!(event.to_display().starts_with("📋"));
+    }
+}
 
 /// Keepalive interval — send progress if no stream-json events for this long.
 pub(crate) const KEEPALIVE_INTERVAL_SECS: u64 = 90;
@@ -4616,6 +4772,21 @@ async fn spawn_claude_cli_with_env(
                                                             .and_then(|n| n.as_str())
                                                             .unwrap_or("unknown")
                                                             .to_string();
+
+                                                        // TodoWrite carries the agent's live task
+                                                        // list — surface it as a progress board
+                                                        // instead of a generic "using tool" line.
+                                                        if tool == "TodoWrite" {
+                                                            if let Some(todos) = block
+                                                                .get("input")
+                                                                .and_then(parse_todo_write_input)
+                                                            {
+                                                                cb(ProgressEvent::TodoUpdate { todos });
+                                                                last_tool_reported = Some(tool);
+                                                                continue;
+                                                            }
+                                                        }
+
                                                         let detail = extract_tool_detail(block);
 
                                                         // Suppress duplicate: same tool consecutively

@@ -1962,6 +1962,18 @@ async fn call_claude_streaming(
                                                             .and_then(|n| n.as_str())
                                                             .unwrap_or("unknown")
                                                             .to_string();
+                                                        // TodoWrite carries the agent's live task
+                                                        // list — surface it as a progress board.
+                                                        if tool == "TodoWrite" {
+                                                            if let Some(todos) = block
+                                                                .get("input")
+                                                                .and_then(crate::channel_reply::parse_todo_write_input)
+                                                            {
+                                                                cb(crate::channel_reply::ProgressEvent::TodoUpdate { todos });
+                                                                last_tool_reported = Some(tool);
+                                                                continue;
+                                                            }
+                                                        }
                                                         let detail = crate::channel_reply::extract_tool_detail(block);
                                                         let dominated = last_tool_reported
                                                             .as_ref()

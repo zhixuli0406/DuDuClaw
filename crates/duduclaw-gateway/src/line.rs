@@ -402,7 +402,16 @@ async fn line_webhook_handler(
                 format!("line:{sender}")
             };
 
+            // Loading animation (LINE shows it in 1:1 chats only; the API
+            // silently no-ops elsewhere). RAII guard stops the refresh loop.
+            let loading_guard = event
+                .source
+                .as_ref()
+                .and_then(|s| s.user_id.clone())
+                .map(|uid| crate::channel_typing::line_loading(state.http.clone(), token.clone(), uid));
+
             let reply = build_reply_with_session(&input_text, &state.ctx, &session_id, sender, on_progress).await;
+            drop(loading_guard);
 
             // Guard: don't send empty replies
             if reply.trim().is_empty() {
@@ -455,12 +464,15 @@ mod line_limits {
 /// within LINE's 5000-char text limit and the 5-messages-per-request cap, so an
 /// over-limit reply is delivered across messages instead of being rejected.
 fn segment_line_reply(reply: &str, agent_name: Option<&str>) -> Vec<serde_json::Value> {
-    // Small enough for one bubble → keep the rich Flex format.
+    // Small enough for one bubble → keep the rich Flex format
+    // (to_line_flex_message does the markdown → plain conversion itself).
     if reply.chars().count() <= line_limits::FLEX_SAFE {
         return vec![channel_format::to_line_flex_message(reply, agent_name)];
     }
 
-    // Long reply → split into text messages on char-safe boundaries.
+    // Long reply → markdown to LINE-friendly plain text, then split into
+    // text messages on char-safe boundaries.
+    let reply = &crate::markdown_render::to_line_plain(reply);
     let chunks = channel_format::split_text(reply, line_limits::TEXT_CHUNK);
 
     let mut messages: Vec<serde_json::Value> = Vec::new();
