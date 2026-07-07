@@ -2,7 +2,19 @@
 
 ## [Unreleased]
 
+## [1.35.0] - 2026-07-07 — True auto-update, Ed25519-signed releases, channel UX
+
 ### Added
+- **Per-channel rich rendering & live progress**: platform-native markdown
+  rendering (Telegram HTML / Slack blocks / WhatsApp markup / Feishu Card 2.0 /
+  Google Chat / Teams / LINE plain text, CJK-width-aware monospace tables),
+  typing indicators on all channels, and a live 📋 task-progress board for
+  long-running jobs (parsed from Claude `TodoWrite` events, edited in place).
+- **Google Chat and Microsoft Teams channels** (JWT-verified webhooks,
+  service-account / Bot Framework proactive sending) — nine channels total.
+- `web_fetch` (L1) / `web_extract` (L2) MCP tools wired to the browser
+  auto-routing ladder; `slack` / `access_control` modules reconnected
+  (previously dead code never declared in `lib.rs`).
 - **True auto-update with in-process restart**: after a self-update installs
   (dashboard "Install update" button or the 6-hourly checker with
   `[gateway] auto_update = true`), the gateway now re-execs the new binary
@@ -21,6 +33,15 @@
 - `InstallMethod::Npm` detection (binary under `node_modules/`) — self-update
   supported; npm registry metadata goes stale until the next `npm i -g`.
 
+### Changed
+- README rewritten in all three languages (zh-TW / en / ja): plain-language
+  opening, 5 badges, one feature-overview table with links into `docs/`,
+  refreshed facts (9 channels, 5 runtimes, signature verification).
+
+### Removed
+- Dead modules `analytics.rs` / `browserbase.rs` / `input_guard.rs`
+  (superseded by the v1.34 security layer; no call sites).
+
 ### Fixed
 - Updater never matched real release assets: `platform_asset_suffix()` looked
   for `arm64-apple-darwin.tar.gz`-style names while CI publishes
@@ -33,6 +54,7 @@
   exits 0 after graceful shutdown, which `on-failure` would not relaunch).
 - Linux: re-exec path is pinned before the binary is replaced
   (`/proc/self/exe` reads `… (deleted)` after the update swaps the file).
+- Pairing flow lock-in bug (stale pairing lock blocked re-pairing).
 
 ## [1.34.0] - 2026-07-06 — Runtime-agnostic security reference monitor
 
