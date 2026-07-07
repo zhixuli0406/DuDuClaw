@@ -89,7 +89,11 @@ pub struct FetchResult {
 // ---------------------------------------------------------------------------
 
 /// Validate that a URL is safe to fetch (not targeting internal resources).
-fn validate_url(url: &str) -> Result<reqwest::Url, FetchError> {
+///
+/// Public so other download paths (`media::download_url`) can share the same
+/// SSRF gate. Note this is the pattern-level check only — the full DNS-rebind
+/// pinning happens inside [`web_fetch_cached`].
+pub fn validate_url(url: &str) -> Result<reqwest::Url, FetchError> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| FetchError::SsrfBlocked(format!("invalid URL: {e}")))?;
 

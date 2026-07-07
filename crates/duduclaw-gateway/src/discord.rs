@@ -965,10 +965,53 @@ async fn gateway_loop(
                                     }
                                     "GUILD_CREATE" => {
                                         if let Some(d) = &payload.d {
-                                            let guild_name = d["name"].as_str().unwrap_or("unknown");
-                                            let guild_id = d["id"].as_str().unwrap_or("");
+                                            let guild_name = d["name"].as_str().unwrap_or("unknown").to_string();
+                                            let guild_id = d["id"].as_str().unwrap_or("").to_string();
                                             info!("Discord: joined guild '{guild_name}' ({guild_id})");
+                                            if !guild_id.is_empty() {
+                                                let ctx = ctx.clone();
+                                                tokio::spawn(async move {
+                                                    let settings = &ctx.channel_settings;
+                                                    // Record the guild name for status reporting
+                                                    // (upsert keeps renames fresh).
+                                                    let _ = settings.set("discord", &guild_id, keys::GUILD_NAME, &guild_name).await;
+                                                    // Seed defaults only when unset. mention_only is
+                                                    // intentionally NOT seeded: its default differs
+                                                    // between the global bot (false) and per-agent
+                                                    // bots (true); a stored value would override both.
+                                                    let existing = settings.get_all("discord", &guild_id).await;
+                                                    if !existing.iter().any(|(k, _)| k == keys::AUTO_THREAD) {
+                                                        let _ = settings.set("discord", &guild_id, keys::AUTO_THREAD, "true").await;
+                                                    }
+                                                });
+                                            }
                                         }
+                                    }
+                                    // Thread lifecycle: close the mapped session when a
+                                    // thread archives or is deleted, so a revived thread
+                                    // starts a fresh conversation instead of dragging in
+                                    // stale context.
+                                    "THREAD_UPDATE" | "THREAD_DELETE" => {
+                                        if let Some(d) = &payload.d {
+                                            let thread_id = d["id"].as_str().unwrap_or("").to_string();
+                                            let archived = event == "THREAD_DELETE"
+                                                || d["thread_metadata"]["archived"].as_bool().unwrap_or(false);
+                                            if archived && !thread_id.is_empty() {
+                                                let ctx = ctx.clone();
+                                                let reason = if event == "THREAD_DELETE" { "deleted" } else { "archived" };
+                                                tokio::spawn(async move {
+                                                    let session_id = format!("discord:thread:{thread_id}");
+                                                    match ctx.session_manager.delete_session(&session_id).await {
+                                                        Ok(()) => info!("Discord: thread {thread_id} {reason} — session closed"),
+                                                        // Most threads never had a session; not an error.
+                                                        Err(e) => debug!("Discord: thread {thread_id} {reason}, no session to close ({e})"),
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }
+                                    "THREAD_CREATE" => {
+                                        debug!("Discord: thread created (session is created lazily on first message)");
                                     }
                                     _ => {
                                         debug!("Discord event: {event}");
@@ -1197,6 +1240,11 @@ async fn handle_message_create(
         return; // In guild, mention_only enabled, but bot not mentioned → skip
     }
 
+    // ── Guild whitelist (global-scope allowed_guilds) ──
+    if !guild_id.is_empty() && !settings.is_guild_allowed("discord", guild_id).await {
+        return;
+    }
+
     // ── Channel whitelist ──
     if !guild_id.is_empty() && !settings.is_channel_allowed("discord", scope_id, channel_id).await {
         return;
@@ -1368,13 +1416,38 @@ async fn handle_message_create(
     let cleanup_token = token.to_string();
     let cleanup_channel = reply_channel_id.clone();
 
+    // ── Resolve effective agent ──
+    // Per-agent bot binding wins; otherwise a guild-level `/agent` override
+    // (AGENT_OVERRIDE, written by the slash command / select menu) applies.
+    let guild_agent_override = if agent_name.is_none() && !guild_id.is_empty() {
+        match settings.get("discord", scope_id, keys::AGENT_OVERRIDE).await {
+            Some(name) if !name.is_empty() => {
+                let reg = ctx.registry.read().await;
+                if reg.get(&name).is_some() {
+                    Some(name)
+                } else {
+                    warn!("Discord guild {guild_id}: agent_override '{name}' is not a loaded agent — ignoring");
+                    None
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let effective_agent: Option<String> =
+        agent_name.map(|s| s.to_string()).or(guild_agent_override);
+
     // ── Get agent display name for embed footer ──
     let display_name = {
         let reg = ctx.registry.read().await;
-        reg.main_agent().map(|a| a.config.agent.display_name.clone())
+        match &effective_agent {
+            Some(name) => reg.get(name).map(|a| a.config.agent.display_name.clone()),
+            None => reg.main_agent().map(|a| a.config.agent.display_name.clone()),
+        }
     };
 
-    let reply = if let Some(agent) = agent_name {
+    let reply = if let Some(agent) = &effective_agent {
         build_reply_for_agent(clean_content, ctx, agent, &session_id, user_id, Some(on_progress)).await
     } else {
         build_reply_with_session(clean_content, ctx, &session_id, user_id, Some(on_progress)).await
@@ -1389,16 +1462,24 @@ async fn handle_message_create(
         return;
     }
 
-    // ── Send reply with embed + buttons ──
-    let mut payload = channel_format::to_discord_message(&reply, display_name.as_deref(), false);
+    // ── Send reply with embed + buttons (respecting per-guild response_mode) ──
+    let response_mode = channel_format::ResponseMode::parse(
+        &settings.get_with_fallback("discord", scope_id, keys::RESPONSE_MODE, "auto").await,
+    );
+    let mut payloads = channel_format::to_discord_messages_mode(
+        &reply,
+        display_name.as_deref(),
+        false,
+        response_mode,
+    );
 
-    // Reply to the original message so the sender gets a notification.
-    // Skip message_reference when:
+    // Reply to the original message so the sender gets a notification
+    // (on the FIRST message only). Skip message_reference when:
     // 1. We just created a new thread (original message is in the parent channel)
     // 2. The reply target channel differs from the original message's channel
     //    (can happen when thread detection missed or gateway state is stale)
     if !created_thread && reply_channel_id == channel_id {
-        if let Some(obj) = payload.as_object_mut() {
+        if let Some(obj) = payloads.first_mut().and_then(|p| p.as_object_mut()) {
             obj.insert("message_reference".to_string(), json!({
                 "message_id": message_id,
                 "channel_id": channel_id,
@@ -1407,9 +1488,9 @@ async fn handle_message_create(
         }
     }
 
-    // Add conversation buttons
+    // Add conversation buttons to the LAST message of the reply.
     let buttons = channel_format::discord_conversation_buttons(&session_id);
-    if let Some(obj) = payload.as_object_mut() {
+    if let Some(obj) = payloads.last_mut().and_then(|p| p.as_object_mut()) {
         obj.insert("components".to_string(), json!([buttons]));
     }
 
@@ -1431,25 +1512,28 @@ async fn handle_message_create(
         });
     }
 
-    // ── Split if needed (embed description > 4096 or plain text > 2000) ──
-    if let Err(e) = send_discord_message(http, token, &reply_channel_id, payload).await {
-        warn!(
-            channel_id = %e.channel_id,
-            status = ?e.status,
-            "Discord reply delivery failed: {e}"
-        );
-        let event = crate::protocol::WsFrame::event(
-            "channels.send_failed",
-            json!({
-                "channel": "discord",
-                "target_channel_id": e.channel_id,
-                "http_status": e.status,
-                "error": e.detail,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }),
-        );
-        if let Ok(json) = serde_json::to_string(&event) {
-            let _ = ctx.event_tx.send(json);
+    // ── Send every message (long replies span several; nothing is dropped) ──
+    for payload in payloads {
+        if let Err(e) = send_discord_message(http, token, &reply_channel_id, payload).await {
+            warn!(
+                channel_id = %e.channel_id,
+                status = ?e.status,
+                "Discord reply delivery failed: {e}"
+            );
+            let event = crate::protocol::WsFrame::event(
+                "channels.send_failed",
+                json!({
+                    "channel": "discord",
+                    "target_channel_id": e.channel_id,
+                    "http_status": e.status,
+                    "error": e.detail,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                }),
+            );
+            if let Ok(json) = serde_json::to_string(&event) {
+                let _ = ctx.event_tx.send(json);
+            }
+            break; // don't spam retries for the remaining chunks of one reply
         }
     }
 
@@ -1583,15 +1667,9 @@ async fn send_discord_message(http: &reqwest::Client, token: &str, channel_id: &
 }
 
 async fn send_raw(http: &reqwest::Client, token: &str, channel_id: &str, payload: &Value) -> Result<(), DiscordSendError> {
-    // Strip any `components` (buttons) from the payload — DuDuClaw does not
-    // handle Discord button interactions, so sending them only confuses users.
-    let cleaned = if payload.get("components").is_some() {
-        let mut p = payload.clone();
-        p.as_object_mut().map(|m| m.remove("components"));
-        p
-    } else {
-        payload.clone()
-    };
+    // Components (buttons/selects) are sent as-is — `handle_component_interaction`
+    // handles the resulting INTERACTION_CREATE (type 3) callbacks.
+    let cleaned = payload.clone();
 
     match http
         .post(format!("{DISCORD_API}/channels/{channel_id}/messages"))
@@ -1686,8 +1764,115 @@ async fn handle_interaction(
         2 => {
             handle_slash_command(data, interaction_id, interaction_token, bot_id, app_id, http, token, ctx).await;
         }
+        // Message Component (button = component type 2, select menu = type 3)
+        3 => {
+            handle_component_interaction(data, interaction_id, interaction_token, http, ctx).await;
+        }
         _ => {
             debug!("Discord: unhandled interaction type {interaction_type}");
+        }
+    }
+}
+
+/// Handle a message-component interaction (buttons / select menus).
+///
+/// `custom_id` format: `duduclaw:{action}[:{payload}]` where the payload may
+/// itself contain `:` (session ids like `discord:thread:{id}`), so we split
+/// at most 3 times.
+async fn handle_component_interaction(
+    data: &Value,
+    interaction_id: &str,
+    interaction_token: &str,
+    http: &reqwest::Client,
+    ctx: &Arc<ReplyContext>,
+) {
+    let cdata = match data.get("data") {
+        Some(d) => d,
+        None => return,
+    };
+    let custom_id = cdata["custom_id"].as_str().unwrap_or("");
+    let guild_id = data["guild_id"].as_str().unwrap_or("");
+
+    let mut parts = custom_id.splitn(3, ':');
+    let ns = parts.next().unwrap_or("");
+    let action = parts.next().unwrap_or("");
+    let payload = parts.next().unwrap_or("");
+    if ns != "duduclaw" {
+        debug!("Discord: ignoring non-duduclaw component: {custom_id}");
+        return;
+    }
+
+    // Ephemeral confirmation helper (flags 64 = only the presser sees it).
+    let ephemeral = |msg: String| json!({ "content": msg, "flags": 64 });
+
+    match action {
+        "new_session" => {
+            let session_id = if payload.is_empty() {
+                let channel_id = data["channel_id"].as_str().unwrap_or("");
+                format!("discord:{channel_id}")
+            } else {
+                payload.to_string()
+            };
+            let msg = match ctx.session_manager.delete_session(&session_id).await {
+                Ok(()) => "✅ 已開啟新的對話".to_string(),
+                Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
+            };
+            send_interaction_response(http, interaction_id, interaction_token, 4, Some(ephemeral(msg))).await;
+        }
+        "agent_menu" => {
+            let agents: Vec<String> = {
+                let reg = ctx.registry.read().await;
+                reg.list().iter().map(|a| a.config.agent.name.clone()).collect()
+            };
+            if agents.is_empty() {
+                send_interaction_response(http, interaction_id, interaction_token, 4,
+                    Some(ephemeral("沒有可切換的 Agent".to_string()))).await;
+                return;
+            }
+            let menu = channel_format::discord_agent_select_menu(&agents);
+            send_interaction_response(http, interaction_id, interaction_token, 4, Some(json!({
+                "content": "選擇此伺服器要使用的 Agent（需要「管理伺服器」權限）：",
+                "components": [menu],
+                "flags": 64
+            }))).await;
+        }
+        "agent_select" => {
+            let selected = cdata["values"].as_array()
+                .and_then(|v| v.first())
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if guild_id.is_empty() {
+                send_interaction_response(http, interaction_id, interaction_token, 4,
+                    Some(ephemeral("❌ 切換 Agent 只能在伺服器中使用".to_string()))).await;
+                return;
+            }
+            if !has_manage_guild_permission(data) {
+                send_interaction_response(http, interaction_id, interaction_token, 4,
+                    Some(ephemeral("❌ 需要「管理伺服器」權限才能切換 Agent".to_string()))).await;
+                return;
+            }
+            let known = {
+                let reg = ctx.registry.read().await;
+                reg.get(selected).is_some()
+            };
+            if !known {
+                send_interaction_response(http, interaction_id, interaction_token, 4,
+                    Some(ephemeral(format!("❌ 找不到 Agent `{selected}`")))).await;
+                return;
+            }
+            let _ = ctx.channel_settings.set("discord", guild_id, keys::AGENT_OVERRIDE, selected).await;
+            send_interaction_response(http, interaction_id, interaction_token, 4,
+                Some(ephemeral(format!("✅ 此伺服器已切換至 Agent：**{selected}**")))).await;
+        }
+        // Legacy button on messages sent before v1.36 (Discord replies have
+        // no voice mode) — acknowledge honestly instead of silently dropping.
+        "voice_toggle" => {
+            send_interaction_response(http, interaction_id, interaction_token, 4,
+                Some(ephemeral("ℹ️ Discord 尚不支援語音回覆模式".to_string()))).await;
+        }
+        _ => {
+            send_interaction_response(http, interaction_id, interaction_token, 4,
+                Some(ephemeral("未知的按鈕動作".to_string()))).await;
         }
     }
 }
@@ -1729,6 +1914,13 @@ async fn handle_slash_command(
 
     match cmd_name {
         "ask" => {
+            // Guild whitelist applies to slash commands too.
+            if !guild_id.is_empty() && !ctx.channel_settings.is_guild_allowed("discord", guild_id).await {
+                send_interaction_response(http, interaction_id, interaction_token, 4,
+                    Some(json!({"content": "❌ 此伺服器未被授權使用 DuDuClaw", "flags": 64}))).await;
+                return;
+            }
+
             // Deferred response (type 5) — we'll edit it later
             send_interaction_response(http, interaction_id, interaction_token, 5, None).await;
 
@@ -1738,12 +1930,30 @@ async fn handle_slash_command(
                 .and_then(|o| o["value"].as_str())
                 .unwrap_or("");
 
+            // Honour the guild-level agent override (written by /agent or the
+            // Switch Agent select menu).
+            let scope = if guild_id.is_empty() { "dm" } else { guild_id };
+            let agent_override = match ctx.channel_settings.get("discord", scope, keys::AGENT_OVERRIDE).await {
+                Some(name) if !name.is_empty() => {
+                    let reg = ctx.registry.read().await;
+                    if reg.get(&name).is_some() { Some(name) } else { None }
+                }
+                _ => None,
+            };
+
             let session_id = format!("discord:{channel_id}");
-            let reply = build_reply_with_session(prompt, ctx, &session_id, user_id, None).await;
+            let reply = if let Some(agent) = &agent_override {
+                build_reply_for_agent(prompt, ctx, agent, &session_id, user_id, None).await
+            } else {
+                build_reply_with_session(prompt, ctx, &session_id, user_id, None).await
+            };
 
             let agent_name = {
                 let reg = ctx.registry.read().await;
-                reg.main_agent().map(|a| a.config.agent.display_name.clone())
+                match &agent_override {
+                    Some(n) => reg.get(n).map(|a| a.config.agent.display_name.clone()),
+                    None => reg.main_agent().map(|a| a.config.agent.display_name.clone()),
+                }
             };
 
             let payload = channel_format::to_discord_message(&reply, agent_name.as_deref(), false);
@@ -1949,14 +2159,7 @@ async fn edit_interaction_response(
     interaction_token: &str,
     data: &Value,
 ) {
-    // Strip components (buttons) — not handled by DuDuClaw
-    let cleaned = if data.get("components").is_some() {
-        let mut d = data.clone();
-        d.as_object_mut().map(|m| m.remove("components"));
-        d
-    } else {
-        data.clone()
-    };
+    let cleaned = data.clone();
 
     let url = format!("{DISCORD_API}/webhooks/{app_id}/{interaction_token}/messages/@original");
     match http.patch(&url).json(&cleaned).send().await {

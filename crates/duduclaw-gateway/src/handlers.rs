@@ -3499,13 +3499,17 @@ impl MethodHandler {
 
         // Detect per-agent channel token changes BEFORE the closure consumes
         // params — so we know what to hot-restart after the write succeeds.
-        // Only Discord/Telegram have working hot-restart helpers today.
         let mut channels_to_restart: Vec<&'static str> = Vec::new();
         if params.get("discord_bot_token").and_then(|v| v.as_str()).is_some() {
             channels_to_restart.push("discord");
         }
         if params.get("telegram_bot_token").and_then(|v| v.as_str()).is_some() {
             channels_to_restart.push("telegram");
+        }
+        if params.get("slack_bot_token").and_then(|v| v.as_str()).is_some()
+            || params.get("slack_app_token").and_then(|v| v.as_str()).is_some()
+        {
+            channels_to_restart.push("slack");
         }
 
         let params_clone = params.clone();
@@ -5380,8 +5384,7 @@ impl MethodHandler {
             let per_agent_handles: Vec<(String, tokio::task::JoinHandle<()>)> = match channel_type {
                 "discord" => crate::discord::start_discord_bots(&self.home_dir, ctx).await,
                 "telegram" => crate::telegram::start_telegram_bots(&self.home_dir, ctx).await,
-                // Slack: per-agent ready but module has unresolved deps
-                // "slack" => crate::slack::start_slack_bots(&self.home_dir, ctx).await,
+                "slack" => crate::slack::start_slack_bots(&self.home_dir, ctx).await,
                 _ => Vec::new(),
             };
             for (label, h) in per_agent_handles {
@@ -5417,6 +5420,7 @@ impl MethodHandler {
         let handle = match channel_type {
             "telegram" => crate::telegram::start_telegram_bot(&home, ctx).await,
             "discord" => crate::discord::start_discord_bot(&home, ctx).await,
+            "slack" => crate::slack::start_slack_bot(&home, ctx).await,
             "line" => {
                 // LINE uses a webhook (axum route is always mounted) — no background
                 // task. The handler reads the token per request, so saving config is
@@ -5470,9 +5474,9 @@ impl MethodHandler {
     ///
     /// Without this, `agents.update` would write the new token but the running
     /// bot loop keeps using the old captured token until gateway restart.
-    /// LINE / Slack / WhatsApp / Feishu are not handled here — LINE is webhook-
-    /// based (no background task), the others lack hot-restart helpers and
-    /// still require gateway restart for token changes.
+    /// LINE / WhatsApp / Feishu are not handled here — LINE is webhook-based
+    /// (no background task), the others lack hot-restart helpers and still
+    /// require gateway restart for token changes.
     async fn hot_restart_agent_channels(&self, channel_types: &[&str], agent_name: &str) -> Vec<String> {
         let ctx = match self.reply_ctx.read().await.clone() {
             Some(ctx) => ctx,
@@ -5487,6 +5491,7 @@ impl MethodHandler {
             let handles: Vec<(String, tokio::task::JoinHandle<()>)> = match *ch {
                 "discord" => crate::discord::start_discord_bots(&self.home_dir, ctx.clone()).await,
                 "telegram" => crate::telegram::start_telegram_bots(&self.home_dir, ctx.clone()).await,
+                "slack" => crate::slack::start_slack_bots(&self.home_dir, ctx.clone()).await,
                 _ => Vec::new(),
             };
             for (l, h) in handles {

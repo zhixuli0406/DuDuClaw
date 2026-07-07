@@ -30,6 +30,16 @@ pub mod keys {
     pub const RESPONSE_MODE: &str = "response_mode";
     /// Thread auto-archive duration in minutes: "60" | "1440" | "4320" | "10080"
     pub const THREAD_ARCHIVE_MINUTES: &str = "thread_archive_minutes";
+    /// JSON array of allowed guild/server IDs (global scope). Empty or missing = all allowed.
+    pub const ALLOWED_GUILDS: &str = "allowed_guilds";
+    /// Human-readable guild/server name, recorded on GUILD_CREATE for status reporting.
+    pub const GUILD_NAME: &str = "guild_name";
+    /// JSON array of allowed user IDs (global scope). Missing = open access.
+    pub const ALLOWED_USERS: &str = "allowed_users";
+    /// JSON array of blocked user IDs (global scope). Blocked users are silently ignored.
+    pub const BLOCKED_USERS: &str = "blocked_users";
+    /// Whether unknown users must pair via `/pair <code>` first. Values: "true" / "false".
+    pub const REQUIRE_PAIRING: &str = "require_pairing";
 }
 
 /// Cache key: (channel_type, scope_id, key)
@@ -244,6 +254,39 @@ impl ChannelSettingsManager {
         }
         allowed.iter().any(|id| id == channel_id)
     }
+
+    /// Check if a guild/server is allowed. The guild whitelist lives at the
+    /// GLOBAL scope only (a guild can't whitelist itself). Missing/empty list
+    /// or corrupt JSON = allow all, matching the channel-whitelist semantics.
+    pub async fn is_guild_allowed(&self, channel_type: &str, guild_id: &str) -> bool {
+        let val = match self.get(channel_type, "global", keys::ALLOWED_GUILDS).await {
+            Some(v) if !v.is_empty() => v,
+            _ => return true,
+        };
+        let allowed: Vec<String> = serde_json::from_str(&val).unwrap_or_else(|e| {
+            tracing::warn!(key = "allowed_guilds", error = %e, "Corrupt JSON in channel settings — falling back to allow-all");
+            Vec::new()
+        });
+        if allowed.is_empty() {
+            return true;
+        }
+        allowed.iter().any(|id| id == guild_id)
+    }
+
+    /// List all distinct scope_ids stored for a channel type (excluding "global").
+    /// Used by the `channel_status` MCP tool to enumerate known guilds/chats.
+    pub async fn list_scopes(&self, channel_type: &str) -> Vec<String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT DISTINCT scope_id FROM channel_settings WHERE channel_type = ?1 AND scope_id != 'global'"
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![channel_type], |row| row.get::<_, String>(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────
@@ -369,5 +412,40 @@ mod tests {
         mgr.set("discord", "guild1", "auto_thread", "false").await.unwrap();
         let all = mgr.get_all("discord", "guild1").await;
         assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_guild_whitelist_empty_allows_all() {
+        let (_tmp, mgr) = temp_db();
+        assert!(mgr.is_guild_allowed("discord", "g999").await);
+    }
+
+    #[tokio::test]
+    async fn test_guild_whitelist_filters() {
+        let (_tmp, mgr) = temp_db();
+        mgr.set("discord", "global", keys::ALLOWED_GUILDS, r#"["g1","g2"]"#).await.unwrap();
+        assert!(mgr.is_guild_allowed("discord", "g1").await);
+        assert!(!mgr.is_guild_allowed("discord", "g999").await);
+    }
+
+    #[tokio::test]
+    async fn test_guild_whitelist_corrupt_json_allows_all() {
+        // Fail-open on corrupt data mirrors allowed_channels: never lock every
+        // guild out because of a bad write.
+        let (_tmp, mgr) = temp_db();
+        mgr.set("discord", "global", keys::ALLOWED_GUILDS, "not json").await.unwrap();
+        assert!(mgr.is_guild_allowed("discord", "g1").await);
+    }
+
+    #[tokio::test]
+    async fn test_list_scopes_excludes_global() {
+        let (_tmp, mgr) = temp_db();
+        mgr.set("discord", "global", "mention_only", "true").await.unwrap();
+        mgr.set("discord", "g1", "guild_name", "Guild One").await.unwrap();
+        mgr.set("discord", "g2", "guild_name", "Guild Two").await.unwrap();
+        mgr.set("telegram", "c1", "mention_only", "true").await.unwrap();
+        let mut scopes = mgr.list_scopes("discord").await;
+        scopes.sort();
+        assert_eq!(scopes, vec!["g1".to_string(), "g2".to_string()]);
     }
 }

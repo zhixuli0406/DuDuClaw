@@ -227,6 +227,8 @@ pub struct ReplyContext {
     pub voice_sessions: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     /// Per-channel, per-scope settings (mention_only, whitelist, auto_thread, etc.).
     pub channel_settings: Arc<ChannelSettingsManager>,
+    /// User-level access control: allowlist / blocklist / pairing codes.
+    pub access_control: Arc<crate::access_control::AccessController>,
     /// Killswitch configuration (safety words, thresholds, escalation).
     pub killswitch: Arc<KillswitchConfig>,
     /// Failsafe degradation manager (per-scope level tracking).
@@ -262,6 +264,8 @@ impl ReplyContext {
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .unwrap_or_default();
+        // Register the channel-status snapshot path (idempotent; first call wins).
+        let _ = CHANNEL_STATUS_PATH.set(home_dir.join("channel_status.json"));
         // Co-locate channel settings in the session database
         let db_path = home_dir.join("sessions.db");
         let channel_settings = ChannelSettingsManager::from_session_db(&db_path)
@@ -273,6 +277,12 @@ impl ReplyContext {
         // Load killswitch config from ~/.duduclaw/KILLSWITCH.toml
         let ks_path = home_dir.join("KILLSWITCH.toml");
         let killswitch = KillswitchConfig::load(&ks_path);
+
+        // User-level access control (pairing / allowlist / blocklist),
+        // persisted across restarts.
+        let access_control = Arc::new(crate::access_control::AccessController::with_persistence(
+            home_dir.join("access_control.json"),
+        ));
 
         // Initialize failsafe manager and circuit breaker registry
         let failsafe = Arc::new(FailsafeManager::new(killswitch.failsafe.clone()));
@@ -295,6 +305,7 @@ impl ReplyContext {
             gap_accumulator: Arc::new(tokio::sync::Mutex::new(GapAccumulator::new(3, 24))),
             sandbox_store: Arc::new(tokio::sync::Mutex::new(SandboxStore::new())),
             voice_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            access_control,
             channel_settings: Arc::new(channel_settings),
             killswitch: Arc::new(killswitch),
             failsafe: Some(failsafe),
@@ -342,6 +353,25 @@ impl ReplyContext {
     }
 }
 
+/// Snapshot file for out-of-process readers (the `channel_status` MCP tool
+/// runs in the `duduclaw mcp-server` process and cannot see the gateway's
+/// in-memory map). Set once at gateway start via [`ReplyContext::new`].
+static CHANNEL_STATUS_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Persist the channel-status snapshot atomically (temp + rename).
+/// Best-effort: a failed write only degrades the MCP `channel_status` view.
+fn persist_channel_status_snapshot(snapshot: serde_json::Value) {
+    let Some(path) = CHANNEL_STATUS_PATH.get() else { return };
+    let path = path.clone();
+    tokio::task::spawn_blocking(move || {
+        let tmp = path.with_extension("json.tmp");
+        let body = serde_json::to_string_pretty(&snapshot).unwrap_or_default();
+        if std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+            tracing::debug!(?path, "channel status snapshot write failed");
+        }
+    });
+}
+
 /// Helper to update a channel's connection state and broadcast the change to dashboard clients.
 pub async fn set_channel_connected(status: &ChannelStatusMap, name: &str, connected: bool, error: Option<String>, event_tx: Option<&tokio::sync::broadcast::Sender<String>>) {
     let now = chrono::Utc::now();
@@ -353,6 +383,18 @@ pub async fn set_channel_connected(status: &ChannelStatusMap, name: &str, connec
             last_event: Some(now),
             error,
         });
+        // Snapshot for the out-of-process `channel_status` MCP tool.
+        let snapshot = serde_json::json!({
+            "updated_at": now.to_rfc3339(),
+            "channels": map.iter().map(|(n, s)| {
+                (n.clone(), serde_json::json!({
+                    "connected": s.connected,
+                    "last_event": s.last_event.map(|t| t.to_rfc3339()),
+                    "error": s.error,
+                }))
+            }).collect::<serde_json::Map<String, serde_json::Value>>(),
+        });
+        persist_channel_status_snapshot(snapshot);
     }
     // Broadcast status change to WebSocket clients for real-time dashboard updates
     if let Some(tx) = event_tx {
@@ -565,6 +607,96 @@ pub async fn build_reply_with_session(
     enforce_contract(restored, &ctx.home_dir, &agent_id).await
 }
 
+/// Channel session-id prefixes subject to the user access gate. Internal
+/// sessions ("default", cron/bus/heartbeat ids) are never gated.
+const GATED_CHANNELS: &[&str] = &[
+    "telegram", "discord", "slack", "line", "whatsapp",
+    "feishu", "googlechat", "teams", "webchat",
+];
+
+/// Central per-user access gate (allowlist / blocklist / pairing).
+///
+/// Called once at the top of the reply pipeline so every channel is covered
+/// by one enforcement point. Returns:
+/// - `None` — allowed; continue to the AI pipeline.
+/// - `Some("")` — blocked; every channel skips sending an empty reply, so
+///   blocked users are silently ignored.
+/// - `Some(text)` — early reply (pairing hint, or the `/pair` verdict).
+///
+/// Defaults are fully open: with no `allowed_users` / `blocked_users` /
+/// `require_pairing` settings stored, this returns `None` unconditionally.
+async fn check_user_access_gate(
+    ctx: &ReplyContext,
+    session_id: &str,
+    user_id: &str,
+    text: &str,
+) -> Option<String> {
+    let channel = session_id.split(':').next().unwrap_or("");
+    if !GATED_CHANNELS.contains(&channel) {
+        return None;
+    }
+
+    let settings = &ctx.channel_settings;
+    let require_pairing = settings
+        .get_bool(channel, "global", crate::channel_settings::keys::REQUIRE_PAIRING, false)
+        .await;
+    let parse_list = |v: Option<String>| -> Option<Vec<String>> {
+        let v = v?;
+        if v.is_empty() {
+            return None;
+        }
+        serde_json::from_str::<Vec<String>>(&v).ok().filter(|l| !l.is_empty())
+    };
+    let allowed = parse_list(
+        settings
+            .get(channel, "global", crate::channel_settings::keys::ALLOWED_USERS)
+            .await,
+    );
+    let blocked = parse_list(
+        settings
+            .get(channel, "global", crate::channel_settings::keys::BLOCKED_USERS)
+            .await,
+    )
+    .unwrap_or_default();
+
+    // Fast path: nothing configured → open access, zero overhead beyond reads.
+    if !require_pairing && allowed.is_none() && blocked.is_empty() {
+        return None;
+    }
+
+    // `/pair <code>` must be usable by not-yet-approved users — intercept it
+    // before the access decision. Codes are operator-generated via the
+    // `pairing_generate` MCP tool for either the user id or the session id.
+    let trimmed = text.trim();
+    if let Some(code) = trimmed.strip_prefix("/pair ").map(str::trim) {
+        if !code.is_empty() {
+            // Blocked users may not pair.
+            if blocked.iter().any(|b| b == user_id || b == session_id) {
+                return Some(String::new());
+            }
+            let ok = ctx.access_control.verify_pairing_code(user_id, code).await
+                || ctx.access_control.verify_pairing_code(session_id, code).await;
+            return Some(if ok {
+                "✅ 配對成功，現在可以開始對話了。".to_string()
+            } else {
+                "❌ 配對碼錯誤或已過期，請向管理員索取新的配對碼。".to_string()
+            });
+        }
+    }
+
+    match ctx
+        .access_control
+        .check_access_dual(user_id, session_id, allowed.as_deref(), &blocked, require_pairing)
+        .await
+    {
+        crate::access_control::AccessDecision::Allowed => None,
+        crate::access_control::AccessDecision::Blocked => Some(String::new()),
+        crate::access_control::AccessDecision::RequirePairing => {
+            Some("🔒 尚未配對。請向管理員索取配對碼，並輸入：/pair <配對碼>".to_string())
+        }
+    }
+}
+
 /// Inner implementation shared by both default-agent and explicit-agent paths.
 ///
 /// When `agent_override` is `Some(name)`, the named agent is looked up directly.
@@ -595,6 +727,13 @@ async fn build_reply_with_session_inner(
     user_id: &str,
     on_progress: Option<ProgressCallback>,
 ) -> String {
+    // ── User access gate (allowlist / blocklist / pairing) ──
+    // Single enforcement point for all channels. Open-by-default: returns
+    // None unless the operator configured access settings for this channel.
+    if let Some(early_reply) = check_user_access_gate(ctx, session_id, user_id, text).await {
+        return early_reply;
+    }
+
     // BLOCKER fix (review B1): use a fresh per-turn ID for citation tracking
     // and prediction-error feedback. `session_id` spans many turns; sharing
     // it as the citation key meant prior turns' citations were attributed

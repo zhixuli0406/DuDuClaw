@@ -34,6 +34,29 @@ pub struct RichMessage {
     pub components: Vec<RichComponent>,
 }
 
+/// Per-scope reply rendering mode (the `response_mode` channel setting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResponseMode {
+    /// Short replies plain, long replies embed (current heuristic).
+    #[default]
+    Auto,
+    /// Always plain-text messages, never embeds.
+    Plain,
+    /// Always embed(s), even for short replies.
+    Embed,
+}
+
+impl ResponseMode {
+    /// Parse the stored setting value; unknown values fall back to Auto.
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "plain" => Self::Plain,
+            "embed" => Self::Embed,
+            _ => Self::Auto,
+        }
+    }
+}
+
 impl RichMessage {
     pub fn text(content: impl Into<String>) -> Self {
         Self { components: vec![RichComponent::Text(content.into())] }
@@ -87,6 +110,17 @@ pub fn to_discord_message(text: &str, agent_name: Option<&str>, error: bool) -> 
 /// This splits the embeds across as many messages as needed so nothing is lost.
 /// Each returned `Value` is a complete message body ready to POST.
 pub fn to_discord_messages(text: &str, agent_name: Option<&str>, error: bool) -> Vec<Value> {
+    to_discord_messages_mode(text, agent_name, error, ResponseMode::Auto)
+}
+
+/// Like [`to_discord_messages`] but honouring an explicit [`ResponseMode`]
+/// (the per-scope `response_mode` channel setting).
+pub fn to_discord_messages_mode(
+    text: &str,
+    agent_name: Option<&str>,
+    error: bool,
+    mode: ResponseMode,
+) -> Vec<Value> {
     // Discord renders standard markdown natively EXCEPT pipe tables —
     // downgrade those to monospace code fences (no-op when no table).
     let text = &crate::markdown_render::preprocess_discord_markdown(text);
@@ -95,8 +129,17 @@ pub fn to_discord_messages(text: &str, agent_name: Option<&str>, error: bool) ->
         .map(|n| format!("DuDuClaw \u{00b7} {n}"))
         .unwrap_or_else(|| "DuDuClaw".to_string());
 
-    // Short, simple replies → single plain-text message
-    if text.len() < 200 && !text.contains("```") && !error {
+    // Plain mode → plain-text messages only, split at the message limit.
+    if mode == ResponseMode::Plain && !error {
+        return split_text(text, limits::DISCORD_MESSAGE - 100)
+            .into_iter()
+            .map(|chunk| json!({ "content": chunk }))
+            .collect();
+    }
+
+    // Short, simple replies → single plain-text message (Auto heuristic;
+    // Embed mode forces the embed path even for short replies).
+    if mode != ResponseMode::Embed && text.len() < 200 && !text.contains("```") && !error {
         return vec![json!({ "content": text })];
     }
 
@@ -158,47 +201,136 @@ pub fn to_discord_messages(text: &str, agent_name: Option<&str>, error: bool) ->
 /// readable plain text (headings → 【】, tables → key-value records,
 /// emphasis stripped).
 pub fn to_line_flex_message(text: &str, agent_name: Option<&str>) -> Value {
-    let text = &crate::markdown_render::to_line_plain(text);
+    to_line_flex_message_styled(text, agent_name, false)
+}
+
+/// Dark code-panel colors for LINE Flex code blocks (LINE has no monospace
+/// font control, so a dark panel visually separates code from prose).
+const LINE_CODE_BG: &str = "#1E293B";
+const LINE_CODE_FG: &str = "#E2E8F0";
+/// Error accent for LINE Flex error replies.
+const LINE_ERROR_ACCENT: &str = "#DC2626";
+
+/// Split markdown into alternating prose / fenced-code segments.
+/// Returns `(is_code, content)` pairs; fence lines themselves are dropped.
+fn split_code_segments(text: &str) -> Vec<(bool, String)> {
+    let mut segments: Vec<(bool, String)> = Vec::new();
+    let mut current = String::new();
+    let mut in_code = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            if !current.trim().is_empty() {
+                segments.push((in_code, current.trim_end().to_string()));
+            }
+            current = String::new();
+            in_code = !in_code;
+            continue;
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    if !current.trim().is_empty() {
+        segments.push((in_code, current.trim_end().to_string()));
+    }
+    segments
+}
+
+/// Like [`to_line_flex_message`] with error styling: error replies render as
+/// a red-accented bubble, and fenced code blocks render as dark code panels.
+pub fn to_line_flex_message_styled(text: &str, agent_name: Option<&str>, error: bool) -> Value {
     let footer_text = agent_name
         .map(|n| format!("DuDuClaw \u{00b7} {n}"))
         .unwrap_or_else(|| "DuDuClaw".to_string());
 
-    // Short replies → plain text
-    if text.len() < 200 && !text.contains("```") {
+    // Short prose replies → plain text (errors always get the styled bubble).
+    if !error && text.len() < 200 && !text.contains("```") {
         return json!({
             "type": "text",
-            "text": text
+            "text": crate::markdown_render::to_line_plain(text)
         });
     }
 
-    // Longer replies → Flex Message bubble
+    // Build body components: prose as normal text, code blocks as dark panels.
+    let mut body_contents: Vec<Value> = Vec::new();
+    if error {
+        body_contents.push(json!({
+            "type": "text",
+            "text": "⚠️ 錯誤",
+            "weight": "bold",
+            "size": "sm",
+            "color": LINE_ERROR_ACCENT
+        }));
+        body_contents.push(json!({ "type": "separator", "margin": "sm", "color": LINE_ERROR_ACCENT }));
+    }
+    for (is_code, segment) in split_code_segments(text) {
+        if is_code {
+            body_contents.push(json!({
+                "type": "box",
+                "layout": "vertical",
+                "backgroundColor": LINE_CODE_BG,
+                "cornerRadius": "6px",
+                "paddingAll": "8px",
+                "margin": "sm",
+                "contents": [{
+                    "type": "text",
+                    "text": segment,
+                    "wrap": true,
+                    "size": "xs",
+                    "color": LINE_CODE_FG
+                }]
+            }));
+        } else {
+            let plain = crate::markdown_render::to_line_plain(&segment);
+            if plain.trim().is_empty() {
+                continue;
+            }
+            body_contents.push(json!({
+                "type": "text",
+                "text": plain,
+                "wrap": true,
+                "size": "sm",
+                "margin": "sm"
+            }));
+        }
+    }
+    // LINE rejects an empty body box — fall back to a single text component.
+    if body_contents.is_empty() {
+        body_contents.push(json!({
+            "type": "text",
+            "text": crate::markdown_render::to_line_plain(text),
+            "wrap": true,
+            "size": "sm"
+        }));
+    }
+
+    let alt_plain = crate::markdown_render::to_line_plain(text);
+    let mut bubble = json!({
+        "type": "bubble",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": body_contents
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [{
+                "type": "text",
+                "text": footer_text,
+                "size": "xxs",
+                "color": if error { LINE_ERROR_ACCENT } else { "#999999" },
+                "align": "end"
+            }]
+        }
+    });
+    if error {
+        bubble["styles"] = json!({ "body": { "backgroundColor": "#FFF5F5" } });
+    }
+
     json!({
         "type": "flex",
-        "altText": truncate_chars(text, 200),
-        "contents": {
-            "type": "bubble",
-            "body": {
-                "type": "box",
-                "layout": "vertical",
-                "contents": [{
-                    "type": "text",
-                    "text": text,
-                    "wrap": true,
-                    "size": "sm"
-                }]
-            },
-            "footer": {
-                "type": "box",
-                "layout": "vertical",
-                "contents": [{
-                    "type": "text",
-                    "text": footer_text,
-                    "size": "xxs",
-                    "color": "#999999",
-                    "align": "end"
-                }]
-            }
-        }
+        "altText": truncate_chars(&alt_plain, 200),
+        "contents": bubble
     })
 }
 
@@ -391,6 +523,10 @@ pub fn split_text(text: &str, max_len: usize) -> Vec<String> {
 // ── Conversation buttons ──────────────────────────────────────
 
 /// Discord action row with conversation control buttons.
+///
+/// `custom_id` format: `duduclaw:{action}[:{session_id}]` — parsed by
+/// `discord::handle_component_interaction`. Discord caps custom_id at 100
+/// chars; session ids (`discord:thread:{snowflake}`) fit comfortably.
 pub fn discord_conversation_buttons(session_id: &str) -> Value {
     json!({
         "type": 1,
@@ -404,10 +540,29 @@ pub fn discord_conversation_buttons(session_id: &str) -> Value {
             {
                 "type": 2,
                 "style": 2,
-                "label": "🎤 Voice Toggle",
-                "custom_id": "duduclaw:voice_toggle"
+                "label": "🤖 Switch Agent",
+                "custom_id": "duduclaw:agent_menu"
             }
         ]
+    })
+}
+
+/// Discord action row with a select menu for agent switching.
+/// Sent as an ephemeral response to the "Switch Agent" button.
+pub fn discord_agent_select_menu(agent_names: &[String]) -> Value {
+    let options: Vec<Value> = agent_names
+        .iter()
+        .take(25) // Discord select menu hard cap
+        .map(|name| json!({ "label": truncate_chars(name, 100), "value": truncate_chars(name, 100) }))
+        .collect();
+    json!({
+        "type": 1,
+        "components": [{
+            "type": 3,
+            "custom_id": "duduclaw:agent_select",
+            "placeholder": "選擇要切換的 Agent",
+            "options": options
+        }]
     })
 }
 
@@ -418,6 +573,38 @@ pub fn telegram_conversation_buttons() -> Value {
             { "text": "🔄 New Session", "callback_data": "duduclaw:new_session" },
             { "text": "🎤 Voice Toggle", "callback_data": "duduclaw:voice_toggle" }
         ]]
+    })
+}
+
+/// Slack Block Kit `actions` block with conversation control buttons.
+/// `action_id` mirrors the Discord custom_id convention; the session id is
+/// carried in `value` and handled by the `interactive` Socket-Mode envelope.
+pub fn slack_action_buttons(session_id: &str) -> Value {
+    json!({
+        "type": "actions",
+        "elements": [{
+            "type": "button",
+            "text": { "type": "plain_text", "text": "🔄 New Session" },
+            "action_id": "duduclaw:new_session",
+            "value": session_id
+        }]
+    })
+}
+
+/// LINE quickReply payload with conversation control buttons.
+/// Attached to the LAST message of a reply (LINE shows quickReply only on
+/// the most recent message); handled by the `postback` webhook event.
+pub fn line_quick_reply() -> Value {
+    json!({
+        "items": [{
+            "type": "action",
+            "action": {
+                "type": "postback",
+                "label": "🔄 新對話",
+                "data": "duduclaw:new_session",
+                "displayText": "開啟新對話"
+            }
+        }]
     })
 }
 
@@ -534,5 +721,104 @@ mod tests {
         // Backwards-compat: single-payload form still returns a valid body.
         let msg = to_discord_message("Error", None, true);
         assert!(msg.get("embeds").is_some());
+    }
+
+    // ── response_mode consumer ─────────────────────────────────────
+
+    #[test]
+    fn test_response_mode_parse() {
+        assert_eq!(ResponseMode::parse("plain"), ResponseMode::Plain);
+        assert_eq!(ResponseMode::parse("embed"), ResponseMode::Embed);
+        assert_eq!(ResponseMode::parse("auto"), ResponseMode::Auto);
+        assert_eq!(ResponseMode::parse("garbage"), ResponseMode::Auto);
+    }
+
+    #[test]
+    fn test_discord_plain_mode_never_embeds() {
+        let long_text = "a".repeat(300);
+        let msgs = to_discord_messages_mode(&long_text, Some("agent"), false, ResponseMode::Plain);
+        for m in &msgs {
+            assert!(m.get("embeds").is_none(), "plain mode must not produce embeds");
+            assert!(m.get("content").is_some());
+        }
+    }
+
+    #[test]
+    fn test_discord_embed_mode_forces_embed_for_short() {
+        let msgs = to_discord_messages_mode("Hi!", None, false, ResponseMode::Embed);
+        assert!(msgs[0].get("embeds").is_some(), "embed mode must embed even short replies");
+    }
+
+    #[test]
+    fn test_discord_plain_mode_error_still_embeds() {
+        // Errors keep the red embed even in plain mode so they stay visible.
+        let msgs = to_discord_messages_mode("boom", None, true, ResponseMode::Plain);
+        assert!(msgs[0].get("embeds").is_some());
+    }
+
+    // ── LINE Flex styling ──────────────────────────────────────────
+
+    #[test]
+    fn test_split_code_segments() {
+        let md = "before\n```rust\nlet x = 1;\n```\nafter";
+        let segs = split_code_segments(md);
+        assert_eq!(segs.len(), 3);
+        assert!(!segs[0].0 && segs[0].1.contains("before"));
+        assert!(segs[1].0 && segs[1].1.contains("let x = 1;"));
+        assert!(!segs[2].0 && segs[2].1.contains("after"));
+    }
+
+    #[test]
+    fn test_line_flex_code_block_gets_dark_panel() {
+        let md = format!("說明文字\n```\ncode line\n```\n{}", "尾".repeat(300));
+        let msg = to_line_flex_message(&md, Some("agent"));
+        assert_eq!(msg["type"], "flex");
+        let contents = msg["contents"]["body"]["contents"].as_array().unwrap();
+        let has_code_panel = contents.iter().any(|c| c["backgroundColor"] == LINE_CODE_BG);
+        assert!(has_code_panel, "code block should render as a dark panel box");
+    }
+
+    #[test]
+    fn test_line_flex_error_variant_red_accent() {
+        let msg = to_line_flex_message_styled("something failed", None, true);
+        assert_eq!(msg["type"], "flex", "errors always render as flex");
+        let contents = msg["contents"]["body"]["contents"].as_array().unwrap();
+        assert_eq!(contents[0]["text"], "⚠️ 錯誤");
+        assert_eq!(contents[0]["color"], LINE_ERROR_ACCENT);
+        assert_eq!(msg["contents"]["styles"]["body"]["backgroundColor"], "#FFF5F5");
+    }
+
+    // ── Interactive component builders ─────────────────────────────
+
+    #[test]
+    fn test_discord_buttons_custom_ids() {
+        let row = discord_conversation_buttons("discord:thread:123");
+        let comps = row["components"].as_array().unwrap();
+        assert_eq!(comps[0]["custom_id"], "duduclaw:new_session:discord:thread:123");
+        assert_eq!(comps[1]["custom_id"], "duduclaw:agent_menu");
+    }
+
+    #[test]
+    fn test_discord_agent_select_menu_caps_at_25() {
+        let agents: Vec<String> = (0..30).map(|i| format!("agent-{i}")).collect();
+        let row = discord_agent_select_menu(&agents);
+        let options = row["components"][0]["options"].as_array().unwrap();
+        assert_eq!(options.len(), 25);
+        assert_eq!(row["components"][0]["custom_id"], "duduclaw:agent_select");
+    }
+
+    #[test]
+    fn test_slack_action_buttons_shape() {
+        let block = slack_action_buttons("slack:group:C123");
+        assert_eq!(block["type"], "actions");
+        assert_eq!(block["elements"][0]["action_id"], "duduclaw:new_session");
+        assert_eq!(block["elements"][0]["value"], "slack:group:C123");
+    }
+
+    #[test]
+    fn test_line_quick_reply_shape() {
+        let qr = line_quick_reply();
+        assert_eq!(qr["items"][0]["action"]["type"], "postback");
+        assert_eq!(qr["items"][0]["action"]["data"], "duduclaw:new_session");
     }
 }

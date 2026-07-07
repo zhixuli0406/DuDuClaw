@@ -29,6 +29,7 @@
 #![allow(clippy::unwrap_or_default)]
 #![allow(clippy::sliced_string_as_bytes)]
 #![allow(clippy::if_same_then_else)]
+pub mod access_control;
 pub mod agent_hook_installer;
 pub mod auth;
 pub mod channel_format;
@@ -95,6 +96,7 @@ pub mod server;
 pub mod session;
 pub mod task_spec;
 pub mod telegram;
+pub mod slack;
 pub mod channel_sender;
 pub mod chat_commands;
 pub mod computer_use;
@@ -106,6 +108,8 @@ pub mod defensive_prompt;
 pub mod updater;
 pub mod webchat;
 pub mod webhook;
+pub mod web_extract;
+pub mod web_fetch;
 pub mod whatsapp;
 pub mod feishu;
 pub mod reminder_scheduler;
@@ -129,3 +133,16 @@ pub mod redaction_integration;
 
 pub use extension::{GatewayExtension, NullExtension};
 pub use server::{start_gateway, GatewayConfig};
+
+/// Process-wide HTTP client shared by channel integrations that reconnect in
+/// a loop (e.g. Slack Socket Mode) — reuses connection pools instead of
+/// rebuilding a client per reconnect (Fix CR-G9).
+pub fn shared_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default()
+    })
+}

@@ -336,10 +336,17 @@ async fn handle_compact(ctx: &ReplyContext, session_id: &str) -> String {
     }
 }
 
-async fn handle_pair(_ctx: &ReplyContext, _session_id: &str, _code: &str) -> String {
-    // Pairing verification via access controller.
-    // TODO: wire to ctx.access_controller when field is added to ReplyContext.
-    "ℹ️ Pairing verification is managed via the Dashboard → Security page.".to_string()
+async fn handle_pair(ctx: &ReplyContext, session_id: &str, code: &str) -> String {
+    // Channels that intercept commands here don't carry a user id, so the
+    // pairing subject is the session id. The central access gate in
+    // channel_reply checks BOTH user id and session id, so either form of
+    // approval unlocks the conversation. Codes come from the operator via
+    // the `pairing_generate` MCP tool.
+    if ctx.access_control.verify_pairing_code(session_id, code).await {
+        "✅ 配對成功，現在可以開始對話了。".to_string()
+    } else {
+        "❌ 配對碼錯誤或已過期，請向管理員索取新的配對碼。".to_string()
+    }
 }
 
 async fn handle_model(ctx: &ReplyContext, agent_id: &str, new_model: Option<&str>) -> String {

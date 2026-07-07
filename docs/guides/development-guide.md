@@ -118,7 +118,7 @@ claude -p "Use web_fetch_cached to fetch https://example.com"
 
 ```bash
 # 測試 CSS 選擇器萃取
-claude -p 'Use web_extract on https://example.com with selectors [{"name":"title","selector":"h1","format":"text"}]'
+claude -p 'Use web_extract on https://example.com with selector "h1" and format "text"'
 ```
 
 **支援格式：**
@@ -253,32 +253,42 @@ claude
 
 ## 3. 安全機制
 
-### 3.1 Input Guard（內容注入掃描）
+### 3.1 Input Guard（注入掃描）
 
-所有透過 L1/L2 爬取的網頁內容都會經過 `input_guard.rs` 掃描，偵測 6 類威脅：
+進入 Agent 的使用者輸入會經過 `duduclaw-security` 的 `input_guard` 掃描——採**風險評分制**（0-100），6 條規則加權累計，超過門檻即封鎖並寫入 `security_audit.jsonl`：
 
-| 類別 | 偵測範例 |
-|------|---------|
-| Direct Injection | "ignore previous instructions", "system prompt:" |
-| Role Manipulation | "act as", "pretend to be", "your new role" |
-| Data Exfiltration | "send to" + URL, "POST to" + IP |
-| Prompt Leaking | "show me your prompt", "reveal your instructions" |
-| Encoded Payload | Base64 > 50 chars, percent-encoded suspicious patterns |
-| Delimiter Injection | `</system>`, `</instructions>`, `[INST]`, `<<SYS>>` |
+| 規則 | 權重 | 偵測範例 |
+|------|------|---------|
+| instruction_override | 40 | "ignore previous instructions" |
+| role_hijack | 35 | "act as", "your new role" |
+| system_prompt_extraction | 30 | "reveal your instructions" |
+| tool_abuse | 30 | 誘導濫用工具呼叫 |
+| encoding_bypass | 25 | Base64 / 編碼繞過 |
+| data_exfiltration | 25 | "send to" + URL |
+
+另有 Unicode 正規化（零寬字元、同形字）防繞過。
+
+> 注意：L1/L2 爬取的網頁內容目前**未經**獨立的內容分類掃描；web_fetch 層的防護為 SSRF 驗證（scheme / 內部 IP / metadata 端點 / DNS rebinding / redirect 逐跳重驗）＋ 5MB 上限 ＋ 速率限制。
 
 ### 3.2 Emergency Stop
 
-Dashboard Header 提供一鍵緊急停止按鈕：
-- **E-Stop**：立即中止所有 Agent 操作
-- **Resume**：恢復正常運作
-- MCP tool `emergency_stop` 也可透過 CLI 觸發
+- 頻道內安全詞：`!STOP` / `!停止`（單一 scope）、`!STOP ALL` / `!全部停止`（全域），`!RESUME` / `!恢復` 復原——由 failsafe 系統處理，需管理員權限
+- Dashboard Header 提供一鍵 E-Stop / Resume
 
-### 3.3 Tool Approval
+### 3.3 Tool Approval（HITL ApprovalBroker）
 
-高風險工具（browser、computer_use）需要明確授權：
-- Dashboard Security 頁面管理授權
-- 支援 session-scoped（會話結束自動撤銷）
-- 支援時間限制（指定分鐘數後過期）
+高風險操作走統一的 ApprovalBroker（`approvals.db`，TTL 過期即拒絕、fail-closed）：
+- `agent.toml [capabilities] approval_required_tools` 宣告需審批的工具
+- autopilot `require_approval` 動作同樣經過此 broker
+- 詳見 observability / capabilities 相關文件
+
+### 3.4 使用者配對（Pairing）
+
+頻道層級的使用者存取控制，設定存於 `channel_settings`（global scope，per channel type）：
+- `require_pairing = "true"`：未核准的使用者需先配對才能對話
+- `allowed_users` / `blocked_users`：JSON 陣列白名單／黑名單
+- 流程：管理員以 MCP tool `pairing_manage`（action=generate）產生 6 位數配對碼（5 分鐘有效）→ 使用者在頻道輸入 `/pair <配對碼>` → 核准並持久化於 `~/.duduclaw/access_control.json`
+- 防暴力破解：單碼 5 次失敗鎖定、跨重生累計 15 次上限、常數時間比對、碼以 SHA-256 存放
 
 ### 3.4 Screenshot Masking
 
