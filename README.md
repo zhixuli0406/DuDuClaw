@@ -300,16 +300,30 @@ DuDuClaw (plumbing)
 | **Claude Code Security Hooks** | 三層漸進式防禦 — Layer 1 黑名單（<50ms）→ Layer 2 混淆偵測（YELLOW+）→ Layer 3 Haiku AI 研判（RED only）|
 | **威脅等級狀態機** | GREEN → YELLOW → RED 自動升降級，24h 無事件降一級 |
 | **SOUL.md 漂移檢測** | SHA-256 fingerprint 即時比對 |
-| **Prompt Injection 掃描** | 6 類規則，XML 分隔標籤防注入 |
+| **Prompt Injection 掃描** | 6 類規則，XML 分隔標籤防注入；v1.34.0 起同時於 **MCP dispatch choke point**（所有 runtime）與 channel 回覆路徑執行，阻擋事件寫入 `security_audit.jsonl` |
 | **Secret 洩漏掃描** | 20+ 模式（Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/DB URL 等）|
 | **敏感檔案保護** | Read/Write/Edit 三方向保護 `secret.key`、`.env*`、`SOUL.md`、`CONTRACT.toml` |
-| **行為契約** | `CONTRACT.toml` 定義 `must_not` / `must_always` 邊界 + `duduclaw test` 紅隊測試（9 項場景）|
+| **行為契約** | `CONTRACT.toml` 定義 `must_not` / `must_always` 邊界 + `duduclaw test` 紅隊測試（9 項場景）；v1.34.0 起 **執行期在最終送出的回覆 bytes 上驗證 `must_not`**（secret 還原之後），違反即攔並寫 audit |
 | **統一多源審計日誌** | `audit.unified_log` 合併 4 條 JSONL（`security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl`）為統一信封（timestamp / source / event_type / agent_id / severity / summary / details），Logs 頁面支援來源篩選、嚴重度下拉、即時與歷史分頁 |
 | **JSONL 審計日誌** | async 寫入，格式相容 Rust `AuditEvent` schema |
 | **CJK-Safe 字串切片** | `truncate_bytes` / `truncate_chars` 新模組取代 31 處 `s[..s.len().min(N)]` byte-index 切片（修復 v1.8.11 多位元組 codepoint panic）|
 | **Per-Agent 密鑰隔離** | AES-256-GCM 加密儲存，agent 間密鑰互不可見 |
-| **容器沙箱** | Docker / Apple Container（`--network=none`、tmpfs、read-only rootfs、512MB limit）|
+| **容器沙箱** | Docker / Apple Container（`--network=none`、tmpfs、read-only rootfs、512MB limit）；另有 **原生 OS 沙箱**（免容器 runtime，見下）|
 | **Browser 自動化** | 5 層路由（API Fetch → Static Scrape → Headless → Sandbox → Computer Use），deny-by-default |
+
+### 安全 Reference Monitor（v1.34.0 新增）
+
+把安全邊界從 prompt／hook／config 移到**確定性 choke point 與 OS 原語**：MCP dispatch 成為真正的 reference monitor（完整仲介 + 防竄改 + 可驗證），所有 runtime（Claude／Codex／Gemini／Antigravity + direct-API／本地推論 tool loop）受同一套零 LLM 政策治理。每項控制 fail-closed、opt-in 者向後相容。
+
+| 特色 | 說明 |
+|------|------|
+| **PolicyKernel** | 確定性、零 LLM 的 `evaluate()` 跑參數級靜態工具政策（`agent.toml [capabilities] policy`，Progent 式 tool+arg matcher）；canonical `fs_write`／`shell_exec`／`mcp_call` 家族讓一條規則跨 runtime 等效；優先序 Forbid > Ask > Allow > 預設拒；空政策棄權（向後相容）。接進 MCP dispatch（`Ask` → ApprovalBroker，TTL 過期＝拒）與 direct-API／本地 tool loop（`PolicyExecutor`），stdio／HTTP／SSE 一致 |
+| **Egress「secret in-use」** | 工具參數含 `<REDACT:…>` token 時，只對白名單工具還原真值、其餘一律拒（`-32007`）、tool 結果再遮蔽；從 stdio serve loop 下推到共用 dispatch choke point，三 transport 一致覆蓋（複用 `duduclaw-redaction` vault）|
+| **原生 OS 沙箱** | 新 crate `duduclaw-sandbox`（opt-in `[capabilities] native_sandbox`）以 **macOS Seatbelt**（`sandbox-exec` profile，活體驗證）／**Linux Landlock** 依 `SandboxLevel` 圍堵 spawn 出的 agent CLI 子行程（檔案寫入圍堵）；要求但不可用時 fail-closed；與 CLI 旗標式沙箱疊加縱深（Windows 為 stub）|
+| **記憶 origin-bound 信任** | 時態記憶新增 `origin`／`origin_trust`／`derived_from`；衍生事實信任 clamp 到 ≤ min(來源；未知來源＝0)，**不可經再衍生洗白提升**；蒸餾對話事實標最低信任、搜尋據此降權 |
+| **CONTRACT 執行期驗證** | `must_not` 邊界在最終送出的回覆 bytes（secret 還原之後）上驗證，違反即攔並寫 `contract_violation` audit |
+| **SecurityPosture 狀態機** | `{Green,Yellow,Red}` escalate-fast／decay-slow，訊號源為 audit 事件計數 + escalation floor（N-deny-in-T → 升；靜默逐階衰減）|
+| **OS ground-truth 對帳** | `os_reconcile` 對「工具宣稱做的事 vs 觀測到的 OS 效果」做純雙向確定性差集（unaccounted 副作用 / missing 足跡）；macOS `eslogger` 解析器、Linux eBPF 分階段 |
 
 ### 帳號與成本
 
@@ -414,6 +428,8 @@ DuDuClaw (plumbing)
 <a id="security"></a>
 
 ## Security Hooks 安全防禦系統
+
+> **v1.34.0 定位**：自 v1.34.0 起，主要安全邊界是 [安全 Reference Monitor](#安全-reference-monitorv1340-新增)（確定性 MCP dispatch choke point + OS 原語，覆蓋所有 runtime）。下述 Claude Code Hook 層降級為「CLI 內建原生工具（不經 MCP 的 bash/edit）」的**選配語意攔截**,其下必有 OS sandbox 兜底。
 
 DuDuClaw 在 Claude Code 的 Hook 系統上建構了三層漸進式防禦：
 

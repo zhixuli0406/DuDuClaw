@@ -304,16 +304,30 @@ DuDuClaw (plumbing)
 | **Claude Code Security Hooks** | 三層プログレッシブ防御 — Layer 1 ブラックリスト（<50ms）→ Layer 2 難読化検出（YELLOW+）→ Layer 3 Haiku AI 判定（RED only）|
 | **脅威レベル状態機械** | GREEN → YELLOW → RED の自動昇降格、24h イベントなしで 1 レベル降格 |
 | **SOUL.md ドリフト検出** | SHA-256 fingerprint のリアルタイム比較 |
-| **Prompt Injection スキャン** | 6 カテゴリのルール、XML 区切りタグで注入防止 |
+| **Prompt Injection スキャン** | 6 カテゴリのルール、XML 区切りタグで注入防止；v1.34.0 からは **MCP dispatch チョークポイント**（全ランタイム）とチャネル応答パスでも実行され、ブロックは `security_audit.jsonl` に記録 |
 | **Secret 漏洩スキャン** | 20+ パターン（Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/DB URL など）|
 | **機微ファイル保護** | Read/Write/Edit の 3 方向で `secret.key`、`.env*`、`SOUL.md`、`CONTRACT.toml` を保護 |
-| **行動契約** | `CONTRACT.toml` が `must_not` / `must_always` 境界を定義 + `duduclaw test` レッドチームテスト（9 シナリオ）|
+| **行動契約** | `CONTRACT.toml` が `must_not` / `must_always` 境界を定義 + `duduclaw test` レッドチームテスト（9 シナリオ）；v1.34.0 からは **`must_not` をユーザーへ送出する最終応答バイト列（秘密復元後）で実行時検証**、違反はブロックして監査記録 |
 | **統一マルチソース監査ログ** | `audit.unified_log` が 4 つの JSONL（`security_audit.jsonl` / `tool_calls.jsonl` / `channel_failures.jsonl` / `feedback.jsonl`）を統一エンベロープ（timestamp / source / event_type / agent_id / severity / summary / details）にマージ、Logs ページはソースフィルタ、重大度ドロップダウン、リアルタイムと履歴のタブ分割をサポート |
 | **JSONL 監査ログ** | async 書き込み、Rust `AuditEvent` schema と互換のフォーマット |
 | **CJK-Safe 文字列スライス** | `truncate_bytes` / `truncate_chars` の新モジュールが 31 箇所の `s[..s.len().min(N)]` byte-index スライスを置換（v1.8.11 のマルチバイト codepoint panic を修正）|
 | **Per-Agent 鍵分離** | AES-256-GCM 暗号化保存、agent 間で鍵は互いに不可視 |
-| **コンテナサンドボックス** | Docker / Apple Container（`--network=none`、tmpfs、read-only rootfs、512MB limit）|
+| **コンテナサンドボックス** | Docker / Apple Container（`--network=none`、tmpfs、read-only rootfs、512MB limit）；**ネイティブ OS サンドボックス**（コンテナランタイム不要）も利用可能、下記参照 |
 | **Browser 自動化** | 5 層ルーティング（API Fetch → Static Scrape → Headless → Sandbox → Computer Use）、deny-by-default |
+
+### セキュリティ Reference Monitor（v1.34.0 新規）
+
+セキュリティ境界を prompt／hook／config から**決定論的なチョークポイントと OS プリミティブ**へ移動：MCP dispatch が真の reference monitor（完全仲介 + 改竄不可 + 検証可能）となり、すべてのランタイム（Claude／Codex／Gemini／Antigravity + direct-API／ローカル推論のツールループ）が同一のゼロ LLM ポリシーで統治される。各制御は fail-closed で、opt-in のものは後方互換。
+
+| 機能 | 説明 |
+|------|------|
+| **PolicyKernel** | 決定論的・ゼロ LLM の `evaluate()` がパラメータ単位の静的ツールポリシー（`agent.toml [capabilities] policy`、Progent 式 tool+arg マッチャ）を評価；正規化された `fs_write`／`shell_exec`／`mcp_call` ファミリで 1 つのルールがランタイム横断で等価に効く；優先順位 Forbid > Ask > Allow > 既定拒否；空ポリシーは棄権（後方互換）。MCP dispatch（`Ask` → ApprovalBroker、TTL 失効＝拒否）と direct-API／ローカルのツールループ（`PolicyExecutor`）に接続、stdio／HTTP／SSE で一律 |
+| **Egress「secret in-use」** | ツール引数に `<REDACT:…>` トークンがある場合、ホワイトリストのツールのみ実値を復元、それ以外は拒否（`-32007`）、結果は再マスク；stdio serve loop から共有 dispatch チョークポイントへ押し下げ、3 トランスポートを一律にカバー（`duduclaw-redaction` vault を再利用）|
+| **ネイティブ OS サンドボックス** | 新 crate `duduclaw-sandbox`（opt-in `[capabilities] native_sandbox`）が spawn した agent CLI 子プロセスを **macOS Seatbelt**（`sandbox-exec` プロファイル、実機検証済み）／**Linux Landlock** で `SandboxLevel` に応じて封じ込め（ファイル書き込みの封じ込め）；要求されたのに利用不可なら fail-closed；CLI フラグ式サンドボックスと多層で重畳（Windows は stub）|
+| **記憶の origin-bound 信頼** | 時間記憶に `origin`／`origin_trust`／`derived_from` を追加；派生事実の信頼は ≤ min(ソース信頼；未知ソース＝0) にクランプ、**再派生で信頼を昇格（ロンダリング）できない**；蒸留された会話事実は最低信頼として検索で減点 |
+| **CONTRACT 実行時強制** | `must_not` 境界を最終応答バイト列（秘密復元後）で検証、違反はブロックして `contract_violation` 監査記録 |
+| **SecurityPosture ステートマシン** | `{Green,Yellow,Red}` の escalate-fast／decay-slow、監査イベント数 + escalation floor が信号源（N-deny-in-T で昇格、静穏区間で 1 段ずつ減衰）|
+| **OS グラウンドトゥルース照合** | `os_reconcile` が「ツールの主張 vs 観測された OS 効果」の純粋な双方向決定論的差分（unaccounted な副作用 / missing なフットプリント）を計算；macOS `eslogger` パーサ、Linux eBPF は段階的 |
 
 ### アカウントとコスト
 
@@ -418,6 +432,8 @@ DuDuClaw (plumbing)
 <a id="security"></a>
 
 ## Security Hooks
+
+> **v1.34.0 の位置づけ**：v1.34.0 以降、主要なセキュリティ境界は [セキュリティ Reference Monitor](#セキュリティ-reference-monitorv1340-新規)（決定論的な MCP dispatch チョークポイント + OS プリミティブ、全ランタイムをカバー）です。以下の Claude Code Hook レイヤは、MCP を経由しない CLI ネイティブツール（bash/edit）向けの**任意のセマンティック傍受**へと降格され、その下には OS サンドボックスがバックストップとして存在します。
 
 DuDuClaw は Claude Code の Hook システムの上に三層プログレッシブ防御を構築しています：
 
