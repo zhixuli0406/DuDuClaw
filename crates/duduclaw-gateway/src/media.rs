@@ -184,12 +184,18 @@ pub fn format_attachment_ref(media_type: &MediaType, filename: &str, path: &std:
 }
 
 /// Download a file from a URL with an optional auth header.
+///
+/// URLs are SSRF-validated first — callers pass externally-supplied URLs
+/// (e.g. LINE external content providers), which must never reach internal
+/// hosts or cloud metadata endpoints. Pattern-level check only (the shared
+/// client can't do per-request DNS pinning); fixed API hosts pass unchanged.
 pub async fn download_url(
     http: &reqwest::Client,
     url: &str,
     auth_header: Option<(&str, &str)>,
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
+    crate::web_fetch::validate_url(url).map_err(|e| format!("URL blocked: {e}"))?;
     let mut req = http.get(url);
     if let Some((key, value)) = auth_header {
         req = req.header(key, value);

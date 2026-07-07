@@ -272,11 +272,36 @@ async fn run_socket_mode(
                 let _ = sink.send(Message::Text(ack.into())).await;
             }
 
-            // Handle events_api type
-            if envelope.envelope_type == "events_api" {
-                if let Some(payload) = &envelope.payload {
-                    handle_event(payload, bot_token, &bot_user_id, ctx, &http, agent_name).await;
+            // Handle envelope types. slash_commands / interactive are spawned
+            // detached: an AI reply can take minutes and the response_url stays
+            // valid for 30 min, while blocking here would delay acks for
+            // subsequent envelopes (Slack then re-delivers them).
+            match envelope.envelope_type.as_str() {
+                "events_api" => {
+                    if let Some(payload) = &envelope.payload {
+                        handle_event(payload, bot_token, &bot_user_id, ctx, &http, agent_name).await;
+                    }
                 }
+                "slash_commands" => {
+                    if let Some(payload) = envelope.payload {
+                        let ctx = ctx.clone();
+                        let http = http.clone();
+                        let agent = agent_name.map(str::to_string);
+                        tokio::spawn(async move {
+                            handle_slash_command_envelope(payload, &ctx, &http, agent.as_deref()).await;
+                        });
+                    }
+                }
+                "interactive" => {
+                    if let Some(payload) = envelope.payload {
+                        let ctx = ctx.clone();
+                        let http = http.clone();
+                        tokio::spawn(async move {
+                            handle_interactive_envelope(payload, &ctx, &http).await;
+                        });
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -486,9 +511,167 @@ async fn handle_event(
     // Split long messages (Slack limit: 4000 chars per section; the native
     // markdown block takes 12000)
     let reply_thread = thread_ts.as_deref().or(Some(ts));
-    send_markdown_message(http, bot_token, channel, &reply, reply_thread, mention).await;
+    send_markdown_message(http, bot_token, channel, &reply, reply_thread, mention, Some(&session_id)).await;
 
     remove_reaction_add_done(http, bot_token, channel, ts).await;
+}
+
+/// Validate a Slack response_url before POSTing to it (external data —
+/// never follow an arbitrary URL from a payload).
+fn is_valid_slack_response_url(response_url: &str) -> bool {
+    match url::Url::parse(response_url) {
+        Ok(u) => {
+            u.scheme() == "https"
+                && u.host_str()
+                    .map(|h| h == "hooks.slack.com" || h.ends_with(".slack.com"))
+                    .unwrap_or(false)
+        }
+        Err(_) => false,
+    }
+}
+
+/// POST a response to a slash-command / interactive `response_url`.
+/// `response_type`: "ephemeral" (only the invoker sees it) or "in_channel".
+async fn respond_via_response_url(
+    http: &reqwest::Client,
+    response_url: &str,
+    response_type: &str,
+    text: &str,
+) {
+    if !is_valid_slack_response_url(response_url) {
+        warn!("Slack: rejecting suspicious response_url");
+        return;
+    }
+    let body = json!({
+        "response_type": response_type,
+        "replace_original": false,
+        "text": text,
+    });
+    if let Err(e) = http.post(response_url).json(&body).send().await {
+        error!("Slack response_url post error: {e}");
+    }
+}
+
+/// Handle a `slash_commands` Socket-Mode envelope (native slash commands).
+///
+/// Note: Slack slash commands are declared in the app manifest (there is no
+/// runtime registration API) — add `/ask` and `/duduclaw` to the app config
+/// with Socket Mode enabled and this handler serves them.
+/// Management subcommands respond ephemerally; AI queries post in-channel.
+async fn handle_slash_command_envelope(
+    payload: serde_json::Value,
+    ctx: &Arc<ReplyContext>,
+    http: &reqwest::Client,
+    agent_name: Option<&str>,
+) {
+    let command = payload["command"].as_str().unwrap_or("");
+    let text = payload["text"].as_str().unwrap_or("").trim().to_string();
+    let channel_id = payload["channel_id"].as_str().unwrap_or("");
+    let user_id = payload["user_id"].as_str().unwrap_or("unknown");
+    let response_url = payload["response_url"].as_str().unwrap_or("");
+    if response_url.is_empty() || channel_id.is_empty() {
+        return;
+    }
+
+    info!("📩 Slack slash {command} from [{user_id}]: {}", truncate_bytes(&text, 80));
+
+    // ── Channel whitelist applies to slash commands too ──
+    if !ctx.channel_settings.is_channel_allowed("slack", "global", channel_id).await {
+        respond_via_response_url(http, response_url, "ephemeral", "❌ 此頻道未被授權使用 DuDuClaw").await;
+        return;
+    }
+
+    let session_id = format!("slack:group:{channel_id}");
+
+    match command {
+        "/ask" => {
+            if text.is_empty() {
+                respond_via_response_url(http, response_url, "ephemeral", "用法：/ask <你的問題>").await;
+                return;
+            }
+            let reply = if let Some(agent) = agent_name {
+                build_reply_for_agent(&text, ctx, agent, &session_id, user_id, None).await
+            } else {
+                build_reply_with_session(&text, ctx, &session_id, user_id, None).await
+            };
+            if reply.trim().is_empty() {
+                respond_via_response_url(http, response_url, "ephemeral", "⚠️ 未取得回覆，請再試一次").await;
+                return;
+            }
+            // Queries are visible to the channel (slash invocations are
+            // otherwise only shown to the invoker).
+            let visible = format!("*<@{user_id}>*: {text}\n\n{}", to_slack_mrkdwn(&reply));
+            respond_via_response_url(http, response_url, "in_channel", &visible).await;
+        }
+        "/duduclaw" => {
+            // Management subcommands (status/new/usage/help/...) route through
+            // chat_commands and stay ephemeral.
+            let cmd_text = if text.is_empty() { "/help".to_string() } else { format!("/{text}") };
+            if let Some(cmd) = crate::chat_commands::parse_command(&cmd_text, None) {
+                let agent_id = {
+                    let reg = ctx.registry.read().await;
+                    agent_name
+                        .map(|s| s.to_string())
+                        .or_else(|| reg.main_agent().map(|a| a.config.agent.name.clone()))
+                        .unwrap_or_default()
+                };
+                let reply = crate::chat_commands::handle_command(&cmd, ctx, &session_id, &agent_id, true).await;
+                respond_via_response_url(http, response_url, "ephemeral", &reply).await;
+            } else {
+                respond_via_response_url(
+                    http,
+                    response_url,
+                    "ephemeral",
+                    "未知的子指令。可用：status / new / usage / help（或用 /ask 提問）",
+                ).await;
+            }
+        }
+        _ => {
+            respond_via_response_url(http, response_url, "ephemeral", &format!("未支援的指令：{command}")).await;
+        }
+    }
+}
+
+/// Handle an `interactive` Socket-Mode envelope (`block_actions` button presses).
+/// `action_id` mirrors the Discord custom_id convention (`duduclaw:{action}`);
+/// the session id travels in the button `value`.
+async fn handle_interactive_envelope(
+    payload: serde_json::Value,
+    ctx: &Arc<ReplyContext>,
+    http: &reqwest::Client,
+) {
+    if payload["type"].as_str() != Some("block_actions") {
+        return;
+    }
+    let action = match payload["actions"].as_array().and_then(|a| a.first()) {
+        Some(a) => a,
+        None => return,
+    };
+    let action_id = action["action_id"].as_str().unwrap_or("");
+    let value = action["value"].as_str().unwrap_or("");
+    let response_url = payload["response_url"].as_str().unwrap_or("");
+    if response_url.is_empty() {
+        return;
+    }
+
+    match action_id {
+        "duduclaw:new_session" => {
+            let session_id = if value.is_empty() {
+                let channel = payload["channel"]["id"].as_str().unwrap_or("");
+                format!("slack:group:{channel}")
+            } else {
+                value.to_string()
+            };
+            let msg = match ctx.session_manager.delete_session(&session_id).await {
+                Ok(()) => "✅ 已開啟新的對話".to_string(),
+                Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
+            };
+            respond_via_response_url(http, response_url, "ephemeral", &msg).await;
+        }
+        other => {
+            warn!("Slack: unknown block action: {other}");
+        }
+    }
 }
 
 /// chat.postMessage returning the created message `ts` (for later edits).
@@ -520,6 +703,10 @@ async fn post_message_returning_ts(
 /// Send an AI reply using Slack's native `markdown` block (standard
 /// markdown incl. tables, headers, fenced code — released 2025-02). Falls
 /// back to classic mrkdwn text when the workspace rejects the block.
+///
+/// When `session_id` is given, the LAST chunk carries conversation-control
+/// action buttons (handled by the `interactive` Socket-Mode envelope).
+#[allow(clippy::too_many_arguments)]
 async fn send_markdown_message(
     http: &reqwest::Client,
     token: &str,
@@ -527,11 +714,13 @@ async fn send_markdown_message(
     markdown: &str,
     thread_ts: Option<&str>,
     mention_user: Option<&str>,
+    session_id: Option<&str>,
 ) {
     // Cumulative cap across markdown blocks is 12000 chars — chunk into
     // separate messages under that.
     const MARKDOWN_BLOCK_CAP: usize = 11500;
     let chunks = channel_format::split_text(markdown, MARKDOWN_BLOCK_CAP);
+    let last_idx = chunks.len().saturating_sub(1);
 
     for (i, chunk) in chunks.iter().enumerate() {
         let mut blocks = vec![];
@@ -544,6 +733,11 @@ async fn send_markdown_message(
             }
         }
         blocks.push(json!({ "type": "markdown", "text": chunk }));
+        if i == last_idx {
+            if let Some(sid) = session_id {
+                blocks.push(channel_format::slack_action_buttons(sid));
+            }
+        }
 
         // Fallback text keeps notifications readable if blocks fail to render.
         let fallback = channel_format::truncate_chars(&to_slack_mrkdwn(chunk), 3000);
@@ -768,5 +962,33 @@ mod tests {
         let ts = "1234567890.123456";
         let thread_ts = Some(ts);
         assert_eq!(thread_ts, Some("1234567890.123456"));
+    }
+
+    #[test]
+    fn test_response_url_validation() {
+        assert!(is_valid_slack_response_url("https://hooks.slack.com/actions/T123/456/abc"));
+        // Unanchored-substring attack must fail (coding convention #2).
+        assert!(!is_valid_slack_response_url("https://hooks.slack.com.evil.com/x"));
+        assert!(!is_valid_slack_response_url("http://hooks.slack.com/actions/x")); // not https
+        assert!(!is_valid_slack_response_url("not a url"));
+    }
+
+    #[test]
+    fn test_parse_slash_command_envelope() {
+        let json = r#"{"type":"slash_commands","envelope_id":"e1","payload":{"command":"/ask","text":"hello","channel_id":"C1","user_id":"U1","response_url":"https://hooks.slack.com/commands/x"}}"#;
+        let env: SlackEnvelope = serde_json::from_str(json).unwrap();
+        assert_eq!(env.envelope_type, "slash_commands");
+        let p = env.payload.unwrap();
+        assert_eq!(p["command"], "/ask");
+        assert_eq!(p["text"], "hello");
+    }
+
+    #[test]
+    fn test_parse_interactive_envelope() {
+        let json = r#"{"type":"interactive","envelope_id":"e2","payload":{"type":"block_actions","actions":[{"action_id":"duduclaw:new_session","value":"slack:group:C1"}],"response_url":"https://hooks.slack.com/actions/x"}}"#;
+        let env: SlackEnvelope = serde_json::from_str(json).unwrap();
+        assert_eq!(env.envelope_type, "interactive");
+        let p = env.payload.unwrap();
+        assert_eq!(p["actions"][0]["action_id"], "duduclaw:new_session");
     }
 }

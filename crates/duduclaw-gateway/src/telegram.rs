@@ -116,6 +116,10 @@ struct TgMessage {
     message_thread_id: Option<i64>,
     /// Entities (mentions, commands, etc.)
     entities: Option<Vec<TgEntity>>,
+    /// Service message: a forum topic was closed (close the mapped session).
+    forum_topic_closed: Option<serde_json::Value>,
+    /// Service message: a forum topic was created (session is created lazily).
+    forum_topic_created: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,9 +131,21 @@ struct TgEntity {
 }
 
 #[derive(Debug, Deserialize)]
+struct TgCallbackQuery {
+    /// Unique callback query ID — required by answerCallbackQuery.
+    id: String,
+    from: Option<TgUser>,
+    /// The message the inline keyboard was attached to.
+    message: Option<TgMessage>,
+    /// The button's `callback_data`.
+    data: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TgUpdate {
     update_id: i64,
     message: Option<TgMessage>,
+    callback_query: Option<TgCallbackQuery>,
 }
 
 #[derive(Debug, Serialize)]
@@ -342,7 +358,7 @@ async fn poll_loop(
     let bot_username = get_bot_username(&client, &api_base).await.unwrap_or_default();
 
     loop {
-        let url = format!("{api_base}/getUpdates?offset={offset}&timeout=25&allowed_updates=[\"message\"]");
+        let url = format!("{api_base}/getUpdates?offset={offset}&timeout=25&allowed_updates=[\"message\",\"callback_query\"]");
 
         let resp = match client.get(&url).send().await {
             Ok(r) => r,
@@ -385,10 +401,34 @@ async fn poll_loop(
             for update in updates {
                 offset = update.update_id + 1;
 
+                // ── Inline keyboard button presses ──
+                if let Some(cb) = update.callback_query {
+                    handle_callback_query(&cb, &client, &api_base, &ctx).await;
+                    continue;
+                }
+
                 let Some(msg) = update.message else { continue };
                 let chat_id = msg.chat.id;
                 let msg_id = msg.message_id;
                 let thread_id = msg.message_thread_id;
+
+                // ── Forum topic lifecycle (service messages) ──
+                // Topic closed → close the mapped session so a reopened topic
+                // starts fresh (mirrors Discord thread auto-archive handling).
+                if msg.forum_topic_closed.is_some() {
+                    if let Some(tid) = thread_id {
+                        let session_id = format!("telegram:{chat_id}:{tid}");
+                        match ctx.session_manager.delete_session(&session_id).await {
+                            Ok(()) => info!("Telegram: forum topic {tid} closed — session cleared"),
+                            Err(e) => warn!("Telegram: forum topic {tid} closed, session clear failed: {e}"),
+                        }
+                    }
+                    continue;
+                }
+                if msg.forum_topic_created.is_some() {
+                    // Session is created lazily on the first real message.
+                    continue;
+                }
                 let chat_type = msg.chat.chat_type.as_deref().unwrap_or("private");
                 let is_group = chat_type == "group" || chat_type == "supergroup";
                 let sender = msg.from.as_ref().and_then(|u| u.first_name.as_deref()).unwrap_or("someone");
@@ -658,6 +698,77 @@ async fn poll_loop(
                 }
             }
         }
+    }
+}
+
+/// Handle an inline-keyboard button press (`callback_query` update).
+///
+/// `callback_data` format mirrors the Discord custom_id convention:
+/// `duduclaw:{action}`. Every press is acknowledged via answerCallbackQuery
+/// so the client's loading spinner always clears.
+async fn handle_callback_query(
+    cb: &TgCallbackQuery,
+    client: &reqwest::Client,
+    api_base: &str,
+    ctx: &Arc<ReplyContext>,
+) {
+    let data = cb.data.as_deref().unwrap_or("");
+    let sender = cb.from.as_ref().and_then(|u| u.first_name.as_deref()).unwrap_or("someone");
+    let Some(msg) = &cb.message else {
+        // No source message (e.g. too old) — just clear the spinner.
+        answer_callback_query(client, api_base, &cb.id, "").await;
+        return;
+    };
+    let chat_id = msg.chat.id;
+    let thread_id = msg.message_thread_id;
+
+    info!("🔘 Telegram [{sender}] pressed: {data}");
+
+    let answer = match data {
+        "duduclaw:new_session" => {
+            let session_id = if let Some(tid) = thread_id {
+                format!("telegram:{chat_id}:{tid}")
+            } else {
+                format!("telegram:{chat_id}")
+            };
+            match ctx.session_manager.delete_session(&session_id).await {
+                Ok(()) => "✅ 已開啟新的對話".to_string(),
+                Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
+            }
+        }
+        "duduclaw:voice_toggle" => {
+            let session_key = format!("telegram:{chat_id}");
+            let mut sessions = ctx.voice_sessions.lock().await;
+            if sessions.contains(&session_key) {
+                sessions.remove(&session_key);
+                "🔇 已關閉語音回覆模式".to_string()
+            } else {
+                sessions.insert(session_key);
+                "🎤 已開啟語音回覆模式".to_string()
+            }
+        }
+        _ => "未知的按鈕動作".to_string(),
+    };
+
+    answer_callback_query(client, api_base, &cb.id, &answer).await;
+}
+
+/// Acknowledge a callback query (clears the client-side loading spinner).
+/// An empty `text` acknowledges silently; otherwise a toast is shown.
+async fn answer_callback_query(client: &reqwest::Client, api_base: &str, callback_id: &str, text: &str) {
+    let mut body = json!({ "callback_query_id": callback_id });
+    if !text.is_empty() {
+        body["text"] = json!(text);
+    }
+    match client.post(format!("{api_base}/answerCallbackQuery")).json(&body).send().await {
+        Ok(resp) => {
+            if let Ok(data) = resp.json::<TgResponse<bool>>().await
+                && !data.ok
+            {
+                warn!("Telegram answerCallbackQuery failed: {}", data.description.unwrap_or_default());
+            }
+        }
+        Err(e) => warn!("Telegram answerCallbackQuery error: {e}"),
     }
 }
 
@@ -1090,6 +1201,39 @@ async fn send_message_once(
             error!("Telegram send error: {e}");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod callback_tests {
+    use super::*;
+
+    #[test]
+    fn parses_callback_query_update() {
+        let json = r#"{
+            "update_id": 42,
+            "callback_query": {
+                "id": "cbq-1",
+                "from": { "id": 7, "username": "amy", "first_name": "Amy" },
+                "message": { "message_id": 9, "chat": { "id": -100123, "type": "supergroup" }, "message_thread_id": 55 },
+                "data": "duduclaw:new_session"
+            }
+        }"#;
+        let update: TgUpdate = serde_json::from_str(json).unwrap();
+        let cb = update.callback_query.expect("callback_query parsed");
+        assert_eq!(cb.id, "cbq-1");
+        assert_eq!(cb.data.as_deref(), Some("duduclaw:new_session"));
+        let msg = cb.message.unwrap();
+        assert_eq!(msg.chat.id, -100123);
+        assert_eq!(msg.message_thread_id, Some(55));
+    }
+
+    #[test]
+    fn message_only_update_still_parses() {
+        let json = r#"{"update_id": 1, "message": { "chat": { "id": 5, "type": "private" } }}"#;
+        let update: TgUpdate = serde_json::from_str(json).unwrap();
+        assert!(update.callback_query.is_none());
+        assert!(update.message.is_some());
     }
 }
 

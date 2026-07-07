@@ -42,6 +42,13 @@ struct LineEvent {
     reply_token: Option<String>,
     source: Option<LineSource>,
     message: Option<LineMessage>,
+    /// Present on `postback` events (quick-reply button presses).
+    postback: Option<LinePostback>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LinePostback {
+    data: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -266,6 +273,12 @@ async fn line_webhook_handler(
     // the in-flight reply) cancelled when LINE disconnects → "已讀沒回應".
     tokio::spawn(async move {
     for event in webhook.events {
+        // ── Quick-reply button presses (postback events) ──
+        if event.event_type == "postback" {
+            handle_postback(&event, &state, &token).await;
+            continue;
+        }
+
         if event.event_type != "message" {
             continue;
         }
@@ -429,7 +442,14 @@ async fn line_webhook_handler(
             // dropped. `segment_line_reply` returns one Flex bubble for short
             // replies, or several plain-text messages (each within LINE's
             // 5000-char text limit, capped at 5 messages/request) for long ones.
-            let messages = segment_line_reply(&reply, agent_name.as_deref());
+            let mut messages = segment_line_reply(&reply, agent_name.as_deref());
+
+            // Attach quick-reply buttons to the LAST message (LINE only shows
+            // quickReply on the most recent message). Presses arrive as
+            // `postback` events handled above.
+            if let Some(last) = messages.last_mut() {
+                last["quickReply"] = channel_format::line_quick_reply();
+            }
 
             // Try Reply API first; if it fails (e.g. reply token expired after
             // long AI processing), fall back to Push API which doesn't require
@@ -446,6 +466,47 @@ async fn line_webhook_handler(
 }
 
 // ── Helpers ─────────────────────────────────────────────────
+
+/// Handle a `postback` event (quick-reply button press).
+/// `data` format mirrors the Discord custom_id convention: `duduclaw:{action}`.
+async fn handle_postback(event: &LineEvent, state: &LineState, token: &str) {
+    let data = event
+        .postback
+        .as_ref()
+        .and_then(|p| p.data.as_deref())
+        .unwrap_or("");
+    let Some(reply_token) = &event.reply_token else { return };
+    let source = &event.source;
+    let sender = source
+        .as_ref()
+        .and_then(|s| s.user_id.as_deref())
+        .unwrap_or("unknown");
+
+    info!("🔘 LINE [{sender}] postback: {data}");
+
+    let answer = match data {
+        "duduclaw:new_session" => {
+            // Session id scoped the same way as the message path.
+            let session_id = if let Some(gid) = source.as_ref().and_then(|s| s.group_id.as_deref()) {
+                format!("line:{gid}")
+            } else if let Some(rid) = source.as_ref().and_then(|s| s.room_id.as_deref()) {
+                format!("line:{rid}")
+            } else {
+                format!("line:{sender}")
+            };
+            match state.ctx.session_manager.delete_session(&session_id).await {
+                Ok(()) => "✅ 已開啟新的對話".to_string(),
+                Err(e) => format!("⚠️ 清除工作階段失敗：{e}"),
+            }
+        }
+        _ => "未知的按鈕動作".to_string(),
+    };
+
+    let messages = vec![serde_json::json!({ "type": "text", "text": answer })];
+    if !send_reply_rich(&state.http, token, reply_token, messages.clone()).await {
+        push_message_rich(&state.http, token, sender, messages).await;
+    }
+}
 
 /// LINE limits for outbound message segmentation.
 mod line_limits {
@@ -675,5 +736,38 @@ mod tests {
         let cjk = "繁體中文測試訊息".repeat(2000);
         let msgs = segment_line_reply(&cjk, None);
         assert!(!msgs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_postback_event() {
+        let json = r#"{
+            "events": [{
+                "type": "postback",
+                "replyToken": "rt-1",
+                "source": { "type": "user", "userId": "U123" },
+                "postback": { "data": "duduclaw:new_session" }
+            }]
+        }"#;
+        let body: LineWebhookBody = serde_json::from_str(json).unwrap();
+        let event = &body.events[0];
+        assert_eq!(event.event_type, "postback");
+        assert_eq!(
+            event.postback.as_ref().and_then(|p| p.data.as_deref()),
+            Some("duduclaw:new_session")
+        );
+    }
+
+    #[test]
+    fn test_message_event_without_postback_still_parses() {
+        let json = r#"{
+            "events": [{
+                "type": "message",
+                "replyToken": "rt-2",
+                "source": { "type": "user", "userId": "U123" },
+                "message": { "id": "m1", "type": "text", "text": "hi" }
+            }]
+        }"#;
+        let body: LineWebhookBody = serde_json::from_str(json).unwrap();
+        assert!(body.events[0].postback.is_none());
     }
 }

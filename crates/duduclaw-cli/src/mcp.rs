@@ -464,11 +464,11 @@ const TOOLS: &[ToolDef] = &[
     // ── Channel settings tools ────────────────────────────────────
     ToolDef {
         name: "channel_config",
-        description: "Get or set channel settings (mention_only, auto_thread, allowed_channels, agent_override, response_mode). Omit 'value' to read current setting.",
+        description: "Get or set channel settings (mention_only, auto_thread, allowed_channels, allowed_guilds, agent_override, response_mode). Omit 'value' to read current setting.",
         params: &[
             ParamDef { name: "channel", description: "Channel type: discord, telegram, slack, line", required: true },
             ParamDef { name: "scope_id", description: "Scope: guild_id, chat_id, or 'global'", required: true },
-            ParamDef { name: "key", description: "Setting key: mention_only, auto_thread, allowed_channels, agent_override, response_mode", required: true },
+            ParamDef { name: "key", description: "Setting key: mention_only, auto_thread, allowed_channels, allowed_guilds (global scope), agent_override, response_mode", required: true },
             ParamDef { name: "value", description: "New value (omit to read current value)", required: false },
         ],
     },
@@ -478,6 +478,47 @@ const TOOLS: &[ToolDef] = &[
         params: &[
             ParamDef { name: "channel", description: "Channel type: discord, telegram, slack, line", required: true },
             ParamDef { name: "scope_id", description: "Scope: guild_id, chat_id, or 'global'", required: true },
+        ],
+    },
+    ToolDef {
+        name: "channel_status",
+        description: "Channel status overview: per-channel connection state (gateway snapshot), \
+                      per-channel session counts (total / active in 24h), thread & topic session counts, \
+                      and known Discord guilds with their per-guild settings.",
+        params: &[
+            ParamDef { name: "channel", description: "Filter to one channel type (discord, telegram, slack, line, whatsapp, feishu); omit for all", required: false },
+        ],
+    },
+    ToolDef {
+        name: "pairing_manage",
+        description: "Manage user pairing for channel access control (used with the require_pairing / \
+                      allowed_users / blocked_users channel settings). Actions: 'generate' creates a \
+                      6-digit code (valid 5 min) the user redeems in-channel with /pair <code>; \
+                      'approve' / 'revoke' manage the approved list directly; 'list' shows approved subjects.",
+        params: &[
+            ParamDef { name: "action", description: "One of: generate, approve, revoke, list", required: true },
+            ParamDef { name: "subject", description: "User id (e.g. Telegram numeric id, Discord snowflake) or session id (e.g. slack:group:C123). Required except for 'list'", required: false },
+        ],
+    },
+    // ── Web fetch / extract (browser pipeline L1 + L2) ────────────
+    ToolDef {
+        name: "web_fetch_cached",
+        description: "Fetch a URL over plain HTTP with SSRF protection, disk caching, and rate limiting \
+                      (browser automation L1 — try this before headless browsers). Returns status, \
+                      content type, and body (truncated at 60k chars).",
+        params: &[
+            ParamDef { name: "url", description: "The http(s) URL to fetch (internal hosts and cloud metadata endpoints are blocked)", required: true },
+            ParamDef { name: "ttl_seconds", description: "Cache TTL in seconds (default 86400 = 24h; 0 also means default)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "web_extract",
+        description: "Fetch a URL and extract elements with a CSS selector (browser automation L2 — \
+                      static scrape). Formats: text (default), html, json (structured with attributes/children).",
+        params: &[
+            ParamDef { name: "url", description: "The http(s) URL to fetch (SSRF-validated, cached)", required: true },
+            ParamDef { name: "selector", description: "CSS selector, e.g. 'h1', '.article p', 'a[href]'", required: true },
+            ParamDef { name: "format", description: "Output format: text | html | json (default text)", required: false },
         ],
     },
     // ── Local inference tools ─────────────────────────────────────
@@ -6394,6 +6435,10 @@ pub(crate) async fn handle_tools_call(
         // Channel settings tools
         "channel_config" => handle_channel_config(&arguments, home_dir).await,
         "channel_config_list" => handle_channel_config_list(&arguments, home_dir).await,
+        "channel_status" => handle_channel_status(&arguments, home_dir).await,
+        "pairing_manage" => handle_pairing_manage(&arguments, home_dir).await,
+        "web_fetch_cached" => handle_web_fetch_cached(&arguments, home_dir).await,
+        "web_extract" => handle_web_extract(&arguments, home_dir).await,
         // Local inference tools
         "inference_status" => handle_inference_status(home_dir).await,
         "model_list" => handle_model_list(home_dir).await,
@@ -6657,7 +6702,11 @@ async fn handle_synthesize_speech(args: &Value) -> Value {
 // ── Channel settings tool handlers ──────────────────────────────
 
 const VALID_CHANNELS: &[&str] = &["discord", "telegram", "slack", "line", "whatsapp", "feishu"];
-const VALID_KEYS: &[&str] = &["mention_only", "auto_thread", "allowed_channels", "agent_override", "response_mode", "thread_archive_minutes"];
+const VALID_KEYS: &[&str] = &[
+    "mention_only", "auto_thread", "allowed_channels", "allowed_guilds",
+    "agent_override", "response_mode", "thread_archive_minutes",
+    "allowed_users", "blocked_users", "require_pairing",
+];
 
 /// Validate scope_id: max 64 chars, alphanumeric + underscore/hyphen or "global"/"dm".
 fn validate_scope_id(scope_id: &str) -> std::result::Result<(), String> {
@@ -6674,14 +6723,14 @@ fn validate_scope_id(scope_id: &str) -> std::result::Result<(), String> {
 /// Validate value based on key type.
 fn validate_value(key: &str, value: &str) -> std::result::Result<(), String> {
     match key {
-        "mention_only" | "auto_thread" => {
+        "mention_only" | "auto_thread" | "require_pairing" => {
             if value != "true" && value != "false" {
                 return Err(format!("{key} must be 'true' or 'false'"));
             }
         }
-        "allowed_channels" => {
+        "allowed_channels" | "allowed_guilds" | "allowed_users" | "blocked_users" => {
             if serde_json::from_str::<Vec<String>>(value).is_err() {
-                return Err("allowed_channels must be a JSON array of strings, e.g. [\"ch1\",\"ch2\"]".into());
+                return Err(format!("{key} must be a JSON array of strings, e.g. [\"id1\",\"id2\"]"));
             }
         }
         "response_mode" => {
@@ -6772,6 +6821,270 @@ async fn handle_channel_config_list(args: &Value, home_dir: &Path) -> Value {
     } else {
         let lines: Vec<String> = all.iter().map(|(k, v)| format!("{k} = {v}")).collect();
         tool_text(&format!("Settings for {channel}/{scope_id}:\n{}", lines.join("\n")))
+    }
+}
+
+/// Per-channel session aggregates computed from sessions.db.
+#[derive(Default, serde::Serialize)]
+struct ChannelSessionStats {
+    total_sessions: u64,
+    /// Sessions whose last_active is within the past 24 hours.
+    active_24h: u64,
+    /// Thread/topic-scoped sessions (Discord threads, Telegram forum topics).
+    thread_sessions: u64,
+}
+
+async fn handle_channel_status(args: &Value, home_dir: &Path) -> Value {
+    let filter = args.get("channel").and_then(|v| v.as_str()).map(|s| s.to_string());
+    if let Some(f) = &filter {
+        if !VALID_CHANNELS.contains(&f.as_str()) {
+            return tool_error(&format!("Invalid channel type: {f}"));
+        }
+    }
+
+    // 1. Connection snapshot — persisted by the gateway on every status change
+    //    (`channel_status.json`); absent when the gateway has never run.
+    let snapshot_path = home_dir.join("channel_status.json");
+    let connections: Value = std::fs::read_to_string(&snapshot_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({
+            "channels": {},
+            "note": "no gateway snapshot found — is the gateway running?"
+        }));
+
+    // 2. Session counts from sessions.db (read-only; missing DB = empty stats).
+    let db_path = home_dir.join("sessions.db");
+    let session_stats = tokio::task::spawn_blocking(move || {
+        let mut stats: std::collections::BTreeMap<String, ChannelSessionStats> = Default::default();
+        let Ok(conn) = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) else {
+            return stats;
+        };
+        let Ok(mut stmt) = conn.prepare("SELECT id, last_active FROM sessions") else {
+            return stats;
+        };
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        });
+        if let Ok(rows) = rows {
+            for (id, last_active) in rows.flatten() {
+                let channel = id.split(':').next().unwrap_or("unknown").to_string();
+                let entry = stats.entry(channel).or_default();
+                entry.total_sessions += 1;
+                if chrono::DateTime::parse_from_rfc3339(&last_active)
+                    .map(|t| t.with_timezone(&chrono::Utc) > cutoff)
+                    .unwrap_or(false)
+                {
+                    entry.active_24h += 1;
+                }
+                // Thread/topic sessions: `discord:thread:{id}` and
+                // `telegram:{chat}:{topic}` (three segments).
+                let is_thread = id.starts_with("discord:thread:")
+                    || (id.starts_with("telegram:") && id.split(':').count() >= 3);
+                if is_thread {
+                    entry.thread_sessions += 1;
+                }
+            }
+        }
+        stats
+    })
+    .await
+    .unwrap_or_default();
+
+    // 3. Known Discord guilds + their per-guild settings (seeded on GUILD_CREATE).
+    let guilds: Vec<Value> = if filter.as_deref().is_none_or(|f| f == "discord") {
+        let db_path = home_dir.join("sessions.db");
+        match duduclaw_gateway::channel_settings::ChannelSettingsManager::from_session_db(&db_path) {
+            Ok(mgr) => {
+                let mut out = Vec::new();
+                for scope in mgr.list_scopes("discord").await {
+                    if scope == "dm" {
+                        continue;
+                    }
+                    let settings: serde_json::Map<String, Value> = mgr
+                        .get_all("discord", &scope)
+                        .await
+                        .into_iter()
+                        .map(|(k, v)| (k, Value::String(v)))
+                        .collect();
+                    out.push(serde_json::json!({ "guild_id": scope, "settings": settings }));
+                }
+                out
+            }
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Assemble, applying the optional channel filter to the session stats and
+    // connection snapshot (connection labels may be "discord:{agent}" etc.).
+    let sessions: serde_json::Map<String, Value> = session_stats
+        .into_iter()
+        .filter(|(ch, _)| filter.as_deref().is_none_or(|f| ch == f))
+        .map(|(ch, st)| (ch, serde_json::to_value(st).unwrap_or_default()))
+        .collect();
+    let connections_filtered = match (&filter, connections.get("channels").and_then(|c| c.as_object())) {
+        (Some(f), Some(map)) => {
+            let filtered: serde_json::Map<String, Value> = map
+                .iter()
+                .filter(|(label, _)| *label == f || label.starts_with(&format!("{f}:")))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            serde_json::json!({ "channels": filtered, "updated_at": connections.get("updated_at") })
+        }
+        _ => connections,
+    };
+
+    let report = serde_json::json!({
+        "connections": connections_filtered,
+        "sessions": sessions,
+        "discord_guilds": guilds,
+    });
+    tool_text(&serde_json::to_string_pretty(&report).unwrap_or_default())
+}
+
+// ── User pairing management ──────────────────────────────────────
+
+async fn handle_pairing_manage(args: &Value, home_dir: &Path) -> Value {
+    let action = match args.get("action").and_then(|v| v.as_str()) {
+        Some(a) => a,
+        None => return tool_error("Missing required parameter: action"),
+    };
+    let subject = args.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+    if action != "list" && subject.is_empty() {
+        return tool_error("Missing required parameter: subject (user id or session id)");
+    }
+
+    // Shares state with the gateway via ~/.duduclaw/access_control.json —
+    // codes generated here are verifiable by the gateway's /pair handler.
+    let ctrl = duduclaw_gateway::access_control::AccessController::with_persistence(
+        home_dir.join("access_control.json"),
+    );
+
+    match action {
+        "generate" => match ctrl.generate_pairing_code(subject).await {
+            Some(code) => tool_text(&format!(
+                "配對碼：{code}（5 分鐘內有效）。請使用者在頻道輸入：/pair {code}\nsubject: {subject}"
+            )),
+            None => tool_error("此 subject 的失敗次數過多，已鎖定產碼（防暴力破解上限 15 次）"),
+        },
+        "approve" => {
+            ctrl.approve_user(subject).await;
+            tool_text(&format!("已核准：{subject}"))
+        }
+        "revoke" => {
+            ctrl.revoke_user(subject).await;
+            tool_text(&format!("已撤銷：{subject}"))
+        }
+        "list" => {
+            let users = ctrl.runtime_approved_users().await;
+            if users.is_empty() {
+                tool_text("目前沒有已核准的 subject。")
+            } else {
+                tool_text(&format!("已核准 {} 個 subject：\n{}", users.len(), users.join("\n")))
+            }
+        }
+        other => tool_error(&format!("Unknown action: {other}. Valid: generate, approve, revoke, list")),
+    }
+}
+
+// ── Web fetch / extract handlers (browser pipeline L1 + L2) ─────
+
+/// Per-process rate limiter shared by web_fetch_cached and web_extract
+/// (10 requests/min, matching the gateway-side default).
+static WEB_FETCH_LIMITER: std::sync::LazyLock<duduclaw_gateway::web_fetch::RateLimiter> =
+    std::sync::LazyLock::new(duduclaw_gateway::web_fetch::RateLimiter::new);
+
+/// Cap on body/extraction text returned through MCP (keeps responses sane).
+const WEB_BODY_CAP_CHARS: usize = 60_000;
+
+async fn fetch_for_tool(
+    args: &Value,
+    home_dir: &Path,
+) -> std::result::Result<duduclaw_gateway::web_fetch::FetchResult, Value> {
+    let url = args
+        .get("url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| tool_error("Missing required parameter: url"))?;
+    let ttl = args.get("ttl_seconds").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    if !WEB_FETCH_LIMITER.check("mcp-server") {
+        return Err(tool_error("Rate limit exceeded (10 requests/min) — try again shortly"));
+    }
+
+    let cache_dir = home_dir.join("web_cache");
+    duduclaw_gateway::web_fetch::web_fetch_cached(url, ttl, &cache_dir)
+        .await
+        .map_err(|e| tool_error(&format!("Fetch failed: {e}")))
+}
+
+async fn handle_web_fetch_cached(args: &Value, home_dir: &Path) -> Value {
+    let result = match fetch_for_tool(args, home_dir).await {
+        Ok(r) => r,
+        Err(err) => return err,
+    };
+
+    let total_chars = result.body.chars().count();
+    let truncated = total_chars > WEB_BODY_CAP_CHARS;
+    let body: String = result.body.chars().take(WEB_BODY_CAP_CHARS).collect();
+    let report = serde_json::json!({
+        "url": result.url,
+        "status_code": result.status_code,
+        "content_type": result.content_type,
+        "cached": result.cached,
+        "fetched_at": result.fetched_at.to_rfc3339(),
+        "body_chars": total_chars,
+        "truncated": truncated,
+        "body": body,
+    });
+    tool_text(&serde_json::to_string_pretty(&report).unwrap_or_default())
+}
+
+async fn handle_web_extract(args: &Value, home_dir: &Path) -> Value {
+    let selector = match args.get("selector").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return tool_error("Missing required parameter: selector"),
+    };
+    let format = match args.get("format").and_then(|v| v.as_str()).unwrap_or("text") {
+        "html" => duduclaw_gateway::web_extract::OutputFormat::Html,
+        "json" => duduclaw_gateway::web_extract::OutputFormat::Json,
+        "text" => duduclaw_gateway::web_extract::OutputFormat::Text,
+        other => return tool_error(&format!("Invalid format: {other}. Valid: text, html, json")),
+    };
+
+    let fetched = match fetch_for_tool(args, home_dir).await {
+        Ok(r) => r,
+        Err(err) => return err,
+    };
+
+    let queries = vec![duduclaw_gateway::web_extract::SelectorQuery {
+        name: "result".to_string(),
+        selector: selector.clone(),
+        format,
+    }];
+    match duduclaw_gateway::web_extract::extract_multiple(&fetched.body, &queries) {
+        Ok(extraction) => {
+            let values = extraction.results.get("result").cloned().unwrap_or_default();
+            let report = serde_json::json!({
+                "url": fetched.url,
+                "selector": selector,
+                "matches": values.len(),
+                "cached": fetched.cached,
+                "results": values,
+            });
+            let mut text = serde_json::to_string_pretty(&report).unwrap_or_default();
+            if text.chars().count() > WEB_BODY_CAP_CHARS {
+                text = text.chars().take(WEB_BODY_CAP_CHARS).collect::<String>()
+                    + "\n…[truncated]";
+            }
+            tool_text(&text)
+        }
+        Err(e) => tool_error(&format!("Extraction failed: {e}")),
     }
 }
 

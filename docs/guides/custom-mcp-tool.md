@@ -304,5 +304,4 @@ When adding tools, follow the existing category naming:
 | `cost_*` | Cost telemetry | `cost_summary`, `cost_agents`, `cost_recent` |
 | `odoo_*` | Odoo ERP | `odoo_crm_leads`, `odoo_sale_orders` |
 | `skill_*` | Skill ecosystem | `skill_search`, `skill_list` |
-| `browserbase_*` | Browser sessions | `browserbase_session`, `browserbase_cost` |
 | (none) | Standalone | `emergency_stop`, `tool_approve`, `schedule_task` |
