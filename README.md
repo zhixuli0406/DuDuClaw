@@ -8,7 +8,7 @@
 
 DuDuClaw 把 Claude Code、Codex、Gemini 這些 AI 指令列工具,接上 Telegram、LINE、Discord 等九個通訊平台,變成一個 24 小時值班、會記得你、會自我改進的 AI 助理。
 
-你只需要一個 Rust binary。通道路由、對話記憶、多帳號輪替、行為安全邊界、本地推論、Web 管理後台全部內建;AI 大腦用哪家隨你換,設定和記憶都留在你自己的機器上。核心採 Apache 2.0 授權。
+你只需要一個 Rust binary。通道路由、對話記憶、多帳號輪替、行為安全邊界、本地推論、Web 管理後台全部內建;AI 大腦要用 Claude、Codex、Gemini、Antigravity 還是任何 OpenAI 相容 API 隨你換,設定和記憶都留在你自己的機器上。核心採 Apache 2.0 授權。
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-1.35.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
@@ -40,17 +40,17 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 | 需求 | 原生 CLI | DuDuClaw |
 |---|---|---|
 | 接上 Telegram / LINE / Discord | 只能在終端機用 | 9 個通道,per-agent bot token |
-| 多 LLM 容錯切換 | 手動重啟 | 內建 4 種輪替策略 + 跨供應商 failover |
+| 多 LLM 容錯切換 | 手動重啟 | 4 種輪替策略 + 跨供應商 failover |
 | 換 LLM 時保留上下文 | 遺失 | 完整保留 |
 | 對話記憶與知識庫 | 單次 session | SQLite 時態記憶 + 分層 wiki + 自動注入 |
-| 工具跨 LLM 共用 | 每家重寫 | MCP 工具寫一次,五種後端共用 |
+| 工具跨 LLM 共用 | 每家重寫 | 130+ MCP 工具寫一次,五種後端共用 |
 | 安全邊界 / 稽核 / 密鑰管理 | 自己造 | 政策核心 + OS 沙箱 + AES-256-GCM 內建 |
 
 <a id="architecture"></a>
 
 ## 架構一覽
 
-AI Runtime 是大腦,DuDuClaw 是水電管線,中間用 MCP(JSON-RPC 2.0)橋接:
+AI 運行時是大腦,DuDuClaw 是水電管線,中間用 MCP(JSON-RPC 2.0)橋接。大腦可換,管線不動:
 
 ```
 AI Runtime (brain) — Claude Code / Codex / Gemini / Antigravity / OpenAI-compat
@@ -60,15 +60,15 @@ DuDuClaw (plumbing)
   │                    / Google Chat / Microsoft Teams / WebChat
   ├─ Multi-Runtime — 5 種後端自動偵測,per-agent 設定
   ├─ Session Memory — 原生 --resume + 時態記憶 + key-fact 累積 + 分層 wiki
-  ├─ MCP Server — 80+ 工具(通訊、記憶、Agent、Skill、任務、知識庫、ERP)
+  ├─ MCP Server — 130+ 工具(通訊、記憶、Agent、Skill、任務、知識庫、ERP)
   ├─ Evolution Engine — GVU² 雙迴圈進化 + 預測驅動 + MistakeNotebook
   ├─ Security — PolicyKernel reference monitor + OS 沙箱 + redaction vault
   ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / MLX
   ├─ Account Rotator — 多 OAuth + API Key 輪替、預算追蹤、健康檢查
-  └─ Web Dashboard — React 19 SPA(24 頁),rust-embed 嵌入 binary
+  └─ Web Dashboard — React 19 SPA(32 頁),rust-embed 嵌入 binary
 ```
 
-完整設計見 [ARCHITECTURE.md](ARCHITECTURE.md)。
+Rust workspace 由 20 個 crate 組成:核心地基 `duduclaw-core`、服務層 `duduclaw-gateway`、統一 API 層 `duduclaw-llm`、本地推論 `duduclaw-inference`、認知記憶 `duduclaw-memory`、安全層 `duduclaw-security` 等。完整設計見 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 <a id="install"></a>
 
@@ -138,22 +138,26 @@ pip install duduclaw
 
 ## 快速開始
 
-還需要一個 AI 大腦,四選一(可以之後在瀏覽器引導中設定):裝好 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex) 或 [Gemini CLI](https://github.com/google-gemini/gemini-cli) 其中之一並登入;或準備一把 API key;或用本地 GGUF 模型。
+還需要一個 AI 大腦,五選一(可以之後在瀏覽器引導中設定):裝好 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli) 或 Antigravity 其中之一並登入;準備一把 API key 走任何 OpenAI 相容供應商;或用本地 GGUF 模型。
 
 ```bash
-# 1. 啟動(gateway + 通道 + 排程 + dispatcher 一次拉起)
+# 1. 首次設定(也可跳過,直接在瀏覽器引導中完成)
+duduclaw onboard
+
+# 2. 啟動(gateway + 通道 + 排程 + dispatcher 一次拉起)
 duduclaw run
 
-# 2. 打開管理後台
+# 3. 打開管理後台
 open http://localhost:18789
 ```
 
-第一次打開會進入三步驟引導:選 AI 後端 → 建立第一個 agent → 直接在內建 WebChat 對話。之後到 Channels 頁貼上 bot token,就能把同一個 agent 接上 Telegram、LINE、Discord 等平台,不用重啟。
+第一次打開會進入引導精靈:選 AI 後端 → 建立第一個 agent → 直接在內建 WebChat 對話。之後到 Channels 頁貼上 bot token,就能把同一個 agent 接上 Telegram、LINE、Discord 等平台,不用重啟。
 
 常用的下一步:
 
 ```bash
-duduclaw agent create      # 建立更多 agent(可指定產業模板)
+duduclaw agent create      # 建立更多 agent
+duduclaw wizard            # 產業模板互動式設定
 duduclaw status            # 系統健康快照
 duduclaw update            # 檢查並安裝新版本
 duduclaw service install   # 開機自動啟動(launchd / systemd)
@@ -165,18 +169,19 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 
 | 領域 | 內建能力 | 深入閱讀 |
 |------|----------|----------|
-| 通訊通道 | 9 通道(Telegram / LINE / Discord / Slack / WhatsApp / Feishu / Google Chat / Teams / WebChat),per-agent bot、熱啟停、平台原生排版、輸入中指示、長任務進度看板 | [docs/features](docs/features/README.md) |
+| 通訊通道 | 9 通道(Telegram / LINE / Discord + 語音 / Slack / WhatsApp / Feishu / Google Chat / Teams / WebChat),per-agent bot、熱啟停、平台原生排版、輸入中指示、長任務進度看板 | [docs/features](docs/features/README.md) |
 | Multi-Runtime | Claude / Codex / Gemini / Antigravity / OpenAI-compat 五後端,自動偵測、per-agent 設定、換後端保留上下文 | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| MCP Server | 80+ 工具:通訊、記憶、agent 編排、skill 市場、任務看板、共享 wiki、Odoo ERP;stdio 與 HTTP/SSE 雙 transport | [docs/api](docs/api/README.md) |
-| 記憶系統 | SQLite 時態記憶(事實取代鏈)、Ebbinghaus 遺忘曲線、知識圖譜檢索、跨 agent 共享 wiki | [docs/features](docs/features/README.md) |
-| 自我進化 | GVU² 雙迴圈 + 預測驅動(約 90% 對話零 LLM 成本)、SOUL.md 版控 + 24h 觀察期自動回滾 | [evolution-engine.md](docs/architecture/evolution-engine.md) |
-| 安全 | PolicyKernel reference monitor(零 LLM、fail-closed)、macOS Seatbelt / Linux Landlock 沙箱、secret redaction vault、CONTRACT.toml 行為契約 + 紅隊測試 | [SECURITY.md](SECURITY.md) |
-| 帳號與成本 | 多 OAuth + API Key 輪替(4 策略)、rate-limit / 帳單冷卻、成本遙測與快取效率分析 | [docs/features](docs/features/README.md) |
-| 本地推論 | llama.cpp(Metal/CUDA/Vulkan)/ mistral.rs / Exo P2P / llamafile / MLX,三層信心路由自動分流 | [docs/features](docs/features/README.md) |
-| 語音 | ASR(SenseVoice / Whisper)+ TTS(Piper / MiniMax)+ VAD,Discord 語音頻道與 LiveKit 會議 | [docs/features](docs/features/README.md) |
+| 統一 LLM API 層 | `duduclaw-llm` 用一套正規化請求覆蓋 4 種原生協定(Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat),內建 8 個 OpenAI-compat preset(DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen)+ 計價 registry + 跨供應商 fallback | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| MCP Server | 138 個工具:通訊、記憶、agent 編排、skill 市場、任務看板、共享 wiki、Odoo ERP、computer use、live forking;stdio 與 HTTP/SSE 雙 transport,對外只暴露 7 個白名單工具 | [docs/api](docs/api/README.md) |
+| 記憶系統 | SQLite 時態記憶(事實取代鏈)、HippoRAG-lite 知識圖譜檢索(Personalized PageRank)、Ebbinghaus 遺忘曲線自動封存、跨 agent 共享 wiki | [docs/features](docs/features/README.md) |
+| 自我進化 | GVU² 雙迴圈 + 預測驅動(約 90% 對話零 LLM 成本)、SOUL.md 版控 + 24h 觀察期自動回滾、MistakeNotebook 跨回合記憶 | [evolution-engine.md](docs/architecture/evolution-engine.md) |
+| 安全 | PolicyKernel reference monitor(零 LLM、fail-closed)、macOS Seatbelt / Linux Landlock 原生沙箱、Docker / Apple Container / WSL2 容器沙箱、secret redaction vault、CONTRACT.toml 行為契約 + 紅隊測試 | [SECURITY.md](SECURITY.md) |
+| 帳號與成本 | 多 OAuth + API Key 輪替(4 策略)、rate-limit / 帳單冷卻、成本遙測與快取效率分析、跨平台 PTY pool 驅動 OAuth 訂閱帳號 | [docs/features](docs/features/README.md) |
+| 本地推論 | llama.cpp(Metal/CUDA/Vulkan)/ mistral.rs / Exo P2P / llamafile / MLX,三層信心路由自動分流;內建 Whisper 語音辨識與向量嵌入 | [docs/features](docs/features/README.md) |
+| Live Forking | RFC-26:把進行中的任務分叉成 N 個競爭分支,各自 copy-on-write 隔離、AI judge 選勝者合併(預設關閉) | [docs/rfc](docs/rfc) |
 | 自動更新 | Dashboard 一鍵更新或背景自動更新(`auto_update = true`),SHA-256 + Ed25519 雙重驗證後原地重啟,前台分頁自動重載 | [deployment-guide.md](docs/guides/deployment-guide.md) |
-| Web Dashboard | React 19 SPA 24 頁,嵌入 binary 零額外部署;zh-TW / en / ja 三語 | [docs/features](docs/features/README.md) |
-| ERP 整合 | Odoo 中間層 15 個 MCP 工具(CRM / 銷售 / 庫存 / 會計),per-agent 認證隔離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
+| Web Dashboard | React 19 + TypeScript SPA 32 頁,嵌入 binary 零額外部署;zh-TW / en / ja 三語 | [docs/features](docs/features/README.md) |
+| ERP 整合 | Odoo 中間層 15 個 MCP 工具(CRM / 銷售 / 庫存 / 會計),CE/EE 自動偵測、per-agent 認證隔離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
 
 完整功能清單見 [docs/features/feature-inventory.md](docs/features/feature-inventory.md),版本演進見 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -185,20 +190,24 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 ## CLI 指令
 
 ```
+duduclaw onboard             # 首次設定(--yes 跳過互動)
 duduclaw run                 # 一鍵啟動(gateway + channels + heartbeat + cron + dispatcher)
-duduclaw agent               # CLI 互動式對話
-duduclaw agent create        # 建立 agent(可指定產業模板)
-duduclaw agent list          # 列出所有 agent
+duduclaw agent               # CLI 互動式對話;子指令 create / list / inspect / pause / resume / run
+duduclaw wizard              # 產業模板互動式設定
 duduclaw status              # 系統健康快照
 duduclaw doctor              # 健康診斷
 duduclaw test <agent>        # 紅隊安全測試(9 項內建場景)
+duduclaw eval                # 執行 agent 行為 eval 套件
 duduclaw update              # 檢查並安裝更新
-duduclaw service install     # 安裝為系統服務(launchd / systemd)
+duduclaw service install     # 安裝為系統服務;另有 start / stop / status / logs / uninstall
+duduclaw export / import     # 匯出 / 匯入 ~/.duduclaw(個人版資料可攜)
 duduclaw mcp-server          # 啟動 MCP Server(stdio JSON-RPC 2.0)
+duduclaw http-server         # 啟動 MCP HTTP/SSE Transport(Bearer 認證)
 duduclaw acp-server          # 啟動 ACP/A2A Server(Zed / JetBrains / Neovim 整合)
+duduclaw license             # 授權管理(activate / status / redeem / rebind / …)
 ```
 
-完整指令用 `duduclaw --help` 查看,開發者相關見 [development-guide.md](docs/guides/development-guide.md)。
+完整 25 個指令與所有子指令用 `duduclaw --help` 查看,開發者相關見 [development-guide.md](docs/guides/development-guide.md)。
 
 <a id="trust"></a>
 
@@ -235,9 +244,9 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 | 語言 | Rust | TypeScript | Rust | Python |
 | 通道 | 9 | 25+ | 8 | 0(API)|
 | Multi-Runtime | 5 後端 | 單一 | 單一 | 多 LLM |
-| MCP Server | 80+ 工具 | 無 | 無 | 無 |
+| MCP Server | 138 工具 | 無 | 無 | 無 |
 | 自我進化引擎 | GVU² 雙迴圈 | 無 | 無 | 無 |
-| 本地推論 | 6 後端 + 信心路由 | 無 | 無 | 無 |
+| 本地推論 | 5 後端 + 信心路由 | 無 | 無 | 無 |
 | 行為契約 | CONTRACT.toml + 紅隊 | 無 | WASM 沙箱 | 無 |
 | 授權 | Apache 2.0(Open Core)| MIT | 開源 | $59+/月 |
 

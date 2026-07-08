@@ -8,7 +8,7 @@
 
 DuDuClaw connects AI command-line tools like Claude Code, Codex, and Gemini to nine messaging platforms (Telegram, LINE, Discord, and more), turning them into an always-on AI assistant that remembers you and improves itself over time.
 
-All you need is one Rust binary. Channel routing, conversation memory, multi-account rotation, behavioral guardrails, local inference, and a web dashboard are built in; swap the AI brain whenever you like, and your config and memory stay on your own machine. The core is Apache 2.0.
+All you need is one Rust binary. Channel routing, conversation memory, multi-account rotation, behavioral guardrails, local inference, and a web dashboard are built in; swap the AI brain for Claude, Codex, Gemini, Antigravity, or any OpenAI-compatible API whenever you like, and your config and memory stay on your own machine. The core is Apache 2.0.
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-1.35.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
@@ -43,14 +43,14 @@ If you run `claude` or `gemini` in a terminal now and then, the native CLIs are 
 | Multi-LLM failover | Manual restart | 4 rotation strategies + cross-provider failover |
 | Context survives switching LLMs | Lost | Preserved |
 | Conversation memory and knowledge base | Single session | SQLite temporal memory + layered wiki, auto-injected |
-| Tools shared across LLMs | Rewrite per vendor | Write MCP tools once, use on all 5 backends |
+| Tools shared across LLMs | Rewrite per vendor | Write 130+ MCP tools once, use on all 5 backends |
 | Guardrails / audit / secret management | Build it yourself | Policy kernel + OS sandbox + AES-256-GCM built in |
 
 <a id="architecture"></a>
 
 ## Architecture at a glance
 
-The AI runtime is the brain, DuDuClaw is the plumbing, and MCP (JSON-RPC 2.0) is the bridge:
+The AI runtime is the brain, DuDuClaw is the plumbing, and MCP (JSON-RPC 2.0) is the bridge. Swap the brain, keep the plumbing:
 
 ```
 AI Runtime (brain) — Claude Code / Codex / Gemini / Antigravity / OpenAI-compat
@@ -60,15 +60,15 @@ DuDuClaw (plumbing)
   │                    / Google Chat / Microsoft Teams / WebChat
   ├─ Multi-Runtime — 5 backends, auto-detected, configured per agent
   ├─ Session Memory — native --resume + temporal memory + key facts + layered wiki
-  ├─ MCP Server — 80+ tools (channels, memory, agents, skills, tasks, wiki, ERP)
+  ├─ MCP Server — 130+ tools (channels, memory, agents, skills, tasks, wiki, ERP)
   ├─ Evolution Engine — GVU² dual-loop evolution + prediction-driven + MistakeNotebook
   ├─ Security — PolicyKernel reference monitor + OS sandbox + redaction vault
   ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / MLX
   ├─ Account Rotator — OAuth + API key rotation, budgets, health checks
-  └─ Web Dashboard — React 19 SPA (24 pages), embedded via rust-embed
+  └─ Web Dashboard — React 19 SPA (32 pages), embedded via rust-embed
 ```
 
-Full design in [ARCHITECTURE.md](ARCHITECTURE.md).
+The Rust workspace is 20 crates: the `duduclaw-core` foundation, the `duduclaw-gateway` service layer, the `duduclaw-llm` unified API layer, `duduclaw-inference` for local models, `duduclaw-memory` for cognitive memory, `duduclaw-security`, and more. Full design in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 <a id="install"></a>
 
@@ -138,22 +138,26 @@ pip install duduclaw
 
 ## Quick start
 
-You still need an AI brain, any one of these (you can also set it up later in the browser wizard): install and log in to [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), or [Gemini CLI](https://github.com/google-gemini/gemini-cli); or bring an API key; or use a local GGUF model.
+You still need an AI brain, any one of five (you can also set it up later in the browser wizard): install and log in to [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or Antigravity; bring an API key for any OpenAI-compatible provider; or use a local GGUF model.
 
 ```bash
-# 1. Start everything (gateway + channels + scheduler + dispatcher)
+# 1. First-run setup (optional — you can also finish it in the browser wizard)
+duduclaw onboard
+
+# 2. Start everything (gateway + channels + scheduler + dispatcher)
 duduclaw run
 
-# 2. Open the dashboard
+# 3. Open the dashboard
 open http://localhost:18789
 ```
 
-The first visit walks you through a three-step wizard: pick an AI backend, create your first agent, then chat with it in the built-in WebChat. Later, paste a bot token on the Channels page to put the same agent on Telegram, LINE, Discord, and the rest, without restarting.
+The first visit walks you through a wizard: pick an AI backend, create your first agent, then chat with it in the built-in WebChat. Later, paste a bot token on the Channels page to put the same agent on Telegram, LINE, Discord, and the rest, without restarting.
 
 Useful next steps:
 
 ```bash
-duduclaw agent create      # create more agents (industry templates available)
+duduclaw agent create      # create more agents
+duduclaw wizard            # industry-template setup
 duduclaw status            # system health snapshot
 duduclaw update            # check for and install updates
 duduclaw service install   # start on boot (launchd / systemd)
@@ -165,18 +169,19 @@ duduclaw service install   # start on boot (launchd / systemd)
 
 | Area | What's built in | Read more |
 |------|-----------------|-----------|
-| Channels | 9 channels (Telegram / LINE / Discord / Slack / WhatsApp / Feishu / Google Chat / Teams / WebChat), per-agent bots, hot start/stop, platform-native formatting, typing indicators, live task-progress boards | [docs/features](docs/features/README.md) |
+| Channels | 9 channels (Telegram / LINE / Discord + voice / Slack / WhatsApp / Feishu / Google Chat / Teams / WebChat), per-agent bots, hot start/stop, platform-native formatting, typing indicators, live task-progress boards | [docs/features](docs/features/README.md) |
 | Multi-runtime | Claude / Codex / Gemini / Antigravity / OpenAI-compat, auto-detected, per-agent config, context survives backend switches | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| MCP server | 80+ tools: channels, memory, agent orchestration, skill market, task board, shared wiki, Odoo ERP; stdio and HTTP/SSE transports | [docs/api](docs/api/README.md) |
-| Memory | SQLite temporal memory (fact supersession chains), Ebbinghaus retention, knowledge-graph retrieval, cross-agent shared wiki | [docs/features](docs/features/README.md) |
-| Self-evolution | GVU² dual loop + prediction-driven (about 90% of conversations cost zero LLM calls), SOUL.md versioning with 24h observation and auto-rollback | [evolution-engine.md](docs/architecture/evolution-engine.md) |
-| Security | PolicyKernel reference monitor (zero-LLM, fail-closed), macOS Seatbelt / Linux Landlock sandbox, secret redaction vault, CONTRACT.toml behavioral contracts + red-team CLI | [SECURITY.md](SECURITY.md) |
-| Accounts and cost | OAuth + API key rotation (4 strategies), rate-limit and billing cooldowns, cost telemetry with cache-efficiency analytics | [docs/features](docs/features/README.md) |
-| Local inference | llama.cpp (Metal/CUDA/Vulkan), mistral.rs, Exo P2P, llamafile, MLX, with three-tier confidence routing | [docs/features](docs/features/README.md) |
-| Voice | ASR (SenseVoice / Whisper), TTS (Piper / MiniMax), VAD, Discord voice channels, LiveKit rooms | [docs/features](docs/features/README.md) |
+| Unified LLM API layer | `duduclaw-llm` covers 4 native protocols (Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat) with one normalized request, plus 8 OpenAI-compat presets (DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen), a pricing registry, and cross-provider fallback | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| MCP server | 138 tools: channels, memory, agent orchestration, skill market, task board, shared wiki, Odoo ERP, computer use, live forking; stdio and HTTP/SSE transports, with only 7 whitelisted tools exposed externally | [docs/api](docs/api/README.md) |
+| Memory | SQLite temporal memory (fact supersession chains), HippoRAG-lite knowledge-graph retrieval (Personalized PageRank), Ebbinghaus forgetting-curve archival, cross-agent shared wiki | [docs/features](docs/features/README.md) |
+| Self-evolution | GVU² dual loop + prediction-driven (about 90% of conversations cost zero LLM calls), SOUL.md versioning with 24h observation and auto-rollback, MistakeNotebook cross-turn memory | [evolution-engine.md](docs/architecture/evolution-engine.md) |
+| Security | PolicyKernel reference monitor (zero-LLM, fail-closed), macOS Seatbelt / Linux Landlock native sandbox, Docker / Apple Container / WSL2 container sandbox, secret redaction vault, CONTRACT.toml behavioral contracts + red-team CLI | [SECURITY.md](SECURITY.md) |
+| Accounts and cost | OAuth + API key rotation (4 strategies), rate-limit and billing cooldowns, cost telemetry with cache-efficiency analytics, cross-platform PTY pool driving OAuth subscription accounts | [docs/features](docs/features/README.md) |
+| Local inference | llama.cpp (Metal/CUDA/Vulkan), mistral.rs, Exo P2P, llamafile, MLX, with three-tier confidence routing; built-in Whisper speech recognition and vector embeddings | [docs/features](docs/features/README.md) |
+| Live forking | RFC-26: fork an in-progress task into N competing branches, each in a copy-on-write isolate, with an AI judge picking the winner to merge (off by default) | [docs/rfc](docs/rfc) |
 | Auto-update | One click from the dashboard or unattended (`auto_update = true`); SHA-256 + Ed25519 verification, in-place restart, open tabs reload themselves | [deployment-guide.md](docs/guides/deployment-guide.md) |
-| Web dashboard | React 19 SPA, 24 pages, embedded in the binary; zh-TW / en / ja | [docs/features](docs/features/README.md) |
-| ERP | Odoo bridge with 15 MCP tools (CRM / sales / inventory / accounting), per-agent credential isolation | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
+| Web dashboard | React 19 + TypeScript SPA, 32 pages, embedded in the binary; zh-TW / en / ja | [docs/features](docs/features/README.md) |
+| ERP | Odoo bridge with 15 MCP tools (CRM / sales / inventory / accounting), CE/EE auto-detection, per-agent credential isolation | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
 
 Full feature list in [docs/features/feature-inventory.md](docs/features/feature-inventory.md); version history in [CHANGELOG.md](CHANGELOG.md).
 
@@ -185,20 +190,24 @@ Full feature list in [docs/features/feature-inventory.md](docs/features/feature-
 ## CLI commands
 
 ```
+duduclaw onboard             # first-run setup (--yes to skip prompts)
 duduclaw run                 # start everything (gateway + channels + heartbeat + cron + dispatcher)
-duduclaw agent               # interactive chat in the terminal
-duduclaw agent create        # create an agent (industry templates available)
-duduclaw agent list          # list agents
+duduclaw agent               # interactive chat; subcommands create / list / inspect / pause / resume / run
+duduclaw wizard              # industry-template setup
 duduclaw status              # system health snapshot
 duduclaw doctor              # diagnostics
 duduclaw test <agent>        # red-team security test (9 built-in scenarios)
+duduclaw eval                # run the agent behavior eval suite
 duduclaw update              # check for and install updates
-duduclaw service install     # install as a system service (launchd / systemd)
+duduclaw service install     # install as a system service; also start / stop / status / logs / uninstall
+duduclaw export / import     # export / import ~/.duduclaw (portable personal data)
 duduclaw mcp-server          # start the MCP server (stdio JSON-RPC 2.0)
+duduclaw http-server         # start the MCP HTTP/SSE transport (Bearer auth)
 duduclaw acp-server          # start the ACP/A2A server (Zed / JetBrains / Neovim)
+duduclaw license             # license management (activate / status / redeem / rebind / …)
 ```
 
-Run `duduclaw --help` for the full list; developer topics are in the [development guide](docs/guides/development-guide.md).
+Run `duduclaw --help` for all 25 commands and their subcommands; developer topics are in the [development guide](docs/guides/development-guide.md).
 
 <a id="trust"></a>
 
@@ -235,9 +244,9 @@ Don't trust prebuilt binaries? [Building from source](#install) takes three comm
 | Language | Rust | TypeScript | Rust | Python |
 | Channels | 9 | 25+ | 8 | 0 (API) |
 | Multi-runtime | 5 backends | single | single | multi-LLM |
-| MCP server | 80+ tools | no | no | no |
+| MCP server | 138 tools | no | no | no |
 | Self-evolution engine | GVU² dual loop | no | no | no |
-| Local inference | 6 backends + confidence routing | no | no | no |
+| Local inference | 5 backends + confidence routing | no | no | no |
 | Behavioral contracts | CONTRACT.toml + red team | no | WASM sandbox | no |
 | License | Apache 2.0 (open core) | MIT | open source | $59+/mo |
 
