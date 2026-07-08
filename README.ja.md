@@ -8,7 +8,7 @@
 
 DuDuClaw は、Claude Code・Codex・Gemini などの AI コマンドラインツールを Telegram・LINE・Discord をはじめとする 9 つのメッセージングプラットフォームにつなぎ、あなたを覚えて自ら成長する 24 時間稼働の AI アシスタントに変えます。
 
-必要なのは Rust バイナリ 1 つだけ。チャネルルーティング、会話メモリ、マルチアカウントローテーション、行動ガードレール、ローカル推論、Web ダッシュボードをすべて内蔵。AI の頭脳はいつでも好きなベンダーに切り替えられ、設定とメモリは自分のマシンに残ります。コアは Apache 2.0 ライセンスです。
+必要なのは Rust バイナリ 1 つだけ。チャネルルーティング、会話メモリ、マルチアカウントローテーション、行動ガードレール、ローカル推論、Web ダッシュボードをすべて内蔵。AI の頭脳は Claude・Codex・Gemini・Antigravity、あるいは任意の OpenAI 互換 API へいつでも切り替えられ、設定とメモリは自分のマシンに残ります。コアは Apache 2.0 ライセンスです。
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-1.35.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
@@ -43,14 +43,14 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 | マルチ LLM フェイルオーバー | 手動再起動 | 4 種のローテーション戦略 + クロスプロバイダ failover |
 | LLM 切替時のコンテキスト | 消失 | 完全保持 |
 | 会話メモリと知識ベース | 単発セッション | SQLite 時系列メモリ + 階層 wiki を自動注入 |
-| ツールの LLM 間共有 | ベンダーごとに書き直し | MCP ツールを一度書けば 5 バックエンドで共用 |
+| ツールの LLM 間共有 | ベンダーごとに書き直し | 130+ MCP ツールを一度書けば 5 バックエンドで共用 |
 | ガードレール / 監査 / 秘密情報管理 | 自作 | ポリシーカーネル + OS サンドボックス + AES-256-GCM 内蔵 |
 
 <a id="architecture"></a>
 
 ## アーキテクチャ概要
 
-AI ランタイムが頭脳、DuDuClaw が配管、その間を MCP(JSON-RPC 2.0)がつなぎます:
+AI ランタイムが頭脳、DuDuClaw が配管、その間を MCP(JSON-RPC 2.0)がつなぎます。頭脳は差し替え可能、配管はそのまま:
 
 ```
 AI Runtime (brain) — Claude Code / Codex / Gemini / Antigravity / OpenAI-compat
@@ -60,15 +60,15 @@ DuDuClaw (plumbing)
   │                    / Google Chat / Microsoft Teams / WebChat
   ├─ Multi-Runtime — 5 バックエンド自動検出、エージェントごとに設定
   ├─ Session Memory — ネイティブ --resume + 時系列メモリ + key facts + 階層 wiki
-  ├─ MCP Server — 80+ ツール(チャネル、メモリ、エージェント、スキル、タスク、wiki、ERP)
+  ├─ MCP Server — 130+ ツール(チャネル、メモリ、エージェント、スキル、タスク、wiki、ERP)
   ├─ Evolution Engine — GVU² 二重ループ進化 + 予測駆動 + MistakeNotebook
   ├─ Security — PolicyKernel reference monitor + OS サンドボックス + redaction vault
   ├─ Inference Engine — llama.cpp / mistral.rs / Exo P2P / llamafile / MLX
   ├─ Account Rotator — OAuth + API キーのローテーション、予算追跡、ヘルスチェック
-  └─ Web Dashboard — React 19 SPA(24 ページ)、rust-embed でバイナリに内蔵
+  └─ Web Dashboard — React 19 SPA(32 ページ)、rust-embed でバイナリに内蔵
 ```
 
-全体設計は [ARCHITECTURE.md](ARCHITECTURE.md) を参照してください。
+Rust ワークスペースは 20 crate 構成:基盤の `duduclaw-core`、サービス層 `duduclaw-gateway`、統一 API 層 `duduclaw-llm`、ローカル推論 `duduclaw-inference`、認知メモリ `duduclaw-memory`、セキュリティ層 `duduclaw-security` など。全体設計は [ARCHITECTURE.md](ARCHITECTURE.md) を参照してください。
 
 <a id="install"></a>
 
@@ -138,22 +138,26 @@ pip install duduclaw
 
 ## クイックスタート
 
-AI の頭脳が 1 つ必要です(ブラウザのセットアップウィザードで後から設定も可能):[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli) のいずれかを入れてログインする、API キーを用意する、ローカル GGUF モデルを使う、のどれかを選んでください。
+AI の頭脳が 1 つ必要です(ブラウザのセットアップウィザードで後から設定も可能)。5 つから選べます:[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、Antigravity のいずれかを入れてログインする、任意の OpenAI 互換プロバイダの API キーを用意する、ローカル GGUF モデルを使う。
 
 ```bash
-# 1. まとめて起動(gateway + チャネル + スケジューラ + dispatcher)
+# 1. 初回セットアップ(省略可 — ブラウザのウィザードでも完了できます)
+duduclaw onboard
+
+# 2. まとめて起動(gateway + チャネル + スケジューラ + dispatcher)
 duduclaw run
 
-# 2. ダッシュボードを開く
+# 3. ダッシュボードを開く
 open http://localhost:18789
 ```
 
-初回アクセスでは 3 ステップのウィザードが案内します:AI バックエンドを選ぶ → 最初のエージェントを作る → 内蔵 WebChat でそのまま会話。あとは Channels ページに bot token を貼れば、同じエージェントを再起動なしで Telegram・LINE・Discord などに接続できます。
+初回アクセスではウィザードが案内します:AI バックエンドを選ぶ → 最初のエージェントを作る → 内蔵 WebChat でそのまま会話。あとは Channels ページに bot token を貼れば、同じエージェントを再起動なしで Telegram・LINE・Discord などに接続できます。
 
 よく使う次の一歩:
 
 ```bash
-duduclaw agent create      # エージェントを追加(業種テンプレートあり)
+duduclaw agent create      # エージェントを追加
+duduclaw wizard            # 業種テンプレートでセットアップ
 duduclaw status            # システムヘルスのスナップショット
 duduclaw update            # アップデートの確認とインストール
 duduclaw service install   # 起動時に自動開始(launchd / systemd)
@@ -165,18 +169,19 @@ duduclaw service install   # 起動時に自動開始(launchd / systemd)
 
 | 領域 | 内蔵機能 | 詳細 |
 |------|----------|------|
-| チャネル | 9 チャネル(Telegram / LINE / Discord / Slack / WhatsApp / Feishu / Google Chat / Teams / WebChat)、エージェントごとの bot、ホット起動/停止、プラットフォーム最適レンダリング、入力中インジケータ、長時間タスクの進捗ボード | [docs/features](docs/features/README.md) |
-| マルチランタイム | Claude / Codex / Gemini / Antigravity / OpenAI-compat の 5 バックエンド、自動検出、エージェントごとの設定、切替時もコンテキスト保持 | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| MCP サーバー | 80+ ツール:チャネル、メモリ、エージェント編成、スキルマーケット、タスクボード、共有 wiki、Odoo ERP。stdio と HTTP/SSE の両トランスポート | [docs/api](docs/api/README.md) |
-| メモリ | SQLite 時系列メモリ(事実の置換チェーン)、エビングハウス保持曲線、知識グラフ検索、エージェント横断の共有 wiki | [docs/features](docs/features/README.md) |
-| 自己進化 | GVU² 二重ループ + 予測駆動(会話の約 90% は LLM コストゼロ)、SOUL.md バージョン管理 + 24 時間観察期間つき自動ロールバック | [evolution-engine.md](docs/architecture/evolution-engine.md) |
-| セキュリティ | PolicyKernel reference monitor(LLM 不使用、fail-closed)、macOS Seatbelt / Linux Landlock サンドボックス、secret redaction vault、CONTRACT.toml 行動契約 + レッドチーム CLI | [SECURITY.md](SECURITY.md) |
-| アカウントとコスト | OAuth + API キーのローテーション(4 戦略)、レート制限 / 課金クールダウン、キャッシュ効率分析つきコストテレメトリ | [docs/features](docs/features/README.md) |
-| ローカル推論 | llama.cpp(Metal/CUDA/Vulkan)/ mistral.rs / Exo P2P / llamafile / MLX、3 段階の信頼度ルーティング | [docs/features](docs/features/README.md) |
-| 音声 | ASR(SenseVoice / Whisper)+ TTS(Piper / MiniMax)+ VAD、Discord ボイスチャンネルと LiveKit ルーム | [docs/features](docs/features/README.md) |
+| チャネル | 9 チャネル(Telegram / LINE / Discord + 音声 / Slack / WhatsApp / Feishu / Google Chat / Teams / WebChat)、エージェントごとの bot、ホット起動/停止、プラットフォーム最適レンダリング、入力中インジケータ、長時間タスクの進捗ボード | [docs/features](docs/features/README.md) |
+| マルチランタイム | Claude / Codex / Gemini / Antigravity / OpenAI-compat、自動検出、エージェントごとの設定、切替時もコンテキスト保持 | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| 統一 LLM API 層 | `duduclaw-llm` が 4 つのネイティブプロトコル(Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat)を単一の正規化リクエストでカバー。8 つの OpenAI-compat プリセット(DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen)+ 価格レジストリ + クロスプロバイダ fallback を内蔵 | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| MCP サーバー | 138 ツール:チャネル、メモリ、エージェント編成、スキルマーケット、タスクボード、共有 wiki、Odoo ERP、computer use、live forking。stdio と HTTP/SSE の両トランスポート、外部には 7 ツールのみ公開 | [docs/api](docs/api/README.md) |
+| メモリ | SQLite 時系列メモリ(事実の置換チェーン)、HippoRAG-lite 知識グラフ検索(Personalized PageRank)、エビングハウス忘却曲線によるアーカイブ、エージェント横断の共有 wiki | [docs/features](docs/features/README.md) |
+| 自己進化 | GVU² 二重ループ + 予測駆動(会話の約 90% は LLM コストゼロ)、SOUL.md バージョン管理 + 24 時間観察期間つき自動ロールバック、MistakeNotebook のターン横断メモリ | [evolution-engine.md](docs/architecture/evolution-engine.md) |
+| セキュリティ | PolicyKernel reference monitor(LLM 不使用、fail-closed)、macOS Seatbelt / Linux Landlock ネイティブサンドボックス、Docker / Apple Container / WSL2 コンテナサンドボックス、secret redaction vault、CONTRACT.toml 行動契約 + レッドチーム CLI | [SECURITY.md](SECURITY.md) |
+| アカウントとコスト | OAuth + API キーのローテーション(4 戦略)、レート制限 / 課金クールダウン、キャッシュ効率分析つきコストテレメトリ、OAuth サブスクリプションアカウントを駆動するクロスプラットフォーム PTY プール | [docs/features](docs/features/README.md) |
+| ローカル推論 | llama.cpp(Metal/CUDA/Vulkan)/ mistral.rs / Exo P2P / llamafile / MLX、3 段階の信頼度ルーティング。Whisper 音声認識とベクトル埋め込みも内蔵 | [docs/features](docs/features/README.md) |
+| Live Forking | RFC-26:進行中のタスクを N 個の競合ブランチに分岐し、それぞれ copy-on-write 隔離、AI ジャッジが勝者を選んでマージ(デフォルト無効) | [docs/rfc](docs/rfc) |
 | 自動アップデート | ダッシュボードからワンクリック、または無人更新(`auto_update = true`)。SHA-256 + Ed25519 の二重検証後にその場で再起動、開いているタブは自動リロード | [deployment-guide.md](docs/guides/deployment-guide.md) |
-| Web ダッシュボード | React 19 SPA 24 ページ、バイナリに内蔵で追加デプロイ不要。zh-TW / en / ja 対応 | [docs/features](docs/features/README.md) |
-| ERP 連携 | Odoo ブリッジ 15 MCP ツール(CRM / 販売 / 在庫 / 会計)、エージェントごとの認証分離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
+| Web ダッシュボード | React 19 + TypeScript SPA 32 ページ、バイナリに内蔵で追加デプロイ不要。zh-TW / en / ja 対応 | [docs/features](docs/features/README.md) |
+| ERP 連携 | Odoo ブリッジ 15 MCP ツール(CRM / 販売 / 在庫 / 会計)、CE/EE 自動検出、エージェントごとの認証分離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
 
 全機能リストは [docs/features/feature-inventory.md](docs/features/feature-inventory.md)、バージョン履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。
 
@@ -185,20 +190,24 @@ duduclaw service install   # 起動時に自動開始(launchd / systemd)
 ## CLI コマンド
 
 ```
+duduclaw onboard             # 初回セットアップ(--yes でプロンプトをスキップ)
 duduclaw run                 # まとめて起動(gateway + channels + heartbeat + cron + dispatcher)
-duduclaw agent               # ターミナルで対話
-duduclaw agent create        # エージェント作成(業種テンプレートあり)
-duduclaw agent list          # エージェント一覧
+duduclaw agent               # ターミナルで対話。サブコマンド create / list / inspect / pause / resume / run
+duduclaw wizard              # 業種テンプレートでセットアップ
 duduclaw status              # システムヘルスのスナップショット
 duduclaw doctor              # ヘルス診断
 duduclaw test <agent>        # レッドチームセキュリティテスト(内蔵 9 シナリオ)
+duduclaw eval                # エージェント行動 eval スイートを実行
 duduclaw update              # アップデートの確認とインストール
-duduclaw service install     # システムサービスとして登録(launchd / systemd)
+duduclaw service install     # システムサービスとして登録。start / stop / status / logs / uninstall も
+duduclaw export / import     # ~/.duduclaw の書き出し / 取り込み(個人データの可搬性)
 duduclaw mcp-server          # MCP サーバー起動(stdio JSON-RPC 2.0)
+duduclaw http-server         # MCP HTTP/SSE トランスポート起動(Bearer 認証)
 duduclaw acp-server          # ACP/A2A サーバー起動(Zed / JetBrains / Neovim 連携)
+duduclaw license             # ライセンス管理(activate / status / redeem / rebind / …)
 ```
 
-全コマンドは `duduclaw --help` で確認できます。開発者向けは[開発ガイド](docs/guides/development-guide.md)へ。
+全 25 コマンドとサブコマンドは `duduclaw --help` で確認できます。開発者向けは[開発ガイド](docs/guides/development-guide.md)へ。
 
 <a id="trust"></a>
 
@@ -235,9 +244,9 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 | 言語 | Rust | TypeScript | Rust | Python |
 | チャネル | 9 | 25+ | 8 | 0(API)|
 | マルチランタイム | 5 バックエンド | 単一 | 単一 | マルチ LLM |
-| MCP サーバー | 80+ ツール | なし | なし | なし |
+| MCP サーバー | 138 ツール | なし | なし | なし |
 | 自己進化エンジン | GVU² 二重ループ | なし | なし | なし |
-| ローカル推論 | 6 バックエンド + 信頼度ルーティング | なし | なし | なし |
+| ローカル推論 | 5 バックエンド + 信頼度ルーティング | なし | なし | なし |
 | 行動契約 | CONTRACT.toml + レッドチーム | なし | WASM サンドボックス | なし |
 | ライセンス | Apache 2.0(オープンコア)| MIT | オープンソース | $59+/月 |
 
