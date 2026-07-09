@@ -1,0 +1,300 @@
+# Instincts generated from https://github.com/zhixuli0406/DuDuClaw
+# Generated: 2026-07-04T01:46:08.846Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: DuDuClaw-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: fix
+
+## Evidence
+
+- 1 commits analyzed
+- Detected conventional commit pattern
+- Examples: fix(paths): canonical DUDUCLAW_HOME resolver + namespaced MCP registration (multi-instance isolation, Plan A)
+
+---
+id: DuDuClaw-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Commit Length
+
+## Action
+
+Write detailed commit messages (~109 characters for first line)
+
+## Evidence
+
+- Average commit message length: 109 chars
+- Based on 1 commits
+
+---
+id: DuDuClaw-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Naming Files
+
+## Action
+
+Use snake_case naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: snake_case
+
+---
+id: DuDuClaw-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: DuDuClaw-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: DuDuClaw-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/zhixuli0406/DuDuClaw
+---
+
+# DuDuClaw Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: duduclaw-instinct-file-naming
+trigger: "When creating a new source file"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct File Naming
+
+## Action
+
+Name the file using snake_case
+
+## Evidence
+
+- Pattern in namingConventions.files: snake_case
+
+---
+id: duduclaw-instinct-function-naming
+trigger: "When defining a new function"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct Function Naming
+
+## Action
+
+Name the function using camelCase
+
+## Evidence
+
+- Pattern in namingConventions.functions: camelCase
+
+---
+id: duduclaw-instinct-class-naming
+trigger: "When defining a new class or struct"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct Class Naming
+
+## Action
+
+Name the class or struct using PascalCase
+
+## Evidence
+
+- Pattern in namingConventions.classes: PascalCase
+
+---
+id: duduclaw-instinct-constant-naming
+trigger: "When defining a constant"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct Constant Naming
+
+## Action
+
+Name the constant using SCREAMING_SNAKE_CASE
+
+## Evidence
+
+- Pattern in namingConventions.constants: SCREAMING_SNAKE_CASE
+
+---
+id: duduclaw-instinct-import-style
+trigger: "When importing modules in Rust code"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct Import Style
+
+## Action
+
+Use relative import paths
+
+## Evidence
+
+- Pattern in importStyle: relative
+
+---
+id: duduclaw-instinct-export-style
+trigger: "When exporting modules or items"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in exportStyle: named
+
+---
+id: duduclaw-instinct-test-location
+trigger: "When adding new tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct Test Location
+
+## Action
+
+Place test files in a separate directory from source files
+
+## Evidence
+
+- Pattern in architecture.folderStructure.testLocation: separate
+
+---
+id: duduclaw-instinct-git-commit-prefix
+trigger: "When writing a commit message"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct Git Commit Prefix
+
+## Action
+
+Start the message with a conventional prefix, such as 'fix'
+
+## Evidence
+
+- Pattern in commits.prefixes: ["fix"]
+- Example: fix(paths): canonical DUDUCLAW_HOME resolver...
+
+---
+id: duduclaw-instinct-git-commit-format
+trigger: "When writing a commit message"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: zhixuli0406/DuDuClaw
+---
+
+# Duduclaw Instinct Git Commit Format
+
+## Action
+
+Follow the conventional commit format: <type>(<scope>): <description>
+
+## Evidence
+
+- Pattern in commits.type: conventional
+- Example: fix(paths): canonical DUDUCLAW_HOME resolver...
+
