@@ -11,6 +11,7 @@ pub mod resolver;
 pub mod runner;
 pub mod skill_loader;
 pub mod skill_registry;
+pub mod trust_tier;
 
 pub use budget::{BudgetManager, BudgetStatus};
 pub use heartbeat::{

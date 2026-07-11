@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::rules::{Match, Rule, RuleKind, RuleSpec};
+use crate::rules::keyword::KeywordRule;
 use crate::rules::regex::RegexRule;
 use crate::source::Source;
 
@@ -64,6 +65,10 @@ impl RuleEngine {
             match &spec.kind {
                 RuleKind::Regex { .. } => {
                     let rule = RegexRule::compile(spec)?;
+                    rules.push(Arc::new(rule));
+                }
+                RuleKind::Keyword { .. } => {
+                    let rule = KeywordRule::compile(spec)?;
                     rules.push(Arc::new(rule));
                 }
                 other => {
@@ -251,6 +256,8 @@ mod tests {
 
     #[test]
     fn future_rule_kinds_are_skipped_gracefully() {
+        // JsonPath is still unimplemented in the engine — it must be skipped,
+        // not error. (Keyword used to be here; it is now compiled — see below.)
         let spec = RuleSpec {
             id: "future".into(),
             category: "X".into(),
@@ -258,12 +265,31 @@ mod tests {
             priority: 50,
             cross_session_stable: false,
             apply_to_system_prompt: false,
-            kind: RuleKind::Keyword {
-                values: vec!["foo".into()],
-                case_sensitive: true,
+            kind: RuleKind::JsonPath {
+                paths: vec!["$.phone".into()],
+                match_tool: None,
             },
         };
         let engine = RuleEngine::from_specs(vec![spec]).unwrap();
         assert_eq!(engine.rule_count(), 0);
+    }
+
+    #[test]
+    fn keyword_rule_kind_is_compiled() {
+        // WP2: keyword rules are now first-class, not skipped.
+        let spec = RuleSpec {
+            id: "customer".into(),
+            category: "CUSTOMER".into(),
+            restore_scope: RestoreScope::Owner,
+            priority: 60,
+            cross_session_stable: true,
+            apply_to_system_prompt: false,
+            kind: RuleKind::Keyword {
+                values: vec!["Amazon".into()],
+                case_sensitive: false,
+            },
+        };
+        let engine = RuleEngine::from_specs(vec![spec]).unwrap();
+        assert_eq!(engine.rule_count(), 1);
     }
 }

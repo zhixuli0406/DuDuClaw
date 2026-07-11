@@ -127,7 +127,7 @@ impl std::str::FromStr for AccessLevel {
 }
 
 /// A user account record.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct User {
     pub id: String,
     pub email: String,

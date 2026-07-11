@@ -5,12 +5,14 @@
 //! [`RestoreScope`] contract. The [`crate::engine::RuleEngine`] applies
 //! a collection of rules and resolves overlaps.
 
+pub mod keyword;
 pub mod regex;
 
 use serde::{Deserialize, Serialize};
 
 use crate::source::Caller;
 
+pub use self::keyword::KeywordRule;
 pub use self::regex::RegexRule;
 
 /// A single PII span detected by a rule.

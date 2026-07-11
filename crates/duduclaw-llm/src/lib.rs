@@ -58,7 +58,7 @@ pub use tool_loop::{
 pub use mcp_client::{
     build_initialize_request, build_initialized_notification, build_tools_call_request,
     build_tools_list_request, parse_tool_call_result, parse_tools_list_response, McpClient,
-    McpError, McpToolDef, ToolCallResult, ToolRegistry, DEFAULT_MCP_TIMEOUT,
+    McpError, McpToolDef, ToolCallResult, ToolFilter, ToolRegistry, DEFAULT_MCP_TIMEOUT,
 };
 pub use types::{
     estimate_tokens, CacheHint, ChatMessage, ChatRequest, ChatResponse, ContentPart,

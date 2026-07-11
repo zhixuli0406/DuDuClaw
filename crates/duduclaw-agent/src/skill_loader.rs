@@ -3,10 +3,22 @@
 //! [B-1a] Parses SKILL.md frontmatter (name, description, trigger, tools)
 //! and converts to DuDuClaw's internal `SkillFile` format.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use tracing::info;
+
+/// Localised display strings for a skill (WP8 — Skill 中文化). Employees who
+/// don't read English see the skill's zh-TW name/description; the original
+/// `name`/`description` remain the machine-stable identity.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LocalizedText {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
 
 /// Skill type in a hierarchical composition (SkillRL-inspired).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -59,6 +71,49 @@ pub struct SkillMeta {
     /// How dependencies should be composed.
     #[serde(default)]
     pub compose_mode: ComposeMode,
+    /// Localised display strings keyed by locale (`zh-TW` / `en` / `ja-JP`).
+    /// Empty for skills predating WP8 — the fallback chain then returns the
+    /// original `name` / `description`.
+    #[serde(default)]
+    pub display: HashMap<String, LocalizedText>,
+    /// Operator/agent estimate of minutes this skill saves per use. Populated
+    /// by the WP8 time-saving approval flow; the WP10 leaderboard aggregates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_minutes_saved: Option<u32>,
+}
+
+/// Default UI locale used by the skill display fallback chain.
+pub const DEFAULT_SKILL_LOCALE: &str = "zh-TW";
+
+impl SkillMeta {
+    /// Display name for `locale`, following the fallback chain
+    /// `locale → zh-TW → original name`. Blank localised entries are skipped.
+    pub fn display_name(&self, locale: &str) -> &str {
+        self.localized_name(locale)
+            .or_else(|| self.localized_name(DEFAULT_SKILL_LOCALE))
+            .unwrap_or(&self.name)
+    }
+
+    /// Display description for `locale`, same fallback chain as [`Self::display_name`].
+    pub fn display_description(&self, locale: &str) -> &str {
+        self.localized_description(locale)
+            .or_else(|| self.localized_description(DEFAULT_SKILL_LOCALE))
+            .unwrap_or(&self.description)
+    }
+
+    fn localized_name(&self, locale: &str) -> Option<&str> {
+        self.display
+            .get(locale)
+            .map(|t| t.name.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn localized_description(&self, locale: &str) -> Option<&str> {
+        self.display
+            .get(locale)
+            .map(|t| t.description.trim())
+            .filter(|s| !s.is_empty())
+    }
 }
 
 /// A fully loaded skill with metadata and content.
@@ -105,6 +160,36 @@ pub fn parse_skill_file(path: &Path) -> Result<ParsedSkill, String> {
     })
 }
 
+/// Parse skill metadata from an in-memory SKILL.md string (no filesystem
+/// round-trip). Used by presentation paths (`skill_list` / `skill_search`) that
+/// already hold the content and need the WP8 `display` map for localisation.
+/// `name_hint` fills the name when frontmatter is absent/blank.
+pub fn parse_skill_meta_from_content(content: &str, name_hint: &str) -> SkillMeta {
+    let path = std::path::PathBuf::from(format!("{name_hint}.md"));
+    match parse_frontmatter(content, &path) {
+        Ok((mut meta, _)) => {
+            if meta.name.trim().is_empty() {
+                meta.name = name_hint.to_string();
+            }
+            meta
+        }
+        Err(_) => SkillMeta {
+            name: name_hint.to_string(),
+            description: String::new(),
+            trigger: String::new(),
+            tools: Vec::new(),
+            tags: Vec::new(),
+            author: String::new(),
+            version: String::new(),
+            requires: Vec::new(),
+            skill_type: SkillType::default(),
+            compose_mode: ComposeMode::default(),
+            display: HashMap::new(),
+            estimated_minutes_saved: None,
+        },
+    }
+}
+
 /// Parse YAML frontmatter delimited by `---`.
 fn parse_frontmatter(content: &str, path: &Path) -> Result<(SkillMeta, String), String> {
     let trimmed = content.trim_start();
@@ -128,6 +213,8 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<(SkillMeta, String), 
                 requires: Vec::new(),
                 skill_type: SkillType::default(),
                 compose_mode: ComposeMode::default(),
+                display: HashMap::new(),
+                estimated_minutes_saved: None,
             },
             content.to_string(),
         ));
@@ -164,6 +251,8 @@ fn parse_simple_yaml(yaml: &str, path: &Path) -> Result<SkillMeta, String> {
         requires: Vec<String>,
         skill_type: SkillType,
         compose_mode: ComposeMode,
+        display: HashMap<String, LocalizedText>,
+        estimated_minutes_saved: Option<u32>,
     }
 
     let raw: RawMeta = serde_yaml::from_str(yaml).unwrap_or_else(|e| {
@@ -191,6 +280,8 @@ fn parse_simple_yaml(yaml: &str, path: &Path) -> Result<SkillMeta, String> {
         requires: raw.requires,
         skill_type: raw.skill_type,
         compose_mode: raw.compose_mode,
+        display: raw.display,
+        estimated_minutes_saved: raw.estimated_minutes_saved,
     })
 }
 
@@ -261,4 +352,58 @@ pub async fn install_skill_global(
 ) -> Result<ParsedSkill, String> {
     let global_skills_dir = home_dir.join("skills");
     install_skill(skill_path, &global_skills_dir, quarantine_dir).await
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    fn meta_with(display: &[(&str, &str, &str)]) -> SkillMeta {
+        let mut map = HashMap::new();
+        for (loc, name, desc) in display {
+            map.insert(
+                loc.to_string(),
+                LocalizedText { name: name.to_string(), description: desc.to_string() },
+            );
+        }
+        SkillMeta {
+            name: "compress-context".into(),
+            description: "Compress the conversation".into(),
+            trigger: String::new(),
+            tools: Vec::new(),
+            tags: Vec::new(),
+            author: String::new(),
+            version: String::new(),
+            requires: Vec::new(),
+            skill_type: SkillType::default(),
+            compose_mode: ComposeMode::default(),
+            display: map,
+            estimated_minutes_saved: None,
+        }
+    }
+
+    #[test]
+    fn prefers_requested_locale() {
+        let m = meta_with(&[("zh-TW", "壓縮對話", "把對話壓縮"), ("en", "Compress", "Compress it")]);
+        assert_eq!(m.display_name("en"), "Compress");
+        assert_eq!(m.display_description("zh-TW"), "把對話壓縮");
+    }
+
+    #[test]
+    fn falls_back_to_zh_tw_then_original() {
+        let m = meta_with(&[("zh-TW", "壓縮對話", "把對話壓縮")]);
+        // ja-JP absent → zh-TW.
+        assert_eq!(m.display_name("ja-JP"), "壓縮對話");
+        // No display at all → original name.
+        let bare = meta_with(&[]);
+        assert_eq!(bare.display_name("zh-TW"), "compress-context");
+        assert_eq!(bare.display_description("en"), "Compress the conversation");
+    }
+
+    #[test]
+    fn blank_localized_entry_is_skipped() {
+        let m = meta_with(&[("zh-TW", "  ", "  ")]);
+        // Blank zh-TW entry must not shadow the original.
+        assert_eq!(m.display_name("zh-TW"), "compress-context");
+    }
 }

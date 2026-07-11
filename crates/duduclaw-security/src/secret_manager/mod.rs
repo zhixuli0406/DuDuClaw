@@ -19,11 +19,22 @@
 //!
 //! ```toml
 //! [secret_manager]
-//! backend = "vault"          # "local" | "vault" | "env"
+//! backend = "vault"          # "local" | "vault" | "env" | "onepassword" | "infisical"
 //! vault_addr  = "http://127.0.0.1:8200"
 //! vault_token = ""           # plaintext Vault token (currently the only field used)
 //! vault_token_enc = ""       # base64(AES-256-GCM encrypted token) — RESERVED, see note
 //! vault_mount = "secret"     # KV v2 mount point
+//!
+//! # 1Password Connect (self-hosted):
+//! onepassword_host  = "https://op-connect.internal:8080"
+//! onepassword_token = ""     # or onepassword_token_enc (keyfile-encrypted)
+//! onepassword_vault = "<vault-id>"
+//!
+//! # Infisical:
+//! infisical_addr        = "https://app.infisical.com"
+//! infisical_token       = ""  # or infisical_token_enc (keyfile-encrypted)
+//! infisical_project_id  = "<workspace-id>"
+//! infisical_environment = "prod"
 //! ```
 //!
 //! ## Note on `vault_token_enc`
@@ -36,11 +47,15 @@
 //! for callers without a `home_dir`.
 
 mod env;
+mod infisical;
 mod local;
+mod onepassword;
 mod vault;
 
 pub use env::EnvSecretAdapter;
+pub use infisical::InfisicalAdapter;
 pub use local::LocalSecretAdapter;
+pub use onepassword::OnePasswordConnectAdapter;
 pub use vault::VaultHttpAdapter;
 
 use async_trait::async_trait;
@@ -61,6 +76,11 @@ pub enum SecretBackend {
     Vault,
     /// OS process environment variable.
     Env,
+    /// 1Password Connect (self-hosted).
+    #[serde(rename = "onepassword")]
+    OnePassword,
+    /// Infisical.
+    Infisical,
 }
 
 impl fmt::Display for SecretBackend {
@@ -69,6 +89,8 @@ impl fmt::Display for SecretBackend {
             SecretBackend::Local => write!(f, "local"),
             SecretBackend::Vault => write!(f, "vault"),
             SecretBackend::Env => write!(f, "env"),
+            SecretBackend::OnePassword => write!(f, "onepassword"),
+            SecretBackend::Infisical => write!(f, "infisical"),
         }
     }
 }
@@ -114,6 +136,8 @@ impl SecretUri {
             "local" => SecretBackend::Local,
             "vault" => SecretBackend::Vault,
             "env" => SecretBackend::Env,
+            "onepassword" | "1password" | "op" => SecretBackend::OnePassword,
+            "infisical" => SecretBackend::Infisical,
             other => {
                 return Err(DuDuClawError::Security(format!(
                     "unknown secret backend '{other}' in URI: {uri}"
@@ -179,10 +203,52 @@ pub struct SecretManagerConfig {
 
     /// KV v2 mount point (defaults to `"secret"`).
     pub vault_mount: Option<String>,
+
+    // ── 1Password Connect ────────────────────────────────────────────────
+    /// Connect server host, e.g. `https://op-connect.internal:8080`.
+    pub onepassword_host: Option<String>,
+    /// Connect API token (plaintext).
+    pub onepassword_token: Option<String>,
+    /// Encrypted Connect token (base64 AES-256-GCM), decrypted via the keyfile.
+    pub onepassword_token_enc: Option<String>,
+    /// Vault id (or name) items are read from.
+    pub onepassword_vault: Option<String>,
+
+    // ── Infisical ────────────────────────────────────────────────────────
+    /// Infisical base address (defaults to `https://app.infisical.com`).
+    pub infisical_addr: Option<String>,
+    /// Infisical service token (plaintext).
+    pub infisical_token: Option<String>,
+    /// Encrypted Infisical token (base64 AES-256-GCM), decrypted via the keyfile.
+    pub infisical_token_enc: Option<String>,
+    /// Project / workspace id.
+    pub infisical_project_id: Option<String>,
+    /// Environment slug (defaults to `prod`).
+    pub infisical_environment: Option<String>,
 }
 
 fn default_backend() -> String {
     "local".to_string()
+}
+
+/// Resolve an encrypted-or-plaintext token pair: prefer the keyfile-decrypted
+/// `enc` value, fall back to `plain`, else `None`. The decrypted value is never
+/// logged (a decrypt failure warns without the ciphertext/plaintext).
+fn resolve_enc_or_plain(
+    enc: Option<&str>,
+    plain: Option<&str>,
+    home_dir: &std::path::Path,
+) -> Option<String> {
+    if let Some(enc) = enc.filter(|s| !s.is_empty()) {
+        if let Some(decrypted) = crate::keyfile::decrypt_keyfile_value(enc, home_dir) {
+            return Some(decrypted);
+        }
+        tracing::warn!(
+            "[secret_manager] *_token_enc set but could not be decrypted; \
+             falling back to plaintext token if present"
+        );
+    }
+    plain.filter(|s| !s.is_empty()).map(str::to_string)
 }
 
 impl Default for SecretManagerConfig {
@@ -193,6 +259,15 @@ impl Default for SecretManagerConfig {
             vault_token: None,
             vault_token_enc: None,
             vault_mount: None,
+            onepassword_host: None,
+            onepassword_token: None,
+            onepassword_token_enc: None,
+            onepassword_vault: None,
+            infisical_addr: None,
+            infisical_token: None,
+            infisical_token_enc: None,
+            infisical_project_id: None,
+            infisical_environment: None,
         }
     }
 }
@@ -264,6 +339,42 @@ impl SecretManagerConfig {
             .map(str::to_string)
     }
 
+    /// Resolve the effective 1Password Connect token (decrypts
+    /// `onepassword_token_enc` via the keyfile, else plaintext). Never logged.
+    pub fn resolved_onepassword_token(&self, home_dir: &std::path::Path) -> Option<String> {
+        resolve_enc_or_plain(
+            self.onepassword_token_enc.as_deref(),
+            self.onepassword_token.as_deref(),
+            home_dir,
+        )
+    }
+
+    /// Resolve the effective Infisical token (decrypts `infisical_token_enc` via
+    /// the keyfile, else plaintext). Never logged.
+    pub fn resolved_infisical_token(&self, home_dir: &std::path::Path) -> Option<String> {
+        resolve_enc_or_plain(
+            self.infisical_token_enc.as_deref(),
+            self.infisical_token.as_deref(),
+            home_dir,
+        )
+    }
+
+    /// Effective Infisical address (falls back to the SaaS default).
+    pub fn effective_infisical_addr(&self) -> &str {
+        self.infisical_addr
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("https://app.infisical.com")
+    }
+
+    /// Effective Infisical environment slug (falls back to `prod`).
+    pub fn effective_infisical_environment(&self) -> &str {
+        self.infisical_environment
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("prod")
+    }
+
     /// Build a concrete [`SecretManager`] backend from this config.
     ///
     /// This is the wiring entry point that turns `[secret_manager]` config into
@@ -286,9 +397,12 @@ impl SecretManagerConfig {
             "local" => SecretBackend::Local,
             "vault" => SecretBackend::Vault,
             "env" => SecretBackend::Env,
+            "onepassword" | "1password" | "op" => SecretBackend::OnePassword,
+            "infisical" => SecretBackend::Infisical,
             other => {
                 return Err(DuDuClawError::Security(format!(
-                    "unknown secret_manager backend '{other}' (expected local|vault|env)"
+                    "unknown secret_manager backend '{other}' \
+                     (expected local|vault|env|onepassword|infisical)"
                 )))
             }
         };
@@ -322,6 +436,61 @@ impl SecretManagerConfig {
                     self.effective_vault_addr(),
                     token,
                     self.effective_vault_mount(),
+                )))
+            }
+            SecretBackend::OnePassword => {
+                let token = self.resolved_onepassword_token(home_dir).ok_or_else(|| {
+                    DuDuClawError::Security(
+                        "secret_manager onepassword backend selected but no token could be \
+                         resolved (set onepassword_token or onepassword_token_enc)"
+                            .to_string(),
+                    )
+                })?;
+                let host = self
+                    .onepassword_host
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        DuDuClawError::Security(
+                            "secret_manager onepassword backend requires onepassword_host"
+                                .to_string(),
+                        )
+                    })?;
+                let vault = self
+                    .onepassword_vault
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        DuDuClawError::Security(
+                            "secret_manager onepassword backend requires onepassword_vault"
+                                .to_string(),
+                        )
+                    })?;
+                Ok(Box::new(OnePasswordConnectAdapter::new(host, token, vault)))
+            }
+            SecretBackend::Infisical => {
+                let token = self.resolved_infisical_token(home_dir).ok_or_else(|| {
+                    DuDuClawError::Security(
+                        "secret_manager infisical backend selected but no token could be \
+                         resolved (set infisical_token or infisical_token_enc)"
+                            .to_string(),
+                    )
+                })?;
+                let project_id = self
+                    .infisical_project_id
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        DuDuClawError::Security(
+                            "secret_manager infisical backend requires infisical_project_id"
+                                .to_string(),
+                        )
+                    })?;
+                Ok(Box::new(InfisicalAdapter::new(
+                    self.effective_infisical_addr(),
+                    token,
+                    project_id,
+                    self.effective_infisical_environment(),
                 )))
             }
         }

@@ -80,6 +80,10 @@ struct LiveAgent {
     config: HeartbeatConfig,
     /// Max silence hours before forced reflection (from EvolutionConfig).
     max_silence_hours: f64,
+    /// Master evolution kill-switch (`[evolution] enabled`). When `false`, the
+    /// silence-breaker below stays inert — the previously-uncovered bypass path
+    /// where an agent kept evolving despite evolution being switched off.
+    evolution_enabled: bool,
     schedule: Option<Schedule>,
     /// Parsed `cron_timezone`. `None` means UTC (legacy). An invalid name in
     /// config (e.g. typo) resolves to `None` here and a single warn-level
@@ -126,6 +130,7 @@ impl LiveAgent {
             agent_id: agent.config.agent.name.clone(),
             config: agent.config.heartbeat.clone(),
             max_silence_hours: agent.config.evolution.max_silence_hours,
+            evolution_enabled: agent.config.evolution.enabled,
             schedule,
             cron_tz,
             last_run: None,
@@ -251,6 +256,7 @@ impl HeartbeatScheduler {
             if let Some(existing) = agents.get_mut(&la.config.agent.name) {
                 existing.config = la.config.heartbeat.clone();
                 existing.max_silence_hours = la.config.evolution.max_silence_hours;
+                existing.evolution_enabled = la.config.evolution.enabled;
                 existing.schedule = parse_cron(&la.config.heartbeat.cron);
                 existing.cron_tz = resolve_cron_tz(
                     &la.config.agent.name,
@@ -365,36 +371,44 @@ impl HeartbeatScheduler {
                     }
 
                     // ── Silence breaker ──
-                    // If no evolution has occurred for max_silence_hours, mark for
-                    // heartbeat so the prediction engine can pick it up on next conversation.
-                    let hours_since_last = agent
-                        .last_evolution_trigger
-                        .map(|t| now.signed_duration_since(t).num_minutes() as f64 / 60.0)
-                        .unwrap_or(agent.max_silence_hours + 1.0);
+                    // Master evolution kill-switch gate: when `[evolution]
+                    // enabled = false`, this agent's autonomous evolution is
+                    // frozen, so the silence-breaker must NOT fire (this was a
+                    // bypass path — the client-reported "evolution kept running
+                    // after I turned it off" bug). Bus polling below is a
+                    // separate, non-evolution concern and still runs regardless.
+                    if agent.evolution_enabled {
+                        // If no evolution has occurred for max_silence_hours, mark for
+                        // heartbeat so the prediction engine can pick it up on next conversation.
+                        let hours_since_last = agent
+                            .last_evolution_trigger
+                            .map(|t| now.signed_duration_since(t).num_minutes() as f64 / 60.0)
+                            .unwrap_or(agent.max_silence_hours + 1.0);
 
-                    if hours_since_last > agent.max_silence_hours {
-                        warn!(
-                            agent = %agent.agent_id,
-                            hours = format!("{hours_since_last:.1}"),
-                            "Silence breaker: no evolution trigger for too long"
-                        );
-                        // Reset the timer first so a slow downstream consumer
-                        // can't cause us to fire repeatedly.
-                        agent.last_evolution_trigger = Some(now);
-                        // Forward to the gateway if a channel is wired up. Use
-                        // `try_send`-style fail-fast: if the receiver is gone
-                        // we don't want to block the scheduler.
-                        if let Some(tx) = self.silence_tx.as_ref() {
-                            let event = SilenceBreakerEvent {
-                                agent_id: agent.agent_id.clone(),
-                                hours: hours_since_last,
-                                timestamp: now,
-                            };
-                            if let Err(e) = tx.send(event) {
-                                debug!(
-                                    agent = %agent.agent_id,
-                                    "Silence breaker channel closed: {e}"
-                                );
+                        if hours_since_last > agent.max_silence_hours {
+                            warn!(
+                                agent = %agent.agent_id,
+                                hours = format!("{hours_since_last:.1}"),
+                                "Silence breaker: no evolution trigger for too long"
+                            );
+                            // Reset the timer first so a slow downstream consumer
+                            // can't cause us to fire repeatedly.
+                            agent.last_evolution_trigger = Some(now);
+                            // Forward to the gateway if a channel is wired up. Use
+                            // `try_send`-style fail-fast: if the receiver is gone
+                            // we don't want to block the scheduler.
+                            if let Some(tx) = self.silence_tx.as_ref() {
+                                let event = SilenceBreakerEvent {
+                                    agent_id: agent.agent_id.clone(),
+                                    hours: hours_since_last,
+                                    timestamp: now,
+                                };
+                                if let Err(e) = tx.send(event) {
+                                    debug!(
+                                        agent = %agent.agent_id,
+                                        "Silence breaker channel closed: {e}"
+                                    );
+                                }
                             }
                         }
                     }
@@ -1020,6 +1034,7 @@ mod tests {
             last_evolution_trigger: None,
             total_runs: 0,
             active_runs: Arc::new(tokio::sync::Semaphore::new(1)),
+            evolution_enabled: false,
         }
     }
 

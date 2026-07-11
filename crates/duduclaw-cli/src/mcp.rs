@@ -200,6 +200,33 @@ const TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
+        name: "code_map",
+        description: "Rank a repository's source files by relevance to a query using an Aider-style code symbol graph (tree-sitter + PageRank). Best for locating where symbols are defined/used across a codebase.",
+        params: &[
+            ParamDef { name: "query", description: "Natural-language or identifier query (e.g. a function/type name)", required: true },
+            ParamDef { name: "root", description: "Repository root to scan (default: current working directory)", required: false },
+            ParamDef { name: "max_files", description: "Max ranked files to return (default 15, cap 100)", required: false },
+            ParamDef { name: "chat_files", description: "Array of repo-relative paths already in context; their symbols bias the ranking", required: false },
+        ],
+    },
+    ToolDef {
+        name: "user_profile_record",
+        description: "Record or update one durable preference fact about a specific end user (e.g. they prefer tea, their timezone, their language). Re-recording the same predicate supersedes the old value. These traits are injected as an '## About This User' block into future replies to that user — use for stable preferences, not one-off facts.",
+        params: &[
+            ParamDef { name: "user_id", description: "Stable per-user id from the channel (e.g. the Telegram/LINE/Discord sender id)", required: true },
+            ParamDef { name: "predicate", description: "The attribute name (e.g. 'prefers', 'timezone', 'language', 'pronouns')", required: true },
+            ParamDef { name: "value", description: "The attribute value (e.g. 'tea', 'Asia/Taipei', 'zh-TW')", required: true },
+            ParamDef { name: "origin_trust", description: "Confidence 0..1 in this observation (default 1.0)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "user_profile_get",
+        description: "Fetch a user's currently-valid preference traits and the rendered '## About This User' block (the same text injected into replies). Read-only.",
+        params: &[
+            ParamDef { name: "user_id", description: "Stable per-user id from the channel", required: true },
+        ],
+    },
+    ToolDef {
         name: "memory_successful_conversations",
         description: "Find successful past conversations related to a topic (high-importance episodic memories)",
         params: &[
@@ -736,6 +763,13 @@ const TOOLS: &[ToolDef] = &[
         ],
     },
     ToolDef {
+        name: "cost_users",
+        description: "List end users ranked by cost over a time window (WP6 — 'which employee is spending?'). Unattributed/system traffic is bucketed under '(system)'. Admin scope.",
+        params: &[
+            ParamDef { name: "hours", description: "Time window in hours (default 24)", required: false },
+        ],
+    },
+    ToolDef {
         name: "cost_recent",
         description: "Show recent individual API call records with detailed token breakdown (input, cache_read, cache_write, output).",
         params: &[
@@ -911,7 +945,7 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "wiki_namespace_status",
-        description: "Inspect the shared-wiki namespace SoT policy (~/.duduclaw/shared/wiki/.scope.toml). Returns each configured namespace's mode (agent_writable / read_only / operator_only) and synced_from capability. Unlisted namespaces are agent_writable. Use this before shared_wiki_write to know whether a target namespace is writable.",
+        description: "Inspect the shared-wiki namespace SoT policy (~/.duduclaw/shared/wiki/.scope.toml). Returns each configured namespace's mode (agent_writable / read_only / operator_only / agent_allowlist) plus synced_from capability or the agent allowlist. Unlisted namespaces are agent_writable. Use this before shared_wiki_write to know whether a target namespace is writable.",
         params: &[],
     },
     ToolDef {
@@ -4816,6 +4850,38 @@ async fn handle_cost_agents(params: &Value, home_dir: &Path) -> Value {
     }
 }
 
+async fn handle_cost_users(params: &Value, home_dir: &Path) -> Value {
+    let _ = duduclaw_gateway::cost_telemetry::init_telemetry(home_dir);
+
+    let telemetry = match duduclaw_gateway::cost_telemetry::get_telemetry() {
+        Some(t) => t,
+        None => return serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "Cost telemetry not initialized"}]
+        }),
+    };
+
+    let hours = params.get("hours").and_then(|v| v.as_u64()).unwrap_or(24);
+
+    match telemetry.summary_by_user(hours).await {
+        Ok(users) => {
+            if users.is_empty() {
+                return serde_json::json!({
+                    "content": [{"type": "text", "text": "No per-user cost data in the selected time window."}]
+                });
+            }
+            let text = serde_json::to_string_pretty(&users).unwrap_or_default();
+            serde_json::json!({
+                "content": [{"type": "text", "text": text}]
+            })
+        }
+        Err(e) => serde_json::json!({
+            "isError": true,
+            "content": [{"type": "text", "text": format!("Error: {e}")}]
+        }),
+    }
+}
+
 async fn handle_cost_recent(params: &Value) -> Value {
     let telemetry = match duduclaw_gateway::cost_telemetry::get_telemetry() {
         Some(t) => t,
@@ -5320,6 +5386,9 @@ fn mcp_text(msg: &str) -> Value {
 /// `description` key, quoted vs. unquoted values. Returns an empty
 /// string in any failure mode — UI just shows a blank description rather
 /// than skipping the skill.
+// Retained as a tolerant fallback parser (still unit-tested). The WP8 display
+// path now uses `parse_skill_meta_from_content` for localisation.
+#[allow(dead_code)]
 fn parse_skill_description_from_content(content: &str) -> String {
     let trimmed = content.trim_start();
     let after = match trimmed.strip_prefix("---") {
@@ -5413,9 +5482,17 @@ async fn handle_skill_list(params: &Value, home_dir: &Path) -> Value {
     for sk in
         duduclaw_agent::registry::AgentRegistry::load_skills(&global_skills_dir).await
     {
-        let desc = parse_skill_description_from_content(&sk.content);
+        // WP8: show the localised (zh-TW default) name/description so
+        // non-English-reading employees can tell what a skill does; the
+        // registry key (sk.name) stays the machine identity for override dedup.
+        let meta = duduclaw_agent::skill_loader::parse_skill_meta_from_content(&sk.content, &sk.name);
+        let locale = duduclaw_agent::skill_loader::DEFAULT_SKILL_LOCALE;
         global_names.insert(sk.name.clone());
-        global_skills.push(format!("- {}: {} (global)", sk.name, desc));
+        global_skills.push(format!(
+            "- {}: {} (global)",
+            meta.display_name(locale),
+            meta.display_description(locale)
+        ));
     }
 
     // Collect agent-local skills from ~/.duduclaw/agents/<agent>/SKILLS/
@@ -5423,9 +5500,15 @@ async fn handle_skill_list(params: &Value, home_dir: &Path) -> Value {
     let mut agent_skills = Vec::new();
 
     for sk in duduclaw_agent::registry::AgentRegistry::load_skills(&skills_dir).await {
-        let desc = parse_skill_description_from_content(&sk.content);
+        let meta = duduclaw_agent::skill_loader::parse_skill_meta_from_content(&sk.content, &sk.name);
+        let locale = duduclaw_agent::skill_loader::DEFAULT_SKILL_LOCALE;
         let suffix = if global_names.contains(&sk.name) { " (override)" } else { "" };
-        agent_skills.push(format!("- {}: {}{}", sk.name, desc, suffix));
+        agent_skills.push(format!(
+            "- {}: {}{}",
+            meta.display_name(locale),
+            meta.display_description(locale),
+            suffix
+        ));
     }
 
     // Remove global skills that are overridden by agent-local
@@ -6096,6 +6179,23 @@ pub async fn get_default_agent(home_dir: &Path) -> String {
 // ── Main server loop ─────────────────────────────────────────
 
 /// Run the MCP server, reading JSON-RPC from stdin and writing responses to stdout.
+/// Opt-in: attach the local char-n-gram semantic embedder (the `w_vec` memory
+/// retrieval signal) when `DUDUCLAW_SEMANTIC_VECTORS=1`. Off by default →
+/// ranking is byte-identical to the FTS/graph-only path. Zero API cost, fully
+/// local. The dense-model (EmbeddingGemma) and sqlite-vec `vec0` backends are
+/// the documented quality/scale upgrades.
+pub(crate) fn maybe_with_semantic_embedder(engine: SqliteMemoryEngine) -> SqliteMemoryEngine {
+    let enabled = std::env::var("DUDUCLAW_SEMANTIC_VECTORS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if enabled {
+        tracing::info!("semantic vector retrieval (w_vec) enabled: ngram-hash-v1");
+        engine.with_embedder(std::sync::Arc::new(duduclaw_memory::NgramHashEmbedder::new()))
+    } else {
+        engine
+    }
+}
+
 pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     info!("Starting DuDuClaw MCP server");
 
@@ -6106,8 +6206,10 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
 
     // Initialize memory engine
     let memory_db_path = home_dir.join("memory.db");
-    let memory = SqliteMemoryEngine::new(&memory_db_path)
-        .map_err(|e| DuDuClawError::Memory(format!("Failed to open memory DB: {e}")))?;
+    let memory = maybe_with_semantic_embedder(
+        SqliteMemoryEngine::new(&memory_db_path)
+            .map_err(|e| DuDuClawError::Memory(format!("Failed to open memory DB: {e}")))?,
+    );
 
     let default_agent = get_default_agent(home_dir).await;
 
@@ -6389,9 +6491,12 @@ pub(crate) async fn handle_tools_call(
         // ── W19-P0 M1: namespace-aware memory endpoints ────────────────────
         "memory_search" => crate::mcp_memory_handlers::handle_memory_search(&arguments, memory, ns_ctx).await,
         "memory_store"  => crate::mcp_memory_handlers::handle_memory_store(&arguments, memory, ns_ctx, daily_quota).await,
+        "user_profile_record" => crate::mcp_memory_handlers::handle_user_profile_record(&arguments, memory, ns_ctx).await,
+        "user_profile_get" => crate::mcp_memory_handlers::handle_user_profile_get(&arguments, memory, ns_ctx).await,
         "memory_read"   => crate::mcp_memory_handlers::handle_memory_read(&arguments, memory, ns_ctx).await,
         "memory_fetch_batch" => crate::mcp_memory_handlers::handle_memory_fetch_batch(&arguments, memory, ns_ctx).await,
         "memory_search_by_layer" => handle_memory_search_by_layer(&arguments, memory, default_agent).await,
+        "code_map" => crate::mcp_memory_handlers::handle_code_map(&arguments).await,
         "memory_successful_conversations" => handle_memory_successful_conversations(&arguments, memory, default_agent).await,
         "memory_episodic_pressure" => handle_memory_episodic_pressure(&arguments, memory, default_agent).await,
         "memory_consolidation_status" => handle_memory_consolidation_status(memory, default_agent).await,
@@ -6457,6 +6562,7 @@ pub(crate) async fn handle_tools_call(
         // Cost telemetry tools
         "cost_summary" => handle_cost_summary(&arguments, home_dir).await,
         "cost_agents" => handle_cost_agents(&arguments, home_dir).await,
+        "cost_users" => handle_cost_users(&arguments, home_dir).await,
         "cost_recent" => handle_cost_recent(&arguments).await,
         // Voice / ASR / TTS tools
         "transcribe_audio" => handle_transcribe_audio(&arguments).await,
