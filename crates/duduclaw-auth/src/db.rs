@@ -33,7 +33,7 @@ impl UserDb {
         Ok(db)
     }
 
-    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         for m in &self.pool {
             if let Ok(guard) = m.try_lock() {
                 return guard;
@@ -81,7 +81,43 @@ impl UserDb {
 
             CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON auth_audit_log(timestamp);
             CREATE INDEX IF NOT EXISTS idx_audit_user ON auth_audit_log(user_id);
-            CREATE INDEX IF NOT EXISTS idx_bindings_agent ON user_agent_bindings(agent_name);",
+            CREATE INDEX IF NOT EXISTS idx_bindings_agent ON user_agent_bindings(agent_name);
+
+            -- Passwordless channel OTP login (WP12). A verified 1:1 channel DM
+            -- identity ties a person's messaging account to their user record;
+            -- OTP challenges are short-lived, single-use, attempt-capped.
+            CREATE TABLE IF NOT EXISTS channel_identities (
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                channel TEXT NOT NULL,
+                channel_user_id TEXT NOT NULL,
+                verified INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (channel, channel_user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_chid_user ON channel_identities(user_id);
+
+            CREATE TABLE IF NOT EXISTS otp_challenges (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                code_hash TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                channel_user_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                consumed INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_otp_user ON otp_challenges(user_id);
+            CREATE INDEX IF NOT EXISTS idx_otp_created ON otp_challenges(created_at);
+
+            -- First-run / break-glass admin bootstrap tokens (host-access root).
+            CREATE TABLE IF NOT EXISTS setup_tokens (
+                id TEXT PRIMARY KEY,
+                token_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                consumed INTEGER NOT NULL DEFAULT 0
+            );",
         )
         .map_err(|e| format!("failed to create auth tables: {e}"))?;
 
@@ -359,6 +395,48 @@ impl UserDb {
         Ok(())
     }
 
+    // ── First-run claim (onboarding chicken-and-egg fix) ─────
+    //
+    // A fresh install bootstraps `admin@local` with a random one-time password
+    // and `must_change_password = 1`. That password is only visible on the
+    // server console, which a Desktop-app / non-terminal operator never sees —
+    // so the LoginPage offers a browser "claim" flow instead. These helpers back
+    // it; the HTTP handler additionally gates the flow to loopback callers.
+
+    /// True while the instance is unclaimed: `admin@local` still carries the
+    /// forced-change flag (its bootstrap password has never been replaced).
+    /// Once the password is set (via claim or a normal change), this is false
+    /// and the claim endpoint becomes inert.
+    pub fn is_unclaimed_default_admin(&self) -> bool {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT must_change_password FROM users WHERE email = 'admin@local'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|flag| flag == 1)
+        .unwrap_or(false) // no such row / error → not claimable (fail-closed)
+    }
+
+    /// Atomically set the bootstrap admin's password and clear the forced-change
+    /// flag, but ONLY while still unclaimed (`must_change_password = 1`). The
+    /// single guarded `UPDATE` is the concurrency gate: a second racing claim
+    /// affects 0 rows. Returns `Ok(true)` when this call performed the claim,
+    /// `Ok(false)` when the instance was already claimed.
+    pub fn claim_default_admin(&self, new_password: &str) -> Result<bool, String> {
+        let hash = hash_password(new_password)?;
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn();
+        let affected = conn
+            .execute(
+                "UPDATE users SET password_hash = ?1, updated_at = ?2, must_change_password = 0 \
+                 WHERE email = 'admin@local' AND must_change_password = 1",
+                params![hash, now],
+            )
+            .map_err(|e| format!("claim error: {e}"))?;
+        Ok(affected == 1)
+    }
+
     // ── Agent Bindings ───────────────────────────────────────
 
     /// Bind a user to an agent with a given access level.
@@ -602,7 +680,7 @@ impl UserDb {
 /// using the OS RNG. Uses an unbiased rejection-free mapping over a 62-char
 /// alphabet by masking to the alphabet size via modulo on uniform bytes drawn
 /// until enough are accepted.
-fn generate_password(len: usize) -> String {
+pub(crate) fn generate_password(len: usize) -> String {
     use password_hash::rand_core::RngCore;
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let mut out = String::with_capacity(len);
@@ -629,7 +707,7 @@ fn generate_password(len: usize) -> String {
 /// Maximum password length to prevent Argon2 DoS (HIGH-4 fix).
 const MAX_PASSWORD_LEN: usize = 1024;
 
-fn hash_password(password: &str) -> Result<String, String> {
+pub(crate) fn hash_password(password: &str) -> Result<String, String> {
     if password.len() > MAX_PASSWORD_LEN {
         return Err("password too long".to_string());
     }
@@ -648,7 +726,7 @@ static DUMMY_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         .expect("DUMMY_HASH init failed: OsRng unavailable — cannot start securely")
 });
 
-fn verify_password_hash(password: &str, stored_hash: &str) -> Result<(), String> {
+pub(crate) fn verify_password_hash(password: &str, stored_hash: &str) -> Result<(), String> {
     let parsed = PasswordHash::new(stored_hash)
         .map_err(|e| format!("invalid stored hash: {e}"))?;
     Argon2::default()

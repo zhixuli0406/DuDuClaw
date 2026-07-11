@@ -200,6 +200,7 @@ mod tests {
                 monthly_limit_cents: 1000,
                 warn_threshold_percent: 80,
                 hard_stop: true,
+                daily_cap_cents: 0,
             },
             permissions: perms,
             evolution: EvolutionConfig {

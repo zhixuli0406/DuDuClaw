@@ -23,6 +23,18 @@ pub struct SkillIndexEntry {
     pub url: String,
     #[serde(default)]
     pub compatible: Vec<String>,
+    /// GitHub `pushed_at` (RFC3339) — last-commit freshness signal for tiering.
+    #[serde(default)]
+    pub pushed_at: Option<String>,
+    /// GitHub `owner.type` (`"Organization"` / `"User"`) — maintainer signal.
+    #[serde(default)]
+    pub owner_type: Option<String>,
+    /// GitHub `stargazers_count` — retained for display.
+    #[serde(default)]
+    pub stars: u64,
+    /// Derived maintenance-trust tier (official / active / orphan).
+    #[serde(default)]
+    pub trust_tier: crate::trust_tier::TrustTier,
 }
 
 /// The full skill index with metadata.
@@ -258,6 +270,17 @@ async fn search_github_repos(
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
 
+            // Trust-tiering signals (last-push age + maintainer type + stars).
+            let pushed_at = repo["pushed_at"].as_str().map(String::from);
+            let owner_type = repo["owner"]["type"].as_str().map(String::from);
+            let stars = repo["stargazers_count"].as_u64().unwrap_or(0);
+            let trust_tier = crate::trust_tier::classify_trust_tier(
+                pushed_at.as_deref(),
+                owner_type.as_deref(),
+                stars,
+                Utc::now(),
+            );
+
             // Build tags from topics + language
             let mut tags = topics;
             if !language.is_empty() {
@@ -271,6 +294,10 @@ async fn search_github_repos(
                 author: owner.to_string(),
                 url: html_url.to_string(),
                 compatible: vec!["claude-code".to_string()],
+                pushed_at,
+                owner_type,
+                stars,
+                trust_tier,
             })
         })
         .collect();

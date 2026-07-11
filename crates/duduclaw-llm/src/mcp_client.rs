@@ -439,15 +439,51 @@ pub struct ToolRegistry {
     defs: Vec<ToolDef>,
 }
 
+/// Per-server tool visibility filter for mounted MCP servers.
+///
+/// `allowed` non-empty ⇒ allowlist (deny-by-default: only listed tools are
+/// exposed). `denied` always removes a tool even if allowlisted. Used by the
+/// MCP Bridge to constrain the tool surface an external third-party server
+/// contributes to an agent.
+#[derive(Debug, Clone, Default)]
+pub struct ToolFilter {
+    pub allowed: Vec<String>,
+    pub denied: Vec<String>,
+}
+
+impl ToolFilter {
+    /// Whether `name` may be exposed under this filter.
+    pub fn permits(&self, name: &str) -> bool {
+        if self.denied.iter().any(|d| d == name) {
+            return false;
+        }
+        if !self.allowed.is_empty() {
+            return self.allowed.iter().any(|a| a == name);
+        }
+        true
+    }
+}
+
 impl ToolRegistry {
     /// Build a registry from already-connected clients, discovering each
     /// server's tools via `tools/list` and resolving name collisions.
-    pub async fn from_clients(mut clients: Vec<McpClient>) -> Result<Self, McpError> {
+    pub async fn from_clients(clients: Vec<McpClient>) -> Result<Self, McpError> {
+        Self::from_clients_filtered(clients, Vec::new()).await
+    }
+
+    /// Like [`from_clients`](Self::from_clients) but applies a per-server
+    /// [`ToolFilter`] (parallel to `clients`; a missing entry ⇒ permissive)
+    /// before the first-wins collision pass. This is the MCP Bridge entry point
+    /// for mounting external servers with a constrained tool surface.
+    pub async fn from_clients_filtered(
+        mut clients: Vec<McpClient>,
+        filters: Vec<ToolFilter>,
+    ) -> Result<Self, McpError> {
         let mut per_client: Vec<Vec<McpToolDef>> = Vec::with_capacity(clients.len());
         for c in clients.iter_mut() {
             per_client.push(c.list_tools().await?);
         }
-        let (routes, defs) = build_routes(&per_client);
+        let (routes, defs) = build_routes_filtered(&per_client, &filters);
         let clients = clients.into_iter().map(Mutex::new).collect();
         Ok(Self { clients, routes, defs })
     }
@@ -471,11 +507,24 @@ impl ToolRegistry {
 /// Pure routing builder: name → client index with first-wins collision
 /// handling. Split out so the collision policy is unit-testable without
 /// spawning any process.
-fn build_routes(per_client: &[Vec<McpToolDef>]) -> (HashMap<String, usize>, Vec<ToolDef>) {
+/// Routing builder with per-client [`ToolFilter`]s applied before the first-wins
+/// collision pass. `filters[idx]` gates client `idx`; a missing entry is
+/// permissive. Pure (no process spawn) so both filtering and collision policy
+/// are unit-testable.
+fn build_routes_filtered(
+    per_client: &[Vec<McpToolDef>],
+    filters: &[ToolFilter],
+) -> (HashMap<String, usize>, Vec<ToolDef>) {
     let mut routes = HashMap::new();
     let mut defs = Vec::new();
     for (idx, tools) in per_client.iter().enumerate() {
+        let filter = filters.get(idx);
         for t in tools {
+            if let Some(f) = filter {
+                if !f.permits(&t.name) {
+                    continue; // filtered out by this server's allow/deny list
+                }
+            }
             if routes.contains_key(&t.name) {
                 warn!(
                     tool = %t.name,
@@ -655,7 +704,7 @@ mod tests {
             McpToolDef { name: "search".into(), description: "B search".into(), input_schema: json!({}) },
             McpToolDef { name: "write".into(), description: "B write".into(), input_schema: json!({}) },
         ];
-        let (routes, defs) = build_routes(&[client_a, client_b]);
+        let (routes, defs) = build_routes_filtered(&[client_a, client_b], &[]);
 
         assert_eq!(routes.len(), 3);
         assert_eq!(routes["search"], 0); // first client wins
@@ -666,5 +715,51 @@ mod tests {
         let search = defs.iter().find(|d| d.name == "search").unwrap();
         assert_eq!(search.description, "A search");
         assert_eq!(defs.len(), 3);
+    }
+
+    #[test]
+    fn tool_filter_allowlist_is_deny_by_default() {
+        let f = ToolFilter {
+            allowed: vec!["read".into(), "list".into()],
+            denied: vec![],
+        };
+        assert!(f.permits("read"));
+        assert!(f.permits("list"));
+        assert!(!f.permits("delete"), "unlisted tool denied under allowlist");
+    }
+
+    #[test]
+    fn tool_filter_denylist_overrides_allow() {
+        let f = ToolFilter {
+            allowed: vec!["read".into(), "write".into()],
+            denied: vec!["write".into()],
+        };
+        assert!(f.permits("read"));
+        assert!(!f.permits("write"), "explicit deny beats allow");
+        // Empty allowlist + only denylist: permissive except denied.
+        let f2 = ToolFilter { allowed: vec![], denied: vec!["danger".into()] };
+        assert!(f2.permits("anything"));
+        assert!(!f2.permits("danger"));
+    }
+
+    #[test]
+    fn build_routes_filtered_applies_per_client_filter() {
+        let internal = vec![
+            McpToolDef { name: "memory_search".into(), description: "".into(), input_schema: json!({}) },
+        ];
+        let external = vec![
+            McpToolDef { name: "crm_list".into(), description: "".into(), input_schema: json!({}) },
+            McpToolDef { name: "crm_delete".into(), description: "".into(), input_schema: json!({}) },
+        ];
+        // Internal server: permissive. External server: allowlist crm_list only.
+        let filters = vec![
+            ToolFilter::default(),
+            ToolFilter { allowed: vec!["crm_list".into()], denied: vec![] },
+        ];
+        let (routes, defs) = build_routes_filtered(&[internal, external], &filters);
+        assert!(routes.contains_key("memory_search"));
+        assert!(routes.contains_key("crm_list"));
+        assert!(!routes.contains_key("crm_delete"), "filtered external tool absent");
+        assert_eq!(defs.len(), 2);
     }
 }

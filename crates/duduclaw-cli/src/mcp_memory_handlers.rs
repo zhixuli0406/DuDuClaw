@@ -14,8 +14,9 @@
 
 use duduclaw_core::traits::MemoryEngine;
 use duduclaw_core::types::MemoryEntry;
-use duduclaw_memory::SqliteMemoryEngine;
+use duduclaw_memory::{CodeMap, CodeMapConfig, SqliteMemoryEngine};
 use serde_json::Value;
+use std::path::PathBuf;
 
 use crate::mcp_memory_quota::DailyQuota;
 use crate::mcp_namespace::NamespaceContext;
@@ -492,6 +493,170 @@ pub async fn handle_memory_improve(
     serde_json::json!({ "content": [{ "type": "text", "text": payload.to_string() }] })
 }
 
+// ── code_map: Aider-style repo symbol graph ────────────────────────────────────
+
+/// Rank a repository's source files by relevance to `query` using the
+/// Personalized-PageRank code symbol graph (tree-sitter + `graph_rank` PPR).
+///
+/// # Parameters (from `params`)
+/// - `query`       : `string` — required; natural-language / identifier query.
+/// - `root`        : `string` — optional; repo root to scan (default: cwd).
+/// - `max_files`   : `integer` — optional (default 15, cap 100).
+/// - `chat_files`  : `array<string>` — optional; repo-relative paths already in
+///   context; their defined symbols seed the walk (Aider personalization).
+///
+/// # Returns
+/// ```json
+/// { "map": "<text>", "files": [ { "path", "score", "symbols":[...] } ],
+///   "indexed_files": N, "indexed_symbols": M }
+/// ```
+///
+/// Note: the map is rebuilt per call (no cache yet); the scan is gitignore-aware
+/// and bounded by per-file size. Runs the CPU-bound parse on a blocking thread.
+pub async fn handle_code_map(params: &Value) -> Value {
+    let query = params
+        .get("query")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    // A non-empty query OR chat_files is required to have something to seed on.
+    let chat_files: Vec<String> = params
+        .get("chat_files")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if query.trim().is_empty() && chat_files.is_empty() {
+        return mcp_error("code_map requires a non-empty 'query' or 'chat_files'");
+    }
+
+    let root = params
+        .get("root")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let max_files = params
+        .get("max_files")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(15)
+        .clamp(1, 100) as usize;
+
+    let cfg = CodeMapConfig::new(root);
+    // CPU-bound directory walk + parse: keep it off the async reactor.
+    let built = tokio::task::spawn_blocking(move || CodeMap::build(&cfg)).await;
+
+    let map = match built {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => return mcp_error(&format!("code_map build failed: {e}")),
+        Err(e) => return mcp_error(&format!("code_map task join failed: {e}")),
+    };
+
+    let ranked = map.rank(&query, &chat_files, max_files);
+    let text = map.render_map(
+        &query,
+        &chat_files,
+        max_files,
+        duduclaw_memory::code_map::DEFAULT_SYMBOLS_PER_FILE,
+    );
+
+    let payload = serde_json::json!({
+        "map": text,
+        "files": ranked,
+        "indexed_files": map.file_count(),
+        "indexed_symbols": map.symbol_count(),
+    });
+    serde_json::json!({ "content": [{ "type": "text", "text": payload.to_string() }] })
+}
+
+// ── user_profile: cross-session per-user preference traits ─────────────────────
+
+/// Wrap a JSON payload in the MCP text-content envelope.
+fn mcp_text(payload: Value) -> Value {
+    serde_json::json!({ "content": [{ "type": "text", "text": payload.to_string() }] })
+}
+
+/// Record (or update) one preference trait about a user. Re-recording the same
+/// `predicate` supersedes the prior value via the temporal chain. The agent is
+/// the server-injected write namespace (never client-supplied).
+///
+/// Params: `user_id`, `predicate`, `value` (all required, non-empty);
+/// `origin_trust` (optional f64 in `[0,1]`, default 1.0).
+pub async fn handle_user_profile_record(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    ns_ctx: &NamespaceContext,
+) -> Value {
+    let user_id = match params.get("user_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return mcp_error("Missing required parameter: user_id"),
+    };
+    let predicate = match params.get("predicate").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return mcp_error("Missing required parameter: predicate"),
+    };
+    let value = match params.get("value").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return mcp_error("Missing required parameter: value"),
+    };
+    let origin_trust = params
+        .get("origin_trust")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0);
+    let namespace = ns_ctx.write_namespace.clone();
+    match duduclaw_memory::user_profile::record_trait(
+        memory,
+        &namespace,
+        user_id,
+        predicate,
+        value,
+        origin_trust,
+    )
+    .await
+    {
+        Ok(id) => mcp_text(serde_json::json!({
+            "memory_id": id,
+            "user_id": user_id,
+            "predicate": predicate,
+        })),
+        Err(e) => mcp_error(&format!("user_profile_record failed: {e}")),
+    }
+}
+
+/// Fetch a user's currently-valid profile traits + the rendered
+/// `## About This User` block (the same bytes injected into the reply prompt).
+///
+/// Params: `user_id` (required). Agent = the server-injected namespace.
+pub async fn handle_user_profile_get(
+    params: &Value,
+    memory: &SqliteMemoryEngine,
+    ns_ctx: &NamespaceContext,
+) -> Value {
+    let user_id = match params.get("user_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return mcp_error("Missing required parameter: user_id"),
+    };
+    let namespace = ns_ctx.write_namespace.clone();
+    match duduclaw_memory::user_profile::profile_traits(memory, &namespace, user_id).await {
+        Ok(traits) => {
+            let items: Vec<Value> = traits
+                .iter()
+                .map(|t| serde_json::json!({ "predicate": t.predicate, "value": t.value }))
+                .collect();
+            let block = duduclaw_memory::user_profile::render_profile_block(&traits);
+            mcp_text(serde_json::json!({
+                "user_id": user_id,
+                "traits": items,
+                "block": block,
+            }))
+        }
+        Err(e) => mcp_error(&format!("user_profile_get failed: {e}")),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -577,6 +742,31 @@ mod tests {
 
     fn error_code(v: &Value) -> Option<u64> {
         v.get("error_code").and_then(|x| x.as_u64())
+    }
+
+    // ── code_map handler: live end-to-end over real crate source ──────────────
+    #[tokio::test]
+    async fn code_map_handler_ranks_real_source() {
+        // Point at this crate's sibling memory crate src (stable real Rust).
+        let root = format!("{}/../duduclaw-memory/src", env!("CARGO_MANIFEST_DIR"));
+        let resp = handle_code_map(&params(serde_json::json!({
+            "query": "TripleGraph personalized_pagerank",
+            "root": root,
+            "max_files": 5
+        })))
+        .await;
+        let payload: Value = serde_json::from_str(&text_of(&resp)).unwrap();
+        assert!(payload["indexed_symbols"].as_u64().unwrap() >= 50);
+        let files = payload["files"].as_array().unwrap();
+        assert!(!files.is_empty(), "should rank real files");
+        assert_eq!(files[0]["path"].as_str().unwrap(), "graph_rank.rs");
+        assert!(payload["map"].as_str().unwrap().contains("graph_rank.rs"));
+    }
+
+    #[tokio::test]
+    async fn code_map_handler_requires_query_or_chat_files() {
+        let resp = handle_code_map(&params(serde_json::json!({}))).await;
+        assert!(text_of(&resp).contains("requires") || is_error(&resp));
     }
 
     // ── M1-T1: Namespace injected as "external/{client_id}" ───────────────────

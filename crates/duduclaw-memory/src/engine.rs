@@ -55,6 +55,12 @@ pub struct RetrievalWeights {
     /// PageRank mass over the SPO triple graph, arXiv:2405.14831; default 0.15).
     /// Only applied when the query seeds at least one graph entity.
     pub w_graph: f64,
+    /// Weight for the semantic vector dimension (cosine similarity of the
+    /// query embedding to each candidate's stored embedding; default 0.15).
+    /// Only applied when an embedder is attached AND matching embedded rows
+    /// exist — otherwise this dimension contributes nothing and ranking is
+    /// byte-identical to the FTS/graph path.
+    pub w_vec: f64,
 }
 
 impl Default for RetrievalWeights {
@@ -67,6 +73,7 @@ impl Default for RetrievalWeights {
             w_importance: 0.35,
             w_fts: 0.40,
             w_graph: 0.15,
+            w_vec: 0.15,
         }
     }
 }
@@ -178,6 +185,12 @@ pub struct SqliteMemoryEngine {
     conn: Mutex<Connection>,
     /// Configurable retrieval weights for search re-ranking.
     pub retrieval_weights: RetrievalWeights,
+    /// Optional semantic embedder. When `None` (default) the vector signal
+    /// (`w_vec`) is skipped entirely and ranking is byte-identical to the
+    /// FTS/graph-only path. When set, each stored memory is embedded lazily on
+    /// write and `search()` blends a cosine similarity signal + appends
+    /// vector-only recall hits.
+    embedder: Option<std::sync::Arc<dyn crate::vector::EmbeddingProvider>>,
 }
 
 impl SqliteMemoryEngine {
@@ -191,6 +204,7 @@ impl SqliteMemoryEngine {
         Ok(Self {
             conn: Mutex::new(conn),
             retrieval_weights: RetrievalWeights::default(),
+            embedder: None,
         })
     }
 
@@ -203,7 +217,62 @@ impl SqliteMemoryEngine {
         Ok(Self {
             conn: Mutex::new(conn),
             retrieval_weights: RetrievalWeights::default(),
+            embedder: None,
         })
+    }
+
+    /// Attach a semantic embedder, enabling the `w_vec` retrieval signal.
+    ///
+    /// Builder-style; `None` (the default) keeps ranking byte-identical to the
+    /// FTS/graph-only path. New memories are embedded lazily on write; existing
+    /// rows stay `NULL` (and skip the vector signal) until re-embedded via
+    /// [`backfill_embeddings`](Self::backfill_embeddings).
+    pub fn with_embedder(
+        mut self,
+        embedder: std::sync::Arc<dyn crate::vector::EmbeddingProvider>,
+    ) -> Self {
+        self.embedder = Some(embedder);
+        self
+    }
+
+    /// Whether a semantic embedder is attached (the `w_vec` signal is active).
+    pub fn has_embedder(&self) -> bool {
+        self.embedder.is_some()
+    }
+
+    /// Embed any currently-valid rows for `agent_id` that lack an embedding
+    /// from the attached embedder's model (lazy backfill). Returns the number
+    /// of rows embedded. No-op when no embedder is attached.
+    pub async fn backfill_embeddings(&self, agent_id: &str) -> Result<usize> {
+        let embedder = match &self.embedder {
+            Some(e) => e.clone(),
+            None => return Ok(0),
+        };
+        let conn = self.conn.lock().await;
+        let now_rfc = Utc::now().to_rfc3339();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, content FROM memories
+                 WHERE agent_id = ?1
+                   AND (embedding IS NULL OR embedding_model IS NULL OR embedding_model != ?2)
+                   AND (valid_until IS NULL OR valid_until > ?3)",
+            )
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params![agent_id, embedder.id(), now_rfc], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+        let mut count = 0;
+        for (id, content) in rows {
+            if let Ok(vec) = embedder.embed(&content) {
+                crate::vector::store_embedding(&conn, agent_id, &id, embedder.id(), &vec)?;
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// Acquire the database connection for maintenance tasks (e.g., decay/archival).
@@ -626,8 +695,28 @@ impl SqliteMemoryEngine {
         )
         .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
 
+        self.embed_on_write(&conn, agent_id, &entry.id, &entry.content);
+
         info!(agent_id, entry_id = %entry.id, "temporal memory stored");
         Ok(entry.id)
+    }
+
+    /// Compute + persist an embedding for a just-written row when an embedder is
+    /// attached. Best-effort: an embed failure is logged and skipped (the row
+    /// simply won't carry the vector signal), never failing the store.
+    fn embed_on_write(&self, conn: &Connection, agent_id: &str, memory_id: &str, content: &str) {
+        if let Some(embedder) = &self.embedder {
+            match embedder.embed(content) {
+                Ok(vec) => {
+                    if let Err(e) =
+                        crate::vector::store_embedding(conn, agent_id, memory_id, embedder.id(), &vec)
+                    {
+                        tracing::warn!(agent_id, memory_id, "embed store failed: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!(agent_id, memory_id, "embed failed: {e}"),
+            }
+        }
     }
 
     /// Read back the stored `origin_trust` for a memory id (P2-1). Returns
@@ -1312,6 +1401,12 @@ impl SqliteMemoryEngine {
             "ALTER TABLE memories ADD COLUMN origin TEXT",
             "ALTER TABLE memories ADD COLUMN origin_trust REAL NOT NULL DEFAULT 1.0",
             "ALTER TABLE memories ADD COLUMN derived_from TEXT",
+            // ── Semantic vector layer (w_vec signal) ──
+            // `embedding` = little-endian f32 BLOB; `embedding_model` = the
+            // embedder id that produced it (never cross-space compared). Both
+            // NULL on old rows ⇒ they skip the vector signal until re-embedded.
+            "ALTER TABLE memories ADD COLUMN embedding BLOB",
+            "ALTER TABLE memories ADD COLUMN embedding_model TEXT",
         ];
         for sql in &migrations {
             match conn.execute_batch(sql) {
@@ -1420,6 +1515,8 @@ impl MemoryEngine for SqliteMemoryEngine {
             params![entry.content, agent_id, entry.id],
         )
         .map_err(|e| DuDuClawError::Memory(e.to_string()))?;
+
+        self.embed_on_write(&conn, agent_id, &entry.id, &entry.content);
 
         info!(agent_id, entry_id = %entry.id, "memory stored");
         Ok(())
@@ -1533,6 +1630,52 @@ impl MemoryEngine for SqliteMemoryEngine {
                 if let Some(entry) = Self::fetch_valid_entry(&conn, agent_id, id, &now_rfc)? {
                     let score = Self::base_relevance_score(&entry, now, w) + w.w_graph * g;
                     scored.push((score, entry));
+                }
+            }
+        }
+
+        // ── Semantic vector signal (w_vec) ──
+        // Fail-safe identical to the graph path: no embedder attached, no
+        // matching embedded rows, or an empty query embedding all yield `None`,
+        // leaving the FTS/graph ranking byte-identical. Cosine is computed ONLY
+        // against same-model vectors (vector_knn enforces `embedding_model`), so
+        // switching embedders never mixes incompatible spaces.
+        if let Some(embedder) = &self.embedder {
+            if let Ok(qvec) = embedder.embed(query) {
+                let knn = crate::vector::vector_knn(
+                    &conn,
+                    agent_id,
+                    &qvec,
+                    embedder.id(),
+                    &now_rfc,
+                    fetch_limit,
+                )
+                .unwrap_or(None);
+                if let Some(hits) = knn {
+                    let vmap: std::collections::HashMap<&str, f32> =
+                        hits.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+                    let present: std::collections::HashSet<String> =
+                        scored.iter().map(|(_, e)| e.id.clone()).collect();
+                    // Blend into existing candidates.
+                    for (score, entry) in scored.iter_mut() {
+                        if let Some(sim) = vmap.get(entry.id.as_str()) {
+                            *score += w.w_vec * (*sim as f64);
+                        }
+                    }
+                    // Append up to MAX_GRAPH_APPENDS vector-only recall hits FTS
+                    // (and graph) missed — same agent/temporal isolation as the
+                    // KNN query.
+                    let appends = hits
+                        .iter()
+                        .filter(|(id, _)| !present.contains(id))
+                        .take(crate::graph_rank::MAX_GRAPH_APPENDS);
+                    for (id, sim) in appends {
+                        if let Some(entry) = Self::fetch_valid_entry(&conn, agent_id, id, &now_rfc)? {
+                            let score = Self::base_relevance_score(&entry, now, w)
+                                + w.w_vec * (*sim as f64);
+                            scored.push((score, entry));
+                        }
+                    }
                 }
             }
         }
@@ -1943,6 +2086,83 @@ mod tests {
         let results = engine.search(agent, "rust", 10).await.unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("rust"));
+    }
+
+    /// Live verification of the `w_vec` signal: the vector layer recalls a
+    /// memory that exact FTS token matching misses (a CJK sub-word), and the
+    /// no-embedder baseline stays empty (byte-identical fail-safe).
+    #[tokio::test]
+    async fn vector_recall_surfaces_what_fts_misses() {
+        use std::sync::Arc;
+        let agent = "vec-agent";
+
+        // Baseline WITHOUT embedder: FTS5 unicode61 tokenizes a contiguous CJK
+        // run as ONE token, so a sub-word query does not match → empty result.
+        let plain = SqliteMemoryEngine::in_memory().unwrap();
+        plain
+            .store(agent, make_entry(agent, "資料庫遷移工作排程", vec![]))
+            .await
+            .unwrap();
+        plain
+            .store(agent, make_entry(agent, "schema 設計文件", vec![]))
+            .await
+            .unwrap();
+        let base = plain.search(agent, "遷移", 5).await.unwrap();
+        assert!(
+            base.is_empty(),
+            "FTS-only baseline misses the CJK sub-word (byte-identical fail-safe)"
+        );
+
+        // WITH the char-ngram embedder: the vector signal recalls it.
+        let vec_engine = SqliteMemoryEngine::in_memory()
+            .unwrap()
+            .with_embedder(Arc::new(crate::vector::NgramHashEmbedder::new()));
+        vec_engine
+            .store(agent, make_entry(agent, "資料庫遷移工作排程", vec![]))
+            .await
+            .unwrap();
+        vec_engine
+            .store(agent, make_entry(agent, "schema 設計文件", vec![]))
+            .await
+            .unwrap();
+        let hits = vec_engine.search(agent, "遷移", 5).await.unwrap();
+        assert!(
+            !hits.is_empty(),
+            "vector recall must surface the 遷移 memory FTS missed"
+        );
+        assert!(hits[0].content.contains("遷移"));
+
+        // Agent isolation holds through the vector path.
+        let other = vec_engine.search("different-agent", "遷移", 5).await.unwrap();
+        assert!(other.is_empty(), "KNN must not leak across agents");
+    }
+
+    /// Rows stored before an embedder was attached carry no embedding; a
+    /// `backfill_embeddings` pass embeds them and they then become recallable.
+    #[tokio::test]
+    async fn backfill_embeds_preexisting_rows() {
+        use std::sync::Arc;
+        let agent = "bf-agent";
+        // Store WITHOUT embedder (rows land with NULL embedding).
+        let mut engine = SqliteMemoryEngine::in_memory().unwrap();
+        engine
+            .store(agent, make_entry(agent, "資料庫遷移工作排程", vec![]))
+            .await
+            .unwrap();
+        // Attach embedder now; existing row is still un-embedded.
+        engine = engine.with_embedder(Arc::new(crate::vector::NgramHashEmbedder::new()));
+        assert!(
+            engine.search(agent, "遷移", 5).await.unwrap().is_empty(),
+            "pre-existing row not yet embedded → no vector recall"
+        );
+        let n = engine.backfill_embeddings(agent).await.unwrap();
+        assert_eq!(n, 1, "one row backfilled");
+        assert!(
+            !engine.search(agent, "遷移", 5).await.unwrap().is_empty(),
+            "after backfill the row is recallable via w_vec"
+        );
+        // Idempotent: a second pass re-embeds nothing (same model id).
+        assert_eq!(engine.backfill_embeddings(agent).await.unwrap(), 0);
     }
 
     #[tokio::test]

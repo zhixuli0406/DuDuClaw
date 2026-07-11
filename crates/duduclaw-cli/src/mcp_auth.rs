@@ -403,8 +403,10 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "memory_successful_conversations"
         | "memory_consolidation_status"
         | "memory_improve"
-        | "memory_episodic_pressure" => Some(Scope::MemoryRead),
-        "memory_store" => Some(Scope::MemoryWrite),
+        | "memory_episodic_pressure"
+        | "user_profile_get"
+        | "code_map" => Some(Scope::MemoryRead),
+        "memory_store" | "user_profile_record" => Some(Scope::MemoryWrite),
         // ── Wiki: read family ────────────────────────────────────────────
         "wiki_read"
         | "wiki_search"

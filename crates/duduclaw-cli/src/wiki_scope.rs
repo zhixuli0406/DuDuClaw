@@ -55,6 +55,11 @@ pub enum NamespaceMode {
     /// `duduclaw wiki scope`) may write here, and that surface goes through
     /// [`WriterCapability::Operator`], not through MCP.
     OperatorOnly,
+    /// Only agents whose exact id is in `agents` (plus the operator) may write.
+    /// This is the WP3 answer to "誰可以寫入" — the operator lists which agents
+    /// own a namespace. An **empty** list is fail-closed: it denies every agent
+    /// (equivalent to `operator_only`), never "open to all".
+    AgentAllowlist { agents: Vec<String> },
 }
 
 impl NamespaceMode {
@@ -63,6 +68,7 @@ impl NamespaceMode {
             NamespaceMode::AgentWritable => "agent_writable",
             NamespaceMode::ReadOnly { .. } => "read_only",
             NamespaceMode::OperatorOnly => "operator_only",
+            NamespaceMode::AgentAllowlist { .. } => "agent_allowlist",
         }
     }
 }
@@ -205,6 +211,32 @@ impl WikiScopePolicy {
                 ),
             }),
 
+            // Agent allowlist: only an MCP caller whose EXACT id is on the list
+            // may write (coding convention #2 — exact equality, no contains/
+            // prefix). Operator was already admitted above. An empty list
+            // matches nobody ⇒ fail-closed (operator-only equivalent).
+            (NamespaceMode::AgentAllowlist { agents }, WriterCapability::Mcp { agent_id })
+                if agents.iter().any(|a| a == agent_id) =>
+            {
+                Ok(())
+            }
+            (NamespaceMode::AgentAllowlist { agents }, _) => Err(ScopeDeny {
+                namespace,
+                mode: "agent_allowlist".into(),
+                reason: if agents.is_empty() {
+                    format!(
+                        "write allowlist is empty (fail-closed — operator only); caller is {}",
+                        caller.label()
+                    )
+                } else {
+                    format!(
+                        "writes restricted to agents [{}]; caller is {}",
+                        agents.join(", "),
+                        caller.label()
+                    )
+                },
+            }),
+
             // Operator-only namespace: nothing else gets through.
             (NamespaceMode::OperatorOnly, _) => Err(ScopeDeny {
                 namespace,
@@ -225,6 +257,10 @@ impl WikiScopePolicy {
                     NamespaceMode::ReadOnly { synced_from } => Some(synced_from.clone()),
                     _ => None,
                 },
+                agents: match mode {
+                    NamespaceMode::AgentAllowlist { agents } => Some(agents.clone()),
+                    _ => None,
+                },
             })
             .collect()
     }
@@ -243,6 +279,10 @@ pub struct NamespaceSnapshot {
     pub namespace: String,
     pub mode: String,
     pub synced_from: Option<String>,
+    /// Populated only for `agent_allowlist` mode: the exact agent ids allowed
+    /// to write this namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Vec<String>>,
 }
 
 // ── Path helpers ─────────────────────────────────────────────────────────────
@@ -279,6 +319,8 @@ struct NamespaceEntry {
     mode: String,
     #[serde(default)]
     synced_from: Option<String>,
+    #[serde(default)]
+    agents: Option<Vec<String>>,
 }
 
 fn parse_toml(raw: &str) -> Result<BTreeMap<String, NamespaceMode>, String> {
@@ -297,10 +339,18 @@ fn parse_toml(raw: &str) -> Result<BTreeMap<String, NamespaceMode>, String> {
                 NamespaceMode::ReadOnly { synced_from }
             }
             "operator_only" => NamespaceMode::OperatorOnly,
+            "agent_allowlist" => {
+                // Empty / absent list is allowed and is fail-closed at write
+                // time (denies every agent — see `check_write`). We normalise
+                // absent → empty here rather than erroring so an operator can
+                // stage a namespace as "locked, fill in agents later".
+                let agents = entry.agents.unwrap_or_default();
+                NamespaceMode::AgentAllowlist { agents }
+            }
             other => {
                 return Err(format!(
                     "namespace '{name}' has unknown mode '{other}' \
-                     (expected 'agent_writable' / 'read_only' / 'operator_only')"
+                     (expected 'agent_writable' / 'read_only' / 'operator_only' / 'agent_allowlist')"
                 ));
             }
         };
@@ -321,6 +371,66 @@ mod tests {
         let path = scope_file_path(home);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, body).unwrap();
+    }
+
+    // ── WP3 agent_allowlist mode ──────────────────────────────────
+
+    fn allowlist_policy(agents: &[&str]) -> WikiScopePolicy {
+        let list = agents
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body = format!(
+            "[namespaces.policies]\nmode = \"agent_allowlist\"\nagents = [{list}]\n"
+        );
+        let map = parse_toml(&body).unwrap();
+        WikiScopePolicy { namespaces: map, loaded_from: None }
+    }
+
+    #[test]
+    fn agent_allowlist_admits_listed_agent_exactly() {
+        let p = allowlist_policy(&["agnes", "boss"]);
+        assert!(p
+            .check_write("policies/hr.md", &WriterCapability::for_agent("agnes"))
+            .is_ok());
+        // Exact match only — a superstring id must NOT pass (convention #2).
+        assert!(p
+            .check_write("policies/hr.md", &WriterCapability::for_agent("agnes-2"))
+            .is_err());
+        // Agent not on the list is denied.
+        assert!(p
+            .check_write("policies/hr.md", &WriterCapability::for_agent("intruder"))
+            .is_err());
+    }
+
+    #[test]
+    fn agent_allowlist_operator_always_allowed() {
+        let p = allowlist_policy(&["agnes"]);
+        assert!(p
+            .check_write("policies/hr.md", &WriterCapability::Operator)
+            .is_ok());
+    }
+
+    #[test]
+    fn agent_allowlist_empty_is_fail_closed() {
+        // Empty list denies every agent (operator-only equivalent), never open.
+        let p = allowlist_policy(&[]);
+        assert!(p
+            .check_write("policies/hr.md", &WriterCapability::for_agent("agnes"))
+            .is_err());
+        assert!(p
+            .check_write("policies/hr.md", &WriterCapability::Operator)
+            .is_ok());
+    }
+
+    #[test]
+    fn agent_allowlist_snapshot_carries_agents() {
+        let p = allowlist_policy(&["agnes", "boss"]);
+        let snap = p.snapshot();
+        let ns = snap.iter().find(|s| s.namespace == "policies").unwrap();
+        assert_eq!(ns.mode, "agent_allowlist");
+        assert_eq!(ns.agents.as_deref(), Some(&["agnes".to_string(), "boss".to_string()][..]));
     }
 
     #[test]

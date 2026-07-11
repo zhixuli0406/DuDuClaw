@@ -13,9 +13,16 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+sha2 = "0.10"
 csv = "1"
 toml = { workspace = true }
 fs2 = "0.4"
+tree-sitter = "0.26.10"
+tree-sitter-rust = "0.24.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+ignore = "0.4.27"
 
 [dev-dependencies]
 tempfile = "3"
