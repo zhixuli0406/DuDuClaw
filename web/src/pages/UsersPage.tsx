@@ -2,6 +2,12 @@ import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type UserDetail } from '@/lib/api';
 import { Dialog } from '@/components/shared/Dialog';
+import {
+  ConfirmDialog,
+  OptionSelect,
+  SettingField,
+  type SelectOption,
+} from '@/components/settings/controls';
 import { toast, formatError } from '@/lib/toast';
 import { Users, UserPlus, Pencil, Link2, UserX, Trash2, X } from 'lucide-react';
 import {
@@ -12,8 +18,27 @@ import {
   Button,
   EmptyState,
   Field,
+  CharacterAvatar,
   controlClass,
 } from '@/components/ui';
+
+// Plain-language options paired with the raw enum value that actually gets
+// written to the RPC payload (OptionSelect renders "label · raw").
+function roleOptions(intl: ReturnType<typeof useIntl>): SelectOption[] {
+  return [
+    { value: 'employee', label: intl.formatMessage({ id: 'users.role.employee' }) },
+    { value: 'manager', label: intl.formatMessage({ id: 'users.role.manager' }) },
+    { value: 'admin', label: intl.formatMessage({ id: 'users.role.admin' }) },
+  ];
+}
+
+function accessOptions(intl: ReturnType<typeof useIntl>): SelectOption[] {
+  return [
+    { value: 'owner', label: intl.formatMessage({ id: 'users.access.owner' }) },
+    { value: 'operator', label: intl.formatMessage({ id: 'users.access.operator' }) },
+    { value: 'viewer', label: intl.formatMessage({ id: 'users.access.viewer' }) },
+  ];
+}
 
 export function UsersPage() {
   const intl = useIntl();
@@ -94,6 +119,7 @@ export function UsersPage() {
         <Card>
           <EmptyState
             icon={Users}
+            dudu="curious"
             title={intl.formatMessage({ id: 'users.title' })}
             action={
               <Button variant="primary" icon={UserPlus} onClick={() => setShowCreate(true)}>
@@ -149,8 +175,9 @@ export function UsersPage() {
                         {user.bindings.map((b) => (
                           <span
                             key={b.agent_name}
-                            className="inline-flex items-center gap-1 rounded-md bg-stone-500/10 px-2 py-0.5 text-xs text-stone-600 dark:text-stone-300"
+                            className="inline-flex items-center gap-1 rounded-control bg-stone-500/10 px-2 py-0.5 text-xs text-stone-600 dark:text-stone-300"
                           >
+                            <CharacterAvatar agentId={b.agent_name} name={b.agent_name} size={16} />
                             {b.agent_name}
                             <span className="text-stone-400">({b.access_level})</span>
                             <button
@@ -292,45 +319,31 @@ function RemoveUserDialog({
 }) {
   const intl = useIntl();
   const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState('');
 
   const handleConfirm = async () => {
-    setError('');
     setSubmitting(true);
     try {
       await api.users.remove(user.id);
       toast.success(intl.formatMessage({ id: 'users.removed' }));
       onRemoved();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
       setSubmitting(false);
     }
   };
 
   return (
-    <Dialog open title={intl.formatMessage({ id: 'users.action.remove' })} onClose={onClose}>
-      <div className="space-y-4">
-        <p className="text-sm text-stone-600 dark:text-stone-400">
-          {intl.formatMessage({ id: 'users.remove.confirm' }, { name: user.display_name })}
-        </p>
-        {error && (
-          <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
-            {error}
-          </p>
-        )}
-        <div className="flex justify-end gap-2">
-          <Button variant="ghost" onClick={onClose}>
-            {intl.formatMessage({ id: 'common.cancel' })}
-          </Button>
-          <Button variant="danger" onClick={handleConfirm} disabled={submitting}>
-            {submitting
-              ? intl.formatMessage({ id: 'common.loading' })
-              : intl.formatMessage({ id: 'common.delete' })}
-          </Button>
-        </div>
-      </div>
-    </Dialog>
+    <ConfirmDialog
+      open
+      onClose={onClose}
+      onConfirm={handleConfirm}
+      title={intl.formatMessage({ id: 'users.action.remove' })}
+      message={intl.formatMessage({ id: 'users.remove.confirm' }, { name: user.display_name })}
+      confirmLabel={intl.formatMessage({ id: 'common.delete' })}
+      requireText={user.display_name}
+      requireTextHint={intl.formatMessage({ id: 'users.remove.requireHint' })}
+      busy={submitting}
+    />
   );
 }
 
@@ -408,15 +421,7 @@ function CreateUserDialog({
           />
         </Field>
         <Field label={intl.formatMessage({ id: 'users.col.role' })}>
-          <select
-            value={userRole}
-            onChange={(e) => setUserRole(e.target.value)}
-            className={controlClass}
-          >
-            <option value="employee">Employee</option>
-            <option value="manager">Manager</option>
-            <option value="admin">Admin</option>
-          </select>
+          <OptionSelect value={userRole} onChange={setUserRole} options={roleOptions(intl)} />
         </Field>
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose}>
@@ -491,15 +496,7 @@ function EditUserDialog({
           />
         </Field>
         <Field label={intl.formatMessage({ id: 'users.col.role' })}>
-          <select
-            value={userRole}
-            onChange={(e) => setUserRole(e.target.value)}
-            className={controlClass}
-          >
-            <option value="employee">Employee</option>
-            <option value="manager">Manager</option>
-            <option value="admin">Admin</option>
-          </select>
+          <OptionSelect value={userRole} onChange={setUserRole} options={roleOptions(intl)} />
         </Field>
         <Field label={intl.formatMessage({ id: 'users.field.new_password' })}>
           <input
@@ -568,15 +565,7 @@ function BindAgentDialog({
           />
         </Field>
         <Field label={intl.formatMessage({ id: 'users.action.bind' })}>
-          <select
-            value={accessLevel}
-            onChange={(e) => setAccessLevel(e.target.value)}
-            className={controlClass}
-          >
-            <option value="owner">Owner</option>
-            <option value="operator">Operator</option>
-            <option value="viewer">Viewer</option>
-          </select>
+          <OptionSelect value={accessLevel} onChange={setAccessLevel} options={accessOptions(intl)} />
         </Field>
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose}>
@@ -604,21 +593,45 @@ function OffboardDialog({
 }) {
   const intl = useIntl();
   const [transferTo, setTransferTo] = useState('');
-  const [error, setError] = useState('');
+  const [confirming, setConfirming] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
-  const handleSubmit = async () => {
-    setError('');
+  const handleConfirm = async () => {
     setSubmitting(true);
     try {
       await api.users.offboard(user.id, transferTo || undefined);
       onOffboarded();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
       setSubmitting(false);
     }
   };
+
+  const hasBindings = user.bindings.length > 0;
+
+  // No AI staff to reassign (or transferee already chosen) → route the
+  // destructive step through the shared ConfirmDialog. Payload is unchanged:
+  // offboard(user.id, transferTo || undefined).
+  if (!hasBindings || confirming) {
+    return (
+      <ConfirmDialog
+        open
+        onClose={hasBindings ? () => setConfirming(false) : onClose}
+        onConfirm={handleConfirm}
+        title={intl.formatMessage({ id: 'users.action.offboard' })}
+        message={intl.formatMessage({ id: 'users.offboard.confirm' }, { name: user.display_name })}
+        confirmLabel={intl.formatMessage({ id: 'users.action.offboard' })}
+        busy={submitting}
+      />
+    );
+  }
+
+  // Bindings present → pick a transferee first (preserves the transferTo field),
+  // then hand off to ConfirmDialog above.
+  const transferOptions: SelectOption[] = [
+    { value: '', label: intl.formatMessage({ id: 'users.offboard.no_transfer' }) },
+    ...users.map((u) => ({ value: u.id, label: `${u.display_name} (${u.email})` })),
+  ];
 
   return (
     <Dialog open title={intl.formatMessage({ id: 'users.action.offboard' })} onClose={onClose}>
@@ -626,45 +639,35 @@ function OffboardDialog({
         <p className="text-sm text-stone-600 dark:text-stone-400">
           {intl.formatMessage({ id: 'users.offboard.confirm' }, { name: user.display_name })}
         </p>
-        {user.bindings.length > 0 && (
-          <div>
-            <p className="text-sm font-medium text-stone-700 dark:text-stone-300">
-              {intl.formatMessage({ id: 'users.offboard.agents' })}
-            </p>
-            <div className="mt-1 flex flex-wrap gap-1">
-              {user.bindings.map((b) => (
-                <span
-                  key={b.agent_name}
-                  className="rounded-md bg-stone-500/10 px-2 py-0.5 text-xs text-stone-600 dark:text-stone-300"
-                >
-                  {b.agent_name}
-                </span>
-              ))}
-            </div>
-            <select
-              value={transferTo}
-              onChange={(e) => setTransferTo(e.target.value)}
-              className={`mt-2 ${controlClass}`}
-            >
-              <option value="">{intl.formatMessage({ id: 'users.offboard.no_transfer' })}</option>
-              {users.map((u) => (
-                <option key={u.id} value={u.id}>
-                  {u.display_name} ({u.email})
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
-        {error && (
-          <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
-            {error}
+        <div>
+          <p className="text-sm font-medium text-stone-700 dark:text-stone-300">
+            {intl.formatMessage({ id: 'users.offboard.agents' })}
           </p>
-        )}
+          <div className="mt-1 flex flex-wrap gap-1">
+            {user.bindings.map((b) => (
+              <span
+                key={b.agent_name}
+                className="inline-flex items-center gap-1 rounded-control bg-stone-500/10 px-2 py-0.5 text-xs text-stone-600 dark:text-stone-300"
+              >
+                <CharacterAvatar agentId={b.agent_name} name={b.agent_name} size={16} />
+                {b.agent_name}
+              </span>
+            ))}
+          </div>
+        </div>
+        <SettingField label={intl.formatMessage({ id: 'users.offboard.transfer' })}>
+          <OptionSelect
+            value={transferTo}
+            onChange={setTransferTo}
+            options={transferOptions}
+            showRaw={false}
+          />
+        </SettingField>
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose}>
             {intl.formatMessage({ id: 'common.cancel' })}
           </Button>
-          <Button variant="danger" onClick={handleSubmit} disabled={submitting}>
+          <Button variant="danger" onClick={() => setConfirming(true)}>
             {intl.formatMessage({ id: 'users.action.offboard' })}
           </Button>
         </div>

@@ -7,6 +7,10 @@ import { PawPrint, X } from 'lucide-react';
  * TourPrompt — the gentle "要不要帶你逛一圈?" card shown bottom-right right after
  * the first agent is created. Accept starts the guided tour; "稍後" marks it
  * skipped so it won't nag again. Mounted once in MainLayout.
+ *
+ * Anchored bottom-right (`bottom-28 right-5`) so it clears the mobile bottom
+ * nav and leaves room for the DuDu character companion (V9) that will share
+ * this corner.
  */
 export function TourPrompt() {
   const intl = useIntl();
@@ -18,7 +22,7 @@ export function TourPrompt() {
   if (status !== 'unset' || !promptPending) return null;
 
   return (
-    <div className="fixed bottom-5 right-5 z-[90] w-80 max-w-[calc(100vw-2.5rem)]">
+    <div className="fixed bottom-28 right-5 z-[90] w-80 max-w-[calc(100vw-2.5rem)]">
       <div className="panel space-y-3 p-4 shadow-xl">
         <div className="flex items-start gap-3">
           <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-amber-500/12 text-amber-600 ring-1 ring-inset ring-amber-500/20 dark:bg-amber-400/10 dark:text-amber-400">

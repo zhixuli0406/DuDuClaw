@@ -4,7 +4,7 @@ import { useConnectionStore } from '@/stores/connection-store';
 import { api, type LicenseSnapshot } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
-import { Page, PageHeader, Card, Section, StatCard, Badge, Button } from '@/components/ui';
+import { Page, PageHeader, Card, Section, StatCard, Badge, Button, Mono } from '@/components/ui';
 import {
   KeyRound,
   ShieldCheck,
@@ -286,6 +286,7 @@ export function LicensePage() {
               <DetailRow
                 label={intl.formatMessage({ id: 'license.customerId' })}
                 value={snapshot.customer_id ?? '—'}
+                mono
               />
               <DetailRow
                 label={intl.formatMessage({ id: 'license.subscriptionId' })}
@@ -299,6 +300,7 @@ export function LicensePage() {
                     ? new Date(snapshot.expires_at).toLocaleString()
                     : '—'
                 }
+                mono
               />
               <DetailRow
                 label={intl.formatMessage({ id: 'license.lastPhoneHome' })}
@@ -307,6 +309,7 @@ export function LicensePage() {
                     ? new Date(snapshot.last_phone_home).toLocaleString()
                     : '—'
                 }
+                mono
               />
               <DetailRow
                 label={intl.formatMessage({ id: 'license.fingerprintMatch' })}
@@ -463,13 +466,8 @@ function DetailRow({
         {Icon && <Icon className="h-3.5 w-3.5" />}
         {label}
       </dt>
-      <dd
-        className={cn(
-          'mt-1 text-sm text-stone-800 dark:text-stone-200',
-          mono && 'font-mono break-all',
-        )}
-      >
-        {value}
+      <dd className="mt-1 text-sm text-stone-800 dark:text-stone-200">
+        {mono ? <Mono className="break-all text-stone-800 dark:text-stone-200">{value}</Mono> : value}
       </dd>
     </div>
   );

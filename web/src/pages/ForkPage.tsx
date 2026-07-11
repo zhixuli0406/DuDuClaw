@@ -3,7 +3,7 @@ import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type ForkSummary, type ForkDetail, type ForkBranch } from '@/lib/api';
 import { GitFork, RefreshCw, Trophy, CircleDot, AlertCircle, CheckCircle2 } from 'lucide-react';
-import { Page, PageHeader, Card, Button, Badge, EmptyState } from '@/components/ui';
+import { Page, PageHeader, Card, Button, Badge, EmptyState, CharacterAvatar } from '@/components/ui';
 
 // RFC-26 Live Run Forking dashboard. Reads fork state from the cross-process
 // ForkStore via the gateway `fork.*` RPC. Forks execute in the MCP-server
@@ -33,7 +33,7 @@ function BranchCard({
   return (
     <div
       className={cn(
-        'flex flex-col rounded-xl border p-4',
+        'flex flex-col rounded-card border p-4',
         isWinner
           ? 'border-amber-400 bg-amber-50 dark:border-amber-500/50 dark:bg-amber-500/10'
           : 'border-[var(--panel-border)] bg-[var(--panel-fill)]'
@@ -55,7 +55,7 @@ function BranchCard({
           {branch.steering}
         </p>
       )}
-      <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-stone-500/5 p-2 text-xs text-stone-600 dark:bg-white/5 dark:text-stone-300">
+      <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-control bg-stone-500/5 p-2 text-xs text-stone-600 dark:bg-white/5 dark:text-stone-300">
         {branch.output || '(no output yet)'}
       </pre>
       <div className="mt-3 flex items-center justify-between text-xs text-stone-500">
@@ -164,6 +164,7 @@ export function ForkPage() {
             <Card>
               <EmptyState
                 icon={GitFork}
+                dudu="curious"
                 title={intl.formatMessage({ id: 'forks.empty.title' })}
                 hint={intl.formatMessage({ id: 'forks.empty.hint' })}
               />
@@ -191,7 +192,8 @@ export function ForkPage() {
                     <CircleDot className="h-3.5 w-3.5 text-amber-500" />
                   )}
                 </span>
-                <span className="text-sm font-medium text-stone-700 dark:text-stone-200">
+                <span className="flex items-center gap-1.5 text-sm font-medium text-stone-700 dark:text-stone-200">
+                  <CharacterAvatar agentId={f.agent_id} name={f.agent_id} size={24} />
                   {f.agent_id}
                 </span>
                 <span className="text-xs text-stone-400">
@@ -235,6 +237,7 @@ export function ForkPage() {
             <Card>
               <EmptyState
                 icon={GitFork}
+                dudu="curious"
                 title={intl.formatMessage({ id: 'forks.detail.empty' })}
               />
             </Card>

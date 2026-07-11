@@ -6,6 +6,7 @@ import { client } from '@/lib/ws-client';
 import { toast, formatError } from '@/lib/toast';
 import { useConnectionStore } from '@/stores/connection-store';
 import { Dialog, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { ConfirmDialog } from '@/components/settings/controls';
 import {
   Page,
   PageHeader,
@@ -14,6 +15,7 @@ import {
   Button,
   EmptyState,
   Field,
+  Mono,
   controlClass,
 } from '@/components/ui';
 import {
@@ -87,6 +89,8 @@ export function ChannelsPage() {
   const [loading, setLoading] = useState(false);
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [editChannel, setEditChannel] = useState<string | null>(null);
+  const [removeTarget, setRemoveTarget] = useState<string | null>(null);
+  const [removing, setRemoving] = useState(false);
   const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
   const toastTimerRef = useRef<ReturnType<typeof setTimeout>>(null);
@@ -165,13 +169,16 @@ export function ChannelsPage() {
   };
 
   const handleRemove = async (type: string) => {
-    if (!confirm(intl.formatMessage({ id: 'channels.confirmRemove' }, { type }))) return;
+    setRemoving(true);
     try {
       await api.channels.remove(type);
       showToast('success', intl.formatMessage({ id: 'channels.removed' }, { type }));
       await fetchChannels();
+      setRemoveTarget(null);
     } catch (e) {
       showToast('error', intl.formatMessage({ id: 'channels.removeFailed' }, { error: String(e) }));
+    } finally {
+      setRemoving(false);
     }
   };
 
@@ -191,7 +198,7 @@ export function ChannelsPage() {
       {/* Toast notification */}
       {toast && (
         <div className={cn(
-          'flex items-start gap-3 rounded-lg px-4 py-3 text-sm transition-all',
+          'flex items-start gap-3 rounded-control px-4 py-3 text-sm transition-all',
           toast.type === 'success'
             ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400'
             : 'bg-rose-50 text-rose-700 dark:bg-rose-900/20 dark:text-rose-400'
@@ -215,6 +222,7 @@ export function ChannelsPage() {
         <Card padded={false}>
           <EmptyState
             icon={Radio}
+            dudu="curious"
             title={intl.formatMessage({ id: 'channels.empty' })}
           />
         </Card>
@@ -228,7 +236,7 @@ export function ChannelsPage() {
                   <div className="flex items-center gap-3">
                     <div
                       className={cn(
-                        'rounded-lg p-2.5',
+                        'rounded-control p-2.5',
                         style.bg,
                         style.darkBg
                       )}
@@ -240,11 +248,11 @@ export function ChannelsPage() {
                         {channel.name}
                       </h3>
                       {channel.last_connected && (
-                        <p className="text-xs text-stone-500 dark:text-stone-400">
+                        <Mono className="block text-xs text-stone-500 dark:text-stone-400">
                           {new Date(channel.last_connected).toLocaleString(
                             'zh-TW'
                           )}
-                        </p>
+                        </Mono>
                       )}
                     </div>
                   </div>
@@ -272,7 +280,7 @@ export function ChannelsPage() {
 
                 {/* Error message — hide transitional states */}
                 {channel.error && channel.error !== 'connecting' && channel.error !== 'reconnecting' && (
-                  <div className="mt-3 flex items-start gap-2 rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
+                  <div className="mt-3 flex items-start gap-2 rounded-control bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
                     <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
                     <span>{channel.error}</span>
                   </div>
@@ -286,7 +294,7 @@ export function ChannelsPage() {
                   <Button size="sm" variant="ghost" icon={Pencil} onClick={() => setEditChannel(channel.name)}>
                     {intl.formatMessage({ id: 'channels.edit' })}
                   </Button>
-                  <Button size="sm" variant="ghost" icon={Trash2} onClick={() => handleRemove(channel.name)} className="text-rose-600 hover:bg-rose-50 hover:text-rose-700 dark:text-rose-400 dark:hover:bg-rose-900/20">
+                  <Button size="sm" variant="ghost" icon={Trash2} onClick={() => setRemoveTarget(channel.name)} className="text-rose-600 hover:bg-rose-50 hover:text-rose-700 dark:text-rose-400 dark:hover:bg-rose-900/20">
                     {intl.formatMessage({ id: 'channels.remove' })}
                   </Button>
                 </div>
@@ -308,6 +316,17 @@ export function ChannelsPage() {
         onClose={() => setEditChannel(null)}
         onCreated={() => { setEditChannel(null); fetchChannels(); }}
         fixedType={editChannel ?? undefined}
+      />
+
+      {/* Destructive remove confirmation (replaces window.confirm) */}
+      <ConfirmDialog
+        open={removeTarget !== null}
+        onClose={() => setRemoveTarget(null)}
+        onConfirm={() => { if (removeTarget) handleRemove(removeTarget); }}
+        title={intl.formatMessage({ id: 'channels.remove.confirmTitle' })}
+        message={removeTarget ? intl.formatMessage({ id: 'channels.confirmRemove' }, { type: removeTarget }) : ''}
+        confirmLabel={intl.formatMessage({ id: 'channels.remove' })}
+        busy={removing}
       />
     </Page>
   );
@@ -490,7 +509,7 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
         )}
 
         {/* Setup guide */}
-        <div className="rounded-lg bg-amber-50 p-3 text-xs text-amber-800 dark:bg-amber-900/20 dark:text-amber-300">
+        <div className="rounded-control bg-amber-50 p-3 text-xs text-amber-800 dark:bg-amber-900/20 dark:text-amber-300">
           <p className="mb-1 font-medium">{intl.formatMessage({ id: 'channels.dialog.setupGuide' })}</p>
           {steps.map((step, i) => (
             <p key={i} className={step.startsWith('⚠') ? 'font-semibold text-rose-600 dark:text-rose-400' : ''}>
@@ -541,7 +560,7 @@ function AddChannelDialog({ open, onClose, onCreated, fixedType }: { open: boole
         )}
 
         {addError && (
-          <div className="flex items-start gap-2 rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
+          <div className="flex items-start gap-2 rounded-control bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
             <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
             <span>{addError}</span>
           </div>

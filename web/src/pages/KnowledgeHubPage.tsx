@@ -37,6 +37,7 @@ import {
   EmptyState,
   Toolbar,
   Tabs,
+  Mono,
   controlClass,
   type TabItem,
 } from '@/components/ui';
@@ -206,7 +207,7 @@ function BrowseTab({ agentId }: { agentId: string }) {
   if (!wikiExists && !loading) {
     return (
       <Card padded={false}>
-        <EmptyState icon={BookOpen} title={intl.formatMessage({ id: 'wiki.empty' })} />
+        <EmptyState dudu="reading" icon={BookOpen} title={intl.formatMessage({ id: 'wiki.empty' })} />
       </Card>
     );
   }
@@ -241,7 +242,7 @@ function BrowseTab({ agentId }: { agentId: string }) {
         {selectedPath ? (
           <WikiPageView path={selectedPath} content={pageContent} />
         ) : (
-          <EmptyState icon={FileText} title={intl.formatMessage({ id: 'wiki.selectPage' })} />
+          <EmptyState dudu="idle" icon={FileText} title={intl.formatMessage({ id: 'wiki.selectPage' })} />
         )}
       </Card>
     </div>
@@ -456,7 +457,7 @@ function GraphTab({ agentId }: { agentId: string }) {
   if (!loading && pages.length === 0) {
     return (
       <Card padded={false}>
-        <EmptyState icon={Share2} title={intl.formatMessage({ id: 'wiki.empty' })} />
+        <EmptyState dudu="reading" icon={Share2} title={intl.formatMessage({ id: 'wiki.empty' })} />
       </Card>
     );
   }
@@ -512,7 +513,7 @@ function SearchTab({ agentId }: { agentId: string }) {
 
       {hits.length === 0 ? (
         <Card padded={false}>
-          <EmptyState icon={Search} title={intl.formatMessage({ id: 'wiki.search.empty' })} />
+          <EmptyState dudu="concerned" icon={Search} title={intl.formatMessage({ id: 'wiki.search.empty' })} />
         </Card>
       ) : (
         <div className="space-y-3">
@@ -523,12 +524,12 @@ function SearchTab({ agentId }: { agentId: string }) {
                   {hit.title}
                 </h3>
                 <span className="shrink-0 text-xs font-medium text-amber-600 dark:text-amber-400">
-                  {intl.formatMessage({ id: 'wiki.relevance' })}: {Number(hit.score).toFixed(1)}
+                  {intl.formatMessage({ id: 'wiki.relevance' })}: <Mono className="text-amber-600 dark:text-amber-400">{Number(hit.score).toFixed(1)}</Mono>
                 </span>
               </div>
               <p className="mb-2 text-xs text-stone-500 dark:text-stone-400">{hit.path}</p>
               {hit.context_lines.length > 0 && (
-                <div className="rounded-lg bg-stone-500/5 p-3 dark:bg-white/5">
+                <div className="rounded-control bg-stone-500/5 p-3 dark:bg-white/5">
                   {hit.context_lines.map((line, i) => (
                     <p key={i} className="font-mono text-xs text-stone-600 dark:text-stone-400">
                       {line}
@@ -575,7 +576,7 @@ function HealthTab({ agentId }: { agentId: string }) {
   if (!stats?.exists && !loading) {
     return (
       <Card padded={false}>
-        <EmptyState icon={BookOpen} title={intl.formatMessage({ id: 'wiki.empty' })} />
+        <EmptyState dudu="reading" icon={BookOpen} title={intl.formatMessage({ id: 'wiki.empty' })} />
       </Card>
     );
   }
@@ -644,7 +645,7 @@ function HealthTab({ agentId }: { agentId: string }) {
                   <span className="text-sm text-stone-600 dark:text-stone-400">{dir}/</span>
                   <div className="flex items-center gap-2">
                     <div className="h-2 rounded-full bg-amber-500" style={{ width: `${Math.max(20, (count / stats.total_pages) * 200)}px` }} />
-                    <span className="text-sm font-medium tabular-nums text-stone-700 dark:text-stone-300">{count}</span>
+                    <Mono className="text-sm font-medium text-stone-700 dark:text-stone-300">{count}</Mono>
                   </div>
                 </div>
               ))}
@@ -662,7 +663,7 @@ function HealthTab({ agentId }: { agentId: string }) {
             </span>
           }
         >
-          <div className="rounded-xl border border-amber-500/30 bg-amber-500/8 p-5 dark:bg-amber-950/20">
+          <div className="rounded-card border border-amber-500/30 bg-amber-500/8 p-5 dark:bg-amber-950/20">
             {lint.orphan_pages.length > 0 && (
               <div className="mb-3">
                 <p className="mb-1 text-sm font-medium text-amber-700 dark:text-amber-400">

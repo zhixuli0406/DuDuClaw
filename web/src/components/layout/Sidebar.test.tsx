@@ -3,7 +3,6 @@ import { screen } from '@testing-library/react';
 import '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { Sidebar } from './Sidebar';
-import { useUiModeStore } from '@/stores/ui-mode-store';
 import { useAuthStore } from '@/stores/auth-store';
 
 beforeEach(() => {
@@ -12,19 +11,17 @@ beforeEach(() => {
   useAuthStore.setState({ user: { display_name: 'A', role: 'admin' } as never });
 });
 
-describe('Sidebar shell modes', () => {
-  it('workspace mode renders the narrow rail (Home), not the full group nav', () => {
-    useUiModeStore.setState({ mode: 'workspace', chosen: true });
+describe('Sidebar', () => {
+  // v2 "嘟嘟事務所" IA (§4.2): daily items are flat (no header); the collapsible
+  // sections are 工作 / 員工 / 公司. Home is the single spine.
+  it('renders the flat daily items and the collapsible sections', () => {
     renderWithProviders(<Sidebar />);
-    // Rail items expose their label as an accessible name (sr-only / title).
-    expect(screen.getByRole('link', { name: /home/i })).toBeInTheDocument();
-    // Full-nav group headers are absent in workspace mode.
-    expect(screen.queryByText(/^Overview$/)).not.toBeInTheDocument();
-  });
-
-  it('dashboard mode renders the full grouped navigation', () => {
-    useUiModeStore.setState({ mode: 'dashboard', chosen: true });
-    renderWithProviders(<Sidebar />);
-    expect(screen.getByText(/^Overview$/)).toBeInTheDocument();
+    // Flat daily items (rendered without a section header).
+    expect(screen.getByRole('link', { name: /Home/i })).toBeInTheDocument();
+    // Collapsible section headers.
+    expect(screen.getByText(/^Work$/)).toBeInTheDocument();
+    expect(screen.getByText(/^Company$/)).toBeInTheDocument();
+    // The primary create-task action.
+    expect(screen.getByRole('button', { name: /New task/i })).toBeInTheDocument();
   });
 });

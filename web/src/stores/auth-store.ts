@@ -28,6 +28,16 @@ interface AuthStore {
   readonly loading: boolean;
 
   login: (email: string, password: string) => Promise<void>;
+  /** Passwordless login step 1: ask the gateway to DM a code. Returns the
+   *  challenge id (+ masked target hint when the account has a channel). */
+  otpRequest: (email: string) => Promise<{ challenge_id: string; hint?: string }>;
+  /** Passwordless login step 2: verify the code and establish the session. */
+  otpVerify: (challengeId: string, code: string) => Promise<void>;
+  /** First-run onboarding: is this instance unclaimed (needs an admin password)? */
+  firstRunStatus: () => Promise<boolean>;
+  /** First-run onboarding: set the initial admin password, then establish the
+   *  session (no console one-time password needed). */
+  firstRunClaim: (password: string) => Promise<void>;
   logout: () => void;
   refresh: () => Promise<void>;
   loadFromStorage: () => Promise<boolean>;
@@ -198,6 +208,68 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         loading: false,
       });
       startRefreshTimer(get().refresh);
+    } catch (e) {
+      set({ loading: false });
+      throw e;
+    }
+  },
+
+  otpRequest: async (email: string) => {
+    const data = await apiPost<{ challenge_id: string; sent: boolean; hint?: string }>(
+      '/api/otp/request',
+      { email },
+    );
+    return { challenge_id: data.challenge_id, hint: data.hint };
+  },
+
+  otpVerify: async (challengeId: string, code: string) => {
+    set({ loading: true });
+    try {
+      const data = await apiPost<{
+        access_token: string;
+        refresh_token: string;
+        user: AuthUser;
+      }>('/api/otp/verify', { challenge_id: challengeId, code });
+
+      refreshTokenStorage.set(data.refresh_token);
+      const me = await apiGet<{ user: AuthUser; bindings: AgentBinding[] }>(
+        '/api/me',
+        data.access_token,
+      );
+      set({
+        user: me.user,
+        jwt: data.access_token,
+        refreshToken: data.refresh_token,
+        isAuthenticated: true,
+        initialized: true,
+        bindings: me.bindings,
+        loading: false,
+      });
+      startRefreshTimer(get().refresh);
+    } catch (e) {
+      set({ loading: false });
+      throw e;
+    }
+  },
+
+  firstRunStatus: async () => {
+    try {
+      const res = await fetch('/api/first-run/status');
+      if (!res.ok) return false;
+      const data = (await res.json()) as { claimable?: boolean };
+      return data.claimable === true;
+    } catch {
+      return false; // fail-closed: no claim UI if we can't confirm
+    }
+  },
+
+  firstRunClaim: async (password: string) => {
+    set({ loading: true });
+    try {
+      await apiPost('/api/first-run/claim', { password });
+      // Claim only sets the password; establish the session via the normal
+      // login path so token wiring / refresh timer are identical.
+      await get().login('admin@local', password);
     } catch (e) {
       set({ loading: false });
       throw e;

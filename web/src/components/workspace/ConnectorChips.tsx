@@ -5,7 +5,6 @@ import { Plug, Radio, Building2, Cpu, ChevronDown } from 'lucide-react';
 import type { ComponentType } from 'react';
 import { useSystemStore } from '@/stores/system-store';
 import { useAuthStore } from '@/stores/auth-store';
-import { useUiModeStore } from '@/stores/ui-mode-store';
 import { filterVisible, type Gated } from '@/lib/nav-visibility';
 
 interface Connector extends Gated {
@@ -35,7 +34,6 @@ const CONNECTORS: Connector[] = [
 export function ConnectorChips() {
   const intl = useIntl();
   const navigate = useNavigate();
-  const setMode = useUiModeStore((s) => s.setMode);
   const status = useSystemStore((s) => s.status);
   const fetchStatus = useSystemStore((s) => s.fetchStatus);
   const role = useAuthStore((s) => s.user?.role);
@@ -70,7 +68,6 @@ export function ConnectorChips() {
 
   const go = (to: string) => {
     setOpen(false);
-    setMode('dashboard');
     navigate(to);
   };
 

@@ -1,12 +1,12 @@
 import { useEffect, lazy, Suspense } from 'react';
-import { Routes, Route } from 'react-router';
+import { Routes, Route, Navigate } from 'react-router';
 import { MainLayout } from './components/layout/MainLayout';
+import { ManageShell } from './components/layout/ManageShell';
 import { AuthGuard, RoleGuard } from './components/AuthGuard';
 import { FirstRunGate } from './components/FirstRunGate';
 import { LoginPage } from './pages/LoginPage';
 import { useConnectionStore } from './stores/connection-store';
 import { useAuthStore } from './stores/auth-store';
-import { useUiModeStore } from './stores/ui-mode-store';
 import { ApprovalModal } from './components/ApprovalModal';
 
 // Code-splitting: every authenticated page is lazy-loaded so heavy, page-only
@@ -17,20 +17,30 @@ const lazyPage = <K extends string>(loader: () => Promise<Record<K, React.Compon
   lazy(() => loader().then((m) => ({ default: m[key] })));
 
 const DashboardPage = lazyPage(() => import('./pages/DashboardPage'), 'DashboardPage');
-const WorkspacePage = lazyPage(() => import('./pages/WorkspacePage'), 'WorkspacePage');
+const HomePage = lazyPage(() => import('./pages/HomePage'), 'HomePage');
+const InboxPage = lazyPage(() => import('./pages/InboxPage'), 'InboxPage');
+const RoutinesPage = lazyPage(() => import('./pages/RoutinesPage'), 'RoutinesPage');
+const AgentDetailPage = lazyPage(() => import('./pages/AgentDetailPage'), 'AgentDetailPage');
+const SkillsShell = lazyPage(() => import('./pages/SkillsShell'), 'SkillsShell');
+const KnowledgeShell = lazyPage(() => import('./pages/KnowledgeShell'), 'KnowledgeShell');
+const IntegrationsPage = lazyPage(() => import('./pages/IntegrationsPage'), 'IntegrationsPage');
+const BillingShell = lazyPage(() => import('./pages/BillingShell'), 'BillingShell');
+const GovernanceShell = lazyPage(() => import('./pages/GovernanceShell'), 'GovernanceShell');
+const LicenseShell = lazyPage(() => import('./pages/LicenseShell'), 'LicenseShell');
 const WebChatPage = lazyPage(() => import('./pages/WebChatPage'), 'WebChatPage');
 const AgentsPage = lazyPage(() => import('./pages/AgentsPage'), 'AgentsPage');
 const TaskBoardPage = lazyPage(() => import('./pages/TaskBoardPage'), 'TaskBoardPage');
 const ForkPage = lazyPage(() => import('./pages/ForkPage'), 'ForkPage');
-const SkillMarketPage = lazyPage(() => import('./pages/SkillMarketPage'), 'SkillMarketPage');
 const MarketplacePage = lazyPage(() => import('./pages/MarketplacePage'), 'MarketplacePage');
 const MemoryPage = lazyPage(() => import('./pages/MemoryPage'), 'MemoryPage');
 const KnowledgeHubPage = lazyPage(() => import('./pages/KnowledgeHubPage'), 'KnowledgeHubPage');
 const SharedWikiPage = lazyPage(() => import('./pages/SharedWikiPage'), 'SharedWikiPage');
 const OrgChartPage = lazyPage(() => import('./pages/OrgChartPage'), 'OrgChartPage');
+const WorldPage = lazyPage(() => import('./pages/WorldPage'), 'WorldPage');
 const PartnerPortalPage = lazyPage(() => import('./pages/PartnerPortalPage'), 'PartnerPortalPage');
 const ReportPage = lazyPage(() => import('./pages/ReportPage'), 'ReportPage');
 const BillingPage = lazyPage(() => import('./pages/BillingPage'), 'BillingPage');
+const ApprovalsPage = lazyPage(() => import('./pages/ApprovalsPage'), 'ApprovalsPage');
 const LicensePage = lazyPage(() => import('./pages/LicensePage'), 'LicensePage');
 const LogsPage = lazyPage(() => import('./pages/LogsPage'), 'LogsPage');
 const ChannelsPage = lazyPage(() => import('./pages/ChannelsPage'), 'ChannelsPage');
@@ -45,8 +55,15 @@ const McpKeysPage = lazyPage(() => import('./pages/McpKeysPage'), 'McpKeysPage')
 const OdooPage = lazyPage(() => import('./pages/OdooPage'), 'OdooPage');
 const InferencePage = lazyPage(() => import('./pages/InferencePage'), 'InferencePage');
 const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
+const MigratePage = lazyPage(() => import('./pages/MigratePage'), 'MigratePage');
 const OnboardWizardPage = lazyPage(() => import('./pages/OnboardWizardPage'), 'OnboardWizardPage');
 const WelcomePage = lazyPage(() => import('./pages/WelcomePage'), 'WelcomePage');
+// v2 redesign lazy placeholder pages (T1.5) — replaced in place by later waves.
+const TaskDetailPage = lazyPage(() => import('./pages/TaskDetailPage'), 'TaskDetailPage');
+const SkillNewPage = lazyPage(() => import('./pages/SkillNewPage'), 'SkillNewPage');
+const SkillCustomDetailPage = lazyPage(() => import('./pages/SkillCustomDetailPage'), 'SkillCustomDetailPage');
+const GrowthPage = lazyPage(() => import('./pages/GrowthPage'), 'GrowthPage');
+const MascotOverlayPage = lazyPage(() => import('./pages/MascotOverlayPage'), 'MascotOverlayPage');
 
 /** Lightweight route-transition fallback while a lazy page chunk loads. */
 function PageFallback() {
@@ -55,16 +72,6 @@ function PageFallback() {
       <span className="h-6 w-6 animate-spin rounded-full border-2 border-amber-500/30 border-t-amber-500" />
     </div>
   );
-}
-
-/**
- * The index route renders the workspace or the dashboard depending on the
- * active shell mode (TODO-genspark-workspace-shell §P0.3). Rendering in place
- * (rather than redirecting) avoids a flash and keeps the URL at `/`.
- */
-function HomeRoute() {
-  const mode = useUiModeStore((s) => s.mode);
-  return mode === 'workspace' ? <WorkspacePage /> : <DashboardPage />;
 }
 
 export function App() {
@@ -91,6 +98,8 @@ export function App() {
         <Routes>
           <Route path="login" element={<LoginPage />} />
           <Route path="wizard" element={<OnboardWizardPage />} />
+          {/* Tauri desktop-pet mini route (§7.4) — no app shell. */}
+          <Route path="mascot-overlay" element={<MascotOverlayPage />} />
           <Route element={<AuthGuard />}>
             <Route element={<MainLayout />}>
               {/* First-run onboarding — mounted OUTSIDE FirstRunGate so the
@@ -99,30 +108,76 @@ export function App() {
 
               {/* Everything else requires at least one agent to exist. */}
               <Route element={<FirstRunGate />}>
-              {/* Open to all authenticated users */}
-              <Route index element={<HomeRoute />} />
-              <Route path="workspace" element={<WorkspacePage />} />
-              <Route path="webchat" element={<WebChatPage />} />
-              <Route path="agents" element={<AgentsPage />} />
+              {/* ── Zone A 每日 — open to all authenticated users ──
+                  Home is the single spine: it carries the one-line launcher
+                  hero at the top (former workspace mode was collapsed here). */}
+              <Route index element={<HomePage />} />
+              <Route path="workspace" element={<HomePage />} />
+              <Route path="inbox" element={<InboxPage />} />
+              {/* v2 (T1.5): /webchat renamed to /chat; old path redirects. */}
+              <Route path="chat" element={<WebChatPage />} />
+              <Route path="webchat" element={<Navigate to="/chat" replace />} />
+
+              {/* ── 工作 ── */}
               <Route path="tasks" element={<TaskBoardPage />} />
-              <Route path="forks" element={<ForkPage />} />
-              <Route path="skills" element={<SkillMarketPage />} />
-              <Route path="marketplace" element={<MarketplacePage />} />
+              <Route path="tasks/:id" element={<TaskDetailPage />} />
+
+              {/* ── 員工 / 公司 ── */}
+              <Route path="agents" element={<AgentsPage />} />
+              {/* The immersive full-bleed world page (PixiJS 2D iso). The Home
+                  band and Org "世界" tab both link here so the heavy scene mounts
+                  in exactly one place. */}
+              <Route path="world" element={<WorldPage />} />
+              <Route path="agents/:id" element={<AgentDetailPage />} />
+              <Route path="agents/:id/:tab" element={<AgentDetailPage />} />
               <Route path="memory" element={<MemoryPage />} />
+              <Route path="growth" element={<GrowthPage />} />
+              <Route path="skills" element={<SkillsShell />} />
+              <Route path="skills/new" element={<SkillNewPage />} />
+              <Route path="skills/custom/:id" element={<SkillCustomDetailPage />} />
+              <Route path="knowledge" element={<KnowledgeShell />} />
+
+              {/* manager+ routes (Zone B/C) */}
+              <Route element={<RoleGuard minRole="manager" />}>
+                <Route path="forks" element={<ForkPage />} />
+                <Route path="routines" element={<RoutinesPage />} />
+                <Route path="reports" element={<ReportPage />} />
+                <Route path="org" element={<OrgChartPage />} />
+              </Route>
+
+              {/* ── Zone D 管理 — single entry, ManageShell subnav tree ──
+                  ManageShell itself fail-closes to manager+; each child re-gates. */}
+              <Route path="manage" element={<ManageShell />}>
+                <Route element={<RoleGuard minRole="manager" />}>
+                  <Route path="billing" element={<BillingShell />} />
+                  <Route path="license" element={<LicenseShell />} />
+                  <Route path="migrate" element={<MigratePage />} />
+                  <Route path="logs" element={<LogsPage />} />
+                </Route>
+                <Route element={<RoleGuard minRole="admin" />}>
+                  <Route path="channels" element={<ChannelsPage />} />
+                  <Route path="integrations" element={<IntegrationsPage />} />
+                  <Route path="inference" element={<InferencePage />} />
+                  <Route path="reliability" element={<ReliabilityPage />} />
+                  <Route path="security" element={<SecurityPage />} />
+                  <Route path="governance" element={<GovernanceShell />} />
+                  <Route path="users" element={<UsersPage />} />
+                  <Route path="system" element={<SettingsPage />} />
+                </Route>
+              </Route>
+
+              {/* ── Legacy route aliases (bookmarks keep working; §0 可回滾) ── */}
+              <Route path="legacy-dashboard" element={<DashboardPage />} />
+              <Route path="marketplace" element={<MarketplacePage />} />
               <Route path="wiki" element={<KnowledgeHubPage />} />
               <Route path="shared-wiki" element={<SharedWikiPage />} />
-
-              {/* manager+ routes */}
               <Route element={<RoleGuard minRole="manager" />}>
-                <Route path="org" element={<OrgChartPage />} />
+                <Route path="approvals" element={<ApprovalsPage />} />
                 <Route path="partner" element={<PartnerPortalPage />} />
-                <Route path="reports" element={<ReportPage />} />
                 <Route path="billing" element={<BillingPage />} />
                 <Route path="license" element={<LicensePage />} />
                 <Route path="logs" element={<LogsPage />} />
               </Route>
-
-              {/* admin-only routes */}
               <Route element={<RoleGuard minRole="admin" />}>
                 <Route path="channels" element={<ChannelsPage />} />
                 <Route path="accounts" element={<AccountsPage />} />

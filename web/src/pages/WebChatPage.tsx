@@ -1,28 +1,59 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
+import { useSearchParams } from 'react-router';
 import { useChatStore, type PendingAttachment } from '@/stores/chat-store';
+import { useAgentsStore } from '@/stores/agents-store';
 import { cn } from '@/lib/utils';
 import { Send, RotateCcw, Loader2, Paperclip, Eye, EyeOff } from 'lucide-react';
 import { toast } from '@/lib/toast';
 import { Button, Badge } from '@/components/ui';
-import { AttachmentChip, MessageBubble, TypingIndicator } from '@/components/chat';
+import {
+  AttachmentChip,
+  MessageBubble,
+  TypingIndicator,
+  TaskInsights,
+  CenterStage,
+  CornerDuDu,
+  EmployeeRow,
+  useChatFace,
+  MicButton,
+  VoicePlayToggle,
+  ttsSynthesizeUrl,
+  VoiceNotConfiguredError,
+} from '@/components/chat';
+import { CharacterAvatar, type AgentLifecycle } from '@/components/character';
+import { DuDu } from '@/components/mascot';
 import { isImageMime, readAttachment } from '@/lib/attachments';
 
 export function WebChatPage() {
   const intl = useIntl();
   const {
     messages,
+    steps,
+    stepTree,
     isStreaming,
+    phase,
+    viseme,
     agentName,
     agentIcon,
+    selectedAgentId,
     supportsVision,
     model,
     connectionState,
+    isRecording,
+    ttsEnabled,
+    setTtsEnabled,
     connect,
     send,
     reset,
+    selectAgent,
   } = useChatStore();
 
+  const agents = useAgentsStore((s) => s.agents);
+  const agentsLoaded = useAgentsStore((s) => s.loaded);
+  const fetchAgents = useAgentsStore((s) => s.fetchAgents);
+
+  const [searchParams] = useSearchParams();
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -32,20 +63,51 @@ export function WebChatPage() {
   const hasImageAttachment = attachments.some((a) => isImageMime(a.mime));
   const showVisionWarning = hasImageAttachment && !supportsVision;
 
-  // Connect on mount
+  // Connect on mount; preselect the conversation partner from `?agent=<id>`.
   useEffect(() => {
-    if (connectionState === 'disconnected') {
-      connect();
-    }
-    return () => {
-      // Don't disconnect on unmount — keep session alive
-    };
+    if (connectionState === 'disconnected') connect();
+    if (!agentsLoaded) fetchAgents();
+    const preselect = searchParams.get('agent');
+    if (preselect) selectAgent(preselect);
+    // Keep the session alive across unmounts — no disconnect here.
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Auto-scroll to bottom
+  // Auto-scroll to bottom on new content.
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isStreaming]);
+  }, [messages, isStreaming, stepTree.length]);
+
+  // The chosen partner (an AI staff member) or DuDu (the office assistant).
+  const partner = useMemo(
+    () => (selectedAgentId ? agents.find((a) => a.name === selectedAgentId) ?? null : null),
+    [agents, selectedAgentId],
+  );
+  const partnerName = partner?.display_name ?? agentName;
+  // Header icon follows the chosen partner (W6a fix: it previously stayed the
+  // main agent's icon even after selecting a different employee).
+  const partnerIcon = partner?.icon ?? agentIcon;
+  const partnerStatus: AgentLifecycle = partner?.status ?? 'active';
+
+  // Recording drives the `listening` face just like typing does.
+  const face = useChatFace(phase, input.trim().length > 0 || isRecording, messages.length > 0);
+
+  // Leading avatar for assistant bubbles — the partner's identity.
+  const leadingAvatar = selectedAgentId ? (
+    <CharacterAvatar agentId={selectedAgentId} name={partnerName} size={26} variant="avatar" animated={false} />
+  ) : (
+    <DuDu face="idle" size={24} animated={false} label="DuDu" />
+  );
+
+  // Split off a still-streaming assistant bubble so the step tree can sit above
+  // it while the reply builds.
+  const last = messages[messages.length - 1];
+  const streamingAssistant =
+    isStreaming && last?.role === 'assistant' && last.tokens == null ? last : null;
+  const priorMessages = streamingAssistant ? messages.slice(0, -1) : messages;
+  const insightsVisible = stepTree.length > 0 || steps.length > 0;
+
+  const empty = messages.length === 0;
+  const duduCentered = empty && !selectedAgentId;
 
   const handleSend = () => {
     const text = input.trim();
@@ -62,6 +124,58 @@ export function WebChatPage() {
       handleSend();
     }
   };
+
+  // Fill the composer from a voice transcript — never auto-send; the human
+  // reviews and hits enter. Appends to any text already typed.
+  const handleTranscript = (text: string) => {
+    setInput((prev) => (prev ? `${prev.trimEnd()} ${text}` : text));
+    inputRef.current?.focus();
+  };
+
+  // Reply playback (openhuman-parity B-P2): when the toggle is on, speak each
+  // freshly-completed assistant reply via /api/tts. Guarded by message id so a
+  // reply is spoken exactly once; a 501 quietly closes the toggle.
+  const lastSpokenRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!ttsEnabled || phase !== 'done') return;
+    const latest = messages[messages.length - 1];
+    if (!latest || latest.role !== 'assistant' || !latest.content.trim()) return;
+    if (lastSpokenRef.current === latest.id) return;
+    lastSpokenRef.current = latest.id;
+
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    (async () => {
+      try {
+        objectUrl = await ttsSynthesizeUrl(latest.content);
+        if (cancelled) {
+          URL.revokeObjectURL(objectUrl);
+          return;
+        }
+        const audio = new Audio(objectUrl);
+        audio.onended = () => objectUrl && URL.revokeObjectURL(objectUrl);
+        await audio.play().catch(() => {
+          /* autoplay may be blocked until first user gesture — ignore */
+        });
+      } catch (err) {
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+        if (err instanceof VoiceNotConfiguredError) {
+          toast.error(
+            err.message ||
+              intl.formatMessage({
+                id: 'voice.tts.notConfigured',
+                defaultMessage: '尚未啟用語音朗讀，請至設定 → 語音',
+              }),
+          );
+          setTtsEnabled(false);
+        }
+        // Other synthesis errors stay silent to avoid spamming per reply.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [phase, ttsEnabled, messages, setTtsEnabled, intl]);
 
   const handleFilesSelected = async (fileList: FileList | null) => {
     if (!fileList || fileList.length === 0) return;
@@ -101,14 +215,14 @@ export function WebChatPage() {
     connectionState === 'connected';
 
   return (
-    <div className="flex h-full flex-col">
-      {/* Header */}
-      <div className="flex items-center justify-between border-b border-[var(--panel-border)] px-6 py-4">
+    <div className="flex h-full min-w-0 flex-col">
+      {/* Header — partner identity + connection + reset. */}
+      <div className="flex items-center justify-between border-b border-[var(--panel-border)] px-6 py-3">
         <div className="flex items-center gap-3">
-          <span className="text-2xl">{agentIcon}</span>
+          <span className="text-2xl">{partnerIcon}</span>
           <div>
             <h2 className="text-lg font-semibold tracking-tight text-stone-900 dark:text-stone-50">
-              {agentName}
+              {partnerName}
             </h2>
             <div className="mt-0.5">
               <Badge
@@ -131,42 +245,63 @@ export function WebChatPage() {
           </div>
         </div>
 
-        <Button
-          variant="ghost"
-          icon={RotateCcw}
-          onClick={reset}
-          title={intl.formatMessage({ id: 'webchat.reset', defaultMessage: 'New conversation' })}
-        />
+        <div className="flex items-center gap-1">
+          <VoicePlayToggle />
+          <Button
+            variant="ghost"
+            icon={RotateCcw}
+            onClick={reset}
+            title={intl.formatMessage({ id: 'webchat.reset', defaultMessage: 'New conversation' })}
+          />
+        </div>
       </div>
 
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-6 py-4">
-        <div className="mx-auto max-w-2xl space-y-3">
-          {messages.length === 0 && (
-            <div className="flex flex-col items-center justify-center py-20 text-center">
-              <span className="text-5xl">{agentIcon}</span>
-              <h3 className="mt-4 text-lg font-medium text-stone-700 dark:text-stone-300">
-                {intl.formatMessage({ id: 'webchat.welcome', defaultMessage: 'Hello! How can I help you?' })}
-              </h3>
-              <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
-                {intl.formatMessage({ id: 'webchat.hint', defaultMessage: 'Type a message or use /help for commands' })}
-              </p>
-            </div>
+      {/* Employee strip — pick the conversation partner. */}
+      {agents.length > 0 && (
+        <div className="border-b border-[var(--panel-border)]">
+          <EmployeeRow agents={agents} selectedId={selectedAgentId} onSelect={selectAgent} />
+        </div>
+      )}
+
+      {/* Conversation — DuDu holds the corner once there's history. */}
+      <div className="relative min-h-0 flex-1 overflow-y-auto px-6 py-4">
+        {!duduCentered && <CornerDuDu face={face} viseme={viseme} />}
+
+        <div className="mx-auto max-w-3xl space-y-3">
+          {empty ? (
+            <CenterStage
+              face={face}
+              viseme={viseme}
+              agentId={selectedAgentId}
+              agentName={partnerName}
+              agentStatus={partnerStatus}
+              phase={phase}
+            />
+          ) : (
+            <>
+              {priorMessages.map((msg) => (
+                <MessageBubble
+                  key={msg.id}
+                  message={msg}
+                  leading={msg.role === 'assistant' ? leadingAvatar : undefined}
+                />
+              ))}
+
+              {insightsVisible && <TaskInsights tree={stepTree} todos={steps} streaming={isStreaming} />}
+
+              {streamingAssistant && <MessageBubble message={streamingAssistant} leading={leadingAvatar} />}
+
+              {isStreaming && !streamingAssistant && <TypingIndicator />}
+            </>
           )}
-
-          {messages.map((msg) => (
-            <MessageBubble key={msg.id} message={msg} />
-          ))}
-
-          {isStreaming && <TypingIndicator />}
 
           <div ref={messagesEndRef} />
         </div>
       </div>
 
-      {/* Input */}
+      {/* Composer — pinned to the bottom. */}
       <div className="border-t border-[var(--panel-border)] px-6 py-4">
-        <div className="mx-auto max-w-2xl space-y-2">
+        <div className="mx-auto max-w-3xl space-y-2">
           {/* Capability badge */}
           <div className="flex items-center gap-2 text-xs text-stone-400 dark:text-stone-500">
             {supportsVision ? (
@@ -230,7 +365,14 @@ export function WebChatPage() {
               onClick={() => fileInputRef.current?.click()}
               disabled={connectionState !== 'connected'}
               title={intl.formatMessage({ id: 'webchat.attach', defaultMessage: '上傳檔案' })}
-              className="h-11 w-11 shrink-0 rounded-xl"
+              className="h-11 w-11 shrink-0 rounded-control"
+            />
+            {/* Push-to-talk mic (openhuman-parity B): hold to record, release to
+                transcribe into the composer. Disabled with a tooltip when the
+                browser can't capture audio or the socket is down. */}
+            <MicButton
+              onTranscript={handleTranscript}
+              disabled={connectionState !== 'connected'}
             />
             <textarea
               ref={inputRef}
@@ -243,9 +385,9 @@ export function WebChatPage() {
               })}
               rows={1}
               className={cn(
-                'flex-1 resize-none rounded-xl border border-[var(--panel-border)] bg-[var(--panel-fill)] px-4 py-3 text-sm',
+                'flex-1 resize-none rounded-control border border-[var(--panel-border)] bg-[var(--panel-fill)] px-4 py-3 text-sm',
                 'text-stone-800 placeholder:text-stone-400 focus-visible:border-amber-500/50 focus-visible:outline-none',
-                'focus-visible:ring-2 focus-visible:ring-amber-500/30 dark:text-stone-100 dark:placeholder:text-stone-500'
+                'focus-visible:ring-2 focus-visible:ring-amber-500/30 dark:text-stone-100 dark:placeholder:text-stone-500',
               )}
               disabled={connectionState !== 'connected'}
             />
@@ -253,7 +395,7 @@ export function WebChatPage() {
               variant="primary"
               onClick={handleSend}
               disabled={!canSend}
-              className="h-11 w-11 shrink-0 rounded-xl px-0"
+              className="h-11 w-11 shrink-0 rounded-control px-0"
             >
               {isStreaming ? (
                 <Loader2 className="h-5 w-5 animate-spin" />

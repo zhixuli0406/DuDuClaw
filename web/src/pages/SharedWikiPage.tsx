@@ -23,6 +23,8 @@ import {
   Badge,
   EmptyState,
   Toolbar,
+  CharacterAvatar,
+  Mono,
 } from '@/components/ui';
 import {
   Globe,
@@ -172,7 +174,7 @@ function BrowseTab() {
   if (!wikiExists || pages.length === 0) {
     return (
       <Card>
-        <EmptyState icon={BookOpen} title={intl.formatMessage({ id: 'sharedWiki.empty' })} />
+        <EmptyState dudu="reading" icon={BookOpen} title={intl.formatMessage({ id: 'sharedWiki.empty' })} />
       </Card>
     );
   }
@@ -200,11 +202,11 @@ function BrowseTab() {
       {/* Content viewer */}
       <Card className="col-span-8" title={selectedPath || undefined}>
         {selectedPath ? (
-          <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap rounded-lg bg-stone-500/5 p-4 font-mono text-sm text-stone-800 dark:bg-white/5 dark:text-stone-200">
+          <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap rounded-control bg-stone-500/5 p-4 font-mono text-sm text-stone-800 dark:bg-white/5 dark:text-stone-200">
             {pageContent || 'Loading...'}
           </pre>
         ) : (
-          <EmptyState icon={FileText} title={intl.formatMessage({ id: 'sharedWiki.selectPage' })} />
+          <EmptyState dudu="idle" icon={FileText} title={intl.formatMessage({ id: 'sharedWiki.selectPage' })} />
         )}
       </Card>
     </div>
@@ -312,7 +314,7 @@ function SearchTab() {
                 </Badge>
               </div>
               {hit.context_lines.length > 0 && (
-                <div className="mt-2 rounded-lg bg-stone-500/5 p-2 text-xs text-stone-600 dark:bg-white/5 dark:text-stone-400">
+                <div className="mt-2 rounded-control bg-stone-500/5 p-2 text-xs text-stone-600 dark:bg-white/5 dark:text-stone-400">
                   {hit.context_lines.map((line, i) => (
                     <div key={i} className="truncate">{line}</div>
                   ))}
@@ -323,7 +325,7 @@ function SearchTab() {
         </div>
       ) : (
         <Card>
-          <EmptyState icon={Search} title={intl.formatMessage({ id: 'sharedWiki.search.empty' })} />
+          <EmptyState dudu="concerned" icon={Search} title={intl.formatMessage({ id: 'sharedWiki.search.empty' })} />
         </Card>
       )}
     </div>
@@ -355,7 +357,7 @@ function StatsTab() {
   if (!stats?.exists) {
     return (
       <Card>
-        <EmptyState icon={BarChart3} title={intl.formatMessage({ id: 'sharedWiki.empty' })} />
+        <EmptyState dudu="reading" icon={BarChart3} title={intl.formatMessage({ id: 'sharedWiki.empty' })} />
       </Card>
     );
   }
@@ -399,6 +401,7 @@ function StatsTab() {
             <div className="space-y-2">
               {authorEntries.map(([author, count]) => (
                 <div key={author} className="flex items-center gap-2">
+                  <CharacterAvatar agentId={author} name={author} size={24} />
                   <span className="flex-1 text-sm text-stone-700 dark:text-stone-300">{author}</span>
                   <div className="h-2 flex-1 overflow-hidden rounded-full bg-stone-500/10 dark:bg-white/10">
                     <div
@@ -406,7 +409,7 @@ function StatsTab() {
                       style={{ width: `${(count / stats.total_pages) * 100}%` }}
                     />
                   </div>
-                  <span className="min-w-[2rem] text-right text-sm font-medium tabular-nums text-stone-500">{count}</span>
+                  <Mono className="min-w-[2rem] text-right text-sm font-medium text-stone-500">{count}</Mono>
                 </div>
               ))}
             </div>
@@ -423,7 +426,7 @@ function StatsTab() {
                 <div key={dir} className="flex items-center gap-2">
                   <Tag className="h-3.5 w-3.5 text-stone-400" />
                   <span className="flex-1 text-sm text-stone-700 dark:text-stone-300">{dir}/</span>
-                  <span className="text-sm font-medium tabular-nums text-stone-500">{count}</span>
+                  <Mono className="text-sm font-medium text-stone-500">{count}</Mono>
                 </div>
               ))}
             </div>
@@ -492,7 +495,7 @@ function PolicyTab() {
           {loading ? (
             <p className="py-8 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
           ) : namespaces.length === 0 ? (
-            <EmptyState icon={Lock} title={intl.formatMessage({ id: 'scp.empty' })} />
+            <EmptyState dudu="idle" icon={Lock} title={intl.formatMessage({ id: 'scp.empty' })} />
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">

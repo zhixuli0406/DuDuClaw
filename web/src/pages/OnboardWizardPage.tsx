@@ -4,6 +4,8 @@ import { useNavigate } from 'react-router';
 import { cn } from '@/lib/utils';
 import { api } from '@/lib/api';
 import { Card, Button, Badge, Field, controlClass } from '@/components/ui';
+import { DuDu } from '@/components/mascot';
+import type { DuduFace } from '@/components/mascot/faces';
 import {
   ChevronLeft,
   ChevronRight,
@@ -55,6 +57,16 @@ const INITIAL_STATE: WizardState = {
 };
 
 const TOTAL_STEPS = 5;
+
+/**
+ * DuDu's expression for each wizard step (§7.3): curious while the operator is
+ * still choosing, writing while they fill in details, proud on the final review.
+ */
+function faceForStep(step: number): DuduFace {
+  if (step >= 5) return 'proud';
+  if (step >= 3) return 'writing';
+  return 'curious';
+}
 
 // ---------------------------------------------------------------------------
 // Industry cards config
@@ -741,6 +753,9 @@ export function OnboardWizardPage() {
       <div className="page-enter mx-auto max-w-4xl space-y-8">
       {/* Header */}
       <div className="text-center">
+        <div className="mb-2 flex justify-center">
+          <DuDu face={faceForStep(step)} size="sm" />
+        </div>
         <h2 className="text-2xl font-semibold tracking-tight text-stone-900 dark:text-stone-50">
           {intl.formatMessage({ id: 'wizard.title' })}
         </h2>

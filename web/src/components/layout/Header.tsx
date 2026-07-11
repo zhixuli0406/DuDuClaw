@@ -1,9 +1,10 @@
 import { useIntl } from 'react-intl';
-import { useNavigate } from 'react-router';
+import { useNavigate, useLocation, NavLink } from 'react-router';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useUpdateStore } from '@/stores/update-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useThemeStore } from '@/stores/theme-store';
+import { useApprovalsStore } from '@/stores/approvals-store';
 import { useLocaleStore, localeNames } from '@/i18n';
 import {
   Sun,
@@ -16,13 +17,126 @@ import {
   Check,
   Search,
   Menu,
+  Trophy,
+  Bell,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { useEffect, useRef, useState, useCallback } from 'react';
-import { ModeToggle } from './ModeToggle';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { Breadcrumbs } from './Breadcrumbs';
+import { crumbsFor } from './nav-model';
+import { CoinChip } from '@/components/ui';
+import { useGrowthStore } from '@/stores/growth-store';
+import { useTodayCost } from '@/components/growth/useTodayCost';
+import { hasMinRole } from '@/lib/roles';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
 import { useSidebarStore } from '@/stores/sidebar-store';
-import { useUiModeStore } from '@/stores/ui-mode-store';
+
+/** Notification bell — the unified "needs me" count → quick-jump to the inbox. */
+function BellTrigger() {
+  const intl = useIntl();
+  const count = useApprovalsStore((s) => s.pendingCount);
+  return (
+    <NavLink
+      to="/inbox"
+      aria-label={intl.formatMessage({ id: 'nav.inbox' })}
+      title={intl.formatMessage({ id: 'nav.inbox' })}
+      className={({ isActive }) =>
+        cn(
+          'relative rounded-lg p-2 transition-colors',
+          isActive
+            ? 'text-amber-600 dark:text-amber-400'
+            : 'text-stone-500 hover:bg-stone-500/10 hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-200',
+        )
+      }
+    >
+      <Bell className="h-4 w-4" />
+      {count > 0 && (
+        <span className="absolute -right-0.5 -top-0.5 inline-flex min-w-[1rem] items-center justify-center rounded-full bg-rose-500 px-1 text-[9px] font-semibold tabular-nums leading-none text-white">
+          {count > 99 ? '99+' : count}
+        </span>
+      )}
+    </NavLink>
+  );
+}
+
+/**
+ * HUD spend chip (§4.3 / T10.5). Today's spend from `growth.daily_report`
+ * ({date: today}), which returns a live rolling figure — labelled "今日" (the
+ * value is still updating). On error it degrades to the cumulative account
+ * total, labelled "累計", never a misleading $0. Manager+ only: cost is not
+ * shown to employees (the daily-report RPC isn't role-gated server-side, so the
+ * gate is enforced here — `enabled: false` skips the fetch entirely).
+ */
+function HudCostChip() {
+  const intl = useIntl();
+  const navigate = useNavigate();
+  const role = useAuthStore((s) => s.user?.role);
+  const canSee = hasMinRole(role, 'manager');
+  const { cents, mode } = useTodayCost({ enabled: canSee });
+
+  if (!canSee) return null;
+  if (mode === 'loading' || cents === null) {
+    return <span className="hidden h-7 w-16 animate-pulse rounded-full bg-stone-500/10 sm:block dark:bg-white/5" aria-hidden="true" />;
+  }
+  const label = intl.formatMessage({ id: mode === 'today' ? 'hud.cost.today' : 'hud.cost.cumulative' });
+  return (
+    <span className="hidden sm:inline-flex">
+      <CoinChip
+        cents={cents}
+        onClick={() => navigate('/manage/billing')}
+        title={`${label} · ${intl.formatMessage({ id: 'nav.billing' })}`}
+      />
+    </span>
+  );
+}
+
+/**
+ * HUD XP capsule (§4.3 / T10.5) — Lv + within-level progress from the growth
+ * snapshot (polled shell-wide by GrowthMount). Plays a badge-pop when the
+ * company levels up (store `levelUpNonce`, T10.4). Falls back to a placeholder
+ * until the first snapshot lands.
+ */
+function HudXpChip() {
+  const intl = useIntl();
+  const navigate = useNavigate();
+  const snapshot = useGrowthStore((s) => s.snapshot);
+  const levelUpNonce = useGrowthStore((s) => s.levelUpNonce);
+  const [pop, setPop] = useState(false);
+  const seenNonce = useRef(levelUpNonce);
+
+  useEffect(() => {
+    if (levelUpNonce === seenNonce.current) return;
+    seenNonce.current = levelUpNonce;
+    setPop(true);
+    const t = window.setTimeout(() => setPop(false), 900);
+    return () => window.clearTimeout(t);
+  }, [levelUpNonce]);
+
+  const span = snapshot ? snapshot.xp_into_level + snapshot.xp_for_next_level : 0;
+  const pct = snapshot && span > 0 ? Math.round((snapshot.xp_into_level / span) * 100) : 0;
+
+  return (
+    <button
+      onClick={() => navigate('/growth')}
+      title={intl.formatMessage({ id: 'hud.growth' })}
+      aria-label={intl.formatMessage({ id: 'hud.growth' })}
+      className={cn(
+        'hidden items-center gap-1.5 rounded-full bg-[color:var(--xp)]/10 px-2.5 py-1 ring-1 ring-inset ring-[color:var(--xp)]/25 transition-colors hover:bg-[color:var(--xp)]/15 sm:inline-flex',
+        pop && 'animate-badge-pop',
+      )}
+    >
+      <Trophy className="h-4 w-4 text-[color:var(--xp)]" aria-hidden="true" />
+      <span className="text-xs font-semibold tabular-nums text-stone-700 dark:text-stone-200">
+        {snapshot ? `Lv.${snapshot.level}` : intl.formatMessage({ id: 'sidebar.level.placeholder' })}
+      </span>
+      {snapshot && (
+        <span className="hidden h-1.5 w-10 overflow-hidden rounded-full bg-stone-500/15 md:block dark:bg-white/10" aria-hidden="true">
+          <span className="block h-full rounded-full bg-[color:var(--xp)]" style={{ width: `${pct}%` }} />
+        </span>
+      )}
+    </button>
+  );
+}
 
 /** Best-effort platform hint for the ⌘K vs Ctrl+K affordance. */
 function isMacLike(): boolean {
@@ -121,10 +235,7 @@ function LanguageMenu() {
 
 function MobileMenuButton() {
   const intl = useIntl();
-  const mode = useUiModeStore((s) => s.mode);
   const toggleMobile = useSidebarStore((s) => s.toggleMobile);
-  // The workspace rail is already slim; only the dashboard sidebar needs a drawer.
-  if (mode === 'workspace') return null;
   return (
     <button
       onClick={toggleMobile}
@@ -140,6 +251,11 @@ function MobileMenuButton() {
 export function Header() {
   const intl = useIntl();
   const navigate = useNavigate();
+  const location = useLocation();
+  const crumbs = useMemo(
+    () => crumbsFor(location.pathname).map((c) => ({ label: intl.formatMessage({ id: c.labelId }), to: c.to })),
+    [location.pathname, intl],
+  );
   const connectionState = useConnectionStore((s) => s.state);
   const connectionError = useConnectionStore((s) => s.error);
   const connectWithAuth = useConnectionStore((s) => s.connectWithAuth);
@@ -177,6 +293,11 @@ export function Header() {
     <header className="glass-chrome relative z-40 flex h-14 items-center justify-between border-b border-stone-300/40 px-4 md:px-6 dark:border-white/8">
       {/* Mobile nav drawer toggle (hidden at md+) */}
       <MobileMenuButton />
+
+      {/* Breadcrumb trail (paperclip P6) — hidden while a banner claims the row */}
+      {crumbs.length > 0 && !(connectionState === 'disconnected' && connectionError) && (
+        <Breadcrumbs items={crumbs} className="min-w-0 flex-1" />
+      )}
 
       {/* Connection error banner */}
       {connectionState === 'disconnected' && connectionError && (
@@ -229,6 +350,13 @@ export function Header() {
       {(connectionState !== 'disconnected' || !connectionError) && !(updateNotification?.available && !updateDismissed && connectionState !== 'disconnected') && <div />}
 
       <div className="flex items-center gap-2">
+        {/* HUD: today spend + XP capsule (§4.3) */}
+        <HudCostChip />
+        <HudXpChip />
+
+        {/* Notification bell — needs-me inbox quick-jump */}
+        <BellTrigger />
+
         {/* Command palette trigger (⌘K) */}
         <CommandTrigger />
 
@@ -245,9 +373,6 @@ export function Header() {
           <div className={cn('h-2 w-2 rounded-full', stateColor[connectionState] ?? 'bg-stone-400')} />
           <span>{stateLabel}</span>
         </button>
-
-        {/* Simple ⇄ Advanced shell switch */}
-        <ModeToggle />
 
         {/* Language Switcher */}
         <LanguageMenu />

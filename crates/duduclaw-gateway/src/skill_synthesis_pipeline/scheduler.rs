@@ -155,6 +155,19 @@ async fn run_once(home_dir: &Path, cfg: &SynthesisScheduleConfig) {
         .clone()
         .unwrap_or_else(|| resolve_default_agent(home_dir));
 
+    // WP1 master kill-switch: skill synthesis is an autonomous evolution path,
+    // so a frozen target agent (`[evolution] enabled = false`) must be a no-op
+    // even when the global `[skill_synthesis] auto_run` is on.
+    let agent_dir = home_dir.join("agents").join(&target_agent);
+    if !duduclaw_core::evolution_master_enabled(&agent_dir) {
+        info!(
+            target: "skill_synthesis",
+            agent = %target_agent,
+            "Auto-run skipped: [evolution] enabled = false (master switch off)"
+        );
+        return;
+    }
+
     let api_key = resolve_api_key(home_dir);
     if !cfg.dry_run && api_key.is_none() {
         warn!(

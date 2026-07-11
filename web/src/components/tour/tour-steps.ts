@@ -15,16 +15,21 @@ export interface TourStep {
   readonly minRole?: UserRole;
 }
 
+// Targets are the `data-tour="nav:<route>"` markers the Sidebar stamps on each
+// nav row (see Sidebar `NavRow` + the 員工 zone's "全部員工 →" link). The routes
+// track the v2「嘟嘟事務所」navigation, not the retired v1 IA — so the walk
+// visits the daily items, the staff roster, and the company section in order.
 const STEPS: ReadonlyArray<TourStep> = [
   { route: '/', target: '[data-tour="nav:/"]', titleKey: 'tour.step.dashboard.title', bodyKey: 'tour.step.dashboard.body' },
-  { route: '/webchat', target: '[data-tour="nav:/webchat"]', titleKey: 'tour.step.webchat.title', bodyKey: 'tour.step.webchat.body' },
+  { route: '/chat', target: '[data-tour="nav:/chat"]', titleKey: 'tour.step.chat.title', bodyKey: 'tour.step.chat.body' },
+  { route: '/inbox', target: '[data-tour="nav:/inbox"]', titleKey: 'tour.step.inbox.title', bodyKey: 'tour.step.inbox.body' },
+  { route: '/tasks', target: '[data-tour="nav:/tasks"]', titleKey: 'tour.step.tasks.title', bodyKey: 'tour.step.tasks.body' },
   { route: '/agents', target: '[data-tour="nav:/agents"]', titleKey: 'tour.step.agents.title', bodyKey: 'tour.step.agents.body' },
-  { route: '/channels', target: '[data-tour="nav:/channels"]', titleKey: 'tour.step.channels.title', bodyKey: 'tour.step.channels.body', minRole: 'admin' },
-  { route: '/accounts', target: '[data-tour="nav:/accounts"]', titleKey: 'tour.step.accounts.title', bodyKey: 'tour.step.accounts.body', minRole: 'admin' },
-  { route: '/inference', target: '[data-tour="nav:/inference"]', titleKey: 'tour.step.inference.title', bodyKey: 'tour.step.inference.body', minRole: 'admin' },
   { route: '/memory', target: '[data-tour="nav:/memory"]', titleKey: 'tour.step.memory.title', bodyKey: 'tour.step.memory.body' },
-  { route: '/wiki', target: '[data-tour="nav:/wiki"]', titleKey: 'tour.step.knowledge.title', bodyKey: 'tour.step.knowledge.body' },
-  { route: '/settings', target: '[data-tour="nav:/settings"]', titleKey: 'tour.step.settings.title', bodyKey: 'tour.step.settings.body', minRole: 'admin' },
+  { route: '/skills', target: '[data-tour="nav:/skills"]', titleKey: 'tour.step.skills.title', bodyKey: 'tour.step.skills.body' },
+  { route: '/knowledge', target: '[data-tour="nav:/knowledge"]', titleKey: 'tour.step.knowledge.title', bodyKey: 'tour.step.knowledge.body' },
+  { route: '/growth', target: '[data-tour="nav:/growth"]', titleKey: 'tour.step.growth.title', bodyKey: 'tour.step.growth.body' },
+  { route: '/manage', target: '[data-tour="nav:/manage"]', titleKey: 'tour.step.manage.title', bodyKey: 'tour.step.manage.body', minRole: 'manager' },
 ] as const;
 
 /** The tour stops the given role can actually reach, in order. */

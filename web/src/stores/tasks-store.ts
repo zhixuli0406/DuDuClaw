@@ -7,12 +7,15 @@ import {
   type TaskCreateParams,
   type TaskUpdateParams,
   type ActivityEvent,
+  type TaskComment,
 } from '@/lib/api';
 import { client } from '@/lib/ws-client';
 
 interface TasksStore {
   readonly tasks: ReadonlyArray<TaskInfo>;
   readonly activities: ReadonlyArray<ActivityEvent>;
+  /** Comments keyed by task id (oldest first). Loaded on demand per task. */
+  readonly comments: Readonly<Record<string, ReadonlyArray<TaskComment>>>;
   readonly loading: boolean;
   readonly error: string | null;
   readonly filterAgent: string | null;
@@ -26,6 +29,18 @@ interface TasksStore {
   setFilterAgent: (agentId: string | null) => void;
   setFilterPriority: (priority: TaskPriority | null) => void;
   fetchActivities: (params?: { agent_id?: string; limit?: number }) => Promise<void>;
+  fetchComments: (taskId: string) => Promise<void>;
+  addComment: (taskId: string, body: string) => Promise<TaskComment | null>;
+}
+
+/** Insert a comment into a task's list, de-duplicating by id and keeping the
+ *  list oldest-first. Pure — exported for the store reducer and its tests. */
+export function mergeComment(
+  existing: ReadonlyArray<TaskComment>,
+  incoming: TaskComment,
+): ReadonlyArray<TaskComment> {
+  if (existing.some((c) => c.id === incoming.id)) return existing;
+  return [...existing, incoming].sort((a, b) => a.created_at.localeCompare(b.created_at));
 }
 
 export const useTasksStore = create<TasksStore>((set, get) => {
@@ -53,9 +68,18 @@ export const useTasksStore = create<TasksStore>((set, get) => {
     set({ activities: [event, ...get().activities].slice(0, 100) });
   });
 
+  // L2: real-time task comments — merge into the per-task list (dedup by id so
+  // the author's own optimistic insert isn't duplicated by the broadcast echo).
+  client.subscribe('task.comment', (payload) => {
+    const c = payload as TaskComment;
+    const existing = get().comments[c.task_id] ?? [];
+    set({ comments: { ...get().comments, [c.task_id]: mergeComment(existing, c) } });
+  });
+
   return {
     tasks: [],
     activities: [],
+    comments: {},
     loading: false,
     error: null,
     filterAgent: null,
@@ -139,6 +163,28 @@ export const useTasksStore = create<TasksStore>((set, get) => {
         set({ activities: result?.events ?? [] });
       } catch (e) {
         set({ error: String(e) });
+      }
+    },
+
+    fetchComments: async (taskId) => {
+      try {
+        const result = await api.tasks.comments(taskId);
+        set({ comments: { ...get().comments, [taskId]: result?.comments ?? [] } });
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    addComment: async (taskId, body) => {
+      try {
+        const result = await api.tasks.comment(taskId, body);
+        const c = result.comment;
+        const existing = get().comments[taskId] ?? [];
+        set({ comments: { ...get().comments, [taskId]: mergeComment(existing, c) } });
+        return c;
+      } catch (e) {
+        set({ error: String(e) });
+        return null;
       }
     },
   };

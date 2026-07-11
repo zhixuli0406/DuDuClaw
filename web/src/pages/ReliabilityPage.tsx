@@ -21,6 +21,8 @@ import {
   Badge,
   Button,
   Toolbar,
+  Mono,
+  CharacterAvatar,
   controlClass,
 } from '@/components/ui';
 
@@ -198,7 +200,7 @@ export function ReliabilityPage() {
             </select>
 
             {/* Window selector */}
-            <div className="flex gap-1 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-fill)] p-1">
+            <div className="flex gap-1 rounded-control border border-[var(--panel-border)] bg-[var(--panel-fill)] p-1">
               {([7, 14, 30] as WindowDays[]).map((d) => (
                 <button
                   key={d}
@@ -231,10 +233,11 @@ export function ReliabilityPage() {
 
       {/* Metadata row */}
       {summary && !loading && (
-        <div className="flex flex-wrap items-center gap-4 rounded-lg bg-stone-500/5 px-4 py-2.5 text-sm dark:bg-white/5">
-          <span className="text-stone-500 dark:text-stone-400">
+        <div className="flex flex-wrap items-center gap-4 rounded-control bg-stone-500/5 px-4 py-2.5 text-sm dark:bg-white/5">
+          <span className="flex items-center gap-2 text-stone-500 dark:text-stone-400">
             {intl.formatMessage({ id: 'reliability.agent' })}
             {': '}
+            <CharacterAvatar agentId={summary.agent_id} name={summary.agent_id} size={24} />
             <span className="font-medium text-stone-700 dark:text-stone-300">
               {summary.agent_id}
             </span>
@@ -242,26 +245,28 @@ export function ReliabilityPage() {
           <span className="text-stone-500 dark:text-stone-400">
             {intl.formatMessage({ id: 'reliability.events' })}
             {': '}
-            <span className="font-medium text-stone-700 dark:text-stone-300">
+            <Mono className="font-medium text-stone-700 dark:text-stone-300">
               {summary.total_events.toLocaleString()}
-            </span>
+            </Mono>
           </span>
-          <span className="ml-auto text-xs text-stone-400 dark:text-stone-500">
+          <span className="ml-auto flex items-center gap-1 text-xs text-stone-400 dark:text-stone-500">
             {intl.formatMessage({ id: 'reliability.generatedAt' })}
             {': '}
-            {new Date(summary.generated_at).toLocaleString('zh-TW', {
-              month: 'short',
-              day: 'numeric',
-              hour: '2-digit',
-              minute: '2-digit',
-            })}
+            <Mono className="text-xs text-stone-400 dark:text-stone-500">
+              {new Date(summary.generated_at).toLocaleString('zh-TW', {
+                month: 'short',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+              })}
+            </Mono>
           </span>
         </div>
       )}
 
       {/* No audit data banner */}
       {noData && !loading && (
-        <div className="flex items-center gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700 dark:border-amber-800/50 dark:bg-amber-900/20 dark:text-amber-400">
+        <div className="flex items-center gap-3 rounded-control border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700 dark:border-amber-800/50 dark:bg-amber-900/20 dark:text-amber-400">
           <AlertTriangle className="h-4 w-4 shrink-0" />
           {intl.formatMessage({ id: 'reliability.noEvents' }, { days: windowDays })}
         </div>

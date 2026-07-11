@@ -18,7 +18,11 @@ authors = ["DuDuClaw Contributors"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# `macos-private-api` is required for the transparent desktop-pet window
+# (§7.4). It pairs with `"macOSPrivateApi": true` in tauri.conf.json. Note:
+# apps using the private API cannot ship on the Mac App Store — DuDuClaw is
+# distributed as a signed DMG (Developer ID), so this is fine.
+tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-shell = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"

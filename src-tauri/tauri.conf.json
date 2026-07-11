@@ -10,6 +10,8 @@
     "frontendDist": "../crates/duduclaw-dashboard/dist"
   },
   "app": {
+    "withGlobalTauri": true,
+    "macOSPrivateApi": true,
     "windows": [
       {
         "title": "DuDuClaw",

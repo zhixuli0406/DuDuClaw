@@ -73,6 +73,21 @@ pub struct ActivityRow {
     pub metadata: Option<String>, // JSON string
 }
 
+// ── Comment row ─────────────────────────────────────────────
+
+/// L2: a human-authored comment on a task. Distinct from `ActivityRow`
+/// (system-generated events) — comments are free-text notes left by a logged-in
+/// user, rendered in the task detail "discussion" tab interleaved with activity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommentRow {
+    pub id: String,
+    pub task_id: String,
+    /// The authoring user id (from the authenticated `UserContext`).
+    pub author_user: String,
+    pub body: String,
+    pub created_at: String,
+}
+
 // ── Store ───────────────────────────────────────────────────
 
 pub struct TaskStore {
@@ -131,7 +146,17 @@ impl TaskStore {
 
              CREATE INDEX IF NOT EXISTS idx_activity_agent ON activity(agent_id);
              CREATE INDEX IF NOT EXISTS idx_activity_type  ON activity(event_type);
-             CREATE INDEX IF NOT EXISTS idx_activity_ts    ON activity(timestamp DESC);",
+             CREATE INDEX IF NOT EXISTS idx_activity_ts    ON activity(timestamp DESC);
+
+             CREATE TABLE IF NOT EXISTS task_comments (
+                 id          TEXT PRIMARY KEY,
+                 task_id     TEXT NOT NULL,
+                 author_user TEXT NOT NULL,
+                 body        TEXT NOT NULL,
+                 created_at  TEXT NOT NULL
+             );
+
+             CREATE INDEX IF NOT EXISTS idx_comments_task ON task_comments(task_id, created_at);",
         )
         .map_err(|e| format!("init task store schema: {e}"))?;
         Ok(())
@@ -392,6 +417,46 @@ impl TaskStore {
 
         Ok((rows, total))
     }
+
+    // ── Task comments (L2) ──────────────────────────────────
+
+    /// Append a comment. Caller is responsible for verifying the task exists and
+    /// that `body` is non-empty and length-capped.
+    pub async fn insert_comment(&self, row: &CommentRow) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO task_comments (id, task_id, author_user, body, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![row.id, row.task_id, row.author_user, row.body, row.created_at],
+        )
+        .map_err(|e| format!("insert comment: {e}"))?;
+        Ok(())
+    }
+
+    /// All comments for a task, oldest first (chronological for the timeline).
+    pub async fn list_comments(&self, task_id: &str) -> Result<Vec<CommentRow>, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, task_id, author_user, body, created_at
+                 FROM task_comments WHERE task_id = ?1 ORDER BY created_at ASC",
+            )
+            .map_err(|e| format!("prepare comments: {e}"))?;
+        let rows = stmt
+            .query_map(params![task_id], |r| {
+                Ok(CommentRow {
+                    id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    author_user: r.get(2)?,
+                    body: r.get(3)?,
+                    created_at: r.get(4)?,
+                })
+            })
+            .map_err(|e| format!("query comments: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect comments: {e}"))?;
+        Ok(rows)
+    }
 }
 
 fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
@@ -451,7 +516,61 @@ pub fn introduces_parent_cycle(
 
 #[cfg(test)]
 mod tests {
-    use super::introduces_parent_cycle;
+    use super::{introduces_parent_cycle, CommentRow, TaskRow, TaskStore};
+
+    fn temp_store() -> (TaskStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TaskStore::open(dir.path()).expect("open store");
+        (store, dir)
+    }
+
+    fn comment(id: &str, task: &str, at: &str, body: &str) -> CommentRow {
+        CommentRow {
+            id: id.into(),
+            task_id: task.into(),
+            author_user: "user-1".into(),
+            body: body.into(),
+            created_at: at.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn comment_insert_and_list_roundtrip_is_chronological() {
+        let (store, _dir) = temp_store();
+        // Seed a task so the comment references a real row.
+        let task = TaskRow::new(
+            "t1".into(),
+            "Task One".into(),
+            String::new(),
+            "medium".into(),
+            "bot".into(),
+            "user-1".into(),
+        );
+        store.insert_task(&task).await.expect("insert task");
+
+        // Insert out of chronological order; list must return oldest-first.
+        store
+            .insert_comment(&comment("c2", "t1", "2026-07-10T10:05:00Z", "second"))
+            .await
+            .expect("insert c2");
+        store
+            .insert_comment(&comment("c1", "t1", "2026-07-10T10:00:00Z", "first"))
+            .await
+            .expect("insert c1");
+
+        let rows = store.list_comments("t1").await.expect("list");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].body, "first", "oldest comment leads");
+        assert_eq!(rows[1].body, "second");
+        assert_eq!(rows[0].author_user, "user-1");
+    }
+
+    #[tokio::test]
+    async fn comment_list_unknown_task_is_empty() {
+        let (store, _dir) = temp_store();
+        let rows = store.list_comments("does-not-exist").await.expect("list");
+        assert!(rows.is_empty(), "no comments for an unknown task");
+    }
 
     fn edges(pairs: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
         pairs

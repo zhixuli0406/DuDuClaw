@@ -246,6 +246,7 @@ export function ReportPage() {
           {costs.length === 0 && (
             <EmptyState
               icon={DollarSign}
+              dudu="reading"
               title={intl.formatMessage({ id: 'common.noData' })}
             />
           )}

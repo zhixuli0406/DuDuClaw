@@ -1,6 +1,7 @@
 import { useEffect, useRef, useCallback } from 'react';
 import * as d3 from 'd3';
 import type { AgentDetail } from '@/lib/api';
+import { characterFor } from '@/lib/character-gen';
 
 // ── Types ─────────────────────────────────────────────────────
 
@@ -266,15 +267,47 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
       .attr('rx', 2)
       .attr('fill', (d) => ROLE_COLORS[d.data.role] ?? '#6b7280');
 
-    // Icon
-    nodeGroups
-      .append('text')
-      .attr('x', 16)
-      .attr('y', NODE_H / 2 + 1)
-      .attr('text-anchor', 'start')
-      .attr('dominant-baseline', 'middle')
-      .attr('font-size', '20px')
-      .text((d) => d.data.icon);
+    // Character head (role-ified node avatar §5.4 T6.3) — drawn as SVG from the
+    // same tint/accessory seed as CharacterAvatar (character-gen), so an agent's
+    // face is identical here and in the roster. Kept imperative (no React-in-d3)
+    // to avoid per-node root churn on every re-render.
+    const HEAD_CX = 24;
+    const HEAD_CY = NODE_H / 2;
+    const HEAD_R = 13;
+    nodeGroups.each(function (d) {
+      const g = d3.select(this);
+      if (d.data.name === '__root__') {
+        // Synthetic root keeps the paw glyph.
+        g.append('text')
+          .attr('x', HEAD_CX)
+          .attr('y', HEAD_CY + 1)
+          .attr('text-anchor', 'middle')
+          .attr('dominant-baseline', 'middle')
+          .attr('font-size', '22px')
+          .text(d.data.icon);
+        return;
+      }
+      const traits = characterFor(d.data.name);
+      // Head
+      g.append('circle')
+        .attr('cx', HEAD_CX)
+        .attr('cy', HEAD_CY)
+        .attr('r', HEAD_R)
+        .style('fill', `var(--agent-${traits.tintIndex}a)`)
+        .attr('stroke', statusColors[d.data.status]?.stroke ?? '#a8a29e')
+        .attr('stroke-width', 1.5);
+      // Eyes (theme-aware ink)
+      g.append('circle').attr('cx', HEAD_CX - 4).attr('cy', HEAD_CY - 1).attr('r', 1.7).style('fill', 'var(--character-ink)');
+      g.append('circle').attr('cx', HEAD_CX + 4).attr('cy', HEAD_CY - 1).attr('r', 1.7).style('fill', 'var(--character-ink)');
+      // Antenna accessory — the house look (weighted highest in character-gen)
+      if (traits.accessory === 'antenna') {
+        g.append('line')
+          .attr('x1', HEAD_CX).attr('y1', HEAD_CY - HEAD_R)
+          .attr('x2', HEAD_CX).attr('y2', HEAD_CY - HEAD_R - 5)
+          .attr('stroke', subtextColor).attr('stroke-width', 1.2).attr('stroke-linecap', 'round');
+        g.append('circle').attr('cx', HEAD_CX).attr('cy', HEAD_CY - HEAD_R - 6).attr('r', 2).style('fill', 'var(--xp)');
+      }
+    });
 
     // Display name
     nodeGroups
@@ -316,14 +349,14 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
         return m.replace('claude-', '');
       });
 
-    // Pulse animation for active nodes
+    // Status dot (top-right) — colored by lifecycle status for every node.
     nodeGroups
-      .filter((d) => d.data.status === 'active')
+      .filter((d) => d.data.name !== '__root__')
       .append('circle')
       .attr('cx', NODE_W - 16)
       .attr('cy', 16)
       .attr('r', 4)
-      .attr('fill', statusColors.active.stroke);
+      .attr('fill', (d) => statusColors[d.data.status]?.stroke ?? '#a8a29e');
   }, [agents, onNodeClick]);
 
   // Render on mount and when agents change

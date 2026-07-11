@@ -8,6 +8,7 @@
 //! environment (no Tauri toolchain) — see Phase D verification notes.
 
 mod lifecycle;
+mod mascot_window;
 mod sidecar;
 
 use std::sync::Arc;
@@ -20,6 +21,13 @@ use tauri::{
 };
 
 use sidecar::{SidecarManager, SidecarStatus};
+
+/// Show/focus the main dashboard window. Invoked by the desktop pet
+/// (`/mascot-overlay` → `window.__TAURI__.core.invoke('open_main_window')`).
+#[tauri::command]
+fn open_main_window(app: AppHandle) {
+    show_main_window(&app);
+}
 
 fn main() {
     tracing_subscriber::fmt()
@@ -44,8 +52,16 @@ fn main() {
             None,
         ))
         .manage(manager.clone())
+        .invoke_handler(tauri::generate_handler![open_main_window])
         .setup(move |app| {
             let handle = app.handle().clone();
+
+            // Create the desktop-pet window up front (hidden); the tray toggles
+            // its visibility. Non-fatal if it fails (e.g. transparency
+            // unsupported) — the main app is unaffected.
+            if let Err(e) = mascot_window::build_mascot_window(&handle) {
+                tracing::warn!("desktop-pet window init failed: {e}");
+            }
 
             // Start (or attach to) the gateway, then point the window at it.
             let port = manager
@@ -127,11 +143,12 @@ fn show_main_window(app: &AppHandle) {
 
 fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "開啟 DuDuClaw", true, None::<&str>)?;
+    let mascot = MenuItem::with_id(app, "toggle_mascot", "顯示/隱藏桌寵", true, None::<&str>)?;
     let restart = MenuItem::with_id(app, "restart", "重啟背景服務", true, None::<&str>)?;
     let status = MenuItem::with_id(app, "status", tray_status_label(manager), false, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "結束", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &status, &restart, &sep, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &mascot, &status, &restart, &sep, &quit])?;
 
     let manager_for_menu = manager.clone();
     TrayIconBuilder::with_id("main-tray")
@@ -140,6 +157,11 @@ fn build_tray(app: &AppHandle, manager: &Arc<SidecarManager>) -> tauri::Result<(
         .menu(&menu)
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "open" => show_main_window(app),
+            "toggle_mascot" => {
+                if let Err(e) = mascot_window::toggle_mascot_window(app) {
+                    tracing::warn!("toggle desktop pet failed: {e}");
+                }
+            }
             "restart" => {
                 manager_for_menu.stop();
                 let _ = manager_for_menu.start(app);

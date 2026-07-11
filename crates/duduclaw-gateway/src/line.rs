@@ -317,7 +317,12 @@ async fn line_webhook_handler(
 
             // ── Build input text + attachment references ──
             let mut attachment_lines: Vec<String> = Vec::new();
-            let base_text = msg.text.as_deref().unwrap_or("").to_string();
+            let mut base_text = msg.text.as_deref().unwrap_or("").to_string();
+            // Voice-to-text: an `audio` message is transcribed and folded into the
+            // input text (mirrors Telegram). Additive — the saved attachment
+            // reference is still emitted, so a failed/keyless transcription
+            // degrades gracefully rather than dropping the message.
+            let mut voice_text = String::new();
 
             // Handle non-text message types: download content and save to disk
             if msg.msg_type != "text" {
@@ -338,6 +343,26 @@ async fn line_webhook_handler(
                     };
 
                     if let Some(data) = content_data {
+                        // Transcribe voice/audio messages to text.
+                        if msg.msg_type == "audio" {
+                            match duduclaw_inference::whisper::transcribe(
+                                &data,
+                                Some("zh"),
+                                &duduclaw_inference::whisper::WhisperMode::Api,
+                            )
+                            .await
+                            {
+                                Ok(t) if !t.trim().is_empty() => {
+                                    info!(
+                                        "🎙 LINE [{sender}] transcribed: {}",
+                                        duduclaw_core::truncate_bytes(&t, 80)
+                                    );
+                                    voice_text = t;
+                                }
+                                Ok(_) => {}
+                                Err(e) => warn!("LINE voice transcription failed: {e}"),
+                            }
+                        }
                         let mime = crate::media::detect_mime(&data);
                         let mt = crate::media::media_type_from_mime(&mime);
                         let fname = if let Some(name) = &msg.file_name {
@@ -354,6 +379,15 @@ async fn line_webhook_handler(
                         }
                     }
                 }
+            }
+
+            // Fold any transcription into the base text.
+            if !voice_text.is_empty() {
+                base_text = if base_text.trim().is_empty() {
+                    voice_text
+                } else {
+                    format!("{base_text}\n{voice_text}")
+                };
             }
 
             // Combine text + attachment references

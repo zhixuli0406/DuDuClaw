@@ -41,6 +41,15 @@ pub enum ChatMessage {
     UserMessage {
         content: String,
         session_id: Option<String>,
+        /// L1 (per-agent routing): which AI staff member should answer. When
+        /// present and the id resolves to a loaded agent, the reply runs against
+        /// that agent's directory / SOUL / session (a per-agent session suffix
+        /// keeps each employee's context isolated). When absent, behaviour is
+        /// byte-compatible with the pre-L1 default-agent path. An id that does
+        /// not resolve produces an `error` frame (fail-closed, no silent
+        /// fall-through to the wrong agent).
+        #[serde(default)]
+        agent: Option<String>,
         /// Uploaded files (base64). Saved to disk and referenced by path in the
         /// prompt, mirroring the channel attachment pipeline (Telegram/LINE).
         #[serde(default)]
@@ -53,7 +62,49 @@ pub enum ChatMessage {
     /// activity / TODO task board). Purely informational; superseded by
     /// `assistant_done`.
     #[serde(rename = "progress")]
-    Progress { content: String },
+    Progress {
+        content: String,
+        /// "tool" | "todo" | "keepalive" — lets the dashboard build a live
+        /// "agentic task insights" timeline instead of just a status string.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        /// Tool name for `kind == "tool"` (e.g. "Read", "Bash", "Grep").
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
+        /// File path / search pattern extracted from the tool input, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    /// Server → Client: a tool-step boundary in the agent's live task tree
+    /// (openhuman-parity project C-P1). Emitted per `tool_use` block (start)
+    /// and its matching `tool_result` (end), parsed from the Claude CLI
+    /// stream-json. Purely additive to the text stream — older clients that
+    /// don't recognise `type: "step"` MUST ignore it (they already ignore
+    /// unknown frame types). The frontend (C-P2) folds these into a
+    /// collapsible "Agentic task insights" tree.
+    ///
+    /// Wire shape (stable):
+    /// ```json
+    /// {"type":"step","phase":"start","tool":"Read","summary":"/etc/hosts","depth":0,"ts":1720598400123}
+    /// {"type":"step","phase":"start","tool":"Bash","summary":"cargo test","depth":1,"ts":1720598400456}
+    /// {"type":"step","phase":"end","tool":"Bash","depth":0,"ts":1720598400900}
+    /// ```
+    /// - `phase`: `"start"` | `"end"`.
+    /// - `tool`: tool name (e.g. `Read` / `Bash` / `Grep` / `Task`).
+    /// - `summary`: CJK-safe args summary, ≤120 chars; omitted on `end` and
+    ///   when the tool has no summarisable input.
+    /// - `depth`: nesting level — count of still-open tool calls when this step
+    ///   started (a `Task` sub-agent's inner tools surface at `depth ≥ 1`).
+    /// - `ts`: unix epoch milliseconds.
+    #[serde(rename = "step")]
+    Step {
+        phase: String,
+        tool: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        depth: usize,
+        ts: u64,
+    },
     /// Server → Client: assistant finished responding.
     #[serde(rename = "assistant_done")]
     AssistantDone {
@@ -327,8 +378,58 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                         };
 
                         match chat_msg {
-                            ChatMessage::UserMessage { content, session_id: custom_session, attachments } => {
-                                let sid = custom_session.as_deref().unwrap_or(&session_id);
+                            ChatMessage::UserMessage { content, session_id: custom_session, agent: requested_agent, attachments } => {
+                                let base_sid = custom_session.as_deref().unwrap_or(&session_id);
+
+                                // ── L1: resolve the requested conversation partner ──
+                                // A non-empty `agent` must resolve to a loaded
+                                // agent; an unknown id fails closed with an error
+                                // frame rather than silently answering as the
+                                // main agent (identity-mixing guard). Absent →
+                                // default-agent path (byte-compatible).
+                                let requested_agent = requested_agent
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty());
+                                let resolved_agent: Option<String> = match requested_agent {
+                                    Some(name) => {
+                                        let exists = {
+                                            let reg = state.ctx.registry.read().await;
+                                            reg.get(name).is_some()
+                                        };
+                                        if exists {
+                                            Some(name.to_string())
+                                        } else {
+                                            let err = ChatMessage::Error {
+                                                message: format!("unknown agent: {name}"),
+                                            };
+                                            if let Ok(json) = serde_json::to_string(&err) {
+                                                let _ = sink.send(Message::Text(json.into())).await;
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                    None => None,
+                                };
+
+                                // Per-agent session isolation: append an
+                                // `#agent:<id>` suffix so employee A's context
+                                // never leaks into employee B's session. The
+                                // channel prefix (split at ':') stays "webchat",
+                                // so the access gate still classifies it. Default
+                                // path keeps the bare `base_sid` (byte-compatible).
+                                let sid_owned;
+                                let sid: &str = match &resolved_agent {
+                                    Some(a) => {
+                                        sid_owned = format!("{base_sid}#agent:{a}");
+                                        &sid_owned
+                                    }
+                                    None => base_sid,
+                                };
+                                // The agent id used for chat-command handling /
+                                // contract enforcement — the selected agent when
+                                // one was routed, else the default main agent.
+                                let effective_agent_id: &str = resolved_agent.as_deref().unwrap_or(&agent_id);
 
                                 // Persist any uploaded files and append path references
                                 // to the prompt — the agent (Claude CLI) reads them from
@@ -348,7 +449,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 if crate::chat_commands::is_command(&content) {
                                     if let Some(cmd) = crate::chat_commands::parse_command(&content, None) {
                                         let reply = crate::chat_commands::handle_command(
-                                            &cmd, &state.ctx, sid, &agent_id, true,
+                                            &cmd, &state.ctx, sid, effective_agent_id, true,
                                         ).await;
                                         let done = ChatMessage::AssistantDone {
                                             content: reply,
@@ -364,21 +465,62 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // Build AI reply, interleaving progress events
                                 // (tool activity / TODO board) onto the socket
                                 // while the task runs.
-                                let (ptx, mut prx) =
-                                    tokio::sync::mpsc::unbounded_channel::<String>();
+                                let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel::<
+                                    crate::channel_reply::ProgressEvent,
+                                >();
                                 let on_progress: crate::channel_reply::ProgressCallback =
                                     Box::new(move |event| {
-                                        let _ = ptx.send(event.to_display());
+                                        // Forward the STRUCTURED event so the dashboard can
+                                        // build a task-insights timeline (not just a string).
+                                        let _ = ptx.send(event);
                                     });
-                                let work = crate::channel_reply::build_reply_with_session(
-                                    &full_content, &state.ctx, sid, &user_id, Some(on_progress),
-                                );
+                                // Route to the selected agent (per-agent
+                                // directory / SOUL / session) when one was
+                                // resolved, else the default-agent path. Both
+                                // branches consume `on_progress`; they are
+                                // mutually exclusive so the single move is valid.
+                                let work = async {
+                                    match &resolved_agent {
+                                        Some(a) => {
+                                            crate::channel_reply::build_reply_for_agent(
+                                                &full_content, &state.ctx, a, sid, &user_id, Some(on_progress),
+                                            )
+                                            .await
+                                        }
+                                        None => {
+                                            crate::channel_reply::build_reply_with_session(
+                                                &full_content, &state.ctx, sid, &user_id, Some(on_progress),
+                                            )
+                                            .await
+                                        }
+                                    }
+                                };
                                 tokio::pin!(work);
                                 let reply = loop {
                                     tokio::select! {
                                         r = &mut work => break r,
-                                        Some(p) = prx.recv() => {
-                                            let msg = ChatMessage::Progress { content: p };
+                                        Some(ev) = prx.recv() => {
+                                            use crate::channel_reply::ProgressEvent;
+                                            let content = ev.to_display();
+                                            let msg = match ev {
+                                                ProgressEvent::ToolUse { tool, detail } => ChatMessage::Progress {
+                                                    content, kind: Some("tool".into()), tool: Some(tool), detail,
+                                                },
+                                                ProgressEvent::TodoUpdate { .. } => ChatMessage::Progress {
+                                                    content, kind: Some("todo".into()), tool: None, detail: None,
+                                                },
+                                                ProgressEvent::Keepalive => ChatMessage::Progress {
+                                                    content, kind: Some("keepalive".into()), tool: None, detail: None,
+                                                },
+                                                // C-P1: structured step boundary → dedicated `step` frame.
+                                                ProgressEvent::Step(step) => ChatMessage::Step {
+                                                    phase: step.phase.as_str().to_string(),
+                                                    tool: step.tool,
+                                                    summary: step.summary,
+                                                    depth: step.depth,
+                                                    ts: step.ts_ms,
+                                                },
+                                            };
                                             if let Ok(json) = serde_json::to_string(&msg) {
                                                 let _ = sink.send(Message::Text(json.into())).await;
                                             }
@@ -540,6 +682,55 @@ mod tests {
             result.is_err(),
             "a user pending a forced password change must be rejected"
         );
+    }
+
+    // ── L1: per-agent routing protocol parsing ──────────────
+
+    /// Extract `(content, session_id, agent)` from a parsed `UserMessage`,
+    /// mirroring how the socket loop reads the frame. Panics on any other
+    /// variant so a regression in the tag mapping is loud.
+    fn parse_user_message(json: &str) -> (String, Option<String>, Option<String>) {
+        match serde_json::from_str::<ChatMessage>(json).expect("parse user_message") {
+            ChatMessage::UserMessage { content, session_id, agent, .. } => (content, session_id, agent),
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_message_without_agent_parses_to_none() {
+        // Byte-compatible legacy frame: no `agent` key at all.
+        let (content, sid, agent) =
+            parse_user_message(r#"{"type":"user_message","content":"hi","session_id":"webchat:x"}"#);
+        assert_eq!(content, "hi");
+        assert_eq!(sid.as_deref(), Some("webchat:x"));
+        assert_eq!(agent, None, "absent agent must deserialize to None");
+    }
+
+    #[test]
+    fn user_message_with_agent_carries_id() {
+        let (_content, _sid, agent) = parse_user_message(
+            r#"{"type":"user_message","content":"hi","session_id":"webchat:x","agent":"sales-bot"}"#,
+        );
+        assert_eq!(agent.as_deref(), Some("sales-bot"));
+    }
+
+    #[test]
+    fn user_message_with_null_agent_is_none() {
+        // An explicit null (some clients send it) must behave like absence.
+        let (_content, _sid, agent) = parse_user_message(
+            r#"{"type":"user_message","content":"hi","session_id":"webchat:x","agent":null}"#,
+        );
+        assert_eq!(agent, None);
+    }
+
+    #[test]
+    fn per_agent_session_suffix_preserves_channel_prefix() {
+        // The suffix used for session isolation must keep "webchat" as the
+        // first `:`-delimited segment so the access gate still classifies it.
+        let base = "webchat:peer:abcd";
+        let suffixed = format!("{base}#agent:sales-bot");
+        assert_eq!(suffixed.split(':').next(), Some("webchat"));
+        assert_ne!(suffixed, base, "distinct agents get distinct session ids");
     }
 
     #[test]

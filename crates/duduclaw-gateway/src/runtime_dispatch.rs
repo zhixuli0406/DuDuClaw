@@ -140,6 +140,16 @@ pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, S
         // Always fall back to Claude (the always-available core) if nothing set.
         .or(Some(RuntimeType::Claude));
 
+    // Budget circuit breaker (cost *enforcement*, not just observation). Blocks
+    // a new LLM call when the agent's rolling spend has hit its hard cap. Inert
+    // when no `[budget]` cap is set or `hard_stop = false`; fail-open when
+    // telemetry is unavailable (a kill switch must not brick work if its own DB
+    // hiccups). Utility calls (empty agent_id) are exempt.
+    let budget = crate::budget::check_agent_budget(req.home_dir, req.agent_dir, req.agent_id).await;
+    if budget.is_denied() {
+        return Err(budget.user_message());
+    }
+
     let reg = registry(req.home_dir).await;
 
     let ctx = RuntimeContext {

@@ -14,6 +14,14 @@ use tracing::info;
 /// Threshold (in tokens) above which a session should be compressed.
 const COMPRESSION_THRESHOLD: u32 = 50_000;
 
+/// Escape LIKE metacharacters so a contact/session prefix containing `%`/`_`
+/// matches literally under an `ESCAPE '\'` clause (GDPR prefix matching).
+fn gdpr_like_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 /// Number of connections in the pool.
 const POOL_SIZE: usize = 4;
 
@@ -145,6 +153,28 @@ impl SessionManager {
         let _ = conn.execute(
             "ALTER TABLE sessions ADD COLUMN last_summarized_at TEXT",
             [],
+        );
+
+        // WP5 T5.3: soft-delete. `archived_at` NULL = live; set = archived
+        // (hidden from normal listings, still replayable / searchable). Real
+        // deletion is `purge_session`.
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN archived_at TEXT",
+            [],
+        );
+
+        // WP5 T5.1: reply-to → session mapping. When the bot sends a reply we
+        // record which session that outbound message belongs to; when the user
+        // replies to that message, we resume the same session instead of the
+        // per-channel main session.
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS message_session_map (
+                channel TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (channel, message_id)
+            );",
         );
         // Ignore errors — columns already exist on subsequent runs
 
@@ -351,13 +381,48 @@ impl SessionManager {
     /// Returns the number of sessions removed.
     /// Delete a session and all its messages. Used by /reset commands.
     /// Uses a transaction to ensure atomicity (consistent with compress()).
+    /// WP5 T5.3: "delete" now ARCHIVES (soft delete). Messages are retained and
+    /// the session stays replayable/searchable; it just drops out of normal
+    /// listings. Use [`Self::purge_session`] for a real, irreversible delete.
+    /// Idempotent — archiving an already-archived session is a no-op.
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+        let conn = self.acquire().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE sessions SET archived_at = ?2 WHERE id = ?1 AND archived_at IS NULL",
+            params![session_id, now],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        info!(session_id, "Session archived (soft delete)");
+        Ok(())
+    }
+
+    /// Un-archive a session so it reappears in normal listings.
+    pub async fn unarchive_session(&self, session_id: &str) -> Result<()> {
+        let conn = self.acquire().await;
+        conn.execute(
+            "UPDATE sessions SET archived_at = NULL WHERE id = ?1",
+            params![session_id],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Hard delete — irreversibly removes the session and its messages. This is
+    /// the pre-WP5 `delete_session` behaviour, now behind an explicit name.
+    pub async fn purge_session(&self, session_id: &str) -> Result<()> {
         let conn = self.acquire().await;
         let tx = conn.unchecked_transaction()
             .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
 
         tx.execute(
             "DELETE FROM session_messages WHERE session_id = ?1",
+            params![session_id],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+
+        tx.execute(
+            "DELETE FROM message_session_map WHERE session_id = ?1",
             params![session_id],
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
@@ -371,35 +436,154 @@ impl SessionManager {
         tx.commit()
             .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
 
-        info!(session_id, "Session deleted");
+        info!(session_id, "Session purged (hard delete)");
         Ok(())
     }
 
-    pub async fn cleanup_inactive(&self, max_age_hours: u64) -> Result<u64> {
-        let conn = self.acquire().await;
-        let cutoff = chrono::Utc::now() - chrono::Duration::hours(max_age_hours as i64);
-        let cutoff_str = cutoff.to_rfc3339();
+    // ── WP5 T5.1: reply-to → session mapping ───────────────────────
 
+    /// Record that an outbound bot message belongs to `session_id`, so a later
+    /// user reply to that message can resume the same session.
+    pub async fn record_message_session(
+        &self,
+        channel: &str,
+        message_id: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        let conn = self.acquire().await;
+        let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "DELETE FROM session_messages WHERE session_id IN (
-                SELECT id FROM sessions WHERE last_active < ?1
-            )",
-            params![cutoff_str],
+            "INSERT OR REPLACE INTO message_session_map (channel, message_id, session_id, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![channel, message_id, session_id, now],
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        Ok(())
+    }
 
-        let deleted = conn
+    /// Resolve the session a user is replying to, given the replied-to message
+    /// id on a channel. `None` ⇒ not a tracked reply ⇒ caller uses the main
+    /// per-channel session.
+    pub async fn session_for_reply(
+        &self,
+        channel: &str,
+        message_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.acquire().await;
+        let r: std::result::Result<String, _> = conn.query_row(
+            "SELECT session_id FROM message_session_map WHERE channel = ?1 AND message_id = ?2",
+            params![channel, message_id],
+            |row| row.get(0),
+        );
+        match r {
+            Ok(s) => Ok(Some(s)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(DuDuClawError::Gateway(format!("session_for_reply: {e}"))),
+        }
+    }
+
+    /// GDPR: session ids belonging to a contact. A "contact" here is the
+    /// `"<channel>:<chat_id>"` session-id prefix (sessions are keyed by that
+    /// string; threads add a `:<tid>` suffix). Matches the exact id and any
+    /// `<contact>:*`. LIKE wildcards in the contact are escaped so a literal
+    /// `%`/`_` cannot widen the match.
+    pub async fn sessions_for_contact(&self, contact: &str) -> Result<Vec<String>> {
+        let conn = self.acquire().await;
+        let like = format!("{}:%", gdpr_like_escape(contact));
+        let mut stmt = conn
+            .prepare("SELECT id FROM sessions WHERE id = ?1 OR id LIKE ?2 ESCAPE '\\'")
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![contact, like], |r| r.get::<_, String>(0))
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| DuDuClawError::Gateway(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    /// GDPR erase: hard-delete every session (and its messages) belonging to a
+    /// contact prefix, in one transaction. Returns `(sessions_deleted,
+    /// messages_deleted)`. Messages are deleted first via a subquery that still
+    /// sees the `sessions` rows.
+    pub async fn erase_sessions_for_contact(&self, contact: &str) -> Result<(u64, u64)> {
+        let conn = self.acquire().await;
+        let like = format!("{}:%", gdpr_like_escape(contact));
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
+        let messages = tx
             .execute(
-                "DELETE FROM sessions WHERE last_active < ?1",
-                params![cutoff_str],
+                "DELETE FROM session_messages WHERE session_id IN (
+                     SELECT id FROM sessions WHERE id = ?1 OR id LIKE ?2 ESCAPE '\\'
+                 )",
+                params![contact, like],
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let sessions = tx
+            .execute(
+                "DELETE FROM sessions WHERE id = ?1 OR id LIKE ?2 ESCAPE '\\'",
+                params![contact, like],
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
+        if sessions > 0 {
+            info!(contact, sessions, messages, "GDPR: erased contact sessions");
+        }
+        Ok((sessions as u64, messages as u64))
+    }
+
+    /// WP5 T5.3: inactive sessions are now ARCHIVED (not hard-deleted), and only
+    /// purged after a retention period. Archives sessions whose `last_active` is
+    /// older than `max_age_hours`; then hard-purges sessions that have been
+    /// archived longer than `purge_after_days` (default 90). Returns the number
+    /// newly archived (messages are preserved until purge).
+    pub async fn cleanup_inactive(&self, max_age_hours: u64) -> Result<u64> {
+        self.cleanup_inactive_with_retention(max_age_hours, 90).await
+    }
+
+    /// Retention-aware variant of [`Self::cleanup_inactive`].
+    pub async fn cleanup_inactive_with_retention(
+        &self,
+        max_age_hours: u64,
+        purge_after_days: u64,
+    ) -> Result<u64> {
+        let conn = self.acquire().await;
+        let now = chrono::Utc::now();
+        let archive_cutoff = (now - chrono::Duration::hours(max_age_hours as i64)).to_rfc3339();
+        let purge_cutoff = (now - chrono::Duration::days(purge_after_days as i64)).to_rfc3339();
+        let now_str = now.to_rfc3339();
+
+        // Step 1: archive inactive live sessions (soft).
+        let archived = conn
+            .execute(
+                "UPDATE sessions SET archived_at = ?2
+                 WHERE last_active < ?1 AND archived_at IS NULL",
+                params![archive_cutoff, now_str],
             )
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
-        if deleted > 0 {
-            info!(deleted, max_age_hours, "Cleaned up inactive sessions");
-        }
+        // Step 2: purge sessions archived beyond the retention window.
+        conn.execute(
+            "DELETE FROM session_messages WHERE session_id IN (
+                SELECT id FROM sessions WHERE archived_at IS NOT NULL AND archived_at < ?1
+            )",
+            params![purge_cutoff],
+        )
+        .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let purged = conn
+            .execute(
+                "DELETE FROM sessions WHERE archived_at IS NOT NULL AND archived_at < ?1",
+                params![purge_cutoff],
+            )
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
-        Ok(deleted as u64)
+        if archived > 0 || purged > 0 {
+            info!(archived, purged, max_age_hours, purge_after_days, "Session cleanup: archived + purged");
+        }
+        Ok(archived as u64)
     }
 
     // ── Instruction Pinning ────────────────────────────────────
@@ -642,6 +826,44 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[tokio::test]
+    async fn wp5_soft_delete_archives_then_purge_removes() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("s1", "a").await.unwrap();
+        mgr.append_message("s1", "user", "hi", 2).await.unwrap();
+
+        // delete = archive: messages survive, replayable.
+        mgr.delete_session("s1").await.unwrap();
+        assert_eq!(mgr.get_messages("s1").await.unwrap().len(), 1, "archived session keeps messages");
+
+        // unarchive brings it back to live.
+        mgr.unarchive_session("s1").await.unwrap();
+
+        // purge = hard delete: messages gone.
+        mgr.purge_session("s1").await.unwrap();
+        assert_eq!(mgr.get_messages("s1").await.unwrap().len(), 0, "purge removes messages");
+    }
+
+    #[tokio::test]
+    async fn wp5_reply_to_session_mapping() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("telegram:42:task-A", "a").await.unwrap();
+        mgr.record_message_session("telegram", "msg-777", "telegram:42:task-A")
+            .await
+            .unwrap();
+
+        // Replying to msg-777 resumes the mapped session.
+        assert_eq!(
+            mgr.session_for_reply("telegram", "msg-777").await.unwrap().as_deref(),
+            Some("telegram:42:task-A")
+        );
+        // Unknown message / wrong channel ⇒ None (caller uses main session).
+        assert_eq!(mgr.session_for_reply("telegram", "nope").await.unwrap(), None);
+        assert_eq!(mgr.session_for_reply("slack", "msg-777").await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn test_hide_restore_message() {
         let tmp = NamedTempFile::new().unwrap();
         let mgr = SessionManager::new(tmp.path()).unwrap();
@@ -671,6 +893,36 @@ mod tests {
         // Should have 2 visible messages again
         let msgs = mgr.get_messages("test-session").await.unwrap();
         assert_eq!(msgs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_gdpr_erase_sessions_for_contact() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+
+        // A contact's base chat + a thread of it, plus an unrelated contact.
+        mgr.get_or_create("telegram:12345", "a").await.unwrap();
+        mgr.append_message("telegram:12345", "user", "hi", 1).await.unwrap();
+        mgr.get_or_create("telegram:12345:77", "a").await.unwrap();
+        mgr.append_message("telegram:12345:77", "user", "thread", 1).await.unwrap();
+        mgr.get_or_create("telegram:99999", "a").await.unwrap();
+        mgr.append_message("telegram:99999", "user", "other", 1).await.unwrap();
+        // A prefix-collision guard: `telegram:123456` must NOT match `telegram:12345`.
+        mgr.get_or_create("telegram:123456", "a").await.unwrap();
+
+        let ids = mgr.sessions_for_contact("telegram:12345").await.unwrap();
+        assert_eq!(ids.len(), 2, "exact id + its thread, not the 99999 or 123456");
+
+        let (sessions, messages) =
+            mgr.erase_sessions_for_contact("telegram:12345").await.unwrap();
+        assert_eq!(sessions, 2);
+        assert_eq!(messages, 2);
+
+        // The unrelated contacts survive.
+        assert_eq!(mgr.get_messages("telegram:99999").await.unwrap().len(), 1);
+        assert!(mgr.sessions_for_contact("telegram:123456").await.unwrap().len() == 1);
+        // The erased contact is gone.
+        assert!(mgr.sessions_for_contact("telegram:12345").await.unwrap().is_empty());
     }
 
     #[tokio::test]

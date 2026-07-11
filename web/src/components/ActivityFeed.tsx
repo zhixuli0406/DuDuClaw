@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useState } from 'react';
+import { useEffect, useCallback, useState, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { useTasksStore } from '@/stores/tasks-store';
@@ -15,6 +15,9 @@ import {
   AlertTriangle,
   ChevronDown,
   Activity,
+  Eye,
+  EyeOff,
+  Layers,
 } from 'lucide-react';
 
 type TypeConfig = {
@@ -82,6 +85,27 @@ const TYPE_CONFIG: Record<ActivityType, TypeConfig> = {
   },
 };
 
+/**
+ * Three-tier denoising (WP14-T14.3). The owner should see big events by
+ * default and only drill into routine chatter on demand.
+ *  Tier 1 — headline events (task lifecycle, learning, errors): always shown.
+ *  Tier 2 — secondary signals (assignment, autopilot, evolution): always shown.
+ *  Tier 3 — routine chatter (per-message replies): hidden until "show all".
+ */
+type Tier = 1 | 2 | 3;
+const TIER: Record<ActivityType, Tier> = {
+  task_created: 1,
+  task_completed: 1,
+  task_blocked: 1,
+  error: 1,
+  skill_learned: 1,
+  task_assigned: 2,
+  evolution_triggered: 2,
+  autopilot_triggered: 2,
+  autopilot_lag: 2,
+  agent_reply: 3,
+};
+
 function ActivityItem({ event }: { event: ActivityEvent }) {
   const config = TYPE_CONFIG[event.type] ?? FALLBACK_CONFIG;
   const Icon = config.icon;
@@ -105,6 +129,22 @@ function ActivityItem({ event }: { event: ActivityEvent }) {
   );
 }
 
+/** A run of ≥3 consecutive updates from the same agent, folded into one row. */
+function CollapsedRun({ agentId, count }: { agentId: string; count: number }) {
+  const intl = useIntl();
+  return (
+    <div className="flex items-center gap-3 py-2 pl-1 text-xs text-stone-400 dark:text-stone-500">
+      <div className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-stone-100 dark:bg-stone-800">
+        <Layers className="h-3.5 w-3.5 text-stone-400" />
+      </div>
+      <span>
+        <span className="text-stone-500 dark:text-stone-400">{agentId}</span>{' '}
+        {intl.formatMessage({ id: 'activity.collapsed' }, { count })}
+      </span>
+    </div>
+  );
+}
+
 function formatTimeAgo(timestamp: string): string {
   const now = Date.now();
   const then = new Date(timestamp).getTime();
@@ -117,6 +157,41 @@ function formatTimeAgo(timestamp: string): string {
   if (diffHr < 24) return `${diffHr}h ago`;
   const diffDay = Math.floor(diffHr / 24);
   return `${diffDay}d ago`;
+}
+
+// A rendered row is either a single event or a collapsed run of same-agent updates.
+type Row =
+  | { kind: 'event'; event: ActivityEvent }
+  | { kind: 'run'; agentId: string; count: number; key: string };
+
+/**
+ * Fold runs of ≥3 consecutive same-agent events (within 5 minutes of each
+ * other) into a single "N consecutive updates" row so a chatty agent doesn't
+ * bury everyone else.
+ */
+function foldRuns(events: ReadonlyArray<ActivityEvent>): Row[] {
+  const rows: Row[] = [];
+  let i = 0;
+  while (i < events.length) {
+    let j = i + 1;
+    while (
+      j < events.length &&
+      events[j].agent_id === events[i].agent_id &&
+      Math.abs(
+        new Date(events[i].timestamp).getTime() - new Date(events[j].timestamp).getTime(),
+      ) <= 5 * 60_000
+    ) {
+      j++;
+    }
+    const runLen = j - i;
+    if (runLen >= 3) {
+      rows.push({ kind: 'run', agentId: events[i].agent_id, count: runLen, key: events[i].id });
+    } else {
+      for (let k = i; k < j; k++) rows.push({ kind: 'event', event: events[k] });
+    }
+    i = j;
+  }
+  return rows;
 }
 
 export function ActivityFeed({
@@ -135,6 +210,8 @@ export function ActivityFeed({
   const connectionState = useConnectionStore((s) => s.state);
   const [visibleCount, setVisibleCount] = useState(limit);
   const [filterAgent, setFilterAgent] = useState<string>(agentId ?? '');
+  // Tier 3 (routine chatter) hidden by default — the owner opts into detail.
+  const [showAll, setShowAll] = useState(false);
 
   useEffect(() => {
     if (connectionState !== 'authenticated') return;
@@ -145,12 +222,18 @@ export function ActivityFeed({
     setVisibleCount((prev) => prev + 20);
   }, []);
 
-  const visible = activities.slice(0, visibleCount);
+  // Tier filter → slice → fold consecutive same-agent runs.
+  const rows = useMemo(() => {
+    const tierFiltered = activities.filter(
+      (e) => showAll || (TIER[e.type] ?? 1) <= 2,
+    );
+    return { total: tierFiltered.length, rows: foldRuns(tierFiltered.slice(0, visibleCount)) };
+  }, [activities, showAll, visibleCount]);
 
   return (
     <div>
-      {showFilter && agents.length > 0 && (
-        <div className="mb-3">
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        {showFilter && agents.length > 0 && (
           <select
             value={filterAgent}
             onChange={(e) => { setFilterAgent(e.target.value); setVisibleCount(limit); }}
@@ -161,21 +244,33 @@ export function ActivityFeed({
               <option key={a.name} value={a.name}>{a.icon || '🤖'} {a.display_name}</option>
             ))}
           </select>
-        </div>
-      )}
-      {visible.length === 0 ? (
+        )}
+        <button
+          onClick={() => setShowAll((v) => !v)}
+          className="ml-auto inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-stone-500 transition-colors hover:bg-stone-500/8 hover:text-stone-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40 dark:text-stone-400 dark:hover:bg-white/5 dark:hover:text-stone-200"
+          aria-pressed={showAll}
+        >
+          {showAll ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+          {intl.formatMessage({ id: showAll ? 'activity.showLess' : 'activity.showAll' })}
+        </button>
+      </div>
+      {rows.rows.length === 0 ? (
         <div className="flex items-center justify-center py-12 text-stone-400 dark:text-stone-500">
           <p>{intl.formatMessage({ id: 'activity.empty' })}</p>
         </div>
       ) : (
         <div className="divide-y divide-stone-100 dark:divide-stone-800">
-          {visible.map((event) => (
-            <ActivityItem key={event.id} event={event} />
-          ))}
+          {rows.rows.map((row) =>
+            row.kind === 'event' ? (
+              <ActivityItem key={row.event.id} event={row.event} />
+            ) : (
+              <CollapsedRun key={`run-${row.key}`} agentId={row.agentId} count={row.count} />
+            ),
+          )}
         </div>
       )}
 
-      {activities.length > visibleCount && (
+      {rows.total > visibleCount && (
         <button
           onClick={handleLoadMore}
           className="mt-3 flex w-full items-center justify-center gap-1 rounded-lg bg-stone-50 py-2 text-xs text-stone-500 transition-colors hover:bg-stone-100 dark:bg-stone-800 dark:text-stone-400 dark:hover:bg-stone-700"

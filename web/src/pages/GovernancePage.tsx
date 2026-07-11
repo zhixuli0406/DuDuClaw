@@ -10,7 +10,8 @@ import {
   type GovRateResource,
   type GovAction,
 } from '@/lib/api';
-import { Dialog, FormField, inputClass, selectClass } from '@/components/shared/Dialog';
+import { Dialog, inputClass } from '@/components/shared/Dialog';
+import { SettingField, OptionSelect } from '@/components/settings/controls';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { toast, formatError } from '@/lib/toast';
 import { Scale, Plus, Trash2, Pencil } from 'lucide-react';
@@ -22,6 +23,7 @@ import {
   Badge,
   EmptyState,
   Tabs,
+  Mono,
   type TabItem,
 } from '@/components/ui';
 
@@ -115,7 +117,7 @@ export function GovernancePage() {
         {loading ? (
           <p className="py-8 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
         ) : visiblePolicies.length === 0 ? (
-          <EmptyState icon={Scale} title={intl.formatMessage({ id: 'gov.empty' })} />
+          <EmptyState icon={Scale} dudu="idle" title={intl.formatMessage({ id: 'gov.empty' })} />
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -131,11 +133,15 @@ export function GovernancePage() {
               <tbody>
                 {visiblePolicies.map((p) => (
                   <tr key={`${p.scope ?? p.agent_id}:${p.policy_id}`} className="border-b border-[var(--panel-border)] last:border-0">
-                    <td className="px-5 py-2.5 font-medium text-stone-800 dark:text-stone-200">{p.policy_id}</td>
+                    <td className="px-5 py-2.5 font-medium text-stone-800 dark:text-stone-200">
+                      <Mono>{p.policy_id}</Mono>
+                    </td>
                     <td className="px-5 py-2.5">
                       <Badge tone={TYPE_TONES[p.policy_type]}>{p.policy_type}</Badge>
                     </td>
-                    <td className="px-5 py-2.5 text-stone-600 dark:text-stone-400">{p.scope ?? p.agent_id}</td>
+                    <td className="px-5 py-2.5 text-stone-600 dark:text-stone-400">
+                      <Mono>{p.scope ?? p.agent_id}</Mono>
+                    </td>
                     <td className="px-5 py-2.5 text-xs text-stone-500 dark:text-stone-400">{policyDetail(p)}</td>
                     <td className="px-5 py-2.5 text-right">
                       <div className="flex items-center justify-end gap-1">
@@ -215,6 +221,27 @@ function PolicyDialog({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Plain-language labels for the technical enum values. The raw value is still
+  // shown after a middle dot by OptionSelect, and the written payload is
+  // unchanged — only the visible label is friendlier.
+  const typeLabels: Record<GovPolicyType, string> = {
+    rate: intl.formatMessage({ id: 'gov.type.opt.rate', defaultMessage: '頻率限制' }),
+    permission: intl.formatMessage({ id: 'gov.type.opt.permission', defaultMessage: '權限範圍' }),
+    quota: intl.formatMessage({ id: 'gov.type.opt.quota', defaultMessage: '用量配額' }),
+    lifecycle: intl.formatMessage({ id: 'gov.type.opt.lifecycle', defaultMessage: '生命週期' }),
+  };
+  const resourceLabels: Record<GovRateResource, string> = {
+    mcp_calls: intl.formatMessage({ id: 'gov.rate.resource.opt.mcp_calls', defaultMessage: '工具呼叫次數' }),
+    memory_writes: intl.formatMessage({ id: 'gov.rate.resource.opt.memory_writes', defaultMessage: '記憶寫入次數' }),
+    wiki_writes: intl.formatMessage({ id: 'gov.rate.resource.opt.wiki_writes', defaultMessage: '知識庫寫入次數' }),
+    message_sends: intl.formatMessage({ id: 'gov.rate.resource.opt.message_sends', defaultMessage: '訊息傳送次數' }),
+  };
+  const actionLabels: Record<GovAction, string> = {
+    reject: intl.formatMessage({ id: 'gov.rate.action.opt.reject', defaultMessage: '直接拒絕' }),
+    warn: intl.formatMessage({ id: 'gov.rate.action.opt.warn', defaultMessage: '僅記錄警告、放行' }),
+    throttle: intl.formatMessage({ id: 'gov.rate.action.opt.throttle', defaultMessage: '限流降速' }),
+  };
+
   const set = <K extends keyof GovPolicy>(key: K, value: GovPolicy[K]) =>
     setPolicy((prev) => ({ ...prev, [key]: value }));
 
@@ -251,7 +278,10 @@ function PolicyDialog({
     >
       <div className="space-y-4">
         <div className="grid grid-cols-2 gap-3">
-          <FormField label={intl.formatMessage({ id: 'gov.field.id' })} hint={intl.formatMessage({ id: 'gov.field.id.hint' })}>
+          <SettingField
+            label={intl.formatMessage({ id: 'gov.field.id' })}
+            help={intl.formatMessage({ id: 'gov.field.id.hint' })}
+          >
             <input
               type="text"
               value={policy.policy_id}
@@ -260,76 +290,116 @@ function PolicyDialog({
               placeholder="default-rate-mcp"
               className={inputClass}
             />
-          </FormField>
-          <FormField label={intl.formatMessage({ id: 'gov.field.type' })}>
-            <select value={policy.policy_type} onChange={(e) => changeType(e.target.value as GovPolicyType)} disabled={!isNew} className={selectClass}>
-              {GOV_POLICY_TYPES.map((t) => (
-                <option key={t} value={t}>{t}</option>
-              ))}
-            </select>
-          </FormField>
+          </SettingField>
+          <SettingField
+            label={intl.formatMessage({ id: 'gov.field.type' })}
+            help={intl.formatMessage({ id: 'gov.field.type.help', defaultMessage: '這條規則要管什麼：頻率、權限、配額或生命週期。建立後不可更改。' })}
+          >
+            <OptionSelect
+              value={policy.policy_type}
+              onChange={(v) => changeType(v as GovPolicyType)}
+              disabled={!isNew}
+              options={GOV_POLICY_TYPES.map((t) => ({ value: t, label: typeLabels[t], raw: t }))}
+            />
+          </SettingField>
         </div>
 
-        <FormField label={intl.formatMessage({ id: 'gov.field.agentId' })} hint={intl.formatMessage({ id: 'gov.field.agentId.hint' })}>
+        <SettingField
+          label={intl.formatMessage({ id: 'gov.field.agentId' })}
+          help={intl.formatMessage({ id: 'gov.field.agentId.hint' })}
+        >
           <input type="text" value={policy.agent_id} onChange={(e) => set('agent_id', e.target.value)} placeholder="*" className={inputClass} />
-        </FormField>
+        </SettingField>
 
         {policy.policy_type === 'rate' && (
           <>
-            <FormField label={intl.formatMessage({ id: 'gov.rate.resource' })}>
-              <select value={policy.resource ?? 'mcp_calls'} onChange={(e) => set('resource', e.target.value as GovRateResource)} className={selectClass}>
-                {GOV_RATE_RESOURCES.map((r) => (
-                  <option key={r} value={r}>{r}</option>
-                ))}
-              </select>
-            </FormField>
+            <SettingField
+              label={intl.formatMessage({ id: 'gov.rate.resource' })}
+              help={intl.formatMessage({ id: 'gov.rate.resource.help', defaultMessage: '要計數的動作。超過下面設定的次數時，就會觸發違規動作。' })}
+            >
+              <OptionSelect
+                value={policy.resource ?? 'mcp_calls'}
+                onChange={(v) => set('resource', v as GovRateResource)}
+                options={GOV_RATE_RESOURCES.map((r) => ({ value: r, label: resourceLabels[r], raw: r }))}
+              />
+            </SettingField>
             <div className="grid grid-cols-2 gap-3">
-              <FormField label={intl.formatMessage({ id: 'gov.rate.limit' })}>
+              <SettingField
+                label={intl.formatMessage({ id: 'gov.rate.limit' })}
+                help={intl.formatMessage({ id: 'gov.rate.limit.help', defaultMessage: '在時間視窗內允許的最多次數。調高＝更寬鬆，調低＝更嚴格。' })}
+              >
                 <input type="number" min={1} value={policy.limit ?? 0} onChange={(e) => set('limit', Number(e.target.value))} className={inputClass} />
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'gov.rate.window' })}>
+              </SettingField>
+              <SettingField
+                label={intl.formatMessage({ id: 'gov.rate.window' })}
+                help={intl.formatMessage({ id: 'gov.rate.window.help', defaultMessage: '計數的時間長度（秒）。例如 60 代表「每分鐘」計算一次上限。' })}
+              >
                 <input type="number" min={1} value={policy.window_seconds ?? 0} onChange={(e) => set('window_seconds', Number(e.target.value))} className={inputClass} />
-              </FormField>
+              </SettingField>
             </div>
-            <FormField label={intl.formatMessage({ id: 'gov.rate.action' })}>
-              <select value={policy.action_on_violation ?? 'reject'} onChange={(e) => set('action_on_violation', e.target.value as GovAction)} className={selectClass}>
-                {GOV_ACTIONS.map((a) => (
-                  <option key={a} value={a}>{a}</option>
-                ))}
-              </select>
-            </FormField>
+            <SettingField
+              label={intl.formatMessage({ id: 'gov.rate.action' })}
+              help={intl.formatMessage({ id: 'gov.rate.action.help', defaultMessage: '超過上限時怎麼處理：直接擋下、只記錄警告、或放慢速度。' })}
+            >
+              <OptionSelect
+                value={policy.action_on_violation ?? 'reject'}
+                onChange={(v) => set('action_on_violation', v as GovAction)}
+                options={GOV_ACTIONS.map((a) => ({ value: a, label: actionLabels[a], raw: a }))}
+              />
+            </SettingField>
           </>
         )}
 
         {policy.policy_type === 'permission' && (
           <>
-            <FormField label={intl.formatMessage({ id: 'gov.perm.allowed' })} hint={intl.formatMessage({ id: 'gov.perm.scope.hint' })}>
+            <SettingField
+              label={intl.formatMessage({ id: 'gov.perm.allowed' })}
+              help={intl.formatMessage({ id: 'gov.perm.allowed.help', defaultMessage: '只允許使用這些權限；留空代表不特別限制。範例格式見下方。' })}
+            >
               <ChipEditor values={policy.allowed_scopes ?? []} onChange={(v) => set('allowed_scopes', v)} placeholder="memory:read" addLabel={intl.formatMessage({ id: 'common.add' })} />
-            </FormField>
-            <FormField label={intl.formatMessage({ id: 'gov.perm.denied' })} hint={intl.formatMessage({ id: 'gov.perm.scope.hint' })}>
+            </SettingField>
+            <SettingField
+              label={intl.formatMessage({ id: 'gov.perm.denied' })}
+              help={intl.formatMessage({ id: 'gov.perm.denied.help', defaultMessage: '明確禁止的權限。即使在允許清單內，出現在這裡也會被擋。' })}
+            >
               <ChipEditor values={policy.denied_scopes ?? []} onChange={(v) => set('denied_scopes', v)} placeholder="odoo:write" addLabel={intl.formatMessage({ id: 'common.add' })} />
-            </FormField>
-            <FormField label={intl.formatMessage({ id: 'gov.perm.requiresApproval' })}>
+            </SettingField>
+            <SettingField
+              label={intl.formatMessage({ id: 'gov.perm.requiresApproval' })}
+              help={intl.formatMessage({ id: 'gov.perm.requiresApproval.help', defaultMessage: '這些權限每次使用前都要先經人工核准，適合高風險操作。' })}
+            >
               <ChipEditor values={policy.requires_approval ?? []} onChange={(v) => set('requires_approval', v)} placeholder="odoo:execute" addLabel={intl.formatMessage({ id: 'common.add' })} />
-            </FormField>
+            </SettingField>
           </>
         )}
 
         {policy.policy_type === 'quota' && (
           <>
             <div className="grid grid-cols-2 gap-3">
-              <FormField label={intl.formatMessage({ id: 'gov.quota.dailyBudget' })}>
+              <SettingField
+                label={intl.formatMessage({ id: 'gov.quota.dailyBudget' })}
+                help={intl.formatMessage({ id: 'gov.quota.dailyBudget.help', defaultMessage: '每天可用的 token 總量。用完後當天暫停，隔天依重置排程歸零。' })}
+              >
                 <input type="number" min={1} value={policy.daily_token_budget ?? 0} onChange={(e) => set('daily_token_budget', Number(e.target.value))} className={inputClass} />
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'gov.quota.maxTasks' })}>
+              </SettingField>
+              <SettingField
+                label={intl.formatMessage({ id: 'gov.quota.maxTasks' })}
+                help={intl.formatMessage({ id: 'gov.quota.maxTasks.help', defaultMessage: '同一時間最多可同時進行的任務數。調高會更快，但也更耗資源。' })}
+              >
                 <input type="number" min={1} value={policy.max_concurrent_tasks ?? 0} onChange={(e) => set('max_concurrent_tasks', Number(e.target.value))} className={inputClass} />
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'gov.quota.maxMemory' })} hint="0 = unlimited">
+              </SettingField>
+              <SettingField
+                label={intl.formatMessage({ id: 'gov.quota.maxMemory' })}
+                help={intl.formatMessage({ id: 'gov.quota.maxMemory.help', defaultMessage: '可保留的記憶筆數上限。填 0 代表不限制。' })}
+              >
                 <input type="number" min={0} value={policy.max_memory_entries ?? 0} onChange={(e) => set('max_memory_entries', Number(e.target.value))} className={inputClass} />
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'gov.quota.resetCron' })}>
+              </SettingField>
+              <SettingField
+                label={intl.formatMessage({ id: 'gov.quota.resetCron' })}
+                help={intl.formatMessage({ id: 'gov.quota.resetCron.help', defaultMessage: '配額歸零的排程（cron 格式）。預設 0 0 * * * 代表每天午夜重置。' })}
+              >
                 <input type="text" value={policy.reset_cron ?? '0 0 * * *'} onChange={(e) => set('reset_cron', e.target.value)} className={inputClass} />
-              </FormField>
+              </SettingField>
             </div>
           </>
         )}
@@ -337,15 +407,24 @@ function PolicyDialog({
         {policy.policy_type === 'lifecycle' && (
           <>
             <div className="grid grid-cols-2 gap-3">
-              <FormField label={intl.formatMessage({ id: 'gov.lifecycle.maxIdle' })}>
+              <SettingField
+                label={intl.formatMessage({ id: 'gov.lifecycle.maxIdle' })}
+                help={intl.formatMessage({ id: 'gov.lifecycle.maxIdle.help', defaultMessage: '閒置超過這麼多小時就視為停擺。預設 168 小時（7 天）。' })}
+              >
                 <input type="number" min={1} value={policy.max_idle_hours ?? 0} onChange={(e) => set('max_idle_hours', Number(e.target.value))} className={inputClass} />
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'gov.lifecycle.healthCheck' })}>
+              </SettingField>
+              <SettingField
+                label={intl.formatMessage({ id: 'gov.lifecycle.healthCheck' })}
+                help={intl.formatMessage({ id: 'gov.lifecycle.healthCheck.help', defaultMessage: '多久檢查一次健康狀態（秒）。調短偵測更即時，但檢查較頻繁。' })}
+              >
                 <input type="number" min={1} value={policy.health_check_interval_seconds ?? 0} onChange={(e) => set('health_check_interval_seconds', Number(e.target.value))} className={inputClass} />
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'gov.lifecycle.autoSuspend' })} hint="0 = off">
+              </SettingField>
+              <SettingField
+                label={intl.formatMessage({ id: 'gov.lifecycle.autoSuspend' })}
+                help={intl.formatMessage({ id: 'gov.lifecycle.autoSuspend.help', defaultMessage: '累積違規達這個次數就自動暫停這個 AI 員工。填 0 代表關閉此功能。' })}
+              >
                 <input type="number" min={0} value={policy.auto_suspend_on_violation_count ?? 0} onChange={(e) => set('auto_suspend_on_violation_count', Number(e.target.value))} className={inputClass} />
-              </FormField>
+              </SettingField>
             </div>
           </>
         )}

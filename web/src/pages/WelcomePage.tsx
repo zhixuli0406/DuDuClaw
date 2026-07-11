@@ -6,17 +6,16 @@ import { api, type RuntimeProvider, type RuntimeDetect } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useTourStore } from '@/stores/tour-store';
 import { Card, Button, Badge, Field, controlClass } from '@/components/ui';
+import { DuDu } from '@/components/mascot';
 import {
   ChevronLeft,
   ChevronRight,
-  Check,
   Rocket,
   Cloud,
   KeyRound,
   Plug,
   Cpu,
   Terminal,
-  PawPrint,
 } from 'lucide-react';
 
 // ---------------------------------------------------------------------------
@@ -307,9 +306,8 @@ export function WelcomePage() {
   if (deployed) {
     return (
       <div className="page-enter mx-auto flex max-w-xl flex-col items-center justify-center py-20 text-center">
-        <div className="mb-6 grid h-20 w-20 place-items-center rounded-full bg-emerald-500/15">
-          <Check className="h-10 w-10 text-emerald-600 dark:text-emerald-400" />
-        </div>
+        {/* DuDu cheers on the first employee joining the team (§7.3). */}
+        <DuDu face="celebrating" size={120} label="DuDu" className="mb-4" />
         <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
           {intl.formatMessage({ id: 'welcome.success.title' })}
         </h2>
@@ -330,9 +328,8 @@ export function WelcomePage() {
       {/* Step 1 — warm welcome */}
       {step === 1 && (
         <div className="flex flex-col items-center gap-5 py-8 text-center">
-          <span className="grid h-16 w-16 place-items-center rounded-2xl bg-amber-500/12 text-amber-600 ring-1 ring-inset ring-amber-500/20 dark:bg-amber-400/10 dark:text-amber-400">
-            <PawPrint className="h-8 w-8" />
-          </span>
+          {/* DuDu the receptionist waves the operator in (§7.3 接待員). */}
+          <DuDu face="waving" size={112} label="DuDu" />
           <h1 className="text-3xl font-semibold tracking-tight text-stone-900 dark:text-stone-50">
             {intl.formatMessage({ id: 'welcome.hero.title' })}
           </h1>
