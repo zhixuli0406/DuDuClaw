@@ -42,6 +42,10 @@ iana-time-zone = "0.1"
 cron = { workspace = true }
 uuid = { workspace = true }
 toml = { workspace = true }
+# migrate-from: OpenClaw `openclaw.json` is JSON5 (comments + trailing commas);
+# serde_json rejects those, so we parse via json5. Hermes/paperclip use YAML.
+json5 = "0.4"
+serde_yaml = "0.9"
 urlencoding = "2"
 dialoguer = { version = "0.11", features = ["password"] }
 console = "0.15"

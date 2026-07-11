@@ -31,10 +31,12 @@ pub mod mcp_namespace;
 pub mod mcp_rate_limit;
 pub mod mcp_redact;
 pub mod mcp_redaction;         // RFC-23 redaction pipeline integration
+pub mod redaction_verify;      // WP2: `duduclaw redaction verify` evidence report
 pub(crate) mod mcp_sse_store;  // W20-P1 Phase 2C: SSE event ring buffer
 pub mod mcp_wiki;
 pub mod license;               // M1: license activate/status/refresh/export/import/deactivate
 mod migrate;
+mod migrate_from;              // Painless migration from OpenClaw / Hermes / paperclip
 pub mod odoo_pool;             // RFC-21 §2: per-agent Odoo connector pool
 mod ptc;
 mod service;
@@ -290,6 +292,36 @@ enum Commands {
     /// Migrate agent.toml to Claude Code format (.claude/settings.local.json)
     Migrate,
 
+    /// Painlessly migrate from OpenClaw / Hermes / paperclip into DuDuClaw.
+    ///
+    /// Default is a dry-run that prints the migration plan (what would be
+    /// imported / skipped and why). Pass `--apply` to actually write.
+    #[command(name = "migrate-from")]
+    MigrateFrom {
+        /// Source platform: `openclaw`, `hermes`, or `paperclip`.
+        platform: String,
+
+        /// Source directory (defaults per platform; REQUIRED for paperclip,
+        /// which reads an official `paperclipai company export` directory).
+        #[arg(long)]
+        source: Option<PathBuf>,
+
+        /// Actually write the imported data (default is a dry-run plan).
+        #[arg(long)]
+        apply: bool,
+
+        /// On a name clash with an existing agent, import under a
+        /// `-imported` suffix instead of skipping.
+        #[arg(long)]
+        rename: bool,
+
+        /// Emit a single machine-readable JSON object on stdout instead of the
+        /// human console plan (used by the dashboard migrate RPCs). Log output
+        /// stays on stderr so stdout is a clean protocol channel.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Export your personal-edition data (`~/.duduclaw/`) as a portable
     /// `.tar.gz` (agents, memory, config, license; skips models/logs/backups).
     /// Use to move between machines or switch self-host ↔ managed.
@@ -306,6 +338,97 @@ enum Commands {
         /// Path to the `.tar.gz` archive to import.
         file: PathBuf,
 
+        /// Overwrite an existing populated home (existing data preserved).
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Export aggregated audit trails (tool calls, security events, budget
+    /// events, channel failures) as NDJSON — write to a file and/or stream to a
+    /// SIEM/webhook (Splunk HEC / Elastic / Datadog / generic).
+    Audit {
+        /// Only include records at/after this RFC3339 time (e.g.
+        /// `2026-07-01T00:00:00Z`).
+        #[arg(long)]
+        since: Option<String>,
+        /// Write NDJSON to this file (default: stdout).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// POST the records to this SIEM/webhook URL.
+        #[arg(long)]
+        webhook: Option<String>,
+        /// Auth header for the webhook, `Name: Value`
+        /// (e.g. `Authorization: Bearer <token>`).
+        #[arg(long)]
+        webhook_auth: Option<String>,
+        /// Webhook wire format: `ndjson` (default) or `json`.
+        #[arg(long, default_value = "ndjson")]
+        format: String,
+    },
+
+    /// Show the security posture report (score + checklist of active
+    /// protections and actionable gaps).
+    Security,
+
+    /// Red-team an agent: synthesize jailbreak prompts from its `CONTRACT.toml`
+    /// `must_not` boundaries and report which the deterministic input-guard
+    /// catches. (Running the suite against the live model is the deeper step.)
+    Redteam {
+        /// Agent id (defaults to the default agent).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Write the full attack suite to this file.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+
+    /// Redaction (de-identification) tools.
+    Redaction {
+        #[command(subcommand)]
+        command: RedactionCommands,
+    },
+
+    /// LINE OA B2C credit management (WP7). Operator grants/adjusts points and
+    /// inspects balances/history. Billing settlement (PayUni) is separate.
+    Credit {
+        #[command(subcommand)]
+        command: CreditCommands,
+    },
+
+    /// Inspect stored sessions (replay a conversation's turns).
+    Session {
+        #[command(subcommand)]
+        command: SessionCommands,
+    },
+
+    /// GDPR data-subject requests: export or erase everything stored about a
+    /// contact (memory triples + free-text mentions + key facts).
+    Gdpr {
+        #[command(subcommand)]
+        command: GdprCommands,
+    },
+
+    /// Memory maintenance / diagnostics.
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommands,
+    },
+
+    /// Back up the DuDuClaw home to a timestamped `.tar.gz` **with a SHA-256
+    /// sidecar** for integrity (disaster recovery / compliance). Reuses the
+    /// `export` packer; adds the checksum `restore` verifies.
+    Backup {
+        /// Output archive path (default: ./duduclaw-backup-<UTC timestamp>.tar.gz).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+
+    /// Restore a backup produced by `duduclaw backup`, verifying its SHA-256
+    /// sidecar first (refuses on mismatch). Refuses to overwrite a populated
+    /// home unless `--force`.
+    Restore {
+        /// Path to the backup `.tar.gz`.
+        file: PathBuf,
         /// Overwrite an existing populated home (existing data preserved).
         #[arg(long)]
         force: bool,
@@ -577,6 +700,23 @@ enum AgentCommands {
         agent: String,
     },
 
+    /// Freeze an agent: disable ALL autonomous evolution + heartbeat in one
+    /// shot (the enterprise "something's wrong, stop it now" escape hatch).
+    /// Sets `[evolution] enabled = false` and `[heartbeat] enabled = false`,
+    /// then writes an audit record. Does not delete anything; reverse with
+    /// `duduclaw agent unfreeze <id>`.
+    Freeze {
+        /// Agent name or ID
+        agent: String,
+    },
+
+    /// Unfreeze an agent frozen with `agent freeze`: re-enables evolution and
+    /// heartbeat (`[evolution] enabled = true`, `[heartbeat] enabled = true`).
+    Unfreeze {
+        /// Agent name or ID
+        agent: String,
+    },
+
     /// Start interactive session with a specific agent
     Run {
         /// Agent name
@@ -607,6 +747,120 @@ enum ServiceCommands {
 
     /// Uninstall the system service
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum SessionCommands {
+    /// Replay a stored session: print its turns in order (and, with --tools, the
+    /// agent's tool-call audit lines interleaved by time).
+    Replay {
+        /// Session id to replay.
+        id: String,
+        /// Also show `tool_calls.jsonl` entries for the session's agent.
+        #[arg(long)]
+        tools: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RedactionCommands {
+    /// Run a file through the REAL redaction pipeline and emit an evidence
+    /// report: every hit (masked original × rule id × token × category), plus
+    /// a reversibility check that restores each token and asserts it round-trips.
+    ///
+    /// This is the "don't just claim it — prove it" tool: it exercises the live
+    /// pipeline (vault writes included, tagged as a verify-run for later GC), so
+    /// the report reflects exactly what a real conversation would redact.
+    Verify {
+        /// CSV or plain-text file to scan.
+        #[arg(long)]
+        file: PathBuf,
+        /// Redaction profile to load (default: whatever config.toml enables, else `general`).
+        #[arg(long)]
+        profile: Option<String>,
+        /// Agent id whose per-agent key + rules apply (default: default agent).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Write the Markdown report here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CreditCommands {
+    /// Grant (or, with a negative amount, adjust) points for a LINE user.
+    Grant {
+        /// OA name (matches `[[channels.line.accounts]] name`).
+        oa: String,
+        /// LINE user id.
+        user: String,
+        /// Points to add (negative to deduct).
+        points: i64,
+        /// Optional reason recorded in the ledger.
+        #[arg(long, default_value = "operator grant")]
+        reason: String,
+    },
+    /// Show a LINE user's current point balance.
+    Balance {
+        oa: String,
+        user: String,
+    },
+    /// Show recent ledger events for a LINE user.
+    History {
+        oa: String,
+        user: String,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+}
+
+#[derive(Subcommand)]
+enum GdprCommands {
+    /// Export everything stored about a contact as a JSON bundle (read-only).
+    Export {
+        /// Contact id (matched as triple subject/object or free-text mention),
+        /// e.g. `user:alice` or an email.
+        contact: String,
+        /// Agent whose memory to search (default: the configured default agent).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Write the JSON bundle here (default: stdout).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Erase everything stored about a contact (hard delete across memories +
+    /// FTS + key facts). Requires --confirm; records a pseudonymised tombstone.
+    Erase {
+        /// Contact id to erase.
+        contact: String,
+        /// Agent whose memory to erase (default: the configured default agent).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Required acknowledgement — without it the command only previews.
+        #[arg(long)]
+        confirm: bool,
+        /// Skip writing the erasure tombstone record.
+        #[arg(long, default_value_t = false)]
+        no_tombstone: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemoryCommands {
+    /// Benchmark HippoRAG-lite PPR latency over the live triple count and print
+    /// P50/P95 plus a partition recommendation (the LightRAG gate).
+    Bench {
+        /// Agent to bench (default: the configured default agent).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Query string to seed the PPR walk.
+        #[arg(long, default_value = "summary")]
+        query: String,
+        /// Number of timed iterations.
+        #[arg(long, default_value_t = 50)]
+        iters: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -934,6 +1188,8 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             Some(AgentCommands::Inspect { agent }) => cmd_agent_inspect(&agent).await,
             Some(AgentCommands::Pause { agent }) => cmd_agent_set_status(&agent, "paused").await,
             Some(AgentCommands::Resume { agent }) => cmd_agent_set_status(&agent, "active").await,
+            Some(AgentCommands::Freeze { agent }) => cmd_agent_freeze(&agent, true).await,
+            Some(AgentCommands::Unfreeze { agent }) => cmd_agent_freeze(&agent, false).await,
             Some(AgentCommands::Run { name }) => cmd_agent_interactive(Some(&name)).await,
         },
         Commands::Gateway => cmd_run_server(true).await,
@@ -950,7 +1206,39 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             }
         }
         Commands::Migrate => cmd_migrate().await,
+        Commands::MigrateFrom { platform, source, apply, rename, json } => {
+            migrate_from::run(&platform, source, apply, rename, json).await
+        }
         Commands::Export { out } => cmd_export_data(out).await,
+        Commands::Audit { since, out, webhook, webhook_auth, format } => {
+            cmd_audit_export(since, out, webhook, webhook_auth, format).await
+        }
+        Commands::Redaction { command } => match command {
+            RedactionCommands::Verify { file, profile, agent, out } => {
+                redaction_verify::run(file, profile, agent, out).await
+            }
+        },
+        Commands::Credit { command } => cmd_credit(command).await,
+        Commands::Session { command } => match command {
+            SessionCommands::Replay { id, tools } => cmd_session_replay(id, tools).await,
+        },
+        Commands::Gdpr { command } => match command {
+            GdprCommands::Export { contact, agent, out } => {
+                cmd_gdpr_export(contact, agent, out).await
+            }
+            GdprCommands::Erase { contact, agent, confirm, no_tombstone } => {
+                cmd_gdpr_erase(contact, agent, confirm, !no_tombstone).await
+            }
+        },
+        Commands::Memory { command } => match command {
+            MemoryCommands::Bench { agent, query, iters } => {
+                cmd_memory_bench(agent, query, iters).await
+            }
+        },
+        Commands::Backup { out } => cmd_backup(out).await,
+        Commands::Restore { file, force } => cmd_restore(file, force).await,
+        Commands::Redteam { agent, out } => cmd_redteam(agent, out).await,
+        Commands::Security => cmd_security_posture().await,
         Commands::Import { file, force } => cmd_import_data(file, force).await,
         Commands::McpServer => cmd_mcp_server().await,
         Commands::Mcp(mcp_cmd) => cmd_mcp(mcp_cmd, &duduclaw_home()).await,
@@ -2585,8 +2873,12 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
             }
             println!();
         } else {
-            println!("   ⚠ No auth configured — dashboard is accessible without authentication");
-            println!("     Set DUDUCLAW_AUTH_TOKEN env var or [gateway].auth_token in config.toml");
+            // Empty users.db right now, but the gateway ensures a default admin
+            // during startup — so JWT auth WILL be required. Point the operator
+            // at the login flow and the one-time password printed below (during
+            // gateway bootstrap), rather than the misleading "no auth needed".
+            println!("   🔐 First run: a default admin is being created —");
+            println!("     watch for the one-time password below, then log in at http://localhost:{port}/login");
             println!();
         }
     }
@@ -3025,6 +3317,199 @@ fn provider_context_filenames(
     }
 }
 
+/// Reusable agent-directory scaffold parameters.
+///
+/// Shared by `cmd_agent_create` (the `duduclaw agent create` CLI path) and the
+/// `migrate-from` importer so both produce byte-compatible agent directories
+/// from one template — no copy-paste drift. All string fields are expected to
+/// be already normalised by the caller (validated id, canonical role).
+pub(crate) struct AgentScaffold {
+    /// Validated lowercase agent id (also the directory name).
+    pub name: String,
+    pub display_name: String,
+    /// Canonical role string (see `AgentRole::as_str`).
+    pub role: String,
+    pub reports_to: String,
+    pub icon: String,
+    pub trigger: String,
+    pub provider: duduclaw_core::types::RuntimeType,
+    /// `[model] preferred`; `None` uses the default `claude-sonnet-4-6`.
+    pub model_preferred: Option<String>,
+    /// Full SOUL.md body; `None` uses the built-in default persona template.
+    pub soul_body: Option<String>,
+}
+
+/// Write a fresh agent directory (agent.toml, SOUL.md, provider context files,
+/// .mcp.json) under `<home>/agents/<name>`. Fail-closed: errors if the target
+/// directory already exists — the caller decides skip/rename semantics before
+/// calling. Does not print; callers own their own console output.
+pub(crate) async fn scaffold_agent_dir(
+    home: &std::path::Path,
+    s: &AgentScaffold,
+) -> duduclaw_core::error::Result<std::path::PathBuf> {
+    let agent_dir = home.join("agents").join(&s.name);
+    if agent_dir.exists() {
+        return Err(DuDuClawError::Agent(format!(
+            "Agent directory already exists: {}",
+            agent_dir.display()
+        )));
+    }
+
+    // Create directory structure
+    for dir in &[
+        agent_dir.clone(),
+        agent_dir.join("SKILLS"),
+        agent_dir.join("memory"),
+        agent_dir.join(".claude"),
+    ] {
+        tokio::fs::create_dir_all(dir).await.map_err(|e| {
+            DuDuClawError::Agent(format!("Failed to create {}: {e}", dir.display()))
+        })?;
+    }
+
+    let AgentScaffold {
+        name: agent_name,
+        display_name,
+        role,
+        reports_to,
+        icon,
+        trigger,
+        provider,
+        model_preferred,
+        soul_body,
+    } = s;
+    let role_str = role.as_str();
+
+    // `[runtime]` section: only written when the operator chose a non-default
+    // provider — default (Claude) scaffolds stay byte-identical to before.
+    let runtime_section = if *provider == duduclaw_core::types::RuntimeType::Claude {
+        String::new()
+    } else {
+        format!("\n[runtime]\nprovider = \"{}\"\n", provider.as_str())
+    };
+
+    let preferred = model_preferred.as_deref().unwrap_or("claude-sonnet-4-6");
+
+    // agent.toml
+    let agent_toml = format!(
+        r#"[agent]
+name = "{agent_name}"
+display_name = "{display_name}"
+role = "{role_str}"
+status = "active"
+trigger = "{trigger}"
+reports_to = "{reports_to}"
+icon = "{icon}"
+{runtime_section}
+[model]
+preferred = "{preferred}"
+fallback = "claude-haiku-4-5"
+account_pool = ["main"]
+api_mode = "auto"
+
+[container]
+timeout_ms = 1800000
+max_concurrent = 1
+readonly_project = true
+additional_mounts = []
+
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 5000
+warn_threshold_percent = 80
+hard_stop = true
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = true
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = ["*"]
+
+[evolution]
+micro_reflection = true
+meso_reflection = true
+macro_reflection = true
+skill_auto_activate = false
+skill_security_scan = true
+"#
+    );
+    tokio::fs::write(agent_dir.join("agent.toml"), &agent_toml)
+        .await
+        .map_err(|e| DuDuClawError::Agent(format!("Failed to write agent.toml: {e}")))?;
+
+    // SOUL.md — imported persona verbatim when supplied, else default template.
+    let soul = soul_body.clone().unwrap_or_else(|| {
+        format!(
+            "# {display_name}\n\nI am {display_name}, a {role_str} AI agent powered by DuDuClaw.\n\n\
+             ## Core Values\n\n- Helpful and precise\n- Clear in communication\n\
+             - Focused on the task at hand\n\n\
+             ## Tool Use\n\n\
+             - To create sub-agents, call the `create_agent` MCP tool. Never fabricate \
+             agent creation in plain text.\n\
+             - To delegate work, use `send_to_agent` or `spawn_agent`.\n\
+             - When uncertain about state, call `list_agents` first.\n"
+        )
+    });
+    tokio::fs::write(agent_dir.join("SOUL.md"), &soul)
+        .await
+        .map_err(|e| DuDuClawError::Agent(format!("Failed to write SOUL.md: {e}")))?;
+
+    // Provider context files — one template, rendered under each filename the
+    // configured runtime's CLI reads (W3): CLAUDE.md always (Claude Code
+    // compatibility invariant; agy shares the lineage), plus AGENTS.md for
+    // codex and GEMINI.md for gemini.
+    let wiki_guide = include_str!("../../../templates/wiki/CLAUDE_WIKI.md");
+    let context_md = format!(
+        "# {display_name}\n\nAgent managed by DuDuClaw v{}.\n\n{}\n",
+        duduclaw_gateway::updater::current_version(),
+        wiki_guide,
+    );
+    for filename in provider_context_filenames(*provider) {
+        tokio::fs::write(agent_dir.join(filename), &context_md)
+            .await
+            .ok();
+    }
+
+    // .mcp.json — wires the duduclaw MCP server into the agent's Claude
+    // Code session so that create_agent / spawn_agent / list_agents /
+    // send_to_agent / etc. tools are actually available to the model.
+    //
+    // Without this file, SOUL.md's `create_agent` rule is unenforceable
+    // because the tool literally does not exist in the agent's toolbelt —
+    // the model either falls back to raw Bash writes (blocked by
+    // agent-file-guard since v1.3.15) or fabricates results in plain text.
+    let mcp_bin = duduclaw_core::resolve_duduclaw_bin()
+        .to_string_lossy()
+        .into_owned();
+    // DUDUCLAW_AGENT_ID lets the MCP subprocess self-identify; without it
+    // every call falls back to `default_agent` and supervisor-relation
+    // authorization breaks (mirrors mcp_template::ensure_duduclaw_absolute_path).
+    let mcp_json = serde_json::json!({
+        "mcpServers": {
+            "duduclaw": {
+                "command": mcp_bin,
+                "args": ["mcp-server"],
+                "env": { "DUDUCLAW_AGENT_ID": agent_name.clone() }
+            }
+        }
+    });
+    let mcp_content = serde_json::to_string_pretty(&mcp_json).map_err(|e| {
+        DuDuClawError::Agent(format!("Failed to serialise .mcp.json: {e}"))
+    })?;
+    tokio::fs::write(agent_dir.join(".mcp.json"), mcp_content)
+        .await
+        .map_err(|e| DuDuClawError::Agent(format!("Failed to write .mcp.json: {e}")))?;
+
+    Ok(agent_dir)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_agent_create(
     name: &str,
@@ -3085,140 +3570,21 @@ async fn cmd_agent_create(
         return Ok(());
     }
 
-    // Create directory structure
-    for dir in &[
-        agent_dir.clone(),
-        agent_dir.join("SKILLS"),
-        agent_dir.join("memory"),
-        agent_dir.join(".claude"),
-    ] {
-        tokio::fs::create_dir_all(dir).await.map_err(|e| {
-            DuDuClawError::Agent(format!("Failed to create {}: {e}", dir.display()))
-        })?;
-    }
-
-    // `[runtime]` section: only written when the operator chose a non-default
-    // provider — default (Claude) scaffolds stay byte-identical to before.
-    let runtime_section = if provider == duduclaw_core::types::RuntimeType::Claude {
-        String::new()
-    } else {
-        format!("\n[runtime]\nprovider = \"{}\"\n", provider.as_str())
-    };
-
-    // agent.toml
-    let agent_toml = format!(
-        r#"[agent]
-name = "{agent_name}"
-display_name = "{display_name}"
-role = "{role_str}"
-status = "active"
-trigger = "{trigger}"
-reports_to = "{reports_to}"
-icon = "{icon}"
-{runtime_section}
-[model]
-preferred = "claude-sonnet-4-6"
-fallback = "claude-haiku-4-5"
-account_pool = ["main"]
-api_mode = "auto"
-
-[container]
-timeout_ms = 1800000
-max_concurrent = 1
-readonly_project = true
-additional_mounts = []
-
-[heartbeat]
-enabled = false
-interval_seconds = 3600
-max_concurrent_runs = 1
-cron = ""
-
-[budget]
-monthly_limit_cents = 5000
-warn_threshold_percent = 80
-hard_stop = true
-
-[permissions]
-can_create_agents = false
-can_send_cross_agent = true
-can_modify_own_skills = true
-can_modify_own_soul = false
-can_schedule_tasks = false
-allowed_channels = ["*"]
-
-[evolution]
-micro_reflection = true
-meso_reflection = true
-macro_reflection = true
-skill_auto_activate = false
-skill_security_scan = true
-"#
-    );
-    tokio::fs::write(agent_dir.join("agent.toml"), &agent_toml)
-        .await
-        .map_err(|e| DuDuClawError::Agent(format!("Failed to write agent.toml: {e}")))?;
-
-    // SOUL.md
-    let soul = format!(
-        "# {display_name}\n\nI am {display_name}, a {role_str} AI agent powered by DuDuClaw.\n\n\
-         ## Core Values\n\n- Helpful and precise\n- Clear in communication\n\
-         - Focused on the task at hand\n\n\
-         ## Tool Use\n\n\
-         - To create sub-agents, call the `create_agent` MCP tool. Never fabricate \
-         agent creation in plain text.\n\
-         - To delegate work, use `send_to_agent` or `spawn_agent`.\n\
-         - When uncertain about state, call `list_agents` first.\n"
-    );
-    tokio::fs::write(agent_dir.join("SOUL.md"), &soul)
-        .await
-        .map_err(|e| DuDuClawError::Agent(format!("Failed to write SOUL.md: {e}")))?;
-
-    // Provider context files — one template, rendered under each filename the
-    // configured runtime's CLI reads (W3): CLAUDE.md always (Claude Code
-    // compatibility invariant; agy shares the lineage), plus AGENTS.md for
-    // codex and GEMINI.md for gemini.
-    let wiki_guide = include_str!("../../../templates/wiki/CLAUDE_WIKI.md");
-    let context_md = format!(
-        "# {display_name}\n\nAgent managed by DuDuClaw v{}.\n\n{}\n",
-        duduclaw_gateway::updater::current_version(),
-        wiki_guide,
-    );
-    for filename in provider_context_filenames(provider) {
-        tokio::fs::write(agent_dir.join(filename), &context_md)
-            .await
-            .ok();
-    }
-
-    // .mcp.json — wires the duduclaw MCP server into the agent's Claude
-    // Code session so that create_agent / spawn_agent / list_agents /
-    // send_to_agent / etc. tools are actually available to the model.
-    //
-    // Without this file, SOUL.md's `create_agent` rule is unenforceable
-    // because the tool literally does not exist in the agent's toolbelt —
-    // the model either falls back to raw Bash writes (blocked by
-    // agent-file-guard since v1.3.15) or fabricates results in plain text.
-    let mcp_bin = duduclaw_core::resolve_duduclaw_bin()
-        .to_string_lossy()
-        .into_owned();
-    // DUDUCLAW_AGENT_ID lets the MCP subprocess self-identify; without it
-    // every call falls back to `default_agent` and supervisor-relation
-    // authorization breaks (mirrors mcp_template::ensure_duduclaw_absolute_path).
-    let mcp_json = serde_json::json!({
-        "mcpServers": {
-            "duduclaw": {
-                "command": mcp_bin,
-                "args": ["mcp-server"],
-                "env": { "DUDUCLAW_AGENT_ID": agent_name.clone() }
-            }
-        }
-    });
-    let mcp_content = serde_json::to_string_pretty(&mcp_json).map_err(|e| {
-        DuDuClawError::Agent(format!("Failed to serialise .mcp.json: {e}"))
-    })?;
-    tokio::fs::write(agent_dir.join(".mcp.json"), mcp_content)
-        .await
-        .map_err(|e| DuDuClawError::Agent(format!("Failed to write .mcp.json: {e}")))?;
+    scaffold_agent_dir(
+        &home,
+        &AgentScaffold {
+            name: agent_name.clone(),
+            display_name,
+            role: role_str.to_string(),
+            reports_to,
+            icon,
+            trigger,
+            provider,
+            model_preferred: None,
+            soul_body: None,
+        },
+    )
+    .await?;
 
     println!(
         "  {} Created agent '{}' ({role_str}) at {}",
@@ -3286,6 +3652,122 @@ async fn cmd_agent_set_status(agent: &str, status: &str) -> duduclaw_core::error
     Ok(())
 }
 
+/// `duduclaw agent freeze|unfreeze <id>` — one-shot enterprise kill-switch.
+///
+/// `freeze=true`  → `[evolution] enabled = false` + `[heartbeat] enabled = false`.
+/// `freeze=false` → both set back to `true`.
+///
+/// Both operations are additive TOML edits (missing sections are created) and
+/// write a `security_audit.jsonl` record so the freeze is forensically visible.
+/// User-authored autopilot rules live in a separate store and are intentionally
+/// NOT auto-modified here (see `docs/guides/evolution-switches.md` — autopilot is
+/// explicit user automation, disable those from the dashboard if needed).
+async fn cmd_agent_freeze(agent: &str, freeze: bool) -> duduclaw_core::error::Result<()> {
+    use console::style;
+    use duduclaw_security::audit::{append_audit_event, AuditEvent, Severity};
+
+    if !is_valid_agent_id(agent) {
+        return Err(DuDuClawError::Agent(
+            "Agent name must be lowercase alphanumeric with hyphens".to_string(),
+        ));
+    }
+
+    let home = duduclaw_home();
+    let agent_toml_path = home.join("agents").join(agent).join("agent.toml");
+    if !agent_toml_path.exists() {
+        return Err(DuDuClawError::Agent(format!("Agent '{}' not found", agent)));
+    }
+
+    let content = tokio::fs::read_to_string(&agent_toml_path)
+        .await
+        .map_err(|e| DuDuClawError::Agent(format!("Failed to read agent.toml: {e}")))?;
+    let mut table: toml::Table = content
+        .parse()
+        .map_err(|e| DuDuClawError::Agent(format!("Failed to parse agent.toml: {e}")))?;
+
+    let enabled = !freeze;
+    for section in ["evolution", "heartbeat"] {
+        let sub = table
+            .entry(section.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let Some(t) = sub.as_table_mut() {
+            t.insert("enabled".to_string(), toml::Value::Boolean(enabled));
+        }
+    }
+
+    let new_content = toml::to_string_pretty(&table)
+        .map_err(|e| DuDuClawError::Agent(format!("Failed to serialise agent.toml: {e}")))?;
+    tokio::fs::write(&agent_toml_path, new_content)
+        .await
+        .map_err(|e| DuDuClawError::Agent(format!("Failed to write agent.toml: {e}")))?;
+
+    append_audit_event(
+        &home,
+        &AuditEvent::new(
+            if freeze { "agent_freeze" } else { "agent_unfreeze" },
+            agent,
+            Severity::Warning,
+            serde_json::json!({
+                "evolution_enabled": enabled,
+                "heartbeat_enabled": enabled,
+                "source": "cli",
+            }),
+        ),
+    );
+
+    if freeze {
+        println!(
+            "  {} Agent '{}' is now {} — evolution and heartbeat halted.",
+            style("🧊").blue(),
+            agent,
+            style("FROZEN").bold().blue()
+        );
+        println!(
+            "      {}",
+            style("Autopilot rules (if any) are user-defined — disable them in the dashboard if needed.").dim()
+        );
+    } else {
+        println!(
+            "  {} Agent '{}' is {} — evolution and heartbeat re-enabled.",
+            style("▶").green(),
+            agent,
+            style("UNFROZEN").bold().green()
+        );
+    }
+    Ok(())
+}
+
+/// `duduclaw credit …` — WP7 LINE OA B2C credit management.
+async fn cmd_credit(command: CreditCommands) -> duduclaw_core::error::Result<()> {
+    use duduclaw_gateway::credit::CreditLedger;
+    let home = duduclaw_home();
+    let ledger = CreditLedger::open(&home.join("credits.db"))
+        .map_err(DuDuClawError::Gateway)?;
+    match command {
+        CreditCommands::Grant { oa, user, points, reason } => {
+            let bal = ledger
+                .grant(&oa, &user, points, &reason)
+                .map_err(DuDuClawError::Gateway)?;
+            println!("  {} {oa}/{user}: {points:+} points → balance {bal}", console::style("credit").green());
+        }
+        CreditCommands::Balance { oa, user } => {
+            let bal = ledger.balance(&oa, &user).map_err(DuDuClawError::Gateway)?;
+            println!("  {oa}/{user}: {bal} points");
+        }
+        CreditCommands::History { oa, user, limit } => {
+            let events = ledger.history(&oa, &user, limit).map_err(DuDuClawError::Gateway)?;
+            if events.is_empty() {
+                println!("  No credit events for {oa}/{user}.");
+            } else {
+                for e in events {
+                    println!("  {}  {:+}  {}", e.created_at, e.delta_points, e.reason);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `duduclaw migrate` - Migrate agent.toml to Claude Code format.
 async fn cmd_migrate() -> duduclaw_core::error::Result<()> {
     let home = duduclaw_home();
@@ -3295,6 +3777,459 @@ async fn cmd_migrate() -> duduclaw_core::error::Result<()> {
 }
 
 /// `duduclaw export` — package `~/.duduclaw/` into a portable `.tar.gz`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+async fn cmd_security_posture() -> duduclaw_core::error::Result<()> {
+    let home = duduclaw_home();
+    let report = duduclaw_gateway::security_posture::compute_posture(&home);
+    let bar = if report.score >= 80 {
+        console::style(format!("{}%", report.score)).green()
+    } else if report.score >= 60 {
+        console::style(format!("{}%", report.score)).yellow()
+    } else {
+        console::style(format!("{}%", report.score)).red()
+    };
+    println!(
+        "{} Security posture: {bar}  ({}/{} checks passed)\n",
+        console::style("🛡").bold(),
+        report.passed,
+        report.total
+    );
+    for c in &report.checks {
+        let mark = if c.passed {
+            console::style("✓").green().to_string()
+        } else {
+            console::style("✗").red().to_string()
+        };
+        let tag = if c.architectural { console::style("[built-in]").dim().to_string() } else { String::new() };
+        println!("  {mark} {} {tag}", c.title);
+        if !c.passed {
+            println!("      → {}", console::style(&c.detail).yellow());
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_redteam(agent: Option<String>, out: Option<PathBuf>) -> duduclaw_core::error::Result<()> {
+    use duduclaw_core::error::DuDuClawError;
+    let home = duduclaw_home();
+    let agent = match agent {
+        Some(a) => a,
+        None => mcp::get_default_agent(&home).await,
+    };
+    let agent_dir = home.join("agents").join(&agent);
+    let contract = duduclaw_agent::contract::load_contract(&agent_dir);
+    if contract.boundaries.must_not.is_empty() {
+        eprintln!(
+            "{} Agent '{agent}' has no CONTRACT.toml must_not boundaries to red-team.",
+            console::style("!").yellow()
+        );
+        return Ok(());
+    }
+    let attacks = duduclaw_gateway::redteam::generate_attacks(&contract.boundaries.must_not);
+    println!(
+        "{} Red-teaming '{agent}': {} attack(s) across {} rule(s)\n",
+        console::style("▶").cyan(),
+        attacks.len(),
+        contract.boundaries.must_not.len()
+    );
+    let mut caught = 0usize;
+    let mut report = String::new();
+    for a in &attacks {
+        let r = duduclaw_security::input_guard::scan_input(
+            &a.prompt,
+            duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
+        );
+        let verdict = if r.blocked {
+            caught += 1;
+            console::style("BLOCKED").green().to_string()
+        } else {
+            console::style("passed ").red().to_string()
+        };
+        println!("  [{:<11}] {verdict} (risk {})  ← {}", a.technique, r.risk_score, a.rule);
+        report.push_str(&format!(
+            "technique={} blocked={} risk={} rule={}\nprompt={}\n\n",
+            a.technique, r.blocked, r.risk_score, a.rule, a.prompt
+        ));
+    }
+    println!(
+        "\n{} Deterministic input-guard caught {caught}/{} attacks. \
+         Uncaught variants rely on the model itself refusing — run them against \
+         the live agent for full coverage.",
+        console::style("Σ").bold(),
+        attacks.len()
+    );
+    if let Some(path) = out {
+        std::fs::write(&path, report)
+            .map_err(|e| DuDuClawError::Gateway(format!("write report: {e}")))?;
+        eprintln!("  → wrote suite to {}", console::style(path.display()).cyan());
+    }
+    Ok(())
+}
+
+async fn cmd_backup(out: Option<PathBuf>) -> duduclaw_core::error::Result<()> {
+    use duduclaw_core::error::DuDuClawError;
+    let home = duduclaw_home();
+    let out = out.unwrap_or_else(|| {
+        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        PathBuf::from(format!("./duduclaw-backup-{stamp}.tar.gz"))
+    });
+    println!("Backing up {} → {}", home.display(), out.display());
+    let n = portability::export_home(&home, &out)?;
+    // SHA-256 sidecar for integrity verification on restore.
+    let bytes = std::fs::read(&out)
+        .map_err(|e| DuDuClawError::Gateway(format!("read archive: {e}")))?;
+    let hash = sha256_hex(&bytes);
+    let name = out.file_name().and_then(|s| s.to_str()).unwrap_or("backup.tar.gz");
+    let sidecar = PathBuf::from(format!("{}.sha256", out.display()));
+    std::fs::write(&sidecar, format!("{hash}  {name}\n"))
+        .map_err(|e| DuDuClawError::Gateway(format!("write sidecar: {e}")))?;
+    println!(
+        "{} Backed up {n} item(s) → {} (+ {} sidecar)",
+        console::style("✓").green(),
+        console::style(out.display()).cyan(),
+        console::style("SHA-256").dim()
+    );
+    Ok(())
+}
+
+async fn cmd_restore(file: PathBuf, force: bool) -> duduclaw_core::error::Result<()> {
+    use duduclaw_core::error::DuDuClawError;
+    let home = duduclaw_home();
+    // Verify the SHA-256 sidecar if present (fail closed on mismatch).
+    let sidecar = PathBuf::from(format!("{}.sha256", file.display()));
+    if let Ok(expected_line) = std::fs::read_to_string(&sidecar) {
+        let expected = expected_line.split_whitespace().next().unwrap_or("").to_lowercase();
+        let bytes = std::fs::read(&file)
+            .map_err(|e| DuDuClawError::Gateway(format!("read archive: {e}")))?;
+        let actual = sha256_hex(&bytes);
+        if !expected.is_empty() && expected != actual {
+            return Err(DuDuClawError::Gateway(format!(
+                "SHA-256 mismatch — archive corrupt or tampered (expected {expected}, got {actual})"
+            )));
+        }
+        println!("{} SHA-256 verified", console::style("✓").green());
+    } else {
+        eprintln!("{} No .sha256 sidecar found — restoring without integrity check", console::style("!").yellow());
+    }
+    portability::import_archive(&file, &home, force)?;
+    println!("{} Restored into {}", console::style("✓").green(), console::style(home.display()).cyan());
+    Ok(())
+}
+
+async fn cmd_session_replay(id: String, tools: bool) -> duduclaw_core::error::Result<()> {
+    use duduclaw_core::error::DuDuClawError;
+    use duduclaw_gateway::session::SessionManager;
+
+    let home = duduclaw_home();
+    let db_path = home.join("sessions.db");
+    let mgr = SessionManager::new(&db_path)
+        .map_err(|e| DuDuClawError::Gateway(format!("open sessions.db: {e}")))?;
+    let messages = mgr
+        .get_messages(&id)
+        .await
+        .map_err(|e| DuDuClawError::Gateway(format!("read session: {e}")))?;
+    if messages.is_empty() {
+        eprintln!("{} No turns found for session '{id}'", console::style("!").yellow());
+        return Ok(());
+    }
+    println!(
+        "{} Session {} — {} turn(s)\n",
+        console::style("▶").cyan(),
+        console::style(&id).bold(),
+        messages.len()
+    );
+    for m in &messages {
+        let role = match m.role.as_str() {
+            "user" => console::style("user").green().to_string(),
+            "assistant" => console::style("assistant").magenta().to_string(),
+            other => console::style(other).dim().to_string(),
+        };
+        println!("[{}] {} ({} tok)", m.timestamp, role, m.tokens);
+        println!("{}\n", m.content);
+    }
+
+    if tools {
+        // Interleave the agent's recent tool-call audit lines. Session ids
+        // encode the agent in DuDuClaw, but to stay decoupled we simply print
+        // the tool_calls.jsonl tail for operator cross-reference.
+        let path = home.join("tool_calls.jsonl");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            println!("{} tool_calls.jsonl (most recent 20):", console::style("⚙").dim());
+            for line in text.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev() {
+                println!("  {line}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Open the memory engine for CLI maintenance commands.
+async fn open_memory_engine() -> duduclaw_core::error::Result<duduclaw_memory::SqliteMemoryEngine> {
+    let home = duduclaw_home();
+    duduclaw_memory::SqliteMemoryEngine::new(&home.join("memory.db"))
+        .map_err(|e| DuDuClawError::Memory(format!("open memory.db: {e}")))
+}
+
+async fn resolve_agent_arg(agent: Option<String>) -> String {
+    match agent {
+        Some(a) => a,
+        None => mcp::get_default_agent(&duduclaw_home()).await,
+    }
+}
+
+/// Collect a contact's session messages (contact = `<channel>:<chat_id>` prefix)
+/// into a JSON array + a session-count. Sessions live in a different id
+/// namespace than memory subjects, so a `user:*` contact simply yields zero
+/// sessions — both stores are searched with the same identifier.
+async fn gdpr_session_bundle(
+    contact: &str,
+) -> duduclaw_core::error::Result<(serde_json::Value, usize)> {
+    use duduclaw_gateway::session::SessionManager;
+    let db_path = duduclaw_home().join("sessions.db");
+    if !db_path.exists() {
+        return Ok((serde_json::json!([]), 0));
+    }
+    let mgr = SessionManager::new(&db_path)
+        .map_err(|e| DuDuClawError::Gateway(format!("open sessions.db: {e}")))?;
+    let ids = mgr.sessions_for_contact(contact).await?;
+    let mut sessions = Vec::new();
+    for id in &ids {
+        let msgs = mgr.get_messages(id).await?;
+        let turns: Vec<serde_json::Value> = msgs
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "role": m.role,
+                    "content": m.content,
+                    "timestamp": m.timestamp,
+                })
+            })
+            .collect();
+        sessions.push(serde_json::json!({ "session_id": id, "turns": turns }));
+    }
+    let n = sessions.len();
+    Ok((serde_json::Value::Array(sessions), n))
+}
+
+async fn cmd_gdpr_export(
+    contact: String,
+    agent: Option<String>,
+    out: Option<PathBuf>,
+) -> duduclaw_core::error::Result<()> {
+    let agent = resolve_agent_arg(agent).await;
+    let engine = open_memory_engine().await?;
+    let mut bundle = duduclaw_memory::gdpr_export(&engine, &agent, &contact).await?;
+    let (sessions, session_count) = gdpr_session_bundle(&contact).await?;
+    // Merge the session store into the bundle alongside memory.
+    if let Some(obj) = bundle.as_object_mut() {
+        obj.insert("sessions".into(), sessions);
+        if let Some(counts) = obj.get_mut("counts").and_then(|c| c.as_object_mut()) {
+            counts.insert("sessions".into(), session_count.into());
+        }
+    }
+    let json = serde_json::to_string_pretty(&bundle)
+        .map_err(|e| DuDuClawError::Memory(format!("serialize bundle: {e}")))?;
+    match out {
+        Some(path) => {
+            std::fs::write(&path, &json)
+                .map_err(|e| DuDuClawError::Memory(format!("write bundle: {e}")))?;
+            let counts = &bundle["counts"];
+            println!(
+                "{} Exported {} memories + {} key facts + {} sessions for '{}' → {}",
+                console::style("✓").green(),
+                counts["memories"],
+                counts["key_facts"],
+                counts["sessions"],
+                console::style(&contact).bold(),
+                console::style(path.display()).cyan(),
+            );
+        }
+        None => println!("{json}"),
+    }
+    Ok(())
+}
+
+async fn cmd_gdpr_erase(
+    contact: String,
+    agent: Option<String>,
+    confirm: bool,
+    tombstone: bool,
+) -> duduclaw_core::error::Result<()> {
+    let agent = resolve_agent_arg(agent).await;
+    let engine = open_memory_engine().await?;
+
+    // Fail-closed: without --confirm this is a dry-run preview only.
+    if !confirm {
+        let bundle = duduclaw_memory::gdpr_export(&engine, &agent, &contact).await?;
+        let counts = &bundle["counts"];
+        let (_, session_count) = gdpr_session_bundle(&contact).await?;
+        eprintln!(
+            "{} DRY RUN — would erase {} memories + {} key facts + {} sessions for '{}' (agent {}). \
+             Re-run with --confirm to delete.",
+            console::style("!").yellow(),
+            counts["memories"],
+            counts["key_facts"],
+            session_count,
+            console::style(&contact).bold(),
+            agent,
+        );
+        return Ok(());
+    }
+
+    let summary = duduclaw_memory::gdpr_erase(&engine, &agent, &contact, tombstone).await?;
+
+    // Sessions live in a separate store (keyed by `<channel>:<chat_id>`); erase
+    // them by the same contact identifier. A `user:*` contact matches zero
+    // sessions — harmless.
+    let (sessions_deleted, session_messages_deleted) = {
+        use duduclaw_gateway::session::SessionManager;
+        let db_path = duduclaw_home().join("sessions.db");
+        if db_path.exists() {
+            let mgr = SessionManager::new(&db_path)
+                .map_err(|e| DuDuClawError::Gateway(format!("open sessions.db: {e}")))?;
+            mgr.erase_sessions_for_contact(&contact).await?
+        } else {
+            (0, 0)
+        }
+    };
+
+    println!(
+        "{} Erased {} memories + {} key facts + {} sessions ({} msgs) for '{}' (agent {}){}",
+        console::style("✓").green(),
+        summary.memories_deleted,
+        summary.key_facts_deleted,
+        sessions_deleted,
+        session_messages_deleted,
+        console::style(&contact).bold(),
+        agent,
+        match &summary.tombstone_id {
+            Some(id) => format!(" — tombstone {id}"),
+            None => String::new(),
+        }
+    );
+    Ok(())
+}
+
+async fn cmd_memory_bench(
+    agent: Option<String>,
+    query: String,
+    iters: usize,
+) -> duduclaw_core::error::Result<()> {
+    let agent = resolve_agent_arg(agent).await;
+    let engine = open_memory_engine().await?;
+    let report = duduclaw_memory::graph_rank_bench(&engine, &agent, &query, iters).await?;
+    println!(
+        "{} PPR bench — agent {} — {} triple(s), {} iter(s)",
+        console::style("▶").cyan(),
+        console::style(&agent).bold(),
+        report.triples,
+        report.iterations,
+    );
+    println!(
+        "   P50 {:.3} ms · P95 {:.3} ms · mean {:.3} ms · max {:.3} ms",
+        report.p50_ms, report.p95_ms, report.mean_ms, report.max_ms,
+    );
+    if report.partition_recommended {
+        println!(
+            "{} Partition recommended (≥{} triples or P95 ≥{:.0} ms) — time to consider \
+             LightRAG-style subgraph partitioning.",
+            console::style("⚠").yellow(),
+            duduclaw_memory::bench::PARTITION_TRIPLE_THRESHOLD,
+            duduclaw_memory::bench::PARTITION_P95_MS_THRESHOLD,
+        );
+    } else {
+        println!(
+            "{} Under threshold — no partitioning needed yet.",
+            console::style("✓").green(),
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_audit_export(
+    since: Option<String>,
+    out: Option<PathBuf>,
+    webhook: Option<String>,
+    webhook_auth: Option<String>,
+    format: String,
+) -> duduclaw_core::error::Result<()> {
+    use duduclaw_core::error::DuDuClawError;
+    use duduclaw_gateway::audit_export::{collect_records, to_ndjson, SiemFormat, SiemSink};
+
+    let home = duduclaw_home();
+    let since_dt = match since {
+        Some(s) => Some(
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .map_err(|e| DuDuClawError::Gateway(format!("invalid --since (RFC3339): {e}")))?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
+    };
+    let wire = match format.to_lowercase().as_str() {
+        "ndjson" => SiemFormat::Ndjson,
+        "json" => SiemFormat::JsonArray,
+        other => {
+            return Err(DuDuClawError::Gateway(format!(
+                "unknown --format '{other}' (use 'ndjson' or 'json')"
+            )))
+        }
+    };
+
+    let records = collect_records(&home, since_dt);
+    eprintln!(
+        "{} Collected {} audit record(s) from {}",
+        console::style("✓").green(),
+        records.len(),
+        home.display()
+    );
+
+    // File / stdout output is always NDJSON (stable line format).
+    let ndjson = to_ndjson(&records);
+    match &out {
+        Some(path) => {
+            std::fs::write(path, &ndjson)
+                .map_err(|e| DuDuClawError::Gateway(format!("write {}: {e}", path.display())))?;
+            eprintln!("  → wrote {}", console::style(path.display()).cyan());
+        }
+        None if webhook.is_none() => {
+            // No file and no webhook: print to stdout so the command is useful bare.
+            print!("{ndjson}");
+        }
+        None => {}
+    }
+
+    if let Some(url) = webhook {
+        let auth_header = match webhook_auth {
+            Some(h) => {
+                let (name, value) = h
+                    .split_once(':')
+                    .ok_or_else(|| DuDuClawError::Gateway("--webhook-auth must be 'Name: Value'".into()))?;
+                Some((name.trim().to_string(), value.trim().to_string()))
+            }
+            None => None,
+        };
+        let sink = SiemSink { url: url.clone(), auth_header, format: wire };
+        let http = reqwest::Client::new();
+        match sink.send(&http, &records).await {
+            Ok(0) => eprintln!("  (no records to push)"),
+            Ok(status) => eprintln!(
+                "{} Pushed {} record(s) to {} (HTTP {status})",
+                console::style("✓").green(),
+                records.len(),
+                console::style(&url).cyan()
+            ),
+            Err(e) => return Err(DuDuClawError::Gateway(format!("SIEM push failed: {e}"))),
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_export_data(out: Option<PathBuf>) -> duduclaw_core::error::Result<()> {
     let home = duduclaw_home();
     let out = out.unwrap_or_else(portability::default_export_path);
@@ -3352,8 +4287,10 @@ async fn cmd_http_server(
 
     // Initialize memory engine
     let memory_db_path = home.join("memory.db");
-    let memory = SqliteMemoryEngine::new(&memory_db_path)
-        .map_err(|e| DuDuClawError::Memory(format!("Failed to open memory DB: {e}")))?;
+    let memory = mcp::maybe_with_semantic_embedder(
+        SqliteMemoryEngine::new(&memory_db_path)
+            .map_err(|e| DuDuClawError::Memory(format!("Failed to open memory DB: {e}")))?,
+    );
 
     let default_agent = mcp::get_default_agent(&home).await;
 
