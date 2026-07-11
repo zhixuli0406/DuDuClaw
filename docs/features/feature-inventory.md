@@ -1,6 +1,36 @@
 # DuDuClaw Complete Feature Inventory
 
-> v1.24.0 | Last updated: 2026-06-25
+> v1.24.0 core + 2026-07 additions | Last updated: 2026-07-09
+>
+> Note: the sections below describe the v1.24.0 baseline. The **2026-07
+> additions** block immediately after captures features shipped since (see
+> `CHANGELOG.md` `[Unreleased]` for the authoritative list). The `ja-JP/` and
+> `zh-TW/` mirrors are synced with the 2026-07 additions.
+
+---
+
+## 2026-07 additions (post-v1.24.0)
+
+| Feature | Description |
+|---------|-------------|
+| Aider-style code map (`code_map` MCP tool) | tree-sitter symbol graph over the HippoRAG-lite Personalized-PageRank engine; ranks repo files by relevance to a query |
+| Semantic vector memory (`w_vec`) | third re-rank signal beside FTS/graph; zero-dep CJK-safe `NgramHashEmbedder`, opt-in `DUDUCLAW_SEMANTIC_VECTORS=1` |
+| Cross-session user profile | per-user preference traits (temporal supersession) → session-stable `## About This User` reply injection; `user_profile_record` / `user_profile_get` MCP tools |
+| GDPR export/erase | `duduclaw gdpr export\|erase <contact>` over memory (triples + mentions + key_facts, 4-table cascade, SHA-256 tombstone) **and** the session store (`<channel>:<chat_id>` prefix) |
+| Memory PPR bench | `duduclaw memory bench` — P50/P95 latency + partition recommendation (LightRAG measurement gate) |
+| Budget circuit breaker | hard per-agent rolling-window spend caps (`[budget] daily_cap_cents`) that block LLM calls at the choke-point; `budget_events.jsonl` |
+| Burn-rate cost anomaly | rolling mean+stddev outlier detection over per-day spend (`cost_anomaly.rs`) |
+| Audit export + SIEM sink | `duduclaw audit` — normalize + stream the JSONL audit trails to NDJSON / a webhook |
+| Output guardrail hook | opt-in `[guardrails]` — secret-leak / injection-echo / deny-phrase / PII scan before send |
+| CI red-team scan | `duduclaw redteam` — jailbreak variants from `CONTRACT.toml` `must_not`, run through the input-guard |
+| Security posture report | `duduclaw security` — weighted checklist of active protections |
+| Backup / restore | `duduclaw backup` / `restore` — timestamped home archive + SHA-256 sidecar (verified on restore) |
+| Session replay | `duduclaw session replay <id>` — print a session's turns (+ `--tools`) |
+| MCP Bridge | `[[mcp.external]]` — mount external MCP servers with a deny-by-default tool filter + `env://` / `secret://` credentials; per-SaaS recipes in `guides/mcp-bridge.md` |
+| Secret manager backends | 1Password Connect + Infisical adapters; `secret://<backend>/<name>` resolution wired into the MCP Bridge |
+| MCP/skill trust tiering | official / active / orphan classification from repo push-age + owner type |
+| Email channel (partial) | async SMTP send (`lettre`, loopback-verified) + RFC822 inbound parse; IMAP poll + channel lifecycle are PENDING-LIVE |
+| Communication Channels | now **nine** (adds Google Chat + Microsoft Teams over the 7 below) |
 
 ---
 

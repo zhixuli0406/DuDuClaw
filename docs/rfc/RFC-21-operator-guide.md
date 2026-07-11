@@ -47,7 +47,22 @@ mode         = "agent_writable"
 # Production policies are operator-only — never writable via MCP
 [namespaces."policies"]
 mode         = "operator_only"
+
+# WP3: only these specific agents may write this namespace (exact id match).
+# The operator can always write. An empty `agents = []` is fail-closed — it
+# denies every agent (operator-only equivalent), never "open to all".
+[namespaces."team-knowledge"]
+mode         = "agent_allowlist"
+agents       = ["agnes", "boss"]
 ```
+
+### `agent_allowlist` — who may write (WP3)
+
+This is the direct answer to "誰可以寫入這個 namespace". List the exact agent
+ids allowed to write a top-level namespace; every other agent is denied and the
+denial is audited. Matching is **exact-equality** — `agnes` on the list does not
+admit an agent id `agnes-2`. The operator (CLI / sync) is always allowed. Both
+`shared_wiki_write` and `shared_wiki_delete` honour the policy.
 
 ### Verify
 
@@ -69,6 +84,7 @@ Unlisted namespaces are reported as `agent_writable` (the default).
 ### Common pitfalls
 
 - ❌ `mode = "read_only"` without `synced_from` is **rejected at parse time**. There is no "no one may write" mode short of `operator_only`.
+- ⚠️ `mode = "agent_allowlist"` with an empty or absent `agents` list parses fine but denies **every** agent at write time (fail-closed). Fill in `agents` or the namespace is effectively operator-only.
 - ❌ Locking down `SOP/` will block evolution writes silently from the agent's perspective. Use `wiki_namespace_status` first to confirm what's writable.
 
 ---

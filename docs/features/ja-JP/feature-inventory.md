@@ -1,6 +1,33 @@
 # DuDuClaw 全機能一覧
 
-> v1.24.0 | 最終更新：2026-06-25
+> v1.24.0 コア + 2026-07 追加 | 最終更新：2026-07-09
+>
+> 注記:以下の各セクションは v1.24.0 のベースラインです。直後の**「2026-07 追加」**ブロックが、それ以降に実装された機能をまとめています(正式な一覧は `CHANGELOG.md` `[Unreleased]` を参照)。本ファイルは英語版と 2026-07 まで同期済みです。
+
+---
+
+## 2026-07 追加(v1.24.0 以降)
+
+| 機能 | 説明 |
+|------|------|
+| Aider 式コードシンボルグラフ(`code_map` MCP ツール) | tree-sitter シンボルグラフを HippoRAG-lite Personalized-PageRank エンジン上で実行し、クエリとの関連度でリポジトリのソースファイルをランク付け |
+| セマンティックベクトル記憶(`w_vec`) | FTS/graph に加えた第三の re-rank シグナル。依存ゼロ・CJK 安全の `NgramHashEmbedder`、`DUDUCLAW_SEMANTIC_VECTORS=1` で有効化 |
+| セッション横断ユーザープロファイル | ユーザーごとの嗜好 traits(temporal supersession)→ セッション安定な `## About This User` を返信に注入。`user_profile_record` / `user_profile_get` MCP ツール |
+| GDPR エクスポート/消去 | `duduclaw gdpr export\|erase <contact>` が記憶(triple + 本文言及 + key_facts、4 テーブルのカスケード、SHA-256 仮名 tombstone)**と**セッションストア(`<channel>:<chat_id>` プレフィックス)を対象 |
+| 記憶 PPR ベンチ | `duduclaw memory bench` — P50/P95 レイテンシ + パーティション推奨(LightRAG 計測ゲート) |
+| 予算サーキットブレーカー | エージェント単位のスライディングウィンドウ上限(`[budget] daily_cap_cents`)。上限到達で choke-point にて LLM 呼び出しを遮断。`budget_events.jsonl` |
+| バーンレート異常検知 | エージェントごとの日次支出に対し移動平均+標準偏差で外れ値を検出(`cost_anomaly.rs`) |
+| 監査エクスポート + SIEM sink | `duduclaw audit` — JSONL 監査ログを正規化し NDJSON / webhook へストリーム |
+| 送信 guardrail フック | opt-in `[guardrails]` — 送信前に秘密情報の漏洩 / インジェクション反響 / 禁止フレーズ / PII をスキャン |
+| CI レッドチームスキャン | `duduclaw redteam` — `CONTRACT.toml` の `must_not` から jailbreak バリアントを生成し input-guard に通す |
+| セキュリティ姿勢レポート | `duduclaw security` — 有効な防御の重み付きチェックリスト |
+| バックアップ / リストア | `duduclaw backup` / `restore` — タイムスタンプ付きホームアーカイブ + SHA-256 サイドカー(リストア時に検証) |
+| セッションリプレイ | `duduclaw session replay <id>` — セッションのターンを順に出力(`--tools` 併用可) |
+| MCP Bridge | `[[mcp.external]]` — 外部 MCP サーバーをマウント。deny-by-default のツールフィルタ + `env://` / `secret://` 認証情報。各 SaaS のレシピは `guides/mcp-bridge.md` |
+| Secret manager バックエンド | 1Password Connect + Infisical アダプタ。`secret://<backend>/<name>` の解決を MCP Bridge に配線 |
+| MCP/skill 信頼ティア分け | リポジトリの最終 push 時期 + オーナー種別から official / active / orphan を判定 |
+| Email チャネル(部分) | 非同期 SMTP 送信(`lettre`、loopback で実地検証)+ RFC822 受信パース。IMAP ポーリング + チャネルライフサイクルは PENDING-LIVE |
+| コミュニケーションチャネル | 現在**9 個**(下記 7 個に Google Chat + Microsoft Teams を追加) |
 
 ---
 

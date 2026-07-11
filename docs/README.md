@@ -40,6 +40,8 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/27-pty-pool-runtime.md](features/27-pty-pool-runtime.md) | Cross-platform PTY pool + worker — drive interactive claude REPL |
 | [features/28-live-forking.md](features/28-live-forking.md) | Live run forking — parallel branches + AI judge (duduclaw-fork) |
 | [features/29-evolution-events.md](features/29-evolution-events.md) | Evolution events — black-box recorder with batch+retry delivery |
+| [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios (zh-TW) — when to use, when not to, vs `duduclaw eval` |
+| [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix (zh-TW) — sales-facing coverage table |
 
 ---
 
@@ -70,6 +72,10 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [rfc/RFC-24-decision-continuity.md](rfc/RFC-24-decision-continuity.md) | Cross-session decision/proposal durability (fixes session-chain breakage) |
 | [rfc/RFC-26-deep-agents-alignment.md](rfc/RFC-26-deep-agents-alignment.md) | Deep-agents / live-forking alignment |
 | [adr/ADR-002-x-duduclaw-capability-negotiation.md](adr/ADR-002-x-duduclaw-capability-negotiation.md) | ACP capability negotiation decision |
+| [adr/ADR-003-excluded-channels.md](adr/ADR-003-excluded-channels.md) | Excluded channels (Signal / personal WeChat / Viber) |
+| [adr/ADR-004-erp-connector-abstraction.md](adr/ADR-004-erp-connector-abstraction.md) | ERP connector abstraction (`trait ErpConnector`) |
+| [adr/ADR-005-document-export.md](adr/ADR-005-document-export.md) | Document export selection (md → Slide / Word / PPT / PDF) |
+| [adr/ADR-006-local-ocr.md](adr/ADR-006-local-ocr.md) | Local OCR for sensitive images — measure before choosing |
 
 ## Planning (TODO)
 
@@ -86,12 +92,14 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/deployment-guide.md](guides/deployment-guide.md) | Production deployment (Tailscale/ngrok/Docker/systemd) | Current |
 | [guides/development-guide.md](guides/development-guide.md) | Developer setup, agent development, browser automation | Current |
 | [guides/custom-mcp-tool.md](guides/custom-mcp-tool.md) | Extending MCP tools — step-by-step guide | Current |
+| [guides/mcp-bridge.md](guides/mcp-bridge.md) | Mounting external MCP servers (`[[mcp.external]]`) + `secret://` credentials + per-SaaS recipes (Gmail/Plane/Chatwoot/Invoice Ninja/WooCommerce) | Current |
 | [guides/evals.md](guides/evals.md) | Agent behavior evals / regression suite (`duduclaw eval`), CI gate, GVU yardstick | Current |
 | [guides/docker.md](guides/docker.md) | Docker build & run | Current |
 | [guides/multi-instance.md](guides/multi-instance.md) | Running multiple instances on one machine (DUDUCLAW_HOME / PORT / INSTANCE) | Current |
 | [guides/observability.md](guides/observability.md) | OpenTelemetry GenAI tracing + OTLP export (`--features otel`, `[telemetry]` config) | Current |
 | [guides/personal-edition-portability.md](guides/personal-edition-portability.md) | 個人版資料可攜：自架 ↔ 代管互轉 | Current |
 | [guides/channels-googlechat-teams.md](guides/channels-googlechat-teams.md) | Google Chat & Microsoft Teams channel setup + per-channel formatting/typing matrix | Current |
+| [guides/migrate-from.md](guides/migrate-from.md) | 從 OpenClaw / Hermes / paperclip 無痛轉移（`duduclaw migrate-from`，預設 dry-run） | Current |
 
 ## API Reference
 
@@ -117,7 +125,11 @@ docs/                                  # L1 PUBLIC — product & developer docum
 │   ├── RFC-24-decision-continuity.md
 │   └── RFC-26-deep-agents-alignment.md
 ├── adr/                               # Architecture Decision Records
-│   └── ADR-002-x-duduclaw-capability-negotiation.md
+│   ├── ADR-002-x-duduclaw-capability-negotiation.md
+│   ├── ADR-003-excluded-channels.md
+│   ├── ADR-004-erp-connector-abstraction.md
+│   ├── ADR-005-document-export.md
+│   └── ADR-006-local-ocr.md
 ├── todo/                              # Public planning / tracking docs
 │   ├── TODO-agent-honesty.md
 │   └── TODO-rfc26-live-forking.md

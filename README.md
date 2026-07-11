@@ -201,13 +201,14 @@ duduclaw eval                # 執行 agent 行為 eval 套件
 duduclaw update              # 檢查並安裝更新
 duduclaw service install     # 安裝為系統服務;另有 start / stop / status / logs / uninstall
 duduclaw export / import     # 匯出 / 匯入 ~/.duduclaw(個人版資料可攜)
+duduclaw migrate-from openclaw   # 從 OpenClaw / Hermes / paperclip 無痛轉移(預設 dry-run,--apply 落地)
 duduclaw mcp-server          # 啟動 MCP Server(stdio JSON-RPC 2.0)
 duduclaw http-server         # 啟動 MCP HTTP/SSE Transport(Bearer 認證)
 duduclaw acp-server          # 啟動 ACP/A2A Server(Zed / JetBrains / Neovim 整合)
 duduclaw license             # 授權管理(activate / status / redeem / rebind / …)
 ```
 
-完整 25 個指令與所有子指令用 `duduclaw --help` 查看,開發者相關見 [development-guide.md](docs/guides/development-guide.md)。
+完整 26 個指令與所有子指令用 `duduclaw --help` 查看,開發者相關見 [development-guide.md](docs/guides/development-guide.md)。
 
 <a id="trust"></a>
 

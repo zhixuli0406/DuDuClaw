@@ -1,6 +1,33 @@
 # DuDuClaw 完整功能清單
 
-> v1.24.0 | 最後更新：2026-06-25
+> v1.24.0 核心 + 2026-07 新增 | 最後更新：2026-07-09
+>
+> 說明:以下各章為 v1.24.0 基準。緊接其後的**「2026-07 新增」**區塊涵蓋此後落地的功能(權威清單見 `CHANGELOG.md` `[Unreleased]`)。本檔已與英文版同步至 2026-07。
+
+---
+
+## 2026-07 新增(v1.24.0 之後)
+
+| 功能 | 說明 |
+|------|------|
+| Aider 式程式碼符號圖(`code_map` MCP 工具) | tree-sitter 符號圖疊在 HippoRAG-lite Personalized-PageRank 引擎上;依查詢相關度排序 repo 原始碼檔案 |
+| 語意向量記憶(`w_vec`) | FTS/graph 之外的第三個 re-rank 訊號;零依賴、CJK-safe 的 `NgramHashEmbedder`,以 `DUDUCLAW_SEMANTIC_VECTORS=1` 開啟 |
+| 跨 session 使用者畫像 | 每使用者偏好 traits(temporal supersession)→ session-stable 的 `## About This User` 回覆注入;`user_profile_record` / `user_profile_get` MCP 工具 |
+| GDPR 匯出/抹除 | `duduclaw gdpr export\|erase <contact>` 涵蓋記憶(triple + 自由文字提及 + key_facts,四表級聯,SHA-256 假名 tombstone)**與** session 儲存(`<channel>:<chat_id>` prefix) |
+| 記憶 PPR 效能量測 | `duduclaw memory bench` — P50/P95 延遲 + 分區建議(LightRAG 量測 gate) |
+| 預算斷路器 | 每 agent 滑動視窗硬上限(`[budget] daily_cap_cents`),到頂即於 choke-point 阻斷 LLM 呼叫;寫 `budget_events.jsonl` |
+| 燒錢速率異常偵測 | 對每 agent 每日花費做滾動平均+標準差離群偵測(`cost_anomaly.rs`) |
+| 稽核匯出 + SIEM sink | `duduclaw audit` — 正規化並串流 JSONL 稽核軌跡至 NDJSON / webhook |
+| 出站 guardrail hook | opt-in `[guardrails]` — 送出前掃描憑證洩漏 / injection echo / deny 詞 / PII 去識別化 |
+| CI 紅隊掃描 | `duduclaw redteam` — 由 `CONTRACT.toml` `must_not` 生成 jailbreak 變體,跑過 input-guard |
+| 安全姿態報告 | `duduclaw security` — 現行防護的加權檢查清單 |
+| 備份 / 還原 | `duduclaw backup` / `restore` — 時間戳家目錄封存 + SHA-256 sidecar(還原時驗證) |
+| Session 重播 | `duduclaw session replay <id>` — 逐輪印出 session(可加 `--tools`) |
+| MCP Bridge | `[[mcp.external]]` — 掛載外部 MCP server,deny-by-default 工具過濾 + `env://` / `secret://` 憑證;各 SaaS recipe 見 `guides/mcp-bridge.md` |
+| Secret manager 後端 | 1Password Connect + Infisical adapter;`secret://<backend>/<name>` 解析接入 MCP Bridge |
+| MCP/skill 信任分級 | 依 repo 最後 push 時間 + 擁有者類型分 official / active / orphan |
+| Email 通道(部分) | 非同步 SMTP 送信(`lettre`,loopback 活體驗證)+ RFC822 入站解析;IMAP poll + 通道生命週期為 PENDING-LIVE |
+| 通訊通道 | 現為**九個**(在下列 7 個之上新增 Google Chat + Microsoft Teams) |
 
 ---
 

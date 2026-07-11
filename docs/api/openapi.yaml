@@ -1661,9 +1661,38 @@ paths:
                         type:
                           type: string
                           enum: [cloud, local]
+                        source:
+                          type: string
+                          description: >
+                            Discovery source for cloud models. `fallback` means
+                            live discovery failed and this is a static list.
+                          enum: [live_api, cli_probe, help_parse, pty_probe, fallback]
+                        fetched_at:
+                          type: string
+                          description: RFC3339 timestamp of the last probe for this provider.
                   default_local:
                     type: string
                     nullable: true
+                  discovered_at:
+                    type: string
+                    description: RFC3339 timestamp of the whole discovery run.
+
+  /rpc/models.refresh:
+    post:
+      tags: [models]
+      summary: Force a live re-probe of installed CLIs/APIs for their model lists
+      description: >
+        Re-runs the per-provider discovery chain (Anthropic /v1/models, CLI
+        --help parsing, optional PTY probe), persists the cache, and returns the
+        fresh list. Same response shape as models.list. Login-readable.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyParams"
+      responses:
+        "200":
+          description: Freshly-probed model list (same shape as models.list)
 
   # ── Logs ─────────────────────────────────────────────────────
 
