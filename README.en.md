@@ -201,13 +201,14 @@ duduclaw eval                # run the agent behavior eval suite
 duduclaw update              # check for and install updates
 duduclaw service install     # install as a system service; also start / stop / status / logs / uninstall
 duduclaw export / import     # export / import ~/.duduclaw (portable personal data)
+duduclaw migrate-from openclaw   # painless migration from OpenClaw / Hermes / paperclip (dry-run by default, --apply to write)
 duduclaw mcp-server          # start the MCP server (stdio JSON-RPC 2.0)
 duduclaw http-server         # start the MCP HTTP/SSE transport (Bearer auth)
 duduclaw acp-server          # start the ACP/A2A server (Zed / JetBrains / Neovim)
 duduclaw license             # license management (activate / status / redeem / rebind / …)
 ```
 
-Run `duduclaw --help` for all 25 commands and their subcommands; developer topics are in the [development guide](docs/guides/development-guide.md).
+Run `duduclaw --help` for all 26 commands and their subcommands; developer topics are in the [development guide](docs/guides/development-guide.md).
 
 <a id="trust"></a>
 

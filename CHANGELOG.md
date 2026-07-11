@@ -2,6 +2,350 @@
 
 ## [Unreleased]
 
+### Added
+- **Painless migration `duduclaw migrate-from <openclaw|hermes|paperclip>`.**
+  One command to move from the three big competitor platforms into DuDuClaw.
+  New `crates/duduclaw-cli/src/migrate_from/` module (`openclaw.rs` / `hermes.rs`
+  / `paperclip.rs` / `report.rs` + shared `mod.rs`). **Default is a dry-run** that
+  prints the migration plan; `--apply` performs the writes; `--rename` imports
+  under a `-imported` suffix on a name clash instead of skipping. Every item is
+  reported honestly — `IMPORTED` / `PARTIAL` / `SKIPPED(reason)` /
+  `CONFLICT(reason)` — rolling up to `COMPLETE` / `DEGRADED` / `PARTIAL`; the
+  report is also written to `~/.duduclaw/imported/<platform>/migration-report.md`
+  and all token values are masked (first 4 + last 4). Maps source agents
+  (workspace `SOUL.md` → `SOUL.md`, `MEMORY.md`/`USER.md` bullets → Semantic
+  memory tagged `imported-from-<platform>`), channel tokens (telegram/discord/slack
+  → AES-256-GCM-encrypted config.toml `[channels]`, **never overwriting** an
+  existing token → `CONFLICT`), the Anthropic API key, `[model] preferred`
+  (strips the `anthropic/` prefix; non-Claude models flagged `PARTIAL` for manual
+  review), legacy cron `jobs.json` (defensive parse → SQLite cron store), and
+  skills (each `SKILL.md` runs through the prompt-injection scanner **before**
+  install — a flagged skill is `SKIPPED(security)`, fail-closed). paperclip goes
+  via the official `paperclipai company export` directory (`--source` required):
+  `reportsTo` → `reports_to` with topological creation order + cycle detection,
+  `TASK.md` → Task Board, `recurring` → cron, `COMPANY.md` → shared wiki. Original
+  session/conversation files are archived verbatim to
+  `~/.duduclaw/imported/<platform>/raw/` (v1 does not parse them into
+  `sessions.db`). The `agent create` scaffold logic was extracted into a shared
+  `scaffold_agent_dir` helper so imported agents and hand-created agents stay
+  byte-compatible. See `docs/guides/migrate-from.md`.
+- **Dynamic runtime model discovery (`runtime_models.rs`).** The dashboard model
+  picker was backed by a hard-coded, hand-edited cloud model list in
+  `handle_models_list` that drifted stale (Claude listed "opus-4-6" with no Fable;
+  codex/gemini hard-coded too). Replaced with a per-provider discovery chain that
+  probes the *real* installed CLIs / APIs and caches to
+  `~/.duduclaw/runtime_models.json` (12h background refresh + startup probe).
+  Discovery chain per provider returns `{models, source, fetched_at}` where
+  `source ∈ live_api / cli_probe / help_parse / pty_probe / fallback`:
+  **claude** → Anthropic `GET /v1/models` when an API key is configured (10s
+  timeout) → parse `claude --help` `--model` aliases (5s timeout, stdin closed)
+  → static fallback (marked); **codex / gemini / agy** → best-effort `--help`
+  `models` subcommand probe (≤5s, stdin closed) → static fallback. All CLI probes
+  close stdin + hard-timeout + `kill_on_drop` so a probe can never drop into the
+  interactive REPL or hang. Optional `pty_probe` source (drives the interactive
+  `/model` menu) is **default OFF**, opt-in via `config.toml [models] pty_probe`.
+  New `models.refresh` RPC (login-readable) forces a live re-probe. Each
+  `models.list` entry now carries `provider` / `source` / `fetched_at`; the
+  picker shows "updated N ago" + a 🔄 refresh button and flags fallback groups as
+  "（預設清單，未能即時取得）". Live discovery failures never fabricate a
+  live-looking list — they surface the static fallback, clearly marked.
+
+- **Gamification growth persistence (V10-T10.0).** New `growth.rs` — SQLite
+  `~/.duduclaw/growth.db` (WAL) storing only facts (achievement unlock
+  timestamps, an XP-snapshot audit log, a per-day daily-report cache). A **pure**
+  judging engine (`compute_snapshot`, fully unit-tested, byte-identical on
+  recompute) scores real internal surfaces (tasks/skills/wiki/cron/custom-skills)
+  into XP (task +12 / skill +25 / knowledge page +8 / routine run +5 + one-time
+  achievement bonuses) and `Lv = floor(sqrt(XP/100))`. Declarative achievement
+  table; sources we cannot read honestly (`inbox_zero_streak_7`,
+  `custom_skill_saved_100h`) surface as `available: false` with a documented
+  reason instead of a fabricated estimate. New RPCs `growth.snapshot` /
+  `growth.daily_report` (login-readable, non-admin).
+- **Human × agent custom skills backend (V13-T13.0).** New `custom_skills.rs` —
+  SQLite `custom_skill_registry` with a `draft → generating → pending_approval →
+  approved / rejected / retired` state machine (illegal transitions refused).
+  Pre-approval `SKILL.md` bodies are quarantined in `~/.duduclaw/skills-drafts/`,
+  which is **never** a skill-loader scan root (isolation asserted by test). Six
+  RPCs `skills.custom_create / custom_generate / custom_update / custom_submit /
+  custom_list / custom_retire`; generation reuses the existing `bus_queue`
+  delegation channel. Submit runs the mandatory `scan_skill` safety pass
+  (includes prompt-injection) — **high/critical risk is refused (fail-closed)**;
+  a pass routes to the shared `ApprovalBroker` (`action_kind = "skill_create"`,
+  7-day TTL = DENY on expiry). Approval side-effect installs the draft into the
+  real global skills dir; deny marks the row rejected with a reason. Single-admin
+  self-approval is audited (`self_approved`). Fail-closed unit tests cover all
+  three invariants (TTL-expiry = deny, high-risk cannot submit, drafts unscanned).
+- **Single-binary commercial upgrade.** A stock `duduclaw` verifies a signed
+  `~/.duduclaw/license.json` out of the box — no separate `duduclaw-pro` binary.
+  `license_runtime::production_registry()` bakes the production issuer public key
+  (env `DUDUCLAW_LICENSE_PUBKEY_*` still overrides; empty/malformed baked key
+  fails safe to OpenSource). Upgrade path: drop in `license.json` → restart.
+- **Perpetual (buy-out / OEM) licenses.** `license-keygen issue --perpetual`
+  issues a no-expiry license (100-year term); mutually exclusive with `--days`
+  (clap-enforced). Term licenses (`--days N`) unchanged.
+- **Proactive license-expiry warnings.** Gateway logs a warning in the 30/7-day
+  pre-expiry window (at boot + daily via the CRL loop); the dashboard shows a
+  cross-page `LicenseExpiryBanner` (warning ≤30d / critical ≤7d / expired),
+  complementing the passive LicensePage countdown. Thresholds shared with the
+  gateway (`classify_expiry_urgency`). Unit-tested.
+- **Dashboard: per-AI-staff live status glyph (WP10-T10.2).** CSS-animated
+  presence dots on the roster (`AgentStatusGlyph` + `agent-activity-store`):
+  idle / 回覆中 / 工具執行中 / 背景固化 / 等待審批, derived non-invasively from the
+  existing `activity.new` + `browser.approval_request` WS events (transient TTL
+  decay, no new backend truth source). Reduced-motion safe. Unit-tested.
+- **Dashboard: owner home incident banner (WP14-T14.2, partial).** A red
+  "需要你關注" strip that stays fully silent when all is well and deep-links each
+  incident chip to its page. Ships with paused-AI-staff + offline-channel
+  sources (existing read paths); budget/approval sources await their read RPCs.
+- **Dashboard: activity feed three-tier denoising (WP14-T14.3).** Headline vs
+  secondary vs routine tiers — routine per-message chatter is hidden behind a
+  "顯示全部細節" toggle, and ≥3 consecutive same-AI-staff updates fold into one
+  "N 筆連續更新" row. Unit-tested.
+- **Suspected-private-use detection guards (WP6-T6.4b, core).** Labour-relations
+  sensitive, so the false-positive guards ship first as `workforce_private.rs`
+  (opt-in, off by default): fail-closed with no operator business-scope baseline;
+  only high-confidence "suspected private" is flagged ("undetermined" never is);
+  exempt list; flag TTL auto-expiry (default 30 days, unparseable timestamp =
+  expired). Advisory only — never grounds for discipline, never employee-visible.
+  Unit-tested. Haiku classification batch + operator-only UI are the follow-up.
+- **CEO/Board governance mode (WP17, core + ADR).** Opt-in `[governance] board_mode`
+  (default off — solo deployments unchanged). New `governance.rs`: a typed
+  `ApprovalKind` (serde-compatible with the stored `action_kind` strings; also used
+  by WP8/WP16) plus fail-closed invariants — `StrategicPlan`/`AgentHire` are
+  Board-human-only (an agent identity is refused, "Board = human"), Initiatives are
+  board-human-created only, and in board_mode no agent may edit `[budget]` via MCP
+  (anti self-promotion). Unit-tested. Design: `docs/adr/ADR-007-board-governance-mode.md`.
+  Strategic-proposal flow + Board panel + cascade budget are follow-up integration.
+- **LINE OA B2C credit metering (WP7, core).** `LineChannelConfig` gains an
+  additive `[[channels.line.accounts]]` array (multi Official Account, each bound
+  to an agent with a `credit_rate`); legacy single-OA config still works via
+  `resolve_accounts()`. New `credit.rs` ledger (`credits.db`): per-`(oa, user)`
+  points balance + append-only events, atomic deduct, fail-closed gate (balance ≤0
+  ⇒ no LLM call), `tokens_to_points`. `duduclaw credit grant|balance|history` CLI
+  for operator top-ups (PayUni settlement is separate). Webhook `destination`
+  routing + per-account signature verify is the follow-up integration.
+- **Channel-side approval buttons (WP16, core).** `RichComponent::Buttons` +
+  `ActionButton`/`ButtonStyle` model for cross-platform action buttons, plus
+  `channel_approval.rs`: the `approval:<id>:<approve|deny>:<nonce>` action-id codec
+  (fits Telegram's 64-byte callback cap), fail-closed exact-match approver
+  authorization (a forwarded button can't be actioned by the recipient), and a
+  one-time nonce against replay. Pure + unit-tested; per-platform native render
+  (TG inline keyboard / Slack Block Kit / Discord components / LINE quick reply)
+  and the four click-event routes are the follow-up integration.
+- **Delegation permission decay — "narrower wins" (WP4, core).** New
+  `delegation_scope.rs` defines the permission-snapshot shape carried across a
+  delegation hop and the intersection rule: allow-lists intersect (empty = no
+  restriction, so the restrictive party wins), deny-lists union, Odoo model/action
+  allow-lists intersect — so agent A delegating to a wider-privileged agent B can
+  never widen what A could reach. Depth cap prevents unbounded hops. Pure,
+  fully unit-tested; dispatcher/Odoo runtime wiring is the follow-up integration.
+- **Per-user cost attribution (WP6) — "which employee is spending?".** `token_usage`
+  gains additive `user_id` + `channel` columns (idempotent migration); the channel-reply
+  path attributes spend to the end user via new `record_attributed` + `CHANNEL_REPLY_USER_ID`
+  task-local. New `summary_by_user` query + admin-scoped `cost_users` MCP tool rank users by
+  cost; non-human traffic buckets under `(system)`. Guide: `docs/guides/workforce-analytics.md`.
+- **Skills speak the employee's language (WP8).** `SkillMeta` gains a `display`
+  map (`zh-TW`/`en`/`ja-JP` → localised name+description) with a
+  `locale → zh-TW → original` fallback chain, so non-English-reading employees
+  see what a skill does. Presentation (`skill_list`, spec) uses it; skills
+  predating the field render unchanged. Plus a skill-activation approval helper
+  (`skill_approval.rs`, `action_kind = skill_activation`) that carries the
+  "省多少分鐘?" estimate (`estimated_minutes_saved`) into the manager's Approval
+  Inbox — the data source for the WP10 leaderboard. Spec: `docs/spec/skill-md-spec.md`.
+- **Shared-wiki `agent_allowlist` namespace mode — "who may write" control.** `.scope.toml`
+  gains a fourth mode: `mode = "agent_allowlist"` + `agents = ["agnes", "boss"]` restricts a
+  namespace's writes to those exact agent ids (exact-equality, no substring), operator always
+  allowed. Empty list is fail-closed (denies every agent). Honoured by both `shared_wiki_write`
+  and `shared_wiki_delete`; surfaced in `wiki_namespace_status`.
+  `crates/duduclaw-cli/src/wiki_scope.rs`.
+- **`duduclaw redaction verify` — prove de-identification works, don't just claim it.**
+  Runs a CSV/text file through the REAL redaction pipeline (vault writes included)
+  and emits a Markdown evidence report: every hit (masked original `王**` × rule id
+  × token × category), `PASS-THROUGH` lines, and a reversibility check that restores
+  each token and asserts it round-trips (`restore OK n/n`). Ships a demo dataset at
+  `docs/examples/redaction-sample.csv`. `crates/duduclaw-cli/src/redaction_verify.rs`.
+- **Keyword redaction rules (no regex needed).** The `keyword` rule kind is now
+  compiled by the engine — operators add a customer name (`Amazon`, `台積電`) via
+  `type = "keyword"` and it is redacted with whole-word, CJK-safe matching
+  (ASCII terms respect word boundaries; CJK terms match as substrings).
+  `crates/duduclaw-redaction/src/rules/keyword.rs`.
+- **`code_map` MCP tool — Aider-style repository symbol graph.** tree-sitter
+  symbol extraction (Rust/Python/JS/TS/TSX) over the existing HippoRAG-lite
+  Personalized-PageRank engine (`graph_rank.rs`): ranks a repo's source files by
+  relevance to a query, with cross-file reference edges (def weight 4, ref weight
+  1) and `chat_files` personalization. `crates/duduclaw-memory/src/code_map.rs`;
+  MCP tool gated by `MemoryRead`, excluded from the external whitelist.
+- **Semantic vector memory retrieval (`w_vec`).** Third re-rank signal alongside
+  `w_fts`/`w_graph`: pluggable `EmbeddingProvider` with a zero-dependency,
+  CJK-safe, stable char-n-gram default (`NgramHashEmbedder`); embeddings stored
+  as additive `embedding` BLOB columns; brute-force cosine KNN respecting
+  agent/temporal isolation and embedder-identity binding. Opt-in via
+  `DUDUCLAW_SEMANTIC_VECTORS=1`. No signal ⇒ ranking byte-identical.
+  `crates/duduclaw-memory/src/vector.rs`.
+- **Budget circuit breaker — cost enforcement, not just observation.** Hard
+  per-agent rolling-window spend caps (`[budget] daily_cap_cents` +
+  `monthly_limit_cents`) that block new LLM calls at the dispatch choke-point and
+  reply with a zh-TW notice; writes `budget_events.jsonl`. Fail-open on telemetry
+  outage. `crates/duduclaw-gateway/src/budget.rs`.
+- **MCP Bridge — mount external third-party MCP servers.** `[[mcp.external]]` in
+  `agent.toml` spawns external MCP servers (Plane/Chatwoot/Gmail/…) alongside the
+  internal server, with a deny-by-default per-server tool allow/deny filter
+  (`duduclaw_llm::ToolFilter`), `env://` credential resolution, and fail-safe
+  skip/degrade. `crates/duduclaw-gateway/src/mcp_external.rs`; guide at
+  `docs/guides/mcp-bridge.md`.
+- **Audit export + SIEM sink.** `duduclaw audit` aggregates the existing JSONL
+  audit trails (security / tool-calls / channel-failures / budget) into a
+  normalized, absolute-time-sorted NDJSON stream with `--since` filtering,
+  writable to a file and/or POSTable to a SIEM/webhook.
+  `crates/duduclaw-gateway/src/audit_export.rs`.
+- **Output guardrail hook** (opt-in `[guardrails]`): scans the outbound reply
+  for leaked secrets, prompt-injection echoes, and operator deny-phrases, and
+  redacts PII — blocking/redacting before send. Deterministic default (Llama
+  Guard is the documented upgrade). `crates/duduclaw-gateway/src/guardrail.rs`.
+- **Burn-rate cost anomaly detection**: rolling mean+stddev over an agent's
+  per-day spend flags statistical outliers (relative baseline, not a fixed
+  threshold). `crates/duduclaw-gateway/src/cost_anomaly.rs` +
+  `CostTelemetry::daily_cost_millicents`.
+- **Security posture report**: `duduclaw security` scores active protections
+  (fail-closed MCP auth, signed updates, injection scanning, HITL, hooks,
+  no-plaintext-secrets, budget caps) as a checklist + weighted score.
+  `crates/duduclaw-gateway/src/security_posture.rs`.
+- **CI red-team scan**: `duduclaw redteam` synthesizes jailbreak prompt variants
+  from an agent's `CONTRACT.toml` `must_not` rules and reports which the
+  deterministic input-guard catches. `crates/duduclaw-gateway/src/redteam.rs`.
+- **`duduclaw backup` / `duduclaw restore`**: timestamped home archive with a
+  SHA-256 sidecar verified on restore (fail-closed on mismatch).
+- **`duduclaw session replay <id>`**: print a stored session's turns in order
+  (with `--tools` to interleave tool-call audit lines).
+- **ADR-003**: records the decision to exclude Signal / personal WeChat / Viber
+  channels (`docs/adr/ADR-003-excluded-channels.md`).
+- **`duduclaw gdpr export|erase <contact>`**: data-subject requests over the
+  memory store. Export = a JSON bundle of every row referencing the contact (as a
+  triple subject/object or a free-text mention, LIKE-escaped). Erase = a single
+  transactional hard delete across `memories` + `memories_fts` + `key_facts` +
+  `key_facts_fts` (no FTS orphan), recording a SHA-256-pseudonymised erasure
+  tombstone. `--confirm` gates deletion (dry-run preview otherwise).
+  `crates/duduclaw-memory/src/gdpr.rs`.
+- **`duduclaw memory bench`**: times HippoRAG-lite Personalized-PageRank over the
+  live triple count and prints P50/P95 + a partition recommendation (the LightRAG
+  subgraph-partition gate — measure before building). Thresholds: ≥10k triples or
+  P95 ≥50 ms. `crates/duduclaw-memory/src/bench.rs`.
+- **Cross-session user profile.** Per-user preference traits stored via temporal
+  supersession (`subject = "user:<id>"`), a deterministic (prompt-cache-stable)
+  `## About This User` render, and reflexion-style consolidation into one durable
+  `profile_summary`. `crates/duduclaw-memory/src/user_profile.rs`.
+- **MCP/skill trust tiering.** `classify_trust_tier` derives an official / active
+  / orphan tier from a repo's last-push age + owner type + stars; `SkillIndexEntry`
+  now carries `pushed_at` / `owner_type` / `stars` / `trust_tier` so users are
+  steered away from abandoned MCP servers. `crates/duduclaw-agent/src/trust_tier.rs`.
+- **Secret manager: 1Password Connect + Infisical backends**, and `secret://`
+  resolution wired into the MCP Bridge. `[[mcp.external]]` credentials may now be
+  `secret://<backend>/<name>`, resolved at spawn time against the configured
+  secret manager; an unresolvable ref drops the server fail-safe (mirrors
+  `env://`). New read-only adapters (`onepassword.rs`, `infisical.rs`) with
+  fail-closed `put`/`delete`.
+- **`## About This User` reply injection + `user_profile_record` /
+  `user_profile_get` MCP tools.** The cross-session user profile is now
+  end-to-end: an agent records preference traits, they render into a
+  session-stable `## About This User` block injected into that user's future
+  replies (next to Past Mistakes / Learned Rules), and are readable back. Agent
+  scope is the server-injected namespace, never a client param.
+- **GDPR erase/export now also covers the session store.** A `duduclaw gdpr`
+  request matches sessions by the `<channel>:<chat_id>` session-id prefix (and its
+  threads) and hard-deletes the matching `sessions` + `session_messages`
+  transactionally; export includes the session turns.
+  `SessionManager::sessions_for_contact` / `erase_sessions_for_contact`.
+- **Email channel (SMTP send + inbound parse).**
+  `crates/duduclaw-gateway/src/email.rs`: async SMTP send via `lettre` (rustls;
+  STARTTLS / implicit-TLS / plaintext), a dependency-free RFC822 inbound parser
+  (`parse_inbound`, header-unfolding), and `[channels.email]` config. Doubles as a
+  fail-safe alert sink. Send path is loopback-verified; the IMAP poll transport +
+  gateway channel-lifecycle wiring are the documented PENDING-LIVE remainder.
+- **MCP Bridge SaaS recipes** in `docs/guides/mcp-bridge.md`: per-service
+  `[[mcp.external]]` config for Gmail/Calendar, Plane, Invoice Ninja, Chatwoot,
+  WooCommerce (+ DocuSeal / Monica notes), each with credential provisioning and
+  `approval_required_tools` guidance for write tools.
+
+### Changed
+- **World stage is a PixiJS 2D isometric scene, now with an immersive full-width
+  `/world` page.** After live testing, the interim three.js real-3D renderer was
+  dropped in favour of a 2:1 isometric PixiJS renderer (`stage-scene.ts`): a
+  batched floor/walls ground layer (town bakes it via `cacheAsTexture`), a
+  depth-sorted actors layer for agents + ambient cars, per-agent characters with
+  always-on nameplates, head-top emotes and fading CJK-safe speech bubbles, and
+  eight-colour town buildings with lit windows. The camera is 2D (no rotation):
+  cursor-anchored wheel / pinch zoom (0.5×–2.5×), bounds-clamped drag pan, and a ⟲
+  recenter that snaps back to the contain-fit framing. Beyond the compact 38vh
+  Home band (which gains a ⤢ 展開 link), the world now has a dedicated full-bleed
+  `/world` page (openhuman Tiny Place style — edge-to-edge canvas, floating ROOM
+  scene panel top-right, info card top-left) reachable from the sidebar (員工/公司
+  → 世界) and the Org "世界" tab (now a link so the heavy scene mounts in one
+  place). CSP note: PixiJS's WebGLRenderer uses `new Function` for uniform sync,
+  so the renderer imports `pixi.js/unsafe-eval` eagerly alongside `pixi.js` to run
+  under the dashboard's `script-src 'self'` CSP; WebGPU is forced off
+  (`preference:'webgl'`) with a 10s init timeout. pixi.js loads in a lazy chunk
+  (dynamic `import()`) — the main bundle is unchanged. The state / behaviour layer
+  (`useWorldState`, `SCENES`, `traffic`, degradation chain, click→route map, scene
+  persistence) is unchanged.
+- **Dashboard: single Home spine (workspace/dashboard shell modes removed).**
+  The `ui-mode-store` toggle, `WorkspacePage`, and `ModeToggle` were dropped;
+  Home is the only index and carries the one-line launcher (`PromptBar`) hero at
+  the top, which hands off to `/webchat` (shared chat session). `/workspace`
+  aliases to Home so old bookmarks keep working.
+- **Licensing: issuer key rotated v1 → v2.** v1's private key was unaccounted-for
+  on the issuing side, so v1 trust was removed from the binary and a fresh v2
+  issuer keypair (private key held offline) replaces it (`PROD_ISSUER_KEY_ID = "v2"`,
+  v2 public key baked). No customer impact — no v1 licenses were issued.
+- **Dashboard navigation regrouped into four owner-oriented groups
+  (WP14-T14.1).** 總覽 / 工作 / 團隊 / 公司, replacing the previous six groups
+  (代理→團隊, 知識 folded into 工作, 整合+營運+系統 folded into 公司). **All routes
+  unchanged** — only grouping and labels moved, so bookmarks keep working.
+- **Dashboard terminology pass toward "AI 員工" (WP14-T14.9, partial).** zh-TW UI
+  copy on the primary owner surfaces (nav labels + descriptions, AI-staff roster,
+  org chart, marketplace/reliability/wiki-trust/skill-synthesis) now says
+  「AI 員工」instead of Agent/代理; measure table recorded in `web/DESIGN.md` §5.
+  Deeper admin/edit-dialog strings remain on the follow-up list.
+- **Sessions are soft-deleted, not destroyed (WP5).** `delete_session` now
+  ARCHIVES (sets `archived_at`, keeps messages, hides from normal listings) — the
+  conversation stays replayable and searchable. Real, irreversible deletion is the
+  new `purge_session`. `cleanup_inactive` archives inactive sessions and only
+  purges them after a 90-day retention window. New `record_message_session` /
+  `session_for_reply` back per-task session resume: replying to a specific bot
+  message resumes that task's session (`message_session_map` table, additive).
+  **Behaviour change**: anything that called `delete_session` expecting a hard
+  delete now archives instead — use `purge_session` for the old behaviour.
+- **LINE inbound voice messages are now transcribed** to text (mirrors the
+  existing Telegram path) via `duduclaw_inference::whisper::transcribe`, folded
+  into the agent's input; the saved attachment reference is retained so a
+  keyless/failed transcription degrades gracefully.
+- `BudgetConfig` gains `daily_cap_cents` (`#[serde(default)]`, backward-compatible).
+- MCP Bridge `env` values now accept `secret://` refs in addition to `env://`
+  (see Added). `SecretBackend` gains `OnePassword` / `Infisical` variants.
+
+### Fixed
+- **Evolution "off" now really stops evolution (master kill-switch).** Turning
+  off self-evolution previously left two bypass paths — the heartbeat
+  silence-breaker and the channel prediction path never checked the toggle, so a
+  "disabled" agent kept reflecting and rewriting `SOUL.md`. `[evolution] enabled`
+  (default `true`, backward-compatible) is now a single master switch enforced at
+  every trigger point: GVU trigger, heartbeat silence-breaker, channel prediction
+  path (skill synthesis/graduation + GVU), sub-agent dispatch, and the
+  skill-synthesis auto-run scheduler. Prediction-error logging (passive telemetry)
+  still runs. New `duduclaw agent freeze|unfreeze <id>` one-shot enterprise
+  escape hatch (also disables heartbeat, writes an audit record). Guide:
+  `docs/guides/evolution-switches.md`.
+- **Dashboard secret-manager backend validation drift**: the settings handler
+  accepted `config` / `keychain` (backends that do not exist) and *rejected*
+  `local` (the default), so any valid backend selection failed. Now validates the
+  real enum: `local` / `vault` / `env` / `onepassword` / `infisical`
+  (`handlers.rs`).
+- **GDPR erase closes an FTS-orphan leak**: the delete cascades `key_facts_fts`
+  alongside `key_facts` (the pre-existing `purge_stale_facts` path leaves the FTS
+  row behind); documented as a follow-up sweep target.
+- **Infisical `exists()`** no longer folds auth/network failures into
+  `Ok(false)` — only a genuine 404 is `false`; other errors propagate
+  (fail-closed, matching the 1Password adapter).
+
 ## [1.35.0] - 2026-07-07 — True auto-update, Ed25519-signed releases, channel UX
 
 ### Added
