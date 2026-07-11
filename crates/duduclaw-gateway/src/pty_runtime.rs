@@ -824,21 +824,14 @@ fn looks_like_oauth_expiry(err: &str) -> bool {
     needles.iter().any(|n| err.contains(n))
 }
 
-/// Spawn factory used by [`init`]. Resolves the `claude` binary and builds
-/// [`SpawnOpts`] with safe defaults. Account-rotation env injection happens
-/// in the deep wiring step (Phase 3.5) — keep it lean for now.
-async fn spawn_session_for_key(
-    home: &Path,
-    key: AgentKey,
-) -> Result<Arc<PtySession>, duduclaw_cli_runtime::SessionError> {
-    let program = resolve_program(home, key.cli_kind)
-        .ok_or_else(|| {
-            duduclaw_cli_runtime::SessionError::UnknownCliKind(format!(
-                "{}: binary not found",
-                key.cli_kind.as_str()
-            ))
-        })?;
-
+/// Build the leading `extra_args` from an [`AgentKey`]: the per-agent
+/// `--model <id>` (from `[model] preferred`) plus `--bare` when applicable.
+///
+/// Extracted as a pure function so the model-switch contract is unit-testable
+/// **without** spawning a real PTY: PTY model switching == the agent's
+/// `[model] preferred` reaching the spawn as `--model`, keyed into the pool so
+/// a model change respawns a distinct session.
+pub(crate) fn model_and_bare_args(key: &AgentKey) -> Vec<String> {
     let mut extra_args: Vec<String> = Vec::new();
     // **Review fix**: honour the caller-supplied model. Previously the
     // PTY OAuth path silently dropped `model` so every PTY session
@@ -857,6 +850,25 @@ async fn spawn_session_for_key(
         // bare_mode must inject ANTHROPIC_API_KEY into env (Phase 3.5).
         extra_args.push("--bare".to_string());
     }
+    extra_args
+}
+
+/// Spawn factory used by [`init`]. Resolves the `claude` binary and builds
+/// [`SpawnOpts`] with safe defaults. Account-rotation env injection happens
+/// in the deep wiring step (Phase 3.5) — keep it lean for now.
+async fn spawn_session_for_key(
+    home: &Path,
+    key: AgentKey,
+) -> Result<Arc<PtySession>, duduclaw_cli_runtime::SessionError> {
+    let program = resolve_program(home, key.cli_kind)
+        .ok_or_else(|| {
+            duduclaw_cli_runtime::SessionError::UnknownCliKind(format!(
+                "{}: binary not found",
+                key.cli_kind.as_str()
+            ))
+        })?;
+
+    let mut extra_args: Vec<String> = model_and_bare_args(&key);
 
     // W1 (capability enforcement): PTY-pooled sessions previously received NO
     // tool restrictions — `CapabilitiesConfig` never reached the interactive
@@ -1075,6 +1087,35 @@ mod tests {
         // Empty env is a no-op (ambient/no-account invokes don't pollute the map).
         stash_account_env("acct-test-empty", &HashMap::new());
         assert!(lookup_account_env("acct-test-empty").is_none());
+    }
+
+    // Task C.1 — PTY model switching contract: the agent's `[model] preferred`
+    // must reach the spawn as `--model <id>`. Without this the pooled session
+    // silently runs the CLI default and per-agent model config is a no-op.
+    #[test]
+    fn spawn_args_include_model_flag_from_agent_key() {
+        let key = AgentKey::with_account_and_model(
+            "agent-x",
+            CliKind::Claude,
+            false,
+            None,
+            Some("claude-fable-5".to_string()),
+        );
+        let args = model_and_bare_args(&key);
+        let pos = args.iter().position(|a| a == "--model").expect("--model present");
+        assert_eq!(args.get(pos + 1).map(String::as_str), Some("claude-fable-5"));
+    }
+
+    #[test]
+    fn spawn_args_omit_model_flag_when_unset() {
+        let key = AgentKey::new("agent-y", CliKind::Claude, false);
+        assert!(!model_and_bare_args(&key).iter().any(|a| a == "--model"));
+    }
+
+    #[test]
+    fn spawn_args_include_bare_for_claude_bare_mode() {
+        let key = AgentKey::new("agent-z", CliKind::Claude, true);
+        assert!(model_and_bare_args(&key).iter().any(|a| a == "--bare"));
     }
 
     // W1 — capability → interactive-CLI flag translation.

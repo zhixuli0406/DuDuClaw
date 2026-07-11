@@ -169,15 +169,82 @@ pub fn which_claude() -> Option<String> {
         return None;
     }
 
-    // Unix: source-order is fine (no BatBadBut hazard).
-    // Windows: pick by .exe > .cmd > extensionless precedence.
+    // Unix: prefer the NEWEST binary when several installs coexist (a stale
+    // /usr/local/bin/claude shadowing a current nvm install makes agents run
+    // an outdated CLI); ties / unversioned candidates keep source order.
+    // Windows: pick by .exe > .cmd > extensionless precedence (BatBadBut).
     #[cfg(not(windows))]
-    let chosen: Option<String> = all.first().cloned();
+    let chosen: Option<String> = pick_newest_version(&all);
     #[cfg(windows)]
     let chosen: Option<String> = pick_windows_preferred(&all);
 
     log_resolved_claude_path_once(chosen.as_deref(), &all);
     chosen
+}
+
+/// Parse the first `MAJOR.MINOR.PATCH` triple out of a `--version` line.
+fn parse_semver_triple(s: &str) -> Option<(u64, u64, u64)> {
+    for token in s.split(|c: char| c.is_whitespace() || c == '(' || c == ')') {
+        let mut parts = token.split('.');
+        if let (Some(a), Some(b), Some(c)) = (parts.next(), parts.next(), parts.next())
+            && let (Ok(a), Ok(b), Ok(c)) = (a.parse::<u64>(), b.parse::<u64>(), c.parse::<u64>())
+        {
+            return Some((a, b, c));
+        }
+    }
+    None
+}
+
+/// Run `<path> --version` with a 2s poll-timeout; a wedged binary is killed
+/// and treated as unversioned rather than hanging gateway startup.
+fn probe_binary_version(path: &str) -> Option<(u64, u64, u64)> {
+    let mut child = std::process::Command::new(path)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut out = String::new();
+    use std::io::Read;
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    parse_semver_triple(&out)
+}
+
+/// Among candidate paths (source order), pick the highest `--version`;
+/// versioned candidates beat unversioned ones; all-unversioned keeps the
+/// first (legacy source-order behavior). Only runs when >1 candidate, so
+/// the common single-install case pays zero probing cost.
+#[cfg(any(unix, test))]
+fn pick_newest_version(all: &[String]) -> Option<String> {
+    if all.len() <= 1 {
+        return all.first().cloned();
+    }
+    let mut best: Option<(u64, u64, u64)> = None;
+    let mut best_path: Option<&String> = None;
+    for path in all {
+        if let Some(v) = probe_binary_version(path)
+            && best.is_none_or(|b| v > b)
+        {
+            best = Some(v);
+            best_path = Some(path);
+        }
+    }
+    best_path.cloned().or_else(|| all.first().cloned())
 }
 
 /// Windows-only precedence: `.exe` STRICTLY > `.cmd` > extensionless.
@@ -716,5 +783,35 @@ mod which_claude_tests {
         write_shim(&npm);
         let found = which_claude_in_home(tmp.path()).unwrap();
         assert_eq!(found, bun.to_string_lossy());
+    }
+}
+
+#[cfg(test)]
+mod version_pick_tests {
+    use super::*;
+
+    #[test]
+    fn semver_parse_from_claude_version_line() {
+        assert_eq!(parse_semver_triple("2.1.173 (Claude Code)"), Some((2, 1, 173)));
+        assert_eq!(parse_semver_triple("claude 2.1.104"), Some((2, 1, 104)));
+        assert_eq!(parse_semver_triple("no version here"), None);
+    }
+
+    #[test]
+    fn semver_ordering_prefers_newest() {
+        assert!(parse_semver_triple("2.1.173").unwrap() > parse_semver_triple("2.1.104").unwrap());
+        assert!(parse_semver_triple("3.0.0").unwrap() > parse_semver_triple("2.99.99").unwrap());
+    }
+
+    #[test]
+    fn single_candidate_skips_probing() {
+        let all = vec!["/nonexistent/claude".to_string()];
+        assert_eq!(pick_newest_version(&all), Some("/nonexistent/claude".to_string()));
+    }
+
+    #[test]
+    fn all_unversioned_falls_back_to_source_order() {
+        let all = vec!["/nonexistent/a".to_string(), "/nonexistent/b".to_string()];
+        assert_eq!(pick_newest_version(&all), Some("/nonexistent/a".to_string()));
     }
 }
