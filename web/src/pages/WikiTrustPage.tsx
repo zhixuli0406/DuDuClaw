@@ -475,8 +475,8 @@ function TrustDetailModal({ row, agentId, onClose, onChanged }: TrustDetailModal
                   />
                   {doNotInject ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                   {intl.formatMessage({
-                    id: 'wikiTrust.override.dni',
-                    defaultMessage: 'do_not_inject',
+                    id: 'wikiTrust.override.dni.label',
+                    defaultMessage: '不注入到 AI 員工提示',
                   })}
                 </label>
               </div>

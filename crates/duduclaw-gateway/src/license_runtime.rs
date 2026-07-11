@@ -62,6 +62,73 @@ fn cached_fingerprint() -> &'static str {
 /// internal-use licenses.
 pub const PUBKEY_ENV_PREFIX: &str = "DUDUCLAW_LICENSE_PUBKEY_";
 
+/// Active production issuer key id claimed by real licenses
+/// (`license.public_key_id`).
+///
+/// **v1 was formally RETIRED on 2026-07-09** — its private counterpart was
+/// unaccounted-for on the issuing side (no `license-signing-v1.key` under the
+/// operator's control), so trusting it as a permanently-baked issuer was a
+/// liability. It is intentionally NOT in the registry anymore; do not re-add v1.
+/// The replacement v2 keypair is generated on a secure offline machine
+/// (`license-keygen keygen --key-id v2`); only its public half is baked below.
+const PROD_ISSUER_KEY_ID: &str = "v2";
+
+/// The production issuer's Ed25519 **public** key (hex), baked into every stock
+/// `duduclaw` binary so the commercial upgrade needs no separate build and no
+/// environment variable: an enterprise drops its signed `license.json` into
+/// `~/.duduclaw/`, restarts, and the paid tier unlocks — no `duduclaw-pro`.
+///
+/// Embedding a *public* key is safe and intended — the private signing key is
+/// generated and held offline and never ships.
+///
+/// Empty would mean "no key baked (env-only, OpenSource)". Set below to the v2
+/// issuer public key (id `v2`), generated offline via
+/// `license-keygen keygen --key-id v2` — its private half is held offline and
+/// never ships. This activates the single-binary upgrade path: a stock binary
+/// verifies a v2-signed `license.json` with no env var and no `duduclaw-pro`.
+const PROD_ISSUER_PUBKEY_HEX: &str =
+    "942d6abae25dcd782c0586132143940003a10b1efd11e0a0b2f5a86d303476d0";
+
+/// Build the trusted-issuer registry for a normal gateway boot.
+///
+/// Precedence: `DUDUCLAW_LICENSE_PUBKEY_<ID>` env vars are collected first and
+/// win on id collision (self-hosters / self-issuers / emergency key rotation
+/// can override), then the baked production key (`PROD_ISSUER_KEY_ID`) is
+/// appended so a stock download trusts DuDuClaw-issued licenses with zero setup.
+///
+/// Fail-safe: an empty or malformed baked constant yields an env-only registry
+/// (OpenSource unless an env key is supplied) rather than panicking. The worst
+/// case is "no baked key" ⇒ OpenSource, never a crash of the Apache-2.0 core.
+pub fn production_registry() -> PublicKeyRegistry {
+    let registry = embedded_registry_from_env();
+    if registry.get(PROD_ISSUER_KEY_ID).is_some() {
+        // An operator-supplied key for this id takes precedence; don't shadow it.
+        return registry;
+    }
+    if PROD_ISSUER_PUBKEY_HEX.is_empty() {
+        // v1 retired; v2 not baked yet → env-only. Commercial licenses verify
+        // only if an operator supplies a key via env; otherwise OpenSource.
+        return registry;
+    }
+    match hex::decode(PROD_ISSUER_PUBKEY_HEX) {
+        Ok(bytes) if bytes.len() == 32 => {
+            info!(
+                key_id = PROD_ISSUER_KEY_ID,
+                "registered baked production issuer public key"
+            );
+            registry.with_key(PROD_ISSUER_KEY_ID, bytes)
+        }
+        _ => {
+            warn!(
+                "baked production issuer key is malformed — commercial licenses \
+                 will not verify from this binary; running OpenSource unless a \
+                 DUDUCLAW_LICENSE_PUBKEY_* env var supplies a valid key"
+            );
+            registry
+        }
+    }
+}
+
 /// How long we wait for a phone-home HTTP request before giving up and
 /// trying again next cycle.
 const PHONE_HOME_TIMEOUT: StdDuration = StdDuration::from_secs(20);
@@ -156,6 +223,12 @@ impl LicenseRuntime {
             registry_keys = count_embedded_issuer_keys(),
             "license runtime initialised"
         );
+
+        // Proactive pre-expiry warning at boot (an already-expired license was
+        // rejected above and logged separately; this covers the 1–30 day window).
+        if let Some(lic) = license.as_ref() {
+            log_expiry_warning(lic.tier, lic.days_until_expiry());
+        }
 
         let last_seen_crl_at = read_last_seen_crl(&home_dir);
 
@@ -435,6 +508,56 @@ pub fn is_self_host_deployment() -> bool {
     }
 }
 
+/// Proactive license-expiry urgency, mirroring the dashboard's `classifyExpiry`
+/// buckets so the log warnings and the UI agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiryUrgency {
+    /// More than 30 days left — no warning.
+    Ok,
+    /// 8–30 days left — plan renewal.
+    Warning,
+    /// 0–7 days left — renew now to avoid a downgrade.
+    Critical,
+    /// Already past expiry.
+    Expired,
+}
+
+/// Pure classification of days-until-expiry into a warning bucket. Thresholds
+/// match the dashboard (`LicensePage.classifyExpiry`) and the OAuth-token
+/// expiry-warning convention (30/7-day pre-warnings).
+pub fn classify_expiry_urgency(days_until_expiry: i64) -> ExpiryUrgency {
+    if days_until_expiry < 0 {
+        ExpiryUrgency::Expired
+    } else if days_until_expiry <= 7 {
+        ExpiryUrgency::Critical
+    } else if days_until_expiry <= 30 {
+        ExpiryUrgency::Warning
+    } else {
+        ExpiryUrgency::Ok
+    }
+}
+
+/// Emit a proactive expiry warning to the tracing log for a still-valid license
+/// nearing its term end. An already-*expired* license never reaches this path
+/// with `Some` (it is rejected during load and separately logged), so this only
+/// fires for the 1–30 day pre-expiry window — the whole point of a proactive
+/// warning is to fire *before* the downgrade.
+fn log_expiry_warning(tier: LicenseTier, days_until_expiry: i64) {
+    match classify_expiry_urgency(days_until_expiry) {
+        ExpiryUrgency::Critical => warn!(
+            tier = %tier,
+            days_left = days_until_expiry,
+            "license expires within 7 days — renew now to avoid an automatic downgrade to OpenSource"
+        ),
+        ExpiryUrgency::Warning => warn!(
+            tier = %tier,
+            days_left = days_until_expiry,
+            "license expires within 30 days — plan renewal"
+        ),
+        ExpiryUrgency::Ok | ExpiryUrgency::Expired => {}
+    }
+}
+
 /// Pure cap check used by the Cloud resource limits (agents / channels).
 /// `max == 0` means unlimited (the features.toml convention), so it never
 /// caps. Otherwise the cap is reached once `current >= max`.
@@ -686,6 +809,10 @@ fn accept_refreshed_license(
 
 async fn crl_loop(runtime: LicenseRuntime) {
     loop {
+        // Re-emit a proactive expiry warning on each daily cycle so a
+        // long-running gateway surfaces the 30/7-day pre-expiry window even if
+        // it was started while the license was still comfortably in date.
+        runtime.log_expiry_status().await;
         if let Err(e) = runtime.do_crl_fetch_once().await {
             debug!(error = %e, "CRL fetch failed; will retry next cycle");
         }
@@ -694,6 +821,15 @@ async fn crl_loop(runtime: LicenseRuntime) {
 }
 
 impl LicenseRuntime {
+    /// Best-effort, read-only proactive expiry warning for the current license.
+    /// Called once per CRL cycle (daily).
+    async fn log_expiry_status(&self) {
+        let inner = self.state.read().await;
+        if let Some(lic) = inner.license.as_ref() {
+            log_expiry_warning(lic.tier, lic.days_until_expiry());
+        }
+    }
+
     async fn do_crl_fetch_once(&self) -> Result<(), PhoneHomeError> {
         let subscription_id = {
             let inner = self.state.read().await;
@@ -1122,6 +1258,57 @@ mod tests {
         assert!(!cap_exceeded(3, 2));
         assert!(cap_exceeded(3, 3));
         assert!(cap_exceeded(3, 4));
+    }
+
+    // ── Baked production issuer key (single-binary commercial upgrade) ──────
+
+    #[test]
+    fn baked_prod_pubkey_is_empty_or_32_byte_hex() {
+        // The baked constant is either empty (v2 issuance pending) or a valid
+        // 32-byte Ed25519 public key. A malformed non-empty value would silently
+        // disable commercial licensing on stock binaries, so guard against it.
+        // This test survives the pending→baked transition unchanged.
+        if PROD_ISSUER_PUBKEY_HEX.is_empty() {
+            return; // v2 pending — env-only, fail-safe.
+        }
+        let bytes = hex::decode(PROD_ISSUER_PUBKEY_HEX)
+            .expect("baked pubkey must be valid hex");
+        assert_eq!(bytes.len(), 32, "Ed25519 public key must be 32 bytes");
+    }
+
+    #[test]
+    fn production_registry_matches_baked_state() {
+        // With no env override for the active key id, the registry reflects the
+        // baked state: empty constant ⇒ no key (v1 retired, v2 pending); a baked
+        // key ⇒ present. Guard: skip if the host exports an override for this id.
+        let env_var = format!(
+            "DUDUCLAW_LICENSE_PUBKEY_{}",
+            PROD_ISSUER_KEY_ID.to_ascii_uppercase()
+        );
+        if std::env::var(&env_var).is_ok() {
+            return;
+        }
+        let reg = production_registry();
+        if PROD_ISSUER_PUBKEY_HEX.is_empty() {
+            assert!(
+                reg.get(PROD_ISSUER_KEY_ID).is_none(),
+                "no key must be baked while v2 issuance is pending"
+            );
+        } else {
+            assert_eq!(reg.get(PROD_ISSUER_KEY_ID).map(|k| k.len()), Some(32));
+        }
+    }
+
+    #[test]
+    fn expiry_urgency_thresholds() {
+        use ExpiryUrgency::*;
+        assert_eq!(classify_expiry_urgency(-1), Expired);
+        assert_eq!(classify_expiry_urgency(0), Critical); // expires today, still valid
+        assert_eq!(classify_expiry_urgency(7), Critical);
+        assert_eq!(classify_expiry_urgency(8), Warning);
+        assert_eq!(classify_expiry_urgency(30), Warning);
+        assert_eq!(classify_expiry_urgency(31), Ok);
+        assert_eq!(classify_expiry_urgency(365), Ok);
     }
 
     #[test]

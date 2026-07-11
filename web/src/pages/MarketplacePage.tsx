@@ -308,6 +308,7 @@ export function MarketplacePage() {
             <Card>
               <EmptyState
                 icon={Package}
+                dudu={servers.length === 0 ? 'idle' : 'concerned'}
                 title={
                   servers.length === 0
                     ? intl.formatMessage({ id: 'marketplace.empty' })

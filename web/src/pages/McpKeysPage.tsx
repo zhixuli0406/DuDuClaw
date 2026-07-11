@@ -218,9 +218,14 @@ function CreateKeyDialog({
         <Field label={intl.formatMessage({ id: 'mcpKeys.scopes' })} help={intl.formatMessage({ id: 'mcpKeys.scopes.hint' })}>
           <div className="grid grid-cols-2 gap-2">
             {MCP_SCOPES.map((s) => (
-              <label key={s} className="flex items-center gap-2 text-sm text-stone-700 dark:text-stone-300">
-                <input type="checkbox" checked={scopes.includes(s)} onChange={() => toggleScope(s)} className="accent-amber-500" />
-                <code className="text-xs">{s}</code>
+              <label key={s} className="flex items-start gap-2 text-sm text-stone-700 dark:text-stone-300">
+                <input type="checkbox" checked={scopes.includes(s)} onChange={() => toggleScope(s)} className="mt-0.5 accent-amber-500" />
+                <span className="min-w-0">
+                  <code className="text-xs">{s}</code>
+                  <span className="mt-0.5 block text-xs text-stone-400 dark:text-stone-500">
+                    {intl.formatMessage({ id: `mcpKeys.scopeDesc.${s.replace(':', '.')}` })}
+                  </span>
+                </span>
               </label>
             ))}
           </div>

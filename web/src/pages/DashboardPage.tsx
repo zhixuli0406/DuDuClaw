@@ -13,6 +13,7 @@ import {
 } from '@/lib/api';
 import { WikiGraph } from '@/components/WikiGraph';
 import { ActivityFeed } from '@/components/ActivityFeed';
+import { IncidentBanner } from '@/components/IncidentBanner';
 import { useTasksStore } from '@/stores/tasks-store';
 import type { TaskStatus } from '@/lib/api';
 import {
@@ -155,6 +156,10 @@ export function DashboardPage() {
   const [wikiPages, setWikiPages] = useState<ReadonlyArray<WikiPageMeta>>([]);
   const [wikiStats, setWikiStats] = useState<WikiStats | null>(null);
   const [wikiContents, setWikiContents] = useState<Record<string, string>>({});
+  // Pending approvals + open budget events feed the IncidentBanner chip.
+  // Both are manager-gated RPCs — failures are swallowed so an employee's
+  // dashboard simply shows no approval chip.
+  const [approvalsCount, setApprovalsCount] = useState(0);
 
   // Fetch data only after WebSocket is authenticated.
   // Re-fetches on reconnect (connectionState goes back to 'authenticated').
@@ -171,6 +176,17 @@ export function DashboardPage() {
       console.warn('[api]', e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     });
+
+    // Approval + budget incident counts for the banner. Silent on failure
+    // (manager-gated; non-privileged users just see no chip).
+    Promise.all([
+      api.approvals.list().catch(() => null),
+      api.budget.incidents().catch(() => null),
+    ]).then(([approvals, budget]) => {
+      const pending = approvals?.count ?? 0;
+      const openBudget = budget?.by_agent?.length ?? 0;
+      setApprovalsCount(pending + openBudget);
+    }).catch(() => { /* silent */ });
 
     // Fetch wiki data for the default (first) agent
     api.agents.list().then(async (res) => {
@@ -240,6 +256,9 @@ export function DashboardPage() {
         title={intl.formatMessage({ id: 'nav.dashboard' })}
         subtitle={intl.formatMessage({ id: 'app.subtitle' })}
       />
+
+      {/* Incident banner — silent unless something needs the owner's attention */}
+      <IncidentBanner approvalsCount={approvalsCount} />
 
       {/* KPI tiles */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">

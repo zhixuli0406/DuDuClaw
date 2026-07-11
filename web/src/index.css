@@ -40,6 +40,13 @@
   --radius-lg: 1rem;
   --radius-sm: 0.5rem;
 
+  /* Soft Play v2 (dashboard-redesign-v2 §3.1 / T0.2) — radius bumped one level
+     for the warmer "soft candy" language. Also exposed as Tailwind `rounded-card`
+     / `rounded-control` / `rounded-bubble` utilities. */
+  --radius-card: 1rem;
+  --radius-control: 0.75rem;
+  --radius-bubble: 1.5rem;
+
   /* system-ui resolves to SF Pro on Apple platforms — the authentic
      Liquid Glass companion. Noto Sans TC covers CJK. */
   --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans TC", "Helvetica Neue", Arial, sans-serif;
@@ -77,6 +84,96 @@
   --panel-border: oklch(82% 0.006 255 / 0.7);
   --panel-border-strong: oklch(74% 0.008 255 / 0.85);
   --panel-shadow-hover: 0 6px 20px -12px oklch(30% 0.02 260 / 0.18);
+
+  /* ── Systematised status vocabulary (dashboard-redesign §2.1 P7 / T0.2) ──
+     One semantic token per agent/work state, reused by badges, rows, glyphs
+     and inbox accents so running/blocked/over-budget read the same everywhere.
+     Hues map to the semantic palette (emerald/amber/rose/sky/stone). */
+  --status-running: oklch(70% 0.15 155);        /* busy / in-progress — emerald */
+  --status-idle: oklch(64% 0.012 255);          /* waiting / on standby — stone */
+  --status-paused: oklch(58% 0.02 255);         /* paused — dim stone */
+  --status-blocked: oklch(64% 0.2 20);          /* blocked — rose */
+  --status-awaiting-approval: oklch(72% 0.16 75); /* needs me — amber */
+  --status-over-budget: oklch(60% 0.22 15);     /* over budget — deep rose */
+  --status-error: oklch(62% 0.21 25);           /* error — rose */
+
+  /* Inbox type accents (one per unified source). */
+  --inbox-approval: var(--status-awaiting-approval);
+  --inbox-decision: oklch(66% 0.12 255);        /* decision — sky */
+  --inbox-blocked: var(--status-blocked);
+  --inbox-budget: var(--status-over-budget);
+
+  /* Greeting-banner reveal timing (respects reduced-motion globally). */
+  --greeting-reveal-ms: 420ms;
+
+  /* ─────────────────── Soft Play v2 tokens (T0.2) ───────────────────
+     Additive only — existing Calm Glass tokens above are untouched. */
+
+  /* Soft-card elevation. Light theme lifts content on a two-layer soft
+     shadow; dark theme has no real shadow to catch, so `panel` swaps to a
+     hairline `--ring-soft` instead (set on `--panel-shadow` below). */
+  --shadow-soft: 0 2px 8px rgb(0 0 0 / 0.04), 0 8px 24px rgb(0 0 0 / 0.06);
+  --shadow-pop: 0 4px 12px rgb(0 0 0 / 0.06), 0 16px 36px rgb(0 0 0 / 0.10);
+  --ring-soft: inset 0 0 0 1px oklch(100% 0 0 / 0.05);
+  /* The shadow `panel` actually paints — flips to a ring in dark mode. */
+  --panel-shadow: var(--shadow-soft);
+
+  /* Motion — a springy pop for entrances/celebrations, a calm fade for reveals.
+     Consumed by the animation utilities at the bottom of this file, all of which
+     are gated behind `prefers-reduced-motion: no-preference`. */
+  --motion-pop: 180ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  --motion-fade: 200ms ease-out;
+
+  /* Agent lifecycle (paperclip P6) — dots / fills / rings. Icon/text uses the
+     `-icon-` variants below (WCAG-AA validated). */
+  --status-agent-idle: oklch(64% 0.012 255);      /* on standby — stone */
+  --status-agent-running: oklch(60% 0.15 255);    /* working — blue */
+  --status-agent-paused: oklch(70% 0.15 75);      /* paused — amber */
+  --status-agent-error: oklch(60% 0.2 25);        /* faulted — red */
+
+  /* Task lifecycle (7 states) — base hues for dots/fills/chart segments. */
+  --status-task-backlog: oklch(64% 0.012 255);    /* grey */
+  --status-task-todo: oklch(72% 0.15 75);         /* amber */
+  --status-task-in_progress: oklch(62% 0.15 255); /* blue */
+  --status-task-in_review: oklch(60% 0.17 300);   /* violet */
+  --status-task-done: oklch(64% 0.15 150);        /* green */
+  --status-task-blocked: oklch(62% 0.2 25);       /* red */
+  --status-task-cancelled: oklch(58% 0.012 255);  /* dim grey */
+
+  /* AA-contrast icon/text variants (validated ≥4.5:1 on the light panel bg). */
+  --status-task-icon-backlog: oklch(52% 0.02 255);
+  --status-task-icon-todo: oklch(55% 0.15 75);
+  --status-task-icon-in_progress: oklch(55% 0.16 255);
+  --status-task-icon-in_review: oklch(53% 0.19 300);
+  --status-task-icon-done: oklch(53% 0.15 150);
+  --status-task-icon-blocked: oklch(55% 0.2 25);
+  --status-task-icon-cancelled: oklch(55% 0.015 255);
+
+  /* 10 warm agent gradient pairs (amber/coral/sage/sky/violet families) — the
+     one visual identity source: avatar backs, org nodes, world sprite tints.
+     Theme-agnostic (chosen to read on both light and dark surfaces). */
+  --agent-1a: oklch(80% 0.13 75);  --agent-1b: oklch(72% 0.15 55);   /* amber   */
+  --agent-2a: oklch(75% 0.14 35);  --agent-2b: oklch(68% 0.16 20);   /* coral   */
+  --agent-3a: oklch(78% 0.09 150); --agent-3b: oklch(70% 0.11 165);  /* sage    */
+  --agent-4a: oklch(78% 0.10 235); --agent-4b: oklch(70% 0.13 255);  /* sky     */
+  --agent-5a: oklch(74% 0.12 300); --agent-5b: oklch(66% 0.15 295);  /* violet  */
+  --agent-6a: oklch(76% 0.12 10);  --agent-6b: oklch(68% 0.15 350);  /* rose    */
+  --agent-7a: oklch(80% 0.11 95);  --agent-7b: oklch(72% 0.13 110);  /* olive   */
+  --agent-8a: oklch(78% 0.10 185); --agent-8b: oklch(70% 0.12 200);  /* teal    */
+  --agent-9a: oklch(82% 0.10 55);  --agent-9b: oklch(74% 0.13 40);   /* peach   */
+  --agent-10a: oklch(72% 0.12 275);--agent-10b: oklch(64% 0.15 285); /* indigo  */
+
+  /* Gamification (§6) — XP amber, coin deeper amber-gold. */
+  --xp: oklch(72% 0.16 75);
+  --coin: oklch(66% 0.15 70);
+
+  /* Character system (§3.2) — the ink for eyes/mouth reads on every agent tint
+     (all agent gradients are light oklch ~72–82%), so it stays dark in both
+     themes. The emote bubble body is a drawn near-white pill. */
+  --character-ink: oklch(34% 0.02 60);
+  --character-ink-soft: oklch(52% 0.02 60);
+  --character-bubble: oklch(99% 0.005 80);
+  --character-bubble-border: oklch(88% 0.01 80);
 }
 
 .dark {
@@ -103,6 +200,56 @@
   --panel-border: oklch(100% 0 0 / 0.08);
   --panel-border-strong: oklch(100% 0 0 / 0.14);
   --panel-shadow-hover: 0 10px 28px -14px oklch(0% 0 0 / 0.5);
+
+  /* Status vocabulary — brightened for the dark stage. */
+  --status-running: oklch(76% 0.16 155);
+  --status-idle: oklch(62% 0.012 255);
+  --status-paused: oklch(50% 0.02 255);
+  --status-blocked: oklch(68% 0.2 20);
+  --status-awaiting-approval: oklch(78% 0.16 75);
+  --status-over-budget: oklch(66% 0.22 15);
+  --status-error: oklch(68% 0.21 25);
+  --inbox-approval: var(--status-awaiting-approval);
+  --inbox-decision: oklch(72% 0.12 255);
+  --inbox-blocked: var(--status-blocked);
+  --inbox-budget: var(--status-over-budget);
+
+  /* ── Soft Play v2 dark overrides (T0.2) ──
+     No ambient shadow reads on a dark stage, so `panel` swaps to a hairline
+     ring for its edge; hover elevation stays a (stronger) shadow. */
+  --shadow-soft: 0 2px 8px rgb(0 0 0 / 0.3), 0 8px 24px rgb(0 0 0 / 0.4);
+  --shadow-pop: 0 6px 16px rgb(0 0 0 / 0.4), 0 18px 40px rgb(0 0 0 / 0.55);
+  --ring-soft: inset 0 0 0 1px oklch(100% 0 0 / 0.06);
+  --panel-shadow: var(--ring-soft);
+
+  /* Agent lifecycle — brightened for the dark stage. */
+  --status-agent-idle: oklch(62% 0.012 255);
+  --status-agent-running: oklch(70% 0.15 255);
+  --status-agent-paused: oklch(78% 0.15 80);
+  --status-agent-error: oklch(70% 0.2 25);
+
+  /* Task lifecycle base — brightened. */
+  --status-task-backlog: oklch(60% 0.012 255);
+  --status-task-todo: oklch(80% 0.15 80);
+  --status-task-in_progress: oklch(72% 0.15 255);
+  --status-task-in_review: oklch(72% 0.16 300);
+  --status-task-done: oklch(74% 0.15 152);
+  --status-task-blocked: oklch(70% 0.2 25);
+  --status-task-cancelled: oklch(55% 0.012 255);
+
+  /* AA-contrast icon/text variants (validated ≥4.5:1 on the dark panel bg). */
+  --status-task-icon-backlog: oklch(72% 0.02 255);
+  --status-task-icon-todo: oklch(80% 0.15 80);
+  --status-task-icon-in_progress: oklch(75% 0.15 255);
+  --status-task-icon-in_review: oklch(76% 0.16 300);
+  --status-task-icon-done: oklch(76% 0.15 152);
+  --status-task-icon-blocked: oklch(72% 0.19 25);
+  --status-task-icon-cancelled: oklch(66% 0.015 255);
+
+  /* Character system — bubble body goes dark; ink stays dark (agent tints are
+     light in both themes, so eyes read as dark on the face either way). */
+  --character-bubble: oklch(32% 0.012 260);
+  --character-bubble-border: oklch(44% 0.014 260);
 }
 
 /* Content card — the workhorse surface used across every page. */
@@ -146,7 +293,11 @@
 @utility panel {
   background: var(--panel-fill);
   border: 1px solid var(--panel-border);
-  border-radius: var(--radius-default);
+  /* Soft Play v2 (T0.2): softer 2xl radius + a soft-card shadow (light) that
+     swaps to a hairline ring in dark mode via `--panel-shadow`. Hairline border
+     is kept in both themes. */
+  border-radius: var(--radius-card);
+  box-shadow: var(--panel-shadow);
 }
 
 @utility panel-hover {
@@ -270,6 +421,105 @@ h1, h2, h3 {
 
 .page-enter {
   animation: page-enter 360ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* ─────────── Agent status glyph (WP10-T10.2) ───────────
+   CSS-only animated presence dots for the AI-staff roster. Each state has a
+   distinct motion signature so the owner can read "who's busy" at a glance
+   without hovering. All motion is disabled by the reduced-motion rule below. */
+@keyframes glyph-breathe {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.7); }
+}
+@keyframes glyph-consolidate {
+  0%, 100% { opacity: 0.85; }
+  50% { opacity: 0.3; }
+}
+@keyframes glyph-pulse-ring {
+  0% { transform: scale(0.6); opacity: 0.7; }
+  100% { transform: scale(2.2); opacity: 0; }
+}
+/* Replying — quick, alert breathing. */
+.glyph-replying { animation: glyph-breathe 1.1s ease-in-out infinite; }
+/* Consolidating (background GVU / memory) — slow, dreamy fade. */
+.glyph-consolidate { animation: glyph-consolidate 2.8s ease-in-out infinite; }
+/* Awaiting approval — an expanding amber ring behind a solid dot. */
+.glyph-approval-ring { animation: glyph-pulse-ring 1.6s ease-out infinite; }
+
+/* ─────────── Soft Play v2 motion (T0.2) ───────────
+   Springy pop entrances, calm fade-up reveals, and celebration primitives
+   (badge pop + falling confetti). Keyframes are inert until an element opts in
+   via the utility classes, which only carry an `animation` inside
+   `prefers-reduced-motion: no-preference` — so in reduced-motion mode elements
+   simply render at their resting state (no starting opacity:0 trap). */
+@keyframes pop-in {
+  from { opacity: 0; transform: scale(0.92); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes badge-pop {
+  0% { opacity: 0; transform: scale(0.4) rotate(-8deg); }
+  60% { opacity: 1; transform: scale(1.15) rotate(3deg); }
+  100% { opacity: 1; transform: scale(1) rotate(0deg); }
+}
+@keyframes confetti-fall {
+  0% { opacity: 1; transform: translateY(-10vh) rotate(0deg); }
+  100% { opacity: 0; transform: translateY(105vh) rotate(720deg); }
+}
+/* DuDu desktop-pet "notice me" hop — used by the overlay when something is
+   waiting on the owner (§7.4). Gated in the no-preference block below. */
+@keyframes dudu-hop {
+  0%, 60%, 100% { transform: translateY(0); }
+  25% { transform: translateY(-8%); }
+  40% { transform: translateY(0); }
+}
+
+/* ─────────── Character system motion (§3.2, T2.2) ───────────
+   Eyes blink out of phase (per-character animation-delay set inline from the
+   generated blinkSeed). Pose micro-animations (typing bob, waving arm) are
+   opt-in per SVG element. All gated behind no-preference below → reduced-motion
+   renders the resting frame (eyes open, arms still). `transform-box: fill-box`
+   makes the SVG transform-origin resolve against each element's own box. */
+@keyframes character-blink {
+  0%, 92%, 100% { transform: scaleY(1); }
+  96% { transform: scaleY(0.12); }
+}
+@keyframes character-work {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(0.5px); }
+}
+@keyframes character-wave {
+  0%, 100% { transform: rotate(0deg); }
+  50% { transform: rotate(-16deg); }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .animate-pop-in { animation: pop-in var(--motion-pop) both; }
+  .animate-fade-up { animation: fade-up var(--motion-fade) both; }
+  .animate-badge-pop { animation: badge-pop 320ms cubic-bezier(0.34, 1.56, 0.64, 1) both; }
+  /* One confetti piece — CelebrationLayer sets per-piece delay/left/colour and
+     also JS-gates on reduced-motion (renders a toast instead of particles). */
+  .confetti-piece { animation: confetti-fall 1.6s cubic-bezier(0.4, 0.2, 0.6, 1) forwards; }
+  .dudu-hop { animation: dudu-hop 1.8s ease-in-out infinite; }
+
+  .character-eyes {
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: character-blink 4.2s ease-in-out infinite;
+  }
+  .character-body-work {
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: character-work 1.3s ease-in-out infinite;
+  }
+  .character-arm-wave {
+    transform-box: fill-box;
+    transform-origin: top center;
+    animation: character-wave 1.1s ease-in-out infinite;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

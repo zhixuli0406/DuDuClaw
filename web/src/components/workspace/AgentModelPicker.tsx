@@ -4,7 +4,6 @@ import { useNavigate } from 'react-router';
 import { ChevronDown, Bot, Settings2 } from 'lucide-react';
 import { useChatStore } from '@/stores/chat-store';
 import { useAgentsStore } from '@/stores/agents-store';
-import { useUiModeStore } from '@/stores/ui-mode-store';
 import { cn } from '@/lib/utils';
 
 /**
@@ -20,7 +19,6 @@ import { cn } from '@/lib/utils';
 export function AgentModelPicker() {
   const intl = useIntl();
   const navigate = useNavigate();
-  const setMode = useUiModeStore((s) => s.setMode);
   const agentName = useChatStore((s) => s.agentName);
   const agentIcon = useChatStore((s) => s.agentIcon);
   const model = useChatStore((s) => s.model);
@@ -53,7 +51,6 @@ export function AgentModelPicker() {
 
   const goManage = () => {
     setOpen(false);
-    setMode('dashboard');
     navigate('/agents');
   };
 

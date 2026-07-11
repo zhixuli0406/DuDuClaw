@@ -5,12 +5,18 @@ import '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { AgentModelPicker } from './AgentModelPicker';
 import { useChatStore } from '@/stores/chat-store';
-import { useUiModeStore } from '@/stores/ui-mode-store';
+
+// Spy on router navigation — "Manage" now deep-links to /agents (the former
+// setMode('dashboard') hop was removed when the shell modes were collapsed).
+const mockNavigate = vi.fn();
+vi.mock('react-router', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('react-router')>();
+  return { ...actual, useNavigate: () => mockNavigate };
+});
 
 beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
-  useUiModeStore.setState({ mode: 'workspace', chosen: true });
   useChatStore.setState({
     agentName: 'Scout',
     agentIcon: '🐾',
@@ -25,11 +31,11 @@ describe('AgentModelPicker', () => {
     expect(screen.getByText(/claude-opus/)).toBeInTheDocument();
   });
 
-  it('opening the menu and choosing Manage switches to dashboard mode', async () => {
+  it('opening the menu and choosing Manage navigates to the Agents page', async () => {
     const user = userEvent.setup();
     renderWithProviders(<AgentModelPicker />);
     await user.click(screen.getByRole('button', { name: /Scout/ }));
     await user.click(screen.getByRole('menuitem', { name: /manage agents/i }));
-    expect(useUiModeStore.getState().mode).toBe('dashboard');
+    expect(mockNavigate).toHaveBeenCalledWith('/agents');
   });
 });

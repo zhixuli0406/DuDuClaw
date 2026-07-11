@@ -441,6 +441,13 @@ pub struct BudgetConfig {
     pub monthly_limit_cents: u64,
     pub warn_threshold_percent: u8,
     pub hard_stop: bool,
+    /// Hard daily spend cap in cents (0 = no daily cap). When exceeded and
+    /// [`hard_stop`](Self::hard_stop) is true, the budget circuit breaker blocks
+    /// new LLM calls for this agent until the rolling 24h spend falls back under
+    /// the cap. Complements the calendar-agnostic `monthly_limit_cents`.
+    /// `#[serde(default)]` keeps pre-existing `[budget]` sections valid.
+    #[serde(default)]
+    pub daily_cap_cents: u64,
 }
 
 /// Permission flags that constrain what an agent is allowed to do.
@@ -824,6 +831,18 @@ pub fn sandbox_level_for(caps: Option<&CapabilitiesConfig>) -> SandboxLevel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct EvolutionConfig {
+    /// Master kill-switch for ALL autonomous evolution paths on this agent.
+    ///
+    /// When `false`, every self-improvement path is inert regardless of the
+    /// individual `*_enabled` toggles below: GVU reflection, heartbeat
+    /// silence-breaker, forced reflection, sub-agent prediction, skill
+    /// synthesis / graduation / recommendation, and curiosity exploration.
+    /// Defaults to `true` so agents predating this field keep their current
+    /// behavior (backward compatible). This is the single switch the operator
+    /// flips to "freeze" an agent's autonomy; user-authored autopilot rules are
+    /// deliberately NOT governed by it (see `docs/guides/evolution-switches.md`).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub skill_auto_activate: bool,
     pub skill_security_scan: bool,
     /// External factors to include in reflections.
@@ -934,6 +953,7 @@ pub struct EvolutionConfig {
 impl Default for EvolutionConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             skill_auto_activate: false,
             skill_security_scan: true,
             external_factors: Default::default(),
@@ -965,6 +985,45 @@ impl Default for EvolutionConfig {
             stagnation_detection: StagnationDetectionConfig::default(),
         }
     }
+}
+
+impl EvolutionConfig {
+    /// True iff the master switch is on AND at least one evolution path is
+    /// individually enabled. The master switch (`enabled`) has veto power:
+    /// when it is `false` this returns `false` even if every sub-toggle is on.
+    pub fn is_any_evolution_enabled(&self) -> bool {
+        self.enabled
+            && (self.gvu_enabled
+                || self.skill_synthesis_enabled
+                || self.skill_graduation_enabled
+                || self.skill_recommendation_enabled
+                || self.curiosity_enabled
+                || self.skill_auto_activate
+                || self.skill_behavior_monitor_enabled)
+    }
+}
+
+/// Read `[evolution] enabled` (the master kill-switch) from an agent's
+/// `agent.toml`, for callsites that don't hold a parsed [`EvolutionConfig`].
+///
+/// Unlike [`crate`]'s stricter per-feature reads, this defaults to **`true`**:
+/// a missing file, malformed TOML, absent `[evolution]` section, or absent
+/// `enabled` key all mean "not explicitly frozen" ⇒ evolution allowed. Only an
+/// explicit `enabled = false` freezes the agent. This preserves the behavior of
+/// every agent that predates the master switch.
+pub fn evolution_master_enabled(agent_dir: &std::path::Path) -> bool {
+    let path = agent_dir.join("agent.toml");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return true;
+    };
+    let Ok(value) = raw.parse::<toml::Value>() else {
+        return true;
+    };
+    value
+        .get("evolution")
+        .and_then(|e| e.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
 }
 
 fn default_true() -> bool {
@@ -1432,6 +1491,11 @@ pub struct TelegramChannelConfig {
 
 
 /// Per-agent LINE channel settings.
+///
+/// Backward compatible with the single-OA layout: the top-level
+/// `channel_token`/`channel_secret` fields still work. WP7 adds
+/// `[[channels.line.accounts]]` so one gateway can host several LINE Official
+/// Accounts (DuduCloud B2C), each bound to an agent with its own credit rate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 #[derive(Default)]
@@ -1440,6 +1504,47 @@ pub struct LineChannelConfig {
     pub channel_token_enc: Option<String>,
     pub channel_secret: String,
     pub channel_secret_enc: Option<String>,
+    /// WP7 multi-OA. When non-empty, each entry is an independent Official
+    /// Account. When empty, the top-level single-OA fields are used (legacy).
+    #[serde(default)]
+    pub accounts: Vec<LineAccount>,
+}
+
+/// One LINE Official Account in a multi-OA deployment (WP7).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "snake_case")]
+pub struct LineAccount {
+    /// Operator-facing label; also the credit-account namespace key.
+    pub name: String,
+    pub channel_token: String,
+    pub channel_token_enc: Option<String>,
+    pub channel_secret: String,
+    pub channel_secret_enc: Option<String>,
+    /// Agent this OA's conversations route to.
+    pub agent_id: String,
+    /// Points charged per 1K output tokens for credit metering. 0 ⇒ metering off.
+    #[serde(default)]
+    pub credit_rate: f64,
+}
+
+impl LineChannelConfig {
+    /// Resolve the effective account list. When `accounts` is empty, synthesize
+    /// a single `"default"` account from the legacy top-level fields so old
+    /// configs behave byte-identically.
+    pub fn resolve_accounts(&self) -> Vec<LineAccount> {
+        if !self.accounts.is_empty() {
+            return self.accounts.clone();
+        }
+        vec![LineAccount {
+            name: "default".to_string(),
+            channel_token: self.channel_token.clone(),
+            channel_token_enc: self.channel_token_enc.clone(),
+            channel_secret: self.channel_secret.clone(),
+            channel_secret_enc: self.channel_secret_enc.clone(),
+            agent_id: String::new(),
+            credit_rate: 0.0,
+        }]
+    }
 }
 
 
@@ -2040,6 +2145,68 @@ pub struct DoctorCheck {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    // ── WP1 evolution master kill-switch ───────────────────────────
+
+    #[test]
+    fn evolution_config_default_has_master_enabled() {
+        // Backward compat: an agent predating the master switch defaults to on.
+        assert!(EvolutionConfig::default().enabled);
+    }
+
+    #[test]
+    fn is_any_evolution_enabled_master_off_vetoes_gvu_on() {
+        // T1.5 ③: master off wins even if gvu_enabled is true.
+        let mut cfg = EvolutionConfig::default();
+        cfg.enabled = false;
+        cfg.gvu_enabled = true;
+        assert!(!cfg.is_any_evolution_enabled());
+    }
+
+    #[test]
+    fn is_any_evolution_enabled_master_on_requires_a_subtoggle() {
+        let mut cfg = EvolutionConfig::default();
+        cfg.enabled = true;
+        cfg.gvu_enabled = false;
+        cfg.skill_synthesis_enabled = false;
+        cfg.skill_graduation_enabled = false;
+        cfg.skill_recommendation_enabled = false;
+        cfg.curiosity_enabled = false;
+        cfg.skill_auto_activate = false;
+        cfg.skill_behavior_monitor_enabled = false;
+        assert!(!cfg.is_any_evolution_enabled());
+        cfg.gvu_enabled = true;
+        assert!(cfg.is_any_evolution_enabled());
+    }
+
+    #[test]
+    fn evolution_config_missing_section_defaults_master_on() {
+        // T1.5 ④: absent [evolution] parses byte-identical to defaults ⇒ on.
+        let cfg: EvolutionConfig = toml::from_str("").unwrap_or_default();
+        assert!(cfg.enabled);
+    }
+
+    #[test]
+    fn evolution_master_enabled_reads_explicit_false() {
+        let tmp = std::env::temp_dir()
+            .join(format!("evo-master-off-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("agent.toml"), "[evolution]\nenabled = false\n").unwrap();
+        assert!(!evolution_master_enabled(&tmp));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn evolution_master_enabled_defaults_true_when_absent_or_missing() {
+        // Missing file → true (not frozen). Present file without the key → true.
+        let tmp = std::env::temp_dir()
+            .join(format!("evo-master-default-{}", uuid::Uuid::new_v4()));
+        assert!(evolution_master_enabled(&tmp)); // no dir/file yet
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("agent.toml"), "[agent]\nname = \"x\"\n").unwrap();
+        assert!(evolution_master_enabled(&tmp));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn capabilities_without_policy_parses_backward_compat() {

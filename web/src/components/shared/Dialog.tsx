@@ -1,6 +1,7 @@
-import { useEffect, useRef, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
 import { X } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { clampDialogOffset, type Offset } from './dialogDrag';
 
 interface DialogProps {
   open: boolean;
@@ -10,14 +11,23 @@ interface DialogProps {
   className?: string;
 }
 
+const ZERO: Offset = { x: 0, y: 0 };
+
 export function Dialog({ open, onClose, title, children, className }: DialogProps) {
   const dialogRef = useRef<HTMLDialogElement>(null);
+  // Drag offset applied on top of the native centered (margin:auto) position.
+  const [offset, setOffset] = useState<Offset>(ZERO);
+  const [dragging, setDragging] = useState(false);
+  // Pointer + dialog-size snapshot captured at drag start (stable during drag).
+  const dragRef = useRef<{ startX: number; startY: number; base: Offset; size: { width: number; height: number } } | null>(null);
 
   useEffect(() => {
     const el = dialogRef.current;
     if (!el) return;
     if (open && !el.open) {
       el.showModal();
+      // Every open re-centers: discard any leftover drag offset from last time.
+      setOffset(ZERO);
     } else if (!open && el.open) {
       el.close();
     }
@@ -31,21 +41,71 @@ export function Dialog({ open, onClose, title, children, className }: DialogProp
     return () => el.removeEventListener('close', handleClose);
   }, [onClose]);
 
+  const onHeaderPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    // Never hijack the close button (or any interactive control) in the header.
+    if ((e.target as HTMLElement).closest('button')) return;
+    // Only the primary button starts a drag (touch/pen report button 0 too).
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    const el = dialogRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    dragRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      base: offset,
+      size: { width: rect.width, height: rect.height },
+    };
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    setDragging(true);
+  };
+
+  const onHeaderPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    const raw: Offset = {
+      x: drag.base.x + (e.clientX - drag.startX),
+      y: drag.base.y + (e.clientY - drag.startY),
+    };
+    setOffset(
+      clampDialogOffset(raw, drag.size, { width: window.innerWidth, height: window.innerHeight })
+    );
+  };
+
+  const endDrag = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current) return;
+    dragRef.current = null;
+    setDragging(false);
+    const el = e.currentTarget as HTMLElement;
+    if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
+  };
+
   return (
     <dialog
       ref={dialogRef}
       aria-labelledby="dialog-title"
       aria-modal="true"
+      // `m-auto` restores UA centering that Tailwind's preflight `margin:0` strips
+      // (without it the modal pins to the top-left). The drag offset rides on top.
+      style={offset === ZERO ? undefined : { transform: `translate3d(${offset.x}px, ${offset.y}px, 0)` }}
       className={cn(
-        'glass-overlay w-full max-w-lg rounded-2xl p-0 text-stone-900 backdrop:bg-stone-950/45 backdrop:backdrop-blur-md dark:text-stone-100',
+        'glass-overlay m-auto w-[calc(100vw-2rem)] max-w-lg rounded-2xl p-0 text-stone-900 backdrop:bg-stone-950/45 backdrop:backdrop-blur-md dark:text-stone-100',
         className
       )}
     >
-      <div className="flex items-center justify-between border-b border-stone-300/40 px-6 py-4 dark:border-white/8">
+      <div
+        onPointerDown={onHeaderPointerDown}
+        onPointerMove={onHeaderPointerMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+        className={cn(
+          'flex touch-none select-none items-center justify-between border-b border-stone-300/40 px-6 py-4 dark:border-white/8',
+          dragging ? 'cursor-grabbing' : 'cursor-grab'
+        )}
+      >
         <h3 id="dialog-title" className="text-lg font-semibold tracking-tight text-stone-900 dark:text-stone-50">{title}</h3>
         <button
           onClick={onClose}
-          className="rounded-lg p-1.5 text-stone-400 hover:bg-stone-500/10 hover:text-stone-600 dark:hover:text-stone-300"
+          className="cursor-pointer rounded-lg p-1.5 text-stone-400 hover:bg-stone-500/10 hover:text-stone-600 dark:hover:text-stone-300"
         >
           <X className="h-4 w-4" />
         </button>

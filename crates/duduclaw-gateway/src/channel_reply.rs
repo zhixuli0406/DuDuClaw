@@ -4,8 +4,11 @@
 //! using the multi-account rotator for key management and budget tracking.
 //! Falls back to direct Anthropic API if Python is unavailable.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use duduclaw_agent::registry::AgentRegistry;
 use duduclaw_agent::resolver::AgentResolver;
@@ -523,6 +526,32 @@ const CONTRACT_BLOCK_MESSAGE: &str = "⚠️ 這則回覆因違反行為契約�
 /// sent. Empty `must_not` (or no CONTRACT.toml) → passthrough (no overhead).
 async fn enforce_contract(final_text: String, home_dir: &std::path::Path, agent_id: &str) -> String {
     let agent_dir = home_dir.join("agents").join(agent_id);
+
+    // ── Output guardrail (opt-in `[guardrails]`) — content-safety last mile ──
+    // Runs before the CONTRACT check; scans the outbound reply for leaked
+    // secrets, injection echoes, and deny phrases. Disabled by default ⇒ no-op.
+    let guard_cfg = crate::guardrail::load_guardrail_config(&agent_dir);
+    let final_text = if guard_cfg.enabled {
+        match crate::guardrail::scan_output(&final_text, &guard_cfg) {
+            crate::guardrail::GuardrailAction::Allow => final_text,
+            crate::guardrail::GuardrailAction::Redacted(t) => {
+                warn!(agent = %agent_id, "guardrail redacted PII in outgoing reply");
+                t
+            }
+            crate::guardrail::GuardrailAction::Blocked(reason) => {
+                warn!(agent = %agent_id, %reason, "guardrail BLOCKED outgoing reply");
+                duduclaw_security::audit::log_contract_violation(
+                    home_dir,
+                    agent_id,
+                    &[format!("guardrail: {reason}")],
+                );
+                return crate::guardrail::blocked_reply();
+            }
+        }
+    } else {
+        final_text
+    };
+
     let contract = duduclaw_agent::contract::load_contract(&agent_dir);
     if contract.boundaries.must_not.is_empty() {
         return final_text;
@@ -1022,6 +1051,19 @@ async fn build_reply_with_session_inner(
         }
     }
 
+    // ── L2.5: Budget circuit breaker (cost enforcement) ──
+    // If the agent has hit its hard spend cap, stop before any LLM call and tell
+    // the user on their own channel — this reply IS the cross-channel budget
+    // alert. Inert unless `agent.toml [budget]` sets a cap with `hard_stop`; the
+    // check fails open if telemetry is unavailable.
+    {
+        let budget =
+            crate::budget::check_agent_budget(&ctx.home_dir, agent_dir.as_deref(), &agent_id).await;
+        if budget.is_denied() {
+            return budget.user_message();
+        }
+    }
+
     // ── L3: Prompt injection scan (existing) ──
     // P0-2: use the audit-emitting variant so a blocked inbound injection
     // leaves a forensic trail in `security_audit.jsonl` (via
@@ -1327,6 +1369,28 @@ async fn build_reply_with_session_inner(
             {
                 prompt = format!("{prompt}\n\n## Learned Rules (from past mistakes)\n{section}");
                 injected_rule_ids = ids;
+            }
+        }
+
+        // B3 cross-session user profile: inject a session-stable
+        // `## About This User` block of the sender's accumulated preference
+        // traits (subject = `user:<user_id>`). Keyed by (agent_id, user_id);
+        // deterministic bytes → prompt-cache friendly. Empty profile ⇒ no-op.
+        // !Send → spawn_blocking.
+        if let Some(db_path) = cognitive_memory_db.clone() {
+            let aid = agent_id.clone();
+            let uid = user_id.to_string();
+            if let Ok(Some(section)) = tokio::task::spawn_blocking(move || {
+                let engine = duduclaw_memory::SqliteMemoryEngine::new(&db_path).ok()?;
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(duduclaw_memory::user_profile::profile_block(&engine, &aid, &uid))
+                    .ok()
+                    .flatten()
+            })
+            .await
+            {
+                // `section` already begins with the `## About This User` header.
+                prompt = format!("{prompt}\n\n{section}");
             }
         }
 
@@ -1752,6 +1816,10 @@ async fn build_reply_with_session_inner(
     // path checks for non-empty before calling cost_telemetry.
     let cli_future = crate::claude_runner::CHANNEL_REPLY_AGENT_ID
         .scope(agent_id.clone(), cli_future);
+    // WP6: scope the end-user id so the token-usage recorder can attribute
+    // spend per employee. Empty user_id ⇒ recorded as unattributed.
+    let cli_future = crate::claude_runner::CHANNEL_REPLY_USER_ID
+        .scope(user_id.to_string(), cli_future);
     let local_first_answered = local_first_reply.is_some();
     let reply = match local_first_reply {
         // Local-first already answered (inference_mode=local): skip the CLI
@@ -2463,8 +2531,19 @@ async fn build_reply_with_session_inner(
                     }
                 }
 
+                // WP1 master kill-switch: when `[evolution] enabled = false`,
+                // freeze ALL autonomous evolution actions in the channel path
+                // (skill diagnose/activate/synthesis/graduation in steps 5–6 and
+                // the GVU trigger in step 7). Steps 1–4.5 above are pure
+                // observation (prediction error logging, user-model update,
+                // mistake recording) and still run so telemetry stays intact.
+                let master_on = agent_dir_for_pred
+                    .as_ref()
+                    .map(|d| duduclaw_core::evolution_master_enabled(d))
+                    .unwrap_or(true);
+
                 // 5. Skill lifecycle: diagnose + activate + track lift
-                {
+                if master_on {
                     let compressed: Vec<_> = {
                         let cache = skill_cache_for_pred.lock().await;
                         cache.all().into_iter().cloned().collect()
@@ -2581,7 +2660,7 @@ async fn build_reply_with_session_inner(
                 }
 
                 // 6. Periodic: evaluate activations + scan distillation (every ~20 conversations)
-                {
+                if master_on {
                     // Use prediction count as conversation counter (low overhead)
                     let should_evaluate = pe.metacognition.lock().await.total_predictions % 20 == 0;
                     if should_evaluate {
@@ -2703,9 +2782,13 @@ async fn build_reply_with_session_inner(
                 // Snapshot consistency first, then lock exploration (audit #1: avoid dual mutex)
                 let consecutive = pe.consecutive_significant_count(&agent_id_for_pred).await;
                 let consistency_snapshot = pe.consistency.lock().await.clone();
-                let action = {
+                // Master kill-switch: a frozen agent routes to `None` so neither
+                // episodic-memory writes nor the GVU self-play loop fire.
+                let action = if master_on {
                     let mut exploration = pe.exploration.lock().await;
                     crate::prediction::router::route(&error, consecutive, &mut exploration, &consistency_snapshot)
+                } else {
+                    crate::prediction::router::EvolutionAction::None
                 };
 
                 match action {
@@ -4024,6 +4107,305 @@ pub enum ProgressEvent {
     /// Claude updated its task list (parsed from a `TodoWrite` tool_use block).
     /// Carries the full list so channels can render/edit a progress board.
     TodoUpdate { todos: Vec<TodoItem> },
+    /// A tool-step boundary (start/end) for the dashboard's agentic task tree
+    /// (openhuman-parity project C-P1). Emitted per `tool_use` block (start) and
+    /// matching `tool_result` (end), with a nesting `depth`. **Dashboard-only**:
+    /// text channels (Telegram/Slack/…) ignore this variant — it renders as an
+    /// empty string via [`ProgressEvent::to_display`] and each channel callback
+    /// early-returns on it. Only the WebChat socket forwards it (as a `step`
+    /// frame). See [`StepEvent`] / [`StepTracker`].
+    Step(StepEvent),
+}
+
+/// Phase of a tool step in the agentic task tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepPhase {
+    /// A `tool_use` block was emitted — the tool started.
+    Start,
+    /// The matching `tool_result` arrived — the tool finished.
+    End,
+}
+
+impl StepPhase {
+    /// Stable wire token used in the WebChat `step` frame.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StepPhase::Start => "start",
+            StepPhase::End => "end",
+        }
+    }
+}
+
+/// One boundary of a tool invocation, forming the dashboard's collapsible
+/// agentic task tree (openhuman-parity project C-P1).
+///
+/// A `Start` carries a CJK-safe args `summary`; an `End` carries `summary =
+/// None`. `depth` is the nesting level — the number of still-open tool calls
+/// at the moment this one started, so a `Task` sub-agent whose inner tools
+/// resolve before it does surfaces its children at `depth ≥ 1`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepEvent {
+    pub phase: StepPhase,
+    pub tool: String,
+    /// CJK-safe args summary (≤120 chars). `None` for `End` phase.
+    pub summary: Option<String>,
+    /// Nesting depth (outstanding tool calls when this step started).
+    pub depth: usize,
+    /// Wall-clock timestamp, unix epoch milliseconds.
+    pub ts_ms: u64,
+}
+
+/// Max chars for a step's args summary (CJK-safe, per project convention 1).
+const STEP_SUMMARY_CHAR_CAP: usize = 120;
+
+/// Current wall-clock time in unix epoch milliseconds (saturating on error).
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// ── Custom-skill usage counting (L5 §14) ────────────────────
+
+/// TTL for the approved custom-skill slug cache — bounds the DB hit to once per
+/// minute per home even under a fast tool_use stream.
+const CUSTOM_SKILL_SLUG_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+struct SlugCacheEntry {
+    loaded_at: Instant,
+    slugs: Arc<HashSet<String>>,
+}
+
+fn custom_skill_slug_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, SlugCacheEntry>> {
+    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, SlugCacheEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Approved custom-skill slugs for `home_dir`, cached [`CUSTOM_SKILL_SLUG_TTL`].
+/// The registry is opened only on a cold/stale entry, and never while the cache
+/// lock is held (the lock never spans an `.await`). Any open/read failure yields
+/// an empty set — usage counting degrades silently, never blocks the reply.
+async fn approved_custom_skill_slugs(home_dir: &Path) -> Arc<HashSet<String>> {
+    {
+        let cache = custom_skill_slug_cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = cache.get(home_dir) {
+            if entry.loaded_at.elapsed() < CUSTOM_SKILL_SLUG_TTL {
+                return entry.slugs.clone();
+            }
+        }
+    }
+    let slugs: HashSet<String> = match crate::custom_skills::CustomSkillStore::open(home_dir) {
+        Ok(store) => store
+            .list_approved()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.slug)
+            .collect(),
+        Err(_) => HashSet::new(),
+    };
+    let arc = Arc::new(slugs);
+    let mut cache = custom_skill_slug_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    cache.insert(
+        home_dir.to_path_buf(),
+        SlugCacheEntry {
+            loaded_at: Instant::now(),
+            slugs: arc.clone(),
+        },
+    );
+    arc
+}
+
+/// Skill names invoked via the Claude CLI `Skill` tool in one stream-json
+/// `assistant` event. The Skill tool carries its target under `input.skill` (its
+/// documented parameter); `command`/`name` are accepted as resilient fallbacks
+/// across CLI versions. Only `tool_use` blocks whose tool name is exactly
+/// "Skill" are considered.
+fn extract_skill_tool_names(event: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if event.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return out;
+    }
+    let Some(content) = event.pointer("/message/content").and_then(|c| c.as_array()) else {
+        return out;
+    };
+    for block in content {
+        if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+            continue;
+        }
+        if block.get("name").and_then(|n| n.as_str()) != Some("Skill") {
+            continue;
+        }
+        let name = block
+            .get("input")
+            .and_then(|i| {
+                i.get("skill")
+                    .or_else(|| i.get("command"))
+                    .or_else(|| i.get("name"))
+            })
+            .and_then(|s| s.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if !name.is_empty() {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// Token-equality match of an invoked skill name against approved custom-skill
+/// slugs. **Exact** string equality — never substring (project convention 2: a
+/// substring test would let the slug "report" be counted for a "report-daily"
+/// invocation and inflate saved-hours). CJK slugs match unchanged.
+fn matched_custom_slug<'a>(invoked: &str, approved: &'a HashSet<String>) -> Option<&'a str> {
+    approved.get(invoked).map(String::as_str)
+}
+
+/// Build a CJK-safe (≤120 char) one-line summary of a `tool_use` block's args
+/// for the dashboard step tree.
+///
+/// Prefers the most informative field (path / command / query / prompt …);
+/// falls back to a compact comma-joined key list. Uses
+/// [`duduclaw_core::truncate_chars`] — never raw byte slicing (project
+/// convention 1: `&s[..n]` panics mid-char on CJK/emoji input).
+fn summarize_tool_input(block: &serde_json::Value) -> Option<String> {
+    let input = block.get("input")?;
+    for key in &[
+        "file_path",
+        "path",
+        "command",
+        "pattern",
+        "query",
+        "url",
+        "prompt",
+        "description",
+    ] {
+        if let Some(val) = input.get(key).and_then(|v| v.as_str()) {
+            let val = val.trim();
+            if !val.is_empty() {
+                return Some(duduclaw_core::truncate_chars(val, STEP_SUMMARY_CHAR_CAP));
+            }
+        }
+    }
+    // Fallback: compact list of argument keys (still informative for the tree).
+    let obj = input.as_object()?;
+    if obj.is_empty() {
+        return None;
+    }
+    let joined = obj.keys().map(String::as_str).collect::<Vec<_>>().join(", ");
+    Some(duduclaw_core::truncate_chars(&joined, STEP_SUMMARY_CHAR_CAP))
+}
+
+/// Stateful converter from parsed stream-json events to ordered [`StepEvent`]s
+/// (openhuman-parity project C-P1).
+///
+/// Feed it every parsed stream-json event via [`StepTracker::ingest`]:
+/// `assistant` messages carry `tool_use` blocks (a step **start**); `user`
+/// messages carry `tool_result` blocks (a step **end**). It keeps a stack of
+/// outstanding `(tool_use_id, tool_name)` pairs so nested / parallel calls get
+/// a correct `depth`, and matches each `tool_result` to its `tool_use_id`
+/// (falling back to the most recent open call when the id is absent).
+///
+/// Pure and deterministic apart from the wall-clock timestamp — unit-tested
+/// against synthetic start / end / nested / non-tool events.
+#[derive(Debug, Default)]
+pub struct StepTracker {
+    /// Outstanding (unresolved) tool calls, innermost last: (tool_use_id, tool).
+    open: Vec<(String, String)>,
+}
+
+impl StepTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Process one parsed stream-json event, returning any step boundaries it
+    /// produced (usually 0 or 1; more when a single assistant message batches
+    /// several parallel `tool_use` blocks).
+    pub fn ingest(&mut self, event: &serde_json::Value) -> Vec<StepEvent> {
+        let ts_ms = now_unix_ms();
+        let mut out = Vec::new();
+        match event.get("type").and_then(|t| t.as_str()) {
+            Some("assistant") => {
+                let Some(content) = event
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                else {
+                    return out;
+                };
+                for block in content {
+                    if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                        continue;
+                    }
+                    let tool = block
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let id = block
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let summary = summarize_tool_input(block);
+                    // depth = outstanding calls *before* this one is pushed.
+                    let depth = self.open.len();
+                    out.push(StepEvent {
+                        phase: StepPhase::Start,
+                        tool: tool.clone(),
+                        summary,
+                        depth,
+                        ts_ms,
+                    });
+                    self.open.push((id, tool));
+                }
+            }
+            Some("user") => {
+                let Some(content) = event
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                else {
+                    return out;
+                };
+                for block in content {
+                    if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                        continue;
+                    }
+                    let id = block.get("tool_use_id").and_then(|i| i.as_str()).unwrap_or_default();
+                    // Match the result to its open call by id; fall back to the
+                    // most recent open call when the id is missing/unknown.
+                    let popped = if !id.is_empty() {
+                        self.open
+                            .iter()
+                            .rposition(|(oid, _)| oid == id)
+                            .map(|pos| self.open.remove(pos))
+                    } else {
+                        self.open.pop()
+                    }
+                    .or_else(|| self.open.pop());
+                    if let Some((_, tool)) = popped {
+                        out.push(StepEvent {
+                            phase: StepPhase::End,
+                            tool,
+                            summary: None,
+                            // depth after removal = the level this step returns to.
+                            depth: self.open.len(),
+                            ts_ms,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        out
+    }
 }
 
 /// One entry of the agent's live task list (mirrors the Claude CLI
@@ -4088,6 +4470,10 @@ impl ProgressEvent {
                 }
             }
             Self::TodoUpdate { todos } => render_todo_list(todos),
+            // Dashboard-only structured step — never rendered as channel text.
+            // Text channels early-return on this variant; WebChat forwards it
+            // as a `step` frame instead.
+            Self::Step(_) => String::new(),
         }
     }
 }
@@ -4190,6 +4576,195 @@ mod todo_progress_tests {
             todos: vec![TodoItem { content: "x".into(), status: "pending".into(), active_form: None }],
         };
         assert!(event.to_display().starts_with("📋"));
+    }
+}
+
+#[cfg(test)]
+mod step_tracker_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Build an `assistant` stream-json event carrying one `tool_use` block.
+    fn tool_use_event(id: &str, name: &str, input: serde_json::Value) -> serde_json::Value {
+        json!({
+            "type": "assistant",
+            "message": { "content": [ { "type": "tool_use", "id": id, "name": name, "input": input } ] }
+        })
+    }
+
+    /// Build a `user` stream-json event carrying one `tool_result` block.
+    fn tool_result_event(id: &str) -> serde_json::Value {
+        json!({
+            "type": "user",
+            "message": { "content": [ { "type": "tool_result", "tool_use_id": id, "content": "ok" } ] }
+        })
+    }
+
+    #[test]
+    fn start_emits_step_with_summary_and_depth_zero() {
+        let mut tr = StepTracker::new();
+        let steps = tr.ingest(&tool_use_event("t1", "Read", json!({ "file_path": "/etc/hosts" })));
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].phase, StepPhase::Start);
+        assert_eq!(steps[0].tool, "Read");
+        assert_eq!(steps[0].summary.as_deref(), Some("/etc/hosts"));
+        assert_eq!(steps[0].depth, 0);
+    }
+
+    #[test]
+    fn end_matches_open_call_by_id() {
+        let mut tr = StepTracker::new();
+        let _ = tr.ingest(&tool_use_event("t1", "Bash", json!({ "command": "ls" })));
+        let ends = tr.ingest(&tool_result_event("t1"));
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].phase, StepPhase::End);
+        assert_eq!(ends[0].tool, "Bash");
+        assert!(ends[0].summary.is_none(), "end phase carries no summary");
+        assert_eq!(ends[0].depth, 0);
+    }
+
+    #[test]
+    fn nested_calls_increment_depth() {
+        let mut tr = StepTracker::new();
+        // Outer Task starts at depth 0…
+        let outer = tr.ingest(&tool_use_event("task1", "Task", json!({ "description": "sub" })));
+        assert_eq!(outer[0].depth, 0);
+        // …an inner Bash starts while Task is still open → depth 1.
+        let inner = tr.ingest(&tool_use_event("bash1", "Bash", json!({ "command": "make" })));
+        assert_eq!(inner[0].depth, 1);
+        // Inner resolves first, returning to depth 1.
+        let inner_end = tr.ingest(&tool_result_event("bash1"));
+        assert_eq!(inner_end[0].tool, "Bash");
+        assert_eq!(inner_end[0].depth, 1);
+        // Outer resolves, returning to depth 0.
+        let outer_end = tr.ingest(&tool_result_event("task1"));
+        assert_eq!(outer_end[0].tool, "Task");
+        assert_eq!(outer_end[0].depth, 0);
+    }
+
+    #[test]
+    fn non_tool_events_emit_nothing() {
+        let mut tr = StepTracker::new();
+        // Text-only assistant message.
+        assert!(tr.ingest(&json!({
+            "type": "assistant",
+            "message": { "content": [ { "type": "text", "text": "hello" } ] }
+        })).is_empty());
+        // Thinking block.
+        assert!(tr.ingest(&json!({
+            "type": "assistant",
+            "message": { "content": [ { "type": "thinking", "thinking": "…" } ] }
+        })).is_empty());
+        // Terminal result event.
+        assert!(tr.ingest(&json!({ "type": "result", "subtype": "success", "result": "done" })).is_empty());
+        // Unknown / system event.
+        assert!(tr.ingest(&json!({ "type": "system", "subtype": "init" })).is_empty());
+    }
+
+    #[test]
+    fn parallel_tool_uses_in_one_message_each_emit_a_start() {
+        let mut tr = StepTracker::new();
+        let event = json!({
+            "type": "assistant",
+            "message": { "content": [
+                { "type": "text", "text": "working" },
+                { "type": "tool_use", "id": "a", "name": "Read", "input": { "file_path": "a.rs" } },
+                { "type": "tool_use", "id": "b", "name": "Grep", "input": { "pattern": "foo" } }
+            ] }
+        });
+        let steps = tr.ingest(&event);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].tool, "Read");
+        assert_eq!(steps[0].depth, 0);
+        assert_eq!(steps[1].tool, "Grep");
+        assert_eq!(steps[1].depth, 1);
+    }
+
+    #[test]
+    fn summary_is_cjk_safe_and_capped() {
+        // 200 CJK chars — raw byte slicing at 120 would panic mid-char.
+        let long = "指令".repeat(100);
+        let steps = StepTracker::new()
+            .ingest(&tool_use_event("t1", "Bash", json!({ "command": long })));
+        let summary = steps[0].summary.as_deref().expect("summary present");
+        assert_eq!(summary.chars().count(), STEP_SUMMARY_CHAR_CAP);
+    }
+
+    #[test]
+    fn summary_falls_back_to_key_list_then_none() {
+        // No known field → comma-joined key list.
+        let steps = StepTracker::new()
+            .ingest(&tool_use_event("t1", "CustomTool", json!({ "alpha": 1, "beta": 2 })));
+        let summary = steps[0].summary.as_deref().expect("fallback summary");
+        assert!(summary.contains("alpha") && summary.contains("beta"));
+        // Empty input object → no summary.
+        let steps2 = StepTracker::new().ingest(&tool_use_event("t2", "NoArgs", json!({})));
+        assert!(steps2[0].summary.is_none());
+    }
+
+    #[test]
+    fn to_display_is_empty_for_step_variant() {
+        let ev = ProgressEvent::Step(StepEvent {
+            phase: StepPhase::Start,
+            tool: "Read".into(),
+            summary: Some("x".into()),
+            depth: 0,
+            ts_ms: 1,
+        });
+        assert!(ev.to_display().is_empty(), "channels must render Step as empty");
+    }
+
+    // ── Custom-skill usage counting (L5 §14) ────────────────
+
+    #[test]
+    fn extract_skill_names_only_from_skill_tool_use() {
+        // A `Skill` tool_use with the documented `skill` arg is picked up.
+        let ev = tool_use_event("t1", "Skill", json!({ "skill": "daily-report", "args": "x" }));
+        assert_eq!(extract_skill_tool_names(&ev), vec!["daily-report".to_string()]);
+
+        // Non-Skill tools are ignored (Read here carries a `skill`-looking key).
+        let read = tool_use_event("t2", "Read", json!({ "skill": "not-a-skill" }));
+        assert!(extract_skill_tool_names(&read).is_empty());
+
+        // Fallback arg keys (command / name) still resolve for Skill.
+        let by_cmd = tool_use_event("t3", "Skill", json!({ "command": "翻譯校對" }));
+        assert_eq!(extract_skill_tool_names(&by_cmd), vec!["翻譯校對".to_string()]);
+
+        // tool_result / non-assistant events yield nothing.
+        assert!(extract_skill_tool_names(&tool_result_event("t1")).is_empty());
+    }
+
+    #[test]
+    fn matched_slug_is_token_equal_never_substring() {
+        let approved: HashSet<String> =
+            ["report", "daily-report", "翻譯校對"].iter().map(|s| s.to_string()).collect();
+
+        // Exact match hits.
+        assert_eq!(matched_custom_slug("report", &approved), Some("report"));
+        assert_eq!(matched_custom_slug("翻譯校對", &approved), Some("翻譯校對"));
+
+        // Substring / superstring must NOT match (the anti-inflation invariant).
+        assert_eq!(matched_custom_slug("report-daily", &approved), None);
+        assert_eq!(matched_custom_slug("rep", &approved), None);
+        assert_eq!(matched_custom_slug("daily-report-v2", &approved), None);
+        // A CJK slug that is a substring of the invoked name must not match.
+        assert_eq!(matched_custom_slug("翻譯校對稿", &approved), None);
+        // Unknown / empty → None.
+        assert_eq!(matched_custom_slug("", &approved), None);
+        assert_eq!(matched_custom_slug("nope", &approved), None);
+    }
+
+    #[test]
+    fn parallel_skill_tool_uses_all_extracted() {
+        let ev = json!({
+            "type": "assistant",
+            "message": { "content": [
+                { "type": "tool_use", "id": "a", "name": "Skill", "input": { "skill": "s1" } },
+                { "type": "tool_use", "id": "b", "name": "Bash", "input": { "command": "ls" } },
+                { "type": "tool_use", "id": "c", "name": "Skill", "input": { "skill": "s2" } }
+            ] }
+        });
+        assert_eq!(extract_skill_tool_names(&ev), vec!["s1".to_string(), "s2".to_string()]);
     }
 }
 
@@ -4749,6 +5324,11 @@ async fn spawn_claude_cli_with_env(
     let mut last_result_subtype: Option<String> = None;
     let mut last_stop_reason: Option<String> = None;
 
+    // C-P1: converts tool_use / tool_result stream-json events into ordered
+    // start/end step events for the dashboard's agentic task tree. Runs
+    // alongside the existing ToolUse/TodoUpdate progress emission below.
+    let mut step_tracker = StepTracker::new();
+
     // Keepalive timer — fires periodically when no stream events arrive
     let mut keepalive = tokio::time::interval(
         std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
@@ -4801,6 +5381,44 @@ async fn spawn_claude_cli_with_env(
 
                         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
                             events_parsed += 1;
+
+                            // C-P1: emit structured start/end step events for the
+                            // dashboard task tree. Additive — leaves the text token
+                            // stream and the ToolUse/TodoUpdate emission untouched.
+                            if let Some(cb) = on_progress {
+                                for step in step_tracker.ingest(&event) {
+                                    cb(ProgressEvent::Step(step));
+                                }
+                            }
+
+                            // L5 §14: count real invocations of approved custom
+                            // skills. Only fires when the event carries a `Skill`
+                            // tool_use; the slug set is 60s-cached and the increment
+                            // is detached so it never delays the reply. Token-equal
+                            // slug match only (no substring).
+                            let skill_names = extract_skill_tool_names(&event);
+                            if !skill_names.is_empty() {
+                                let approved = approved_custom_skill_slugs(home_dir).await;
+                                for name in skill_names {
+                                    if let Some(slug) = matched_custom_slug(&name, &approved) {
+                                        let home = home_dir.to_path_buf();
+                                        let slug = slug.to_string();
+                                        tokio::spawn(async move {
+                                            match crate::custom_skills::CustomSkillStore::open(&home) {
+                                                Ok(store) => {
+                                                    if let Err(e) =
+                                                        store.increment_usage_by_slug(&slug).await
+                                                    {
+                                                        warn!(slug = %slug, error = %e, "custom skill usage increment failed");
+                                                    }
+                                                }
+                                                Err(e) => warn!(error = %e, "open custom skill store for usage increment failed"),
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+
                             match event.get("type").and_then(|t| t.as_str()) {
                                 // Final result event — contains the complete response.
                                 //
@@ -5046,12 +5664,24 @@ async fn spawn_claude_cli_with_env(
         if !agent_id.is_empty()
             && let Some(telemetry) = crate::cost_telemetry::get_telemetry()
         {
+            // WP6: attribute this spend to the end-user + channel when the
+            // channel_reply path scoped them (empty ⇒ unattributed / system).
+            let user_id = crate::claude_runner::CHANNEL_REPLY_USER_ID
+                .try_with(|u| u.clone())
+                .ok()
+                .filter(|u| !u.is_empty());
+            let channel = crate::claude_runner::REPLY_CHANNEL
+                .try_with(|c| c.clone())
+                .ok()
+                .filter(|c| !c.is_empty());
             telemetry
-                .record(
+                .record_attributed(
                     &agent_id,
                     crate::cost_telemetry::RequestType::Chat,
                     model,
                     usage,
+                    user_id.as_deref(),
+                    channel.as_deref(),
                 )
                 .await;
         }

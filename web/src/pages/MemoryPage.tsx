@@ -16,6 +16,8 @@ import {
   EmptyState,
   Toolbar,
   controlClass,
+  CharacterAvatar,
+  Mono,
   type TabItem,
 } from '@/components/ui';
 import {
@@ -155,6 +157,7 @@ function MemoriesTab() {
         <Card>
           <EmptyState
             icon={Brain}
+            dudu="idle"
             title={intl.formatMessage({ id: 'memory.empty.memories' })}
             action={
               <Link
@@ -177,12 +180,13 @@ function MemoriesTab() {
             return (
               <Card key={entry.id}>
                 <div className="mb-2 flex items-center justify-between">
-                  <span className="text-xs font-medium text-amber-600 dark:text-amber-400">
+                  <span className="flex items-center gap-1.5 text-xs font-medium text-amber-600 dark:text-amber-400">
+                    <CharacterAvatar agentId={entry.agent_id} name={entry.agent_id} size={24} />
                     {entry.agent_id}
                   </span>
                   <span className="flex items-center gap-1 text-xs text-stone-400 dark:text-stone-500">
                     <Clock className="h-3 w-3" />
-                    {new Date(entry.timestamp).toLocaleString()}
+                    <Mono className="text-stone-400 dark:text-stone-500">{new Date(entry.timestamp).toLocaleString()}</Mono>
                   </span>
                 </div>
                 <p className="text-sm text-stone-700 dark:text-stone-300 whitespace-pre-wrap">
@@ -222,6 +226,7 @@ function PredictionMemoryCard({ entry, data }: { entry: MemoryEntry; data: Predi
     <Card>
       <div className="mb-2 flex items-center justify-between">
         <span className="flex items-center gap-1.5 text-xs font-medium text-amber-600 dark:text-amber-400">
+          <CharacterAvatar agentId={entry.agent_id} name={entry.agent_id} size={24} />
           <Activity className="h-3.5 w-3.5" />
           {entry.agent_id}
           <span className="text-stone-400 dark:text-stone-500">
@@ -230,7 +235,7 @@ function PredictionMemoryCard({ entry, data }: { entry: MemoryEntry; data: Predi
         </span>
         <span className="flex items-center gap-1 text-xs text-stone-400 dark:text-stone-500">
           <Clock className="h-3 w-3" />
-          {new Date(entry.timestamp).toLocaleString()}
+          <Mono className="text-stone-400 dark:text-stone-500">{new Date(entry.timestamp).toLocaleString()}</Mono>
         </span>
       </div>
       <p className="text-sm text-stone-700 dark:text-stone-300">
@@ -337,6 +342,7 @@ function SkillsTab() {
         <Card>
           <EmptyState
             icon={BookOpen}
+            dudu="idle"
             title={intl.formatMessage({ id: 'memory.empty.skills' })}
             action={
               <Link
@@ -367,6 +373,7 @@ function SkillsTab() {
                       </h3>
                       {skill.agent_id && (
                         <p className="flex items-center gap-1.5 text-xs text-stone-500 dark:text-stone-400">
+                          <CharacterAvatar agentId={skill.agent_id} name={skill.agent_id} size={24} />
                           {skill.agent_id}
                           {skill.scope && <Badge tone="neutral">{skill.scope}</Badge>}
                         </p>
@@ -488,7 +495,7 @@ function EvolutionTab() {
           {lastAppliedAt && (
             <span className="flex items-center gap-1 text-xs text-stone-500 dark:text-stone-400">
               <Clock className="h-3 w-3" />
-              {new Date(lastAppliedAt).toLocaleString()}
+              <Mono className="text-stone-500 dark:text-stone-400">{new Date(lastAppliedAt).toLocaleString()}</Mono>
             </span>
           )}
         </div>
@@ -502,6 +509,7 @@ function EvolutionTab() {
         <Card>
           <EmptyState
             icon={GitBranch}
+            dudu="idle"
             title={intl.formatMessage({ id: 'common.noData' })}
           />
         </Card>
@@ -510,9 +518,7 @@ function EvolutionTab() {
           {agents.map((agent) => (
             <Card key={agent.agent_id}>
               <div className="mb-4 flex items-center gap-3">
-                <div className="rounded-lg bg-amber-500/12 p-2 text-amber-600 dark:text-amber-400">
-                  <GitBranch className="h-4 w-4" />
-                </div>
+                <CharacterAvatar agentId={agent.agent_id} name={agent.agent_id} size={28} />
                 <h3 className="font-semibold text-stone-900 dark:text-stone-50">{agent.agent_id}</h3>
               </div>
 
@@ -574,6 +580,7 @@ function EvolutionTab() {
             <Card>
               <EmptyState
                 icon={GitBranch}
+                dudu="reading"
                 title={intl.formatMessage({ id: 'evolution.noHistory' })}
               />
             </Card>
@@ -629,17 +636,18 @@ function EvolutionVersionCard({ version }: { version: EvolutionVersion }) {
     <Card bodyClassName="p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
+          <CharacterAvatar agentId={version.agent_id} name={version.agent_id} size={24} />
           <span className="text-sm font-medium text-amber-600 dark:text-amber-400">
             {version.agent_id}
           </span>
           <Badge tone={statusTone[version.status] ?? 'neutral'}>
             {statusLabel}
           </Badge>
-          <code className="text-[10px] text-stone-400">{version.soul_hash.slice(0, 8)}</code>
+          <Mono className="text-[10px] text-stone-400">{version.soul_hash.slice(0, 8)}</Mono>
         </div>
         <span className="flex items-center gap-1 text-xs text-stone-400">
           <Clock className="h-3 w-3" />
-          {new Date(version.applied_at).toLocaleString()}
+          <Mono className="text-stone-400">{new Date(version.applied_at).toLocaleString()}</Mono>
         </span>
       </div>
       {version.soul_summary && (
@@ -742,6 +750,7 @@ function InsightsTab() {
         <Card>
           <EmptyState
             icon={Lightbulb}
+            dudu="idle"
             title={intl.formatMessage({ id: 'memory.empty.insights' })}
           />
         </Card>
@@ -751,6 +760,7 @@ function InsightsTab() {
             <Card key={fact.id}>
               <div className="mb-2 flex items-start justify-between gap-3">
                 <div className="flex items-center gap-2">
+                  <CharacterAvatar agentId={fact.agent_id} name={fact.agent_id} size={24} />
                   <Lightbulb className="h-4 w-4 text-amber-500 dark:text-amber-400" />
                   <span className="text-xs font-medium text-amber-600 dark:text-amber-400">
                     {fact.agent_id}
@@ -766,7 +776,7 @@ function InsightsTab() {
                 </div>
                 <span className="flex shrink-0 items-center gap-1 text-xs text-stone-400 dark:text-stone-500">
                   <Clock className="h-3 w-3" />
-                  {new Date(fact.timestamp).toLocaleString()}
+                  <Mono className="text-stone-400 dark:text-stone-500">{new Date(fact.timestamp).toLocaleString()}</Mono>
                 </span>
               </div>
               <p className="text-sm text-stone-700 dark:text-stone-300 whitespace-pre-wrap">
@@ -775,13 +785,13 @@ function InsightsTab() {
               {(fact.source_session || fact.channel || fact.chat_id) && (
                 <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1 border-t border-[var(--panel-border)] pt-2 text-[11px] text-stone-400 dark:text-stone-500">
                   {fact.source_session && (
-                    <span>session: <code className="text-stone-500 dark:text-stone-400">{fact.source_session}</code></span>
+                    <span>session: <Mono className="text-[11px] text-stone-500 dark:text-stone-400">{fact.source_session}</Mono></span>
                   )}
                   {fact.channel && (
-                    <span>channel: <code className="text-stone-500 dark:text-stone-400">{fact.channel}</code></span>
+                    <span>channel: <Mono className="text-[11px] text-stone-500 dark:text-stone-400">{fact.channel}</Mono></span>
                   )}
                   {fact.chat_id && (
-                    <span>chat: <code className="text-stone-500 dark:text-stone-400">{fact.chat_id}</code></span>
+                    <span>chat: <Mono className="text-[11px] text-stone-500 dark:text-stone-400">{fact.chat_id}</Mono></span>
                   )}
                 </div>
               )}

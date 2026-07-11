@@ -11,6 +11,9 @@ beforeEach(() => {
   // Default: the API returns empty agents list
   mockWsClient.call.mockResolvedValue({ agents: [] });
   useAgentsStore.setState({ agents: [], loading: false, error: null });
+  // Roster view preference persists in localStorage; reset so each test starts
+  // from the default character-card view (§5.4 T6.1).
+  try { localStorage.clear(); } catch { /* jsdom */ }
 });
 
 describe('AgentsPage', () => {
@@ -29,32 +32,40 @@ describe('AgentsPage', () => {
     });
   });
 
-  it('renders agent cards when agents exist', () => {
-    useAgentsStore.setState({
-      agents: [
-        {
-          name: 'my-bot',
-          display_name: 'My Bot',
-          status: 'active',
-          role: 'main',
-          sandboxed: false,
-        },
-        {
-          name: 'helper',
-          display_name: 'Helper',
-          status: 'paused',
-          role: 'specialist',
-          sandboxed: true,
-        },
-      ] as never[],
-      loading: false,
-    });
+  it('renders roster character cards, and lifecycle status in the management view', async () => {
+    const user = userEvent.setup();
+    const roster = [
+      {
+        name: 'my-bot',
+        display_name: 'My Bot',
+        status: 'active',
+        role: 'main',
+        sandboxed: false,
+      },
+      {
+        name: 'helper',
+        display_name: 'Helper',
+        status: 'paused',
+        role: 'specialist',
+        sandboxed: true,
+      },
+    ];
+    // The mount effect re-fetches agents (and tasks) — keep the mock returning
+    // the roster so the async fetch doesn't wipe the seeded list.
+    mockWsClient.call.mockResolvedValue({ agents: roster });
+    useAgentsStore.setState({ agents: roster as never[], loading: false });
 
     renderWithProviders(<AgentsPage />);
 
+    // Default character-card roster shows the staff names.
     expect(screen.getByText('My Bot')).toBeInTheDocument();
     expect(screen.getByText('Helper')).toBeInTheDocument();
-    expect(screen.getByText('Active')).toBeInTheDocument();
+
+    // Lifecycle status text (Active/Paused) lives in the management view — the
+    // second segmented toggle tab.
+    const tabs = screen.getAllByRole('tab');
+    await user.click(tabs[1]);
+    expect(await screen.findByText('Active')).toBeInTheDocument();
     expect(screen.getByText('Paused')).toBeInTheDocument();
   });
 

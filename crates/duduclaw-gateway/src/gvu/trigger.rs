@@ -136,6 +136,13 @@ where
             reason: format!("category {category:?} does not warrant GVU"),
         };
     }
+    // Master kill-switch: `[evolution] enabled = false` freezes ALL autonomous
+    // evolution paths regardless of the individual `gvu_enabled` toggle below.
+    if !duduclaw_core::evolution_master_enabled(agent_dir) {
+        return TriggerDecision::Skipped {
+            reason: "agent.toml [evolution] enabled = false (master switch off)".to_string(),
+        };
+    }
     if !agent_gvu_enabled(agent_dir) {
         return TriggerDecision::Skipped {
             reason: "agent.toml [evolution] gvu_enabled = false".to_string(),

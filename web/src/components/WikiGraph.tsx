@@ -227,14 +227,24 @@ export function WikiGraph({ pages, pageContents, width = 700, height = 500, onSe
 
   return (
     <div className="glass-card rounded-2xl overflow-hidden">
-      {/* Legend */}
-      <div className="flex items-center gap-4 px-4 py-2 border-b border-stone-200 dark:border-stone-800">
+      {/* Legend + stats bar (OpenHuman-style: counts on the left, category
+          swatches on the right). Categories are the real top-level knowledge
+          directories, not fabricated tiers. */}
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 border-b border-stone-200 px-4 py-2 dark:border-stone-800">
+        <span className="text-xs font-medium tabular-nums text-stone-500 dark:text-stone-400">
+          {nodes.length} nodes · {links.length} links
+        </span>
+        <span className="hidden h-3 w-px bg-stone-300 dark:bg-stone-700 sm:inline-block" />
         {Object.entries(DIR_COLORS).map(([dir, color]) => (
-          <div key={dir} className="flex items-center gap-1.5 text-xs text-stone-500">
+          <div key={dir} className="flex items-center gap-1.5 text-xs text-stone-500 dark:text-stone-400">
             <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ backgroundColor: color }} />
             {dir}
           </div>
         ))}
+        <div className="flex items-center gap-1.5 text-xs text-stone-500 dark:text-stone-400">
+          <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ backgroundColor: DEFAULT_COLOR }} />
+          other
+        </div>
       </div>
       <svg
         ref={svgRef}

@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useTasksStore } from '@/stores/tasks-store';
 import { cn } from '@/lib/utils';
 import {
   api,
@@ -18,11 +19,47 @@ import {
   type ContainerEnvVar,
   type AgentOdooOverride,
 } from '@/lib/api';
-import { Dialog, FormField, inputClass, selectClass } from '@/components/shared/Dialog';
+import { Dialog, FormField, inputClass } from '@/components/shared/Dialog';
+import { ModelSelect } from '@/components/shared/ModelSelect';
+import { useAvailableModels } from '@/hooks/useAvailableModels';
 import { ChipEditor } from '@/components/shared/ChipEditor';
+import {
+  SettingField,
+  OptionSelect,
+  Switch as ControlSwitch,
+  MoneyField,
+  DurationField,
+  ScheduleBuilder,
+  DangerZone,
+  type SelectOption,
+} from '@/components/settings/controls';
 import { toast, formatError } from '@/lib/toast';
-import { Bot, Pause, Play, Send, Eye, Plus, X, ShieldCheck, Pencil, Trash2 } from 'lucide-react';
+import { Bot, Pause, Play, Send, Eye, Plus, X, ShieldCheck, Pencil, Trash2, LayoutGrid, Table2 } from 'lucide-react';
 import { Page, Card, Button, Badge, EmptyState, Tabs } from '@/components/ui';
+import { AgentStatusGlyph } from '@/components/AgentStatusGlyph';
+import { RosterCard, HireSlotCard } from '@/components/agent';
+import { useAgentGlyphState } from '@/stores/agent-activity-store';
+
+/** Roster view mode — remembered in localStorage (§5.4 T6.1). */
+type AgentsView = 'cards' | 'table';
+const VIEW_KEY = 'duduclaw:agents:view';
+function readView(): AgentsView {
+  try {
+    return localStorage.getItem(VIEW_KEY) === 'table' ? 'table' : 'cards';
+  } catch {
+    return 'cards';
+  }
+}
+
+/** Live presence glyph for one roster card — reads the transient activity
+ *  state derived from existing WS events (WP10-T10.2). For paused/terminated
+ *  the label is suppressed (the StatusBadge already spells out lifecycle
+ *  status); the glyph then only adds a subtle dot. */
+function AgentLiveGlyph({ agent }: { agent: { name: string; status: string } }) {
+  const state = useAgentGlyphState(agent.name, agent.status);
+  const lifecycle = state === 'paused' || state === 'terminated';
+  return <AgentStatusGlyph state={state} showLabel={!lifecycle} />;
+}
 
 function StatusBadge({ status }: { status: string }) {
   const intl = useIntl();
@@ -52,6 +89,8 @@ export function AgentsPage() {
   const intl = useIntl();
   const navigate = useNavigate();
   const { agents, fetchAgents, pauseAgent, resumeAgent, removeAgent, loading } = useAgentsStore();
+  const { tasks, fetchTasks } = useTasksStore();
+  const [view, setView] = useState<AgentsView>(readView);
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [delegateTarget, setDelegateTarget] = useState<string | null>(null);
   const [inspectTarget, setInspectTarget] = useState<AgentDetail | null>(null);
@@ -60,7 +99,25 @@ export function AgentsPage() {
 
   useEffect(() => {
     fetchAgents();
-  }, [fetchAgents]);
+    // Tasks power the derived level + today's-tally on each roster card (§5.4).
+    fetchTasks();
+  }, [fetchAgents, fetchTasks]);
+
+  const changeView = useCallback((next: AgentsView) => {
+    setView(next);
+    try {
+      localStorage.setItem(VIEW_KEY, next);
+    } catch {
+      /* private mode — preference just won't persist */
+    }
+  }, []);
+
+  const openDetail = useCallback(
+    (name: string) => navigate(`/agents/${encodeURIComponent(name)}`),
+    [navigate],
+  );
+
+  const empty = agents.length === 0 && !loading;
 
   return (
     <Page wide>
@@ -79,7 +136,13 @@ export function AgentsPage() {
         </Button>
       </header>
 
-      {agents.length === 0 && !loading ? (
+      {!empty && (
+        <div className="flex justify-end">
+          <ViewToggle view={view} onChange={changeView} />
+        </div>
+      )}
+
+      {empty ? (
         <Card padded={false}>
           <EmptyState
             icon={Bot}
@@ -91,7 +154,16 @@ export function AgentsPage() {
             }
           />
         </Card>
+      ) : view === 'cards' ? (
+        /* Character roster (§5.4 T6.1). */
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+          {agents.map((agent) => (
+            <RosterCard key={agent.name} agent={agent} tasks={tasks} onOpen={openDetail} />
+          ))}
+          <HireSlotCard onClick={() => setShowCreateDialog(true)} />
+        </div>
       ) : (
+        /* Management view — the v1 roster cards, kept for full lifecycle control. */
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {agents.map((agent) => (
             <Card key={agent.name} interactive>
@@ -103,7 +175,10 @@ export function AgentsPage() {
                     <p className="truncate text-xs text-stone-500 dark:text-stone-400">{agent.trigger}</p>
                   </div>
                 </div>
-                <StatusBadge status={agent.status} />
+                <div className="flex shrink-0 flex-col items-end gap-1.5">
+                  <StatusBadge status={agent.status} />
+                  <AgentLiveGlyph agent={agent} />
+                </div>
               </div>
 
               <div className="mt-3 flex items-center gap-2">
@@ -158,7 +233,7 @@ export function AgentsPage() {
                 <Button size="sm" variant="ghost" icon={Send} onClick={() => setDelegateTarget(agent.name)}>
                   {intl.formatMessage({ id: 'agents.delegate' })}
                 </Button>
-                <Button size="sm" variant="ghost" icon={Eye} onClick={() => setInspectTarget(agent)}>
+                <Button size="sm" variant="ghost" icon={Eye} onClick={() => navigate(`/agents/${encodeURIComponent(agent.name)}`)}>
                   {intl.formatMessage({ id: 'agents.inspect' })}
                 </Button>
                 <Button size="sm" variant="ghost" icon={Pencil} onClick={() => setEditTarget(agent)}>
@@ -223,6 +298,41 @@ export function AgentsPage() {
   );
 }
 
+/** Segmented cards ⇄ table toggle for the roster (§5.4 T6.1). */
+function ViewToggle({ view, onChange }: { view: AgentsView; onChange: (v: AgentsView) => void }) {
+  const intl = useIntl();
+  const opts: ReadonlyArray<{ id: AgentsView; icon: typeof LayoutGrid; label: string }> = [
+    { id: 'cards', icon: LayoutGrid, label: intl.formatMessage({ id: 'agents.view.cards' }) },
+    { id: 'table', icon: Table2, label: intl.formatMessage({ id: 'agents.view.table' }) },
+  ];
+  return (
+    <div className="inline-flex rounded-control border border-[var(--panel-border)] p-0.5" role="tablist">
+      {opts.map((o) => {
+        const Icon = o.icon;
+        const active = view === o.id;
+        return (
+          <button
+            key={o.id}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            onClick={() => onChange(o.id)}
+            className={cn(
+              'inline-flex items-center gap-1.5 rounded-[calc(var(--radius-control)-2px)] px-3 py-1.5 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50',
+              active
+                ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                : 'text-stone-500 hover:text-stone-800 dark:text-stone-400 dark:hover:text-stone-200',
+            )}
+          >
+            <Icon className="h-4 w-4" />
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 function CreateAgentDialog({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: () => void }) {
   const intl = useIntl();
   const [name, setName] = useState('');
@@ -254,18 +364,18 @@ function CreateAgentDialog({ open, onClose, onCreated }: { open: boolean; onClos
   return (
     <Dialog open={open} onClose={onClose} title={intl.formatMessage({ id: 'agents.create' })}>
       <div className="space-y-4">
-        <FormField label="Agent ID" hint={intl.formatMessage({ id: 'agents.create.idHint' })}>
+        <FormField label={intl.formatMessage({ id: 'agents.create.idLabel' })} hint={intl.formatMessage({ id: 'agents.create.idHint' })}>
           <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="coder" className={inputClass} />
         </FormField>
         <FormField label={intl.formatMessage({ id: 'agents.create.displayName' })}>
           <input type="text" value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder="Coder" className={inputClass} />
         </FormField>
         <FormField label={intl.formatMessage({ id: 'orgchart.detail.role' })}>
-          <select value={role} onChange={(e) => setRole(e.target.value)} className={selectClass}>
-            {['main', 'specialist', 'worker', 'developer', 'qa', 'planner'].map((r) => (
-              <option key={r} value={r}>{intl.formatMessage({ id: `agents.role.${r}` })}</option>
-            ))}
-          </select>
+          <OptionSelect
+            value={role}
+            onChange={setRole}
+            options={['main', 'specialist', 'worker', 'developer', 'qa', 'planner'].map((r) => ({ value: r, label: intl.formatMessage({ id: `agents.role.${r}` }), raw: r }))}
+          />
         </FormField>
         <FormField label={intl.formatMessage({ id: 'orgchart.detail.trigger' })} hint={intl.formatMessage({ id: 'agents.create.triggerHint' })}>
           <input type="text" value={trigger} onChange={(e) => setTrigger(e.target.value)} placeholder="@Coder" className={inputClass} />
@@ -393,38 +503,39 @@ function InspectDialog({ agent, onClose, onEdit }: { agent: AgentDetail | null; 
   );
 }
 
-// ── Toggle component ──
-
-function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label: string }) {
-  return (
-    <label className="flex items-center justify-between py-1.5">
-      <span className="text-sm text-stone-700 dark:text-stone-300">{label}</span>
-      <button
-        type="button"
-        role="switch"
-        aria-checked={checked}
-        onClick={() => onChange(!checked)}
-        className={cn(
-          'relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full transition-colors',
-          checked ? 'bg-amber-500' : 'bg-stone-300 dark:bg-stone-600'
-        )}
-      >
-        <span
-          className={cn(
-            'pointer-events-none inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform mt-0.5',
-            checked ? 'translate-x-4 ml-0.5' : 'translate-x-0.5'
-          )}
-        />
-      </button>
-    </label>
-  );
-}
-
 // ── Edit Agent Dialog ──
 
-type EditTab = 'identity' | 'model' | 'runtime' | 'heartbeat' | 'container' | 'evolution' | 'permissions' | 'capabilities' | 'contract' | 'odoo' | 'sticker' | 'channels' | 'advanced';
+/** Two-level edit structure (spec §4.2): a top "一般 / 進階" split, and inside
+ *  進階 a second-level tab strip of four groups. */
+type MainTab = 'general' | 'advanced';
+type AdvGroup = 'run' | 'access' | 'integration' | 'evo';
 
 const RUNTIME_PROVIDERS: ReadonlyArray<RuntimeProvider> = ['claude', 'codex', 'gemini', 'openai_compat'];
+
+const AGENT_ROLES: ReadonlyArray<string> = ['main', 'specialist', 'worker', 'developer', 'qa', 'planner'];
+
+/** Labeled on/off row — SettingField + shared Switch with a one-line help. The
+ *  single replacement for the ad-hoc <Toggle> across the edit dialog (spec:
+ *  "所有 toggle 換 Switch"). */
+function SwitchRow({
+  label,
+  help,
+  checked,
+  onChange,
+  disabled,
+}: {
+  label: string;
+  help?: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <SettingField label={label} help={help} layout="row">
+      <ControlSwitch checked={checked} onChange={onChange} disabled={disabled} label={label} />
+    </SettingField>
+  );
+}
 
 /** RT — runtime form defaults. `agents.inspect` does not return [runtime], so
  *  this tab is write-only: it shows defaults and writes a partial update only
@@ -576,13 +687,21 @@ const DEFAULT_ADVANCED: {
 
 function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | null; onClose: () => void; onSaved: () => void }) {
   const intl = useIntl();
-  const { updateAgent } = useAgentsStore();
-  const [tab, setTab] = useState<EditTab>('identity');
+  const { updateAgent, agents } = useAgentsStore();
+  const [mainTab, setMainTab] = useState<MainTab>('general');
+  const [advGroup, setAdvGroup] = useState<AdvGroup>('run');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Available models (cloud + local)
-  const [availableModels, setAvailableModels] = useState<ReadonlyArray<{ id: string; label: string; type: 'cloud' | 'local'; file?: string }>>([]);
+  // Available models (cloud + local) — live from the registry, deduped/cached.
+  const {
+    models: availableModels,
+    loading: modelsLoading,
+    error: modelsError,
+    discoveredAt: modelsDiscoveredAt,
+    refreshing: modelsRefreshing,
+    refresh: modelsRefresh,
+  } = useAvailableModels();
 
   // Local form state — initialized from agent when dialog opens
   const [form, setForm] = useState<AgentUpdateParams>({});
@@ -620,19 +739,15 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
 
   useEffect(() => {
     if (agent) {
-      // Fetch available models
-      api.models.list().then((res) => setAvailableModels(res?.models ?? [])).catch((e) => {
-        console.warn("[api]", e);
-        toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
-      });
-
-      // Determine current preferred/fallback as unified IDs
+      // Determine current preferred/fallback as unified IDs. No hardcoded model
+      // default — fall back to empty so ModelSelect prompts a live choice rather
+      // than fabricating a model that may not exist for this deployment.
       const localModel = agent.model?.local?.model ?? '';
       const preferLocal = agent.model?.local?.prefer_local ?? false;
       const currentPreferred = preferLocal && localModel
         ? `local:${localModel}`
-        : agent.model?.preferred ?? 'claude-sonnet-4-6';
-      const currentFallback = agent.model?.fallback ?? 'claude-haiku-4-5';
+        : agent.model?.preferred ?? '';
+      const currentFallback = agent.model?.fallback ?? '';
 
       setForm({
         display_name: agent.display_name,
@@ -670,7 +785,8 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
         sticker_cooldown_messages: agent.sticker?.cooldown_messages ?? 5,
         sticker_expressiveness: (agent.sticker?.expressiveness ?? 'moderate') as 'minimal' | 'moderate' | 'expressive',
       });
-      setTab('identity');
+      setMainTab('general');
+      setAdvGroup('run');
       setError(null);
       // Reset CAP/CON state for the newly-opened agent.
       setCaps(DEFAULT_CAPABILITIES);
@@ -693,9 +809,10 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
     }
   }, [agent]);
 
-  // CON — lazily load CONTRACT.toml when the Contract tab is first opened.
+  // CON — lazily load CONTRACT.toml when the 能力與權限 group (which hosts the
+  // contract editor) is first opened.
   useEffect(() => {
-    if (tab !== 'contract' || !agent || contractLoaded) return;
+    if (mainTab !== 'advanced' || advGroup !== 'access' || !agent || contractLoaded) return;
     api.contract.get(agent.name).then((res) => {
       setContract({
         must_not: res.must_not ?? [],
@@ -708,7 +825,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
       setContractLoaded(true);
     });
-  }, [tab, agent, contractLoaded, intl]);
+  }, [mainTab, advGroup, agent, contractLoaded, intl]);
 
   const updateCap = useCallback(<K extends keyof typeof DEFAULT_CAPABILITIES>(key: K, value: (typeof DEFAULT_CAPABILITIES)[K]) => {
     setCapsDirty(true);
@@ -777,16 +894,28 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
     setSaving(true);
     setError(null);
     try {
-      // Decompose unified model IDs into cloud preferred + local config
+      // Decompose unified model IDs into cloud preferred + local config.
       const submitForm = { ...form };
       const pref = submitForm.preferred ?? '';
       const fb = submitForm.fallback ?? '';
+
+      // When a local model occupies the preferred/fallback slot the backend still
+      // needs a cloud model in the cloud slot. Derive it from live data — the
+      // agent's existing cloud preferred/fallback, else the first cloud model the
+      // registry reports — instead of hardcoding a model id.
+      const firstCloud = availableModels.find((m) => m.type === 'cloud')?.id ?? '';
+      const existingCloudPref = agent.model?.preferred && !agent.model.preferred.startsWith('local:')
+        ? agent.model.preferred : '';
+      const existingCloudFb = agent.model?.fallback && !agent.model.fallback.startsWith('local:')
+        ? agent.model.fallback : '';
+      const cloudPrefSlot = existingCloudPref || firstCloud;
+      const cloudFbSlot = existingCloudFb || firstCloud;
 
       if (pref.startsWith('local:')) {
         // Local model as preferred: set prefer_local + local_model, keep a cloud fallback
         submitForm.local_model = pref.replace('local:', '');
         submitForm.prefer_local = true;
-        submitForm.preferred = fb.startsWith('local:') ? 'claude-sonnet-4-6' : (fb || 'claude-sonnet-4-6');
+        submitForm.preferred = fb.startsWith('local:') ? cloudPrefSlot : (fb || cloudPrefSlot);
       } else {
         // Cloud model as preferred
         submitForm.prefer_local = false;
@@ -794,7 +923,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
 
       if (fb.startsWith('local:')) {
         submitForm.local_model = submitForm.local_model || fb.replace('local:', '');
-        submitForm.fallback = 'claude-haiku-4-5';
+        submitForm.fallback = cloudFbSlot;
       }
 
       // CAP — only include capabilities when the operator edited that tab, so we
@@ -921,230 +1050,247 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
 
   if (!agent) return null;
 
-  const tabs: { id: EditTab; label: string }[] = [
-    { id: 'identity', label: intl.formatMessage({ id: 'agents.edit.identity' }) },
-    { id: 'model', label: intl.formatMessage({ id: 'agents.edit.model' }) },
-    { id: 'runtime', label: intl.formatMessage({ id: 'agents.edit.runtime' }) },
-    { id: 'heartbeat', label: intl.formatMessage({ id: 'agents.edit.heartbeat' }) },
-    { id: 'container', label: intl.formatMessage({ id: 'settings.container' }) },
-    { id: 'evolution', label: intl.formatMessage({ id: 'agents.edit.evolution' }) },
-    { id: 'permissions', label: intl.formatMessage({ id: 'agents.edit.permissions' }) },
-    { id: 'capabilities', label: intl.formatMessage({ id: 'agents.edit.capabilities' }) },
-    { id: 'contract', label: intl.formatMessage({ id: 'agents.edit.contract' }) },
-    { id: 'odoo', label: intl.formatMessage({ id: 'agents.edit.odoo' }) },
-    { id: 'sticker', label: intl.formatMessage({ id: 'agents.edit.sticker' }) },
-    { id: 'channels', label: intl.formatMessage({ id: 'channels.title' }) },
-    { id: 'advanced', label: intl.formatMessage({ id: 'agents.edit.advanced' }) },
+  // Top-level "一般 / 進階" split, and the 進階 second-level group strip.
+  const mainTabs: { id: MainTab; label: string }[] = [
+    { id: 'general', label: intl.formatMessage({ id: 'agents.edit.tab.general' }) },
+    { id: 'advanced', label: intl.formatMessage({ id: 'agents.edit.tab.advanced' }) },
   ];
+  const advTabs: { id: AdvGroup; label: string }[] = [
+    { id: 'run', label: intl.formatMessage({ id: 'agents.edit.group.run' }) },
+    { id: 'access', label: intl.formatMessage({ id: 'agents.edit.group.access' }) },
+    { id: 'integration', label: intl.formatMessage({ id: 'agents.edit.group.integration' }) },
+    { id: 'evo', label: intl.formatMessage({ id: 'agents.edit.group.evo' }) },
+  ];
+
+  // Plain-language option sets (label + raw technical value).
+  const roleOptions: SelectOption[] = AGENT_ROLES.map((r) => ({ value: r, label: intl.formatMessage({ id: `agents.role.${r}` }), raw: r }));
+  const apiModeOptions: SelectOption[] = [
+    { value: 'cli', label: intl.formatMessage({ id: 'agents.apiMode.cli' }), raw: 'cli' },
+    { value: 'direct', label: intl.formatMessage({ id: 'agents.apiMode.direct' }), raw: 'direct' },
+    { value: 'auto', label: intl.formatMessage({ id: 'agents.apiMode.auto' }), raw: 'auto' },
+  ];
+  const providerOptions: SelectOption[] = RUNTIME_PROVIDERS.map((p) => ({ value: p, label: intl.formatMessage({ id: `agents.runtime.provider.${p}` }), raw: p }));
+  const fallbackProviderOptions: SelectOption[] = [
+    { value: '', label: intl.formatMessage({ id: 'agents.runtime.fallback.none' }), raw: '' },
+    ...providerOptions,
+  ];
+  const localBackendOptions: SelectOption[] = [
+    { value: 'llama_cpp', label: intl.formatMessage({ id: 'agents.backend.llamaCpp' }), raw: 'llama_cpp' },
+    { value: 'mistral_rs', label: intl.formatMessage({ id: 'agents.backend.mistralRs' }), raw: 'mistral_rs' },
+    { value: 'openai_compat', label: intl.formatMessage({ id: 'agents.backend.openaiCompat' }), raw: 'openai_compat' },
+  ];
+  const expressivenessOptions: SelectOption[] = [
+    { value: 'minimal', label: intl.formatMessage({ id: 'agents.edit.stickerMinimal' }), raw: 'minimal' },
+    { value: 'moderate', label: intl.formatMessage({ id: 'agents.edit.stickerModerate' }), raw: 'moderate' },
+    { value: 'expressive', label: intl.formatMessage({ id: 'agents.edit.stickerExpressive' }), raw: 'expressive' },
+  ];
+  const computerUseModeOptions: SelectOption[] = [
+    { value: 'container', label: intl.formatMessage({ id: 'agents.cap.mode.container' }), raw: 'container' },
+    { value: 'native', label: intl.formatMessage({ id: 'agents.cap.mode.native' }), raw: 'native' },
+    { value: 'auto', label: intl.formatMessage({ id: 'agents.cap.mode.auto' }), raw: 'auto' },
+  ];
+  const stagnationActionOptions: SelectOption[] = [
+    { value: 'log_only', label: intl.formatMessage({ id: 'agents.adv.stagnation.logOnly' }), raw: 'log_only' },
+    { value: 'suppress', label: intl.formatMessage({ id: 'agents.adv.stagnation.suppress' }), raw: 'suppress' },
+  ];
+  const statusOptions: SelectOption[] = ['active', 'paused', 'terminated'].map((s) => ({ value: s, label: intl.formatMessage({ id: `status.${s}` }), raw: s }));
+
+  // 上級 dropdown — existing agents (excluding self); keep the current value even
+  // if it isn't in the live roster so it is never silently dropped.
+  const reportsToOptions: SelectOption[] = [
+    { value: '', label: intl.formatMessage({ id: 'agents.edit.reportsTo.none' }), raw: '' },
+    ...agents.filter((a) => a.name !== agent.name).map((a) => ({ value: a.name, label: a.display_name || a.name, raw: a.name })),
+  ];
+  if (form.reports_to && !reportsToOptions.some((o) => o.value === form.reports_to)) {
+    reportsToOptions.push({ value: form.reports_to, label: form.reports_to, raw: form.reports_to });
+  }
 
   return (
     <Dialog open={agent !== null} onClose={onClose} title={`${agent.icon || '🤖'} ${intl.formatMessage({ id: 'agents.edit' })}`} className="max-w-2xl">
       <div className="space-y-4">
-        {/* Tab bar */}
-        <Tabs items={tabs} value={tab} onChange={(id) => setTab(id as EditTab)} />
+        {/* Top-level tab bar: 一般 / 進階 */}
+        <Tabs items={mainTabs} value={mainTab} onChange={(id) => setMainTab(id as MainTab)} />
 
-        {/* Tab content */}
+        {/* Content */}
         <div className="max-h-[50vh] overflow-y-auto space-y-4 pr-1">
-          {tab === 'identity' && (
-            <>
-              <FormField label={intl.formatMessage({ id: 'agents.edit.displayName' })}>
-                <input type="text" value={form.display_name ?? ''} onChange={(e) => updateField('display_name', e.target.value)} className={inputClass} />
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'agents.edit.role' })}>
-                <select value={form.role ?? 'specialist'} onChange={(e) => updateField('role', e.target.value)} className={selectClass}>
-                  {['main', 'specialist', 'worker', 'developer', 'qa', 'planner'].map((r) => (
-                    <option key={r} value={r}>{intl.formatMessage({ id: `agents.role.${r}` })}</option>
-                  ))}
-                </select>
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'agents.edit.trigger' })}>
-                <input type="text" value={form.trigger ?? ''} onChange={(e) => updateField('trigger', e.target.value)} className={inputClass} />
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'agents.edit.icon' })}>
-                <input type="text" value={form.icon ?? ''} onChange={(e) => updateField('icon', e.target.value)} className={inputClass} />
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'agents.edit.reportsTo' })}>
-                <input type="text" value={form.reports_to ?? ''} onChange={(e) => updateField('reports_to', e.target.value)} className={inputClass} />
-              </FormField>
-            </>
-          )}
+          {mainTab === 'general' && (
+            <div className="space-y-6">
+              {/* 身分 */}
+              <section className="space-y-1">
+                <h4 className="text-xs font-semibold uppercase tracking-wide text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.edit.section.identity' })}</h4>
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.displayName' })} help={intl.formatMessage({ id: 'agents.edit.displayName.help' })}>
+                  <input type="text" value={form.display_name ?? ''} onChange={(e) => updateField('display_name', e.target.value)} className={inputClass} />
+                </SettingField>
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.icon' })} help={intl.formatMessage({ id: 'agents.edit.icon.help' })}>
+                  <input type="text" value={form.icon ?? ''} onChange={(e) => updateField('icon', e.target.value)} className={inputClass} />
+                </SettingField>
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.role' })} help={intl.formatMessage({ id: 'agents.edit.role.help' })}>
+                  <OptionSelect value={form.role ?? 'specialist'} onChange={(v) => updateField('role', v)} options={roleOptions} />
+                </SettingField>
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.trigger' })} help={intl.formatMessage({ id: 'agents.edit.trigger.help' })}>
+                  <input type="text" value={form.trigger ?? ''} onChange={(e) => updateField('trigger', e.target.value)} className={inputClass} />
+                </SettingField>
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.reportsTo' })} help={intl.formatMessage({ id: 'agents.edit.reportsTo.help' })}>
+                  <OptionSelect value={form.reports_to ?? ''} onChange={(v) => updateField('reports_to', v)} options={reportsToOptions} />
+                </SettingField>
+              </section>
 
-          {tab === 'model' && (() => {
-            const cloudModels = availableModels.filter((m) => m.type === 'cloud');
-            const localModels = availableModels.filter((m) => m.type === 'local');
-            const prefIsLocal = (form.preferred ?? '').startsWith('local:');
-            const fbIsLocal = (form.fallback ?? '').startsWith('local:');
-            const hasLocalSelected = prefIsLocal || fbIsLocal;
-
-            return (
-              <>
-                <FormField label={intl.formatMessage({ id: 'agents.edit.preferredModel' })}>
-                  <select value={form.preferred ?? ''} onChange={(e) => updateField('preferred', e.target.value)} className={selectClass}>
-                    <optgroup label="Cloud">
-                      {cloudModels.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
-                    </optgroup>
-                    {localModels.length > 0 && (
-                      <optgroup label="Local">
-                        {localModels.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
-                      </optgroup>
-                    )}
-                  </select>
-                </FormField>
-                <FormField label={intl.formatMessage({ id: 'agents.edit.fallbackModel' })}>
-                  <select value={form.fallback ?? ''} onChange={(e) => updateField('fallback', e.target.value)} className={selectClass}>
-                    <optgroup label="Cloud">
-                      {cloudModels.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
-                    </optgroup>
-                    {localModels.length > 0 && (
-                      <optgroup label="Local">
-                        {localModels.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
-                      </optgroup>
-                    )}
-                  </select>
-                </FormField>
-
-                <FormField label={intl.formatMessage({ id: 'agents.edit.apiMode' })}>
-                  <select value={form.api_mode ?? 'cli'} onChange={(e) => updateField('api_mode', e.target.value as 'cli' | 'direct' | 'auto')} className={selectClass}>
-                    <option value="cli">CLI (OAuth)</option>
-                    <option value="direct">Direct API</option>
-                    <option value="auto">Auto</option>
-                  </select>
-                </FormField>
-
-                <Toggle checked={form.use_router ?? false} onChange={(v) => updateField('use_router', v)} label={intl.formatMessage({ id: 'agents.edit.confidenceRouter' })} />
-
-                {/* Local model advanced config — shown when a local model is selected */}
-                {hasLocalSelected && (
-                  <div className="rounded-lg border border-amber-200 bg-amber-50/50 p-4 dark:border-amber-800 dark:bg-amber-900/10">
-                    <h4 className="mb-3 text-xs font-semibold uppercase text-amber-700 dark:text-amber-400">{intl.formatMessage({ id: 'agents.edit.localInference' })}</h4>
-                    <FormField label={intl.formatMessage({ id: 'agents.edit.inferenceBackend' })}>
-                      <select value={form.local_backend ?? 'llama_cpp'} onChange={(e) => updateField('local_backend', e.target.value)} className={selectClass}>
-                        <option value="llama_cpp">llama.cpp (Metal/CUDA)</option>
-                        <option value="mistral_rs">mistral.rs (Rust-native)</option>
-                        <option value="openai_compat">OpenAI-compatible (Exo/vLLM)</option>
-                      </select>
-                    </FormField>
+              {/* 模型 */}
+              <section className="space-y-1 border-t border-[var(--panel-border)] pt-4">
+                <h4 className="text-xs font-semibold uppercase tracking-wide text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.edit.section.model' })}</h4>
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.preferredModel' })} help={intl.formatMessage({ id: 'agents.edit.preferredModel.help' })}>
+                  <ModelSelect value={form.preferred ?? ''} onChange={(v) => updateField('preferred', v)} models={availableModels} loading={modelsLoading} error={modelsError} discoveredAt={modelsDiscoveredAt} refreshing={modelsRefreshing} onRefresh={modelsRefresh} ariaLabel={intl.formatMessage({ id: 'agents.edit.preferredModel' })} />
+                </SettingField>
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.fallbackModel' })} help={intl.formatMessage({ id: 'agents.edit.fallbackModel.help' })}>
+                  <ModelSelect value={form.fallback ?? ''} onChange={(v) => updateField('fallback', v)} models={availableModels} loading={modelsLoading} error={modelsError} discoveredAt={modelsDiscoveredAt} refreshing={modelsRefreshing} onRefresh={modelsRefresh} ariaLabel={intl.formatMessage({ id: 'agents.edit.fallbackModel' })} />
+                </SettingField>
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.apiMode' })} help={intl.formatMessage({ id: 'agents.edit.apiMode.help' })}>
+                  <OptionSelect value={form.api_mode ?? 'cli'} onChange={(v) => updateField('api_mode', v as 'cli' | 'direct' | 'auto')} options={apiModeOptions} />
+                </SettingField>
+                <SwitchRow label={intl.formatMessage({ id: 'agents.edit.confidenceRouter' })} help={intl.formatMessage({ id: 'agents.edit.confidenceRouter.help' })} checked={form.use_router ?? false} onChange={(v) => updateField('use_router', v)} />
+                {((form.preferred ?? '').startsWith('local:') || (form.fallback ?? '').startsWith('local:')) && (
+                  <div className="rounded-lg border border-amber-200 bg-amber-50/50 p-4 dark:border-amber-800 dark:bg-amber-900/10 space-y-1">
+                    <h5 className="mb-2 text-xs font-semibold uppercase text-amber-700 dark:text-amber-400">{intl.formatMessage({ id: 'agents.edit.localInference' })}</h5>
+                    <SettingField label={intl.formatMessage({ id: 'agents.edit.inferenceBackend' })}>
+                      <OptionSelect value={form.local_backend ?? 'llama_cpp'} onChange={(v) => updateField('local_backend', v)} options={localBackendOptions} />
+                    </SettingField>
                     <div className="grid grid-cols-2 gap-3">
-                      <FormField label={intl.formatMessage({ id: 'agents.edit.contextLength' })}>
+                      <SettingField label={intl.formatMessage({ id: 'agents.edit.contextLength' })}>
                         <input type="number" min={512} value={form.local_context_length ?? 4096} onChange={(e) => updateField('local_context_length', Number(e.target.value))} className={inputClass} />
-                      </FormField>
-                      <FormField label={intl.formatMessage({ id: 'agents.edit.gpuLayers' })}>
+                      </SettingField>
+                      <SettingField label={intl.formatMessage({ id: 'agents.edit.gpuLayers' })}>
                         <input type="number" min={-1} value={form.local_gpu_layers ?? -1} onChange={(e) => updateField('local_gpu_layers', Number(e.target.value))} className={inputClass} />
-                      </FormField>
+                      </SettingField>
                     </div>
                   </div>
                 )}
+              </section>
 
-                <div className="border-t border-stone-200 pt-4 dark:border-stone-700">
-                  <h4 className="mb-3 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'dashboard.budget.title' })}</h4>
-                  <FormField label={intl.formatMessage({ id: 'agents.edit.budgetLimit' })}>
-                    <input type="number" min={0} value={form.monthly_limit_cents ?? 5000} onChange={(e) => updateField('monthly_limit_cents', Number(e.target.value))} className={inputClass} />
-                  </FormField>
-                  <FormField label={intl.formatMessage({ id: 'agents.edit.warnThreshold' })}>
-                    <input type="number" min={0} max={100} value={form.warn_threshold_percent ?? 80} onChange={(e) => updateField('warn_threshold_percent', Number(e.target.value))} className={inputClass} />
-                  </FormField>
-                  <Toggle checked={form.hard_stop ?? true} onChange={(v) => updateField('hard_stop', v)} label={intl.formatMessage({ id: 'agents.edit.hardStop' })} />
-                </div>
-              </>
-            );
-          })()}
+              {/* 預算 */}
+              <section className="space-y-1 border-t border-[var(--panel-border)] pt-4">
+                <h4 className="text-xs font-semibold uppercase tracking-wide text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.edit.section.budget' })}</h4>
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.budgetLimit' })} help={intl.formatMessage({ id: 'agents.edit.budgetLimit.help' })}>
+                  <MoneyField cents={form.monthly_limit_cents ?? 5000} onChange={(c) => updateField('monthly_limit_cents', c)} />
+                </SettingField>
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.warnThreshold' })} help={intl.formatMessage({ id: 'agents.edit.warnThreshold.help' })}>
+                  <input type="number" min={0} max={100} value={form.warn_threshold_percent ?? 80} onChange={(e) => updateField('warn_threshold_percent', Number(e.target.value))} className={inputClass} />
+                </SettingField>
+                <SwitchRow label={intl.formatMessage({ id: 'agents.edit.hardStop' })} help={intl.formatMessage({ id: 'agents.edit.hardStop.help' })} checked={form.hard_stop ?? true} onChange={(v) => updateField('hard_stop', v)} />
+              </section>
 
-          {tab === 'runtime' && (
-            <div className="space-y-4">
-              <p className="text-xs text-stone-400 dark:text-stone-500">
-                {intl.formatMessage({ id: 'agents.runtime.desc' })}
-              </p>
-              <FormField label={intl.formatMessage({ id: 'agents.runtime.provider' })} hint={intl.formatMessage({ id: 'agents.runtime.provider.hint' })}>
-                <select value={runtime.provider} onChange={(e) => updateRuntime('provider', e.target.value as RuntimeProvider)} className={selectClass}>
-                  {RUNTIME_PROVIDERS.map((p) => (
-                    <option key={p} value={p}>{p}</option>
-                  ))}
-                </select>
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'agents.runtime.fallback' })} hint={intl.formatMessage({ id: 'agents.runtime.fallback.hint' })}>
-                <select value={runtime.fallback} onChange={(e) => updateRuntime('fallback', e.target.value)} className={selectClass}>
-                  <option value="">{intl.formatMessage({ id: 'agents.runtime.fallback.none' })}</option>
-                  {RUNTIME_PROVIDERS.map((p) => (
-                    <option key={p} value={p}>{p}</option>
-                  ))}
-                </select>
-              </FormField>
-              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-1">
-                <h4 className="mb-2 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.runtime.ptyTitle' })}</h4>
-                <Toggle checked={runtime.pty_pool_enabled} onChange={(v) => updateRuntime('pty_pool_enabled', v)} label={intl.formatMessage({ id: 'agents.runtime.ptyPoolEnabled' })} />
-                <Toggle checked={runtime.worker_managed} onChange={(v) => updateRuntime('worker_managed', v)} label={intl.formatMessage({ id: 'agents.runtime.workerManaged' })} />
-                <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'agents.runtime.pty.hint' })}</p>
-              </div>
+              {/* 貼圖 */}
+              <section className="space-y-1 border-t border-[var(--panel-border)] pt-4">
+                <h4 className="text-xs font-semibold uppercase tracking-wide text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.edit.sticker' })}</h4>
+                <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'agents.edit.stickerDesc' })}</p>
+                <SwitchRow label={intl.formatMessage({ id: 'agents.edit.stickerEnabled' })} checked={form.sticker_enabled ?? false} onChange={(v) => updateField('sticker_enabled', v)} />
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.stickerProbability' })}>
+                  <div className="flex items-center">
+                    <input type="range" min={0} max={1} step={0.05} value={form.sticker_probability ?? 0.3} onChange={(e) => updateField('sticker_probability', Number(e.target.value))} className="w-full accent-amber-500" />
+                    <span className="ml-2 text-xs text-stone-500 dark:text-stone-400">{((form.sticker_probability ?? 0.3) * 100).toFixed(0)}%</span>
+                  </div>
+                </SettingField>
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.stickerIntensity' })}>
+                  <div className="flex items-center">
+                    <input type="range" min={0} max={1} step={0.05} value={form.sticker_intensity_threshold ?? 0.7} onChange={(e) => updateField('sticker_intensity_threshold', Number(e.target.value))} className="w-full accent-amber-500" />
+                    <span className="ml-2 text-xs text-stone-500 dark:text-stone-400">{((form.sticker_intensity_threshold ?? 0.7) * 100).toFixed(0)}%</span>
+                  </div>
+                </SettingField>
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.stickerCooldown' })}>
+                  <input type="number" min={0} max={100} value={form.sticker_cooldown_messages ?? 5} onChange={(e) => updateField('sticker_cooldown_messages', Number(e.target.value))} className={inputClass} />
+                </SettingField>
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.stickerExpressiveness' })}>
+                  <OptionSelect value={form.sticker_expressiveness ?? 'moderate'} onChange={(v) => updateField('sticker_expressiveness', v as 'minimal' | 'moderate' | 'expressive')} options={expressivenessOptions} />
+                </SettingField>
+              </section>
             </div>
           )}
 
-          {tab === 'heartbeat' && (
-            <>
-              <Toggle checked={form.heartbeat_enabled ?? false} onChange={(v) => updateField('heartbeat_enabled', v)} label={intl.formatMessage({ id: 'agents.edit.heartbeatEnabled' })} />
-              <FormField label={intl.formatMessage({ id: 'agents.edit.heartbeatInterval' })}>
-                <input type="number" min={60} value={form.heartbeat_interval ?? 3600} onChange={(e) => updateField('heartbeat_interval', Number(e.target.value))} className={inputClass} />
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'agents.edit.heartbeatCron' })} hint="e.g. 0 * * * * (every hour)">
-                <input type="text" value={form.heartbeat_cron ?? ''} onChange={(e) => updateField('heartbeat_cron', e.target.value)} placeholder="0 * * * *" className={inputClass} />
-              </FormField>
-            </>
-          )}
+          {mainTab === 'advanced' && (
+            <div className="space-y-4">
+              {/* Second-level group strip */}
+              <Tabs items={advTabs} value={advGroup} onChange={(id) => setAdvGroup(id as AdvGroup)} />
 
-          {tab === 'container' && (
-            <>
-              <Toggle checked={form.sandbox_enabled ?? false} onChange={(v) => updateField('sandbox_enabled', v)} label={intl.formatMessage({ id: 'agents.edit.sandbox' })} />
-              <Toggle checked={form.network_access ?? false} onChange={(v) => updateField('network_access', v)} label={intl.formatMessage({ id: 'agents.edit.networkAccess' })} />
-              <Toggle checked={form.readonly_project ?? true} onChange={(v) => updateField('readonly_project', v)} label={intl.formatMessage({ id: 'agents.edit.readonlyProject' })} />
-              <FormField label={intl.formatMessage({ id: 'agents.edit.taskTimeout' })}>
-                <input type="number" min={0} value={form.timeout_ms ?? 1800000} onChange={(e) => updateField('timeout_ms', Number(e.target.value))} className={inputClass} />
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'agents.edit.maxConcurrent' })}>
-                <input type="number" min={1} max={10} value={form.max_concurrent ?? 1} onChange={(e) => updateField('max_concurrent', Number(e.target.value))} className={inputClass} />
-              </FormField>
+          {advGroup === 'run' && (
+            <div className="space-y-4">
+              <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'agents.runtime.desc' })}</p>
+              <SettingField label={intl.formatMessage({ id: 'agents.runtime.provider' })} help={intl.formatMessage({ id: 'agents.runtime.provider.hint' })}>
+                <OptionSelect value={runtime.provider} onChange={(v) => updateRuntime('provider', v as RuntimeProvider)} options={providerOptions} />
+              </SettingField>
+              <SettingField label={intl.formatMessage({ id: 'agents.runtime.fallback' })} help={intl.formatMessage({ id: 'agents.runtime.fallback.hint' })}>
+                <OptionSelect value={runtime.fallback} onChange={(v) => updateRuntime('fallback', v)} options={fallbackProviderOptions} />
+              </SettingField>
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-1">
+                <h4 className="mb-2 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.runtime.ptyTitle' })}</h4>
+                <SwitchRow label={intl.formatMessage({ id: 'agents.runtime.ptyPoolEnabled' })} checked={runtime.pty_pool_enabled} onChange={(v) => updateRuntime('pty_pool_enabled', v)} />
+                <SwitchRow label={intl.formatMessage({ id: 'agents.runtime.workerManaged' })} checked={runtime.worker_managed} onChange={(v) => updateRuntime('worker_managed', v)} />
+                <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'agents.runtime.pty.hint' })}</p>
+              </div>
 
-              {/* CT — advanced container (worktree / mounts / cmd / env). Write-only. */}
-              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-4">
-                <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'agents.container.advancedDesc' })}</p>
-                <div className="space-y-1">
-                  <h4 className="mb-1 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.container.worktreeTitle' })}</h4>
-                  <Toggle checked={ctAdv.worktree_enabled} onChange={(v) => updateCtAdv('worktree_enabled', v)} label={intl.formatMessage({ id: 'agents.container.worktreeEnabled' })} />
-                  <Toggle checked={ctAdv.worktree_auto_merge} onChange={(v) => updateCtAdv('worktree_auto_merge', v)} label={intl.formatMessage({ id: 'agents.container.worktreeAutoMerge' })} />
-                  <Toggle checked={ctAdv.worktree_cleanup_on_exit} onChange={(v) => updateCtAdv('worktree_cleanup_on_exit', v)} label={intl.formatMessage({ id: 'agents.container.worktreeCleanup' })} />
-                  <FormField label={intl.formatMessage({ id: 'agents.container.worktreeCopyFiles' })} hint={intl.formatMessage({ id: 'agents.container.worktreeCopyFiles.hint' })}>
+              {/* Heartbeat — 自動巡邏 */}
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-1">
+                <h4 className="mb-2 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.edit.heartbeat' })}</h4>
+                <SwitchRow label={intl.formatMessage({ id: 'agents.edit.heartbeatEnabled' })} help={intl.formatMessage({ id: 'agents.edit.heartbeatEnabled.help' })} checked={form.heartbeat_enabled ?? false} onChange={(v) => updateField('heartbeat_enabled', v)} />
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.heartbeatInterval' })} help={intl.formatMessage({ id: 'agents.edit.heartbeatInterval.help' })}>
+                  <DurationField seconds={form.heartbeat_interval ?? 3600} onChange={(s) => updateField('heartbeat_interval', s)} units={['sec', 'min', 'hour']} min={60} />
+                </SettingField>
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.heartbeatCron' })} help={intl.formatMessage({ id: 'agents.edit.heartbeatCron.help' })}>
+                  <ScheduleBuilder value={form.heartbeat_cron ?? ''} onChange={(c) => updateField('heartbeat_cron', c)} />
+                </SettingField>
+              </div>
+
+              {/* Container */}
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-1">
+                <h4 className="mb-2 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'settings.container' })}</h4>
+                <SwitchRow label={intl.formatMessage({ id: 'agents.edit.sandbox' })} help={intl.formatMessage({ id: 'agents.edit.sandbox.help' })} checked={form.sandbox_enabled ?? false} onChange={(v) => updateField('sandbox_enabled', v)} />
+                <SwitchRow label={intl.formatMessage({ id: 'agents.edit.readonlyProject' })} help={intl.formatMessage({ id: 'agents.edit.readonlyProject.help' })} checked={form.readonly_project ?? true} onChange={(v) => updateField('readonly_project', v)} />
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.taskTimeout' })} help={intl.formatMessage({ id: 'agents.edit.taskTimeout.help' })}>
+                  <DurationField seconds={Math.round((form.timeout_ms ?? 1800000) / 1000)} onChange={(s) => updateField('timeout_ms', s * 1000)} units={['sec', 'min', 'hour']} min={0} />
+                </SettingField>
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.maxConcurrent' })} help={intl.formatMessage({ id: 'agents.edit.maxConcurrent.help' })}>
+                  <input type="number" min={1} max={10} value={form.max_concurrent ?? 1} onChange={(e) => updateField('max_concurrent', Number(e.target.value))} className={inputClass} />
+                </SettingField>
+
+                <div className="pt-2 space-y-1">
+                  <h5 className="mb-1 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.container.worktreeTitle' })}</h5>
+                  <SwitchRow label={intl.formatMessage({ id: 'agents.container.worktreeEnabled' })} checked={ctAdv.worktree_enabled} onChange={(v) => updateCtAdv('worktree_enabled', v)} />
+                  <SwitchRow label={intl.formatMessage({ id: 'agents.container.worktreeCleanup' })} checked={ctAdv.worktree_cleanup_on_exit} onChange={(v) => updateCtAdv('worktree_cleanup_on_exit', v)} />
+                  <SettingField label={intl.formatMessage({ id: 'agents.container.worktreeCopyFiles' })} help={intl.formatMessage({ id: 'agents.container.worktreeCopyFiles.hint' })}>
                     <ChipEditor values={ctAdv.worktree_copy_files} onChange={(v) => updateCtAdv('worktree_copy_files', v)} placeholder=".env" addLabel={intl.formatMessage({ id: 'common.add' })} />
-                  </FormField>
+                  </SettingField>
                 </div>
 
-                <MountTable
-                  mounts={ctAdv.additional_mounts}
-                  onChange={(v) => updateCtAdv('additional_mounts', v)}
-                />
-
-                <FormField label={intl.formatMessage({ id: 'agents.container.cmd' })} hint={intl.formatMessage({ id: 'agents.container.cmd.hint' })}>
+                <SettingField label={intl.formatMessage({ id: 'agents.container.cmd' })} help={intl.formatMessage({ id: 'agents.container.cmd.hint' })}>
                   <ChipEditor values={ctAdv.cmd} onChange={(v) => updateCtAdv('cmd', v)} placeholder="bash" addLabel={intl.formatMessage({ id: 'common.add' })} />
-                </FormField>
+                </SettingField>
 
                 <EnvTable env={ctAdv.env} onChange={(v) => updateCtAdv('env', v)} />
               </div>
-            </>
+
+              {/* DangerZone — host access / mounts / auto-merge */}
+              <DangerZone title={intl.formatMessage({ id: 'agents.container.danger.title' })} description={intl.formatMessage({ id: 'agents.container.danger.desc' })}>
+                <SwitchRow label={intl.formatMessage({ id: 'agents.edit.networkAccess' })} help={intl.formatMessage({ id: 'agents.edit.networkAccess.help' })} checked={form.network_access ?? false} onChange={(v) => updateField('network_access', v)} />
+                <SwitchRow label={intl.formatMessage({ id: 'agents.container.worktreeAutoMerge' })} help={intl.formatMessage({ id: 'agents.container.worktreeAutoMerge.help' })} checked={ctAdv.worktree_auto_merge} onChange={(v) => updateCtAdv('worktree_auto_merge', v)} />
+                <MountTable mounts={ctAdv.additional_mounts} onChange={(v) => updateCtAdv('additional_mounts', v)} />
+              </DangerZone>
+            </div>
           )}
 
-          {tab === 'evolution' && (
+          {advGroup === 'evo' && (
             <div className="space-y-4">
               <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'agents.evo.desc' })}</p>
 
               <div className="space-y-1">
                 <h4 className="mb-1 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.evo.externalFactors' })}</h4>
-                <Toggle checked={evoAdv.external_factors.user_feedback} onChange={(v) => updateEvoFactor('user_feedback', v)} label={intl.formatMessage({ id: 'agents.evo.userFeedback' })} />
-                <Toggle checked={evoAdv.external_factors.security_events} onChange={(v) => updateEvoFactor('security_events', v)} label={intl.formatMessage({ id: 'agents.evo.securityEvents' })} />
-                <Toggle checked={evoAdv.external_factors.channel_metrics} onChange={(v) => updateEvoFactor('channel_metrics', v)} label={intl.formatMessage({ id: 'agents.evo.channelMetrics' })} />
-                <Toggle checked={evoAdv.external_factors.business_context} onChange={(v) => updateEvoFactor('business_context', v)} label={intl.formatMessage({ id: 'agents.evo.businessContext' })} />
-                <Toggle checked={evoAdv.external_factors.peer_signals} onChange={(v) => updateEvoFactor('peer_signals', v)} label={intl.formatMessage({ id: 'agents.evo.peerSignals' })} />
+                <SwitchRow checked={evoAdv.external_factors.user_feedback} onChange={(v) => updateEvoFactor('user_feedback', v)} label={intl.formatMessage({ id: 'agents.evo.userFeedback' })} />
+                <SwitchRow checked={evoAdv.external_factors.security_events} onChange={(v) => updateEvoFactor('security_events', v)} label={intl.formatMessage({ id: 'agents.evo.securityEvents' })} />
+                <SwitchRow checked={evoAdv.external_factors.channel_metrics} onChange={(v) => updateEvoFactor('channel_metrics', v)} label={intl.formatMessage({ id: 'agents.evo.channelMetrics' })} />
+                <SwitchRow checked={evoAdv.external_factors.business_context} onChange={(v) => updateEvoFactor('business_context', v)} label={intl.formatMessage({ id: 'agents.evo.businessContext' })} />
+                <SwitchRow checked={evoAdv.external_factors.peer_signals} onChange={(v) => updateEvoFactor('peer_signals', v)} label={intl.formatMessage({ id: 'agents.evo.peerSignals' })} />
               </div>
 
               <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-2">
                 <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.evo.skillSynthesis' })}</h4>
-                <Toggle checked={evoAdv.skill_synthesis_enabled} onChange={(v) => updateEvoAdv('skill_synthesis_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
+                <SwitchRow checked={evoAdv.skill_synthesis_enabled} onChange={(v) => updateEvoAdv('skill_synthesis_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
                 <div className="grid grid-cols-2 gap-3">
                   <FormField label={intl.formatMessage({ id: 'agents.evo.threshold' })} hint={intl.formatMessage({ id: 'agents.evo.synthesisThreshold.hint' })}>
                     <input type="number" min={1} step={1} value={evoAdv.skill_synthesis_threshold} onChange={(e) => updateEvoAdv('skill_synthesis_threshold', Math.round(Number(e.target.value)))} className={inputClass} />
@@ -1160,7 +1306,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
 
               <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-2">
                 <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.evo.skillGraduation' })}</h4>
-                <Toggle checked={evoAdv.skill_graduation_enabled} onChange={(v) => updateEvoAdv('skill_graduation_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
+                <SwitchRow checked={evoAdv.skill_graduation_enabled} onChange={(v) => updateEvoAdv('skill_graduation_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
                 <FormField label={intl.formatMessage({ id: 'agents.evo.minLift' })} hint="0.0-1.0">
                   <input type="number" min={0} max={1} step={0.05} value={evoAdv.skill_graduation_min_lift} onChange={(e) => updateEvoAdv('skill_graduation_min_lift', Number(e.target.value))} className={inputClass} />
                 </FormField>
@@ -1168,7 +1314,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
 
               <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-2">
                 <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.evo.skillRecommendation' })}</h4>
-                <Toggle checked={evoAdv.skill_recommendation_enabled} onChange={(v) => updateEvoAdv('skill_recommendation_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
+                <SwitchRow checked={evoAdv.skill_recommendation_enabled} onChange={(v) => updateEvoAdv('skill_recommendation_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
                 <FormField label={intl.formatMessage({ id: 'agents.evo.threshold' })} hint="0.0-1.0">
                   <input type="number" min={0} max={1} step={0.05} value={evoAdv.skill_recommendation_threshold} onChange={(e) => updateEvoAdv('skill_recommendation_threshold', Number(e.target.value))} className={inputClass} />
                 </FormField>
@@ -1176,7 +1322,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
 
               <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-2">
                 <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.evo.curiosity' })}</h4>
-                <Toggle checked={evoAdv.curiosity_enabled} onChange={(v) => updateEvoAdv('curiosity_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
+                <SwitchRow checked={evoAdv.curiosity_enabled} onChange={(v) => updateEvoAdv('curiosity_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
                 <div className="grid grid-cols-2 gap-3">
                   <FormField label={intl.formatMessage({ id: 'agents.evo.threshold' })} hint="0.0-1.0">
                     <input type="number" min={0} max={1} step={0.05} value={evoAdv.curiosity_threshold} onChange={(e) => updateEvoAdv('curiosity_threshold', Number(e.target.value))} className={inputClass} />
@@ -1189,7 +1335,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
 
               <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-2">
                 <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.evo.behaviorMonitor' })}</h4>
-                <Toggle checked={evoAdv.skill_behavior_monitor_enabled} onChange={(v) => updateEvoAdv('skill_behavior_monitor_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
+                <SwitchRow checked={evoAdv.skill_behavior_monitor_enabled} onChange={(v) => updateEvoAdv('skill_behavior_monitor_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
                 <FormField label={intl.formatMessage({ id: 'agents.evo.driftThreshold' })} hint="0.0-1.0">
                   <input type="number" min={0} max={1} step={0.05} value={evoAdv.skill_behavior_drift_threshold} onChange={(e) => updateEvoAdv('skill_behavior_drift_threshold', Number(e.target.value))} className={inputClass} />
                 </FormField>
@@ -1197,89 +1343,85 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
             </div>
           )}
 
-          {tab === 'permissions' && (
-            <>
-              <div className="space-y-1">
-                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400 mb-2">
-                  {intl.formatMessage({ id: 'agents.edit.permissions' }).split('&')[0]?.trim() ?? 'Permissions'}
-                </h4>
-                <Toggle checked={form.can_create_agents ?? false} onChange={(v) => updateField('can_create_agents', v)} label={intl.formatMessage({ id: 'agents.edit.canCreateAgents' })} />
-                <Toggle checked={form.can_send_cross_agent ?? true} onChange={(v) => updateField('can_send_cross_agent', v)} label={intl.formatMessage({ id: 'agents.edit.canSendCrossAgent' })} />
-                <Toggle checked={form.can_modify_own_skills ?? true} onChange={(v) => updateField('can_modify_own_skills', v)} label={intl.formatMessage({ id: 'agents.edit.canModifySkills' })} />
-                <Toggle checked={form.can_modify_own_soul ?? false} onChange={(v) => updateField('can_modify_own_soul', v)} label={intl.formatMessage({ id: 'agents.edit.canModifySoul' })} />
-                <Toggle checked={form.can_schedule_tasks ?? false} onChange={(v) => updateField('can_schedule_tasks', v)} label={intl.formatMessage({ id: 'agents.edit.canScheduleTasks' })} />
-              </div>
-              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-1">
-                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400 mb-2">Evolution</h4>
-                <Toggle checked={form.skill_auto_activate ?? false} onChange={(v) => updateField('skill_auto_activate', v)} label={intl.formatMessage({ id: 'agents.edit.skillAutoActivate' })} />
-                <Toggle checked={form.skill_security_scan ?? true} onChange={(v) => updateField('skill_security_scan', v)} label={intl.formatMessage({ id: 'agents.edit.skillSecurityScan' })} />
-                <Toggle checked={form.gvu_enabled ?? true} onChange={(v) => updateField('gvu_enabled', v)} label={intl.formatMessage({ id: 'agents.edit.gvuEnabled' })} />
-                <Toggle checked={form.cognitive_memory ?? false} onChange={(v) => updateField('cognitive_memory', v)} label={intl.formatMessage({ id: 'agents.edit.cognitiveMemory' })} />
-                <FormField label={intl.formatMessage({ id: 'agents.edit.maxActiveSkills' })}>
-                  <input type="number" min={1} max={20} value={form.max_active_skills ?? 5} onChange={(e) => updateField('max_active_skills', Number(e.target.value))} className={inputClass} />
-                </FormField>
-                <FormField label={intl.formatMessage({ id: 'agents.edit.maxSilenceHours' })}>
-                  <input type="number" min={1} step={0.5} value={form.max_silence_hours ?? 12} onChange={(e) => updateField('max_silence_hours', Number(e.target.value))} className={inputClass} />
-                </FormField>
-              </div>
-            </>
-          )}
-
-          {tab === 'capabilities' && (
+          {advGroup === 'access' && (
             <div className="space-y-4">
-              <p className="text-xs text-stone-400 dark:text-stone-500">
-                {intl.formatMessage({ id: 'agents.cap.desc' })}
-              </p>
-              <Toggle checked={caps.computer_use} onChange={(v) => updateCap('computer_use', v)} label={intl.formatMessage({ id: 'agents.cap.computerUse' })} />
-              <FormField label={intl.formatMessage({ id: 'agents.cap.computerUseMode' })}>
-                <select value={caps.computer_use_mode} onChange={(e) => updateCap('computer_use_mode', e.target.value as ComputerUseMode)} className={selectClass}>
-                  <option value="container">container</option>
-                  <option value="native">native</option>
-                  <option value="auto">auto</option>
-                </select>
-              </FormField>
-              <Toggle checked={caps.browser_via_bash} onChange={(v) => updateCap('browser_via_bash', v)} label={intl.formatMessage({ id: 'agents.cap.browserViaBash' })} />
+              <div className="space-y-1">
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400 mb-2">{intl.formatMessage({ id: 'agents.edit.section.permissions' })}</h4>
+                <SwitchRow label={intl.formatMessage({ id: 'agents.edit.canSendCrossAgent' })} help={intl.formatMessage({ id: 'agents.edit.canSendCrossAgent.help' })} checked={form.can_send_cross_agent ?? true} onChange={(v) => updateField('can_send_cross_agent', v)} />
+                <SwitchRow label={intl.formatMessage({ id: 'agents.edit.canModifySkills' })} help={intl.formatMessage({ id: 'agents.edit.canModifySkills.help' })} checked={form.can_modify_own_skills ?? true} onChange={(v) => updateField('can_modify_own_skills', v)} />
+                <SwitchRow label={intl.formatMessage({ id: 'agents.edit.canScheduleTasks' })} help={intl.formatMessage({ id: 'agents.edit.canScheduleTasks.help' })} checked={form.can_schedule_tasks ?? false} onChange={(v) => updateField('can_schedule_tasks', v)} />
+                <SwitchRow label={intl.formatMessage({ id: 'agents.edit.skillSecurityScan' })} help={intl.formatMessage({ id: 'agents.edit.skillSecurityScan.help' })} checked={form.skill_security_scan ?? true} onChange={(v) => updateField('skill_security_scan', v)} />
+                <SwitchRow label={intl.formatMessage({ id: 'agents.edit.gvuEnabled' })} help={intl.formatMessage({ id: 'agents.edit.gvuEnabled.help' })} checked={form.gvu_enabled ?? true} onChange={(v) => updateField('gvu_enabled', v)} />
+                <SwitchRow label={intl.formatMessage({ id: 'agents.edit.cognitiveMemory' })} help={intl.formatMessage({ id: 'agents.edit.cognitiveMemory.help' })} checked={form.cognitive_memory ?? false} onChange={(v) => updateField('cognitive_memory', v)} />
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.maxActiveSkills' })}>
+                  <input type="number" min={1} max={20} value={form.max_active_skills ?? 5} onChange={(e) => updateField('max_active_skills', Number(e.target.value))} className={inputClass} />
+                </SettingField>
+                <SettingField label={intl.formatMessage({ id: 'agents.edit.maxSilenceHours' })}>
+                  <input type="number" min={1} step={0.5} value={form.max_silence_hours ?? 12} onChange={(e) => updateField('max_silence_hours', Number(e.target.value))} className={inputClass} />
+                </SettingField>
+              </div>
 
+              {/* DangerZone — privilege escalation */}
+              <DangerZone title={intl.formatMessage({ id: 'agents.perm.danger.title' })} description={intl.formatMessage({ id: 'agents.perm.danger.desc' })}>
+                <SwitchRow label={intl.formatMessage({ id: 'agents.edit.canCreateAgents' })} help={intl.formatMessage({ id: 'agents.edit.canCreateAgents.help' })} checked={form.can_create_agents ?? false} onChange={(v) => updateField('can_create_agents', v)} />
+                <SwitchRow label={intl.formatMessage({ id: 'agents.edit.canModifySoul' })} help={intl.formatMessage({ id: 'agents.edit.canModifySoul.help' })} checked={form.can_modify_own_soul ?? false} onChange={(v) => updateField('can_modify_own_soul', v)} />
+                <SwitchRow label={intl.formatMessage({ id: 'agents.edit.skillAutoActivate' })} help={intl.formatMessage({ id: 'agents.edit.skillAutoActivate.help' })} checked={form.skill_auto_activate ?? false} onChange={(v) => updateField('skill_auto_activate', v)} />
+              </DangerZone>
+
+              {/* Capabilities */}
               <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-4">
-                <FormField label={intl.formatMessage({ id: 'agents.cap.allowedTools' })} hint={intl.formatMessage({ id: 'agents.cap.allowedTools.hint' })}>
+                <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.edit.capabilities' })}</h4>
+                <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'agents.cap.desc' })}</p>
+                <SettingField label={intl.formatMessage({ id: 'agents.cap.allowedTools' })} help={intl.formatMessage({ id: 'agents.cap.allowedTools.hint' })}>
                   <ChipEditor values={caps.allowed_tools} onChange={(v) => updateCap('allowed_tools', v)} placeholder="Read" addLabel={intl.formatMessage({ id: 'common.add' })} />
-                </FormField>
-                <FormField label={intl.formatMessage({ id: 'agents.cap.deniedTools' })} hint={intl.formatMessage({ id: 'agents.cap.deniedTools.hint' })}>
+                </SettingField>
+                <SettingField label={intl.formatMessage({ id: 'agents.cap.deniedTools' })} help={intl.formatMessage({ id: 'agents.cap.deniedTools.hint' })}>
                   <ChipEditor values={caps.denied_tools} onChange={(v) => updateCap('denied_tools', v)} placeholder="Bash" addLabel={intl.formatMessage({ id: 'common.add' })} />
-                </FormField>
-                <FormField label={intl.formatMessage({ id: 'agents.cap.wikiVisibleTo' })} hint={intl.formatMessage({ id: 'agents.cap.wikiVisibleTo.hint' })}>
+                </SettingField>
+                <SettingField label={intl.formatMessage({ id: 'agents.cap.wikiVisibleTo' })} help={intl.formatMessage({ id: 'agents.cap.wikiVisibleTo.hint' })}>
                   <ChipEditor values={caps.wiki_visible_to} onChange={(v) => updateCap('wiki_visible_to', v)} placeholder="coder" addLabel={intl.formatMessage({ id: 'common.add' })} />
-                </FormField>
+                </SettingField>
               </div>
 
-              <div className="rounded-lg border border-amber-200 bg-amber-50/50 p-4 dark:border-amber-800 dark:bg-amber-900/10 space-y-4">
-                <h4 className="text-xs font-semibold uppercase text-amber-700 dark:text-amber-400">{intl.formatMessage({ id: 'agents.cap.computerUseConfig' })}</h4>
-                <FormField label={intl.formatMessage({ id: 'agents.cap.allowedApps' })}>
-                  <ChipEditor values={caps.computer_use_config.allowed_apps ?? []} onChange={(v) => updateCapConfig('allowed_apps', v)} placeholder="Safari" addLabel={intl.formatMessage({ id: 'common.add' })} />
-                </FormField>
-                <FormField label={intl.formatMessage({ id: 'agents.cap.blockedActions' })}>
-                  <ChipEditor values={caps.computer_use_config.blocked_actions ?? []} onChange={(v) => updateCapConfig('blocked_actions', v)} placeholder="key:cmd+q" addLabel={intl.formatMessage({ id: 'common.add' })} />
-                </FormField>
-                <div className="grid grid-cols-2 gap-3">
-                  <FormField label={intl.formatMessage({ id: 'agents.cap.maxSessionMinutes' })} hint="1-1440">
-                    <input type="number" min={1} max={1440} value={caps.computer_use_config.max_session_minutes} onChange={(e) => updateCapConfig('max_session_minutes', Number(e.target.value))} className={inputClass} />
-                  </FormField>
-                  <FormField label={intl.formatMessage({ id: 'agents.cap.maxActions' })} hint="1-10000">
-                    <input type="number" min={1} max={10000} value={caps.computer_use_config.max_actions} onChange={(e) => updateCapConfig('max_actions', Number(e.target.value))} className={inputClass} />
-                  </FormField>
-                  <FormField label={intl.formatMessage({ id: 'agents.cap.displayWidth' })} hint="320-7680">
-                    <input type="number" min={320} max={7680} value={caps.computer_use_config.display_width} onChange={(e) => updateCapConfig('display_width', Number(e.target.value))} className={inputClass} />
-                  </FormField>
-                  <FormField label={intl.formatMessage({ id: 'agents.cap.displayHeight' })} hint="240-4320">
-                    <input type="number" min={240} max={4320} value={caps.computer_use_config.display_height} onChange={(e) => updateCapConfig('display_height', Number(e.target.value))} className={inputClass} />
-                  </FormField>
+              {/* DangerZone — Computer Use */}
+              <DangerZone title={intl.formatMessage({ id: 'agents.cap.danger.title' })} description={intl.formatMessage({ id: 'agents.cap.danger.desc' })}>
+                <SwitchRow label={intl.formatMessage({ id: 'agents.cap.computerUse' })} help={intl.formatMessage({ id: 'agents.cap.computerUse.help' })} checked={caps.computer_use} onChange={(v) => updateCap('computer_use', v)} />
+                <SettingField label={intl.formatMessage({ id: 'agents.cap.computerUseMode' })} help={intl.formatMessage({ id: 'agents.cap.computerUseMode.help' })}>
+                  <OptionSelect value={caps.computer_use_mode} onChange={(v) => updateCap('computer_use_mode', v as ComputerUseMode)} options={computerUseModeOptions} />
+                </SettingField>
+                {caps.computer_use_mode === 'native' && (
+                  <p className="rounded-md bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">{intl.formatMessage({ id: 'agents.cap.nativeWarning' })}</p>
+                )}
+                <SwitchRow label={intl.formatMessage({ id: 'agents.cap.browserViaBash' })} help={intl.formatMessage({ id: 'agents.cap.browserViaBash.help' })} checked={caps.browser_via_bash} onChange={(v) => updateCap('browser_via_bash', v)} />
+                <div className="space-y-3 border-t border-rose-300/40 pt-3">
+                  <h5 className="text-xs font-semibold uppercase text-rose-700 dark:text-rose-300">{intl.formatMessage({ id: 'agents.cap.computerUseConfig' })}</h5>
+                  <SettingField label={intl.formatMessage({ id: 'agents.cap.allowedApps' })}>
+                    <ChipEditor values={caps.computer_use_config.allowed_apps ?? []} onChange={(v) => updateCapConfig('allowed_apps', v)} placeholder="Safari" addLabel={intl.formatMessage({ id: 'common.add' })} />
+                  </SettingField>
+                  <SettingField label={intl.formatMessage({ id: 'agents.cap.blockedActions' })}>
+                    <ChipEditor values={caps.computer_use_config.blocked_actions ?? []} onChange={(v) => updateCapConfig('blocked_actions', v)} placeholder="key:cmd+q" addLabel={intl.formatMessage({ id: 'common.add' })} />
+                  </SettingField>
+                  <div className="grid grid-cols-2 gap-3">
+                    <FormField label={intl.formatMessage({ id: 'agents.cap.maxSessionMinutes' })} hint="1-1440">
+                      <input type="number" min={1} max={1440} value={caps.computer_use_config.max_session_minutes} onChange={(e) => updateCapConfig('max_session_minutes', Number(e.target.value))} className={inputClass} />
+                    </FormField>
+                    <FormField label={intl.formatMessage({ id: 'agents.cap.maxActions' })} hint="1-10000">
+                      <input type="number" min={1} max={10000} value={caps.computer_use_config.max_actions} onChange={(e) => updateCapConfig('max_actions', Number(e.target.value))} className={inputClass} />
+                    </FormField>
+                    <FormField label={intl.formatMessage({ id: 'agents.cap.displayWidth' })} hint="320-7680">
+                      <input type="number" min={320} max={7680} value={caps.computer_use_config.display_width} onChange={(e) => updateCapConfig('display_width', Number(e.target.value))} className={inputClass} />
+                    </FormField>
+                    <FormField label={intl.formatMessage({ id: 'agents.cap.displayHeight' })} hint="240-4320">
+                      <input type="number" min={240} max={4320} value={caps.computer_use_config.display_height} onChange={(e) => updateCapConfig('display_height', Number(e.target.value))} className={inputClass} />
+                    </FormField>
+                  </div>
+                  <SwitchRow label={intl.formatMessage({ id: 'agents.cap.autoConfirmTrusted' })} help={intl.formatMessage({ id: 'agents.cap.autoConfirmTrusted.help' })} checked={caps.computer_use_config.auto_confirm_trusted ?? false} onChange={(v) => updateCapConfig('auto_confirm_trusted', v)} />
                 </div>
-                <Toggle checked={caps.computer_use_config.auto_confirm_trusted ?? false} onChange={(v) => updateCapConfig('auto_confirm_trusted', v)} label={intl.formatMessage({ id: 'agents.cap.autoConfirmTrusted' })} />
-              </div>
+              </DangerZone>
             </div>
           )}
 
-          {tab === 'contract' && (
+          {advGroup === 'access' && (
             <div className="space-y-4">
               <p className="text-xs text-stone-400 dark:text-stone-500">
                 {intl.formatMessage({ id: 'agents.contract.desc' })}
@@ -1319,8 +1461,9 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
             </div>
           )}
 
-          {tab === 'odoo' && (
+          {advGroup === 'integration' && (
             <div className="space-y-4">
+              <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">Odoo</h4>
               <p className="text-xs text-stone-400 dark:text-stone-500">
                 {intl.formatMessage({ id: 'agents.odoo.desc' })}
               </p>
@@ -1359,34 +1502,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
             </div>
           )}
 
-          {tab === 'sticker' && (
-            <div className="space-y-4">
-              <p className="text-xs text-stone-400 dark:text-stone-500">
-                {intl.formatMessage({ id: 'agents.edit.stickerDesc' })}
-              </p>
-              <Toggle checked={form.sticker_enabled ?? false} onChange={(v) => updateField('sticker_enabled', v)} label={intl.formatMessage({ id: 'agents.edit.stickerEnabled' })} />
-              <FormField label={intl.formatMessage({ id: 'agents.edit.stickerProbability' })}>
-                <input type="range" min={0} max={1} step={0.05} value={form.sticker_probability ?? 0.3} onChange={(e) => updateField('sticker_probability', Number(e.target.value))} className="w-full accent-amber-500" />
-                <span className="text-xs text-stone-500 dark:text-stone-400 ml-2">{((form.sticker_probability ?? 0.3) * 100).toFixed(0)}%</span>
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'agents.edit.stickerIntensity' })}>
-                <input type="range" min={0} max={1} step={0.05} value={form.sticker_intensity_threshold ?? 0.7} onChange={(e) => updateField('sticker_intensity_threshold', Number(e.target.value))} className="w-full accent-amber-500" />
-                <span className="text-xs text-stone-500 dark:text-stone-400 ml-2">{((form.sticker_intensity_threshold ?? 0.7) * 100).toFixed(0)}%</span>
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'agents.edit.stickerCooldown' })}>
-                <input type="number" min={0} max={100} value={form.sticker_cooldown_messages ?? 5} onChange={(e) => updateField('sticker_cooldown_messages', Number(e.target.value))} className={inputClass} />
-              </FormField>
-              <FormField label={intl.formatMessage({ id: 'agents.edit.stickerExpressiveness' })}>
-                <select value={form.sticker_expressiveness ?? 'moderate'} onChange={(e) => updateField('sticker_expressiveness', e.target.value as 'minimal' | 'moderate' | 'expressive')} className={selectClass}>
-                  <option value="minimal">{intl.formatMessage({ id: 'agents.edit.stickerMinimal' })}</option>
-                  <option value="moderate">{intl.formatMessage({ id: 'agents.edit.stickerModerate' })}</option>
-                  <option value="expressive">{intl.formatMessage({ id: 'agents.edit.stickerExpressive' })}</option>
-                </select>
-              </FormField>
-            </div>
-          )}
-
-          {tab === 'channels' && (
+          {advGroup === 'integration' && (
             <div className="space-y-5">
               <p className="text-xs text-stone-400 dark:text-stone-500">
                 {intl.formatMessage({ id: 'agents.edit.channelsDesc' })}
@@ -1468,20 +1584,16 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
             </div>
           )}
 
-          {tab === 'advanced' && (
-            <div className="space-y-5">
+          {advGroup === 'evo' && (
+            <div className="space-y-5 border-t border-stone-200 pt-4 dark:border-stone-700">
               <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'agents.adv.desc' })}</p>
 
               {/* UI.3 — already-supported scalar fields */}
               <div className="space-y-3">
                 <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.adv.status' })}</h4>
-                <FormField label={intl.formatMessage({ id: 'agents.adv.statusField' })}>
-                  <select value={form.status ?? 'active'} onChange={(e) => updateField('status', e.target.value)} className={selectClass}>
-                    {['active', 'paused', 'terminated'].map((s) => (
-                      <option key={s} value={s}>{intl.formatMessage({ id: `status.${s}` })}</option>
-                    ))}
-                  </select>
-                </FormField>
+                <SettingField label={intl.formatMessage({ id: 'agents.adv.statusField' })}>
+                  <OptionSelect value={form.status ?? 'active'} onChange={(v) => updateField('status', v)} options={statusOptions} />
+                </SettingField>
                 <div className="grid grid-cols-2 gap-3">
                   <FormField label={intl.formatMessage({ id: 'agents.adv.maxGvuGenerations' })}>
                     <input type="number" min={0} value={form.max_gvu_generations ?? 3} onChange={(e) => updateField('max_gvu_generations', Number(e.target.value))} className={inputClass} />
@@ -1498,7 +1610,7 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
               {/* UI.3 — stagnation detection */}
               <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-2">
                 <h4 className="text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'agents.adv.stagnation' })}</h4>
-                <Toggle checked={adv.stagnation_enabled} onChange={(v) => updateAdv('stagnation_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
+                <SwitchRow checked={adv.stagnation_enabled} onChange={(v) => updateAdv('stagnation_enabled', v)} label={intl.formatMessage({ id: 'agents.evo.enabled' })} />
                 <div className="grid grid-cols-2 gap-3">
                   <FormField label={intl.formatMessage({ id: 'agents.adv.stagnationWindow' })}>
                     <input type="number" min={1} value={adv.stagnation_window_seconds} onChange={(e) => updateAdv('stagnation_window_seconds', Number(e.target.value))} className={inputClass} />
@@ -1507,12 +1619,9 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
                     <input type="number" min={1} value={adv.stagnation_trigger_threshold} onChange={(e) => updateAdv('stagnation_trigger_threshold', Number(e.target.value))} className={inputClass} />
                   </FormField>
                 </div>
-                <FormField label={intl.formatMessage({ id: 'agents.adv.stagnationAction' })}>
-                  <select value={adv.stagnation_action} onChange={(e) => updateAdv('stagnation_action', e.target.value as 'log_only' | 'suppress')} className={selectClass}>
-                    <option value="log_only">log_only</option>
-                    <option value="suppress">suppress</option>
-                  </select>
-                </FormField>
+                <SettingField label={intl.formatMessage({ id: 'agents.adv.stagnationAction' })}>
+                  <OptionSelect value={adv.stagnation_action} onChange={(v) => updateAdv('stagnation_action', v as 'log_only' | 'suppress')} options={stagnationActionOptions} />
+                </SettingField>
               </div>
 
               {/* G.8 — model extras */}
@@ -1522,7 +1631,17 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
                   <ChipEditor values={adv.account_pool} onChange={(v) => updateAdv('account_pool', v)} placeholder="oauth-pro" addLabel={intl.formatMessage({ id: 'common.add' })} />
                 </FormField>
                 <FormField label={intl.formatMessage({ id: 'agents.adv.utility' })} hint={intl.formatMessage({ id: 'agents.adv.utility.hint' })}>
-                  <input type="text" value={adv.utility} onChange={(e) => updateAdv('utility', e.target.value)} placeholder="claude-haiku-4-5" className={inputClass} />
+                  <ModelSelect
+                    value={adv.utility}
+                    onChange={(v) => updateAdv('utility', v)}
+                    models={availableModels}
+                    loading={modelsLoading}
+                    error={modelsError}
+                    discoveredAt={modelsDiscoveredAt}
+                    refreshing={modelsRefreshing}
+                    onRefresh={modelsRefresh}
+                    ariaLabel={intl.formatMessage({ id: 'agents.adv.utility' })}
+                  />
                 </FormField>
               </div>
 
@@ -1550,9 +1669,14 @@ function EditAgentDialog({ agent, onClose, onSaved }: { agent: AgentDetail | nul
               </div>
 
               {/* G.8 — free-form scalar tables */}
-              <KvTable title={intl.formatMessage({ id: 'agents.adv.ptc' })} rows={adv.ptc} onChange={(v) => updateAdv('ptc', v)} />
-              <KvTable title={intl.formatMessage({ id: 'agents.adv.prompt' })} rows={adv.prompt} onChange={(v) => updateAdv('prompt', v)} />
-              <KvTable title={intl.formatMessage({ id: 'agents.adv.culturalContext' })} rows={adv.cultural_context} onChange={(v) => updateAdv('cultural_context', v)} />
+              <div className="border-t border-stone-200 pt-4 dark:border-stone-700 space-y-2">
+                <p className="rounded-md bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">{intl.formatMessage({ id: 'agents.adv.kv.warning' })}</p>
+                <KvTable title={intl.formatMessage({ id: 'agents.adv.ptc' })} rows={adv.ptc} onChange={(v) => updateAdv('ptc', v)} />
+                <KvTable title={intl.formatMessage({ id: 'agents.adv.prompt' })} rows={adv.prompt} onChange={(v) => updateAdv('prompt', v)} />
+                <KvTable title={intl.formatMessage({ id: 'agents.adv.culturalContext' })} rows={adv.cultural_context} onChange={(v) => updateAdv('cultural_context', v)} />
+              </div>
+            </div>
+          )}
             </div>
           )}
         </div>

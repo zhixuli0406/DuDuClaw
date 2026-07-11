@@ -12,6 +12,7 @@ import {
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { toast, formatError } from '@/lib/toast';
 import { Page, PageHeader, Card, Button, Field, controlClass } from '@/components/ui';
+import { SettingField } from '@/components/settings/controls';
 import { Cpu, Save, RefreshCw, Loader2, AlertTriangle } from 'lucide-react';
 
 // ── Local Toggle (mirrors AgentsPage) ──
@@ -213,8 +214,9 @@ export function InferencePage() {
   const BackendSection = ({ title, map, set }: { title: string; map: Record<string, string>; set: (m: Record<string, string>) => void }) => {
     const keys = Object.keys(map);
     return (
-      <div className="rounded-lg border border-[var(--panel-border)] p-3">
+      <div className="rounded-control border border-[var(--panel-border)] p-3">
         <h4 className="mb-2 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{title}</h4>
+        <p className="mb-2 text-xs text-stone-400 dark:text-stone-500">{t('inference.backend.rawNotice')}</p>
         {keys.length === 0 ? (
           <p className="text-xs text-stone-400 dark:text-stone-500">{t('inference.backend.emptySection')}</p>
         ) : (
@@ -250,6 +252,11 @@ export function InferencePage() {
         }
       />
 
+      <div className="flex items-start gap-2 rounded-control border border-[var(--panel-border)] bg-stone-500/5 px-3 py-2.5 text-xs text-stone-500 dark:bg-white/5 dark:text-stone-400">
+        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+        <span>{t('inference.advancedNotice')}</span>
+      </div>
+
       {loading && !config ? (
         <div className="flex justify-center py-16">
           <Loader2 className="h-6 w-6 animate-spin text-amber-500" />
@@ -260,19 +267,19 @@ export function InferencePage() {
           <Card title={t('inference.section.backend')}>
             <div className="space-y-3">
               <Toggle checked={enabled} onChange={setEnabled} label={t('inference.enabled')} />
-              <Field label={t('inference.backend')} help={t('inference.backend.hint')}>
+              <SettingField label={t('inference.backend')} help={t('inference.backend.hint')}>
                 <input type="text" value={backend} onChange={(e) => setBackend(e.target.value)} placeholder="llama_cpp" className={controlClass} />
-              </Field>
-              <Field label={t('inference.modelsDir')}>
+              </SettingField>
+              <SettingField label={t('inference.modelsDir')} help={t('inference.modelsDir.hint')}>
                 <input type="text" value={modelsDir} onChange={(e) => setModelsDir(e.target.value)} placeholder="~/.duduclaw/models" className={controlClass} />
-              </Field>
-              <Field label={t('inference.defaultModel')}>
+              </SettingField>
+              <SettingField label={t('inference.defaultModel')} help={t('inference.defaultModel.hint')}>
                 <input type="text" value={defaultModel} onChange={(e) => setDefaultModel(e.target.value)} className={controlClass} />
-              </Field>
+              </SettingField>
               <Toggle checked={autoLoad} onChange={setAutoLoad} label={t('inference.autoLoad')} />
-              <Field label={t('inference.maxMemoryMb')}>
+              <SettingField label={t('inference.maxMemoryMb')} help={t('inference.maxMemoryMb.hint')}>
                 <input type="number" min={0} value={maxMemoryMb} onChange={(e) => setMaxMemoryMb(e.target.value)} className={controlClass} />
-              </Field>
+              </SettingField>
             </div>
           </Card>
 
@@ -307,7 +314,7 @@ export function InferencePage() {
             <div className="space-y-3">
               <Toggle checked={Boolean(router.enabled)} onChange={(v) => setRouter((p) => ({ ...p, enabled: v }))} label={t('inference.router.enabled')} />
               {strongGteFast && (
-                <div className="flex items-center gap-2 rounded-lg bg-rose-500/10 p-2 text-xs text-rose-600 dark:text-rose-400">
+                <div className="flex items-center gap-2 rounded-control bg-rose-500/10 p-2 text-xs text-rose-600 dark:text-rose-400">
                   <AlertTriangle className="h-4 w-4 shrink-0" />
                   {t('inference.router.thresholdError')}
                 </div>
@@ -341,7 +348,7 @@ export function InferencePage() {
           {/* Local backends */}
           <Card title={t('inference.section.localBackends')}>
             <div className="space-y-3">
-              <div className="rounded-lg border border-[var(--panel-border)] p-3">
+              <div className="rounded-control border border-[var(--panel-border)] p-3">
                 <h4 className="mb-2 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">openai_compat</h4>
                 <div className="space-y-3">
                   <Field label={t('inference.oc.baseUrl')}>

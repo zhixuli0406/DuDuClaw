@@ -3,6 +3,7 @@ import { useIntl } from 'react-intl';
 import { api, type AuditEvent, type KillswitchConfig } from '@/lib/api';
 import { useConnectionStore } from '@/stores/connection-store';
 import { FormField } from '@/components/shared/Dialog';
+import { AdvancedSection } from '@/components/settings/controls';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { toast, formatError } from '@/lib/toast';
 import {
@@ -13,6 +14,8 @@ import {
   Badge,
   Button,
   EmptyState,
+  Mono,
+  CharacterAvatar,
   controlClass,
 } from '@/components/ui';
 import { cn } from '@/lib/utils';
@@ -84,6 +87,7 @@ export function SecurityPage() {
           ) : auditEvents.length === 0 ? (
             <EmptyState
               icon={History}
+              dudu="curious"
               title={intl.formatMessage({ id: 'security.audit.empty' })}
             />
           ) : (
@@ -98,20 +102,20 @@ export function SecurityPage() {
         {/* Credential Proxy */}
         <SecurityCard
           icon={Lock}
-          title="Credential Proxy"
-          description="Credential injection via secure proxy. No secrets exposed to agents."
+          title={intl.formatMessage({ id: 'security.credentialProxy.title' })}
+          description={intl.formatMessage({ id: 'security.credentialProxy.desc' })}
         >
           <div className="space-y-3">
             <StatusRow
-              label="Proxy Status"
+              label={intl.formatMessage({ id: 'security.proxyStatus' })}
               status={status?.credential_proxy.active ? 'active' : 'inactive'}
             />
             <StatusRow
-              label="Vault Backend"
+              label={intl.formatMessage({ id: 'security.vaultBackend' })}
               value={status?.credential_proxy.vault_backend ?? '—'}
             />
             <StatusRow
-              label="Injected Secrets"
+              label={intl.formatMessage({ id: 'security.injectedSecrets' })}
               value={String(status?.credential_proxy.injected_secrets ?? 0)}
             />
           </div>
@@ -120,8 +124,8 @@ export function SecurityPage() {
         {/* Mount Guard */}
         <SecurityCard
           icon={ShieldCheck}
-          title="Mount Guard"
-          description="Container filesystem mount rules. Controls what agents can access."
+          title={intl.formatMessage({ id: 'security.mountGuard.title' })}
+          description={intl.formatMessage({ id: 'security.mountGuard.desc' })}
         >
           <div className="space-y-2">
             {status?.mount_guard.rules && status.mount_guard.rules.length > 0 ? (
@@ -139,27 +143,27 @@ export function SecurityPage() {
         {/* RBAC */}
         <SecurityCard
           icon={Users}
-          title="RBAC"
-          description="Role-based access control for agent permissions."
+          title={intl.formatMessage({ id: 'security.rbac.title' })}
+          description={intl.formatMessage({ id: 'security.rbac.desc' })}
         >
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-[var(--panel-border)]">
                   <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">
-                    Agent
+                    {intl.formatMessage({ id: 'security.rbac.agent' })}
                   </th>
                   <th className="py-2 text-center font-medium text-stone-500 dark:text-stone-400">
-                    Tool
+                    {intl.formatMessage({ id: 'security.rbac.tool' })}
                   </th>
                   <th className="py-2 text-center font-medium text-stone-500 dark:text-stone-400">
-                    Web
+                    {intl.formatMessage({ id: 'security.rbac.web' })}
                   </th>
                   <th className="py-2 text-center font-medium text-stone-500 dark:text-stone-400">
-                    File
+                    {intl.formatMessage({ id: 'security.rbac.file' })}
                   </th>
                   <th className="py-2 text-center font-medium text-stone-500 dark:text-stone-400">
-                    Shell
+                    {intl.formatMessage({ id: 'security.rbac.shell' })}
                   </th>
                 </tr>
               </thead>
@@ -167,8 +171,11 @@ export function SecurityPage() {
                 {(status?.rbac ?? []).map((agent) => (
                   <tr key={agent.agent_id} className="border-b border-[var(--panel-border)]">
                     <td className="py-2 text-stone-700 dark:text-stone-300">
-                      <code className="text-xs">{agent.agent_id}</code>
-                      <span className="ml-1 text-xs text-stone-400">({agent.role})</span>
+                      <span className="flex items-center gap-2">
+                        <CharacterAvatar agentId={agent.agent_id} name={agent.agent_id} size={24} />
+                        <Mono className="text-xs">{agent.agent_id}</Mono>
+                        <span className="text-xs text-stone-400">({agent.role})</span>
+                      </span>
                     </td>
                     <PermCell allowed={agent.tool_use} />
                     <PermCell allowed={agent.web_access} />
@@ -191,16 +198,16 @@ export function SecurityPage() {
         {/* Rate Limiter */}
         <SecurityCard
           icon={Timer}
-          title="Rate Limiter"
-          description="API call rate limiting per agent per time window."
+          title={intl.formatMessage({ id: 'security.rateLimiter.title' })}
+          description={intl.formatMessage({ id: 'security.rateLimiter.desc' })}
         >
           <div className="space-y-3">
             <LimitRow
-              label="Requests / minute"
+              label={intl.formatMessage({ id: 'security.reqPerMin' })}
               value={String(status?.rate_limiter.requests_per_minute ?? 60)}
             />
             <LimitRow
-              label="Concurrent requests"
+              label={intl.formatMessage({ id: 'security.concurrent' })}
               value={String(status?.rate_limiter.concurrent_requests ?? 5)}
             />
           </div>
@@ -269,26 +276,24 @@ function KillswitchSection() {
           {/* Triggers */}
           <Section title={intl.formatMessage({ id: 'killswitch.triggers' })}>
             <div className="grid gap-4 sm:grid-cols-2">
-              <FormField label={intl.formatMessage({ id: 'killswitch.maxRepliesPerMinute' })} hint="1-10000">
+              <FormField label={intl.formatMessage({ id: 'killswitch.maxRepliesPerMinute' })} hint={intl.formatMessage({ id: 'killswitch.maxRepliesPerMinute.help' })}>
                 <input type="number" min={1} max={10000} value={config.triggers.max_replies_per_minute} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, max_replies_per_minute: Number(e.target.value) } })} className={controlClass} />
               </FormField>
-              <FormField label={intl.formatMessage({ id: 'killswitch.maxConsecutiveErrors' })} hint="1-1000">
+              <FormField label={intl.formatMessage({ id: 'killswitch.maxConsecutiveErrors' })} hint={intl.formatMessage({ id: 'killswitch.maxConsecutiveErrors.help' })}>
                 <input type="number" min={1} max={1000} value={config.triggers.max_consecutive_errors} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, max_consecutive_errors: Number(e.target.value) } })} className={controlClass} />
               </FormField>
-              <FormField label={intl.formatMessage({ id: 'killswitch.errorRateThreshold' })} hint="0.0-1.0">
+              <FormField label={intl.formatMessage({ id: 'killswitch.errorRateThreshold' })} hint={intl.formatMessage({ id: 'killswitch.errorRateThreshold.help' })}>
                 <input type="number" min={0} max={1} step={0.01} value={config.triggers.error_rate_threshold} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, error_rate_threshold: Number(e.target.value) } })} className={controlClass} />
               </FormField>
-              <FormField label={intl.formatMessage({ id: 'killswitch.costLimitUsd' })} hint="0-1000000">
+              <FormField label={intl.formatMessage({ id: 'killswitch.costLimitUsd' })} hint={intl.formatMessage({ id: 'killswitch.costLimitUsd.help' })}>
                 <input type="number" min={0} step={0.01} value={config.triggers.cost_limit_usd} onChange={(e) => setConfig({ ...config, triggers: { ...config.triggers, cost_limit_usd: Number(e.target.value) } })} className={controlClass} />
               </FormField>
             </div>
           </Section>
 
-          {/* Circuit breaker */}
-          <Section
-            title={intl.formatMessage({ id: 'killswitch.circuitBreaker' })}
-            className="border-t border-[var(--panel-border)] pt-4"
-          >
+          {/* Circuit breaker — advanced thresholds */}
+          <AdvancedSection storageKey="security.killswitch" label={intl.formatMessage({ id: 'killswitch.advanced' })}>
+            <Section title={intl.formatMessage({ id: 'killswitch.circuitBreaker' })}>
             <div className="grid gap-4 sm:grid-cols-2">
               <FormField label={intl.formatMessage({ id: 'killswitch.frequencyWindowSecs' })} hint="1-86400">
                 <input type="number" min={1} max={86400} value={config.circuit_breaker.frequency_window_secs} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, frequency_window_secs: Number(e.target.value) } })} className={controlClass} />
@@ -309,7 +314,8 @@ function KillswitchSection() {
                 <input type="number" min={1} max={1000} value={config.circuit_breaker.half_open_allow_count} onChange={(e) => setConfig({ ...config, circuit_breaker: { ...config.circuit_breaker, half_open_allow_count: Number(e.target.value) } })} className={controlClass} />
               </FormField>
             </div>
-          </Section>
+            </Section>
+          </AdvancedSection>
 
           {/* Safety words */}
           <Section
@@ -387,18 +393,21 @@ function AuditRow({ event }: { event: AuditEvent }) {
   const time = new Date(event.timestamp).toLocaleString();
 
   return (
-    <div className="flex items-start gap-2 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-fill)] p-2.5">
+    <div className="flex items-start gap-2 rounded-control border border-[var(--panel-border)] bg-[var(--panel-fill)] p-2.5">
       <SevIcon className={cn('mt-0.5 h-4 w-4 shrink-0', severityStyles[event.severity] ?? 'text-stone-400')} />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           <span className="text-xs font-medium text-stone-900 dark:text-stone-100">
             {event.event_type}
           </span>
-          <span className="text-xs text-stone-400">{event.agent_id}</span>
+          {event.agent_id && (
+            <span className="flex items-center gap-1 text-xs text-stone-400">
+              <CharacterAvatar agentId={event.agent_id} name={event.agent_id} size={16} />
+              {event.agent_id}
+            </span>
+          )}
         </div>
-        <p className="truncate text-xs text-stone-500 dark:text-stone-400">
-          {time}
-        </p>
+        <Mono className="block truncate text-xs">{time}</Mono>
       </div>
     </div>
   );
@@ -439,20 +448,21 @@ function StatusRow({
   status?: string;
   value?: string;
 }) {
+  const intl = useIntl();
   return (
     <div className="flex items-center justify-between text-sm">
       <span className="text-stone-600 dark:text-stone-400">{label}</span>
       {status === 'active' ? (
         <Badge tone="success">
           <Shield className="h-3 w-3" />
-          Active
+          {intl.formatMessage({ id: 'security.active' })}
         </Badge>
       ) : status === 'inactive' ? (
-        <Badge tone="neutral">Inactive</Badge>
+        <Badge tone="neutral">{intl.formatMessage({ id: 'security.inactive' })}</Badge>
       ) : (
-        <span className="font-medium text-stone-900 dark:text-stone-50">
+        <Mono className="font-medium text-stone-900 dark:text-stone-50">
           {value}
-        </span>
+        </Mono>
       )}
     </div>
   );
@@ -467,9 +477,9 @@ function RuleRow({ path, access }: { path: string; access: string }) {
 
   return (
     <div className="flex items-center justify-between text-sm">
-      <code className="rounded bg-stone-500/10 px-2 py-0.5 font-mono text-xs text-stone-700 dark:text-stone-300">
+      <Mono className="rounded-control bg-stone-500/10 px-2 py-0.5 text-xs text-stone-700 dark:text-stone-300">
         {path}
-      </code>
+      </Mono>
       <Badge tone={accessTone[access] ?? 'neutral'}>{access}</Badge>
     </div>
   );
@@ -479,9 +489,9 @@ function LimitRow({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-center justify-between text-sm">
       <span className="text-stone-600 dark:text-stone-400">{label}</span>
-      <span className="font-medium text-stone-900 dark:text-stone-50">
+      <Mono className="font-medium text-stone-900 dark:text-stone-50">
         {value}
-      </span>
+      </Mono>
     </div>
   );
 }

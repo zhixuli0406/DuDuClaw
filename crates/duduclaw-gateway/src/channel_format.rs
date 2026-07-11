@@ -26,6 +26,37 @@ pub enum RichComponent {
         color: Option<u32>,
         footer: Option<String>,
     },
+    /// WP16: a row of action buttons (approval decisions, etc.). Channels with
+    /// native buttons (Telegram inline keyboard / Slack Block Kit actions /
+    /// Discord components / LINE quick reply) render them natively; channels
+    /// without button support fall back to a numbered-command text hint.
+    Buttons(Vec<ActionButton>),
+}
+
+/// Visual weight of an action button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ButtonStyle {
+    /// The affirmative / primary action (approve).
+    Primary,
+    /// A destructive / caution action (deny, reject).
+    Danger,
+    /// Everything else.
+    Neutral,
+}
+
+/// A single actionable button. `action_id` is the opaque token the channel
+/// returns on click; keep it short (Telegram caps callback_data at 64 bytes).
+#[derive(Debug, Clone)]
+pub struct ActionButton {
+    pub label: String,
+    pub action_id: String,
+    pub style: ButtonStyle,
+}
+
+impl ActionButton {
+    pub fn new(label: impl Into<String>, action_id: impl Into<String>, style: ButtonStyle) -> Self {
+        Self { label: label.into(), action_id: action_id.into(), style }
+    }
 }
 
 /// A complete rich message ready for platform rendering.

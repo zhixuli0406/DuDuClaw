@@ -2,7 +2,7 @@ use axum::{
     Json, Router,
     extract::{Query, State},
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::ConnectInfo,
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -68,6 +68,28 @@ fn reset_login_rate_limit(ip: IpAddr, email: &str) {
     map.remove(&(ip, email.to_string()));
 }
 
+/// Per-IP rate limit for OTP *verification* (Haiku review #2/#3). The engine
+/// already caps 5 attempts per challenge and 3 live challenges per account, but
+/// verify itself had no IP throttle — a distributed guesser could try many
+/// codes across challenges. This bounds verify attempts to 10 per IP per minute.
+static OTP_VERIFY_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<IpAddr, (Instant, u32)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn check_otp_verify_rate_limit(ip: IpAddr) -> bool {
+    let mut map = OTP_VERIFY_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if map.len() > 10000 {
+        map.retain(|_, (t, _)| now.duration_since(*t).as_secs() < 60);
+    }
+    let entry = map.entry(ip).or_insert((now, 0));
+    if now.duration_since(entry.0).as_secs() > 60 {
+        *entry = (now, 1);
+        return true;
+    }
+    entry.1 += 1;
+    entry.1 <= 10
+}
+
 use crate::auth::AuthManager;
 use crate::extension::GatewayExtension;
 use crate::handlers::MethodHandler;
@@ -103,6 +125,12 @@ struct AppState {
     user_db: Arc<UserDb>,
     /// JWT configuration for token issuance and verification.
     jwt_config: Arc<JwtConfig>,
+    /// Channel-DM delivery for passwordless login OTP codes (WP12). Injected so
+    /// the pre-auth OTP handler never needs raw channel config / secret manager.
+    otp_delivery: Arc<dyn crate::otp_delivery::OtpDeliverer>,
+    /// DuDuClaw home directory (`~/.duduclaw`). Used by the voice endpoints to
+    /// read `[voice]` STT/TTS config from `config.toml`.
+    home_dir: std::path::PathBuf,
 }
 
 /// Start the WebSocket RPC gateway and block until it shuts down.
@@ -244,7 +272,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // empty key registry, signature mismatch, expired license, or
     // grace-period exceeded all collapse to OpenSource mode.
     let _license_runtime = {
-        let registry = crate::license_runtime::embedded_registry_from_env();
+        // Baked production issuer key (v2; v1 retired) + any operator env
+        // overrides, so a stock binary verifies a DuDuClaw-issued license.json
+        // with no extra setup — the enterprise upgrade path is "drop in
+        // license.json → restart". Env-only + OpenSource until the v2 pubkey is
+        // baked (see license_runtime::PROD_ISSUER_PUBKEY_HEX).
+        let registry = crate::license_runtime::production_registry();
         let runtime = crate::license_runtime::LicenseRuntime::bootstrap(
             home_dir.clone(),
             registry,
@@ -387,8 +420,16 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     );
     // Ensure a default admin exists on first run
     match user_db.ensure_default_admin() {
-        Ok(Some(_password)) => {
-            // Password already printed by ensure_default_admin
+        Ok(Some(password)) => {
+            // First-run bootstrap. `ensure_default_admin` logs a box that a
+            // password was generated but NOT its value — so surface it here, or
+            // a fresh install has no way to log in (OTP needs a channel that
+            // isn't configured yet). The account is flagged must_change_password,
+            // so this one-time value forces a reset on first login.
+            println!("\n  🔑 First-run admin — log in with this, you'll be asked to change it:");
+            println!("     Email:    admin@local");
+            println!("     Password: {password}");
+            println!();
         }
         Ok(None) => {} // Admin already exists
         Err(e) => {
@@ -430,6 +471,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             }
         });
     }
+
+    // ── Runtime model discovery: startup probe + 12h refresh ───
+    // Replaces the old hard-coded cloud model list — probes each installed
+    // CLI / API for its real available models and caches to
+    // runtime_models.json. Failures keep the previous cache (marked fallback).
+    crate::runtime_models::spawn_periodic_refresh(home_dir.clone());
 
     // ── Cost telemetry: periodic cleanup + adaptive routing ────
     {
@@ -1005,6 +1052,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Inject user_db into handler for user management RPC methods
     handler.set_user_db(user_db.clone(), jwt_config.clone()).await;
 
+    let otp_delivery: Arc<dyn crate::otp_delivery::OtpDeliverer> =
+        Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(
+            home_dir.clone(),
+            reqwest::Client::new(),
+        ));
+
     let state = Arc::new(AppState {
         auth: AuthManager::new(config.auth_token),
         handler,
@@ -1012,6 +1065,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         event_tx,
         user_db,
         jwt_config,
+        otp_delivery,
+        home_dir: home_dir.clone(),
     });
 
     // M1/M60: open the shared audit index once and refresh it on a background
@@ -1042,9 +1097,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // ── REST API endpoints for authentication ────────────────
     let auth_router = Router::new()
         .route("/api/login", post(handle_login))
+        .route("/api/otp/request", post(handle_otp_request))
+        .route("/api/otp/verify", post(handle_otp_verify))
+        .route("/api/channel-identity/bind", post(handle_channel_bind))
         .route("/api/refresh", post(handle_refresh))
         .route("/api/me", get(handle_me))
         .route("/api/change-password", post(handle_change_password))
+        .route("/api/first-run/status", get(handle_first_run_status))
+        .route("/api/first-run/claim", post(handle_first_run_claim))
         .with_state(state.clone());
 
     let mut app = Router::new()
@@ -1057,6 +1117,19 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         )
         .route("/api/mcp/oauth/callback", get(handle_mcp_oauth_callback))
         .route("/api/reliability/summary", get(handle_reliability_summary_http))
+        // Voice endpoints (openhuman-parity B): STT (multipart audio → text) +
+        // TTS (text → audio). Bearer-JWT gated. STT gets a raised body limit so
+        // a short voice clip (≤10 MiB) is accepted; the default axum 2 MiB cap
+        // would 413 most recordings.
+        .route(
+            "/api/stt",
+            post(handle_stt).layer(DefaultBodyLimit::max(STT_MAX_UPLOAD_BYTES + 512 * 1024)),
+        )
+        .route("/api/tts", post(handle_tts))
+        .route(
+            "/api/voice/config",
+            get(handle_voice_config_get).post(handle_voice_config_set),
+        )
         .with_state(state)
         .merge(auth_router)
         .merge(webchat_router);
@@ -1276,6 +1349,257 @@ async fn handle_login(
         "refresh_token": refresh_token,
         "user": user,
     })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct OtpRequestBody {
+    email: String,
+}
+
+/// POST /api/otp/request — passwordless login step 1 (WP12). Enumeration-
+/// consistent: always returns 200 with a challenge id (a decoy when the account
+/// is unknown or has no verified channel). Delivery is fire-and-forget so the
+/// response time never leaks account existence.
+async fn handle_otp_request(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<OtpRequestBody>,
+) -> impl IntoResponse {
+    let ip = addr.ip();
+    if !check_login_rate_limit(ip, &body.email) {
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "too many attempts, try again later"})),
+        )
+            .into_response();
+    }
+
+    match state.user_db.request_otp(&body.email) {
+        Ok(Some(challenge)) => {
+            let cid = challenge.challenge_id.clone();
+            let deliverer = state.otp_delivery.clone();
+            let user_db = state.user_db.clone();
+            let (user_id, channel, chat_id, code) = (
+                challenge.user_id.clone(),
+                challenge.channel.clone(),
+                challenge.channel_user_id.clone(),
+                challenge.code.clone(),
+            );
+            tokio::spawn(async move {
+                let text = format!(
+                    "🐾 DuDuClaw 登入驗證碼：{code}\n5 分鐘內有效，請勿分享給任何人。"
+                );
+                match deliverer.deliver(&channel, &chat_id, &text).await {
+                    Ok(()) => {
+                        let _ = user_db.log_action(Some(&user_id), "otp_sent", Some(&channel), None, None);
+                    }
+                    Err(e) => {
+                        warn!("OTP delivery failed: {e}");
+                        let _ = user_db.log_action(
+                            Some(&user_id),
+                            "otp_delivery_failed",
+                            Some(&channel),
+                            Some(&e),
+                            None,
+                        );
+                    }
+                }
+            });
+            // Uniform response shape — no `hint` field, so a real account is
+            // indistinguishable from an unknown one (Haiku review #1: the mere
+            // presence of `hint` was an enumeration oracle). The FE shows a
+            // generic "if the account has a linked channel, a code was sent".
+            Json(serde_json::json!({ "challenge_id": cid, "sent": true })).into_response()
+        }
+        Ok(None) => Json(serde_json::json!({
+            "challenge_id": uuid::Uuid::new_v4().to_string(),
+            "sent": true,
+        }))
+        .into_response(),
+        Err(_) => (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "too many codes requested, try again shortly"})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct OtpVerifyBody {
+    challenge_id: String,
+    code: String,
+}
+
+/// POST /api/otp/verify — passwordless login step 2 (WP12). On success issues
+/// the same JWT pair as password login; every failure collapses to one generic
+/// 401 (no oracle for code-guessing).
+async fn handle_otp_verify(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<OtpVerifyBody>,
+) -> impl IntoResponse {
+    let ip = addr.ip();
+    // Per-IP throttle on verification (Haiku review #2) — bounds distributed
+    // code-guessing beyond the per-challenge attempt cap.
+    if !check_otp_verify_rate_limit(ip) {
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "too many attempts, try again later"})),
+        )
+            .into_response();
+    }
+    let user = match state.user_db.verify_otp(&body.challenge_id, &body.code) {
+        Ok(u) => u,
+        Err(_) => {
+            let ip_str = ip.to_string();
+            let _ = state
+                .user_db
+                .log_action(None, "otp_login_failed", None, None, Some(&ip_str));
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "invalid or expired code"})),
+            )
+                .into_response();
+        }
+    };
+
+    let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
+    let agent_access: Vec<(String, duduclaw_auth::AccessLevel)> = bindings
+        .iter()
+        .map(|b| (b.agent_name.clone(), b.access_level))
+        .collect();
+
+    let access_token = match state.jwt_config.issue_access_token(&user, &agent_access) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Failed to issue access token: {e}");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "token generation failed"})),
+            )
+                .into_response();
+        }
+    };
+    let refresh_token = match state.jwt_config.issue_refresh_token(&user.id) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Failed to issue refresh token: {e}");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "token generation failed"})),
+            )
+                .into_response();
+        }
+    };
+
+    let ip_str = ip.to_string();
+    let _ = state
+        .user_db
+        .log_action(Some(&user.id), "login_otp", None, None, Some(&ip_str));
+
+    Json(serde_json::json!({
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "user": user,
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct ChannelBindBody {
+    user_id: String,
+    channel: String,
+    channel_user_id: String,
+}
+
+/// POST /api/channel-identity/bind — admin-only (WP12 T12.3, admin-prefill path):
+/// bind and verify a user's 1:1 channel DM identity so they can log in via OTP.
+/// Fail-closed: the authoritative role is re-read from the DB, not trusted from
+/// the token. Self-service verified binding via a DM handshake is a follow-up.
+async fn handle_channel_bind(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ChannelBindBody>,
+) -> impl IntoResponse {
+    // Fail-closed input validation (Haiku review #4).
+    const OTP_CHANNELS: [&str; 4] = ["telegram", "line", "discord", "slack"];
+    if body.user_id.is_empty()
+        || body.user_id.len() > 255
+        || body.channel_user_id.is_empty()
+        || body.channel_user_id.len() > 512
+        || !OTP_CHANNELS.contains(&body.channel.as_str())
+    {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid channel binding request"})),
+        )
+            .into_response();
+    }
+    let token = match extract_bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "missing Authorization header"})),
+            )
+                .into_response();
+        }
+    };
+    let claims = match state.jwt_config.verify_access_token(token) {
+        Ok(c) => c,
+        _ => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "invalid or expired token"})),
+            )
+                .into_response();
+        }
+    };
+    let caller = match state.user_db.get_user(&claims.sub) {
+        Ok(Some(u)) => u,
+        _ => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "user not found"})),
+            )
+                .into_response();
+        }
+    };
+    if caller.role != duduclaw_auth::UserRole::Admin {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "admin required"})),
+        )
+            .into_response();
+    }
+    // Never bind an orphan identity to a non-existent user (fail-closed).
+    if !matches!(state.user_db.get_user(&body.user_id), Ok(Some(_))) {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "target user not found"})),
+        )
+            .into_response();
+    }
+    match state
+        .user_db
+        .bind_channel_identity(&body.user_id, &body.channel, &body.channel_user_id, true)
+    {
+        Ok(()) => {
+            let _ = state.user_db.log_action(
+                Some(&caller.id),
+                "channel_identity_bound",
+                Some(&body.user_id),
+                Some(&body.channel),
+                None,
+            );
+            Json(serde_json::json!({"success": true})).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
 }
 
 /// Iterate every agent's wiki under `agents_dir` and run the Phase 3
@@ -1522,6 +1846,75 @@ async fn handle_change_password(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct FirstRunClaimRequest {
+    password: String,
+}
+
+/// GET /api/first-run/status — report whether this instance is unclaimed, so the
+/// LoginPage can show a "set your admin password" form instead of demanding the
+/// console one-time password (the onboarding chicken-and-egg).
+///
+/// Loopback-only: off-loopback callers always see `claimable: false` so the
+/// unclaimed state is never advertised to the network.
+async fn handle_first_run_status(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> impl IntoResponse {
+    let claimable = addr.ip().is_loopback() && state.user_db.is_unclaimed_default_admin();
+    Json(serde_json::json!({ "claimable": claimable }))
+}
+
+/// POST /api/first-run/claim — set the initial `admin@local` password WITHOUT an
+/// old password, so a first-time operator (incl. Desktop-app users with no
+/// console) can get in. Fail-closed on three gates:
+///   1. loopback caller only (a remote attacker cannot reach the flow);
+///   2. instance still unclaimed (`must_change_password = 1`) — enforced
+///      atomically inside `claim_default_admin`, so it is single-shot;
+///   3. minimum password length.
+/// After a successful claim the flag is cleared and the endpoint goes inert.
+async fn handle_first_run_claim(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<FirstRunClaimRequest>,
+) -> impl IntoResponse {
+    if !addr.ip().is_loopback() {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "first-run setup is only available from localhost"})),
+        )
+            .into_response();
+    }
+    if body.password.chars().count() < 8 {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "password must be at least 8 characters"})),
+        )
+            .into_response();
+    }
+    match state.user_db.claim_default_admin(&body.password) {
+        Ok(true) => {
+            let _ = state
+                .user_db
+                .log_action(None, "first_run_claim", None, None, None);
+            Json(serde_json::json!({"ok": true})).into_response()
+        }
+        Ok(false) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "this instance has already been set up"})),
+        )
+            .into_response(),
+        Err(e) => {
+            warn!("first-run claim failed: {e}");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to set password"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Whether the request's `Origin` is an allowed local dashboard origin.
 ///
 /// HS3/C5: uses exact authority matching (any port on localhost / 127.0.0.1 /
@@ -1542,6 +1935,451 @@ fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+// ── Voice endpoints (openhuman-parity B: STT + TTS) ──────────────
+
+/// Max accepted STT audio upload (10 MiB — a short push-to-talk clip).
+const STT_MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
+
+/// Authenticate a request from its `Authorization: Bearer <jwt>` header.
+/// Returns `Ok(())` for a valid active-user access token, else an
+/// `into_response()`-ready 401. Same stance as `handle_me`.
+fn require_bearer(state: &AppState, headers: &axum::http::HeaderMap) -> Result<(), axum::response::Response> {
+    let token = extract_bearer_token(headers).ok_or_else(|| {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "missing Authorization header" })),
+        )
+            .into_response()
+    })?;
+    authenticate_jwt(state, token).map(|_| ()).map_err(|_| {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "invalid or expired token" })),
+        )
+            .into_response()
+    })
+}
+
+/// POST /api/stt — transcribe an uploaded audio clip to text.
+///
+/// Multipart body with an `audio` (or `file`) part (webm/ogg/wav, ≤10 MiB) plus
+/// an optional `language` text part. Returns `{ "text": "..." }`.
+///
+/// **Fail-closed**: when STT is unconfigured (`config.toml [voice] stt_provider`
+/// unset) this returns HTTP 501 with a friendly zh-TW message — never a guessed
+/// or fabricated transcript.
+async fn handle_stt(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    mut multipart: Multipart,
+) -> axum::response::Response {
+    if let Err(resp) = require_bearer(&state, &headers) {
+        return resp;
+    }
+
+    // Resolve the configured provider first — fail closed before touching the body.
+    let provider = match crate::stt::build_provider_from_config(&state.home_dir).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return (
+                axum::http::StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({
+                    "error": "尚未設定語音轉文字（STT）。請至「設定 → 語音」選擇 STT 供應商並填入必要欄位後再試。"
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("STT 設定錯誤：{e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    // Pull the audio + optional language out of the multipart form.
+    let mut audio: Option<Vec<u8>> = None;
+    let mut filename = "audio.webm".to_string();
+    let mut language: Option<String> = None;
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("malformed multipart: {e}") })),
+                )
+                    .into_response();
+            }
+        };
+        match field.name().unwrap_or("") {
+            "audio" | "file" => {
+                if let Some(fname) = field.file_name() {
+                    if !fname.is_empty() {
+                        filename = fname.to_string();
+                    }
+                }
+                match field.bytes().await {
+                    Ok(data) => {
+                        if let Err(msg) = crate::stt::check_audio_size(data.len(), STT_MAX_UPLOAD_BYTES) {
+                            return (
+                                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                                Json(serde_json::json!({ "error": msg })),
+                            )
+                                .into_response();
+                        }
+                        audio = Some(data.to_vec());
+                    }
+                    Err(e) => {
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({ "error": format!("failed to read audio: {e}") })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            "language" => {
+                language = field.text().await.ok().filter(|s| !s.is_empty());
+            }
+            _ => {}
+        }
+    }
+
+    let audio = match audio {
+        Some(a) => a,
+        None => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "missing 'audio' field" })),
+            )
+                .into_response();
+        }
+    };
+
+    match provider.transcribe(&audio, &filename, language.as_deref()).await {
+        Ok(text) => Json(serde_json::json!({ "text": text })).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": format!("轉錄失敗：{e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct TtsRequestBody {
+    text: String,
+    #[serde(default)]
+    voice: String,
+}
+
+/// POST /api/tts — synthesize speech for `text`, returning audio bytes.
+///
+/// Reuses `tts.rs` (edge-tts / MiniMax / OpenAI / Piper). The provider strategy
+/// follows `inference.toml [voice] tts_provider`. When TTS is explicitly
+/// disabled (or no provider is available) this returns HTTP 501 so the client
+/// can quietly turn its play toggle off.
+async fn handle_tts(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<TtsRequestBody>,
+) -> axum::response::Response {
+    use crate::tts::{TtsProvider, TtsRouter, TtsStrategy};
+
+    if let Err(resp) = require_bearer(&state, &headers) {
+        return resp;
+    }
+
+    let text = req.text.trim();
+    if text.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing 'text'" })),
+        )
+            .into_response();
+    }
+
+    // Read [voice] tts_provider / tts_voice from inference.toml (where the
+    // dashboard Voice tab persists them).
+    let (tts_provider, cfg_voice) = {
+        let path = state.home_dir.join("inference.toml");
+        let table: toml::Table = tokio::fs::read_to_string(&path)
+            .await
+            .ok()
+            .and_then(|c| c.parse().ok())
+            .unwrap_or_default();
+        let voice = table.get("voice").and_then(|v| v.as_table()).cloned().unwrap_or_default();
+        (
+            voice.get("tts_provider").and_then(|v| v.as_str()).unwrap_or("").trim().to_ascii_lowercase(),
+            voice.get("tts_voice").and_then(|v| v.as_str()).unwrap_or("").trim().to_string(),
+        )
+    };
+
+    // Explicit opt-out → 501 (client closes its play toggle).
+    if matches!(tts_provider.as_str(), "none" | "off" | "disabled") {
+        return (
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "尚未啟用語音朗讀（TTS）。請至「設定 → 語音」選擇語音供應商後再試。"
+            })),
+        )
+            .into_response();
+    }
+
+    let strategy = match tts_provider.as_str() {
+        "edge-tts" | "edge" => TtsStrategy::EdgeOnly,
+        "minimax" | "openai-tts" | "openai" => TtsStrategy::CloudBest,
+        _ => TtsStrategy::LocalFirst,
+    };
+
+    let models_dir = state.home_dir.join("models");
+    let router = TtsRouter::auto_detect(&models_dir, strategy);
+
+    let voice = if req.voice.trim().is_empty() {
+        cfg_voice
+    } else {
+        req.voice.trim().to_string()
+    };
+
+    match router.synthesize(text, &voice).await {
+        Ok(audio) if !audio.is_empty() => {
+            // Sniff the container so the browser <audio> element decodes it.
+            let ct = if audio.starts_with(b"RIFF") {
+                "audio/wav"
+            } else if audio.starts_with(b"OggS") {
+                "audio/ogg"
+            } else {
+                "audio/mpeg"
+            };
+            let mut resp = axum::response::Response::new(axum::body::Body::from(audio));
+            resp.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static(ct),
+            );
+            resp
+        }
+        Ok(_) => (
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "尚未啟用語音朗讀（TTS）。請至「設定 → 語音」選擇語音供應商後再試。"
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": format!("語音合成失敗：{e}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// Authenticate + require an Admin role. Returns `Ok(())` or an
+/// `into_response()`-ready 401/403.
+fn require_admin_bearer(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), axum::response::Response> {
+    let token = extract_bearer_token(headers).ok_or_else(|| {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "missing Authorization header" })),
+        )
+            .into_response()
+    })?;
+    let ctx = authenticate_jwt(state, token).map_err(|_| {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "invalid or expired token" })),
+        )
+            .into_response()
+    })?;
+    if !ctx.is_admin() {
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "admin role required" })),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+/// GET /api/voice/config — read the `[voice]` STT settings from `config.toml`.
+///
+/// The API key is never returned; instead `stt_api_key_set` reports whether one
+/// is stored. This is the source of truth for the STT provider chain that the
+/// dashboard Voice tab edits (the general TTS/ASR voice preferences continue to
+/// live in `inference.toml [voice]` via `system.update_config`).
+async fn handle_voice_config_get(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if let Err(resp) = require_bearer(&state, &headers) {
+        return resp;
+    }
+    let table: toml::Table = tokio::fs::read_to_string(state.home_dir.join("config.toml"))
+        .await
+        .ok()
+        .and_then(|c| c.parse().ok())
+        .unwrap_or_default();
+    let voice = table
+        .get("voice")
+        .and_then(|v| v.as_table())
+        .cloned()
+        .unwrap_or_default();
+    let s = |k: &str| voice.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let key_set = voice
+        .get("stt_api_key_enc")
+        .and_then(|v| v.as_str())
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+        || voice
+            .get("stt_api_key")
+            .and_then(|v| v.as_str())
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+    Json(serde_json::json!({
+        "stt_provider": s("stt_provider"),
+        "stt_base_url": s("stt_base_url"),
+        "stt_model": s("stt_model"),
+        "stt_command": s("stt_command"),
+        "stt_api_key_set": key_set,
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct VoiceConfigBody {
+    #[serde(default)]
+    stt_provider: String,
+    #[serde(default)]
+    stt_base_url: String,
+    #[serde(default)]
+    stt_model: String,
+    #[serde(default)]
+    stt_command: String,
+    /// Omitted / empty → leave the stored key untouched. A literal empty-clear
+    /// is done by sending the sentinel `"__CLEAR__"`.
+    stt_api_key: Option<String>,
+}
+
+/// POST /api/voice/config — write the `[voice]` STT settings to `config.toml`
+/// (admin only). The API key is encrypted at rest (AES-256-GCM →
+/// `stt_api_key_enc`), matching every other gateway secret.
+async fn handle_voice_config_set(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<VoiceConfigBody>,
+) -> axum::response::Response {
+    if let Err(resp) = require_admin_bearer(&state, &headers) {
+        return resp;
+    }
+
+    // Validate provider (fail-closed on typos).
+    let provider = body.stt_provider.trim();
+    if !provider.is_empty() && crate::stt::parse_provider_kind(provider).is_none() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("未知的 stt_provider '{provider}'（可用：openai_compat / command）")
+            })),
+        )
+            .into_response();
+    }
+
+    let config_path = state.home_dir.join("config.toml");
+    let mut table: toml::Table = tokio::fs::read_to_string(&config_path)
+        .await
+        .ok()
+        .and_then(|c| c.parse().ok())
+        .unwrap_or_default();
+
+    let voice = table
+        .entry("voice".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let voice = match voice.as_table_mut() {
+        Some(v) => v,
+        None => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "config.toml [voice] is not a table" })),
+            )
+                .into_response();
+        }
+    };
+
+    voice.insert("stt_provider".into(), toml::Value::String(provider.to_string()));
+    voice.insert(
+        "stt_base_url".into(),
+        toml::Value::String(body.stt_base_url.trim().to_string()),
+    );
+    voice.insert(
+        "stt_model".into(),
+        toml::Value::String(body.stt_model.trim().to_string()),
+    );
+    voice.insert(
+        "stt_command".into(),
+        toml::Value::String(body.stt_command.trim().to_string()),
+    );
+
+    // API key: encrypt at rest. Empty/absent → keep existing; "__CLEAR__" → wipe.
+    match body.stt_api_key.as_deref() {
+        None | Some("") => { /* leave stored key untouched */ }
+        Some("__CLEAR__") => {
+            voice.remove("stt_api_key");
+            voice.remove("stt_api_key_enc");
+        }
+        Some(k) => {
+            voice.remove("stt_api_key");
+            match crate::config_crypto::encrypt_value(k, &state.home_dir) {
+                Some(enc) => {
+                    voice.insert("stt_api_key_enc".into(), toml::Value::String(enc));
+                }
+                None => {
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": "failed to encrypt stt_api_key" })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
+    // Atomic write: temp file + rename, same pattern as the config handlers.
+    let serialized = match toml::to_string_pretty(&table) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("serialize config.toml: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let tmp = config_path.with_extension("toml.tmp");
+    if let Err(e) = tokio::fs::write(&tmp, serialized).await {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("write config.toml: {e}") })),
+        )
+            .into_response();
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, &config_path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("commit config.toml: {e}") })),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({ "success": true })).into_response()
 }
 
 // ── WebSocket Handlers ───────────────────────────────────────

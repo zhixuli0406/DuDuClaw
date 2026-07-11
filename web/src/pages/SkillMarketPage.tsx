@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
-import { api, type SkillIndexEntry, type SharedSkillInfo, type SkillInfo } from '@/lib/api';
+import { api, type SkillIndexEntry, type SharedSkillInfo, type SkillInfo, type SkillLeaderboardEntry } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
 import { Dialog } from '@/components/shared/Dialog';
+import { CustomSkillsSection } from '@/components/skills/CustomSkillsSection';
 import { toast, formatError } from '@/lib/toast';
 import {
   Page,
@@ -16,13 +17,14 @@ import {
   Badge,
   EmptyState,
   Field,
+  CharacterAvatar,
+  Mono,
   controlClass,
   type TabItem,
 } from '@/components/ui';
 import {
   Search,
   Tag,
-  User,
   ExternalLink,
   Download,
   Shield,
@@ -36,6 +38,8 @@ import {
   Sparkles,
   Store,
   Puzzle,
+  Trophy,
+  Clock,
 } from 'lucide-react';
 
 interface VetResult {
@@ -51,7 +55,7 @@ interface VetResponse {
   passed: boolean;
 }
 
-type SkillTab = 'market' | 'shared' | 'mySkills';
+type SkillTab = 'market' | 'shared' | 'mySkills' | 'leaderboard';
 
 export function SkillMarketPage() {
   const intl = useIntl();
@@ -61,6 +65,7 @@ export function SkillMarketPage() {
     { id: 'market', label: intl.formatMessage({ id: 'skills.tab.market' }), icon: Store },
     { id: 'shared', label: intl.formatMessage({ id: 'skills.tab.shared' }), icon: Users },
     { id: 'mySkills', label: intl.formatMessage({ id: 'skills.tab.mySkills' }), icon: Sparkles },
+    { id: 'leaderboard', label: intl.formatMessage({ id: 'skills.tab.leaderboard' }), icon: Trophy },
   ];
 
   return (
@@ -76,7 +81,104 @@ export function SkillMarketPage() {
       {activeTab === 'market' && <MarketTab />}
       {activeTab === 'shared' && <SharedSkillsTab />}
       {activeTab === 'mySkills' && <MySkillsTab />}
+      {activeTab === 'leaderboard' && <LeaderboardTab />}
     </Page>
+  );
+}
+
+// ── Leaderboard Tab (WP10-T10.1 — honour roll of time-saving skills) ─────
+
+const RANK_ACCENT: Record<number, string> = {
+  0: 'text-amber-500',
+  1: 'text-stone-400',
+  2: 'text-orange-400',
+};
+
+function LeaderboardTab() {
+  const intl = useIntl();
+  const [entries, setEntries] = useState<SkillLeaderboardEntry[]>([]);
+  const [note, setNote] = useState<string>('');
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setLoading(true);
+    (async () => {
+      try {
+        const res = await api.skills.leaderboard();
+        setEntries(res?.leaderboard ?? []);
+        setNote(res?.note ?? '');
+      } catch (e) {
+        console.warn('[api]', e);
+        toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+        setEntries([]);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [intl]);
+
+  return (
+    <div className="space-y-6">
+      <p className="text-sm text-stone-500 dark:text-stone-400">
+        {intl.formatMessage({ id: 'skills.leaderboard.subtitle' })}
+      </p>
+
+      {loading ? (
+        <div className="py-12 text-center text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</div>
+      ) : entries.length === 0 ? (
+        <Card>
+          <EmptyState
+            dudu="curious"
+            icon={Trophy}
+            title={intl.formatMessage({ id: 'skills.leaderboard.empty' })}
+          />
+        </Card>
+      ) : (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {entries.map((entry, i) => (
+            <Card key={`${entry.owner}/${entry.skill}`}>
+              <div className="flex items-start gap-3">
+                <span
+                  className={cn(
+                    'flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-stone-500/10 text-sm font-bold tabular-nums dark:bg-white/5',
+                    RANK_ACCENT[i] ?? 'text-stone-500 dark:text-stone-400',
+                  )}
+                  aria-hidden="true"
+                >
+                  {i < 3 ? <Trophy className="h-4 w-4" /> : i + 1}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <h3 className="truncate font-semibold text-stone-900 dark:text-stone-50" title={entry.display_name || entry.skill}>
+                    {entry.display_name || entry.skill}
+                  </h3>
+                  <p className="mt-1 flex items-center gap-1.5 text-sm font-medium text-amber-600 dark:text-amber-400">
+                    <Clock className="h-3.5 w-3.5" />
+                    {intl.formatMessage(
+                      { id: 'skills.leaderboard.minutesSaved' },
+                      { minutes: entry.estimated_minutes_saved },
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-4 flex flex-wrap items-center gap-1.5 border-t border-[var(--panel-border)] pt-3 text-xs text-stone-500 dark:text-stone-400">
+                {entry.owner && (
+                  <span className="flex items-center gap-1">
+                    <CharacterAvatar agentId={entry.owner} name={entry.owner} size={24} />
+                    {entry.owner}
+                  </span>
+                )}
+                {entry.scope && <Badge tone="neutral">{entry.scope}</Badge>}
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {note && (
+        <p className="text-xs text-stone-400 dark:text-stone-500">{note}</p>
+      )}
+    </div>
   );
 }
 
@@ -137,6 +239,7 @@ function MarketTab() {
       {!loading && searched && results.length === 0 && (
         <Card>
           <EmptyState
+            dudu="concerned"
             icon={Search}
             title={intl.formatMessage({ id: 'skills.market.noResults' })}
           />
@@ -237,6 +340,7 @@ function SharedSkillsTab() {
       ) : sharedSkills.length === 0 ? (
         <Card>
           <EmptyState
+            dudu="curious"
             icon={Share2}
             title={intl.formatMessage({ id: 'skills.shared.empty' })}
           />
@@ -260,12 +364,12 @@ function SharedSkillsTab() {
 
               <div className="mt-4 space-y-2 text-xs text-stone-500 dark:text-stone-400">
                 <div className="flex items-center gap-2">
-                  <User className="h-3 w-3" />
+                  <CharacterAvatar agentId={skill.shared_by} name={skill.shared_by} size={24} />
                   <span>{intl.formatMessage({ id: 'skills.shared.sharedBy' })}: {skill.shared_by}</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <Download className="h-3 w-3" />
-                  <span>{intl.formatMessage({ id: 'skills.shared.usageCount' })}: {skill.usage_count}</span>
+                  <span>{intl.formatMessage({ id: 'skills.shared.usageCount' })}: <Mono>{skill.usage_count}</Mono></span>
                 </div>
                 {skill.adopted_by.length > 0 && (
                   <div className="flex items-center gap-2">
@@ -314,7 +418,7 @@ function SharedSkillsTab() {
               ))}
             </select>
             {adoptSuccess && (
-              <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700 dark:border-emerald-800 dark:bg-emerald-900/20 dark:text-emerald-400">
+              <div className="flex items-center gap-2 rounded-control border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700 dark:border-emerald-800 dark:bg-emerald-900/20 dark:text-emerald-400">
                 <CheckCircle className="h-4 w-4 flex-shrink-0" />
                 {adoptSuccess}
               </div>
@@ -385,6 +489,9 @@ function MySkillsTab() {
 
   return (
     <div className="space-y-6">
+      {/* Self-built skills (V13 / T13.2) */}
+      <CustomSkillsSection />
+
       {/* Agent selector */}
       <Toolbar>
         <Field label="Agent" className="space-y-0">
@@ -405,6 +512,7 @@ function MySkillsTab() {
       ) : skills.length === 0 ? (
         <Card>
           <EmptyState
+            dudu="curious"
             icon={Sparkles}
             title={intl.formatMessage({ id: 'common.noData' })}
           />
@@ -494,7 +602,7 @@ function SkillCard({
       <div className="flex items-center justify-between border-t border-[var(--panel-border)] pt-3">
         {skill.author && (
           <span className="flex items-center gap-1 text-xs text-stone-400">
-            <User className="h-3 w-3" />
+            <CharacterAvatar agentId={skill.author} name={skill.author} size={24} />
             {skill.author}
           </span>
         )}
@@ -688,14 +796,14 @@ function InstallDialog({
 
         {/* Error */}
         {error && (
-          <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-400">
+          <div className="rounded-control border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-400">
             {error}
           </div>
         )}
 
         {/* Success message */}
         {installed && scanResult && (
-          <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700 dark:border-emerald-800 dark:bg-emerald-900/20 dark:text-emerald-400">
+          <div className="flex items-center gap-2 rounded-control border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700 dark:border-emerald-800 dark:bg-emerald-900/20 dark:text-emerald-400">
             <CheckCircle className="h-4 w-4 flex-shrink-0" />
             {intl.formatMessage(
               { id: 'skills.install.success' },
@@ -747,7 +855,7 @@ function FindingsList({
           return (
             <li
               key={i}
-              className={`flex items-start gap-2 rounded-lg border p-2.5 text-sm ${SEVERITY_BG[severityKey] ?? SEVERITY_BG.low}`}
+              className={`flex items-start gap-2 rounded-control border p-2.5 text-sm ${SEVERITY_BG[severityKey] ?? SEVERITY_BG.low}`}
             >
               <AlertTriangle className={`mt-0.5 h-3.5 w-3.5 flex-shrink-0 ${SEVERITY_COLORS[severityKey] ?? SEVERITY_COLORS.low}`} />
               <div className="min-w-0">

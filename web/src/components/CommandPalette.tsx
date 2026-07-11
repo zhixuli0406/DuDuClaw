@@ -11,19 +11,23 @@ import {
   Monitor,
   Languages,
   LogOut,
-  LayoutGrid,
-  Home,
+  Bot,
+  ClipboardList,
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { fuzzyMatch, highlightSegments } from '@/lib/fuzzy';
-import { navGroups } from '@/components/layout/nav-model';
+import { dailyItems, navGroups, staffEntry, manageNav, manageEntry, type NavItem } from '@/components/layout/nav-model';
 import { hasMinRole } from '@/lib/roles';
+import { isVisible } from '@/lib/nav-visibility';
+import { useForksExist } from '@/hooks/useForksExist';
+import { CharacterAvatar } from '@/components/character';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
 import { useSystemStore } from '@/stores/system-store';
+import { useAgentsStore } from '@/stores/agents-store';
+import { useTasksStore } from '@/stores/tasks-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useThemeStore } from '@/stores/theme-store';
-import { useUiModeStore } from '@/stores/ui-mode-store';
 import { useLocaleStore, localeNames } from '@/i18n';
 
 interface Command {
@@ -35,6 +39,9 @@ interface Command {
   /** Extra Latin/alias tokens so CJK labels are reachable by English typing. */
   readonly keywords: string;
   readonly icon: LucideIcon;
+  /** When set, the result row leads with the AI-staff character avatar for this
+   *  agent id instead of the lucide icon (T2.3). */
+  readonly avatarAgentId?: string;
   readonly perform: () => void;
   /** For nav commands: highlight active route + power "recent". */
   readonly route?: string;
@@ -66,10 +73,17 @@ export function CommandPalette() {
 
   const status = useSystemStore((s) => s.status);
   const user = useAuthStore((s) => s.user);
+  const bindings = useAuthStore((s) => s.bindings);
+  const agents = useAgentsStore((s) => s.agents);
+  const tasks = useTasksStore((s) => s.tasks);
   const logout = useAuthStore((s) => s.logout);
+  // Operator/owner binding gates sensitive `operatorOnly` commands (fail-closed).
+  const hasOperatorAccess = bindings.some(
+    (b) => b.access_level === 'owner' || b.access_level === 'operator',
+  );
+  // Progressive disclosure for /forks — same signal the Sidebar uses.
+  const forksExist = useForksExist(hasMinRole(user?.role, 'manager'));
   const setTheme = useThemeStore((s) => s.setTheme);
-  const setMode = useUiModeStore((s) => s.setMode);
-  const mode = useUiModeStore((s) => s.mode);
   const setLocale = useLocaleStore((s) => s.setLocale);
 
   const [query, setQuery] = useState('');
@@ -105,24 +119,70 @@ export function CommandPalette() {
 
   // Build the full command set (nav + actions), role/edition gated like the sidebar.
   const commands = useMemo<Command[]>(() => {
-    const navCommands: Command[] = navGroups.flatMap((group) =>
-      group.items
-        .filter(
-          (item) => hasMinRole(user?.role, item.minRole) && !(isPersonal && item.enterprise)
-        )
-        .map((item) => ({
-          id: `nav:${item.to}`,
-          groupLabel: t(group.label),
-          label: t(item.label),
-          subtitle: t(item.desc),
-          // Latin alias from the i18n id (e.g. "nav.settings" → "settings") + route
-          // + the localized description so users can search by what a page does.
-          keywords: `${item.label.replace(/^nav\./, '')} ${item.to} ${t(item.desc)}`,
-          icon: item.icon,
-          route: item.to,
-          perform: () => navigate(item.to),
-        }))
-    );
+    // Daily items + the two collapsible groups live in `navGroups`, but the flat
+    // daily row and the 員工 roster entry sit outside it — fold them all back in
+    // so ⌘K reaches every destination (T1.5).
+    const navSources: Array<{ item: NavItem; groupLabel: string }> = [
+      ...dailyItems.map((item) => ({ item, groupLabel: 'navGroup.daily' })),
+      ...navGroups.flatMap((group) => group.items.map((item) => ({ item, groupLabel: group.label }))),
+      { item: staffEntry, groupLabel: 'navGroup.staff' },
+    ];
+    const visibilityCtx = { hasOperatorAccess, forksExist };
+    const navCommands: Command[] = navSources
+      .filter(({ item }) => isVisible(item, user?.role, isPersonal, visibilityCtx))
+      .map(({ item, groupLabel }) => ({
+        id: `nav:${item.to}`,
+        groupLabel: t(groupLabel),
+        label: t(item.label),
+        subtitle: t(item.desc),
+        // Latin alias from the i18n id (e.g. "nav.settings" → "settings") + route
+        // + the localized description so users can search by what a page does.
+        keywords: `${item.label.replace(/^nav\./, '')} ${item.to} ${t(item.desc)}`,
+        icon: item.icon,
+        route: item.to,
+        perform: () => navigate(item.to),
+      }));
+
+    // Zone D management pages live behind a single sidebar entry, so ⌘K is the
+    // primary way to reach them directly (dashboard-redesign §3.1, T1.3).
+    const manageCommands: Command[] = manageNav
+      .filter((item) => isVisible(item, user?.role, isPersonal, visibilityCtx))
+      .map((item) => ({
+        id: `nav:${item.to}`,
+        groupLabel: t(manageEntry.label),
+        label: t(item.label),
+        subtitle: t(item.desc),
+        keywords: `${item.label.replace(/^manage\./, '')} ${item.to} ${t(item.desc)} manage 管理`,
+        icon: item.icon,
+        route: item.to,
+        perform: () => navigate(item.to),
+      }));
+
+    // Entity search (T1.3) — jump straight to a specific AI staff detail page.
+    const agentCommands: Command[] = agents.map((a) => ({
+      id: `entity:agent:${a.name}`,
+      groupLabel: t('cmdk.group.agents'),
+      label: a.display_name,
+      subtitle: a.name,
+      keywords: `${a.name} ${a.display_name} staff 員工`,
+      icon: Bot,
+      avatarAgentId: a.name,
+      route: `/agents/${a.name}`,
+      perform: () => navigate(`/agents/${encodeURIComponent(a.name)}`),
+    }));
+
+    // Entity search (T1.5) — jump to a task detail by fuzzy title (CJK-safe via
+    // the shared `fuzzyMatch`). Sourced from whatever the tasks store holds.
+    const taskCommands: Command[] = tasks.map((task) => ({
+      id: `entity:task:${task.id}`,
+      groupLabel: t('cmdk.group.tasks'),
+      label: task.title,
+      subtitle: task.id,
+      keywords: `${task.title} ${task.id} task 任務`,
+      icon: ClipboardList,
+      route: `/tasks/${task.id}`,
+      perform: () => navigate(`/tasks/${encodeURIComponent(task.id)}`),
+    }));
 
     const actionGroup = t('cmdk.group.actions');
     const themeActions: Command[] = (['light', 'dark', 'system'] as const).map((th) => ({
@@ -143,15 +203,6 @@ export function CommandPalette() {
       perform: () => setLocale(code),
     }));
 
-    const modeAction: Command = {
-      id: 'action:mode',
-      groupLabel: actionGroup,
-      label: t(mode === 'workspace' ? 'cmdk.action.mode.toDashboard' : 'cmdk.action.mode.toWorkspace'),
-      keywords: 'mode workspace dashboard switch shell 模式 切換',
-      icon: mode === 'workspace' ? LayoutGrid : Home,
-      perform: () => setMode(mode === 'workspace' ? 'dashboard' : 'workspace'),
-    };
-
     const logoutAction: Command = {
       id: 'action:logout',
       groupLabel: actionGroup,
@@ -161,8 +212,8 @@ export function CommandPalette() {
       perform: () => logout(),
     };
 
-    return [...navCommands, modeAction, ...themeActions, ...localeActions, logoutAction];
-  }, [t, user?.role, isPersonal, mode, navigate, setTheme, setLocale, setMode, logout]);
+    return [...navCommands, ...manageCommands, ...agentCommands, ...taskCommands, ...themeActions, ...localeActions, logoutAction];
+  }, [t, user?.role, hasOperatorAccess, forksExist, agents, tasks, isPersonal, navigate, setTheme, setLocale, logout]);
 
   // Empty query → recent routes first, then all commands in natural order.
   const results = useMemo<ScoredCommand[]>(() => {
@@ -321,13 +372,19 @@ export function CommandPalette() {
                           : 'text-stone-700 dark:text-stone-300'
                       )}
                     >
-                      <Icon
-                        className={cn(
-                          'mt-0.5 h-[1.125rem] w-[1.125rem] shrink-0',
-                          isActive ? 'text-amber-600 dark:text-amber-400' : 'text-stone-400'
-                        )}
-                        aria-hidden="true"
-                      />
+                      {cmd.avatarAgentId ? (
+                        <span className="mt-0.5 shrink-0">
+                          <CharacterAvatar agentId={cmd.avatarAgentId} name={cmd.label} size={20} />
+                        </span>
+                      ) : (
+                        <Icon
+                          className={cn(
+                            'mt-0.5 h-[1.125rem] w-[1.125rem] shrink-0',
+                            isActive ? 'text-amber-600 dark:text-amber-400' : 'text-stone-400'
+                          )}
+                          aria-hidden="true"
+                        />
+                      )}
                       <span className="min-w-0 flex-1">
                         <span className="block truncate leading-tight">
                           {highlightSegments(cmd.label, cmd.indices).map((seg, i) =>

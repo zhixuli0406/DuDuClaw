@@ -207,7 +207,15 @@ export class DuDuClawClient {
    * reaches `authenticated` to prevent race conditions where API calls
    * fire before the handshake completes.
    */
-  call(method: string, params: Record<string, unknown> = {}, skipAuthWait = false): Promise<unknown> {
+  call(
+    method: string,
+    params: Record<string, unknown> = {},
+    skipAuthWait = false,
+    // Per-call response timeout. Defaults to 30s; long-running RPCs (e.g.
+    // `migrate.apply`, which may run up to 300s server-side) pass a larger value
+    // so the dashboard doesn't reject a request the gateway is still working on.
+    timeoutMs = 30000,
+  ): Promise<unknown> {
     const waitForReady = (): Promise<void> => {
       // For handshake calls, only need WS to be open
       const isReady = skipAuthWait
@@ -244,7 +252,7 @@ export class DuDuClawClient {
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(id);
         reject(new Error(`Request timeout: ${method}`));
-      }, 30000);
+      }, timeoutMs);
 
       this.pendingRequests.set(id, { resolve, reject, timeout });
 

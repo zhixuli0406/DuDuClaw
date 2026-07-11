@@ -28,6 +28,8 @@ import {
   Badge,
   EmptyState,
   Toolbar,
+  Mono,
+  CharacterAvatar,
   controlClass,
 } from '@/components/ui';
 import type { TabItem } from '@/components/ui';
@@ -225,6 +227,7 @@ function HistoryTab() {
         <Card className="flex-1" bodyClassName="flex h-full items-center justify-center">
           <EmptyState
             icon={Inbox}
+            dudu="concerned"
             title={intl.formatMessage({ id: 'logs.empty.noMatch' })}
           />
         </Card>
@@ -349,13 +352,14 @@ function AuditRow({
           {event.event_type}
         </span>
         {event.agent_id && (
-          <span className="text-xs font-medium text-amber-600 dark:text-amber-400">
+          <span className="flex items-center gap-1 text-xs font-medium text-amber-600 dark:text-amber-400">
+            <CharacterAvatar agentId={event.agent_id} name={event.agent_id} size={16} />
             {event.agent_id}
           </span>
         )}
-        <span className="ml-auto text-xs text-stone-400 dark:text-stone-500">
+        <Mono className="ml-auto text-xs text-stone-400 dark:text-stone-500">
           {time}
-        </span>
+        </Mono>
       </div>
 
       {event.summary && (

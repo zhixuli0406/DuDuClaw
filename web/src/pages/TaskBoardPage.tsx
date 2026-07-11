@@ -1,30 +1,63 @@
-import { useEffect, useState, useCallback, type DragEvent } from 'react';
+import { useCallback, useEffect, useMemo, useState, type DragEvent } from 'react';
 import { useIntl } from 'react-intl';
+import { useNavigate, useSearchParams } from 'react-router';
 import { cn } from '@/lib/utils';
 import { useTasksStore } from '@/stores/tasks-store';
 import { useAgentsStore } from '@/stores/agents-store';
-import { Dialog, FormField, inputClass, selectClass } from '@/components/shared/Dialog';
-import { Page, PageHeader, Card, Badge, Button, EmptyState, Toolbar, controlClass } from '@/components/ui';
+import { Dialog } from '@/components/shared/Dialog';
+import {
+  Page,
+  PageHeader,
+  Card,
+  Badge,
+  Button,
+  EmptyState,
+  Toolbar,
+  GroupHeader,
+  StatusIcon,
+  PriorityIcon,
+  CharacterAvatar,
+  Mono,
+  controlClass,
+} from '@/components/ui';
+import { CreateTaskModal, TaskDoneBurst, celebrateTaskDone } from '@/components/task';
+import { toStatusKey, toBackendStatus } from '@/lib/task-status';
+import { timeAgo } from '@/lib/format';
 import type { TaskInfo, TaskStatus, TaskPriority, TaskCreateParams } from '@/lib/api';
-import type { TaskUpdateParams } from '@/lib/api';
 import {
   Plus,
   GripVertical,
-  AlertCircle,
   Clock,
+  AlertCircle,
   CheckCircle2,
   Ban,
-  Flag,
   Filter,
   Trash2,
-  X,
-  Pencil,
-  Save,
-  User,
-  Calendar,
-  Link2,
   KanbanSquare,
+  List,
 } from 'lucide-react';
+
+// ── Preferences (localStorage, §4.4) ────────────────────────
+const VIEW_KEY = 'duduclaw:tasks:view';
+const GROUP_KEY = 'duduclaw:tasks:group';
+type ViewMode = 'kanban' | 'list';
+type GroupMode = 'status' | 'assignee';
+
+function readPref<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
+  try {
+    const v = localStorage.getItem(key);
+    return v && (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function writePref(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* private mode — preference just won't persist */
+  }
+}
 
 const COLUMNS: ReadonlyArray<{ status: TaskStatus; icon: React.ComponentType<{ className?: string }> }> = [
   { status: 'todo', icon: Clock },
@@ -40,8 +73,6 @@ const COLUMN_STYLES: Record<TaskStatus, string> = {
   blocked: 'border-t-rose-500',
 };
 
-// ── Priority Badge ──────────────────────────────────────────
-
 const PRIORITY_TONES: Record<TaskPriority, 'neutral' | 'info' | 'warning' | 'danger'> = {
   low: 'neutral',
   medium: 'info',
@@ -49,32 +80,19 @@ const PRIORITY_TONES: Record<TaskPriority, 'neutral' | 'info' | 'warning' | 'dan
   urgent: 'danger',
 };
 
-function PriorityBadge({ priority }: { priority: TaskPriority }) {
-  const intl = useIntl();
-  return (
-    <Badge tone={PRIORITY_TONES[priority]}>
-      <Flag className="h-3 w-3" />
-      {intl.formatMessage({ id: `tasks.priority.${priority}` })}
-    </Badge>
-  );
-}
-
-// ── Task Card ───────────────────────────────────────────────
-
+// ── Board card ──────────────────────────────────────────────
 function TaskCard({
   task,
-  agents,
+  agent,
+  onOpen,
   onRemove,
-  onSelect,
 }: {
   task: TaskInfo;
-  agents: ReadonlyArray<{ name: string; display_name: string; icon: string }>;
-  onRemove: (id: string) => void;
-  onSelect: (task: TaskInfo) => void;
+  agent?: { name: string; display_name: string };
+  onOpen: (id: string) => void;
+  onRemove: (task: TaskInfo) => void;
 }) {
   const intl = useIntl();
-  const agent = agents.find((a) => a.name === task.assigned_to);
-
   const handleDragStart = useCallback(
     (e: DragEvent<HTMLDivElement>) => {
       e.dataTransfer.setData('text/plain', task.id);
@@ -87,27 +105,25 @@ function TaskCard({
     <div
       draggable
       onDragStart={handleDragStart}
-      className="panel panel-hover group cursor-grab rounded-lg p-3 active:cursor-grabbing"
+      className="panel panel-hover group cursor-grab rounded-card p-3 active:cursor-grabbing"
     >
       <div className="flex items-start justify-between gap-2">
-        <div className="flex items-start gap-2">
+        <div className="flex min-w-0 items-start gap-2">
           <GripVertical className="mt-0.5 h-4 w-4 flex-shrink-0 text-stone-300 dark:text-stone-600" />
           <div className="min-w-0">
             <button
-              onClick={(e) => { e.stopPropagation(); onSelect(task); }}
+              onClick={() => onOpen(task.id)}
               className="text-left text-sm font-medium text-stone-900 hover:text-amber-600 dark:text-stone-50 dark:hover:text-amber-400"
             >
               {task.title}
             </button>
             {task.description && (
-              <p className="mt-1 line-clamp-2 text-xs text-stone-500 dark:text-stone-400">
-                {task.description}
-              </p>
+              <p className="mt-1 line-clamp-2 text-xs text-stone-500 dark:text-stone-400">{task.description}</p>
             )}
           </div>
         </div>
         <button
-          onClick={() => onRemove(task.id)}
+          onClick={() => onRemove(task)}
           className="flex-shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
           title={intl.formatMessage({ id: 'tasks.remove' })}
         >
@@ -116,22 +132,19 @@ function TaskCard({
       </div>
 
       <div className="mt-3 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <PriorityBadge priority={task.priority} />
-          {task.tags.length > 0 && (
-            <Badge tone="neutral">
-              {task.tags[0]}
-              {task.tags.length > 1 && ` +${task.tags.length - 1}`}
-            </Badge>
-          )}
+        <div className="flex items-center gap-1.5">
+          <PriorityIcon priority={task.priority} size="sm" />
+          <Badge tone={PRIORITY_TONES[task.priority]}>
+            {intl.formatMessage({ id: `tasks.priority.${task.priority}` })}
+          </Badge>
         </div>
         {agent && (
-          <div className="flex items-center gap-1.5" title={agent.display_name}>
-            <span className="text-sm">{agent.icon || '🤖'}</span>
-            <span className="max-w-[80px] truncate text-xs text-stone-500 dark:text-stone-400">
+          <span className="flex items-center gap-1.5" title={agent.display_name}>
+            <CharacterAvatar agentId={agent.name} name={agent.display_name} size={22} animated={false} />
+            <span className="max-w-[84px] truncate text-xs text-stone-500 dark:text-stone-400">
               {agent.display_name}
             </span>
-          </div>
+          </span>
         )}
       </div>
 
@@ -144,60 +157,42 @@ function TaskCard({
   );
 }
 
-// ── Kanban Column ───────────────────────────────────────────
-
+// ── Kanban column ───────────────────────────────────────────
 function KanbanColumn({
   status,
   icon: Icon,
   tasks,
   agents,
   onDrop,
+  onOpen,
   onRemove,
-  onSelect,
 }: {
   status: TaskStatus;
   icon: React.ComponentType<{ className?: string }>;
   tasks: ReadonlyArray<TaskInfo>;
-  agents: ReadonlyArray<{ name: string; display_name: string; icon: string }>;
+  agents: ReadonlyArray<{ name: string; display_name: string }>;
   onDrop: (taskId: string, status: TaskStatus) => void;
-  onRemove: (id: string) => void;
-  onSelect: (task: TaskInfo) => void;
+  onOpen: (id: string) => void;
+  onRemove: (task: TaskInfo) => void;
 }) {
   const intl = useIntl();
   const [isDragOver, setIsDragOver] = useState(false);
 
-  const handleDragOver = useCallback((e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    setIsDragOver(true);
-  }, []);
-
-  const handleDragLeave = useCallback(() => {
-    setIsDragOver(false);
-  }, []);
-
-  const handleDrop = useCallback(
-    (e: DragEvent<HTMLDivElement>) => {
-      e.preventDefault();
-      setIsDragOver(false);
-      const taskId = e.dataTransfer.getData('text/plain');
-      if (taskId) {
-        onDrop(taskId, status);
-      }
-    },
-    [onDrop, status],
-  );
-
   return (
     <div
-      className={cn(
-        'panel flex min-h-[300px] flex-col border-t-4',
-        COLUMN_STYLES[status],
-        isDragOver && 'ring-2 ring-amber-400/50',
-      )}
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
+      className={cn('panel flex min-h-[300px] flex-col border-t-4', COLUMN_STYLES[status], isDragOver && 'ring-2 ring-amber-400/50')}
+      onDragOver={(e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        setIsDragOver(true);
+      }}
+      onDragLeave={() => setIsDragOver(false)}
+      onDrop={(e) => {
+        e.preventDefault();
+        setIsDragOver(false);
+        const taskId = e.dataTransfer.getData('text/plain');
+        if (taskId) onDrop(taskId, status);
+      }}
     >
       <div className="flex items-center justify-between border-b border-[var(--panel-border)] px-4 py-3">
         <div className="flex items-center gap-2">
@@ -205,21 +200,27 @@ function KanbanColumn({
           <h3 className="text-sm font-semibold text-stone-700 dark:text-stone-300">
             {intl.formatMessage({ id: `tasks.column.${status}` })}
           </h3>
-          <Badge tone="neutral" className="tabular-nums">{tasks.length}</Badge>
+          <Badge tone="neutral" className="tabular-nums">
+            {tasks.length}
+          </Badge>
         </div>
       </div>
 
       <div className="flex-1 space-y-2 p-3">
         {tasks.map((task) => (
-          <TaskCard key={task.id} task={task} agents={agents} onRemove={onRemove} onSelect={onSelect} />
+          <TaskCard
+            key={task.id}
+            task={task}
+            agent={agents.find((a) => a.name === task.assigned_to)}
+            onOpen={onOpen}
+            onRemove={onRemove}
+          />
         ))}
         {tasks.length === 0 && (
           <div
             className={cn(
-              'flex items-center justify-center rounded-lg border-2 border-dashed py-8 text-xs text-stone-400 transition-colors dark:text-stone-600',
-              isDragOver
-                ? 'border-amber-400 bg-amber-50/50 dark:bg-amber-900/10'
-                : 'border-[var(--panel-border)]',
+              'flex items-center justify-center rounded-card border-2 border-dashed py-8 text-xs text-stone-400 transition-colors dark:text-stone-600',
+              isDragOver ? 'border-amber-400 bg-amber-50/50 dark:bg-amber-900/10' : 'border-[var(--panel-border)]',
             )}
           >
             {intl.formatMessage({ id: 'tasks.dropHint' })}
@@ -230,352 +231,48 @@ function KanbanColumn({
   );
 }
 
-// ── Create Task Dialog ──────────────────────────────────────
-
-function CreateTaskDialog({
-  open,
-  onClose,
-  agents,
-  onCreate,
-}: {
-  open: boolean;
-  onClose: () => void;
-  agents: ReadonlyArray<{ name: string; display_name: string; icon: string }>;
-  onCreate: (params: TaskCreateParams) => Promise<void>;
-}) {
-  const intl = useIntl();
-  const [title, setTitle] = useState('');
-  const [description, setDescription] = useState('');
-  const [assignedTo, setAssignedTo] = useState(agents[0]?.name ?? '');
-  const [priority, setPriority] = useState<TaskPriority>('medium');
-  const [tagsInput, setTagsInput] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-
-  const handleSubmit = useCallback(async () => {
-    if (!title.trim() || !assignedTo) return;
-    setSubmitting(true);
-    try {
-      await onCreate({
-        title: title.trim(),
-        description: description.trim() || undefined,
-        assigned_to: assignedTo,
-        priority,
-        tags: tagsInput
-          .split(',')
-          .map((t) => t.trim())
-          .filter(Boolean),
-      });
-      setTitle('');
-      setDescription('');
-      setTagsInput('');
-      onClose();
-    } finally {
-      setSubmitting(false);
-    }
-  }, [title, description, assignedTo, priority, tagsInput, onCreate, onClose]);
-
-  return (
-    <Dialog
-      open={open}
-      title={intl.formatMessage({ id: 'tasks.create' })}
-      onClose={onClose}
-    >
-      <div className="space-y-4">
-        <FormField label={intl.formatMessage({ id: 'tasks.field.title' })}>
-          <input
-            className={inputClass}
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            placeholder={intl.formatMessage({ id: 'tasks.field.title' })}
-            autoFocus
-          />
-        </FormField>
-
-        <FormField label={intl.formatMessage({ id: 'tasks.field.description' })}>
-          <textarea
-            className={cn(inputClass, 'min-h-[80px] resize-y')}
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
-            placeholder={intl.formatMessage({ id: 'tasks.field.description' })}
-          />
-        </FormField>
-
-        <FormField label={intl.formatMessage({ id: 'tasks.field.assignTo' })}>
-          <select className={selectClass} value={assignedTo} onChange={(e) => setAssignedTo(e.target.value)}>
-            {agents.map((a) => (
-              <option key={a.name} value={a.name}>
-                {a.icon || '🤖'} {a.display_name}
-              </option>
-            ))}
-          </select>
-        </FormField>
-
-        <FormField label={intl.formatMessage({ id: 'tasks.field.priority' })}>
-          <select
-            className={selectClass}
-            value={priority}
-            onChange={(e) => setPriority(e.target.value as TaskPriority)}
-          >
-            {(['low', 'medium', 'high', 'urgent'] as const).map((p) => (
-              <option key={p} value={p}>
-                {intl.formatMessage({ id: `tasks.priority.${p}` })}
-              </option>
-            ))}
-          </select>
-        </FormField>
-
-        <FormField label={intl.formatMessage({ id: 'tasks.field.tags' })}>
-          <input
-            className={inputClass}
-            value={tagsInput}
-            onChange={(e) => setTagsInput(e.target.value)}
-            placeholder="bug, feature, docs"
-          />
-        </FormField>
-
-        <div className="flex justify-end gap-3 pt-2">
-          <Button variant="secondary" onClick={onClose}>
-            {intl.formatMessage({ id: 'agents.delegate.close' })}
-          </Button>
-          <Button
-            variant="primary"
-            onClick={handleSubmit}
-            disabled={submitting || !title.trim()}
-          >
-            {submitting
-              ? intl.formatMessage({ id: 'agents.delegate.submitting' })
-              : intl.formatMessage({ id: 'tasks.create' })}
-          </Button>
-        </div>
-      </div>
-    </Dialog>
-  );
-}
-
-// ── Task Detail Panel (side-sliding) ────────────────────────
-
-function TaskDetailPanel({
+// ── List row ────────────────────────────────────────────────
+function TaskListRow({
   task,
-  agents,
-  onClose,
-  onUpdate,
+  agent,
+  onOpen,
+  onStatus,
 }: {
   task: TaskInfo;
-  agents: ReadonlyArray<{ name: string; display_name: string; icon: string }>;
-  onClose: () => void;
-  onUpdate: (taskId: string, fields: TaskUpdateParams) => Promise<void>;
+  agent?: { name: string; display_name: string };
+  onOpen: (id: string) => void;
+  onStatus: (task: TaskInfo, key: import('@/components/ui').TaskStatusKey) => void;
 }) {
-  const intl = useIntl();
-  const [editing, setEditing] = useState(false);
-  const [title, setTitle] = useState(task.title);
-  const [description, setDescription] = useState(task.description);
-  const [priority, setPriority] = useState<TaskPriority>(task.priority);
-  const [assignedTo, setAssignedTo] = useState(task.assigned_to);
-  const [blockedReason, setBlockedReason] = useState(task.blocked_reason ?? '');
-  const [tagsInput, setTagsInput] = useState(task.tags.join(', '));
-  const [saving, setSaving] = useState(false);
-
-  const agent = agents.find((a) => a.name === task.assigned_to);
-
-  const handleSave = useCallback(async () => {
-    setSaving(true);
-    try {
-      await onUpdate(task.id, {
-        title: title.trim(),
-        description: description.trim(),
-        priority,
-        assigned_to: assignedTo,
-        blocked_reason: blockedReason.trim() || undefined,
-        tags: tagsInput.split(',').map((t) => t.trim()).filter(Boolean),
-      });
-      setEditing(false);
-    } finally {
-      setSaving(false);
-    }
-  }, [task.id, title, description, priority, assignedTo, blockedReason, tagsInput, onUpdate]);
-
-  const formatDate = (d?: string) =>
-    d ? new Date(d).toLocaleString('zh-TW', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—';
-
   return (
-    <>
-      {/* Backdrop */}
-      <div className="fixed inset-0 z-40 bg-black/20 backdrop-blur-sm" onClick={onClose} />
-
-      {/* Panel */}
-      <div className="glass-overlay fixed inset-y-0 right-0 z-50 flex w-full max-w-md flex-col border-l border-[var(--panel-border)] animate-in slide-in-from-right duration-200">
-        {/* Header */}
-        <div className="flex items-center justify-between border-b border-[var(--panel-border)] px-6 py-4">
-          <h3 className="text-lg font-semibold text-stone-900 dark:text-stone-50">
-            {intl.formatMessage({ id: 'tasks.detail' })}
-          </h3>
-          <div className="flex items-center gap-2">
-            {!editing ? (
-              <Button variant="ghost" size="sm" icon={Pencil} onClick={() => setEditing(true)} />
-            ) : (
-              <Button variant="ghost" size="sm" icon={Save} onClick={handleSave} disabled={saving} />
-            )}
-            <Button variant="ghost" size="sm" icon={X} onClick={onClose} />
-          </div>
-        </div>
-
-        {/* Body */}
-        <div className="flex-1 overflow-y-auto px-6 py-5">
-          <div className="space-y-5">
-            {/* Title */}
-            {editing ? (
-              <input
-                className={cn(inputClass, 'text-lg font-semibold')}
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-              />
-            ) : (
-              <h4 className="text-lg font-semibold text-stone-900 dark:text-stone-50">{task.title}</h4>
-            )}
-
-            {/* Status + Priority row */}
-            <div className="flex items-center gap-3">
-              <Badge
-                tone={
-                  task.status === 'done'
-                    ? 'success'
-                    : task.status === 'in_progress'
-                      ? 'warning'
-                      : task.status === 'blocked'
-                        ? 'danger'
-                        : 'neutral'
-                }
-              >
-                {intl.formatMessage({ id: `tasks.status.${task.status}` })}
-              </Badge>
-              {editing ? (
-                <select className={cn(selectClass, 'w-auto')} value={priority} onChange={(e) => setPriority(e.target.value as TaskPriority)}>
-                  {(['low', 'medium', 'high', 'urgent'] as const).map((p) => (
-                    <option key={p} value={p}>{intl.formatMessage({ id: `tasks.priority.${p}` })}</option>
-                  ))}
-                </select>
-              ) : (
-                <PriorityBadge priority={task.priority} />
-              )}
-            </div>
-
-            {/* Description */}
-            <div>
-              <label className="mb-1.5 block text-xs font-medium text-stone-500 dark:text-stone-400">
-                {intl.formatMessage({ id: 'tasks.field.description' })}
-              </label>
-              {editing ? (
-                <textarea
-                  className={cn(inputClass, 'min-h-[100px] resize-y')}
-                  value={description}
-                  onChange={(e) => setDescription(e.target.value)}
-                />
-              ) : (
-                <p className="whitespace-pre-wrap text-sm text-stone-700 dark:text-stone-300">
-                  {task.description || '—'}
-                </p>
-              )}
-            </div>
-
-            {/* Assigned to */}
-            <div>
-              <label className="mb-1.5 block text-xs font-medium text-stone-500 dark:text-stone-400">
-                {intl.formatMessage({ id: 'tasks.field.assignTo' })}
-              </label>
-              {editing ? (
-                <select className={selectClass} value={assignedTo} onChange={(e) => setAssignedTo(e.target.value)}>
-                  {agents.map((a) => (
-                    <option key={a.name} value={a.name}>{a.icon || '🤖'} {a.display_name}</option>
-                  ))}
-                </select>
-              ) : (
-                <div className="flex items-center gap-2">
-                  <span className="text-lg">{agent?.icon || '🤖'}</span>
-                  <span className="text-sm text-stone-700 dark:text-stone-300">{agent?.display_name ?? task.assigned_to}</span>
-                </div>
-              )}
-            </div>
-
-            {/* Blocked reason (only for blocked tasks) */}
-            {(task.status === 'blocked' || editing) && (
-              <div>
-                <label className="mb-1.5 block text-xs font-medium text-stone-500 dark:text-stone-400">
-                  {intl.formatMessage({ id: 'tasks.field.blockedReason' })}
-                </label>
-                {editing ? (
-                  <input className={inputClass} value={blockedReason} onChange={(e) => setBlockedReason(e.target.value)} />
-                ) : (
-                  <p className="text-sm text-rose-600 dark:text-rose-400">{task.blocked_reason || '—'}</p>
-                )}
-              </div>
-            )}
-
-            {/* Tags */}
-            <div>
-              <label className="mb-1.5 block text-xs font-medium text-stone-500 dark:text-stone-400">
-                {intl.formatMessage({ id: 'tasks.field.tags' })}
-              </label>
-              {editing ? (
-                <input className={inputClass} value={tagsInput} onChange={(e) => setTagsInput(e.target.value)} placeholder="bug, feature" />
-              ) : (
-                <div className="flex flex-wrap gap-1.5">
-                  {task.tags.length > 0 ? task.tags.map((tag) => (
-                    <Badge key={tag} tone="neutral">{tag}</Badge>
-                  )) : <span className="text-sm text-stone-400">—</span>}
-                </div>
-              )}
-            </div>
-
-            {/* Metadata section */}
-            <div className="space-y-3 border-t border-[var(--panel-border)] pt-4">
-              <div className="flex items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
-                <User className="h-3.5 w-3.5" />
-                <span className="font-medium">{intl.formatMessage({ id: 'tasks.detail.createdBy' })}</span>
-                <span className="ml-auto text-stone-700 dark:text-stone-300">{task.created_by}</span>
-              </div>
-              <div className="flex items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
-                <Calendar className="h-3.5 w-3.5" />
-                <span className="font-medium">{intl.formatMessage({ id: 'tasks.detail.createdAt' })}</span>
-                <span className="ml-auto text-stone-700 dark:text-stone-300">{formatDate(task.created_at)}</span>
-              </div>
-              <div className="flex items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
-                <Calendar className="h-3.5 w-3.5" />
-                <span className="font-medium">{intl.formatMessage({ id: 'tasks.detail.updatedAt' })}</span>
-                <span className="ml-auto text-stone-700 dark:text-stone-300">{formatDate(task.updated_at)}</span>
-              </div>
-              {task.completed_at && (
-                <div className="flex items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
-                  <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
-                  <span className="font-medium">{intl.formatMessage({ id: 'tasks.detail.completedAt' })}</span>
-                  <span className="ml-auto text-stone-700 dark:text-stone-300">{formatDate(task.completed_at)}</span>
-                </div>
-              )}
-              {task.parent_task_id && (
-                <div className="flex items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
-                  <Link2 className="h-3.5 w-3.5" />
-                  <span className="font-medium">{intl.formatMessage({ id: 'tasks.detail.parentTask' })}</span>
-                  <span className="ml-auto font-mono text-stone-700 dark:text-stone-300">{task.parent_task_id}</span>
-                </div>
-              )}
-              {task.message_id && (
-                <div className="flex items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
-                  <Link2 className="h-3.5 w-3.5" />
-                  <span className="font-medium">{intl.formatMessage({ id: 'tasks.detail.messageId' })}</span>
-                  <span className="ml-auto font-mono text-stone-700 dark:text-stone-300">{task.message_id}</span>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      </div>
-    </>
+    <li className="flex items-center gap-3 px-4 py-2.5 transition-colors hover:bg-stone-500/5 dark:hover:bg-white/5">
+      <StatusIcon status={toStatusKey(task.status)} size="sm" onChange={(key) => onStatus(task, key)} />
+      <button
+        type="button"
+        onClick={() => onOpen(task.id)}
+        className="min-w-0 flex-1 truncate text-left text-sm font-medium text-stone-800 hover:text-amber-600 dark:text-stone-100 dark:hover:text-amber-400"
+      >
+        {task.title}
+      </button>
+      <PriorityIcon priority={task.priority} size="sm" />
+      {agent && (
+        <span className="hidden items-center gap-1.5 sm:flex" title={agent.display_name}>
+          <CharacterAvatar agentId={agent.name} name={agent.display_name} size={24} animated={false} />
+          <span className="max-w-[100px] truncate text-xs text-stone-500 dark:text-stone-400">{agent.display_name}</span>
+        </span>
+      )}
+      <Mono className="hidden w-16 shrink-0 text-right text-[0.6875rem] md:inline">{task.id.slice(0, 8)}</Mono>
+      <span className="w-12 shrink-0 text-right text-[0.6875rem] tabular-nums text-stone-400 dark:text-stone-500">
+        {timeAgo(task.updated_at)}
+      </span>
+    </li>
   );
 }
 
-// ── Main Page ───────────────────────────────────────────────
-
+// ── Page ────────────────────────────────────────────────────
 export function TaskBoardPage() {
   const intl = useIntl();
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const {
     tasks,
     loading,
@@ -589,47 +286,131 @@ export function TaskBoardPage() {
     setFilterPriority,
   } = useTasksStore();
   const { agents, fetchAgents } = useAgentsStore();
-  const { updateTask } = useTasksStore();
-  const [showCreateDialog, setShowCreateDialog] = useState(false);
+
+  const [view, setView] = useState<ViewMode>(() => readPref(VIEW_KEY, ['kanban', 'list'] as const, 'kanban'));
+  const [group, setGroup] = useState<GroupMode>(() => readPref(GROUP_KEY, ['status', 'assignee'] as const, 'status'));
+  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
+  const [showCreate, setShowCreate] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<TaskInfo | null>(null);
-  const [detailTarget, setDetailTarget] = useState<TaskInfo | null>(null);
+  const [burst, setBurst] = useState<{ agentId: string } | null>(null);
 
   useEffect(() => {
     fetchTasks();
     fetchAgents();
   }, [fetchTasks, fetchAgents]);
 
-  const handleCreate = useCallback(
-    async (params: TaskCreateParams) => {
-      await createTask(params);
+  // Open the create modal when routed here with `?new=1` (Sidebar / MobileBottomNav).
+  useEffect(() => {
+    if (searchParams.get('new') === '1') setShowCreate(true);
+  }, [searchParams]);
+
+  // `?assignee=<id>` (W3b employee-detail "交辦" button) preselects the assignee
+  // in the create modal (A3). Read live so a fresh deep-link seeds the picker.
+  const defaultAssignee = searchParams.get('assignee') || undefined;
+
+  const setViewPref = (v: ViewMode) => {
+    setView(v);
+    writePref(VIEW_KEY, v);
+  };
+  const setGroupPref = (g: GroupMode) => {
+    setGroup(g);
+    writePref(GROUP_KEY, g);
+  };
+
+  const closeCreate = useCallback(() => {
+    setShowCreate(false);
+    if (searchParams.get('new') || searchParams.get('assignee')) {
+      const next = new URLSearchParams(searchParams);
+      next.delete('new');
+      next.delete('assignee');
+      setSearchParams(next, { replace: true });
+    }
+  }, [searchParams, setSearchParams]);
+
+  const openTask = useCallback((id: string) => navigate(`/tasks/${id}`), [navigate]);
+
+  const handleCreate = useCallback(async (params: TaskCreateParams) => createTask(params), [createTask]);
+
+  // One completion path for both drag-drop and the list StatusIcon: write via
+  // the store, and fire the §5.5 celebration when a task first reaches `done`.
+  const applyStatus = useCallback(
+    (task: TaskInfo, next: TaskStatus) => {
+      if (next === task.status) return;
+      if (next === 'done') {
+        celebrateTaskDone(intl.formatMessage({ id: 'tasks.celebrate.done' }));
+        if (task.assigned_to) setBurst({ agentId: task.assigned_to });
+      }
+      moveTask(task.id, next);
     },
-    [createTask],
+    [moveTask, intl],
   );
 
   const handleDrop = useCallback(
-    (taskId: string, newStatus: TaskStatus) => {
-      moveTask(taskId, newStatus);
+    (taskId: string, status: TaskStatus) => {
+      const task = tasks.find((t) => t.id === taskId);
+      if (task) applyStatus(task, status);
     },
-    [moveTask],
+    [tasks, applyStatus],
+  );
+
+  const handleListStatus = useCallback(
+    (task: TaskInfo, key: import('@/components/ui').TaskStatusKey) => {
+      const backend = toBackendStatus(key);
+      if (backend) applyStatus(task, backend);
+    },
+    [applyStatus],
   );
 
   const handleRemoveConfirm = useCallback(async () => {
     if (removeTarget) {
       await removeTask(removeTarget.id);
       setRemoveTarget(null);
-      // The detail panel may still reference the task we just deleted.
-      setDetailTarget((prev) => (prev?.id === removeTarget.id ? null : prev));
     }
   }, [removeTarget, removeTask]);
 
-  // Apply filters
-  const filteredTasks = tasks.filter((t) => {
-    if (filterAgent && t.assigned_to !== filterAgent) return false;
-    if (filterPriority && t.priority !== filterPriority) return false;
-    return true;
-  });
+  const filteredTasks = useMemo(
+    () =>
+      tasks.filter((t) => {
+        if (filterAgent && t.assigned_to !== filterAgent) return false;
+        if (filterPriority && t.priority !== filterPriority) return false;
+        return true;
+      }),
+    [tasks, filterAgent, filterPriority],
+  );
+
+  // List grouping — by status (column order) or by assignee.
+  const listGroups = useMemo(() => {
+    if (group === 'assignee') {
+      const buckets = new Map<string, TaskInfo[]>();
+      for (const t of filteredTasks) {
+        const key = t.assigned_to || '__unassigned';
+        (buckets.get(key) ?? buckets.set(key, []).get(key)!).push(t);
+      }
+      return Array.from(buckets.entries()).map(([key, rows]) => ({
+        key,
+        label:
+          key === '__unassigned'
+            ? intl.formatMessage({ id: 'tasks.assignee.none' })
+            : agents.find((a) => a.name === key)?.display_name ?? key,
+        rows,
+      }));
+    }
+    return COLUMNS.map(({ status }) => ({
+      key: status,
+      label: intl.formatMessage({ id: `tasks.column.${status}` }),
+      rows: filteredTasks.filter((t) => t.status === status),
+    })).filter((g) => g.rows.length > 0);
+  }, [group, filteredTasks, agents, intl]);
 
   const tasksByStatus = (status: TaskStatus) => filteredTasks.filter((t) => t.status === status);
+
+  const toggleGroup = (key: string) =>
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
 
   return (
     <Page wide>
@@ -638,13 +419,12 @@ export function TaskBoardPage() {
         title={intl.formatMessage({ id: 'nav.tasks' })}
         subtitle={intl.formatMessage({ id: 'tasks.title' })}
         actions={
-          <Button variant="primary" icon={Plus} onClick={() => setShowCreateDialog(true)}>
+          <Button variant="primary" icon={Plus} onClick={() => setShowCreate(true)}>
             {intl.formatMessage({ id: 'tasks.create' })}
           </Button>
         }
       />
 
-      {/* Filters */}
       <Toolbar>
         <Filter className="h-4 w-4 text-stone-400" />
         <select
@@ -652,10 +432,12 @@ export function TaskBoardPage() {
           value={filterAgent ?? ''}
           onChange={(e) => setFilterAgent(e.target.value || null)}
         >
-          <option value="">{intl.formatMessage({ id: 'tasks.filter.all' })} — {intl.formatMessage({ id: 'tasks.filter.agent' })}</option>
+          <option value="">
+            {intl.formatMessage({ id: 'tasks.filter.all' })} — {intl.formatMessage({ id: 'tasks.filter.agent' })}
+          </option>
           {agents.map((a) => (
             <option key={a.name} value={a.name}>
-              {a.icon || '🤖'} {a.display_name}
+              {a.display_name}
             </option>
           ))}
         </select>
@@ -664,71 +446,115 @@ export function TaskBoardPage() {
           value={filterPriority ?? ''}
           onChange={(e) => setFilterPriority((e.target.value as TaskPriority) || null)}
         >
-          <option value="">{intl.formatMessage({ id: 'tasks.filter.all' })} — {intl.formatMessage({ id: 'tasks.field.priority' })}</option>
+          <option value="">
+            {intl.formatMessage({ id: 'tasks.filter.all' })} — {intl.formatMessage({ id: 'tasks.field.priority' })}
+          </option>
           {(['low', 'medium', 'high', 'urgent'] as const).map((p) => (
             <option key={p} value={p}>
               {intl.formatMessage({ id: `tasks.priority.${p}` })}
             </option>
           ))}
         </select>
+
+        {/* Group-by (list view only) */}
+        {view === 'list' && (
+          <select
+            className={cn(controlClass, 'w-auto min-w-[130px]')}
+            value={group}
+            onChange={(e) => setGroupPref(e.target.value as GroupMode)}
+            aria-label={intl.formatMessage({ id: 'tasks.groupBy' })}
+          >
+            <option value="status">{intl.formatMessage({ id: 'tasks.groupBy.status' })}</option>
+            <option value="assignee">{intl.formatMessage({ id: 'tasks.groupBy.assignee' })}</option>
+          </select>
+        )}
+
+        {/* Kanban ⇄ List view toggle */}
+        <div className="flex-1" />
+        <div className="inline-flex rounded-control border border-stone-300/50 p-0.5 dark:border-white/10">
+          {(
+            [
+              { id: 'kanban', icon: KanbanSquare },
+              { id: 'list', icon: List },
+            ] as const
+          ).map(({ id, icon: Icon }) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => setViewPref(id)}
+              aria-pressed={view === id}
+              className={cn(
+                'flex items-center gap-1.5 rounded-[calc(var(--radius-control)-2px)] px-2.5 py-1 text-xs font-medium transition-colors',
+                view === id
+                  ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                  : 'text-stone-500 hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-200',
+              )}
+            >
+              <Icon className="h-3.5 w-3.5" />
+              {intl.formatMessage({ id: `tasks.view.${id}` })}
+            </button>
+          ))}
+        </div>
       </Toolbar>
 
-      {/* Empty hint (only when truly empty and loaded) */}
       {tasks.length === 0 && !loading && (
         <Card padded={false}>
-          <EmptyState
-            icon={Clock}
-            title={intl.formatMessage({ id: 'tasks.empty' })}
-          />
+          <EmptyState icon={Clock} title={intl.formatMessage({ id: 'tasks.empty' })} />
         </Card>
       )}
 
-      {/* Kanban Board — always 4 columns, matches original Multica design */}
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
-        {COLUMNS.map(({ status, icon }) => (
-          <KanbanColumn
-            key={status}
-            status={status}
-            icon={icon}
-            tasks={tasksByStatus(status)}
-            agents={agents}
-            onDrop={handleDrop}
-            onRemove={(id) => {
-              const t = tasks.find((task) => task.id === id);
-              if (t) setRemoveTarget(t);
-            }}
-            onSelect={setDetailTarget}
-          />
-        ))}
-      </div>
-
-      {/* Create Dialog */}
-      <CreateTaskDialog
-        open={showCreateDialog}
-        onClose={() => setShowCreateDialog(false)}
-        agents={agents}
-        onCreate={handleCreate}
-      />
-
-      {/* Task Detail Panel */}
-      {detailTarget && (
-        <TaskDetailPanel
-          task={detailTarget}
-          agents={agents}
-          onClose={() => setDetailTarget(null)}
-          onUpdate={async (taskId, fields) => {
-            await updateTask(taskId, fields);
-            setDetailTarget(null);
-          }}
-        />
+      {view === 'kanban' ? (
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
+          {COLUMNS.map(({ status, icon }) => (
+            <KanbanColumn
+              key={status}
+              status={status}
+              icon={icon}
+              tasks={tasksByStatus(status)}
+              agents={agents}
+              onDrop={handleDrop}
+              onOpen={openTask}
+              onRemove={setRemoveTarget}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {listGroups.map((g) => {
+            const isCollapsed = collapsed.has(g.key);
+            return (
+              <div key={g.key}>
+                <GroupHeader label={g.label} count={g.rows.length} collapsed={isCollapsed} onToggle={() => toggleGroup(g.key)} />
+                {!isCollapsed && (
+                  <Card padded={false}>
+                    <ul className="divide-y divide-stone-200/60 dark:divide-white/5">
+                      {g.rows.map((t) => (
+                        <TaskListRow
+                          key={t.id}
+                          task={t}
+                          agent={agents.find((a) => a.name === t.assigned_to)}
+                          onOpen={openTask}
+                          onStatus={handleListStatus}
+                        />
+                      ))}
+                    </ul>
+                  </Card>
+                )}
+              </div>
+            );
+          })}
+        </div>
       )}
 
-      {/* Remove Confirmation Dialog */}
-      <Dialog
-        open={removeTarget !== null}
-        title={intl.formatMessage({ id: 'tasks.remove' })}
-        onClose={() => setRemoveTarget(null)}
-      >
+      <CreateTaskModal
+        open={showCreate}
+        onClose={closeCreate}
+        agents={agents}
+        onCreate={handleCreate}
+        defaultAssignee={defaultAssignee}
+      />
+
+      <Dialog open={removeTarget !== null} title={intl.formatMessage({ id: 'tasks.remove' })} onClose={() => setRemoveTarget(null)}>
         <div className="space-y-4">
           <p className="text-sm text-stone-600 dark:text-stone-400">
             {removeTarget && intl.formatMessage({ id: 'tasks.remove.confirm' }, { title: removeTarget.title })}
@@ -743,6 +569,14 @@ export function TaskBoardPage() {
           </div>
         </div>
       </Dialog>
+
+      {burst && (
+        <TaskDoneBurst
+          agentId={burst.agentId}
+          agentName={agents.find((a) => a.name === burst.agentId)?.display_name}
+          onDone={() => setBurst(null)}
+        />
+      )}
     </Page>
   );
 }

@@ -27,7 +27,7 @@ portable-pty = "0.9"
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 cron = { workspace = true }
-axum = { workspace = true }
+axum = { workspace = true, features = ["multipart"] }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 serde = { workspace = true }
@@ -38,6 +38,8 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 uuid = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "multipart"] }
+# Email channel — async SMTP send (rustls, aligns with the workspace TLS stack).
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
 # Slack Socket Mode URL validation (already in the tree via reqwest — no new compile units)
 url = "2"
 # web_extract L2 CSS-selector extraction (same version as duduclaw-cli)

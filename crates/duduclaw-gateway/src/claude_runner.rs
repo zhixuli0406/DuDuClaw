@@ -902,26 +902,74 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
         warn!("MCP tool loop disabled — duduclaw binary did not resolve to an absolute path");
         return None;
     }
-    let envs = mcp_client_envs(agent_id);
-    let client = match duduclaw_llm::McpClient::connect(
-        &bin.to_string_lossy(),
-        &["mcp-server".to_string()],
-        &envs,
-        duduclaw_llm::DEFAULT_MCP_TIMEOUT,
-    )
-    .await
-    {
+
+    // Connect the internal duduclaw MCP server (always client 0 → wins name
+    // collisions against any external server).
+    let connect_internal = || async {
+        duduclaw_llm::McpClient::connect(
+            &bin.to_string_lossy(),
+            &["mcp-server".to_string()],
+            &mcp_client_envs(agent_id),
+            duduclaw_llm::DEFAULT_MCP_TIMEOUT,
+        )
+        .await
+    };
+    let internal = match connect_internal().await {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "MCP server spawn failed — Direct-API reply will be tools-less");
             return None;
         }
     };
-    match duduclaw_llm::ToolRegistry::from_clients(vec![client]).await {
+
+    // MCP Bridge: mount external third-party servers declared in agent.toml.
+    // `secret://` env refs are resolved here against the secret manager (async);
+    // a server with an unresolvable credential is dropped fail-safe.
+    let home_dir = duduclaw_core::platform::duduclaw_home();
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    let externals =
+        crate::mcp_external::load_external_mcp_servers_resolved(&agent_dir, &home_dir).await;
+
+    if externals.is_empty() {
+        return match duduclaw_llm::ToolRegistry::from_clients(vec![internal]).await {
+            Ok(reg) => Some(reg),
+            Err(e) => {
+                warn!(error = %e, "MCP tools/list failed — Direct-API reply will be tools-less");
+                None
+            }
+        };
+    }
+
+    let mut clients = vec![internal];
+    let mut filters = vec![duduclaw_llm::ToolFilter::default()];
+    for ext in externals {
+        match duduclaw_llm::McpClient::connect(
+            &ext.command,
+            &ext.args,
+            &ext.env,
+            duduclaw_llm::DEFAULT_MCP_TIMEOUT,
+        )
+        .await
+        {
+            Ok(c) => {
+                info!(server = %ext.name, "external MCP server mounted");
+                clients.push(c);
+                filters.push(ext.filter);
+            }
+            // A single external server failing must not sink the whole reply —
+            // skip it; the internal server + other externals still serve.
+            Err(e) => warn!(server = %ext.name, error = %e, "external MCP connect failed — skipping"),
+        }
+    }
+
+    match duduclaw_llm::ToolRegistry::from_clients_filtered(clients, filters).await {
         Ok(reg) => Some(reg),
         Err(e) => {
-            warn!(error = %e, "MCP tools/list failed — Direct-API reply will be tools-less");
-            None
+            // A misbehaving external server can fail the combined tools/list.
+            // Degrade to internal-only rather than losing all tools.
+            warn!(error = %e, "combined MCP registry build failed — retrying internal-only");
+            let internal = connect_internal().await.ok()?;
+            duduclaw_llm::ToolRegistry::from_clients(vec![internal]).await.ok()
         }
     }
 }
@@ -2071,6 +2119,11 @@ tokio::task_local! {
     /// for whichever agent owned the channel reply (5/5 trace had agnes
     /// running 23 minutes with no telemetry row).
     pub static CHANNEL_REPLY_AGENT_ID: String;
+
+    /// WP6: end-user id for per-user cost attribution along the channel_reply
+    /// path. Empty when there is no human user (sub-agent / cron). Paired with
+    /// [`REPLY_CHANNEL`] for the channel dimension.
+    pub static CHANNEL_REPLY_USER_ID: String;
 
     /// Worktree path override injected by the dispatcher when L0 worktree
     /// isolation is enabled.  `prepare_claude_cmd` uses this as the working

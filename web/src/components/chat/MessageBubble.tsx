@@ -1,17 +1,21 @@
+import type { ReactNode } from 'react';
 import type { ChatMessage } from '@/stores/chat-store';
 import { cn } from '@/lib/utils';
 import { AttachmentChip } from './AttachmentChip';
 
-/** A single chat turn rendered as a left/right-aligned bubble. */
-export function MessageBubble({ message }: { message: ChatMessage }) {
+/** A single chat turn rendered as a left/right-aligned bubble.
+ *  `leading` renders a small avatar to the left of an assistant/system bubble
+ *  (the conversation partner's identity, V7 / T7.2). */
+export function MessageBubble({ message, leading }: { message: ChatMessage; leading?: ReactNode }) {
   const isUser = message.role === 'user';
   const isSystem = message.role === 'system';
 
   return (
-    <div className={cn('flex w-full', isUser ? 'justify-end' : 'justify-start')}>
+    <div className={cn('flex w-full items-end gap-2', isUser ? 'justify-end' : 'justify-start')}>
+      {!isUser && leading && <div className="mb-0.5 shrink-0">{leading}</div>}
       <div
         className={cn(
-          'max-w-[80%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed',
+          'max-w-[80%] rounded-bubble px-4 py-2.5 text-sm leading-relaxed',
           isUser
             ? 'bg-amber-500 text-white'
             : isSystem

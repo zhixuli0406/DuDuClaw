@@ -302,6 +302,17 @@ pub struct AgentCostSummary {
     pub cache_health: String,
 }
 
+/// Per-user cost aggregate (WP6). `user_id` is `"(system)"` for non-attributed
+/// traffic (sub-agent dispatch, evolution, utility calls).
+#[derive(Debug, Clone, Serialize)]
+pub struct UserCostSummary {
+    pub user_id: String,
+    pub total_requests: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cost_millicents: u64,
+}
+
 // ---------------------------------------------------------------------------
 // CostTelemetry — SQLite-backed analytics
 // ---------------------------------------------------------------------------
@@ -404,16 +415,54 @@ impl CostTelemetry {
                 ON token_usage(created_at);",
         )
         .map_err(|e| format!("init telemetry schema: {e}"))?;
+
+        // WP6 additive migration: per-user / per-channel attribution columns.
+        // Idempotent — an "duplicate column name" error on an already-migrated
+        // DB is expected and ignored (same pattern as the memory crate).
+        for stmt in [
+            "ALTER TABLE token_usage ADD COLUMN user_id TEXT",
+            "ALTER TABLE token_usage ADD COLUMN channel TEXT",
+        ] {
+            if let Err(e) = conn.execute(stmt, []) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(format!("token_usage migration failed: {e}"));
+                }
+            }
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_token_usage_user_time
+                ON token_usage(user_id, created_at);",
+        )
+        .map_err(|e| format!("token_usage user index: {e}"))?;
         Ok(())
     }
 
-    /// Record a single API call's token usage.
+    /// Record a single API call's token usage (no user/channel attribution).
+    /// Thin wrapper over [`Self::record_attributed`] for callers that don't have
+    /// a human user (sub-agent dispatch, evolution, utility calls).
     pub async fn record(
         &self,
         agent_id: &str,
         request_type: RequestType,
         model: &str,
         usage: &TokenUsage,
+    ) {
+        self.record_attributed(agent_id, request_type, model, usage, None, None)
+            .await;
+    }
+
+    /// Record a single API call's token usage, attributing it to a specific end
+    /// user and channel where known (WP6 — "which employee spent this?").
+    /// `user_id` / `channel` are optional so non-channel callers keep working.
+    pub async fn record_attributed(
+        &self,
+        agent_id: &str,
+        request_type: RequestType,
+        model: &str,
+        usage: &TokenUsage,
+        user_id: Option<&str>,
+        channel: Option<&str>,
     ) {
         let now = chrono::Utc::now().to_rfc3339();
         let efficiency = usage.cache_efficiency();
@@ -426,8 +475,8 @@ impl CostTelemetry {
             "INSERT INTO token_usage
              (agent_id, request_type, model, input_tokens, cache_read_tokens,
               cache_creation_tokens, output_tokens, cache_efficiency, cost_millicents,
-              cache_hit_rate, cache_savings_millicents, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+              cache_hit_rate, cache_savings_millicents, created_at, user_id, channel)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 agent_id,
                 request_type.as_str(),
@@ -441,6 +490,8 @@ impl CostTelemetry {
                 cache_hit_rate,
                 cache_savings,
                 now,
+                user_id,
+                channel,
             ],
         );
 
@@ -662,6 +713,45 @@ impl CostTelemetry {
         Ok(result)
     }
 
+    /// Per-user cost summary over a time window (WP6 — the boss's "which
+    /// employee is spending?" view). Rows with a NULL `user_id` (non-channel
+    /// traffic: sub-agent dispatch, evolution) are bucketed under `"(system)"`.
+    /// Sorted by total cost descending.
+    pub async fn summary_by_user(&self, hours_ago: u64) -> Result<Vec<UserCostSummary>, String> {
+        let cutoff = cutoff_time(hours_ago);
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT
+                    COALESCE(user_id, '(system)') AS uid,
+                    COUNT(*),
+                    COALESCE(SUM(input_tokens + cache_read_tokens + cache_creation_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cost_millicents), 0)
+                 FROM token_usage
+                 WHERE created_at >= ?1
+                 GROUP BY uid
+                 ORDER BY SUM(cost_millicents) DESC",
+            )
+            .map_err(|e| format!("summary_by_user prepare: {e}"))?;
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                Ok(UserCostSummary {
+                    user_id: row.get(0)?,
+                    total_requests: safe_u64(row.get::<_, i64>(1)?),
+                    total_input_tokens: safe_u64(row.get::<_, i64>(2)?),
+                    total_output_tokens: safe_u64(row.get::<_, i64>(3)?),
+                    total_cost_millicents: safe_u64(row.get::<_, i64>(4)?),
+                })
+            })
+            .map_err(|e| format!("summary_by_user query: {e}"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| format!("summary_by_user row: {e}"))?);
+        }
+        Ok(out)
+    }
+
     /// Recent cost records (for debugging / dashboard).
     pub async fn recent_records(&self, limit: u32) -> Result<Vec<CostRecord>, String> {
         let conn = self.conn.lock().await;
@@ -701,6 +791,39 @@ impl CostTelemetry {
             result.push(row.map_err(|e| format!("recent_records row: {e}"))?);
         }
         Ok(result)
+    }
+
+    /// Per-day total spend (millicents) for `agent_id` over the last `days`
+    /// days, oldest first. Days with no spend are omitted (the returned series
+    /// is the set of active days); callers treating it as a baseline should use
+    /// the values, not calendar positions. Used by burn-rate anomaly detection.
+    pub async fn daily_cost_millicents(
+        &self,
+        agent_id: &str,
+        days: u64,
+    ) -> Result<Vec<u64>, String> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT substr(created_at, 1, 10) AS day,
+                        COALESCE(SUM(cost_millicents), 0)
+                 FROM token_usage
+                 WHERE agent_id = ?1 AND created_at >= ?2
+                 GROUP BY day
+                 ORDER BY day ASC",
+            )
+            .map_err(|e| format!("daily_cost prepare: {e}"))?;
+        let rows = stmt
+            .query_map(params![agent_id, cutoff], |row| {
+                Ok(safe_u64(row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| format!("daily_cost query: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("daily_cost row: {e}"))?);
+        }
+        Ok(out)
     }
 
     /// Clean up records older than `days` days.
@@ -1070,6 +1193,53 @@ mod tests {
         // All agents
         let all = telemetry.all_agents_summary(1).await.unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wp6_per_user_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = CostTelemetry::new(&dir.path().join("u.db")).unwrap();
+        let usage = TokenUsage {
+            input_tokens: 1000,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 100,
+        };
+        // Two users on Telegram + one unattributed (system) record.
+        telemetry
+            .record_attributed("agnes", RequestType::Chat, "claude-sonnet-4-6", &usage, Some("u-alice"), Some("telegram:1"))
+            .await;
+        telemetry
+            .record_attributed("agnes", RequestType::Chat, "claude-sonnet-4-6", &usage, Some("u-alice"), Some("telegram:1"))
+            .await;
+        telemetry
+            .record_attributed("agnes", RequestType::Chat, "claude-sonnet-4-6", &usage, Some("u-bob"), Some("telegram:2"))
+            .await;
+        telemetry
+            .record("agnes", RequestType::Evolution, "claude-sonnet-4-6", &usage) // no user
+            .await;
+
+        let by_user = telemetry.summary_by_user(1).await.unwrap();
+        // Alice (2), Bob (1), (system) (1).
+        let alice = by_user.iter().find(|u| u.user_id == "u-alice").unwrap();
+        assert_eq!(alice.total_requests, 2);
+        let bob = by_user.iter().find(|u| u.user_id == "u-bob").unwrap();
+        assert_eq!(bob.total_requests, 1);
+        assert!(by_user.iter().any(|u| u.user_id == "(system)"));
+    }
+
+    #[tokio::test]
+    async fn wp6_migration_is_idempotent() {
+        // Opening the same DB twice must not fail on the additive ALTERs.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mig.db");
+        let _t1 = CostTelemetry::new(&path).unwrap();
+        drop(_t1);
+        let t2 = CostTelemetry::new(&path).unwrap();
+        // And a plain record still works post-migration.
+        let usage = TokenUsage { input_tokens: 10, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 1 };
+        t2.record("a", RequestType::Chat, "claude-sonnet-4-6", &usage).await;
+        assert_eq!(t2.summary_global(1).await.unwrap().total_requests, 1);
     }
 
     // ── W1: registry-based per-model pricing ────────────────────────────────

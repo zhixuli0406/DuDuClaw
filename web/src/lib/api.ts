@@ -1,4 +1,5 @@
 import { client } from './ws-client';
+import { migrateScanArgs, migrateApplyArgs } from './migrate';
 
 // Type definitions matching Rust types
 export interface AgentInfo {
@@ -393,6 +394,18 @@ export interface ActivityEvent {
   summary: string;
   timestamp: string;
   metadata?: Record<string, unknown>;
+}
+
+// ── Task comment types (L2) ─────────────────────────────────
+
+/** A human-authored comment on a task (distinct from system activity events). */
+export interface TaskComment {
+  id: string;
+  task_id: string;
+  /** Authoring user id (from the authenticated session). */
+  author_user: string;
+  body: string;
+  created_at: string;
 }
 
 // ── Autopilot types ─────────────────────────────────────────
@@ -1345,6 +1358,97 @@ export interface WikiScopeNamespace {
   synced_from: string | null;
 }
 
+// ── APR: HITL approval center (WP14-T14.7) ─────────────────────
+
+/** Known approval kinds. Unknown kinds are surfaced verbatim as a fallback. */
+export type ApprovalKind =
+  | 'browser_action'
+  | 'tool_call'
+  | 'skill_activation'
+  | 'strategic_plan'
+  | 'agent_hire'
+  | 'wiki_ingest'
+  | (string & {});
+
+export interface ApprovalItem {
+  id: string;
+  agent_id: string;
+  kind: ApprovalKind;
+  summary: string;
+  /** Opaque request payload — shape varies by kind. */
+  payload: unknown;
+  created_at: string;
+  ttl_seconds: number;
+}
+
+// ── BUD: budget incident console (WP14-T14.6) ──────────────────
+
+export interface BudgetIncident {
+  ts: string;
+  agent_id: string;
+  event: string;
+  scope: string;
+  spent_cents: number;
+  cap_cents: number;
+}
+
+export interface BudgetByAgent {
+  agent_id: string;
+  open_events: number;
+}
+
+// ── LB: skill leaderboard (WP10-T10.1) ─────────────────────────
+
+export interface SkillLeaderboardEntry {
+  skill: string;
+  display_name: string;
+  estimated_minutes_saved: number;
+  scope: string;
+  owner: string;
+}
+
+// ── MIG: painless migration wizard (migrate.scan / migrate.apply) ──────────
+
+/** Source platforms the migration wizard can import from. */
+export type MigratePlatform = 'openclaw' | 'hermes' | 'paperclip';
+
+/** Per-item outcome of a migration scan/apply. Reported honestly — SKIPPED and
+ *  CONFLICT carry a reason and are never smoothed over in the UI. */
+export type MigrateItemStatus = 'imported' | 'partial' | 'skipped' | 'conflict';
+
+/** Overall verdict aggregating every item's status. */
+export type MigrateVerdict = 'COMPLETE' | 'DEGRADED' | 'PARTIAL';
+
+export interface MigrateItem {
+  /** Item category, e.g. `agent`, `channel_token`, `skill`, `cron`, `model`. */
+  kind: string;
+  name: string;
+  status: MigrateItemStatus;
+  /** Why the item was skipped / partially imported / in conflict. Null when clean. */
+  reason: string | null;
+}
+
+export interface MigrateSummary {
+  imported: number;
+  partial: number;
+  skipped: number;
+  conflict: number;
+}
+
+/** Result shape shared by `migrate.scan` (dry_run:true) and `migrate.apply`
+ *  (dry_run:false, report_path populated). */
+export interface MigrateResult {
+  platform: MigratePlatform;
+  source: string;
+  dry_run: boolean;
+  items: MigrateItem[];
+  summary: MigrateSummary;
+  verdict: MigrateVerdict;
+  notes: string[];
+  /** Absolute path of the written report — only present after a real apply. */
+  report_path: string | null;
+}
+
 // API namespace
 export const api = {
   agents: {
@@ -1549,6 +1653,13 @@ export const api = {
         skill_name: string;
         scope: string;
       }>,
+    /** WP10-T10.1 — approved skills ranked by estimated time saved. Any authed. */
+    leaderboard: (limit?: number) =>
+      client.call('skills.leaderboard', limit != null ? { limit } : {}) as Promise<{
+        leaderboard: SkillLeaderboardEntry[];
+        metric: string;
+        note: string;
+      }>,
   },
   evolution: {
     status: () =>
@@ -1693,8 +1804,37 @@ export const api = {
   models: {
     list: () =>
       client.call('models.list') as Promise<{
-        models: Array<{ id: string; label: string; type: 'cloud' | 'local'; file?: string; size_bytes?: number }>;
+        models: Array<{
+          id: string;
+          label: string;
+          type: 'cloud' | 'local';
+          provider?: string;
+          /** Discovery source: live_api / cli_probe / help_parse / pty_probe / fallback. */
+          source?: string;
+          /** RFC3339 timestamp of the last probe for this provider. */
+          fetched_at?: string;
+          file?: string;
+          size_bytes?: number;
+        }>;
         default_local: string | null;
+        /** RFC3339 timestamp of the whole discovery run. */
+        discovered_at?: string;
+      }>,
+    /** Force a live re-probe of every installed CLI/API, then return the fresh list. */
+    refresh: () =>
+      client.call('models.refresh') as Promise<{
+        models: Array<{
+          id: string;
+          label: string;
+          type: 'cloud' | 'local';
+          provider?: string;
+          source?: string;
+          fetched_at?: string;
+          file?: string;
+          size_bytes?: number;
+        }>;
+        default_local: string | null;
+        discovered_at?: string;
       }>,
   },
   logs: {
@@ -1752,6 +1892,28 @@ export const api = {
       client.call('billing.usage') as Promise<BillingUsage>,
     history: () =>
       client.call('billing.history') as Promise<{ invoices: BillingInvoice[] }>,
+  },
+  // WP14-T14.7 — HITL approval center. `list` is manager-gated; `decide` errors
+  // on already-terminal requests or board-kind requests without admin scope.
+  approvals: {
+    list: (agentId?: string) =>
+      client.call('approvals.list', agentId ? { agent_id: agentId } : {}) as Promise<{
+        approvals: ApprovalItem[];
+        count: number;
+      }>,
+    decide: (id: string, approve: boolean) =>
+      client.call('approvals.decide', { id, approve }) as Promise<{
+        id: string;
+        decided: 'approved' | 'denied';
+      }>,
+  },
+  // WP14-T14.6 — budget incident console (manager-gated read).
+  budget: {
+    incidents: (limit?: number) =>
+      client.call('budget.incidents', limit != null ? { limit } : {}) as Promise<{
+        incidents: BudgetIncident[];
+        by_agent: BudgetByAgent[];
+      }>,
   },
   license: {
     /**
@@ -1817,6 +1979,12 @@ export const api = {
       client.call('tasks.remove', { task_id: taskId }) as Promise<{ success: boolean }>,
     assign: (taskId: string, agentId: string) =>
       client.call('tasks.assign', { task_id: taskId, agent_id: agentId }) as Promise<{ task: TaskInfo }>,
+    // L2: post a comment on a task; author is the authenticated caller.
+    comment: (taskId: string, body: string) =>
+      client.call('tasks.comment', { task_id: taskId, body }) as Promise<{ comment: TaskComment }>,
+    // L2: list a task's comments (oldest first).
+    comments: (taskId: string) =>
+      client.call('tasks.comments', { task_id: taskId }) as Promise<{ comments: TaskComment[] }>,
   },
   // RFC-24 Decision Continuity — an agent's still-open proposals awaiting a choice.
   decisions: {
@@ -1987,6 +2155,22 @@ export const api = {
         success: boolean;
         changes: string[];
       }>,
+  },
+  migrate: {
+    /** Dry-run preview — reads the source platform and reports what WOULD be
+     *  imported / skipped / conflicted. Writes nothing. manager-gated. */
+    scan: (platform: MigratePlatform, source?: string) =>
+      client.call('migrate.scan', migrateScanArgs(platform, source)) as Promise<MigrateResult>,
+    /** Execute the migration — writes agents/tokens/skills/etc. and returns the
+     *  same shape with `dry_run:false` + a `report_path`. May run up to 300s
+     *  server-side, so a 300s response timeout is used. manager-gated. */
+    apply: (platform: MigratePlatform, source?: string, rename?: boolean) =>
+      client.call(
+        'migrate.apply',
+        migrateApplyArgs(platform, source, rename),
+        false,
+        300000,
+      ) as Promise<MigrateResult>,
   },
   users: {
     list: () =>

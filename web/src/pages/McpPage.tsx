@@ -6,6 +6,7 @@ import { useAgentsStore } from '@/stores/agents-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { type McpServerDef, type McpCatalogItem, type McpOAuthProvider } from '@/lib/api';
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { DangerZone } from '@/components/settings/controls';
 import {
   Page,
   PageHeader,
@@ -924,38 +925,45 @@ function AddServerDialog({
           />
         </FormField>
 
-        {/* Command */}
-        <FormField label={intl.formatMessage({ id: 'mcp.command' })}>
-          <input
-            type="text"
-            value={command}
-            onChange={(e) => setCommand(e.target.value)}
-            placeholder="e.g. npx"
-            className={inputClass}
-          />
-        </FormField>
+        {/* Command / Args / Env — spawning an MCP server runs a real process on
+            the host, so these live inside a DangerZone. */}
+        <DangerZone
+          title={intl.formatMessage({ id: 'mcp.custom.dangerTitle' })}
+          description={intl.formatMessage({ id: 'mcp.custom.dangerDesc' })}
+        >
+          {/* Command */}
+          <FormField label={intl.formatMessage({ id: 'mcp.command' })}>
+            <input
+              type="text"
+              value={command}
+              onChange={(e) => setCommand(e.target.value)}
+              placeholder="e.g. npx"
+              className={inputClass}
+            />
+          </FormField>
 
-        {/* Args */}
-        <FormField label={intl.formatMessage({ id: 'mcp.args' })}>
-          <input
-            type="text"
-            value={args}
-            onChange={(e) => setArgs(e.target.value)}
-            placeholder="e.g. -y @modelcontextprotocol/server-filesystem /path"
-            className={inputClass}
-          />
-        </FormField>
+          {/* Args */}
+          <FormField label={intl.formatMessage({ id: 'mcp.args' })}>
+            <input
+              type="text"
+              value={args}
+              onChange={(e) => setArgs(e.target.value)}
+              placeholder="e.g. -y @modelcontextprotocol/server-filesystem /path"
+              className={inputClass}
+            />
+          </FormField>
 
-        {/* Env vars */}
-        <FormField label={intl.formatMessage({ id: 'mcp.env' })}>
-          <textarea
-            value={envText}
-            onChange={(e) => setEnvText(e.target.value)}
-            placeholder={"API_KEY=your-key\nANOTHER_VAR=value"}
-            rows={3}
-            className={cn(inputClass, 'resize-none font-mono text-xs')}
-          />
-        </FormField>
+          {/* Env vars */}
+          <FormField label={intl.formatMessage({ id: 'mcp.env' })} hint={intl.formatMessage({ id: 'mcp.env.help' })}>
+            <textarea
+              value={envText}
+              onChange={(e) => setEnvText(e.target.value)}
+              placeholder={"API_KEY=your-key\nANOTHER_VAR=value"}
+              rows={3}
+              className={cn(inputClass, 'resize-none font-mono text-xs')}
+            />
+          </FormField>
+        </DangerZone>
 
         {error && (
           <div className="flex items-start gap-2 rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:bg-rose-900/20 dark:text-rose-400">
