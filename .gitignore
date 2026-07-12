@@ -58,3 +58,10 @@ npm/win32-x64/bin/
 
 # Brag launch-video output (heavy mp4s — uploaded to GitHub Releases, not git)
 brag-output*/
+
+# M1 memory benchmark downloaded datasets (fetched via fetch_benchmarks.py, not committed).
+# Only the hand-crafted sample.jsonl fixtures are tracked for offline smoke/tests.
+python/duduclaw/memory_eval/data/longmemeval_v2/full.jsonl
+python/duduclaw/memory_eval/data/longmemeval_v2/*.raw.jsonl
+python/duduclaw/memory_eval/data/personamem_v2/full.jsonl
+python/duduclaw/memory_eval/data/personamem_v2/*.raw.jsonl
