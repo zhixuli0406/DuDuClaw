@@ -1,0 +1,37 @@
+{
+  "name": "@duduclaw/paperclip-adapter",
+  "version": "0.1.0",
+  "description": "Paperclip external adapter that runs DuDuClaw agents through the local duduclaw binary",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./ui-parser": "./dist/ui-parser.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "paperclip": {
+    "adapterUiParser": "1.0.0"
+  },
+  "keywords": [
+    "paperclip-adapter",
+    "duduclaw",
+    "agentcompanies"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.1.0"
+  }
+}
