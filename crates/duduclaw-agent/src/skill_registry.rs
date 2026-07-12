@@ -56,6 +56,16 @@ impl SkillIndex {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Vec<&SkillIndexEntry> {
+        self.search_scored(query, limit)
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect()
+    }
+
+    /// Same weighted search as [`Self::search`] but keeps the match score so
+    /// cross-hub aggregation (G5 skill hubs) can merge results under the exact
+    /// same weighting. `search` delegates here — ordering is byte-identical.
+    pub fn search_scored(&self, query: &str, limit: usize) -> Vec<(&SkillIndexEntry, usize)> {
         let lower = query.to_lowercase();
         let terms: Vec<&str> = lower.split_whitespace().collect();
 
@@ -69,7 +79,7 @@ impl SkillIndex {
             .collect();
 
         results.sort_by_key(|item| std::cmp::Reverse(item.1));
-        results.into_iter().take(limit).map(|(s, _)| s).collect()
+        results.into_iter().take(limit).collect()
     }
 
     pub fn len(&self) -> usize {
@@ -81,7 +91,9 @@ impl SkillIndex {
     }
 }
 
-fn score_match(skill: &SkillIndexEntry, terms: &[&str]) -> usize {
+/// Weighted term scoring shared by [`SkillIndex::search`] and the G5 hub
+/// aggregator: name hit = 10, tag hit = 7, description hit = 5.
+pub(crate) fn score_match(skill: &SkillIndexEntry, terms: &[&str]) -> usize {
     let mut score = 0;
     let name_lower = skill.name.to_lowercase();
     let desc_lower = skill.description.to_lowercase();
@@ -109,8 +121,9 @@ const GITHUB_SEARCH_QUERIES: &[&str] = &[
 /// GitHub Search API endpoint.
 const GITHUB_SEARCH_URL: &str = "https://api.github.com/search/repositories";
 
-/// Maximum cache age (24 hours).
-const CACHE_MAX_AGE_SECS: i64 = 86400;
+/// Maximum cache age (24 hours). Shared with the G5 per-hub caches so every
+/// hub follows the same freshness contract as the GitHub index.
+pub(crate) const CACHE_MAX_AGE_SECS: i64 = 86400;
 
 // ── SkillRegistry ───────────────────────────────────────────
 

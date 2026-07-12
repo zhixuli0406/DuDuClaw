@@ -29,6 +29,7 @@
 #![allow(clippy::unwrap_or_default)]
 #![allow(clippy::sliced_string_as_bytes)]
 #![allow(clippy::if_same_then_else)]
+pub mod a2a_signing;
 pub mod access_control;
 pub mod agent_hook_installer;
 pub mod auth;
@@ -39,6 +40,8 @@ pub mod channel_typing;
 pub mod webhook_jwt;
 pub mod googlechat;
 pub mod msteams;
+pub mod wecom;
+pub mod dingtalk;
 pub mod extension;
 pub mod channel_settings;
 pub mod config_crypto;
@@ -51,9 +54,13 @@ pub mod cron_store;
 pub mod license_runtime;
 pub mod task_store;
 pub mod partner_store;
+pub mod branding;
+pub mod distributor_store;
+pub mod license_serve;
 pub mod autopilot_store;
 pub mod autopilot_engine;
 pub mod approval;
+pub mod capability;
 pub mod growth;
 pub mod custom_skills;
 pub mod audit_export;
@@ -61,14 +68,19 @@ pub mod budget;
 pub mod cost_anomaly;
 pub mod guardrail;
 pub mod redteam;
+pub mod mast;
+pub mod foresight;
 pub mod security_posture;
 pub mod events_store;
+pub mod canvas;
 pub mod direct_api;
 pub mod delegation;
+pub mod delegation_router;
 pub mod discord;
 pub mod discord_voice;
 pub mod email;
 pub mod dispatcher;
+pub mod ephemeral;
 pub mod message_queue;
 pub mod external_factors;
 pub mod cli_auth;
@@ -88,6 +100,7 @@ pub mod failover;
 pub mod gvu;
 pub mod prediction;
 pub mod reflexion;
+pub mod run_steps;
 pub mod runtime;
 pub mod runtime_config;
 pub mod runtime_dispatch;
@@ -112,6 +125,7 @@ pub mod skill_approval;
 pub mod skill_lifecycle;
 pub mod server;
 pub mod session;
+pub mod session_portability;
 pub mod task_spec;
 pub mod telegram;
 pub mod slack;
@@ -165,3 +179,17 @@ pub fn shared_http_client() -> &'static reqwest::Client {
             .unwrap_or_default()
     })
 }
+
+// ── G3: event-triggered cron (condition script + on_exit) ──
+pub mod condition_eval;
+
+// ── R1: lightweight deterministic trajectory anomaly detection ──
+pub mod trajectory_guard;
+
+// ── N1–N4: Night Engine idle-time compute suite ──
+pub mod night_engine;
+pub mod night_llm;
+
+// ── G1: durable multi-agent dispatch engine (atomic claim / zombie reclaim /
+//        dependency unlock / goal-mode judge acceptance) ──
+pub mod dispatch_engine;

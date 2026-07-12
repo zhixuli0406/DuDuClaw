@@ -26,6 +26,10 @@ pub struct InferenceEngine {
     router: Option<ConfidenceRouter>,
     manager: InferenceManager,
     mlx: Option<MlxBridge>,
+    /// JitRL zero-gradient continual learning (arXiv:2601.18510, see
+    /// [`crate::jitrl`]). `None` unless `[jitrl] enabled = true` — the
+    /// disabled hot path carries zero JitRL code and requests are untouched.
+    jitrl: Option<crate::jitrl::JitrlEngine>,
     /// DuDuClaw home dir (`~/.duduclaw`), used to resolve encrypted config
     /// fields (e.g. `openai_compat.api_key_enc`) read-only at backend build.
     home_dir: std::path::PathBuf,
@@ -41,6 +45,10 @@ impl InferenceEngine {
         let router = config.router.clone().map(ConfidenceRouter::new);
         let manager = InferenceManager::new(&config);
         let mlx = config.mlx.clone().map(MlxBridge::new);
+        let jitrl = config
+            .jitrl
+            .clone()
+            .and_then(|c| crate::jitrl::JitrlEngine::new(c, home_dir));
 
         Self {
             config,
@@ -50,6 +58,7 @@ impl InferenceEngine {
             router,
             manager,
             mlx,
+            jitrl,
             home_dir: home_dir.to_path_buf(),
         }
     }
@@ -340,7 +349,121 @@ impl InferenceEngine {
             }
         }
 
+        // JitRL Tier B injection (arXiv:2601.18510, see `crate::jitrl`):
+        // when enabled and a stored experience is similar enough, clone the
+        // request and attach the clamped logit-bias map. Disabled (`jitrl` is
+        // `None`) skips this block entirely — the request passes through
+        // untouched and un-cloned.
+        if let Some(ref jitrl) = self.jitrl {
+            let model_id = self.jitrl_model_key(request.model_id.as_deref()).await;
+            if let Some(model_id) = model_id
+                && let Some(bias) = jitrl.prepare_bias(&request.user_prompt, &model_id) {
+                    let mut biased = request.clone();
+                    biased.params.logit_bias = Some(bias);
+                    return backend.generate(&biased).await;
+                }
+        }
+
         backend.generate(request).await
+    }
+
+    /// Canonical JitRL model key — ONE resolution chain shared by the
+    /// retrieval side ([`Self::generate`]) and the record side
+    /// ([`Self::jitrl_record_feedback`]): explicit request model →
+    /// `ModelManager`'s loaded id → backend-reported loaded model.
+    ///
+    /// HIGH-D (2026-07): record used to key by `endpoint.model` (the compat
+    /// server's *configured* model name) while retrieval keyed by
+    /// `request.model_id` / the loaded id — when those strings differed,
+    /// every recorded reward was unretrievable (vocabulary isolation filters
+    /// on exact `model_id` equality).
+    async fn jitrl_model_key(&self, request_model: Option<&str>) -> Option<String> {
+        if let Some(id) = request_model {
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+        if let Some(id) = self.model_manager.loaded_model_id().await {
+            return Some(id);
+        }
+        if let Ok(backend) = self.get_backend().await {
+            if let Some(m) = backend.loaded_model().await {
+                return Some(m.id);
+            }
+        }
+        None
+    }
+
+    /// Record explicit JitRL feedback for a `(prompt, response)` pair
+    /// (reward in `[-1, 1]`, positive = reinforce, negative = suppress).
+    ///
+    /// v1 tokenizes the response through the active OpenAI-compatible
+    /// server's `/tokenize` endpoint so the stored token ids belong to the
+    /// serving model's vocabulary. Errors honestly when JitRL is disabled or
+    /// no compat endpoint is active — feedback is never fabricated.
+    pub async fn jitrl_record_feedback(
+        &self,
+        prompt: &str,
+        response: &str,
+        reward: f32,
+    ) -> Result<usize> {
+        // Disabled check FIRST: "jitrl is disabled" must win over "no
+        // tokenizer endpoint" for an honest error message.
+        if self.jitrl.is_none() {
+            return Err(InferenceError::Config(
+                "jitrl is disabled — set [jitrl] enabled = true in inference.toml".to_string(),
+            ));
+        }
+        let endpoint =
+            self.compat_endpoint()
+                .await
+                .ok_or_else(|| InferenceError::BackendUnavailable {
+                    backend: "jitrl-tokenizer".to_string(),
+                    reason: "no OpenAI-compatible endpoint active — JitRL v1 needs the \
+                             server's /tokenize to map the response onto the model's \
+                             token ids"
+                        .to_string(),
+                })?;
+        let tokenizer = crate::jitrl::HttpTokenizer::new(
+            &endpoint.base_url,
+            &endpoint.model,
+            endpoint.api_key.clone(),
+        );
+        // HIGH-D key unification: store under the SAME key retrieval will use
+        // (loaded model id first); the endpoint's configured model name is
+        // only the last resort when nothing is loaded.
+        let model_key = self
+            .jitrl_model_key(None)
+            .await
+            .unwrap_or_else(|| endpoint.model.clone());
+        self.jitrl_record_feedback_with(&tokenizer, prompt, response, reward, &model_key)
+            .await
+    }
+
+    /// Tokenizer-injected core of [`Self::jitrl_record_feedback`] — split out
+    /// so tests can prove the record→retrieve key roundtrip without an HTTP
+    /// `/tokenize` endpoint.
+    async fn jitrl_record_feedback_with(
+        &self,
+        tokenizer: &dyn crate::jitrl::JitrlTokenizer,
+        prompt: &str,
+        response: &str,
+        reward: f32,
+        model_key: &str,
+    ) -> Result<usize> {
+        let Some(ref jitrl) = self.jitrl else {
+            return Err(InferenceError::Config(
+                "jitrl is disabled — set [jitrl] enabled = true in inference.toml".to_string(),
+            ));
+        };
+        jitrl
+            .record_feedback(tokenizer, prompt, response, reward, model_key)
+            .await
+    }
+
+    /// Whether JitRL is enabled and active.
+    pub fn jitrl_enabled(&self) -> bool {
+        self.jitrl.is_some()
     }
 
     /// Generate text with a simple prompt (convenience method).
@@ -829,5 +952,260 @@ post_hoc_enabled = {post_hoc_enabled}
         assert_eq!(response.model_id, "fast-model");
         assert_eq!(backend.calls.lock().unwrap().len(), 1);
         assert!(engine.assess_response(&response).is_none());
+    }
+
+    // ── JitRL (arXiv:2601.18510) engine-wiring tests ────────────────────
+
+    /// Stub backend that records the `logit_bias` carried by every request.
+    /// It ignores the bias when generating — which also proves that a backend
+    /// without a bias surface passes through unaffected.
+    struct BiasCaptureStub {
+        biases: std::sync::Mutex<Vec<Option<std::collections::HashMap<u32, f32>>>>,
+        loaded: RwLock<Option<ModelInfo>>,
+    }
+
+    impl BiasCaptureStub {
+        fn new() -> Self {
+            Self {
+                biases: std::sync::Mutex::new(Vec::new()),
+                loaded: RwLock::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl InferenceBackend for BiasCaptureStub {
+        fn name(&self) -> &str {
+            "bias-capture-stub"
+        }
+
+        fn requires_local_file(&self) -> bool {
+            false
+        }
+
+        async fn load_model(
+            &self,
+            model_path: &str,
+            _params: &GenerationParams,
+        ) -> Result<ModelInfo> {
+            let info = CascadeStub::stub_info(model_path);
+            *self.loaded.write().await = Some(info.clone());
+            Ok(info)
+        }
+
+        async fn unload_model(&self) -> Result<()> {
+            *self.loaded.write().await = None;
+            Ok(())
+        }
+
+        async fn loaded_model(&self) -> Option<ModelInfo> {
+            self.loaded.read().await.clone()
+        }
+
+        async fn generate(&self, request: &InferenceRequest) -> Result<InferenceResponse> {
+            self.biases
+                .lock()
+                .unwrap()
+                .push(request.params.logit_bias.clone());
+            Ok(InferenceResponse {
+                text: "ok".to_string(),
+                tokens_generated: 1,
+                tokens_prompt: 1,
+                generation_time_ms: 1,
+                tokens_per_second: 0.0,
+                backend: BackendType::OpenAiCompat,
+                model_id: request.model_id.clone().unwrap_or_default(),
+                mean_logprob: None,
+            })
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    fn jitrl_request(prompt: &str) -> InferenceRequest {
+        InferenceRequest {
+            system_prompt: String::new(),
+            user_prompt: prompt.to_string(),
+            params: GenerationParams::default(),
+            model_id: Some("jitrl-model".to_string()),
+        }
+    }
+
+    /// Seed one positive experience for `jitrl-model` into the store file
+    /// that `JitrlEngine` will read from `home`.
+    fn seed_experience(home: &std::path::Path, prompt: &str) {
+        let store =
+            crate::jitrl::ExperienceStore::new(home.join("jitrl_experience.jsonl"), 100);
+        store
+            .append(&crate::jitrl::ExperienceRecord {
+                id: "seed".to_string(),
+                model_id: "jitrl-model".to_string(),
+                sketch: crate::jitrl::fingerprint::shingle_sketch(prompt),
+                token_weights: [(42u32, 1.0f32)].into_iter().collect(),
+                reward: 1.0,
+                created_at: chrono::Utc::now().timestamp(),
+            })
+            .expect("seed experience");
+    }
+
+    #[tokio::test]
+    async fn jitrl_disabled_leaves_request_untouched() {
+        // No [jitrl] section at all — even with a seeded store file present,
+        // the request must pass through with no logit_bias (byte-identical).
+        let tmp = TempDir::new().expect("tempdir");
+        seed_experience(tmp.path(), "please summarize this quarterly report");
+        let engine = InferenceEngine::new(tmp.path()).await;
+        assert!(!engine.jitrl_enabled());
+        let backend = Arc::new(BiasCaptureStub::new());
+        engine.set_backend_for_test(backend.clone()).await;
+
+        engine
+            .generate(&jitrl_request("please summarize this quarterly report"))
+            .await
+            .expect("generate ok");
+
+        let biases = backend.biases.lock().unwrap();
+        assert_eq!(biases.len(), 1);
+        assert!(biases[0].is_none(), "disabled JitRL must not touch the request");
+    }
+
+    async fn jitrl_engine(tmp: &TempDir) -> InferenceEngine {
+        tokio::fs::write(
+            tmp.path().join("inference.toml"),
+            "enabled = true\n\n[jitrl]\nenabled = true\n",
+        )
+        .await
+        .expect("write inference.toml");
+        InferenceEngine::new(tmp.path()).await
+    }
+
+    #[tokio::test]
+    async fn jitrl_enabled_injects_bias_for_similar_prompt() {
+        let tmp = TempDir::new().expect("tempdir");
+        seed_experience(tmp.path(), "please summarize this quarterly report");
+        let engine = jitrl_engine(&tmp).await;
+        assert!(engine.jitrl_enabled());
+        let backend = Arc::new(BiasCaptureStub::new());
+        engine.set_backend_for_test(backend.clone()).await;
+
+        // The backend ignores the bias — response still succeeds, proving a
+        // bias-less backend is transparently unaffected.
+        let resp = engine
+            .generate(&jitrl_request("please summarize this quarterly report for me"))
+            .await
+            .expect("generate ok");
+        assert_eq!(resp.text, "ok");
+
+        let biases = backend.biases.lock().unwrap();
+        assert_eq!(biases.len(), 1);
+        let bias = biases[0].as_ref().expect("similar prompt must carry bias");
+        let b = bias.get(&42).copied().expect("seeded token biased");
+        assert!(b > 0.0 && b <= 2.0, "clamped positive bias, got {b}");
+    }
+
+    #[tokio::test]
+    async fn jitrl_enabled_skips_bias_for_dissimilar_prompt() {
+        let tmp = TempDir::new().expect("tempdir");
+        seed_experience(tmp.path(), "please summarize this quarterly report");
+        let engine = jitrl_engine(&tmp).await;
+        let backend = Arc::new(BiasCaptureStub::new());
+        engine.set_backend_for_test(backend.clone()).await;
+
+        engine
+            .generate(&jitrl_request("write a haiku about mountains in winter"))
+            .await
+            .expect("generate ok");
+
+        let biases = backend.biases.lock().unwrap();
+        assert!(biases[0].is_none(), "no similar experience → untouched request");
+    }
+
+    /// Deterministic mock tokenizer: one token per whitespace-separated word,
+    /// id = word char count (vocabulary-free — test only).
+    struct WordLenTokenizer;
+
+    #[async_trait]
+    impl crate::jitrl::JitrlTokenizer for WordLenTokenizer {
+        async fn encode(&self, text: &str) -> Result<Vec<u32>> {
+            Ok(text
+                .split_whitespace()
+                .map(|w| w.chars().count() as u32)
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn jitrl_record_and_retrieve_share_one_model_key() {
+        // HIGH-D regression: record keyed by `endpoint.model` while retrieval
+        // keyed by `request.model_id`/loaded id — a recorded reward was
+        // unretrievable whenever the strings differed. Both sides now resolve
+        // through `jitrl_model_key`; this proves the roundtrip end-to-end.
+        let tmp = TempDir::new().expect("tempdir");
+        let engine = jitrl_engine(&tmp).await;
+        assert!(engine.jitrl_enabled());
+        let backend = Arc::new(BiasCaptureStub::new());
+        engine.set_backend_for_test(backend.clone()).await;
+
+        // Load "jitrl-model" so the canonical key resolves from the manager
+        // (the same source `generate` consults).
+        engine
+            .load_model("jitrl-model")
+            .await
+            .expect("stub load ok");
+
+        // Record through the same resolution the public entry point uses
+        // (jitrl_model_key(None) — no request model), tokenizer injected.
+        let key = engine
+            .jitrl_model_key(None)
+            .await
+            .expect("a loaded model must yield a key");
+        assert_eq!(key, "jitrl-model");
+        let n = engine
+            .jitrl_record_feedback_with(
+                &WordLenTokenizer,
+                "please summarize this quarterly report",
+                "revenue grew twelve percent",
+                1.0,
+                &key,
+            )
+            .await
+            .expect("record ok");
+        assert!(n > 0);
+
+        // Retrieval on a similar prompt for the SAME model must see the bias.
+        engine
+            .generate(&jitrl_request("please summarize this quarterly report for me"))
+            .await
+            .expect("generate ok");
+        let biases = backend.biases.lock().unwrap();
+        let bias = biases
+            .last()
+            .and_then(|b| b.as_ref())
+            .expect("recorded reward must be retrievable under the unified key");
+        assert!(bias.values().all(|v| *v > 0.0), "positive reinforcement expected");
+    }
+
+    #[tokio::test]
+    async fn jitrl_feedback_errors_honestly_without_tokenizer_endpoint() {
+        // JitRL enabled but no OpenAI-compat endpoint → record_feedback must
+        // fail loudly (token ids cannot be fabricated), not degrade silently.
+        let tmp = TempDir::new().expect("tempdir");
+        let engine = jitrl_engine(&tmp).await;
+        let err = engine
+            .jitrl_record_feedback("prompt", "response", 1.0)
+            .await
+            .expect_err("no tokenizer endpoint must be an error");
+        assert!(matches!(err, InferenceError::BackendUnavailable { .. }));
+
+        // And when JitRL itself is disabled, the error says so.
+        let tmp2 = TempDir::new().expect("tempdir");
+        let engine2 = InferenceEngine::new(tmp2.path()).await;
+        let err2 = engine2
+            .jitrl_record_feedback("prompt", "response", 1.0)
+            .await
+            .expect_err("disabled jitrl must error");
+        assert!(matches!(err2, InferenceError::Config(_)));
     }
 }

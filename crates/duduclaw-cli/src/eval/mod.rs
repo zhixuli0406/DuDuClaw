@@ -291,6 +291,19 @@ fn render(reports: &[CaseReport], opts: &EvalOptions) -> duduclaw_core::error::R
     );
     println!();
 
+    // ── MAST failure-taxonomy breakdown (R3) ─────────────────
+    // Attribute every failure deterministically onto a MAST mode / infra /
+    // unclassified label (arXiv:2503.13657). Only rendered when failures
+    // exist so a green run stays quiet.
+    let mast_breakdown = mast_breakdown(reports);
+    if !mast_breakdown.is_empty() {
+        println!("  {}", style("MAST failure breakdown").bold());
+        for (label, count) in &mast_breakdown {
+            println!("    {} × {}", style(count).yellow().bold(), label);
+        }
+        println!();
+    }
+
     if let Some(report_path) = &opts.report {
         let json = serde_json::json!({
             "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -298,6 +311,10 @@ fn render(reports: &[CaseReport], opts: &EvalOptions) -> duduclaw_core::error::R
             "total": total,
             "passed": passed,
             "failed": total - passed,
+            "mast_breakdown": mast_breakdown.iter().map(|(label, count)| serde_json::json!({
+                "label": label,
+                "count": count,
+            })).collect::<Vec<_>>(),
             "cases": reports,
         });
         std::fs::write(report_path, serde_json::to_string_pretty(&json)? + "\n")?;
@@ -307,10 +324,87 @@ fn render(reports: &[CaseReport], opts: &EvalOptions) -> duduclaw_core::error::R
     Ok(())
 }
 
+/// Deterministically attribute each failure onto a MAST label
+/// (arXiv:2503.13657), returning `(display, count)` pairs sorted by count
+/// desc then label. A case that died before assertions ran is `infra`; each
+/// failed deterministic assertion maps via `mast::classify_eval_assertion`.
+/// A judge-only failure (assertions all passed) is `unclassified` — the LLM
+/// rubric is semantic, outside the deterministic table.
+fn mast_breakdown(reports: &[CaseReport]) -> Vec<(String, usize)> {
+    use duduclaw_gateway::mast;
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for r in reports.iter().filter(|r| !r.passed) {
+        if let Some(err) = &r.error {
+            let label = mast::classify_eval_error(err);
+            *counts.entry(label.display()).or_insert(0) += 1;
+            continue;
+        }
+        let mut attributed = false;
+        for a in r.assertions.iter().filter(|a| !a.passed) {
+            let label = mast::classify_eval_assertion(&a.name);
+            *counts.entry(label.display()).or_insert(0) += 1;
+            attributed = true;
+        }
+        if !attributed {
+            // Failed with all deterministic assertions passing ⇒ judge failure.
+            *counts
+                .entry(mast::MastLabel::Unclassified.display())
+                .or_insert(0) += 1;
+        }
+    }
+    let mut out: Vec<(String, usize)> = counts.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
+
+    fn report(name: &str, passed: bool, error: Option<&str>, assertions: Vec<(&str, bool)>) -> CaseReport {
+        CaseReport {
+            name: name.into(),
+            path: "p".into(),
+            passed,
+            error: error.map(String::from),
+            assertions: assertions
+                .into_iter()
+                .map(|(n, p)| AssertionResult {
+                    name: n.into(),
+                    passed: p,
+                    detail: String::new(),
+                })
+                .collect(),
+            judge: None,
+            tool_calls: vec![],
+            diagnostics: None,
+            duration_ms: 0,
+        }
+    }
+
+    #[test]
+    fn mast_breakdown_attributes_failures() {
+        let reports = vec![
+            report("ok", true, None, vec![("must_use_tools: x", true)]),
+            report("spec-fail", false, None, vec![("must_use_tools: tasks_create", false)]),
+            report("spec-fail-2", false, None, vec![("output_contains: \"x\"", false)]),
+            report("infra", false, Some("spawn failed"), vec![]),
+            report("judge-only", false, None, vec![("output_contains: \"x\"", true)]),
+        ];
+        let bd = mast_breakdown(&reports);
+        // Two FM-1.1 spec failures, one infra, one unclassified (judge).
+        let map: std::collections::HashMap<_, _> = bd.into_iter().collect();
+        assert_eq!(map.get("FM-1.1 Disobey Task Specification"), Some(&2));
+        assert_eq!(map.get("infra (outside MAST scope)"), Some(&1));
+        assert_eq!(map.get("unclassified"), Some(&1));
+    }
+
+    #[test]
+    fn mast_breakdown_empty_when_all_pass() {
+        let reports = vec![report("ok", true, None, vec![])];
+        assert!(mast_breakdown(&reports).is_empty());
+    }
 
     struct StubJudge(&'static str);
     #[async_trait]

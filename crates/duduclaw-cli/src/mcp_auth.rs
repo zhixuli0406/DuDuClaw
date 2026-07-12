@@ -405,6 +405,7 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "memory_improve"
         | "memory_episodic_pressure"
         | "user_profile_get"
+        | "user_code_profile"
         | "code_map" => Some(Scope::MemoryRead),
         "memory_store" | "user_profile_record" => Some(Scope::MemoryWrite),
         // ── Wiki: read family ────────────────────────────────────────────
@@ -428,6 +429,13 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "wiki_rebuild_fts"
         | "shared_wiki_write"
         | "shared_wiki_delete" => Some(Scope::WikiWrite),
+        // ── G15 Live Canvas ──────────────────────────────────────────────
+        // Agent-authored presentation content pushed to the dashboard — same
+        // trust tier as shared_wiki_write (agent-visible content mutation;
+        // server-side ammonia-sanitized at write, sandbox-iframed at render).
+        // No MCP read tool exists: viewing goes through the dashboard
+        // `canvas.get` RPC only.
+        "canvas_push" | "canvas_clear" => Some(Scope::WikiWrite),
         // ── Messaging / media egress ─────────────────────────────────────
         "send_message" | "send_photo" | "send_sticker" | "synthesize_speech"
         | "transcribe_audio" => Some(Scope::MessagingSend),
@@ -488,6 +496,10 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         "execute_program"
         | "create_agent"
         | "spawn_agent"
+        // O2 ephemeral synthesis: same blast radius as spawn_agent (agent
+        // lifecycle + dispatch) — enumerated explicitly instead of relying
+        // on the Admin fall-through (2026-07 scope-table consistency).
+        | "spawn_ephemeral"
         | "agent_update"
         | "agent_update_soul"
         | "agent_remove"
@@ -504,6 +516,13 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "llamafile_start"
         | "llamafile_stop"
         | "inference_mode"
+        // JitRL feedback mutates the local-inference experience store —
+        // same tier as the other inference-control tools above.
+        | "jitrl_feedback"
+        // Cost analytics comparison: enumerated explicitly at the same
+        // effective scope it already had via the Admin default (the other
+        // cost_* tools also resolve to Admin today).
+        | "cost_multi_vs_single"
         | "skill_extract"
         | "skill_graduate"
         | "skill_security_scan"
@@ -745,6 +764,20 @@ is_external = {is_external}
     }
 
     #[test]
+    fn test_explicitly_enumerated_admin_tools_2026_07() {
+        // Scope-table consistency (2026-07): these previously relied on the
+        // Admin fall-through; now enumerated explicitly with the same
+        // effective scope. `jitrl_feedback` sits with the inference tools.
+        for tool in ["spawn_ephemeral", "cost_multi_vs_single", "jitrl_feedback"] {
+            assert_eq!(
+                tool_requires_scope(tool),
+                Some(Scope::Admin),
+                "tool {tool} must be explicitly Admin"
+            );
+        }
+    }
+
+    #[test]
     fn test_read_tools_keep_narrow_scope() {
         // Narrow read keys must keep working (not forced to Admin).
         assert_eq!(tool_requires_scope("wiki_ls"), Some(Scope::WikiRead));
@@ -753,6 +786,16 @@ is_external = {is_external}
             Some(Scope::MemoryRead)
         );
         assert_eq!(tool_requires_scope("send_photo"), Some(Scope::MessagingSend));
+    }
+
+    #[test]
+    fn test_user_code_profile_is_memory_read() {
+        // UaC profile compilation is a read-only memory view — same scope as
+        // memory_search / user_profile_get.
+        assert_eq!(
+            tool_requires_scope("user_code_profile"),
+            Some(Scope::MemoryRead)
+        );
     }
 
     // ── M6: fail-closed when nothing is configured ────────────────────────────

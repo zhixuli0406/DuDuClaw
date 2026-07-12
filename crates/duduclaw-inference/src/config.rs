@@ -63,6 +63,18 @@ pub struct InferenceConfig {
     /// max_history = 100
     /// ```
     pub embedding: Option<EmbeddingConfig>,
+
+    /// JitRL zero-gradient continual learning (arXiv:2601.18510) —
+    /// experimental, DEFAULT FALSE. See [`crate::jitrl`].
+    ///
+    /// ```toml
+    /// [jitrl]
+    /// enabled = false
+    /// max_bias = 2.0
+    /// top_k = 8
+    /// min_similarity = 0.3
+    /// ```
+    pub jitrl: Option<crate::jitrl::JitrlConfig>,
 }
 
 /// Embedding model configuration for the prediction engine.
@@ -181,6 +193,7 @@ impl Default for InferenceConfig {
             mlx: None,
             voice: None,
             embedding: None,
+            jitrl: None,
         }
     }
 }
@@ -469,6 +482,10 @@ impl InferenceConfig {
                 return Err(InferenceError::Config(
                     "router.post_hoc_accept_threshold must be within [0.0, 1.0]".to_string(),
                 ));
+            }
+        if let Some(ref jitrl) = self.jitrl
+            && jitrl.enabled {
+                jitrl.validate()?;
             }
         Ok(())
     }

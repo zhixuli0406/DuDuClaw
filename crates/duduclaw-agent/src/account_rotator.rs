@@ -133,8 +133,21 @@ impl Account {
                 }
         match self.auth_method {
             AuthMethod::ApiKey => !self.api_key.is_empty(),
-            // OAuth: either has explicit token (setup-token) or credentials_dir (OS keychain)
-            AuthMethod::OAuth => self.oauth_token.is_some() || self.credentials_dir.is_some(),
+            AuthMethod::OAuth => {
+                if self.provider == "anthropic" {
+                    // Claude.ai subscription: needs an explicit setup-token
+                    // (CLAUDE_CODE_OAUTH_TOKEN) or a credentials dir (OS keychain).
+                    self.oauth_token.is_some() || self.credentials_dir.is_some()
+                } else {
+                    // Subscription OAuth for a non-Anthropic provider (ChatGPT
+                    // Codex / GitHub Copilot / Qwen Portal). Token acquisition is
+                    // runtime-managed — the Codex runtime inherits the host
+                    // ChatGPT login, so there is no local token/dir to check.
+                    // Availability is governed by health / cooldown / expiry
+                    // (checked above); a live seat is available by default.
+                    true
+                }
+            }
         }
     }
 
@@ -158,6 +171,13 @@ pub struct AccountEnv {
     /// Raw API key for direct-API callers. `Some` for API-key accounts (any
     /// provider); `None` for OAuth accounts (which have no static key).
     pub raw_key: Option<String>,
+    /// Stored subscription-seat credential for a **non-Anthropic OAuth** seat
+    /// (the long-lived GitHub OAuth token for Copilot; the Qwen token bundle).
+    /// `None` for API-key accounts and for Anthropic OAuth (whose token is
+    /// injected as an env var / keychain instead). A direct-API caller must NOT
+    /// treat this as an API key — it is a seat credential the proxy exchanges
+    /// for a short-lived upstream token. See `duduclaw proxy` seat forwarding.
+    pub seat_token: Option<String>,
     /// Env vars to set on the subprocess
     pub env_vars: HashMap<String, String>,
 }
@@ -270,6 +290,15 @@ impl AccountRotator {
                         });
                     } else if auth_type == "oauth" {
                         let profile = acc_table.get("profile").and_then(|v| v.as_str()).unwrap_or("default");
+                        // Subscription source. Absent → "anthropic" (Claude.ai),
+                        // preserving byte-identical behavior for every existing
+                        // config. A non-anthropic value (openai/github/qwen) marks
+                        // a consumer subscription seat from another provider.
+                        let provider = acc_table
+                            .get("provider")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("anthropic")
+                            .to_string();
                         let email = acc_table.get("email").and_then(|v| v.as_str()).unwrap_or("");
                         let sub = acc_table.get("subscription").and_then(|v| v.as_str()).unwrap_or("");
                         let label = acc_table.get("label").and_then(|v| v.as_str()).unwrap_or("");
@@ -311,8 +340,7 @@ impl AccountRotator {
                         loaded.push(Account {
                             id: id.to_string(),
                             auth_method: AuthMethod::OAuth,
-                            // OAuth is a Claude.ai subscription mechanism — always Anthropic.
-                            provider: "anthropic".to_string(),
+                            provider,
                             priority: acc_table.get("priority").and_then(|v| v.as_integer()).unwrap_or(5) as u32,
                             monthly_budget_cents: 0,
                             tags: Vec::new(),
@@ -336,8 +364,13 @@ impl AccountRotator {
             }
         }
 
-        // 2. Auto-detect default OAuth session via `claude auth status`
-        if !loaded.iter().any(|a| a.auth_method == AuthMethod::OAuth) {
+        // 2. Auto-detect default OAuth session via `claude auth status`.
+        //
+        // Gate on an *Anthropic* OAuth account specifically — a foreign-provider
+        // OAuth seat (copilot / qwen / codex added via `duduclaw auth device`)
+        // must NOT suppress the Anthropic host-login auto-detect, or the
+        // anthropic pool ends up empty and every channel reply fails NoAccounts.
+        if should_autodetect_anthropic_oauth(&loaded) {
             // Use spawn_blocking to avoid holding a tokio worker thread
             // while waiting for the `claude` CLI subprocess.
             let detected = tokio::task::spawn_blocking(detect_default_oauth_session)
@@ -528,6 +561,39 @@ impl AccountRotator {
         })
     }
 
+    /// Whether the pool currently has an *available* non-Anthropic OAuth
+    /// subscription seat for `provider` that carries a stored seat credential.
+    ///
+    /// Read-only (no rotation side effects), so it is safe to call from the
+    /// proxy's model-catalogue handler to fail-closed: no seat ⇒ no advertised
+    /// models for that provider ⇒ 404/503, never a silent Anthropic fallback.
+    pub async fn has_seat_for_provider(&self, provider: &str) -> bool {
+        let accounts = self.accounts.read().await;
+        accounts.iter().any(|a| {
+            a.provider == provider
+                && a.auth_method == AuthMethod::OAuth
+                && a.is_available()
+                && a.oauth_token.as_ref().is_some_and(|t| !t.is_empty())
+        })
+    }
+
+    /// Swap the in-memory seat credential after a token refresh (Qwen seat
+    /// rotation). Without this, the next request would re-read the stale
+    /// in-memory bundle and try to refresh with an already-rotated (revoked)
+    /// refresh token. The caller is responsible for the encrypted persist to
+    /// `config.toml`; this only updates the live pool.
+    pub async fn update_seat_token(&self, account_id: &str, new_token: &str) {
+        let mut accounts = self.accounts.write().await;
+        if let Some(acc) = accounts
+            .iter_mut()
+            .find(|a| a.id == account_id && a.auth_method == AuthMethod::OAuth)
+        {
+            acc.oauth_token = Some(new_token.to_string());
+        } else {
+            warn!(account = account_id, "update_seat_token: no OAuth account with this id");
+        }
+    }
+
     pub async fn on_success(&self, account_id: &str, cost_cents: u64) {
         let mut accounts = self.accounts.write().await;
         if let Some(acc) = accounts.iter_mut().find(|a| a.id == account_id) {
@@ -714,6 +780,17 @@ impl AccountRotator {
 
 // ── OAuth helpers ───────────────────────────────────────────
 
+/// Whether the Anthropic host-login auto-detect should still run for the
+/// loaded pool: yes unless an **Anthropic** OAuth account is already
+/// configured. Foreign-provider OAuth seats (copilot / qwen / codex from
+/// `duduclaw auth device`) do not count — they serve a different provider
+/// pool and must never mask the missing Anthropic session (pure, testable).
+fn should_autodetect_anthropic_oauth(loaded: &[Account]) -> bool {
+    !loaded
+        .iter()
+        .any(|a| a.auth_method == AuthMethod::OAuth && a.provider == "anthropic")
+}
+
 /// Detect the default OAuth session via `claude auth status`.
 ///
 /// Works with all Claude Code versions — does not depend on `.credentials.json`
@@ -894,6 +971,22 @@ fn provider_env_key_names(provider: &str) -> &'static [&'static str] {
     }
 }
 
+/// Human-facing catalogue of consumer subscription sources the rotator can
+/// carry as OAuth pool members (`provider` id → display label).
+///
+/// Descriptive metadata for status / validation surfaces only — it does NOT
+/// gate rotation (any `provider` string is accepted on an account). Codex
+/// (`openai`) is live through the Codex runtime's host-login inheritance; the
+/// remaining entries are PENDING-LIVE on provider-specific device-code flows.
+pub fn known_subscription_providers() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("anthropic", "Claude Pro/Max"),
+        ("openai", "ChatGPT (Codex)"),
+        ("github", "GitHub Copilot"),
+        ("qwen", "Qwen Portal"),
+    ]
+}
+
 /// Build the subprocess env vars + direct-API metadata for a selected account.
 ///
 /// Anthropic emission is unchanged from the original inline logic (API key vs.
@@ -903,6 +996,7 @@ fn provider_env_key_names(provider: &str) -> &'static [&'static str] {
 fn build_account_env(a: &Account) -> AccountEnv {
     let mut env_vars = HashMap::new();
     let mut raw_key = None;
+    let mut seat_token = None;
 
     if a.provider == "anthropic" {
         match a.auth_method {
@@ -945,13 +1039,43 @@ fn build_account_env(a: &Account) -> AccountEnv {
             }
         }
     } else {
-        // Non-Anthropic providers are API-key only. Emit the provider's canonical
-        // env var so a subprocess sees the right variable, and expose the raw key.
-        if let Some(name) = provider_env_key_names(&a.provider).first() {
-            env_vars.insert((*name).to_string(), a.api_key.clone());
-        }
-        if !a.api_key.is_empty() {
-            raw_key = Some(a.api_key.clone());
+        // Non-Anthropic provider.
+        match a.auth_method {
+            AuthMethod::ApiKey => {
+                // Emit the provider's canonical env var so a subprocess sees the
+                // right variable, and expose the raw key for direct-API callers.
+                if let Some(name) = provider_env_key_names(&a.provider).first() {
+                    env_vars.insert((*name).to_string(), a.api_key.clone());
+                }
+                if !a.api_key.is_empty() {
+                    raw_key = Some(a.api_key.clone());
+                }
+            }
+            AuthMethod::OAuth => {
+                // Subscription OAuth for a non-Anthropic provider (ChatGPT Codex
+                // / GitHub Copilot / Qwen Portal). Token acquisition + injection
+                // is runtime-specific:
+                //   - Codex (openai): inherits the host ChatGPT login — nothing
+                //     to inject here (the runtime already sees it).
+                //   - Copilot / Qwen: PENDING-LIVE (device-code flows need
+                //     provider-specific credentials we do not fabricate).
+                // We deliberately do NOT invent env-var names for tokens we
+                // cannot verify, and do NOT expose the seat token as `raw_key`
+                // (it is a subscription seat, not an API key — a direct-API
+                // caller must not treat it as one). The account remains a
+                // first-class rotation member: `provider` is carried below.
+                //
+                // When a persisted seat credential IS present (e.g. a GitHub
+                // OAuth token minted by `duduclaw auth device --provider
+                // copilot`, decrypted from `oauth_token_enc` at load time), it
+                // is surfaced on `seat_token` so `duduclaw proxy` can exchange
+                // it for a short-lived upstream token and forward the seat.
+                if let Some(ref token) = a.oauth_token {
+                    if !token.is_empty() {
+                        seat_token = Some(token.clone());
+                    }
+                }
+            }
         }
     }
 
@@ -960,6 +1084,7 @@ fn build_account_env(a: &Account) -> AccountEnv {
         auth_method: a.auth_method.clone(),
         provider: a.provider.clone(),
         raw_key,
+        seat_token,
         env_vars,
     }
 }
@@ -990,6 +1115,7 @@ fn env_fallback_account_env(provider: &str) -> Option<AccountEnv> {
         auth_method: AuthMethod::ApiKey,
         provider: provider.to_string(),
         raw_key: Some(key),
+        seat_token: None,
         env_vars,
     })
 }
@@ -1135,6 +1261,47 @@ mod select_env_tests {
             "LeastCost should rotate across all three equal-cost OAuth accounts, \
              not repeatedly pick the first; saw {seen:?}"
         );
+    }
+
+    /// HIGH-C regression: a foreign-provider OAuth seat (added via
+    /// `duduclaw auth device`, e.g. copilot/qwen) must NOT suppress the
+    /// Anthropic host-login auto-detect — otherwise the anthropic pool is
+    /// empty and every channel reply fails NoAccounts.
+    #[test]
+    fn foreign_oauth_seat_does_not_suppress_anthropic_autodetect() {
+        let mut seat = oauth_account("copilot-seat");
+        seat.provider = "github".to_string();
+        assert!(
+            should_autodetect_anthropic_oauth(&[seat]),
+            "a github OAuth seat alone must still trigger anthropic auto-detect"
+        );
+
+        let mut qwen = oauth_account("qwen-seat");
+        qwen.provider = "qwen".to_string();
+        let mut codex = oauth_account("codex-seat");
+        codex.provider = "openai".to_string();
+        assert!(
+            should_autodetect_anthropic_oauth(&[qwen, codex]),
+            "multiple foreign seats must still trigger anthropic auto-detect"
+        );
+    }
+
+    /// The auto-detect gate closes only when an Anthropic OAuth account is
+    /// already configured; an Anthropic API-key account does not close it
+    /// (API-key and OAuth are distinct pools by design).
+    #[test]
+    fn anthropic_oauth_account_suppresses_autodetect() {
+        let anth = oauth_account("anthropic-oauth"); // provider = "anthropic"
+        assert!(!should_autodetect_anthropic_oauth(&[anth]));
+
+        // Empty pool → detect.
+        assert!(should_autodetect_anthropic_oauth(&[]));
+
+        // Mixed: foreign seat + anthropic OAuth → no detect needed.
+        let mut seat = oauth_account("copilot-seat");
+        seat.provider = "github".to_string();
+        let anth2 = oauth_account("anthropic-oauth-2");
+        assert!(!should_autodetect_anthropic_oauth(&[seat, anth2]));
     }
 }
 
@@ -1321,5 +1488,172 @@ mod provider_rotation_tests {
         assert!(!sel.env_vars.contains_key("GOOGLE_API_KEY"));
 
         unsafe { std::env::remove_var("GOOGLE_API_KEY") };
+    }
+}
+
+// ── Subscription-OAuth breadth (G2 Part A) ──────────────────
+//
+// The rotator carries consumer subscription seats from providers OTHER than
+// Anthropic (ChatGPT Codex / GitHub Copilot / Qwen Portal) as OAuth pool
+// members, selectable under any strategy within their provider pool.
+#[cfg(test)]
+mod subscription_oauth_tests {
+    use super::*;
+
+    /// A subscription OAuth seat for an arbitrary provider. No explicit token
+    /// and no credentials dir — mirrors the Codex "host login inherited" case.
+    fn oauth_seat(id: &str, provider: &str) -> Account {
+        Account {
+            id: id.to_string(),
+            auth_method: AuthMethod::OAuth,
+            provider: provider.to_string(),
+            priority: 1,
+            monthly_budget_cents: 0,
+            tags: vec![],
+            profile: "default".to_string(),
+            email: String::new(),
+            subscription: "pro".to_string(),
+            label: id.to_string(),
+            expires_at: None,
+            api_key: String::new(),
+            oauth_token: None,
+            credentials_dir: None,
+            is_healthy: true,
+            consecutive_errors: 0,
+            spent_this_month: 0,
+            cooldown_until: None,
+            last_used: None,
+            total_requests: 0,
+        }
+    }
+
+    /// A non-Anthropic subscription seat is available with neither an explicit
+    /// token nor a credentials dir (host-login inheritance) — unlike an
+    /// Anthropic OAuth account, which requires one of the two.
+    #[test]
+    fn non_anthropic_oauth_seat_available_without_token_or_dir() {
+        let codex = oauth_seat("codex-1", "openai");
+        assert!(
+            codex.is_available(),
+            "non-Anthropic subscription seat should be available on health alone"
+        );
+        // Contrast: an Anthropic OAuth account with no token/dir is unavailable.
+        let anth = oauth_seat("anth-1", "anthropic");
+        assert!(
+            !anth.is_available(),
+            "Anthropic OAuth needs an explicit token or credentials dir"
+        );
+    }
+
+    /// `select_for_provider` isolates by provider across a mixed OAuth pool and
+    /// carries the provider on the selection.
+    #[tokio::test]
+    async fn select_isolates_by_provider_across_oauth_pool() {
+        let rotator = AccountRotator::new(RotationStrategy::LeastCost, 120);
+        rotator.push_account_for_test(oauth_seat("codex-1", "openai")).await;
+        rotator.push_account_for_test(oauth_seat("copilot-1", "github")).await;
+
+        let sel = rotator
+            .select_for_provider("openai")
+            .await
+            .expect("should select the openai subscription seat");
+        assert_eq!(sel.id, "codex-1");
+        assert_eq!(sel.provider, "openai");
+        // Codex inherits host login — no fabricated token env var is emitted,
+        // and (critically) no ANTHROPIC_API_KEY leaks onto the seat.
+        assert!(sel.env_vars.is_empty(), "no env vars for host-login-inherited seat");
+        // The seat token is NOT exposed as an API key.
+        assert!(sel.raw_key.is_none());
+
+        let sel2 = rotator
+            .select_for_provider("github")
+            .await
+            .expect("should select the copilot seat");
+        assert_eq!(sel2.id, "copilot-1");
+        assert_eq!(sel2.provider, "github");
+    }
+
+    /// `select()` (the Anthropic back-compat shim) never returns a
+    /// non-Anthropic subscription seat — provider isolation holds.
+    #[tokio::test]
+    async fn anthropic_shim_ignores_non_anthropic_seats() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(oauth_seat("codex-1", "openai")).await;
+        // No anthropic account present → the anthropic pool is empty.
+        assert!(
+            rotator.select().await.is_none(),
+            "anthropic selection must not fall through to an openai seat"
+        );
+    }
+
+    /// LeastCost prefers an OAuth seat (subscription, zero per-token cost) over
+    /// an API-key account within the SAME provider pool.
+    #[tokio::test]
+    async fn least_cost_prefers_oauth_seat_within_provider() {
+        let rotator = AccountRotator::new(RotationStrategy::LeastCost, 120);
+        // API-key openai account…
+        let mut key_acc = oauth_seat("openai-key", "openai");
+        key_acc.auth_method = AuthMethod::ApiKey;
+        key_acc.api_key = "sk-openai".to_string();
+        key_acc.monthly_budget_cents = 5000;
+        rotator.push_account_for_test(key_acc).await;
+        // …and an OAuth seat for the same provider.
+        rotator.push_account_for_test(oauth_seat("openai-seat", "openai")).await;
+
+        let sel = rotator
+            .select_for_provider("openai")
+            .await
+            .expect("should select within the openai pool");
+        assert_eq!(
+            sel.id, "openai-seat",
+            "LeastCost should prefer the zero-cost subscription seat"
+        );
+    }
+
+    /// A stored seat credential (decrypted from `oauth_token_enc` at load) is
+    /// surfaced on `AccountEnv.seat_token` for a non-Anthropic OAuth seat, but
+    /// never as `raw_key` (it is not an API key). `has_seat_for_provider`
+    /// reports it as available.
+    #[tokio::test]
+    async fn stored_seat_credential_surfaces_on_seat_token_not_raw_key() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        let mut seat = oauth_seat("copilot-seat", "github");
+        seat.oauth_token = Some("gho_stored_token".to_string());
+        rotator.push_account_for_test(seat).await;
+
+        assert!(rotator.has_seat_for_provider("github").await);
+        assert!(!rotator.has_seat_for_provider("qwen").await);
+
+        let sel = rotator
+            .select_for_provider("github")
+            .await
+            .expect("should select the copilot seat");
+        assert_eq!(sel.seat_token.as_deref(), Some("gho_stored_token"));
+        assert!(sel.raw_key.is_none(), "seat token must NOT be an API key");
+    }
+
+    /// A non-Anthropic OAuth seat WITHOUT a stored token (host-login-inherited,
+    /// e.g. Codex) has no `seat_token` and is not reported by
+    /// `has_seat_for_provider` (nothing to forward through the proxy).
+    #[tokio::test]
+    async fn host_login_seat_has_no_seat_token() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator
+            .push_account_for_test(oauth_seat("codex-1", "openai"))
+            .await;
+        let sel = rotator.select_for_provider("openai").await.unwrap();
+        assert!(sel.seat_token.is_none());
+        assert!(!rotator.has_seat_for_provider("openai").await);
+    }
+
+    /// The subscription catalogue exposes the four consumer sources.
+    #[test]
+    fn known_subscription_providers_catalogue() {
+        let cat = known_subscription_providers();
+        let ids: Vec<&str> = cat.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&"anthropic"));
+        assert!(ids.contains(&"openai"));
+        assert!(ids.contains(&"github"));
+        assert!(ids.contains(&"qwen"));
     }
 }

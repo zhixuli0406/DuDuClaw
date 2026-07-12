@@ -23,6 +23,7 @@ pub mod engine;
 pub mod error;
 pub mod exo_cluster;
 pub mod hardware;
+pub mod jitrl;
 #[cfg(any(feature = "metal", feature = "cuda", feature = "vulkan"))]
 pub mod llama_cpp;
 pub mod llamafile;

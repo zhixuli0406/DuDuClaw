@@ -296,6 +296,19 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         runtime
     };
 
+    // ── First-run branding bundle seeding (§11.2) ───────────────
+    //
+    // When this binary ships co-located with a signed branding.bundle.json
+    // (DUDUCLAW_BRANDING_BUNDLE env / executable sibling / macOS .app
+    // Resources), verify it against the baked issuer registry and copy it into
+    // ~/.duduclaw/ *before* any branding::load reads it. Idempotent (never
+    // overwrites an existing bundle) and fail-closed (an unverifiable candidate
+    // is warned once and skipped). Runs after the license runtime so the same
+    // production registry the branding verifier uses is warm; the desktop
+    // sidecar path (`duduclaw run --yes` → start_gateway) is covered here too.
+    // The call logs its own outcome; the return value is only for tests.
+    let _ = crate::branding::seed_bundle_if_absent(&home_dir);
+
     // Initialize wiki trust store (Phase 2 of wiki RL trust feedback).
     // Best-effort: if open fails, the rest of the system still works — RAG
     // simply falls back to frontmatter trust and trust feedback is skipped.
@@ -586,14 +599,16 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     for (label, h) in crate::discord::start_discord_bots(&home_dir, reply_ctx.clone()).await {
         handler.register_channel_handle(&label, h).await;
     }
-    // Webhook channels (LINE, WhatsApp, Feishu, Google Chat, Teams) — global
-    // only for now. Per-agent webhook routing requires multi-path routers
-    // (TODO-per-agent-channels.md)
+    // Webhook channels (LINE, WhatsApp, Feishu, Google Chat, Teams, WeCom,
+    // DingTalk) — global only for now. Per-agent webhook routing requires
+    // multi-path routers (TODO-per-agent-channels.md)
     let line_router = crate::line::start_line_bot(&home_dir, reply_ctx.clone()).await;
     let whatsapp_router = crate::whatsapp::start_whatsapp_webhook(&home_dir, reply_ctx.clone()).await;
     let feishu_router = crate::feishu::start_feishu_webhook(&home_dir, reply_ctx.clone()).await;
     let googlechat_router = crate::googlechat::start_googlechat_webhook(&home_dir, reply_ctx.clone()).await;
     let teams_router = crate::msteams::start_teams_webhook(&home_dir, reply_ctx.clone()).await;
+    let wecom_router = crate::wecom::start_wecom_webhook(&home_dir, reply_ctx.clone()).await;
+    let dingtalk_router = crate::dingtalk::start_dingtalk_webhook(&home_dir, reply_ctx.clone()).await;
     let webchat_ctx = reply_ctx.clone();
 
     // Start unified heartbeat scheduler (per-agent: evolution + cron + monitoring)
@@ -612,6 +627,22 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     );
     handler.set_heartbeat(heartbeat).await;
     info!("Heartbeat scheduler started (per-agent evolution + monitoring)");
+
+    // ── Night Engine (N1–N4 idle-time compute suite) ──
+    // Runs its own idle-aware loop over the same agent registry: for each agent
+    // with `[night_engine] enabled = true` that has been idle past its
+    // threshold, fire a budget-bounded night pass (N3 schema induction + N4
+    // recurrence-gated consolidation are live/deterministic; N1/N2 sleep-time +
+    // prefetch call a real model via `night_llm::RotatedNightLlm` when the
+    // global `config.toml [night] llm_enabled = true` — otherwise the
+    // scheduler passes `None` and N1/N2 no-op exactly as before). Safe to
+    // always spawn — disabled by default per agent.
+    let _night_engine = crate::night_engine::spawn_night_engine(
+        home_dir.clone(),
+        handler.registry().clone(),
+        300, // check every 5 minutes
+    );
+    info!("Night Engine scheduler started (idle-time N1–N4, disabled per-agent by default)");
 
     // P1 (2026-05-09): build the GvuTriggerCtx once and share it across the
     // silence-event consumer and the dispatcher so both code paths fire GVU
@@ -834,6 +865,32 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     }
 
     // ── Periodic update check (every 6 hours) — broadcast to dashboard ──
+    // ── G1: durable dispatch engine ──────────────────────────
+    // Background loop that provides the durability guarantees the legacy
+    // bus_queue.jsonl file rail lacks: zombie reclaim (crashed-worker leases) +
+    // goal-mode judge acceptance. Atomic claim / dependency unlock are enforced
+    // in task_store and reached via the tasks_claim MCP tool.
+    // NOTE: the acceptance judge is not yet wired to the account rotator; goal-mode
+    // `review` tasks sit safely in `review` (never auto-accepted) until an
+    // LlmAcceptanceJudge is injected here (follow-up). Zombie reclaim + dependency
+    // gating are fully live regardless.
+    // Default OFF (conservative rollout default — see `dispatch_engine_enabled`).
+    // Lease renewal is wired (LeaseRenewalGuard for in-process workers,
+    // `tasks_renew` MCP heartbeat for external agents) and reclaim is
+    // conservative (expiry + one full unrenewed lease window), so enabling via
+    // `[dispatch] enabled = true` / DUDUCLAW_DISPATCH_ENGINE=1 is safe.
+    // Synchronous claim/dependency/complete via the MCP task tools work
+    // regardless of this flag.
+    if crate::dispatch_engine::dispatch_engine_enabled(&home_dir) {
+        if let Some(ts) = task_store_opt.clone() {
+            let engine = Arc::new(crate::dispatch_engine::DispatchEngine::new(ts, None));
+            bg_handles.push(tokio::spawn(async move { engine.run().await }));
+            info!("Dispatch engine started (durable SQLite派工：殭屍回收 + goal-mode 驗收)");
+        }
+    } else {
+        info!("Dispatch engine disabled (預設關；lease 續租已接上，可用 [dispatch] enabled=true 啟用)");
+    }
+
     // Pro edition: auto-download + install + graceful restart (unless disabled).
     // CE edition: notify dashboard only.
     let auto_update = crate::updater::auto_update_enabled(&home_dir);
@@ -1162,10 +1219,22 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         );
     }
 
+    // ── License control-plane (P2, white-label owner) ─────────────
+    // Always mounted; each handler self-gates on `[distributor] issuer_key_path`
+    // (absent ⇒ 404) so a plain gateway exposes no behaviour. Public (no bearer)
+    // — trust is proven by subscription_id + machine_fingerprint. Own state
+    // (home_dir) + 64 KiB body cap, like the federation route above.
+    app = app.merge(crate::license_serve::router(home_dir.clone()));
+
     // ── .well-known endpoints for protocol discovery ──────────────
     app = app
         .route("/.well-known/mcp-server.json", get(well_known_mcp_server_card))
-        .route("/.well-known/agent.json", get(well_known_agent_card));
+        // A2A v1.0 signed Agent Card (G6). `agent-card.json` is the v1.0 path;
+        // `agent.json` is kept as a legacy alias. Both serve the signed card.
+        .route("/.well-known/agent-card.json", get(well_known_agent_card))
+        .route("/.well-known/agent.json", get(well_known_agent_card))
+        // JWKS advertising the A2A signing public key for card verification.
+        .route("/.well-known/jwks.json", get(well_known_jwks));
 
     // Mount LINE webhook endpoint (always — the handler reads config per request)
     app = app.merge(line_router);
@@ -1180,6 +1249,12 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         app = app.merge(r);
     }
     if let Some(r) = teams_router {
+        app = app.merge(r);
+    }
+    if let Some(r) = wecom_router {
+        app = app.merge(r);
+    }
+    if let Some(r) = dingtalk_router {
         app = app.merge(r);
     }
 
@@ -2986,8 +3061,39 @@ mod login_rate_limit_tests {
     }
 }
 
-async fn well_known_agent_card() -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({
+/// Process-wide A2A signer, initialized once from the on-disk key (generating it
+/// on first use). `None` means key load/generation failed — the card is served
+/// unsigned (fail-open on availability, fail-closed on integrity: an unsigned
+/// card is honest about its lack of a signature). A warning is logged once.
+fn a2a_signer() -> Option<&'static crate::a2a_signing::A2aSigner> {
+    use std::sync::OnceLock;
+    static SIGNER: OnceLock<Option<crate::a2a_signing::A2aSigner>> = OnceLock::new();
+    SIGNER
+        .get_or_init(|| {
+            let path = crate::a2a_signing::default_key_path();
+            match crate::a2a_signing::A2aSigner::load_or_generate(&path) {
+                Ok((signer, generated)) => {
+                    if generated {
+                        info!(
+                            "已生成 A2A Agent Card 簽章金鑰（{}），公鑰指紋 {}",
+                            path.display(),
+                            signer.fingerprint()
+                        );
+                    }
+                    Some(signer)
+                }
+                Err(e) => {
+                    warn!("A2A 簽章金鑰不可用，Agent Card 將以未簽章方式提供：{e}");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Build the unsigned A2A Agent Card body (existing fields, unchanged).
+fn build_agent_card() -> serde_json::Value {
+    serde_json::json!({
         "name": "DuDuClaw Agent",
         "description": "AI agent with channel routing, memory, and self-evolution",
         "url": format!("http://localhost:{}", std::env::var("DUDUCLAW_PORT").unwrap_or_else(|_| "3000".to_string())),
@@ -3002,5 +3108,25 @@ async fn well_known_agent_card() -> axum::Json<serde_json::Value> {
             {"name": "channel_messaging", "description": "Telegram/LINE/Discord messaging", "tags": ["messaging"]},
             {"name": "memory", "description": "Search and store memories", "tags": ["memory"]},
         ],
-    }))
+    })
+}
+
+async fn well_known_agent_card() -> axum::Json<serde_json::Value> {
+    let mut card = build_agent_card();
+    // A2A v1.0 signature — only added when a signer is available; original
+    // fields are never modified (only-add invariant). Fail-closed on error =>
+    // serve the unsigned card rather than a 500.
+    if let Some(signer) = a2a_signer() {
+        signer.sign_card(&mut card);
+    }
+    axum::Json(card)
+}
+
+/// JWKS endpoint advertising the A2A signing public key (RFC 8037 OKP/Ed25519).
+/// Empty key set when no signer is available.
+async fn well_known_jwks() -> axum::Json<serde_json::Value> {
+    match a2a_signer() {
+        Some(signer) => axum::Json(signer.jwks()),
+        None => axum::Json(serde_json::json!({ "keys": [] })),
+    }
 }

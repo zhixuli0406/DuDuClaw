@@ -238,6 +238,68 @@ pub fn decision_ttl_days(agent_dir: &Path) -> i64 {
         .unwrap_or(DEFAULT_TTL_DAYS)
 }
 
+// ── O1: confidence-aware delegation routing config ──────────────────
+//
+// Opt-in, default OFF. Global switch in `<home>/config.toml`:
+//
+//   [delegation]
+//   confidence_routing = true
+//
+// Per-agent override in `agent.toml` (agent wins over global, both ways):
+//
+//   [model]
+//   delegation_routing = true   # or false
+//   standard = "..."            # optional mid tier; unset ⇒ preferred
+//
+// All readers are fail-safe: a missing/malformed file or wrong-typed key
+// resolves to the default (routing off / no standard model), never an error.
+
+/// Global `config.toml [delegation] confidence_routing` flag (O1).
+/// Default `false` — absent/malformed file or non-bool value keeps routing off.
+pub fn global_delegation_routing(home_dir: &Path) -> bool {
+    read_global_config(home_dir)
+        .as_ref()
+        .and_then(|v| v.get("delegation"))
+        .and_then(|d| d.get("confidence_routing"))
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false)
+}
+
+/// Per-agent `agent.toml [model] delegation_routing` override (O1).
+/// `None` when unset/malformed — the caller falls back to the global flag.
+pub fn agent_delegation_routing(agent_dir: &Path) -> Option<bool> {
+    read_agent_toml(agent_dir)
+        .and_then(|v| {
+            v.get("model")
+                .and_then(|m| m.get("delegation_routing"))
+                .and_then(|b| b.as_bool())
+        })
+}
+
+/// Optional mid-tier model from `agent.toml [model] standard` (O1).
+/// `None` (or a blank value) means the config does not distinguish a mid
+/// tier — the Standard tier then resolves to the agent's preferred model.
+pub fn agent_standard_model(agent_dir: &Path) -> Option<String> {
+    read_agent_toml(agent_dir)
+        .and_then(|v| {
+            v.get("model")
+                .and_then(|m| m.get("standard"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+}
+
+/// Effective delegation-routing switch (O1): the per-agent override wins in
+/// both directions; when the agent is silent, the global flag decides.
+/// Fully unconfigured ⇒ `false` (byte-identical legacy dispatch behavior).
+pub fn delegation_routing_enabled(home_dir: &Path, agent_dir: &Path) -> bool {
+    match agent_delegation_routing(agent_dir) {
+        Some(explicit) => explicit,
+        None => global_delegation_routing(home_dir),
+    }
+}
+
 // ── Global utility config (RFC-25 N2) ───────────────────────────────
 //
 // Background utility tasks (session summarizer, wiki ingest, forced reflection,
@@ -579,6 +641,71 @@ mod tests {
         let spec = resolve_utility(home.path(), None);
         assert_eq!(spec.provider, RuntimeType::Claude);
         assert_eq!(spec.model, DEFAULT_UTILITY_MODEL);
+    }
+
+    // ── O1: delegation confidence-routing config ────────────────────
+
+    #[test]
+    fn delegation_routing_defaults_off_when_unconfigured() {
+        let home = TempDir::new().unwrap();
+        let agent = TempDir::new().unwrap();
+        assert!(!global_delegation_routing(home.path()));
+        assert_eq!(agent_delegation_routing(agent.path()), None);
+        assert!(!delegation_routing_enabled(home.path(), agent.path()));
+    }
+
+    #[test]
+    fn delegation_routing_global_flag() {
+        let home = TempDir::new().unwrap();
+        let agent = TempDir::new().unwrap();
+        write_global_config(home.path(), "[delegation]\nconfidence_routing = true\n");
+        assert!(global_delegation_routing(home.path()));
+        assert!(delegation_routing_enabled(home.path(), agent.path()));
+    }
+
+    #[test]
+    fn delegation_routing_agent_override_wins_both_ways() {
+        let home = TempDir::new().unwrap();
+        let agent = TempDir::new().unwrap();
+        // Global ON, agent explicitly OFF → off.
+        write_global_config(home.path(), "[delegation]\nconfidence_routing = true\n");
+        write_agent_toml(agent.path(), "[model]\ndelegation_routing = false\n");
+        assert_eq!(agent_delegation_routing(agent.path()), Some(false));
+        assert!(!delegation_routing_enabled(home.path(), agent.path()));
+        // Global OFF, agent explicitly ON → on.
+        write_global_config(home.path(), "");
+        write_agent_toml(agent.path(), "[model]\ndelegation_routing = true\n");
+        assert!(delegation_routing_enabled(home.path(), agent.path()));
+    }
+
+    #[test]
+    fn delegation_routing_fail_safe_on_malformed() {
+        let home = TempDir::new().unwrap();
+        let agent = TempDir::new().unwrap();
+        // Wrong-typed values → default off / None.
+        write_global_config(home.path(), "[delegation]\nconfidence_routing = \"yes\"\n");
+        write_agent_toml(agent.path(), "[model]\ndelegation_routing = \"yes\"\n");
+        assert!(!global_delegation_routing(home.path()));
+        assert_eq!(agent_delegation_routing(agent.path()), None);
+        assert!(!delegation_routing_enabled(home.path(), agent.path()));
+        // Malformed toml → same.
+        write_global_config(home.path(), "not valid toml ===");
+        write_agent_toml(agent.path(), "not valid toml ===");
+        assert!(!delegation_routing_enabled(home.path(), agent.path()));
+    }
+
+    #[test]
+    fn standard_model_reads_and_filters_blank() {
+        let agent = TempDir::new().unwrap();
+        assert_eq!(agent_standard_model(agent.path()), None);
+        write_agent_toml(agent.path(), "[model]\nstandard = \"claude-sonnet-4-6\"\n");
+        assert_eq!(
+            agent_standard_model(agent.path()),
+            Some("claude-sonnet-4-6".to_string())
+        );
+        // Blank / whitespace value → None (fail-safe to preferred).
+        write_agent_toml(agent.path(), "[model]\nstandard = \"  \"\n");
+        assert_eq!(agent_standard_model(agent.path()), None);
     }
 
     #[test]

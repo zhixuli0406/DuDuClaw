@@ -657,6 +657,24 @@ pub async fn handle_user_profile_get(
     }
 }
 
+/// Compile the calling agent's user-as-code profile: typed preference rules
+/// (deterministically parsed from currently-valid `user:*` SPO triples and
+/// `user-profile`-tagged entries), unresolved conflicts, and the count of
+/// rows the parsers could not type. Read-only; the agent is the
+/// server-injected write namespace (never client-supplied). No parameters.
+pub async fn handle_user_code_profile(
+    memory: &SqliteMemoryEngine,
+    ns_ctx: &NamespaceContext,
+) -> Value {
+    match duduclaw_memory::compile_user_profile(&ns_ctx.write_namespace, memory).await {
+        Ok(profile) => match serde_json::to_value(&profile) {
+            Ok(v) => mcp_text(v),
+            Err(e) => mcp_error(&format!("user_code_profile serialization failed: {e}")),
+        },
+        Err(e) => mcp_error(&format!("user_code_profile failed: {e}")),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1247,5 +1265,20 @@ mod tests {
         let payload: Value = serde_json::from_str(&text_of(&resp)).unwrap();
         assert_eq!(payload["total_found"].as_u64().unwrap(), 0);
         assert_eq!(payload["total_missing"].as_u64().unwrap(), 1);
+    }
+
+    // ── user_code_profile ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn user_code_profile_empty_store_returns_empty_profile() {
+        let mem = SqliteMemoryEngine::in_memory().unwrap();
+        let ns = internal_ns("a1");
+        let resp = handle_user_code_profile(&mem, &ns).await;
+        assert!(resp.get("isError").is_none(), "must not error: {resp}");
+        let payload: Value = serde_json::from_str(&text_of(&resp)).unwrap();
+        assert_eq!(payload["agent_id"].as_str().unwrap(), "internal/a1");
+        assert!(payload["rules"].as_array().unwrap().is_empty());
+        assert!(payload["conflicts"].as_array().unwrap().is_empty());
+        assert_eq!(payload["unparsed_count"].as_u64().unwrap(), 0);
     }
 }

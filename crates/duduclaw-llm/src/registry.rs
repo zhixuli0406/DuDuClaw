@@ -7,11 +7,12 @@
 //! return `None` — callers decide (the gateway will fall back to its legacy
 //! pricing table).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::moa::{MoaSpec, DEFAULT_PROPOSER_MAX_TOKENS};
 use crate::provider::split_model_id;
 use crate::types::NormalizedUsage;
 
@@ -91,10 +92,26 @@ impl ModelInfo {
     }
 }
 
+/// Raw `[moa.<name>]` section shape (name comes from the table key).
+#[derive(Debug, Deserialize)]
+struct MoaSpecToml {
+    proposers: Vec<String>,
+    aggregator: String,
+    #[serde(default)]
+    max_parallel: Option<usize>,
+    #[serde(default)]
+    proposer_max_tokens: Option<u32>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ModelsFile {
     #[serde(default)]
     models: Vec<ModelInfo>,
+    /// Named Mixture-of-Agents ensembles (G7): `[moa.<name>]` sections in the
+    /// same override file. Absent ⇒ the MoA feature is invisible.
+    /// BTreeMap for deterministic iteration order.
+    #[serde(default)]
+    moa: BTreeMap<String, MoaSpecToml>,
 }
 
 /// The model registry. Lookup accepts both `"provider/model"` and bare
@@ -108,6 +125,9 @@ pub struct ModelRegistry {
     bare_index: HashMap<String, String>,
     /// insertion order for deterministic iteration
     order: Vec<String>,
+    /// Named MoA ensembles from `[moa.<name>]` override sections (G7).
+    /// Empty ⇒ `moa:<name>` ids never resolve (feature invisible).
+    moa: BTreeMap<String, MoaSpec>,
 }
 
 impl ModelRegistry {
@@ -132,12 +152,39 @@ impl ModelRegistry {
     /// ones with the same qualified id (this is also the refresh loader —
     /// a models.dev-style fetched document converted to this schema merges
     /// through the same path; network wiring is a later wave).
+    ///
+    /// `[moa.<name>]` sections merge idempotently by name (a re-merge of the
+    /// same name replaces the spec). All MoA specs are validated BEFORE
+    /// anything is inserted, so an invalid spec rejects the whole document
+    /// and leaves the registry unchanged (fail-closed, no partial merge).
+    /// Returns the number of merged entries (models + MoA specs).
     pub fn merge_toml_str(&mut self, toml_str: &str) -> Result<usize, String> {
         let parsed: ModelsFile =
             toml::from_str(toml_str).map_err(|e| format!("models.toml parse error: {e}"))?;
-        let n = parsed.models.len();
+
+        // Validate MoA specs up front — before mutating anything.
+        let mut moa_specs: Vec<MoaSpec> = Vec::with_capacity(parsed.moa.len());
+        for (name, raw) in parsed.moa {
+            let proposer_count = raw.proposers.len();
+            let spec = MoaSpec {
+                name,
+                proposers: raw.proposers,
+                aggregator: raw.aggregator,
+                max_parallel: raw.max_parallel.unwrap_or_else(|| proposer_count.max(1)),
+                proposer_max_tokens: raw
+                    .proposer_max_tokens
+                    .unwrap_or(DEFAULT_PROPOSER_MAX_TOKENS),
+            };
+            spec.validate()?;
+            moa_specs.push(spec);
+        }
+
+        let n = parsed.models.len() + moa_specs.len();
         for info in parsed.models {
             self.insert(info);
+        }
+        for spec in moa_specs {
+            self.moa.insert(spec.name.clone(), spec);
         }
         Ok(n)
     }
@@ -202,6 +249,18 @@ impl ModelRegistry {
     /// All known models in insertion order.
     pub fn models(&self) -> impl Iterator<Item = &ModelInfo> {
         self.order.iter().filter_map(|q| self.models.get(q))
+    }
+
+    /// Look up a MoA ensemble by name (the `<name>` in `moa:<name>`).
+    /// Unknown → `None`; the MoA executor turns that into an explicit
+    /// fail-closed error (never a silent single-model fallback).
+    pub fn moa_spec(&self, name: &str) -> Option<&MoaSpec> {
+        self.moa.get(name)
+    }
+
+    /// All configured MoA ensembles, in name order (deterministic).
+    pub fn moa_specs(&self) -> impl Iterator<Item = &MoaSpec> {
+        self.moa.values()
     }
 
     /// Cost of a usage record in millicents.
@@ -434,5 +493,127 @@ mod tests {
         let mut reg = ModelRegistry::empty();
         assert!(reg.merge_toml_str("this is [ not toml").is_err());
         assert_eq!(reg.models().count(), 0);
+    }
+
+    // ── MoA spec loading (G7) ──────────────────────────────────────────────
+
+    #[test]
+    fn moa_sections_parse_with_defaults_and_are_idempotent() {
+        let mut reg = ModelRegistry::vendored();
+        assert!(reg.moa_spec("planner").is_none(), "no spec ⇒ invisible");
+
+        let doc = r#"
+            [moa.planner]
+            proposers = ["anthropic/claude-sonnet-5", "deepseek/deepseek-v3.2", "xai/grok-4.1-fast"]
+            aggregator = "anthropic/claude-sonnet-5"
+
+            [moa.coder]
+            proposers = ["deepseek/deepseek-v3.2"]
+            aggregator = "openai/gpt-5.4"
+            max_parallel = 1
+            proposer_max_tokens = 512
+        "#;
+        // 0 models + 2 moa specs merged.
+        assert_eq!(reg.merge_toml_str(doc).expect("merge"), 2);
+
+        let planner = reg.moa_spec("planner").expect("planner spec");
+        assert_eq!(planner.proposers.len(), 3);
+        assert_eq!(planner.aggregator, "anthropic/claude-sonnet-5");
+        // Defaults: max_parallel = all proposers; token cap = default const.
+        assert_eq!(planner.max_parallel, 3);
+        assert_eq!(planner.proposer_max_tokens, DEFAULT_PROPOSER_MAX_TOKENS);
+
+        let coder = reg.moa_spec("coder").expect("coder spec");
+        assert_eq!(coder.max_parallel, 1);
+        assert_eq!(coder.proposer_max_tokens, 512);
+
+        // Deterministic name-ordered iteration.
+        let names: Vec<&str> = reg.moa_specs().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["coder", "planner"]);
+
+        // Idempotent re-merge: same name replaces, count stays 2.
+        let doc2 = r#"
+            [moa.planner]
+            proposers = ["openai/gpt-5.4"]
+            aggregator = "openai/gpt-5.4"
+        "#;
+        reg.merge_toml_str(doc2).expect("re-merge");
+        assert_eq!(reg.moa_specs().count(), 2);
+        assert_eq!(reg.moa_spec("planner").unwrap().proposers, vec!["openai/gpt-5.4"]);
+    }
+
+    #[test]
+    fn moa_and_models_coexist_in_one_override_file() {
+        let mut reg = ModelRegistry::vendored();
+        let n = reg
+            .merge_toml_str(
+                r#"
+                [[models]]
+                id = "my-local-model"
+                provider = "local"
+                context_window = 32000
+                max_output_tokens = 4096
+                input_mc = 0
+                output_mc = 0
+
+                [moa.hybrid]
+                proposers = ["local/my-local-model"]
+                aggregator = "anthropic/claude-sonnet-5"
+                "#,
+            )
+            .expect("merge");
+        assert_eq!(n, 2); // 1 model + 1 moa spec
+        assert!(reg.get("local/my-local-model").is_some());
+        assert!(reg.moa_spec("hybrid").is_some());
+    }
+
+    #[test]
+    fn invalid_moa_spec_rejects_whole_document_no_partial_merge() {
+        let mut reg = ModelRegistry::vendored();
+        let before = reg.models().count();
+        // Empty proposers is invalid — the model in the same doc must NOT land.
+        let err = reg
+            .merge_toml_str(
+                r#"
+                [[models]]
+                id = "should-not-land"
+                provider = "local"
+                context_window = 1000
+                max_output_tokens = 100
+                input_mc = 0
+                output_mc = 0
+
+                [moa.broken]
+                proposers = []
+                aggregator = "anthropic/claude-sonnet-5"
+                "#,
+            )
+            .expect_err("invalid spec");
+        assert!(err.contains("broken"), "got: {err}");
+        assert_eq!(reg.models().count(), before);
+        assert!(reg.get("local/should-not-land").is_none());
+        assert!(reg.moa_spec("broken").is_none());
+
+        // Nested moa: member is rejected too.
+        assert!(reg
+            .merge_toml_str(
+                r#"
+                [moa.nested]
+                proposers = ["moa:other"]
+                aggregator = "anthropic/claude-sonnet-5"
+                "#
+            )
+            .is_err());
+        // max_parallel = 0 is rejected.
+        assert!(reg
+            .merge_toml_str(
+                r#"
+                [moa.zero]
+                proposers = ["anthropic/claude-sonnet-5"]
+                aggregator = "anthropic/claude-sonnet-5"
+                max_parallel = 0
+                "#
+            )
+            .is_err());
     }
 }

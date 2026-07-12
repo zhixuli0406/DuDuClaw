@@ -281,6 +281,18 @@ pub struct NormalizedUsage {
 }
 
 impl NormalizedUsage {
+    /// Component-wise saturating sum. Used by ensemble executors (MoA) to
+    /// aggregate usage across sub-calls into one billable total.
+    pub fn saturating_add(&self, other: &Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            cache_read_tokens: self.cache_read_tokens.saturating_add(other.cache_read_tokens),
+            cache_write_tokens: self.cache_write_tokens.saturating_add(other.cache_write_tokens),
+            reasoning_tokens: self.reasoning_tokens.saturating_add(other.reasoning_tokens),
+        }
+    }
+
     /// Fraction of the prompt served from cache (mirrors CostTelemetry).
     pub fn cache_efficiency(&self) -> f64 {
         let total = self.input_tokens + self.cache_read_tokens + self.cache_write_tokens;

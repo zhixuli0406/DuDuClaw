@@ -129,6 +129,27 @@ pub fn production_registry() -> PublicKeyRegistry {
     }
 }
 
+/// Resolve the control-plane base URL with §10.5 precedence:
+/// `DUDUCLAW_CONTROL_URL` env > `license.control_url` (self-carried) > the baked
+/// default. A blank env value is treated as unset.
+pub fn resolve_control_url(license: Option<&License>) -> String {
+    if let Ok(env_url) = std::env::var("DUDUCLAW_CONTROL_URL") {
+        let trimmed = env_url.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Some(lic) = license {
+        if let Some(url) = lic.control_url.as_deref() {
+            let trimmed = url.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    DEFAULT_CONTROL_URL.to_string()
+}
+
 /// How long we wait for a phone-home HTTP request before giving up and
 /// trying again next cycle.
 const PHONE_HOME_TIMEOUT: StdDuration = StdDuration::from_secs(20);
@@ -188,9 +209,6 @@ impl LicenseRuntime {
                 .expect("embedded features.toml is malformed"),
         );
 
-        let control_url = std::env::var("DUDUCLAW_CONTROL_URL")
-            .unwrap_or_else(|_| DEFAULT_CONTROL_URL.to_string());
-
         // M52 fix: honor a persisted revocation marker — if a prior revocation
         // could not delete license.json, do NOT reload it on restart.
         let license = if home_dir.join(REVOKED_FILENAME).exists() {
@@ -202,6 +220,12 @@ impl LicenseRuntime {
         } else {
             load_and_validate(&registry, &gate).await
         };
+
+        // §10.5: resolve the control-plane URL AFTER loading the license so a
+        // self-carried `license.control_url` (baked in by the issuer) is honored
+        // when the operator has not set `DUDUCLAW_CONTROL_URL`. Precedence:
+        // env > license.control_url > DEFAULT.
+        let control_url = resolve_control_url(license.as_ref());
 
         let tier = license
             .as_ref()
@@ -277,6 +301,13 @@ impl LicenseRuntime {
     /// the read lock.
     pub fn feature_gate(&self) -> Arc<FeatureGate> {
         self.gate.clone()
+    }
+
+    /// The resolved control-plane base URL for this instance (§10.5). Used by
+    /// `branding.bundle.create` to reach the owner gateway's `/v1/branding/sign`
+    /// with the exact same precedence phone-home uses.
+    pub fn control_url(&self) -> &str {
+        &self.control_url
     }
 
     /// Snapshot of the current license, if any. Returned by reference

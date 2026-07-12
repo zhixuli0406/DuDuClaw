@@ -4,13 +4,17 @@
 //! can send screenshots, text updates, and confirmation requests back to the
 //! user's messaging channel without knowing which channel is in use.
 //!
-//! Supported channels (all 7):
+//! Supported channels:
 //! - Telegram  — Bot API sendMessage / sendPhoto
 //! - LINE      — Messaging API push message
 //! - Discord   — REST API Create Message + attachment
 //! - Slack     — Web API chat.postMessage + files.upload
 //! - WhatsApp  — Cloud API messages (text / image via media upload)
 //! - Feishu    — Open API send message (text / image)
+//! - Google Chat — spaces.messages.create (photo falls back to text notice)
+//! - MS Teams  — Bot Connector proactive send (photo falls back to text notice)
+//! - WeCom     — message/send + media/upload (text / image)
+//! - DingTalk  — sessionWebhook reply (photo falls back to text notice)
 //! - WebChat   — WebSocket JSON envelope
 //!
 //! The user can be on their phone — all interaction happens in-channel,
@@ -212,6 +216,28 @@ pub struct ChannelTarget {
     pub(crate) extra_id: Option<String>,
 }
 
+/// Channels whose senders resolve their own credentials from global config
+/// at send time (multi-field credentials like corpid+corpsecret+agentid),
+/// so `ChannelTarget.token` is ignored and a `<channel>_bot_token` lookup
+/// must NOT gate delivery for them (cron notifications, OTP).
+///
+/// Marker-field presence for these channels is checked via
+/// [`self_config_marker_field`].
+pub fn sender_self_configures(channel_type: &str) -> bool {
+    matches!(channel_type, "wecom" | "dingtalk")
+}
+
+/// The config.toml `[channels]` field whose presence proves a
+/// self-configuring channel is actually set up (enc-aware lookup is the
+/// caller's job). `None` for channels that use a plain bot token.
+pub fn self_config_marker_field(channel_type: &str) -> Option<&'static str> {
+    match channel_type {
+        "wecom" => Some("wecom_corp_secret"),
+        "dingtalk" => Some("dingtalk_app_secret"),
+        _ => None,
+    }
+}
+
 /// Create a `Box<dyn ChannelSender>` for the given channel target.
 ///
 /// This is the primary entry point for the orchestrator to obtain a sender
@@ -250,6 +276,20 @@ pub fn create_sender(target: &ChannelTarget, http: reqwest::Client) -> Box<dyn C
             access_token: target.token.clone(),
             chat_id: target.chat_id.clone(),
             http,
+        }),
+        // WeCom / DingTalk credentials live in global config, not on
+        // `ChannelTarget` (same situation as Teams / Google Chat) — resolve
+        // via the canonical home dir so factory-built senders (cron
+        // notifications, OTP, computer use) deliver instead of silently
+        // falling through to NullSender.
+        "wecom" => Box::new(WeComSender {
+            home_dir: duduclaw_core::platform::duduclaw_home(),
+            touser: target.chat_id.clone(),
+        }),
+        "dingtalk" => Box::new(DingTalkSender {
+            home_dir: duduclaw_core::platform::duduclaw_home(),
+            conversation_id: target.chat_id.clone(),
+            user_id: target.extra_id.clone().unwrap_or_default(),
         }),
         "webchat" => {
             warn!("WebChat sender created via generic factory — use create_webchat_sender() with event_tx for full functionality");
@@ -901,7 +941,109 @@ impl ChannelSender for TeamsSender {
 }
 
 // ===========================================================================
-// 9. WebChat (WebSocket)
+// 9. WeCom (企業微信)
+// ===========================================================================
+
+/// WeCom sender — self-built app `message/send` (text) + `media/upload`
+/// (image). Credentials (corpid / corpsecret / agentid) are read from
+/// global config, so this needs `home_dir` like Teams / Google Chat.
+pub struct WeComSender {
+    pub(crate) home_dir: std::path::PathBuf,
+    /// Target member UserID (`touser`).
+    pub(crate) touser: String,
+}
+
+/// Create a WeCom sender (dedicated constructor — needs `home_dir` for
+/// corp credentials, which `ChannelTarget` doesn't carry).
+pub fn create_wecom_sender(home_dir: std::path::PathBuf, touser: String) -> Box<dyn ChannelSender> {
+    Box::new(WeComSender { home_dir, touser })
+}
+
+#[async_trait]
+impl ChannelSender for WeComSender {
+    async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
+        crate::wecom::send_text_via_config(&self.home_dir, &self.touser, text)
+            .await
+            .map_err(ChannelSendError)
+    }
+
+    async fn send_photo(&self, png_data: &[u8], caption: &str) -> Result<(), ChannelSendError> {
+        crate::wecom::send_photo_via_config(&self.home_dir, &self.touser, png_data)
+            .await
+            .map_err(ChannelSendError)?;
+        if !caption.is_empty() {
+            self.send_text(caption).await?;
+        }
+        Ok(())
+    }
+
+    async fn request_confirmation(
+        &self, prompt: &str, screenshot: Option<&[u8]>, timeout_secs: u64,
+    ) -> Result<bool, ChannelSendError> {
+        if let Some(png) = screenshot { self.send_photo(png, prompt).await?; }
+        else { self.send_text(prompt).await?; }
+        wait_for_confirmation(&self.touser, timeout_secs).await
+    }
+
+    fn channel_type(&self) -> &'static str { "wecom" }
+}
+
+// ===========================================================================
+// 10. DingTalk (釘釘)
+// ===========================================================================
+
+/// DingTalk sender — enterprise internal robot reply via the persisted
+/// per-conversation `sessionWebhook` (valid ~90 min after the last inbound
+/// message; sends past expiry fail with a clear error).
+pub struct DingTalkSender {
+    pub(crate) home_dir: std::path::PathBuf,
+    pub(crate) conversation_id: String,
+    /// Requesting user's staff id for confirmation scoping.
+    pub(crate) user_id: String,
+}
+
+/// Create a DingTalk sender (dedicated constructor — needs `home_dir` for
+/// the session-webhook store, which `ChannelTarget` doesn't carry).
+pub fn create_dingtalk_sender(
+    home_dir: std::path::PathBuf,
+    conversation_id: String,
+    user_id: String,
+) -> Box<dyn ChannelSender> {
+    Box::new(DingTalkSender { home_dir, conversation_id, user_id })
+}
+
+#[async_trait]
+impl ChannelSender for DingTalkSender {
+    async fn send_text(&self, text: &str) -> Result<(), ChannelSendError> {
+        crate::dingtalk::send_text_to_conversation(&self.home_dir, &self.conversation_id, text)
+            .await
+            .map_err(ChannelSendError)
+    }
+
+    async fn send_photo(&self, png_data: &[u8], caption: &str) -> Result<(), ChannelSendError> {
+        // sessionWebhook has no binary upload; deliver the caption + a size
+        // note (fail-soft, consistent with Google Chat / Teams fallback).
+        let msg = format!(
+            "{caption}\n(📸 截圖已擷取，共 {} KB — 釘釘圖片附件上傳尚未支援)",
+            png_data.len() / 1024
+        );
+        self.send_text(&msg).await
+    }
+
+    async fn request_confirmation(
+        &self, prompt: &str, screenshot: Option<&[u8]>, timeout_secs: u64,
+    ) -> Result<bool, ChannelSendError> {
+        if let Some(png) = screenshot { self.send_photo(png, prompt).await?; }
+        else { self.send_text(prompt).await?; }
+        let key = if self.user_id.is_empty() { &self.conversation_id } else { &self.user_id };
+        wait_for_confirmation(key, timeout_secs).await
+    }
+
+    fn channel_type(&self) -> &'static str { "dingtalk" }
+}
+
+// ===========================================================================
+// 11. WebChat (WebSocket)
 // ===========================================================================
 
 /// WebChat sender — sends JSON messages over the WebSocket broadcast channel.
@@ -1058,6 +1200,55 @@ mod tests {
         };
         let sender = create_sender(&target, reqwest::Client::new());
         assert_eq!(sender.channel_type(), "feishu");
+    }
+
+    /// HIGH-B regression: wecom/dingtalk previously fell through the wildcard
+    /// to NullSender, so cron / OTP / computer-use sends were silently dropped.
+    #[test]
+    fn factory_creates_wecom() {
+        let target = ChannelTarget {
+            channel_type: "wecom".into(),
+            chat_id: "zhangsan".into(),
+            token: String::new(),
+            extra_id: None,
+        };
+        let sender = create_sender(&target, reqwest::Client::new());
+        assert_eq!(sender.channel_type(), "wecom");
+    }
+
+    #[test]
+    fn factory_creates_dingtalk() {
+        let target = ChannelTarget {
+            channel_type: "dingtalk".into(),
+            chat_id: "cid6906".into(),
+            token: String::new(),
+            extra_id: Some("manager123".into()),
+        };
+        let sender = create_sender(&target, reqwest::Client::new());
+        assert_eq!(sender.channel_type(), "dingtalk");
+    }
+
+    /// Cron/OTP token-resolution parity: wecom/dingtalk senders build their
+    /// credentials from global config (corpid+corpsecret+agentid / app key+
+    /// secret), so a `<channel>_bot_token` lookup must not gate their
+    /// delivery. Every token-bearing channel must NOT be flagged
+    /// self-configuring, and each self-configuring channel must declare a
+    /// config marker field for a clear is-it-configured check.
+    #[test]
+    fn self_configuring_channels_are_exactly_wecom_and_dingtalk() {
+        assert!(sender_self_configures("wecom"));
+        assert!(sender_self_configures("dingtalk"));
+        for ch in [
+            "telegram", "line", "discord", "slack", "whatsapp", "feishu", "webchat", "",
+            // anchored matching: no substring surprises
+            "wecom2", "xdingtalk",
+        ] {
+            assert!(!sender_self_configures(ch), "{ch} must not be self-configuring");
+        }
+
+        assert_eq!(self_config_marker_field("wecom"), Some("wecom_corp_secret"));
+        assert_eq!(self_config_marker_field("dingtalk"), Some("dingtalk_app_secret"));
+        assert_eq!(self_config_marker_field("telegram"), None);
     }
 
     #[test]

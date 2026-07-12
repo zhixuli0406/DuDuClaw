@@ -19,6 +19,9 @@ duduclaw-container = { workspace = true }
 duduclaw-security = { workspace = true }
 duduclaw-odoo = { workspace = true }
 duduclaw-inference = { workspace = true }
+# G2 Part B: local reverse-proxy reuses the unified provider layer to forward
+# rotator-selected accounts to their real upstream (OpenAI-compat endpoint out).
+duduclaw-llm = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 # Personal-edition data portability (export/import ~/.duduclaw as .tar.gz).

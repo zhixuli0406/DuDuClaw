@@ -156,6 +156,13 @@ pub fn start_agent_dispatcher_with_crypto(
             // Clean up orphaned delegation callbacks every 720 ticks (~1 hour)
             if tick % 720 == 0 {
                 cleanup_stale_delegation_callbacks(&home_dir).await;
+                // O2: ephemeral agent GC rides the same hourly maintenance
+                // tick (documented choice — no new scheduler; see
+                // `crate::ephemeral` module docs for the removal policy).
+                let swept = crate::ephemeral::sweep(&home_dir).await;
+                if swept > 0 {
+                    info!(swept, "ephemeral agent GC sweep complete");
+                }
             }
             // TaskSpec polling every 2 ticks (~10 seconds)
             if tick % 2 == 0 {
@@ -763,6 +770,21 @@ async fn dispatch_to_agent(
     prompt: &str,
     delegation: &DelegationEnv,
 ) -> Result<String, String> {
+    // O2: ephemeral synthesized agents (`eph-*`) live under
+    // `<home>/agents/.ephemeral/` and are invisible to the registry scan.
+    // Route them through the ephemeral loader; everything downstream
+    // (response append, delegation callback forwarding, prediction record)
+    // is shared with normal agents because this branch sits inside the
+    // same dispatch flow.
+    if crate::ephemeral::is_ephemeral_id(agent_id) {
+        let env_map = delegation.to_env_map();
+        return crate::claude_runner::DELEGATION_ENV
+            .scope(
+                env_map,
+                crate::ephemeral::dispatch(home_dir, registry, agent_id, prompt),
+            )
+            .await;
+    }
     // Read isolation flags from agent config.
     let (use_sandbox, use_worktree, worktree_cfg) = {
         let reg = registry.read().await;
@@ -981,6 +1003,23 @@ async fn dispatch_sandboxed(
     }
     let system_prompt = parts.join("\n\n---\n\n");
     drop(reg);
+
+    // O1: confidence-aware delegation routing (opt-in, default OFF). The
+    // sandboxed dispatch path resolves its model here (it bypasses
+    // call_claude_for_agent_with_type), so apply the same tier routing
+    // symmetrically. When off this returns `model` byte-identically.
+    // Tier routing only applies to Claude runtimes (multi-model doctrine —
+    // tier models are Claude ids; a codex/gemini agent keeps its own model).
+    let delegation_settings = crate::runtime_config::load_runtime_settings(&agent_dir);
+    let model = crate::delegation_router::resolve_delegation_model(
+        home_dir,
+        &agent_dir,
+        agent_id,
+        prompt,
+        &model,
+        &delegation_settings.utility_model,
+        delegation_settings.non_claude_provider().is_none(),
+    );
 
     // Get API key
     let api_key = crate::claude_runner::get_api_key_from_home(home_dir).await;
@@ -2589,6 +2628,26 @@ async fn forward_to_channel(
                 crate::msteams::send_text_to_conversation(home_dir, channel_id, body)
                     .await
                     .map_err(|e| format!("teams send chunk {}/{}: {e}", i + 1, total))?;
+                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
+            }
+        }
+        "wecom" => {
+            // channel_id = target member UserID (touser); credentials +
+            // chunking live in wecom::send_text_via_config.
+            for (i, body) in chunks.iter().enumerate() {
+                crate::wecom::send_text_via_config(home_dir, channel_id, body)
+                    .await
+                    .map_err(|e| format!("wecom send chunk {}/{}: {e}", i + 1, total))?;
+                if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
+            }
+        }
+        "dingtalk" => {
+            // channel_id = DingTalk conversationId; replies ride the stored
+            // sessionWebhook (~90 min validity — errors past expiry).
+            for (i, body) in chunks.iter().enumerate() {
+                crate::dingtalk::send_text_to_conversation(home_dir, channel_id, body)
+                    .await
+                    .map_err(|e| format!("dingtalk send chunk {}/{}: {e}", i + 1, total))?;
                 if i + 1 < total { tokio::time::sleep(chunk_gap).await; }
             }
         }

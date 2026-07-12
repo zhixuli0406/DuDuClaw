@@ -1436,6 +1436,8 @@ pub struct ChannelsConfig {
     pub feishu: Option<FeishuChannelConfig>,
     pub googlechat: Option<GoogleChatChannelConfig>,
     pub teams: Option<TeamsChannelConfig>,
+    pub wecom: Option<WeComChannelConfig>,
+    pub dingtalk: Option<DingTalkChannelConfig>,
 }
 
 /// Per-agent Discord channel settings.
@@ -1587,6 +1589,46 @@ pub struct FeishuChannelConfig {
 }
 
 
+/// Per-agent WeCom (企業微信) channel settings — self-built app (自建應用).
+///
+/// Inbound callbacks hit the global `POST /webhook/wecom` endpoint; the
+/// callback Token + EncodingAESKey authenticate/decrypt them (fail-closed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+#[derive(Default)]
+pub struct WeComChannelConfig {
+    /// Enterprise ID (corpid) — also the receiveid the crypto envelope must carry.
+    pub corp_id: String,
+    /// Self-built app secret (corpsecret) for gettoken.
+    pub corp_secret: String,
+    pub corp_secret_enc: Option<String>,
+    /// Self-built app AgentId.
+    pub agent_id: String,
+    /// Callback verification Token (msg_signature key).
+    pub callback_token: String,
+    pub callback_token_enc: Option<String>,
+    /// 43-char EncodingAESKey for the AES-256-CBC callback envelope.
+    pub encoding_aes_key: String,
+    pub encoding_aes_key_enc: Option<String>,
+}
+
+
+/// Per-agent DingTalk (釘釘) channel settings — enterprise internal robot.
+///
+/// Inbound callbacks hit the global `POST /webhook/dingtalk` endpoint,
+/// verified via the HMAC-SHA256 `sign` header keyed by `app_secret`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+#[derive(Default)]
+pub struct DingTalkChannelConfig {
+    /// Robot AppKey / Client ID.
+    pub app_key: String,
+    /// Robot AppSecret — the callback signature key.
+    pub app_secret: String,
+    pub app_secret_enc: Option<String>,
+}
+
+
 /// Per-agent Google Chat channel settings.
 ///
 /// The Chat app is configured in the Google Cloud console with an HTTP
@@ -1684,6 +1726,10 @@ pub struct AgentConfig {
     /// Session continuity is now handled by native multi-turn session management.
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// Night Engine (N1–N4 idle-time compute suite). Disabled by default;
+    /// opt in per agent via `[night_engine] enabled = true`.
+    #[serde(default)]
+    pub night_engine: NightEngineConfig,
     /// System prompt assembly mode (#11 Active Retrieval, 2026-05-12).
     /// Default `Full` preserves v1.12.x behaviour; opt-in `Minimal` switches
     /// to Anthropic Skills-style "index + MCP on demand" — wiki/skill
@@ -1974,6 +2020,95 @@ impl ProactiveConfig {
             );
             self.max_turns = 64;
         }
+    }
+}
+
+/// Night Engine configuration (N1–N4 idle-time compute suite).
+///
+/// The Night Engine layers four paper-grounded idle-time capabilities on top of
+/// the existing heartbeat scheduler + evolution engine — "the AI employee tidies
+/// its memory and pre-reads tomorrow's work while it sleeps":
+///
+/// - **N1 Sleep-time compute** (arXiv:2504.13171) — pre-reason over active
+///   context during idle windows; results land in a per-agent night cache.
+/// - **N2 Proactive prefetch** (ProAct, arXiv:2605.25971) — predict the user's
+///   next need from history + memory and gather evidence ahead of time.
+/// - **N3 Schema induction** (DCPM, arXiv:2606.09483) — a nightly System-2 pass
+///   that induces recurring schemas from episodic memory (deterministic).
+/// - **N4 Recurrence-gated consolidation + trust verification** (RecMem
+///   arXiv:2605.16045 + TRUSTMEM arXiv:2606.25161) — only semantically recurring
+///   knowledge triggers consolidation; the result passes a deterministic
+///   coverage/preservation/faithfulness gate before it is written (rollback on
+///   failure).
+///
+/// Disabled by default — opt in per agent via `agent.toml [night_engine]`, or
+/// set a global default in `config.toml [night_engine]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct NightEngineConfig {
+    /// Master switch. Default `false` — the whole suite is inert unless opted in.
+    pub enabled: bool,
+    /// Minutes of no user interaction before an agent is considered idle and a
+    /// night pass may run. Default 90.
+    pub idle_threshold_minutes: u64,
+    /// Hard budget cap per night pass, in cents. Once a pass' estimated spend
+    /// reaches this, remaining LLM-backed sub-passes (N1/N2) are skipped.
+    /// Deterministic passes (N3/N4) never spend and run regardless. Default 20.
+    pub max_pass_cost_cents: u64,
+    /// Circuit breaker: maximum night passes per agent per rolling 24h. Guards
+    /// against runaway idle loops. Default 8.
+    pub max_passes_per_day: u32,
+    /// N1 Sleep-time compute sub-pass toggle. Default `true` (still gated by
+    /// `enabled`). Requires an LLM path.
+    pub sleep_time: bool,
+    /// N2 Proactive prefetch sub-pass toggle. Default `true`. Requires an LLM path.
+    pub prefetch: bool,
+    /// N3 Schema induction sub-pass toggle. Default `true`. Deterministic, no LLM.
+    pub schema_induction: bool,
+    /// N4 Recurrence-gated consolidation sub-pass toggle. Default `true`.
+    /// Deterministic verification, no LLM required.
+    pub recurrence_consolidation: bool,
+    /// N3: minimum number of episodic occurrences a pattern needs before it is
+    /// promoted to a schema entry. Default 3.
+    pub schema_min_support: u32,
+    /// N4: minimum semantic recurrence count before consolidation is triggered
+    /// (the RecMem recurrence gate). Default 3.
+    pub recurrence_threshold: u32,
+    /// N1/N2: how many recent memories / turns to consider as context per pass.
+    /// Default 40.
+    pub context_window: u32,
+}
+
+impl Default for NightEngineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            idle_threshold_minutes: 90,
+            max_pass_cost_cents: 20,
+            max_passes_per_day: 8,
+            sleep_time: true,
+            prefetch: true,
+            schema_induction: true,
+            recurrence_consolidation: true,
+            schema_min_support: 3,
+            recurrence_threshold: 3,
+            context_window: 40,
+        }
+    }
+}
+
+impl NightEngineConfig {
+    /// Clamp values to sane ranges after deserialization.
+    pub fn sanitize(&mut self) {
+        if self.idle_threshold_minutes == 0 {
+            self.idle_threshold_minutes = 90;
+        }
+        if self.max_passes_per_day == 0 {
+            self.max_passes_per_day = 1;
+        }
+        self.schema_min_support = self.schema_min_support.max(2);
+        self.recurrence_threshold = self.recurrence_threshold.max(2);
+        self.context_window = self.context_window.clamp(5, 500);
     }
 }
 

@@ -123,8 +123,29 @@ pub async fn run(cmd: LicenseCommands) -> Result<()> {
 }
 
 /// Resolve the control-plane base URL (override with `DUDUCLAW_CONTROL_URL`).
+/// Used by flows without an installed license in scope (e.g. `redeem`).
 fn control_url() -> String {
-    std::env::var("DUDUCLAW_CONTROL_URL").unwrap_or_else(|_| DEFAULT_CONTROL_URL.to_string())
+    resolve_control_url(None)
+}
+
+/// §10.5 control-plane URL resolution: `DUDUCLAW_CONTROL_URL` env >
+/// self-carried `license.control_url` > baked default. A blank env value is
+/// treated as unset. Shared by `refresh` (which passes the license URL) and the
+/// no-license flows (which pass `None`).
+fn resolve_control_url(license_control_url: Option<&str>) -> String {
+    if let Ok(env_url) = std::env::var("DUDUCLAW_CONTROL_URL") {
+        let trimmed = env_url.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Some(url) = license_control_url {
+        let trimmed = url.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    DEFAULT_CONTROL_URL.to_string()
 }
 
 fn http_client() -> Result<reqwest::Client> {
@@ -500,8 +521,8 @@ async fn cmd_refresh() -> Result<()> {
         }
     };
 
-    let control_url = std::env::var("DUDUCLAW_CONTROL_URL")
-        .unwrap_or_else(|_| DEFAULT_CONTROL_URL.to_string());
+    // §10.5 precedence: env > self-carried license.control_url > default.
+    let control_url = resolve_control_url(license.control_url.as_deref());
     let endpoint = format!("{}/v1/license/refresh", control_url.trim_end_matches('/'));
 
     let request_body = serde_json::json!({

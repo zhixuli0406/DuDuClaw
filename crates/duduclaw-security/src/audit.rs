@@ -2,6 +2,32 @@
 //!
 //! [C-2b] All security events (drift, injection, quarantine) are persisted
 //! to `~/.duduclaw/security_audit.jsonl` for forensic review.
+//!
+//! ## Tool-call trace completeness (R4, TraceElephant arXiv:2604.22708)
+//!
+//! The 2026-07 trace audit found `tool_calls.jsonl` records captured only a
+//! caller-authored **outcome summary** (`params_summary`, e.g.
+//! `"ok: old_hash=…, size=…"`) — the tool's *input arguments* were never
+//! persisted, so post-hoc forensics could see *that* a state-changing tool
+//! ran but not *what it was asked to do*. [`append_tool_call_with_input`]
+//! closes that gap: call sites may pass the raw args JSON and the record
+//! gains two **optional** fields (`input`, `input_truncated`) — old rows
+//! and old callers stay valid, and every existing consumer (the Rust
+//! `action_claim_verifier`, the Python adapters) parses records as generic
+//! JSON objects, so the schema remains backward-compatible.
+//!
+//! ### Retention / size tradeoff
+//! Inputs are captured **only for state-changing tools** (read-only tools
+//! are skipped by a conservative verb-token check — unknown names count as
+//! state-changing so evidence is never silently dropped), values under
+//! secret-looking keys are masked *before* serialization, and the
+//! serialized input is capped at [`AUDIT_INPUT_MAX_CHARS`] chars
+//! (CJK-safe `truncate_chars`) with an explicit `input_truncated: true`
+//! marker. With the existing 5 MB rotation ([`maybe_rotate_tool_calls`])
+//! the worst case is ~1.2k full-size records per rotation window — the
+//! rotation cadence shortens under heavy tool traffic, trading history
+//! *depth* for input *completeness*. Operators who need longer retention
+//! should archive the `.jsonl.old` file, not raise the cap.
 
 use std::path::Path;
 
@@ -288,7 +314,12 @@ pub fn append_tool_call_with_extras(
         .open(&path)
     {
         Ok(mut f) => {
-            let _ = duduclaw_core::platform::flock_exclusive(&f);
+            // Warn (not silently swallow) like the security_audit.jsonl
+            // sibling path — a failed lock means concurrent writers may
+            // interleave lines (2026-07 MED).
+            if let Err(e) = duduclaw_core::platform::flock_exclusive(&f) {
+                warn!("flock failed on tool_calls.jsonl: {e}");
+            }
             if let Err(e) = writeln!(f, "{json}") {
                 warn!("Failed to write tool call record: {e}");
             }
@@ -297,6 +328,153 @@ pub fn append_tool_call_with_extras(
             warn!("Failed to open tool_calls.jsonl: {e}");
         }
     }
+}
+
+// ── R4: input capture (TraceElephant) ─────────────────────────
+
+/// Cap on the serialized (masked) input stored per tool-call record.
+/// Chars, not bytes — truncation is CJK-safe via `truncate_chars`.
+pub const AUDIT_INPUT_MAX_CHARS: usize = 4096;
+
+/// Maximum JSON nesting depth walked by the masker; deeper values are
+/// replaced wholesale (defensive bound against pathological inputs).
+const MASK_MAX_DEPTH: usize = 16;
+
+/// Key names whose values are always masked (case-insensitive exact match
+/// on the key, never substring — project convention 2).
+const SENSITIVE_KEYS: &[&str] = &[
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "secret",
+    "client_secret",
+    "corpsecret",
+    "password",
+    "passwd",
+    "api_key",
+    "apikey",
+    "authorization",
+    "auth",
+    "credential",
+    "credentials",
+    "cookie",
+    "session_key",
+    "private_key",
+    "signing_key",
+    "webhook_secret",
+];
+
+/// Value prefixes that mark a string as a credential regardless of its key
+/// (well-known secret formats). Anchored `starts_with`, never substring.
+const SENSITIVE_VALUE_PREFIXES: &[&str] = &[
+    "sk-ant-",
+    "sk-proj-",
+    "xoxb-",
+    "xoxp-",
+    "xapp-",
+    "ghp_",
+    "gho_",
+    "github_pat_",
+    "AKIA",
+    "Bearer ",
+    "glpat-",
+];
+
+fn is_sensitive_key(key: &str) -> bool {
+    SENSITIVE_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k))
+}
+
+fn is_sensitive_value(v: &str) -> bool {
+    SENSITIVE_VALUE_PREFIXES.iter().any(|p| v.starts_with(p))
+}
+
+/// Recursively mask secret-looking values inside a JSON tree. Returns a new
+/// value (never mutates the input). Masking happens **before** the size cap
+/// so a truncated record can never end mid-secret.
+pub fn mask_sensitive_json(v: &serde_json::Value) -> serde_json::Value {
+    mask_at_depth(v, 0)
+}
+
+fn mask_at_depth(v: &serde_json::Value, depth: usize) -> serde_json::Value {
+    if depth > MASK_MAX_DEPTH {
+        return serde_json::Value::String("***depth-capped***".into());
+    }
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, val) in map {
+                if is_sensitive_key(k) {
+                    out.insert(k.clone(), serde_json::Value::String("***".into()));
+                } else {
+                    out.insert(k.clone(), mask_at_depth(val, depth + 1));
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items.iter().map(|i| mask_at_depth(i, depth + 1)).collect(),
+        ),
+        serde_json::Value::String(s) if is_sensitive_value(s) => {
+            // Keep a short, CJK-safe prefix for correlation, mask the rest.
+            let head = duduclaw_core::truncate_chars(s, 8);
+            serde_json::Value::String(format!("{head}***"))
+        }
+        other => other.clone(),
+    }
+}
+
+/// Read-only verb tokens: a tool name whose `_`-split tokens include one of
+/// these is treated as read-only and its input is **not** captured (it left
+/// no state change to reconstruct). Token equality, never substring —
+/// `tasks_list` matches via its `list` token, `enlist_agent` does not.
+/// Conservative bias: unknown names count as state-changing (capture more,
+/// masked — audit completeness wins).
+const READONLY_VERB_TOKENS: &[&str] = &[
+    "list", "get", "read", "search", "status", "stats", "ls", "info", "recent", "summary",
+];
+
+/// `true` when every heuristic agrees the tool only reads state.
+pub fn is_readonly_tool_name(name: &str) -> bool {
+    name.split('_')
+        .any(|tok| READONLY_VERB_TOKENS.iter().any(|v| tok.eq_ignore_ascii_case(v)))
+}
+
+/// Variant of [`append_tool_call`] that additionally captures the tool's
+/// **input arguments** (R4 — record full inputs, not just outcomes).
+///
+/// Behavior:
+/// - `input = None` or a read-only tool name ⇒ byte-identical record shape
+///   to [`append_tool_call`] (no new fields).
+/// - Otherwise the record gains `input` (masked via
+///   [`mask_sensitive_json`], serialized, capped at
+///   [`AUDIT_INPUT_MAX_CHARS`] chars) and `input_truncated: bool`.
+///
+/// Old consumers keep working: both fields are additive and optional.
+pub fn append_tool_call_with_input(
+    home_dir: &Path,
+    agent_id: &str,
+    tool_name: &str,
+    params_summary: &str,
+    success: bool,
+    input: Option<&serde_json::Value>,
+) {
+    let mut extras: Vec<(&str, serde_json::Value)> = Vec::new();
+    if let Some(raw) = input {
+        if !is_readonly_tool_name(tool_name) {
+            let masked = mask_sensitive_json(raw);
+            let serialized = masked.to_string();
+            let truncated = serialized.chars().count() > AUDIT_INPUT_MAX_CHARS;
+            let rendered = if truncated {
+                duduclaw_core::truncate_chars(&serialized, AUDIT_INPUT_MAX_CHARS)
+            } else {
+                serialized
+            };
+            extras.push(("input", serde_json::Value::String(rendered)));
+            extras.push(("input_truncated", serde_json::Value::Bool(truncated)));
+        }
+    }
+    append_tool_call_with_extras(home_dir, agent_id, tool_name, params_summary, success, &extras)
 }
 
 /// Read tool call records for a specific agent within a time window.
@@ -498,4 +676,181 @@ pub fn log_failsafe_change(
         }),
     );
     append_audit_event(home_dir, &event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_home() -> std::path::PathBuf {
+        // No uuid dep in this crate — pid + monotonic counter + nanos is
+        // unique enough for a test scratch dir.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!(
+            "dudu-audit-{}-{}-{nanos}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn read_last_record(home: &std::path::Path) -> serde_json::Value {
+        let body = std::fs::read_to_string(home.join("tool_calls.jsonl")).unwrap();
+        serde_json::from_str(body.lines().last().unwrap()).unwrap()
+    }
+
+    // ── Masking ─────────────────────────────────────────
+
+    #[test]
+    fn mask_replaces_sensitive_keys_recursively() {
+        let v = serde_json::json!({
+            "title": "deploy",
+            "api_key": "sk-live-abcdef",
+            "nested": { "PASSWORD": "hunter2", "note": "ok" },
+            "list": [ { "client_secret": "s3cr3t" } ],
+        });
+        let m = mask_sensitive_json(&v);
+        assert_eq!(m["title"], "deploy");
+        assert_eq!(m["api_key"], "***");
+        assert_eq!(m["nested"]["PASSWORD"], "***", "case-insensitive key match");
+        assert_eq!(m["nested"]["note"], "ok");
+        assert_eq!(m["list"][0]["client_secret"], "***");
+    }
+
+    #[test]
+    fn mask_detects_secret_value_prefixes() {
+        let v = serde_json::json!({
+            "content": "sk-ant-api03-verylongsecrettoken",
+            "header": "Bearer eyJhbGciOi...",
+            "plain": "sk8er boy", // no match — anchored prefix only
+        });
+        let m = mask_sensitive_json(&v);
+        let c = m["content"].as_str().unwrap();
+        assert!(c.ends_with("***") && !c.contains("verylongsecrettoken"));
+        assert!(m["header"].as_str().unwrap().ends_with("***"));
+        assert_eq!(m["plain"], "sk8er boy");
+    }
+
+    #[test]
+    fn mask_key_match_is_exact_not_substring() {
+        // `token_count` must NOT be masked (only exact key `token` is).
+        let v = serde_json::json!({ "token_count": 42, "token": "abc" });
+        let m = mask_sensitive_json(&v);
+        assert_eq!(m["token_count"], 42);
+        assert_eq!(m["token"], "***");
+    }
+
+    #[test]
+    fn mask_depth_cap_never_recurses_forever() {
+        let mut v = serde_json::json!("leaf");
+        for _ in 0..40 {
+            v = serde_json::json!({ "inner": v });
+        }
+        let m = mask_sensitive_json(&v);
+        assert!(m.to_string().contains("depth-capped"));
+    }
+
+    #[test]
+    fn mask_is_cjk_safe_on_prefixed_values() {
+        // Multi-byte content behind a secret prefix must not panic on the
+        // 8-char correlation head.
+        let v = serde_json::json!({ "content": "Bearer 憑證繁體中文金鑰內容" });
+        let m = mask_sensitive_json(&v);
+        assert!(m["content"].as_str().unwrap().ends_with("***"));
+    }
+
+    // ── Read-only heuristic ─────────────────────────────
+
+    #[test]
+    fn readonly_tool_names_by_verb_token() {
+        assert!(is_readonly_tool_name("tasks_list"));
+        assert!(is_readonly_tool_name("memory_search"));
+        assert!(is_readonly_tool_name("shared_wiki_read"));
+        assert!(is_readonly_tool_name("cost_summary"));
+        assert!(is_readonly_tool_name("inference_status"));
+        // State-changing (and unknown-verb) names capture input.
+        assert!(!is_readonly_tool_name("agent_update_soul"));
+        assert!(!is_readonly_tool_name("tasks_create"));
+        assert!(!is_readonly_tool_name("shared_wiki_write"));
+        assert!(!is_readonly_tool_name("totally_new_tool"));
+        // Token equality, not substring: `enlist` ≠ `list`.
+        assert!(!is_readonly_tool_name("enlist_agent"));
+    }
+
+    // ── Input capture records ───────────────────────────
+
+    #[test]
+    fn input_captured_masked_for_state_changing_tool() {
+        let home = fresh_home();
+        let input = serde_json::json!({ "title": "發布", "api_key": "sk-live-xyz" });
+        append_tool_call_with_input(&home, "agnes", "tasks_create", "ok", true, Some(&input));
+        let rec = read_last_record(&home);
+        assert_eq!(rec["tool_name"], "tasks_create");
+        assert_eq!(rec["success"], true);
+        let stored = rec["input"].as_str().unwrap();
+        assert!(stored.contains("發布"));
+        assert!(!stored.contains("sk-live-xyz"), "secret must be masked");
+        assert_eq!(rec["input_truncated"], false);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn input_skipped_for_readonly_tool_and_none() {
+        let home = fresh_home();
+        let input = serde_json::json!({ "query": "q" });
+        append_tool_call_with_input(&home, "agnes", "memory_search", "ok", true, Some(&input));
+        append_tool_call_with_input(&home, "agnes", "tasks_create", "ok", true, None);
+        let body = std::fs::read_to_string(home.join("tool_calls.jsonl")).unwrap();
+        for line in body.lines() {
+            let rec: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(rec.get("input").is_none(), "no input field expected: {line}");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn oversized_input_truncated_with_marker_cjk_safe() {
+        let home = fresh_home();
+        // > AUDIT_INPUT_MAX_CHARS of multi-byte content.
+        let big = "繁體中文稽核".repeat(1500);
+        let input = serde_json::json!({ "content": big });
+        append_tool_call_with_input(&home, "agnes", "shared_wiki_write", "ok", true, Some(&input));
+        let rec = read_last_record(&home);
+        assert_eq!(rec["input_truncated"], true);
+        assert!(rec["input"].as_str().unwrap().chars().count() <= AUDIT_INPUT_MAX_CHARS);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn legacy_rows_and_new_rows_coexist() {
+        // Backward compatibility: a pre-R4 row (no input fields) and a new
+        // row parse through the same consumer path.
+        let home = fresh_home();
+        append_tool_call(&home, "agnes", "agent_update_soul", "ok: hash=abc", true);
+        append_tool_call_with_input(
+            &home,
+            "agnes",
+            "agent_update_soul",
+            "ok: hash=def",
+            true,
+            Some(&serde_json::json!({ "content": "soul text" })),
+        );
+        let since = "2000-01-01T00:00:00Z";
+        let rows = read_tool_calls_since(&home, "agnes", since);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].get("input").is_none());
+        assert!(rows[1].get("input").is_some());
+        // Canonical fields present on both shapes.
+        for r in &rows {
+            assert!(r.get("timestamp").is_some());
+            assert!(r.get("params_summary").is_some());
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
