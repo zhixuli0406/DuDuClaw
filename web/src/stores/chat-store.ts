@@ -3,6 +3,7 @@ import { useAuthStore } from './auth-store';
 import type { VisemeShape } from '@/components/mascot';
 import { REST_VISEME, sampleViseme } from '@/components/chat/viseme-sampler';
 import { loadTtsEnabled, saveTtsEnabled } from '@/components/chat/tts-playback';
+import { effectiveName, effectiveLogoGlyph } from '@/lib/branding';
 
 export interface ChatAttachmentMeta {
   readonly name: string;
@@ -401,8 +402,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
     phase: 'idle',
     viseme: REST_VISEME,
     sessionId: null,
-    agentName: 'DuDuClaw',
-    agentIcon: '🐾',
+    agentName: effectiveName(),
+    agentIcon: effectiveLogoGlyph(),
     selectedAgentId: null,
     supportsVision: false,
     model: '',

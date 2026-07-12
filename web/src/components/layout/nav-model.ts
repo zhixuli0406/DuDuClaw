@@ -3,8 +3,10 @@ import {
   Inbox,
   MessageCircle,
   KanbanSquare,
+  ListChecks,
   GitFork,
   CalendarClock,
+  ChartGantt,
   BarChart3,
   Users,
   Users2,
@@ -25,6 +27,10 @@ import {
   Building2,
   Globe2,
   Import,
+  Info,
+  Store,
+  ScrollText,
+  Presentation,
 } from 'lucide-react';
 import type { UserRole } from '@/stores/auth-store';
 import type { Gated } from '@/lib/nav-visibility';
@@ -87,7 +93,15 @@ export const navGroups: NavGroup[] = [
     label: 'navGroup.work',
     items: [
       { to: '/tasks', icon: KanbanSquare, label: 'nav.tasks', desc: 'nav.tasks.desc', ownScope: true },
+      // U4 co-edited plans — shared step lists between the user and an AI employee.
+      { to: '/plans', icon: ListChecks, label: 'nav.plans', desc: 'nav.plans.desc', ownScope: true },
+      // G12 run inspector — per-run transcripts (session turns + tool receipts).
+      { to: '/runs', icon: ScrollText, label: 'nav.runs', desc: 'nav.runs.desc', ownScope: true },
+      // G15 Live Canvas — agent-pushed HTML workspace, sandbox-rendered.
+      { to: '/canvas', icon: Presentation, label: 'nav.canvas', desc: 'nav.canvas.desc', ownScope: true },
       { to: '/routines', icon: CalendarClock, label: 'nav.routines', desc: 'nav.routines.desc', minRole: 'manager' },
+      // G11 Work Timeline — company-level Gantt of every AI staff member's runs.
+      { to: '/timeline', icon: ChartGantt, label: 'nav.timeline', desc: 'nav.timeline.desc', minRole: 'manager' },
       { to: '/reports', icon: BarChart3, label: 'nav.reports', desc: 'nav.reports.desc', minRole: 'manager' },
       // Progressive disclosure: hidden until the first fork ever runs — a
       // dormant RFC-26 surface shouldn't occupy nav space with a dead page.
@@ -104,6 +118,8 @@ export const navGroups: NavGroup[] = [
       { to: '/skills', icon: Puzzle, label: 'nav.skills', desc: 'nav.skills.desc' },
       { to: '/knowledge', icon: BookOpen, label: 'nav.knowledge', desc: 'nav.knowledge.desc' },
       { to: '/growth', icon: Trophy, label: 'nav.growth', desc: 'nav.growth.desc', ownScope: true },
+      // 關於 — brand info + fixed upstream-vendor block. Open to every user.
+      { to: '/about', icon: Info, label: 'nav.about', desc: 'nav.about.desc' },
     ],
   },
 ];
@@ -148,6 +164,7 @@ export const manageNav: NavItem[] = [
   { to: '/manage/governance', icon: Scale, label: 'manage.governance', desc: 'manage.governance.desc', minRole: 'admin', enterprise: true },
   { to: '/manage/users', icon: Users, label: 'manage.users', desc: 'manage.users.desc', minRole: 'admin', enterprise: true },
   { to: '/manage/license', icon: KeyRound, label: 'manage.license', desc: 'manage.license.desc', minRole: 'manager' },
+  { to: '/manage/distributors', icon: Store, label: 'manage.distributors', desc: 'manage.distributors.desc', minRole: 'admin' },
   { to: '/manage/migrate', icon: Import, label: 'manage.migrate', desc: 'manage.migrate.desc', minRole: 'manager' },
   { to: '/manage/logs', icon: FileText, label: 'manage.logs', desc: 'manage.logs.desc', minRole: 'manager' },
   { to: '/manage/system', icon: Settings, label: 'manage.system', desc: 'manage.system.desc', minRole: 'admin' },

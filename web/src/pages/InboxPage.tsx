@@ -6,6 +6,7 @@ import { api, type ApprovalItem, type TaskInfo, type DecisionInfo } from '@/lib/
 import { useConnectionStore } from '@/stores/connection-store';
 import { useApprovalsStore } from '@/stores/approvals-store';
 import { toast, formatError } from '@/lib/toast';
+import { cn } from '@/lib/utils';
 import {
   Page,
   PageHeader,
@@ -23,6 +24,14 @@ import { InboxToolbar } from '@/components/inbox/InboxToolbar';
 import { ApprovalDetailPanel } from '@/components/inbox/ApprovalDetailPanel';
 import { TYPE_META } from '@/components/inbox/meta';
 import type { InboxRowLabels } from '@/components/inbox/InboxRow';
+import {
+  approvalRisk,
+  readApprovedToday,
+  bumpApprovedToday,
+  similarBatches,
+  FATIGUE_NUDGE_THRESHOLD,
+  type RiskLevel,
+} from '@/lib/approval-risk';
 import {
   type InboxItem,
   type InboxTab,
@@ -75,6 +84,9 @@ export function InboxPage() {
   const [read, setRead] = useState<ReadonlySet<string>>(() => loadIdSet(READ_KEY));
   const [archived, setArchived] = useState<ReadonlySet<string>>(() => loadIdSet(ARCHIVED_KEY));
   const [undoStack, setUndoStack] = useState<RawEntry[]>([]);
+  // Fatigue protection (arXiv:2606.08919): today's approval volume, surfaced
+  // (not enforced) so a tired operator notices before rubber-stamping.
+  const [approvedToday, setApprovedToday] = useState<number>(() => readApprovedToday());
 
   const updatePrefs = useCallback((patch: Partial<InboxPrefs>) => {
     setPrefs((p) => {
@@ -117,6 +129,7 @@ export function InboxPage() {
           urgency: TYPE_URGENCY.approval,
           actionable: true,
           status: 'pending',
+          risk: approvalRisk(a.kind, a.payload),
         },
       });
     }
@@ -294,6 +307,7 @@ export function InboxPage() {
       const a = entry.raw as ApprovalItem;
       try {
         await api.approvals.decide(a.id, approve); // side_effect field ignored
+        if (approve) setApprovedToday(bumpApprovedToday());
         toast.success(
           approve
             ? intl.formatMessage({ id: 'approvals.approvedToast' }, { summary: a.summary })
@@ -454,11 +468,29 @@ export function InboxPage() {
   const rowLabels: InboxRowLabels = useMemo(
     () => ({
       typeLabel: (item) => t(TYPE_META[item.type].labelKey),
+      riskLabel: (level: RiskLevel) => t(`approval.risk.${level}`),
       approve: t('inbox.action.approve'),
       reject: t('inbox.action.reject'),
       view: t('inbox.action.view'),
       archive: t('inbox.action.archive'),
     }),
+    [t],
+  );
+
+  // ── Fatigue signals (arXiv:2606.08919) ──────────────────────────────────────
+  // Same-kind clusters among *pending* approvals: hint that a batch is alike so
+  // the operator can spot-check representatively — never an auto-approve.
+  const approvalKinds = useMemo(
+    () => entries.filter((e) => e.item.type === 'approval').map((e) => (e.raw as ApprovalItem).kind),
+    [entries],
+  );
+  const batches = useMemo(() => similarBatches(approvalKinds), [approvalKinds]);
+  const approvalKindLabel = useCallback(
+    (kind: string) => {
+      const key = `approvals.kind.${kind}`;
+      const label = t(key);
+      return label === key ? t('approvals.kind.unknown') : label;
+    },
     [t],
   );
 
@@ -518,6 +550,32 @@ export function InboxPage() {
         </Card>
       ) : (
         <div className="space-y-4">
+          {(approvedToday > 0 || batches.length > 0) && (
+            <div
+              className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-control bg-stone-500/6 px-3 py-2 text-xs text-stone-500 dark:bg-white/5 dark:text-stone-400"
+              role="status"
+            >
+              {approvedToday > 0 && (
+                <span
+                  className={cn(
+                    approvedToday >= FATIGUE_NUDGE_THRESHOLD && 'font-medium text-amber-700 dark:text-amber-400',
+                  )}
+                >
+                  {intl.formatMessage({ id: 'approval.fatigue.today' }, { count: approvedToday })}
+                  {approvedToday >= FATIGUE_NUDGE_THRESHOLD && ` · ${t('approval.fatigue.nudge')}`}
+                </span>
+              )}
+              {batches.map((b) => (
+                <span key={b.kind} className="rounded bg-stone-500/10 px-1.5 py-0.5 dark:bg-white/10">
+                  {intl.formatMessage(
+                    { id: 'approval.batch.hint' },
+                    { count: b.count, kind: approvalKindLabel(b.kind) },
+                  )}
+                </span>
+              ))}
+            </div>
+          )}
+
           <Tabs items={tabs} value={prefs.tab} onChange={(id) => updatePrefs({ tab: id as InboxTab })} />
 
           <InboxToolbar

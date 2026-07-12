@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useConnectionStore } from '@/stores/connection-store';
 import { api, type LicenseSnapshot } from '@/lib/api';
+import { TIER_LABELS } from '@/lib/license-labels';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
 import { Page, PageHeader, Card, Section, StatCard, Badge, Button, Mono } from '@/components/ui';
@@ -22,19 +23,6 @@ import {
   Minus,
   Award,
 } from 'lucide-react';
-
-/** Human-readable label for each tier. */
-const TIER_LABELS: Record<LicenseSnapshot['tier'], string> = {
-  opensource: 'Open Source',
-  hobby: 'Hobby (Trial)',
-  solo: 'Solo',
-  studio: 'Studio',
-  business: 'Business',
-  partner: 'Partner (NFR)',
-  personal_pro_self_host: 'Personal Pro',
-  self_host_pro: 'Self-Host Pro',
-  oem: 'OEM',
-};
 
 /** Commercial-module feature flags advertised on the LicensePage matrix. */
 const COMMERCIAL_FEATURES: ReadonlyArray<{

@@ -1,5 +1,6 @@
 import { client } from './ws-client';
 import { migrateScanArgs, migrateApplyArgs } from './migrate';
+import type { RunDetail, RunSummary } from './run-transcript';
 
 // Type definitions matching Rust types
 export interface AgentInfo {
@@ -372,6 +373,59 @@ export interface TaskUpdateParams {
   tags?: string[];
 }
 
+// ── Co-edited plan types (U4) ───────────────────────────────
+
+export type PlanStatus = 'active' | 'done' | 'archived';
+export type PlanStepStatus = 'todo' | 'doing' | 'done' | 'skipped';
+export type PlanAssigneeKind = 'user' | 'agent';
+
+/** A shared plan co-edited by the user and one AI employee. */
+export interface PlanInfo {
+  id: string;
+  title: string;
+  description: string;
+  /** Owning AI employee. */
+  agent_id: string;
+  goal_id?: string | null;
+  status: PlanStatus;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  /** Progress counters — present on `plans.list` responses. */
+  steps_total?: number;
+  steps_done?: number;
+}
+
+export interface PlanStep {
+  id: string;
+  plan_id: string;
+  text: string;
+  assignee_kind: PlanAssigneeKind;
+  /** User id (kind=user) or agent id (kind=agent). Empty = unassigned. */
+  assignee: string;
+  status: PlanStepStatus;
+  step_order: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PlanCreateParams {
+  title: string;
+  agent_id: string;
+  description?: string;
+  goal_id?: string;
+  steps?: Array<{ text: string; assignee_kind?: PlanAssigneeKind; assignee?: string }>;
+}
+
+export interface PlanStepUpdateParams {
+  text?: string;
+  status?: PlanStepStatus;
+  assignee_kind?: PlanAssigneeKind;
+  assignee?: string;
+  /** Target display index — reorder. */
+  position?: number;
+}
+
 // ── Activity Feed types ─────────────────────────────────────
 
 export type ActivityType =
@@ -394,6 +448,75 @@ export interface ActivityEvent {
   summary: string;
   timestamp: string;
   metadata?: Record<string, unknown>;
+}
+
+// ── Work Timeline types (G11) ───────────────────────────────
+
+/** Lane kinds the company timeline can carry. */
+export type TimelineKind =
+  | 'task'
+  | 'delegation'
+  | 'heartbeat'
+  | 'skill'
+  | 'autopilot'
+  | 'governance'
+  | 'activity';
+
+/** One Gantt row of the company work timeline — derived server-side from real
+ *  timestamps only. An instant is `ended_at === started_at` (rendered as a dot). */
+export interface TimelineRow {
+  agent_id: string;
+  kind: TimelineKind;
+  label: string;
+  /** RFC3339. */
+  started_at: string;
+  /** null = still running (bar extends to now); `=== started_at` = instant. */
+  ended_at: string | null;
+  status: string;
+  ref_id: string;
+}
+
+export interface TimelineListResult {
+  rows: TimelineRow[];
+  /** Server row cap; when `truncated` is true the window holds more than `cap` rows. */
+  cap: number;
+  truncated: boolean;
+  from: string;
+  to: string;
+}
+
+// ── Live Canvas types (G15) ─────────────────────────────────
+
+/** One stored canvas version (current or historical). */
+export interface CanvasInfo {
+  /** Monotonic version number (server-assigned, per push). */
+  seq: number;
+  agent_id: string;
+  title: string;
+  /**
+   * Server-sanitized HTML. Empty string ⇒ the agent cleared the canvas.
+   * Render ONLY via a sandboxed iframe (see lib/canvas-doc.ts) — never
+   * dangerouslySetInnerHTML.
+   */
+  html: string;
+  updated_at: string;
+}
+
+/** History metadata — no HTML body (versions can be up to 256 KB each). */
+export interface CanvasVersionMeta {
+  seq: number;
+  title: string;
+  updated_at: string;
+  /** Sanitized HTML size in bytes (0 ⇒ cleared tombstone). */
+  bytes: number;
+}
+
+export interface CanvasGetResult {
+  agent_id: string;
+  /** null ⇒ the agent has never pushed (or the requested seq is gone). */
+  canvas: CanvasInfo | null;
+  /** Retained versions, newest first (≤ 5). */
+  history: CanvasVersionMeta[];
 }
 
 // ── Task comment types (L2) ─────────────────────────────────
@@ -1449,6 +1572,145 @@ export interface MigrateResult {
   report_path: string | null;
 }
 
+// ── Branding / white-label (design-distributor-white-label §3.5) ────────────
+
+/** The upstream software vendor block — authored by the backend const, never
+ *  writable from the dashboard. Always present in `branding.get` / `about.get`. */
+export interface BrandingVendor {
+  name_zh: string;
+  name_en: string;
+  url: string;
+}
+
+/** Distributor-authored branding. All fields optional — a null/absent field
+ *  means "use the DuDuClaw default". `updated_at` is server-set (read-only). */
+export interface BrandingConfig {
+  product_name?: string | null;
+  subtitle?: string | null;
+  /** Inline `data:image/{png,jpeg,webp};base64,…` logo, or null for the default. */
+  logo_data_uri?: string | null;
+  company_name?: string | null;
+  website?: string | null;
+  support_email?: string | null;
+  description?: string | null;
+  /** Sanitized HTML block for the About page (server-sanitized on read). */
+  about_html?: string | null;
+  /** Brand accent color as `#rrggbb`, or null for the default amber. */
+  accent_color?: string | null;
+  updated_at?: string | null;
+}
+
+/** Where the active branding resolved from (design §10.1 resolution order). */
+export type BrandingSource = 'local' | 'bundle' | 'default';
+
+/** Server-provided defaults used when a field is unset. */
+export interface BrandingDefaults {
+  product_name: string;
+  subtitle_key: string;
+}
+
+/** Response of `branding.get`. */
+export interface BrandingGetResponse {
+  branding: BrandingConfig;
+  vendor: BrandingVendor;
+  defaults: BrandingDefaults;
+  white_label_active: boolean;
+  /** Which layer the active branding resolved from (local / bundle / default). */
+  source: BrandingSource;
+}
+
+/** Writable subset accepted by `branding.set` (mirrors the backend whitelist). */
+export interface BrandingSetInput {
+  product_name?: string;
+  subtitle?: string;
+  logo_data_uri?: string;
+  company_name?: string;
+  website?: string;
+  support_email?: string;
+  description?: string;
+  about_html?: string;
+  accent_color?: string;
+}
+
+/** Response of `about.get` — distributor branding + fixed vendor + version/tier. */
+export interface AboutResponse {
+  vendor: BrandingVendor;
+  branding: BrandingConfig;
+  version: string;
+  tier: string;
+  white_label_active: boolean;
+  /** Which layer the About branding resolved from. */
+  source: BrandingSource;
+}
+
+/** A signed branding bundle (design §10.1) — dropped into a customer's
+ *  `~/.duduclaw/branding.bundle.json` to auto-apply the brand with no license. */
+export interface BrandingBundle {
+  schema: number;
+  distributor_id: string;
+  subscription_id: string;
+  branding: BrandingConfig;
+  issued_at: string;
+  public_key_id: string;
+  signature: string;
+}
+
+// ── Distributor management (owner-only, design-distributor-white-label §3) ──
+
+/** A distributor account (owner bookkeeping). */
+export interface DistributorProfile {
+  id: string;
+  name: string;
+  contact: string;
+  note: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  /** Licenses issued to this distributor — populated by `distributor.list`. */
+  licenses?: IssuedLicense[];
+}
+
+/** A license issued to a distributor. `license_blob` is only returned on issue. */
+export interface IssuedLicense {
+  id: string;
+  distributor_id: string;
+  subscription_id: string;
+  customer_id: string;
+  tier: string;
+  machine_fingerprint: string;
+  issued_at: string;
+  expires_at: string;
+  status: 'active' | 'revoked';
+  revoked_at?: string | null;
+  license_blob?: string;
+  /** RFC3339 of the last successful control-plane refresh (P2 phone-home).
+   *  `null`/absent until the distributor instance phones home at least once. */
+  last_refresh_at?: string | null;
+}
+
+/** Aggregate counters shown on the distributor console. Rendered defensively
+ *  (`?? 0`) since the exact backend field set may extend over time. */
+export interface DistributorStats {
+  total_distributors?: number;
+  active_distributors?: number;
+  total_licenses?: number;
+  active_licenses?: number;
+  revoked_licenses?: number;
+}
+
+export interface DistributorInput {
+  name: string;
+  contact?: string;
+  note?: string;
+}
+
+export interface DistributorPatch {
+  name?: string;
+  contact?: string;
+  note?: string;
+  status?: string;
+}
+
 // API namespace
 export const api = {
   agents: {
@@ -1986,6 +2248,28 @@ export const api = {
     comments: (taskId: string) =>
       client.call('tasks.comments', { task_id: taskId }) as Promise<{ comments: TaskComment[] }>,
   },
+  // U4 co-edited plans — a shared, ordered step list per AI employee that both
+  // the user (here) and the agent (plan_get / plan_update_step MCP) edit.
+  plans: {
+    list: (filters?: { agent_id?: string; status?: PlanStatus }) =>
+      client.call('plans.list', filters ?? {}) as Promise<{ plans: PlanInfo[] }>,
+    get: (planId: string) =>
+      client.call('plans.get', { plan_id: planId }) as Promise<{ plan: PlanInfo; steps: PlanStep[] }>,
+    create: (params: PlanCreateParams) =>
+      client.call('plans.create', { ...params }) as Promise<{ plan: PlanInfo; steps: PlanStep[] }>,
+    update: (planId: string, fields: { title?: string; description?: string; status?: PlanStatus }) =>
+      client.call('plans.update', { plan_id: planId, ...fields }) as Promise<{ plan: PlanInfo }>,
+    remove: (planId: string) =>
+      client.call('plans.remove', { plan_id: planId }) as Promise<{ success: boolean }>,
+    addStep: (
+      planId: string,
+      params: { text: string; assignee_kind?: PlanAssigneeKind; assignee?: string; position?: number },
+    ) => client.call('plans.add_step', { plan_id: planId, ...params }) as Promise<{ step: PlanStep }>,
+    updateStep: (stepId: string, fields: PlanStepUpdateParams) =>
+      client.call('plans.update_step', { step_id: stepId, ...fields }) as Promise<{ step: PlanStep }>,
+    removeStep: (stepId: string) =>
+      client.call('plans.remove_step', { step_id: stepId }) as Promise<{ success: boolean }>,
+  },
   // RFC-24 Decision Continuity — an agent's still-open proposals awaiting a choice.
   decisions: {
     list: (agentId: string, limit?: number) =>
@@ -2006,6 +2290,29 @@ export const api = {
     // No unsubscribe: the backend broadcasts activity events to every
     // authenticated WS client, so disconnecting the WS is the only way to
     // stop receiving them.
+  },
+  // G11 Work Timeline — company Gantt rows (tasks + activity + heartbeats).
+  timeline: {
+    list: (params?: { from?: string; to?: string; agent_id?: string }) =>
+      client.call('timeline.list', params ?? {}) as Promise<TimelineListResult>,
+  },
+  // G12 Run inspector — per-run transcripts derived from session turns +
+  // the MCP tool audit trail. Shapes live in lib/run-transcript.ts.
+  runs: {
+    list: (params?: { agent_id?: string; limit?: number }) =>
+      client.call('runs.list', params ?? {}) as Promise<{ runs: RunSummary[] }>,
+    get: (runId: string) =>
+      client.call('runs.get', { run_id: runId }) as Promise<RunDetail>,
+  },
+  // G15 Live Canvas — agent-pushed HTML workspace. The HTML is sanitized
+  // server-side at write time and MUST still be rendered only inside a fully
+  // sandboxed iframe (`sandbox=""`, srcdoc) — see lib/canvas-doc.ts.
+  canvas: {
+    get: (agentId: string, seq?: number) =>
+      client.call(
+        'canvas.get',
+        seq === undefined ? { agent_id: agentId } : { agent_id: agentId, seq },
+      ) as Promise<CanvasGetResult>,
   },
   autopilot: {
     list: () =>
@@ -2205,5 +2512,80 @@ export const api = {
       }) as Promise<{ status: string }>,
     auditLog: (params?: { user_id?: string; action?: string; limit?: number }) =>
       client.call('users.audit_log', params ?? {}) as Promise<{ entries: AuditEntry[] }>,
+  },
+  // ── Branding / white-label ────────────────────────────────────
+  branding: {
+    /** Read the active branding + fixed vendor block. Any authed user. */
+    get: () => client.call('branding.get') as Promise<BrandingGetResponse>,
+    /** Update the distributor branding. admin + white_label gated (fail-closed). */
+    set: (input: BrandingSetInput) =>
+      client.call('branding.set', { ...input }) as Promise<{ ok: boolean; branding: BrandingConfig }>,
+    /** Clear all custom branding → revert to DuDuClaw defaults. */
+    reset: () => client.call('branding.reset') as Promise<{ ok: boolean }>,
+    /** Sanitize raw About-page HTML for live preview. admin + white_label gated. */
+    preview: (aboutHtml: string) =>
+      client.call('branding.preview', { about_html: aboutHtml }) as Promise<{
+        ok: boolean;
+        sanitized_html: string;
+      }>,
+    bundle: {
+      /** Produce a signed branding bundle for this instance to ship to customers. */
+      create: () =>
+        client.call('branding.bundle.create') as Promise<{
+          ok: boolean;
+          bundle: BrandingBundle;
+        }>,
+    },
+  },
+  about: {
+    /** About-page payload: distributor branding + fixed vendor + version/tier. */
+    get: () => client.call('about.get') as Promise<AboutResponse>,
+  },
+  // ── Distributor management (owner instance only) ──────────────
+  distributor: {
+    /** Whether an issuer key is configured + aggregate stats. */
+    status: () =>
+      client.call('distributor.status') as Promise<{
+        issuer_configured: boolean;
+        issuer_key_id: string;
+        /** P2: whether the /v1/license/refresh + /crl control-plane is live. */
+        refresh_endpoint_active?: boolean;
+        stats: DistributorStats;
+      }>,
+    list: () =>
+      client.call('distributor.list') as Promise<{ distributors: DistributorProfile[] }>,
+    add: (input: DistributorInput) =>
+      client.call('distributor.add', { ...input }) as Promise<{ ok: boolean; distributor: DistributorProfile }>,
+    update: (id: string, patch: DistributorPatch) =>
+      client.call('distributor.update', { id, patch }) as Promise<{ ok: boolean }>,
+    remove: (id: string) =>
+      client.call('distributor.remove', { id }) as Promise<{ ok: boolean }>,
+    /** Sign a new OEM white-label license for the distributor's machine. */
+    issue: (params: {
+      distributor_id: string;
+      machine_fingerprint: string;
+      expires_days?: number;
+      note?: string;
+    }) =>
+      client.call('distributor.issue', { ...params }) as Promise<{
+        ok: boolean;
+        license_blob: string;
+        record: IssuedLicense;
+      }>,
+    /** Locally mark a license revoked. Remote propagation needs a CRL publish. */
+    revoke: (licenseId: string) =>
+      client.call('distributor.revoke', { license_id: licenseId }) as Promise<{
+        ok: boolean;
+        crl_note: string;
+      }>,
+    bundle: {
+      /** Owner-side counter-sign of a branding bundle for a distributor (used
+       *  when the distributor instance cannot reach this gateway directly). */
+      sign: (params: { distributor_id: string; branding: BrandingConfig }) =>
+        client.call('distributor.bundle.sign', { ...params }) as Promise<{
+          ok: boolean;
+          bundle: BrandingBundle;
+        }>,
+    },
   },
 };

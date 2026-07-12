@@ -12,6 +12,7 @@ import { GrowthMount } from '@/components/growth/GrowthMount';
 import { PanelProvider, PropertiesPanel, CelebrationLayer, usePanel } from '@/components/ui';
 import { useTourStore } from '@/stores/tour-store';
 import { useSystemStore } from '@/stores/system-store';
+import { useBrandingStore } from '@/lib/branding';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
 import { useSidebarStore } from '@/stores/sidebar-store';
 
@@ -86,11 +87,18 @@ export function MainLayout() {
   const fetchStatus = useSystemStore((s) => s.fetchStatus);
   const recordVisit = useCommandPaletteStore((s) => s.recordVisit);
   const closeMobileNav = useSidebarStore((s) => s.closeMobile);
+  const fetchBranding = useBrandingStore((s) => s.fetch);
 
   // Restore the once-per-user tour state once the user id is known.
   useEffect(() => {
     hydrateTour();
   }, [hydrateTour]);
+
+  // Refresh the authoritative branding (white-label) now that we're past auth +
+  // WS handshake; the cache already primed the pre-auth surfaces (LoginPage).
+  useEffect(() => {
+    fetchBranding();
+  }, [fetchBranding]);
 
   // System status drives the edition badge + sidebar gating — fetch it
   // shell-wide so every page sees it.

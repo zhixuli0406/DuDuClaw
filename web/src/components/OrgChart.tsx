@@ -2,6 +2,7 @@ import { useEffect, useRef, useCallback } from 'react';
 import * as d3 from 'd3';
 import type { AgentDetail } from '@/lib/api';
 import { characterFor } from '@/lib/character-gen';
+import { useEffectiveName, useEffectiveLogoGlyph } from '@/lib/branding';
 
 // ── Types ─────────────────────────────────────────────────────
 
@@ -30,9 +31,9 @@ interface OrgChartProps {
 
 // ── Helpers ───────────────────────────────────────────────────
 
-function buildTree(agents: ReadonlyArray<AgentDetail>): OrgNode {
+function buildTree(agents: ReadonlyArray<AgentDetail>, rootName: string, rootGlyph: string): OrgNode {
   if (agents.length === 0) {
-    return { name: '__root__', displayName: 'DuDuClaw', role: 'system', status: 'active', icon: '\u{1F43E}', model: '', children: [] };
+    return { name: '__root__', displayName: rootName, role: 'system', status: 'active', icon: rootGlyph, model: '', children: [] };
   }
 
   // Find the root: prefer role=main, then first agent with no reports_to
@@ -95,10 +96,10 @@ function buildTree(agents: ReadonlyArray<AgentDetail>): OrgNode {
   // No root found — synthetic root grouping all agents
   return {
     name: '__root__',
-    displayName: 'DuDuClaw',
+    displayName: rootName,
     role: 'system',
     status: 'active',
-    icon: '\u{1F43E}',
+    icon: rootGlyph,
     model: '',
     children: agents.map((a) => toNode(a)),
   };
@@ -134,6 +135,9 @@ const NODE_RX = 10;
 export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  // Synthetic-root name/glyph follow the active (white-label) brand.
+  const brandName = useEffectiveName();
+  const brandGlyph = useEffectiveLogoGlyph();
 
   const render = useCallback(() => {
     if (!svgRef.current || !containerRef.current || agents.length === 0)
@@ -148,7 +152,7 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
     const svg = d3.select(svgRef.current);
     svg.selectAll('*').remove();
 
-    const root = d3.hierarchy(buildTree(agents));
+    const root = d3.hierarchy(buildTree(agents, brandName, brandGlyph));
     const containerWidth = containerRef.current.clientWidth;
     const containerHeight = containerRef.current.clientHeight;
 
@@ -357,7 +361,7 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
       .attr('cy', 16)
       .attr('r', 4)
       .attr('fill', (d) => statusColors[d.data.status]?.stroke ?? '#a8a29e');
-  }, [agents, onNodeClick]);
+  }, [agents, onNodeClick, brandName, brandGlyph]);
 
   // Render on mount and when agents change
   useEffect(() => {

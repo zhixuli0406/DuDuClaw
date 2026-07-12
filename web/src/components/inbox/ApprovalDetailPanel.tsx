@@ -1,14 +1,47 @@
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
-import { ShieldCheck, ShieldAlert, CheckCircle2, XCircle } from 'lucide-react';
+import { ShieldCheck, ShieldAlert, CheckCircle2, XCircle, ChevronRight, ChevronDown } from 'lucide-react';
 import { Button, PropertyRow, PropertySection, CharacterAvatar, Mono, Badge } from '@/components/ui';
+import { ConfirmDialog } from '@/components/settings/controls/ConfirmDialog';
 import { cn } from '@/lib/utils';
 import { timeAgo } from '@/lib/format';
 import { toast, formatError } from '@/lib/toast';
 import type { ApprovalItem } from '@/lib/api';
+import {
+  approvalRisk,
+  riskTone,
+  riskNeedsConfirm,
+  extractPlanFacts,
+  hasPlanFacts,
+  type RiskLevel,
+} from '@/lib/approval-risk';
 import { decideApproval } from '@/lib/api-custom-skills';
 import { parseSkillCreatePayload, type SkillCreatePayload } from '@/components/skills/skill-create-payload';
 import { formatTimeSaved } from '@/components/skills/status-meta';
+
+/** Action kinds with a hand-written plain-language description key. */
+const DESCRIBED_KINDS = new Set([
+  'browser_action',
+  'tool_call',
+  'skill_activation',
+  'skill_create',
+  'strategic_plan',
+  'agent_hire',
+  'wiki_ingest',
+]);
+
+/** Small risk pill shown at the plan-summary header (whole-action level only —
+ *  never per-token, per arXiv:2605.28571 which found over-granular uncertainty
+ *  breeds over-trust). */
+function RiskBadge({ level, label }: { level: RiskLevel; label: string }) {
+  const Icon = level === 'high' ? ShieldAlert : ShieldCheck;
+  return (
+    <Badge tone={riskTone(level)} className="shrink-0">
+      <Icon className="h-3 w-3" aria-hidden="true" />
+      {label}
+    </Badge>
+  );
+}
 
 /**
  * ApprovalDetailPanel — right-panel body shown when `Enter` opens an approval
@@ -40,9 +73,6 @@ export function ApprovalDetailPanel({
    *  parent can remove the decided row without issuing a second decide. */
   onDecided?: () => void;
 }) {
-  const intl = useIntl();
-  const t = (id: string) => intl.formatMessage({ id });
-
   // ── skill_create specialization (T13.3) ──
   if (approval.kind === 'skill_create') {
     const parsed = parseSkillCreatePayload(approval.payload);
@@ -56,8 +86,50 @@ export function ApprovalDetailPanel({
         />
       );
     }
-    // Missing artifact → fall through to the generic raw-payload view.
+    // Missing artifact → fall through to the generic view.
   }
+
+  return (
+    <GenericApprovalView
+      approval={approval}
+      agentName={agentName}
+      onApprove={onApprove}
+      onReject={onReject}
+    />
+  );
+}
+
+/**
+ * GenericApprovalView — the U2 evidence-based redesign of the default approval
+ * card. Leads with a plain-language plan summary ("what does this AI employee
+ * intend to do") + a whole-action risk badge, so the operator reviews the plan
+ * before the decision buttons become the visual focus (arXiv:2604.04918). Full
+ * payload is a one-click, opt-in spot-check — not force-read (arXiv:2606.05391).
+ * High-risk actions gate approve behind a ConfirmDialog.
+ */
+function GenericApprovalView({
+  approval,
+  agentName,
+  onApprove,
+  onReject,
+}: {
+  approval: ApprovalItem;
+  agentName?: string;
+  onApprove: () => void;
+  onReject: () => void;
+}) {
+  const intl = useIntl();
+  const t = (id: string) => intl.formatMessage({ id });
+
+  const [spotCheck, setSpotCheck] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  const risk = approvalRisk(approval.kind, approval.payload);
+  const facts = extractPlanFacts(approval.payload);
+  const described = DESCRIBED_KINDS.has(approval.kind);
+  const kindDesc = described
+    ? t(`approval.plan.kind.${approval.kind}`)
+    : t('approval.plan.kind.unknown');
 
   const ttlAt = approval.created_at
     ? new Date(Date.parse(approval.created_at) + approval.ttl_seconds * 1000).toISOString()
@@ -65,40 +137,119 @@ export function ApprovalDetailPanel({
   const payload =
     typeof approval.payload === 'string' ? approval.payload : JSON.stringify(approval.payload, null, 2);
 
+  const requestApprove = () => {
+    if (riskNeedsConfirm(risk)) setConfirmOpen(true);
+    else onApprove();
+  };
+
   return (
     <div className="space-y-4">
-      <p className="text-sm text-stone-800 dark:text-stone-100">{approval.summary}</p>
-
-      <PropertySection title={t('inbox.approval.panelTitle')}>
-        <PropertyRow label={t('inbox.approval.kind')}>
-          <Mono>{approval.kind}</Mono>
-        </PropertyRow>
-        {approval.agent_id && (
-          <PropertyRow label={t('inbox.approval.agent')}>
-            <span className="flex items-center gap-1.5">
+      {/* ── Plan summary first (arXiv:2604.04918) ── */}
+      <PropertySection title={t('approval.plan.title')}>
+        <div className="space-y-2 rounded-control bg-stone-500/6 p-3 dark:bg-white/5">
+          <div className="flex items-start gap-2">
+            <p className="min-w-0 flex-1 text-sm font-medium text-stone-800 dark:text-stone-100">
+              {kindDesc}
+            </p>
+            <RiskBadge level={risk} label={t(`approval.risk.${risk}`)} />
+          </div>
+          <p className="text-sm text-stone-600 dark:text-stone-300">{approval.summary}</p>
+          {approval.agent_id && (
+            <div className="flex items-center gap-1.5 pt-0.5 text-xs text-stone-500 dark:text-stone-400">
               <CharacterAvatar agentId={approval.agent_id} name={agentName ?? approval.agent_id} size={18} />
               <span className="truncate">{agentName ?? approval.agent_id}</span>
-            </span>
-          </PropertyRow>
+              {!described && <Mono className="text-[11px]">{approval.kind}</Mono>}
+            </div>
+          )}
+        </div>
+      </PropertySection>
+
+      {/* ── Scope of impact (heuristic verification aid, arXiv:2606.05391) ── */}
+      {hasPlanFacts(facts) && (
+        <PropertySection title={t('approval.plan.scope')}>
+          {facts.scope && (
+            <PropertyRow label={t('approval.plan.scopeLabel')}>
+              <Mono>{facts.scope}</Mono>
+            </PropertyRow>
+          )}
+          {facts.tools.length > 0 && (
+            <PropertyRow label={t('approval.plan.tools')}>
+              <span className="flex flex-wrap justify-end gap-1">
+                {facts.tools.map((tool) => (
+                  <Mono key={tool} className="rounded bg-stone-500/10 px-1 text-[11px] dark:bg-white/10">
+                    {tool}
+                  </Mono>
+                ))}
+              </span>
+            </PropertyRow>
+          )}
+          {facts.targets.length > 0 && (
+            <PropertyRow label={t('approval.plan.targets')}>
+              <span className="flex flex-col items-end gap-0.5">
+                {facts.targets.map((target) => (
+                  <span key={target} className="max-w-full truncate text-[11px]" title={target}>
+                    {target}
+                  </span>
+                ))}
+              </span>
+            </PropertyRow>
+          )}
+        </PropertySection>
+      )}
+
+      {/* ── One-click spot-check — opt-in, not force-read (arXiv:2606.05391) ── */}
+      <div className="space-y-2">
+        <button
+          type="button"
+          onClick={() => setSpotCheck((v) => !v)}
+          aria-expanded={spotCheck}
+          className="flex w-full items-center gap-1.5 rounded-control px-1.5 py-1.5 text-left text-xs font-semibold uppercase tracking-wide text-stone-400 hover:bg-stone-500/8 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 dark:text-stone-500 dark:hover:bg-white/5"
+        >
+          {spotCheck ? (
+            <ChevronDown className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          ) : (
+            <ChevronRight className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          )}
+          {t('approval.spotCheck.toggle')}
+        </button>
+        {spotCheck && (
+          <div className="space-y-3 pl-1.5">
+            <div className="grid grid-cols-1 gap-0.5">
+              <PropertyRow label={t('inbox.approval.kind')}>
+                <Mono>{approval.kind}</Mono>
+              </PropertyRow>
+              <PropertyRow label={t('inbox.approval.created')}>{timeAgo(approval.created_at)}</PropertyRow>
+              {ttlAt && <PropertyRow label={t('inbox.approval.ttl')}>{timeAgo(ttlAt)}</PropertyRow>}
+            </div>
+            <pre className="max-h-64 overflow-auto rounded-control bg-stone-500/8 p-2 text-[11px] leading-relaxed text-stone-700 dark:bg-white/5 dark:text-stone-300">
+              {payload}
+            </pre>
+          </div>
         )}
-        <PropertyRow label={t('inbox.approval.created')}>{timeAgo(approval.created_at)}</PropertyRow>
-        {ttlAt && <PropertyRow label={t('inbox.approval.ttl')}>{timeAgo(ttlAt)}</PropertyRow>}
-      </PropertySection>
+      </div>
 
-      <PropertySection title={t('inbox.approval.payload')}>
-        <pre className="max-h-64 overflow-auto rounded-control bg-stone-500/8 p-2 text-[11px] leading-relaxed text-stone-700 dark:bg-white/5 dark:text-stone-300">
-          {payload}
-        </pre>
-      </PropertySection>
-
+      {/* ── Decision (after the summary is read) ── */}
       <div className="flex items-center gap-2">
-        <Button size="sm" variant="primary" onClick={onApprove} className="flex-1">
+        <Button size="sm" variant="primary" onClick={requestApprove} className="flex-1">
           {t('inbox.approval.approve')}
         </Button>
         <Button size="sm" variant="danger" onClick={onReject} className="flex-1">
           {t('inbox.approval.reject')}
         </Button>
       </div>
+
+      {/* High-risk second confirmation (reuses the site-wide ConfirmDialog). */}
+      <ConfirmDialog
+        open={confirmOpen}
+        onClose={() => setConfirmOpen(false)}
+        onConfirm={() => {
+          setConfirmOpen(false);
+          onApprove();
+        }}
+        title={t('approval.confirm.title')}
+        message={intl.formatMessage({ id: 'approval.confirm.message' }, { summary: approval.summary })}
+        confirmLabel={t('approval.confirm.approve')}
+      />
     </div>
   );
 }
@@ -127,6 +278,7 @@ function SkillCreateApprovalView({
   const [decided, setDecided] = useState<DecidedState>(null);
 
   const sr = payload.safety_report;
+  const risk = approvalRisk(approval.kind, approval.payload);
 
   const handleApprove = async () => {
     if (busy) return;
@@ -166,7 +318,10 @@ function SkillCreateApprovalView({
 
   return (
     <div className="space-y-4">
-      <p className="text-sm text-stone-800 dark:text-stone-100">{approval.summary}</p>
+      <div className="flex items-start gap-2">
+        <p className="min-w-0 flex-1 text-sm text-stone-800 dark:text-stone-100">{approval.summary}</p>
+        <RiskBadge level={risk} label={t(`approval.risk.${risk}`)} />
+      </div>
 
       {/* Human-facing fields (given for context; the review target is the SKILL.md) */}
       <PropertySection title={t('inbox.skillCreate.fields')}>

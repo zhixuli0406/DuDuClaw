@@ -13,3 +13,5 @@ export { sampleViseme, REST_VISEME } from './viseme-sampler';
 export { MicButton } from './MicButton';
 export { VoicePlayToggle } from './VoicePlayToggle';
 export { ttsSynthesizeUrl, VoiceNotConfiguredError } from './voice-api';
+export { TalkModeButton, TalkModeStatusPill } from './TalkModeButton';
+export { useTalkMode, type TalkModeHandle } from './useTalkMode';

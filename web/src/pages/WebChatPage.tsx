@@ -18,6 +18,9 @@ import {
   useChatFace,
   MicButton,
   VoicePlayToggle,
+  TalkModeButton,
+  TalkModeStatusPill,
+  useTalkMode,
   ttsSynthesizeUrl,
   VoiceNotConfiguredError,
 } from '@/components/chat';
@@ -56,6 +59,7 @@ export function WebChatPage() {
   const [searchParams] = useSearchParams();
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const [pttCapturing, setPttCapturing] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -132,12 +136,66 @@ export function WebChatPage() {
     inputRef.current?.focus();
   };
 
+  // Talk Mode (G13): continuous voice loop — listen → STT → send → TTS →
+  // listen. Transcripts go through the same `send()` path as typed messages.
+  const talk = useTalkMode({
+    onNotConfigured: (msg) => {
+      toast.error(
+        msg ||
+          intl.formatMessage({
+            id: 'voice.stt.notConfigured',
+            defaultMessage: '尚未設定語音轉文字，請至設定 → 語音',
+          }),
+      );
+    },
+    onError: (msg) => {
+      toast.error(
+        intl.formatMessage(
+          { id: 'voice.stt.failed', defaultMessage: '語音辨識失敗：{message}' },
+          { message: msg },
+        ),
+      );
+    },
+    onTtsFailed: () => {
+      toast.error(
+        intl.formatMessage({
+          id: 'voice.talk.ttsFailed',
+          defaultMessage: '語音朗讀失敗，已繼續聆聽',
+        }),
+      );
+    },
+    onEngageFailed: (msg) => {
+      if (msg === 'unsupported') return; // button is already disabled
+      toast.error(
+        intl.formatMessage(
+          { id: 'voice.talk.engageFailed', defaultMessage: '無法啟動對話模式：{message}' },
+          { message: msg },
+        ),
+      );
+    },
+  });
+
+  // Esc exits Talk Mode from anywhere on the page.
+  useEffect(() => {
+    if (!talk.active) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        talk.stop();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [talk.active, talk.stop]);
+
   // Reply playback (openhuman-parity B-P2): when the toggle is on, speak each
   // freshly-completed assistant reply via /api/tts. Guarded by message id so a
   // reply is spoken exactly once; a 501 quietly closes the toggle.
   const lastSpokenRef = useRef<string | null>(null);
   useEffect(() => {
     if (!ttsEnabled || phase !== 'done') return;
+    // Talk Mode owns reply playback while engaged — avoid speaking twice.
+    if (talk.active) return;
     const latest = messages[messages.length - 1];
     if (!latest || latest.role !== 'assistant' || !latest.content.trim()) return;
     if (lastSpokenRef.current === latest.id) return;
@@ -175,7 +233,7 @@ export function WebChatPage() {
     return () => {
       cancelled = true;
     };
-  }, [phase, ttsEnabled, messages, setTtsEnabled, intl]);
+  }, [phase, ttsEnabled, messages, setTtsEnabled, intl, talk.active]);
 
   const handleFilesSelected = async (fileList: FileList | null) => {
     if (!fileList || fileList.length === 0) return;
@@ -330,6 +388,8 @@ export function WebChatPage() {
               </span>
             )}
             {model && <span className="opacity-70 tabular-nums">· {model}</span>}
+            {/* Talk Mode live state (G13): listening / transcribing / speaking. */}
+            <TalkModeStatusPill status={talk.status} className="ml-auto" />
           </div>
 
           {/* Vision warning when an image is queued for a text-only model */}
@@ -372,7 +432,16 @@ export function WebChatPage() {
                 browser can't capture audio or the socket is down. */}
             <MicButton
               onTranscript={handleTranscript}
-              disabled={connectionState !== 'connected'}
+              disabled={connectionState !== 'connected' || talk.active}
+              onCapturingChange={setPttCapturing}
+            />
+            {/* Talk Mode toggle (G13): continuous voice conversation loop.
+                Exits via the same button or Esc. Mutually exclusive with the
+                push-to-talk hold — disabled while PTT is capturing so a
+                two-finger touch can't drive both recorders at once. */}
+            <TalkModeButton
+              handle={talk}
+              disabled={connectionState !== 'connected' || pttCapturing}
             />
             <textarea
               ref={inputRef}

@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { useIntl } from 'react-intl';
 import { Mic, Loader2 } from 'lucide-react';
 import { toast } from '@/lib/toast';
@@ -11,15 +12,21 @@ import { isCapturing, isTranscribing } from './voice-recorder';
  * release to transcribe; the recognized text is handed to `onTranscript` (the
  * composer fills it — we never auto-send). When the browser can't capture audio
  * the button is disabled with an explanatory tooltip.
+ *
+ * `onCapturingChange` reports the live PTT capture state so the composer can
+ * disable the mutually-exclusive Talk Mode toggle while a hold is active
+ * (prevents a two-finger touch entering both recorders at once).
  */
 export function MicButton({
   onTranscript,
   disabled = false,
   className,
+  onCapturingChange,
 }: {
   onTranscript: (text: string) => void;
   disabled?: boolean;
   className?: string;
+  onCapturingChange?: (capturing: boolean) => void;
 }) {
   const intl = useIntl();
   const setTtsEnabled = useChatStore((s) => s.setTtsEnabled);
@@ -52,6 +59,12 @@ export function MicButton({
   const capturing = isCapturing(state);
   const busy = isTranscribing(state);
   const isDisabled = disabled || !supported || busy;
+
+  // Report capture transitions up so the composer can lock out Talk Mode
+  // while a push-to-talk hold is in flight (see onCapturingChange doc above).
+  useEffect(() => {
+    onCapturingChange?.(capturing);
+  }, [capturing, onCapturingChange]);
 
   const label = !supported
     ? intl.formatMessage({
