@@ -78,6 +78,10 @@ bollard = "0.18"
 ring = "0.17"
 base64 = "0.22"
 
+# HTML sanitization (white-label About block) — servo ecosystem standard,
+# allowlist-based; security review low. Pinned to the 4.x line.
+ammonia = "4"
+
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
