@@ -79,6 +79,14 @@ async def run_smoke_test(
     result = await _tc_episodic_pressure_check(memory_client)
     report.results.append(result)
 
+    # TC-4: longmemeval_v2 sample fixture（離線自足，用 InMemory client）
+    result = await _tc_longmemeval_v2_sample()
+    report.results.append(result)
+
+    # TC-5: personamem_v2 sample fixture（離線自足，用 InMemory client）
+    result = await _tc_personamem_v2_sample()
+    report.results.append(result)
+
     # 統計
     for r in report.results:
         if r.passed and r.error is None:
@@ -225,6 +233,100 @@ async def _tc_memory_isolation(client: MemoryClient) -> SmokeTestResult:
             passed=False,
             duration_ms=duration_ms,
             detail=f"❌ TC-2 ERROR: {type(e).__name__}",
+            error=str(e),
+        )
+
+
+async def _tc_longmemeval_v2_sample() -> SmokeTestResult:
+    """
+    TC-4：longmemeval_v2 sample fixture
+    離線自足——用 InMemoryMemoryClient 對 5 題 sample 跑一次 store→search→recall，
+    驗證 M1 LongMemEval-V2 檢索管線接線正確（非真實 451 題分數）。
+    """
+    test_name = "longmemeval_v2_sample"
+    start_time = time.time()
+    try:
+        from .fixture_client import InMemoryMemoryClient
+        from .longmemeval_v2 import SAMPLE_PATH, compute_longmemeval
+        from .config import LongMemEvalConfig
+
+        client = InMemoryMemoryClient()
+        config = LongMemEvalConfig()
+        result = await compute_longmemeval(client, config, SAMPLE_PATH, ingest=True)
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        if result.question_count >= 3 and result.recall_at_k > 0.0:
+            return SmokeTestResult(
+                test_name=test_name,
+                passed=True,
+                duration_ms=duration_ms,
+                detail=(
+                    f"✅ TC-4 PASS: LongMemEval-V2 sample recall@{result.k}="
+                    f"{result.recall_at_k:.2f} ({result.question_count} q, "
+                    f"{len(result.per_ability)} abilities)"
+                ),
+            )
+        return SmokeTestResult(
+            test_name=test_name,
+            passed=False,
+            duration_ms=duration_ms,
+            detail="❌ TC-4 FAIL: sample pipeline produced no retrieval hits",
+            error=f"count={result.question_count}, recall={result.recall_at_k}",
+        )
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        return SmokeTestResult(
+            test_name=test_name,
+            passed=False,
+            duration_ms=duration_ms,
+            detail=f"❌ TC-4 ERROR: {type(e).__name__}",
+            error=str(e),
+        )
+
+
+async def _tc_personamem_v2_sample() -> SmokeTestResult:
+    """
+    TC-5：personamem_v2 sample fixture
+    離線自足——用 InMemoryMemoryClient 對 4 題 sample 跑一次 store→search→recall，
+    驗證 M1 PersonaMem-v2 檢索管線接線正確（非真實 1000 組分數）。
+    """
+    test_name = "personamem_v2_sample"
+    start_time = time.time()
+    try:
+        from .fixture_client import InMemoryMemoryClient
+        from .personamem_v2 import SAMPLE_PATH, compute_personamem
+        from .config import PersonaMemConfig
+
+        client = InMemoryMemoryClient()
+        config = PersonaMemConfig()
+        result = await compute_personamem(client, config, SAMPLE_PATH, ingest=True)
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        if result.question_count >= 3 and result.recall_at_k > 0.0:
+            return SmokeTestResult(
+                test_name=test_name,
+                passed=True,
+                duration_ms=duration_ms,
+                detail=(
+                    f"✅ TC-5 PASS: PersonaMem-v2 sample recall@{result.k}="
+                    f"{result.recall_at_k:.2f} ({result.question_count} q, "
+                    f"{len(result.per_scenario)} scenarios)"
+                ),
+            )
+        return SmokeTestResult(
+            test_name=test_name,
+            passed=False,
+            duration_ms=duration_ms,
+            detail="❌ TC-5 FAIL: sample pipeline produced no retrieval hits",
+            error=f"count={result.question_count}, recall={result.recall_at_k}",
+        )
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        return SmokeTestResult(
+            test_name=test_name,
+            passed=False,
+            duration_ms=duration_ms,
+            detail=f"❌ TC-5 ERROR: {type(e).__name__}",
             error=str(e),
         )
 

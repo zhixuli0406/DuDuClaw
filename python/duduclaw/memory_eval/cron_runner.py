@@ -6,12 +6,14 @@ memory_eval/cron_runner.py
 CLI 用法：python -m memory_eval.cron_runner [smoke_test|weekly_kpis|monthly_locomo]
 
 Cron 排程（依規格 §4.1）：
-  Daily Smoke Test    → 每日 03:00 UTC
-  Memory Snapshot     → 每週日 03:30 UTC
-  Weekly Native KPIs  → 每週日 04:00 UTC
-  Monthly LOCOMO      → 每月 1 日 04:00 UTC（P3）
+  Daily Smoke Test     → 每日 03:00 UTC（含 M1 LongMemEval-V2 / PersonaMem-v2 sample smoke）
+  Memory Snapshot      → 每週日 03:30 UTC
+  Weekly Native KPIs   → 每週日 04:00 UTC（含 M1 benchmark 檢索評測，對齊 LOCOMO 報告）
+  Monthly LOCOMO       → 每月 1 日 04:00 UTC（P3）
+  Monthly Benchmarks   → 每月 1 日（M1 完整 LongMemEval-V2 + PersonaMem-v2，需先 fetch）
 
 W21 Sprint 實作 — ENG-MEMORY
+M1 記憶評測接軌 — LongMemEval-V2（arXiv:2605.12493）/ PersonaMem-v2（arXiv:2512.06688）
 """
 from __future__ import annotations
 
@@ -23,13 +25,53 @@ from datetime import datetime, timezone
 
 import asyncpg
 
-from .config import EvalConfig
+from .config import EvalConfig, LongMemEvalConfig, PersonaMemConfig
 from .smoke_test import run_smoke_test
 from .retention_rate import compute_retention_rate, evaluate_rr_alerts
 from .retrieval_accuracy import compute_retrieval_accuracy, evaluate_ra_alerts
 from .db.snapshots import take_memory_snapshot
+from . import longmemeval_v2 as lme
+from . import personamem_v2 as pm
 
 logger = logging.getLogger(__name__)
+
+
+async def _run_benchmark_suite(memory_client) -> tuple[dict, list[str]]:
+    """跑 LongMemEval-V2 + PersonaMem-v2 檢索評測，回傳 (report_dict, alerts)。
+
+    資料集就緒策略（誠實）：
+      - full.jsonl 存在 → 用傳入的真實 client 對完整資料集跑（真實引擎檢索）。
+      - full.jsonl 不存在 → 退到離線 InMemory client + sample fixture，
+        report 內 dataset='sample' 明示這只是管線在線訊號，非真實 benchmark 分數。
+    """
+    from .fixture_client import InMemoryMemoryClient
+
+    report: dict = {}
+    alerts: list[str] = []
+
+    # LongMemEval-V2
+    lme_cfg = LongMemEvalConfig()
+    if lme.FULL_PATH.exists():
+        lme_res = await lme.compute_longmemeval(memory_client, lme_cfg, lme.FULL_PATH)
+    else:
+        lme_res = await lme.compute_longmemeval(
+            InMemoryMemoryClient(), lme_cfg, lme.SAMPLE_PATH, ingest=True
+        )
+    report["longmemeval_v2"] = lme_res.to_report()
+    alerts.extend(lme.evaluate_lme_alerts(lme_res, lme_cfg))
+
+    # PersonaMem-v2
+    pm_cfg = PersonaMemConfig()
+    if pm.FULL_PATH.exists():
+        pm_res = await pm.compute_personamem(memory_client, pm_cfg, pm.FULL_PATH)
+    else:
+        pm_res = await pm.compute_personamem(
+            InMemoryMemoryClient(), pm_cfg, pm.SAMPLE_PATH, ingest=True
+        )
+    report["personamem_v2"] = pm_res.to_report()
+    alerts.extend(pm.evaluate_pm_alerts(pm_res, pm_cfg))
+
+    return report, alerts
 
 
 async def run_daily_smoke_test(agent_id: str, db_dsn: str) -> dict:
@@ -122,6 +164,12 @@ async def run_weekly_native_kpis(agent_id: str, db_dsn: str) -> dict:
         results["temporal_consistency"]   = {"status": "not_implemented", "note": "P2, W22"}
         results["episodic_pressure_resp"] = {"status": "not_implemented", "note": "P2, W22"}
 
+        # Phase 6: 記憶 benchmark 接軌（M1）— LongMemEval-V2 + PersonaMem-v2
+        # 與 LOCOMO/RR/RA 對齊寫進同一 report，讓 dashboard 三 benchmark 一起顯示。
+        bench_report, bench_alerts = await _run_benchmark_suite(client)
+        results["benchmarks"] = bench_report
+        all_alerts.extend(bench_alerts)
+
         results["alerts"]    = all_alerts
         results["timestamp"] = datetime.now(timezone.utc).isoformat()
 
@@ -149,6 +197,41 @@ async def run_monthly_locomo(agent_id: str, db_dsn: str) -> dict:
     }
 
 
+async def run_monthly_benchmarks(agent_id: str, db_dsn: str) -> dict:
+    """
+    Monthly Cron：每月 1 日（建議接在 LOCOMO 後）
+    對「完整」LongMemEval-V2 + PersonaMem-v2 跑真實引擎檢索評測。
+
+    誠實紀律：full.jsonl 不存在 → 明確回報 PENDING-LIVE（需先跑 fetch_benchmarks.py），
+    不以 sample fixture 假冒完整 benchmark 分數。
+    """
+    from .client import build_client
+
+    config = EvalConfig(agent_id=agent_id, db_dsn=db_dsn)
+    result: dict = {"timestamp": datetime.now(timezone.utc).isoformat()}
+
+    missing = [
+        name for name, p in (("longmemeval_v2", lme.FULL_PATH), ("personamem_v2", pm.FULL_PATH))
+        if not p.exists()
+    ]
+    if missing:
+        result["status"] = "pending_live"
+        result["note"] = (
+            f"缺完整資料集 {missing}；先執行 "
+            "`python -m duduclaw.memory_eval.fetch_benchmarks all` 下載後再跑。"
+            " sample fixture 只用於 daily smoke，不代表完整 benchmark 分數。"
+        )
+        result["missing"] = missing
+        return result
+
+    client = build_client(config)
+    bench_report, bench_alerts = await _run_benchmark_suite(client)
+    result["status"] = "ok"
+    result["benchmarks"] = bench_report
+    result["alerts"] = bench_alerts
+    return result
+
+
 def _get_required_env(key: str) -> str:
     """讀取必要環境變數，不存在則 raise"""
     value = os.environ.get(key, "")
@@ -168,12 +251,20 @@ def main() -> None:
     )
 
     if len(sys.argv) < 2:
-        print("Usage: python -m memory_eval.cron_runner <smoke_test|weekly_kpis|monthly_locomo>")
+        print(
+            "Usage: python -m memory_eval.cron_runner "
+            "<smoke_test|weekly_kpis|monthly_locomo|monthly_benchmarks>"
+        )
         sys.exit(1)
 
     command = sys.argv[1]
     agent_id = os.environ.get("EVAL_AGENT_ID", "duduclaw-eng-memory")
-    db_dsn = _get_required_env("DATABASE_DSN")
+
+    # monthly_benchmarks 在 full 資料集缺席時不需 DB（直接回 PENDING-LIVE）
+    if command == "monthly_benchmarks":
+        db_dsn = os.environ.get("DATABASE_DSN", "")
+    else:
+        db_dsn = _get_required_env("DATABASE_DSN")
 
     if command == "smoke_test":
         result = asyncio.run(run_daily_smoke_test(agent_id, db_dsn))
@@ -181,6 +272,8 @@ def main() -> None:
         result = asyncio.run(run_weekly_native_kpis(agent_id, db_dsn))
     elif command == "monthly_locomo":
         result = asyncio.run(run_monthly_locomo(agent_id, db_dsn))
+    elif command == "monthly_benchmarks":
+        result = asyncio.run(run_monthly_benchmarks(agent_id, db_dsn))
     else:
         print(f"Unknown command: {command}")
         sys.exit(1)

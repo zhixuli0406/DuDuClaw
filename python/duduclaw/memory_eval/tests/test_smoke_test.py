@@ -289,11 +289,14 @@ async def test_smoke_test_report_summary_format():
 
 
 @pytest.mark.asyncio
-async def test_smoke_test_report_has_3_results():
-    """report 應包含恰好 3 個測試案例結果"""
+async def test_smoke_test_report_has_5_results():
+    """report 應包含 5 個測試案例：TC-1~3 原生 + TC-4/5 M1 benchmark sample smoke"""
     client = MockMemoryClient(pressure=0.5)
     report = await run_smoke_test(client, agent_id="test-agent")
-    assert len(report.results) == 3
+    assert len(report.results) == 5
+    names = {r.test_name for r in report.results}
+    assert "longmemeval_v2_sample" in names
+    assert "personamem_v2_sample" in names
 
 
 @pytest.mark.asyncio

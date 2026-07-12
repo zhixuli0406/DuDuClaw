@@ -71,3 +71,33 @@ class LOCOMOConfig:
                 self.dataset_version = info.get("version", self.dataset_version)
             except (FileNotFoundError, ImportError):
                 pass
+
+
+@dataclass
+class LongMemEvalConfig:
+    """LongMemEval-V2 Benchmark 評測配置（arXiv:2605.12493）
+
+    451 題、5 種記憶能力、context 由 web-agent 歷史 trajectory 構成。
+    我們以「gold evidence 是否被檢索到」為記憶系統層級的 recall@k 指標
+    （完整 QA answer-correctness 需 LLM judge，屬 PENDING-LIVE）。
+    """
+    k:                       int   = 5
+    sample_size:             int   = 200
+    recall_warn_threshold:   float = 0.70
+    recall_crit_threshold:   float = 0.60
+    memory_namespace_prefix: str   = "longmemeval_v2"
+
+
+@dataclass
+class PersonaMemConfig:
+    """PersonaMem-v2 Benchmark 評測配置（arXiv:2512.06688）
+
+    HF 資料集 `bowen-upenn/PersonaMem-v2`，1000 組 user-chatbot 互動、
+    300+ 情境、隱式偏好。測長上下文使用者理解。
+    我們以「隱式偏好對應的 persona 記憶是否被檢索到」為 recall@k 指標。
+    """
+    k:                       int   = 5
+    sample_size:             int   = 200
+    recall_warn_threshold:   float = 0.70
+    recall_crit_threshold:   float = 0.60
+    memory_namespace_prefix: str   = "personamem_v2"
