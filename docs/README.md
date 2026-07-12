@@ -100,6 +100,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/personal-edition-portability.md](guides/personal-edition-portability.md) | 個人版資料可攜：自架 ↔ 代管互轉 | Current |
 | [guides/channels-googlechat-teams.md](guides/channels-googlechat-teams.md) | Google Chat & Microsoft Teams channel setup + per-channel formatting/typing matrix | Current |
 | [guides/migrate-from.md](guides/migrate-from.md) | 從 OpenClaw / Hermes / paperclip 無痛轉移（`duduclaw migrate-from`，預設 dry-run） | Current |
+| [guides/white-label.md](guides/white-label.md) | White-label branding (reseller logo/name) + distributor key console (`/manage/distributors`, `[distributor] issuer_key_path`) | Current |
 
 ## API Reference
 

@@ -3,6 +3,329 @@
 ## [Unreleased]
 
 ### Added
+- **收尾波（2026-07-12）— P2 兩項＋G12 落盤＋四項欠帳接線。** G13 Talk Mode（dashboard
+  對話模式：WebAudio RMS VAD-lite＋狀態機＋Talk 切換鈕，疊在既有 PTT/STT/TTS 上；
+  不做 wake word／barge-in；mic 迴圈 PENDING-LIVE）；G15 Live Canvas（agent
+  `canvas_push`/`canvas_clear` 推 HTML 視覺工作區，寫入時 ammonia allowlist＋渲染時
+  `<iframe srcdoc sandbox="">`＋自包含 CSP 三層防護，`canvas.get` RPC＋`/畫布` 頁）；
+  G12 step 事件落盤（`run_steps.db` 持久化 tool_step/todo_update，runs.get 合併真步驟，
+  祕密 mask-before-truncate）；`user_code_profile` MCP 工具；`[fork] judge = "llm"` 生產
+  LlmJudge 建構點（FallbackJudge 降級）；ephemeral 成本父歸因（`ephemeral_parents` JOIN）。
+- **P1 尾輪十五項（2026-07-12）。** G4 session 可攜三件套（`/handoff` 歧義即拒防跨使用者外洩、
+  `/undo` tombstone 軟刪、`/rollback` 對話水位、世系 `#N`；chat 指令派發補齊 TG/DC/LINE）；
+  G5 skill hub taps（clawhub/lobehub 一手驗證、**裝前必過安檢掃描 fail-closed**）＋curator
+  生命週期（30d stale／90d 封存／pin 豁免，無使用訊號絕不自動封存）；G7 MoA 虛擬模型
+  （`[moa.<name>]`＋`moa:` 解析、提案 `<data>` 降格、usage 誠實加總、gateway direct-API
+  路由＋CLI 路徑明確拒絕）；G9 agentcompanies 雙向互通（export 確定性＋secret 全 scrub＋
+  PARTIAL 誠實標注、npm `@duduclaw/paperclip-adapter` 建置測試綠未發布）；G12 執行紀錄
+  `/runs`（sessions.db＋tool_calls.jsonl 誠實重建，未持久事件明示不偽造）；M2 User-as-Code
+  read-only 實驗（typed 規則＋四階確定性衝突解決）；M3 JitRL 零梯度學習（OpenAI-compat
+  `logit_bias` Tier B 上線、llama.cpp seam、預設關、僅顯式回饋 `jitrl_feedback` MCP）；
+  S3 紅隊外部靶場（`duduclaw test --bank`＋over-defense 追蹤＋25 案例起始 bank）；
+  R2 Foresight 前綴預警（確定性零 LLM、`run.at_risk` autopilot 事件）；R3 MAST 14 模式
+  失敗分類（channel_failures＋eval 報告）；R4 audit 輸入捕捉（先遮罩後截斷、白名單擴充
+  20 項高危工具）；O2 `spawn_ephemeral` 動態子代理（四元組、特權升級 fail-closed、GC
+  圍堵）；O3 FineVerify 細粒度裁判（確定性聚合）；O4 誠實成本守門（委派 vs 直接回覆報表
+  ＋spawn 成本提示，粒度限制如實輸出）；U4 共同計畫（`plans` 表＋`/plans` 頁＋agent
+  holder-guard 步驟更新＋prompt 注入）。
+- **白牌 P2 後段 — HTML 區塊、簽章散發包、主題色、金鑰自帶回家地址、channel 白牌。**
+  ① **About HTML 區塊**（`about_html`）：新增 `ammonia` 依賴，保守 allowlist 消毒
+  （`<a>` 強制 `rel="nofollow noopener noreferrer" target="_blank"`、`<img>` 僅
+  `data:image/png|jpeg|webp` 且沿用 logo 的 magic-bytes/512KB 驗證、剝除
+  `style/class/id/on*/<script>`、>64KB 直接拒絕）；消毒時機為 `branding.set` 儲存前＋
+  `branding::load` 讀出後（防手改檔）。新 RPC `branding.preview`（所見即所存）。
+  ② **主題色**（`accent_color`，驗證 `#rrggbb`）隨品牌散發。
+  ③ **簽章散發包**（`branding.bundle.json`）：由 owner issuer 金鑰簽章，任何 instance
+  只要驗簽通過即自動套用品牌，**無需 white_label license** 即可*顯示*（*編輯*仍受 gate）；
+  gateway 品牌解析順序 local `branding.json` > 驗簽通過的 bundle > 預設，回應新增頂層
+  `source` 欄位；owner gateway 新增 `POST /v1/branding/sign`（issuer-gate、per-IP 10/min、
+  複用 refresh 的 subscription+fingerprint 閘）；RPC `branding.bundle.create`（經銷商自助）
+  與 `distributor.bundle.sign`（owner 離線代簽）。vendor 名永遠疊加在最上層，散發包蓋不掉。
+  ④ **金鑰自帶回家地址**：`config.toml [distributor] public_url` 設定後，`distributor.issue`
+  將 owner URL 嵌入金鑰 `control_url`，客戶 instance 無需設 `DUDUCLAW_CONTROL_URL` 即自動
+  續期（根治 60 天離線降級）。⑤ **Channel 白牌**：Telegram/Discord/Slack/Google Chat/
+  WebChat 使用者可見的 "DuDuClaw" 字樣改吃品牌生效名稱（`effective_product_name`，短 TTL
+  快取；log/內部識別不動）。詳見 `docs/guides/white-label.md`「Shipping your branding to
+  customers」節。
+- **G1 派工引擎收尾 — lease 續租＋Goal 鏈（G8）。** 續租三面向接上：dispatch engine 的
+  `LeaseRenewalGuard` RAII ticker（lease/3 週期）、外部認領者的 `tasks_renew` MCP 工具
+  （holder-guarded）、系統提示 Task Queue 段與 heartbeat 喚醒訊息的續租教學＋
+  `tasks_claim` 回應附 `lease_note`。依賴閘控改為真強制：`atomic_claim` 在單一
+  IMMEDIATE transaction 內驗證每個 `depends_on` 皆存在且 `done`（fail-closed，回傳
+  `BlockedByDeps`）。新 `goals` 表（parent 鏈、循環拒絕、TOCTOU 防護）＋
+  `goals_create`/`goals_list` MCP＋`tasks_create goal_id`；pending-task 注入攜帶
+  root-first goal ancestry（byte-stable、CJK-safe）。`pending` 任務納入 heartbeat 拉取
+  與提示注入。背景引擎預設仍關（`[dispatch] enabled = true` 開啟即安全）。
+- **G10 — 企業微信（WeCom）＋釘釘（DingTalk）通道。** WeCom 自建應用：回調簽章
+  known-answer 驗證＋AES-256-CBC 加解密（panic-safe 邊界檢查）＋gettoken 快取＋
+  text/markdown 發送＋圖片上傳＋±1h 重放窗。DingTalk 企業內部機器人：HMAC-SHA256
+  驗簽 fail-closed（1h 時鐘窗）＋sessionWebhook 回覆（conversation 持久化 90 分鐘窗，
+  超窗主動發送誠實回錯）＋`*.dingtalk.com` 錨定允許清單防 SSRF。接線鏡射 feishu 全部
+  註冊點（含 dashboard ChannelsPage、sender factory、GATED_CHANNELS、委派轉發）。
+  活體驗證需真租戶憑證（PENDING-LIVE）。
+- **G11 — Work Timeline（公司級時間軸）。** 新 `timeline.list` RPC（authz 同
+  `activity.list`、非 admin fail-closed agent filter）＋純 SVG Gantt 頁 `/timeline`
+  （每 AI 員工一 lane、重疊自動堆疊、1h/6h/24h/7d、now 線、雙主題、三語 i18n、30s
+  靜默刷新）。誠實呈現：任務板有真起迄 ⇒ bar；活動/心跳只有單點 ⇒ dot，不捏造時長。
+- **N1/N2 — 夜間引擎真 LLM adapter（活體驗證）。** `night_llm::RotatedNightLlm` 走既有
+  帳號輪替路徑（CLI → Direct API fallback、haiku 級 utility model），每次呼叫前過
+  DailyCircuitBreaker（rolling-24h 花費上限，狀態原子落盤 `night_breaker.json`，重啟
+  不歸零）。`config.toml [night] llm_enabled` 預設關（fail-safe：關閉時與 scaffold
+  byte-identical）。夜間 spawn 鎖零工具 capabilities、注入記憶一律 `<data>` 降格。
+- **G2 收尾 — 訂閱 seat device-code 登入＋proxy 轉發。** `duduclaw auth device
+  --provider copilot|qwen`（RFC 8628 device flow、長效 GitHub token AES-256-GCM 加密
+  落庫、短效 Copilot token 按需鑄造 <5min 刷新、公開 client id 可 config 覆寫）；
+  `duduclaw proxy` seat 轉發（SSE passthrough、無 seat ⇒ models 不列出 fail-closed）；
+  `/v1/models` 補 60 req/min 限流（pre-auth）。Qwen 官方已停免費 OAuth ⇒ PENDING-LIVE。
+- **S2 — 引數級 provenance v1（PACT，arXiv:2605.11039，library 層）。**
+  `duduclaw-llm::provenance` 污染 span ledger（window-hash ≥12 字元比對、CJK-safe、
+  512 span 上限鎖存）＋`run_tool_loop` 政策 `Off/Warn/Enforce`：Enforce 只擋「敏感工具
+  ×污染引數」組合並以 `is_error` 回饋讓模型重規劃，非敏感工具照跑。預設 Off，既有
+  呼叫者零行為變更；v1 限制（子字串比對非資料流追蹤）明載模組 doc。
+- **O1 — 信心感知派工路由（OI-MAS，arXiv:2601.04861）。** `delegation_router` 三層
+  tier 純函式（機械動詞＋短 ⇒ utility 模型；架構/安全/除錯訊號 ⇒ Preferred；模糊不
+  降級），僅作用於 Dispatch 派工路徑（channel reply 不可能被改道）、非 Claude runtime
+  不注入 Claude model id。`[delegation] confidence_routing` 預設關，關閉時 byte-identical。
+- **U1 — 主動訊息時機引擎。** `proactive_timing::TimingGate` 純函式：24 槽日節律直方圖
+  判 quiet hours＋10 分鐘 mid-flow 偵測（sessions.db 唯讀隨查隨算）。只延遲不丟訊息
+  （6h 硬上限）、cold start 隱形、使用者排程 reminder 結構豁免；silence breaker 與
+  PROACTIVE.md 兩條 send path 皆過 gate。預設開，`[proactive] natural_timing = false`
+  kill switch 回復原行為。
+
+- **Distributor white-label portal (backend).** Resellers whose license carries the
+  `white_label` feature (tier = Oem) can rebrand the dashboard while the upstream
+  vendor credit ("嘟嘟數位科技有限公司 / DuDu Digital Technology Co., Ltd.") stays
+  const-assembled into every response — never config-sourced, never writable. New
+  `crates/duduclaw-gateway/src/branding.rs` (`branding.json` atomic persistence;
+  fail-closed validation: SVG rejected, logo magic-byte + 512 KB + data-URI prefix
+  whitelist, CJK-safe codepoint length caps) and
+  `crates/duduclaw-gateway/src/distributor_store.rs` (SQLite `distributor.db`,
+  WAL/0600, `distributors` + `issued_licenses`). New dashboard RPCs `branding.get`
+  / `about.get` (any logged-in user), `branding.set` / `branding.reset`
+  (`require_admin!` **+** fail-closed white_label gate), and `distributor.status /
+  list / add / update / remove / issue / revoke` (`require_admin!`). Issuance reuses
+  the License v2 format (tier = Oem, `public_key_id = v2`, machine-bound, default
+  365-day term), self-verifies against the binary's baked v2 public key before
+  booking, and never logs the issuer private key; issue/revoke write
+  `security_audit.jsonl`. Issuer key path comes only from `[distributor]
+  issuer_key_path` (unset = explicit zh-TW error, no path guessing). **Known limit
+  (§7):** a self-signed OEM license downgrades to OpenSource after 60 days without a
+  phone-home — surfaced as an issue-time warning; a lightweight refresh/CRL endpoint
+  is deferred to P2. 17 new unit tests.
+- **Distributor white-label control-plane (P2 — refresh & revocation).** The owner
+  gateway now acts as a lightweight control-plane for the OEM keys it signs, so they
+  no longer trip the 60-day offline downgrade and revocations propagate. New
+  `crates/duduclaw-gateway/src/license_serve.rs` mounts two public, issuer-gated
+  endpoints (unset `[distributor] issuer_key_path` ⇒ `404` — a plain gateway exposes
+  nothing): `POST /v1/license/refresh` re-signs the caller's license with
+  `last_phone_home = now` (**never extends the term**; returns `revoked` for a
+  revoked key, `403` for a fingerprint mismatch or expired key, echoes the request
+  `nonce` verbatim for the anti-replay client) and `GET /v1/license/crl` serves an
+  Ed25519-signed CRL (7-day TTL, canonical payload byte-aligned to the client
+  verifier). Trust is proven by `subscription_id` + `machine_fingerprint` (no
+  bearer, matching the cloud plane); per-IP rate limits (refresh 30/min, crl
+  60/min); the issuer private key is read per request, never logged, never echoed.
+  `distributor_store` gains `get_license_by_subscription_id`, an idempotent
+  `last_refresh_at` column migration + `touch_refresh`, and a pure
+  `resign_license_for_refresh` (shares the sign + self-verify kernel with issuance).
+  Zero client code change — a reseller sets `DUDUCLAW_CONTROL_URL` to the owner
+  gateway. `distributor.status` reports `refresh_endpoint_active`; the console shows
+  an endpoint badge, the `DUDUCLAW_CONTROL_URL` setup snippet, and per-key last
+  refresh time; the issue-time warning now guides distributors to point at the
+  gateway instead of only warning about the 60-day downgrade. 10 new unit tests + 6
+  integration tests.
+- **Distributor white-label portal (dashboard).** New `useBrandingStore`
+  (`web/src/lib/branding.ts`) hydrates from a localStorage cache pre-auth and from
+  `branding.get` post-auth, driving the sidebar mark, login page, document title,
+  favicon, and agent-name fallbacks (defaults unchanged: DuDuClaw / 🐾). New
+  `/about` page shows the reseller's own branding above a fixed vendor block
+  ("嘟嘟數位科技有限公司 / DuDu Digital Technology Co., Ltd.") sourced from the
+  backend const with a hard-coded front-end fallback. New "品牌設定" settings tab
+  (logo upload via base64, PNG/JPEG/WebP only, 512 KB pre-check; read-only with an
+  upgrade notice when `white_label` is not licensed) and an admin-only
+  `/manage/distributors` console (add resellers, issue machine-bound OEM keys with
+  a copyable activation blob, revoke with an honest CRL note; empty state explains
+  `[distributor] issuer_key_path`). i18n keys added across zh-TW / en / ja-JP.
+- **G6 — A2A v1.0 signed agent cards.** `/.well-known/agent-card.json` now carries
+  an EdDSA (Ed25519) detached-JWS `signatures` array so a recipient can verify the
+  card's authenticity; `GET /.well-known/jwks.json` serves the public key (OKP /
+  Ed25519, RFC 8037). The signing key is auto-generated at
+  `~/.duduclaw/keys/a2a-signing.ed25519` (chmod 600) on first start. Fail-closed:
+  a key error yields the unsigned card + a warning, never a 500. New
+  `crates/duduclaw-gateway/src/a2a_signing.rs` (14 unit tests, sign→verify
+  roundtrip). Existing card fields are unchanged — signatures are additive.
+- **G2 — Subscription-OAuth breadth + local `duduclaw proxy`.** The `AccountRotator`
+  OAuth path is generalized beyond hardcoded Anthropic: OAuth seats carry a
+  `provider` field (Claude / ChatGPT-Codex / Copilot / Qwen Portal are catalogued),
+  and non-Anthropic seats never fabricate env-var names or leak a seat token as an
+  API key. `duduclaw proxy --bind 127.0.0.1:PORT` exposes the account pool as a
+  local OpenAI-compatible endpoint (`POST /v1/chat/completions` with SSE,
+  `GET /v1/models`, `GET /healthz`) so external tools (Aider / Cline / Codex) can
+  borrow subscription quota; Bearer-guarded, loopback by default, 503 fail-closed
+  on no accounts. Copilot/Qwen device-code token acquisition and OAuth-seat
+  forwarding through the proxy are **PENDING-LIVE** (need per-vendor credentials /
+  a CLI-runtime bridge).
+- **U2 — Evidence-based approval UX (CHI/FAccT 2026).** Approval cards in the Inbox
+  are redesigned around three empirical findings: plan-first (arXiv:2604.04918 —
+  "what this AI employee intends to do" summary leads, approve/deny follows),
+  heuristic verification (arXiv:2606.05391 — risk badge + opt-in one-tap spot-check
+  instead of forcing a full read), and reviewer-fatigue protection
+  (arXiv:2606.08919 — daily approval count + same-kind batch hint, never
+  auto-approve). Confidence/risk is shown only at the whole-action level, never
+  token-level (arXiv:2605.28571) — codified in `web/DESIGN.md` §13. High-risk
+  actions gate through the shared `ConfirmDialog`. Pure risk-tiering in
+  `web/src/lib/approval-risk.ts` (30 tests); backend approval RPCs unchanged.
+- **G1 — Durable multi-agent dispatch engine.** Upgrades cross-agent delegation
+  from the fragile file-based IPC (`bus_queue.jsonl`) to a durable SQLite task
+  lifecycle, closing the gap against Hermes Kanban swarm / paperclip wakeup queue.
+  `crates/duduclaw-gateway/src/task_store.rs` gains an idempotent column
+  migration (`claimed_by` / `claimed_at` / `lease_expires_at` / `depends_on` /
+  `retry_count` / `max_retries` / `goal_mode` / `acceptance_criteria` /
+  `result_summary` / `judge_feedback`) plus four durability primitives: **atomic
+  claim** (`atomic_claim` — conditional `UPDATE ... WHERE status='pending' AND
+  claimed_by IS NULL`, exactly one worker wins), **zombie reclaim**
+  (`reclaim_zombies` — a leased task whose worker died is requeued with a retry
+  count, or marked `failed` once the budget is spent; NULL-lease board tasks are
+  never touched), **dependency unlock** (`claimable_tasks` gates a task until
+  every `depends_on` id is `done`), and **goal mode** (`complete_task` routes a
+  `goal_mode` task to a `review` state; acceptance is decided by a judge). A new
+  background loop `crates/duduclaw-gateway/src/dispatch_engine.rs`
+  (`DispatchEngine`, heartbeat-cadence tick, spawned in `server.rs`) drives
+  zombie reclaim every tick and runs goal-mode review through a pluggable
+  `AcceptanceJudge` (`LlmAcceptanceJudge` reuses the fork crate's `LlmCaller`
+  abstraction). **Fail-safe:** a judge error parks the task as `needs_human` —
+  never auto-accepted, never looped. The MCP `tasks_claim` tool now uses the
+  atomic primitive (falling back to the legacy claim for pre-G1 board tasks),
+  `tasks_complete` routes goal-mode tasks to review, and `tasks_create` accepts
+  `depends_on` / `goal_mode` / `acceptance_criteria` / `max_retries` / `durable`.
+  The `bus_queue.jsonl` rail is retained as a compatibility path (unchanged). 19
+  new unit tests (12 task_store + 7 dispatch_engine) cover atomic-claim
+  concurrency, zombie requeue/fail at the retry cap, dependency gating, and
+  goal-mode accept/reject/judge-failure, plus a guard so `complete_task` cannot
+  overwrite a task already in a terminal (`done`/`cancelled`) state. **The
+  synchronous primitives (atomic claim, dependency gating, complete) are live
+  via the MCP task tools; the background `DispatchEngine` loop is default-OFF**
+  (`config.toml [dispatch] enabled = true` / `DUDUCLAW_DISPATCH_ENGINE=1`):
+  its zombie-reclaim would falsely requeue any task running longer than the
+  fixed 300s lease because there is no mid-task lease-renewal signal yet
+  (`renew_lease` has no caller). It stays off until renewal is wired. The
+  acceptance judge is likewise spawned with `None`, so goal-mode `review` tasks
+  sit safely in `review`.
+- **Night Engine — idle-time compute suite (N1–N4).** "The AI employee tidies
+  its memory and pre-reads tomorrow's work while it sleeps": four paper-grounded
+  capabilities layered on the existing heartbeat scheduler + evolution engine,
+  default OFF per agent (`agent.toml [night_engine] enabled = true`; new
+  `NightEngineConfig` in `duduclaw-core`). A gateway-side idle-aware scheduler
+  (`crates/duduclaw-gateway/src/night_engine.rs`, `spawn_night_engine`) reuses the
+  heartbeat agent registry, reads `sessions.last_active` to detect idle agents,
+  and fires a night pass bounded by a **per-pass cost cap** (`PassBudget`) and a
+  **per-agent daily circuit breaker** (`DailyCircuitBreaker`) so idle compute can
+  never run away. **N3 Schema induction** (DCPM arXiv:2606.09483) and **N4
+  Recurrence-gated consolidation + deterministic trust verification** (RecMem
+  arXiv:2605.16045 + TRUSTMEM arXiv:2606.25161) are live and fully deterministic
+  (zero LLM), implemented in `crates/duduclaw-memory/src/night.rs`: N3 scans
+  episodic memory for token themes recurring across ≥ `schema_min_support`
+  memories and promotes each into a `night-schema` semantic entry (superseded by
+  theme via the temporal chain); N4 only consolidates a theme that recurs ≥
+  `recurrence_threshold` times, then gates the merge on a coverage / preservation
+  / faithfulness check and **rolls back** (never stores) a merge that fails, so
+  the store can't degrade the more it tidies. **N1 Sleep-time compute**
+  (arXiv:2504.13171) and **N2 Proactive prefetch** (ProAct arXiv:2605.25971) are
+  scaffolded behind a `NightLlm` trait — orchestration, budget gating, prompt
+  building and `night_cache.jsonl` write are implemented and unit-tested with a
+  mock LLM, but the live LLM adapter is not yet wired into the running scheduler
+  (passes `None`), so N1/N2 are PENDING-LIVE. 28 new unit tests (12 memory + 16
+  gateway) cover the tokenizer, theme detection, recurrence gate, three-axis
+  verification, idle detection, circuit breaker, budget, prompt/cache, and the
+  end-to-end deterministic + mock-LLM passes.
+- **Event-triggered cron (G3, parity with OpenClaw 2026.7).** Cron tasks gain
+  two event-driven trigger kinds on top of the existing time schedule. New
+  `crates/duduclaw-gateway/src/condition_eval.rs` holds the fail-closed decision
+  logic (pure, unit-tested): `TriggerKind` state machine (`time` | `condition` |
+  `on_exit`), condition-output parsing (`{fire, message?, state?}` with a 16 KiB
+  `state` cap and logs-then-JSON tolerance), and sandboxed execution via the
+  existing `duduclaw-sandbox` native OS primitive (macOS Seatbelt / Linux
+  Landlock). A **`condition`** task runs its script at each due cron slot and
+  fires only on `fire:true`, persisting `state` (≤16 KiB, oversize rejected
+  fail-closed) across evaluations and injecting the script's `message` into the
+  fired prompt; an **`on_exit`** task fires only when its watch command exits 0.
+  `CronStore` gains four idempotently-migrated columns (`trigger_kind`,
+  `condition_script`, `condition_state`, `watch_command`) plus `update_trigger` /
+  `update_condition_state` setters; `cron.add` / `cron.update` RPCs read and
+  strictly validate the new fields (unknown `trigger_kind`, or a
+  condition/on_exit task missing its script/command, is rejected at write time).
+  Every failure mode — sandbox refusal, spawn error, 30 s timeout, non-JSON
+  output, missing `fire`, oversized state — resolves to *do not fire*. The cron
+  schedule acts as the evaluation cadence; `last_run` advances at each due slot
+  regardless of the gate outcome, so a condition is re-checked only on schedule
+  (no per-tick runaway).
+- **Lightweight trajectory anomaly detection (R1, Trajectory Guard arXiv:2601.00516).**
+  New `crates/duduclaw-gateway/src/trajectory_guard.rs` — a **deterministic,
+  zero-LLM-cost** heuristic guard over the structured tool-step stream
+  (`StepEvent`/`StepTracker`) plus a cost-slope signal. Four pure, unit-tested
+  rules emit `AnomalySignal { kind, severity, evidence }`: **repeated-tool loop**
+  (same tool + normalized input ≥N in a window — the runaway-loop fingerprint),
+  **excessive depth** (outstanding tool-call nesting past a threshold),
+  **cost-slope spike** (cumulative spend rate past `baseline × multiplier`), and
+  **trajectory stall** (many steps, overwhelmingly read-only, no productive
+  output). Severity grades Low/Medium/High with per-kind de-dup + escalation.
+  Wired into the `channel_reply` stream loop: every parsed step feeds the guard;
+  a High-severity signal is appended to `channel_failures.jsonl` (with an
+  `anomaly` classification, under an advisory file lock) and logged in zh-TW.
+  **Fail-safe, not fail-closed** — the guard NEVER kills a task; tripping an
+  existing circuit breaker is an explicit operator opt-in (`intervene = true`)
+  surfaced as a pure `should_intervene` decision, default report-only. Tunable
+  via `config.toml [trajectory_guard]` (conservative defaults, `enabled = true`).
+  36 new unit tests (each rule normal/anomaly + window boundaries + cost-slope
+  math + severity grading + config parse/clamp + stateful de-dup/escalation).
+- **Memory benchmark integration (M1): LongMemEval-V2 + PersonaMem-v2.**
+  Two 2026 memory benchmarks wired into the existing `python/duduclaw/memory_eval`
+  pipeline alongside LOCOMO/RR/RA. New modules `longmemeval_v2.py`
+  (arXiv:2605.12493 — 451 questions, 5 memory abilities, agentic-trajectory
+  context) and `personamem_v2.py` (arXiv:2512.06688 — HF `bowen-upenn/PersonaMem-v2`,
+  1000 user-chatbot interactions, 300+ implicit-preference scenarios), both
+  mirroring `retrieval_accuracy.py`'s loader + metric + alert shape. They measure
+  a **retrieval-level `recall@k`** (does the gold evidence memory land in the
+  top-K search over the SqliteMemoryEngine batch-query surface), broken down per
+  ability / per scenario — a memory-system proxy; full QA answer-correctness needs
+  an LLM judge and is left explicitly **PENDING-LIVE**. `to_report()` emits the
+  same report shape as LOCOMO so the dashboard shows all three benchmarks together.
+  Dataset acquisition via new `fetch_benchmarks.py` (downloads from HuggingFace,
+  converts to local jsonl; on no-network / no-`datasets` / unknown-repo it
+  **fails honestly** with the exact fetch commands and never fabricates data —
+  LongMemEval-V2's repo id must be operator-supplied since it wasn't verified).
+  Each benchmark ships a hand-crafted 4-5 question **sample fixture**
+  (`data/<bench>/sample.jsonl`) plus a zero-dependency `InMemoryMemoryClient`
+  (`fixture_client.py`) so smoke + unit tests run fully offline. Wired into the
+  cron runner: the daily 03:00 UTC smoke test gains `longmemeval_v2_sample` /
+  `personamem_v2_sample` cases (TC-4/TC-5, sample fixtures); weekly KPIs include
+  the benchmark suite (full dataset if fetched, else sample fallback marked
+  `dataset: "sample"`); new `monthly_benchmarks` command runs the full sets and
+  reports `pending_live` when they aren't downloaded. 30 new unit tests
+  (loader / recall metric / alerts / offline end-to-end / honest-fail); downloaded
+  `full.jsonl`/`*.raw.jsonl` are gitignored, only sample fixtures tracked.
+- **Revocable, epoch-bound capability lifecycle (PORTICO, arXiv:2606.22504).**
+  New `crates/duduclaw-gateway/src/capability.rs` upgrades HITL from a *one-shot*
+  `request → decide` (where a human approval was a **permanent** grant that was
+  never taken back) to `request → grant → invoke`. Approving now mints a
+  **`CapabilityGrant`** — an epoch-bound handle tied to a task/session subgoal
+  (`scope_epoch`) via `CapabilityBroker::grant` / `grant_from_approval`. A tool
+  runs `invoke(handle)` before acting; when the subgoal closes,
+  `close_scope(epoch)` **auto-revokes** every handle bound to it, so any later
+  `invoke` of the same handle is denied (PORTICO's post-closure "N/N blocked").
+  Fully **fail-closed**: unknown handle → `NotFound`, revoked → `Revoked`,
+  past-TTL or unparseable expiry → `Expired`, closed scope (even if the row's
+  `revoked_at` wasn't yet stamped) → `ScopeClosed`, store error → `Store` — never
+  a silent allow; granting *into* an already-closed scope is rejected up front
+  (stale-write guard). Storage shares the `approvals.db` file with the approval
+  store but owns two tables (`capability_grants`, `capability_closed_scopes`;
+  WAL, parameterized SQL only). **Wired:** `approvals.decide` mints a grant on
+  approve when the approval payload carries a `scope_epoch` (optional
+  `capability_ttl_seconds`); `tasks.update → status=done` calls `close_scope(task_id)`
+  to auto-revoke that subgoal's capabilities. Session-end auto-close and the
+  MCP-tool `invoke` gate expose the API (`close_scope` / `invoke`) but their
+  call-sites are follow-up wiring. 12 unit tests cover grant→invoke, post-closure
+  reuse denial, expiry, unknown/revoked handles, and the stale-write guard.
 - **Painless migration `duduclaw migrate-from <openclaw|hermes|paperclip>`.**
   One command to move from the three big competitor platforms into DuDuClaw.
   New `crates/duduclaw-cli/src/migrate_from/` module (`openclaw.rs` / `hermes.rs`
@@ -267,6 +590,13 @@
   `approval_required_tools` guidance for write tools.
 
 ### Changed
+- **`License` 新增可選 `control_url` 欄位（相容性：向後相容）。** 白牌 §10.5 讓 issuer
+  金鑰自帶續期端點。此欄位 **不進 canonical_payload**（與 `signature` 同級排除，不影響簽章），
+  且 `#[serde(default, skip_serializing_if="Option::is_none")]`：舊 `license.json`（無此欄位）
+  讀出即 `None`，行為不變；新舊 binary 互讀相容（License 無 `deny_unknown_fields`）。控制面
+  URL 解析順序改為 `DUDUCLAW_CONTROL_URL` env > `license.control_url` > 內建預設（gateway
+  `license_runtime` 與 CLI `license refresh` 同步）。`resign_license_for_refresh` 保留原
+  `control_url`。
 - **World stage is a PixiJS 2D isometric scene, now with an immersive full-width
   `/world` page.** After live testing, the interim three.js real-3D renderer was
   dropped in favour of a 2:1 isometric PixiJS renderer (`stage-scene.ts`): a
@@ -322,7 +652,47 @@
 - MCP Bridge `env` values now accept `secret://` refs in addition to `env://`
   (see Added). `SecretBackend` gains `OnePassword` / `Infisical` variants.
 
+### Security
+- **收尾波複查修正（2026-07-12）。** Live Canvas 補自包含 srcDoc CSP（`default-src 'none';
+  img-src data:`）——關掉 CSS `background:url()` 的外連信標通道（沙箱已擋 script，此層擋
+  網路 egress，使 Canvas 成為全離線視覺面）。
+- **P1 尾輪雙鏡頭複查修正（2026-07-12）。** skill 安裝 `meta.name` 路徑穿越（掃描乾淨的
+  skill 可覆寫其他 agent 的 SOUL.md——全安裝路徑單點消毒，CRITICAL）；全通道
+  `handle_command` 的 `is_admin=true` hardcode（任何群組成員可 `!STOP ALL` 全域停機——改
+  `admin_users` 頻道設定，fail-closed 無名單即無管理員，CRITICAL）；指令攔截點前置中央
+  存取閘（pairing/allowlist 不再被繞過）；export 不再跟隨 symlink＋contract/skill 目錄
+  全檔 scrub＋token 形狀擴充；LobeHub manifest SSRF 允許清單；hub 安裝暫存檔移出共享
+  /tmp；agents.update 通道密鑰不再以明文複活；全通道 config 密鑰 enc-only（presence
+  檢查改 `_enc`-aware，移除 TG/DC/LINE 最後三個明文例外）；`spawn_ephemeral`/
+  `spawn_agent` bus 入列補跨程序檔鎖；ephemeral 32 上限防 TOCTOU；`/handoff` 跨使用者
+  對話外洩（歧義即拒）。
+- **雙鏡頭複查修正（2026-07-11 第二輪）。** WeCom `corpsecret`/access_token 與 DingTalk
+  sessionWebhook token 不再經 reqwest 錯誤 URL 洩漏到 log/dashboard（`scrub_reqwest_err`
+  全站套用）；wecom/dingtalk 密鑰不再以明文與 `_enc` 並存於 config；
+  `dingtalk_sessions.json` 與 `teams_conversations.json` 改 0600 原子建檔；DingTalk
+  sessionWebhook 加 `*.dingtalk.com` 錨定允許清單（sign 不覆蓋 body 的 SSRF 面）；
+  WeCom 回調加 ±1h 重放窗；夜間 LLM spawn 由預設 capabilities（skip-permissions 全工具
+  面）收緊為零工具 allowlist＋注入記憶 `<data>` 降格；N3/N4 夜間升格記憶 importance
+  封頂 5.0＋來源 tag（重複注入內容無法壓過 curated 條目）；`complete_task`/`block` 補
+  claim-holder guard（殭屍工人不能蓋掉新持有者結果）。
+
 ### Fixed
+- **P1 尾輪雙鏡頭複查修正（2026-07-12）。** MoA 在派工/cron 路徑原會毒化共享帳號池
+  （rotator 之前即攔截＋direct-API 正確路由＋成本入 telemetry＋對話 history 接通）；
+  JitRL 回饋零 caller＋record/generate model key 不一致（已接 MCP 工具＋統一 key）；
+  audit 輸入捕捉零 caller 死碼（已接中央稽核站）；curator 會封存從未被 stamp 的活躍
+  skill（無使用訊號改 stale-only）；`run_at_risk` 缺席 autopilot trigger 白名單；Slack
+  指令 session key 錯位（幽靈 session）；handoff 佈告 marker 順序（`/rollback` 不再能
+  整段吃掉匯入歷史）；runs.get／儀表板計數補 tombstone 過濾；proactive_timing 排除已
+  撤銷輪；channel_reply 兩處 CJK 不安全位元組切片；curator 巢狀配置不再每日誤報。
+- **雙鏡頭複查修正（2026-07-11 第二輪）。** 依賴閘控死碼（`claimable_tasks` 零呼叫者
+  ⇒ 已 fold 進 `atomic_claim` 單一交易）；外部 provider seat 不再壓掉 anthropic OAuth
+  自動偵測（channel reply 全斷回歸）；API-key qwen 帳號不再被 seat 分支劫持成 503；
+  wecom/dingtalk 補 `create_sender` factory arm（cron/OTP/computer-use 不再靜默丟訊息）；
+  goals/depends_on 循環檢查包 IMMEDIATE txn（TOCTOU）；zombie reclaim 加
+  `lease_expires_at` CAS；`tasks_claim` legacy fallback 不能偷走已指派任務；timeline
+  `truncated` 旗標修正＋`taskStatus.failed` 三語補齊；cli MCP `VALID_CHANNELS` 補
+  wecom/dingtalk。
 - **Evolution "off" now really stops evolution (master kill-switch).** Turning
   off self-evolution previously left two bypass paths — the heartbeat
   silence-breaker and the channel prediction path never checked the toggle, so a
