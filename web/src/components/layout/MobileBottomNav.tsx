@@ -6,9 +6,11 @@ import { cn } from '@/lib/utils';
 import { mobileNavItems, type NavItem } from './nav-model';
 
 /**
- * MobileBottomNav — Zone A quick access on small screens (§4.3). Five slots:
- * 首頁 / 收件匣 / ＋交辦（center raised action） / 任務 / 對話. Hidden at md+ (the
- * sidebar takes over). The inbox slot carries the live "needs me" count.
+ * MobileBottomNav — Zone A quick access on small screens (§4.3). Slots:
+ * 首頁 / 收件匣 / ＋交辦（center raised action, links to the task board's create
+ * intent） / 對話 / 任務. Hidden at md+ (the sidebar takes over). The inbox slot
+ * carries the live "needs me" count. Two balanced side groups (2 left / 2 right)
+ * flank the centre ＋交辦; the ＋ remains the quick create entry.
  */
 function BottomNavLink({ item, inboxCount }: { item: NavItem; inboxCount: number }) {
   const intl = useIntl();
@@ -47,21 +49,28 @@ export function MobileBottomNav() {
   const navigate = useNavigate();
   const inboxCount = useApprovalsStore((s) => s.pendingCount);
 
-  // Split the four side items 2 | center | 2.
-  const left = mobileNavItems.slice(0, 2);
-  const right = mobileNavItems.slice(2, 4);
+  // Split the side items around the center ＋交辦 action. The center is a
+  // fixed-width slot flanked by two equal-flex groups, so the raised ＋ button
+  // stays dead-centre horizontally. With 4 items the split is a balanced 2/2,
+  // giving every tab the same width.
+  const mid = Math.ceil(mobileNavItems.length / 2);
+  const left = mobileNavItems.slice(0, mid);
+  const right = mobileNavItems.slice(mid);
 
   return (
     <nav
       aria-label={intl.formatMessage({ id: 'nav.mobile.label' })}
       className="glass-chrome fixed inset-x-0 bottom-0 z-40 flex h-14 items-stretch border-t border-stone-300/40 md:hidden dark:border-white/8"
     >
-      {left.map((item) => (
-        <BottomNavLink key={item.to} item={item} inboxCount={inboxCount} />
-      ))}
+      <div className="flex flex-1 items-stretch">
+        {left.map((item) => (
+          <BottomNavLink key={item.to} item={item} inboxCount={inboxCount} />
+        ))}
+      </div>
 
-      {/* Center raised action: ＋交辦 */}
-      <div className="flex flex-1 items-center justify-center">
+      {/* Center raised action: ＋交辦 — a fixed-width slot kept horizontally
+          centred by the equal-flex groups on either side. */}
+      <div className="flex w-16 shrink-0 items-center justify-center">
         <button
           type="button"
           // TODO(v2-V5): route to the task board's create intent until a global
@@ -75,9 +84,11 @@ export function MobileBottomNav() {
         </button>
       </div>
 
-      {right.map((item) => (
-        <BottomNavLink key={item.to} item={item} inboxCount={inboxCount} />
-      ))}
+      <div className="flex flex-1 items-stretch">
+        {right.map((item) => (
+          <BottomNavLink key={item.to} item={item} inboxCount={inboxCount} />
+        ))}
+      </div>
     </nav>
   );
 }

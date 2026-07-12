@@ -390,6 +390,41 @@ pub async fn install_skill_global(
     install_skill(skill_path, &global_skills_dir, quarantine_dir).await
 }
 
+/// WP7: install a skill into a department's shared skill directory
+/// `~/.duduclaw/shared/skills/departments/<dept>/`.
+///
+/// Department skills sit between global and per-agent in the lookup order
+/// (per-agent > department > global; nearest wins on a name collision). The
+/// department name is DATA and is validated against the
+/// [`duduclaw_core::is_valid_department`] allowlist here at the sink, so a
+/// hostile `../..` department can never escape the shared skills tree.
+pub async fn install_skill_department(
+    skill_path: &Path,
+    home_dir: &Path,
+    department: &str,
+    quarantine_dir: &Path,
+) -> Result<ParsedSkill, String> {
+    if !duduclaw_core::is_valid_department(department) {
+        return Err(format!(
+            "install DENIED: department '{}' is not a valid name \
+             (ASCII alphanumeric, '-', '_'; 1..=64 bytes)",
+            department.escape_debug()
+        ));
+    }
+    let dept_skills_dir = department_skills_dir(home_dir, department);
+    install_skill(skill_path, &dept_skills_dir, quarantine_dir).await
+}
+
+/// Path to a department's shared skill directory. `department` MUST already be
+/// validated via [`duduclaw_core::is_valid_department`].
+pub fn department_skills_dir(home_dir: &Path, department: &str) -> std::path::PathBuf {
+    home_dir
+        .join("shared")
+        .join("skills")
+        .join("departments")
+        .join(department)
+}
+
 #[cfg(test)]
 mod display_tests {
     use super::*;
@@ -507,6 +542,33 @@ mod install_safety_tests {
         let parsed = install_skill(&good, &skills_dir, &quarantine).await.unwrap();
         assert_eq!(parsed.meta.name, "notes");
         assert!(skills_dir.join("notes.md").is_file());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn install_department_validates_name_and_targets_shared_dir() {
+        let home = std::env::temp_dir().join(format!("duduclaw-dept-{}", uuid::Uuid::new_v4()));
+        let src_dir = home.join("src");
+        let quarantine = home.join("quarantine");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let skill = src_dir.join("s.md");
+        std::fs::write(&skill, "---\nname: art-brief\n---\nbody").unwrap();
+
+        // Traversal-shaped department is rejected at the sink.
+        for bad in ["../evil", "a/b", ".", ""] {
+            let err = install_skill_department(&skill, &home, bad, &quarantine)
+                .await
+                .unwrap_err();
+            assert!(err.contains("DENIED"), "must reject department {bad:?}: {err}");
+        }
+
+        // Valid install lands under shared/skills/departments/<dept>/.
+        let parsed = install_skill_department(&skill, &home, "art", &quarantine)
+            .await
+            .unwrap();
+        assert_eq!(parsed.meta.name, "art-brief");
+        assert!(department_skills_dir(&home, "art").join("art-brief.md").is_file());
 
         let _ = std::fs::remove_dir_all(&home);
     }

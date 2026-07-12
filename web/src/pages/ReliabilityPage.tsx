@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
-import { api, type ReliabilitySummary } from '@/lib/api';
+import { api, type ReliabilitySummary, type EvolutionEvent } from '@/lib/api';
 import {
   Activity,
   ShieldCheck,
@@ -11,6 +11,7 @@ import {
   GitFork,
   RefreshCw,
   AlertTriangle,
+  Sparkles,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
@@ -23,12 +24,139 @@ import {
   Toolbar,
   Mono,
   CharacterAvatar,
+  EmptyState,
   controlClass,
 } from '@/components/ui';
 
 // ── Window options ────────────────────────────────────────────────────────────
 
 type WindowDays = 7 | 14 | 30;
+
+// ── Evolution events (self-evolution audit trail) ───────────────────────────────
+
+function evolutionOutcomeTone(outcome: string): 'success' | 'warning' | 'danger' | 'neutral' {
+  const o = outcome.toLowerCase();
+  if (o.includes('success') || o.includes('accept') || o.includes('adopt') || o.includes('confirm')) return 'success';
+  if (o.includes('fail') || o.includes('reject') || o.includes('rollback') || o.includes('error')) return 'danger';
+  if (o.includes('pending') || o.includes('observ') || o.includes('extend') || o.includes('trigger')) return 'warning';
+  return 'neutral';
+}
+
+function EvolutionEventsSection({
+  agentId,
+  windowDays,
+}: {
+  agentId: string;
+  windowDays: WindowDays;
+}) {
+  const intl = useIntl();
+  const [events, setEvents] = useState<EvolutionEvent[] | null>(null);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    if (!agentId) return;
+    setLoading(true);
+    setError(null);
+    const since = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000).toISOString();
+    try {
+      const res = await api.audit.evolutionQuery({ agent_id: agentId, since, limit: 25 });
+      setEvents(res.events ?? []);
+      setTotal(res.total ?? 0);
+    } catch (e) {
+      // A missing/empty index must not blank the whole page — degrade to an
+      // inline error and keep the reliability gauges above intact.
+      console.warn('[evolution]', e);
+      setError(formatError(e));
+      setEvents([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [agentId, windowDays]);
+
+  useEffect(() => { load(); }, [load]);
+
+  return (
+    <Card
+      bodyClassName="space-y-3"
+      title={
+        <span className="flex items-center gap-2">
+          <Sparkles className="h-4 w-4 text-amber-500" />
+          {intl.formatMessage({ id: 'evolution.events.title' })}
+        </span>
+      }
+    >
+      <p className="text-xs text-stone-400 dark:text-stone-500">
+        {intl.formatMessage({ id: 'evolution.events.desc' })}
+      </p>
+
+      {loading ? (
+        <div className="space-y-2">
+          {[0, 1, 2].map((i) => (
+            <div key={i} className="h-9 animate-pulse rounded-lg bg-stone-500/5 dark:bg-white/5" />
+          ))}
+        </div>
+      ) : error ? (
+        <div className="flex items-center gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2.5 text-sm text-rose-700 dark:border-rose-800/50 dark:bg-rose-900/20 dark:text-rose-400">
+          <AlertTriangle className="h-4 w-4 shrink-0" />
+          <span>{intl.formatMessage({ id: 'evolution.events.error' }, { message: error })}</span>
+        </div>
+      ) : events && events.length > 0 ? (
+        <>
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[36rem] text-left text-sm">
+              <thead>
+                <tr className="border-b border-[var(--panel-border)] text-xs uppercase text-stone-500 dark:text-stone-400">
+                  <th className="py-2 pr-3 font-medium">{intl.formatMessage({ id: 'evolution.events.col.type' })}</th>
+                  <th className="py-2 pr-3 font-medium">{intl.formatMessage({ id: 'evolution.events.col.outcome' })}</th>
+                  <th className="py-2 pr-3 font-medium">{intl.formatMessage({ id: 'evolution.events.col.detail' })}</th>
+                  <th className="py-2 pl-3 text-right font-medium">{intl.formatMessage({ id: 'evolution.events.col.time' })}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {events.map((ev, i) => (
+                  <tr key={i} className="border-b border-[var(--panel-border)]/50 last:border-0">
+                    <td className="py-2 pr-3">
+                      <span className="font-medium text-stone-700 dark:text-stone-300">{ev.event_type}</span>
+                    </td>
+                    <td className="py-2 pr-3">
+                      <Badge tone={evolutionOutcomeTone(ev.outcome)}>{ev.outcome}</Badge>
+                    </td>
+                    <td className="py-2 pr-3 text-stone-500 dark:text-stone-400">
+                      {ev.skill_id ? <Mono className="text-xs">{ev.skill_id}</Mono> : ev.trigger_signal || '—'}
+                    </td>
+                    <td className="py-2 pl-3 text-right">
+                      <Mono className="text-xs text-stone-400 dark:text-stone-500">
+                        {new Date(ev.timestamp).toLocaleString('zh-TW', {
+                          month: 'short',
+                          day: 'numeric',
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })}
+                      </Mono>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {total > events.length && (
+            <p className="text-xs text-stone-400 dark:text-stone-500">
+              {intl.formatMessage({ id: 'evolution.events.more' }, { shown: events.length, total })}
+            </p>
+          )}
+        </>
+      ) : (
+        <EmptyState
+          icon={Sparkles}
+          title={intl.formatMessage({ id: 'evolution.events.empty' })}
+          hint={intl.formatMessage({ id: 'evolution.events.empty.desc' })}
+        />
+      )}
+    </Card>
+  );
+}
 
 // ── Gauge component ───────────────────────────────────────────────────────────
 
@@ -335,6 +463,11 @@ export function ReliabilityPage() {
             </p>
           </div>
         </Card>
+      )}
+
+      {/* Self-evolution audit trail for the selected agent + window. */}
+      {selectedAgent && (
+        <EvolutionEventsSection agentId={selectedAgent} windowDays={windowDays} />
       )}
     </Page>
   );

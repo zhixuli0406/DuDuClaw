@@ -1065,6 +1065,12 @@ pub fn cli_kind_for_provider(provider: duduclaw_core::types::RuntimeType) -> Opt
         RuntimeType::Codex => Some(CliKind::Codex),
         RuntimeType::Gemini => Some(CliKind::Gemini),
         RuntimeType::Antigravity => Some(CliKind::Antigravity),
+        // R4 phase 1: Grok has no interactive-REPL PtyPool kind yet — it is routed
+        // through the oneshot `runtime_dispatch` path (like every non-Claude
+        // provider today), so `None` here keeps it off the PtyPool. Adding a
+        // dedicated `CliKind::Grok` is a follow-up when an interactive REPL is
+        // implemented.
+        RuntimeType::Grok => None,
         RuntimeType::OpenAiCompat => None,
     }
 }

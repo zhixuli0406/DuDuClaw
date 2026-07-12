@@ -41,6 +41,7 @@ import {
   Plus,
   Pencil,
   Trash2,
+  Building2,
 } from 'lucide-react';
 
 type TabId = 'browse' | 'search' | 'stats' | 'policy';
@@ -226,9 +227,13 @@ function TreeItem({
   onSelect: (path: string) => void;
   depth: number;
 }) {
+  const intl = useIntl();
   const [expanded, setExpanded] = useState(depth < 1);
 
   if (node.isDir) {
+    // WP7 — surface the top-level `departments/` namespace as a friendly,
+    // read-only "部門知識庫" group for a non-technical audience.
+    const isDeptRoot = depth === 0 && node.name === 'departments';
     return (
       <div>
         <button
@@ -237,7 +242,14 @@ function TreeItem({
           style={{ paddingLeft: `${depth * 12 + 8}px` }}
         >
           {expanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
-          <span className="font-medium">{node.name}/</span>
+          {isDeptRoot ? (
+            <span className="flex items-center gap-1.5 font-medium text-amber-700 dark:text-amber-300">
+              <Building2 className="h-3.5 w-3.5" />
+              {intl.formatMessage({ id: 'sharedWiki.departments.group' })}
+            </span>
+          ) : (
+            <span className="font-medium">{node.name}/</span>
+          )}
         </button>
         {expanded && node.children.map((child) => (
           <TreeItem

@@ -252,7 +252,12 @@ impl HeartbeatScheduler {
         agents.retain(|name, _| current_names.contains(name));
 
         for la in &snapshot {
-            if la.config.agent.status == AgentStatus::Terminated {
+            // Terminated / Archived / Deleted agents are off the scheduler —
+            // archived + soft-deleted (WP4) also halt heartbeat/evolution.
+            if matches!(
+                la.config.agent.status,
+                AgentStatus::Terminated | AgentStatus::Archived | AgentStatus::Deleted
+            ) {
                 agents.remove(&la.config.agent.name);
                 continue;
             }

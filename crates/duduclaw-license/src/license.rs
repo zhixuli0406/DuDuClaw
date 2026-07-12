@@ -80,6 +80,25 @@ pub struct License {
     /// old file and vice-versa).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_url: Option<String>,
+
+    /// White-label field-level edit claim (WP8). When present, lists the exact
+    /// branding field names (BrandingInput keys, e.g. `"logo_data_uri"`) that
+    /// this license's operator may edit — the carrier for "distributor token vs
+    /// customer token have different editable ranges". `None` = no restriction
+    /// declared → the consumer resolves it to the full vendor-editable set
+    /// (backward-compatible: an OEM license issued before WP8 keeps editing
+    /// every vendor field).
+    ///
+    /// **Part of [`Self::canonical_payload`]** (unlike `control_url`): the claim
+    /// is a security boundary — an unsigned claim could be self-escalated by
+    /// editing the local `license.json`. Because it is signed, stripping or
+    /// widening it invalidates the signature → the license is rejected →
+    /// OpenSource → white_label off → no branding at all (fail-closed). It is
+    /// added at the END of the canonical struct with `skip_serializing_if`, so a
+    /// `None` claim serializes byte-identically to a pre-WP8 license and old
+    /// signatures still verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branding_editable: Option<Vec<String>>,
 }
 
 impl License {
@@ -213,6 +232,7 @@ impl License {
             expires_at: self.expires_at,
             last_phone_home: self.last_phone_home,
             public_key_id: &self.public_key_id,
+            branding_editable: self.branding_editable.as_ref(),
         };
         serde_json::to_vec(&payload)
             .map_err(|e| LicenseError::ParseError(format!("canonical payload: {e}")))
@@ -244,6 +264,7 @@ impl License {
             public_key_id: public_key_id.into(),
             signature: Vec::new(),
             control_url: None,
+            branding_editable: None,
         }
     }
 }
@@ -263,6 +284,11 @@ struct CanonicalPayload<'a> {
     expires_at: DateTime<Utc>,
     last_phone_home: DateTime<Utc>,
     public_key_id: &'a str,
+    /// WP8 signed field-level branding claim. Added last with
+    /// `skip_serializing_if` so a `None` claim yields byte-identical canonical
+    /// bytes to a pre-WP8 license (old signatures keep verifying).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branding_editable: Option<&'a Vec<String>>,
 }
 
 /// Serde helper for encoding `Vec<u8>` as base64 strings in JSON.
@@ -300,6 +326,7 @@ mod tests {
             public_key_id: "v1".into(),
             signature: Vec::new(),
             control_url: None,
+            branding_editable: None,
         }
     }
 
@@ -509,6 +536,53 @@ mod tests {
         assert_eq!(
             parsed_new.control_url.as_deref(),
             Some("https://owner.example/")
+        );
+    }
+
+    #[test]
+    fn canonical_payload_excludes_branding_editable_when_none() {
+        // WP8 backward-compat: a None claim must not appear in the signed bytes,
+        // so a pre-WP8 license (no such field) verifies byte-identically.
+        let license = make_license(LicenseTier::Oem, 30, 0);
+        assert!(license.branding_editable.is_none());
+        let payload = String::from_utf8(license.canonical_payload().unwrap()).unwrap();
+        assert!(
+            !payload.contains("branding_editable"),
+            "None claim must be omitted from canonical bytes: {payload}"
+        );
+    }
+
+    #[test]
+    fn canonical_payload_includes_branding_editable_when_some() {
+        // A Some claim IS signed (it is a security boundary, unlike control_url).
+        let mut license = make_license(LicenseTier::Oem, 30, 0);
+        let base = license.canonical_payload().unwrap();
+        license.branding_editable = Some(vec!["logo_data_uri".to_string()]);
+        let with_claim = license.canonical_payload().unwrap();
+        assert_ne!(base, with_claim, "claim must change the signed payload");
+        let text = String::from_utf8(with_claim).unwrap();
+        assert!(text.contains("branding_editable"));
+        assert!(text.contains("logo_data_uri"));
+    }
+
+    #[test]
+    fn branding_editable_serde_roundtrips_and_old_json_defaults_none() {
+        let mut license = make_license(LicenseTier::Oem, 365, 1);
+        let json_old = serde_json::to_string(&license).unwrap();
+        assert!(
+            !json_old.contains("branding_editable"),
+            "None is skipped in serialization"
+        );
+        let parsed_old: License = serde_json::from_str(&json_old).unwrap();
+        assert!(parsed_old.branding_editable.is_none());
+
+        license.branding_editable = Some(vec!["logo_data_uri".into(), "product_name".into()]);
+        let json_new = serde_json::to_string(&license).unwrap();
+        assert!(json_new.contains("branding_editable"));
+        let parsed_new: License = serde_json::from_str(&json_new).unwrap();
+        assert_eq!(
+            parsed_new.branding_editable.as_deref(),
+            Some(["logo_data_uri".to_string(), "product_name".to_string()].as_slice())
         );
     }
 

@@ -1,6 +1,7 @@
 pub mod agent_guard;
 pub mod config;
 pub mod cron_tz;
+pub mod department;
 pub mod error;
 pub mod fs_lock;
 pub mod keychain;
@@ -13,6 +14,9 @@ pub mod types;
 pub use agent_guard::{check_agent_file_write, check_bash_command, GuardDecision, AGENT_STRUCTURE_FILES};
 pub use config::write_minimal_config;
 pub use cron_tz::{parse_timezone, should_fire_in_tz};
+pub use department::{
+    department_of_page, department_page_visible, is_valid_department, DEPARTMENTS_NAMESPACE,
+};
 pub use error::{DuDuClawError, Result};
 pub use fs_lock::with_file_lock;
 pub use keychain::{resolve_master_key, KeychainError, MasterKeySource};
@@ -539,6 +543,22 @@ pub fn which_agy() -> Option<String> {
 /// Resolve the `agy` CLI from a specific HOME. See [`which_cli_in_home`].
 pub fn which_agy_in_home(home: &std::path::Path) -> Option<String> {
     which_cli_in_home(home, "agy")
+}
+
+/// Resolve the xAI Grok CLI binary (R4). Prefers the official `grok` ("Grok
+/// Build") binary and falls back to the third-party `grok-cli`
+/// (`superagent-ai/grok-cli`, API-key only) so either install is discovered.
+/// See [`which_cli`].
+///
+/// UNVERIFIED (R4, 2026-07-12): the official "Grok Build" binary name is
+/// assumed to be `grok`. If xAI ships it under a different name, add it here.
+pub fn which_grok() -> Option<String> {
+    which_cli("grok").or_else(|| which_cli("grok-cli"))
+}
+
+/// Resolve the Grok CLI from a specific HOME. See [`which_cli_in_home`].
+pub fn which_grok_in_home(home: &std::path::Path) -> Option<String> {
+    which_cli_in_home(home, "grok").or_else(|| which_cli_in_home(home, "grok-cli"))
 }
 
 #[cfg(test)]

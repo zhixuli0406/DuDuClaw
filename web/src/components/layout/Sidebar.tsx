@@ -322,10 +322,10 @@ export function Sidebar() {
   const companyItems = filterVisible(navGroups[1].items, user?.role, isPersonal, ctx);
   const canManage = hasMinRole(user?.role, manageEntry.minRole);
 
-  // Icon-rail curated set (collapsed desktop mode).
+  // Icon-rail curated set (collapsed desktop mode). Tasks was demoted from the
+  // primary nav (2026-07-12 meeting), so the rail no longer carries it either.
   const railItems: NavItem[] = [
     ...dailyItems,
-    ...workItems.filter((i) => i.to === '/tasks'),
     staffEntry,
     ...companyItems.filter((i) => ['/memory', '/growth'].includes(i.to)),
     ...(canManage ? [manageEntry] : []),

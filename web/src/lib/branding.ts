@@ -88,6 +88,10 @@ interface BrandingStore {
   readonly branding: BrandingConfig | null;
   readonly vendor: BrandingVendor | null;
   readonly whiteLabelActive: boolean;
+  /** WP8: branding field names this instance may edit (serde keys). Empty until a
+   *  live `branding.get` resolves — fail-closed so nothing is editable pre-fetch.
+   *  Not persisted to the pre-auth cache (it is a runtime license signal). */
+  readonly editableFields: string[];
   /** True once a live `branding.get` has resolved (cache alone is not loaded). */
   readonly loaded: boolean;
   /** Fetch the authoritative branding after auth; refreshes the cache. */
@@ -102,6 +106,7 @@ export const useBrandingStore = create<BrandingStore>((set, get) => ({
   branding: initial?.branding ?? null,
   vendor: initial?.vendor ?? null,
   whiteLabelActive: initial?.white_label_active ?? false,
+  editableFields: [],
   loaded: false,
 
   fetch: async () => {
@@ -111,6 +116,7 @@ export const useBrandingStore = create<BrandingStore>((set, get) => ({
         branding: res.branding ?? null,
         vendor: res.vendor ?? null,
         whiteLabelActive: res.white_label_active,
+        editableFields: res.editable_fields ?? [],
         loaded: true,
       });
       writeCache({

@@ -16,6 +16,21 @@ export function formatCents(cents: number | null | undefined): string {
   return `$${(n / 100).toFixed(2)}`;
 }
 
+/**
+ * Format a millicent integer as `$0.01234`. 1 cent = 1000 millicents, so
+ * dollars = millicents / 100_000. Sub-cent amounts keep enough precision to
+ * stay non-zero; larger amounts round to cents. Safe on null/NaN.
+ */
+export function formatMillicents(millicents: number | null | undefined): string {
+  // NOTE: despite the `millicents` name, the backend cost telemetry stores and
+  // sums these values in CENTS (see cost_telemetry.rs unit note — the field name
+  // is a historical misnomer). Dollars = cents / 100, not / 100_000.
+  const n = typeof millicents === 'number' && Number.isFinite(millicents) ? millicents : 0;
+  const dollars = n / 100;
+  const digits = Math.abs(dollars) >= 1 ? 2 : Math.abs(dollars) >= 0.01 ? 4 : 5;
+  return `$${dollars.toFixed(digits)}`;
+}
+
 /** Format a token count with a `k`/`M` suffix once it gets large. */
 export function formatTokens(tokens: number | null | undefined): string {
   const n = typeof tokens === 'number' && Number.isFinite(tokens) ? tokens : 0;

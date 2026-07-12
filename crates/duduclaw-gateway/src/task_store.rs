@@ -604,6 +604,30 @@ impl TaskStore {
         Ok(n > 0)
     }
 
+    /// WP4 hand-off: reassign every *open* (not-`done`) task owned by
+    /// `from_agent` to `to_agent`, and follow through on any active claim/lease
+    /// so the successor holds the work outright. Returns the number of tasks
+    /// moved. Idempotent — a re-run finds nothing left assigned to `from_agent`.
+    pub async fn reassign_open_tasks(
+        &self,
+        from_agent: &str,
+        to_agent: &str,
+        now: &str,
+    ) -> Result<u64, String> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE tasks
+                    SET assigned_to = ?2,
+                        claimed_by = CASE WHEN claimed_by = ?1 THEN ?2 ELSE claimed_by END,
+                        updated_at = ?3
+                  WHERE assigned_to = ?1 AND status != 'done'",
+                params![from_agent, to_agent, now],
+            )
+            .map_err(|e| format!("reassign open tasks: {e}"))?;
+        Ok(n as u64)
+    }
+
     /// All `(task_id, parent_task_id)` edges — for cycle detection.
     pub async fn parent_edges(&self) -> Result<Vec<(String, Option<String>)>, String> {
         let conn = self.conn.lock().await;
@@ -2208,6 +2232,47 @@ mod tests {
         let (store, _dir) = temp_store();
         let rows = store.list_comments("does-not-exist").await.expect("list");
         assert!(rows.is_empty(), "no comments for an unknown task");
+    }
+
+    #[tokio::test]
+    async fn reassign_open_tasks_moves_only_unfinished_work() {
+        let (store, _dir) = temp_store();
+        // Two open tasks + one done task, all owned by alice.
+        for id in ["open1", "open2", "done1"] {
+            let t = TaskRow::new(
+                id.into(),
+                format!("Task {id}"),
+                String::new(),
+                "medium".into(),
+                "alice".into(),
+                "user-1".into(),
+            );
+            store.insert_task(&t).await.expect("insert");
+        }
+        store
+            .update_task("done1", &serde_json::json!({ "status": "done" }))
+            .await
+            .expect("mark done");
+
+        let moved = store
+            .reassign_open_tasks("alice", "bob", "2026-07-12T00:00:00Z")
+            .await
+            .expect("reassign");
+        assert_eq!(moved, 2, "only the two open tasks move");
+
+        // Bob now owns the open tasks; alice keeps the completed one.
+        let bob = store.list_tasks(None, Some("bob"), None).await.unwrap();
+        assert_eq!(bob.len(), 2);
+        let alice = store.list_tasks(None, Some("alice"), None).await.unwrap();
+        assert_eq!(alice.len(), 1, "done task stays with the original owner");
+        assert_eq!(alice[0].id, "done1");
+
+        // Idempotent: a re-run finds nothing left open for alice.
+        let again = store
+            .reassign_open_tasks("alice", "bob", "2026-07-12T00:01:00Z")
+            .await
+            .expect("reassign again");
+        assert_eq!(again, 0);
     }
 
     fn edges(pairs: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {

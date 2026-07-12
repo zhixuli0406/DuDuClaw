@@ -3,6 +3,168 @@
 ## [Unreleased]
 
 ### Added
+- **成本／快取效率遙測 dashboard RPC（#3，2026-07-12）。** 為既有的
+  `cost_summary` / `cost_agents` / `cost_recent` MCP 工具補上三個 admin-gated
+  （`require_admin!` fail-closed）dashboard RPC，位於
+  `crates/duduclaw-gateway/src/handlers.rs`，**復用同一條 `CostTelemetry` 查詢
+  邏輯**（`summary_global` / `all_agents_summary` / `recent_records`），未另寫成本
+  或快取效率公式：**`cost.summary {hours?=24}`**（總請求／各類 token／
+  `avg_cache_efficiency`（＝`cache_hit_rate`）／成本 millicents／快取節省 ＋ 由
+  `near_price_cliff_for` 衍生的 200K price-cliff 狀態 block）；**`cost.agents {hours?}`**
+  （per-agent 明細 ＋ `cache_health`）；**`cost.recent {limit?=20,≤500}`**（近期
+  per-request 記錄）。遙測未初始化時回良構的空／零 payload（`available:false`），
+  不報錯。僅後端 RPC，前端下一波接線。
+- **記憶時序／取代鏈 dashboard RPC（F1 Temporal Memory v1.19.0，#5，2026-07-12）。**
+  為 `SqliteMemoryEngine` 既有的 `get_history` / `get_at` 補上 dashboard 操作面，
+  authz 對齊既有 `memory.*`（`check_agent!(Viewer)` per-agent 可見性），
+  `crates/duduclaw-gateway/src/handlers.rs`：**`memory.history {agent_id, subject,
+  predicate | memory_id}`**（回該事實的完整取代鏈，各版本
+  `valid_from`/`valid_until`/`superseded_by`/`supersedes`/`confidence` ＋
+  `is_current` 旗標 ＋ `current_id`；給 memory_id 時先以新增的
+  `SqliteMemoryEngine::triple_for_id` 解析出 triple，非 triple／非本 agent 回空鏈
+  不報錯）；**`memory.at {agent_id, subject, predicate, at(RFC-3339)}`**（point-in-time，
+  回當時有效的事實；查無回 `found:false`）。復用引擎方法，未重寫時序邏輯。
+- **per-agent Odoo 憑證隔離 dashboard RPC（RFC-21 §2，#8，2026-07-12）。**
+  三個 admin-gated RPC 讓 `agent.toml [odoo]` override 可讀寫測試，
+  `crates/duduclaw-gateway/src/handlers.rs`：**`odoo.agent_config_get {agent_id}`**
+  （回 profile／url／db／username／allowed_models／allowed_actions／company_ids ＋
+  `api_key_set`／`password_set` 布林 ＋ 遮罩 `***set***`，**永不回傳明文或密文**）；
+  **`odoo.agent_config_set {agent_id, url, db, user|username, api_key, password,
+  profile, allowed_models, allowed_actions, company_ids}`**（api_key/password 走
+  AES-256-GCM 加密存 `*_enc`，遮罩佔位符被拒收不覆蓋既有密鑰；url/db 沿用與全域
+  相同的 SSRF/HTTPS/db-name 驗證器——復用 `apply_odoo_to_table`）；
+  **`odoo.agent_test {agent_id}`**（以「全域 config.toml [odoo] ＋ 該 agent 覆寫」
+  的有效設定測連線，憑證優先取 agent、否則全域；對實際撥號的 url 再做一次
+  fail-closed SSRF 檢查；不寫入磁碟）。
+- **`native_sandbox` ＋ Progent `policy` 經 dashboard 完整 round-trip（#6，2026-07-12）。**
+  `agents.update` 的 `apply_capabilities_to_table` 補上 `capabilities.native_sandbox`
+  （bool，Seatbelt/Landlock）與 `capabilities.policy[]`（Progent 參數級 tool policy：
+  `{tool, effect: allow|forbid|ask, when: [{arg, op: equals|contains|starts_with,
+  value}]}`）的寫入與嚴格驗證（非法 effect/op/缺 tool → fail-closed 拒絕整包）；
+  `agents.inspect` 現回傳完整 `capabilities`（serde 直出 `CapabilitiesConfig`，含
+  native_sandbox ＋ policy 的精確 ToolPolicy 形狀）供前端編輯器 round-trip。
+- **Identity Resolution dashboard surface（RFC-21 §1，2026-07-12）。** 為既有的
+  `duduclaw-identity` crate ＋ `identity_resolve` MCP 工具補上 dashboard 操作面，
+  客戶可當場示範「AI 怎麼知道發訊的人是誰、怎麼拒絕非專案成員」。新增三個
+  admin-gated（`require_admin!` 全數 fail-closed）dashboard RPC，位於
+  `crates/duduclaw-gateway/src/handlers.rs`：**`identity.resolve`**（輸入 email／帳號
+  ＋ channel，走與 MCP `identity_resolve` 同一條 `IdentityProvider` trait 解析路徑，回
+  `ResolvedPerson` ＋ `is_project_member`；查無回 `found:false` 不是錯誤）；
+  **`identity.config_get` / `identity.config_set`**（讀寫 config.toml `[identity]`：
+  provider 選擇 wiki_cache／notion／chained、Notion database id ＋ `field_map`、
+  `refresh_seconds`；Notion 整合金鑰 write-only、AES-256-GCM 加密存 `api_key_enc`、
+  讀回遮罩 `***set***`，對齊既有 channel token 加密慣例）。provider 依設定建構
+  （`build_identity_provider`）：Notion 未設定完整時 fail-safe 降級回 wiki_cache。
+  前端：Integrations 頁（`web/src/pages/IntegrationsPage.tsx`）新增「身分解析」分頁
+  `web/src/pages/IdentityPage.tsx`——provider 選擇 ＋ Notion 設定表單 ＋「測試解析」輸入框
+  （即時查出姓名／角色／專案／是否專案成員）；`web/src/lib/api.ts` 補型別與
+  `api.identity.*` 呼叫；i18n 三語（zh-TW／en／ja-JP）。
+- **R4 Grok CLI 成為第六個 `AgentRuntime`（xAI「Grok Build」，2026-07-12）。**
+  `RuntimeType::Grok`（`crates/duduclaw-core/src/types.rs`）＋ `which_grok` /
+  `which_grok_in_home`（`crates/duduclaw-core/src/lib.rs`，官方 `grok` 優先、第三方
+  `grok-cli` fallback）。新 `GrokRuntime`（`crates/duduclaw-gateway/src/runtime/grok.rs`，
+  仿 antigravity）：偵測到 binary 才由 `RuntimeRegistry` 註冊，`execute()` 走 oneshot
+  `grok -p`，system prompt＋history 內嵌進 prompt（無已驗證 `--system` flag、CJK-safe），
+  duduclaw MCP server 寫入 `<agent_dir>/.grok/settings.json`，token 用量估算。接線：
+  `runtime_config::model_matches_provider`（grok-* ↔ provider grok）、
+  `model_capabilities::supports_vision`（Grok 保守 fail-closed，僅顯式 vision id）、
+  `cli/lib.rs` `agent create --runtime grok`（scaffold `AGENTS.md`＋`CLAUDE.md`、typo 拒絕）、
+  container `sandbox.rs`（`XAI_API_KEY` 注入＋`grok -p` 指令組裝）、dashboard
+  `runtime_detect` 與 `runtime_models` 探測。**僅 CLI 偵測＋headless spawn**；
+  SuperGrok OAuth（accounts.x.ai device-flow）與 Grok CLI 實際 flag / MCP config 路徑 /
+  context 檔名皆標記 UNVERIFIED，列為 follow-up（見 `runtime/grok.rs` 檔頭）。
+- **WP4 AI 員工離職生命週期（後端，2026-07-12）。** 新增 admin-gated（`require_admin!`
+  全數 fail-closed）員工離職流程：**封存** `agents.archive` / **解封** `agents.unarchive`
+  （`status=archived` + 復用 freeze kill-switch 停 heartbeat/evolution；`agents.list`
+  預設排除、帶 `include_archived=true` 才回，回傳物件標 `archived` 旗標，零刪除可復原）；
+  **交接** `agents.handoff`（memory/wiki/tasks 三開關預設全開：memory 走
+  `duduclaw-memory::reassign_agent`（同庫 agent_id re-key，含 FTS 一致性、temporal
+  supersession 鏈保留、交易內完成）或 `reassign_agent_cross_db`（per-agent memory.db
+  ATTACH 跨庫搬移）；wiki 合併 `agents/<from>/wiki`→`agents/<to>/wiki`（衝突加尾綴不覆蓋）；
+  tasks 走 `TaskStore::reassign_open_tasks`（未完成任務改指派）；完成後可選 `auto_archive`
+  預設 true；全程冪等，任一子項失敗如實回報 `status:"PARTIAL"` 不吞錯）；**大頭貼上傳**
+  `agents.set_avatar` / `agents.clear_avatar`（PNG/JPEG/WebP data URI，magic-byte 驗證＋
+  512KB 上限，原子寫 `agents/<id>/avatar.<ext>`，`agents.get`/`inspect` 回傳 data URI、
+  `agents.list` 回傳 `has_avatar`）。
+- **WP4 移除語意改為軟刪除。** `agents.remove` 由硬刪（移入 `_trash/`）改為 `status=deleted`
+  + freeze kill-switch，agent 目錄與 memory.db **資料保留不刪**、從所有清單/路由隱藏，
+  拒絕對 main agent 執行（RPC 名維持相容）。archive/remove/handoff 皆寫入 audit log。
+- **WP3 WebChat 歷史對話續聊（2026-07-12）。** 新增 `chat.sessions.list`（per-agent 歷史
+  session 清單：首句摘要 CJK-safe 截斷、最後更新、輪數；非 admin 依 agent 可見性 fail-closed）
+  與 `chat.sessions.history`（載入指定 session 對話輪，取最新 window 維持時序）RPC；`/ws/chat`
+  UserMessage 幀帶 session_id 可 resume 既有 session（回送 session_info 確認；不帶維持原行為
+  byte-compatible），前端 header `SessionHistoryMenu` 選歷史對話續聊。
+- **WP5 agent 自助裝工具審批閘（2026-07-12，安全）。** MCP install-class 工具
+  （`skill_hub_install`）一律經 `ApprovalBroker` 送收件匣人工拍板：安全掃描在前（High risk
+  直接 DENY 不進審批），broker 不可用/逾時/拒絕皆 fail-closed DENY；唯一豁免為 operator 顯式
+  `agent.toml [capabilities] auto_approve_install = true`（預設 false）。反向強制清單
+  `approval_required_tools` 覆蓋豁免。補上會議指出的「agent 自主裝工具無授權」缺口。
+- **WP6 Grok（xAI）direct-API 支援（2026-07-12）。** `ModelRegistry` 補 `grok-4.3`（1M ctx）
+  /`grok-4.5`（500K ctx）＋既有 `grok-4.1-fast`；gateway `runtime` PROVIDERS 表補 xai entry
+  對齊 duduclaw-llm preset（OpenAI-compat，tool calling/streaming 齊全）。使用者可經
+  `~/.duduclaw/models.toml` override。
+- **WP7 部門層知識庫/skill（公司→部門→個人，2026-07-12）。** `agent.toml [agent] department`
+  欄位（選填，向後相容）；shared wiki `departments/<dept>/` 命名空間（agent 只讀寫自己部門＋公司層，
+  跨部門 fail-closed）；skill 三層查找 per-agent > 部門 > global（近者優先），install scope 文法
+  擴充 `department:<dept>`（admin/approval gate 沿用）；`wiki_namespace_status` 回報部門與讀隔離狀態。
+- **WP8 白牌欄位級編輯分層（2026-07-12，安全）。** OEM license 攜帶簽章 `branding_editable` claim：
+  系統方簽發的經銷商 token 與經銷商簽發的客戶 token 授予不同可編輯品牌欄位範圍。`branding.get`
+  回 `editable_fields` 供前端遮罩；`branding.set`/`reset` 依範圍過濾（違規欄位整請求拒絕、部分範圍
+  writer 不能清掉經銷商其他欄位）；`distributor.issue` 收選填 `branding_editable`。未顯式升級為 vendor
+  級的欄位預設 system-only（fail-closed），System 範圍需真實簽章驗證的 issuer 私鑰、config 存在
+  不足以升權。向後相容：無 claim 的 license 解析為完整 vendor 集。
+- **WP9 Telegram 共用 bot + 員工綁定連結/QR（2026-07-12）。** 一間公司共用一個 Telegram bot，
+  員工掃 QR／開連結即綁定到自己的 AI 員工，取代「一員工一 bot token」（規避 Telegram 多 bot
+  帳號鎖定風險）。新增 `crates/duduclaw-gateway/src/agent_binding.rs`：`AgentBindingStore` 持久化
+  `~/.duduclaw/agent_bindings.json`（`with_file_lock` 冪等原子寫，fail-closed）—— 存
+  `(channel, external_user_id) → agent_id` 綁定表＋一次性綁定 token（SHA-256 digest 存儲、
+  預設 TTL 15 分、用過即失效、`max_uses` 上限、過期自動修剪；plaintext 僅存在於 deep-link）。
+  admin-gated RPC `channels.telegram_bind_token`（輸入 target agent，getMe 即時取 bot username
+  不硬編，回 `token`/`deep_link`(`https://t.me/<bot>?start=<token>`)/`bot_username`/`expires_in_minutes`/
+  `max_uses`）。全域 bot 收 `/start <token>` → 驗 token → 綁定該 Telegram user → target agent
+  （成功同時 `approve_user` 過存取閘），無效/過期明確友善拒絕不靜默；每則訊息先 `resolve_bound_agent`
+  路由到綁定 agent（agent 已刪則 fail-closed 不誤路由），未綁定且開啟 `shared_bot_binding` 設定時
+  回引導訊息，否則維持既有 default-agent 行為。per-agent token 多 bot 模式不受影響（維持原路由）。
+  external_user_id exact 比對、跨 channel token 不混用。前端通道設定頁「員工綁定連結」對話框：選
+  AI 員工 → 產 token → 顯示 deep-link＋QR（純前端 `qrcode-generator` 產 SVG，無外部 CDN/服務）＋複製鈕；
+  i18n 三語同步。
+
+### Changed
+- **去識別化設定 UI 改用白話，外部系統（ERP/CRM）成一等公民（2026-07-12）。** 客戶回饋
+  「設定太難懂，連開發者都看不懂」——`RedactionTab`（`web/src/components/settings/sections/`）
+  重寫：主開關配一句白話說明（明確點名檔案／Wiki／記憶／Odoo／鼎新 ERP／CRM 皆涵蓋）；
+  「資料來源保護」每列加白話標題＋一行說明，主保護點「AI 讀取的外部資料」置頂，遮蔽模式
+  改稱一律遮蔽／不遮蔽／智慧遮蔽／沿用上游；工程術語的「工具出口規則＋glob」改成
+  **「外部系統（ERP／CRM／資料庫）」**區塊，用 Odoo／鼎新 ERP／Salesforce／HubSpot／自訂
+  一鍵加入（底層仍是既有 `tool_egress`，無後端 schema 變更），外送政策白話化為
+  完全不外送（最安全，預設）／需要時還原真實值／原樣傳遞代號。保管期限／清除／設定檔收進
+  「進階設定」摺疊區。誠實標註：Odoo 為內建連接器，鼎新／Salesforce／HubSpot 標
+  「範本·連接器規劃中」（規則可預先武裝，不假裝已有 live 整合）。i18n 三語同步、新增
+  `common.remove`。純前端＋文案，引擎不動（所有 MCP 工具結果早已在 `mcp_dispatch.rs`
+  單一節流點以 `Source::ToolResult` 去識別化，外部系統本就在保護範圍內）。
+- **首屏/清單效能三修（2026-07-12）。** (E1) 新增輕量 `agents.avatar` RPC（輸入 `agent_id`，
+  只讀 `agents/<id>/avatar.<ext>` 回 data URI 或 null，**不**跑 telemetry 月度聚合、**不**序列化
+  SOUL/identity/skills/model config；authz 沿用 `check_agent!(Viewer)` fail-closed）；前端 avatar
+  store 改呼叫它取代 `agents.inspect`，首屏 N 個有頭貼員工不再各發一次重 RPC（`agents.inspect`
+  的 `avatar` 欄位保留相容）。(E2) `chat.sessions.list` 改為先在內層 `SELECT id ... ORDER BY
+  last_active DESC LIMIT` 縮小列集，外層才對這批 id 算 title/turn 相關子查詢，並加
+  `idx_sessions_last_active(agent_id, last_active)` 索引（冪等建於建表路徑），大量 session 時
+  popover 不再全表掃描；清單內容與排序不變。(E3) `agents.list` 的 `agent_has_avatar` 由每員工最多
+  3 次 `Path::exists` stat 改為單次 `read_dir`。 `AgentStatus` 新增 `is_operational()` /
+  `is_listable(include_archived)`（fail-closed，非 Active 皆非 operational），取代散落的 ad-hoc
+  match；掛到 MCP `list_agents`（恆隱藏 Deleted）、`spawn_agent`/`agents.delegate`（拒絕
+  non-operational 目標不 enqueue）、「Your Team」名冊、dashboard `agents.list`。修正軟刪/封存 agent
+  仍可被 spawn/委派/列名的漏洞。
+- **部門 wiki 讀隔離與 `.scope.toml` 寫政策正交（2026-07-12，安全）。** 部門讀隔離永遠生效，不再被
+  `.scope.toml` 對 `departments` 命名空間的宣告反向關閉；`shared_wiki_stats`/`lint` 亦依部門過濾。
+- **agent 封存/解封保留原演化旗標。** archive 快照 `evolution.enabled`/`heartbeat.enabled` 原值，
+  unarchive 還原（無快照保守維持 false），不再無條件開啟自我演化。
+
+### Security
+- **WebChat resume 擁有權閘（2026-07-12）。** `/ws/chat` resume 強制 resumed session 屬本連線
+  （id 相符或 `{session_id}#` 前綴），跨 channel / 他連線一律拒絕（fail-closed）；關閉「送他人
+  session_id 讀寫其對話」的越權。殘餘限制：webchat session 無 user 維度，前一連線的 session 無法
+  跨連線 resume（誠實 DEGRADED，待 webchat 導入真實使用者驗證）。
 - **收尾波（2026-07-12）— P2 兩項＋G12 落盤＋四項欠帳接線。** G13 Talk Mode（dashboard
   對話模式：WebAudio RMS VAD-lite＋狀態機＋Talk 切換鈕，疊在既有 PTT/STT/TTS 上；
   不做 wake word／barge-in；mic 迴圈 PENDING-LIVE）；G15 Live Canvas（agent
@@ -677,6 +839,10 @@
   claim-holder guard（殭屍工人不能蓋掉新持有者結果）。
 
 ### Fixed
+- **去識別化外部系統移除後不再靜默復活（2026-07-12）。** `redaction.update` 的
+  `tool_egress` 是 upsert-merge（僅 `null` 值移除，缺席 key 不動）。`RedactionTab` 存檔原本
+  只送當前 map,移除某外部系統/工具規則後該 key 只是缺席→後端不刪除→重載復活。改為存檔時
+  對「先前存在但現已移除」的 key 明確送 `null`,並在載入/存檔後更新基準 key 集。
 - **P1 尾輪雙鏡頭複查修正（2026-07-12）。** MoA 在派工/cron 路徑原會毒化共享帳號池
   （rotator 之前即攔截＋direct-API 正確路由＋成本入 telemetry＋對話 history 接通）；
   JitRL 回饋零 caller＋record/generate model key 不一致（已接 MCP 工具＋統一 key）；

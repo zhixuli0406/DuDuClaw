@@ -31,6 +31,7 @@
 #![allow(clippy::if_same_then_else)]
 pub mod a2a_signing;
 pub mod access_control;
+pub mod agent_binding;
 pub mod agent_hook_installer;
 pub mod auth;
 pub mod channel_format;

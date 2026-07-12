@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate, useParams } from 'react-router';
-import { ArrowLeft, Pause, Play, Trash2, Brain, Puzzle, CalendarClock, LayoutDashboard, Settings } from 'lucide-react';
+import { ArrowLeft, Pause, Play, LogOut, RotateCcw, Brain, Puzzle, CalendarClock, LayoutDashboard, Settings, Upload, Trash2, ImageIcon, Wrench } from 'lucide-react';
 import {
   api,
   type AgentDetail,
@@ -9,15 +9,23 @@ import {
   type SkillInfo,
   type TaskInfo,
   type ActivityEvent,
+  type ToolCatalogEntry,
 } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useAgentAvatarStore } from '@/stores/agent-avatar-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentGlyphState } from '@/stores/agent-activity-store';
+import { readFileAsBase64 } from '@/lib/attachments';
 import { toast, formatError } from '@/lib/toast';
-import { Page, Card, Button, Badge, EmptyState, SkeletonList, Mono, Tabs, type TabItem } from '@/components/ui';
+import { Page, Card, Button, Badge, CharacterAvatar, EmptyState, SkeletonList, Mono, Tabs, type TabItem } from '@/components/ui';
 import { AgentHero, AgentOverviewTab, agentTaskStats, isLiveState } from '@/components/agent';
-import { ConfirmDialog } from '@/components/settings/controls';
+import { OffboardDialog } from '@/components/agent/OffboardDialog';
 import { formatCents } from '@/lib/format';
+
+/** 512 KB — matches the backend avatar cap (`agents.set_avatar`). */
+const MAX_AVATAR_BYTES = 512 * 1024;
+const AVATAR_ACCEPT = '.png,.jpg,.jpeg,.webp';
+const AVATAR_MIME = new Set(['image/png', 'image/jpeg', 'image/webp']);
 
 const TAB_IDS = ['overview', 'memory', 'skills', 'routines', 'settings'] as const;
 type TabId = (typeof TAB_IDS)[number];
@@ -41,18 +49,23 @@ export function AgentDetailPage() {
   const tab: TabId = (TAB_IDS as readonly string[]).includes(rawTab) ? (rawTab as TabId) : 'overview';
 
   const connectionState = useConnectionStore((s) => s.state);
-  const { pauseAgent, resumeAgent, removeAgent } = useAgentsStore();
+  const { pauseAgent, resumeAgent, unarchiveAgent, agents, fetchAgents } = useAgentsStore();
+  const setAvatarCache = useAgentAvatarStore((s) => s.set);
 
   const [detail, setDetail] = useState<AgentDetail | null>(null);
   const [facts, setFacts] = useState<KeyFactEntry[] | null>(null);
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
+  const [tools, setTools] = useState<ToolCatalogEntry[] | null>(null);
+  const [toolsError, setToolsError] = useState(false);
   const [routines, setRoutines] = useState<Routine[] | null>(null);
   const [tasks, setTasks] = useState<TaskInfo[] | null>(null);
   const [activities, setActivities] = useState<ActivityEvent[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
-  // 離職 confirmation (spec §4.2 — requireText = the staff display name).
-  const [showDismiss, setShowDismiss] = useState(false);
+  // 離職 flow (WP4): three-way offboard — archive / remove / handoff-then-archive.
+  const [showOffboard, setShowOffboard] = useState(false);
+  const [avatarBusy, setAvatarBusy] = useState(false);
+  const avatarFileRef = useRef<HTMLInputElement>(null);
 
   // Live-run state for this one agent (drives the hero pose + XP live dot).
   const glyph = useAgentGlyphState(id, detail?.status);
@@ -63,13 +76,15 @@ export function AgentDetailPage() {
     try {
       const d = await api.agents.inspect(id);
       setDetail(d);
+      // Publish the resolved avatar so the hero + every other surface match.
+      setAvatarCache(id, d.avatar ?? null);
     } catch (e) {
       console.warn('[api]', e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
     } finally {
       setLoading(false);
     }
-  }, [id, intl]);
+  }, [id, intl, setAvatarCache]);
 
   useEffect(() => {
     if (connectionState !== 'authenticated' || !id) return;
@@ -110,10 +125,17 @@ export function AgentDetailPage() {
     if (tab === 'skills' && skills === null) {
       api.skills.list(id).then((r) => setSkills(r?.skills ?? [])).catch((e) => { onTabLoadError(e); setSkills([]); });
     }
+    // Platform tool catalog (global, not per-agent) — shown alongside skills so
+    // the operator can see the full capability surface this AI staff can call.
+    if (tab === 'skills' && tools === null && !toolsError) {
+      api.tools.catalog()
+        .then((r) => setTools(r?.tools ?? []))
+        .catch((e) => { console.warn('[api]', e); setToolsError(true); setTools([]); });
+    }
     if (tab === 'routines' && routines === null) {
       api.cron.list().then((r) => setRoutines((r?.tasks ?? []).filter((t) => t.agent_id === id))).catch((e) => { onTabLoadError(e); setRoutines([]); });
     }
-  }, [tab, connectionState, id, facts, skills, routines, activities, onTabLoadError]);
+  }, [tab, connectionState, id, facts, skills, tools, toolsError, routines, activities, onTabLoadError]);
 
   const setTab = (next: string) => navigate(`/agents/${encodeURIComponent(id)}/${next}`);
 
@@ -132,6 +154,52 @@ export function AgentDetailPage() {
     },
     [detail, id, intl, loadDetail],
   );
+
+  // Roster (for the handoff target picker).
+  useEffect(() => {
+    if (connectionState === 'authenticated') fetchAgents();
+  }, [connectionState, fetchAgents]);
+
+  const handleAvatarFile = useCallback(
+    async (file: File) => {
+      if (!AVATAR_MIME.has(file.type)) {
+        toast.error(intl.formatMessage({ id: 'agents.avatar.badType' }));
+        return;
+      }
+      if (file.size > MAX_AVATAR_BYTES) {
+        toast.error(intl.formatMessage({ id: 'agents.avatar.tooLarge' }));
+        return;
+      }
+      setAvatarBusy(true);
+      try {
+        const b64 = await readFileAsBase64(file);
+        const dataUri = `data:${file.type};base64,${b64}`;
+        await api.agents.setAvatar(id, dataUri);
+        setAvatarCache(id, dataUri);
+        setDetail((d) => (d ? { ...d, avatar: dataUri, has_avatar: true } : d));
+        toast.success(intl.formatMessage({ id: 'agents.avatar.saved' }));
+      } catch (e) {
+        toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+      } finally {
+        setAvatarBusy(false);
+      }
+    },
+    [id, intl, setAvatarCache],
+  );
+
+  const handleAvatarClear = useCallback(async () => {
+    setAvatarBusy(true);
+    try {
+      await api.agents.clearAvatar(id);
+      setAvatarCache(id, null);
+      setDetail((d) => (d ? { ...d, avatar: null, has_avatar: false } : d));
+      toast.success(intl.formatMessage({ id: 'agents.avatar.removed' }));
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    } finally {
+      setAvatarBusy(false);
+    }
+  }, [id, intl, setAvatarCache]);
 
   const stats = useMemo(() => agentTaskStats(tasks ?? [], id), [tasks, id]);
 
@@ -168,6 +236,8 @@ export function AgentDetailPage() {
     );
   }
 
+  const isMain = detail.role === 'main';
+
   return (
     <Page wide>
       <button
@@ -178,6 +248,20 @@ export function AgentDetailPage() {
       </button>
 
       <div className="space-y-4">
+        {detail.archived && (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-card border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
+            <span>{intl.formatMessage({ id: 'agents.archived.notice' }, { name: detail.display_name })}</span>
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={RotateCcw}
+              disabled={busy}
+              onClick={() => lifecycleAction(() => unarchiveAgent(id), 'agents.unarchive.done')}
+            >
+              {intl.formatMessage({ id: 'agents.unarchive' })}
+            </Button>
+          </div>
+        )}
         <AgentHero
           detail={detail}
           live={live}
@@ -214,21 +298,25 @@ export function AgentDetailPage() {
         )}
 
         {tab === 'skills' && (
-          <Card title={intl.formatMessage({ id: 'agentDetail.skills.title' })}>
-            {skills === null ? (
-              <SkeletonList rows={3} rowClassName="h-10" />
-            ) : skills.length === 0 ? (
-              <EmptyState icon={Puzzle} title={intl.formatMessage({ id: 'agentDetail.skills.empty' })} />
-            ) : (
-              <div className="flex flex-wrap gap-2">
-                {skills.map((s) => (
-                  <Badge key={s.name} tone={s.security_status === 'fail' ? 'danger' : s.security_status === 'warn' ? 'warning' : 'neutral'}>
-                    {s.name}
-                  </Badge>
-                ))}
-              </div>
-            )}
-          </Card>
+          <div className="space-y-4">
+            <Card title={intl.formatMessage({ id: 'agentDetail.skills.title' })}>
+              {skills === null ? (
+                <SkeletonList rows={3} rowClassName="h-10" />
+              ) : skills.length === 0 ? (
+                <EmptyState icon={Puzzle} title={intl.formatMessage({ id: 'agentDetail.skills.empty' })} />
+              ) : (
+                <div className="flex flex-wrap gap-2">
+                  {skills.map((s) => (
+                    <Badge key={s.name} tone={s.security_status === 'fail' ? 'danger' : s.security_status === 'warn' ? 'warning' : 'neutral'}>
+                      {s.name}
+                    </Badge>
+                  ))}
+                </div>
+              )}
+            </Card>
+
+            <AgentToolsCard tools={tools} error={toolsError} />
+          </div>
         )}
 
         {tab === 'routines' && (
@@ -256,6 +344,7 @@ export function AgentDetailPage() {
               <dl className="space-y-2 text-sm">
                 <Row label={intl.formatMessage({ id: 'agentDetail.field.name' })}><Mono>{detail.name}</Mono></Row>
                 <Row label={intl.formatMessage({ id: 'agentDetail.field.reportsTo' })}>{detail.reports_to || '—'}</Row>
+                <Row label={intl.formatMessage({ id: 'agents.department.label' })}>{detail.department || '—'}</Row>
                 <Row label={intl.formatMessage({ id: 'agentDetail.field.model' })}><Mono>{detail.model?.preferred ?? '—'}</Mono></Row>
                 <Row label={intl.formatMessage({ id: 'agentDetail.field.spent' })}><Mono>{formatCents(detail.budget?.spent_cents)}</Mono></Row>
                 <Row label={intl.formatMessage({ id: 'agentDetail.field.limit' })}><Mono>{formatCents(detail.budget?.monthly_limit_cents)}</Mono></Row>
@@ -270,9 +359,59 @@ export function AgentDetailPage() {
                 {intl.formatMessage({ id: 'agentDetail.editFull' })} →
               </button>
             </Card>
+
+            {/* Avatar (WP4). Upload / remove — falls back to the generative face. */}
+            <Card title={intl.formatMessage({ id: 'agents.avatar.title' })}>
+              <div className="flex items-center gap-4">
+                <CharacterAvatar
+                  agentId={detail.name}
+                  name={detail.display_name}
+                  size={64}
+                  variant="avatar"
+                  avatar={detail.avatar ?? null}
+                />
+                <div className="flex flex-col gap-2">
+                  <input
+                    ref={avatarFileRef}
+                    type="file"
+                    accept={AVATAR_ACCEPT}
+                    className="hidden"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) void handleAvatarFile(f);
+                      e.target.value = '';
+                    }}
+                  />
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="secondary"
+                      icon={Upload}
+                      disabled={avatarBusy}
+                      onClick={() => avatarFileRef.current?.click()}
+                    >
+                      {intl.formatMessage({ id: 'agents.avatar.upload' })}
+                    </Button>
+                    {detail.has_avatar && (
+                      <Button variant="ghost" icon={Trash2} disabled={avatarBusy} onClick={handleAvatarClear}>
+                        {intl.formatMessage({ id: 'agents.avatar.remove' })}
+                      </Button>
+                    )}
+                  </div>
+                  <p className="flex items-center gap-1 text-xs text-stone-400 dark:text-stone-500">
+                    <ImageIcon className="h-3.5 w-3.5" />
+                    {intl.formatMessage({ id: 'agents.avatar.hint' })}
+                  </p>
+                </div>
+              </div>
+            </Card>
+
             <Card title={intl.formatMessage({ id: 'agentDetail.settings.title' })}>
               <div className="flex flex-wrap items-center gap-2">
-                {detail.status === 'active' ? (
+                {detail.archived ? (
+                  <Button variant="primary" icon={RotateCcw} disabled={busy} onClick={() => lifecycleAction(() => unarchiveAgent(id), 'agents.unarchive.done')}>
+                    {intl.formatMessage({ id: 'agents.unarchive' })}
+                  </Button>
+                ) : detail.status === 'active' ? (
                   <Button icon={Pause} disabled={busy} onClick={() => lifecycleAction(() => pauseAgent(id), 'agentDetail.rested')}>
                     {intl.formatMessage({ id: 'agentDetail.rest' })}
                   </Button>
@@ -284,33 +423,34 @@ export function AgentDetailPage() {
                 <Button variant="secondary" icon={Settings} onClick={() => navigate('/agents')}>
                   {intl.formatMessage({ id: 'agentDetail.editFull' })}
                 </Button>
-                <Button
-                  variant="danger"
-                  icon={Trash2}
-                  disabled={busy}
-                  onClick={() => setShowDismiss(true)}
-                >
-                  {intl.formatMessage({ id: 'agentDetail.dismiss' })}
-                </Button>
+                <span title={isMain ? intl.formatMessage({ id: 'agents.offboard.mainBlocked' }) : undefined}>
+                  <Button
+                    variant="danger"
+                    icon={LogOut}
+                    disabled={busy || isMain}
+                    onClick={() => setShowOffboard(true)}
+                  >
+                    {intl.formatMessage({ id: 'agentDetail.dismiss' })}
+                  </Button>
+                </span>
               </div>
+              {isMain && (
+                <p className="mt-2 text-xs text-stone-400 dark:text-stone-500">
+                  {intl.formatMessage({ id: 'agents.offboard.mainBlocked' })}
+                </p>
+              )}
             </Card>
           </div>
         )}
       </div>
 
-      <ConfirmDialog
-        open={showDismiss}
-        onClose={() => setShowDismiss(false)}
-        onConfirm={async () => {
-          setShowDismiss(false);
-          await lifecycleAction(async () => { await removeAgent(id); navigate('/agents'); }, 'agentDetail.dismissed');
-        }}
-        title={intl.formatMessage({ id: 'agentDetail.dismiss' })}
-        message={intl.formatMessage({ id: 'agentDetail.dismiss.confirm' }, { name: detail.display_name })}
-        confirmLabel={intl.formatMessage({ id: 'agentDetail.dismiss' })}
-        requireText={detail.display_name}
-        requireTextHint={intl.formatMessage({ id: 'agentDetail.dismiss.requireHint' }, { name: detail.display_name })}
+      <OffboardDialog
+        open={showOffboard}
+        agent={detail}
+        candidates={agents.filter((a) => a.name !== id && !a.archived)}
         busy={busy}
+        onClose={() => setShowOffboard(false)}
+        onDone={() => { setShowOffboard(false); navigate('/agents'); }}
       />
     </Page>
   );
@@ -322,5 +462,70 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
       <dt className="text-stone-500 dark:text-stone-400">{label}</dt>
       <dd className="text-stone-800 dark:text-stone-100">{children}</dd>
     </div>
+  );
+}
+
+/**
+ * AgentToolsCard — the platform-wide capability surface every AI staff can
+ * call. `tools.catalog` is global (not per-agent), so this is framed as "tools
+ * available on this platform" and grouped by the name prefix (agents / channels
+ * / memory / …). Handles loading / error / empty inline so a catalog failure
+ * never blanks the skills tab.
+ */
+function AgentToolsCard({ tools, error }: { tools: ToolCatalogEntry[] | null; error: boolean }) {
+  const intl = useIntl();
+
+  const groups = useMemo(() => {
+    if (!tools) return [];
+    const map = new Map<string, ToolCatalogEntry[]>();
+    for (const t of tools) {
+      const key = t.name.includes('.') ? t.name.split('.')[0] : 'other';
+      const arr = map.get(key) ?? [];
+      arr.push(t);
+      map.set(key, arr);
+    }
+    return Array.from(map.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+  }, [tools]);
+
+  return (
+    <Card
+      title={
+        <span className="flex items-center gap-2">
+          <Wrench className="h-4 w-4 text-amber-500" />
+          {intl.formatMessage({ id: 'agentDetail.tools.title' })}
+        </span>
+      }
+    >
+      <p className="mb-3 text-xs text-stone-400 dark:text-stone-500">
+        {intl.formatMessage({ id: 'agentDetail.tools.desc' })}
+      </p>
+
+      {tools === null ? (
+        <SkeletonList rows={3} rowClassName="h-10" />
+      ) : error ? (
+        <EmptyState icon={Wrench} title={intl.formatMessage({ id: 'agentDetail.tools.error' })} />
+      ) : tools.length === 0 ? (
+        <EmptyState icon={Wrench} title={intl.formatMessage({ id: 'agentDetail.tools.empty' })} />
+      ) : (
+        <div className="space-y-4">
+          {groups.map(([group, items]) => (
+            <div key={group}>
+              <h4 className="mb-2 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">
+                {group}
+                <span className="ml-1.5 font-normal text-stone-400 dark:text-stone-500">({items.length})</span>
+              </h4>
+              <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+                {items.map((t) => (
+                  <div key={t.name} className="rounded-lg bg-stone-500/5 px-3 py-2 dark:bg-white/5">
+                    <Mono className="text-xs text-stone-700 dark:text-stone-300">{t.name}</Mono>
+                    <p className="mt-0.5 text-xs text-stone-500 dark:text-stone-400">{t.description}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
   );
 }

@@ -38,6 +38,11 @@ pub fn supports_vision(provider: RuntimeType, model_id: &str) -> bool {
                 || m.starts_with("o3")
                 || m.starts_with("o4")
         }
+        // Grok: `grok-build-0.1` is a coding model; Grok vision support is
+        // UNVERIFIED (R4), so only allow an explicitly `-vision`-suffixed id and
+        // fail closed otherwise. Anchored (ends_with) rather than substring —
+        // convention #2 bans unanchored `contains` for routing decisions.
+        RuntimeType::Grok => m.ends_with("-vision") || m.ends_with("vision-preview"),
         RuntimeType::OpenAiCompat => false,
     }
 }

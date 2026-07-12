@@ -195,7 +195,7 @@ impl AgentRuntime for OpenAiCompatRuntime {
         const PROVIDER_KEYS: &[&str] = &[
             "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "MINIMAX_API_KEY",
             "GROQ_API_KEY", "TOGETHER_API_KEY", "MISTRAL_API_KEY",
-            "OPENROUTER_API_KEY",
+            "OPENROUTER_API_KEY", "XAI_API_KEY",
         ];
         PROVIDER_KEYS.iter().any(|k| std::env::var(k).is_ok())
     }
@@ -236,6 +236,11 @@ pub const PROVIDERS: &[ProviderPreset] = &[
         name: "openai",
         base_url: "https://api.openai.com/v1",
         default_model: "gpt-4o",
+    },
+    ProviderPreset {
+        name: "xai",
+        base_url: "https://api.x.ai/v1",
+        default_model: "grok-4.1-fast",
     },
 ];
 
@@ -452,10 +457,13 @@ mod tests {
 
     #[test]
     fn test_provider_presets() {
-        assert_eq!(PROVIDERS.len(), 5);
+        assert_eq!(PROVIDERS.len(), 6);
         let minimax = PROVIDERS.iter().find(|p| p.name == "minimax").unwrap();
         assert_eq!(minimax.base_url, "https://api.minimax.io/v1");
         assert_eq!(minimax.default_model, "MiniMax-M2.7");
+        // WP6: xAI (Grok) direct-API preset.
+        let xai = PROVIDERS.iter().find(|p| p.name == "xai").unwrap();
+        assert_eq!(xai.base_url, "https://api.x.ai/v1");
     }
 
     #[test]

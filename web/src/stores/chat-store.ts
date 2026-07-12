@@ -119,6 +119,17 @@ interface ChatStore {
   /** Current mouth shape while `speaking` — sampled per assistant chunk. */
   readonly viseme: VisemeShape;
   readonly sessionId: string | null;
+  /**
+   * The session id the server assigned to THIS connection, captured from the
+   * first `session_info` frame. Held in store state (not a module variable) so
+   * it's cleared on reconnect, visible in devtools, and assertable in tests. It
+   * is the "home base" the active `sessionId` is restored to whenever the user
+   * leaves a resumed historical conversation — a new conversation (`reset`),
+   * switching partner (`selectAgent`), or a resume miss. Without this, a
+   * resumed `sessionId` would leak into the next `/new` (archiving the wrong
+   * session) or the next send (read by the server as a cross-agent resume).
+   */
+  readonly ownSessionId: string | null;
   readonly agentName: string;
   readonly agentIcon: string;
   /** The AI staff member currently chosen as the conversation partner, or null
@@ -147,6 +158,15 @@ interface ChatStore {
   reset: () => void;
   /** Pick the conversation partner (null → DuDu). Visual only for now. */
   selectAgent: (id: string | null) => void;
+  /**
+   * Resume a past conversation (WP3). Renders the loaded history and points the
+   * active session at `sessionId` so the NEXT `user_message` frame carries it —
+   * the gateway then resumes that server-side session and confirms with a
+   * `session_info` frame. The current partner selection is left untouched (the
+   * history list is already scoped to that partner, so the session's owner
+   * matches it).
+   */
+  resumeSession: (sessionId: string, messages: readonly ChatMessage[]) => void;
   setRecording: (v: boolean) => void;
   setTranscribing: (v: boolean) => void;
   setTtsEnabled: (v: boolean) => void;
@@ -186,6 +206,41 @@ export function buildUserMessageFrame(opts: {
   };
 }
 
+/** The wire shape of one message returned by `chat.sessions.history`. */
+export interface HistoryMessageWire {
+  readonly role: string;
+  readonly content: string;
+  /** RFC3339 timestamp. */
+  readonly timestamp: string;
+  readonly tokens?: number;
+}
+
+/**
+ * Map history-RPC messages into the store's `ChatMessage` shape (pure — exported
+ * for tests). Unknown roles collapse to `user`; an unparseable timestamp falls
+ * back to "now" so a bad row never breaks the render.
+ */
+export function historyToMessages(raw: readonly HistoryMessageWire[]): ChatMessage[] {
+  return raw.map((m) => {
+    const role: ChatMessage['role'] =
+      m.role === 'assistant' ? 'assistant' : m.role === 'system' ? 'system' : 'user';
+    const ts = Date.parse(m.timestamp);
+    return {
+      id: nextId(),
+      role,
+      content: m.content ?? '',
+      timestamp: Number.isFinite(ts) ? ts : Date.now(),
+      ...(typeof m.tokens === 'number' ? { tokens: m.tokens } : {}),
+    };
+  });
+}
+
+/** True when a `/ws/chat` error frame reports a resume miss (the session the
+ *  client tried to continue no longer exists). Pure — exported for tests. */
+export function isResumeNotFound(message: string | null | undefined): boolean {
+  return /conversation not found/i.test(String(message ?? ''));
+}
+
 // Module-level WebSocket reference — kept outside Zustand to avoid
 // serialization issues and enable reconnection logic.
 let wsRef: WebSocket | null = null;
@@ -223,7 +278,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     if (wsRef && wsRef.readyState === WebSocket.OPEN) return;
 
     intentionalDisconnect = false;
-    set({ connectionState: 'connecting' });
+    set({ connectionState: 'connecting', ownSessionId: null });
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${protocol}//${window.location.host}/ws/chat`;
@@ -251,13 +306,21 @@ export const useChatStore = create<ChatStore>((set, get) => {
         const data = JSON.parse(event.data);
         switch (data.type) {
           case 'session_info':
-            set({
+            // The first session_info after a fresh connect is this connection's
+            // own session — remember it so a later resume miss / new-conversation
+            // / partner-switch can fall back to it. Resume-confirmation frames (a
+            // different session_id) must not overwrite this baseline.
+            set((state) => ({
+              ownSessionId:
+                state.ownSessionId === null && typeof data.session_id === 'string'
+                  ? data.session_id
+                  : state.ownSessionId,
               sessionId: data.session_id,
               agentName: data.agent_name,
               agentIcon: data.agent_icon,
               supportsVision: data.supports_vision ?? false,
               model: data.model ?? '',
-            });
+            }));
             break;
 
           case 'assistant_chunk':
@@ -361,6 +424,30 @@ export const useChatStore = create<ChatStore>((set, get) => {
             break;
 
           case 'error':
+            if (isResumeNotFound(data.message)) {
+              // Resume miss: the session we tried to continue was archived or
+              // removed between listing and sending. Drop back to a fresh
+              // conversation on the connection's own session, and tell the user
+              // plainly (never swallow it).
+              set({
+                messages: [
+                  {
+                    id: nextId(),
+                    role: 'system',
+                    content: '⚠️ 找不到這個對話（可能已被封存或移除），已為你開啟新對話。',
+                    timestamp: Date.now(),
+                  },
+                ],
+                sessionId: get().ownSessionId,
+                steps: [],
+                stepTree: [],
+                isStreaming: false,
+                phase: 'idle' as ChatPhase,
+                viseme: REST_VISEME,
+              });
+              clearVisemeIdle();
+              break;
+            }
             set((state) => ({
               messages: [
                 ...state.messages,
@@ -402,6 +489,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     phase: 'idle',
     viseme: REST_VISEME,
     sessionId: null,
+    ownSessionId: null,
     agentName: effectiveName(),
     agentIcon: effectiveLogoGlyph(),
     selectedAgentId: null,
@@ -428,9 +516,27 @@ export const useChatStore = create<ChatStore>((set, get) => {
       // `/new` is sent — the sessions are already distinct server-side.
       if (id === get().selectedAgentId) return;
       clearVisemeIdle();
-      set({
+      set((state) => ({
         selectedAgentId: id,
         messages: [],
+        steps: [],
+        stepTree: [],
+        isStreaming: false,
+        phase: 'idle',
+        viseme: REST_VISEME,
+        // Restore the active session to this connection's own id. If we were
+        // viewing a resumed historical conversation, its `sessionId` belongs to
+        // the previous partner; keeping it would make the next send read as a
+        // cross-agent resume and be rejected by the server's identity guard.
+        sessionId: state.ownSessionId,
+      }));
+    },
+
+    resumeSession: (sessionId: string, messages: readonly ChatMessage[]) => {
+      clearVisemeIdle();
+      set({
+        sessionId,
+        messages: [...messages],
         steps: [],
         stepTree: [],
         isStreaming: false,
@@ -491,16 +597,21 @@ export const useChatStore = create<ChatStore>((set, get) => {
     },
 
     reset: () => {
-      const { sessionId, selectedAgentId } = get();
-      // Send /new command to clear the server session. Include the selected
-      // agent so the gateway clears the SAME per-agent session (else /new would
-      // wipe the default session, not the employee's).
-      if (wsRef && wsRef.readyState === WebSocket.OPEN && sessionId) {
+      const { ownSessionId, sessionId, selectedAgentId } = get();
+      // The "new conversation" button always operates on THIS connection's own
+      // session, never a resumed historical one — otherwise /new would archive
+      // the conversation we were merely viewing (its owner is a different
+      // session/agent). Fall back to the current sessionId only before the first
+      // session_info has established our own id. Include the selected agent so
+      // the gateway clears the SAME per-agent session (else /new would wipe the
+      // default session, not the employee's).
+      const target = ownSessionId ?? sessionId;
+      if (wsRef && wsRef.readyState === WebSocket.OPEN && target) {
         wsRef.send(
           JSON.stringify({
             type: 'user_message',
             content: '/new',
-            session_id: sessionId,
+            session_id: target,
             ...(selectedAgentId ? { agent: selectedAgentId } : {}),
           })
         );
@@ -513,6 +624,9 @@ export const useChatStore = create<ChatStore>((set, get) => {
         isStreaming: false,
         phase: 'idle',
         viseme: REST_VISEME,
+        // Point the active session back at our own conversation so the next
+        // message continues the fresh thread, not the resumed historical one.
+        sessionId: target,
       });
     },
   };

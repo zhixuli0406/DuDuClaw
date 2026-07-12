@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn vendored_seed_parses_and_has_all_models() {
         let reg = ModelRegistry::vendored();
-        assert_eq!(reg.models().count(), 15, "expected 15 vendored models");
+        assert_eq!(reg.models().count(), 17, "expected 17 vendored models");
     }
 
     #[test]
@@ -342,7 +342,11 @@ mod tests {
     fn context_window_and_supports() {
         let reg = ModelRegistry::vendored();
         assert_eq!(reg.context_window("xai/grok-4.1-fast"), Some(2_000_000));
+        assert_eq!(reg.context_window("xai/grok-4.3"), Some(1_000_000));
+        assert_eq!(reg.context_window("xai/grok-4.5"), Some(500_000));
         assert_eq!(reg.context_window("unknown"), None);
+        assert!(reg.supports("xai/grok-4.3", Feature::Tools));
+        assert!(reg.supports("xai/grok-4.5", Feature::Caching));
         assert!(reg.supports("deepseek/deepseek-v3.2", Feature::Tools));
         assert!(!reg.supports("deepseek/deepseek-v3.2", Feature::Vision));
         assert!(!reg.supports("qwen/qwen3.7-max", Feature::Reasoning));
@@ -460,8 +464,8 @@ mod tests {
         assert_eq!(reg.get("local/my-local-model").unwrap().context_window, 32_000);
         // Bare lookup still resolves after override.
         assert_eq!(reg.get("claude-sonnet-5").unwrap().input_mc, 111);
-        // Model count: 15 vendored + 1 new.
-        assert_eq!(reg.models().count(), 16);
+        // Model count: 17 vendored + 1 new.
+        assert_eq!(reg.models().count(), 18);
     }
 
     #[test]

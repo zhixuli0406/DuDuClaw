@@ -58,18 +58,41 @@ pub fn gate_hub_content(
     Ok(scan)
 }
 
-/// Fetch `skill_name` from `hub_id` and install it — scan-gated, fail-closed.
+/// A hub manifest that has already passed the fetch + fail-closed security
+/// scan gate. Produced by [`fetch_and_gate`]; consumed by [`install_gated`].
 ///
-/// `scope` is `"global"` or an agent id; `owner` disambiguates hubs where
-/// several publishers share a slug (ClawHub 409). Caller must have validated
-/// all three as safe path components, as the MCP handler does.
-pub async fn install_from_hub(
+/// Splitting fetch+scan from the actual write lets a caller (e.g. the MCP
+/// `skill_hub_install` handler) interpose a human-approval gate **between**
+/// "scan passed" and "written to a loader root": a High-risk skill is denied
+/// by the gate and never reaches the approval queue, while a clean-but-
+/// untrusted skill can require admin approval before it is installed.
+#[derive(Debug, Clone)]
+pub struct GatedManifest {
+    pub hub: String,
+    /// The requested slug (not necessarily the frontmatter `name`).
+    pub skill_name: String,
+    /// Scanned-and-passed skill content (never empty — the gate rejects blank).
+    pub content: String,
+    /// Debug-rendered `RiskLevel` (`"Low"`, `"Medium"`, …) — for summaries.
+    pub risk_level: String,
+    pub findings: usize,
+}
+
+/// Phase 1: fetch `skill_name` from `hub_id` and run it through the
+/// fail-closed security scan gate. Returns the gated content on success.
+///
+/// This performs NO filesystem writes — it is safe to call before a human
+/// approval step. Fail-closed cases (all `Err`, never install): unknown hub,
+/// skill not found, absent/blank content, scan risk ≥ High.
+///
+/// `scope`/`owner` semantics match [`install_from_hub`]; caller must have
+/// validated `skill_name`/`owner` as safe path components.
+pub async fn fetch_and_gate(
     home_dir: &Path,
     hub_id: &str,
     skill_name: &str,
     owner: Option<&str>,
-    scope: &str,
-) -> Result<HubInstallReport, String> {
+) -> Result<GatedManifest, String> {
     let registry = HubRegistry::from_home(home_dir);
     // Exact-id lookup — an unknown hub is a DENY, never a default.
     let Some(hub) = registry.get(hub_id) else {
@@ -88,9 +111,31 @@ pub async fn install_from_hub(
         return Err(format!("skill '{skill_name}' not found on hub '{hub_id}'"));
     };
 
-    // ── The gate ────────────────────────────────────────────
+    // ── The gate (fail-closed: absent/blank/High-risk ⇒ Err) ─
     let scan = gate_hub_content(hub_id, skill_name, manifest.content.as_deref())?;
-    let content = manifest.content.as_deref().unwrap_or_default();
+    let content = manifest.content.as_deref().unwrap_or_default().to_string();
+
+    Ok(GatedManifest {
+        hub: hub_id.to_string(),
+        skill_name: skill_name.to_string(),
+        content,
+        risk_level: format!("{:?}", scan.risk_level),
+        findings: scan.findings.len(),
+    })
+}
+
+/// Phase 2: write an already-gated manifest into a skills directory and track
+/// it for the curator. Only ever called on a [`GatedManifest`] returned by
+/// [`fetch_and_gate`] (so the scan gate has provably already passed) — and,
+/// where required, only after a human approval decision.
+pub async fn install_gated(
+    home_dir: &Path,
+    gated: &GatedManifest,
+    scope: &str,
+) -> Result<HubInstallReport, String> {
+    let hub_id = gated.hub.as_str();
+    let skill_name = gated.skill_name.as_str();
+    let content = gated.content.as_str();
 
     // Write to a per-call unique temp dir under the duduclaw home and reuse
     // the shared install primitives. NOT the shared world-writable /tmp: a
@@ -108,6 +153,15 @@ pub async fn install_from_hub(
     let install_result = if scope == "global" {
         duduclaw_agent::skill_loader::install_skill_global(&tmp_file, home_dir, &quarantine_dir)
             .await
+    } else if let Some(dept) = scope.strip_prefix("department:") {
+        // WP7: department layer install (validated at the loader sink).
+        duduclaw_agent::skill_loader::install_skill_department(
+            &tmp_file,
+            home_dir,
+            dept,
+            &quarantine_dir,
+        )
+        .await
     } else {
         let agent_skills_dir = home_dir.join("agents").join(scope).join("SKILLS");
         duduclaw_agent::skill_loader::install_skill(&tmp_file, &agent_skills_dir, &quarantine_dir)
@@ -120,6 +174,9 @@ pub async fn install_from_hub(
     // Track it for the curator from day one.
     let curation_scope = if scope == "global" {
         super::curator::SCOPE_GLOBAL.to_string()
+    } else if scope.starts_with("department:") {
+        // Already carries the `department:<dept>` shape used by scope_dir.
+        scope.to_string()
     } else {
         format!("agent:{scope}")
     };
@@ -137,7 +194,7 @@ pub async fn install_from_hub(
         hub = hub_id,
         skill = %parsed.meta.name,
         scope,
-        risk = ?scan.risk_level,
+        risk = %gated.risk_level,
         "hub skill installed (scan-gated)"
     );
 
@@ -145,9 +202,28 @@ pub async fn install_from_hub(
         hub: hub_id.to_string(),
         skill_name: parsed.meta.name,
         scope: scope.to_string(),
-        risk_level: format!("{:?}", scan.risk_level),
-        findings: scan.findings.len(),
+        risk_level: gated.risk_level.clone(),
+        findings: gated.findings,
     })
+}
+
+/// Fetch `skill_name` from `hub_id` and install it — scan-gated, fail-closed.
+///
+/// Convenience wrapper = [`fetch_and_gate`] then [`install_gated`], with no
+/// approval interposed (used by paths that carry their own authorization).
+///
+/// `scope` is `"global"` or an agent id; `owner` disambiguates hubs where
+/// several publishers share a slug (ClawHub 409). Caller must have validated
+/// all three as safe path components, as the MCP handler does.
+pub async fn install_from_hub(
+    home_dir: &Path,
+    hub_id: &str,
+    skill_name: &str,
+    owner: Option<&str>,
+    scope: &str,
+) -> Result<HubInstallReport, String> {
+    let gated = fetch_and_gate(home_dir, hub_id, skill_name, owner).await?;
+    install_gated(home_dir, &gated, scope).await
 }
 
 // ── Tests ───────────────────────────────────────────────────

@@ -651,6 +651,35 @@ pub fn tool_requires_approval(agent_dir: &Path, tool_name: &str) -> bool {
     approval_required_tools(agent_dir).contains(tool_name)
 }
 
+/// F1: whether the operator has explicitly opted an agent OUT of the
+/// install-class MCP approval gate via `agent.toml [capabilities]
+/// auto_approve_install = true`.
+///
+/// **Fail-closed:** a missing file, missing key, malformed table, or a
+/// non-bool value all return `false` (the gate stays ON). Only an explicit
+/// `true` disables the gate — the WP5 requirement is that MCP-reached
+/// install-class tools need human approval by default, and the caller holding
+/// `Scope::Admin` (the default internal principal) is NOT a bypass. This is
+/// the sole exemption an operator can grant.
+pub fn auto_approve_install(agent_dir: &Path) -> bool {
+    let path = agent_dir.join("agent.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let value: toml::Value = match toml::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(?path, error = %e, "malformed agent.toml — auto_approve_install defaults to false (gate stays on)");
+            return false;
+        }
+    };
+    value
+        .get("capabilities")
+        .and_then(|c| c.get("auto_approve_install"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 // ── Decision source: autopilot rule ─────────────────────────
 
 /// True when an autopilot rule's `action` JSON opts into human approval

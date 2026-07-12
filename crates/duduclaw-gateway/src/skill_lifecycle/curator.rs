@@ -168,11 +168,19 @@ pub fn decide(
 
 // ── Filesystem helpers ──────────────────────────────────────
 
-/// Skills dir for a scope string (`"global"` or `"agent:<id>"`). Returns None
-/// for malformed scopes (fail-safe: no file action).
+/// Skills dir for a scope string (`"global"`, `"department:<dept>"`, or
+/// `"agent:<id>"`). Returns None for malformed scopes (fail-safe: no file
+/// action).
 fn scope_dir(home_dir: &Path, scope: &str) -> Option<PathBuf> {
     if scope == SCOPE_GLOBAL {
         return Some(home_dir.join("skills"));
+    }
+    if let Some(dept) = scope.strip_prefix("department:") {
+        // WP7: department layer at shared/skills/departments/<dept>.
+        if !duduclaw_core::is_valid_department(dept) {
+            return None;
+        }
+        return Some(duduclaw_agent::skill_loader::department_skills_dir(home_dir, dept));
     }
     let id = scope.strip_prefix("agent:")?;
     if id.is_empty() || !is_safe_component(id) {

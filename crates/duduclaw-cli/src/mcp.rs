@@ -284,8 +284,10 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "list_agents",
-        description: "List all registered agents with their role, status, and reports_to hierarchy",
-        params: &[],
+        description: "List all registered operational agents with their role, status, and reports_to hierarchy. Soft-deleted agents are always hidden; archived agents are hidden unless include_archived is true.",
+        params: &[
+            ParamDef { name: "include_archived", description: "Include archived (off-boarded but recoverable) agents. Default false.", required: false },
+        ],
     },
     ToolDef {
         name: "create_task",
@@ -3051,7 +3053,14 @@ async fn handle_create_agent(params: &Value, home_dir: &Path) -> Value {
 }
 
 /// List all registered agents with role, status, and hierarchy.
-async fn handle_list_agents(home_dir: &Path) -> Value {
+async fn handle_list_agents(params: &Value, home_dir: &Path) -> Value {
+    // F2: accept both a bool and the string "true" (MCP args often arrive as
+    // strings); default false so soft-deleted stay hidden and archived only
+    // surface on explicit request.
+    let include_archived = params
+        .get("include_archived")
+        .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+        .unwrap_or(false);
     let agents_dir = home_dir.join("agents");
     let mut entries = match tokio::fs::read_dir(&agents_dir).await {
         Ok(e) => e,
@@ -3078,6 +3087,10 @@ async fn handle_list_agents(home_dir: &Path) -> Value {
         let toml_path = path.join("agent.toml");
         if let Ok(content) = tokio::fs::read_to_string(&toml_path).await
             && let Ok(config) = toml::from_str::<duduclaw_core::types::AgentConfig>(&content) {
+                // F2: hide soft-deleted always; hide archived unless requested.
+                if !config.agent.status.is_listable(include_archived) {
+                    continue;
+                }
                 agents.push(serde_json::json!({
                     "name": config.agent.name,
                     "display_name": config.agent.display_name,
@@ -3508,6 +3521,21 @@ async fn handle_task_status(params: &Value, home_dir: &Path, caller: &str) -> Va
     }
 }
 
+/// Read an agent's lifecycle status from its `agent.toml` (`[agent].status`).
+/// Robust to unrelated config fields — parses only the one field. Returns
+/// `None` when the file is missing / unparseable / the field is absent, so
+/// callers can decide the indeterminate policy (spawn treats indeterminate as
+/// operational for backward-compat with pre-WP4 configs that lack the field).
+fn agent_status_of(home_dir: &Path, agent_id: &str) -> Option<duduclaw_core::types::AgentStatus> {
+    let toml_path = home_dir.join("agents").join(agent_id).join("agent.toml");
+    let content = std::fs::read_to_string(&toml_path).ok()?;
+    let value: toml::Value = content.parse().ok()?;
+    let status_str = value.get("agent")?.get("status")?.as_str()?;
+    // AgentStatus derives Deserialize with snake_case rename, so a bare status
+    // string round-trips through serde.
+    serde_json::from_value(serde_json::Value::String(status_str.to_string())).ok()
+}
+
 /// Spawn a persistent sub-agent task in the background.
 async fn handle_spawn_agent(params: &Value, home_dir: &Path, caller: &str) -> Value {
     spawn_agent_with_ctx(params, home_dir, caller, DelegationContext::from_env()).await
@@ -3542,6 +3570,23 @@ async fn spawn_agent_with_ctx(
     if !agent_dir.join("agent.toml").exists() {
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error: agent '{agent_id}' not found")}],
+            "isError": true
+        });
+    }
+
+    // ── F2: off-boarded target guard ───────────────────────────
+    // An archived / soft-deleted agent must never be spawned. Fail-closed on a
+    // resolved non-operational status; an indeterminate status (pre-WP4 config
+    // without the field) keeps the pre-existing allow behaviour.
+    if let Some(status) = agent_status_of(home_dir, agent_id)
+        && !status.is_operational()
+    {
+        let status_str = format!("{status:?}").to_lowercase();
+        return serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "Error: agent '{agent_id}' is not operational (status: {status_str}); \
+                 it has been off-boarded and cannot be spawned."
+            )}],
             "isError": true
         });
     }
@@ -5908,8 +5953,171 @@ async fn handle_skill_search(params: &Value, home_dir: &Path) -> Value {
     })
 }
 
-/// Install a skill from a hub — always through the fail-closed scan gate.
-async fn handle_skill_hub_install(params: &Value, home_dir: &Path) -> Value {
+// ── Install-class approval gate (WP5, stdio-path parity) ────────────────────
+//
+// The WS/PolicyKernel path (`mcp_dispatch.rs`) already blocks high-risk tool
+// calls on the `ApprovalBroker`. The stdio direct path bypassed it, so an
+// agent could self-install a hub skill (scan-gated only) with no human in the
+// loop — the "agent 自己接工具誰授權?→ 這沒做" gap. These helpers give the
+// stdio path the same admin-approval gate for install/attach-class tools.
+//
+// Fail-closed throughout: broker unavailable, request failure, denial, or TTL
+// expiry all resolve to a DENY — never a silent install.
+
+/// TTL for an install-class approval raised on the stdio path. Mirrors the
+/// WS PolicyKernel `Ask` gate (5 min) so a human has a realistic window to
+/// approve from the dashboard inbox before it auto-denies.
+const INSTALL_APPROVAL_TTL_SECONDS: i64 = 300;
+
+/// Poll cadence while blocking on an install-class approval decision.
+const INSTALL_APPROVAL_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Max chars of the (partly external) approval summary persisted + surfaced in
+/// the inbox. CJK-safe via `truncate_chars` — never a raw byte slice.
+const INSTALL_APPROVAL_SUMMARY_MAX_CHARS: usize = 300;
+
+/// Tools that mutate the agent's tool surface by installing / attaching an
+/// external capability. A non-admin caller must get admin approval before one
+/// of these runs on the stdio path. `agent.toml [capabilities]
+/// approval_required_tools` can add more tools explicitly.
+fn is_install_class_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "skill_hub_install")
+}
+
+/// Decide whether an install-class tool call must obtain approval before it
+/// runs.
+///
+/// F1 (WP5 dead-gate fix): the caller being an "admin" is **NOT** a bypass.
+/// The default internal MCP principal always holds `Scope::Admin`, and the MCP
+/// tool path is exactly the agent-autonomous (LLM-issued `tool_call`) path WP5
+/// must gate — humans install via the dashboard `skills.install` route, which
+/// has its own `require_admin!` gate. So `caller_is_admin` is ignored here.
+///
+/// Approval is required when EITHER:
+///   * the tool is install-class AND the operator has not explicitly exempted
+///     the agent via `[capabilities] auto_approve_install = true`, OR
+///   * the agent's `agent.toml` explicitly lists the tool in
+///     `approval_required_tools` (operator intent — always honoured, and it
+///     overrides the `auto_approve_install` exemption).
+///
+/// Pure + deterministic so the branch logic is unit-testable without a broker.
+fn install_approval_required(agent_dir: &Path, tool_name: &str, _caller_is_admin: bool) -> bool {
+    // Explicit per-tool listing always forces approval (wins over any exemption).
+    if duduclaw_gateway::approval::tool_requires_approval(agent_dir, tool_name) {
+        return true;
+    }
+    // Install-class tools reached via MCP need approval unless the operator has
+    // explicitly opted this agent out.
+    is_install_class_tool(tool_name)
+        && !duduclaw_gateway::approval::auto_approve_install(agent_dir)
+}
+
+/// Outcome of an install-class approval gate.
+enum InstallApprovalOutcome {
+    /// Admin caller, no gate, or an explicit approval was granted.
+    Proceed,
+    /// Denied / expired / broker-unavailable — carries a zh-TW user message.
+    Denied(String),
+}
+
+/// Run one approval round against a broker: request → block on decision.
+/// Denial, TTL-expiry, and request failure all map to `Denied` (fail-closed).
+/// Split out from [`gate_install_approval`] so tests can drive it with an
+/// in-memory broker and a short TTL/poll.
+async fn run_install_approval(
+    broker: &duduclaw_gateway::approval::ApprovalBroker,
+    agent_id: &str,
+    summary: &str,
+    payload: Value,
+    ttl_seconds: i64,
+    poll: std::time::Duration,
+) -> InstallApprovalOutcome {
+    use duduclaw_gateway::approval::ApprovalStatus;
+
+    // External content (skill name/description) is truncated before it is
+    // persisted or shown in the inbox (CJK-safe, no raw byte slicing).
+    let summary = duduclaw_core::truncate_chars(summary, INSTALL_APPROVAL_SUMMARY_MAX_CHARS);
+
+    let approval_id = match broker
+        .request(agent_id, "mcp_install", &summary, payload, ttl_seconds)
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(error = %e, "install approval request failed — denying (fail-closed)");
+            return InstallApprovalOutcome::Denied(
+                "審批系統無法建立審核請求，已拒絕安裝（fail-closed）。".to_string(),
+            );
+        }
+    };
+
+    match broker.await_decision(&approval_id, poll).await {
+        Ok(ApprovalStatus::Approved) => InstallApprovalOutcome::Proceed,
+        Ok(ApprovalStatus::Denied) => InstallApprovalOutcome::Denied(format!(
+            "安裝要求已被管理員拒絕（審核編號 {approval_id}）。"
+        )),
+        Ok(ApprovalStatus::Expired) => InstallApprovalOutcome::Denied(format!(
+            "安裝要求逾時未核可，已自動拒絕（fail-closed，審核編號 {approval_id}）。"
+        )),
+        Ok(ApprovalStatus::Pending) => InstallApprovalOutcome::Denied(
+            "審核狀態異常（仍為待審），已拒絕安裝（fail-closed）。".to_string(),
+        ),
+        Err(e) => {
+            warn!(error = %e, "await_decision failed — denying (fail-closed)");
+            InstallApprovalOutcome::Denied(
+                "等待審核決定時發生錯誤，已拒絕安裝（fail-closed）。".to_string(),
+            )
+        }
+    }
+}
+
+/// Gate an install-class tool behind admin approval on the stdio path.
+/// Returns [`InstallApprovalOutcome::Proceed`] when no gate applies (admin, or
+/// tool not gated) or when a human approved; otherwise a fail-closed `Denied`.
+async fn gate_install_approval(
+    home_dir: &Path,
+    agent_id: &str,
+    tool_name: &str,
+    summary: &str,
+    payload: Value,
+    caller_is_admin: bool,
+) -> InstallApprovalOutcome {
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    if !install_approval_required(&agent_dir, tool_name, caller_is_admin) {
+        return InstallApprovalOutcome::Proceed;
+    }
+
+    // Open the on-disk broker only when a gate actually applies. Broker
+    // unavailable ⇒ DENY (never fall through to install).
+    let broker = match duduclaw_gateway::approval::ApprovalBroker::open(home_dir) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "ApprovalBroker unavailable — denying install (fail-closed)");
+            return InstallApprovalOutcome::Denied(
+                "審批系統暫時無法使用，已拒絕安裝（fail-closed）。請稍後再試或由管理員手動安裝。"
+                    .to_string(),
+            );
+        }
+    };
+    run_install_approval(
+        &broker,
+        agent_id,
+        summary,
+        payload,
+        INSTALL_APPROVAL_TTL_SECONDS,
+        INSTALL_APPROVAL_POLL,
+    )
+    .await
+}
+
+/// Install a skill from a hub — always through the fail-closed scan gate, and
+/// (for non-admin callers) through the admin-approval gate.
+async fn handle_skill_hub_install(
+    params: &Value,
+    home_dir: &Path,
+    default_agent: &str,
+    caller_is_admin: bool,
+) -> Value {
     let hub = params.get("hub").and_then(|v| v.as_str()).unwrap_or("");
     let skill_name = params.get("skill_name").and_then(|v| v.as_str()).unwrap_or("");
     let owner = params.get("owner").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
@@ -5931,11 +6139,44 @@ async fn handle_skill_hub_install(params: &Value, home_dir: &Path) -> Value {
         return mcp_error("invalid scope (use 'global' or a valid agent id)");
     }
 
-    match duduclaw_gateway::skill_lifecycle::hub_install::install_from_hub(
-        home_dir, hub, skill_name, owner, scope,
+    use duduclaw_gateway::skill_lifecycle::hub_install;
+
+    // ── Phase 1: fetch + security scan (fail-closed) ────────────────────────
+    // High-risk / unknown hub / absent content DENY here and never reach the
+    // approval queue — approval is only for scanned-and-passed skills.
+    let gated = match hub_install::fetch_and_gate(home_dir, hub, skill_name, owner).await {
+        Ok(g) => g,
+        Err(e) => return mcp_error(&e),
+    };
+
+    // ── Phase 2: admin approval (non-admin install-class or explicit) ───────
+    let summary = format!(
+        "安裝技能「{skill_name}」（來源 hub：{hub}，範圍：{scope}，掃描風險：{}，{} 項發現）",
+        gated.risk_level, gated.findings
+    );
+    let payload = serde_json::json!({
+        "tool": "skill_hub_install",
+        "hub": hub,
+        "skill_name": skill_name,
+        "owner": owner,
+        "scope": scope,
+    });
+    match gate_install_approval(
+        home_dir,
+        default_agent,
+        "skill_hub_install",
+        &summary,
+        payload,
+        caller_is_admin,
     )
     .await
     {
+        InstallApprovalOutcome::Proceed => {}
+        InstallApprovalOutcome::Denied(msg) => return mcp_error(&msg),
+    }
+
+    // ── Phase 3: write the gated skill into the loader root ─────────────────
+    match hub_install::install_gated(home_dir, &gated, scope).await {
         Ok(report) => mcp_text(&format!(
             "Skill '{}' installed from hub '{}' into scope '{}' (scan: risk {}, {} finding(s)).",
             report.skill_name, report.hub, report.scope, report.risk_level, report.findings
@@ -7150,7 +7391,7 @@ pub(crate) async fn handle_tools_call(
         "list_reminders" => handle_list_reminders(&arguments, home_dir, default_agent).await,
         "cancel_reminder" => handle_cancel_reminder(&arguments, home_dir, default_agent).await,
         "create_agent" => handle_create_agent(&arguments, home_dir).await,
-        "list_agents" => handle_list_agents(home_dir).await,
+        "list_agents" => handle_list_agents(&arguments, home_dir).await,
         "create_task" => handle_create_task(&arguments, home_dir, default_agent).await,
         "check_responses" => handle_check_responses(&arguments, home_dir).await,
         "task_status" => handle_task_status(&arguments, home_dir, default_agent).await,
@@ -7166,7 +7407,7 @@ pub(crate) async fn handle_tools_call(
         "skill_graduate" => handle_skill_graduate(&arguments, home_dir).await,
         "skill_synthesis_status" => handle_skill_synthesis_status(&arguments, home_dir).await,
         "skill_synthesis_run" => handle_skill_synthesis_run(&arguments, home_dir, default_agent).await,
-        "skill_hub_install" => handle_skill_hub_install(&arguments, home_dir).await,
+        "skill_hub_install" => handle_skill_hub_install(&arguments, home_dir, default_agent, caller_is_admin).await,
         "skill_curator_status" => handle_skill_curator_status(&arguments, home_dir).await,
         "skill_pin" => handle_skill_pin(&arguments, home_dir).await,
         "submit_feedback" => handle_submit_feedback(&arguments, home_dir, default_agent).await,
@@ -7221,14 +7462,14 @@ pub(crate) async fn handle_tools_call(
         "wiki_trust_audit" => handle_wiki_trust_audit(&arguments, home_dir, wiki_agent).await,
         "wiki_trust_history" => handle_wiki_trust_history(&arguments, home_dir, wiki_agent).await,
         // Shared Wiki tools
-        "shared_wiki_ls" => handle_shared_wiki_ls(home_dir).await,
-        "shared_wiki_read" => handle_shared_wiki_read(&arguments, home_dir).await,
+        "shared_wiki_ls" => handle_shared_wiki_ls(home_dir, default_agent).await,
+        "shared_wiki_read" => handle_shared_wiki_read(&arguments, home_dir, default_agent).await,
         "shared_wiki_write" => handle_shared_wiki_write(&arguments, home_dir, default_agent).await,
-        "shared_wiki_search" => handle_shared_wiki_search(&arguments, home_dir).await,
+        "shared_wiki_search" => handle_shared_wiki_search(&arguments, home_dir, default_agent).await,
         "shared_wiki_delete" => handle_shared_wiki_delete(&arguments, home_dir, default_agent).await,
-        "shared_wiki_stats" => handle_shared_wiki_stats(home_dir).await,
-        "shared_wiki_lint" => handle_shared_wiki_lint(home_dir).await,
-        "wiki_namespace_status" => handle_wiki_namespace_status(home_dir).await,
+        "shared_wiki_stats" => handle_shared_wiki_stats(home_dir, default_agent).await,
+        "shared_wiki_lint" => handle_shared_wiki_lint(home_dir, default_agent).await,
+        "wiki_namespace_status" => handle_wiki_namespace_status(home_dir, default_agent).await,
         // Live Canvas tools (G15) — agent_id comes from the caller context
         // (default_agent), never from arguments, so an agent can only ever
         // write its own canvas.
@@ -8953,15 +9194,82 @@ async fn handle_wiki_trust_history(args: &Value, home_dir: &Path, default_agent:
     }
 }
 
-async fn handle_shared_wiki_ls(home_dir: &Path) -> Value {
+/// WP7: resolve an agent's department from its agent.toml. Returns `None` when
+/// the agent has no department, an invalid one, or the config can't be read
+/// (fail-safe: a caller with no resolvable department sees only the company
+/// layer, never another team's pages).
+fn resolve_agent_department(home_dir: &Path, agent_id: &str) -> Option<String> {
+    if !is_valid_agent_id(agent_id) {
+        return None;
+    }
+    let toml_path = home_dir.join("agents").join(agent_id).join("agent.toml");
+    let content = std::fs::read_to_string(&toml_path).ok()?;
+    // Parse only the `[agent].department` field — robust to any other missing
+    // config fields, and cheap. An invalid / traversal-shaped value is dropped
+    // (treated as "no department"), so a path is never built from it.
+    let value: toml::Value = content.parse().ok()?;
+    let dept = value.get("agent")?.get("department")?.as_str()?.trim();
+    if dept.is_empty() || !duduclaw_core::is_valid_department(dept) {
+        return None;
+    }
+    Some(dept.to_string())
+}
+
+/// WP7 precomputed department-visibility context for a single shared-wiki tool
+/// call. Built once per call (resolves the caller's department) and then reused
+/// as a cheap per-page predicate — the single READ-isolation decision point
+/// behind `shared_wiki_ls/read/search/stats/lint`.
+///
+/// F4: department **read** isolation is ALWAYS in force and is orthogonal to
+/// the `.scope.toml` **write** policy. Declaring the `departments` namespace in
+/// `.scope.toml` tightens who may *write*; it must never open cross-department
+/// *reads* (the previous `explicit_override` short-circuit did exactly the
+/// wrong thing — it disabled read isolation entirely). An agent may only ever
+/// read its own department's pages plus the open company layer.
+struct DeptVisibility {
+    caller_department: Option<String>,
+}
+
+impl DeptVisibility {
+    fn for_agent(home_dir: &Path, caller_agent: &str) -> Self {
+        Self {
+            caller_department: resolve_agent_department(home_dir, caller_agent),
+        }
+    }
+
+    /// Whether the caller may see/touch `page_path` (department dimension only;
+    /// `.scope.toml` write policy is checked separately on write/delete).
+    fn allows(&self, page_path: &str) -> bool {
+        duduclaw_core::department_page_visible(page_path, self.caller_department.as_deref())
+    }
+}
+
+/// Single shared-wiki page-enumeration predicate honouring department read
+/// isolation (F4/F5). Every read-side tool (`ls`, `stats`, `lint`) enumerates
+/// through this so other departments' pages never leak into a listing, a
+/// contributor count, or a lint report. Paths are returned wiki-relative.
+fn collect_visible_shared_pages(
+    home_dir: &Path,
+    wiki_dir: &Path,
+    caller_agent: &str,
+) -> Vec<std::path::PathBuf> {
+    let visibility = DeptVisibility::for_agent(home_dir, caller_agent);
+    collect_md_files(wiki_dir, wiki_dir)
+        .into_iter()
+        .filter(|rel| visibility.allows(&rel.to_string_lossy().replace('\\', "/")))
+        .collect()
+}
+
+async fn handle_shared_wiki_ls(home_dir: &Path, caller_agent: &str) -> Value {
     let wiki_dir = resolve_shared_wiki_dir(home_dir);
     if !wiki_dir.exists() {
         return tool_text("No shared wiki found. Use shared_wiki_write to create the first page.");
     }
 
-    let pages = collect_md_files(&wiki_dir, &wiki_dir);
+    // WP7 / F4: hide other departments' pages (read isolation always on).
+    let pages = collect_visible_shared_pages(home_dir, &wiki_dir, caller_agent);
     if pages.is_empty() {
-        return tool_text("Shared wiki directory exists but contains no pages.");
+        return tool_text("Shared wiki directory exists but contains no pages visible to you.");
     }
 
     let mut lines = Vec::with_capacity(pages.len() + 1);
@@ -8981,7 +9289,7 @@ async fn handle_shared_wiki_ls(home_dir: &Path) -> Value {
     tool_text(&lines.join("\n"))
 }
 
-async fn handle_shared_wiki_read(args: &Value, home_dir: &Path) -> Value {
+async fn handle_shared_wiki_read(args: &Value, home_dir: &Path, caller_agent: &str) -> Value {
     let page_path = match args.get("page_path").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => return tool_error("Missing required parameter: page_path"),
@@ -8989,6 +9297,15 @@ async fn handle_shared_wiki_read(args: &Value, home_dir: &Path) -> Value {
 
     if page_path.contains("..") || page_path.starts_with('/') || page_path.starts_with('\\') {
         return tool_error("Path traversal is not allowed");
+    }
+
+    // WP7 / F4: an agent may only read its own department's pages (company
+    // layer is open to all). Fail-closed for other departments / no-department
+    // callers — always on, independent of the `.scope.toml` write policy.
+    if !DeptVisibility::for_agent(home_dir, caller_agent).allows(page_path) {
+        return tool_error(&format!(
+            "Shared wiki read denied: '{page_path}' belongs to another department."
+        ));
     }
 
     let wiki_dir = resolve_shared_wiki_dir(home_dir);
@@ -9030,6 +9347,18 @@ async fn handle_shared_wiki_write(args: &Value, home_dir: &Path, caller_agent: &
     // effect immediately. Absent / malformed file ⇒ empty policy ⇒ all
     // namespaces writable (no regression vs. v1.10.1).
     let scope_policy = crate::wiki_scope::WikiScopePolicy::load_for(home_dir);
+
+    // WP7: department isolation. An agent may only write to its own
+    // department's `departments/<dept>/…` sub-tree; the company layer stays
+    // governed by `.scope.toml` below. Deferred when the operator explicitly
+    // declared the `departments` namespace (explicit policy wins).
+    if !scope_policy.has_explicit_namespace(duduclaw_core::DEPARTMENTS_NAMESPACE) {
+        let dept = resolve_agent_department(home_dir, caller_agent);
+        if let Err(deny) = crate::wiki_scope::check_department_access(page_path, dept.as_deref()) {
+            return tool_error(&format!("Shared wiki write denied: {deny}"));
+        }
+    }
+
     let caller_capability = crate::wiki_scope::WriterCapability::for_agent(caller_agent);
     if let Err(deny) = scope_policy.check_write(page_path, &caller_capability) {
         return tool_error(&format!("Shared wiki write denied: {deny}"));
@@ -9267,7 +9596,7 @@ fn is_agent_id_shape(s: &str) -> bool {
         && s.chars().any(|c| c.is_ascii_alphabetic())
 }
 
-async fn handle_shared_wiki_search(args: &Value, home_dir: &Path) -> Value {
+async fn handle_shared_wiki_search(args: &Value, home_dir: &Path, caller_agent: &str) -> Value {
     let query = match args.get("query").and_then(|v| v.as_str()) {
         Some(q) if !q.is_empty() => q,
         _ => return tool_error("Missing required parameter: query"),
@@ -9297,6 +9626,13 @@ async fn handle_shared_wiki_search(args: &Value, home_dir: &Path) -> Value {
         Ok(h) => h,
         Err(e) => return tool_error(&format!("Shared wiki search failed: {e}")),
     };
+
+    // WP7 / F4: drop hits from other departments before rendering.
+    let visibility = DeptVisibility::for_agent(home_dir, caller_agent);
+    let hits: Vec<_> = hits
+        .into_iter()
+        .filter(|h| visibility.allows(&h.path.replace('\\', "/")))
+        .collect();
 
     if hits.is_empty() {
         return tool_text(&format!("No shared wiki pages match '{}'.", query));
@@ -9331,6 +9667,15 @@ async fn handle_shared_wiki_delete(args: &Value, home_dir: &Path, caller_agent: 
     // even for the original page author — the namespace policy is the
     // authority, not the per-page ACL.
     let scope_policy = crate::wiki_scope::WikiScopePolicy::load_for(home_dir);
+
+    // WP7: an agent may only delete within its own department's sub-tree.
+    if !scope_policy.has_explicit_namespace(duduclaw_core::DEPARTMENTS_NAMESPACE) {
+        let dept = resolve_agent_department(home_dir, caller_agent);
+        if let Err(deny) = crate::wiki_scope::check_department_access(page_path, dept.as_deref()) {
+            return tool_error(&format!("Shared wiki delete denied: {deny}"));
+        }
+    }
+
     let caller_capability = crate::wiki_scope::WriterCapability::for_agent(caller_agent);
     if let Err(deny) = scope_policy.check_write(page_path, &caller_capability) {
         return tool_error(&format!("Shared wiki delete denied: {deny}"));
@@ -9366,15 +9711,17 @@ async fn handle_shared_wiki_delete(args: &Value, home_dir: &Path, caller_agent: 
     }
 }
 
-async fn handle_shared_wiki_stats(home_dir: &Path) -> Value {
+async fn handle_shared_wiki_stats(home_dir: &Path, caller_agent: &str) -> Value {
     let wiki_dir = resolve_shared_wiki_dir(home_dir);
     if !wiki_dir.exists() {
         return tool_text("No shared wiki found.");
     }
 
-    let pages = collect_md_files(&wiki_dir, &wiki_dir);
+    // F5: only enumerate pages the caller may read — other departments' path
+    // names and author counts must not leak through stats.
+    let pages = collect_visible_shared_pages(home_dir, &wiki_dir, caller_agent);
     if pages.is_empty() {
-        return tool_text("Shared wiki exists but has no pages.");
+        return tool_text("Shared wiki exists but has no pages visible to you.");
     }
 
     let mut author_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -9423,9 +9770,15 @@ async fn handle_shared_wiki_stats(home_dir: &Path) -> Value {
 /// RFC-21 §3: Inspect the shared-wiki namespace policy (`.scope.toml`).
 /// Returns the configured namespaces and their modes plus a hint about the
 /// fallback ("agent_writable") behaviour for namespaces not listed.
-async fn handle_wiki_namespace_status(home_dir: &Path) -> Value {
+async fn handle_wiki_namespace_status(home_dir: &Path, caller_agent: &str) -> Value {
     let policy = crate::wiki_scope::WikiScopePolicy::load_for(home_dir);
     let snapshot = policy.snapshot();
+
+    // WP7: surface the caller's department + the built-in department isolation
+    // rule so the dashboard can render "which departments can I see".
+    let caller_department = resolve_agent_department(home_dir, caller_agent);
+    let departments_explicit =
+        policy.has_explicit_namespace(duduclaw_core::DEPARTMENTS_NAMESPACE);
 
     let payload = serde_json::json!({
         "policy_file": policy.loaded_from()
@@ -9434,6 +9787,22 @@ async fn handle_wiki_namespace_status(home_dir: &Path) -> Value {
         "policy_loaded": policy.loaded_from().is_some(),
         "default_mode": "agent_writable",
         "namespaces": snapshot,
+        "department": {
+            "caller_agent": caller_agent,
+            "caller_department": caller_department,
+            "namespace": duduclaw_core::DEPARTMENTS_NAMESPACE,
+            // F4: department READ isolation is ALWAYS enforced — an agent can
+            // only read `departments/<own-dept>/…` plus the open company layer,
+            // regardless of `.scope.toml`. Report it honestly so this snapshot
+            // never contradicts the actual enforcement.
+            "read_isolation_enforced": true,
+            // The `.scope.toml` flag only affects the WRITE policy for the
+            // `departments` namespace (who may write there); it does NOT relax
+            // read isolation. When true, the operator's write policy governs
+            // writes to `departments/…`; when false, the built-in rule limits
+            // writes to `departments/<own-dept>/…`.
+            "write_policy_from_scope_toml": departments_explicit,
+        },
     });
 
     let pretty = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
@@ -9523,15 +9892,17 @@ async fn handle_identity_resolve(args: &Value, home_dir: &Path, caller_agent: &s
 
 /// Audit shared wiki for Karpathy-schema compliance: missing frontmatter
 /// fields, fallback-content markers, orphan pages, broken links, stale pages.
-async fn handle_shared_wiki_lint(home_dir: &Path) -> Value {
+async fn handle_shared_wiki_lint(home_dir: &Path, caller_agent: &str) -> Value {
     let wiki_dir = resolve_shared_wiki_dir(home_dir);
     if !wiki_dir.exists() {
         return tool_text("No shared wiki found.");
     }
 
-    let pages = collect_md_files(&wiki_dir, &wiki_dir);
+    // F5: only lint pages the caller may read — other departments' page paths
+    // must not surface in the report.
+    let pages = collect_visible_shared_pages(home_dir, &wiki_dir, caller_agent);
     if pages.is_empty() {
-        return tool_text("Shared wiki exists but has no pages.");
+        return tool_text("Shared wiki exists but has no pages visible to you.");
     }
 
     // Schema compliance + fallback scan
@@ -9555,9 +9926,19 @@ async fn handle_shared_wiki_lint(home_dir: &Path) -> Value {
         }
     }
 
-    // Delegate graph-level checks to WikiStore::lint
+    // Delegate graph-level checks to WikiStore::lint. F5: the graph lint scans
+    // the whole store, so filter its path-bearing results through the same
+    // department read-isolation predicate — other departments' orphan/broken/
+    // stale pages must not surface in this caller's report.
     let store = duduclaw_memory::WikiStore::new_shared(home_dir);
-    let graph = store.lint().ok();
+    let graph = store.lint().ok().map(|mut r| {
+        let vis = DeptVisibility::for_agent(home_dir, caller_agent);
+        let visible = |p: &str| vis.allows(&p.replace('\\', "/"));
+        r.orphan_pages.retain(|p| visible(p));
+        r.stale_pages.retain(|p| visible(p));
+        r.broken_links.retain(|(from, _to)| visible(from));
+        r
+    });
 
     let mut output = format!("Shared Wiki Lint Report\n\nTotal pages: {}\n", pages.len());
     if let Some(ref r) = graph {
@@ -11728,6 +12109,64 @@ high_context = true
         assert_eq!(msg["sender_agent"], "main");
     }
 
+    /// F2: overwrite an agent's `[agent].status` in its fixture agent.toml.
+    fn set_agent_status(agents_dir: &std::path::Path, name: &str, status: &str) {
+        let toml_path = agents_dir.join(name).join("agent.toml");
+        let content = fs::read_to_string(&toml_path).unwrap();
+        let updated = content.replace("status = \"active\"", &format!("status = \"{status}\""));
+        assert_ne!(updated, content, "fixture must contain status = \"active\" to replace");
+        fs::write(&toml_path, updated).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn f2_spawn_rejects_archived_agent() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        create_test_agent(&agents_dir, "main", "");
+        create_test_agent(&agents_dir, "worker", "main");
+        set_agent_status(&agents_dir, "worker", "archived");
+
+        let ctx = DelegationContext { depth: 0, origin: None };
+        let params = serde_json::json!({ "agent_id": "worker", "task": "work" });
+        let result = spawn_agent_with_ctx(&params, home, "main", ctx).await;
+
+        assert_eq!(result["isError"].as_bool(), Some(true), "archived spawn must fail: {result}");
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("not operational"), "got: {text}");
+        assert!(
+            !home.join("bus_queue.jsonl").exists(),
+            "a rejected spawn must not enqueue a bus task"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn f2_list_agents_hides_deleted_and_archived() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        let agents_dir = home.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        create_test_agent(&agents_dir, "active-one", "");
+        create_test_agent(&agents_dir, "archived-one", "");
+        create_test_agent(&agents_dir, "deleted-one", "");
+        set_agent_status(&agents_dir, "archived-one", "archived");
+        set_agent_status(&agents_dir, "deleted-one", "deleted");
+
+        // Default: only active shown.
+        let res = handle_list_agents(&serde_json::json!({}), home).await;
+        let text = res["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("active-one"), "active must be listed: {text}");
+        assert!(!text.contains("archived-one"), "archived hidden by default: {text}");
+        assert!(!text.contains("deleted-one"), "deleted always hidden: {text}");
+
+        // include_archived=true: archived surfaces, deleted still hidden.
+        let res = handle_list_agents(&serde_json::json!({ "include_archived": true }), home).await;
+        let text = res["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("archived-one"), "archived shown on request: {text}");
+        assert!(!text.contains("deleted-one"), "deleted still hidden even with flag: {text}");
+    }
+
     // ── O2: spawn_ephemeral (dynamic sub-agent synthesis) ────────────
 
     /// Like `create_test_agent` but with a restricted `allowed_tools` list
@@ -12443,6 +12882,262 @@ mod wiki_schema_tests {
         assert!(!result["isError"].as_bool().unwrap_or(false));
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // WP7 — department knowledge-base isolation (departments/<dept>/…)
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn write_agent_toml_dept(agents_dir: &std::path::Path, name: &str, department: &str) {
+        let dir = agents_dir.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("agent.toml"),
+            format!(
+                "[agent]\nname = \"{name}\"\nrole = \"main\"\ndepartment = \"{department}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wp7_agent_can_write_and_read_own_department() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml_dept(&agents_dir, "monet", "art");
+
+        let write_args = serde_json::json!({
+            "page_path": "departments/art/palette.md",
+            "content": clean_karpathy_page("Palette"),
+        });
+        let w = handle_shared_wiki_write(&write_args, tmp.path(), "monet").await;
+        assert!(
+            w["content"][0]["text"].as_str().unwrap_or("").contains("Written shared wiki page"),
+            "own-department write should succeed: {w}"
+        );
+
+        let read_args = serde_json::json!({ "page_path": "departments/art/palette.md" });
+        let r = handle_shared_wiki_read(&read_args, tmp.path(), "monet").await;
+        assert!(!r["isError"].as_bool().unwrap_or(false), "own-department read should succeed: {r}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wp7_agent_cannot_write_other_department() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml_dept(&agents_dir, "monet", "art");
+
+        // art agent writing into sales' namespace → denied, nothing persisted.
+        let args = serde_json::json!({
+            "page_path": "departments/sales/quota.md",
+            "content": clean_karpathy_page("Quota"),
+        });
+        let result = handle_shared_wiki_write(&args, tmp.path(), "monet").await;
+        assert!(result["isError"].as_bool().unwrap_or(false), "cross-department write must be denied: {result}");
+        assert!(
+            result["content"][0]["text"].as_str().unwrap_or("").contains("write denied"),
+            "got: {result}"
+        );
+        assert!(
+            !tmp.path().join("shared/wiki/departments/sales/quota.md").exists(),
+            "denied write must not create the file"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wp7_no_department_agent_denied_all_departments() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        // Agent with no department field at all.
+        write_agent_toml(&agents_dir, "agnes");
+
+        let args = serde_json::json!({
+            "page_path": "departments/art/palette.md",
+            "content": clean_karpathy_page("Palette"),
+        });
+        let w = handle_shared_wiki_write(&args, tmp.path(), "agnes").await;
+        assert!(w["isError"].as_bool().unwrap_or(false), "no-department write to a dept must be denied: {w}");
+
+        let r = handle_shared_wiki_read(
+            &serde_json::json!({ "page_path": "departments/art/palette.md" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(r["isError"].as_bool().unwrap_or(false), "no-department read of a dept page must be denied: {r}");
+
+        // But the company layer stays open to a no-department agent.
+        let company = handle_shared_wiki_write(
+            &serde_json::json!({
+                "page_path": "sop/onboarding.md",
+                "content": clean_karpathy_page("Onboarding"),
+            }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(
+            company["content"][0]["text"].as_str().unwrap_or("").contains("Written shared wiki page"),
+            "company-layer write should succeed for a no-department agent: {company}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wp7_explicit_scope_declaration_overrides_builtin() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml_dept(&agents_dir, "monet", "art");
+
+        // Operator takes over the departments namespace as operator_only:
+        // the built-in "own department" allowance is deferred, so even the
+        // owning-department agent is now denied writes (policy wins).
+        write_scope_policy(
+            tmp.path(),
+            r#"
+                [namespaces."departments"]
+                mode = "operator_only"
+            "#,
+        );
+        let args = serde_json::json!({
+            "page_path": "departments/art/palette.md",
+            "content": clean_karpathy_page("Palette"),
+        });
+        let result = handle_shared_wiki_write(&args, tmp.path(), "monet").await;
+        assert!(result["isError"].as_bool().unwrap_or(false), "explicit operator_only must deny: {result}");
+        assert!(
+            result["content"][0]["text"].as_str().unwrap_or("").contains("operator_only"),
+            "explicit policy (not built-in dept rule) should be the reason: {result}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wp7_ls_hides_other_departments() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml_dept(&agents_dir, "monet", "art");
+        write_agent_toml_dept(&agents_dir, "seller", "sales");
+
+        // art page (by monet) + sales page (by seller) + a company page.
+        let _ = handle_shared_wiki_write(
+            &serde_json::json!({ "page_path": "departments/art/palette.md", "content": clean_karpathy_page("Palette") }),
+            tmp.path(), "monet",
+        ).await;
+        let _ = handle_shared_wiki_write(
+            &serde_json::json!({ "page_path": "departments/sales/quota.md", "content": clean_karpathy_page("Quota") }),
+            tmp.path(), "seller",
+        ).await;
+        let _ = handle_shared_wiki_write(
+            &serde_json::json!({ "page_path": "sop/hours.md", "content": clean_karpathy_page("Hours") }),
+            tmp.path(), "monet",
+        ).await;
+
+        let ls = handle_shared_wiki_ls(tmp.path(), "monet").await;
+        let text = ls["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("departments/art/palette.md"), "own dept visible: {text}");
+        assert!(text.contains("sop/hours.md"), "company page visible: {text}");
+        assert!(!text.contains("departments/sales/quota.md"), "other dept must be hidden: {text}");
+    }
+
+    /// F4: an operator declaring the `departments` namespace in `.scope.toml`
+    /// tightens the WRITE policy — it must NOT open cross-department reads.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wp7_explicit_scope_does_not_open_cross_department_reads() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml_dept(&agents_dir, "monet", "art");
+        write_agent_toml_dept(&agents_dir, "seller", "sales");
+
+        // Populate a sales page BEFORE any policy is declared.
+        let _ = handle_shared_wiki_write(
+            &serde_json::json!({ "page_path": "departments/sales/quota.md", "content": clean_karpathy_page("Quota") }),
+            tmp.path(), "seller",
+        ).await;
+
+        // Operator declares the departments namespace (would previously flip the
+        // buggy `explicit_override` and open reads to everyone).
+        write_scope_policy(
+            tmp.path(),
+            r#"
+                [namespaces."departments"]
+                mode = "operator_only"
+            "#,
+        );
+
+        // Cross-department read is STILL denied.
+        let r = handle_shared_wiki_read(
+            &serde_json::json!({ "page_path": "departments/sales/quota.md" }),
+            tmp.path(), "monet",
+        ).await;
+        assert!(
+            r["isError"].as_bool().unwrap_or(false),
+            "explicit .scope.toml must NOT open cross-department reads: {r}"
+        );
+
+        // And ls still hides it.
+        let ls = handle_shared_wiki_ls(tmp.path(), "monet").await;
+        let text = ls["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            !text.contains("departments/sales/quota.md"),
+            "other dept must stay hidden under explicit scope: {text}"
+        );
+    }
+
+    /// F5: `shared_wiki_stats` must not leak other departments' page paths or
+    /// author counts.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wp7_stats_hides_other_departments() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml_dept(&agents_dir, "monet", "art");
+        write_agent_toml_dept(&agents_dir, "seller", "sales");
+
+        let _ = handle_shared_wiki_write(
+            &serde_json::json!({ "page_path": "departments/art/palette.md", "content": clean_karpathy_page("Palette") }),
+            tmp.path(), "monet",
+        ).await;
+        let _ = handle_shared_wiki_write(
+            &serde_json::json!({ "page_path": "departments/sales/quota.md", "content": clean_karpathy_page("Quota") }),
+            tmp.path(), "seller",
+        ).await;
+
+        let stats = handle_shared_wiki_stats(tmp.path(), "monet").await;
+        let text = stats["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("departments/art"), "own dept dir visible: {text}");
+        assert!(!text.contains("sales"), "other dept path/author must not leak: {text}");
+        assert!(!text.contains("seller"), "other dept author must not leak: {text}");
+    }
+
+    /// F5: `shared_wiki_lint` must not surface other departments' page paths.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wp7_lint_hides_other_departments() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml_dept(&agents_dir, "monet", "art");
+        write_agent_toml_dept(&agents_dir, "seller", "sales");
+
+        // A deliberately schema-broken sales page so lint would want to name it.
+        let _ = handle_shared_wiki_write(
+            &serde_json::json!({ "page_path": "departments/art/palette.md", "content": clean_karpathy_page("Palette") }),
+            tmp.path(), "monet",
+        ).await;
+        let sales_dir = tmp.path().join("shared/wiki/departments/sales");
+        fs::create_dir_all(&sales_dir).unwrap();
+        fs::write(sales_dir.join("quota.md"), "no frontmatter at all").unwrap();
+
+        let lint = handle_shared_wiki_lint(tmp.path(), "monet").await;
+        let text = lint["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            !text.contains("departments/sales/quota.md"),
+            "other dept page must not appear in lint report: {text}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn shared_wiki_write_unaffected_when_no_scope_policy_present() {
         let tmp = TempDir::new();
@@ -12534,7 +13229,7 @@ mod wiki_schema_tests {
             "#,
         );
 
-        let result = handle_wiki_namespace_status(tmp.path()).await;
+        let result = handle_wiki_namespace_status(tmp.path(), "agnes").await;
         let text = result["content"][0]["text"].as_str().unwrap_or("");
         assert!(text.contains("\"namespace\": \"identity\""), "got: {text}");
         assert!(text.contains("\"mode\": \"read_only\""), "got: {text}");
@@ -12547,7 +13242,7 @@ mod wiki_schema_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn wiki_namespace_status_reports_empty_policy_when_file_absent() {
         let tmp = TempDir::new();
-        let result = handle_wiki_namespace_status(tmp.path()).await;
+        let result = handle_wiki_namespace_status(tmp.path(), "agnes").await;
         let text = result["content"][0]["text"].as_str().unwrap_or("");
         assert!(
             text.contains("none configured") && text.contains("agent_writable"),
@@ -14510,21 +15205,25 @@ mod wiki_namespace_tests {
         std::fs::create_dir_all(&home).unwrap();
 
         // Missing params.
-        let res = super::handle_skill_hub_install(&json!({}), &home).await;
+        let res = super::handle_skill_hub_install(&json!({}), &home, "dudu", true).await;
         assert_eq!(res["isError"].as_bool(), Some(true));
 
         // Path traversal in slug.
         let res = super::handle_skill_hub_install(
             &json!({"hub": "clawhub", "skill_name": "../evil"}),
             &home,
+            "dudu",
+            true,
         )
         .await;
         assert_eq!(res["isError"].as_bool(), Some(true));
 
-        // Unknown hub is denied without any network call.
+        // Unknown hub is denied without any network call (before approval).
         let res = super::handle_skill_hub_install(
             &json!({"hub": "not-a-hub", "skill_name": "fine-name"}),
             &home,
+            "dudu",
+            true,
         )
         .await;
         assert_eq!(res["isError"].as_bool(), Some(true));
@@ -15253,3 +15952,195 @@ mod audit_input_and_jitrl_tests {
     }
 }
 
+
+#[cfg(test)]
+mod wp5_install_approval_tests {
+    use super::*;
+    use duduclaw_gateway::approval::{ApprovalBroker, ApprovalStore};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct TempHome(std::path::PathBuf);
+    impl TempHome {
+        fn new() -> Self {
+            let p = std::env::temp_dir()
+                .join(format!("duduclaw-wp5-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn in_mem_broker() -> ApprovalBroker {
+        ApprovalBroker::new(Arc::new(ApprovalStore::open_in_memory().unwrap()))
+    }
+
+    fn write_agent_toml(home: &std::path::Path, agent: &str, body: &str) {
+        let dir = home.join("agents").join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), body).unwrap();
+    }
+
+    // ── Branch logic: who must obtain approval ─────────────────────────────
+
+    #[test]
+    fn non_admin_install_class_requires_approval() {
+        let home = TempHome::new();
+        let agent_dir = home.path().join("agents").join("dudu");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        // No agent.toml at all: install-class + non-admin still gates.
+        assert!(install_approval_required(&agent_dir, "skill_hub_install", false));
+    }
+
+    #[test]
+    fn admin_install_class_still_requires_approval() {
+        let home = TempHome::new();
+        let agent_dir = home.path().join("agents").join("dudu");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        // F1: the internal admin principal is NOT a bypass. An install-class
+        // tool reached via MCP still needs human approval even for an admin
+        // caller (this is the agent-autonomous path WP5 must gate).
+        assert!(install_approval_required(&agent_dir, "skill_hub_install", true));
+    }
+
+    #[test]
+    fn auto_approve_install_exempts_install_class() {
+        let home = TempHome::new();
+        write_agent_toml(
+            home.path(),
+            "dudu",
+            "[capabilities]\nauto_approve_install = true\n",
+        );
+        let agent_dir = home.path().join("agents").join("dudu");
+        // Explicit operator opt-out disables the gate for both admin + non-admin.
+        assert!(!install_approval_required(&agent_dir, "skill_hub_install", true));
+        assert!(!install_approval_required(&agent_dir, "skill_hub_install", false));
+    }
+
+    #[test]
+    fn explicit_list_overrides_auto_approve_install() {
+        let home = TempHome::new();
+        write_agent_toml(
+            home.path(),
+            "dudu",
+            "[capabilities]\nauto_approve_install = true\napproval_required_tools = [\"skill_hub_install\"]\n",
+        );
+        let agent_dir = home.path().join("agents").join("dudu");
+        // Explicit per-tool listing wins over the exemption — approval required.
+        assert!(install_approval_required(&agent_dir, "skill_hub_install", true));
+        assert!(install_approval_required(&agent_dir, "skill_hub_install", false));
+    }
+
+    #[test]
+    fn explicit_agent_toml_gates_even_admin() {
+        let home = TempHome::new();
+        write_agent_toml(
+            home.path(),
+            "dudu",
+            "[capabilities]\napproval_required_tools = [\"skill_hub_install\"]\n",
+        );
+        let agent_dir = home.path().join("agents").join("dudu");
+        // Operator intent (explicit listing) is honoured regardless of admin.
+        assert!(install_approval_required(&agent_dir, "skill_hub_install", true));
+        assert!(install_approval_required(&agent_dir, "skill_hub_install", false));
+    }
+
+    #[test]
+    fn non_install_class_non_admin_not_gated_here() {
+        let home = TempHome::new();
+        let agent_dir = home.path().join("agents").join("dudu");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        // A read-only tool is not install-class; this gate does not apply
+        // (unless explicitly listed, which it is not here).
+        assert!(!install_approval_required(&agent_dir, "memory_search", false));
+    }
+
+    // ── Decision loop: approve / deny / expire (fail-closed) ───────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approval_granted_proceeds() {
+        let broker = in_mem_broker();
+        let b2 = broker.clone();
+        // Approve the sole pending request from another task.
+        tokio::spawn(async move {
+            // Give the request time to land, then approve it.
+            for _ in 0..50 {
+                if let Ok(pending) = b2.list_pending(Some("dudu")).await {
+                    if let Some(rec) = pending.first() {
+                        b2.decide(&rec.id, true, "dashboard:admin").await.unwrap();
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let out = run_install_approval(
+            &broker,
+            "dudu",
+            "安裝技能「notes」",
+            serde_json::json!({"tool": "skill_hub_install"}),
+            60,
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(matches!(out, InstallApprovalOutcome::Proceed));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approval_denied_blocks() {
+        let broker = in_mem_broker();
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            for _ in 0..50 {
+                if let Ok(pending) = b2.list_pending(Some("dudu")).await {
+                    if let Some(rec) = pending.first() {
+                        b2.decide(&rec.id, false, "dashboard:admin").await.unwrap();
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let out = run_install_approval(
+            &broker,
+            "dudu",
+            "安裝技能「evil」",
+            serde_json::json!({}),
+            60,
+            Duration::from_millis(10),
+        )
+        .await;
+        match out {
+            InstallApprovalOutcome::Denied(msg) => assert!(msg.contains("拒絕"), "got: {msg}"),
+            InstallApprovalOutcome::Proceed => panic!("denied approval must NOT proceed"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approval_ttl_expiry_denies() {
+        let broker = in_mem_broker();
+        // ttl of 1s, nobody decides ⇒ await_decision returns Expired ⇒ Denied.
+        let out = run_install_approval(
+            &broker,
+            "dudu",
+            "安裝技能「slow」",
+            serde_json::json!({}),
+            1,
+            Duration::from_millis(20),
+        )
+        .await;
+        match out {
+            InstallApprovalOutcome::Denied(msg) => {
+                assert!(msg.contains("逾時") || msg.contains("fail-closed"), "got: {msg}")
+            }
+            InstallApprovalOutcome::Proceed => panic!("TTL expiry must deny (fail-closed)"),
+        }
+    }
+}

@@ -1,6 +1,7 @@
 import { useId } from 'react';
 import { cn } from '@/lib/utils';
 import { characterFor } from '@/lib/character-gen';
+import { useAgentAvatar } from '@/stores/agent-avatar-store';
 import { StatusEmote, type StatusEmoteKind } from './StatusEmote';
 import type { CharacterPose } from './poses';
 
@@ -36,6 +37,14 @@ export interface CharacterAvatarProps {
   live?: boolean;
   /** Disable blink / micro-motion even when motion is allowed. Default true. */
   animated?: boolean;
+  /**
+   * Uploaded avatar image as a data URI (WP4). When provided (a non-empty
+   * string) it replaces the generative character. `null`/`''` explicitly means
+   * "no upload, use the generative face" and skips the lazy avatar lookup. When
+   * omitted (`undefined`) the component resolves any uploaded avatar for
+   * `agentId` from the shared cache, so every surface stays consistent.
+   */
+  avatar?: string | null;
   className?: string;
 }
 
@@ -257,6 +266,7 @@ export function CharacterAvatar({
   emote,
   live = false,
   animated = true,
+  avatar,
   className,
 }: CharacterAvatarProps) {
   const uid = useId().replace(/[:]/g, '');
@@ -264,6 +274,11 @@ export function CharacterAvatar({
   const traits = characterFor(agentId);
   const isBust = variant ? variant === 'bust' : size >= 64;
   const label = name ?? agentId;
+
+  // Resolve an uploaded avatar. An explicit prop wins (even null = "generative");
+  // when omitted we consult the shared cache so any surface picks it up.
+  const resolved = useAgentAvatar(avatar === undefined ? agentId : undefined);
+  const uploadedSrc = avatar !== undefined ? avatar || undefined : resolved;
 
   const head: Head = isBust ? { cx: 24, cy: 17, r: 12.5 } : { cx: 24, cy: 24, r: 18 };
   const aVar = `var(--agent-${traits.tintIndex}a)`;
@@ -277,6 +292,14 @@ export function CharacterAvatar({
       className={cn('relative inline-block align-middle', className)}
       style={{ width: size, height: size }}
     >
+      {uploadedSrc ? (
+        <img
+          src={uploadedSrc}
+          alt=""
+          aria-hidden="true"
+          className="h-full w-full rounded-full object-cover ring-1 ring-inset ring-black/5 dark:ring-white/10"
+        />
+      ) : (
       <svg viewBox={`0 0 ${VIEW} ${VIEW}`} width={size} height={size} aria-hidden="true" className="overflow-visible">
         <defs>
           <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
@@ -302,6 +325,7 @@ export function CharacterAvatar({
         <Mouth h={head} pose={pose} />
         <Accessory h={head} kind={traits.accessory} gradId={gradId} />
       </svg>
+      )}
 
       {emote && (
         <span className="absolute -right-1 -top-1">

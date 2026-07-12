@@ -663,9 +663,19 @@ async fn poll_loop(
 
                 let user_id = msg.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default();
                 let reply = if let Some(ref agent) = agent_name {
+                    // Per-agent bot: unchanged deterministic routing to its owner.
                     build_reply_for_agent(&input_text, &ctx, agent, &session_id, &user_id, Some(on_progress)).await
                 } else {
-                    build_reply_with_session(&input_text, &ctx, &session_id, &user_id, Some(on_progress)).await
+                    // Global/shared bot: route by the user→agent binding (WP9).
+                    match resolve_shared_route(&ctx, &user_id).await {
+                        SharedRoute::Bound(bound_agent) => {
+                            build_reply_for_agent(&input_text, &ctx, &bound_agent, &session_id, &user_id, Some(on_progress)).await
+                        }
+                        SharedRoute::Unbound => {
+                            build_reply_with_session(&input_text, &ctx, &session_id, &user_id, Some(on_progress)).await
+                        }
+                        SharedRoute::Guide(msg) => msg,
+                    }
                 };
                 drop(typing_guard);
 
@@ -797,6 +807,28 @@ async fn handle_command(
     agent_name: Option<&str>,
     from_user_id: Option<i64>,
 ) {
+    // ── WP9: `/start <token>` deep-link binding (global/shared bot only) ──
+    // Runs BEFORE the access gate so a brand-new employee can onboard even
+    // under require_pairing; a successful bind also approves the user. Only
+    // the shared bot (agent_name = None) participates — per-agent bots route
+    // deterministically to their owner and ignore /start.
+    {
+        let raw = text.split_whitespace().next().unwrap_or("");
+        let base = raw.split('@').next().unwrap_or(raw);
+        if base == "/start" && agent_name.is_none() {
+            // Split off the command token by whitespace rather than a raw byte
+            // slice (coding convention #1: never index strings by byte offset —
+            // safe here even with leading whitespace / multi-byte payloads).
+            let payload = text
+                .split_once(char::is_whitespace)
+                .map(|(_, rest)| rest.trim())
+                .unwrap_or("");
+            let reply = handle_start_binding(ctx, payload, from_user_id).await;
+            send_reply(client, api_base, chat_id, &reply, thread_id, None, None).await;
+            return;
+        }
+    }
+
     // Central access gate (pairing / allowlist / blocklist) — the command
     // intercept runs BEFORE channel_reply's pipeline gate, so apply the SAME
     // gate here: unpaired/blocked users must not run /reset //undo //handoff
@@ -847,7 +879,18 @@ async fn handle_command(
             let reply = if let Some(agent) = agent_name {
                 build_reply_for_agent(args, ctx, agent, &session_id, scope_id, None).await
             } else {
-                build_reply_with_session(args, ctx, &session_id, scope_id, None).await
+                // Global/shared bot: honor the user→agent binding (WP9). The
+                // per-user key is the sender's id when present, else the chat.
+                let bind_key = from_user_id.map(|id| id.to_string()).unwrap_or_else(|| scope_id.to_string());
+                match resolve_shared_route(ctx, &bind_key).await {
+                    SharedRoute::Bound(bound_agent) => {
+                        build_reply_for_agent(args, ctx, &bound_agent, &session_id, scope_id, None).await
+                    }
+                    SharedRoute::Unbound => {
+                        build_reply_with_session(args, ctx, &session_id, scope_id, None).await
+                    }
+                    SharedRoute::Guide(msg) => msg,
+                }
             };
             drop(typing_guard);
             send_reply_markdown(client, api_base, chat_id, &reply, thread_id, None, Some(channel_format::telegram_conversation_buttons())).await;
@@ -943,6 +986,98 @@ async fn handle_command(
                 send_reply(client, api_base, chat_id, &reply, thread_id, None, None).await;
             }
             // Still-unknown slash command — ignore (legacy behavior).
+        }
+    }
+}
+
+// ── WP9: shared-bot user→agent binding ──────────────────────
+
+/// How the shared (global) Telegram bot should route one user's message.
+enum SharedRoute {
+    /// Route to a specific bound agent (user has scanned a bind link).
+    Bound(String),
+    /// No binding — fall back to the existing default-agent reply path.
+    Unbound,
+    /// No binding and shared-bot mode is on — reply with bind-first guidance
+    /// (never route to a default agent, to avoid misrouting).
+    Guide(String),
+}
+
+/// Decide how the global bot routes a message from `user_id` (fail-closed —
+/// a message is only routed to a bound agent when a durable binding exists AND
+/// that agent is still present in the registry).
+async fn resolve_shared_route(ctx: &Arc<ReplyContext>, user_id: &str) -> SharedRoute {
+    if let Some(agent) = ctx.agent_binding.resolve_bound_agent("telegram", user_id).await {
+        // Honor the binding only if the target agent is still operational — a
+        // soft-deleted/archived agent keeps its registry entry (that is what soft
+        // delete means), so an existence check is not enough (F2): route only when
+        // is_operational(), otherwise fall through instead of misrouting.
+        let operational = ctx
+            .registry
+            .read()
+            .await
+            .get(&agent)
+            .map(|a| a.config.agent.status.is_operational())
+            .unwrap_or(false);
+        if operational {
+            return SharedRoute::Bound(agent);
+        }
+        warn!(
+            agent,
+            user_id, "Telegram: bound agent no longer operational — falling back"
+        );
+    }
+    // Unbound: guide the user only when the operator has enabled shared-bot
+    // binding for telegram; otherwise keep the legacy default-agent behavior.
+    let shared_mode = ctx
+        .channel_settings
+        .get_bool("telegram", "global", keys::SHARED_BOT_BINDING, false)
+        .await;
+    if shared_mode {
+        SharedRoute::Guide(
+            "👋 您好！請使用專屬的綁定連結或掃描 QR code 來連結您的 AI 助理，之後即可直接對話。\n若您沒有連結，請向管理員索取。"
+                .to_string(),
+        )
+    } else {
+        SharedRoute::Unbound
+    }
+}
+
+/// Handle a `/start [payload]` on the global bot. With a payload it is treated
+/// as a one-time bind token: on success the Telegram user is bound to the
+/// target agent (and approved for the access gate); otherwise a friendly
+/// rejection. A bare `/start` greets and points the user at their bind link.
+async fn handle_start_binding(
+    ctx: &Arc<ReplyContext>,
+    payload: &str,
+    from_user_id: Option<i64>,
+) -> String {
+    let Some(uid) = from_user_id else {
+        return "⚠️ 目前無法辨識您的帳號，請稍後再試一次。".to_string();
+    };
+    let user_id = uid.to_string();
+
+    if payload.is_empty() {
+        return "👋 歡迎！請使用專屬的綁定連結或掃描 QR code 來連結您的 AI 助理。".to_string();
+    }
+
+    match ctx.agent_binding.redeem_bind_token("telegram", payload, &user_id).await {
+        Ok(agent_id) => {
+            // A successful bind also grants access, so pairing-protected
+            // deployments let this now-known employee through immediately.
+            ctx.access_control.approve_user(&user_id).await;
+            let display = {
+                let reg = ctx.registry.read().await;
+                reg.get(&agent_id)
+                    .map(|a| a.config.agent.display_name.clone())
+                    .unwrap_or_else(|| agent_id.clone())
+            };
+            info!(user_id, agent_id, "Telegram: user bound via /start deep-link");
+            format!("✅ 綁定成功！您已連結到「{display}」，直接傳訊息就能開始對話。")
+        }
+        Err(e) => {
+            warn!(user_id, ?e, "Telegram: /start bind token rejected");
+            "❌ 這個連結無效或已過期，請向管理員索取新的綁定連結。".to_string()
         }
     }
 }

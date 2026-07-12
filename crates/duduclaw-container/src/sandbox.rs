@@ -162,6 +162,8 @@ pub async fn run_sandboxed_for_runtime(
         RuntimeType::Codex => env.push(format!("OPENAI_API_KEY={api_key}")),
         RuntimeType::Gemini => env.push(format!("GEMINI_API_KEY={api_key}")),
         RuntimeType::Antigravity => env.push(format!("ANTIGRAVITY_API_KEY={api_key}")),
+        // R4 / UNVERIFIED: xAI's standard env var for the api-key CLI.
+        RuntimeType::Grok => env.push(format!("XAI_API_KEY={api_key}")),
         // No CLI binary for OpenAI-compat — treated as Claude-shaped fallback
         // upstream; nothing extra to inject here.
         RuntimeType::OpenAiCompat => {}
@@ -435,6 +437,20 @@ pub(crate) fn build_agent_cmd(
                 cmd.push(model.to_string());
             }
             // `-p` consumes the NEXT argv token as the prompt — it must be last.
+            cmd.push("-p".to_string());
+            cmd.push(flag_safe(&embed_system_prompt(safe_system_prompt, prompt)));
+            cmd
+        }
+        RuntimeType::Grok => {
+            // R4 / UNVERIFIED: no verified `--system` or sandbox flag, so embed the
+            // system prompt and rely on the container as the enforcement boundary.
+            // `--model` before the prompt; `-p <payload>` last (safe under both
+            // value-consuming and boolean+positional `-p` interpretations).
+            let mut cmd = vec!["grok".to_string()];
+            if !model.is_empty() {
+                cmd.push("--model".to_string());
+                cmd.push(model.to_string());
+            }
             cmd.push("-p".to_string());
             cmd.push(flag_safe(&embed_system_prompt(safe_system_prompt, prompt)));
             cmd
